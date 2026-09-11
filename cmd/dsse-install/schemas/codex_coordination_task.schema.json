@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/codex_coordination_task.schema.json",
+  "title": "CodexCoordinationTask",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "id",
+    "role",
+    "status",
+    "priority",
+    "created_at",
+    "updated_at",
+    "created_by",
+    "summary",
+    "handoff",
+    "expected_result",
+    "workspace",
+    "allowed_writes",
+    "blocks",
+    "notes"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "codex_coordination_task.v1"
+      ]
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{2,120}$"
+    },
+    "role": {
+      "type": "string",
+      "enum": [
+        "dev",
+        "human_validation",
+        "claude_review"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "in_progress",
+        "needs_human_validation",
+        "needs_claude_review",
+        "blocked",
+        "passed",
+        "done",
+        "cancelled"
+      ]
+    },
+    "priority": {
+      "type": "string",
+      "enum": [
+        "P0",
+        "P1",
+        "P2",
+        "P3"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_by": {
+      "type": "string",
+      "enum": [
+        "dev_main",
+        "human_validation",
+        "claude_review",
+        "user"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "handoff": {
+      "type": "object",
+      "required": [
+        "context",
+        "files",
+        "commands"
+      ],
+      "properties": {
+        "context": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "expected_result": {
+      "type": "string"
+    },
+    "workspace": {
+      "type": "string"
+    },
+    "allowed_writes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "blocks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

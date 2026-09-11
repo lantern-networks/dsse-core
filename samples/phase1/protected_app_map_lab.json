@@ -1,0 +1,62 @@
+{
+  "tenant_id": "tenant_lab_001",
+  "version": "2026.05.22.001",
+  "applications": [
+    {
+      "application_id": "app_dummy_https",
+      "fqdn": "dummy-private-app.local",
+      "service_family": "https",
+      "destination_port": 443,
+      "steering_mode": "explicit_proxy",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "destination_role": "private_app",
+        "private_path": "/private-app/dummy",
+        "sensitivity": "medium"
+      }
+    },
+    {
+      "application_id": "app_dummy_ssh",
+      "fqdn": "dummy-ssh.local",
+      "service_family": "ssh",
+      "destination_port": 22,
+      "steering_mode": "network_extension",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "destination_role": "ssh_server",
+        "private_path": "/private-app/dummy-ssh",
+        "sensitivity": "high"
+      }
+    },
+    {
+      "application_id": "app_dummy_postgres",
+      "fqdn": "dummy-postgres.local",
+      "service_family": "database",
+      "destination_port": 5432,
+      "steering_mode": "network_extension",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "database_protocol": "postgresql",
+        "destination_role": "database_server",
+        "private_path": "/private-app/dummy-postgres",
+        "sensitivity": "high"
+      }
+    },
+    {
+      "application_id": "app_dummy_rdp",
+      "fqdn": "dummy-rdp.local",
+      "service_family": "rdp",
+      "destination_port": 3389,
+      "steering_mode": "network_extension",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "destination_role": "admin_server",
+        "private_path": "/private-app/dummy-rdp",
+        "sensitivity": "high"
+      }
+    }
+  ],
+  "metadata": {
+    "source": "phase1_lab"
+  }
+}

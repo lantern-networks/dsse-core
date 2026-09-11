@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_config.schema.json",
+  "title": "AgentConfig",
+  "type": "object",
+  "required": [
+    "edge_url",
+    "device_id",
+    "tenant_id",
+    "user_id",
+    "os",
+    "agent_version",
+    "device_trust_level",
+    "cache_dir"
+  ],
+  "properties": {
+    "edge_url": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "runtime_connector_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional connector id sent as x-connector-id when Edge runtime endpoints require connector-bound runtime authentication."
+    },
+    "runtime_secret": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional runtime secret sent as x-connector-secret to protected Edge device endpoints. Phase 1 lab bridge; production should replace this with device-bound credentials."
+    },
+    "runtime_secret_file": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional local file path containing the runtime secret. This lets MDM-managed config reference a device-local credential without embedding the secret value."
+    },
+    "runtime_secret_keychain_service": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional macOS Keychain generic-password service name used to resolve the runtime secret when runtime_secret and runtime_secret_file are not set."
+    },
+    "runtime_secret_keychain_account": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional macOS Keychain generic-password account used with runtime_secret_keychain_service."
+    },
+    "fetch_trusted_keyring": {
+      "type": "boolean",
+      "description": "When true, the agent fetches /devices/{device_id}/trusted-keyring from Edge after registration and uses it to verify the fetched policy bundle."
+    },
+    "hostname": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "os": {
+      "type": "string"
+    },
+    "os_version": {
+      "type": "string"
+    },
+    "agent_version": {
+      "type": "string"
+    },
+    "target_agent_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "release_channel": {
+      "type": "string",
+      "enum": [
+        "lab",
+        "alpha",
+        "stable",
+        "pilot",
+        "canary",
+        "emergency"
+      ]
+    },
+    "update_source": {
+      "type": "string",
+      "enum": [
+        "mdm",
+        "control_plane",
+        "manual"
+      ]
+    },
+    "rollout_policy_enabled": {
+      "type": "boolean"
+    },
+    "device_trust_level": {
+      "type": "string",
+      "enum": [
+        "managed",
+        "unmanaged",
+        "unknown"
+      ]
+    },
+    "cache_dir": {
+      "type": "string"
+    },
+    "trusted_keyring": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "proxy_mode": {
+      "type": "string",
+      "enum": [
+        "explicit",
+        "pac",
+        "system_proxy",
+        "network_extension"
+      ]
+    },
+    "protected_app_map_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "network_extension_rules_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional path to generated network_extension_steering_rules.v1 manifest used by App Proxy Provider / Packet Tunnel Provider steering."
+    },
+    "network_extension_runtime_evidence_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional path to Network Extension runtime evidence JSON collected by the provider or Phase 1 not-installed contract. The Local Client reports it in Agent Status without treating would-steer evidence as installed runtime proof."
+    },
+    "network_extension_runtime_copy_endpoint_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional Edge endpoint path used by the Network Extension runtime-copy transport. When omitted, the provider uses the reviewed default round-trip endpoint path."
+    },
+    "network_extension_runtime_copy_transport_scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "real_edge",
+        "lab_endpoint",
+        null
+      ],
+      "description": "Optional non-secret runtime-copy transport evidence label scope. real_edge is the production Edge/Connector path; lab_endpoint is only for the Phase 2 human smoke harness responder and must not be used to claim real Edge/Connector product traversal."
+    },
+    "network_extension_runtime_copy_evidence_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional path to the non-secret Network Extension runtime-copy evidence JSON written by the provider during Phase 2 flow-copy smoke. The file contains counts and gate categories only."
+    },
+    "windows_observe_mode_report_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional path to Windows Observe Mode report JSON. Before WFP/WinDivert is installed, the Local Client reports this as driver/filter not installed and enforcement disabled."
+    },
+    "local_proxy_metrics_url": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional local proxy /metrics URL. When present, the Local Client reports observed proxy steering counters in agent status telemetry."
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

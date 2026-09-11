@@ -1,0 +1,18 @@
+# Build artifacts + vendored engine binaries — fetched/built via README.md, never committed.
+egress-broker-cgo
+egress-broker-amd64
+core
+cli/
+cli.tgz
+cgo-arm64/
+cgo-amd64/
+cli-amd64/
+cgo-deps/
+.engine-downloads/
+cc-wheel/
+*.bak
+*.bak[0-9]
+*.bak-*
+
+.build-inspection-root.pem
+.engine-version

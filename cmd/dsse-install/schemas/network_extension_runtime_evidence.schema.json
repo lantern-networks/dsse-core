@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/network_extension_runtime_evidence.schema.json",
+  "title": "NetworkExtensionRuntimeEvidence",
+  "description": "Runtime evidence shape. Cross-field consistency for installed=true evidence, runtime_running, rules_loaded, rule_count, and flow counters is enforced by verify_network_extension_runtime_evidence.sh.",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "runtime_installed",
+    "runtime_running",
+    "runtime_provider",
+    "rules_loaded",
+    "rule_count",
+    "flow_extraction_attempted",
+    "flow_extraction_succeeded",
+    "flow_extraction_denied",
+    "flow_extraction_gate",
+    "flow_attempted",
+    "flow_tunneled",
+    "flow_denied",
+    "last_error",
+    "evidence_source",
+    "secret_leak_gate"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "runtime_installed": {
+      "type": "boolean",
+      "description": "Whether a real Network Extension runtime was installed on the endpoint."
+    },
+    "runtime_running": {
+      "type": "boolean",
+      "description": "Whether the installed Network Extension runtime was running when evidence was collected."
+    },
+    "runtime_provider": {
+      "type": "string",
+      "enum": [
+        "not_installed",
+        "app_proxy_provider",
+        "packet_tunnel_provider"
+      ]
+    },
+    "rules_loaded": {
+      "type": "boolean"
+    },
+    "rule_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "flow_extraction_attempted": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of provider flows whose authority extraction was attempted before a policy decision."
+    },
+    "flow_extraction_succeeded": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of extraction attempts that produced a TCP host/port authority eligible for decision."
+    },
+    "flow_extraction_denied": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of extraction attempts denied before decision because the flow authority was unsupported or invalid."
+    },
+    "flow_extraction_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "flow_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "flow_tunneled": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "flow_denied": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "evidence_source": {
+      "type": "string",
+      "description": "Source of this evidence. provider_runtime is the only source allowed to claim runtime_installed=true in Phase 1; agent_status is reserved for a future metadata-mirror writer and current verifiers reject it as installed runtime proof.",
+      "enum": [
+        "not_installed_contract",
+        "provider_runtime",
+        "agent_status"
+      ]
+    },
+    "secret_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DsseBundle.wxs — Burn bootstrapper that wraps the DsseAgent MSI into a single signed DsseAgentSetup.exe
+  (a Burn bootstrapper). It chains any prerequisites (WebView2 Evergreen — opt-in via
+  -d WebView2=1, only needed once the WebView2-based stepup/captive helper is packaged) and then the MSI.
+
+  The FINE compatibility gate (arch / S Mode / HVCI / Secure Boot / Win11 build) is the MSI's job (compatcheck /
+  M8.2); the bundle only enforces the coarse "64-bit Windows" precondition and gives the install a UI + a single
+  signed artifact for distribution. The packaged agent is pure Go + a kernel driver, so it needs NO VC++ redist.
+
+  Build:
+    wix build DsseBundle.wxs -ext WixToolset.BootstrapperApplications.wixext -ext WixToolset.Util.wixext
+              -b <dir-with-DsseAgent.msi> -d Version=x.y.z [-d WebView2=1] -o DsseAgentSetup.exe
+-->
+<!-- Guarded: an unguarded <?define?> WINS over the build's -d, so it is an override wearing a default's
+     clothes. DsseAgent.wxs shipped exactly that and produced ProductVersion 0.1.0 for every -Version asked for;
+     ops/checks/windows_packaging_buildability.sh now refuses both files without the guard. -->
+<?ifndef Version ?>
+  <?define Version = "0.1.0" ?>
+<?endif?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="Lantern DSSE Agent"
+          Manufacturer="Lantern Networks"
+          Version="$(var.Version)"
+          UpgradeCode="8B1E5F2C-3D47-4A9E-B6C1-7E90D2F4A118">
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="" SuppressOptionsUI="yes" />
+    </BootstrapperApplication>
+
+    <?ifdef WebView2 ?>
+    <!-- Detect the per-machine WebView2 Evergreen runtime; empty => absent => the ExePackage installs it. -->
+    <util:RegistrySearch Id="WebView2RuntimeVersionSearch" Variable="WebView2RuntimeVersion" Root="HKLM"
+                         Key="SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+                         Value="pv" Result="value" />
+    <?endif?>
+
+    <!-- Coarse precondition only: 64-bit Windows (kernel driver = no emulation, no 32-bit). The detailed gate
+         (S Mode / HVCI / Secure Boot vs signing / Win11 build / ARM64 artifact selection) is compatcheck inside
+         the MSI. -->
+    <bal:Condition Condition="VersionNT64" Message="Lantern DSSE Agent requires 64-bit Windows." />
+
+    <Chain>
+      <?ifdef WebView2 ?>
+      <!-- WebView2 Evergreen: install only if the runtime is absent (DetectCondition on the per-machine runtime
+           registry key). The Evergreen bootstrapper is staged next to the bundle inputs. Needed once the
+           WebView2-based stepup/captive helper ships in the MSI; harmless (skipped) when already present. -->
+      <ExePackage Id="WebView2Runtime"
+                  SourceFile="MicrosoftEdgeWebview2Setup.exe"
+                  InstallArguments="/silent /install"
+                  Permanent="yes"
+                  Vital="yes"
+                  DetectCondition="WebView2RuntimeVersion AND WebView2RuntimeVersion &lt;&gt; 0" />
+      <?endif?>
+
+      <MsiPackage SourceFile="DsseAgent.msi" Vital="yes" />
+    </Chain>
+  </Bundle>
+</Wix>

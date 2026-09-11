@@ -1,0 +1,11 @@
+# driver build artifacts (not committed; reproduce via BUILD.md)
+x64/
+dsse-wfp/
+*.obj
+*.sys
+*.pdb
+*.tlog
+*.recipe
+*.log
+*.lastbuildstate
+*.cer

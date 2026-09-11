@@ -1,0 +1,45 @@
+{
+  "$id": "https://example.local/schemas/human_identity.schema.json",
+  "type": "object",
+  "required": ["id", "tenant_id", "subject", "source", "status"],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "email": {
+      "type": ["string", "null"]
+    },
+    "display_name": {
+      "type": ["string", "null"]
+    },
+    "source": {
+      "type": "string",
+      "description": "Identity directory source such as idp, hris, scim, or lab_import."
+    },
+    "department": {
+      "type": ["string", "null"]
+    },
+    "last_seen_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": ["string", "null"],
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "suspended", "deleted"]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

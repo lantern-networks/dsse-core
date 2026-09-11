@@ -1,0 +1,400 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/network_extension_swift_contract_smoke.schema.json",
+  "title": "NetworkExtensionSwiftContractSmoke",
+  "description": "Swift contract smoke report shape. Required case names are bound to exact expected outcomes by verify_network_extension_swift_contract_smoke.sh.",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "rules_manifest",
+    "case_count",
+    "cases",
+    "runtime_evidence_writer",
+    "provider_flow_takeover"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "rules_manifest": {
+      "type": "string"
+    },
+    "case_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "provider_action",
+          "action",
+          "reason"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "provider_action": {
+            "type": "string",
+            "enum": [
+              "open_tunnel",
+              "deny"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "tunnel",
+              "deny"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "matched_network_extension_rule",
+              "no_matching_network_extension_rule",
+              "invalid_flow_authority",
+              "invalid_network_extension_rules"
+            ]
+          },
+          "application_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_lifecycle_status": {
+            "type": "string",
+            "enum": [
+              "running",
+              "failed"
+            ]
+          },
+          "rules_loaded": {
+            "type": "boolean"
+          },
+          "rule_count": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "runtime_evidence_writer": {
+      "type": "object",
+      "required": [
+        "status",
+        "runtime_evidence_report",
+        "runtime_installed",
+        "runtime_running",
+        "runtime_provider",
+        "rules_loaded",
+        "rule_count",
+        "flow_extraction_attempted",
+        "flow_extraction_succeeded",
+        "flow_extraction_denied",
+        "flow_extraction_gate",
+        "flow_attempted",
+        "flow_tunneled",
+        "flow_denied",
+        "atomic_write_gate",
+        "path_guard_gate",
+        "last_error_sanitizer_gate",
+        "secret_leak_gate"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "runtime_evidence_report": {
+          "type": "string"
+        },
+        "runtime_installed": {
+          "type": "boolean"
+        },
+        "runtime_running": {
+          "type": "boolean"
+        },
+        "runtime_provider": {
+          "type": "string",
+          "enum": [
+            "app_proxy_provider",
+            "transparent_proxy_provider"
+          ]
+        },
+        "rules_loaded": {
+          "type": "boolean"
+        },
+        "rule_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "flow_extraction_attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_extraction_succeeded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_extraction_denied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_extraction_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "flow_attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_tunneled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "flow_denied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "atomic_write_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "path_guard_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "last_error_sanitizer_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "secret_leak_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "provider_flow_takeover": {
+      "type": "object",
+      "required": [
+        "status",
+        "provider_superclass",
+        "runtime_provider",
+        "compile_only",
+        "handle_new_flow_return_action",
+        "flow_copy_review_boundary_required",
+        "case_count",
+        "cases"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "provider_superclass": {
+          "type": "string",
+          "enum": [
+            "NETransparentProxyProvider"
+          ]
+        },
+        "runtime_provider": {
+          "type": "string",
+          "enum": [
+            "transparent_proxy_provider"
+          ]
+        },
+        "compile_only": {
+          "type": "boolean",
+          "const": true
+        },
+        "handle_new_flow_return_action": {
+          "type": "string",
+          "enum": [
+            "take_over_matched_flow_live_copy_real_edge_transport_reviewed"
+          ]
+        },
+        "flow_copy_review_boundary_required": {
+          "type": "boolean",
+          "const": true
+        },
+        "case_count": {
+          "type": "integer",
+          "minimum": 11
+        },
+        "cases": {
+          "type": "array",
+          "minItems": 11,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "provider_action",
+              "action",
+              "reason",
+              "flow_extraction_status",
+              "flow_extraction_reason",
+              "source_bundle_id_present",
+              "source_bundle_id_trusted",
+              "accept_flow",
+              "return_action",
+              "flow_copy_skeleton_status",
+              "flow_copy_action",
+              "flow_copy_mode",
+              "flow_copy_implementation",
+              "flow_copy_review_boundary_required",
+              "network_extension_flow_opened",
+              "edge_tunnel_open_started",
+              "tcp_payload_copy_started",
+              "flow_payload_read_started",
+              "flow_payload_write_started",
+              "guard_contract"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "provider_action": {
+                "type": "string",
+                "enum": [
+                  "open_tunnel",
+                  "deny"
+                ]
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "tunnel",
+                  "deny"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "matched_network_extension_rule",
+                  "no_matching_network_extension_rule",
+                  "invalid_flow_authority",
+                  "invalid_network_extension_rules"
+                ]
+              },
+              "flow_extraction_status": {
+                "type": "string",
+                "enum": [
+                  "ok",
+                  "denied"
+                ]
+              },
+              "flow_extraction_reason": {
+                "type": "string"
+              },
+              "source_bundle_id_present": {
+                "type": "boolean"
+              },
+              "source_bundle_id_trusted": {
+                "type": "boolean",
+                "const": false
+              },
+              "accept_flow": {
+                "type": "boolean"
+              },
+              "return_action": {
+                "type": "string",
+                "enum": [
+                  "take_over_matched_flow_live_copy_real_edge_transport_reviewed",
+                  "deny_closed_no_copy"
+                ]
+              },
+              "flow_copy_skeleton_status": {
+                "type": "string",
+                "enum": [
+                  "planned",
+                  "deny_closed"
+                ]
+              },
+              "flow_copy_action": {
+                "type": "string",
+                "enum": [
+                  "drive_live_runtime_copy_real_edge_transport_configured_reviewed",
+                  "deny_closed_no_copy"
+                ]
+              },
+              "flow_copy_mode": {
+                "type": "string",
+                "enum": [
+                  "tcp_bidirectional_live_copy",
+                  "none"
+                ]
+              },
+              "flow_copy_implementation": {
+                "type": "string",
+                "enum": [
+                  "wired_into_live_handle_new_flow_real_edge_transport_reviewed",
+                  "not_started"
+                ]
+              },
+              "flow_copy_review_boundary_required": {
+                "type": "boolean",
+                "const": true
+              },
+              "network_extension_flow_opened": {
+                "type": "boolean",
+                "const": false
+              },
+              "edge_tunnel_open_started": {
+                "type": "boolean",
+                "const": false
+              },
+              "tcp_payload_copy_started": {
+                "type": "boolean",
+                "const": false
+              },
+              "flow_payload_read_started": {
+                "type": "boolean",
+                "const": false
+              },
+              "flow_payload_write_started": {
+                "type": "boolean",
+                "const": false
+              },
+              "guard_contract": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

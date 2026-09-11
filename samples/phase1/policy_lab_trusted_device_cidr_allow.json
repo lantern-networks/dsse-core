@@ -1,0 +1,42 @@
+{
+  "id": "pol_lab_trusted_device_cidr_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Allow managed device from trusted source CIDR to dummy private app",
+  "priority": 85,
+  "conditions": {
+    "actor_type": {
+      "op": "eq",
+      "value": "human"
+    },
+    "application_id": "app_dummy_https",
+    "service_family": "https",
+    "device_trust_level": {
+      "op": "eq",
+      "value": "managed"
+    },
+    "source_ip": {
+      "op": "cidr_contains",
+      "value": "10.10.0.0/16"
+    }
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": null,
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/signed_config_envelope.schema.json",
+  "title": "SignedConfigEnvelope",
+  "type": "object",
+  "required": [
+    "type",
+    "version",
+    "payload",
+    "checksum",
+    "signature",
+    "signing_key_id",
+    "created_at",
+    "expires_at",
+    "status"
+  ],
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": [
+        "agent_config",
+        "trusted_keyring",
+        "protected_app_map",
+        "mdm_managed_app_config"
+      ]
+    },
+    "version": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "checksum": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "signature": {
+      "type": "string",
+      "pattern": "^ed25519:[A-Za-z0-9_-]+$"
+    },
+    "signing_key_id": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "revoked",
+        "expired"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

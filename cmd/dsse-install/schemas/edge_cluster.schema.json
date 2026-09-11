@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/edge_cluster.schema.json",
+  "title": "EdgeCluster",
+  "type": "object",
+  "required": [
+    "id",
+    "edge_region_id",
+    "pop_code",
+    "name",
+    "health_status",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "edge_region_id": {
+      "type": "string"
+    },
+    "pop_code": {
+      "type": "string"
+    },
+    "pop_name": {
+      "type": "string"
+    },
+    "metro": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "geography": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "name": {
+      "type": "string"
+    },
+    "capacity_profile": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "supported_routes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "supported_inspection_modes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "anycast_enabled": {
+      "type": "boolean"
+    },
+    "anycast_vip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "bgp_advertise_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "route_withdrawal_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "primary_secondary_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routing_weight": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "health_check_endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "latency_score": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "health_status": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

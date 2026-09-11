@@ -1,0 +1,13 @@
+{
+  "id": "dev_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "agent_version": "0.1.1",
+  "device_trust_level": "managed",
+  "policy_bundle_id": "pb_lab_20260522_001",
+  "policy_bundle_version": "2026.05.22.001",
+  "status": "healthy",
+  "timestamp": "2026-05-22T00:05:00Z",
+  "metadata": {
+    "network": "lab"
+  }
+}

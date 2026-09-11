@@ -1,0 +1,271 @@
+package main
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"database/sql"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"github.com/lantern-networks/dsse-core/archive"
+)
+
+// Retention pruning (W4, docs/feature_inventory_and_production_readiness.md A-1). The postgres log/outbox
+// tables (hot_events, admin_audit_outbox, domain_event_outbox) had no retention — published/dead rows and
+// mirrored events accumulate forever, bloating storage + degrading queries. This periodically deletes rows
+// past their TTL. Runs only where the durable tables live (the control plane, -postgres-dsn set). Pending /
+// publishing outbox rows are NEVER pruned (only published + dead, which are terminal).
+
+type retentionConfig struct {
+	interval        time.Duration
+	hotEvents       time.Duration // move/delete hot_events older than this (0 = keep)
+	outboxPublished time.Duration // delete published outbox rows older than this (0 = keep)
+	outboxDead      time.Duration // delete dead outbox rows older than this (0 = keep)
+	// archive, when set, turns hot_events pruning into TIER-TO-COLD: aged rows are written (per tenant+stream,
+	// gzip NDJSON) to the sovereign cold archive BEFORE they are deleted — long-term compliance/DFIR retention
+	// on a sovereign store, not a hard delete. nil = delete-only (previous behaviour).
+	archive archive.ColdArchive
+	// auditColdRetain, when set, WORM-locks (object-lock) the archived AUDIT-stream segments for this long from
+	// archive time — tamper-proof compliance retention for the audit trail. 0 = no lock.
+	auditColdRetain time.Duration
+	// perStream overrides the hot-events retention PER STREAM (e.g. keep audit far longer than access). A stream
+	// not listed falls back to hotEvents. A value of 0 = keep that stream in hot forever (never prune it).
+	perStream map[string]time.Duration
+	// legalHold, when set, freezes retention for tenants under a legal hold: the pruner preserves ALL their
+	// logs (no delete, no tier-then-delete) until the hold is released. nil = no holds.
+	legalHold *legalHoldStore
+	// auditChain, when set, embeds a tamper-evident hash-chain header in each archived AUDIT segment so that
+	// deleting/altering/reordering any segment is detectable. nil = no chain.
+	auditChain *auditChainStore
+	// override, when set, holds admin-configured per-stream retention (Console) that takes precedence over the
+	// startup-flag defaults, so retention is tunable without a redeploy. nil = flags only.
+	override *retentionOverrideStore
+}
+
+func (c retentionConfig) enabled() bool {
+	return c.interval > 0 && (c.hotEvents > 0 || len(c.perStream) > 0 || c.outboxPublished > 0 || c.outboxDead > 0)
+}
+
+// retentionForStream is the hot-events retention for a stream. Precedence: admin Console override (runtime) >
+// per-stream startup flag > global default.
+func (c retentionConfig) retentionForStream(stream string) time.Duration {
+	if c.override != nil {
+		if d, ok := c.override.Get(stream); ok {
+			return time.Duration(d) * 24 * time.Hour // configured in DAYS
+		}
+	}
+	if d, ok := c.perStream[stream]; ok {
+		return d
+	}
+	return c.hotEvents
+}
+
+func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) (func() error, error) {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+	go func() {
+		runRetentionPrune(ctx, db, cfg) // initial sweep
+		t := time.NewTicker(cfg.interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				runRetentionPrune(ctx, db, cfg)
+			}
+		}
+	}()
+	log.Printf("retention pruner ENABLED (interval=%s hot_events=%s outbox_published=%s outbox_dead=%s)",
+		cfg.interval, cfg.hotEvents, cfg.outboxPublished, cfg.outboxDead)
+	return db.Close, nil
+}
+
+func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
+	// CP HA: only the leader prunes/tiers, so two active CPs don't double-delete rows or double-archive segments
+	// to the cold store. A standby simply skips; when it becomes leader it takes over the sweep.
+	if !cpLeaderElectorInstance.IsLeader() {
+		return
+	}
+	now := time.Now()
+	if cfg.hotEvents > 0 || len(cfg.perStream) > 0 {
+		pruneHotEventsPerStream(ctx, db, cfg, now)
+	}
+	for _, tbl := range []string{"admin_audit_outbox", "domain_event_outbox"} {
+		if cfg.outboxPublished > 0 {
+			pruneOlderThan(ctx, db, tbl, "updated_at", "status = 'published'", now.Add(-cfg.outboxPublished))
+		}
+		if cfg.outboxDead > 0 {
+			pruneOlderThan(ctx, db, tbl, "updated_at", "status = 'dead'", now.Add(-cfg.outboxDead))
+		}
+	}
+}
+
+// pruneHotEventsPerStream applies each stream's own retention (audit/deny kept longer than allow/access) to the
+// hot_events table. Per (tenant, stream): compute the stream's cutoff, then either TIER-to-cold-then-delete
+// (when a cold archive is configured) or delete-only. A per-stream retention of 0 keeps that stream forever.
+func pruneHotEventsPerStream(ctx context.Context, db *sql.DB, cfg retentionConfig, now time.Time) {
+	rows, err := db.QueryContext(ctx, "SELECT DISTINCT tenant_id, stream FROM hot_events")
+	if err != nil {
+		log.Printf("retention: list hot_events streams: %v", err)
+		return
+	}
+	type ts struct{ tenant, stream string }
+	var pairs []ts
+	for rows.Next() {
+		var p ts
+		if err := rows.Scan(&p.tenant, &p.stream); err == nil {
+			pairs = append(pairs, p)
+		}
+	}
+	rows.Close()
+	for _, p := range pairs {
+		if cfg.legalHold != nil && cfg.legalHold.IsHeld(p.tenant) {
+			continue // legal hold: preserve everything for this tenant (no delete, no tier)
+		}
+		ret := cfg.retentionForStream(p.stream)
+		if ret <= 0 {
+			continue // keep this stream in hot forever
+		}
+		cutoff := now.Add(-ret)
+		if cfg.archive != nil {
+			archiveThenPruneStream(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
+		} else {
+			deleteHotStreamOlderThan(ctx, db, p.tenant, p.stream, cutoff)
+		}
+	}
+}
+
+// deleteHotStreamOlderThan is the delete-only path (no cold archive configured) for one stream.
+func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, tenant, stream string, cutoff time.Time) {
+	res, err := db.ExecContext(ctx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3", tenant, stream, cutoff)
+	if err != nil {
+		log.Printf("retention prune hot_events %s/%s: %v", tenant, stream, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("retention prune hot_events %s/%s: deleted %d row(s) older than %s", tenant, stream, n, cutoff.UTC().Format(time.RFC3339))
+	}
+}
+
+func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
+	rows, err := db.QueryContext(ctx, "SELECT payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at", tenant, stream, cutoff)
+	if err != nil {
+		log.Printf("cold-archive: read %s/%s: %v", tenant, stream, err)
+		return
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	// Tamper-evident chain: the audit stream's segments begin with a chain header binding this segment to the
+	// previous one. Written BEFORE the records so it is covered by the segment hash.
+	chainSeq := 0
+	chained := stream == "audit" && cfg.auditChain != nil
+	if chained {
+		var prev string
+		chainSeq, prev = cfg.auditChain.Next(tenant)
+		gz.Write(auditChainHeaderLine(chainSeq, prev))
+	}
+	n := 0
+	for rows.Next() {
+		var payload []byte // jsonb comes back as raw JSON bytes
+		if err := rows.Scan(&payload); err != nil {
+			continue
+		}
+		gz.Write(bytes.TrimRight(payload, "\n"))
+		gz.Write([]byte("\n"))
+		n++
+	}
+	rows.Close()
+	if n == 0 {
+		return
+	}
+	if err := gz.Close(); err != nil {
+		log.Printf("cold-archive: gzip %s/%s: %v", tenant, stream, err)
+		return
+	}
+	// Key: hot_events/<tenant>/<stream>/<cutoff-date>-<count>.ndjson.gz — sortable, per-stream, idempotent-ish.
+	key := fmt.Sprintf("hot_events/%s/%s/%s-%d.ndjson.gz", tenant, stream, cutoff.UTC().Format("2006-01-02T150405"), n)
+	opts := archive.PutOptions{ContentType: "application/gzip"}
+	if stream == "audit" && cfg.auditColdRetain > 0 {
+		opts.RetainUntil = now.Add(cfg.auditColdRetain) // WORM: audit segments are tamper-proof for the retention window
+	}
+	if _, err := cfg.archive.Put(ctx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), opts); err != nil {
+		log.Printf("cold-archive: put %s FAILED — leaving %d row(s) in place for retry: %v", key, n, err)
+		return
+	}
+	// Advance the tamper-evident chain only AFTER the segment is durably written (its hash = the object bytes).
+	if chained {
+		cfg.auditChain.Commit(tenant, chainSeq, hashObjectBytes(buf.Bytes()))
+	}
+	// Archived successfully → now safe to delete exactly this stream's aged rows.
+	res, err := db.ExecContext(ctx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3", tenant, stream, cutoff)
+	if err != nil {
+		log.Printf("cold-archive: archived %s but delete failed (will re-archive next sweep): %v", key, err)
+		return
+	}
+	deleted, _ := res.RowsAffected()
+	worm := ""
+	if !opts.RetainUntil.IsZero() {
+		worm = fmt.Sprintf(" worm_until=%s", opts.RetainUntil.UTC().Format(time.RFC3339))
+	}
+	log.Printf("cold-archive: tiered %d row(s) %s/%s to %s (deleted %d from hot)%s", n, tenant, stream, key, deleted, worm)
+}
+
+// pruneOlderThan deletes rows whose timeCol is < cutoff, optionally filtered by extraWhere. Best-effort:
+// errors are logged (a missing table on a non-CP node is fine — the pruner only runs with -postgres-dsn).
+func pruneOlderThan(ctx context.Context, db *sql.DB, table, timeCol, extraWhere string, cutoff time.Time) {
+	where := timeCol + " < $1"
+	if extraWhere != "" {
+		where = extraWhere + " AND " + where
+	}
+	res, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", table, where), cutoff)
+	if err != nil {
+		log.Printf("retention prune %s (%s): %v", table, extraWhere, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("retention prune %s%s: deleted %d row(s) older than %s",
+			table, ifNonEmpty(" "+extraWhere), n, cutoff.UTC().Format(time.RFC3339))
+	}
+}
+
+func ifNonEmpty(s string) string {
+	if s == " " {
+		return ""
+	}
+	return s
+}
+
+// parseRetentionOverrides parses "stream=duration,stream=duration" (e.g. "audit=8760h,access=168h") into a
+// per-stream retention map. Invalid entries are skipped (logged) so a typo can't disable pruning entirely.
+func parseRetentionOverrides(spec string) map[string]time.Duration {
+	out := map[string]time.Duration{}
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			log.Printf("retention: ignoring malformed override %q (want stream=duration)", part)
+			continue
+		}
+		stream := strings.TrimSpace(kv[0])
+		d, err := time.ParseDuration(strings.TrimSpace(kv[1]))
+		if err != nil || stream == "" {
+			log.Printf("retention: ignoring override %q: %v", part, err)
+			continue
+		}
+		out[stream] = d
+	}
+	return out
+}

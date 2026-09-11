@@ -1,0 +1,42 @@
+{
+  "edge_url": "http://127.0.0.1:18090",
+  "device_id": "dev_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "user_id": "user_lab_001",
+  "runtime_connector_id": "conn_lab_001",
+  "runtime_secret": "local-connector-secret",
+  "runtime_secret_file": null,
+  "runtime_secret_keychain_service": "com.example.dsse.agent",
+  "runtime_secret_keychain_account": "conn_lab_001",
+  "fetch_trusted_keyring": false,
+  "hostname": "macbook-lab",
+  "os": "macos",
+  "os_version": "15.5",
+  "agent_version": "0.1.0",
+  "target_agent_version": "0.1.1",
+  "release_channel": "lab",
+  "update_source": "mdm",
+  "rollout_policy_enabled": true,
+  "device_trust_level": "managed",
+  "cache_dir": "var/localclient",
+  "trusted_keyring": "",
+  "proxy_mode": "explicit",
+  "protected_app_map_ref": "samples/phase1/protected_app_map_lab.json",
+  "network_extension_rules_ref": "samples/phase1/network_extension_steering_rules_lab.json",
+  "network_extension_runtime_evidence_ref": "samples/phase1/network_extension_runtime_evidence_lab.json",
+  "network_extension_runtime_copy_endpoint_path": "/network-extension/runtime-copy/round-trip",
+  "network_extension_runtime_copy_transport_scope": "lab_endpoint",
+  "network_extension_runtime_copy_evidence_ref": "network_extension_runtime_copy_evidence.json",
+  "windows_observe_mode_report_ref": null,
+  "local_proxy_metrics_url": "http://127.0.0.1:18096/metrics",
+  "metadata": {
+    "source": "phase1_lab"
+  },
+  "network_extension_self_exclusion_enabled": true,
+  "network_extension_self_exclusion_source_app_signing_identifiers": [
+    "team-id:Q6L2SF6YDW",
+    "com.anthropic.claude-code",
+    "com.anthropic.claudefordesktop",
+    "com.anthropic.claudefordesktop.helper"
+  ]
+}

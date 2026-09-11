@@ -1,0 +1,1 @@
+{"created_at":"2026-05-27T20:15:00Z","direction":"outbound","protocol":"tcp","destination_ip":"192.0.2.45","destination_port":445,"collector_instance_id":"windivert-smb445-minimum-lab"}

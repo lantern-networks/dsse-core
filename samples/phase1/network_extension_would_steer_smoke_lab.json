@@ -1,0 +1,93 @@
+{
+  "status": "ok",
+  "created_at": "2026-05-26T16:18:00Z",
+  "rules_manifest": "network_extension_steering_rules_lab.json",
+  "protected_app_map": "protected_app_map_lab.json",
+  "runtime_installed": false,
+  "default_action": "deny",
+  "rule_count": 3,
+  "flow_count": 8,
+  "matched_count": 3,
+  "denied_count": 5,
+  "invalid_flow_count": 1,
+  "flows": [
+    {
+      "name": "rule:app_dummy_postgres",
+      "host": "dummy-postgres.local",
+      "port": 5432,
+      "expected_action": "tunnel",
+      "expected_reason": "matched_network_extension_rule",
+      "action": "tunnel",
+      "reason": "matched_network_extension_rule",
+      "application_id": "app_dummy_postgres",
+      "service_family": "database"
+    },
+    {
+      "name": "wrong_port:app_dummy_postgres",
+      "host": "dummy-postgres.local",
+      "port": 5433,
+      "expected_action": "deny",
+      "expected_reason": "no_matching_network_extension_rule",
+      "action": "deny",
+      "reason": "no_matching_network_extension_rule"
+    },
+    {
+      "name": "rule:app_dummy_rdp",
+      "host": "dummy-rdp.local",
+      "port": 3389,
+      "expected_action": "tunnel",
+      "expected_reason": "matched_network_extension_rule",
+      "action": "tunnel",
+      "reason": "matched_network_extension_rule",
+      "application_id": "app_dummy_rdp",
+      "service_family": "rdp"
+    },
+    {
+      "name": "wrong_port:app_dummy_rdp",
+      "host": "dummy-rdp.local",
+      "port": 3390,
+      "expected_action": "deny",
+      "expected_reason": "no_matching_network_extension_rule",
+      "action": "deny",
+      "reason": "no_matching_network_extension_rule"
+    },
+    {
+      "name": "rule:app_dummy_ssh",
+      "host": "dummy-ssh.local",
+      "port": 22,
+      "expected_action": "tunnel",
+      "expected_reason": "matched_network_extension_rule",
+      "action": "tunnel",
+      "reason": "matched_network_extension_rule",
+      "application_id": "app_dummy_ssh",
+      "service_family": "ssh"
+    },
+    {
+      "name": "wrong_port:app_dummy_ssh",
+      "host": "dummy-ssh.local",
+      "port": 23,
+      "expected_action": "deny",
+      "expected_reason": "no_matching_network_extension_rule",
+      "action": "deny",
+      "reason": "no_matching_network_extension_rule"
+    },
+    {
+      "name": "excluded:app_dummy_https",
+      "host": "dummy-private-app.local",
+      "port": 443,
+      "expected_action": "deny",
+      "expected_reason": "no_matching_network_extension_rule",
+      "action": "deny",
+      "reason": "no_matching_network_extension_rule"
+    },
+    {
+      "name": "invalid_authority:wildcard",
+      "host": "*.dummy-postgres.local",
+      "port": 5432,
+      "expected_action": "deny",
+      "expected_reason": "invalid_flow_authority",
+      "action": "deny",
+      "reason": "invalid_flow_authority"
+    }
+  ]
+}

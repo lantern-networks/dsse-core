@@ -1,0 +1,816 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DsseAgent.wxs — Lantern DSSE Windows agent MSI (roadmap M8.3 skeleton;
+  the agent packaging and install design).
+
+  This skeleton installs the user-mode payload (steering service + step-up window + compat-check helper) to
+  %ProgramFiles%\DSSE, registers the DsseSteer LocalSystem service, and creates the config-store registry key.
+  It deliberately does NOT start the service at install time — DsseSteer depends on the DsseWfp driver, which is
+  co-installed in M8.4; starting it here (driver absent) would fail. The signed-profile Apply custom action and
+  the driver INF/pnputil steps are later milestones (M8.3b / M8.4).
+
+  Build (unsigned, from the packaging dir, with the staged exes on the bind path):
+    wix build DsseAgent.wxs -arch x64 -b <stage-dir> -o DsseAgent.msi
+-->
+<!-- ★ GUARDED, because an unguarded <?define?> is not a default — it WINS.
+     Found 2026-08-11 by reading the built artifact instead of the build's success message: `build-msi.ps1
+     -Version 0.2.0` produced an MSI whose ProductVersion was 0.1.0. WiX emits WIX1118 ("previously declared
+     with value '0.2.0'") and carries on with the in-file value, so every package ever built from this tree
+     claimed 0.1.0 no matter what was asked for. The comment here used to say the opposite.
+     A version that is not the version breaks the things keyed on it: a major upgrade is not detected as one,
+     and the rollback store — keyed by the version the AGENT reports, which does change with -ldflags — ends up
+     disagreeing with the package it stored. -->
+<?ifndef Version ?>
+  <?define Version = "0.1.0" ?><!-- default; `wix build -d Version=x.y.z` (see build-msi.ps1) supplies the real one -->
+<?endif?>
+<!-- The upgrade family. A variable rather than the literal in two places: it now appears on Package/@UpgradeCode
+     AND on the hand-authored Upgrade/@Id, and two copies of a GUID that must be identical is a way to have them
+     stop being identical. If they ever diverged, upgrades would install alongside each other instead of
+     replacing, which looks like nothing until a box is running two agents. -->
+<?define UpgradeCode = "4D8F2B6E-9C3A-4E71-A0D2-1F5B7C9E3A20" ?>
+<!-- Compatibility-gate args: a dev/test-signed driver makes Secure Boot / HVCI hard blocks, so the gate runs
+     in test-signed mode by default. A production build passes `-d DriverAttested=1` (the .cat is MS
+     attestation-signed) to drop that, letting Secure Boot / HVCI machines through. -->
+<?ifdef DriverAttested ?>
+  <?define CompatGateArgs = "" ?>
+<?else?>
+  <?define CompatGateArgs = "--test-signed" ?>
+<?endif?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Lantern DSSE Agent"
+           Manufacturer="Lantern Networks"
+           Version="$(var.Version)"
+           UpgradeCode="$(var.UpgradeCode)"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <!-- The mark, in the one place Windows shows a product rather than a window: Apps &amp; features, and the
+         Programs and Features list behind it. Without ARPPRODUCTICON an entry there shows a blank page icon,
+         which for an agent that steers every connection on the machine reads as something that arrived rather
+         than something that was installed.
+
+         Same brand/lantern.ico the step-up window embeds, so the window a person authenticates in and the
+         entry they would uninstall from carry the same mark.
+
+         ★ The Id MUST end in .ico. Windows Installer keys the Icon table by name and derives the
+         extension from it; with a bare "LanternIcon" the package validates, installs, and writes an EMPTY
+         DisplayIcon — Apps and features shows the blank page icon and nothing anywhere says why. Measured
+         here: same package, same Icon row, DisplayIcon empty until the suffix was added. -->
+    <Icon Id="LanternIcon.ico" SourceFile="brand/lantern.ico" />
+    <Property Id="ARPPRODUCTICON" Value="LanternIcon.ico" />
+
+    <!-- Block downgrades and reinstall-over cleanly (config store + certs are preserved: this MSI does not
+         remove HKLM\SOFTWARE\DSSE\Agent values on upgrade, only on uninstall).
+
+         ★ HAND-AUTHORED INSTEAD OF MajorUpgrade, for exactly one reason: the ROLLBACK.
+         MajorUpgrade generates the launch condition "NOT WIX_DOWNGRADE_DETECTED", which is unconditional. That
+         is right for an accidental downgrade and wrong for the one case the product needs — a device restoring
+         the package it stored before an update that went bad. Without an exception, the recovery path could
+         never run: msiexec would refuse the older package in seconds while the journal said a rollback was in
+         progress, and ten minutes later that reads as an interrupted install telling the operator to check a
+         healthy machine's network. There is no attribute on MajorUpgrade that admits one caller, so the rows
+         are written out.
+
+         ★ These rows REPRODUCE what MajorUpgrade generated, deliberately and verifiably: Upgrade rows
+         (max/exclusive with MigrateFeatures for the upgrade direction, min/exclusive with OnlyDetect for the
+         downgrade direction) and RemoveExistingProducts after InstallValidate. That scheduling is the part a
+         hand-authored Upgrade does NOT get for free, and forgetting it would leave every upgrade installing
+         alongside the old product rather than replacing it — silently, and only visible later. The before/after
+         MSI tables were compared to confirm the only difference is the launch condition.
+
+         The exception is a DECLARATION, not a hole: DSSEROLLBACK is set only by the updater's rollback path
+         (updateplatform.RollbackProperty), and an operator running msiexec by hand on an older package still
+         gets the refusal. An override that cannot be told apart from the ordinary case is not an override. -->
+    <Upgrade Id="$(var.UpgradeCode)">
+      <!-- IncludeMinimum="no" is stated even though there is no Minimum: UpgradeVersion defaults it to yes,
+           which sets VersionMinInclusive and made these Attributes 257 where MajorUpgrade produced 1. The
+           behaviour is identical on a row with no minimum — and that is exactly why it is spelled out, because
+           "identical except the launch condition" is the claim this rewrite rests on, and a difference nobody
+           can explain is not one to leave in a packaging file. -->
+      <UpgradeVersion Maximum="$(var.Version)" IncludeMaximum="no" IncludeMinimum="no" MigrateFeatures="yes"
+                      Property="WIX_UPGRADE_DETECTED" />
+      <!-- ★ OnlyDetect="no", and this is the ONE place these rows deliberately differ from what MajorUpgrade
+           generated. MajorUpgrade only ever DETECTS a newer product, because without a rollback path there is
+           nothing to do about one but refuse. There is a rollback path now, and it installs the older package
+           over the newer one.
+
+           Measured on win-dev-1 2026-08-11, with OnlyDetect="yes" and the launch conditions satisfied: the
+           declared rollback SUCCEEDED, msiexec returned 0, the files and the config store went back to 0.1.0 —
+           and BOTH products stayed registered, 0.1.0 and 0.2.0, sharing one INSTALLDIR and one set of service
+           names. RemoveExistingProducts ran and removed nothing, because a detect-only row is not a row it
+           removes. Uninstalling either one afterwards takes the shared files and services out from under the
+           other, and the first of them to be removed also clears the rollback store.
+
+           The property is still set for the launch condition above (FindRelatedProducts sets ActionProperty
+           either way, and it is sequenced at 25, before LaunchConditions at 100), so the guard is unchanged:
+           an undeclared downgrade is refused before anything is removed. What changes is only what happens
+           AFTER a downgrade has been authorised. -->
+      <UpgradeVersion Minimum="$(var.Version)" IncludeMinimum="no" OnlyDetect="no"
+                      Property="WIX_DOWNGRADE_DETECTED" />
+      <!-- ★ THE EQUAL CASE, WHICH NEITHER ROW ABOVE COVERS. The upgrade row is bounded Maximum/exclusive and
+           the downgrade row Minimum/exclusive, so a product installed at EXACTLY this version is detected by
+           neither. That is not a hypothetical: WiX assigns a fresh ProductCode to every build, so two packages
+           built from different commits at the same VERSION are different products with equal versions.
+
+           Measured on win-dev-1 2026-09-09. A candidate built at 0.3.0 was refused with 1603 at
+           LaunchConditions over a 0.3.0 already installed by our own MSI two days earlier:
+
+             Installed               false — different ProductCode
+             WIX_UPGRADE_DETECTED    false — not below this version
+             WIX_DOWNGRADE_DETECTED  false — not above it
+             NOT FOREIGNSTEERSERVICE false — DsseSteer exists, installed by that earlier package
+
+           Every term false, so the foreign-service guard fired on a service this product installed, and told
+           the operator to migrate a hand-installed agent that does not exist. The comment above warns about
+           exactly this shape for the ROLLBACK case and fixed it there; holding the version and rebuilding is
+           the same shape and was not in scope of that fix.
+
+           OnlyDetect defaults to no, so RemoveExistingProducts replaces the equal-versioned product rather
+           than installing alongside it — the failure the scheduling note above describes. The property is its
+           own name rather than WIX_UPGRADE_DETECTED because this is not an upgrade and a reader should not
+           have to infer that from a range boundary. -->
+      <UpgradeVersion Minimum="$(var.Version)" Maximum="$(var.Version)"
+                      IncludeMinimum="yes" IncludeMaximum="yes" MigrateFeatures="yes"
+                      Property="DSSE_SAMEVERSION_DETECTED" />
+    </Upgrade>
+    <InstallExecuteSequence>
+      <RemoveExistingProducts After="InstallValidate" />
+      <!-- Before the removal, while the old service still holds them. Conditioned on an upgrade actually being
+           detected (any of the three Upgrade rows) so a fresh install does not run it, and on NOT REMOVE so an
+           uninstall does not. See the CaptureBeforeUpgrade custom action for why this cannot be deferred. -->
+      <Custom Action="CaptureBeforeUpgrade" Before="RemoveExistingProducts"
+              Condition="(WIX_UPGRADE_DETECTED OR WIX_DOWNGRADE_DETECTED OR DSSE_SAMEVERSION_DETECTED) AND NOT REMOVE" />
+    </InstallExecuteSequence>
+    <Launch Condition="NOT WIX_DOWNGRADE_DETECTED OR DSSEROLLBACK = &quot;1&quot;"
+            Message="A newer version of the Lantern DSSE Agent is already installed." />
+
+    <!-- REFUSE to install over a DsseSteer service this MSI did not create.
+         Found on the lab box, 2026-08-05: its service was registered by the "service-install" mode with an
+         explicit flag list (transport URL, pinned CA, client cert/key, bypass set, agent-policy pin). The MSI
+         registers the SAME service name with the "service-run + config-store" arguments below, which read a
+         signed L1 profile from the config store, and such a box has no profile. Installing would replace a
+         working, steering configuration with one that starts fail-closed and cannot reach the Edge, and the
+         command that does it reads like a routine reinstall. (That instruction went into a handoff; the
+         Windows session was right to refuse it.)
+         The condition is "not installed" AND "no other version of THIS product is here": a genuine upgrade
+         legitimately finds its own service and must proceed. A service present on a first install came from
+         somewhere else, and the honest answer to "which configuration wins" is to stop and let a human decide,
+         not to guess. Detected via the SCM's own registry key rather than a service API, since MSI conditions
+         evaluate properties.
+
+         ★ WIX_DOWNGRADE_DETECTED IS IN THE LIST, and it was the SECOND GUARD that refused the first real
+         rollback on hardware — the one the macOS side warned to go looking for ("what ELSE decides whether a
+         downgrade may happen, besides the check you can see"). Measured on win-dev-1 2026-08-11: the downgrade
+         guard above was satisfied by DSSEROLLBACK=1, and then this condition refused with 1603, because during
+         a rollback the older package is not Installed (different ProductCode) and is not an upgrade, so the
+         only surviving term was NOT FOREIGNSTEERSERVICE — and the DsseSteer service it found had been
+         registered by OUR OWN newer package. The journal was left saying rolling_back on a box nothing had
+         changed. Every rollback on every box would have hit it.
+
+         Detecting a related product of this UpgradeCode in EITHER direction is the accurate reading of "did
+         this MSI create that service", which is the question the guard is asking. It is not a rollback-shaped
+         hole: a hand-installed service on a box with no product of ours registered still gets the refusal, and
+         an undeclared downgrade is stopped by the condition above before this one is reached. -->
+    <Property Id="FOREIGNSTEERSERVICE">
+      <RegistrySearch Id="DsseSteerImagePath" Root="HKLM"
+                      Key="SYSTEM\CurrentControlSet\Services\DsseSteer" Name="ImagePath" Type="raw" />
+    </Property>
+    <!-- DSSE_SAMEVERSION_DETECTED joins the list for the reason given beside the Upgrade rows: a rebuild at
+         the same version is a related product of this UpgradeCode, so the service it registered is ours and
+         not a foreign one. It does NOT weaken the guard — a hand-installed service on a box carrying no
+         product of this UpgradeCode still finds every term false and still gets refused. -->
+    <Launch Condition="Installed OR WIX_UPGRADE_DETECTED OR WIX_DOWNGRADE_DETECTED OR DSSE_SAMEVERSION_DETECTED OR NOT FOREIGNSTEERSERVICE"
+            Message="A DsseSteer service is already registered on this machine and was not installed by this package. Installing would replace its configuration with the config-store profile this MSI expects, and a machine configured by --service-install has no such profile — steering would stop. Migrate it deliberately: see &quot;Migrating a hand-installed agent to the MSI&quot; in the packaging README." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Payload: the user-mode exes under %ProgramFiles%\DSSE. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="DSSE">
+
+        <!-- DsseWfp kernel WFP callout driver (M8.4). A WFP callout is NOT a PnP device AND the Windows Installer
+             ServiceInstall table cannot express a kernel-mode service (only ownProcess/shareProcess). So the MSI
+             just LAYS DOWN the .sys here and the driversvc helper (a deferred SYSTEM custom action, below) does
+             the sc-create/start on install and stop/delete on uninstall. Production ships a Microsoft
+             attestation-signed .sys; the dev/test .sys is self-signed (needs testsigning + the cert trusted). -->
+        <Component Id="WfpDriver" Bitness="always64">
+          <File Id="dsse_wfp.sys" Source="dsse-wfp.sys" KeyPath="yes" />
+        </Component>
+
+        <!-- The kernel-driver install/uninstall helper (invoked by the custom actions below). -->
+        <Component Id="DriverSvcExe" Bitness="always64">
+          <File Id="driversvc.exe" Source="driversvc.exe" KeyPath="yes" />
+        </Component>
+
+        <Component Id="SteerExe" Bitness="always64">
+          <File Id="dsse_steer.exe" Source="dsse-steer.exe" KeyPath="yes" />
+          <!-- LocalSystem service; binPath = this exe plus the service-run argument (config comes from the
+               config store, NOT a giant binPath flag list). It DEPENDS on the DsseWfp driver.
+               Start=DEMAND (manual), NOT auto (review finding S4): DsseSteer with no applied profile is
+               fail-closed with no transport, so if it were Start=auto the SCM would auto-start it on the FIRST
+               REBOOT after install (before enrollment) and black-hole the box's network. It is neither started
+               by the MSI nor auto-started at boot; the Apply/enrollment step (M8.3b) flips it to auto and starts
+               it only once a verified profile with a transport is present.
+
+               ★ AND IT GETS THE AGENT-POLICY PIN, WHICH IT NEVER DID (2026-08-12, measured on win-dev-1). The
+               arguments were a literal service-run plus config-store, so every MSI-installed box started with
+               no agent-policy pin, and that flag gates two things the deployment believes it has. This is what
+               the box logs on every start:
+
+                 trust_anchor_recovery disabled (no agent policy pin; the signed bundle could not be verified)
+
+               which means it can never ADOPT a rotated transport CA. On the day the fleet withdraws the old
+               one, that device loses the Edge with no path back. The signed steer-exclusion policy is gated on
+               the same flag, so it verifies nothing either.
+
+               The key was already here. PlanPin is the AGENT-POLICY key (build-msi.ps1 says so where it is
+               declared: "the agent-policy key, NOT the update key"), it is validated at build time, and it was
+               threaded into DsseUpdater's arguments below and withheld from the agent that needs it for
+               everything except the rollout plan. Same preprocessor shape as the updater's, for the same
+               reason: one argument string, built once. -->
+          <?define SteerArgs = "--service-run --config-store" ?>
+          <!-- Keep the configured L1 verifier visible in the service arguments
+               when MSI recreates the service. ConfigPin comes from the same Pin
+               that is baked into DsseSteer and profileapply; PlanPin may differ. -->
+          <?ifdef ConfigPin ?>
+            <?define SteerArgs = "$(var.SteerArgs) --config-pin $(var.ConfigPin)" ?>
+          <?endif?>
+          <?ifdef PlanPin ?>
+            <?define SteerArgs = "$(var.SteerArgs) --agent-policy-pin $(var.PlanPin)" ?>
+          <?endif?>
+          <!-- ★ THE DESTINATION BYPASS THE MSI COULD NOT EXPRESS (2026-08-14, measured on win-dev-1).
+               The comment above lists "bypass set" as part of the hand-installed flag list, and there was no
+               way to pass one. The hand-deployed agent carried `bypass-dest <edge>:8088,203.0.113.10` and
+               the MSI dropped it, which is not a missing convenience: that entry was a design decision.
+               (Flag names are written here without their leading dashes: XML comments cannot contain them.)
+               The rule is that the management path must not run
+               through the managed object, because an edge that is down then takes the recovery route down
+               inside the thing it manages: an existing working configuration IS the specification.
+
+               What it cost on 2026-08-14: `ssh mac` died. The destination WAS the edge, so the edge was asked
+               to dial itself and the flow ended app_to_edge=21 / edge_to_app=0 — the same hairpin
+               diagnosed on AWS a month earlier, down to the 21 bytes of the SSH banner. Restoring reachability
+               needed a CP steer-exclusion for ssh.exe and scp.exe, because the CP's exclusion model is
+               app-based and cannot express a destination at all. That exclusion is far coarser than the
+               original: it exempts SSH to EVERY host, where `bypass-dest <edge>:22` exempted one. -->
+          <?ifdef BypassDest ?>
+            <?define SteerArgs = "$(var.SteerArgs) --bypass-dest $(var.BypassDest)" ?>
+          <?endif?>
+          <ServiceInstall Id="DsseSteerSvc"
+                          Name="DsseSteer"
+                          DisplayName="Lantern DSSE Steering Agent"
+                          Description="Steers this device's traffic through the Lantern secure gateway (WFP)."
+                          Type="ownProcess"
+                          Start="demand"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="$(var.SteerArgs)"
+                          Vital="yes">
+            <ServiceDependency Id="DsseWfp" />
+          </ServiceInstall>
+          <ServiceControl Id="DsseSteerCtl"
+                          Name="DsseSteer"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+
+        <!-- dsse-tray.exe REMOVED 2026-08-05. It was installed but could never work: the tray reads a
+             read-only status endpoint that steer serves only when the status-listen flag is passed, which the service
+             does not pass and which defaults to off. And the reason it defaults to off is that the endpoint is
+             an unauthenticated loopback listener — status_server.go says so itself, calling an ACL'd named pipe
+             "the hardening follow-up" that would "authorize the caller instead of trusting every local process
+             on loopback". What it discloses includes posture, i.e. precisely when enforcement is degraded,
+             which is reconnaissance for an attacker already on the box. Shipping a UI whose data source is
+             unsafe to enable is worse than not shipping it. The source is kept; this returns with the pipe. -->
+
+        <!-- The branded out-of-band step-up window (task #14): the WebView2 host that shows the real IdP page
+             during the east-west step-up ceremony, instead of a surprise default-browser tab. The agent
+             resolves it BESIDE dsse-steer.exe at runtime and silently falls back to the browser when it is
+             absent — which is exactly why it went unshipped unnoticed until 2026-08-05. steer's
+             companions_test.go now fails the build if a companion it resolves is missing from this manifest.
+             NOTE: this is what makes the WebView2 Evergreen prerequisite in DsseBundle.wxs load-bearing. -->
+        <Component Id="StepUpWindowExe" Bitness="always64">
+          <File Id="dsse_stepup_window.exe" Source="dsse-stepup-window.exe" KeyPath="yes" />
+        </Component>
+
+        <!-- dsse-watchdog: the process that restores this box's network when the WFP redirect is left armed
+             with no agent behind it. Clearing the redirect needs an IOCTL that only dsse-steer issues, so an
+             agent that dies without issuing it (crash, TerminateProcess, a files-in-use kill during an
+             upgrade, power loss) leaves every connection on the machine refused until a person arrives.
+             The agent's own fail-open recovery monitor cannot cover this: it lives inside dsse-steer.
+
+             Start=auto and NO ServiceDependency, deliberately. Depending on DsseSteer or DsseWfp would be
+             backwards — the state it watches for is one of them being absent, so a dependency would keep the
+             watchdog stopped exactly when it is needed. It is safe to auto-start before enrollment: with no
+             driver present it decides "nothing to recover" and does nothing (unlike DsseSteer, which is
+             demand-start because starting it unenrolled would black-hole the box). -->
+        <Component Id="WatchdogExe" Bitness="always64">
+          <File Id="dsse_watchdog.exe" Source="dsse-watchdog.exe" KeyPath="yes" />
+          <ServiceInstall Id="DsseWatchdogSvc"
+                          Name="DsseWatchdog"
+                          DisplayName="Lantern DSSE Network Watchdog"
+                          Description="Restores this device's network if the DSSE steering redirect is left armed with no agent behind it."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="--service-run"
+                          Vital="no" />
+          <ServiceControl Id="DsseWatchdogCtl"
+                          Name="DsseWatchdog"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+
+        <!-- dsse-updater: decides WHEN this device installs a new agent build, and records what happened.
+             SEPARATE from DsseWatchdog on purpose. The watchdog is the safety net and the updater is the
+             riskiest component here, so a net sharing a process with the thing it catches is not a net. More
+             precisely: the updater READS a value the agent writes (the running-version marker), while the
+             watchdog exists for when the agent is writing nothing — opposite assumptions about one process,
+             and one of them would always be wrong in a shared one.
+
+             Start=auto and NO ServiceDependency, the same shape as the watchdog and for a related reason.
+             Depending on DsseSteer would keep the updater stopped on exactly the boxes whose agent is broken,
+             and one of the things it reports is a device whose running version cannot be established — which
+             IS that box. It is safe unenrolled: with no manifest published it idles.
+
+             The update-signing key is a build-time argument and is NOT the config-signing anchor. That
+             separation is the point: one key doing both would make a compromise of the configuration path a
+             compromise of the code-execution path. A generic MSI ships without it, and the service then says
+             this device can never update rather than pretending otherwise. -->
+        <Component Id="UpdaterExe" Bitness="always64">
+          <File Id="dsse_updater.exe" Source="dsse-updater.exe" KeyPath="yes" />
+          <!-- The two pins are independent, so writing one ServiceInstall per combination would be four
+               near-identical blocks and four chances to mistype one. The preprocessor builds the argument
+               string instead, and the ServiceInstall below exists once.
+
+               UpdatePin verifies the MANIFEST (what this device runs) and PlanPin verifies the ROLLOUT PLAN
+               (when, and whether the fleet is halted). Different keys on purpose: an Edge holds the plan key,
+               so it can stall a rollout and cannot publish code.
+
+               UpdatePublisher is the THIRD authority and answers a question neither key does: who BUILT the
+               bytes. A manifest signer names a digest, and until this existed that digest was the only thing
+               between a download and msiexec running as SYSTEM. It travels here, inside the signed package,
+               rather than in a file under %ProgramData% — so changing what this device accepts requires an
+               install that the requirement itself governs. -->
+          <?define UpdaterArgs = "--service-run" ?>
+          <?ifdef UpdatePin ?>
+            <?define UpdaterArgs = "$(var.UpdaterArgs) --update-pin $(var.UpdatePin)" ?>
+          <?endif?>
+          <?ifdef PlanPin ?>
+            <?define UpdaterArgs = "$(var.UpdaterArgs) --plan-pin $(var.PlanPin)" ?>
+          <?endif?>
+          <?ifdef UpdatePublisher ?>
+            <!-- Quoted, unlike the two pins: a Subject O= contains spaces and commas ("Lantern Networks, Inc."),
+                 and an unquoted one would reach the service as an argument that stops at the first space — which
+                 parses as a requirement naming a different organisation, not as an error. -->
+            <?define UpdaterArgs = "$(var.UpdaterArgs) --update-publisher &quot;$(var.UpdatePublisher)&quot;" ?>
+          <?endif?>
+          <ServiceInstall Id="DsseUpdaterSvc"
+                          Name="DsseUpdater"
+                          DisplayName="Lantern DSSE Agent Updater"
+                          Description="Decides when this device installs a new DSSE agent build, and records what happened."
+                          Type="ownProcess"
+                          Start="auto"
+                          ErrorControl="normal"
+                          Account="LocalSystem"
+                          Arguments="$(var.UpdaterArgs)"
+                          Vital="no" />
+          <ServiceControl Id="DsseUpdaterCtl"
+                          Name="DsseUpdater"
+                          Start="install"
+                          Stop="both"
+                          Remove="uninstall"
+                          Wait="yes" />
+        </Component>
+
+        <Component Id="CompatExe" Bitness="always64">
+          <File Id="compatcheck.exe" Source="compatcheck.exe" KeyPath="yes" />
+        </Component>
+
+        <!-- The install-time profile-apply helper (M8.3b): verifies the bundled signed profile against its
+             baked-in trust anchor and persists it to the config store, then flips DsseSteer to auto-start. -->
+        <Component Id="ProfileApplyExe" Bitness="always64">
+          <File Id="profileapply.exe" Source="profileapply.exe" KeyPath="yes" />
+        </Component>
+
+        <?ifdef Profile ?>
+        <!-- Provisioned (per-tenant) MSI: the CP-signed L1 install profile, bundled. profileapply verifies it at
+             install against the anchor baked into profileapply.exe (-ldflags), so both the profile and its trust
+             anchor travel inside the Authenticode-signed MSI — never in the mutable store (review S1). -->
+        <Component Id="ProfileFile" Bitness="always64">
+          <File Id="profile.json" Source="profile.json" KeyPath="yes" />
+        </Component>
+        <?endif?>
+
+        <!-- Config store: the L1 signed profile is persisted here by configstore.Apply. The MSI
+             creates the key + an InstalledVersion marker (MDM detection rule). Values are removed on uninstall
+             (this component owns them) but preserved across upgrades. The key DACL is hardened to SYSTEM/Admin-
+             write, Users-read by the HardenConfigStore custom action (S3). -->
+        <Component Id="ConfigStoreKey" Bitness="always64">
+          <RegistryKey Root="HKLM" Key="SOFTWARE\DSSE\Agent">
+            <RegistryValue Name="InstalledVersion" Type="string" Value="$(var.Version)" KeyPath="yes" />
+            <!-- S3 (done, defense-in-depth): the config-store key DACL is hardened to SYSTEM/Admin-write,
+                 Users-read by the HardenConfigStore custom action (the profileapply harden step, Return=ignore)
+                 instead of util:PermissionEx/SecureObjects, which rolled the install back here. It is NOT the S1
+                 mitigation (a local admin can rewrite any DACL) — verify-on-read against the baked anchor pin is.
+                 The default HKLM\SOFTWARE ACL already denies non-admin writes; this makes it explicit + PROTECTED. -->
+          </RegistryKey>
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <!-- ★ THE ANCHOR THE DEVICE IS BORN WITH (2026-08-12, traced on win-dev-1). Nothing provisioned it: the
+         install profile carries `transport_anchor`, a FINGERPRINT, whose comment says "else obtained at
+         enroll" — and the enrol response returns the DEVICE-ISSUING CA, a different PKI that cannot verify a
+         server. So a freshly installed device had no transport anchor by any route, and once the agent
+         correctly stopped persisting an identity it could not prove, it stopped being able to enrol at all:
+         standing aside forever, waiting for a file the product never produced.
+
+         Laid beside the agent's other state rather than under INSTALLDIR, because it outlives the program —
+         adopted anchors from a signed trust bundle supersede it, and an uninstall must not take a device's
+         trust with it. Permanent="yes" for the same reason. -->
+    <!-- The directory itself is unconditional: WiX is happy with one that holds no components, and gating it
+         on a preprocessor `or` of two possibly-undefined variables is not something the preprocessor can do. -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DSSEDATADIR" Name="DSSE">
+        <?ifdef TransportCA ?>
+        <Component Id="TransportCAFile" Guid="*" Bitness="always64" Permanent="yes">
+          <File Id="transport_ca.pem" Source="transport_ca.pem" KeyPath="yes" />
+        </Component>
+        <?endif?>
+        <!-- The organization's interception root, carried BY THE PACKAGE.
+             docs/pki_trust_model.md section 8.2: the first trust decision cannot be learned from the network, because
+             an agent would have to trust something already in order to accept the document telling it what to
+             trust. Embedding also makes a device's organization a property of the artifact it was installed
+             from, so an endpoint built for one organization cannot be talked onto another's authorities.
+             Permanent="yes" like the transport CA: an uninstall must not take a machine's trust with it, and
+             this file is also the evidence of WHICH authority the box was installed for. -->
+        <?ifdef InterceptionRoot ?>
+        <Component Id="InterceptionRootFile" Guid="*" Bitness="always64" Permanent="yes">
+          <File Id="interception_root.pem" Source="interception_root.pem" KeyPath="yes" />
+        </Component>
+        <?endif?>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Lantern DSSE Agent" Level="1">
+      <?ifdef TransportCA ?><ComponentRef Id="TransportCAFile" /><?endif?>
+      <?ifdef InterceptionRoot ?><ComponentRef Id="InterceptionRootFile" /><?endif?>
+      <ComponentRef Id="WfpDriver" />
+      <ComponentRef Id="DriverSvcExe" />
+      <ComponentRef Id="SteerExe" />
+      <ComponentRef Id="StepUpWindowExe" />
+      <ComponentRef Id="WatchdogExe" />
+      <ComponentRef Id="UpdaterExe" />
+      <ComponentRef Id="CompatExe" />
+      <ComponentRef Id="ProfileApplyExe" />
+      <?ifdef Profile ?><ComponentRef Id="ProfileFile" /><?endif?>
+      <ComponentRef Id="ConfigStoreKey" />
+    </Feature>
+
+    <!-- Compatibility gate: run compatcheck as an IMMEDIATE, blocking custom action
+         BEFORE any system change, so an incompatible machine (S Mode / x86 / — with a test-signed driver —
+         Secure Boot or HVCI) is stopped up front instead of failing later when the driver won't load. compatcheck
+         is embedded in the Binary table (not the payload File) so it can run before InstallFiles. Return=check:
+         a non-zero exit (blocked) aborts the install. Args come from the CompatGateArgs preprocessor var. -->
+    <Binary Id="CompatCheckBin" SourceFile="compatcheck.exe" />
+    <CustomAction Id="CompatGate" BinaryRef="CompatCheckBin" ExeCommand="$(var.CompatGateArgs)"
+                  Execute="immediate" Return="check" />
+
+    <!-- ★★★ THE ONLY MOMENT THE OLD PRODUCT'S AUTHORITIES STILL EXIST (2026-09-09).
+         A deployment-independent package bakes no anchor, so provisioning writes the adopted keys into
+         DsseSteer's service ARGUMENTS. A major upgrade recreates the service from this package's ServiceInstall
+         and those arguments are gone — and RemoveExistingProducts is scheduled After="InstallValidate", which is
+         before InstallInitialize, so EVERY deferred action of this package runs after the old service has
+         already been deleted. ReconcileConfigPin therefore cannot see them: it was measured "working" only on a
+         box whose store had been filled by hand first, which is exactly what the acceptance forbids.
+
+         So the capture is IMMEDIATE and sequenced before RemoveExistingProducts. profileapply is duplicated
+         into the Binary table for the same reason compatcheck is: an action that must run before InstallFiles
+         cannot reference a file InstallFiles has not laid down yet. It is the same signed binary the package
+         installs, harvested from the same build.
+
+         Return="check" ON PURPOSE, and it is the one custom action here that stops an install. Everything else
+         in this package is Return="ignore" because a failed step is better than no agent — but if the keys
+         cannot be saved and the upgrade proceeds anyway, RemoveExistingProducts destroys the only copy. Halting
+         leaves the existing product installed and working, which is strictly the better failure.
+
+         It runs in the installing user's context (immediate actions do), so writing the protected store needs
+         administrative rights and an unelevated attempt fails HERE, before anything has been removed. -->
+    <Binary Id="ProfileApplyBin" SourceFile="profileapply.exe" />
+    <CustomAction Id="CaptureBeforeUpgrade" BinaryRef="ProfileApplyBin" ExeCommand="--capture-before-upgrade"
+                  Execute="immediate" Return="check" />
+
+    <!-- Kernel-driver lifecycle via the driversvc helper (deferred, no-impersonate = runs as SYSTEM). driversvc
+         resolves a relative "dsse-wfp.sys" against its own install dir, so no INSTALLDIR needs threading through
+         CustomActionData. Install: rollback registered first, then create+start. Uninstall: stop+delete before
+         the files are removed (Return=ignore so a stray driver state never blocks removal). -->
+    <CustomAction Id="RollbackWfpDriver" FileRef="driversvc.exe" ExeCommand="--uninstall --name DsseWfp"
+                  Execute="rollback" Impersonate="no" Return="ignore" />
+    <CustomAction Id="InstallWfpDriver" FileRef="driversvc.exe" ExeCommand="--install --name DsseWfp --sys dsse-wfp.sys"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="UninstallWfpDriver" FileRef="driversvc.exe" ExeCommand="--uninstall --name DsseWfp"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Defense in depth: harden the config-store key DACL to SYSTEM/Admin-write, Users-read.
+         Code-based (the profileapply harden step sets a PROTECTED DACL via SetNamedSecurityInfo), NOT
+         util:PermissionEx/SecureObjects — that rolled the install back here. profileapply.exe is always in the
+         package (not Profile-gated), so this runs for the generic MSI too. Return=ignore: this secondary
+         hardening must NEVER block an install. -->
+    <CustomAction Id="HardenConfigStore" FileRef="profileapply.exe" ExeCommand="--harden"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Install the organization's interception root into LocalMachine\Root from the package.
+         Return="check", unlike the harden step beside it, and the difference is deliberate. Hardening is
+         defense in depth, so a hiccup must not roll an install back. This is the machine's ability to VERIFY
+         intercepted TLS at all: proceeding without it produces an agent that steers traffic it cannot
+         validate, which is every HTTPS site on the box failing — the symptom
+         docs/handoff_windows_interception_root_changed_to_hsm.ja.md opens with.
+         It only fails on a real problem. A root already present is a no-op (the ordinary re-install), and the
+         one refusal is a DIFFERENT authority already holding the same subject, which is a machine that needs a
+         person before more software is layered onto it. -->
+    <?ifdef InterceptionRoot ?>
+    <CustomAction Id="InstallInterceptionRoot" FileRef="profileapply.exe"
+                  ExeCommand="--install-interception-root &quot;[CommonAppDataFolder]DSSE\interception_root.pem&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- The counterpart the installer went without until 2026-08-30. Installing a root and never removing it
+         left every uninstalled machine trusting a CA for EVERY name on the internet, whose private key
+         belongs to a deployment that in a lab is usually already deleted. Measured on win-dev-1 the evening
+         the second lab was torn down: FOUR interception roots in the machine store, from four deployments,
+         all of them destroyed. One per rebuild, because nothing removed any.
+
+         Return="ignore", deliberately: an uninstall that FAILS here leaves the machine holding the agent AND
+         the root, which is strictly worse than either. profileapply reports what it could not do and exits 0.
+         It matches BY FINGERPRINT against this package's own artifact, never by subject: another deployment
+         can hold a root with the same name (a rotation in flight, a device moved between organizations) and
+         taking that one is an outage, not a cleanup. -->
+    <CustomAction Id="RemoveInterceptionRoot" FileRef="profileapply.exe"
+                  ExeCommand="--remove-interception-root &quot;[CommonAppDataFolder]DSSE\interception_root.pem&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <?endif?>
+
+    <!-- ★★★ AND THE LANE THIS PRODUCT ACTUALLY SHIPS (2026-09-03, measured while tearing a lab down: the
+         agent uninstalled and left THREE roots trusted, including an organization's interception root).
+
+         The action above is compiled in only when InterceptionRoot is defined at build time — it exists only in a package built WITH a
+         root baked in. What ships is a signed profile applied by profileapply on the machine, which installs
+         the organization's interception root, and (where the deployment's step-up portal is on a certificate
+         it issued itself) that authority too. Neither had any removal by any route.
+
+         An interception root left trusted on a machine that no longer runs the agent is a CA whose key
+         belongs to a deployment, able to sign anything for that machine, with nothing on the box that would
+         use it or notice it — and the deployment may by then be gone, so nobody can revoke it either.
+
+         NOT gated on any build-time variable: what it removes is decided on the machine, by fingerprint,
+         against the artefacts provisioning wrote. A machine that was never given one has nothing to take
+         back, which is silence rather than failure. Return=ignore for the same reason as the action above:
+         an uninstall that refuses leaves the box holding both the agent and the root. -->
+    <CustomAction Id="RemoveProvisionedAnchors" FileRef="profileapply.exe"
+                  ExeCommand="--remove-what-provisioning-trusted"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Restore DsseSteer's start type after the service has been (re)created.
+         A major upgrade deletes the old service and recreates it from the ServiceInstall above, which says
+         demand-start — so an upgrade silently undid whatever raised it to auto on an enrolled box. Nothing
+         broke at the time (the running agent kept steering); the box just stopped steering after its NEXT
+         reboot, far enough away that the upgrade was not the obvious suspect.
+         The reconcile-start-type mode DERIVES the answer from this box's own state (verified transport-bearing
+         profile + a device identity on disk) instead of preserving something an operator typed, so it is safe
+         to run unconditionally: on a fresh, un-enrolled install it changes nothing, and it only ever raises
+         demand to auto, never the reverse. NOT Profile-gated — the state it reads is in the config store, not
+         in a bundled file. Return=ignore: a start-type reconcile must never fail an install. -->
+    <CustomAction Id="ReconcileSteerStartType" FileRef="profileapply.exe" ExeCommand="--reconcile-start-type"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Put back the profile VERIFIER a major upgrade drops.
+         ★★★ MEASURED ON win-dev-1 2026-09-09, AND IT STOPS THE AGENT DEAD. A deployment-independent package
+         bakes no anchor, so provisioning writes the adopted key into DsseSteer's arguments instead — that is
+         what makes a generic package work at all. A major upgrade then recreates the service from the
+         ServiceInstall in THIS file, and those arguments are gone. Nothing restores them: ProvisionFromConsole
+         runs only when CONFIG= was passed, and nobody passes CONFIG= to an upgrade.
+         The device is then correct in every part and broken as a whole — profile present, key file right,
+         identity untouched — and DsseSteer cannot verify anything, falls back to SAFE fail-closed defaults,
+         finds no steering target in them, and EXITS ON A USAGE ERROR. The service does not start at all.
+         Unconditional and Return=ignore, like the reconcile above: it acts only when the arguments name NO
+         key, reports and changes nothing in every other case, and must never fail an install. -->
+    <CustomAction Id="ReconcileConfigPin" FileRef="profileapply.exe" ExeCommand="--reconcile-config-pin"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Put the signed install profile back if the config store has none.
+         Uninstall scrubs the config store on purpose (ClearProfile below), and until now nothing on the device
+         could undo that: the profile is issued by the control plane, the profile.json this package carries is a
+         sample for a different tenant that the baked-in anchor correctly refuses, and the store was the only
+         copy. Measured on win-dev-1 2026-08-21: uninstall (exit 0), reinstall (exit 0), then `sc start
+         DsseSteer` -> 1053, because the agent starts, finds no profile, and exits. Uninstall-and-reinstall is
+         the first thing an administrator tries, and it produced a device that could not be made to steer again
+         without going back to the issuer.
+         Every successful apply run now also writes the VERIFIED envelope to %ProgramData%\DSSE, outside MSI
+         component tracking, the same way the rollback store survives. This action reads it back.
+         Safe unconditionally: it changes NOTHING on a box whose store already holds a verified profile, and
+         the restored envelope goes back in through configstore.Apply — re-verified against the anchor and
+         re-checked against the anti-rollback floor — so the copy is a convenience, never a second authority.
+         NOT Profile-gated, for the same reason ReconcileSteerStartType is not: the state it reads is on the
+         device, not in a bundled file. Return=ignore: recovering a profile must never fail an install, and a
+         refusal (a tampered or superseded escrow) is worth seeing in the log rather than rolling back. -->
+    <CustomAction Id="RestoreProfile" FileRef="profileapply.exe" ExeCommand="--restore-profile"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- Keep THIS package, so a later update has something to roll back to. agentupdate.Run
+         refuses to start when no restore material exists, and nothing was storing any — so that refusal would
+         have fired on every box forever, looking like a broken updater rather than a missing install step.
+         The package is only reliably on hand while it is being installed; msiexec's own cache is keyed by
+         product code, is discarded by cleanup tooling, and holds the LAST package rather than one per version.
+
+         ★ [OriginalDatabase] IS WRITTEN STRAIGHT INTO ExeCommand. The earlier pair — a SetProperty feeding an
+         ExeCommand of "[CustomActionData]" — is gone: it did not work, and it failed silently.
+
+         The CustomActionData mechanism is for deferred DLL and script actions, which call MsiGetProperty at
+         EXECUTE time. An EXE action has no such call: its command line is the Target column, which MSI
+         formats when it WRITES the execution script, during the immediate phase, where every property is
+         still readable. So "[CustomActionData]" was resolved right there, to the empty string (no property of
+         that name exists), and profileapply was launched with NO ARGUMENTS. It printed its usage line and
+         exited 2, and Return="ignore" turned that into a successful install with no rollback material: the
+         failure mode this whole action exists to prevent, produced by the action itself.
+
+         Measured on win-dev-1 2026-08-11, both halves in one install log. With an empty Target, msiexec logged
+         "CustomAction StashRollbackMsi returned actual error code 2 but will be translated to success due to
+         continue marking" and the store stayed empty. With the flag and the expanded package path in Target,
+         the package and its .accepts-rollback-intent marker were stored.
+
+         Pinned by TestTheStashCustomActionReceivesThePackagePath, which also refuses [CustomActionData] on ANY
+         exe action here, since none of them can read it.
+
+         Deliberately NOT keyed on ProductVersion: three numeric fields cannot carry the "+2e39256d" the agent
+         reports, so the stash and the updater's lookup would disagree on every box while each looked correct
+         on its own. profileapply asks the just-installed dsse-steer.exe instead, so one function produces both
+         strings.
+
+         NOT Profile-gated and NOT `NOT Installed`: an upgrade is a case that needs its own package stored, and
+         it is the case the whole mechanism exists for. Return=ignore — a box that could not stash refuses
+         future updates and says why, which is honest; failing the install would turn "cannot roll back later"
+         into "has no agent now". -->
+    <CustomAction Id="StashRollbackMsi" FileRef="profileapply.exe"
+                  ExeCommand="--stash-rollback-msi &quot;[OriginalDatabase]&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- On uninstall, remove the stored packages. Same reason ClearProfile exists: the store is written
+         OUTSIDE MSI component tracking, so RemoveFiles never touches it, and what it leaves behind is tens of
+         megabytes per retained version rather than a stray registry value. -->
+    <CustomAction Id="ClearRollbackStore" FileRef="profileapply.exe" ExeCommand="--clear-rollback-store"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <?ifdef Profile ?>
+    <!-- M8.3b: verify + persist the bundled signed profile to the config store. Return=ignore: a bad/absent
+         profile must NOT fail the install; the agent then runs fail-closed SafeDefaults. Scheduled After
+         StartServices so DsseSteer already exists (InstallServices).
+         NOTE (review SEC-1): we deliberately do NOT pass the set-start-auto flag. DsseSteer needs the enrollment
+         (L2) mTLS material (pinned CA + client cert) to build its transport; before enrollment it cannot start
+         fail-closed (buildTransportConfig errors then exits). Flipping it to auto at install would make the SCM
+         auto-start it on the first reboot, it would exit without arming any WFP filter, and the box would egress
+         DIRECT/UNSTEERED — the opposite of fail-closed. The service therefore stays demand-start; the enrollment /
+         onboarding step is what flips it to auto and starts it, once it can actually steer. -->
+    <CustomAction Id="ApplyProfile" FileRef="profileapply.exe" ExeCommand="--apply --config profile.json"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <?endif?>
+    <!-- On uninstall, scrub the persisted profile. configstore.Apply writes the envelope OUTSIDE MSI component
+         tracking, so RemoveFiles/registry-component removal would otherwise leave the envelope behind. -->
+    <!-- ★★★ PROVISIONING AT INSTALL, WHICH IS WHAT MAKES THE PACKAGE GENERIC (2026-08-29, after walking the
+         install on win-dev-1 and finding it could not be done from what a customer receives).
+         The description says a customer gets three things: an installer, a signed profile downloaded from the
+         Console, and a one-time token shown once. On Windows every organization-specific fact was a BUILD-TIME
+         input to build-msi.ps1 instead — the profile, the deployment anchor, the interception root, the device
+         CA pin, the update pins — so the vendor had to build and re-sign one package per customer, and the
+         "deployment-independent installer" did not exist. Nothing produced enrolment.json at all, so the
+         self-enrolment the agent implements could only ever be started by a person with a shell.
+         CONFIG and TOKEN are those two artefacts, passed at install:
+             msiexec /i DsseAgent.msi CONFIG=&lt;path&gt;\install_profile.json TOKEN=&lt;path&gt;\enrolment_token.txt
+         profileapply, in its provision mode, derives the rest from the profile, installs this organization's
+         interception root into the machine Root store, and writes the enrolment seed the agent enrols itself
+         with. (An XML comment cannot carry a double hyphen, so the flag is named in prose here rather than
+         spelled; the literal is on the CustomAction below, and the WiX build is what catches the difference —
+         the Go tests read this file as text and cannot.)
+         Return=check, unlike ApplyProfile: a BUNDLED profile that fails to apply leaves a package that was
+         merely built without one, and the box falls back to fail-closed SafeDefaults. A profile the operator
+         passed on the command line failing is a typo in the thing they are doing right now, and installing
+         anyway would hand them a device that looks installed and steers nothing. -->
+    <!-- PIN is the FOURTH artefact (2026-08-29, the operator's decision, relayed from the macOS session): the
+         key the profile is verified against, placed by the operator beside the token. NOT baked into the
+         package, which would mean one signed installer per deployment and end the single Console download; and
+         NOT adopted from the profile on first sight, which would approve an authority without an explicit act
+         and then defend the wrong one perfectly. Placing the file IS the act. -->
+    <Property Id="CONFIG" Secure="yes" />
+    <Property Id="TOKEN" Secure="yes" />
+    <Property Id="PIN" Secure="yes" />
+    <!-- The property references go STRAIGHT into ExeCommand, the same shape StashRollbackMsi uses and for the
+         same reason: MSI formats an exe action's Target when it writes the execution script, so the values are
+         baked in there. A [CustomActionData] indirection resolves to the empty string and launches the program
+         with no arguments — which rollback_property_pin_test.go exists to catch, and did. -->
+    <CustomAction Id="ProvisionFromConsole" FileRef="profileapply.exe"
+                  ExeCommand="--provision --config &quot;[CONFIG]&quot; --token &quot;[TOKEN]&quot; --pin-file &quot;[PIN]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <!-- ★★★ AND THE CASE WHERE NOBODY TYPED ANYTHING, which is what the Console's README describes
+         (2026-09-07, measured by following the published instructions exactly on a Windows box).
+         The README the Console writes into the device folder is sent to every platform and says the
+         installer takes the three files from the folder it is opened from. True on macOS. Here the action
+         above is conditioned on CONFIG, which has no default, so `msiexec /i` from that folder never
+         scheduled it — the install returned 0, the services started, nothing was provisioned, and the
+         verbose log did not even say it had been skipped, because a false condition is not mentioned at all.
+         On a box that had been used before, the agent then came up bound to the deployment whose leftovers
+         were still in %ProgramData%\DSSE\ — one that had been destroyed the day before.
+         OriginalDatabase is the package's own path and needs no ResolveSource. Return=check, because a
+         profile that is PRESENT and bad is still somebody's mistake; a profile that is absent is not, and
+         profileapply says so and exits 0. -->
+    <CustomAction Id="ProvisionFromInstallerFolder" FileRef="profileapply.exe"
+                  ExeCommand="--from-installer-folder &quot;[OriginalDatabase]&quot;"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="ClearProfile" FileRef="profileapply.exe" ExeCommand="--clear"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <!-- On uninstall, RESTORE the box's native network BEFORE anything is removed — undo the
+         DNS 127.0.0.1 takeover, the QUIC firewall block, and the NCSI/WFP mutations. Runs FIRST among the
+         uninstall actions, while dsse-steer.exe AND the driver still exist. Return=ignore: a recover hiccup must
+         never block removal.
+         The recover-keep-services flag (review C-2): recover does ONLY the network restore here; stopping and
+         removing the services is the MSI's own job (UninstallWfpDriver + DeleteServices below), and the WFP
+         redirect filters come down when the driver unloads there. This keeps recover off the redundant,
+         hang-prone sc.exe service stops in the session-0 CA context. recover's remaining child processes
+         (netsh/powershell) are bounded by a timeout in the recover code so a hung child can never wedge the
+         msiexec transaction. -->
+    <CustomAction Id="RecoverNetwork" FileRef="dsse_steer.exe" ExeCommand="--mode recover --recover-keep-services"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <!-- Gate first, before costing commits to any change, and only on a fresh install/upgrade (NOT Installed). -->
+      <Custom Action="CompatGate" After="CostFinalize" Condition="NOT Installed" />
+      <Custom Action="RollbackWfpDriver" After="InstallFiles" Condition="NOT Installed" />
+      <Custom Action="InstallWfpDriver" After="RollbackWfpDriver" Condition="NOT Installed" />
+      <Custom Action="HardenConfigStore" After="StartServices" Condition="NOT Installed" />
+      <!-- After InstallFiles (the PEM has to be on disk) and NOT conditioned on `NOT Installed`: an UPGRADE is
+           exactly when a rotation's new root arrives, and skipping it there would leave an upgraded box
+           trusting only what it was first installed with. Idempotent, so running it every time costs nothing. -->
+      <?ifdef InterceptionRoot ?>
+      <Custom Action="InstallInterceptionRoot" After="InstallFiles" Condition="NOT REMOVE" />
+      <!-- BEFORE RemoveFiles, because the artifact this reads is one of the files being removed: after it
+           there is nothing left to name the certificate with, and the root would survive the uninstall. -->
+      <Custom Action="RemoveInterceptionRoot" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <?endif?>
+      <!-- Before RemoveFiles, because it reads the artefacts provisioning wrote to decide what to take back. -->
+      <!-- ★ AND NOT UPGRADINGPRODUCTCODE, ON BOTH OF THESE, AND IT IS NOT A REFINEMENT. RemoveExistingProducts
+           uninstalls the old product with REMOVE=ALL, so as written these fired during every UPGRADE: the
+           interception root came out of the machine store and the provisioned anchors were taken back, in the
+           middle of an install whose whole purpose was to keep the device working. A generic MSI carries no
+           profile to put them back with, so what followed was a device that had been upgraded into being
+           unable to verify its own Edge — the shape of an outage, produced by a successful install.
+
+           Windows sets UPGRADINGPRODUCTCODE only on the old product's uninstall during RemoveExistingProducts,
+           which is exactly the distinction these two actions need and the only one that separates "this
+           machine is done with the agent" from "this machine is getting a newer one". An explicit uninstall
+           has REMOVE=ALL and no UPGRADINGPRODUCTCODE, so removal there is unchanged — and it must be: an
+           interception root left trusted on a machine that no longer runs the agent is the thing the comment
+           above this action exists to prevent. -->
+      <Custom Action="RemoveProvisionedAnchors" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <?ifdef Profile ?><Custom Action="ApplyProfile" After="HardenConfigStore" Condition="NOT Installed" /><?endif?>
+      <!-- After ApplyProfile (so a bundled profile wins and this is a no-op) and BEFORE the start type is
+           reconciled, because that action derives the start type from the persisted profile — restoring one
+           afterwards would leave the device holding a profile and still on demand-start until the next
+           install. Declared after ApplyProfile under the same anchor so it takes the later sequence number
+           whether or not the package bundles a profile. -->
+      <!-- Before RestoreProfile, so a profile the operator just handed us wins over an escrowed one from a
+           previous organization, and before ReconcileSteerStartType, which derives the start type from what is
+           now persisted. Only when CONFIG was actually passed. -->
+      <Custom Action="ProvisionFromConsole" After="HardenConfigStore" Condition="CONFIG AND NOT REMOVE" />
+      <!-- Only when nobody passed one. CONFIG keeps its meaning — "exactly this file, and fail if it is not
+           there" — and this is the other half: the folder the package was opened from, as the README says. -->
+      <Custom Action="ProvisionFromInstallerFolder" After="ProvisionFromConsole" Condition="NOT CONFIG AND NOT REMOVE" />
+      <Custom Action="RestoreProfile" After="HardenConfigStore" Condition="NOT REMOVE" />
+      <!-- After the service exists and the profile (if bundled) has been applied. Deliberately NOT conditioned
+           on `NOT Installed`: the case this exists for IS the upgrade, where the service was just recreated as
+           demand-start. Skipped only on a genuine uninstall, where there is nothing to reconcile. -->
+      <!-- BEFORE the start-type reconcile, and the order is the whole point: that action STARTS the service,
+           and a service started without a verifier exits on a usage error. Restoring the key afterwards would
+           leave the box holding a service that has already failed to come up. -->
+      <Custom Action="ReconcileConfigPin" After="RestoreProfile" Condition="NOT REMOVE" />
+      <Custom Action="ReconcileSteerStartType" After="ReconcileConfigPin" Condition="NOT REMOVE" />
+      <!-- After StartServices, so dsse-steer.exe is on disk to be asked its version. It only needs
+           InstallFiles for that, but sequencing it here keeps every profileapply action in one place, and the
+           cost is nothing: the version flag is checked immediately after flag.Parse(), before the agent's log
+           redirect and posture banner, and the child is bounded by a timeout so it cannot wedge the
+           transaction. -->
+      <Custom Action="StashRollbackMsi" After="ReconcileSteerStartType" Condition="NOT REMOVE" />
+      <!-- Genuine uninstall only, never a MajorUpgrade's RemoveExistingProducts (review C-1, same as
+           ClearProfile): pruning the store mid-upgrade would delete the package the NEXT rollback needs, at
+           the one moment we are guaranteed to have it. -->
+      <Custom Action="ClearRollbackStore" Before="ClearProfile" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <!-- REMOVE=ALL AND NOT UPGRADINGPRODUCTCODE (review C-1): fire ONLY on a genuine uninstall, NOT on a
+           MajorUpgrade's RemoveExistingProducts (which also sets REMOVE=ALL). Otherwise every upgrade would wipe
+           the persisted profile (ClearProfile) and tear the network down mid-upgrade (RecoverNetwork). -->
+      <Custom Action="RecoverNetwork" Before="ClearProfile" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="ClearProfile" Before="UninstallWfpDriver" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+      <Custom Action="UninstallWfpDriver" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

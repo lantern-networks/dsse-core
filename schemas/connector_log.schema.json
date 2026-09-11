@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/connector_log.schema.json",
+  "title": "ConnectorLog",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "event_type",
+    "connector_id",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "connector_registered",
+        "connector_heartbeat",
+        "connector_connected",
+        "connector_reconnect",
+        "connector_disconnected",
+        "connector_route_allowed",
+        "connector_route_denied"
+      ]
+    },
+    "connector_id": {
+      "type": "string"
+    },
+    "connector_group_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tunnel_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "access_decision_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_family": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_port": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "decision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_region_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_cluster_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_heartbeat_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "id": "ip_tls_readiness_lab",
+  "tenant_id": "tenant_lab_001",
+  "name": "Lab TLS inspection readiness metadata profile",
+  "inspection_mode": "tls_readiness",
+  "trust_profile_id": "tp_lab_managed_browser_001",
+  "tenant_root_ca_id": "trca_lab_001",
+  "quic_policy_mode": "prefer_tcp_tls",
+  "quic_policy_action": "tcp_tls_required",
+  "payload_policy": "metadata_only",
+  "certificate_issuance_mode": "not_issued",
+  "tls_interception_enabled": false,
+  "network_extension_dependency": "none_policy_layer",
+  "status": "active",
+  "metadata": {
+    "readiness_scope": "policy_layer_only",
+    "private_key_recorded": false,
+    "runtime_smoke_required": false
+  }
+}

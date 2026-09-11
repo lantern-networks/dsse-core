@@ -1,0 +1,29 @@
+{
+  "id": "hae_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "approval_source": "admin_console",
+  "approver_user_id": "approver_lab_001",
+  "subject_user_id": "user_lab_001",
+  "actor_nhi_id": "nhi_soc_agent_001",
+  "delegated_access_grant_id": "dag_lab_001",
+  "agent_task_session_id": "ats_lab_001",
+  "application_id": "app_dummy_https",
+  "audience": "https://mcp.local/soc",
+  "resource": "incident/inc_lab_001",
+  "action_type": "ticket:create",
+  "task_id": "task_lab_001",
+  "run_id": "run_lab_001",
+  "requested_scopes": [
+    "incident:read",
+    "ticket:create"
+  ],
+  "reason": "Approved for ransomware investigation exercise",
+  "approval_result": "approved",
+  "evidence_link": "evidence://audit/hae_lab_001",
+  "activated_at": "2026-05-22T00:00:00Z",
+  "expires_at": "2026-05-22T00:30:00Z",
+  "created_at": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "approval_ttl_seconds": 1800
+  }
+}

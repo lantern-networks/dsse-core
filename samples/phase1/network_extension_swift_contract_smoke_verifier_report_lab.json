@@ -1,0 +1,17 @@
+{
+  "status": "ok",
+  "created_at": "2026-06-03T06:08:58Z",
+  "source_report": "network_extension_swift_contract_smoke_lab.json",
+  "case_count": 13,
+  "open_tunnel_count": 3,
+  "deny_count": 10,
+  "lifecycle_case_count": 4,
+  "runtime_evidence_writer_gate": "ok",
+  "provider_flow_takeover_gate": "ok",
+  "provider_flow_takeover_case_count": 11,
+  "flow_extraction_counters_gate": "ok",
+  "runtime_evidence_flow_extraction_gate": "ok",
+  "last_error_sanitizer_gate": "ok",
+  "expectations_gate": "ok",
+  "secret_leak_gate": "ok"
+}

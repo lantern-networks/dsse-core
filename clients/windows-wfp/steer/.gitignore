@@ -1,0 +1,3 @@
+# `go build` in this directory drops the compiled agent here. It is a build artefact, not source.
+steer
+steer.exe

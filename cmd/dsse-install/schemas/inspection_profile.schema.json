@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/inspection_profile.schema.json",
+  "title": "InspectionProfile",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "inspection_mode",
+    "payload_policy",
+    "tls_interception_enabled",
+    "certificate_issuance_mode",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "inspection_mode": {
+      "type": "string",
+      "enum": [
+        "passthrough",
+        "metadata_only",
+        "tls_readiness"
+      ]
+    },
+    "trust_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tenant_root_ca_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quic_policy_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "allow",
+        "detect_only",
+        "prefer_tcp_tls",
+        "block_quic",
+        null
+      ]
+    },
+    "quic_policy_action": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "audit_only",
+        "tcp_tls_required",
+        "prefer_tcp_tls",
+        "redirect_to_tcp_tls",
+        "disable_http3",
+        null
+      ]
+    },
+    "payload_policy": {
+      "type": "string",
+      "enum": [
+        "none",
+        "metadata_only",
+        "payload_ref_only"
+      ]
+    },
+    "certificate_issuance_mode": {
+      "type": "string",
+      "enum": [
+        "not_issued",
+        "external_only",
+        "post_mvp"
+      ]
+    },
+    "tls_interception_enabled": {
+      "type": "boolean"
+    },
+    "network_extension_dependency": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none_policy_layer",
+        "runtime_required_post_mvp",
+        null
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "inactive",
+        "revoked"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Non-secret metadata only. Do not store private keys, raw certificates, payloads, credentials, tokens, cookies, or raw runtime logs."
+    }
+  }
+}

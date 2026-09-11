@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/device.schema.json",
+  "title": "Device",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "user_id",
+    "hostname",
+    "os",
+    "agent_version",
+    "device_trust_level",
+    "policy_bundle_id",
+    "policy_bundle_version",
+    "status",
+    "registered_at",
+    "last_seen_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "hostname": {
+      "type": "string"
+    },
+    "os": {
+      "type": "string"
+    },
+    "os_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_version": {
+      "type": "string"
+    },
+    "device_trust_level": {
+      "type": "string",
+      "enum": [
+        "managed",
+        "unmanaged",
+        "unknown"
+      ]
+    },
+    "policy_bundle_id": {
+      "type": "string"
+    },
+    "policy_bundle_version": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "registered",
+        "healthy",
+        "degraded",
+        "offline",
+        "revoked"
+      ]
+    },
+    "registered_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_seen_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

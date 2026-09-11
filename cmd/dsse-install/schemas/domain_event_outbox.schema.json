@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/domain_event_outbox.schema.json",
+  "title": "DomainEventOutbox",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "schema_version",
+    "event_plane",
+    "stream",
+    "event_type",
+    "status",
+    "occurred_at",
+    "received_at",
+    "payload",
+    "payload_checksum",
+    "publish_attempt",
+    "metadata"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "event_plane": {
+      "type": "string",
+      "enum": [
+        "domain",
+        "access",
+        "evidence"
+      ]
+    },
+    "stream": {
+      "type": "string",
+      "enum": [
+        "authentication_events",
+        "break_glass_events",
+        "device_events",
+        "agent_update_events",
+        "human_approval_events",
+        "delegated_access_grants",
+        "tool_call_events",
+        "inspection_events",
+        "access_logs",
+        "decision_traces",
+        "connector_logs"
+      ]
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "publishing",
+        "published",
+        "dead"
+      ]
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "payload_checksum": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "publish_attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_attempt_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "locked_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "locked_until": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dead_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

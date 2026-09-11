@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/network_extension_swift_contract_smoke_verifier_report.schema.json",
+  "title": "NetworkExtensionSwiftContractSmokeVerifierReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "source_report",
+    "case_count",
+    "open_tunnel_count",
+    "deny_count",
+    "lifecycle_case_count",
+    "runtime_evidence_writer_gate",
+    "provider_flow_takeover_gate",
+    "provider_flow_takeover_case_count",
+    "flow_extraction_counters_gate",
+    "runtime_evidence_flow_extraction_gate",
+    "last_error_sanitizer_gate",
+    "expectations_gate",
+    "secret_leak_gate"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_report": {
+      "type": "string"
+    },
+    "case_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "open_tunnel_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "deny_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "lifecycle_case_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "runtime_evidence_writer_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "provider_flow_takeover_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "provider_flow_takeover_case_count": {
+      "type": "integer",
+      "minimum": 11
+    },
+    "flow_extraction_counters_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "runtime_evidence_flow_extraction_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "last_error_sanitizer_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "expectations_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "secret_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_update_event.schema.json",
+  "title": "AgentUpdateEvent",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "device_id",
+    "current_agent_version",
+    "target_agent_version",
+    "release_channel",
+    "update_status",
+    "update_source",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "current_agent_version": {
+      "type": "string"
+    },
+    "target_agent_version": {
+      "type": "string"
+    },
+    "release_channel": {
+      "type": "string",
+      "enum": [
+        "lab",
+        "alpha",
+        "stable",
+        "pilot",
+        "canary",
+        "emergency"
+      ]
+    },
+    "update_status": {
+      "type": "string",
+      "enum": [
+        "available",
+        "downloaded",
+        "installing",
+        "installed",
+        "failed",
+        "rolled_back"
+      ]
+    },
+    "update_source": {
+      "type": "string",
+      "enum": [
+        "mdm",
+        "control_plane",
+        "manual"
+      ]
+    },
+    "package_checksum": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "package_signature": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failure_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "rollback_outcome_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_applicable",
+        "succeeded",
+        "failed",
+        null
+      ]
+    },
+    "rollback_failure_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "previous_version_unavailable",
+        "package_signature_validation",
+        "installer_failure",
+        "post_update_health_check_failed",
+        "unknown",
+        null
+      ]
+    },
+    "rollback_target_agent_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "audit_log_result_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_recorded",
+        "recorded",
+        "record_failed",
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

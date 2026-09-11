@@ -1,0 +1,373 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/policy.schema.json",
+  "title": "Policy",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "name",
+    "priority",
+    "conditions",
+    "action",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "priority": {
+      "type": "integer"
+    },
+    "conditions": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": [
+                "string",
+                "integer",
+                "boolean"
+              ]
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "op"
+            ],
+            "properties": {
+              "op": {
+                "type": "string",
+                "enum": [
+                  "eq",
+                  "equals",
+                  "in",
+                  "contains",
+                  "lte",
+                  "gte",
+                  "cidr_contains"
+                ]
+              },
+              "value": {
+                "type": [
+                  "string",
+                  "integer",
+                  "boolean",
+                  "null"
+                ]
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": [
+                    "string",
+                    "integer",
+                    "boolean"
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    "action": {
+      "type": "object",
+      "required": [
+        "decision"
+      ],
+      "properties": {
+        "decision": {
+          "type": "string",
+          "enum": [
+            "allow",
+            "deny",
+            "require_reauthentication",
+            "require_step_up_mfa",
+            "require_interactive_mfa",
+            "require_human_approval",
+            "require_token_exchange",
+            "require_token_binding",
+            "require_workload_attestation",
+            "require_masking",
+            "require_inspection",
+            "warn",
+            "observe",
+            "audit_only"
+          ]
+        }
+      }
+    },
+    "actor_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_nhi_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delegated_access_grant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "required_token_binding": {
+      "type": "boolean"
+    },
+    "required_human_approval": {
+      "type": "boolean"
+    },
+    "required_workload_attestation": {
+      "type": "boolean",
+      "description": "When true, delegated agent/NHI allow decisions require a verified workload attestation state before access is allowed."
+    },
+    "break_glass_policy": {
+      "type": "boolean",
+      "description": "Marks the policy as a Break-glass emergency access policy. Break-glass policies must define a bounded session TTL, strong authentication requirement, and audit requirement before an allow decision can stand."
+    },
+    "break_glass_identity_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Non-secret reference to the Break-glass identity or group authorized for this policy."
+    },
+    "break_glass_max_session_seconds": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1,
+      "maximum": 3600,
+      "description": "Maximum Break-glass session duration accepted by policy evaluation. The guard denies unbounded or longer-than-one-hour Break-glass policies."
+    },
+    "break_glass_strong_auth_required": {
+      "type": "boolean",
+      "description": "When true, Break-glass allow decisions require fresh MFA/strong-auth evidence such as OTP, WebAuthn, FIDO2, passkey, or hardware key."
+    },
+    "break_glass_audit_required": {
+      "type": "boolean",
+      "description": "When true, Break-glass decisions emit explicit audit metadata and a Break-glass session-used Audit Log row."
+    },
+    "break_glass_device_group_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "managed_recovery_device_group",
+        "registered_break_glass_device_group",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_allowed_time_window_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "bounded_short_ttl",
+        "scheduled_recovery_window",
+        "not_configured",
+        null
+      ]
+    },
+    "break_glass_approver_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "pre_registered_break_glass_approver",
+        "dual_approval_required",
+        "not_configured",
+        null
+      ]
+    },
+    "break_glass_reason_required": {
+      "type": "boolean"
+    },
+    "break_glass_audit_level": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "elevated",
+        "full_session",
+        null
+      ]
+    },
+    "break_glass_policy_ttl_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "short_ttl",
+        "expired",
+        "not_configured",
+        null
+      ]
+    },
+    "allowed_task_purposes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_tool_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_tool_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_context_scope_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_memory_scope_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_data_classifications": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "agent_runtime_environment_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "max_tool_calls": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "data_egress_limit": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "inspection_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_region_policy": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "log_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_family": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connection_initiator": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "exception_expiry": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "emergency_mode_scope": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "inactive",
+        "expired",
+        "revoked"
+      ]
+    },
+    "created_by": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

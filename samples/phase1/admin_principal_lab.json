@@ -1,0 +1,18 @@
+{
+  "id": "admin_user_lab_001",
+  "tenant_id": "tenant_lab",
+  "subject": "oidc-sub-admin-lab-001",
+  "email": "admin@example.jp",
+  "display_name": "Lab Admin",
+  "roles": [
+    "admin",
+    "analyst"
+  ],
+  "idp_id": "keycloak_lab",
+  "status": "active",
+  "created_at": "2026-05-23T00:00:00Z",
+  "last_login_at": "2026-05-23T01:00:00Z",
+  "metadata": {
+    "source": "phase1_lab"
+  }
+}

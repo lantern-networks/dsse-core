@@ -1,0 +1,303 @@
+/* ---------------------------------------------------------------------------
+ * ui.css — the shared component layer for the product-quality console.
+ * Design tokens (reuse the existing palette from styles.css) + the reusable
+ * primitives (toast, modal/confirm, form fields, data table, states, buttons).
+ * Built for the vertical-slice redesign (see docs/console_ux_design_direction.md);
+ * intended to carry every object view, replacing the raw-JSON cards.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  --ui-gap: 12px;
+  --ui-text: var(--text);
+  --ui-panel: var(--panel);
+  --ui-border: var(--border);
+  --ui-bg: var(--bg);
+  --ui-radius: 8px;
+  --ui-muted: #5d6a7c;
+  --ui-line: var(--border);
+  --ui-danger: #b42335;
+  --ui-danger-bg: #fff0f1;
+  --ui-ok: #167149;
+  --ui-warn: var(--warn);
+  --ui-accent: #b84431;
+  --ui-field-bg: var(--panel);
+}
+
+/* ---- grouped navigation ---- */
+.nav-section { padding: 14px 12px 4px; font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--ui-muted); }
+.nav-section:first-child { padding-top: 4px; }
+
+/* ---- tabs ---- */
+.ui-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--ui-line); margin: 12px 0 16px; }
+.ui-tab { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--ui-muted); padding: 8px 14px; cursor: pointer; font-size: 13px; font-weight: 600; }
+.ui-tab:hover { color: #202b3a; }
+.ui-tab.active { color: #202b3a; border-bottom-color: var(--ui-accent); }
+
+/* ---- inline checklist (multi-select in a form) ---- */
+.ui-checklist { max-height: 180px; overflow: auto; border: 1px solid var(--ui-line); border-radius: 6px; padding: 6px 8px; }
+.ui-checkrow { display: flex; align-items: center; gap: 8px; padding: 3px 0; font-size: 13px; }
+.ui-checkrow input { margin: 0; }
+/* A spacer only pushed things apart inside a toolbar, so a row that used one elsewhere simply had no gap.
+   Scoped per row rather than made global: .ui-spacer is a layout instruction, and it should mean the same
+   thing wherever a row uses it. */
+.ui-checkrow .ui-spacer { flex: 1 1 auto; }
+
+/* ---- view header ---- */
+.ui-view-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.ui-view-title { font-size: 20px; font-weight: 650; margin: 0 0 4px; }
+.ui-view-desc { color: var(--ui-muted); font-size: 13px; margin: 0; max-width: 70ch; }
+
+/* ---- toolbar (search + filters + primary action) ---- */
+.ui-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 12px 0; }
+.ui-toolbar .ui-spacer { flex: 1 1 auto; }
+.ui-search { min-width: 220px; }
+
+/* ---- buttons ---- */
+.ui-btn { background: #edf0f4; color: #202b3a; border: 1px solid var(--ui-line); border-radius: 6px; padding: 7px 12px; font-size: 13px; cursor: pointer; line-height: 1; }
+.ui-btn:hover { background: #e5e9ef; }
+.ui-btn:disabled { opacity: .5; cursor: not-allowed; }
+.ui-btn-primary { background: var(--ui-accent); border-color: var(--ui-accent); color: #fff; font-weight: 600; }
+.ui-btn-primary:hover { background: #983927; }
+.ui-btn-danger { background: var(--ui-danger-bg); border-color: #ecc5c9; color: #a52434; }
+.ui-btn-danger:hover { background: #fbe3e6; }
+.ui-btn-sm { padding: 5px 9px; font-size: 12px; }
+
+/* ---- data table ---- */
+.ui-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ui-table th { text-align: left; color: var(--ui-muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding: 8px 10px; border-bottom: 1px solid var(--ui-line); }
+.ui-table td { padding: 10px; border-bottom: 1px solid #e7ebf0; vertical-align: middle; }
+.ui-table tr:hover td { background: var(--panel); }
+.ui-table .ui-row-actions { text-align: right; white-space: nowrap; }
+.ui-table code { background: var(--bg); padding: 2px 6px; border-radius: 4px; }
+
+/* ---- status badges ---- */
+.ui-badge { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; white-space: nowrap; }
+.ui-badge-ok { background: #eaf6ef; color: #167149; }
+.ui-badge-off { background: #dce2e9; color: #536174; }
+.ui-badge-warn { background: #fff5df; color: #946200; }
+.ui-badge-danger { background: var(--ui-danger-bg); color: #a52434; }
+
+/* ---- card + callout ----
+   .ui-card is a plain grouping box. It was already in use (pkireadiness) with no definition at all, so it
+   rendered as a bare div; giving it one styles those views too.
+   .ui-callout is for the one thing on a page that needs to be read before everything else — used by the
+   licensing view to put "these customers cannot enrol" above the totals. */
+.ui-card { border: 1px solid var(--ui-line); border-radius: var(--ui-radius); padding: 14px 16px; margin: 12px 0; }
+.ui-card p { margin: 4px 0; }
+.ui-callout { border: 1px solid var(--ui-line); border-left-width: 4px; border-radius: var(--ui-radius); padding: 12px 16px; margin: 12px 0; }
+.ui-callout ul { margin: 8px 0 4px; padding-left: 20px; }
+.ui-callout li { margin: 3px 0; }
+.ui-callout-warn { border-left-color: #946200; background: #fff8eb; }
+
+/* ---- states (empty / loading / error) ---- */
+.ui-state { text-align: center; color: var(--ui-muted); padding: 36px 16px; border: 1px dashed var(--ui-line); border-radius: var(--ui-radius); }
+.ui-state-error { color: #a52434; border-color: #ecc5c9; background: var(--ui-danger-bg); }
+.ui-state-actions { margin-top: 12px; }
+.ui-spinner { display: inline-block; width: 16px; height: 16px; border: 2px solid #dce2e9; border-top-color: var(--ui-accent); border-radius: 50%; animation: ui-spin .7s linear infinite; vertical-align: -3px; margin-right: 8px; }
+@keyframes ui-spin { to { transform: rotate(360deg); } }
+
+/* ---- form fields ---- */
+.ui-field { display: block; margin-bottom: 14px; }
+.ui-field-label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 5px; }
+.ui-field-req { color: var(--ui-danger); margin-left: 3px; }
+.ui-field-hint { display: block; color: var(--ui-muted); font-size: 12px; margin-top: 4px; }
+.ui-input, .ui-textarea, .ui-select { width: 100%; box-sizing: border-box; background: var(--ui-field-bg); color: #202b3a; border: 1px solid var(--ui-line); border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; }
+.ui-textarea { min-height: 70px; resize: vertical; }
+.ui-input:focus, .ui-textarea:focus, .ui-select:focus { outline: none; border-color: var(--ui-accent); }
+.ui-field-err .ui-input, .ui-field-err .ui-textarea, .ui-field-err .ui-select { border-color: var(--ui-danger); }
+.ui-field-error-msg { display: none; color: #a52434; font-size: 12px; margin-top: 4px; }
+.ui-field-err .ui-field-error-msg { display: block; }
+
+/* ---- modal (confirm / preview / form) ---- */
+.ui-modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+.ui-modal { background: var(--panel); border: 1px solid var(--ui-line); border-radius: 10px; width: min(520px, 92vw); max-height: 86vh; overflow: auto; box-shadow: 0 12px 40px rgba(26,42,64,.14); }
+.ui-modal-head { padding: 16px 18px 6px; font-size: 16px; font-weight: 650; }
+.ui-modal-body { padding: 6px 18px 14px; font-size: 13px; color: #3e4d60; }
+.ui-modal-foot { padding: 12px 18px 16px; display: flex; gap: 10px; justify-content: flex-end; }
+.ui-preview { background: var(--bg); border: 1px solid var(--ui-line); border-radius: 6px; padding: 10px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 240px; overflow: auto; margin-top: 8px; }
+
+/* ---- toasts ---- */
+.ui-toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 1100; }
+.ui-toast { min-width: 220px; max-width: 380px; padding: 11px 14px; border-radius: 8px; font-size: 13px; color: #fff; box-shadow: 0 6px 20px rgba(26,42,64,.12); border: 1px solid transparent; animation: ui-toast-in .18s ease; }
+.ui-toast-ok { background: #eaf6ef; border-color: #bcddc9; color: #16603e; }
+.ui-toast-err { background: var(--ui-danger-bg); border-color: #ecc5c9; color: #a52434; }
+.ui-toast-info { background: #edf3fb; border-color: #c8d7ec; color: #254f85; }
+@keyframes ui-toast-in { from { opacity: 0; transform: translateY(8px); } }
+
+/* Tenant indicator in the top bar — always shows which organization (tenant) is in context. */
+.tenant-indicator { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border: 1px solid var(--ui-line); border-radius: 999px; background: var(--ui-field-bg); font-size: 12px; font-weight: 600; white-space: nowrap; }
+.tenant-indicator::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--ui-accent); flex: none; }
+.tenant-indicator.operating { border-color: #e3c990; background: #fff5df; color: #765014; }
+.tenant-indicator.operating::before { background: #946200; }
+
+/* Operating-within-tenant banner — a cross-tenant operator is acting inside another tenant; loud + auditable. */
+.operating-banner { display: flex; align-items: center; gap: 12px; padding: 9px 16px; background: #fff5df; border-bottom: 1px solid #e3c990; color: #765014; font-size: 13px; }
+.operating-banner .operating-dot { width: 9px; height: 9px; border-radius: 50%; background: #946200; flex: none; }
+.operating-banner .ui-btn { margin-left: auto; }
+
+/* ---- key/value detail block (drill-down modals, e.g. connector instance detail) ---- */
+.ui-row-clickable { cursor: pointer; }
+.ui-row-clickable:hover { background: var(--ui-field-bg); }
+.ui-kv { display: flex; flex-direction: column; gap: 2px; }
+.ui-kv-row { display: grid; grid-template-columns: 180px 1fr; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--ui-line); align-items: start; }
+.ui-kv-row:last-child { border-bottom: none; }
+.ui-kv-key { color: var(--ui-muted, #5d6a7c); font-size: 12px; font-weight: 600; }
+.ui-kv-val { font-size: 13px; word-break: break-word; }
+.ui-kv-sub { color: var(--ui-muted, #5d6a7c); font-size: 11px; font-weight: 600; margin: 6px 0 3px; }
+.ui-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 2px 7px; border: 1px solid var(--ui-line); border-radius: 6px; background: var(--ui-field-bg); font-family: ui-monospace, monospace; font-size: 12px; }
+
+/* Predefined-catalog / pinned tables. Previously UNSTYLED (browser default) -> centered headers, a blown-out
+   Entry column, and vertically-wrapped state badges. Give it the same left-aligned, full-width treatment as
+   .ui-table, cap the multi-line description so it wraps instead of stretching the column, and keep badges on
+   one line. */
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; table-layout: fixed; }
+.data-table th { text-align: left; color: var(--ui-muted, #5d6a7c); font-weight: 600; font-size: 12px; padding: 8px 10px; border-bottom: 1px solid var(--ui-line, #e7ebf0); white-space: nowrap; }
+.data-table td { padding: 10px; border-bottom: 1px solid #e7ebf0; vertical-align: top; word-break: break-word; }
+.data-table tr:hover td { background: var(--panel); }
+.data-table td .group-desc { display: block; }
+/* column proportions: Entry | Vendor/Category | Patterns | State | Actions */
+.data-table col.c-entry { width: 26%; }
+.data-table col.c-vendor { width: 13%; }
+.data-table col.c-patterns { width: 34%; }
+.data-table col.c-state { width: 11%; }
+.data-table col.c-actions { width: 16%; }
+.data-table td.nowrap, .data-table th.nowrap { white-space: nowrap; }
+
+/* ---- Devices redesign (fleet summary + 5-column state-first table) ---------------------------------------
+   docs/2026-07-25_trip_wrapup_and_aws_shutdown.ja.md + the "Devices — redesign proposal" mockup.
+   Reuses ui-badge tones (ok/warn/danger/off) for the primary pill; these add the fleet bar, the severity
+   row-stripe, quiet signal chips, and the row overflow menu. "Show problems, keep normal quiet". */
+.dev-fleet { display: flex; gap: 10px; flex-wrap: wrap; margin: 0 0 16px; }
+.dev-stat { display: flex; align-items: center; gap: 9px; background: var(--ui-panel, #f0f2f4);
+  border: 1px solid var(--ui-line, #dce2e9); border-radius: 10px; padding: 10px 14px; cursor: pointer;
+  transition: border-color .12s, background .12s; }
+.dev-stat:hover { border-color: #b3bdca; }
+.dev-stat.is-active { border-color: var(--ui-accent, #b84431); }
+.dev-stat .dev-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.dev-stat .dev-n { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1; }
+.dev-stat .dev-lbl { color: var(--ui-muted, #5d6a7c); font-size: 12px; line-height: 1.25; }
+.dev-dot-ok { background: #167149; } .dev-dot-warn { background: #946200; }
+.dev-dot-danger { background: #b42335; } .dev-dot-off { background: #687588; } .dev-dot-accent { background: #b84431; }
+
+/* severity stripe on the row's first cell */
+.ui-table td.dev-lead { border-left: 3px solid transparent; }
+tr.dev-sev-danger td.dev-lead { border-left-color: #b42335; }
+tr.dev-sev-warn td.dev-lead { border-left-color: #946200; }
+tr.dev-sev-off td.dev-lead { border-left-color: #5d6a7c; }
+
+.dev-id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; font-weight: 600; }
+.dev-meta { color: var(--ui-muted, #5d6a7c); font-size: 12px; margin-top: 3px; display: flex; gap: 6px;
+  align-items: center; flex-wrap: wrap; }
+.dev-grp { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #4a5a70; background: #edf0f4;
+  border: 1px solid var(--ui-line, #dce2e9); padding: 1px 6px; border-radius: 5px; }
+.dev-sub { color: var(--ui-muted, #5d6a7c); font-size: 12px; margin-top: 4px; }
+.dev-sub .dev-lo { color: #5d6a7c; }
+
+.dev-signals { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.dev-chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 500;
+  padding: 2px 8px; border-radius: 6px; border: 1px solid var(--ui-line, #dce2e9); color: var(--ui-muted, #5d6a7c);
+  background: var(--bg); white-space: nowrap; }
+.dev-chip-warn { color: #946200; border-color: #e3c990; background: #fff5df; }
+.dev-chip-danger { color: #a52434; border-color: #ecc5c9; background: var(--ui-danger-bg, #fff0f1); }
+.dev-chip-ok { color: #167149; border-color: transparent; background: transparent; padding-left: 0; }
+.dev-risk-ok { color: #5d6a7c; font-size: 12.5px; }
+
+/* row overflow menu */
+.dev-ov { position: relative; display: inline-block; }
+.dev-ov-menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 40; min-width: 150px;
+  background: var(--ui-panel, #f0f2f4); border: 1px solid var(--ui-line, #dce2e9); border-radius: 8px;
+  padding: 4px; box-shadow: 0 8px 24px rgba(26,42,64,.12); }
+.dev-ov-item { display: block; width: 100%; text-align: left; background: transparent; border: 0;
+  color: var(--ui-text, #202b3a); padding: 7px 10px; font-size: 12.5px; border-radius: 6px; cursor: pointer;
+  font-family: inherit; }
+.dev-ov-item:hover { background: #edf0f4; }
+.dev-ov-item.dev-ov-danger { color: #a52434; }
+.dev-ov-sep { height: 1px; background: var(--ui-line, #dce2e9); margin: 4px 2px; }
+
+/* ---- Overview dashboard (docs/overview_dashboard_redesign.md) --------------------------------------------
+   At-a-glance operational dashboard: fleet/devices/tenants/regions/edge + inline-SVG charts. Reuses the
+   ui-badge tones; adds panels, stat tiles, stacked bars, hbars, donuts, and the status strip. Light surfaces with shared semantic colors. */
+.ov-strip{display:flex;flex-wrap:wrap;gap:9px 20px;align-items:center;background:var(--ui-panel,#f0f2f4);
+  border:1px solid var(--ui-line,#dce2e9);border-radius:12px;padding:12px 16px;margin-bottom:14px;}
+.ov-sys{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;}
+.ov-dot{width:8px;height:8px;border-radius:50%;flex:none;}
+.ov-dot-ok{background:#167149;}.ov-dot-warn{background:#946200;}.ov-dot-danger{background:#b42335;}.ov-dot-off{background:#687588;}
+.ov-strip .ov-id{margin-left:auto;color:var(--ui-muted,#5d6a7c);font-size:12px;font-family:ui-monospace,Menlo,monospace;}
+.ov-strip .ov-id b{color:var(--ui-text,#202b3a);font-weight:600;}
+
+.ov-grid{display:grid;gap:14px;}
+.ov-tiles{grid-template-columns:repeat(5,1fr);}
+@media(max-width:900px){.ov-tiles{grid-template-columns:repeat(2,1fr);}}
+.ov-tile{background:var(--ui-panel,#f0f2f4);border:1px solid var(--ui-line,#dce2e9);border-radius:12px;padding:13px 15px;min-width:0;}
+.ov-lbl{color:var(--ui-muted,#5d6a7c);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;}
+.ov-big{font-size:25px;font-weight:660;line-height:1.05;margin-top:5px;font-variant-numeric:tabular-nums;}
+.ov-big small{font-size:14px;font-weight:500;color:var(--ui-muted,#5d6a7c);}
+.ov-foot{margin-top:8px;font-size:11.5px;color:var(--ui-muted,#5d6a7c);}
+
+.ov-panel{background:var(--ui-panel,#f0f2f4);border:1px solid var(--ui-line,#dce2e9);border-radius:12px;padding:16px 18px;}
+.ov-panel-h{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:14px;}
+.ov-panel-h h3{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--ui-muted,#5d6a7c);margin:0;}
+.ov-panel-h .ov-more{font-size:12px;color:#5d6a7c;}
+.ov-metric{font-size:12px;color:var(--ui-muted,#5d6a7c);}
+.ov-metric b{color:var(--ui-text,#202b3a);font-weight:650;}
+
+.ov-segbar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#edf0f4;}
+.ov-segbar span{height:100%;}
+.ov-legend{display:flex;flex-wrap:wrap;gap:7px 14px;font-size:11.5px;color:var(--ui-muted,#5d6a7c);}
+.ov-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;vertical-align:-1px;}
+
+.ov-hbar{display:grid;gap:8px;}
+.ov-hbar .ov-row{display:grid;grid-template-columns:130px 1fr 52px;align-items:center;gap:10px;font-size:12px;}
+.ov-hbar .ov-k{color:var(--ui-muted,#5d6a7c);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-family:ui-monospace,Menlo,monospace;}
+.ov-hbar .ov-track{height:8px;border-radius:4px;background:#f2f4f7;overflow:hidden;}
+.ov-hbar .ov-fill{height:100%;border-radius:4px;}
+.ov-hbar .ov-v{text-align:right;color:var(--ui-text,#202b3a);font-variant-numeric:tabular-nums;}
+
+.ov-donutwrap{text-align:center;}
+.ov-note{color:#5d6a7c;font-size:11px;margin-top:8px;}
+.ov-empty{border:1px dashed var(--ui-line,#dce2e9);border-radius:10px;padding:16px;color:#5d6a7c;font-size:12.5px;text-align:center;}
+.ov-region{display:flex;align-items:center;gap:10px;padding:10px;border:1px solid var(--ui-line,#dce2e9);border-radius:10px;}
+.ov-clickable{cursor:pointer;}
+.ov-clickable:hover{border-color:#b3bdca;}
+
+
+/* Shared components use the same surfaces in tables, forms, dialogs and dashboards. */
+.nav-section { padding: 20px 15px 8px; font-size: 10px; letter-spacing: .08em; }
+.ui-view-head { margin-bottom: 24px; }
+.ui-view-title { font-size: 27px; letter-spacing: -.035em; line-height: 1.25; margin-bottom: 8px; }
+.ui-view-desc { line-height: 1.65; }
+.ui-btn { background: var(--panel); min-height: 34px; border-radius: 8px; line-height: 1.3; }
+.ui-btn:hover { background: var(--panel2); }
+.ui-btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ui-btn-primary:hover { background: #983927; border-color: #983927; }
+.ui-btn-danger { background: var(--ui-danger-bg); color: var(--ui-danger); border-color: #ecc5c9; }
+.ui-btn-danger:hover { background: #fbe3e6; }
+.ui-table, .data-table { background: var(--panel); }
+.ui-table th, .data-table th { background: var(--panel2); padding: 12px 14px; text-transform: none; letter-spacing: 0; }
+.ui-table td, .data-table td { padding: 14px; }
+.ui-table tr:hover td, .data-table tr:hover td { background: #faf5f2; }
+.ui-field input, .ui-field select, .ui-field textarea { background: var(--panel); }
+.ui-modal { border-radius: 16px; }
+.ui-modal-head { padding: 24px 24px 12px; font-size: 20px; }
+.ui-modal-body { padding: 8px 24px 20px; }
+.ui-modal-foot { padding: 16px 24px 22px; border-top: 1px solid var(--border); }
+.ui-toasts { max-width: calc(100vw - 32px); }
+.ui-toast { min-width: 0; max-width: 380px; }
+.tenant-indicator { padding: 6px 12px; background: var(--bg); }
+.ov-tile, .ov-panel, .ov-strip, .dev-stat { box-shadow: 0 3px 14px rgba(30,45,65,.025); }
+.ov-tiles { gap: 16px; }
+.ov-tile { padding: 20px; }
+.ov-big { font-size: 32px; letter-spacing: -.035em; margin-top: 12px; }
+.ov-panel { padding: 22px 24px; }
+.ov-panel-h h3 { color: var(--text); font-size: 14px; text-transform: none; letter-spacing: 0; }
+.ov-panel-h .ov-more { color: var(--accent); }
+@media (max-width: 600px) {
+  .ui-view-head { flex-wrap: wrap; }
+  .ui-view-title { font-size: 24px; }
+  .ui-search { min-width: 0; width: 100%; }
+  .ui-kv-row { grid-template-columns: 1fr; gap: 4px; }
+  .ov-grid { grid-template-columns: 1fr !important; }
+  .ov-tiles { grid-template-columns: repeat(2, minmax(0,1fr)) !important; }
+  .ov-tile { padding: 16px; }
+  .ov-panel { padding: 18px; }
+}

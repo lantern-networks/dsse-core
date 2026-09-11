@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/audit_log.schema.json",
+  "title": "AuditLog",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "actor_user_id",
+    "event_type",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "actor_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_nhi_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "target_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "action": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "access_decision_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "policy_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "policy_bundle_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_region_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_cluster_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "authentication_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "break_glass_audit_event_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "access_started",
+        "strong_auth_completed",
+        "policy_decision_recorded",
+        "target_application_recorded",
+        "access_ended",
+        "auto_expired",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_incident_timeline_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "timeline_event_reference_bound",
+        "timeline_not_created_metadata_only",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_review_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "post_use_review_required",
+        "review_not_started",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_end_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ended_by_user",
+        "ended_by_ttl",
+        "not_recorded",
+        null
+      ]
+    },
+    "break_glass_auto_expiry_result_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "auto_expiry_recorded",
+        "auto_expiry_not_recorded",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_reason_review_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "reason_confirmed",
+        "reason_missing",
+        "review_not_started",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_policy_expiry_review_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "policy_expiry_confirmed",
+        "policy_expiry_not_confirmed",
+        "review_not_started",
+        "not_applicable",
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lantern DSSE — Admin Console</title>
+  <link rel="icon" href="brand/lantern-symbol.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="ui.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img class="brand-symbol" src="brand/lantern-symbol.svg" alt="" width="48" height="48" /> <span data-i18n="appTitle">Admin Console</span></div>
+    <div class="topbar-right">
+      <span id="tenant-indicator" class="tenant-indicator" style="display:none"></span>
+      <span id="whoami-row" style="display:none"><span class="muted" data-i18n="operatingAs">Operating as</span> <span id="whoami" class="conn-status"></span></span>
+      <button id="signout-btn" data-i18n="signOut" style="display:none">Sign out</button>
+      <div class="lang">
+        <button id="lang-en" class="lang-btn">EN</button>
+        <button id="lang-ja" class="lang-btn">日本語</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Always-visible Connector Access (east-west) posture banner: OBSERVE -> PARTIAL -> FULL, with the
+       adjacent step as a button. app.js fills it in from /admin/east-west after an authenticated session is
+       confirmed. (It was described here as a "policy-learning" banner long after it started reading
+       /admin/east-west; the tenant-wide policy-learning mode itself was removed on 2026-08-05.) -->
+  <div id="operating-banner" class="operating-banner" role="status" aria-live="polite" style="display:none"></div>
+  <div id="mode-banner" class="mode-banner" role="status" aria-live="polite" style="display:none"></div>
+
+  <!-- The admin console is rendered ONLY after app.js confirms an authenticated admin session
+       (GET /admin/session). With no session, app.js redirects to the login page (index.html) before
+       any of this surface is built. -->
+  <main class="layout" id="console-layout" style="display:none">
+    <nav id="nav" class="nav"></nav>
+    <div id="content" class="content"></div>
+  </main>
+  <p id="gate-status" class="conn-status gate-status" data-i18n="checkingSession">Checking your session…</p>
+
+  <script src="i18n.js"></script>
+  <script src="ui.js"></script>
+  <script src="app.js"></script>
+  <script src="assets.js"></script>
+  <script src="fleetstatus.js"></script>
+  <script src="operatormachines.js"></script>
+  <script src="overview.js"></script>
+  <script src="tenant_restriction.js"></script>
+  <script src="rules.js"></script>
+  <script src="internalcas.js"></script>
+  <script src="pinned.js"></script>
+  <script src="predefined_catalog.js"></script>
+  <script src="devices.js"></script>
+  <script src="applications.js"></script>
+  <script src="sites.js"></script>
+  <script src="steerexcl.js"></script>
+  <script src="connectors.js"></script>
+  <script src="dns.js"></script>
+  <script src="organizations.js"></script>
+  <script src="organizationsetup.js"></script>
+  <script src="organizationwizard.js"></script>
+  <script src="operators.js"></script>
+  <script src="operatorhome.js"></script>
+  <script src="operatoraccess.js"></script>
+  <script src="administrators.js"></script>
+  <script src="apitokens.js"></script>
+  <script src="agentreleases.js"></script>
+  <script src="enrolmenttokens.js"></script>
+  <script src="agentprofile.js"></script>
+  <script src="devicebundle.js"></script>
+  <script src="licensing.js"></script>
+  <script src="tenantsettings.js"></script>
+  <script src="certs.js"></script>
+  <script src="networkzones.js"></script>
+  <script src="incoming.js"></script>
+  <script src="peopleaccounts.js"></script>
+  <script src="aiinsights.js"></script>
+  <script src="logsaudit.js"></script>
+  <script src="eastwestadvanced.js"></script>
+  <script src="idp.js"></script>
+  <script src="grants.js"></script>
+  <script src="effective_policy.js"></script>
+  <script src="dlpfindings.js"></script>
+  <script src="dlpclassifiers.js"></script>
+  <script src="dlpallowlist.js"></script>
+  <script src="dlpfingerprints.js"></script>
+  <script src="sensitivedata.js"></script>
+  <script src="dlppolicies.js"></script>
+</body>
+</html>

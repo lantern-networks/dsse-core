@@ -1,0 +1,433 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/access_decision.schema.json",
+  "title": "AccessDecision",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "actor_type",
+    "application_id",
+    "policy_id",
+    "policy_bundle_id",
+    "policy_bundle_version",
+    "decision",
+    "reason_codes",
+    "actions",
+    "bypass",
+    "cache_status",
+    "ttl_seconds",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "authentication_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_type": {
+      "type": "string",
+      "enum": [
+        "human",
+        "nhi",
+        "delegated_agent",
+        "system"
+      ]
+    },
+    "actor_nhi_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delegated_access_grant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_task_session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_action_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_permission_profile": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_signature_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_server_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_resource_uri": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_audience": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_token_passthrough_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtime_environment_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "context_boundary_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_classification": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "device_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "type": "string"
+    },
+    "policy_id": {
+      "type": "string"
+    },
+    "policy_bundle_id": {
+      "type": "string"
+    },
+    "policy_bundle_version": {
+      "type": "string"
+    },
+    "risk_state_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_port": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "destination": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_port": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "protocol": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "fqdn": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sni": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_family": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connection_initiator": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_role": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_vlan_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination_vlan_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "matched_conditions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "token_binding_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workload_attestation_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "human_approval_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny",
+        "require_reauthentication",
+        "require_step_up_mfa",
+        "require_interactive_mfa",
+        "require_human_approval",
+        "require_token_exchange",
+        "require_token_binding",
+        "require_workload_attestation",
+        "require_masking",
+        "require_inspection",
+        "warn",
+        "observe",
+        "audit_only",
+        "quarantine_tool",
+        "disable_tool",
+        "terminate_existing_session",
+        "apply_ransomware_protection_mode"
+      ]
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "prompt_reauthentication",
+              "prompt_step_up_mfa",
+              "prompt_interactive_mfa",
+              "request_human_approval",
+              "request_token_binding",
+              "request_workload_attestation",
+              "warn_user",
+              "terminate_session",
+              "apply_emergency_policy",
+              "refresh_policy_bundle",
+              "emit_audit_event"
+            ]
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ttl_seconds": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "bypass": {
+      "type": "boolean"
+    },
+    "inspection_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inspection_mode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inspection_route_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "passthrough",
+        "metadata_inspection",
+        "tls_readiness_candidate",
+        null
+      ]
+    },
+    "inspection_execution_scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_executed_metadata_only",
+        "metadata_inspection_only",
+        "post_mvp_tls",
+        null
+      ]
+    },
+    "edge_region_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_cluster_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connector_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cache_status": {
+      "type": "string"
+    },
+    "ttl_seconds": {
+      "type": "integer"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

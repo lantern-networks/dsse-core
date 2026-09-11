@@ -1,0 +1,19 @@
+{
+  "tenant_id": "tenant_lab_001",
+  "version": "2026.05.22.001",
+  "keys": [
+    {
+      "id": "pbsign_lab_2026_01",
+      "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "status": "active"
+    },
+    {
+      "id": "pbsign_lab_2025_12",
+      "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "status": "verify_only"
+    }
+  ],
+  "metadata": {
+    "source": "phase1_lab"
+  }
+}

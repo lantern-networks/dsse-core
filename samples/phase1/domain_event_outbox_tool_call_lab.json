@@ -1,0 +1,35 @@
+{
+  "id": "domain_outbox_tool_call_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "schema_version": "2026-05-24.1",
+  "event_plane": "domain",
+  "stream": "tool_call_events",
+  "event_type": "tool_call_event_recorded",
+  "status": "pending",
+  "occurred_at": "2026-05-24T03:00:00Z",
+  "received_at": "2026-05-24T03:00:01Z",
+  "payload": {
+    "id": "tce_lab_001",
+    "tenant_id": "tenant_lab_001",
+    "actor_nhi_id": "nhi_soc_agent_001",
+    "subject_user_id": "user_lab_001",
+    "tool_id": "tool_ticket_create_001",
+    "access_decision_id": "dec_nhi_tool_lab_001",
+    "result_status": "success",
+    "requested_at": "2026-05-24T03:00:00Z",
+    "metadata": {
+      "result_summary_scope": "metadata_only"
+    }
+  },
+  "payload_checksum": "sha256:13ca93bb77c4c11e315c4b475b66f57b30dd74928f594d982195c2cf518ee66d",
+  "publish_attempt": 0,
+  "next_attempt_at": null,
+  "locked_by": null,
+  "locked_until": null,
+  "last_error": null,
+  "dead_at": null,
+  "metadata": {
+    "delivery_target": "evidence",
+    "dedup_key": "tenant_lab_001:tool_call_events:tce_lab_001"
+  }
+}

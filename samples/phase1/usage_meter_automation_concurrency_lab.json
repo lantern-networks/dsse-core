@@ -1,0 +1,40 @@
+{
+  "id": "usage_automation_concurrency_202605_lab",
+  "tenant_id": "tenant_lab_001",
+  "schema_version": "usage_meter.v1",
+  "period_start": "2026-05-01T00:00:00Z",
+  "period_end": "2026-06-01T00:00:00Z",
+  "meter_type": "automation_concurrency",
+  "subject_type": "tenant",
+  "subject_id": "tenant_lab_001",
+  "quantity": 18,
+  "unit": "concurrent_execution",
+  "quota": {
+    "quota_id": "core_automation_concurrency_observe",
+    "included_quantity": 10,
+    "overage_quantity": 8,
+    "soft_cap_exceeded": true,
+    "hard_cap_exceeded": false
+  },
+  "dimensions": {
+    "metric": "peak_concurrent_automation_actors",
+    "window_seconds": 60,
+    "actor_types": [
+      "delegated_agent",
+      "nhi",
+      "service_account"
+    ],
+    "authority_modes": [
+      "subject_user_delegation",
+      "service_account",
+      "nhi_identity"
+    ],
+    "attribution": "execution_actor",
+    "decision_quota_basis": "human_seat"
+  },
+  "collected_at": "2026-05-24T00:00:00Z",
+  "metadata": {
+    "pricing_model": "automation_burst_initial_hypothesis",
+    "billing_action": "observe_only"
+  }
+}

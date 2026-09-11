@@ -1,0 +1,195 @@
+{
+  "schema_version": "1.0",
+  "status": "ready",
+  "generated_at": "2026-05-25T11:21:13Z",
+  "source_report_created_at": "2026-05-25T11:19:36Z",
+  "tenant_id": "tenant_lab_001",
+  "device_id": "dev_lab_001",
+  "target_agent_version": "0.1.1",
+  "quality_status": "ok",
+  "support_bundle_verified": true,
+  "artifacts": {
+    "agent_config": "agent_config.json",
+    "protected_app_map": "protected_app_map.json",
+    "pac_file": "dsse_agent.pac",
+    "macos_system_proxy_script": "apply_macos_system_proxy.sh",
+    "macos_system_proxy_plan": "macos_system_proxy_plan.txt",
+    "mobileconfig": "dsse_agent.mobileconfig",
+    "launchd_plist": "com.example.dsse.localclient.plist",
+    "launchd_uninstall_script": "uninstall_dsse_launchd.sh",
+    "windows_service_script": "install_dsse_localclient.ps1",
+    "windows_service_uninstall_script": "uninstall_dsse_localclient.ps1",
+    "support_bundle": "support_bundle_20260525T111935Z.tar.gz"
+  },
+  "phases": [
+    {
+      "id": "prepare",
+      "title": "Prepare device-specific inputs",
+      "steps": [
+        {
+          "id": "prepare-runtime-secret",
+          "title": "Provision the runtime secret through Keychain or a device-local secret file; do not embed the secret in MDM profile content.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "Doctor report shows runtime_secret_source=file or keychain."
+        },
+        {
+          "id": "prepare-agent-config",
+          "title": "Generate or distribute Agent Config from MDM Managed App Config and confirm tenant/device/user IDs.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "agent_config.json",
+          "expected": "Agent Config exists; runtime_secret and runtime_secret_file are redacted in any shared copy."
+        },
+        {
+          "id": "prepare-protected-app-map",
+          "title": "Review the protected app map that will drive proxy-based steering.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "protected_app_map.json",
+          "expected": "Protected FQDNs and application IDs match the PoC target set."
+        },
+        {
+          "id": "prepare-pac-file",
+          "title": "For the macOS proxy-based PoC path, install or inspect the generated PAC file for protected FQDN routing.",
+          "platform": "macos",
+          "required": true,
+          "status": "not_started",
+          "evidence": "dsse_agent.pac",
+          "command": "grep -n \"PROXY\" dsse_agent.pac",
+          "expected": "PAC returns the local proxy for protected FQDNs and DIRECT otherwise."
+        },
+        {
+          "id": "prepare-macos-system-proxy-helper",
+          "title": "Inspect the guarded macOS System Proxy helper before applying PAC settings to a test network service.",
+          "platform": "macos",
+          "required": true,
+          "status": "not_started",
+          "evidence": "macos_system_proxy_plan.txt",
+          "command": "bash -n apply_macos_system_proxy.sh && grep -n \"networksetup -setautoproxyurl\" macos_system_proxy_plan.txt",
+          "expected": "Script defaults to status mode, plan output shows guarded apply/rollback commands, and apply or rollback requires DSSE_APPLY_SYSTEM_PROXY=true."
+        }
+      ]
+    },
+    {
+      "id": "install",
+      "title": "Install startup integration",
+      "steps": [
+        {
+          "id": "install-macos-launchd",
+          "title": "Install the generated launchd plist with the expected binary path and config path.",
+          "platform": "macos",
+          "required": true,
+          "status": "not_started",
+          "evidence": "com.example.dsse.localclient.plist",
+          "command": "plutil -lint com.example.dsse.localclient.plist",
+          "expected": "plist syntax is valid and ProgramArguments contains -config."
+        },
+        {
+          "id": "install-windows-service",
+          "title": "Install or update the Windows Service wrapper for the Local Client.",
+          "platform": "windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "install_dsse_localclient.ps1",
+          "expected": "PowerShell script contains New-Service and -config; no runtime secret marker."
+        }
+      ]
+    },
+    {
+      "id": "verify",
+      "title": "Verify runtime behavior",
+      "steps": [
+        {
+          "id": "run-doctor",
+          "title": "Run Local Client doctor before connecting to Edge.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "localclient_doctor.json",
+          "expected": "status is ok or warning; failed is not acceptable."
+        },
+        {
+          "id": "run-cache-verifier",
+          "title": "After one Local Client run, verify the local cache without contacting Edge.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "agent_cache_verifier.json",
+          "expected": "tenant_id/device_id/policy bundle/agent status all match."
+        },
+        {
+          "id": "run-macos-system-proxy-steering-smoke",
+          "title": "On a macOS test device, apply the guarded System Proxy PAC and verify that System Proxy-originated traffic increments localproxy steering metrics.",
+          "platform": "macos",
+          "required": true,
+          "status": "not_started",
+          "evidence": "macos_system_proxy_steering_smoke.json and macos_system_proxy_steering_smoke_verifier.json",
+          "command": "PLAN_ONLY=false DSSE_APPLY_SYSTEM_PROXY=true bash scripts/macos_system_proxy_steering_smoke.sh && REPORT_PATH=var/macos-system-proxy-steering-smoke/macos_system_proxy_steering_smoke_verifier.json bash scripts/verify_macos_system_proxy_steering_smoke.sh var/macos-system-proxy-steering-smoke/macos_system_proxy_steering_smoke.json",
+          "expected": "Verifier status is ok; request_command uses macos_system_proxy_request.py; steering_attempted and steering_succeeded are greater than zero."
+        },
+        {
+          "id": "check-agent-quality",
+          "title": "Check the Edge Agent Quality summary for the test tenant.",
+          "platform": "edge",
+          "required": true,
+          "status": "not_started",
+          "evidence": "agent_lab_smoke_report.public.json",
+          "expected": "quality_status is ok."
+        }
+      ]
+    },
+    {
+      "id": "support",
+      "title": "Collect support evidence",
+      "steps": [
+        {
+          "id": "create-support-bundle",
+          "title": "Create and verify the Support Bundle after collecting real-device evidence. When macOS System Proxy smoke was run, include its report directory.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "support_bundle_20260525T111935Z.tar.gz",
+          "command": "MACOS_SYSTEM_PROXY_SMOKE_DIR=var/macos-system-proxy-steering-smoke bash scripts/support_bundle.sh",
+          "expected": "Support Bundle verifier status is ok; cache_verified is true; source dirs are redacted. For macOS System Proxy PoC, verifier reports macos_system_proxy_steering_smoke_status=ok and macos_system_proxy_steering_smoke_verified=true."
+        },
+        {
+          "id": "share-agent-lab-artifacts",
+          "title": "Share the Agent Lab artifact archive rather than raw local working directories.",
+          "platform": "macos_windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "agent_lab_artifacts_*.tar.gz",
+          "expected": "Public report uses basenames only and contains no local absolute paths."
+        }
+      ]
+    },
+    {
+      "id": "uninstall",
+      "title": "Uninstall after PoC",
+      "steps": [
+        {
+          "id": "uninstall-macos-launchd",
+          "title": "Remove the launchd job with the generated uninstall helper after collecting evidence.",
+          "platform": "macos",
+          "required": true,
+          "status": "not_started",
+          "evidence": "uninstall_dsse_launchd.sh",
+          "expected": "Script contains launchctl and no runtime secret marker."
+        },
+        {
+          "id": "uninstall-windows-service",
+          "title": "Remove the Windows Service wrapper with the generated uninstall helper after collecting evidence.",
+          "platform": "windows",
+          "required": true,
+          "status": "not_started",
+          "evidence": "uninstall_dsse_localclient.ps1",
+          "expected": "Script contains sc.exe delete and no runtime secret marker."
+        }
+      ]
+    }
+  ]
+}

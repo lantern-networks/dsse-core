@@ -1,0 +1,19 @@
+{
+  "id": "conn_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "connector_group_id": "cgrp_lab_001",
+  "name": "Lab Connector",
+  "edge_region_id": "local",
+  "edge_cluster_id": "local-edge-001",
+  "application_ids": [
+    "app_dummy_https",
+    "app_dummy_ssh",
+    "app_dummy_postgres",
+    "app_dummy_rdp"
+  ],
+  "connector_version": "0.1.0-lab",
+  "status": "healthy",
+  "created_at": "2026-05-22T00:00:00Z",
+  "last_heartbeat_at": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

@@ -1,0 +1,9 @@
+{
+  "id": "conn_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "status": "healthy",
+  "policy_bundle_id": "pb_lab_20260522_001",
+  "policy_bundle_version": "2026.05.22.001",
+  "timestamp": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

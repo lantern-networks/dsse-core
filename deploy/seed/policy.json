@@ -1,0 +1,1 @@
+{ "id": "pol-allow-users", "tenant_id": "acme", "name": "allow users", "priority": 100, "status": "active", "conditions": { "actor_type": "user" }, "action": { "decision": "allow" } }

@@ -1,0 +1,434 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_lab_postgres_smoke_summary.schema.json",
+  "title": "AgentLabPostgresSmokeSummary",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "work_dir",
+    "smoke_created_at",
+    "base_url",
+    "smoke_status",
+    "doctor_status",
+    "runtime_secret_source",
+    "preflight_status",
+    "cache_status",
+    "connector_tunnel_route_verified",
+    "connector_route_response",
+    "connector_route_status",
+    "connector_route_application_id",
+    "connector_route_connector_id",
+    "connector_route_tunnel_id_gate",
+    "support_bundle_cache_verified",
+    "support_bundle_default_leak_gate",
+    "support_bundle_default_forbidden_marker_count",
+    "support_bundle_forbidden_pattern_configured",
+    "support_bundle_forbidden_pattern_gate",
+    "quality_status",
+    "quality_access_decisions_total",
+    "quality_access_decisions_with_connector",
+    "agent_update_events_total",
+    "agent_status_events_total",
+    "artifact_archive",
+    "artifact_archive_sha256",
+    "artifact_default_leak_gate",
+    "artifact_default_forbidden_marker_count",
+    "support_bundle_name",
+    "support_bundle_sha256",
+    "review_bundle_archive",
+    "review_bundle_archive_sha256",
+    "review_prompt",
+    "review_prompt_verifier",
+    "review_prompt_print_report",
+    "review_prompt_print_sha256",
+    "review_prompt_print_bytes",
+    "review_prompt_visible_bundle_sha",
+    "review_prompt_visible_bundle_sha_gate",
+    "review_prompt_print_default_leak_gate",
+    "review_bundle_files_checked",
+    "review_bundle_progress_doc_count",
+    "review_bundle_schema_count",
+    "review_bundle_sample_count",
+    "poc_results_report_present",
+    "poc_results_default_leak_gate",
+    "poc_results_default_forbidden_marker_count",
+    "poc_results_archive",
+    "poc_results_archive_sha256",
+    "poc_results_is_dry_run",
+    "poc_results_evidence_step_count",
+    "acceptance_status",
+    "target_platform"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "work_dir": {
+      "type": "string"
+    },
+    "smoke_created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "base_url": {
+      "type": "string"
+    },
+    "smoke_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "doctor_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "runtime_secret_source": {
+      "type": "string",
+      "enum": [
+        "file",
+        "env",
+        "inline"
+      ]
+    },
+    "preflight_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "cache_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "connector_tunnel_route_verified": {
+      "type": "boolean",
+      "const": true,
+      "description": "Whether the PostgreSQL Agent Lab smoke verified an Edge application route through a standalone Connector tunnel."
+    },
+    "connector_route_response": {
+      "type": "string",
+      "const": "connector_route_response.json"
+    },
+    "connector_route_status": {
+      "type": "string",
+      "enum": [
+        "reachable_via_connector"
+      ]
+    },
+    "connector_route_application_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "connector_route_connector_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "connector_route_tunnel_id_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_cache_verified": {
+      "type": "boolean",
+      "const": true
+    },
+    "support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "support_bundle_forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "quality_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "quality_access_decisions_total": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "quality_access_decisions_with_connector": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "agent_update_events_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "agent_status_events_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "artifact_archive": {
+      "type": "string",
+      "pattern": "^agent_lab_artifacts_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "artifact_archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the generated Agent Lab artifact tarball."
+    },
+    "artifact_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "artifact_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_name": {
+      "type": "string",
+      "pattern": "^support_bundle_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "support_bundle_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the support bundle tarball nested in the Agent Lab artifact archive."
+    },
+    "review_bundle_archive": {
+      "type": "string",
+      "pattern": "^agent_poc_review_bundle_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "review_bundle_archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the generated Agent PoC review bundle tarball."
+    },
+    "review_prompt": {
+      "type": "string",
+      "const": "agent_poc_review_prompt.md"
+    },
+    "review_prompt_verifier": {
+      "type": "string",
+      "const": "agent_poc_review_prompt_verifier.json"
+    },
+    "review_prompt_print_report": {
+      "type": "string",
+      "const": "agent_poc_review_prompt_print_report.json"
+    },
+    "review_prompt_print_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "review_prompt_print_bytes": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "review_prompt_visible_bundle_sha": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 shown in the human-readable Bundle section of the review prompt."
+    },
+    "review_prompt_visible_bundle_sha_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "review_prompt_print_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "review_bundle_files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "review_bundle_progress_doc_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "review_bundle_schema_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "review_bundle_sample_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "poc_results_report_present": {
+      "type": "boolean"
+    },
+    "poc_results_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "poc_results_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "poc_results_archive": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^agent_poc_results_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "poc_results_archive_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "poc_results_is_dry_run": {
+      "type": "boolean"
+    },
+    "poc_results_evidence_step_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "acceptance_status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "accepted",
+        "accepted_with_exceptions",
+        "incomplete",
+        "blocked",
+        null
+      ]
+    },
+    "target_platform": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "all",
+        "macos",
+        "windows",
+        null
+      ]
+    },
+    "handoff_archive": {
+      "type": "string",
+      "pattern": "^agent_poc_handoff_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$",
+      "description": "Latest generated Agent PoC handoff archive, when the summary is generated after handoff verification."
+    },
+    "handoff_archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the generated Agent PoC handoff tarball, when available."
+    },
+    "handoff_files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "handoff_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "handoff_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "handoff_artifact_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "handoff_artifact_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "handoff_support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "handoff_support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "handoff_review_prompt_print_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "handoff_review_prompt_print_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "handoff_review_prompt_visible_bundle_sha": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "handoff_review_prompt_visible_bundle_sha_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "handoff_review_prompt_print_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "handoff_poc_results_report_present": {
+      "type": "boolean"
+    },
+    "handoff_poc_results_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "handoff_poc_results_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "handoff_poc_results_is_dry_run": {
+      "type": "boolean"
+    },
+    "handoff_poc_results_evidence_step_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false
+}

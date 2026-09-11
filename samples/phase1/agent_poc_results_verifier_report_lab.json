@@ -1,0 +1,32 @@
+{
+  "status": "ok",
+  "created_at": "2026-05-25T12:20:00Z",
+  "archive": "agent_poc_results_20260525T122000Z.tar.gz",
+  "archive_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+  "package_name": "agent_poc_results_20260525T122000Z",
+  "manifest_created_at": "2026-05-25T12:20:00Z",
+  "files_checked": 6,
+  "acceptance_status": "accepted",
+  "target_platform": "all",
+  "poc_results_is_dry_run": false,
+  "step_counts": {
+    "total": 14,
+    "not_started": 0,
+    "completed": 14,
+    "skipped": 0,
+    "blocked": 0
+  },
+  "evidence_step_count": 1,
+  "require_accepted": true,
+  "allow_accepted_with_exceptions": false,
+  "default_leak_gate": "ok",
+  "default_forbidden_marker_count": 4,
+  "support_bundle_name": "support_bundle_20260525T121900Z.tar.gz",
+  "support_bundle_sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+  "support_bundle_default_leak_gate": "ok",
+  "support_bundle_default_forbidden_marker_count": 4,
+  "support_bundle_forbidden_pattern_configured": true,
+  "support_bundle_forbidden_pattern_gate": "ok",
+  "support_bundle_macos_system_proxy_steering_smoke_status": "ok",
+  "support_bundle_macos_system_proxy_steering_smoke_verified": true
+}

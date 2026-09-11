@@ -1,0 +1,35 @@
+{
+  "schema_version": "1.0",
+  "generated_at": "2026-05-25T11:40:00Z",
+  "checklist_schema_version": "1.0",
+  "target_platform": "all",
+  "tenant_id": "tenant_lab_001",
+  "device_id": "dev_lab_001",
+  "target_agent_version": "0.1.1",
+  "quality_status": "ok",
+  "support_bundle_verified": true,
+  "dry_run": false,
+  "status": "accepted",
+  "step_counts": {
+    "total": 14,
+    "not_started": 0,
+    "completed": 14,
+    "skipped": 0,
+    "blocked": 0
+  },
+  "evidence_steps": [
+    {
+      "phase_id": "preflight",
+      "id": "run-doctor",
+      "title": "Run localclient doctor",
+      "status": "completed",
+      "updated_at": "2026-05-25T11:35:00Z",
+      "result_note": "Doctor passed on lab workstation",
+      "evidence_observed": "localclient_doctor.json status ok"
+    }
+  ],
+  "blocked_steps": [],
+  "incomplete_steps": [],
+  "skipped_steps": [],
+  "excluded_steps": []
+}

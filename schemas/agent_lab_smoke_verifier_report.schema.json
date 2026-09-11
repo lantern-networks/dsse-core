@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_lab_smoke_verifier_report.schema.json",
+  "title": "AgentLabSmokeVerifierReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "source_report",
+    "smoke_status",
+    "doctor_status",
+    "runtime_secret_source",
+    "preflight_status",
+    "config_directory_permissions_gate",
+    "config_directory_path_guard_gate",
+    "config_directory_symlink_guard_gate",
+    "config_directory_owner_group_gate",
+    "cache_status",
+    "tenant_id",
+    "device_id",
+    "support_bundle_verifier_status",
+    "support_bundle_cache_verified",
+    "support_bundle_files_checked",
+    "support_bundle_default_leak_gate",
+    "support_bundle_default_forbidden_marker_count",
+    "support_bundle_forbidden_pattern_configured",
+    "support_bundle_forbidden_pattern_gate",
+    "local_proxy_steering_present",
+    "local_proxy_steering_attempted",
+    "local_proxy_steering_succeeded",
+    "local_proxy_steering_failed",
+    "local_proxy_connect_unsupported",
+    "quality_status",
+    "quality_access_decisions_total",
+    "quality_access_decisions_with_connector",
+    "quality_agent_status_connect_unsupported",
+    "require_quality"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_report": {
+      "type": "string"
+    },
+    "smoke_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "doctor_status": {
+      "type": "string"
+    },
+    "runtime_secret_source": {
+      "type": "string"
+    },
+    "preflight_status": {
+      "type": "string"
+    },
+    "config_directory_permissions_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "config_directory_path_guard_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "config_directory_symlink_guard_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "config_directory_owner_group_gate": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "not_enforced"
+      ]
+    },
+    "cache_status": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "support_bundle_verifier_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_cache_verified": {
+      "type": "boolean"
+    },
+    "support_bundle_files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "support_bundle_forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "local_proxy_steering_present": {
+      "type": "boolean"
+    },
+    "local_proxy_steering_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "local_proxy_steering_succeeded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "local_proxy_steering_failed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "local_proxy_connect_unsupported": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "quality_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quality_access_decisions_total": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "quality_access_decisions_with_connector": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "quality_agent_status_connect_unsupported": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "require_quality": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

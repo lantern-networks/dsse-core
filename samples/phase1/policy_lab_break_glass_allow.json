@@ -1,0 +1,44 @@
+{
+  "id": "pol_lab_break_glass_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Lab Break-glass Recovery Console Allow",
+  "priority": 30,
+  "conditions": {
+    "actor_type": "human",
+    "application_id": "app_recovery_console",
+    "service_family": "https",
+    "auth_method": "break_glass",
+    "auth_age_seconds": {
+      "op": "lte",
+      "value": 900
+    }
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "break_glass_policy": true,
+  "break_glass_identity_id": "bg_identity_lab_001",
+  "break_glass_max_session_seconds": 900,
+  "break_glass_strong_auth_required": true,
+  "break_glass_audit_required": true,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": null,
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app",
+  "status": "active",
+  "created_by": "phase1_lab",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "purpose": "break_glass_lab",
+    "audit_scope": "all_break_glass_request_approval_issue_use_export_operations"
+  }
+}

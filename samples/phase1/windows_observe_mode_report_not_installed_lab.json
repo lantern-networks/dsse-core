@@ -1,0 +1,20 @@
+{
+  "schema_version": "windows_observe_mode_report.v1",
+  "status": "ok",
+  "created_at": "2026-05-27T04:35:00Z",
+  "platform": "windows",
+  "mode": "observe",
+  "network_filter": "not_installed",
+  "driver": "none",
+  "driver_installed": false,
+  "driver_running": false,
+  "enforcement_enabled": false,
+  "steering_attempted": 0,
+  "steering_succeeded": 0,
+  "steering_failed": 0,
+  "observed_protocols": [],
+  "telemetry_source": "contract_smoke",
+  "runtime_overclaim_gate": "ok",
+  "secret_leak_gate": "ok",
+  "next_runtime_candidate": "windivert_userspace"
+}

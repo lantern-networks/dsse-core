@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_poc_checklist.schema.json",
+  "title": "AgentPoCChecklist",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "generated_at",
+    "source_report_created_at",
+    "tenant_id",
+    "device_id",
+    "target_agent_version",
+    "quality_status",
+    "support_bundle_verified",
+    "artifacts",
+    "phases"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ready"
+      ]
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_report_created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "target_agent_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quality_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "support_bundle_verified": {
+      "type": "boolean"
+    },
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "agent_config",
+        "protected_app_map",
+        "pac_file",
+        "macos_system_proxy_script",
+        "macos_system_proxy_plan",
+        "mobileconfig",
+        "launchd_plist",
+        "launchd_uninstall_script",
+        "windows_service_script",
+        "windows_service_uninstall_script",
+        "support_bundle"
+      ],
+      "properties": {
+        "agent_config": {
+          "type": "string"
+        },
+        "protected_app_map": {
+          "type": "string"
+        },
+        "pac_file": {
+          "type": "string"
+        },
+        "macos_system_proxy_script": {
+          "type": "string"
+        },
+        "macos_system_proxy_plan": {
+          "type": "string"
+        },
+        "mobileconfig": {
+          "type": "string"
+        },
+        "launchd_plist": {
+          "type": "string"
+        },
+        "launchd_uninstall_script": {
+          "type": "string"
+        },
+        "windows_service_script": {
+          "type": "string"
+        },
+        "windows_service_uninstall_script": {
+          "type": "string"
+        },
+        "support_bundle": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "phases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "steps"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "title",
+                "platform",
+                "required",
+                "status",
+                "evidence"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "platform": {
+                  "type": "string",
+                  "enum": [
+                    "macos",
+                    "windows",
+                    "macos_windows",
+                    "edge"
+                  ]
+                },
+                "required": {
+                  "type": "boolean"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "not_started",
+                    "completed",
+                    "skipped",
+                    "blocked"
+                  ]
+                },
+                "evidence": {
+                  "type": "string"
+                },
+                "command": {
+                  "type": "string"
+                },
+                "expected": {
+                  "type": "string"
+                },
+                "updated_at": {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                "result_note": {
+                  "type": "string"
+                },
+                "evidence_observed": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

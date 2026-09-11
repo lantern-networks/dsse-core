@@ -1,0 +1,14 @@
+{
+  "device_id": "dev_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "current_agent_version": "0.1.0",
+  "target_agent_version": "0.1.1",
+  "release_channel": "lab",
+  "update_source": "control_plane",
+  "update_required": true,
+  "timestamp": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "source": "local_edge",
+    "rollout_batch": "lab-001"
+  }
+}

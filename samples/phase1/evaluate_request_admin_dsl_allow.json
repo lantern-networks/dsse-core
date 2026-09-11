@@ -1,0 +1,27 @@
+{
+  "tenant_id": "tenant_lab_001",
+  "session_id": "sess_lab_003",
+  "user_id": "user_lab_admin_001",
+  "subject_user_id": "user_lab_admin_001",
+  "user_groups": [
+    "security-admins",
+    "it-admins"
+  ],
+  "actor_type": "human",
+  "device_id": "dev_lab_001",
+  "application_id": "app_dummy_https",
+  "application_sensitivity": "medium",
+  "source_ip": "127.0.0.1",
+  "source_port": 50102,
+  "destination": "dummy-private-app.local",
+  "destination_ip": "127.0.0.1",
+  "destination_port": 8443,
+  "protocol": "tcp",
+  "fqdn": "dummy-private-app.local",
+  "sni": "dummy-private-app.local",
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app",
+  "ransomware_protection_mode": false
+}

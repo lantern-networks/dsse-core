@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_rollout_policy.schema.json",
+  "title": "AgentRolloutPolicy",
+  "type": "object",
+  "required": [
+    "device_id",
+    "tenant_id",
+    "current_agent_version",
+    "target_agent_version",
+    "release_channel",
+    "update_source",
+    "update_required",
+    "timestamp"
+  ],
+  "properties": {
+    "device_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "current_agent_version": {
+      "type": "string"
+    },
+    "target_agent_version": {
+      "type": "string"
+    },
+    "release_channel": {
+      "type": "string",
+      "enum": [
+        "lab",
+        "alpha",
+        "stable",
+        "pilot",
+        "canary",
+        "emergency"
+      ]
+    },
+    "update_source": {
+      "type": "string",
+      "enum": [
+        "mdm",
+        "control_plane",
+        "manual"
+      ]
+    },
+    "update_required": {
+      "type": "boolean"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

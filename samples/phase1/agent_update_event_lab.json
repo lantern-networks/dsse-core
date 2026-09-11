@@ -1,0 +1,19 @@
+{
+  "id": "aue_lab_20260522_001",
+  "tenant_id": "tenant_lab_001",
+  "device_id": "dev_lab_001",
+  "user_id": "user_lab_001",
+  "current_agent_version": "0.1.0",
+  "target_agent_version": "0.1.1",
+  "release_channel": "lab",
+  "update_status": "available",
+  "update_source": "mdm",
+  "package_checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "package_signature": "ed25519:mock-agent-package-signature",
+  "failure_reason": null,
+  "timestamp": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "rollout_batch": "lab-001",
+    "rollback_target_version": "0.1.0"
+  }
+}

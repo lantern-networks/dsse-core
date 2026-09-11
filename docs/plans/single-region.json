@@ -1,0 +1,25 @@
+{
+  "deployment": "example.test",
+  "agent_publisher": "REPLACE_WITH_YOUR_PACKAGE_SIGNING_IDENTITY",
+  "regions": [
+    {
+      "id": "region-a",
+      "founding": true,
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "node-a",
+          "holds": [
+            "control-plane",
+            "edges"
+          ],
+          "addresses": [
+            "10.20.1.10"
+          ],
+          "reachable": "node-a.example.test",
+          "reachable_address": "10.20.1.10"
+        }
+      ]
+    }
+  ]
+}

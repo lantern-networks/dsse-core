@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/domain_event_object_manifest.schema.json",
+  "title": "DomainEventObjectManifest",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tenant_id",
+    "event_plane",
+    "stream",
+    "event_type",
+    "outbox_id",
+    "object_ref",
+    "object_checksum",
+    "payload_checksum",
+    "format",
+    "compression",
+    "row_count",
+    "occurred_at",
+    "received_at",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "event_plane": {
+      "type": "string",
+      "enum": [
+        "domain",
+        "access",
+        "evidence"
+      ]
+    },
+    "stream": {
+      "type": "string",
+      "enum": [
+        "authentication_events",
+        "break_glass_events",
+        "device_events",
+        "agent_update_events",
+        "human_approval_events",
+        "delegated_access_grants",
+        "tool_call_events",
+        "inspection_events",
+        "access_logs",
+        "decision_traces",
+        "connector_logs"
+      ]
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "outbox_id": {
+      "type": "string"
+    },
+    "object_ref": {
+      "type": "string",
+      "pattern": "^domain-events/[^/]+/(domain|access|evidence)/[0-9]{4}/[0-9]{2}/[0-9]{2}/[^/]+\\.ndjson\\.gz$"
+    },
+    "object_checksum": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "payload_checksum": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "ndjson"
+      ]
+    },
+    "compression": {
+      "type": "string",
+      "enum": [
+        "gzip"
+      ]
+    },
+    "row_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "received_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}

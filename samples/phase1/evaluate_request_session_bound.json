@@ -1,0 +1,14 @@
+{
+  "session_id": "sess_lab_001",
+  "actor_type": "human",
+  "application_id": "app_dummy_https",
+  "application_sensitivity": "medium",
+  "destination": "dummy-private-app.local",
+  "destination_port": 8443,
+  "protocol": "tcp",
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app",
+  "ransomware_protection_mode": false
+}

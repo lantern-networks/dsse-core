@@ -1,0 +1,670 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/support_bundle_verifier_report.schema.json",
+  "title": "SupportBundleVerifierReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "archive",
+    "archive_sha256",
+    "bundle_name",
+    "manifest_created_at",
+    "source_dirs_redacted",
+    "files_checked",
+    "cache_verified",
+    "default_leak_gate",
+    "default_forbidden_marker_count",
+    "forbidden_pattern_configured",
+    "forbidden_pattern_gate",
+    "doctor_status",
+    "preflight_status",
+    "config_directory_permissions_gate",
+    "config_directory_path_guard_gate",
+    "config_directory_symlink_guard_gate",
+    "config_directory_owner_group_gate",
+    "cache_report_status",
+    "launchd_plist_present",
+    "launchd_uninstall_script_present",
+    "windows_service_script_present",
+    "windows_service_uninstall_script_present",
+    "trusted_keyring_cache_present",
+    "logs_present",
+    "macos_system_proxy_steering_smoke_present",
+    "macos_system_proxy_steering_smoke_verifier_present",
+    "macos_system_proxy_steering_smoke_status",
+    "macos_system_proxy_steering_smoke_verified",
+    "network_extension_rules_present",
+    "network_extension_rules_verified",
+    "network_extension_rule_count",
+    "network_extension_excluded_non_network_extension_count",
+    "network_extension_would_steer_smoke_present",
+    "network_extension_would_steer_smoke_verified",
+    "network_extension_would_steer_runtime_installed",
+    "network_extension_would_steer_flow_count",
+    "network_extension_would_steer_matched_count",
+    "network_extension_would_steer_denied_count",
+    "network_extension_would_steer_invalid_flow_count",
+    "network_extension_runtime_evidence_present",
+    "network_extension_runtime_evidence_verified",
+    "network_extension_runtime_installed",
+    "network_extension_runtime_running",
+    "network_extension_runtime_provider",
+    "network_extension_runtime_rules_loaded",
+    "network_extension_runtime_rule_count",
+    "network_extension_runtime_flow_extraction_attempted",
+    "network_extension_runtime_flow_extraction_succeeded",
+    "network_extension_runtime_flow_extraction_denied",
+    "network_extension_runtime_flow_extraction_gate",
+    "network_extension_runtime_flow_attempted",
+    "network_extension_runtime_flow_tunneled",
+    "network_extension_runtime_flow_denied",
+    "windows_observe_mode_report_present",
+    "windows_observe_mode_report_verified",
+    "windows_observe_source_schema_version",
+    "windows_observe_runtime_evidence_kind",
+    "windows_observe_network_filter",
+    "windows_observe_enforcement_enabled",
+    "windows_observe_payload_capture_gate",
+    "windows_observe_payload_captured",
+    "windows_observe_protocol_verified",
+    "windows_observe_collector_identity_trusted",
+    "windows_observe_process_unknown",
+    "windows_observe_runtime_candidate",
+    "windows_observe_product_runtime_committed",
+    "windows_observe_smb445_observe_minimum_gate",
+    "windows_observe_smb445_observe_event_count",
+    "windows_observe_payload_event_redaction_gate",
+    "google_oidc_real_flow_verifier_present",
+    "google_oidc_real_flow_verified",
+    "oidc_group_claim_real_flow_verifier_present",
+    "oidc_group_claim_real_flow_verified",
+    "oidc_strict_group_claim_confirmed",
+    "persistent_runtime_status_present",
+    "persistent_runtime_diagnostic_scope_category",
+    "persistent_runtime_lifecycle_state",
+    "persistent_runtime_steering_scope_category",
+    "persistent_runtime_unmatched_tcp_action",
+    "persistent_runtime_edge_connector_topology_category",
+    "persistent_runtime_edge_connector_network_namespace_category",
+    "persistent_runtime_support_bundle_before_removal_category",
+    "persistent_runtime_rollback_readiness_category",
+    "persistent_runtime_raw_identifier_leak_gate",
+    "persistent_runtime_product_claim_gate",
+    "agent_controller_runtime_health_category",
+    "ne_provider_runtime_health_category",
+    "edge_service_runtime_health_category",
+    "connector_service_runtime_health_category",
+    "policy_cache_runtime_health_category",
+    "support_bundle_runtime_health_category"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "archive": {
+      "type": "string"
+    },
+    "archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the verified support bundle tarball."
+    },
+    "bundle_name": {
+      "type": "string"
+    },
+    "manifest_created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "source_dirs_redacted": {
+      "type": "boolean"
+    },
+    "files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cache_verified": {
+      "type": "boolean"
+    },
+    "default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ],
+      "description": "Whether the verifier scanned the support bundle with its built-in local path and secret marker denylist."
+    },
+    "default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "doctor_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "preflight_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "config_directory_permissions_gate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        null
+      ]
+    },
+    "config_directory_path_guard_gate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        null
+      ]
+    },
+    "config_directory_symlink_guard_gate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        null
+      ]
+    },
+    "config_directory_owner_group_gate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        "not_enforced",
+        null
+      ]
+    },
+    "cache_report_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "admin_visibility_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "visible_to_admin",
+        "not_visible_to_admin",
+        "not_reported",
+        null
+      ]
+    },
+    "support_bundle_generation_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "existing_bundle_metadata_only",
+        "generation_not_run",
+        "not_reported",
+        null
+      ]
+    },
+    "support_bundle_redaction_visibility_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "redaction_gate_visible",
+        "redaction_gate_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "launchd_plist_present": {
+      "type": "boolean"
+    },
+    "launchd_uninstall_script_present": {
+      "type": "boolean"
+    },
+    "windows_service_script_present": {
+      "type": "boolean"
+    },
+    "windows_service_uninstall_script_present": {
+      "type": "boolean"
+    },
+    "trusted_keyring_cache_present": {
+      "type": "boolean"
+    },
+    "logs_present": {
+      "type": "boolean"
+    },
+    "macos_system_proxy_steering_smoke_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included the macOS System Proxy steering smoke source report."
+    },
+    "macos_system_proxy_steering_smoke_verifier_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included the matching macOS System Proxy steering smoke verifier report."
+    },
+    "macos_system_proxy_steering_smoke_status": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "planned",
+        "ok"
+      ],
+      "description": "Status of collected macOS System Proxy steering smoke evidence. not_collected means no report was included."
+    },
+    "macos_system_proxy_steering_smoke_verified": {
+      "type": "boolean",
+      "description": "True only when the bundled macOS System Proxy steering smoke verifier report was present and ok."
+    },
+    "network_extension_rules_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included the generated network_extension_steering_rules.v1 manifest."
+    },
+    "network_extension_rules_verified": {
+      "type": "boolean",
+      "description": "True when the bundled Network Extension steering rules verifier report was present and ok."
+    },
+    "network_extension_rule_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_excluded_non_network_extension_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_would_steer_smoke_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included the Network Extension would-steer smoke source report."
+    },
+    "network_extension_would_steer_smoke_verified": {
+      "type": "boolean",
+      "description": "True when the bundled Network Extension would-steer smoke verifier report was present and ok."
+    },
+    "network_extension_would_steer_runtime_installed": {
+      "type": "boolean",
+      "description": "False for Phase 1 evidence; true would mean the support bundle claims a real Network Extension runtime was installed."
+    },
+    "network_extension_would_steer_flow_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_would_steer_matched_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_would_steer_denied_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_would_steer_invalid_flow_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_evidence_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included Network Extension runtime evidence."
+    },
+    "network_extension_runtime_evidence_verified": {
+      "type": "boolean",
+      "description": "True only when the bundled runtime evidence passed its verifier."
+    },
+    "network_extension_runtime_installed": {
+      "type": "boolean",
+      "description": "True only when a real Network Extension runtime was installed; would-steer evidence alone must not set this."
+    },
+    "network_extension_runtime_running": {
+      "type": "boolean"
+    },
+    "network_extension_runtime_provider": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "app_proxy_provider",
+        "packet_tunnel_provider"
+      ]
+    },
+    "network_extension_runtime_rules_loaded": {
+      "type": "boolean"
+    },
+    "network_extension_runtime_rule_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_flow_extraction_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_flow_extraction_succeeded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_flow_extraction_denied": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_flow_extraction_gate": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "not_collected"
+      ]
+    },
+    "network_extension_runtime_flow_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_flow_tunneled": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "network_extension_runtime_flow_denied": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "windows_observe_mode_report_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included a Windows Observe Mode source report."
+    },
+    "windows_observe_mode_report_verified": {
+      "type": "boolean",
+      "description": "True only when the bundled Windows Observe Mode verifier report was present, passed, and kept the secret leak gate ok."
+    },
+    "windows_observe_source_schema_version": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "windows_observe_mode_report.v1",
+        "windows_observe_mode_report.v2"
+      ]
+    },
+    "windows_observe_runtime_evidence_kind": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "fixture",
+        "human_windows_capture"
+      ],
+      "description": "human_windows_capture means a human-run Windows lab smoke produced the report; it is not a product runtime adoption claim."
+    },
+    "windows_observe_network_filter": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "windivert_userspace"
+      ]
+    },
+    "windows_observe_enforcement_enabled": {
+      "type": "boolean"
+    },
+    "windows_observe_payload_capture_gate": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "disabled"
+      ]
+    },
+    "windows_observe_payload_captured": {
+      "type": "boolean",
+      "description": "Must remain false for observe-only Windows SMB 445 evidence."
+    },
+    "windows_observe_protocol_verified": {
+      "type": "boolean"
+    },
+    "windows_observe_collector_identity_trusted": {
+      "type": "boolean"
+    },
+    "windows_observe_process_unknown": {
+      "type": "boolean"
+    },
+    "windows_observe_runtime_candidate": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "windivert_userspace_lab_candidate"
+      ],
+      "description": "WinDivert remains a lab/runtime candidate for observe evidence, not a committed product implementation."
+    },
+    "windows_observe_product_runtime_committed": {
+      "type": "boolean",
+      "const": false
+    },
+    "windows_observe_smb445_observe_minimum_gate": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "ok"
+      ]
+    },
+    "windows_observe_smb445_observe_event_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "windows_observe_payload_event_redaction_gate": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "ok"
+      ]
+    },
+    "google_oidc_real_flow_verifier_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included a redacted Google hosted-domain OIDC verifier report."
+    },
+    "google_oidc_real_flow_verified": {
+      "type": "boolean",
+      "description": "True when the bundled Google hosted-domain OIDC verifier report was present, ok, and passed its secret leak gate."
+    },
+    "oidc_group_claim_real_flow_verifier_present": {
+      "type": "boolean",
+      "description": "Whether the support bundle included a redacted strict OIDC group claim verifier report."
+    },
+    "oidc_group_claim_real_flow_verified": {
+      "type": "boolean",
+      "description": "True when the bundled strict OIDC group claim verifier report was present, ok, and passed its secret leak gate."
+    },
+    "oidc_strict_group_claim_confirmed": {
+      "type": "boolean",
+      "description": "True only when the bundled strict OIDC group claim verifier report confirmed a real group membership claim."
+    },
+    "persistent_runtime_status_present": {
+      "type": "boolean"
+    },
+    "persistent_runtime_diagnostic_scope_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "local_persistent_runtime_status_metadata_only"
+      ],
+      "description": "Support bundle view of P1 persistent runtime diagnostics; metadata only, no runtime execution claim."
+    },
+    "persistent_runtime_lifecycle_state": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "uninstalled",
+        "installed_stopped",
+        "installed_starting",
+        "running_healthy",
+        "running_degraded",
+        "fail_secure",
+        "stopping",
+        "uninstalling",
+        "rollback_pending"
+      ]
+    },
+    "persistent_runtime_steering_scope_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "configured_private_app_destinations_only"
+      ]
+    },
+    "persistent_runtime_unmatched_tcp_action": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "passthrough"
+      ]
+    },
+    "persistent_runtime_edge_connector_topology_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "host_separated_containers_required"
+      ]
+    },
+    "persistent_runtime_edge_connector_network_namespace_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "distinct_container_netns_on_user_defined_bridge"
+      ]
+    },
+    "persistent_runtime_support_bundle_before_removal_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "support_bundle_before_removal_required"
+      ]
+    },
+    "persistent_runtime_rollback_readiness_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "rollback_runbook_required",
+        "rollback_ready"
+      ]
+    },
+    "persistent_runtime_raw_identifier_leak_gate": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "ok"
+      ]
+    },
+    "persistent_runtime_product_claim_gate": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "contract_only_no_persistent_deploy_claim"
+      ]
+    },
+    "agent_controller_runtime_health_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending"
+      ]
+    },
+    "ne_provider_runtime_health_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending"
+      ]
+    },
+    "edge_service_runtime_health_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending"
+      ]
+    },
+    "connector_service_runtime_health_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending"
+      ]
+    },
+    "policy_cache_runtime_health_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending"
+      ]
+    },
+    "support_bundle_runtime_health_category": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

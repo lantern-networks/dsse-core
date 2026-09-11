@@ -1,0 +1,409 @@
+{
+  "schema_version": "swg_saas_tenant_enforcement_preflight.v1",
+  "status": "passed",
+  "milestone": "",
+  "depth_locked_unit": "swg_saas_tenant_enforcement_minimal_path_preflight",
+  "tenant_id": "tenant_swg_lab",
+  "source_prd_scope": [
+    "tenant-enforcement",
+    "saas-tenant-headers"
+  ],
+  "preflight_scope": "local_policy_evaluator_swg_header_injection_and_tls_bypass_model_no_runtime_traffic",
+  "default_tls_decryption_required": true,
+  "per_destination_tls_bypass_required": true,
+  "mac_ca_trust_required": true,
+  "header_value_material_in_decision": false,
+  "policy_bundle": {
+    "id": "pb_swg_preflight_m1583",
+    "tenant_id": "tenant_swg_lab",
+    "version": "swg-saas-tenant-preflight.v1",
+    "policy_schema_version": "2026-06-11.tenant-enforcement-preflight",
+    "status": "active",
+    "saas_catalog": [
+      {
+        "tenant_id": "tenant_swg_lab",
+        "saas_application_id": "saas_google_workspace",
+        "name": "Google Workspace",
+        "provider": "google_workspace",
+        "category": "major_saas",
+        "risk_tier": "standard",
+        "domain_patterns": [
+          "google.com",
+          "*.google.com",
+          "googleapis.com",
+          "*.googleapis.com",
+          "googleusercontent.com",
+          "*.googleusercontent.com"
+        ],
+        "sni_patterns": [
+          "*.google.com",
+          "*.googleapis.com",
+          "*.googleusercontent.com"
+        ],
+        "tags": [
+          "swg",
+          "tenant_restriction_header"
+        ]
+      },
+      {
+        "tenant_id": "tenant_swg_lab",
+        "saas_application_id": "saas_microsoft_365",
+        "name": "Microsoft 365",
+        "provider": "microsoft_365",
+        "category": "major_saas",
+        "risk_tier": "standard",
+        "domain_patterns": [
+          "office.com",
+          "*.office.com",
+          "microsoftonline.com",
+          "*.microsoftonline.com"
+        ],
+        "sni_patterns": [
+          "*.office.com",
+          "*.microsoftonline.com"
+        ],
+        "tags": [
+          "swg",
+          "tenant_restriction_header"
+        ]
+      },
+      {
+        "tenant_id": "tenant_swg_lab",
+        "saas_application_id": "saas_sensitive_banking",
+        "name": "Sensitive Banking Category",
+        "provider": "sensitive_web",
+        "category": "banking",
+        "risk_tier": "privacy_sensitive",
+        "domain_patterns": [
+          "bank.example",
+          "*.bank.example"
+        ],
+        "sni_patterns": [
+          "*.bank.example"
+        ],
+        "tags": [
+          "tls_bypass"
+        ]
+      }
+    ],
+    "swg_tenant_restriction_rules": [
+      {
+        "id": "swg_tr_google_workspace_lab",
+        "tenant_id": "tenant_swg_lab",
+        "saas_application_id": "saas_google_workspace",
+        "provider": "google_workspace",
+        "header_name": "X-GoogApps-Allowed-Domains",
+        "header_value_ref": "operator_config_ref:google_workspace_allowed_domains",
+        "header_value_kind": "configured_allowed_domains",
+        "enforcement_mode": "inject_on_default_tls_decrypt",
+        "status": "active",
+        "metadata": {
+          "header_value_material_in_decision": false
+        }
+      },
+      {
+        "id": "swg_tr_microsoft_365_lab",
+        "tenant_id": "tenant_swg_lab",
+        "saas_application_id": "saas_microsoft_365",
+        "provider": "microsoft_365",
+        "header_name": "Restrict-Access-To-Tenants",
+        "header_value_ref": "operator_config_ref:microsoft_365_allowed_tenants",
+        "header_value_kind": "configured_allowed_tenant_ids",
+        "enforcement_mode": "inject_on_default_tls_decrypt",
+        "status": "active",
+        "metadata": {
+          "header_value_material_in_decision": false
+        }
+      }
+    ],
+    "swg_tls_bypass_rules": [
+      {
+        "id": "swg_tls_bypass_banking_category",
+        "tenant_id": "tenant_swg_lab",
+        "name": "Privacy-sensitive banking category bypass",
+        "match_type": "category",
+        "category": "banking",
+        "reason": "privacy_or_legal_exclusion",
+        "status": "active",
+        "metadata": {
+          "header_injection_suppressed": false
+        }
+      },
+      {
+        "id": "swg_tls_bypass_pinned_google_exact",
+        "tenant_id": "tenant_swg_lab",
+        "name": "Pinned Google client endpoint bypass",
+        "match_type": "fqdn",
+        "pattern": "pinned-client.google.com",
+        "reason": "certificate_pinning_breakage",
+        "status": "active",
+        "metadata": {
+          "header_injection_suppressed": true
+        }
+      }
+    ],
+    "tenant_root_cas": [
+      {
+        "id": "trca_swg_lab",
+        "tenant_id": "tenant_swg_lab",
+        "name": "Example tenant CA",
+        "status": "planned",
+        "distribution_mode": "mac_os_or_browser_trust_profile_required",
+        "trust_store_target": "mac_os_and_managed_browser",
+        "private_key_status": "not_recorded",
+        "metadata": {
+          "certificate_material_committed": false
+        }
+      }
+    ],
+    "trust_profiles": [
+      {
+        "id": "tp_swg_mac_trust",
+        "tenant_id": "tenant_swg_lab",
+        "name": "Example macOS trust profile",
+        "tenant_root_ca_id": "trca_swg_lab",
+        "trust_store_state": "planned",
+        "certificate_pinning_policy": "per_destination_bypass_required",
+        "status": "active",
+        "metadata": {
+          "mac_ca_trust_observed": false
+        }
+      }
+    ],
+    "inspection_profiles": [
+      {
+        "id": "ip_swg_default_tls_decrypt",
+        "tenant_id": "tenant_swg_lab",
+        "name": "Default TLS decrypt for tenant headers",
+        "inspection_mode": "default_tls_decrypt",
+        "trust_profile_id": "tp_swg_mac_trust",
+        "tenant_root_ca_id": "trca_swg_lab",
+        "quic_policy_mode": "prefer_tcp_tls",
+        "quic_policy_action": "tcp_tls_required",
+        "payload_policy": "tenant_header_injection_only",
+        "certificate_issuance_mode": "tenant_ca_required_not_issued_by_preflight",
+        "tls_interception_enabled": true,
+        "network_extension_dependency": "mac_swg_steering_required_not_run",
+        "status": "active",
+        "metadata": {
+          "runtime_tls_decryption_observed": false,
+          "runtime_header_injection_observed": false
+        }
+      }
+    ],
+    "metadata": {
+      "swg_preflight": true,
+      "default_tls_decryption_required": true,
+      "per_destination_tls_bypass_required": true,
+      "mac_ca_trust_required": true,
+      "runtime_traffic_observed": false
+    }
+  },
+  "policies": [
+    {
+      "id": "pol_google_workspace_swg_allow_001",
+      "tenant_id": "tenant_swg_lab",
+      "name": "Google Workspace tenant header preflight",
+      "priority": 100,
+      "conditions": {
+        "actor_type": "human",
+        "saas_application_id": "saas_google_workspace",
+        "service_family": "https",
+        "destination_port": 443,
+        "steering_mode": "network_extension"
+      },
+      "action": {
+        "decision": "allow"
+      },
+      "inspection_profile_id": "ip_swg_default_tls_decrypt",
+      "status": "active",
+      "metadata": {
+        "swg_preflight": true
+      }
+    },
+    {
+      "id": "pol_microsoft_365_swg_allow_001",
+      "tenant_id": "tenant_swg_lab",
+      "name": "Microsoft 365 tenant header preflight",
+      "priority": 100,
+      "conditions": {
+        "actor_type": "human",
+        "saas_application_id": "saas_microsoft_365",
+        "service_family": "https",
+        "destination_port": 443,
+        "steering_mode": "network_extension"
+      },
+      "action": {
+        "decision": "allow"
+      },
+      "inspection_profile_id": "ip_swg_default_tls_decrypt",
+      "status": "active",
+      "metadata": {
+        "swg_preflight": true
+      }
+    },
+    {
+      "id": "pol_sensitive_banking_bypass_allow_001",
+      "tenant_id": "tenant_swg_lab",
+      "name": "Privacy-sensitive bypass preflight",
+      "priority": 120,
+      "conditions": {
+        "actor_type": "human",
+        "saas_category": "banking",
+        "service_family": "https",
+        "destination_port": 443,
+        "steering_mode": "network_extension"
+      },
+      "action": {
+        "decision": "allow"
+      },
+      "inspection_profile_id": "ip_swg_default_tls_decrypt",
+      "status": "active",
+      "metadata": {
+        "swg_preflight": true
+      }
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture_id": "swg_google_workspace_header_injection",
+      "fixture_class": "tenant_header_injection",
+      "request": {
+        "tenant_id": "tenant_swg_lab",
+        "actor_type": "human",
+        "application_id": "app_swg_egress",
+        "service_family": "https",
+        "destination_port": 443,
+        "protocol": "tcp",
+        "steering_mode": "network_extension",
+        "fqdn": "mail.google.com",
+        "sni": "mail.google.com"
+      },
+      "expected": {
+        "decision": "allow",
+        "policy_id": "pol_google_workspace_swg_allow_001",
+        "saas_application_id": "saas_google_workspace",
+        "header_injection_applied": true,
+        "header_name": "X-GoogApps-Allowed-Domains",
+        "tls_bypass_applied": false,
+        "reason_codes": [
+          "policy_matched",
+          "application_allowed",
+          "swg_default_tls_decryption_required",
+          "swg_tenant_restriction_header_injection_planned"
+        ]
+      }
+    },
+    {
+      "fixture_id": "swg_microsoft_365_header_injection",
+      "fixture_class": "tenant_header_injection",
+      "request": {
+        "tenant_id": "tenant_swg_lab",
+        "actor_type": "human",
+        "application_id": "app_swg_egress",
+        "service_family": "https",
+        "destination_port": 443,
+        "protocol": "tcp",
+        "steering_mode": "network_extension",
+        "fqdn": "www.office.com",
+        "sni": "www.office.com"
+      },
+      "expected": {
+        "decision": "allow",
+        "policy_id": "pol_microsoft_365_swg_allow_001",
+        "saas_application_id": "saas_microsoft_365",
+        "header_injection_applied": true,
+        "header_name": "Restrict-Access-To-Tenants",
+        "tls_bypass_applied": false,
+        "reason_codes": [
+          "policy_matched",
+          "application_allowed",
+          "swg_default_tls_decryption_required",
+          "swg_tenant_restriction_header_injection_planned"
+        ]
+      }
+    },
+    {
+      "fixture_id": "swg_sensitive_banking_tls_bypass",
+      "fixture_class": "tls_bypass",
+      "request": {
+        "tenant_id": "tenant_swg_lab",
+        "actor_type": "human",
+        "application_id": "app_swg_egress",
+        "service_family": "https",
+        "destination_port": 443,
+        "protocol": "tcp",
+        "steering_mode": "network_extension",
+        "fqdn": "portal.bank.example",
+        "sni": "portal.bank.example"
+      },
+      "expected": {
+        "decision": "allow",
+        "policy_id": "pol_sensitive_banking_bypass_allow_001",
+        "saas_application_id": "saas_sensitive_banking",
+        "header_injection_applied": false,
+        "tls_bypass_applied": true,
+        "tls_bypass_rule_id": "swg_tls_bypass_banking_category",
+        "reason_codes": [
+          "policy_matched",
+          "application_allowed",
+          "swg_default_tls_decryption_required",
+          "swg_tls_bypass_applied"
+        ]
+      }
+    },
+    {
+      "fixture_id": "swg_pinned_google_tls_bypass_suppresses_header",
+      "fixture_class": "tls_bypass_suppresses_header",
+      "request": {
+        "tenant_id": "tenant_swg_lab",
+        "actor_type": "human",
+        "application_id": "app_swg_egress",
+        "service_family": "https",
+        "destination_port": 443,
+        "protocol": "tcp",
+        "steering_mode": "network_extension",
+        "fqdn": "pinned-client.google.com",
+        "sni": "pinned-client.google.com"
+      },
+      "expected": {
+        "decision": "allow",
+        "policy_id": "pol_google_workspace_swg_allow_001",
+        "saas_application_id": "saas_google_workspace",
+        "header_injection_applied": false,
+        "header_injection_suppressed_by_bypass": true,
+        "tls_bypass_applied": true,
+        "tls_bypass_rule_id": "swg_tls_bypass_pinned_google_exact",
+        "reason_codes": [
+          "policy_matched",
+          "application_allowed",
+          "swg_default_tls_decryption_required",
+          "swg_tls_bypass_applied"
+        ]
+      }
+    }
+  ],
+  "verification": {
+    "go_package": "./internal/decision",
+    "go_test_name": "TestSWGSaaSTenantEnforcementPreflightFixtures",
+    "go_test_command": "go test ./internal/decision -run ^TestSWGSaaSTenantEnforcementPreflightFixtures$ -count=1",
+    "verifier": "prototype/scripts/verify_swg_saas_tenant_enforcement_preflight.rb",
+    "smoke": "prototype/scripts/swg_saas_tenant_enforcement_preflight_smoke.sh"
+  },
+  "claim_guard": {
+    "swg_runtime_traffic_observed": false,
+    "tls_runtime_decryption_observed": false,
+    "header_injection_runtime_observed": false,
+    "mac_ca_trust_observed": false,
+    "human_boundary_created": false,
+    "gui_buildout_started": false,
+    "paper_only_contract_slice_started": false,
+    "p4_packaging_mdm_signing_install_started": false,
+    "shipping_product_claimed": false,
+    "production_scale_claimed": false,
+    "mvp_pilot_success_claimed": false,
+    "windows_work_started": false,
+    "captured_secret_material_committed": false,
+    "no_secret_attestation": true
+  }
+}

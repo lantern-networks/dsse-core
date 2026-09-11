@@ -1,0 +1,33 @@
+{
+  "bundle_id": "com.example.dsse.agent",
+  "payload_identifier": "com.example.dsse.agent.lab",
+  "tenant_id": "tenant_lab_001",
+  "configuration": {
+    "edge_url": "https://edge.lab.example.local",
+    "proxy_mode": "explicit",
+    "cache_dir": "/Library/Application Support/Dsse/cache",
+    "trusted_keyring_path": "/Library/Application Support/Dsse/config/trusted_keys.json",
+    "config_keyring_path": "/Library/Application Support/Dsse/config/config_signing_keys.json",
+    "runtime_connector_id": "conn_lab_001",
+    "runtime_secret": null,
+    "runtime_secret_file": "/Library/Application Support/Dsse/credentials/runtime_secret",
+    "runtime_secret_keychain_service": "com.example.dsse.agent",
+    "runtime_secret_keychain_account": "conn_lab_001",
+    "fetch_trusted_keyring": false,
+    "protected_app_map_path": "/Library/Application Support/Dsse/config/protected_app_map.json",
+    "network_extension_rules_path": "/Library/Application Support/Dsse/config/network_extension_steering_rules.json",
+    "network_extension_runtime_evidence_path": "/Library/Application Support/Dsse/config/network_extension_runtime_evidence.json",
+    "local_proxy_metrics_url": "http://127.0.0.1:18096/metrics",
+    "support_bundle_enabled": true,
+    "release_channel": "lab",
+    "target_agent_version": "0.1.1",
+    "update_source": "mdm",
+    "rollout_policy_enabled": true
+  },
+  "metadata": {
+    "mdm_targets": [
+      "jamf",
+      "intune"
+    ]
+  }
+}

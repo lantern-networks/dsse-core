@@ -1,0 +1,23 @@
+{
+  "tenant_id": "tenant_lab_001",
+  "session_id": "sess_lab_002",
+  "user_id": "user_lab_001",
+  "subject_user_id": "user_lab_001",
+  "actor_type": "human",
+  "device_id": "dev_lab_001",
+  "application_id": "app_admin_rdp",
+  "application_sensitivity": "high",
+  "source_ip": "127.0.0.1",
+  "source_port": 50101,
+  "destination": "admin-server.local",
+  "destination_ip": "127.0.0.1",
+  "destination_port": 3389,
+  "protocol": "tcp",
+  "fqdn": "admin-server.local",
+  "sni": "",
+  "service_family": "rdp",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "admin_server",
+  "ransomware_protection_mode": true
+}

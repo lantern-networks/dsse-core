@@ -1,0 +1,11 @@
+-- The policy-signing keys a device would accept, which this table would otherwise drop.
+--
+-- The config-signing key moves into a token by switching its algorithm to ECDSA, and that switch is only safe
+-- once every device has adopted the next key — signing to a key a device does not hold freezes it on its last
+-- policy. Devices report the set they would verify with (pin + adopted); the Edge must be able to see it to
+-- know the switch is safe. The in-memory backend carries it; without this column the durable backend would
+-- record the row and discard exactly the readiness signal the switch turns on.
+--
+-- Additive and defaulted: rows written before this read as "the device did not say", the same as an agent
+-- that has not reported the field yet.
+ALTER TABLE observed_steer_exclusions ADD COLUMN IF NOT EXISTS agent_policy_public_keys jsonb NOT NULL DEFAULT '[]';

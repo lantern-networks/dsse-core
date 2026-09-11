@@ -1,0 +1,7 @@
+{
+  "designated_requirement": "identifier \"jp.co.lantern-networks.dsse.agent\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = M4U8GSBL6C",
+  "designated_requirement_sha256": "c3f4d4d6cc92c2f830e8dc6f567826c15817ce7978fe27562c8b8184be61366e",
+  "bundle_id": "jp.co.lantern-networks.dsse.agent",
+  "team_id": "M4U8GSBL6C",
+  "provider_executable": "DsseAppProxyProvider"
+}

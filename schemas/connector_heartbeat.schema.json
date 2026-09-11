@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/connector_heartbeat.schema.json",
+  "title": "ConnectorHeartbeat",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "status",
+    "policy_bundle_id",
+    "policy_bundle_version",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "healthy",
+        "degraded",
+        "offline"
+      ]
+    },
+    "policy_bundle_id": {
+      "type": "string"
+    },
+    "policy_bundle_version": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Operational heartbeat metadata. Server-managed runtime credential metadata such as runtime_secret_hash, runtime_secret_rotated_at, and runtime_secret_rotated_by is ignored on heartbeat and must be changed through enrollment or the Admin rotation endpoint."
+    }
+  }
+}

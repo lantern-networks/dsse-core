@@ -1,0 +1,67 @@
+;
+; dsse-wfp.inf — install manifest for the DSSE WFP callout driver.
+;
+; WHY THIS EXISTS. The driver is loaded as a kernel SERVICE (driversvc.exe --install), not through PnP, so
+; nothing here ever needed an INF to run. Microsoft's attestation signing does: a submission is a CAB holding
+; the driver package, and the INF is what the dashboard validates and signs against. Without it the driver can
+; only be test-signed, which is what pinned this box to `bcdedit testsigning on` and blocked the MSI
+; happy-path install everywhere else.
+;
+; THE CAB CARRIES THIS INF AND dsse-wfp.sys, AND NOTHING ELSE. An earlier version of this comment said the
+; submission also holds the symbols. It did, and that is precisely what Microsoft is changing: files a driver
+; package contains but the INF does not reference are covered by a new signing policy
+; (https://aka.ms/UnreferencedInfFiles). Symbols belong in a symbol store. See build-attestation-cab.ps1 in
+; ../packaging, which builds the submission from exactly the files named below.
+;
+; It is deliberately a non-PnP, [DefaultInstall]-style INF: there is no hardware to enumerate. That shape is
+; accepted for attestation — the .sys comes back Microsoft-signed — provided the file itself passes InfVerif.
+; Known rejections to keep out of here: CoInstallers32 and Installer32 sections, and anything requiring a
+; co-installer DLL.
+;
+; The runtime install path does NOT change. driversvc.exe still creates and starts the service; this INF
+; exists so the binary it loads can carry a Microsoft signature instead of ours.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+CatalogFile = dsse-wfp.cat
+DriverVer   = 08/07/2026,1.0.0.0
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12 ; %SystemRoot%\System32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%
+
+[SourceDisksFiles]
+dsse-wfp.sys = 1
+
+[DefaultInstall.NTamd64]
+CopyFiles = DsseWfp.CopyFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = %ServiceName%,,DsseWfp.Service
+
+[DsseWfp.CopyFiles]
+dsse-wfp.sys
+
+[DsseWfp.Service]
+DisplayName    = %ServiceDesc%
+Description    = %ServiceDesc%
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+; DEMAND_START, not AUTO_START. The callout enforces nothing until userspace pushes a policy, and a driver
+; that autostarts before the agent can hand it one is a driver that is loaded and idle at every boot.
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\dsse-wfp.sys
+LoadOrderGroup = NDIS
+
+[Strings]
+ManufacturerName = "LANTERN NETWORKS, INC."
+DiskName         = "DSSE WFP Driver Installation Disk"
+ServiceName      = "DsseWfp"
+ServiceDesc      = "DSSE WFP steering callout"

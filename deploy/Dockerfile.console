@@ -1,0 +1,23 @@
+# The Admin Console: the static application and the server that gates it.
+#
+# ★ THE CONSOLE FILES ARE BAKED IN, not bind-mounted. The reference lab mounts them from a source checkout,
+# which is right for a lab and wrong for a deployment: an image that needs a copy of this repository beside it
+# is not an image anybody can run. A deployment gets one artifact.
+#
+# ★★ THE SERVER IS DENY-BY-DEFAULT. Every asset except the minimal sign-in page requires a valid admin
+# session, validated server-side against the control plane — so the admin application is never handed to an
+# unauthenticated client. Set ADMIN_SESSION_VALIDATE_CA to the deployment anchor; without a validate URL the
+# gate DISABLES itself and says so in the log, which is a line worth reading on first start.
+FROM golang:1.27.1-alpine3.24@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+COPY egress-broker/go.mod egress-broker/go.sum ./egress-broker/
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o /out/dsse-console ./cmd/dsse-console
+
+FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/dsse-console /usr/local/bin/dsse-console
+COPY --from=build /src/console /console
+ENTRYPOINT ["/usr/local/bin/dsse-console"]

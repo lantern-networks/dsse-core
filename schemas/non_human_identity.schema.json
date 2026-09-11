@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/non_human_identity.schema.json",
+  "title": "NonHumanIdentity",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "name",
+    "nhi_type",
+    "owner_user_id",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "nhi_type": {
+      "type": "string"
+    },
+    "owner_user_id": {
+      "type": "string"
+    },
+    "trust_domain": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "issuer": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "credential_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "allowed_application_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_scopes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowlist_enforced": {
+      "type": "boolean",
+      "description": "When true, empty application/scope allowlists deny use instead of Phase 1 allow-all compatibility."
+    },
+    "owner_visibility_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "owner_visible",
+        "owner_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "trust_domain_binding_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "trust_domain_bound",
+        "trust_domain_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "issuer_subject_binding_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "issuer_subject_bound",
+        "issuer_subject_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "credential_type_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "credential_type_bound",
+        "credential_type_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "allowed_application_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "application_scope_bound",
+        "application_scope_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "expiry_visibility_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "expiry_visible",
+        "expiry_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "last_used_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "expired",
+        "revoked"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

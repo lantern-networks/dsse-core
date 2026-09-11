@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/network_extension_steering_rules.schema.json",
+  "title": "NetworkExtensionSteeringRules",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tenant_id",
+    "version",
+    "source_protected_app_map",
+    "generated_at",
+    "default_action",
+    "rules"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "network_extension_steering_rules.v1"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "source_protected_app_map": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "default_action": {
+      "type": "string",
+      "enum": [
+        "deny",
+        "tunnel"
+      ]
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "application_id",
+          "fqdn",
+          "destination_port",
+          "service_family",
+          "steering_mode",
+          "action"
+        ],
+        "properties": {
+          "application_id": {
+            "type": "string"
+          },
+          "fqdn": {
+            "type": "string",
+            "pattern": "^(?!(?:[0-9]+\\.){3}[0-9]+$)(?!.*\\.\\.)(?!.*\\.$)(?!\\.)(?!.*[*/:\\s])(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+            "description": "Canonical lowercase FQDN accepted by the Network Extension runtime contract; IPv4 literals, wildcards, slashes, colons, spaces, empty labels, and leading/trailing hyphen labels are denied."
+          },
+          "destination_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "service_family": {
+            "type": "string"
+          },
+          "steering_mode": {
+            "type": "string",
+            "enum": [
+              "network_extension"
+            ]
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "tunnel"
+            ]
+          },
+          "connector_group_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

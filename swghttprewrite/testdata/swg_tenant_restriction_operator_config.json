@@ -1,0 +1,48 @@
+{
+  "schema_version": "swg_tenant_restriction_operator_config.v1",
+  "status": "active",
+  "tenant_id": "tenant_swg_lab",
+  "version": "operator-config-resolver.v1",
+  "header_values": [
+    {
+      "ref": "operator_config_ref:google_workspace_allowed_domains",
+      "tenant_id": "tenant_swg_lab",
+      "saas_application_id": "saas_google_workspace",
+      "provider": "google_workspace",
+      "header_name": "X-GoogApps-Allowed-Domains",
+      "header_value_kind": "configured_allowed_domains",
+      "value": "google-workspace.lab.example",
+      "status": "active",
+      "metadata": {
+        "operator_managed": true,
+        "operator_config_value_secret": false,
+        "captured_secret_material_committed": false,
+        "report_value_material_logged": false
+      }
+    },
+    {
+      "ref": "operator_config_ref:microsoft_365_allowed_tenants",
+      "tenant_id": "tenant_swg_lab",
+      "saas_application_id": "saas_microsoft_365",
+      "provider": "microsoft_365",
+      "header_name": "Restrict-Access-To-Tenants",
+      "header_value_kind": "configured_allowed_tenant_ids",
+      "value": "microsoft-365-tenant.lab.example",
+      "status": "active",
+      "metadata": {
+        "operator_managed": true,
+        "operator_config_value_secret": false,
+        "captured_secret_material_committed": false,
+        "report_value_material_logged": false
+      }
+    }
+  ],
+  "metadata": {
+    "source": "swg_operator_config_resolver_product_unit",
+    "designated_operator_config_file": true,
+    "operator_authored_config_secret": false,
+    "captured_secret_material_committed": false,
+    "runtime_observation_status": "not_observed",
+    "report_value_material_allowed": false
+  }
+}

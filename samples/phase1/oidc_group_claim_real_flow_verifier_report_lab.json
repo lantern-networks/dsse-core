@@ -1,0 +1,23 @@
+{
+  "schema_version": "1.0",
+  "status": "ok",
+  "created_at": "2026-05-26T12:47:00Z",
+  "session_report": "oidc_strict_group_session_lab.json",
+  "decision_report": "oidc_strict_group_decision_lab.json",
+  "idp_name": "entra-id-lab",
+  "issuer": "https://login.microsoftonline.com/tenant-lab/v2.0",
+  "group_claim_name": "groups",
+  "expected_group": "group-object-id-security-admins-lab",
+  "group_present": true,
+  "strict_group_claim_confirmed": true,
+  "session_id": "sess_oidc_strict_group_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "user_id": "entra-sub-lab-001",
+  "auth_method": "oidc_authorization_code",
+  "decision_id": "dec_oidc_strict_group_lab_001",
+  "decision": "allow",
+  "policy_id": "pol_lab_strict_group_https_allow_001",
+  "application_id": "app_strict_group_https",
+  "matched_user_groups_condition": true,
+  "secret_leak_gate": "ok"
+}

@@ -1,0 +1,50 @@
+{
+  "id": "pol_lab_admin_https_dsl_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Allow security admin group to dummy private app with condition DSL",
+  "priority": 90,
+  "conditions": {
+    "actor_type": {
+      "op": "eq",
+      "value": "human"
+    },
+    "service_family": {
+      "op": "in",
+      "values": [
+        "https",
+        "ssh"
+      ]
+    },
+    "destination_port": {
+      "op": "in",
+      "values": [
+        8443,
+        9443
+      ]
+    },
+    "user_groups": {
+      "op": "contains",
+      "value": "security-admins"
+    }
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": null,
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

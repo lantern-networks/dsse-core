@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/tool_call_event.schema.json",
+  "title": "ToolCallEvent",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "actor_nhi_id",
+    "tool_id",
+    "action_type",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "agent_task_session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_nhi_id": {
+      "type": "string"
+    },
+    "subject_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delegated_access_grant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_id": {
+      "type": "string"
+    },
+    "mcp_server_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtime_environment_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "action_type": {
+      "type": "string"
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "context_boundary_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_classification": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "token_audience": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "human_approval_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "access_decision_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inspection_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "policy_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result_summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result_summary_scope": {
+      "type": "string",
+      "enum": [
+        "metadata_only",
+        "masked_summary",
+        "payload_reference"
+      ]
+    },
+    "masked": {
+      "type": "boolean"
+    },
+    "payload_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "retention_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "nhi_soc_agent_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "SOC Investigation Agent",
+  "nhi_type": "ai_agent",
+  "owner_user_id": "user_security_owner_001",
+  "trust_domain": "dsse.local",
+  "issuer": "idp_keycloak_lab",
+  "subject": "system:agent:soc-investigation",
+  "credential_type": "short_lived_token",
+  "allowed_application_ids": [
+    "app_dummy_https"
+  ],
+  "allowed_scopes": [
+    "incident:read",
+    "ticket:create"
+  ],
+  "allowlist_enforced": true,
+  "last_used_at": "2026-05-22T00:00:00Z",
+  "expires_at": "2026-05-22T01:00:00Z",
+  "status": "active",
+  "metadata": {
+    "purpose": "ransomware_investigation_assistance"
+  }
+}

@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_lab_smoke_report.schema.json",
+  "title": "AgentLabSmokeReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "base_url",
+    "artifacts",
+    "doctor",
+    "preflight",
+    "cache",
+    "support_bundle_verifier",
+    "quality"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "base_url": {
+      "type": "string"
+    },
+    "artifacts": {
+      "type": "object",
+      "required": [
+        "agent_config",
+        "protected_app_map",
+        "network_extension_rules",
+        "pac_file",
+        "macos_system_proxy_script",
+        "macos_system_proxy_plan",
+        "mobileconfig",
+        "launchd_plist",
+        "launchd_uninstall_script",
+        "windows_service_script",
+        "windows_service_uninstall_script",
+        "support_bundle"
+      ],
+      "properties": {
+        "agent_config": {
+          "type": "string"
+        },
+        "protected_app_map": {
+          "type": "string"
+        },
+        "network_extension_rules": {
+          "type": "string"
+        },
+        "pac_file": {
+          "type": "string"
+        },
+        "macos_system_proxy_script": {
+          "type": "string"
+        },
+        "macos_system_proxy_plan": {
+          "type": "string"
+        },
+        "mobileconfig": {
+          "type": "string"
+        },
+        "launchd_plist": {
+          "type": "string"
+        },
+        "launchd_uninstall_script": {
+          "type": "string"
+        },
+        "windows_service_script": {
+          "type": "string"
+        },
+        "windows_service_uninstall_script": {
+          "type": "string"
+        },
+        "support_bundle": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "doctor": {
+      "type": "object",
+      "required": [
+        "status",
+        "runtime_secret_source"
+      ],
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "runtime_secret_source": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "preflight": {
+      "type": "object",
+      "required": [
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "cache": {
+      "type": "object",
+      "required": [
+        "status",
+        "tenant_id",
+        "device_id"
+      ],
+      "properties": {
+        "status": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "device_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "local_proxy_steering": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "required": [
+        "status",
+        "local_proxy_metrics_url",
+        "steering_host",
+        "pac_decision",
+        "steering_attempted",
+        "steering_succeeded",
+        "steering_failed",
+        "connect_unsupported"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "local_proxy_metrics_url": {
+          "type": "string"
+        },
+        "steering_host": {
+          "type": "string"
+        },
+        "pac_decision": {
+          "type": "string",
+          "pattern": "^PROXY .+$"
+        },
+        "pac_resolution_report": {
+          "type": "string"
+        },
+        "steering_attempted": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "steering_succeeded": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "steering_failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "connect_unsupported": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "support_bundle_verifier": {
+      "type": "object",
+      "required": [
+        "status",
+        "cache_verified",
+        "default_leak_gate",
+        "default_forbidden_marker_count",
+        "files_checked"
+      ],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "cache_verified": {
+          "type": "boolean"
+        },
+        "default_leak_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "default_forbidden_marker_count": {
+          "type": "integer",
+          "minimum": 4
+        },
+        "files_checked": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "archive": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "quality": {
+      "type": "object",
+      "required": [
+        "quality_status",
+        "access_decisions"
+      ],
+      "properties": {
+        "quality_status": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "access_decisions": {
+          "type": "object",
+          "required": [
+            "total",
+            "with_connector"
+          ],
+          "properties": {
+            "total": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "with_connector": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

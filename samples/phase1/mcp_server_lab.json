@@ -1,0 +1,23 @@
+{
+  "id": "mcp_soc_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "SOC MCP Server",
+  "owner_user_id": "user_security_owner_001",
+  "publisher": "dsse-lab",
+  "version": "0.1.0",
+  "supported_transport": "http_stream",
+  "resource_uri": "https://mcp.local/soc",
+  "audience": "https://mcp.local/soc",
+  "authorization_server_ref": "idp_keycloak_lab",
+  "allowed_tool_ids": [
+    "tool_ticket_create_001"
+  ],
+  "token_binding_state": "required",
+  "token_passthrough_policy": "blocked",
+  "network_destination": "mcp.local:443",
+  "data_classification": "confidential",
+  "status": "active",
+  "metadata": {
+    "environment": "lab"
+  }
+}

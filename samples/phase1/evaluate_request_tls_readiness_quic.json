@@ -1,0 +1,30 @@
+{
+  "tenant_id": "tenant_lab_001",
+  "session_id": "sess_lab_001",
+  "authentication_event_id": "auth_lab_001",
+  "user_id": "user_lab_001",
+  "subject_user_id": "user_lab_001",
+  "user_groups": [
+    "security"
+  ],
+  "actor_type": "human",
+  "device_id": "dev_lab_001",
+  "device_trust_level": "managed",
+  "application_id": "app_dummy_https",
+  "application_sensitivity": "medium",
+  "destination": "dummy-private-app.local",
+  "destination_port": 443,
+  "protocol": "udp",
+  "fqdn": "dummy-private-app.local",
+  "sni": "dummy-private-app.local",
+  "service_family": "quic",
+  "inspection_profile_id": "ip_tls_readiness_lab",
+  "inspection_mode": "tls_readiness",
+  "trust_profile_id": "tp_lab_managed_browser_001",
+  "tenant_root_ca_id": "trca_lab_001",
+  "quic_policy_mode": "prefer_tcp_tls",
+  "quic_policy_action": "tcp_tls_required",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app"
+}

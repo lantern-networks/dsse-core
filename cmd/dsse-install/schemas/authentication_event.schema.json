@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/authentication_event.schema.json",
+  "title": "AuthenticationEvent",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "user_id",
+    "session_id",
+    "idp_id",
+    "method",
+    "mfa_state",
+    "auth_time",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "user_id": {
+      "type": "string"
+    },
+    "subject_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": "string"
+    },
+    "idp_id": {
+      "type": "string"
+    },
+    "method": {
+      "type": "string",
+      "enum": [
+        "oidc_authorization_code",
+        "oidc_refresh",
+        "step_up_mfa",
+        "interactive_mfa",
+        "break_glass"
+      ]
+    },
+    "amr": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "acr": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mfa_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "stale",
+        "required",
+        "bypassed"
+      ]
+    },
+    "auth_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "source_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "device_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "result": {
+      "type": "string",
+      "enum": [
+        "success",
+        "failure"
+      ]
+    },
+    "break_glass_start_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "start_recorded_metadata_only",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_reason_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "operator_supplied_recovery_reason",
+        "not_provided",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_auth_strength_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "strong_auth_evidence_present",
+        "strong_auth_required",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_policy_ttl_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "short_ttl_bound",
+        "expired",
+        "not_applicable",
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

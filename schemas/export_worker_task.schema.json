@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/export_worker_task.schema.json",
+  "title": "ExportWorkerTask",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "export_job_id",
+    "created_by_admin_principal_id",
+    "idempotency_key",
+    "stream",
+    "format",
+    "filters",
+    "from",
+    "to",
+    "limit",
+    "output_ref_prefix",
+    "requested_at",
+    "lease_expires_at",
+    "timeout_seconds",
+    "cancel_check_interval_rows",
+    "retry_policy",
+    "attempt",
+    "max_attempts",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "export_job_id": {
+      "type": "string"
+    },
+    "created_by_admin_principal_id": {
+      "type": "string"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "description": "Deterministic key used by Alpha workers to make queue delivery and object writes idempotent for the same export job."
+    },
+    "stream": {
+      "type": "string",
+      "enum": [
+        "access",
+        "audit",
+        "decision_trace",
+        "connector",
+        "human_approval_events",
+        "delegated_access_grants",
+        "tool_call_events",
+        "inspection_events"
+      ]
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "ndjson",
+        "csv"
+      ]
+    },
+    "filters": {
+      "type": "object"
+    },
+    "from": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "to": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "output_ref_prefix": {
+      "type": "string"
+    },
+    "requested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "lease_expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "Null while queued in Phase 1. Alpha queue workers set this when they acquire a task lease."
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "cancel_check_interval_rows": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "retry_policy": {
+      "type": "object",
+      "description": "Worker retry contract. backoff_seconds must have the same length as max_attempts; Alpha workers must validate this before indexing by attempt.",
+      "required": [
+        "retryable_error_codes",
+        "non_retryable_error_codes",
+        "backoff_seconds"
+      ],
+      "properties": {
+        "retryable_error_codes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "non_retryable_error_codes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "backoff_seconds": {
+          "type": "array",
+          "description": "Retry backoff seconds indexed by attempt. The array length must match max_attempts.",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_attempts": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "trace_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

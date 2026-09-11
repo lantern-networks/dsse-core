@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lantern DSSE — Sign in</title>
+  <link rel="icon" href="brand/lantern-symbol.svg" type="image/svg+xml" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="login-body">
+  <header class="topbar">
+    <div class="brand"><img class="brand-symbol" src="brand/lantern-symbol.svg" alt="" width="48" height="48" /> <span data-i18n="appTitle">Admin Console</span></div>
+    <div class="lang">
+      <button id="lang-en" class="lang-btn">EN</button>
+      <button id="lang-ja" class="lang-btn">日本語</button>
+    </div>
+  </header>
+
+  <!-- Sign-in: the ONLY pre-auth surface. No admin nav, no endpoint catalog, no break-glass token field —
+       nothing that maps the product's admin surface is shipped before authentication. The admin console
+       (console.html) is a separate document reached only after a session is established. -->
+  <main class="login-wrap">
+    <section class="login-card" id="signin-card">
+      <h1 class="login-title" data-i18n="signInTitle">Sign in</h1>
+      <div class="config-row">
+        <label data-i18n="signInEmail">Work email</label>
+        <input id="signin-email" type="email" placeholder="you@your-company.com" autocomplete="username" />
+      </div>
+      <div class="config-row">
+        <label data-i18n="password">Password</label>
+        <input id="signin-password" type="password" placeholder="••••••••" autocomplete="current-password" />
+      </div>
+      <div class="config-row" id="totp-row" style="display:none">
+        <label data-i18n="totpCode">2FA code</label>
+        <input id="signin-totp" type="text" inputmode="numeric" placeholder="123456" autocomplete="one-time-code" />
+      </div>
+      <div class="config-actions">
+        <button id="signin-btn" class="primary" data-i18n="signIn">Sign in</button>
+      </div>
+      <span id="conn-status" class="conn-status"></span>
+    </section>
+
+    <!-- Activation (reached only via the emailed link /?activate=<token>) lives on the same minimal page. -->
+    <section class="login-card activation" id="activation-panel" style="display:none">
+      <h1 class="login-title" data-i18n="activateTitle">Activate your admin account</h1>
+      <p id="activation-email" class="conn-status"></p>
+      <div class="config-row">
+        <label data-i18n="newPassword">New password</label>
+        <input id="activate-password" type="password" autocomplete="new-password" />
+      </div>
+      <div class="config-actions">
+        <button id="activate-password-btn" class="primary" data-i18n="setPassword">Set password</button>
+      </div>
+      <div id="activate-2fa" style="display:none">
+        <p data-i18n="enroll2fa">Scan this in your authenticator app, then enter the 6-digit code:</p>
+        <div id="activate-qr" style="margin:8px 0;display:inline-block;background:#fff;padding:8px;border-radius:6px"></div>
+        <p style="font-size:12px;opacity:.8" data-i18n="cantScan">Can't scan? Enter this secret key manually:</p>
+        <pre id="activate-secret" class="resp" style="user-select:all"></pre>
+        <details><summary style="font-size:12px;opacity:.7" data-i18n="showOtpauth">Show otpauth URI</summary>
+        <pre id="activate-otpauth" class="resp"></pre></details>
+        <div class="config-row">
+          <label data-i18n="totpCode">2FA code</label>
+          <input id="activate-totp" type="text" inputmode="numeric" placeholder="123456" />
+        </div>
+        <div class="config-actions">
+          <button id="activate-complete-btn" class="primary" data-i18n="completeActivation">Enroll 2FA &amp; finish</button>
+        </div>
+      </div>
+      <div id="activate-recovery" style="display:none">
+        <p data-i18n="recoveryCodes">Save these one-time recovery codes:</p>
+        <pre id="activate-recovery-codes" class="resp"></pre>
+        <p data-i18n="activationDone">Account activated. You can now sign in with your email, password, and 2FA.</p>
+      </div>
+      <span id="activation-status" class="conn-status"></span>
+    </section>
+  </main>
+
+  <script src="vendor/qrcode.min.js"></script>
+  <script src="i18n.js"></script>
+  <script src="login.js"></script>
+</body>
+</html>

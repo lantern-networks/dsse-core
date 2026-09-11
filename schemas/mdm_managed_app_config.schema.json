@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/mdm_managed_app_config.schema.json",
+  "title": "MDMManagedAppConfig",
+  "type": "object",
+  "required": [
+    "bundle_id",
+    "payload_identifier",
+    "tenant_id",
+    "configuration"
+  ],
+  "properties": {
+    "bundle_id": {
+      "type": "string"
+    },
+    "payload_identifier": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "configuration": {
+      "type": "object",
+      "required": [
+        "edge_url",
+        "proxy_mode",
+        "cache_dir",
+        "trusted_keyring_path",
+        "protected_app_map_path",
+        "support_bundle_enabled"
+      ],
+      "properties": {
+        "edge_url": {
+          "type": "string"
+        },
+        "proxy_mode": {
+          "type": "string",
+          "enum": [
+            "explicit",
+            "pac",
+            "system_proxy",
+            "network_extension"
+          ]
+        },
+        "cache_dir": {
+          "type": "string"
+        },
+        "trusted_keyring_path": {
+          "type": "string"
+        },
+        "config_keyring_path": {
+          "type": "string"
+        },
+        "runtime_connector_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional connector id copied to agent_config.runtime_connector_id and sent as x-connector-id for Edge runtime endpoints."
+        },
+        "runtime_secret": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Phase 1 lab compatibility bridge copied to agent_config.runtime_secret. Prefer runtime_secret_file or runtime_secret_keychain_* for endpoint tests so the managed profile does not embed the secret value."
+        },
+        "runtime_secret_file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional device-local file path copied to agent_config.runtime_secret_file. The Local Client reads the secret from this file when runtime_secret is absent."
+        },
+        "runtime_secret_keychain_service": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional macOS Keychain generic-password service name copied to agent_config.runtime_secret_keychain_service."
+        },
+        "runtime_secret_keychain_account": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional macOS Keychain generic-password account copied to agent_config.runtime_secret_keychain_account."
+        },
+        "fetch_trusted_keyring": {
+          "type": "boolean",
+          "description": "When true, the Local Client fetches the tenant trusted keyring from Edge after device registration before validating the policy bundle."
+        },
+        "protected_app_map_path": {
+          "type": "string"
+        },
+        "network_extension_rules_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional path to generated network_extension_steering_rules.v1 manifest distributed with the agent for transparent steering."
+        },
+        "network_extension_runtime_evidence_path": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional path copied to agent_config.network_extension_runtime_evidence_ref. Phase 1 uses this for not-installed/runtime evidence separation; production providers should write this evidence locally."
+        },
+        "local_proxy_metrics_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Optional local proxy /metrics URL copied to agent_config.local_proxy_metrics_url for proxy-based steering telemetry."
+        },
+        "support_bundle_enabled": {
+          "type": "boolean"
+        },
+        "release_channel": {
+          "type": "string",
+          "enum": [
+            "lab",
+            "alpha",
+            "stable",
+            "pilot",
+            "canary",
+            "emergency"
+          ]
+        },
+        "target_agent_version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "update_source": {
+          "type": "string",
+          "enum": [
+            "mdm",
+            "control_plane",
+            "manual"
+          ]
+        },
+        "rollout_policy_enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "id": "conn_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "connector_group_id": "cgrp_lab_001",
+  "name": "Lab Connector",
+  "edge_region_id": "local",
+  "edge_cluster_id": "local-edge-001",
+  "application_ids": [
+    "app_dummy_https",
+    "app_dummy_ssh",
+    "app_dummy_postgres",
+    "app_dummy_rdp"
+  ],
+  "private_base_url": "http://127.0.0.1:18090",
+  "status": "registered",
+  "registered_at": "2026-05-22T00:00:00Z",
+  "last_heartbeat_at": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "runtime_secret_hash": "sha256:053a68922e418b435f8d80ca36abde5cc87c63b44136da9ba88afcb7a0cc89c0"
+  }
+}

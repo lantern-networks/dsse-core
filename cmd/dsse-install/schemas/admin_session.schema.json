@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/admin_session.schema.json",
+  "title": "AdminSession",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "admin_principal_id",
+    "subject",
+    "roles",
+    "auth_time",
+    "mfa_state",
+    "created_at",
+    "expires_at",
+    "last_active_at",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "admin_principal_id": {
+      "type": "string"
+    },
+    "subject": {
+      "type": "string"
+    },
+    "roles": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "auth_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "mfa_state": {
+      "type": "string",
+      "enum": [
+        "fresh",
+        "stale",
+        "absent"
+      ]
+    },
+    "source_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_agent": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_active_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "expired",
+        "revoked"
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "csrf_token": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

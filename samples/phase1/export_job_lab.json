@@ -1,0 +1,29 @@
+{
+  "id": "export_lab_001",
+  "tenant_id": "tenant_lab",
+  "created_by_admin_principal_id": "admin_user_lab_001",
+  "stream": "access",
+  "format": "ndjson",
+  "filters": {
+    "application_id": "app_dummy_ssh"
+  },
+  "from": "2026-05-23T00:00:00Z",
+  "to": "2026-05-23T01:00:00Z",
+  "status": "completed",
+  "row_count": 12,
+  "object_ref": "evidence://tenant/tenant_lab/exports/2026/05/23/export_lab_001.ndjson.gz",
+  "payload_checksum": "sha256:lab-export-checksum",
+  "created_at": "2026-05-23T01:00:00Z",
+  "started_at": "2026-05-23T01:00:05Z",
+  "completed_at": "2026-05-23T01:00:10Z",
+  "expires_at": "2026-05-30T01:00:00Z",
+  "error_code": null,
+  "metadata": {
+    "export_mode": "async",
+    "total_matches": 12,
+    "truncated": false,
+    "progress_phase": "completed",
+    "rows_exported": 12,
+    "last_progress_at": "2026-05-23T01:00:10Z"
+  }
+}

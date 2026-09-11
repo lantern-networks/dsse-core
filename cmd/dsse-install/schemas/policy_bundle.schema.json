@@ -1,0 +1,325 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/policy_bundle.schema.json",
+  "title": "PolicyBundle",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "version",
+    "policy_schema_version",
+    "checksum",
+    "signature",
+    "signing_key_id",
+    "target_scope",
+    "policy_ids",
+    "compiled_policy_ref",
+    "bundle_type",
+    "expires_at",
+    "created_at",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "policy_schema_version": {
+      "type": "string"
+    },
+    "checksum": {
+      "type": "string"
+    },
+    "signature": {
+      "type": "string"
+    },
+    "signing_key_id": {
+      "type": "string"
+    },
+    "target_scope": {
+      "type": "object",
+      "required": [
+        "target_type"
+      ],
+      "properties": {
+        "target_type": {
+          "type": "string",
+          "enum": [
+            "local_edge",
+            "edge_cluster",
+            "agent",
+            "device_group",
+            "connector_group",
+            "tenant",
+            "network_boundary"
+          ]
+        },
+        "edge_region_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "edge_cluster_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "device_group_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "connector_group_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "policy_ids": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string"
+      }
+    },
+    "compiled_policy_ref": {
+      "type": "string"
+    },
+    "bundle_type": {
+      "type": "string",
+      "enum": [
+        "standard",
+        "emergency",
+        "pilot",
+        "canary",
+        "break_glass",
+        "vlan_boundary"
+      ]
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "revoked_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "activated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "expired",
+        "revoked"
+      ]
+    },
+    "saas_catalog": {
+      "type": "array",
+      "description": "Tenant-scoped SaaS catalog entries used to derive non-secret SaaS context from FQDN/SNI before policy matching.",
+      "items": {
+        "type": "object",
+        "required": [
+          "saas_application_id",
+          "provider",
+          "category"
+        ],
+        "properties": {
+          "tenant_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "saas_application_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "category": {
+            "type": "string"
+          },
+          "risk_tier": {
+            "type": "string"
+          },
+          "domain_patterns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sni_patterns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "tenant_root_cas": {
+      "type": "array",
+      "description": "Non-secret Tenant Root CA readiness settings. Private keys, raw certificate bodies, and generated certificates are not stored in the policy bundle.",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "tenant_id",
+          "status",
+          "private_key_status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "planned",
+              "configured",
+              "distributed",
+              "revoked"
+            ]
+          },
+          "distribution_mode": {
+            "type": "string"
+          },
+          "trust_store_target": {
+            "type": "string"
+          },
+          "certificate_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private_key_status": {
+            "type": "string",
+            "enum": [
+              "not_recorded",
+              "external_hsm",
+              "external_kms"
+            ]
+          },
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "trust_profiles": {
+      "type": "array",
+      "description": "Tenant-scoped trust profile readiness settings for OS/browser trust store policy and certificate pinning bypass classification.",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "tenant_id",
+          "tenant_root_ca_id",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tenant_root_ca_id": {
+            "type": "string"
+          },
+          "trust_store_state": {
+            "type": "string"
+          },
+          "certificate_pinning_policy": {
+            "type": "string"
+          },
+          "bypass_policy_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "active",
+              "inactive",
+              "revoked"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "inspection_profiles": {
+      "type": "array",
+      "description": "InspectionProfile entries used by policy inspection_profile_id to attach TLS readiness metadata without performing TLS interception or certificate issuance.",
+      "items": {
+        "$ref": "inspection_profile.schema.json"
+      }
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,1003 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_status.schema.json",
+  "title": "AgentStatus",
+  "type": "object",
+  "required": [
+    "device_id",
+    "tenant_id",
+    "policy_bundle_id",
+    "policy_bundle_version",
+    "bundle_source",
+    "device_trust_level",
+    "status",
+    "timestamp"
+  ],
+  "properties": {
+    "device_id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "policy_bundle_id": {
+      "type": "string"
+    },
+    "policy_bundle_version": {
+      "type": "string"
+    },
+    "bundle_source": {
+      "type": "string",
+      "enum": [
+        "remote",
+        "cache_fallback"
+      ]
+    },
+    "device_trust_level": {
+      "type": "string",
+      "enum": [
+        "managed",
+        "unmanaged",
+        "unknown"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "healthy",
+        "degraded",
+        "offline"
+      ]
+    },
+    "policy_apply_result": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "applied",
+        "failed",
+        "cache_fallback",
+        null
+      ]
+    },
+    "policy_apply_failure_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "signature_validation",
+        "expired_bundle",
+        "revoked_bundle",
+        "version_mismatch",
+        "fetch_error",
+        "policy_parse_error",
+        "unknown",
+        null
+      ]
+    },
+    "last_policy_apply_success_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "trust_profile_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "trust_profile_source": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "remote",
+        "cache_fallback",
+        null
+      ]
+    },
+    "os_trust_store_apply_result": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "applied",
+        "failed",
+        "not_applicable",
+        null
+      ]
+    },
+    "browser_trust_store_apply_result": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "applied",
+        "failed",
+        "not_applicable",
+        null
+      ]
+    },
+    "certificate_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "certificate_revocation_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "valid",
+        "revoked",
+        "unknown",
+        null
+      ]
+    },
+    "quic_policy_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "allow",
+        "detect_only",
+        "prefer_tcp_tls",
+        "block_quic",
+        null
+      ]
+    },
+    "decryption_bypass_policy_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_reported",
+        "applied",
+        "failed",
+        "not_applicable",
+        null
+      ]
+    },
+    "degraded_operation_control_plane_reachability_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "control_plane_reachable",
+        "control_plane_unreachable",
+        "not_reported",
+        null
+      ]
+    },
+    "degraded_operation_policy_source_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "last_verified_signed_policy_bundle",
+        "missing_verified_policy_bundle",
+        "not_reported",
+        null
+      ]
+    },
+    "degraded_operation_decision_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "protected_traffic_decision_continues_metadata_only",
+        "no_degraded_decision",
+        "not_reported",
+        null
+      ]
+    },
+    "trust_profile_apply_failure_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "profile_fetch_error",
+        "trust_store_permission",
+        "certificate_revoked",
+        "version_mismatch",
+        "unknown",
+        null
+      ]
+    },
+    "agent_version_report_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "agent_version_present",
+        "agent_version_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "os_version_support_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "supported_os_version",
+        "unsupported_os_version",
+        "unknown",
+        "not_reported",
+        null
+      ]
+    },
+    "compatibility_matrix_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "compatible",
+        "incompatible",
+        "unknown",
+        "not_reported",
+        null
+      ]
+    },
+    "pilot_quality_measurement_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "metadata_only_no_measurement_execution",
+        "measurement_result_present",
+        "not_reported",
+        null
+      ]
+    },
+    "recent_error_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "none",
+        "policy_apply_failure",
+        "trust_profile_failure",
+        "steering_failure",
+        "unknown",
+        "not_reported",
+        null
+      ]
+    },
+    "agent_update_success_measurement_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "success_rate_metadata_present",
+        "success_rate_metadata_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "agent_rollback_success_measurement_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "rollback_success_metadata_present",
+        "rollback_success_metadata_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "crash_free_session_measurement_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "crash_free_metadata_present",
+        "crash_observed_metadata_present",
+        "not_reported",
+        null
+      ]
+    },
+    "steering_success_measurement_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "steering_success_metadata_present",
+        "steering_failure_metadata_present",
+        "not_reported",
+        null
+      ]
+    },
+    "resource_usage_measurement_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "within_expected_bounds",
+        "outside_expected_bounds",
+        "not_reported",
+        null
+      ]
+    },
+    "admin_last_comms_visibility_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "last_comms_timestamp_visible",
+        "last_comms_timestamp_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "admin_support_bundle_visibility_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "support_bundle_metadata_visible",
+        "support_bundle_metadata_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Operational Agent telemetry. Phase 1 uses crash_count and steering_* counters as the endpoint-side Agent Quality signal.",
+      "properties": {
+        "client": {
+          "type": "string"
+        },
+        "crash_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "steering_attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "steering_succeeded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "steering_failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "connect_unsupported": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_rules_ref": {
+          "type": "string"
+        },
+        "network_extension_rules_status": {
+          "type": "string",
+          "enum": [
+            "loaded",
+            "unavailable"
+          ]
+        },
+        "network_extension_rule_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "transparent_steering_runtime": {
+          "type": "string",
+          "enum": [
+            "not_installed",
+            "app_proxy_provider",
+            "packet_tunnel_provider"
+          ]
+        },
+        "network_extension_runtime_evidence_ref": {
+          "type": "string"
+        },
+        "network_extension_runtime_evidence_status": {
+          "type": "string",
+          "enum": [
+            "loaded",
+            "unavailable",
+            "invalid"
+          ]
+        },
+        "network_extension_runtime_invalid_reason": {
+          "type": "string",
+          "enum": [
+            "counter_inconsistent",
+            "evidence_source_invalid",
+            "flow_extraction_gate",
+            "installed_overclaim",
+            "not_installed_overclaim",
+            "parse_error",
+            "runtime_provider_invalid",
+            "rules_loaded_overclaim",
+            "rules_not_loaded_overclaim",
+            "schema_mismatch",
+            "secret_leak_gate",
+            "stopped_runtime_overclaim",
+            "unavailable"
+          ]
+        },
+        "network_extension_runtime_installed": {
+          "type": "boolean"
+        },
+        "network_extension_runtime_running": {
+          "type": "boolean"
+        },
+        "network_extension_runtime_provider": {
+          "type": "string",
+          "enum": [
+            "not_installed",
+            "app_proxy_provider",
+            "packet_tunnel_provider"
+          ]
+        },
+        "network_extension_runtime_rules_loaded": {
+          "type": "boolean"
+        },
+        "network_extension_runtime_rule_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_flow_extraction_attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_flow_extraction_succeeded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_flow_extraction_denied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_flow_extraction_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "network_extension_runtime_flow_attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_flow_tunneled": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_flow_denied": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "network_extension_runtime_evidence_source": {
+          "type": "string",
+          "description": "Forwarded runtime evidence source. agent_status is not accepted as proof of an installed Network Extension runtime; it is reserved for a future Agent Status mirror writer.",
+          "enum": [
+            "not_installed_contract",
+            "provider_runtime",
+            "agent_status"
+          ]
+        },
+        "transparent_steering_default_action": {
+          "type": "string",
+          "enum": [
+            "deny"
+          ]
+        },
+        "windows_observe_mode_report_ref": {
+          "type": "string"
+        },
+        "windows_observe_mode_status": {
+          "type": "string",
+          "enum": [
+            "loaded",
+            "unavailable",
+            "invalid"
+          ]
+        },
+        "windows_observe_invalid_reason": {
+          "type": "string",
+          "enum": [
+            "acl_unreadable",
+            "hardlink",
+            "identity_mismatch",
+            "overclaim_capture",
+            "overclaim_payload",
+            "path_escape",
+            "provenance_missing",
+            "reparse_point",
+            "report_too_large",
+            "schema_mismatch",
+            "stale_report",
+            "toctou",
+            "unavailable"
+          ]
+        },
+        "windows_observe_schema_version": {
+          "type": "string",
+          "enum": [
+            "windows_observe_mode_report.v1",
+            "windows_observe_mode_report.v2"
+          ]
+        },
+        "windows_observe_mode": {
+          "type": "string",
+          "enum": [
+            "observe"
+          ]
+        },
+        "windows_observe_network_filter": {
+          "type": "string",
+          "enum": [
+            "not_installed",
+            "windivert_userspace"
+          ]
+        },
+        "windows_observe_driver": {
+          "type": "string",
+          "enum": [
+            "none",
+            "windivert"
+          ]
+        },
+        "windows_observe_driver_installed": {
+          "type": "boolean"
+        },
+        "windows_observe_driver_running": {
+          "type": "boolean"
+        },
+        "windows_observe_enforcement_enabled": {
+          "type": "boolean"
+        },
+        "windows_observe_runtime_evidence_source": {
+          "type": "string",
+          "enum": [
+            "collector_runtime"
+          ]
+        },
+        "windows_observe_runtime_evidence_kind": {
+          "type": "string",
+          "enum": [
+            "fixture",
+            "human_windows_capture"
+          ]
+        },
+        "windows_observe_runtime_candidate": {
+          "type": "string",
+          "enum": [
+            "windivert_userspace_lab_candidate"
+          ]
+        },
+        "windows_observe_product_runtime_committed": {
+          "type": "boolean",
+          "const": false
+        },
+        "windows_observe_packet_write_enabled": {
+          "type": "boolean"
+        },
+        "windows_observe_packet_reinject_attempted": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "windows_observe_capture_mode": {
+          "type": "string",
+          "enum": [
+            "sniff"
+          ]
+        },
+        "windows_observe_observed_services": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "smb",
+              "winrm_http",
+              "winrm_https",
+              "rdp"
+            ]
+          }
+        },
+        "windows_observe_observed_flow_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "windows_observe_destination_ip_mode": {
+          "type": "string",
+          "enum": [
+            "cidr_bucket"
+          ]
+        },
+        "windows_observe_classification_method": {
+          "type": "string",
+          "enum": [
+            "destination_port"
+          ]
+        },
+        "windows_observe_protocol_confidence": {
+          "type": "string",
+          "enum": [
+            "port_inferred"
+          ]
+        },
+        "windows_observe_protocol_verified": {
+          "type": "boolean"
+        },
+        "windows_observe_payload_capture_gate": {
+          "type": "string",
+          "enum": [
+            "disabled"
+          ]
+        },
+        "windows_observe_payload_captured": {
+          "type": "boolean",
+          "const": false
+        },
+        "windows_observe_collector_identity_trusted": {
+          "type": "boolean"
+        },
+        "windows_observe_process_unknown": {
+          "type": "boolean"
+        },
+        "windows_observe_identity_authority": {
+          "type": "string",
+          "enum": [
+            "local_client"
+          ]
+        },
+        "windows_observe_identity_mismatch_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "windows_observe_report_permission_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "windows_observe_runtime_provenance_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "windows_observe_smb445_observe_minimum_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "windows_observe_smb445_observe_event_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "windows_observe_flow_event_schema_version": {
+          "type": "string",
+          "enum": [
+            "windows_observe_flow_event.v1"
+          ]
+        },
+        "windows_observe_payload_event_redaction_gate": {
+          "type": "string",
+          "enum": [
+            "ok"
+          ]
+        },
+        "windows_observe_next_runtime_candidate": {
+          "type": "string",
+          "enum": [
+            "windivert_userspace",
+            "wfp_callout_driver"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "persistent_runtime_diagnostic_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "local_persistent_runtime_status_metadata_only",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_lifecycle_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "uninstalled",
+        "installed_stopped",
+        "installed_starting",
+        "running_healthy",
+        "running_degraded",
+        "fail_secure",
+        "stopping",
+        "uninstalling",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_steering_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "configured_private_app_destinations_only",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_unmatched_tcp_action": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "passthrough",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_edge_connector_topology_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "host_separated_containers_required",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_edge_connector_network_namespace_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "distinct_container_netns_on_user_defined_bridge",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_support_bundle_before_removal_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "support_bundle_before_removal_required",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_rollback_readiness_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "rollback_runbook_required",
+        "rollback_ready",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_raw_identifier_leak_gate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_productization_claim_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "contract_only_no_persistent_deploy_claim",
+        "not_reported",
+        null
+      ]
+    },
+    "agent_controller_runtime_health_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "ne_provider_runtime_health_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "edge_service_runtime_health_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "connector_service_runtime_health_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "policy_cache_runtime_health_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "support_bundle_runtime_health_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_installed",
+        "starting",
+        "healthy",
+        "degraded",
+        "fail_secure",
+        "stopped",
+        "rollback_pending",
+        "not_reported",
+        null
+      ]
+    },
+    "persistent_runtime_deploy_claimed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "production_scale_claimed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "shipping_product_claimed": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "raw_container_ids_included": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "raw_process_id_included": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "raw_host_values_included": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "raw_network_values_included": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    }
+  }
+}

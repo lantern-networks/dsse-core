@@ -1,0 +1,242 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/delegated_access_grant.schema.json",
+  "title": "DelegatedAccessGrant",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "subject_user_id",
+    "actor_nhi_id",
+    "expires_at",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "subject_user_id": {
+      "type": "string"
+    },
+    "actor_nhi_id": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "audience": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resource": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scopes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "purpose": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "approval_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject_user_binding_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "subject_user_bound",
+        "subject_user_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "actor_nhi_binding_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "actor_nhi_bound",
+        "actor_nhi_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "delegated_application_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "application_scope_bound",
+        "application_scope_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "audience_resource_binding_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "audience_resource_bound",
+        "audience_resource_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "delegated_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "delegated_scope_bound",
+        "delegated_scope_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "approval_event_binding_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "approval_event_bound",
+        "approval_event_missing",
+        "approval_not_required",
+        "not_reported",
+        null
+      ]
+    },
+    "token_binding_requirement_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "token_binding_required",
+        "token_binding_not_required",
+        "not_reported",
+        null
+      ]
+    },
+    "ttl_expiry_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ttl_expiry_bound",
+        "ttl_expiry_missing",
+        "not_reported",
+        null
+      ]
+    },
+    "revocation_state_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "revocation_state_active",
+        "revocation_state_expired",
+        "revocation_state_revoked",
+        "not_reported",
+        null
+      ]
+    },
+    "token_binding_required": {
+      "type": "boolean"
+    },
+    "max_session_duration": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "revoked_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "revocation_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "expired",
+        "revoked"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

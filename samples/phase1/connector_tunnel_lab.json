@@ -1,0 +1,15 @@
+{
+  "id": "tun_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "connector_id": "conn_lab_001",
+  "edge_region_id": "local",
+  "edge_cluster_id": "local-edge-001",
+  "protocol": "websocket_tls",
+  "status": "connected",
+  "connected_at": "2026-05-22T00:00:00Z",
+  "last_heartbeat_at": "2026-05-22T00:00:10Z",
+  "disconnected_at": null,
+  "reconnect_reason": null,
+  "stream_multiplexing_mode": "single_stream_lab",
+  "metadata": {}
+}

@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go build + vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          # ★ FROM go.mod, NOT A LITERAL. It said "1.22" while the module requires 1.25, so the very first
+          # job on the public repo would have refused to build before running a single test — and a version
+          # pinned in two places drifts the moment one of them moves.
+          go-version-file: go.mod
+          check-latest: true
+      # ★ THE WINDOWS BINARIES ARE BUILT AS WINDOWS. Three packages under clients/windows-wfp keep main() in
+      # *_windows.go, so `go build ./...` on a Linux runner reports "function main is undeclared" for them —
+      # always, on a healthy tree. Left as one blanket build, CI would have been red from the first push, and
+      # a permanently red badge is worse than none: nobody can tell a real break from the standing one.
+      - name: Build (host)
+        run: |
+          set -o pipefail
+          out="$(go build ./... 2>&1 || true)"
+          # The ONE tolerated error, for exactly those packages. Anything else is a real failure.
+          rest="$(printf '%s\n' "$out" \
+            | grep -v '^# github.com/lantern-networks/dsse-core/clients/windows-wfp/' \
+            | grep -v '^runtime\.main_main·f: function main is undeclared in the main package$' \
+            | grep -v '^$' || true)"
+          if [ -n "$rest" ]; then printf '%s\n' "$rest"; exit 1; fi
+          echo "host build ok (the Windows-only binaries are built in the next step)"
+      - name: Build (windows)
+        run: GOOS=windows go build ./...
+      - run: go vet ./...
+      - run: go test ./... -count=1
+
+  macos:
+    name: macOS network extension (swift build + test)
+    # macos-15 ships Xcode 16 / Swift 6; the package declares swift-tools-version 6.0 (macos-14 has Swift 5.10).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: swift build + test
+        working-directory: clients/macos-network-extension
+        run: |
+          swift build
+          swift test

@@ -1,0 +1,21 @@
+{
+  "schema_version": "network_extension_runtime_smoke_verifier_report.v1",
+  "status": "passed",
+  "created_at": "2026-05-31T00:00:00Z",
+  "source_report": "network_extension_runtime_smoke_result_not_run.json",
+  "source_schema_version": "network_extension_runtime_smoke_result.v1",
+  "evidence_kind": "fixture_not_run",
+  "runtime_execution_status": "not_run",
+  "system_extension_install_status": "not_started",
+  "network_extension_activation_status": "not_started",
+  "runtime_smoke_status": "not_run",
+  "flow_read_write_status": "not_started",
+  "edge_tunnel_open_status": "not_started",
+  "tcp_payload_copy_status": "not_started",
+  "support_bundle_status": "not_started",
+  "rollback_status": "not_required",
+  "redaction_status": "ok",
+  "tenant_scope_runtime_resolved": false,
+  "runtime_overclaim_gate": "ok",
+  "secret_leak_gate": "ok"
+}

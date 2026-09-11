@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/macos_system_proxy_steering_smoke_verifier_report.schema.json",
+  "title": "MacOSSystemProxySteeringSmokeVerifierReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "created_at",
+    "source_report",
+    "smoke_status",
+    "request_url",
+    "plan_only",
+    "system_proxy_apply_requested",
+    "system_proxy_applied",
+    "request_command_direct_gate",
+    "steering_attempted",
+    "steering_succeeded",
+    "steering_failed",
+    "connect_unsupported"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_report": {
+      "type": "string"
+    },
+    "smoke_status": {
+      "type": "string",
+      "enum": [
+        "planned",
+        "ok"
+      ]
+    },
+    "request_url": {
+      "type": "string",
+      "pattern": "^https?://"
+    },
+    "plan_only": {
+      "type": "boolean"
+    },
+    "system_proxy_apply_requested": {
+      "type": "boolean"
+    },
+    "system_proxy_applied": {
+      "type": "boolean"
+    },
+    "request_command_direct_gate": {
+      "type": "string",
+      "enum": [
+        "not_applicable",
+        "ok"
+      ]
+    },
+    "request_transport": {
+      "type": "string",
+      "enum": [
+        "system_pac_http_proxy",
+        "system_pac_https_connect"
+      ]
+    },
+    "request_http_status": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "HTTP status returned by the request helper. HTTPS CONNECT reports require 200 from the post-CONNECT lab probe."
+    },
+    "request_connect_status_line": {
+      "type": "string"
+    },
+    "request_tunnel_probe": {
+      "type": "string",
+      "enum": [
+        "plaintext_http_after_connect",
+        "not_sent"
+      ]
+    },
+    "steering_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steering_succeeded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steering_failed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "connect_unsupported": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "CONNECT requests observed by localproxy during the smoke. HTTPS CONNECT-capable reports must keep this at zero."
+    }
+  },
+  "additionalProperties": false
+}

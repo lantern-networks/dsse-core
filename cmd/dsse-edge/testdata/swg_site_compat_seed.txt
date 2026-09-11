@@ -1,0 +1,48 @@
+# SWG site-compatibility seed list (no network needed to ship; the harness fetches these live).
+# One host per line. "#" comments and "rank,host" (Tranco CSV) lines are accepted.
+# Curated: Japanese EC/finance/portal (the release-critical interop targets) + global representatives
+# spanning CDNs, SaaS auth, and multi-domain login/checkout flows.
+
+# --- 国内 EC / 決済 (multi-domain checkout — the reported failure class) ---
+www.amazon.co.jp
+www.rakuten.co.jp
+www.yahoo.co.jp
+shopping.yahoo.co.jp
+www.mercari.com
+kakaku.com
+www.biccamera.com
+www.yodobashi.com
+www.uniqlo.com
+store.shopping.yahoo.co.jp
+paypay.ne.jp
+
+# --- 国内 ポータル / メディア / 交通 ---
+news.yahoo.co.jp
+www.nicovideo.jp
+www.jreast.co.jp
+www.japanpost.jp
+
+# --- 国内 金融 (TLS strict, sometimes pinning-adjacent) ---
+www.smbc.co.jp
+www.mufg.jp
+www.rakuten-bank.co.jp
+
+# --- SaaS / auth (HTTP/2-only auth hosts; multi-hop OIDC) ---
+accounts.google.com
+login.microsoftonline.com
+github.com
+www.salesforce.com
+slack.com
+www.dropbox.com
+
+# --- グローバル 代表 (CDN / 大規模) ---
+www.google.com
+www.cloudflare.com
+www.youtube.com
+www.wikipedia.org
+www.amazon.com
+www.facebook.com
+x.com
+www.netflix.com
+www.apple.com
+www.microsoft.com

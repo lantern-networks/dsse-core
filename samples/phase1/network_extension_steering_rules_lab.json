@@ -1,0 +1,57 @@
+{
+  "schema_version": "network_extension_steering_rules.v1",
+  "tenant_id": "tenant_lab_001",
+  "version": "2026.05.22.001",
+  "source_protected_app_map": "protected_app_map_lab.json",
+  "generated_at": "2026-05-26T14:48:00Z",
+  "default_action": "deny",
+  "rules": [
+    {
+      "application_id": "app_dummy_postgres",
+      "fqdn": "dummy-postgres.local",
+      "destination_port": 5432,
+      "service_family": "database",
+      "steering_mode": "network_extension",
+      "action": "tunnel",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "database_protocol": "postgresql",
+        "destination_role": "database_server",
+        "private_path": "/private-app/dummy-postgres",
+        "sensitivity": "high"
+      }
+    },
+    {
+      "application_id": "app_dummy_rdp",
+      "fqdn": "dummy-rdp.local",
+      "destination_port": 3389,
+      "service_family": "rdp",
+      "steering_mode": "network_extension",
+      "action": "tunnel",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "destination_role": "admin_server",
+        "private_path": "/private-app/dummy-rdp",
+        "sensitivity": "high"
+      }
+    },
+    {
+      "application_id": "app_dummy_ssh",
+      "fqdn": "dummy-ssh.local",
+      "destination_port": 22,
+      "service_family": "ssh",
+      "steering_mode": "network_extension",
+      "action": "tunnel",
+      "connector_group_id": "cg_lab_001",
+      "metadata": {
+        "destination_role": "ssh_server",
+        "private_path": "/private-app/dummy-ssh",
+        "sensitivity": "high"
+      }
+    }
+  ],
+  "metadata": {
+    "source": "protected_app_map",
+    "non_network_extension_entries_excluded": 1
+  }
+}

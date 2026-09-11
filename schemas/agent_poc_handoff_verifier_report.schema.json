@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_poc_handoff_verifier_report.schema.json",
+  "title": "AgentPoCHandoffVerifierReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "archive",
+    "archive_sha256",
+    "package_name",
+    "manifest_created_at",
+    "files_checked",
+    "default_leak_gate",
+    "default_forbidden_marker_count",
+    "artifact_default_leak_gate",
+    "artifact_default_forbidden_marker_count",
+    "support_bundle_default_leak_gate",
+    "support_bundle_default_forbidden_marker_count",
+    "support_bundle_forbidden_pattern_configured",
+    "support_bundle_forbidden_pattern_gate",
+    "poc_results_report_present",
+    "poc_results_default_leak_gate",
+    "poc_results_default_forbidden_marker_count",
+    "poc_results_is_dry_run",
+    "poc_results_evidence_step_count",
+    "quality_status",
+    "review_bundle_archive",
+    "review_bundle_archive_sha256",
+    "review_prompt_verifier_status",
+    "review_prompt_print_status",
+    "review_prompt_print_sha256",
+    "review_prompt_visible_bundle_sha",
+    "review_prompt_visible_bundle_sha_gate",
+    "review_prompt_print_default_leak_gate"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "archive": {
+      "type": "string",
+      "pattern": "^agent_poc_handoff_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the verified handoff tarball."
+    },
+    "package_name": {
+      "type": "string",
+      "pattern": "^agent_poc_handoff_[0-9]{8}T[0-9]{6}Z$"
+    },
+    "manifest_created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ],
+      "description": "Whether the verifier scanned the handoff package with its built-in local path and secret marker denylist."
+    },
+    "default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4,
+      "description": "Number of built-in denylist markers checked by the verifier."
+    },
+    "artifact_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "artifact_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "support_bundle_forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "poc_results_report_present": {
+      "type": "boolean"
+    },
+    "poc_results_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "poc_results_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "poc_results_is_dry_run": {
+      "type": "boolean"
+    },
+    "poc_results_evidence_step_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "quality_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "review_bundle_archive": {
+      "type": "string",
+      "pattern": "^agent_poc_review_bundle_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "review_bundle_archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "review_prompt_verifier_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "review_prompt_print_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "review_prompt_print_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "review_prompt_visible_bundle_sha": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 shown in the human-readable Bundle section of the handoff review prompt."
+    },
+    "review_prompt_visible_bundle_sha_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "review_prompt_print_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

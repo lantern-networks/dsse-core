@@ -1,0 +1,19 @@
+{
+  "status": "ok",
+  "created_at": "2026-05-26T18:55:00Z",
+  "runtime_installed": false,
+  "runtime_running": false,
+  "runtime_provider": "not_installed",
+  "rules_loaded": false,
+  "rule_count": 0,
+  "flow_extraction_attempted": 0,
+  "flow_extraction_succeeded": 0,
+  "flow_extraction_denied": 0,
+  "flow_extraction_gate": "ok",
+  "flow_attempted": 0,
+  "flow_tunneled": 0,
+  "flow_denied": 0,
+  "last_error": null,
+  "evidence_source": "not_installed_contract",
+  "secret_leak_gate": "ok"
+}

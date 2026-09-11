@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/connector_registration.schema.json",
+  "title": "ConnectorRegistration",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "connector_group_id",
+    "name",
+    "edge_region_id",
+    "edge_cluster_id",
+    "application_ids",
+    "private_base_url",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "connector_group_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "edge_region_id": {
+      "type": "string"
+    },
+    "edge_cluster_id": {
+      "type": "string"
+    },
+    "application_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "private_base_url": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "registered",
+        "healthy",
+        "degraded",
+        "offline"
+      ]
+    },
+    "registered_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "last_heartbeat_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Operational connector metadata. runtime_secret_hash, when present, enables connector-specific runtime authentication and must be a sha256:<hex> hash of the connector runtime secret. runtime_secret_rotated_at and runtime_secret_rotated_by are server-managed fields and are ignored during connector registration.",
+      "properties": {
+        "runtime_secret_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

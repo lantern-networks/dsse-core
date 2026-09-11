@@ -1,0 +1,156 @@
+{
+  "id": "pb_lab_20260522_001",
+  "tenant_id": "tenant_lab_001",
+  "version": "2026.05.22.001",
+  "policy_schema_version": "2026.05.22",
+  "checksum": "sha256:mock-checksum",
+  "signature": "mock-signature",
+  "signing_key_id": "mock-local-signing-key",
+  "target_scope": {
+    "target_type": "local_edge",
+    "edge_region_id": "local",
+    "edge_cluster_id": "local-edge-001",
+    "device_group_id": null,
+    "connector_group_id": null
+  },
+  "policy_ids": [
+    "pol_lab_break_glass_allow_001",
+    "pol_lab_admin_https_dsl_allow_001",
+    "pol_lab_https_allow_001",
+    "pol_lab_nhi_tool_allow_001",
+    "pol_lab_postgres_allow_001",
+    "pol_lab_rdp_allow_001",
+    "pol_lab_saas_slack_allow_001",
+    "pol_lab_ssh_allow_001",
+    "pol_lab_ssh_reauth_required_001"
+  ],
+  "compiled_policy_ref": "samples/phase1/policy_lab_break_glass_allow.json,samples/phase1/policy_lab_https_allow.json,samples/phase1/policy_lab_nhi_tool_allow.json,samples/phase1/policy_lab_ssh_allow.json,samples/phase1/policy_lab_ssh_reauth_required.json,samples/phase1/policy_lab_postgres_allow.json,samples/phase1/policy_lab_rdp_allow.json,samples/phase1/policy_lab_saas_slack_allow.json",
+  "bundle_type": "standard",
+  "expires_at": "2030-01-01T00:00:00Z",
+  "revoked_at": null,
+  "created_at": "2026-05-22T00:00:00Z",
+  "activated_at": "2026-05-22T00:00:00Z",
+  "status": "active",
+  "saas_catalog": [
+    {
+      "tenant_id": "tenant_lab_001",
+      "saas_application_id": "saas_slack",
+      "name": "Slack",
+      "provider": "slack",
+      "category": "collaboration",
+      "risk_tier": "standard",
+      "domain_patterns": [
+        "slack.com",
+        "*.slack.com"
+      ],
+      "sni_patterns": [
+        "slack.com",
+        "*.slack.com"
+      ],
+      "tags": [
+        "mvp_alpha",
+        "collaboration"
+      ]
+    },
+    {
+      "tenant_id": "tenant_lab_001",
+      "saas_application_id": "saas_google_workspace",
+      "name": "Google Workspace",
+      "provider": "google",
+      "category": "productivity",
+      "risk_tier": "standard",
+      "domain_patterns": [
+        "accounts.google.com",
+        "drive.google.com",
+        "mail.google.com",
+        "*.google.com"
+      ],
+      "sni_patterns": [
+        "accounts.google.com",
+        "drive.google.com",
+        "mail.google.com",
+        "*.google.com"
+      ],
+      "tags": [
+        "mvp_alpha",
+        "productivity"
+      ]
+    },
+    {
+      "tenant_id": "tenant_lab_001",
+      "saas_application_id": "saas_github",
+      "name": "GitHub",
+      "provider": "github",
+      "category": "developer_platform",
+      "risk_tier": "sensitive",
+      "domain_patterns": [
+        "github.com",
+        "*.github.com"
+      ],
+      "sni_patterns": [
+        "github.com",
+        "*.github.com"
+      ],
+      "tags": [
+        "mvp_alpha",
+        "source_code"
+      ]
+    }
+  ],
+  "tenant_root_cas": [
+    {
+      "id": "trca_lab_001",
+      "tenant_id": "tenant_lab_001",
+      "name": "Lab Tenant Root CA readiness record",
+      "status": "configured",
+      "distribution_mode": "mdm_or_browser_trust_store",
+      "trust_store_target": "os_and_browser",
+      "certificate_ref": "tenant-root-ca-ref-lab",
+      "private_key_status": "not_recorded",
+      "created_at": "2026-05-31T22:40:00Z",
+      "updated_at": "2026-05-31T22:40:00Z",
+      "metadata": {
+        "readiness_scope": "policy_layer_only"
+      }
+    }
+  ],
+  "trust_profiles": [
+    {
+      "id": "tp_lab_managed_browser_001",
+      "tenant_id": "tenant_lab_001",
+      "name": "Managed endpoint browser trust readiness",
+      "tenant_root_ca_id": "trca_lab_001",
+      "trust_store_state": "planned",
+      "certificate_pinning_policy": "bypass_required",
+      "bypass_policy_id": null,
+      "status": "active",
+      "metadata": {
+        "raw_mobileconfig_recorded": false,
+        "raw_certificate_recorded": false
+      }
+    }
+  ],
+  "inspection_profiles": [
+    {
+      "id": "ip_tls_readiness_lab",
+      "tenant_id": "tenant_lab_001",
+      "name": "Lab TLS inspection readiness metadata profile",
+      "inspection_mode": "tls_readiness",
+      "trust_profile_id": "tp_lab_managed_browser_001",
+      "tenant_root_ca_id": "trca_lab_001",
+      "quic_policy_mode": "prefer_tcp_tls",
+      "quic_policy_action": "tcp_tls_required",
+      "payload_policy": "metadata_only",
+      "certificate_issuance_mode": "not_issued",
+      "tls_interception_enabled": false,
+      "network_extension_dependency": "none_policy_layer",
+      "status": "active",
+      "metadata": {
+        "readiness_scope": "policy_layer_only",
+        "private_key_recorded": false,
+        "runtime_smoke_required": false
+      }
+    }
+  ],
+  "metadata": {}
+}

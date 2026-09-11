@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/usage_meter.schema.json",
+  "title": "UsageMeter",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "schema_version",
+    "period_start",
+    "period_end",
+    "meter_type",
+    "subject_type",
+    "quantity",
+    "unit",
+    "collected_at",
+    "dimensions",
+    "metadata"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "type": "string"
+    },
+    "period_start": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "period_end": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "meter_type": {
+      "type": "string",
+      "description": "Observed usage meter type. nhi_seat is retained as a governance observation for registered NHI count, not as a billable seat in the MVP.",
+      "enum": [
+        "human_seat",
+        "nhi_seat",
+        "decision",
+        "automation_concurrency",
+        "decision_burst",
+        "traffic",
+        "log",
+        "event_stream"
+      ]
+    },
+    "subject_type": {
+      "type": "string",
+      "enum": [
+        "tenant",
+        "human",
+        "nhi",
+        "system"
+      ]
+    },
+    "subject_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quantity": {
+      "type": "number",
+      "minimum": 0
+    },
+    "unit": {
+      "type": "string",
+      "enum": [
+        "seat",
+        "decision",
+        "concurrent_execution",
+        "decision_per_minute",
+        "event",
+        "byte",
+        "gb",
+        "count"
+      ]
+    },
+    "quota": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "quota_id": {
+          "type": "string"
+        },
+        "included_quantity": {
+          "type": "number",
+          "minimum": 0
+        },
+        "overage_quantity": {
+          "type": "number",
+          "minimum": 0
+        },
+        "soft_cap_exceeded": {
+          "type": "boolean"
+        },
+        "hard_cap_exceeded": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "dimensions": {
+      "type": "object"
+    },
+    "collected_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": false
+}

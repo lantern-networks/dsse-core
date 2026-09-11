@@ -1,0 +1,15 @@
+{
+  "status": "ok",
+  "created_at": "2026-05-26T16:18:00Z",
+  "source_report": "network_extension_would_steer_smoke_lab.json",
+  "rules_manifest": "network_extension_steering_rules_lab.json",
+  "protected_app_map": "protected_app_map_lab.json",
+  "runtime_installed": false,
+  "default_action": "deny",
+  "flow_count": 8,
+  "matched_count": 3,
+  "denied_count": 5,
+  "invalid_flow_count": 1,
+  "expectations_gate": "ok",
+  "secret_leak_gate": "ok"
+}

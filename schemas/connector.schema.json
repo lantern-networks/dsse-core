@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/connector.schema.json",
+  "title": "Connector",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "connector_group_id",
+    "name",
+    "edge_region_id",
+    "edge_cluster_id",
+    "application_ids",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "connector_group_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "edge_region_id": {
+      "type": "string"
+    },
+    "edge_cluster_id": {
+      "type": "string"
+    },
+    "application_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "connector_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "registered",
+        "healthy",
+        "degraded",
+        "offline",
+        "revoked"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_heartbeat_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

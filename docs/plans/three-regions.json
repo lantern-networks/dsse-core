@@ -1,0 +1,62 @@
+{
+  "deployment": "example.test",
+  "agent_publisher": "REPLACE_WITH_YOUR_PACKAGE_SIGNING_IDENTITY",
+  "mesh": true,
+  "regions": [
+    {
+      "id": "region-a",
+      "founding": true,
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "node-a",
+          "holds": [
+            "control-plane",
+            "edges"
+          ],
+          "addresses": [
+            "10.20.1.10"
+          ],
+          "reachable": "node-a.example.test",
+          "reachable_address": "10.20.1.10"
+        }
+      ]
+    },
+    {
+      "id": "region-b",
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "node-b",
+          "holds": [
+            "control-plane",
+            "edges"
+          ],
+          "addresses": [
+            "10.20.2.10"
+          ],
+          "reachable": "node-b.example.test",
+          "reachable_address": "10.20.2.10"
+        }
+      ]
+    },
+    {
+      "id": "region-c",
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "node-c",
+          "holds": [
+            "control-plane",
+            "edges"
+          ],
+          "addresses": [
+            "10.20.3.10"
+          ],
+          "reachable": "node-c.example.test",
+          "reachable_address": "10.20.3.10"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_tool.schema.json",
+  "title": "AgentTool",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "name",
+    "action_type",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "owner_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "publisher": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "signature_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "permission_profile": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "action_type": {
+      "type": "string"
+    },
+    "mcp_server_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "allowed_application_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_destinations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_data_classifications": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "human_approval_required": {
+      "type": "boolean"
+    },
+    "runtime_environment_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_used_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "inactive",
+        "revoked"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

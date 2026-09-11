@@ -1,0 +1,164 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/knownbypass"
+	"github.com/lantern-networks/dsse-core/logs"
+)
+
+// Predefined SaaS-catalog admin routes (read, signed feed apply/rollback, overrides).
+// Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
+func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer) {
+	mux.HandleFunc("GET /admin/predefined-catalog", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if config.CatalogOverrides == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
+			return
+		}
+		tenant := adminTenantIDFromRequest(r)
+		// Effective catalog = the applied signed feed if one is in force, else the built-in default.
+		cat := knownbypass.Catalog()
+		source := "builtin"
+		if config.CatalogFeed != nil {
+			cat = config.CatalogFeed.EffectiveCatalog()
+			if config.CatalogFeed.Status(time.Now().UTC()).Source == "feed" {
+				source = "feed"
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"version":                cat.Version,
+			"source":                 source,
+			"entries":                cat.Entries,
+			"overrides":              config.CatalogOverrides.List(tenant),
+			"effective_bypass_hosts": config.CatalogOverrides.EffectiveBypassHostsFrom(cat.Entries, tenant),
+		})
+	}))
+	// Signed predefined-catalog FEED admin: apply a vendor-signed catalog, view feed status + version history,
+	// and roll back to a prior version. The feed replaces the built-in default when valid; an invalid/older/
+	// expired feed is rejected and the current catalog is kept (last-known-good).
+	mux.HandleFunc("GET /admin/predefined-catalog/feed", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if config.CatalogFeed == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog feed is not configured on this edge"))
+			return
+		}
+		writeJSON(w, http.StatusOK, config.CatalogFeed.Status(time.Now().UTC()))
+	}))
+	mux.HandleFunc("POST /admin/predefined-catalog/feed", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if config.CatalogFeed == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog feed is not configured on this edge"))
+			return
+		}
+		// ★★ THE CATALOG IS THE NODE'S, AND A CUSTOMER COULD ROLL IT BACK (2026-08-18). The bypass catalog says
+		// which destinations are NOT decrypted; it is one document for the whole node, with no tenant in it, so
+		// changing it changes what is inspected for every organization on this Edge.
+		//
+		// Applying a feed is signature-verified and version-monotonic, which is a real wall. ROLLBACK has
+		// neither: it names a version already in the history and installs it, so a customer holding
+		// admin.policy.write — every tenant administrator — could put the deployment back onto an older bypass
+		// set. "Signed" was doing the work for one route and nothing for the one beside it.
+		//
+		// Gated here rather than by moving admin.policy.write, because the same scope carries the per-tenant
+		// OVERRIDES below, which are a customer's own choice about their own organization. Taking that away to
+		// close this would be closing an operator hole by removing a customer's right.
+		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
+			writeError(w, http.StatusForbidden, fmt.Errorf(
+				"the predefined catalog is one document for this deployment, not per organization, so it is the "+
+					"operator's to change; your organization's exceptions are at /admin/predefined-catalog/overrides"))
+			return
+		}
+		raw, err := io.ReadAll(io.LimitReader(r.Body, maxEdgeRuntimeJSONBodyBytes))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("read feed envelope: %w", err))
+			return
+		}
+		applied, err := config.CatalogFeed.Apply(raw, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if config.ApplyMaterializedCertPinBypass != nil {
+			config.ApplyMaterializedCertPinBypass(adminTenantIDFromRequest(r))
+		}
+		writeJSON(w, http.StatusOK, applied)
+	}))
+	mux.HandleFunc("POST /admin/predefined-catalog/feed/rollback", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if config.CatalogFeed == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog feed is not configured on this edge"))
+			return
+		}
+		// ★★ THE CATALOG IS THE NODE'S, AND A CUSTOMER COULD ROLL IT BACK (2026-08-18). The bypass catalog says
+		// which destinations are NOT decrypted; it is one document for the whole node, with no tenant in it, so
+		// changing it changes what is inspected for every organization on this Edge.
+		//
+		// Applying a feed is signature-verified and version-monotonic, which is a real wall. ROLLBACK has
+		// neither: it names a version already in the history and installs it, so a customer holding
+		// admin.policy.write — every tenant administrator — could put the deployment back onto an older bypass
+		// set. "Signed" was doing the work for one route and nothing for the one beside it.
+		//
+		// Gated here rather than by moving admin.policy.write, because the same scope carries the per-tenant
+		// OVERRIDES below, which are a customer's own choice about their own organization. Taking that away to
+		// close this would be closing an operator hole by removing a customer's right.
+		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
+			writeError(w, http.StatusForbidden, fmt.Errorf(
+				"the predefined catalog is one document for this deployment, not per organization, so it is the "+
+					"operator's to change; your organization's exceptions are at /admin/predefined-catalog/overrides"))
+			return
+		}
+		var body struct {
+			CatalogVersion int `json:"catalog_version"`
+		}
+		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode rollback request: %w", err))
+			return
+		}
+		applied, err := config.CatalogFeed.Rollback(body.CatalogVersion, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if config.ApplyMaterializedCertPinBypass != nil {
+			config.ApplyMaterializedCertPinBypass(adminTenantIDFromRequest(r))
+		}
+		writeJSON(w, http.StatusOK, applied)
+	}))
+	mux.HandleFunc("POST /admin/predefined-catalog/overrides", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if config.CatalogOverrides == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
+			return
+		}
+		var req knownbypass.Override
+		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("decode catalog override request: %w", err))
+			return
+		}
+		tenant := adminTenantIDFromRequest(r)
+		o, err := config.CatalogOverrides.Set(tenant, req, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if config.ApplyMaterializedCertPinBypass != nil {
+			config.ApplyMaterializedCertPinBypass(tenant)
+		}
+		writeJSON(w, http.StatusOK, o)
+	}))
+	mux.HandleFunc("POST /admin/predefined-catalog/overrides/{id}/clear", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if config.CatalogOverrides == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
+			return
+		}
+		tenant := adminTenantIDFromRequest(r)
+		id := strings.TrimSpace(r.PathValue("id"))
+		cleared := config.CatalogOverrides.Clear(tenant, id)
+		if config.ApplyMaterializedCertPinBypass != nil {
+			config.ApplyMaterializedCertPinBypass(tenant)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"entry_id": id, "cleared": cleared})
+	}))
+
+}

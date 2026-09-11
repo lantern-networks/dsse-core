@@ -1,0 +1,35 @@
+{
+  "id": "pol_lab_saas_slack_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Allow lab user to Slack SaaS catalog entry",
+  "priority": 120,
+  "conditions": {
+    "actor_type": "human",
+    "saas_application_id": "saas_slack",
+    "service_family": "https"
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "required_workload_attestation": false,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": null,
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "saas_application",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-31T13:20:24Z",
+  "metadata": {
+    "saas_catalog_required": true,
+    "saas_context_source": "policy_bundle_saas_catalog"
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "schema_version": "mvp_alpha_tls_metadata_harness_fixture.v1",
+  "harness_scope": "branch_a_metadata_flow_processing",
+  "source_preflight_gate": "m1469_branch_a_ready_without_cert_trust_ne_tcp_bind",
+  "harness_execution_mode": "local_metadata_fixture_no_tls_handshake",
+  "expected_claim_scope": "flow_tunneled_only",
+  "flows": [
+    {
+      "id": "tls_candidate_https_private_app",
+      "protocol": "tcp",
+      "service_family": "https",
+      "destination_port": 443,
+      "inspection_profile_id": "ip_tls_readiness_lab",
+      "inspection_mode": "tls_readiness",
+      "trust_profile_id": "tp_lab_managed_browser_001",
+      "tenant_root_ca_id": "trca_lab_001",
+      "sni_category": "private_app_fqdn_category",
+      "alpn_categories": [
+        "http_1_1"
+      ],
+      "expected_harness_decision": "metadata_ready",
+      "expected_transport_recommendation": "tcp_tls",
+      "expected_tls_runtime_required": false,
+      "expected_tls_interception_claimed": false,
+      "expected_certificate_issuance_claimed": false
+    },
+    {
+      "id": "quic_candidate_private_app",
+      "protocol": "udp",
+      "service_family": "quic",
+      "destination_port": 443,
+      "inspection_profile_id": "ip_tls_readiness_lab",
+      "inspection_mode": "tls_readiness",
+      "trust_profile_id": "tp_lab_managed_browser_001",
+      "tenant_root_ca_id": "trca_lab_001",
+      "sni_category": "private_app_fqdn_category",
+      "alpn_categories": [
+        "h3"
+      ],
+      "quic_policy_mode": "prefer_tcp_tls",
+      "quic_policy_action": "tcp_tls_required",
+      "expected_harness_decision": "metadata_ready",
+      "expected_transport_recommendation": "tcp_tls",
+      "expected_quic_policy_signal": "tcp_tls_required",
+      "expected_tls_runtime_required": false,
+      "expected_tls_interception_claimed": false,
+      "expected_certificate_issuance_claimed": false
+    }
+  ],
+  "generates_certificate_material": false,
+  "applies_trust_store": false,
+  "runs_tls_handshake": false,
+  "runs_network_listener": false,
+  "runs_network_extension_runtime": false,
+  "runs_tls_interception_runtime": false,
+  "contains_raw_tls_material": false,
+  "contains_secret_material": false,
+  "contains_endpoint_values": false,
+  "creates_human_boundary": false
+}

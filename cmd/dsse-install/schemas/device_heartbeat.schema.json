@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/device_heartbeat.schema.json",
+  "title": "DeviceHeartbeat",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "agent_version",
+    "device_trust_level",
+    "policy_bundle_id",
+    "policy_bundle_version",
+    "status",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "agent_version": {
+      "type": "string"
+    },
+    "device_trust_level": {
+      "type": "string",
+      "enum": [
+        "managed",
+        "unmanaged",
+        "unknown"
+      ]
+    },
+    "policy_bundle_id": {
+      "type": "string"
+    },
+    "policy_bundle_version": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "healthy",
+        "degraded",
+        "offline",
+        "revoked"
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

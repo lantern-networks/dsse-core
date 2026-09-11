@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_poc_acceptance_summary.schema.json",
+  "title": "AgentPoCAcceptanceSummary",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "checklist_schema_version",
+    "target_platform",
+    "tenant_id",
+    "device_id",
+    "target_agent_version",
+    "quality_status",
+    "support_bundle_verified",
+    "dry_run",
+    "status",
+    "step_counts",
+    "evidence_steps",
+    "blocked_steps",
+    "incomplete_steps",
+    "skipped_steps",
+    "excluded_steps"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "checklist_schema_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target_platform": {
+      "type": "string",
+      "enum": [
+        "all",
+        "macos",
+        "windows"
+      ]
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "device_id": {
+      "type": "string"
+    },
+    "target_agent_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quality_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "support_bundle_verified": {
+      "type": "boolean"
+    },
+    "dry_run": {
+      "type": "boolean",
+      "description": "Whether this acceptance summary was generated from a dry-run PoC results rehearsal rather than a real endpoint PoC."
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "accepted",
+        "accepted_with_exceptions",
+        "incomplete",
+        "blocked"
+      ]
+    },
+    "step_counts": {
+      "type": "object",
+      "required": [
+        "total",
+        "not_started",
+        "completed",
+        "skipped",
+        "blocked"
+      ],
+      "properties": {
+        "total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_started": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "skipped": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blocked": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "blocked_steps": {
+      "$ref": "#/$defs/step_refs"
+    },
+    "evidence_steps": {
+      "$ref": "#/$defs/step_refs"
+    },
+    "incomplete_steps": {
+      "$ref": "#/$defs/step_refs"
+    },
+    "skipped_steps": {
+      "$ref": "#/$defs/step_refs"
+    },
+    "excluded_steps": {
+      "$ref": "#/$defs/step_refs"
+    }
+  },
+  "$defs": {
+    "step_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "phase_id",
+          "id",
+          "title"
+        ],
+        "properties": {
+          "phase_id": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "not_started",
+              "completed",
+              "skipped",
+              "blocked"
+            ]
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "result_note": {
+            "type": "string"
+          },
+          "evidence_observed": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

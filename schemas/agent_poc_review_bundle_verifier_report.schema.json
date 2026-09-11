@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_poc_review_bundle_verifier_report.schema.json",
+  "title": "AgentPoCReviewBundleVerifierReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "archive",
+    "archive_sha256",
+    "package_name",
+    "manifest_created_at",
+    "files_checked",
+    "readme_present",
+    "artifact_report_status",
+    "artifact_default_leak_gate",
+    "artifact_default_forbidden_marker_count",
+    "support_bundle_default_leak_gate",
+    "support_bundle_default_forbidden_marker_count",
+    "support_bundle_forbidden_pattern_configured",
+    "support_bundle_forbidden_pattern_gate",
+    "support_bundle_macos_system_proxy_steering_smoke_status",
+    "support_bundle_macos_system_proxy_steering_smoke_verified",
+    "poc_results_support_bundle_default_leak_gate",
+    "poc_results_support_bundle_default_forbidden_marker_count",
+    "poc_results_support_bundle_forbidden_pattern_configured",
+    "poc_results_support_bundle_forbidden_pattern_gate",
+    "poc_results_support_bundle_macos_system_proxy_steering_smoke_status",
+    "poc_results_support_bundle_macos_system_proxy_steering_smoke_verified",
+    "poc_results_default_leak_gate",
+    "poc_results_default_forbidden_marker_count",
+    "poc_results_archive",
+    "poc_results_archive_sha256",
+    "poc_results_is_dry_run",
+    "poc_results_evidence_step_count",
+    "poc_results_report_present",
+    "acceptance_status",
+    "target_platform",
+    "progress_doc_count",
+    "schema_count",
+    "sample_count"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "archive": {
+      "type": "string"
+    },
+    "archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the verified review bundle tarball."
+    },
+    "package_name": {
+      "type": "string"
+    },
+    "manifest_created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "readme_present": {
+      "type": "boolean",
+      "const": true
+    },
+    "artifact_report_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "artifact_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "artifact_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "support_bundle_forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "support_bundle_macos_system_proxy_steering_smoke_status": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "planned",
+        "ok"
+      ]
+    },
+    "support_bundle_macos_system_proxy_steering_smoke_verified": {
+      "type": "boolean"
+    },
+    "poc_results_support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "poc_results_support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "poc_results_support_bundle_forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "poc_results_support_bundle_forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "poc_results_support_bundle_macos_system_proxy_steering_smoke_status": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "planned",
+        "ok"
+      ]
+    },
+    "poc_results_support_bundle_macos_system_proxy_steering_smoke_verified": {
+      "type": "boolean"
+    },
+    "poc_results_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "poc_results_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "poc_results_archive": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^agent_poc_results_[0-9]{8}T[0-9]{6}Z\\.tar\\.gz$"
+    },
+    "poc_results_archive_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "poc_results_is_dry_run": {
+      "type": "boolean",
+      "description": "True when the bundled PoC results verifier report marks the archive as a dry-run rehearsal."
+    },
+    "poc_results_evidence_step_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "poc_results_report_present": {
+      "type": "boolean"
+    },
+    "acceptance_status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "accepted",
+        "accepted_with_exceptions",
+        "incomplete",
+        "blocked",
+        null
+      ]
+    },
+    "target_platform": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "all",
+        "macos",
+        "windows",
+        null
+      ]
+    },
+    "progress_doc_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "schema_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false
+}

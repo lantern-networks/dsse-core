@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/connector_tunnel.schema.json",
+  "title": "ConnectorTunnel",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "connector_id",
+    "edge_region_id",
+    "edge_cluster_id",
+    "protocol",
+    "status",
+    "connected_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "connector_id": {
+      "type": "string"
+    },
+    "edge_region_id": {
+      "type": "string"
+    },
+    "edge_cluster_id": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "string",
+      "enum": [
+        "websocket_tls"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "connected",
+        "reconnecting",
+        "disconnected",
+        "closed"
+      ]
+    },
+    "connected_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "last_heartbeat_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "disconnected_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "reconnect_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "stream_multiplexing_mode": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "single_stream_lab",
+        "logical_stream_id",
+        null
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

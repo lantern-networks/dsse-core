@@ -1,0 +1,22 @@
+{
+  "id": "audit_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "actor_user_id": null,
+  "actor_nhi_id": null,
+  "event_type": "policy_bundle_loaded",
+  "target_type": "policy_bundle",
+  "target_id": "pb_lab_20260522_001",
+  "action": "load",
+  "result": "success",
+  "reason": "Local Edge loaded standard policy bundle.",
+  "access_decision_id": null,
+  "policy_id": null,
+  "policy_bundle_id": "pb_lab_20260522_001",
+  "edge_region_id": "local",
+  "edge_cluster_id": "local-edge-001",
+  "session_id": null,
+  "authentication_event_id": null,
+  "source_ip": "127.0.0.1",
+  "timestamp": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

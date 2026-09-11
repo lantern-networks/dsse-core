@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/macos_system_proxy_steering_smoke.schema.json",
+  "title": "MacOSSystemProxySteeringSmoke",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "created_at",
+    "base_url",
+    "local_proxy_listen",
+    "protected_app_map",
+    "connector_id",
+    "steering_host",
+    "request_url",
+    "network_service",
+    "pac_file",
+    "pac_decision",
+    "pac_resolution_report",
+    "macos_system_proxy_script",
+    "macos_system_proxy_plan",
+    "plan_only",
+    "system_proxy_apply_requested",
+    "system_proxy_applied",
+    "steering_attempted",
+    "steering_succeeded",
+    "steering_failed",
+    "connect_unsupported"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "planned",
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "base_url": {
+      "type": "string"
+    },
+    "local_proxy_listen": {
+      "type": "string"
+    },
+    "protected_app_map": {
+      "type": "string"
+    },
+    "connector_id": {
+      "type": "string"
+    },
+    "steering_host": {
+      "type": "string"
+    },
+    "request_url": {
+      "type": "string",
+      "pattern": "^https?://"
+    },
+    "network_service": {
+      "type": "string"
+    },
+    "pac_file": {
+      "type": "string"
+    },
+    "pac_decision": {
+      "type": "string",
+      "pattern": "^PROXY .+"
+    },
+    "pac_resolution_report": {
+      "type": "string"
+    },
+    "macos_system_proxy_script": {
+      "type": "string"
+    },
+    "macos_system_proxy_plan": {
+      "type": "string"
+    },
+    "plan_only": {
+      "type": "boolean"
+    },
+    "system_proxy_apply_requested": {
+      "type": "boolean"
+    },
+    "system_proxy_applied": {
+      "type": "boolean"
+    },
+    "request_command": {
+      "type": "string"
+    },
+    "request_exit_code": {
+      "type": "integer"
+    },
+    "request_transport": {
+      "type": "string",
+      "enum": [
+        "system_pac_http_proxy",
+        "system_pac_https_connect"
+      ],
+      "description": "Transport path used by macos_system_proxy_request.py. HTTPS reports use CONNECT and then a plaintext lab probe inside the tunnel."
+    },
+    "request_http_status": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "request_connect_status_line": {
+      "type": "string"
+    },
+    "request_tunnel_probe": {
+      "type": "string",
+      "enum": [
+        "plaintext_http_after_connect",
+        "not_sent"
+      ]
+    },
+    "request_stdout": {
+      "type": "string"
+    },
+    "request_stderr": {
+      "type": "string"
+    },
+    "steering_attempted": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steering_succeeded": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "steering_failed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "connect_unsupported": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of HTTPS CONNECT requests that reached localproxy but were rejected as unsupported. HTTPS CONNECT-capable reports must keep this at zero."
+    }
+  },
+  "additionalProperties": false
+}

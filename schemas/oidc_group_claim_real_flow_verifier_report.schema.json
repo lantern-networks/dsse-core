@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/oidc_group_claim_real_flow_verifier_report.schema.json",
+  "title": "OIDCGroupClaimRealFlowVerifierReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "created_at",
+    "session_report",
+    "decision_report",
+    "issuer",
+    "group_claim_name",
+    "expected_group",
+    "group_present",
+    "strict_group_claim_confirmed",
+    "session_id",
+    "tenant_id",
+    "user_id",
+    "auth_method",
+    "decision_id",
+    "decision",
+    "policy_id",
+    "application_id",
+    "matched_user_groups_condition",
+    "secret_leak_gate"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "session_report": {
+      "type": "string"
+    },
+    "decision_report": {
+      "type": "string"
+    },
+    "idp_name": {
+      "type": "string"
+    },
+    "issuer": {
+      "type": "string",
+      "pattern": "^https?://"
+    },
+    "group_claim_name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "expected_group": {
+      "type": "string",
+      "minLength": 1
+    },
+    "group_present": {
+      "type": "boolean",
+      "const": true
+    },
+    "strict_group_claim_confirmed": {
+      "type": "boolean",
+      "const": true
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "tenant_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "user_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "auth_method": {
+      "type": "string",
+      "enum": [
+        "oidc_authorization_code"
+      ]
+    },
+    "decision_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "decision": {
+      "type": "string",
+      "enum": [
+        "allow"
+      ]
+    },
+    "policy_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "application_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "matched_user_groups_condition": {
+      "type": "boolean",
+      "const": true
+    },
+    "secret_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

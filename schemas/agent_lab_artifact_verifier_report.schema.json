@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/agent_lab_artifact_verifier_report.schema.json",
+  "title": "AgentLabArtifactVerifierReport",
+  "type": "object",
+  "required": [
+    "status",
+    "created_at",
+    "archive",
+    "archive_sha256",
+    "package_name",
+    "manifest_created_at",
+    "files_checked",
+    "smoke_status",
+    "smoke_verifier_status",
+    "quality_status",
+    "quality_access_decisions_total",
+    "quality_access_decisions_with_connector",
+    "poc_checklist_status",
+    "default_leak_gate",
+    "default_forbidden_marker_count",
+    "support_bundle_name",
+    "support_bundle_sha256",
+    "support_bundle_default_leak_gate",
+    "support_bundle_default_forbidden_marker_count",
+    "support_bundle_forbidden_pattern_configured",
+    "support_bundle_forbidden_pattern_gate",
+    "support_bundle_macos_system_proxy_steering_smoke_status",
+    "support_bundle_macos_system_proxy_steering_smoke_verified"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "archive": {
+      "type": "string"
+    },
+    "archive_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "SHA-256 of the verified Agent Lab artifact tarball."
+    },
+    "package_name": {
+      "type": "string"
+    },
+    "manifest_created_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "files_checked": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "smoke_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "smoke_verifier_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "quality_status": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "quality_access_decisions_total": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "quality_access_decisions_with_connector": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "poc_checklist_status": {
+      "type": "string",
+      "enum": [
+        "ready"
+      ]
+    },
+    "default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ],
+      "description": "Whether the verifier scanned the Agent Lab artifact package with its built-in local path and secret marker denylist."
+    },
+    "default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_name": {
+      "type": "string"
+    },
+    "support_bundle_sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "support_bundle_default_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "support_bundle_default_forbidden_marker_count": {
+      "type": "integer",
+      "minimum": 4
+    },
+    "support_bundle_forbidden_pattern_configured": {
+      "type": "boolean"
+    },
+    "support_bundle_forbidden_pattern_gate": {
+      "type": "string",
+      "enum": [
+        "not_configured",
+        "ok"
+      ]
+    },
+    "support_bundle_macos_system_proxy_steering_smoke_status": {
+      "type": "string",
+      "enum": [
+        "not_collected",
+        "planned",
+        "ok"
+      ]
+    },
+    "support_bundle_macos_system_proxy_steering_smoke_verified": {
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false
+}

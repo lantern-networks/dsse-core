@@ -1,0 +1,49 @@
+{
+  "id": "export_task_lab_001",
+  "tenant_id": "tenant_lab",
+  "export_job_id": "export_lab_001",
+  "created_by_admin_principal_id": "admin_user_lab_001",
+  "idempotency_key": "export_job:tenant_lab:export_lab_001:2026-05-23T01:00:00Z",
+  "stream": "access",
+  "format": "ndjson",
+  "filters": {
+    "application_id": "app_dummy_ssh"
+  },
+  "from": "2026-05-23T00:00:00Z",
+  "to": "2026-05-23T01:00:00Z",
+  "limit": 1000000,
+  "output_ref_prefix": "evidence://tenant/tenant_lab/exports/2026/05/23/",
+  "requested_at": "2026-05-23T01:00:00Z",
+  "started_at": null,
+  "lease_expires_at": null,
+  "timeout_seconds": 3600,
+  "cancel_check_interval_rows": 1000,
+  "retry_policy": {
+    "retryable_error_codes": [
+      "worker_context_cancelled",
+      "object_store_timeout",
+      "hot_store_timeout",
+      "temporary_write_failed"
+    ],
+    "non_retryable_error_codes": [
+      "cancelled",
+      "invalid_object_ref",
+      "invalid_local_filename",
+      "query_failed",
+      "write_failed"
+    ],
+    "backoff_seconds": [
+      30,
+      120,
+      300
+    ]
+  },
+  "attempt": 0,
+  "max_attempts": 3,
+  "status": "queued",
+  "trace_id": "trace_export_lab_001",
+  "source_ip": "127.0.0.1",
+  "metadata": {
+    "worker_mode": "phase1_sync_boundary"
+  }
+}

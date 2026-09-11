@@ -1,0 +1,48 @@
+{
+  "id": "pol_lab_nhi_tool_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Allow delegated SOC agent to create incident ticket",
+  "priority": 80,
+  "conditions": {
+    "actor_type": "delegated_agent",
+    "actor_nhi_id": "nhi_soc_agent_001",
+    "delegated_access_grant_id": "dag_lab_001",
+    "tool_id": "tool_ticket_create_001",
+    "tool_action_type": "ticket:create",
+    "human_approval_event_id": "hae_lab_001",
+    "data_classification": "confidential"
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": true,
+  "required_human_approval": true,
+  "required_workload_attestation": true,
+  "allowed_task_purposes": [
+    "incident_response"
+  ],
+  "allowed_tool_ids": [
+    "tool_ticket_create_001"
+  ],
+  "allowed_tool_actions": [
+    "ticket:create"
+  ],
+  "allowed_context_scope_ids": [
+    "ctx_incident_lab_001"
+  ],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [
+    "confidential"
+  ],
+  "inspection_profile_id": null,
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "mcp_server",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "result_summary_scope": "metadata_only"
+  }
+}

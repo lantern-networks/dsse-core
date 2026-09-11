@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/protected_app_map.schema.json",
+  "title": "ProtectedAppMap",
+  "type": "object",
+  "required": [
+    "tenant_id",
+    "version",
+    "applications"
+  ],
+  "properties": {
+    "tenant_id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "applications": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "application_id",
+          "fqdn",
+          "service_family",
+          "destination_port",
+          "steering_mode"
+        ],
+        "properties": {
+          "application_id": {
+            "type": "string"
+          },
+          "fqdn": {
+            "type": "string"
+          },
+          "service_family": {
+            "type": "string"
+          },
+          "destination_port": {
+            "type": "integer"
+          },
+          "steering_mode": {
+            "type": "string",
+            "enum": [
+              "explicit_proxy",
+              "pac",
+              "system_proxy",
+              "network_extension"
+            ]
+          },
+          "connector_group_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metadata": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

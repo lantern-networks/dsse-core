@@ -1,0 +1,32 @@
+{
+  "id": "alog_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "access_decision_id": "dec_lab_001",
+  "session_id": "sess_lab_001",
+  "user_id": "user_lab_001",
+  "subject_user_id": "user_lab_001",
+  "actor_type": "human",
+  "actor_nhi_id": null,
+  "delegated_access_grant_id": null,
+  "human_approval_event_id": null,
+  "agent_task_session_id": null,
+  "tool_id": null,
+  "tool_action_type": null,
+  "mcp_server_id": null,
+  "runtime_environment_id": null,
+  "device_id": "dev_lab_001",
+  "application_id": "app_dummy_https",
+  "source_ip": "127.0.0.1",
+  "destination": "dummy-private-app.local",
+  "service_family": "https",
+  "decision": "allow",
+  "reason_codes": [
+    "policy_matched",
+    "application_allowed"
+  ],
+  "edge_region_id": "local",
+  "edge_cluster_id": "local-edge-001",
+  "connector_id": null,
+  "timestamp": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

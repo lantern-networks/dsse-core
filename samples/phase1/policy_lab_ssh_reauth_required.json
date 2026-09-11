@@ -1,0 +1,37 @@
+{
+  "id": "pol_lab_ssh_reauth_required_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Require reauthentication for stale SSH session",
+  "priority": 90,
+  "conditions": {
+    "actor_type": "human",
+    "application_id": "app_dummy_ssh",
+    "service_family": "ssh",
+    "auth_age_seconds": {
+      "op": "gte",
+      "value": 901
+    }
+  },
+  "action": {
+    "decision": "require_reauthentication"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": null,
+  "service_family": "ssh",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "ssh_server",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "reauth_interval_seconds": 900
+  }
+}

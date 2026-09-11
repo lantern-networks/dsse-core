@@ -1,0 +1,32 @@
+# built binaries (never commit compiled output to the source repo)
+/dsse-edge
+/dsse-cp
+/dsse-connector
+/dsse-connector-install
+/steer.exe
+*.exe
+*.out
+# accidental duplicate copies
+* 2/
+* 2
+
+# ★★★ BUILD OUTPUT AND SIGNING MATERIAL, BECAUSE THE PACKAGING SCRIPTS TELL YOU TO PUT IT HERE
+# (2026-09-04, found while moving the macOS packaging lane into this tree). build_macos_ne_app.sh looks for
+# app.provisionprofile and systemextension.provisionprofile in <tree>/var/
+
+# ★ AND WHERE THE WINDOWS BUILD PUTS ITS OUTPUT (2026-09-04). build-msi.ps1 used to write two directories
+# ABOVE this tree, which is the monorepo root here and somebody's home directory for a receiver who unpacked
+# the tree on its own. It writes inside now, so this tree has to say the output is not source.
+/outputs/signing — Apple credentials, issued
+# to whoever builds this — and the packagers write their artifacts to <tree>/var. In the monorepo an outer
+# .gitignore covered this path; that file does not travel with the published tree, so a receiver following the
+# instructions would have had git track their own signing material.
+/var/
+
+# ★ AND WHERE THE WINDOWS BUILD PUTS ITS OUTPUT (2026-09-04). build-msi.ps1 used to write two directories
+# ABOVE this tree, which is the monorepo root here and somebody's home directory for a receiver who unpacked
+# the tree on its own. It writes inside now, so this tree has to say the output is not source.
+/outputs/
+
+# Built by `go build` in that directory; the published tree carries source, not binaries.
+clients/windows-wfp/packaging/cmd/profileapply/profileapply

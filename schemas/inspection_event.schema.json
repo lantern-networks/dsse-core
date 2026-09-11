@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/inspection_event.schema.json",
+  "title": "InspectionEvent",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "access_decision_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_call_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "device_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inspection_profile_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "inspection_mode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "content_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "finding_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "severity": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload_stored": {
+      "type": "boolean"
+    },
+    "payload_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "masked": {
+      "type": "boolean"
+    },
+    "retention_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload_storage_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "not_stored_metadata_only",
+        "payload_reference_only",
+        "post_mvp_payload_storage",
+        null
+      ]
+    },
+    "masking_policy_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "masked_metadata_only",
+        "masking_required",
+        "not_applicable",
+        null
+      ]
+    },
+    "retention_policy_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "metadata_retention",
+        "payload_reference_retention",
+        "post_mvp_retention_policy",
+        null
+      ]
+    },
+    "inspection_event_execution_scope": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "metadata_event_contract_only",
+        "metadata_inspection_event_only",
+        "post_mvp_tls_event",
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

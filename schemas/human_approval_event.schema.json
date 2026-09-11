@@ -1,0 +1,138 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/human_approval_event.schema.json",
+  "title": "HumanApprovalEvent",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "approval_source",
+    "approval_result",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "approval_source": {
+      "type": "string"
+    },
+    "approver_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_nhi_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delegated_access_grant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_task_session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "audience": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resource": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "action_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "requested_scopes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "approval_result": {
+      "type": "string",
+      "enum": [
+        "approved",
+        "denied",
+        "expired",
+        "revoked"
+      ]
+    },
+    "evidence_link": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "activated_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

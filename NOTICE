@@ -1,0 +1,30 @@
+dsse-core
+Copyright 2026 Lantern Networks, Inc.
+
+This product includes software developed at Lantern Networks, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this file except in compliance with the License. You may obtain a copy of the
+License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed
+under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+CONDITIONS OF ANY KIND, either express or implied. See the License for the
+specific language governing permissions and limitations under the License.
+
+--------------------------------------------------------------------------------
+
+Third-party components
+
+  third_party/fhttp
+    A vendored fork of github.com/bogdanfinn/fhttp v0.6.8, itself derived from
+    the Go standard library's net/http. Those files carry
+    "Copyright The Go Authors. All rights reserved." and are governed by a
+    BSD-style licence. DSSE_PATCH.md in that directory records the single change
+    made against upstream v0.6.8.
+
+    NOTE: the upstream LICENSE file is not currently present in that directory
+    and must be restored before redistribution — see the publication checklist
+    in the project's internal docs/oss_scope.md.

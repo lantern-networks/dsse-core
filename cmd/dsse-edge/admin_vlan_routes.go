@@ -1,0 +1,105 @@
+package main
+
+// VLAN Boundary Enforcement admin routes (Named Networks / Subnet objects +
+// inter-VLAN boundary policies + the agentless-firewall export), moved verbatim out of
+// newServerWithConfig (Phase 2 route-registration split). Parameter names match the
+// constructor's locals so the handler bodies are untouched.
+
+import (
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/vlan"
+)
+
+func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, vlanBoundary *vlan.Store, configSourceURL string) {
+	mux.HandleFunc("POST /admin/vlan-objects", adminEndpoint("admin.vlan.write", func(w http.ResponseWriter, r *http.Request) {
+		if configWriteRejectedWhenSourced(w, configSourceURL, "VLAN objects") {
+			return
+		}
+		var o model.VLANObject
+		if err := decodeLimitedJSONBody(w, r, &o, maxEdgeRuntimeJSONBodyBytes); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+			return
+		}
+		// The organization comes from the CALLER, never from the body: a body-supplied tenant_id let a
+		// customer file an object under another organization's name. An operator may still author on behalf of
+		// an organization, which is what X-Operate-Tenant already means and adminTenantIDFromRequest resolves.
+		tenantForWrite, terr := adminTenantForWrite(r, o.TenantID)
+		if terr != nil {
+			writeError(w, http.StatusForbidden, terr)
+			return
+		}
+		o.TenantID = tenantForWrite
+		saved, err := vlanBoundary.UpsertObject(o)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, saved)
+	}))
+	mux.HandleFunc("GET /admin/vlan-objects", adminEndpoint("admin.vlan.read", func(w http.ResponseWriter, r *http.Request) {
+		callerTenant, isOperator := adminVLANCallerTenant(r)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"objects": vlanObjectsVisibleTo(vlanBoundary.ListObjects(), callerTenant, isOperator),
+		})
+	}))
+	mux.HandleFunc("DELETE /admin/vlan-objects/{object_id}", adminEndpoint("admin.vlan.write", func(w http.ResponseWriter, r *http.Request) {
+		if configWriteRejectedWhenSourced(w, configSourceURL, "VLAN objects") {
+			return
+		}
+		id := r.PathValue("object_id")
+		// ★ An id is not a permission. Resolve it first and answer ABSENT when it belongs to somebody else:
+		// a 403 would confirm the id exists, and this route deleted another organization's object with a 200.
+		callerTenant, isOperator := adminVLANCallerTenant(r)
+		if existing, ok := vlanBoundary.GetObject(id); ok && !vlanObjectVisibleTo(existing, callerTenant, isOperator) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("vlan object %q is absent", id))
+			return
+		}
+		if !vlanBoundary.DeleteObject(id) {
+			writeError(w, http.StatusNotFound, fmt.Errorf("vlan object %q is absent", id))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+	}))
+	mux.HandleFunc("POST /admin/vlan-boundary-policies", adminEndpoint("admin.vlan.write", func(w http.ResponseWriter, r *http.Request) {
+		if configWriteRejectedWhenSourced(w, configSourceURL, "VLAN boundary policies") {
+			return
+		}
+		var p model.VLANBoundaryPolicy
+		if err := decodeLimitedJSONBody(w, r, &p, maxEdgeRuntimeJSONBodyBytes); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+			return
+		}
+		tenantForWrite, terr := adminTenantForWrite(r, p.TenantID)
+		if terr != nil {
+			writeError(w, http.StatusForbidden, terr)
+			return
+		}
+		p.TenantID = tenantForWrite
+		saved, err := vlanBoundary.UpsertPolicy(p)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, saved)
+	}))
+	mux.HandleFunc("GET /admin/vlan-boundary-policies", adminEndpoint("admin.vlan.read", func(w http.ResponseWriter, r *http.Request) {
+		callerTenant, isOperator := adminVLANCallerTenant(r)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"policies": vlanPoliciesVisibleTo(vlanBoundary.ListPolicies(), callerTenant, isOperator),
+		})
+	}))
+	mux.HandleFunc("GET /admin/vlan-boundary-policies/export", adminEndpoint("admin.vlan.read", func(w http.ResponseWriter, r *http.Request) {
+		// The export is what somebody pastes into a firewall. Built from the caller's own definitions only —
+		// an export carrying another organization's subnets is that organization's network map leaving with it.
+		callerTenant, isOperator := adminVLANCallerTenant(r)
+		export := vlan.BuildBoundaryExport(
+			vlanObjectsVisibleTo(vlanBoundary.ListObjects(), callerTenant, isOperator),
+			vlanPoliciesVisibleTo(vlanBoundary.ListPolicies(), callerTenant, isOperator),
+			time.Now().UTC().Format(time.RFC3339))
+		writeJSON(w, http.StatusOK, export)
+	}))
+}

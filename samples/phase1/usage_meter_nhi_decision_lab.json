@@ -1,0 +1,34 @@
+{
+  "id": "usage_nhi_decision_202605_lab",
+  "tenant_id": "tenant_lab_001",
+  "schema_version": "usage_meter.v1",
+  "period_start": "2026-05-01T00:00:00Z",
+  "period_end": "2026-06-01T00:00:00Z",
+  "meter_type": "decision",
+  "subject_type": "nhi",
+  "subject_id": "nhi_soc_agent_001",
+  "quantity": 125000,
+  "unit": "decision",
+  "quota": {
+    "quota_id": "core_decision_quota",
+    "included_quantity": 5000000,
+    "overage_quantity": 0,
+    "soft_cap_exceeded": false,
+    "hard_cap_exceeded": false
+  },
+  "dimensions": {
+    "actor_type": "nhi",
+    "actor_nhi_id": "nhi_soc_agent_001",
+    "event_plane": "access",
+    "source_stream": "decision_traces",
+    "human_seat_count": 50,
+    "decision_quota_basis": "human_seat",
+    "decision_unit": 100000
+  },
+  "collected_at": "2026-05-24T00:00:00Z",
+  "metadata": {
+    "pricing_model": "core_observed_decision_quota_initial_hypothesis",
+    "nhi_billing_treatment": "governance_subject_not_billable_seat",
+    "billing_action": "observe_only"
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "status": "ok",
+  "created_at": "2026-05-25T12:50:00Z",
+  "base_url": "http://127.0.0.1:18093",
+  "artifacts": {
+    "agent_config": "var/agent-lab-smoke/agent_config.json",
+    "protected_app_map": "var/agent-lab-smoke/protected_app_map.json",
+    "network_extension_rules": "var/agent-lab-smoke/network_extension_steering_rules.json",
+    "pac_file": "var/agent-lab-smoke/dsse_agent.pac",
+    "macos_system_proxy_script": "var/agent-lab-smoke/apply_macos_system_proxy.sh",
+    "macos_system_proxy_plan": "var/agent-lab-smoke/macos_system_proxy_plan.txt",
+    "mobileconfig": "var/agent-lab-smoke/agent.mobileconfig",
+    "launchd_plist": "var/agent-lab-smoke/com.example.dsse.localclient.plist",
+    "launchd_uninstall_script": "var/agent-lab-smoke/uninstall_dsse_launchd.sh",
+    "windows_service_script": "var/agent-lab-smoke/install_dsse_localclient.ps1",
+    "windows_service_uninstall_script": "var/agent-lab-smoke/uninstall_dsse_localclient.ps1",
+    "support_bundle": "var/agent-lab-smoke/support_bundle_20260525T125000Z.tar.gz"
+  },
+  "doctor": {
+    "status": "ok",
+    "runtime_secret_source": "file"
+  },
+  "preflight": {
+    "status": "ok",
+    "config_directory_permissions_gate": "ok",
+    "config_directory_path_guard_gate": "ok",
+    "config_directory_symlink_guard_gate": "ok",
+    "config_directory_owner_group_gate": "not_enforced",
+    "config_directory_checked_path_count": 4
+  },
+  "cache": {
+    "status": "ok",
+    "tenant_id": "tenant_lab_001",
+    "device_id": "dev_lab_001",
+    "target_agent_version": "0.1.1"
+  },
+  "local_proxy_steering": {
+    "status": "ok",
+    "created_at": "2026-05-25T12:49:30Z",
+    "local_proxy_metrics_url": "http://127.0.0.1:18096/metrics",
+    "steering_host": "dummy-private-app.local",
+    "pac_decision": "PROXY 127.0.0.1:18096",
+    "pac_resolution_report": "local_proxy_pac_resolution.json",
+    "steering_attempted": 1,
+    "steering_succeeded": 1,
+    "steering_failed": 0,
+    "connect_unsupported": 0
+  },
+  "support_bundle_verifier": {
+    "status": "ok",
+    "archive": "support_bundle_20260525T125000Z.tar.gz",
+    "cache_verified": true,
+    "default_leak_gate": "ok",
+    "default_forbidden_marker_count": 4,
+    "forbidden_pattern_configured": true,
+    "forbidden_pattern_gate": "ok",
+    "files_checked": 11
+  },
+  "quality": {
+    "quality_status": "ok",
+    "quality_reasons": [],
+    "access_decisions": {
+      "total": 1,
+      "decision_counts": {
+        "allow": 1
+      },
+      "application_counts": {
+        "app_dummy_https": 1
+      },
+      "service_family_counts": {
+        "https": 1
+      },
+      "allowed_events": 1,
+      "with_connector": 1,
+      "allow_rate": 1.0
+    }
+  }
+}

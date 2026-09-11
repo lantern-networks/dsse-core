@@ -1,0 +1,17 @@
+{
+  "schema_version": "2026-05-24.1",
+  "tenant_id": "tenant_lab_001",
+  "event_plane": "evidence",
+  "stream": "tool_call_events",
+  "event_type": "tool_call_event_recorded",
+  "outbox_id": "domain_outbox_tool_call_lab_001",
+  "object_ref": "domain-events/tenant_lab_001/evidence/2026/05/24/domain_outbox_tool_call_lab_001.ndjson.gz",
+  "object_checksum": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "payload_checksum": "sha256:13ca93bb77c4c11e315c4b475b66f57b30dd74928f594d982195c2cf518ee66d",
+  "format": "ndjson",
+  "compression": "gzip",
+  "row_count": 1,
+  "occurred_at": "2026-05-24T03:00:00Z",
+  "received_at": "2026-05-24T03:00:01Z",
+  "created_at": "2026-05-24T03:00:02Z"
+}

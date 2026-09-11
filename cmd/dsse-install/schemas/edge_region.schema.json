@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/edge_region.schema.json",
+  "title": "EdgeRegion",
+  "type": "object",
+  "required": [
+    "id",
+    "name",
+    "country_code",
+    "jurisdiction",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "country": {
+      "type": "string"
+    },
+    "country_code": {
+      "type": "string"
+    },
+    "jurisdiction": {
+      "type": "string"
+    },
+    "region_group": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "default_log_region": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "default_key_region": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_plane_allowed": {
+      "type": "boolean"
+    },
+    "control_plane_allowed": {
+      "type": "boolean"
+    },
+    "provider": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_residency_class": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

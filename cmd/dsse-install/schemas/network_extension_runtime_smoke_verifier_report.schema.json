@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/network_extension_runtime_smoke_verifier_report.schema.json",
+  "title": "NetworkExtensionRuntimeSmokeVerifierReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "created_at",
+    "source_report",
+    "source_schema_version",
+    "evidence_kind",
+    "runtime_execution_status",
+    "system_extension_install_status",
+    "network_extension_activation_status",
+    "runtime_smoke_status",
+    "flow_read_write_status",
+    "edge_tunnel_open_status",
+    "tcp_payload_copy_status",
+    "support_bundle_status",
+    "rollback_status",
+    "redaction_status",
+    "tenant_scope_runtime_resolved",
+    "runtime_overclaim_gate",
+    "secret_leak_gate"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "network_extension_runtime_smoke_verifier_report.v1"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "passed"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_report": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_schema_version": {
+      "type": "string",
+      "enum": [
+        "network_extension_runtime_smoke_result.v1"
+      ]
+    },
+    "evidence_kind": {
+      "type": "string",
+      "enum": [
+        "fixture_not_run",
+        "human_runtime_status"
+      ]
+    },
+    "runtime_execution_status": {
+      "type": "string",
+      "enum": [
+        "not_run",
+        "blocked",
+        "failed",
+        "passed"
+      ]
+    },
+    "system_extension_install_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "installed",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "network_extension_activation_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "activated",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "runtime_smoke_status": {
+      "type": "string",
+      "enum": [
+        "not_run",
+        "passed",
+        "failed",
+        "blocked"
+      ]
+    },
+    "flow_read_write_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "passed",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "edge_tunnel_open_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "opened",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "tcp_payload_copy_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "copied",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "support_bundle_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "verified",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "rollback_status": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "not_required",
+        "completed",
+        "failed",
+        "blocked",
+        "skipped"
+      ]
+    },
+    "redaction_status": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "tenant_scope_runtime_resolved": {
+      "type": "boolean"
+    },
+    "runtime_overclaim_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    },
+    "secret_leak_gate": {
+      "type": "string",
+      "enum": [
+        "ok"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

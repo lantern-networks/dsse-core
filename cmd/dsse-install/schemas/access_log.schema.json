@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/access_log.schema.json",
+  "title": "AccessLog",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "access_decision_id",
+    "timestamp"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "access_decision_id": {
+      "type": "string"
+    },
+    "session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "subject_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "actor_type": {
+      "type": "string"
+    },
+    "actor_nhi_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "delegated_access_grant_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "human_approval_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "agent_task_session_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_action_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_server_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtime_environment_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "device_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "application_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_ip": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "destination": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "service_family": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "decision": {
+      "type": "string"
+    },
+    "reason_codes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "edge_region_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "edge_cluster_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "connector_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "break_glass_access_phase_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "start",
+        "use",
+        "end",
+        "auto_expiry",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_target_application_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "recovery_target_application",
+        "non_recovery_application",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_session_duration_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "short_session",
+        "expired_session",
+        "not_applicable",
+        null
+      ]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

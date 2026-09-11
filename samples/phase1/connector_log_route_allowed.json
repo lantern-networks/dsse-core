@@ -1,0 +1,23 @@
+{
+  "id": "connlog_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "event_type": "connector_route_allowed",
+  "connector_id": "conn_lab_001",
+  "connector_group_id": "cgrp_lab_001",
+  "tunnel_id": null,
+  "access_decision_id": "dec_lab_001",
+  "application_id": "app_dummy_https",
+  "service_family": "https",
+  "destination_port": 443,
+  "decision": "allow",
+  "reason_codes": [
+    "policy_matched",
+    "application_allowed"
+  ],
+  "status": "healthy",
+  "edge_region_id": "local",
+  "edge_cluster_id": "local-edge-001",
+  "last_heartbeat_at": "2026-05-22T00:00:00Z",
+  "timestamp": "2026-05-22T00:00:01Z",
+  "metadata": {}
+}

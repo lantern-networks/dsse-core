@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/export_job.schema.json",
+  "title": "ExportJob",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "created_by_admin_principal_id",
+    "stream",
+    "format",
+    "filters",
+    "from",
+    "to",
+    "status",
+    "row_count",
+    "created_at",
+    "expires_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "created_by_admin_principal_id": {
+      "type": "string"
+    },
+    "stream": {
+      "type": "string",
+      "enum": [
+        "access",
+        "audit",
+        "decision_trace",
+        "connector",
+        "human_approval_events",
+        "delegated_access_grants",
+        "tool_call_events",
+        "inspection_events"
+      ]
+    },
+    "format": {
+      "type": "string",
+      "enum": [
+        "ndjson",
+        "csv"
+      ]
+    },
+    "filters": {
+      "type": "object"
+    },
+    "from": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "to": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "expired",
+        "cancelled"
+      ]
+    },
+    "row_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "object_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "payload_checksum": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "break_glass_audit_export_scope_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "break_glass_events_only",
+        "audit_stream_with_break_glass_filter",
+        "not_applicable",
+        null
+      ]
+    },
+    "break_glass_audit_export_review_category": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "post_use_review_export_requested",
+        "export_not_requested",
+        "not_applicable",
+        null
+      ]
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "export_mode": {
+          "type": "string"
+        },
+        "total_matches": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "progress_phase": {
+          "type": "string",
+          "enum": [
+            "queued",
+            "running",
+            "exporting",
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "rows_exported": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_progress_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cancelled_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "cancelled_by_admin_principal_id": {
+          "type": "string"
+        },
+        "cancellation_reason": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

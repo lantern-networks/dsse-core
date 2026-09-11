@@ -1,0 +1,35 @@
+{
+  "id": "usage_nhi_seat_202605_lab",
+  "tenant_id": "tenant_lab_001",
+  "schema_version": "usage_meter.v1",
+  "period_start": "2026-05-01T00:00:00Z",
+  "period_end": "2026-06-01T00:00:00Z",
+  "meter_type": "nhi_seat",
+  "subject_type": "tenant",
+  "subject_id": "tenant_lab_001",
+  "quantity": 12,
+  "unit": "seat",
+  "quota": {
+    "quota_id": "nhi_governance_observation_threshold",
+    "included_quantity": 50,
+    "overage_quantity": 0,
+    "soft_cap_exceeded": false,
+    "hard_cap_exceeded": false
+  },
+  "dimensions": {
+    "human_seat_count": 50,
+    "billing_treatment": "governance_observation",
+    "governance_threshold_count": 50,
+    "active_nhi_count": 12,
+    "active_nhi_types": [
+      "ai_agent",
+      "service_account",
+      "ci_cd"
+    ]
+  },
+  "collected_at": "2026-05-24T00:00:00Z",
+  "metadata": {
+    "pricing_model": "nhi_not_billable_seat_mvp",
+    "billing_action": "observe_only"
+  }
+}

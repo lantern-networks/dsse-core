@@ -1,0 +1,34 @@
+{
+  "id": "pol_lab_postgres_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Allow lab user to dummy PostgreSQL application",
+  "priority": 120,
+  "conditions": {
+    "actor_type": "human",
+    "application_id": "app_dummy_postgres",
+    "service_family": "database",
+    "destination_port": 5432
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": null,
+  "service_family": "database",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "database_server",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-22T00:00:00Z",
+  "metadata": {
+    "database_protocol": "postgresql"
+  }
+}

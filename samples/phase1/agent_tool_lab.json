@@ -1,0 +1,30 @@
+{
+  "id": "tool_ticket_create_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Create Investigation Ticket",
+  "description": "Creates a ticket for a ransomware investigation exercise.",
+  "owner_user_id": "user_security_owner_001",
+  "publisher": "dsse-lab",
+  "version": "0.1.0",
+  "signature_state": "signed",
+  "permission_profile": "write_ticket_only",
+  "action_type": "ticket:create",
+  "mcp_server_id": "mcp_soc_lab_001",
+  "allowed_application_ids": [
+    "app_dummy_https"
+  ],
+  "allowed_destinations": [
+    "mcp.local:443"
+  ],
+  "allowed_data_classifications": [
+    "internal",
+    "confidential"
+  ],
+  "human_approval_required": true,
+  "runtime_environment_id": "runtime_managed_cloud_lab_001",
+  "last_used_at": "2026-05-22T00:00:00Z",
+  "status": "active",
+  "metadata": {
+    "result_summary_scope": "metadata_only"
+  }
+}

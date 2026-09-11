@@ -1,0 +1,21 @@
+{
+  "id": "admin_token_lab_001",
+  "tenant_id": "tenant_lab",
+  "name": "siem-export-token",
+  "token_hash": "sha256:lab-token-hash",
+  "roles": [
+    "auditor"
+  ],
+  "scopes": [
+    "admin.logs.read",
+    "admin.export.read"
+  ],
+  "created_by_admin_principal_id": "admin_user_lab_001",
+  "created_at": "2026-05-23T01:00:00Z",
+  "expires_at": "2026-08-23T01:00:00Z",
+  "last_used_at": null,
+  "status": "active",
+  "metadata": {
+    "token_display_prefix": "adm_lab"
+  }
+}

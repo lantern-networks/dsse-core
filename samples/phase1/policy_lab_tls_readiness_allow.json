@@ -1,0 +1,33 @@
+{
+  "id": "pol_lab_tls_readiness_allow_001",
+  "tenant_id": "tenant_lab_001",
+  "name": "Allow lab HTTPS app with TLS readiness metadata",
+  "priority": 95,
+  "conditions": {
+    "actor_type": "human",
+    "application_id": "app_dummy_https"
+  },
+  "action": {
+    "decision": "allow"
+  },
+  "required_token_binding": false,
+  "required_human_approval": false,
+  "required_workload_attestation": false,
+  "allowed_task_purposes": [],
+  "allowed_tool_ids": [],
+  "allowed_tool_actions": [],
+  "allowed_context_scope_ids": [],
+  "allowed_memory_scope_ids": [],
+  "allowed_data_classifications": [],
+  "inspection_profile_id": "ip_tls_readiness_lab",
+  "service_family": "https",
+  "connection_initiator": "client",
+  "source_role": "managed_endpoint",
+  "destination_role": "private_app",
+  "status": "active",
+  "created_by": "system",
+  "updated_at": "2026-05-31T22:40:00Z",
+  "metadata": {
+    "tls_inspection_readiness": "policy_layer"
+  }
+}

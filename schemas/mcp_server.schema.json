@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/schemas/mcp_server.schema.json",
+  "title": "MCPServer",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "name",
+    "resource_uri",
+    "audience",
+    "status"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "tenant_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "owner_user_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "publisher": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "supported_transport": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "resource_uri": {
+      "type": "string"
+    },
+    "audience": {
+      "type": "string"
+    },
+    "authorization_server_ref": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "allowed_tool_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "token_binding_state": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "token_passthrough_policy": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "network_destination": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "data_classification": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "active",
+        "inactive",
+        "revoked"
+      ]
+    },
+    "metadata": {
+      "type": "object"
+    }
+  }
+}

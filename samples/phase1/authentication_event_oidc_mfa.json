@@ -1,0 +1,22 @@
+{
+  "id": "auth_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "user_id": "user_lab_001",
+  "subject_user_id": "user_lab_001",
+  "session_id": "sess_lab_001",
+  "idp_id": "idp_keycloak_lab",
+  "method": "oidc_authorization_code",
+  "amr": [
+    "pwd",
+    "otp"
+  ],
+  "acr": "urn:mfa:fresh",
+  "mfa_state": "fresh",
+  "auth_time": "2026-05-22T00:00:00Z",
+  "expires_at": "2026-05-22T01:00:00Z",
+  "source_ip": "127.0.0.1",
+  "device_id": "dev_lab_001",
+  "result": "success",
+  "timestamp": "2026-05-22T00:00:00Z",
+  "metadata": {}
+}

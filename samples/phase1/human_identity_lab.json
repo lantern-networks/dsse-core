@@ -1,0 +1,16 @@
+{
+  "id": "human_lab_001",
+  "tenant_id": "tenant_lab_001",
+  "subject": "user_lab_001",
+  "email": "user.lab@example.jp",
+  "display_name": "Lab User",
+  "source": "lab_import",
+  "department": "security",
+  "last_seen_at": "2026-05-24T00:00:00Z",
+  "expires_at": null,
+  "status": "active",
+  "metadata": {
+    "identity_directory_role": "usage_meter_human_seat_source",
+    "billing_action": "observe_only"
+  }
+}

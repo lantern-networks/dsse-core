@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>PayloadType</key>            <string>Configuration</string>
+  <key>PayloadVersion</key>         <integer>1</integer>
+  <key>PayloadIdentifier</key>      <string>page.shinnagi.dsse.mdm.systemextension</string>
+  <key>PayloadUUID</key>            <string>7634321F-E647-4C36-89FC-EB563DC637DB</string>
+  <key>PayloadDisplayName</key>     <string>DSSE — Network Extension Auto-Approval</string>
+  <key>PayloadDescription</key>     <string>Pre-approves the Lantern DSSE network system extension so it loads on MDM-managed Macs with no user interaction (no "System Extension Blocked" prompt). Must be delivered by an MDM the Mac is enrolled in — a manually-installed profile does NOT grant system-extension approval.</string>
+  <key>PayloadOrganization</key>    <string>Lantern DSSE</string>
+  <key>PayloadScope</key>           <string>System</string>
+  <key>PayloadRemovalDisallowed</key><false/>
+  <key>PayloadContent</key>
+  <array>
+    <dict>
+      <key>PayloadType</key>        <string>com.apple.system-extension-policy</string>
+      <key>PayloadVersion</key>     <integer>1</integer>
+      <key>PayloadIdentifier</key>  <string>page.shinnagi.dsse.mdm.systemextension.policy</string>
+      <key>PayloadUUID</key>        <string>E5601EFF-B10A-4E85-BBF4-82F691C53CE6</string>
+      <key>PayloadDisplayName</key> <string>Allowed System Extensions — DSSE</string>
+      <!-- Auto-approve the DSSE network extension by team + bundle id (exact allow-list). -->
+      <key>AllowedSystemExtensions</key>
+      <dict>
+        <key>M4U8GSBL6C</key>
+        <array>
+          <string>jp.co.lantern-networks.dsse.agent.networkextension</string>
+        </array>
+      </dict>
+      <!-- Also allow any (future re-signed) extension from this team, so a Developer ID rebuild keeps loading. -->
+      <key>AllowedTeamIdentifiers</key>
+      <array>
+        <string>M4U8GSBL6C</string>
+      </array>
+    </dict>
+  </array>
+</dict>
+</plist>

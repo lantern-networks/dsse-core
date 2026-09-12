@@ -180,6 +180,25 @@ For reassignment, coordinate removal of the old enrolment and a fresh install wi
 new organization's material. Verify that a new identity has been provisioned; reusing
 residual identity files can cause the same refusal again.
 
+## Restore normal networking
+
+Before retiring a deployment, disable the installed transparent proxy from the logged-in
+Mac user account. This operation works without the deployment. Run it **without sudo**:
+
+```sh
+"/Applications/LanternDsseAgent.app/Contents/MacOS/LanternDsseAgent" --disable
+```
+
+Wait for `disable completed error=none`. The app stops the tunnel and saves the proxy
+configuration as disabled so its connection watchdog does not restart it. This keeps
+the app, enrolment, and trust material installed; it is not an uninstall or a device
+revocation. Verify ordinary browsing after the command completes. If an error is reported,
+keep the installed app and include the full output when requesting help.
+
+The preference belongs to the logged-in user's session. Running a separate root copy
+is not a substitute for disabling that user's proxy. Deactivating or uninstalling the
+system extension is a separate operation that can require OS approval or a restart.
+
 ## Removing it
 
 ```sh

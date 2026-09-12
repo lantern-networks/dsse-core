@@ -35,7 +35,7 @@ const (
 	valSource    = "InstallProfileSource"    // provenance: bundled | path | mdm
 	valAppliedAt = "InstallProfileAppliedAt" // RFC3339 timestamp the profile was applied
 	valVersion   = "InstallProfileVersion"   // applied profile SCHEMA version — MDM detection (see the S2 note in Apply)
-	valIssuedAt  = "InstallProfileIssuedAt"  // issued_at of the applied profile, RFC3339 — the real anti-rollback floor (S2)
+	valIssuedAt  = "InstallProfileIssuedAt"  // issued_at display metadata, RFC3339; rollback protection re-verifies valEnvelope
 	valTenant    = "InstallProfileTenant"    // resolved tenant id (observability; NOT trusted for auth)
 )
 

@@ -2,7 +2,7 @@
 
 # Lantern DSSE
 
-**Self-hosted network access and web inspection, with policies you can inspect in source.**
+**Self-hosted network access and web inspection, built as one layer of ransomware defense.**
 
 Lantern DSSE is an open-source Secure Service Edge (SSE / ZTNA) implementation for
 self-hosted labs. Connect Windows and macOS devices to an Edge, inspect selected web
@@ -23,10 +23,30 @@ A successful installation check is not evidence of long-duration reliability or 
 security audit. It has not been independently run at length by anyone who did not write it.
 See the [threat model](docs/threat-model.md) and each platform's limitations.
 
+## Why we built it
+
+Lantern DSSE grew out of work on ransomware defense: if a device is compromised,
+which internal systems can it reach, and what can it send outside the organization?
+The aim is to help limit the spread and impact of a compromise through explicit
+network access policy and selected outbound content inspection.
+
+[East-West policies](docs/east-west-policy.md) let operators evaluate and restrict
+supported internal connections, including access to private applications through
+connectors. [Internet Access](docs/egress-policy.md) and [DLP](docs/dlp.md) address
+outbound access and supported upload content. These controls apply only to traffic
+that reaches their enforcement paths; they are not a claim of ransomware prevention.
+DSSE does not detect local file encryption, remove malware, or restore encrypted data.
+It complements endpoint protection and recovery measures.
+
+Start by observing legitimate traffic, then deliberately enable and verify enforcement.
+The default Connector Access posture is **OBSERVE**, and DLP **Observe** permits uploads;
+observation alone does not contain an attack.
+
 ## What can you explore?
 
 | Your question | What to try in DSSE |
 |---|---|
+| If a device is compromised, which internal systems could it reach? | Review observed connections, narrow access to required destinations and services, then verify the intended East-West enforcement. [Internal access guide](docs/east-west-policy.md) |
 | What sensitive content might devices send to an AI or web service? | Attach an **Observe** DLP policy to inspected web traffic and check the corresponding detections in **DLP Findings**. Observe permits the upload. [DLP guide](docs/dlp.md) |
 | Can I restrict which organization accounts people use in supported SaaS services? | Configure provider-specific restriction headers for Google Workspace, Microsoft 365, ChatGPT, or Anthropic Claude. The request must be inspected, and enforcement depends on the provider. [SaaS tenant restriction](docs/saas-tenant-restriction.md) |
 | How can enrolled devices reach a private application? | Publish it through an outbound connector, configure access policy, and verify the result from an enrolled device. [Connector guide](docs/connector.md) |

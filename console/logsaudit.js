@@ -59,8 +59,11 @@ function laDecisionBadge(dec) {
   return uiBadge(label, kind);
 }
 function laResultBadge(res) {
-  const r = String(res || "").toLowerCase();
-  const kind = /ok|success|allow|approved|done|complete/.test(r) ? "ok" : /fail|deny|error|reject/.test(r) ? "danger" : "off";
+  const r = String(res || "").trim().toLowerCase();
+  // Match whole outcomes: "revoked" contains "ok", and "incomplete" contains "complete".
+  // Unknown outcomes retain their text and remain neutral rather than implying success.
+  const kind = /^(ok|success|allow|allowed|approved|done|complete|completed)$/.test(r) ? "ok"
+    : /^(fail|failed|failure|deny|denied|error|reject|rejected|revoked)$/.test(r) ? "danger" : "off";
   return uiBadge(laDash(res), kind);
 }
 

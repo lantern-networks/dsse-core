@@ -76,7 +76,11 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
-		legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now())
+		if err := legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
+			logErrorf("legal hold update failed: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(tenantID)})
 	}))
 	// Verify the tamper-evident hash chain of the tenant's archived audit segments (compliance integrity check).

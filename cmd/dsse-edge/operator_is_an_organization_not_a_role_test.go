@@ -43,10 +43,14 @@ func TestACustomersSuperAdminIsNotAnOperator(t *testing.T) {
 		t.Fatal("with no operator organization configured, a principal of tenant_operator_001 crossed — " +
 			"nothing had named that organization as the operator, so there was nothing to be answered from")
 	}
-	if !adminIdentityMayActAcrossOrganizations(unscoped) {
-		t.Fatal("a deployment with no tenant model attaches no organization to the identity; there is nothing " +
-			"to cross and this must stay allowed, or every single-tenant edge loses its admin plane")
+	if adminIdentityMayActAcrossOrganizations(unscoped) {
+		t.Fatal("a missing organization claim must not bypass a configured tenant model")
 	}
+	declareOperatorTenant("", false)
+	if !adminIdentityMayActAcrossOrganizations(unscoped) {
+		t.Fatal("explicitly tenant-less deployment must retain legacy administration")
+	}
+	declareOperatorTenant("", true)
 	if adminIdentityMayActAcrossOrganizations(unscopedPlain) {
 		t.Fatal("an identity with no organization AND no admin.tenant.admin was allowed to cross — the role " +
 			"is checked first, precisely so an empty organization cannot short-circuit past it")
@@ -54,6 +58,9 @@ func TestACustomersSuperAdminIsNotAnOperator(t *testing.T) {
 
 	declareOperatorTenant("tenant_operator_001", true)
 	defer declareOperatorTenant("", false)
+	if adminIdentityMayActAcrossOrganizations(unscoped) {
+		t.Fatal("configured operator must not admit an identity with a missing organization")
+	}
 
 	if adminIdentityMayActAcrossOrganizations(customer) {
 		t.Fatal("★ a super_admin of tenant_reference_lab was allowed to act inside another organization. " +

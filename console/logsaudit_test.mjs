@@ -424,3 +424,43 @@ test('export list treats malformed success responses as unavailable and supports
   recover=true;await states.at(-1)[3].onClick();assert.deepEqual(empty,['No exports yet.']);
  }
 });
+
+function logSearchHarness(fetch){
+ const states=[],calls=[];
+ const c=vm.createContext({host:{innerHTML:'',appendChild(){}},URLSearchParams,bl:v=>v.en,
+  freshRender:h=>{const seq=h.seq=(h.seq||0)+1;return ()=>h.seq===seq;},
+  uiState:(...args)=>states.push(args),el:()=>({appendChild(){}}),
+  apiFetch:async(...args)=>{calls.push(args);return fetch(...args);}});
+ vm.runInContext(source,c);vm.runInContext('laColsFor=()=>[]',c);
+ return {states,calls,render:append=>vm.runInContext(`laLoadStream(host,null,null,${!!append})`,c),
+  state:()=>JSON.parse(vm.runInContext('JSON.stringify({rows:_laRows,cursor:_laCursor,total:_laTotal})',c))};
+}
+
+test('log search rejects malformed success responses instead of reporting no matches',async()=>{
+ for(const body of [{},[],{rows:null,total_matches:0},{rows:[null],total_matches:1},{rows:[[]],total_matches:1},
+  ...[null,'0',-1,1.5,Infinity].map(total_matches=>({rows:[],total_matches})),
+  {rows:[],total_matches:0,next_cursor:{}}]){
+  const h=logSearchHarness(async()=>({ok:true,body}));await h.render(false);
+  assert.equal(h.states.at(-1)[1],'error');assert.deepEqual(h.state(),{rows:[],cursor:'',total:0});
+ }
+ const empty=logSearchHarness(async()=>({ok:true,body:{rows:[],total_matches:0,next_cursor:null}}));
+ await empty.render(false);assert.equal(empty.states.at(-1)[1],'empty');
+});
+
+test('failed older-page requests retry the same cursor without dropping or duplicating loaded rows',async()=>{
+ for(const failure of [{ok:false,status:503},new Error('offline'),{ok:true,body:{rows:[{id:'corrupt'}],total_matches:'bad',next_cursor:'wrong'}}]){
+  let request=0;
+  const h=logSearchHarness(async()=>{
+   request++;
+   if(request===1)return {ok:true,body:{rows:[{id:'first'}],total_matches:2,next_cursor:'page-2'}};
+   if(request===2){if(failure instanceof Error)throw failure;return failure;}
+   return {ok:true,body:{rows:[{id:'second'}],total_matches:2,next_cursor:null}};
+  });
+  await h.render(false);const before=h.state();await h.render(true);
+  assert.equal(h.states.at(-1)[1],'error');assert.deepEqual(h.state(),before);
+  await h.states.at(-1)[3].onClick();
+  assert.deepEqual(h.state(),{rows:[{id:'first'},{id:'second'}],cursor:'',total:2});
+  assert.equal(new URL('https://console.test'+h.calls[1][1]).searchParams.get('cursor'),'page-2');
+  assert.equal(h.calls[2][1],h.calls[1][1]);
+ }
+});

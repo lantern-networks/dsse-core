@@ -762,15 +762,20 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
   try {
     const qs = laQueryString(append ? _laCursor : "");
     const r = await apiFetch("GET", "/admin/logs/" + encodeURIComponent(_laStream) + (qs ? "?" + qs : ""), undefined, laPlaneFor(_laStream));
-    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }); return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
     if (!current()) return;
-    const body = r.body || {};
+    const body = r.body;
+    if (!body || !Array.isArray(body.rows) || body.rows.some(row => !row || typeof row !== "object" || Array.isArray(row)) ||
+        !Number.isSafeInteger(body.total_matches) || body.total_matches < 0 ||
+        (body.next_cursor != null && typeof body.next_cursor !== "string")) {
+      throw new Error("Invalid log search response");
+    }
     coverage = body.region_coverage;
-    const rows = Array.isArray(body) ? body : (body.rows || body.entries || body.events || []);
+    const rows = body.rows;
     _laRows = append ? _laRows.concat(rows) : rows;
-    _laCursor = (body && body.next_cursor) || "";
-    if (body && body.total_matches != null) _laTotal = Number(body.total_matches);
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }); return; }
+    _laCursor = body.next_cursor || "";
+    _laTotal = body.total_matches;
+  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost, append) }); return; }
   // For the audit stream, resolve admin principal ids → email/name once so the Admin column shows WHO acted.
   if (_laStream === "audit" && !append) {
     const directory = {};

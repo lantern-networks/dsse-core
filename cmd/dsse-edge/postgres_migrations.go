@@ -18,6 +18,7 @@ const (
 	postgresMigrationUsageMeter                = "008"
 	postgresMigrationNonHumanIdentity          = "009"
 	postgresMigrationHotEventsText             = "010"
+	postgresMigrationHotEventsRegion           = "050"
 	postgresMigrationWorkloadNonce             = "011"
 	postgresMigrationHumanIdentity             = "012"
 	postgresMigrationHumanIdentityImportRun    = "013"
@@ -129,6 +130,7 @@ func postgresHotStoreMigrationVersions() []string {
 	return []string{
 		postgresMigrationHotEvents,
 		postgresMigrationHotEventsText,
+		postgresMigrationHotEventsRegion,
 	}
 }
 

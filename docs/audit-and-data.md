@@ -114,3 +114,13 @@ reporting channel in [SECURITY.md](../SECURITY.md) for vulnerabilities.
 Implementation: [pruner](../cmd/dsse-edge/retention_pruner.go),
 [retention routes](../cmd/dsse-edge/admin_logs_retention_routes.go),
 [Console routing](../console/logsaudit.js), and [flags](../cmd/dsse-edge/main.go).
+
+### PostgreSQL regional log schema
+
+The PostgreSQL hot store requires migration
+`050_hot_events_region.sql` for regional log ingestion and filtering. Component
+startup applies it when migrations are enabled. If you manage migrations separately,
+apply it before starting the updated service. Existing log rows are preserved and
+receive an empty region value; the migration does not infer their original region.
+New records carry the region supplied by the event. Verify ingestion and a regional
+search after upgrading, and check service logs for ingestion errors.

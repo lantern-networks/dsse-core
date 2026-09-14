@@ -85,7 +85,7 @@ func TestPostgresAdminTenantModelStoreE2E(t *testing.T) {
 			// describes: the tables go, the ledger says they are applied, and the next run dies. Found by
 			// adding 041 and reading the cleanup rather than by the second run.
 			"DROP TABLE IF EXISTS admin_tenant_model_purge_orders",
-			"DELETE FROM schema_migrations WHERE version IN ('023', '024', '038', '039', '040', '041')",
+			"DELETE FROM schema_migrations WHERE version IN ('023', '024', '038', '039', '040', '041', '044')",
 		} {
 			_, _ = db.ExecContext(context.Background(), stmt)
 		}

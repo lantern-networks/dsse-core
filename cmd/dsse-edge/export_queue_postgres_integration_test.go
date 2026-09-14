@@ -206,6 +206,22 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 		_ = db.Close()
 	})
 
+	// Upgrade an existing pre-region table through production component setup.
+	migrations, err := migrationstore.LoadDir(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := selectPostgresComponentMigrations(migrations, "legacy hot store", postgresMigrationHotEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrationstore.Apply(ctx, db, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO hot_events(tenant_id,stream,event_id,occurred_at,payload) VALUES('tenant_legacy','access','old-event',now(),'{}')`); err != nil {
+		t.Fatal(err)
+	}
+
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewWriter returned error: %v", err)
@@ -226,8 +242,14 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 		}
 	})
 
+	var legacyRegion string
+	if err := db.QueryRowContext(ctx, `SELECT edge_region_id FROM hot_events WHERE tenant_id='tenant_legacy' AND event_id='old-event'`).Scan(&legacyRegion); err != nil || legacyRegion != "" {
+		t.Fatalf("legacy row upgrade: region=%q err=%v", legacyRegion, err)
+	}
+
 	if err := writer.Append("access.log.jsonl", map[string]any{
 		"id":                 "alog_edge_ingest_001",
+		"edge_region_id":     "region-test",
 		"tenant_id":          "tenant_lab_001",
 		"timestamp":          "2026-05-23T04:00:00Z",
 		"decision":           "allow",
@@ -248,7 +270,7 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 	result, err := store.Search(ctx, hotstore.SearchQuery{
 		TenantID: "tenant_lab_001",
 		Stream:   "access",
-		Filters:  map[string]string{"decision": "allow"},
+		Filters:  map[string]string{"decision": "allow", "edge_region_id": "region-test"},
 		Limit:    10,
 	})
 	if err != nil {
@@ -568,8 +590,13 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 	if err != nil {
 		t.Fatalf("ReadJSONL returned error: %v", err)
 	}
-	if len(auditRows) != 0 {
-		t.Fatalf("audit rows = %#v, want no direct JSONL audit writes", auditRows)
+	// The worker suppresses its domain JSONL events; the shared HTTP audit remains mandatory.
+	if len(auditRows) != 1 || auditRows[0]["event_type"] != "admin_config_change" || auditRows[0]["result"] != "success" {
+		t.Fatalf("expected one shared HTTP audit, got %#v", auditRows)
+	}
+	metadata, ok := auditRows[0]["metadata"].(map[string]any)
+	if !ok || metadata["path"] != "/admin/export-jobs" || metadata["status_code"] != float64(202) {
+		t.Fatalf("HTTP audit metadata=%#v", metadata)
 	}
 }
 
@@ -1338,6 +1365,9 @@ func resetPostgresExportTaskQueueTables(t *testing.T, ctx context.Context, db *s
 		"DROP TABLE IF EXISTS export_worker_task_dead_letters",
 		"DROP TABLE IF EXISTS export_worker_tasks",
 		"DROP TABLE IF EXISTS admin_export_jobs",
+		// Migration 047 attaches a non-idempotent trigger to this table.
+		// Its table must be removed together with the migration ledger.
+		"DROP TABLE IF EXISTS cp_state_blobs CASCADE",
 		"DROP TABLE IF EXISTS schema_migrations",
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {

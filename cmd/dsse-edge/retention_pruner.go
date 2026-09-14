@@ -91,6 +91,10 @@ func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) 
 }
 
 func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
+	if err := cfg.legalHold.Health(); err != nil {
+		log.Printf("retention paused: %v", err)
+		return
+	}
 	// CP HA: only the leader prunes/tiers, so two active CPs don't double-delete rows or double-archive segments
 	// to the cold store. A standby simply skips; when it becomes leader it takes over the sweep.
 	if !cpLeaderElectorInstance.IsLeader() {

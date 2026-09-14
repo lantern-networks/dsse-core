@@ -124,3 +124,17 @@ apply it before starting the updated service. Existing log rows are preserved an
 receive an empty region value; the migration does not infer their original region.
 New records carry the region supplied by the event. Verify ingestion and a regional
 search after upgrading, and check service logs for ingestion errors.
+
+### When legal-hold state cannot be loaded
+
+A storage read error or invalid legal-hold snapshot pauses retention pruning and
+refuses tenant deletion, purge, and hold changes. The Console shows a load error
+with Retry instead of treating the hold as off. Repair the storage or restore a
+verified snapshot, then restart the affected service so it can load the complete
+state. Refreshing the page alone does not clear the protection. Do not replace an
+unreadable snapshot with an empty list to regain access: that would discard holds.
+
+A failed hold change records an error through the normal HTTP audit path, provided
+the audit writer is available. Audit outbox health describes delivery processing;
+it is not proof that every primary audit-file write succeeded. Inspect service
+logs for `admin_audit_write_failed` when investigating missing audit records.

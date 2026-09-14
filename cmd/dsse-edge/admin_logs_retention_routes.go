@@ -64,9 +64,17 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		return mine
 	}
 	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := legalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		if err := legalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		var req struct {
 			Active bool   `json:"active"`
 			Reason string `json:"reason"`

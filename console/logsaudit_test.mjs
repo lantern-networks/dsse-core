@@ -49,3 +49,20 @@ test('approval outcome does not borrow device trust state', () => {
   assert.equal(trust.c({trust_state: 'trusted'}), 'trusted');
   assert.equal(outcome.c({outcome: 'denied', trust_state: 'trusted'}).kind, 'danger');
 });
+
+test('unavailable legal hold never renders Off or a mutation button', async () => {
+  for (const response of [{ok:false,status:503,body:{error:'unavailable'}},{ok:true,body:{}},new Error('offline')]) {
+    const states=[],badges=[];
+    const host={};
+    const context=vm.createContext({host, freshRender:()=>()=>true, bl:v=>v.en,
+      apiFetch:async()=>{if(response instanceof Error)throw response;return response;},
+      uiState:(...args)=>states.push(args),uiBadge:(...args)=>badges.push(args),
+      el:()=>{throw new Error('error state must not render mutation controls');}});
+    vm.runInContext(source,context);
+    await vm.runInContext('laLegalHold(host)',context);
+    assert.equal(states.length,1);
+    assert.equal(states[0][1],'error');
+    assert.equal(badges.length,0);
+    assert.equal(typeof states[0][3].onClick,'function');
+  }
+});

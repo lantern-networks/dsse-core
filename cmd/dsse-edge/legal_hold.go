@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,7 @@ type legalHoldStore struct {
 	mu        sync.RWMutex
 	held      map[string]legalHoldRecord // tenant_id -> record
 	persister blobstore.Persister
+	loadErr   error
 }
 
 func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
@@ -37,6 +39,7 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 	}
 	data, err := p.Load()
 	if err != nil {
+		s.loadErr = err
 		log.Printf("legal-hold store load: %v", err)
 		return s
 	}
@@ -45,13 +48,26 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 	}
 	var records []legalHoldRecord
 	if err := json.Unmarshal(data, &records); err != nil {
+		s.loadErr = err
 		log.Printf("legal-hold store parse: %v", err)
 		return s
 	}
+	if records == nil {
+		s.loadErr = fmt.Errorf("legal hold snapshot must be an array")
+		return s
+	}
 	for _, r := range records {
-		if r.TenantID != "" {
-			s.held[r.TenantID] = r
+		tenant := strings.TrimSpace(r.TenantID)
+		if tenant == "" {
+			s.loadErr = fmt.Errorf("legal hold record has no tenant")
+			return s
 		}
+		if _, exists := s.held[tenant]; exists {
+			s.loadErr = fmt.Errorf("duplicate legal hold tenant")
+			return s
+		}
+		r.TenantID = tenant
+		s.held[tenant] = r
 	}
 	if len(s.held) > 0 {
 		log.Printf("legal-hold store loaded: %d tenant(s) under hold", len(s.held))
@@ -66,6 +82,9 @@ func (s *legalHoldStore) IsHeld(tenantID string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return true
+	}
 	_, ok := s.held[tenantID]
 	return ok
 }
@@ -77,6 +96,9 @@ func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now t
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
+	}
 	previous, existed := s.held[tenantID]
 	if active {
 		if _, exists := s.held[tenantID]; !exists {
@@ -131,6 +153,19 @@ func (s *legalHoldStore) persistLocked() error {
 	}
 	if err := s.persister.Save(data); err != nil {
 		return fmt.Errorf("persist legal hold: %w", err)
+	}
+	return nil
+}
+
+// An unavailable snapshot cannot authorize deletion or be overwritten with partial state.
+func (s *legalHoldStore) Health() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
 	}
 	return nil
 }

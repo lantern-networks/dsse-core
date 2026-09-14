@@ -588,8 +588,18 @@ function laAuditChain(host) {
 
 // Legal hold: freeze retention for THIS tenant (litigation / e-discovery). While held, no log is deleted/tiered.
 async function laLegalHold(host) {
-  let held = false;
-  try { const r = await apiFetch("GET", "/admin/legal-hold", undefined, _LA_PLANE); if (r.ok && r.body) held = !!r.body.tenant_held; } catch (e) { /* optional */ }
+  const current = freshRender(host);
+  let held;
+  try {
+    const r = await apiFetch("GET", "/admin/legal-hold", undefined, _LA_PLANE);
+    if (!r.ok || !r.body || typeof r.body.tenant_held !== "boolean") throw new Error((r.body && r.body.error) || "Legal hold status is unavailable");
+    held = r.body.tenant_held;
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLegalHold(host) });
+    return;
+  }
+  if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Legal hold", ja: "リーガルホールド" }) }));
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));

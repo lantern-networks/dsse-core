@@ -39,7 +39,9 @@ function renderAssetsView(content) {
 async function loadAssetsArr(path) {
   const r = await apiFetch("GET", path);
   if (!r.ok) throw new Error("HTTP " + r.status);
-  return Array.isArray(r.body) ? r.body : [];
+  if (r.body === null) return [];
+  if (!Array.isArray(r.body)) throw new Error("Invalid catalog response");
+  return r.body;
 }
 function platLabel(p) { return p === "macos" ? "macOS" : p === "windows" ? "Windows" : "—"; }
 
@@ -213,14 +215,25 @@ async function renderGroupsSection(section) {
   renderCatalogGroups(section);
 }
 
+function assetGroupMemberRows(ids, endpoints) {
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string" && id)) throw new Error("Invalid group member list");
+  if (!Array.isArray(endpoints) || !endpoints.every((ep) => ep && typeof ep.id === "string" && ep.id)) throw new Error("Invalid endpoint list");
+  const byID = new Map(endpoints.map((ep) => [ep.id, ep]));
+  return ids.map((id) => byID.get(id) || { id, alias: id });
+}
+
 async function showGroupMembers(g) {
   const bodyHost = el("div", {}, el("span", { class: "ui-spinner" }));
   const m = uiModal({ title: bl({ en: "Members of ", ja: "メンバー: " }) + g.alias, body: [bodyHost], footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })] });
   try {
-    const list = await loadAssetsArr("/admin/assets/groups/" + encodeURIComponent(g.id) + "/members");
+    const [ids, endpoints] = await Promise.all([
+      loadAssetsArr("/admin/assets/groups/" + encodeURIComponent(g.id) + "/members"),
+      loadAssetsArr("/admin/assets/endpoints"),
+    ]);
+    const list = assetGroupMemberRows(ids, endpoints);
     bodyHost.innerHTML = "";
     if (!list.length) { bodyHost.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "No members match right now.", ja: "現在一致するメンバーはありません。" }) })); return; }
-    list.forEach((mem) => bodyHost.appendChild(el("div", { class: "ui-checkrow" }, [uiBadge(platLabel(mem.platform), "off"), el("span", { text: mem.alias })])));
+    list.forEach((mem) => bodyHost.appendChild(el("div", { class: "ui-checkrow" }, [uiBadge(platLabel(mem.platform), "off"), el("span", { text: mem.alias || mem.id })])));
   } catch (e) { bodyHost.textContent = String(e); }
 }
 

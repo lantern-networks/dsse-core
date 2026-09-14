@@ -285,9 +285,8 @@ async function openEnrolTokenForm(content) {
       }
       if (!r.ok) {
         submit.disabled = false;
-        const malformedPartial = r.status === 409 && r.body && r.body.partial === true &&
-          (!Array.isArray(r.body.tokens) || !enrolTokenRowsValid(r.body.tokens));
-        const msg = malformedPartial ? enrolTokenResponseWarning() :
+        const uncertainPartial = r.status === 409 && r.body && r.body.partial === true;
+        const msg = uncertainPartial ? enrolTokenResponseWarning() :
           (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
         labelF.setError(msg); uiToast(msg, "err"); return;
       }
@@ -328,8 +327,8 @@ function enrolTokenRowsValid(rows) {
 }
 function enrolTokenResponseWarning() {
   return bl({
-    en: "The issued token response is incomplete or invalid. Tokens may already have been created. Check the unused tokens in the list before issuing more; revoke any unneeded tokens.",
-    ja: "発行応答が不完全か、不正です。サーバー側では発行済みの可能性があります。追加発行の前に一覧の未使用トークンを確認し、不要なものを失効してください。"
+    en: "Token issuance could not be confirmed. Tokens may already have been created. Resolve the failure and reload the unused-token list before issuing more; revoke any unneeded tokens.",
+    ja: "トークンの発行結果を確認できません。サーバー側では発行済みの可能性があります。障害を解消し、未使用トークンの一覧を再読込してから追加発行してください。不要なものは失効してください。"
   });
 }
 function showEnrolTokenOnce(body) {

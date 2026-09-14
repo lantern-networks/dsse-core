@@ -51,7 +51,7 @@ test('partial batch responses reach one-time disclosure instead of being discard
   await vm.runInContext('openEnrolTokenForm({})',c);await submit();
   assert.equal(closed,count?1:0);assert.equal(refresh,count?1:0);
   if(count){assert.equal(disclosures[0].tokens.length,count);assert.equal(disclosures[0].requested_count,3);assert.equal(disclosures[0].partial,true);}
-  else {assert.equal(disclosures.length,0);assert.equal(errors[0][1],'err');}
+  else {assert.equal(disclosures.length,0);assert.equal(errors[0][1],'err');assert.match(errors[0][0],/may already have been created/);assert.match(errors[0][0],/Resolve the failure/);}
  }
 });
 
@@ -89,7 +89,7 @@ test('malformed partial issuance warns of saved tokens without disclosure or aut
   await vm.runInContext('openEnrolTokenForm({})',c);await submit();
   assert.equal(calls,1);assert.equal(closed,0);assert.equal(errors.length,1);
   assert.match(errors[0][0],/may already have been created/);
-  assert.match(errors[0][0],/Check the unused tokens/);
+  assert.match(errors[0][0],/reload the unused-token list/);
   assert.equal(fieldErrors[0],errors[0][0]);assert.equal(errors[0][1],'err');
  }
 });

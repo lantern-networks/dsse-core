@@ -412,3 +412,15 @@ test('starting a new log query clears the preceding allow-rate summary even when
     assert.equal(summary.innerHTML,'');finish();await load;assert.equal(summary.innerHTML,'');
   }
 });
+
+test('export list treats malformed success responses as unavailable and supports retry',async()=>{
+ for(const body of [{},{jobs:null},{jobs:{}},{jobs:'bad'},{jobs:[null]},{jobs:[[]]}]){
+  let recover=false;const states=[],empty=[];
+  const c=vm.createContext({section:{innerHTML:'',appendChild(){}},bl:v=>v.en,freshRender:()=>()=>true,
+   uiState:(...args)=>states.push(args),el:()=>({}),emptyBox:text=>{empty.push(text);return {};},
+   apiFetch:async()=>({ok:true,body:recover?{jobs:[]}:body})});
+  vm.runInContext(source,c);await vm.runInContext('laExports(section)',c);
+  assert.equal(states.at(-1)[1],'error');assert.equal(empty.length,0);
+  recover=true;await states.at(-1)[3].onClick();assert.deepEqual(empty,['No exports yet.']);
+ }
+});

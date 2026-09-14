@@ -895,7 +895,8 @@ async function laExports(section) {
   uiState(section, "loading");
   const current = freshRender(section);
   let jobs;
-  try { const r = await apiFetch("GET", "/admin/export-jobs", undefined, _LA_PLANE); if (!r.ok) throw new Error("HTTP " + r.status); jobs = (r.body && r.body.jobs) || []; }
+  try { const r = await apiFetch("GET", "/admin/export-jobs", undefined, _LA_PLANE); if (!r.ok) throw new Error("HTTP " + r.status); jobs = r.body && r.body.jobs;
+    if (!Array.isArray(jobs) || jobs.some(job => !job || typeof job !== "object" || Array.isArray(job))) throw new Error("Invalid export jobs response"); }
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laExports(section) }); return; }
   if (!current()) return;
   section.innerHTML = "";

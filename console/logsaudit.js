@@ -469,6 +469,9 @@ function renderLogsAuditView(content) {
       el("p", { class: "ui-view-desc", text: bl({ en: "Access decisions and activity, and scheduled exports.", ja: "アクセス判断・アクティビティと、エクスポート。" }) }),
     ]),
   ]));
+  const writerHealthHost = el("div", {});
+  content.appendChild(writerHealthHost);
+  laAuditWriterHealth(writerHealthHost);
   content.appendChild(uiTabs([
     { id: "logs", label: bl({ en: "Logs", ja: "ログ" }) },
     { id: "volume", label: bl({ en: "Volume", ja: "ログ量" }) },
@@ -876,4 +879,40 @@ function laRegionCoverageText(coverage) {
     return bl({ en: "Records with an unknown region excluded from these filters: ", ja: "同じ検索条件で地域不明のため除外された記録: " }) + count;
   }
   return bl({ en: "Records without a region are excluded. Their count could not be determined; this result does not establish that no such records exist.", ja: "地域不明の記録は除外されています。件数を確認できないため、この結果だけで記録が存在しないとは判断できません。" });
+}
+
+
+function laAuditWriterHealthText(h) {
+  if (!h || !["healthy", "degraded", "unknown", "unavailable"].includes(h.status) ||
+      !Number.isSafeInteger(h.primary_failures) || h.primary_failures < 0 ||
+      !Number.isSafeInteger(h.hook_failures) || h.hook_failures < 0) {
+    throw new Error("Invalid audit writer health response");
+  }
+  const title = bl({en:"Audit file writes",ja:"監査原本の保存"});
+  if (h.status === "unavailable") return title + ": " + bl({en:"Unavailable",ja:"取得不能"});
+  if (h.status === "unknown") return title + ": " + bl({en:"No completed writes observed yet",ja:"保存完了の観測はまだありません"});
+  return title + ": " + bl({en:"Write failures",ja:"保存失敗"}) + " " + h.primary_failures +
+    " / " + bl({en:"Post-write hook failures",ja:"保存後の転送処理失敗"}) + " " + h.hook_failures +
+    ". " + bl({en:"This process only; restart resets observations. Outbox delivery is separate.",ja:"このプロセスの観測です。再起動でリセットされます。配送待ちの状態とは別です。"});
+}
+
+async function laAuditWriterHealth(host) {
+  const current = freshRender(host);
+  try {
+    const r = await apiFetch("GET", "/admin/audit-writer/health", undefined, _LA_PLANE);
+    if (!current()) return;
+    if (r.status === 403) {
+      host.innerHTML = "";
+      host.appendChild(el("p", {class:"ui-view-desc",text:bl({en:"Audit writer health is available to deployment administrators.",ja:"監査原本の保存状態は配備管理者が確認できます。"})}));
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const text = laAuditWriterHealthText(r.body);
+    host.innerHTML = "";
+    if (r.body.primary_failures > 0 || r.body.hook_failures > 0) host.appendChild(uiBadge(bl({en:"Attention needed",ja:"要確認"}), "danger"));
+    host.appendChild(el("p", {class:"ui-view-desc",text}));
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", String(e), {label:bl({en:"Retry",ja:"再試行"}),onClick:()=>laAuditWriterHealth(host)});
+  }
 }

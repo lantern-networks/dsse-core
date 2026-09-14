@@ -13476,6 +13476,62 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /admin/audit-writer/health:
+    get:
+      summary: Report observed primary audit-file write failures.
+      description: >-
+        Requires admin.logs.read and deployment-wide administration. Tenant-scoped
+        sessions and requests operating on a tenant receive 403. Counters describe
+        completed audit appends in this node's current Writer instance, reset on
+        recreation, and do not prove durable storage or fleet-wide completeness.
+        Primary failures remain degraded after successful writes. Hook failures
+        are counted separately and do not change primary status. Reading does not
+        append an audit event or clear failures.
+      tags:
+        - AdminLog
+      responses:
+        "200":
+          description: In-memory writer observations, including unknown or unavailable states.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, scope, attempts, primary_successes, primary_failures, hook_failures]
+                properties:
+                  status:
+                    type: string
+                    enum: [unknown, unavailable, healthy, degraded]
+                  scope:
+                    type: string
+                    enum: [writer_process_lifetime]
+                  attempts:
+                    type: integer
+                    minimum: 0
+                  primary_successes:
+                    type: integer
+                    minimum: 0
+                  primary_failures:
+                    type: integer
+                    minimum: 0
+                  hook_failures:
+                    type: integer
+                    minimum: 0
+                  last_success_at:
+                    type: string
+                    format: date-time
+                  last_primary_failure_at:
+                    type: string
+                    format: date-time
+                  last_hook_failure_at:
+                    type: string
+                    format: date-time
+                  last_primary_failure_phase:
+                    type: string
+                    enum: [encode, open, write, rotation]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /admin/hot-store/health:
     get:
       summary: Return Edge Hot Store mirror health.

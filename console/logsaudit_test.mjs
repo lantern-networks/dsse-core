@@ -116,3 +116,23 @@ test('export list shows regional exclusions for completed and legacy jobs', asyn
     assert.ok(texts.some(t=>coverage ? /: 0$/.test(t) : /could not be determined/.test(t)));
   }
 });
+
+test('audit writer observations never turn unknown or malformed state into healthy', () => {
+ const c=vm.createContext({bl:v=>v.en});vm.runInContext(source,c);
+ for(const value of [null,{}, {status:'healthy',primary_failures:null,hook_failures:0}]){
+  c.value=value;assert.throws(()=>vm.runInContext('laAuditWriterHealthText(value)',c));
+ }
+ for(const [status,match] of [['unknown',/No completed writes/],['unavailable',/Unavailable/],['degraded',/Write failures 2/]]){
+  c.value={status,primary_failures:status==='degraded'?2:0,hook_failures:0};assert.match(vm.runInContext('laAuditWriterHealthText(value)',c),match);
+ }
+});
+
+test('audit writer read failure offers retry; forbidden scope shows no statistics', async () => {
+ for(const response of [{ok:false,status:503},{ok:false,status:403}]){
+  const states=[],texts=[];const c=vm.createContext({host:{innerHTML:'',appendChild(){}},bl:v=>v.en,freshRender:()=>()=>true,
+   apiFetch:async()=>response,uiState:(...a)=>states.push(a),el:(tag,p)=>{texts.push(p.text);return {};}});
+  vm.runInContext(source,c);await vm.runInContext('laAuditWriterHealth(host)',c);
+  if(response.status===503){assert.equal(states[0][1],'error');assert.equal(typeof states[0][3].onClick,'function');}
+  else {assert.equal(states.length,0);assert.match(texts[0],/deployment administrators/);}
+ }
+});

@@ -358,6 +358,13 @@ func domainEventOutboxReplayAuditLog(result postgresDomainEventOutboxReplayResul
 // Hot-store health plus the embedded outbox admin surface (off by default in the
 // production binary; see -embedded-outbox-admin). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerOutboxAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, domainEventOutbox domainEventOutboxWriter, domainEventMirror *domainEventOutboxMirrorMonitor, hotStoreMirror *hotStoreAppendMirrorMonitor, exportObjectStore adminExportObjectStore) {
+	mux.HandleFunc("GET /admin/audit-writer/health", adminEndpoint("admin.logs.read", func(w http.ResponseWriter, r *http.Request) {
+		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
+			writeError(w, http.StatusForbidden, fmt.Errorf("audit writer health requires deployment-wide administration"))
+			return
+		}
+		writeJSON(w, http.StatusOK, writer.AuditHealth())
+	}))
 	mux.HandleFunc("GET /admin/hot-store/health", adminEndpoint("admin.logs.read", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, hotStoreMirror.Health(time.Now()))
 	}))

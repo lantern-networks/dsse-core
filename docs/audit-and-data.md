@@ -149,6 +149,35 @@ the audit writer is available. Audit outbox health describes delivery processing
 it is not proof that every primary audit-file write succeeded. Inspect service
 logs for `admin_audit_write_failed` when investigating missing audit records.
 
+### Observing audit-file write failures
+
+Deployment-wide administrators can read `GET /admin/audit-writer/health` with
+`admin.logs.read`; customer-scoped requests, including an operator acting within a
+customer, cannot read this node-wide diagnostic. Logs & Audit displays the same
+observation and offers Retry if it cannot be fetched. The endpoint is independent
+of the optional embedded outbox-admin endpoints.
+
+The common writer observes appends to the logical `audit.log.jsonl` stream, including
+direct worker audit writes. `primary_failures` covers encoding, opening, writing and
+rotation failures. `hook_failures` separately counts post-write append-hook failures:
+the primary file write has completed before the hook runs. These are not outbox
+backlog counts, and outbox-insert failures after `Append` returns are not measured
+by this monitor.
+
+`unknown` means no completed append has been observed; `unavailable` means no writer
+is configured. Any observed primary failure keeps status `degraded`, even after
+later successful writes. Counters and fixed failure-phase/timestamp fields carry no
+tenant identifiers, event contents, filesystem paths or raw error messages.
+
+These are in-memory observations for this Writer instance, normally its process
+lifetime. Restart or recreation resets them to unknown; it does not prove that a
+missing audit record was recovered. An append still in progress is not yet counted.
+This is not a storage probe, a stalled-write watchdog, a fleet aggregate, an fsync
+guarantee or a completeness claim. Rotation failure may occur after bytes were
+written, so a failure count is not an exact count of missing records. Preserve and
+investigate service logs before restarting a failed writer. Reading health performs
+no audit write of its own and cannot repair or clear an earlier failure.
+
 ### Records without a region
 
 A regional search excludes records whose stored region is unknown, including older

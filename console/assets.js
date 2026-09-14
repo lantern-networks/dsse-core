@@ -336,6 +336,19 @@ async function renderServicesSection(section) {
   draw();
 }
 
+function servicePortsFromRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const ports = [];
+  for (const row of rows) {
+    const text = String(row.port).trim();
+    if (!/^\d+$/.test(text) || !["tcp", "udp"].includes(row.protocol)) return null;
+    const port = Number(text);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    ports.push({ protocol: row.protocol, port });
+  }
+  return ports;
+}
+
 function openServiceForm(section) {
   const aliasF = uiField({ name: "alias", label: bl({ en: "Service name", ja: "サービス名" }), required: true, placeholder: bl({ en: "e.g. PostgreSQL", ja: "例: PostgreSQL" }) });
   const portRows = [];
@@ -361,9 +374,9 @@ function openServiceForm(section) {
     el("div", { style: "margin-top:6px" }, el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "+ Add port", ja: "+ ポート追加" }), onClick: () => { portRows.push({ protocol: "tcp", port: "" }); renderPorts(); } })),
   ], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
-    if (!aliasF.validate()) return;
-    const ports = portRows.map((r) => ({ protocol: r.protocol, port: parseInt(r.port, 10) })).filter((p) => Number.isInteger(p.port) && p.port > 0);
-    if (!ports.length) { uiToast(bl({ en: "Add at least one valid port.", ja: "有効なポートを1つ以上追加してください。" }), "err"); return; }
+    if (submit.disabled || !aliasF.validate()) return;
+    const ports = servicePortsFromRows(portRows);
+    if (!ports) { uiToast(bl({ en: "Enter a whole port number from 1 to 65535 in every row.", ja: "各行のポートに1から65535の整数を入力してください。" }), "err"); return; }
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/assets/services", { alias: aliasF.get(), ports });

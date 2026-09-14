@@ -66,3 +66,15 @@ test('unavailable legal hold never renders Off or a mutation button', async () =
     assert.equal(typeof states[0][3].onClick,'function');
   }
 });
+
+test('regional coverage distinguishes zero from unavailable', () => {
+  const context=vm.createContext({bl:v=>v.en});vm.runInContext(source,context);
+  for(const value of [undefined,{status:'unavailable',unknown_region_count:null},{status:'available',unknown_region_count:null},{status:'available',unknown_region_count:-1}]){
+    context.coverage=value;
+    assert.match(vm.runInContext('laRegionCoverageText(coverage)',context),/could not be determined/);
+  }
+  for(const count of [0,7]){
+    context.coverage={status:'available',unknown_region_count:count};
+    assert.match(vm.runInContext('laRegionCoverageText(coverage)',context),new RegExp(': '+count+'$'));
+  }
+});

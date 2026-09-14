@@ -651,6 +651,7 @@ function laFilterBar(filterHost, host, summaryHost) {
   // "app_swg_egress" placeholder, so an app-name filter never matched. The host is what operators filter by.
   if (isDecisionStream) { const dst = uiField({ name: "destination", label: bl({ en: "Destination", ja: "宛先" }), type: "text", value: _laFilters.destination || "" }); fields.push(["destination", dst]); }
   const dev = uiField({ name: "device_id", label: bl({ en: "Device", ja: "デバイス" }), type: "text", value: _laFilters.device_id || "" }); fields.push(["device_id", dev]);
+  const region = uiField({ name: "edge_region_id", label: bl({ en: "Region", ja: "リージョン" }), type: "text", value: _laFilters.edge_region_id || "" }); fields.push(["edge_region_id", region]);
   const from = uiField({ name: "from", label: bl({ en: "From", ja: "開始" }), type: "date", value: _laFilters._from || "" }); fields.push(["from", from]);
   const to = uiField({ name: "to", label: bl({ en: "To", ja: "終了" }), type: "date", value: _laFilters._to || "" }); fields.push(["to", to]);
 
@@ -707,11 +708,14 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
   // append that lands after a newer query started would concatenate two different result sets.
   const current = freshRender(host);
   if (!append) { _laRows = []; _laCursor = ""; _laTotal = 0; uiState(host, "loading"); }
+  let coverage;
   try {
     const qs = laQueryString(append ? _laCursor : "");
     const r = await apiFetch("GET", "/admin/logs/" + encodeURIComponent(_laStream) + (qs ? "?" + qs : ""), undefined, laPlaneFor(_laStream));
     if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }); return; }
+    if (!current()) return;
     const body = r.body || {};
+    coverage = body.region_coverage;
     const rows = Array.isArray(body) ? body : (body.rows || body.entries || body.events || []);
     _laRows = append ? _laRows.concat(rows) : rows;
     _laCursor = (body && body.next_cursor) || "";
@@ -726,7 +730,11 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
       admins.forEach((a) => { const id = a && (a.id || a.principal_id); if (id) _laAdminDir[id] = { email: (a.email || "").trim(), name: ((a.display_name || a.name) || "").trim() }; });
     } catch (e) { /* directory optional — metadata email still shows */ }
   }
-  if (summaryHost) laSummary(summaryHost, _laRows, _laStream);
+  if (!current()) return;
+  if (summaryHost) {
+    laSummary(summaryHost, _laRows, _laStream);
+    if (_laFilters.edge_region_id) summaryHost.appendChild(el("p", { class: "ui-view-desc", text: laRegionCoverageText(coverage) }));
+  }
   if (!_laRows.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No matching entries.", ja: "該当エントリはありません。" })); return; }
   const cols = laColsFor(_laStream);
   const trs = _laRows.map((row) => {
@@ -854,4 +862,12 @@ function openExportForm(section) {
       m.close(); uiToast(bl({ en: "Export started.", ja: "エクスポートを開始しました。" }), "ok"); laExports(section);
     } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
   });
+}
+
+function laRegionCoverageText(coverage) {
+  const count = coverage && coverage.unknown_region_count;
+  if (coverage && coverage.status === "available" && Number.isSafeInteger(count) && count >= 0) {
+    return bl({ en: "Records with an unknown region excluded from these filters: ", ja: "同じ検索条件で地域不明のため除外された記録: " }) + count;
+  }
+  return bl({ en: "Records without a region are excluded. Their count could not be determined; this result does not establish that no such records exist.", ja: "地域不明の記録は除外されています。件数を確認できないため、この結果だけで記録が存在しないとは判断できません。" });
 }

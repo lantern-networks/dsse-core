@@ -8801,9 +8801,6 @@ func writeEastWestCeremonySuccess(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("<!doctype html><html><body><h2>Authentication complete</h2><p>You may now retry your connection.</p></body></html>"))
 }
 
-// adminLoginTenantCookie carries the tenant resolved by home-realm discovery from /admin/login/discover to
-// the /admin/oidc/callback so the callback validates against (and binds the session to) the right tenant IdP.
-
 func randomURLToken(size int) (string, error) {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {

@@ -138,3 +138,22 @@ A failed hold change records an error through the normal HTTP audit path, provid
 the audit writer is available. Audit outbox health describes delivery processing;
 it is not proof that every primary audit-file write succeeded. Inspect service
 logs for `admin_audit_write_failed` when investigating missing audit records.
+
+### Records without a region
+
+A regional search excludes records whose stored region is unknown, including older
+PostgreSQL rows upgraded without a region. A zero-result regional search therefore
+does not prove that no relevant older records exist.
+
+For regional log queries, `region_coverage` reports an `unknown_region_count` when
+the backend can count it. PostgreSQL counts unknown-region records in the same tenant,
+stream, time range, text query and remaining filters, independent of pagination.
+The count is a separate live query, not a transactionally frozen export snapshot.
+Unsupported backends or count failures return `status: "unavailable"` and a null
+count. The Console displays that uncertainty instead of zero.
+
+The synchronous preview export includes `X-DSSE-Region-Coverage`,
+`X-DSSE-Region-Notice`, and, when available, `X-DSSE-Unknown-Region-Count` headers.
+These headers are not embedded in exported log rows. Asynchronous export artifacts
+do not yet carry this coverage information; retain that limitation when using a
+regional export to assess completeness.

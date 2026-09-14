@@ -289,6 +289,38 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 	if related.TotalRows != 1 || len(related.RowsByStream["access"]) != 1 {
 		t.Fatalf("related = %#v", related)
 	}
+	// Region coverage ignores only region/pagination, retaining all other scope.
+	from, to := time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
+	for _, row := range []struct {
+		id, tenant, stream, region, decision, text string
+		at                                         time.Time
+	}{
+		{"match", "tenant_coverage", "access", "", "deny", "needle", time.Now()},
+		{"foreign", "foreign", "access", "", "deny", "needle", time.Now()},
+		{"stream", "tenant_coverage", "audit", "", "deny", "needle", time.Now()},
+		{"known", "tenant_coverage", "access", "region-test", "deny", "needle", time.Now()},
+		{"allow", "tenant_coverage", "access", "", "allow", "needle", time.Now()},
+		{"text", "tenant_coverage", "access", "", "deny", "other", time.Now()},
+		{"old", "tenant_coverage", "access", "", "deny", "needle", from.Add(-time.Hour)},
+	} {
+		payload, _ := json.Marshal(map[string]string{"decision": row.decision, "message": row.text})
+		if _, err := db.ExecContext(ctx, `INSERT INTO hot_events(tenant_id,stream,event_id,edge_region_id,occurred_at,payload) VALUES($1,$2,$3,$4,$5,$6)`, row.tenant, row.stream, row.id, row.region, row.at, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counter, ok := store.(hotstore.UnknownRegionCounter)
+	if !ok {
+		t.Fatal("PostgreSQL region counter absent")
+	}
+	query := hotstore.SearchQuery{TenantID: "tenant_coverage", Stream: "access", Filters: map[string]string{"edge_region_id": "region-test", "decision": "deny", "tenant_id": "foreign"}, Text: "needle", From: &from, To: &to, Limit: 1, Cursor: "ignored-by-count"}
+	if n, err := counter.CountUnknownRegion(ctx, query); err != nil || n != 1 {
+		t.Fatalf("unknown count=%d err=%v", n, err)
+	}
+	query.TenantID = "empty-tenant"
+	if n, err := counter.CountUnknownRegion(ctx, query); err != nil || n != 0 {
+		t.Fatalf("empty count=%d err=%v", n, err)
+	}
+
 }
 
 func TestPostgresAdminExportJobStoreE2E(t *testing.T) {

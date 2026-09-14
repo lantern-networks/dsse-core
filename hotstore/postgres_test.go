@@ -229,3 +229,29 @@ func normalizePostgresHotStoreSQLContract(sqlText string) string {
 	sqlText = strings.ReplaceAll(sqlText, ";", " ")
 	return strings.Join(strings.Fields(sqlText), " ")
 }
+
+func TestUnknownRegionCountPreservesQueryScope(t *testing.T) {
+	from := time.Now().Add(-time.Hour)
+	to := time.Now()
+	filters := map[string]string{"tenant_id": "foreign", "edge_region_id": "region-a", "decision": "deny"}
+	statement, err := buildPostgresSearchStatement(SearchQuery{TenantID: "own", Stream: "audit", Filters: filters, Text: "needle", From: &from, To: &to, Limit: 1, countUnknownRegion: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, clause := range []string{"SELECT count(*)", "tenant_id = $1", "stream = $2", "edge_region_id = ''", "payload ->>", "lower(payload::text)", "occurred_at >=", "occurred_at <="} {
+		if !strings.Contains(statement.SQL, clause) {
+			t.Fatalf("missing %s in %s", clause, statement.SQL)
+		}
+	}
+	if strings.Contains(statement.SQL, "LIMIT") || strings.Contains(statement.SQL, "OFFSET") {
+		t.Fatal("count was paginated")
+	}
+	for _, arg := range statement.Args {
+		if arg == "region-a" || arg == "foreign" {
+			t.Fatal("removed region or untrusted tenant retained")
+		}
+	}
+	if statement.Args[0] != "own" || statement.Args[1] != "audit" || filters["edge_region_id"] != "region-a" {
+		t.Fatal("query scope or caller filters changed")
+	}
+}

@@ -82,28 +82,35 @@ func adminLogExport(store hotstore.Store, tenantID, stream string, query url.Val
 	return result, nil
 }
 
+type adminLogRegionCoverage struct {
+	Status             string `json:"status"`
+	UnknownRegionCount *int64 `json:"unknown_region_count"`
+}
+
 type adminLogSearchResult struct {
-	stream       string
-	limit        int
-	filters      map[string]string
-	query        string
-	totalScanned int
-	totalMatches int
-	nextCursor   *string
-	rows         []map[string]any
+	regionCoverage *adminLogRegionCoverage
+	stream         string
+	limit          int
+	filters        map[string]string
+	query          string
+	totalScanned   int
+	totalMatches   int
+	nextCursor     *string
+	rows           []map[string]any
 }
 
 func (result adminLogSearchResult) response() map[string]any {
 	return map[string]any{
-		"stream":        result.stream,
-		"limit":         result.limit,
-		"filters":       result.filters,
-		"query":         result.query,
-		"total_scanned": result.totalScanned,
-		"total_matches": result.totalMatches,
-		"returned":      len(result.rows),
-		"next_cursor":   result.nextCursor,
-		"rows":          result.rows,
+		"region_coverage": result.regionCoverage,
+		"stream":          result.stream,
+		"limit":           result.limit,
+		"filters":         result.filters,
+		"query":           result.query,
+		"total_scanned":   result.totalScanned,
+		"total_matches":   result.totalMatches,
+		"returned":        len(result.rows),
+		"next_cursor":     result.nextCursor,
+		"rows":            result.rows,
 	}
 }
 
@@ -124,15 +131,29 @@ func adminLogSearchWithLimitBounds(store hotstore.Store, tenantID, stream string
 		return adminLogSearchResult{}, err
 	}
 
+	var coverage *adminLogRegionCoverage
+	if strings.TrimSpace(searchQuery.Filters["edge_region_id"]) != "" {
+		coverage = &adminLogRegionCoverage{Status: "unavailable"}
+		if counter, ok := store.(hotstore.UnknownRegionCounter); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			count, countErr := counter.CountUnknownRegion(ctx, searchQuery)
+			cancel()
+			if countErr == nil && count >= 0 {
+				coverage.Status = "available"
+				coverage.UnknownRegionCount = &count
+			}
+		}
+	}
 	return adminLogSearchResult{
-		stream:       result.Stream,
-		limit:        result.Limit,
-		filters:      result.Filters,
-		query:        result.Query,
-		totalScanned: result.TotalScanned,
-		totalMatches: result.TotalMatches,
-		nextCursor:   result.NextCursor,
-		rows:         result.Rows,
+		regionCoverage: coverage,
+		stream:         result.Stream,
+		limit:          result.Limit,
+		filters:        result.Filters,
+		query:          result.Query,
+		totalScanned:   result.TotalScanned,
+		totalMatches:   result.TotalMatches,
+		nextCursor:     result.NextCursor,
+		rows:           result.Rows,
 	}, nil
 }
 

@@ -285,7 +285,10 @@ async function openEnrolTokenForm(content) {
       }
       if (!r.ok) {
         submit.disabled = false;
-        const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
+        const malformedPartial = r.status === 409 && r.body && r.body.partial === true &&
+          (!Array.isArray(r.body.tokens) || !enrolTokenRowsValid(r.body.tokens));
+        const msg = malformedPartial ? enrolTokenResponseWarning() :
+          (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
         labelF.setError(msg); uiToast(msg, "err"); return;
       }
       m.close();
@@ -323,10 +326,16 @@ function enrolTokenRowsValid(rows) {
   return rows.every(r => r && r.token && typeof r.token === "object" && !Array.isArray(r.token) &&
     typeof r.token.id === "string" && r.token.id.length > 0 && typeof r.secret === "string" && r.secret.length > 0);
 }
+function enrolTokenResponseWarning() {
+  return bl({
+    en: "The issued token response is incomplete or invalid. Tokens may already have been created. Check the unused tokens in the list before issuing more; revoke any unneeded tokens.",
+    ja: "発行応答が不完全か、不正です。サーバー側では発行済みの可能性があります。追加発行の前に一覧の未使用トークンを確認し、不要なものを失効してください。"
+  });
+}
 function showEnrolTokenOnce(body) {
   const rows = (body && body.tokens) || [];
   if (!Array.isArray(rows) || !enrolTokenRowsValid(rows)) {
-    uiToast("Invalid issued token response", "err"); return;
+    uiToast(enrolTokenResponseWarning(), "err"); return;
   }
   const notice = body && body.partial === true ? [el("p", { class: "ui-view-desc", text: bl({
     en: "Issuance stopped: " + rows.length + " of " + body.requested_count + " requested tokens were returned. Save these tokens and investigate the failure before issuing more.",
@@ -366,7 +375,7 @@ function showEnrolTokenOnce(body) {
     return;
   }
   const secret = (body && body.secret) || (rows.length === 1 && rows[0].secret);
-  if (typeof secret !== "string" || !secret) { uiToast("Issued token is unavailable", "err"); return; }
+  if (typeof secret !== "string" || !secret) { uiToast(enrolTokenResponseWarning(), "err"); return; }
   // ★★★ THE TOKEN IS A FILE, NOT A FIELD (2026-08-30). This offered the secret as text to read, and said to
   // "put it in the device's installer settings" — there are no installer settings. What the installer reads is
   // a file named enrolment_token.txt sitting next to it, so that is what this hands over. Typing a 43-character

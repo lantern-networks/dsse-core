@@ -68,8 +68,28 @@ test('single-token partial batch preserves its secret and shows the partial issu
 
 test('missing issuance credentials never announce approval success',()=>{
  for(const body of [{},{tokens:[{token:{id:'bad'}}]},{tokens:'bad'}]){
-  const errors=[];const c=vm.createContext({body,uiToast:(...a)=>errors.push(a)});
+  const errors=[];const c=vm.createContext({body,bl:v=>v.en,uiToast:(...a)=>errors.push(a)});
   vm.runInContext(source,c);vm.runInContext('showEnrolTokenOnce(body)',c);
   assert.equal(errors.length,1);assert.equal(errors[0][1],'err');
+  assert.match(errors[0][0],/may already have been created/);
+  assert.match(errors[0][0],/before issuing more/);
+ }
+});
+
+
+test('malformed partial issuance warns of saved tokens without disclosure or automatic reissue',async()=>{
+ for(const tokens of [[{token:{id:'valid'},secret:'secret-valid'},{token:{id:'missing-secret'}}],'invalid',undefined]){
+  let submit,calls=0,closed=0;const errors=[],fieldErrors=[];
+  const c=vm.createContext({bl:v=>v.en,uiToast:(...a)=>errors.push(a),
+   uiField:f=>({el:{},get:()=>f.name==='count'?'3':f.value||'label',validate:()=>true,focus(){},setError:m=>fieldErrors.push(m)}),
+   el:(tag,attrs)=>({...attrs,addEventListener:(event,fn)=>{submit=fn;}}),uiModal:()=>({close:()=>closed++}),
+   apiFetch:async()=>{calls++;return {ok:false,status:409,body:{partial:true,tokens,error:'stopped'}};},
+   fail:()=>assert.fail('must not disclose a malformed batch')});
+  vm.runInContext(source,c);vm.runInContext('showEnrolTokenOnce=fail',c);
+  await vm.runInContext('openEnrolTokenForm({})',c);await submit();
+  assert.equal(calls,1);assert.equal(closed,0);assert.equal(errors.length,1);
+  assert.match(errors[0][0],/may already have been created/);
+  assert.match(errors[0][0],/Check the unused tokens/);
+  assert.equal(fieldErrors[0],errors[0][0]);assert.equal(errors[0][1],'err');
  }
 });

@@ -59,10 +59,15 @@ func TestAuditChainVerifyDetectsTampering(t *testing.T) {
 	ctx := context.Background()
 	tenant := "t1"
 	for i := 0; i < 3; i++ {
-		seq, prev := cs.Next(tenant)
+		seq, prev, err := cs.Next(tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
 		seg, h := buildAuditSegment(seq, prev, [][]byte{[]byte(`{"event":"e` + strconv.Itoa(i) + `"}`)})
 		fa.objs[fmt.Sprintf("hot_events/%s/audit/2026-01-0%d.ndjson.gz", tenant, i+1)] = seg
-		cs.Commit(tenant, seq, h)
+		if err := cs.Commit(tenant, seq, h); err != nil {
+			t.Fatal(err)
+		}
 	}
 	res, err := verifyAuditChain(ctx, fa, tenant)
 	if err != nil || !res.OK || res.Segments != 3 {

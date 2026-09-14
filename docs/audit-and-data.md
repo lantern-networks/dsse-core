@@ -260,3 +260,28 @@ legacy unchained segment also fail verification.
 Audit writer health displays the browser retrieval time and does not refresh automatically.
 Its failure counters describe append operations, not a count of missing audit records;
 rotation can fail after record bytes have already been written.
+
+## Archive write failures and hot-row deletion
+
+Tiering locks the selected hot rows in a database transaction while uploading the
+segment. A scan or row-read failure aborts the attempt without publishing or deleting
+rows. After upload, only the selected event IDs may be deleted; older rows arriving
+during upload remain for a later sweep. The upload holds row locks, so slow archive
+storage can delay updates to those rows.
+
+For chained audit segments, chain state must save successfully before hot-row deletion.
+A state-save error leaves hot rows in place and pauses further chained writes in this
+process. Each attempt checks the listed archive count against the saved chain position;
+a mismatch also pauses writes, including after a restart. This is a reconciliation guard,
+not a transactional or completeness guarantee across the database and archive backend.
+Repair requires inspecting the saved head and archived objects together. Do not reset the
+chain to zero or delete retained hot rows to clear the error.
+
+Segment names include creation time, sequence and content hash so a retry after a failed
+delete does not overwrite a preceding chained segment. Upload followed by delete failure
+can leave duplicate audit records in multiple valid segments. An ambiguous upload or
+state-save outcome may require operator reconciliation. Writes are serialized in one
+process; cross-process writers and leader changes still require separate coordination.
+
+When a runtime override store is configured, the pruner can apply Console overrides even
+if startup hot-event TTLs are all zero. A zero polling interval still disables the pruner.

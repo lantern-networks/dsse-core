@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"sort"
@@ -27,9 +28,11 @@ type auditChainState struct {
 }
 
 type auditChainStore struct {
-	mu        sync.Mutex
-	per       map[string]auditChainState // tenant -> running chain state
-	persister blobstore.Persister
+	operationMu sync.Mutex // Serialize archive/advance within this process.
+	mu          sync.Mutex
+	stateErr    error
+	per         map[string]auditChainState // tenant -> running chain state
+	persister   blobstore.Persister
 }
 
 func newAuditChainStore(p blobstore.Persister) *auditChainStore {
@@ -39,50 +42,124 @@ func newAuditChainStore(p blobstore.Persister) *auditChainStore {
 	}
 	data, err := p.Load()
 	if err != nil {
+		s.stateErr = fmt.Errorf("audit chain state could not be loaded")
 		log.Printf("audit-chain store load: %v", err)
 		return s
 	}
 	if len(data) == 0 {
 		return s
 	}
-	if err := json.Unmarshal(data, &s.per); err != nil {
+	loaded, err := decodeAuditChainState(data)
+	if err != nil {
+		s.stateErr = fmt.Errorf("audit chain state could not be loaded")
 		log.Printf("audit-chain store parse: %v", err)
-		s.per = map[string]auditChainState{}
+	} else {
+		s.per = loaded
 	}
+
 	return s
 }
 
-// Next returns the seq + prev-hash to embed in the tenant's next audit segment.
-func (s *auditChainStore) Next(tenant string) (int, string) {
+func decodeAuditChainState(data []byte) (map[string]auditChainState, error) {
+	d := json.NewDecoder(bytes.NewReader(data))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("expected chain state object")
+	}
+	result := map[string]auditChainState{}
+	for d.More() {
+		token, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		tenant, ok := token.(string)
+		if !ok || tenant == "" {
+			return nil, fmt.Errorf("invalid chain tenant")
+		}
+		if _, exists := result[tenant]; exists {
+			return nil, fmt.Errorf("duplicate chain tenant")
+		}
+		var state struct {
+			Seq      *int    `json:"seq"`
+			LastHash *string `json:"last_hash"`
+		}
+		if err := d.Decode(&state); err != nil {
+			return nil, err
+		}
+		if state.Seq == nil || state.LastHash == nil || *state.Seq < 0 {
+			return nil, fmt.Errorf("invalid chain state")
+		}
+		hash, err := hex.DecodeString(*state.LastHash)
+		if (*state.Seq == 0 && *state.LastHash != "") || (*state.Seq > 0 && (err != nil || len(hash) != sha256.Size)) {
+			return nil, fmt.Errorf("invalid chain hash")
+		}
+		result[tenant] = auditChainState{Seq: *state.Seq, LastHash: *state.LastHash}
+	}
+	if _, err := d.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, fmt.Errorf("trailing chain state data")
+	}
+	return result, nil
+}
+
+func (s *auditChainStore) Health() error {
 	if s == nil {
-		return 0, ""
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.stateErr
+}
+
+// Next returns the seq + prev-hash to embed in the tenant's next audit segment.
+func (s *auditChainStore) Next(tenant string) (int, string, error) {
+	if s == nil {
+		return 0, "", fmt.Errorf("audit chain state is unavailable")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stateErr != nil {
+		return 0, "", s.stateErr
+	}
 	st := s.per[tenant]
-	return st.Seq, st.LastHash
+	return st.Seq, st.LastHash, nil
 }
 
 // Commit records that the segment with this seq + hash was successfully written, advancing the chain.
-func (s *auditChainStore) Commit(tenant string, seq int, hash string) {
+func (s *auditChainStore) Commit(tenant string, seq int, hash string) error {
 	if s == nil {
-		return
+		return fmt.Errorf("audit chain state is unavailable")
 	}
 	s.mu.Lock()
-	s.per[tenant] = auditChainState{Seq: seq + 1, LastHash: hash}
-	s.persistLocked()
-	s.mu.Unlock()
-}
-
-func (s *auditChainStore) persistLocked() {
-	if s.persister == nil {
-		return
+	defer s.mu.Unlock()
+	if s.stateErr != nil {
+		return s.stateErr
 	}
-	data, err := json.Marshal(s.per)
-	if err != nil {
-		return
+	if s.per[tenant].Seq != seq {
+		s.stateErr = fmt.Errorf("audit chain generation changed; reconciliation required")
+		return s.stateErr
 	}
-	_ = s.persister.Save(data)
+	next := make(map[string]auditChainState, len(s.per)+1)
+	for key, state := range s.per {
+		next[key] = state
+	}
+	next[tenant] = auditChainState{Seq: seq + 1, LastHash: hash}
+	if s.persister != nil {
+		data, err := json.Marshal(next)
+		if err == nil {
+			err = s.persister.Save(data)
+		}
+		if err != nil {
+			// The object already exists. Retrying with the old head could create a fork.
+			s.stateErr = fmt.Errorf("audit chain state save failed; reconciliation required")
+			log.Printf("audit-chain state save: %v", err)
+			return s.stateErr
+		}
+	}
+	s.per = next
+	return nil
 }
 
 type auditChainHeader struct {

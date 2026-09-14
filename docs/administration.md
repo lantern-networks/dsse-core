@@ -104,6 +104,13 @@ email address. Conflicts fail the request and refresh local state without retryi
 the deletion automatically. A tenant cascade stops at its first failure and can
 have already removed earlier accounts; inspect the reported outcome before retrying.
 
+Full tenant erasure also sweeps residual database rows on the local node. Its
+credential-table batches use the same transaction-local writer protocol and count
+only committed deletions, including a successful zero-row cleanup. If the preceding
+account-deletion phase fails, the residual credential sweep is skipped rather than
+bypassing its refusal. Failures keep the tenant deletion/erasure records for retry.
+This operation is not one atomic transaction across all tenant stores.
+
 Credential persistence calls carry a five-second deadline. PostgreSQL honors that
 deadline; filesystem operations are not guaranteed to be interruptible. Existing
 session checks and principal labels read the last committed account snapshot without

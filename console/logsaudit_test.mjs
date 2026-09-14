@@ -383,3 +383,32 @@ test('related approval summaries do not use trust state as an approval outcome',
   assert.doesNotMatch(vm.runInContext('laRelatedSummary("human_approval_events",{trust_state:"trusted"})',c),/trusted/);
   assert.match(vm.runInContext('laRelatedSummary("human_approval_events",{outcome:"denied",trust_state:"trusted"})',c),/denied/);
 });
+
+test('stale administrator directory cannot overwrite the newest audit actor mapping',async()=>{
+  let finish;const pending=new Promise(resolve=>{finish=resolve;});let reads=0;
+  const host={appendChild(){}};
+  const c=vm.createContext({host,URLSearchParams,bl:v=>v.en,uiState(){},
+    freshRender:h=>{const seq=h.seq=(h.seq||0)+1;return ()=>h.seq===seq;},
+    apiFetch:async(method,path)=>path.startsWith('/admin/logs/')?{ok:true,body:{rows:[],total_matches:0}}:
+      (++reads===1?pending:{ok:true,body:{admins:[{id:'actor',email:'current@example.test'}]}})});
+  vm.runInContext(source,c);vm.runInContext('_laStream="audit"',c);
+  const old=vm.runInContext('laLoadStream(host,null,null)',c);
+  // Let the first log read reach its optional directory lookup.
+  await new Promise(resolve=>setImmediate(resolve));
+  await vm.runInContext('laLoadStream(host,null,null)',c);
+  assert.equal(vm.runInContext('_laAdminDir.actor.email',c),'current@example.test');
+  finish({ok:true,body:{admins:[{id:'actor',email:'stale@example.test'}]}});await old;
+  assert.equal(vm.runInContext('_laAdminDir.actor.email',c),'current@example.test');
+});
+
+test('starting a new log query clears the preceding allow-rate summary even when it fails',async()=>{
+  for(const response of [{ok:false,status:503},new Error('offline')]){
+    let finish;const pending=new Promise(resolve=>{finish=resolve;});
+    const summary={innerHTML:'Allow rate 100%'};
+    const c=vm.createContext({host:{},summary,URLSearchParams,bl:v=>v.en,uiState(){},freshRender:()=>()=>true,
+      apiFetch:async()=>{await pending;if(response instanceof Error)throw response;return response;}});
+    vm.runInContext(source,c);
+    const load=vm.runInContext('laLoadStream(host,null,summary)',c);
+    assert.equal(summary.innerHTML,'');finish();await load;assert.equal(summary.innerHTML,'');
+  }
+});

@@ -757,7 +757,7 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
   // The guard is taken for EVERY call, not only the fresh ones: "Load older" appends to the same host, and an
   // append that lands after a newer query started would concatenate two different result sets.
   const current = freshRender(host);
-  if (!append) { _laRows = []; _laCursor = ""; _laTotal = 0; uiState(host, "loading"); }
+  if (!append) { _laRows = []; _laCursor = ""; _laTotal = 0; if (summaryHost) summaryHost.innerHTML = ""; uiState(host, "loading"); }
   let coverage;
   try {
     const qs = laQueryString(append ? _laCursor : "");
@@ -773,12 +773,14 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
   } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }); return; }
   // For the audit stream, resolve admin principal ids → email/name once so the Admin column shows WHO acted.
   if (_laStream === "audit" && !append) {
-    _laAdminDir = {};
+    const directory = {};
     try {
       const ar = await apiFetch("GET", "/admin/admins", undefined, _LA_PLANE);
       const admins = (ar && ar.ok && ar.body && (ar.body.admins || ar.body.principals || ar.body.items)) || [];
-      admins.forEach((a) => { const id = a && (a.id || a.principal_id); if (id) _laAdminDir[id] = { email: (a.email || "").trim(), name: ((a.display_name || a.name) || "").trim() }; });
+      admins.forEach((a) => { const id = a && (a.id || a.principal_id); if (id) directory[id] = { email: (a.email || "").trim(), name: ((a.display_name || a.name) || "").trim() }; });
     } catch (e) { /* directory optional — metadata email still shows */ }
+    if (!current()) return;
+    _laAdminDir = directory;
   }
   if (!current()) return;
   if (summaryHost) {

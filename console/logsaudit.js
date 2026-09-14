@@ -905,11 +905,37 @@ async function laExports(section) {
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laExports(section) }); return; }
   if (!current()) return;
   section.innerHTML = "";
-  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
+  section.appendChild(el("div", { class: "ui-toolbar" }, [el("button", { class: "ui-btn", text: bl({ en: "Refresh", ja: "更新" }), onClick: () => laExports(section) }), el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
   if (!jobs.length) { section.appendChild(emptyBox(bl({ en: "No exports yet.", ja: "エクスポートがありません。" }))); return; }
-  section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" })], jobs.map((j) => [
+  section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" }), bl({ en: "Actions", ja: "操作" })], jobs.map((j) => [
     el("div", {}, [el("span", { text: j.stream || "—" }), ...(j.filters && j.filters.edge_region_id ? [el("p", { class: "ui-view-desc", text: laRegionCoverageText(j.metadata && j.metadata.region_coverage) })] : [])]), el("span", { text: j.format || "—" }), laResultBadge(j.status), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+    j.status === "completed" && typeof j.id === "string" && j.id ? el("button", { class: "ui-btn", text: bl({en:"Download",ja:"ダウンロード"}), onClick: event => laDownloadExport(j, event.currentTarget) }) : el("span", {text:"—"}),
   ])));
+}
+
+// Resolve only the token path against the Console control-plane proxy. The server's
+// absolute URL can name an internal service behind the front door.
+async function laDownloadExport(job, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const r = await apiFetch("POST", "/admin/export-jobs/" + encodeURIComponent(job.id) + "/download-url", {}, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const raw = r.body && r.body.download_url;
+    if (typeof raw !== "string") throw new Error("Invalid download response");
+    const url = new URL(raw, window.location.origin);
+    if (!/^https?:$/.test(url.protocol) || !/^\/admin\/export-downloads\/[A-Za-z0-9_-]+$/.test(url.pathname) || url.search || url.hash) throw new Error("Invalid download response");
+    const response = await fetch(baseForPlane(_LA_PLANE) + url.pathname, {credentials:"same-origin", cache:"no-store", redirect:"error", referrerPolicy:"no-referrer"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const blob = await response.blob();
+    const objectURL = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectURL; a.download = "dsse-export-" + job.id.replace(/[^A-Za-z0-9_-]/g, "_") + ".ndjson.gz";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectURL), 10000);
+  } catch (e) {
+    uiToast(bl({en:"Could not download the export. Retry to request a new download link.",ja:"エクスポートを取得できませんでした。再度ダウンロードを押すと、新しい取得リンクを発行します。"}), "err");
+  } finally { button.disabled = false; }
 }
 
 // Date selections use the operator's local calendar, matching log search.

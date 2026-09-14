@@ -464,3 +464,27 @@ test('failed older-page requests retry the same cursor without dropping or dupli
   assert.equal(h.calls[2][1],h.calls[1][1]);
  }
 });
+
+test('export download rejects malformed links and failures without offering a file', async () => {
+  for (const mode of ['http', 'missing', 'path', 'scheme', 'query', 'fetch', 'network']) {
+    const messages=[]; let fetched=0; const button={disabled:false};
+    const links={path:'https://internal.invalid/admin/other/token',scheme:'javascript:alert(1)',query:'https://internal.invalid/admin/export-downloads/token?extra=1'};
+    const c=vm.createContext({URL,window:{location:{origin:'https://console.invalid'}},bl:v=>v.en,uiToast:(...a)=>messages.push(a),baseForPlane:()=>'/control',
+      apiFetch:async()=>({ok:mode!=='http',status:503,body:mode==='missing'?{}:{download_url:links[mode]||'https://internal.invalid/admin/export-downloads/token'}}),
+      fetch:async()=>{fetched++;if(mode==='network')throw new Error('offline');return {ok:false,status:404};},button});
+    vm.runInContext(source,c);await vm.runInContext('laDownloadExport({id:"job"},button)',c);
+    assert.equal(messages.length,1);assert.equal(messages[0][1],'err');assert.equal(button.disabled,false);
+    assert.equal(fetched,['fetch','network'].includes(mode)?1:0);
+  }
+});
+
+test('export download stays on the control proxy and blocks concurrent clicks', async () => {
+  const calls=[];let clicked=0,release; const button={disabled:false};
+  const c=vm.createContext({URL:class extends URL {static createObjectURL(){return 'blob:test';}static revokeObjectURL(){}},window:{location:{origin:'https://console.invalid'}},bl:v=>v.en,uiToast:()=>assert.fail('unexpected failure'),baseForPlane:()=>'/control',setTimeout:()=>{},button,
+    apiFetch:async(...args)=>{calls.push(args);await new Promise(r=>release=r);return {ok:true,body:{download_url:'https://internal.invalid/admin/export-downloads/token-1'}};},
+    fetch:async(path,options)=>{assert.equal(path,'/control/admin/export-downloads/token-1');assert.equal(options.redirect,'error');return {ok:true,blob:async()=>({})};},
+    document:{createElement:()=>({click(){clicked++;},remove(){}}),body:{appendChild(){}}}});
+  vm.runInContext(source,c);const first=vm.runInContext('laDownloadExport({id:"job/id"},button)',c);
+  await vm.runInContext('laDownloadExport({id:"job/id"},button)',c);assert.equal(calls.length,1);release();await first;
+  assert.equal(calls[0][1],'/admin/export-jobs/job%2Fid/download-url');assert.equal(calls[0][3],'control');assert.equal(clicked,1);assert.equal(button.disabled,false);
+});

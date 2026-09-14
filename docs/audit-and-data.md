@@ -308,3 +308,9 @@ valid for API clients requesting one instant.
 Invalid or missing dates remain in the form with an error so they can be corrected.
 Failed export requests receive error audit outcomes. Job-state colors use explicit
 outcomes; an unknown or incomplete status is not evidence of a completed export.
+
+### Enrolment token state persistence
+
+For the file/blob-backed enrolment token store, issuance, consumption, revocation and tenant removal publish their new in-memory state only after saving succeeds. A save failure stops further issuance and token verification/spending in that process; the AdminConsole token routes report the store as unavailable. A revocation whose save fails returns 503 and is audited as an error. Tenant erasure reports a failure instead of counting unsaved token removals as erased.
+
+Treat an unavailable store as requiring investigation. A storage error may mean nothing was saved, or that saving completed but its acknowledgement was lost. Reconcile the saved state and the failed operation before restarting; a restart alone does not establish that a failed revocation was persisted. Existing successfully issued device certificates are not revoked by this token-store safeguard. The in-memory store without a persister remains non-durable. A persister that explicitly reports `ErrSavedWithoutAtomicity` retains its existing saved-but-not-atomic behavior and warning.

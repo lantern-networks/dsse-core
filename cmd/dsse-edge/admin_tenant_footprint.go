@@ -479,7 +479,12 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.EnrolmentTokens != nil {
-		add("enrolment_tokens_store", e.EnrolmentTokens.RemoveTenant(tenantID))
+		n := e.EnrolmentTokens.RemoveTenant(tenantID)
+		if err := e.EnrolmentTokens.Health(); err != nil {
+			result.Failures = append(result.Failures, "enrolment_tokens_store: "+err.Error())
+		} else {
+			add("enrolment_tokens_store", n)
+		}
 	}
 	if e.AgentRolloutPlans != nil {
 		add("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenant(tenantID))

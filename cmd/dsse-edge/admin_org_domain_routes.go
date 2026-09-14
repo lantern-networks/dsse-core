@@ -20,7 +20,11 @@ func registerOrganizationDomainRoutes(mux *http.ServeMux, adminEndpoint func(str
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		saved := organizationDomains.SetDomains(tenant, body.Domains)
+		saved, err := organizationDomains.SetDomainsDurable(tenant, body.Domains)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("could not save organization domains"))
+			return
+		}
 		logInfof("organization_domains_applied_by_admin tenant=%s domains=%d", tenant, len(saved))
 		writeJSON(w, http.StatusOK, map[string]any{"domains": saved})
 	}))

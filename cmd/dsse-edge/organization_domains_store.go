@@ -44,8 +44,8 @@ func (s *organizationDomainsStore) Domains(tenantID string) []string {
 	return append([]string(nil), s.byTenant[tenantID]...)
 }
 
-// SetDomains replaces a tenant's organization domains (normalized + de-duplicated; empties dropped).
-func (s *organizationDomainsStore) SetDomains(tenantID string, domains []string) []string {
+// normalizedOrganizationDomains normalizes, sorts and de-duplicates nonempty inputs.
+func normalizedOrganizationDomains(domains []string) []string {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(domains))
 	for _, d := range domains {
@@ -56,6 +56,11 @@ func (s *organizationDomainsStore) SetDomains(tenantID string, domains []string)
 		}
 	}
 	sort.Strings(out)
+	return out
+}
+
+func (s *organizationDomainsStore) SetDomains(tenantID string, domains []string) []string {
+	out := normalizedOrganizationDomains(domains)
 	s.mu.Lock()
 	if len(out) == 0 {
 		delete(s.byTenant, tenantID)
@@ -95,34 +100,55 @@ func (s *organizationDomainsStore) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-// PersistIfDirty writes a snapshot when there are unsaved changes.
-func (s *organizationDomainsStore) PersistIfDirty() error {
-	s.mu.Lock()
-	if !s.dirty || s.persister == nil {
-		s.mu.Unlock()
+func (s *organizationDomainsStore) snapshotLocked() organizationDomainsSnapshot {
+	next := organizationDomainsSnapshot{ByTenant: map[string][]string{}}
+	for tenant, domains := range s.byTenant {
+		next.ByTenant[tenant] = append([]string(nil), domains...)
+	}
+	return next
+}
+
+func (s *organizationDomainsStore) saveSnapshotLocked(next organizationDomainsSnapshot) error {
+	if s.persister == nil {
 		return nil
 	}
-	snap := organizationDomainsSnapshot{ByTenant: map[string][]string{}}
-	for t, d := range s.byTenant {
-		snap.ByTenant[t] = d
-	}
-	data, err := json.Marshal(snap)
-	p := s.persister
-	if err == nil {
-		s.dirty = false
-	}
-	s.mu.Unlock()
+	raw, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	if err := p.Save(data); err != nil {
-		// dirty was cleared optimistically (Save runs outside the lock); re-mark so the next periodic
-		// flush retries instead of silently dropping the snapshot (review #17).
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
+	return s.persister.Save(raw)
+}
+
+// SetDomainsDurable saves before publishing the account-classification change.
+func (s *organizationDomainsStore) SetDomainsDurable(tenant string, domains []string) ([]string, error) {
+	out := normalizedOrganizationDomains(domains)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.snapshotLocked()
+	if len(out) == 0 {
+		delete(next.ByTenant, tenant)
+	} else {
+		next.ByTenant[tenant] = out
+	}
+	if err := s.saveSnapshotLocked(next); err != nil {
+		return nil, err
+	}
+	s.byTenant = next.ByTenant
+	s.dirty = false
+	return append([]string{}, out...), nil
+}
+
+// Periodic snapshots and admin commits share the lock to preserve save order.
+func (s *organizationDomainsStore) PersistIfDirty() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty || s.persister == nil {
+		return nil
+	}
+	if err := s.saveSnapshotLocked(s.snapshotLocked()); err != nil {
 		return err
 	}
+	s.dirty = false
 	return nil
 }
 

@@ -833,23 +833,33 @@ function laFieldRow(k, v) {
 // One-line summary of a related record (grant / approval / inspection / decision-trace) linked to a decision.
 function laRelatedSummary(s, r) {
   if (s === "delegated_access_grants") return [laVal(r, "grantee_id", "actor_nhi_id", "user_id"), laVal(r, "scope", "application_id", "tool_id"), laVal(r, "event_type", "action", "status")].filter(Boolean).join(" · ") || "—";
-  if (s === "human_approval_events") return [laVal(r, "requester_user_id", "user_id", "subject_user_id"), "→", laVal(r, "approver_user_id", "approver_id"), laVal(r, "outcome", "result", "trust_state")].filter(Boolean).join(" ") || "—";
+  if (s === "human_approval_events") return [laVal(r, "requester_user_id", "user_id", "subject_user_id"), "→", laVal(r, "approver_user_id", "approver_id"), laVal(r, "outcome", "result")].filter(Boolean).join(" ") || "—";
   if (s === "inspection_events") return [laPretty(laVal(r, "finding_type", "event_type")), laVal(r, "inspection_mode"), laVal(r, "severity")].filter(Boolean).join(" · ") || "—";
   return Object.keys(r).slice(0, 3).map((k) => k + "=" + laVal(r, k)).join(" ") || "—";
 }
 // Fetch the records LINKED to an access decision (its grant, approval, inspection, decision trace) and show
 // them — so a grant/approval is visible right from the access-log entry it authorized.
 async function laRelatedRecords(host, decisionId) {
+  const current = freshRender(host);
+  uiState(host, "loading");
+  let rel;
+  try {
+    const r = await apiFetch("GET", "/admin/access-decisions/" + encodeURIComponent(decisionId), undefined, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = r.body;
+    rel = body && body.related_logs;
+    if (!body || body.access_decision_id !== decisionId || !rel || typeof rel !== "object" || Array.isArray(rel) ||
+        Object.values(rel).some(rows => !Array.isArray(rows) || rows.some(row => !row || typeof row !== "object" || Array.isArray(row)))) {
+      throw new Error("Invalid related records response");
+    }
+  } catch (e) {
+    if (current()) uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laRelatedRecords(host, decisionId) });
+    return;
+  }
+  if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("div", { class: "ui-field-label", text: bl({ en: "Related records", ja: "関連レコード" }) }));
-  const status = el("div", { class: "ui-view-desc", text: bl({ en: "Loading…", ja: "読込中…" }) });
-  host.appendChild(status);
-  let body;
-  try { const r = await apiFetch("GET", "/admin/access-decisions/" + encodeURIComponent(decisionId), undefined, _LA_PLANE); if (!r.ok) { status.textContent = "HTTP " + r.status; return; } body = r.body; }
-  catch (e) { status.textContent = String(e); return; }
-  const rel = (body && body.related_logs) || {};
-  const streams = Object.keys(rel).filter((s) => (rel[s] || []).length);
-  status.remove();
+  const streams = Object.keys(rel).filter(s => rel[s].length);
   if (!streams.length) { host.appendChild(el("div", { class: "ui-view-desc", text: bl({ en: "No linked grant / approval / inspection for this decision.", ja: "この判断に紐づく grant/承認/検査はありません。" }) })); return; }
   streams.forEach((s) => {
     const label = (_LA_STREAMS.find((x) => x.id === s) || { label: { en: s, ja: s } }).label;

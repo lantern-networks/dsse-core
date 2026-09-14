@@ -331,3 +331,55 @@ test('access decision summary never labels other streams with an allow rate',()=
     if(stream==='access')assert.match(JSON.stringify(nodes),/50%/);
   }
 });
+
+function relatedHarness(fetch) {
+  const states=[],nodes=[];
+  const host={appendChild:n=>nodes.push(n),set innerHTML(v){nodes.length=0;}};
+  const context=vm.createContext({host,bl:v=>v.en,apiFetch:fetch,
+    freshRender:h=>{const seq=h.seq=(h.seq||0)+1;return ()=>h.seq===seq;},
+    uiState:(h,...args)=>{h.innerHTML='';states.push(args);},uiBadge:(label,kind)=>({label,kind}),
+    el:(tag,attrs={},children=[])=>({tag,...attrs,children})});
+  vm.runInContext(source,context);
+  return {states,nodes,render:id=>{context.id=id;return vm.runInContext('laRelatedRecords(host,id)',context);}};
+}
+
+test('missing or malformed related records never claim that no records exist',async()=>{
+  for(const body of [{},{access_decision_id:'d'},
+    ...[null,[],{audit:null},{audit:'bad'},{audit:[null]},{audit:[[]]}].map(related_logs=>({access_decision_id:'d',related_logs})),
+    {access_decision_id:'other',related_logs:{}}]){
+    const h=relatedHarness(async()=>({ok:true,body}));await h.render('d');
+    assert.equal(h.states.at(-1)[0],'error');assert.equal(h.nodes.length,0);
+    assert.equal(typeof h.states.at(-1)[2].onClick,'function');
+  }
+});
+
+test('related record failures can retry and only valid empty responses claim no links',async()=>{
+  for(const response of [{ok:false,status:403},{ok:false,status:503},new Error('offline')]){
+    let retry=false;
+    const h=relatedHarness(async()=>{
+      if(retry)return {ok:true,body:{access_decision_id:'d',related_logs:{audit:[]}}};
+      if(response instanceof Error)throw response;return response;
+    });
+    await h.render('d');assert.equal(h.states.at(-1)[0],'error');
+    retry=true;await h.states.at(-1)[2].onClick();
+    assert.match(JSON.stringify(h.nodes),/No linked/);
+  }
+});
+
+test('older related-record responses cannot replace the current decision',async()=>{
+  for(const late of [{ok:true,body:{access_decision_id:'old',related_logs:{}}},{ok:false,status:503}]){
+    let finish;const pending=new Promise(resolve=>{finish=resolve;});
+    const h=relatedHarness(async(method,path)=>path.endsWith('/old')?pending:
+      {ok:true,body:{access_decision_id:'new',related_logs:{audit:[{event_type:'new-event'}]}}});
+    const old=h.render('old');await h.render('new');
+    const rendered=JSON.stringify(h.nodes),stateCount=h.states.length;
+    assert.match(rendered,/new-event/);finish(late);await old;
+    assert.equal(JSON.stringify(h.nodes),rendered);assert.equal(h.states.length,stateCount);
+  }
+});
+
+test('related approval summaries do not use trust state as an approval outcome',()=>{
+  const c=vm.createContext({});vm.runInContext(source,c);
+  assert.doesNotMatch(vm.runInContext('laRelatedSummary("human_approval_events",{trust_state:"trusted"})',c),/trusted/);
+  assert.match(vm.runInContext('laRelatedSummary("human_approval_events",{outcome:"denied",trust_state:"trusted"})',c),/denied/);
+});

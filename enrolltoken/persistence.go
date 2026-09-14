@@ -47,8 +47,8 @@ func (s *Store) loadLocked() {
 	}
 	var state stateFile
 	if err := json.Unmarshal(data, &state); err != nil {
-		// Refuse to start from a half-understood state: silently continuing with an EMPTY token set would mark
-		// every previously-spent token unspent again.
+		// Do not treat corrupt persistence as a clean empty registry: accepting new mutations could
+		// overwrite the saved issuance, consumption and revocation history.
 		s.stateErr = ErrStateUnavailable
 		log.Printf("enrolment_tokens persist: load failed, keeping current state: %v", err)
 		return

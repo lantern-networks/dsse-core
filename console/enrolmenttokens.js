@@ -269,13 +269,20 @@ async function openEnrolTokenForm(content) {
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
   submit.addEventListener("click", async () => {
-    if (!labelF.validate()) return;
+    if (submit.disabled || !labelF.validate()) return;
     submit.disabled = true;
     try {
       const count = Math.max(1, Number(countF.get()) || 1);
       const r = await apiFetch("POST", "/admin/enrolment-tokens",
         { label: labelF.get(), group: groupF.get(), expires_in_hours: Number(validF.get()), count },
         _ENROL_PLANE);
+      if (!r.ok && r.status === 409 && r.body && r.body.partial === true &&
+          Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
+        m.close();
+        showEnrolTokenOnce({ ...r.body, requested_count: count });
+        renderEnrolmentTokensView(content);
+        return;
+      }
       if (!r.ok) {
         submit.disabled = false;
         const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
@@ -312,8 +319,19 @@ function downloadTokenBatch(rows, count) {
 
 // The secret exists in this one response and nowhere else — the Edge keeps only a hash — so the modal has to be
 // unmistakable about that. A lost token is re-approved, not looked up.
+function enrolTokenRowsValid(rows) {
+  return rows.every(r => r && r.token && typeof r.token === "object" && !Array.isArray(r.token) &&
+    typeof r.token.id === "string" && r.token.id.length > 0 && typeof r.secret === "string" && r.secret.length > 0);
+}
 function showEnrolTokenOnce(body) {
   const rows = (body && body.tokens) || [];
+  if (!Array.isArray(rows) || !enrolTokenRowsValid(rows)) {
+    uiToast("Invalid issued token response", "err"); return;
+  }
+  const notice = body && body.partial === true ? [el("p", { class: "ui-view-desc", text: bl({
+    en: "Issuance stopped: " + rows.length + " of " + body.requested_count + " requested tokens were returned. Save these tokens and investigate the failure before issuing more.",
+    ja: "発行が途中で停止しました。要求 " + body.requested_count + " 件中 " + rows.length + " 件を受け取りました。このトークンを保存し、追加発行の前に失敗原因を確認してください。"
+  }) })] : [];
   if (rows.length > 1) {
     let downloaded = false;
     const dl = el("button", { class: "ui-btn ui-btn-primary",
@@ -321,6 +339,7 @@ function showEnrolTokenOnce(body) {
     const m2 = uiModal({
       title: bl({ en: rows.length + " devices approved", ja: rows.length + " 台を承認しました" }),
       body: [
+        ...notice,
         el("p", { class: "ui-view-desc", text: bl({
           en: "This is the only time these tokens are shown. Download them now — they cannot be retrieved later, and an approval that is lost has to be made again.",
           ja: "これらのトークンが表示されるのはこの一度だけです。いまダウンロードしてください — 後から取得はできず、失った分は承認をやり直すことになります。" }) }),
@@ -346,8 +365,8 @@ function showEnrolTokenOnce(body) {
     });
     return;
   }
-  const secret = body && body.secret;
-  if (!secret) { uiToast(bl({ en: "Device approved.", ja: "端末を承認しました。" }), "ok"); return; }
+  const secret = (body && body.secret) || (rows.length === 1 && rows[0].secret);
+  if (typeof secret !== "string" || !secret) { uiToast("Issued token is unavailable", "err"); return; }
   // ★★★ THE TOKEN IS A FILE, NOT A FIELD (2026-08-30). This offered the secret as text to read, and said to
   // "put it in the device's installer settings" — there are no installer settings. What the installer reads is
   // a file named enrolment_token.txt sitting next to it, so that is what this hands over. Typing a 43-character
@@ -369,6 +388,7 @@ function showEnrolTokenOnce(body) {
   const m = uiModal({
     title: bl({ en: "Device approved — take the token now", ja: "端末を承認しました — トークンを今受け取ってください" }),
     body: [
+        ...notice,
       el("p", { class: "ui-view-desc", text: bl({
         en: "This is the only time this token is shown. If it is lost, approve the device again — it cannot be looked up.",
         ja: "このトークンが表示されるのはこの一度だけです。紛失した場合は再度承認してください — 後から確認することはできません。" }) }),

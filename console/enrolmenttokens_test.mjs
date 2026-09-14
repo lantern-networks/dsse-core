@@ -37,3 +37,39 @@ test('revocation preserves cancellation, control-plane routing and already-used 
   if(confirmed){assert.equal(calls[0][1],'/admin/enrolment-tokens/token%2Fid/revoke');assert.equal(calls[0][3],'control');assert.equal(messages[0][1],note?'err':'ok');}
  }
 });
+
+test('partial batch responses reach one-time disclosure instead of being discarded',async()=>{
+ for(const count of [0,1,2]){
+  let submit,closed=0,refresh=0;const disclosures=[],errors=[];
+  const tokens=Array.from({length:count},(_,i)=>({token:{id:'id-'+i},secret:'secret-'+i}));
+  const c=vm.createContext({bl:v=>v.en,uiToast:(...a)=>errors.push(a),
+   uiField:f=>({el:{},get:()=>f.name==='count'?'3':f.value||'label',validate:()=>true,focus(){},setError(){}}),
+   el:(tag,attrs)=>({...attrs,addEventListener:(event,fn)=>{submit=fn;}}),uiModal:()=>({close:()=>closed++}),
+   apiFetch:async()=>({ok:false,status:409,body:{partial:true,tokens,error:'stopped'}}),
+   disclose:b=>disclosures.push(b),refresh:()=>refresh++});
+  vm.runInContext(source,c);vm.runInContext('showEnrolTokenOnce=disclose;renderEnrolmentTokensView=refresh',c);
+  await vm.runInContext('openEnrolTokenForm({})',c);await submit();
+  assert.equal(closed,count?1:0);assert.equal(refresh,count?1:0);
+  if(count){assert.equal(disclosures[0].tokens.length,count);assert.equal(disclosures[0].requested_count,3);assert.equal(disclosures[0].partial,true);}
+  else {assert.equal(disclosures.length,0);assert.equal(errors[0][1],'err');}
+ }
+});
+
+test('single-token partial batch preserves its secret and shows the partial issuance notice',()=>{
+ const modals=[],errors=[];
+ const c=vm.createContext({bl:v=>v.en,uiToast:(...a)=>errors.push(a),
+  el:(tag,attrs={})=>({tag,...attrs,addEventListener(){}}),uiModal:m=>{modals.push(m);return {close(){}};}});
+ vm.runInContext(source,c);
+ vm.runInContext('showEnrolTokenOnce({partial:true,requested_count:3,tokens:[{token:{id:"one"},secret:"exact-secret"}]})',c);
+ assert.equal(errors.length,0);assert.equal(modals.length,1);
+ assert.ok(modals[0].body.some(n=>n.text==='exact-secret'));
+ assert.ok(modals[0].body.some(n=>n.text?.includes('1 of 3')));
+});
+
+test('missing issuance credentials never announce approval success',()=>{
+ for(const body of [{},{tokens:[{token:{id:'bad'}}]},{tokens:'bad'}]){
+  const errors=[];const c=vm.createContext({body,uiToast:(...a)=>errors.push(a)});
+  vm.runInContext(source,c);vm.runInContext('showEnrolTokenOnce(body)',c);
+  assert.equal(errors.length,1);assert.equal(errors[0][1],'err');
+ }
+});

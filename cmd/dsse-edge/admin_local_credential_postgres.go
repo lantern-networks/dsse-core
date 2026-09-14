@@ -24,7 +24,7 @@ func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdm
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
 		       recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
-		       activation_expires_at, created_at, updated_at
+		       activation_expires_at, created_at, updated_at, last_totp_counter
 		FROM admin_local_credentials`)
 	if err != nil {
 		return nil, err
@@ -37,11 +37,15 @@ func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdm
 		var lockedUntil, activationExpiresAt sql.NullTime
 		if err := rows.Scan(&c.Email, &c.PrincipalID, &c.TenantID, &rolesJSON, &c.Status, &c.PasswordHash,
 			&c.TOTPSecret, &c.TOTPEnrolled, &recoveryJSON, &c.FailedAttempts, &lockedUntil,
-			&c.ActivationTokenHash, &activationExpiresAt, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.ActivationTokenHash, &activationExpiresAt, &c.CreatedAt, &c.UpdatedAt, &c.LastTOTPCounter); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(rolesJSON, &c.Roles)
-		_ = json.Unmarshal(recoveryJSON, &c.RecoveryCodeHashes)
+		if err := json.Unmarshal(rolesJSON, &c.Roles); err != nil {
+			return nil, fmt.Errorf("decode administrator roles: %w", err)
+		}
+		if err := json.Unmarshal(recoveryJSON, &c.RecoveryCodeHashes); err != nil {
+			return nil, fmt.Errorf("decode administrator recovery hashes: %w", err)
+		}
 		// Unseal the at-rest TOTP secret (no-op when stored as plaintext / no KEK). Fail-closed: a sealed
 		// secret with no KEK aborts the load rather than silently dropping every operator's 2FA.
 		if c.TOTPSecret, err = unsealTOTPSecretFromStore(c.TOTPSecret); err != nil {
@@ -77,18 +81,19 @@ func (p postgresCredentialPersistence) Upsert(ctx context.Context, c *localAdmin
 		INSERT INTO admin_local_credentials (
 			email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
 			recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
-			activation_expires_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			activation_expires_at, created_at, updated_at, last_totp_counter)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		ON CONFLICT (email) DO UPDATE SET
 			principal_id=EXCLUDED.principal_id, tenant_id=EXCLUDED.tenant_id, roles=EXCLUDED.roles,
 			status=EXCLUDED.status, password_hash=EXCLUDED.password_hash, totp_secret=EXCLUDED.totp_secret,
 			totp_enrolled=EXCLUDED.totp_enrolled, recovery_code_hashes=EXCLUDED.recovery_code_hashes,
 			failed_attempts=EXCLUDED.failed_attempts, locked_until=EXCLUDED.locked_until,
 			activation_token_hash=EXCLUDED.activation_token_hash,
-			activation_expires_at=EXCLUDED.activation_expires_at, updated_at=EXCLUDED.updated_at`,
+			activation_expires_at=EXCLUDED.activation_expires_at, updated_at=EXCLUDED.updated_at,
+            last_totp_counter=EXCLUDED.last_totp_counter`,
 		c.Email, c.PrincipalID, c.TenantID, roles, c.Status, c.PasswordHash, sealedTOTP, c.TOTPEnrolled,
 		recovery, c.FailedAttempts, nullTime(c.LockedUntil), c.ActivationTokenHash,
-		nullTime(c.ActivationExpiresAt), c.CreatedAt, c.UpdatedAt)
+		nullTime(c.ActivationExpiresAt), c.CreatedAt, c.UpdatedAt, c.LastTOTPCounter)
 	return err
 }
 
@@ -132,7 +137,7 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 				db.Close()
 				return nil, nil, fmt.Errorf("load local-credential migrations: %w", err)
 			}
-			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials)
+			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials, postgresMigrationCredentialTOTP)
 			if err != nil {
 				db.Close()
 				return nil, nil, err

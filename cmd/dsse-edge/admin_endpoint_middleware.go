@@ -21,7 +21,7 @@ import (
 )
 
 func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, adminAuth adminAuthRuntimeStore, adminToken string, devMode bool, tenantModelStore adminTenantModelRuntimeStore,
-	hasAdministrators func(context.Context, string) (bool, bool), credentialStores ...*localAdminCredentialStore) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+	hasAdministrators func(context.Context, string) (bool, bool), credentials *localAdminCredentialStore) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(permission string, handler http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			// ★★★ BEFORE ANYTHING ELSE: a change written to a node that does not lead is accepted and then
@@ -33,8 +33,8 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 				return
 			}
 			identity, ok, err := adminRequestIdentity(r, evaluator.PolicyBundle.TenantID, adminToken, adminAuth, devMode, time.Now())
-			if ok && err == nil && len(credentialStores) > 0 {
-				identity, ok, err = refreshManagedAdminIdentity(r.Context(), adminAuth, credentialStores[0], identity)
+			if ok && err == nil {
+				identity, ok, err = refreshManagedAdminIdentity(r.Context(), adminAuth, credentials, identity)
 			}
 			if err != nil {
 				log.Printf("admin auth store error: %v", err)
@@ -348,6 +348,8 @@ func refreshManagedAdminIdentity(ctx context.Context, auth adminAuthRuntimeStore
 	if auth == nil || credentials == nil || (identity.AuthMethod != "admin_session" && identity.AuthMethod != "admin_api_token") {
 		return identity, true, nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, credentialPersistenceTimeout)
+	defer cancel()
 	principal, found, err := auth.FindPrincipal(ctx, identity.PrincipalID, identity.TenantID)
 	if err != nil {
 		return adminIdentity{}, false, err
@@ -358,10 +360,8 @@ func refreshManagedAdminIdentity(ctx context.Context, auth adminAuthRuntimeStore
 	if principal.IDPID != "first_party" {
 		return identity, true, nil
 	}
-	credentials.mu.Lock()
-	credential := cloneCredential(credentials.findByPrincipalLocked(identity.TenantID, identity.PrincipalID))
-	credentials.mu.Unlock()
-	if credential == nil || credential.Status != credentialStatusActive {
+	credential, exists := credentials.authorityFor(identity.TenantID, identity.PrincipalID)
+	if !exists || credential.Status != credentialStatusActive {
 		return adminIdentity{}, false, nil
 	}
 	if identity.AuthMethod == "admin_session" {

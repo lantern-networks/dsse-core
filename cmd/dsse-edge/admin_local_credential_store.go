@@ -11,9 +11,11 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -173,9 +175,8 @@ type localAdminCredential struct {
 	LastLoginAt time.Time
 	// LastTOTPCounter is the TOTP time-step of the most recently CONSUMED code (RFC 6238 replay
 	// protection): a code whose matched step is <= this is rejected as a replay, so a captured 6-digit code
-	// cannot be reused within its ~90s validity window. In-memory only (like LastLoginAt) — a control-plane
-	// restart resets it, which at worst re-opens the current 90s window once; the durable cost of a column +
-	// migration is not worth that bounded, restart-only gap.
+	// cannot be reused within its validity window, including after a restart with durable credentials.
+	// A newly enrolled TOTP secret starts a separate counter history.
 	LastTOTPCounter uint64
 }
 
@@ -200,6 +201,7 @@ type localAdminCredentialStore struct {
 	byEmail     map[string]*localAdminCredential
 	issuer      string
 	persistence credentialPersistence
+	authority   atomic.Pointer[map[credentialAuthorityKey]credentialAuthorityRecord]
 }
 
 func newLocalAdminCredentialStore(issuer string) *localAdminCredentialStore {
@@ -215,7 +217,9 @@ func newLocalAdminCredentialStoreWithPersistence(issuer string, persistence cred
 	s := newLocalAdminCredentialStore(issuer)
 	s.persistence = persistence
 	if persistence != nil {
-		creds, err := persistence.LoadAll(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), credentialPersistenceTimeout)
+		defer cancel()
+		creds, err := persistence.LoadAll(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("load persisted admin credentials: %w", err)
 		}
@@ -224,8 +228,11 @@ func newLocalAdminCredentialStoreWithPersistence(issuer string, persistence cred
 		}
 		log.Printf("first-party admin credentials: loaded %d account(s) from the durable store", len(creds))
 	}
+	s.publishAuthorityLocked()
 	return s, nil
 }
+
+const credentialPersistenceTimeout = 5 * time.Second
 
 var errCredentialPersistence = fmt.Errorf("admin credential storage is unavailable")
 
@@ -234,12 +241,18 @@ var errCredentialPersistence = fmt.Errorf("admin credential storage is unavailab
 // even during an outage, but never issue a successful login after a failed save.
 func (s *localAdminCredentialStore) persistLocked(cred *localAdminCredential) error {
 	if s.persistence != nil {
-		if err := s.persistence.Upsert(context.Background(), cred); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), credentialPersistenceTimeout)
+		defer cancel()
+		if err := s.persistence.Upsert(ctx, cred); err != nil {
 			log.Printf("admin credential persistence failed: %v", err)
 			return errCredentialPersistence
 		}
 	}
+	previous := s.byEmail[credentialEmailKey(cred.Email)]
 	s.byEmail[credentialEmailKey(cred.Email)] = cred
+	if previous == nil || previous.PrincipalID != cred.PrincipalID || previous.TenantID != cred.TenantID || previous.Status != cred.Status || !slices.Equal(previous.Roles, cred.Roles) {
+		s.publishAuthorityLocked()
+	}
 	return nil
 }
 
@@ -310,6 +323,7 @@ func (s *localAdminCredentialStore) Invite(email, tenantID, principalID string, 
 	cred.Status = credentialStatusPending
 	cred.PasswordHash = ""
 	cred.TOTPSecret = ""
+	cred.LastTOTPCounter = 0
 	cred.TOTPEnrolled = false
 	cred.FailedAttempts = 0
 	cred.LockedUntil = time.Time{}
@@ -400,6 +414,7 @@ func (s *localAdminCredentialStore) BeginTOTPEnrollment(rawToken string, now tim
 		return "", "", err
 	}
 	cred.TOTPSecret = secret
+	cred.LastTOTPCounter = 0
 	cred.TOTPEnrolled = false
 	cred.UpdatedAt = now.UTC()
 	if err := s.persistLocked(cred); err != nil {
@@ -670,6 +685,7 @@ func (s *localAdminCredentialStore) Delete(tenantID, principalID string, now tim
 		return adminAccountSummary{}, err
 	}
 	delete(s.byEmail, credentialEmailKey(cred.Email))
+	s.publishAuthorityLocked()
 	return summary, nil
 }
 
@@ -728,6 +744,7 @@ func (s *localAdminCredentialStore) DeleteAllForTenant(tenantID string) ([]strin
 		}
 		removed = append(removed, cred.Email)
 		delete(s.byEmail, key)
+		s.publishAuthorityLocked()
 	}
 	sort.Strings(removed)
 	return removed, saveErr
@@ -738,9 +755,48 @@ func (s *localAdminCredentialStore) deleteLocked(cred *localAdminCredential) err
 	if s.persistence == nil {
 		return nil
 	}
-	if err := s.persistence.Delete(context.Background(), cred.TenantID, cred.Email); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), credentialPersistenceTimeout)
+	defer cancel()
+	if err := s.persistence.Delete(ctx, cred.TenantID, cred.Email); err != nil {
 		log.Printf("admin credential deletion failed: %v", err)
 		return errCredentialPersistence
 	}
 	return nil
+}
+
+// This immutable, non-secret index isolates request authentication from slow
+// credential writes. Only successfully committed account changes are published.
+type credentialAuthorityKey struct{ TenantID, PrincipalID string }
+type credentialAuthorityRecord struct {
+	Email  string
+	Status string
+	Roles  []string
+}
+
+func (s *localAdminCredentialStore) publishAuthorityLocked() {
+	records := make(map[credentialAuthorityKey]credentialAuthorityRecord, len(s.byEmail))
+	for _, c := range s.byEmail {
+		if c == nil {
+			continue
+		}
+		records[credentialAuthorityKey{c.TenantID, c.PrincipalID}] = credentialAuthorityRecord{Email: c.Email, Status: c.Status, Roles: slices.Clone(c.Roles)}
+	}
+	s.authority.Store(&records)
+}
+
+func (s *localAdminCredentialStore) authorityFor(tenant, principal string) (credentialAuthorityRecord, bool) {
+	if s == nil {
+		return credentialAuthorityRecord{}, false
+	}
+	tenant, principal = strings.TrimSpace(tenant), strings.TrimSpace(principal)
+	if tenant == "" || principal == "" {
+		return credentialAuthorityRecord{}, false
+	}
+	records := s.authority.Load()
+	if records == nil {
+		return credentialAuthorityRecord{}, false
+	}
+	record, ok := (*records)[credentialAuthorityKey{tenant, principal}]
+	record.Roles = slices.Clone(record.Roles)
+	return record, ok
 }

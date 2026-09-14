@@ -46,6 +46,7 @@ type persistedCredential struct {
 	PasswordHash        string    `json:"password_hash"`
 	TOTPSecret          string    `json:"totp_secret"` // sealed at rest (sealTOTPSecretForStore)
 	TOTPEnrolled        bool      `json:"totp_enrolled"`
+	LastTOTPCounter     uint64    `json:"last_totp_counter"`
 	RecoveryCodeHashes  []string  `json:"recovery_code_hashes"`
 	FailedAttempts      int       `json:"failed_attempts"`
 	LockedUntil         time.Time `json:"locked_until"`
@@ -167,6 +168,7 @@ func credentialToPersisted(c *localAdminCredential) (persistedCredential, error)
 		PasswordHash:        c.PasswordHash,
 		TOTPSecret:          sealedTOTP,
 		TOTPEnrolled:        c.TOTPEnrolled,
+		LastTOTPCounter:     c.LastTOTPCounter,
 		RecoveryCodeHashes:  append([]string(nil), c.RecoveryCodeHashes...),
 		FailedAttempts:      c.FailedAttempts,
 		LockedUntil:         c.LockedUntil,
@@ -192,6 +194,7 @@ func credentialFromPersisted(p persistedCredential) (*localAdminCredential, erro
 		PasswordHash:        p.PasswordHash,
 		TOTPSecret:          totp,
 		TOTPEnrolled:        p.TOTPEnrolled,
+		LastTOTPCounter:     p.LastTOTPCounter,
 		RecoveryCodeHashes:  append([]string(nil), p.RecoveryCodeHashes...),
 		FailedAttempts:      p.FailedAttempts,
 		LockedUntil:         p.LockedUntil.UTC(),

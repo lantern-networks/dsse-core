@@ -571,7 +571,11 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentialStore, adminAuth adminAuthRuntimeStore, ledger *enrolledinventory.Ledger, tenantID string, now time.Time) map[string]any {
 	result := map[string]any{}
 	if credentials != nil {
-		if removed := credentials.DeleteAllForTenant(tenantID); len(removed) > 0 {
+		removed, err := credentials.DeleteAllForTenant(tenantID)
+		if err != nil {
+			result["administrators_error"] = "credential deletion incomplete: storage unavailable"
+		}
+		if len(removed) > 0 {
 			result["administrators"] = removed
 			log.Printf("tenant %q deleted: removed %d administrator account(s): %s", tenantID, len(removed), strings.Join(removed, ", "))
 		}

@@ -63,7 +63,7 @@ function laResultBadge(res) {
   // Match whole outcomes: "revoked" contains "ok", and "incomplete" contains "complete".
   // Unknown outcomes retain their text and remain neutral rather than implying success.
   const kind = /^(ok|success|allow|allowed|approved|done|complete|completed)$/.test(r) ? "ok"
-    : /^(fail|failed|failure|deny|denied|error|reject|rejected|revoked)$/.test(r) ? "danger" : "off";
+    : /^(fail|failed|failure|deny|denied|error|reject|rejected|revoked|expired|cancelled|canceled|withdrawn|timeout|timed_out)$/.test(r) ? "danger" : "off";
   return uiBadge(laDash(res), kind);
 }
 
@@ -433,7 +433,8 @@ const _LA_COLS = {
     { h: { en: "Approver", ja: "承認者" }, c: (r) => laDash(laVal(r, "approver_user_id", "approver_id")) },
     { h: { en: "Object", ja: "対象" }, c: (r) => laDash(laVal(r, "target_id", "application_id")) },
     { h: { en: "Event", ja: "イベント" }, c: (r) => laEventLabel(r, "event_type", "action") },
-    { h: { en: "Outcome", ja: "結果" }, c: (r) => laResultBadge(laVal(r, "outcome", "result", "trust_state")) },
+    { h: { en: "Outcome", ja: "結果" }, c: (r) => laResultBadge(laVal(r, "outcome", "result")) },
+    { h: { en: "Trust state", ja: "信頼状態" }, c: (r) => laDash(laVal(r, "trust_state")) },
   ],
   delegated_access_grants: [
     { h: { en: "Time", ja: "時刻" }, c: laWhen },
@@ -607,11 +608,11 @@ async function laLegalHold(host) {
 
 function laLogs(section) {
   section.innerHTML = "";
-  const sel = uiField({ name: "stream", type: "select", value: _laStream, options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
+  const sel = uiField({ name: "stream", label: bl({ en: "Stream", ja: "ストリーム" }), type: "select", value: _laStream, options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
   sel.el.style.marginBottom = "0";
   sel.el.querySelector("select").addEventListener("change", () => { _laStream = sel.get(); _laFilters = {}; laLoadStream(host, filterHost, summaryHost); });
   section.appendChild(el("div", { class: "ui-toolbar" }, [
-    el("span", { class: "ui-view-desc", text: bl({ en: "Stream:", ja: "ストリーム:" }) }), sel.el,
+    sel.el,
     el("span", { class: "ui-spacer" }),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }),
   ]));

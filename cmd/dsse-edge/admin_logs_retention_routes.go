@@ -131,10 +131,21 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 				"log retention is set for this deployment, not per organization, so it is the operator's to change"))
 			return
 		}
+		if retentionOverride == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
+			return
+		}
+		days := req.Days
 		if req.Clear {
-			retentionOverride.Set(req.Stream, -1) // revert to the flag default
-		} else {
-			retentionOverride.Set(req.Stream, req.Days)
+			days = -1
+		} else if days < 0 || int64(days) > int64((1<<63-1)/(24*time.Hour)) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are out of range"))
+			return
+		}
+		if err := retentionOverride.Set(strings.TrimSpace(req.Stream), days); err != nil {
+			logErrorf("retention override update failed: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("retention settings could not be saved"))
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))

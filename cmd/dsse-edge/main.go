@@ -5372,7 +5372,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return false, false
 			}
 			return counts.Principals > 0, true
-		})
+		}, config.LocalCredentials)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)

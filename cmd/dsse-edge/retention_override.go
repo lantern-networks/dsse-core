@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"sync"
 
@@ -51,19 +52,28 @@ func (s *retentionOverrideStore) Get(stream string) (int, bool) {
 }
 
 // Set records (or clears, when days < 0) a per-stream retention override and persists it.
-func (s *retentionOverrideStore) Set(stream string, days int) {
+func (s *retentionOverrideStore) Set(stream string, days int) error {
 	if s == nil || stream == "" {
-		return
+		return fmt.Errorf("retention store or stream is unavailable")
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous, existed := s.days[stream]
 	if days < 0 {
 		delete(s.days, stream)
 	} else {
 		s.days[stream] = days
 	}
-	s.persistLocked()
-	s.mu.Unlock()
+	if err := s.persistLocked(); err != nil {
+		if existed {
+			s.days[stream] = previous
+		} else {
+			delete(s.days, stream)
+		}
+		return err
+	}
 	log.Printf("retention_override_set stream=%s days=%d", stream, days)
+	return nil
 }
 
 // All returns a copy of the current overrides.
@@ -80,13 +90,13 @@ func (s *retentionOverrideStore) All() map[string]int {
 	return out
 }
 
-func (s *retentionOverrideStore) persistLocked() {
+func (s *retentionOverrideStore) persistLocked() error {
 	if s.persister == nil {
-		return
+		return nil
 	}
 	data, err := json.Marshal(s.days)
 	if err != nil {
-		return
+		return err
 	}
-	_ = s.persister.Save(data)
+	return s.persister.Save(data)
 }

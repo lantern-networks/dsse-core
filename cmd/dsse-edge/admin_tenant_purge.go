@@ -73,7 +73,11 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	}
 
 	if credentials != nil {
-		if removed := credentials.DeleteAllForTenant(tenantID); len(removed) > 0 {
+		removed, err := credentials.DeleteAllForTenant(tenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, "admin_accounts: credential deletion incomplete")
+		}
+		if len(removed) > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "admin_accounts", Count: int64(len(removed))})
 		}
 	}

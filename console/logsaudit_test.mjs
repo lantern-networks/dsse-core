@@ -31,3 +31,21 @@ test('unrecognized values remain neutral and keep their original text', () => {
   }
   assert.equal(badge(null).label, '—');
 });
+
+test('terminal negative outcomes are distinguishable from pending', () => {
+  assert.equal(badge('pending').kind, 'off');
+  for (const value of ['expired', 'cancelled', 'canceled', 'withdrawn', 'timeout', 'timed_out']) {
+    assert.equal(badge(value).kind, 'danger', value);
+  }
+});
+
+test('approval outcome does not borrow device trust state', () => {
+  const context = vm.createContext({uiBadge: (label, kind) => ({label, kind})});
+  vm.runInContext(source, context);
+  const columns = vm.runInContext('_LA_COLS.human_approval_events', context);
+  const outcome = columns.find(c => c.h.en === 'Outcome');
+  const trust = columns.find(c => c.h.en === 'Trust state');
+  assert.equal(outcome.c({trust_state: 'trusted'}).label, '—');
+  assert.equal(trust.c({trust_state: 'trusted'}), 'trusted');
+  assert.equal(outcome.c({outcome: 'denied', trust_state: 'trusted'}).kind, 'danger');
+});

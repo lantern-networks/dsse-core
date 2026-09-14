@@ -97,33 +97,37 @@ func (f *fileCredentialPersistence) LoadAll(_ context.Context) ([]*localAdminCre
 	return out, nil
 }
 
-// Upsert mirrors a credential into the durable set and rewrites the whole snapshot. The in-memory set is updated
-// first; a Save failure is logged (email/tenant + error only — never secret material) but NOT returned, because
-// the authoritative in-memory store has already applied the change and the caller must not see it as failed.
+// Upsert and Delete roll back the resident snapshot if saving fails, so a later
+// unrelated save cannot silently commit an earlier failed operation.
 func (f *fileCredentialPersistence) Upsert(_ context.Context, cred *localAdminCredential) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.byEmail[credentialEmailKey(cred.Email)] = cloneCredential(cred)
+	key := credentialEmailKey(cred.Email)
+	previous, existed := f.byEmail[key]
+	f.byEmail[key] = cloneCredential(cred)
 	if err := f.saveLocked(); err != nil {
-		logErrorf("persist admin credential %s (tenant %s) to snapshot failed (durability at risk): %v",
-			cred.Email, cred.TenantID, err)
+		if existed {
+			f.byEmail[key] = previous
+		} else {
+			delete(f.byEmail, key)
+		}
+		return err
 	}
 	return nil
 }
 
-// Delete removes a credential from the durable set (tenant-scoped, exactly like the Postgres WHERE email AND
-// tenant_id predicate — a delete can never reach across tenants) and rewrites the snapshot. Save failures are
-// logged, not returned (the in-memory delete already stands).
 func (f *fileCredentialPersistence) Delete(_ context.Context, tenantID, email string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := credentialEmailKey(email)
-	if existing, ok := f.byEmail[key]; ok && existing.TenantID == tenantID {
-		delete(f.byEmail, key)
+	previous, existed := f.byEmail[key]
+	if !existed || previous.TenantID != tenantID {
+		return nil
 	}
+	delete(f.byEmail, key)
 	if err := f.saveLocked(); err != nil {
-		logErrorf("delete admin credential %s (tenant %s) from snapshot failed (durability at risk): %v",
-			email, tenantID, err)
+		f.byEmail[key] = previous
+		return err
 	}
 	return nil
 }
@@ -200,6 +204,9 @@ func credentialFromPersisted(p persistedCredential) (*localAdminCredential, erro
 
 // cloneCredential deep-copies a credential so the durable set never aliases the store's live pointer.
 func cloneCredential(c *localAdminCredential) *localAdminCredential {
+	if c == nil {
+		return nil
+	}
 	dup := *c
 	dup.Roles = append([]string(nil), c.Roles...)
 	dup.RecoveryCodeHashes = append([]string(nil), c.RecoveryCodeHashes...)

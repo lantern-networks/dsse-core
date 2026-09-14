@@ -21,7 +21,7 @@ import (
 )
 
 func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, adminAuth adminAuthRuntimeStore, adminToken string, devMode bool, tenantModelStore adminTenantModelRuntimeStore,
-	hasAdministrators func(context.Context, string) (bool, bool)) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+	hasAdministrators func(context.Context, string) (bool, bool), credentialStores ...*localAdminCredentialStore) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(permission string, handler http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			// ★★★ BEFORE ANYTHING ELSE: a change written to a node that does not lead is accepted and then
@@ -33,6 +33,9 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 				return
 			}
 			identity, ok, err := adminRequestIdentity(r, evaluator.PolicyBundle.TenantID, adminToken, adminAuth, devMode, time.Now())
+			if ok && err == nil && len(credentialStores) > 0 {
+				identity, ok, err = refreshManagedAdminIdentity(r.Context(), adminAuth, credentialStores[0], identity)
+			}
 			if err != nil {
 				log.Printf("admin auth store error: %v", err)
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAuthFailureAuditLog("admin_auth_failed", evaluator, sourceIPFromRequest(r), r.UserAgent(), "authentication_store_error"), time.Now())
@@ -336,4 +339,33 @@ func adminPermissionAllowedAny(roles []string, permission string) bool {
 		}
 	}
 	return false
+}
+
+// Existing sessions must observe account suspension, removal and current roles.
+// First-party provenance comes from the authenticated principal, never a request field.
+// External IdPs and a relying Edge with no local credential authority remain unchanged.
+func refreshManagedAdminIdentity(ctx context.Context, auth adminAuthRuntimeStore, credentials *localAdminCredentialStore, identity adminIdentity) (adminIdentity, bool, error) {
+	if auth == nil || credentials == nil || (identity.AuthMethod != "admin_session" && identity.AuthMethod != "admin_api_token") {
+		return identity, true, nil
+	}
+	principal, found, err := auth.FindPrincipal(ctx, identity.PrincipalID, identity.TenantID)
+	if err != nil {
+		return adminIdentity{}, false, err
+	}
+	if !found {
+		return adminIdentity{}, false, nil
+	}
+	if principal.IDPID != "first_party" {
+		return identity, true, nil
+	}
+	credentials.mu.Lock()
+	credential := cloneCredential(credentials.findByPrincipalLocked(identity.TenantID, identity.PrincipalID))
+	credentials.mu.Unlock()
+	if credential == nil || credential.Status != credentialStatusActive {
+		return adminIdentity{}, false, nil
+	}
+	if identity.AuthMethod == "admin_session" {
+		identity.Roles = credential.Roles
+	}
+	return identity, true, nil
 }

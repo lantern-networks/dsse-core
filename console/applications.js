@@ -98,6 +98,33 @@ async function renderAppList(host) {
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Showing ", ja: "表示 " }) + filtered.length + " / " + apps.length }));
 }
 
+// The catalog POST replaces an entry. Preserve fields outside this form from a
+// fresh detail read instead of resetting routing, classification and SaaS metadata.
+async function appSaveBase(id, editing) {
+  const r = await apiFetch("GET", "/admin/applications/" + encodeURIComponent(id));
+  if (r.status === 404 && !editing) return {};
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const entry = r.body;
+  if (!entry || typeof entry !== "object" || Array.isArray(entry) || entry.application_id !== id ||
+      !["private_app", "saas"].includes(entry.application_type)) {
+    throw new Error("Invalid application response");
+  }
+  const strings = ["tenant_id", "name", "service_family", "protocol", "destination_role",
+    "application_sensitivity", "route_ref", "saas_provider", "saas_category", "saas_risk_tier", "status"];
+  if (strings.some(key => typeof entry[key] !== "string") ||
+      ["domain_pattern_count", "sni_pattern_count"].some(key => !Number.isSafeInteger(entry[key]) || entry[key] < 0) ||
+      !Object.hasOwn(entry, "tags") || (entry.tags !== null && (!Array.isArray(entry.tags) || entry.tags.some(tag => typeof tag !== "string"))) ||
+      !Object.hasOwn(entry, "updated_at") || (entry.updated_at !== null && typeof entry.updated_at !== "string")) {
+    throw new Error("Invalid application response");
+  }
+  return entry;
+}
+
+function appOptionsWithCurrent(options, value) {
+  return value && !options.some(o => o.value === value)
+    ? options.concat([{ value, label: value }]) : options;
+}
+
 function openAppForm(content, existing) {
   existing = existing || null;
   const idF = uiField({ name: "id", label: bl({ en: "Application ID", ja: "アプリ ID" }), required: true, value: existing ? existing.application_id : "",
@@ -109,15 +136,15 @@ function openAppForm(content, existing) {
     { value: "private_app", label: bl({ en: "Internal app", ja: "社内アプリ" }) },
     { value: "saas", label: bl({ en: "SaaS app", ja: "SaaS アプリ" }) },
   ] });
-  const sensF = uiField({ name: "sensitivity", label: bl({ en: "Sensitivity", ja: "重要度" }), type: "select", value: existing ? existing.application_sensitivity : "normal", options: [
+  const sensF = uiField({ name: "sensitivity", label: bl({ en: "Sensitivity", ja: "重要度" }), type: "select", value: existing ? existing.application_sensitivity : "normal", options: appOptionsWithCurrent([
     { value: "low", label: bl({ en: "Low", ja: "低" }) },
     { value: "normal", label: bl({ en: "Normal", ja: "標準" }) },
     { value: "high", label: bl({ en: "High", ja: "高" }) },
-  ] });
-  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: existing ? existing.status : "active", options: [
+  ], existing && existing.application_sensitivity) });
+  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: existing ? existing.status : "active", options: appOptionsWithCurrent([
     { value: "active", label: bl({ en: "Active", ja: "有効" }) },
     { value: "disabled", label: bl({ en: "Disabled", ja: "無効" }) },
-  ] });
+  ], existing && existing.status) });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: existing ? bl({ en: "Save changes", ja: "変更を保存" }) : bl({ en: "Add application", ja: "アプリを追加" }) });
   const backdrop = el("div", { class: "ui-modal-backdrop", onClick: (e) => { if (e.target === backdrop) backdrop.remove(); } }, [
     el("div", { class: "ui-modal", role: "dialog" }, [
@@ -127,15 +154,17 @@ function openAppForm(content, existing) {
     ]),
   ]);
   submit.addEventListener("click", async () => {
-    if (!idF.validate() || !nameF.validate()) return;
+    if (submit.disabled || !idF.validate() || !nameF.validate()) return;
     submit.disabled = true;
     try {
-      const r = await apiFetch("POST", "/admin/applications", { application_id: idF.get(), name: nameF.get(), application_type: typeF.get(), application_sensitivity: sensF.get(), status: statusF.get() });
+      const edited = { application_id: idF.get(), name: nameF.get(), application_type: typeF.get(), application_sensitivity: sensF.get(), status: statusF.get() };
+      const base = await appSaveBase(edited.application_id, Boolean(existing));
+      const r = await apiFetch("POST", "/admin/applications", { ...base, ...edited });
       if (!r.ok) { submit.disabled = false; const m = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); idF.setError(m); uiToast(m, "err"); return; }
       backdrop.remove();
       uiToast(existing ? bl({ en: "Application saved.", ja: "アプリを保存しました。" }) : bl({ en: "Application added.", ja: "アプリを追加しました。" }), "ok");
       renderApplicationsView(document.getElementById("content"));
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) { submit.disabled = false; idF.setError(String(e)); uiToast(String(e), "err"); }
   });
   document.body.appendChild(backdrop);
   (existing ? nameF : idF).focus();

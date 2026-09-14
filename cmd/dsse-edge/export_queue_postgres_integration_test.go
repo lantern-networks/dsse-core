@@ -1397,9 +1397,10 @@ func resetPostgresExportTaskQueueTables(t *testing.T, ctx context.Context, db *s
 		"DROP TABLE IF EXISTS export_worker_task_dead_letters",
 		"DROP TABLE IF EXISTS export_worker_tasks",
 		"DROP TABLE IF EXISTS admin_export_jobs",
-		// Migration 047 attaches a non-idempotent trigger to this table.
-		// Its table must be removed together with the migration ledger.
+		// Migrations 047/051 attach triggers to these tables.
+		// Remove their tables together with the migration ledger.
 		"DROP TABLE IF EXISTS cp_state_blobs CASCADE",
+		"DROP TABLE IF EXISTS admin_local_credentials CASCADE",
 		"DROP TABLE IF EXISTS schema_migrations",
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {

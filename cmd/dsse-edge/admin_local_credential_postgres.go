@@ -96,10 +96,18 @@ func (p postgresCredentialPersistence) Upsert(ctx context.Context, c *localAdmin
  last_totp_counter=$16, revision=nextval('admin_local_credentials_revision_seq')
  WHERE email=$1 AND tenant_id=$3 AND revision=$17 RETURNING revision`
 	}
+	tx, err := p.beginCredentialWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var revision int64
-	err = p.db.QueryRowContext(ctx, query, args...).Scan(&revision)
+	err = tx.QueryRowContext(ctx, query, args...).Scan(&revision)
 	if err == sql.ErrNoRows {
 		return errCredentialConflict
+	}
+	if err == nil {
+		err = tx.Commit()
 	}
 	if err == nil {
 		c.Revision = revision
@@ -113,14 +121,35 @@ func (p postgresCredentialPersistence) Delete(ctx context.Context, tenantID, ema
 	if revision <= 0 {
 		return errCredentialConflict
 	}
+	tx, err := p.beginCredentialWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
 	var deleted int64
-	err := p.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`DELETE FROM admin_local_credentials WHERE email=$1 AND tenant_id=$2 AND revision=$3 RETURNING revision`,
 		credentialEmailKey(email), tenantID, revision).Scan(&deleted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return errCredentialConflict
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Transaction-local state cannot authorize a later borrower of this pooled connection.
+func (p postgresCredentialPersistence) beginCredentialWrite(ctx context.Context) (*sql.Tx, error) {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `SET LOCAL dsse.credential_write_protocol = '1'`); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
 }
 
 func nullTime(t time.Time) sql.NullTime {
@@ -154,7 +183,7 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 				db.Close()
 				return nil, nil, fmt.Errorf("load local-credential migrations: %w", err)
 			}
-			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials, postgresMigrationCredentialTOTP, postgresMigrationCredentialRevision)
+			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials, postgresMigrationCredentialTOTP, postgresMigrationCredentialRevision, postgresMigrationCredentialWriterProtocol)
 			if err != nil {
 				db.Close()
 				return nil, nil, err

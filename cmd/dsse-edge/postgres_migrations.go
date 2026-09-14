@@ -31,6 +31,7 @@ const (
 	postgresMigrationLocalCredentials          = "020"
 	postgresMigrationCredentialTOTP            = "048"
 	postgresMigrationCredentialRevision        = "049"
+	postgresMigrationCredentialWriterProtocol  = "051"
 	postgresMigrationSteerExclusions           = "021"
 	postgresMigrationConfigVersions            = "022"
 	postgresMigrationAdminTenantModel          = "023"

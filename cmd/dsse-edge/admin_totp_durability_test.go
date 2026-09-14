@@ -178,6 +178,7 @@ func TestTOTPCounterPostgresUpgradeAndRestart(t *testing.T) {
 	}
 	exerciseTOTPRestartProtection(t, func() credentialPersistence { return persistence })
 	exerciseConcurrentCredentialConsumption(t, persistence)
+	exerciseLegacyCredentialWriterFence(t, persistence.(postgresCredentialPersistence))
 	store, err := newLocalAdminCredentialStoreWithPersistence("DSSE", persistence)
 	if err != nil {
 		t.Fatal(err)
@@ -224,13 +225,13 @@ func TestTOTPCounterPostgresUpgradeAndRestart(t *testing.T) {
 	}
 	for _, field := range []string{"roles", "recovery_code_hashes"} {
 		// The column names are fixed test cases, never external input.
-		if _, err := old.ExecContext(ctx, `UPDATE admin_local_credentials SET `+field+`='{}'::jsonb WHERE email='legacy@example.invalid'`); err != nil {
+		if _, err := credentialFixtureExec(ctx, persistence.(postgresCredentialPersistence), `UPDATE admin_local_credentials SET `+field+`='{}'::jsonb WHERE email='legacy@example.invalid'`); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := newLocalAdminCredentialStoreWithPersistence("DSSE", persistence); err == nil {
 			t.Fatalf("malformed %s was silently dropped", field)
 		}
-		if _, err := old.ExecContext(ctx, `UPDATE admin_local_credentials SET `+field+`='[]'::jsonb WHERE email='legacy@example.invalid'`); err != nil {
+		if _, err := credentialFixtureExec(ctx, persistence.(postgresCredentialPersistence), `UPDATE admin_local_credentials SET `+field+`='[]'::jsonb WHERE email='legacy@example.invalid'`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -352,4 +353,109 @@ func exerciseConcurrentCredentialConsumption(t *testing.T, p credentialPersisten
 	if _, e := fresh.Delete("tenant_cas", "adm_recreated", now); e != nil {
 		t.Fatal(e)
 	}
+}
+
+// Malformed JSON fixtures deliberately participate in the current write protocol.
+func credentialFixtureExec(ctx context.Context, p postgresCredentialPersistence, query string) (sql.Result, error) {
+	tx, err := p.beginCredentialWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	return result, tx.Commit()
+}
+
+func exerciseLegacyCredentialWriterFence(t *testing.T, p postgresCredentialPersistence) {
+	t.Helper()
+	ctx := context.Background()
+	// Force reuse of the connection that performs authorized writes and failed CAS.
+	p.db.SetMaxOpenConns(1)
+	rows, err := p.LoadAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cred *localAdminCredential
+	for _, row := range rows {
+		if row.Email == "legacy@example.invalid" {
+			cred = row
+		}
+	}
+	if cred == nil {
+		t.Fatal("legacy fixture missing")
+	}
+	before := cred.Revision
+	if err := p.Upsert(ctx, cred); err != nil {
+		t.Fatal(err)
+	}
+	if cred.Revision <= before {
+		t.Fatal("committed generation did not advance")
+	}
+	for _, query := range []string{
+		`UPDATE admin_local_credentials SET status='suspended' WHERE email='legacy@example.invalid'`,
+		`DELETE FROM admin_local_credentials WHERE email='legacy@example.invalid'`,
+		`DELETE FROM admin_local_credentials WHERE email='absent@example.invalid'`,
+		`INSERT INTO admin_local_credentials(email,principal_id,tenant_id,status) VALUES('old-writer@example.invalid','old','tenant','active')`,
+		`TRUNCATE admin_local_credentials`,
+	} {
+		if _, err := p.db.ExecContext(ctx, query); err == nil || !strings.Contains(err.Error(), "writer protocol is unsupported") {
+			t.Fatalf("old statement not explicitly rejected: %s: %v", query, err)
+		}
+	}
+	// Unsupported future/incorrect protocols are also refused, and rollback clears the marker.
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, `SET LOCAL dsse.credential_write_protocol = '2'`); err != nil {
+		tx.Rollback()
+		t.Fatal(err)
+	}
+	_, err = tx.ExecContext(ctx, `DELETE FROM admin_local_credentials WHERE email='legacy@example.invalid'`)
+	tx.Rollback()
+	if err == nil {
+		t.Fatal("unknown protocol accepted")
+	}
+	stale := cloneCredential(cred)
+	if err := p.Upsert(ctx, cred); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Upsert(ctx, stale); !errors.Is(err, errCredentialConflict) {
+		t.Fatal("stale update accepted")
+	}
+	if _, err := p.db.ExecContext(ctx, `DELETE FROM admin_local_credentials WHERE email='legacy@example.invalid'`); err == nil {
+		t.Fatal("transaction-local marker leaked after rollback")
+	}
+	// A failure at COMMIT must not publish the generated revision or successful deletion.
+	if _, err := p.db.ExecContext(ctx, `CREATE FUNCTION reject_credential_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'commit rejected'; END $$;
+CREATE CONSTRAINT TRIGGER reject_credential_commit AFTER INSERT OR UPDATE OR DELETE ON admin_local_credentials DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_credential_commit()`); err != nil {
+		t.Fatal(err)
+	}
+	candidate := cloneCredential(cred)
+	candidate.Status = credentialStatusSuspended
+	if err := p.Upsert(ctx, candidate); err == nil || candidate.Revision != cred.Revision {
+		t.Fatalf("failed commit published revision: %v", err)
+	}
+	if err := p.Delete(ctx, cred.TenantID, cred.Email, cred.Revision); err == nil {
+		t.Fatal("failed delete commit reported success")
+	}
+	if _, err := p.db.ExecContext(ctx, `DROP TRIGGER reject_credential_commit ON admin_local_credentials`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = p.LoadAll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.Email == cred.Email {
+			if row.Status != cred.Status || row.Revision != cred.Revision {
+				t.Fatal("refused old writer changed the row")
+			}
+			return
+		}
+	}
+	t.Fatal("refused writer deleted the account")
 }

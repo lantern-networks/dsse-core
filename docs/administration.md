@@ -64,8 +64,9 @@ recovery-code consumption is also saved before sign-in succeeds. A credential wr
 failure refuses sign-in rather than issuing a session whose replay protection was not saved.
 
 For PostgreSQL, the component startup migration includes
-`048_admin_local_credentials_totp_counter.sql` and
-`049_admin_local_credentials_revision.sql`. The default
+`048_admin_local_credentials_totp_counter.sql`,
+`049_admin_local_credentials_revision.sql`, and
+`051_admin_credentials_writer_protocol.sql`. The default
 `-postgres-run-migrations=true` applies it before credential loading. If migrations
 are disabled, apply these migrations through your database upgrade procedure before
 starting the updated binary. Back up the credential store and validate the upgrade
@@ -75,7 +76,18 @@ Older file snapshots and database rows have no consumed-step history; the new fi
 starts at zero and protection is established by the first successful sign-in after
 upgrade. Previously consumed codes cannot be reconstructed. Stop all authentication authorities for this upgrade, apply the migrations, and
 restart them with the updated binary. Do not run mixed versions: older binaries do
-not participate in the concurrency checks.
+not participate in the concurrency checks. After migration 051, the database rejects
+credential INSERT, UPDATE, DELETE and TRUNCATE statements that do not declare the
+supported transaction-local writer protocol. This makes writes from older binaries
+fail explicitly instead of silently overwriting newer state. It also affects manual
+maintenance scripts; review and update them before this migration. Do not disable
+the trigger or set a session-wide protocol value to keep old writers running.
+
+The writer protocol is a compatibility guard, not an authorization boundary against
+a database owner or arbitrary SQL access. Reads from an old process are not blocked,
+and a process retaining old in-memory credentials may still serve stale state.
+Stop all authorities during upgrade even though legacy database writes are refused.
+The guard requires migration 051 and applies only to PostgreSQL, not shared files.
 
 PostgreSQL credential writes compare a database generation before accepting a
 change. Simultaneous consumption of the same TOTP or recovery code through separate

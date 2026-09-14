@@ -254,6 +254,12 @@ on the listed objects. It does not compare against an independently trusted fina
 expected segment count. Removing the last segment(s), rewriting a complete internally
 consistent chain, or an incomplete archive listing can escape detection. Retain independent
 checkpoints and verify storage retention controls before relying on completeness claims.
+With the remaining headers unchanged, removing a first or intermediate segment breaks
+sequence continuity. Rewriting an intermediate segment without updating its successor
+breaks the successor's hash reference. However, rewriting the final segment as valid gzip
+while retaining its header is also undetectable here: there is no successor to check its
+new object hash against. A trusted terminal hash is needed to cover that case.
+
 A reported failure is not by itself proof of malicious tampering; incomplete writes or a
 legacy unchained segment also fail verification.
 

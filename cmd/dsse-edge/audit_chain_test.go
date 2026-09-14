@@ -174,3 +174,40 @@ func TestAuditChainHTTPReportsEmptyAndBrokenArchives(t *testing.T) {
 		}
 	}
 }
+
+func TestAuditChainDeletionAndRewriteDetectionBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		index            int
+		rewrite, detects bool
+	}{
+		{"delete_first", 0, false, true}, {"delete_middle", 1, false, true}, {"delete_last", 2, false, false},
+		{"rewrite_middle_without_relinking", 1, true, true}, {"rewrite_last_valid_gzip", 2, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			arc := &fakeArchive{objs: map[string][]byte{}}
+			previous := ""
+			var links []string
+			for i := 0; i < 3; i++ {
+				links = append(links, previous)
+				data, hash := buildAuditSegment(i, previous, [][]byte{[]byte(`{"event":"original"}`)})
+				arc.objs[fmt.Sprintf("hot_events/t1/audit/%d.gz", i)] = data
+				previous = hash
+			}
+			key := fmt.Sprintf("hot_events/t1/audit/%d.gz", tc.index)
+			if tc.rewrite {
+				data, _ := buildAuditSegment(tc.index, links[tc.index], [][]byte{[]byte(`{"event":"rewritten"}`)})
+				arc.objs[key] = data // Valid gzip and original link; successor is deliberately untouched.
+			} else {
+				delete(arc.objs, key)
+			}
+			result, err := verifyAuditChain(context.Background(), arc, "t1")
+			if err != nil || result.OK == tc.detects {
+				t.Fatalf("detection boundary: %+v %v", result, err)
+			}
+			if result.Scope != "listed_segments_only" {
+				t.Fatal("scope lost")
+			}
+		})
+	}
+}

@@ -870,7 +870,7 @@ function laDetail(row) {
   const m = uiModal({ title: bl({ en: "Log entry", ja: "ログエントリ" }), body: body, footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })] });
 }
 
-// ---- Exports (unchanged behaviour) --------------------------------------
+// ---- Exports ----------------------------------------------------------
 async function laExports(section) {
   uiState(section, "loading");
   const current = freshRender(section);
@@ -882,27 +882,45 @@ async function laExports(section) {
   section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
   if (!jobs.length) { section.appendChild(emptyBox(bl({ en: "No exports yet.", ja: "エクスポートがありません。" }))); return; }
   section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" })], jobs.map((j) => [
-    el("div", {}, [el("span", { text: j.stream || "—" }), ...(j.filters && j.filters.edge_region_id ? [el("p", { class: "ui-view-desc", text: laRegionCoverageText(j.metadata && j.metadata.region_coverage) })] : [])]), el("span", { text: j.format || "—" }), uiBadge(j.status || "—", /done|complete|ready/i.test(j.status || "") ? "ok" : "off"), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+    el("div", {}, [el("span", { text: j.stream || "—" }), ...(j.filters && j.filters.edge_region_id ? [el("p", { class: "ui-view-desc", text: laRegionCoverageText(j.metadata && j.metadata.region_coverage) })] : [])]), el("span", { text: j.format || "—" }), laResultBadge(j.status), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
   ])));
+}
+
+// Date selections use the operator's local calendar, matching log search.
+function laExportDateRange(from, to) {
+  const parseDay = value => {
+    const text = String(value || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error(bl({en:"Select valid start and end dates.",ja:"開始日と終了日を正しく選択してください。"}));
+    const date = new Date(text + "T00:00:00");
+    if (!Number.isFinite(date.getTime()) || date.getFullYear() !== Number(text.slice(0,4)) ||
+        date.getMonth()+1 !== Number(text.slice(5,7)) || date.getDate() !== Number(text.slice(8,10))) {
+      throw new Error(bl({en:"Select valid start and end dates.",ja:"開始日と終了日を正しく選択してください。"}));
+    }
+    return date;
+  };
+  const start = parseDay(from), end = parseDay(to);
+  if (start > end) throw new Error(bl({en:"End date must not precede start date.",ja:"終了日は開始日以降を選択してください。"}));
+  end.setHours(23,59,59,999);
+  return {from:start.toISOString(),to:end.toISOString().replace(".999Z", ".999999999Z")};
 }
 
 function openExportForm(section) {
   const streamF = uiField({ name: "stream", label: bl({ en: "Log", ja: "ログ" }), type: "select", value: "access", options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
-  const fmtF = uiField({ name: "fmt", label: bl({ en: "Format", ja: "形式" }), type: "select", value: "ndjson", options: [{ value: "ndjson", label: "NDJSON" }, { value: "csv", label: "CSV" }] });
+  const fmtF = uiField({ name: "fmt", label: bl({ en: "Format", ja: "形式" }), type: "select", value: "ndjson", options: [{ value: "ndjson", label: "NDJSON" }] });
   const fromF = uiField({ name: "from", label: bl({ en: "From", ja: "開始" }), type: "date" });
   const toF = uiField({ name: "to", label: bl({ en: "To", ja: "終了" }), type: "date" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Create export", ja: "エクスポート作成" }) });
   const m = uiModal({ title: bl({ en: "New export", ja: "エクスポート作成" }), body: [streamF.el, fmtF.el, fromF.el, toF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
+    if (submit.disabled) return;
     submit.disabled = true;
-    const payload = { stream: streamF.get(), format: fmtF.get() };
-    if (fromF.get()) payload.from = new Date(fromF.get()).toISOString();
-    if (toF.get()) payload.to = new Date(toF.get()).toISOString();
     try {
+      const payload = {stream:streamF.get(),format:fmtF.get(),...laExportDateRange(fromF.get(),toF.get())};
       const r = await apiFetch("POST", "/admin/export-jobs", payload, _LA_PLANE);
-      if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
       m.close(); uiToast(bl({ en: "Export started.", ja: "エクスポートを開始しました。" }), "ok"); laExports(section);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) { uiToast(String(e), "err"); }
+    finally { submit.disabled = false; }
   });
 }
 

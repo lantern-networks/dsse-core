@@ -216,3 +216,48 @@ test('audit writer snapshot states retrieval time and avoids missing-record inte
  assert.ok(texts.some(t=>/not missing-record counts/.test(t)));
  assert.ok(texts.some(t=>/Retrieved at .*T.*Z.*does not refresh automatically/.test(t)));
 });
+
+test('export calendar range includes the whole local end day across time zones and DST',()=>{
+ const saved=process.env.TZ;
+ try{
+  for(const [zone,day,from,to] of [
+   ['Asia/Tokyo','2026-09-14','2026-09-13T15:00:00.000Z','2026-09-14T14:59:59.999999999Z'],
+   ['UTC','2026-09-14','2026-09-14T00:00:00.000Z','2026-09-14T23:59:59.999999999Z'],
+   ['America/New_York','2026-03-08','2026-03-08T05:00:00.000Z','2026-03-09T03:59:59.999999999Z'],
+  ]){
+   process.env.TZ=zone;
+   const c=vm.createContext({bl:v=>v.en,day});vm.runInContext(source,c);
+   const range=vm.runInContext('laExportDateRange(day,day)',c);
+   assert.equal(range.from,from);assert.equal(range.to,to);
+  }
+ }finally{if(saved===undefined)delete process.env.TZ;else process.env.TZ=saved;}
+});
+
+test('export form rejects incomplete and invalid dates, allows retry and omits unsupported CSV',async()=>{
+ for(const [from,to] of [['',''],['2026-02-30','2026-03-01'],['2026-09-15','2026-09-14']]){
+  const fields={},buttons=[],toasts=[],calls=[];
+  const c=vm.createContext({section:{},bl:v=>v.en,uiToast:(...a)=>toasts.push(a),
+   apiFetch:async(...a)=>{calls.push(a);return {ok:false,status:503};},
+   uiModal:()=>({close(){}}),uiField:spec=>{const f={el:{},value:spec.value,get(){return this.value;},options:spec.options};fields[spec.name]=f;return f;},
+   el:(tag,p)=>{const e={...p,addEventListener:(event,fn)=>{e.click=fn;}};if(tag==='button')buttons.push(e);return e;}});
+  vm.runInContext(source,c);vm.runInContext('openExportForm(section)',c);
+  assert.deepEqual(Array.from(fields.fmt.options,x=>x.value),['ndjson']);
+  fields.from.value=from;fields.to.value=to;
+  const submit=buttons.find(b=>b.text==='Create export');await submit.click();
+  assert.equal(calls.length,0);assert.equal(submit.disabled,false);assert.equal(toasts[0][1],'err');
+  fields.from.value='2026-09-14';fields.to.value='2026-09-14';await submit.click();
+  assert.equal(calls.length,1);assert.equal(submit.disabled,false);assert.equal(toasts.at(-1)[1],'err');
+ }
+});
+
+test('export statuses use exact outcomes rather than substring success',async()=>{
+ const badges=[];
+ const c=vm.createContext({section:{innerHTML:'',appendChild(){}},bl:v=>v.en,freshRender:()=>()=>true,uiState(){},
+  apiFetch:async()=>({ok:true,body:{jobs:['incomplete','failed','completed','queued'].map(status=>({status}))}}),
+  uiBadge:(label,kind)=>{badges.push({label,kind});return {};},el:()=>({}),simpleTable:()=>({})});
+ vm.runInContext(source,c);await vm.runInContext('laExports(section)',c);
+ assert.equal(badges.find(x=>x.label==='incomplete').kind,'off');
+ assert.equal(badges.find(x=>x.label==='failed').kind,'danger');
+ assert.equal(badges.find(x=>x.label==='completed').kind,'ok');
+ assert.equal(badges.find(x=>x.label==='queued').kind,'off');
+});

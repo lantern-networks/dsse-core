@@ -295,3 +295,16 @@ process; cross-process writers and leader changes still require separate coordin
 
 When a runtime override store is configured, the pruner can apply Console overrides even
 if startup hot-event TTLs are all zero. A zero polling interval still disables the pruner.
+
+## Export form dates and format
+
+The asynchronous export API supports NDJSON; the Console offers that format only.
+Both a start and an end date are required. Console date selections use the operator's
+local calendar: start is local midnight, and the selected end date includes its entire
+day, including on daylight-saving transitions. The API receives explicit timestamps
+and rejects an end before the start before submitting work. Equal timestamps remain
+valid for API clients requesting one instant.
+
+Invalid or missing dates remain in the form with an error so they can be corrected.
+Failed export requests receive error audit outcomes. Job-state colors use explicit
+outcomes; an unknown or incomplete status is not evidence of a completed export.

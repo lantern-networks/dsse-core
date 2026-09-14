@@ -14019,7 +14019,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create asynchronous log export job.
-      description: Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF.
+      description: Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Both bounds are required; to must not precede from. Only ndjson is supported. Validation occurs before worker submission.
       tags:
         - AdminExport
       requestBody:
@@ -14058,14 +14058,15 @@ paths:
                   type: string
                   enum:
                     - ndjson
-                    - csv
                   default: ndjson
                 limit:
                   type: integer
                   minimum: 0
                   maximum: 1000000
-                  description: Omit or set 0 to use the server-side Phase 1 default of 1000000 rows. Alpha should make the default explicit per plan.
+                  description: Omit or set 0 to use the default of 1000000 rows.
       responses:
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "202":
           description: Export job accepted.
           content:

@@ -117,7 +117,7 @@ func (f *fileCredentialPersistence) Upsert(_ context.Context, cred *localAdminCr
 	return nil
 }
 
-func (f *fileCredentialPersistence) Delete(_ context.Context, tenantID, email string) error {
+func (f *fileCredentialPersistence) Delete(_ context.Context, tenantID, email string, _ int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	key := credentialEmailKey(email)

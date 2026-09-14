@@ -27,11 +27,11 @@ func (p *failingCredentials) Upsert(ctx context.Context, c *localAdminCredential
 	}
 	return p.fakeCredentialPersistence.Upsert(ctx, c)
 }
-func (p *failingCredentials) Delete(ctx context.Context, tenant, email string) error {
+func (p *failingCredentials) Delete(ctx context.Context, tenant, email string, revision int64) error {
 	if p.fail {
 		return fmt.Errorf("private database failure sentinel")
 	}
-	return p.fakeCredentialPersistence.Delete(ctx, tenant, email)
+	return p.fakeCredentialPersistence.Delete(ctx, tenant, email, revision)
 }
 
 func credentialFailureFixture(t *testing.T) (*localAdminCredentialStore, *failingCredentials, string, time.Time) {

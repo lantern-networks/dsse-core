@@ -305,6 +305,7 @@ func exerciseConcurrentCredentialConsumption(t *testing.T, p credentialPersisten
 	// An existing row deleted elsewhere must never be reinserted by a stale upsert.
 	a, b = load(), load()
 	oldGeneration := cloneCredential(a.byEmail[email])
+	staleDeletionNodes := []*localAdminCredentialStore{load(), load()}
 	if _, e := a.Delete("tenant_cas", "adm_cas", now); e != nil {
 		t.Fatal(e)
 	}
@@ -325,6 +326,28 @@ func exerciseConcurrentCredentialConsumption(t *testing.T, p credentialPersisten
 	}
 	if load().byEmail[email].PrincipalID != "adm_recreated" {
 		t.Fatal("recreated identity overwritten")
+	}
+	// A stale authority must not delete the replacement, either individually or in a tenant cascade.
+	for i, staleNode := range staleDeletionNodes {
+		if i == 1 {
+			removed, e := staleNode.DeleteAllForTenant("tenant_cas")
+			if !errors.Is(e, errCredentialPersistence) || len(removed) != 0 {
+				t.Fatalf("stale bulk delete: removed=%v err=%v", removed, e)
+			}
+		} else {
+			if _, e := staleNode.Delete("tenant_cas", "adm_cas", now); !errors.Is(e, errCredentialPersistence) {
+				t.Fatalf("stale delete: %v", e)
+			}
+		}
+		if load().byEmail[email].PrincipalID != "adm_recreated" || staleNode.byEmail[email].PrincipalID != "adm_recreated" {
+			t.Fatal("replacement deleted or conflict state not refreshed")
+		}
+	}
+	if e := p.Delete(context.Background(), "another-tenant", email, fresh.byEmail[email].Revision); !errors.Is(e, errCredentialConflict) {
+		t.Fatalf("cross-tenant deletion: %v", e)
+	}
+	if e := p.Delete(context.Background(), "tenant_cas", email, 0); !errors.Is(e, errCredentialConflict) {
+		t.Fatalf("unversioned deletion: %v", e)
 	}
 	if _, e := fresh.Delete("tenant_cas", "adm_recreated", now); e != nil {
 		t.Fatal(e)

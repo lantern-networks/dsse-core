@@ -86,7 +86,11 @@ storage-unavailable response; restart the sign-in flow with a fresh code.
 
 This does not provide continuous synchronization of existing session authorization
 across authorities. Independent databases and shared JSON files are not coordinated
-by this mechanism. Deletion remains tenant-scoped but is not generation-checked.
+by this mechanism. PostgreSQL deletion is tenant-scoped and generation-checked as well: a stale
+individual or tenant-cascade deletion cannot erase an account recreated at the same
+email address. Conflicts fail the request and refresh local state without retrying
+the deletion automatically. A tenant cascade stops at its first failure and can
+have already removed earlier accounts; inspect the reported outcome before retrying.
 
 Credential persistence calls carry a five-second deadline. PostgreSQL honors that
 deadline; filesystem operations are not guaranteed to be interruptible. Existing

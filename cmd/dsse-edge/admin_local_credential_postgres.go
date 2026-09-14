@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -108,10 +109,17 @@ func (p postgresCredentialPersistence) Upsert(ctx context.Context, c *localAdmin
 
 // Delete removes a credential durably. The (email, tenant_id) predicate keeps the delete tenant-scoped so an
 // account can never be removed across tenants even though email is the table's primary key.
-func (p postgresCredentialPersistence) Delete(ctx context.Context, tenantID, email string) error {
-	_, err := p.db.ExecContext(ctx,
-		`DELETE FROM admin_local_credentials WHERE email=$1 AND tenant_id=$2`,
-		credentialEmailKey(email), tenantID)
+func (p postgresCredentialPersistence) Delete(ctx context.Context, tenantID, email string, revision int64) error {
+	if revision <= 0 {
+		return errCredentialConflict
+	}
+	var deleted int64
+	err := p.db.QueryRowContext(ctx,
+		`DELETE FROM admin_local_credentials WHERE email=$1 AND tenant_id=$2 AND revision=$3 RETURNING revision`,
+		credentialEmailKey(email), tenantID, revision).Scan(&deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errCredentialConflict
+	}
 	return err
 }
 

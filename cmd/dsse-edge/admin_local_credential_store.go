@@ -193,8 +193,8 @@ func (c *localAdminCredential) locked(now time.Time) bool {
 type credentialPersistence interface {
 	LoadAll(ctx context.Context) ([]*localAdminCredential, error)
 	Upsert(ctx context.Context, cred *localAdminCredential) error
-	// Delete removes a credential durably. Tenant-scoped so a delete can never reach across tenants.
-	Delete(ctx context.Context, tenantID, email string) error
+	// Delete removes the observed generation durably; PostgreSQL rejects stale revisions.
+	Delete(ctx context.Context, tenantID, email string, revision int64) error
 }
 
 // localAdminCredentialStore is the first-party admin credential store. Concurrency-safe. `issuer` labels the
@@ -250,20 +250,7 @@ func (s *localAdminCredentialStore) persistLocked(cred *localAdminCredential) er
 		defer cancel()
 		if err := s.persistence.Upsert(ctx, cred); err != nil {
 			log.Printf("admin credential persistence failed: %v", err)
-			if errors.Is(err, errCredentialConflict) {
-				// Refresh for the next request, but never retry a security mutation implicitly.
-				rows, loadErr := s.persistence.LoadAll(ctx)
-				if loadErr == nil {
-					fresh := make(map[string]*localAdminCredential, len(rows))
-					for _, row := range rows {
-						fresh[credentialEmailKey(row.Email)] = row
-					}
-					s.byEmail = fresh
-					s.publishAuthorityLocked()
-				} else {
-					log.Printf("admin credential conflict refresh failed: %v", loadErr)
-				}
-			}
+			s.refreshConflictLocked(ctx, err)
 			return errCredentialPersistence
 		}
 	}
@@ -273,6 +260,25 @@ func (s *localAdminCredentialStore) persistLocked(cred *localAdminCredential) er
 		s.publishAuthorityLocked()
 	}
 	return nil
+}
+
+// Refresh only for a subsequent request; never retry a destructive/security mutation.
+// The caller holds s.mu and supplies the operation's bounded context.
+func (s *localAdminCredentialStore) refreshConflictLocked(ctx context.Context, err error) {
+	if !errors.Is(err, errCredentialConflict) {
+		return
+	}
+	rows, loadErr := s.persistence.LoadAll(ctx)
+	if loadErr != nil {
+		log.Printf("admin credential conflict refresh failed: %v", loadErr)
+		return
+	}
+	fresh := make(map[string]*localAdminCredential, len(rows))
+	for _, row := range rows {
+		fresh[credentialEmailKey(row.Email)] = row
+	}
+	s.byEmail = fresh
+	s.publishAuthorityLocked()
 }
 
 func credentialEmailKey(email string) string { return strings.ToLower(strings.TrimSpace(email)) }
@@ -759,7 +765,7 @@ func (s *localAdminCredentialStore) DeleteAllForTenant(tenantID string) ([]strin
 		}
 		if err := s.deleteLocked(cred); err != nil {
 			saveErr = err
-			continue
+			break // Conflict refresh may have replaced byEmail; do not iterate stale candidates.
 		}
 		removed = append(removed, cred.Email)
 		delete(s.byEmail, key)
@@ -776,8 +782,9 @@ func (s *localAdminCredentialStore) deleteLocked(cred *localAdminCredential) err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), credentialPersistenceTimeout)
 	defer cancel()
-	if err := s.persistence.Delete(ctx, cred.TenantID, cred.Email); err != nil {
+	if err := s.persistence.Delete(ctx, cred.TenantID, cred.Email, cred.Revision); err != nil {
 		log.Printf("admin credential deletion failed: %v", err)
+		s.refreshConflictLocked(ctx, err)
 		return errCredentialPersistence
 	}
 	return nil

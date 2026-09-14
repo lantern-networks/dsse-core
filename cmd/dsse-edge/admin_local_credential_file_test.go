@@ -96,7 +96,7 @@ func TestLocalCredentialFilePersistenceDeletePersists(t *testing.T) {
 	if err := p.Upsert(ctx, cred); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := p.Delete(ctx, cred.TenantID, cred.Email); err != nil {
+	if err := p.Delete(ctx, cred.TenantID, cred.Email, cred.Revision); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestLocalCredentialFilePersistenceDeleteTenantScoped(t *testing.T) {
 	if err := p.Upsert(ctx, cred); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := p.Delete(ctx, "some-other-tenant", cred.Email); err != nil {
+	if err := p.Delete(ctx, "some-other-tenant", cred.Email, cred.Revision); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	got, err := newFileCredentialPersistence(path).LoadAll(ctx)
@@ -176,7 +176,7 @@ func TestLocalCredentialFileFailureDoesNotCommitLater(t *testing.T) {
 			}
 			var err error
 			if operation == "delete" {
-				err = p.Delete(ctx, original.TenantID, original.Email)
+				err = p.Delete(ctx, original.TenantID, original.Email, original.Revision)
 			} else {
 				err = p.Upsert(ctx, candidate)
 			}

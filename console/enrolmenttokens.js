@@ -295,11 +295,11 @@ async function openEnrolTokenForm(content) {
 function downloadTokenBatch(rows, count) {
   const header = "label,token_id,secret,expires_at\n";
   const csv = header + rows.map((r) => [
-    JSON.stringify(r.token.label || ""),
+    r.token.label || "",
     r.token.id,
     r.secret,
     r.token.expires_at,
-  ].join(",")).join("\n") + "\n";
+  ].map(value => '"' + String(value == null ? "" : value).replace(/"/g, '""') + '"').join(",")).join("\n") + "\n";
   const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
   const a = document.createElement("a");
   a.href = url;
@@ -394,7 +394,9 @@ async function revokeEnrolToken(t, host) {
     confirmLabel: bl({ en: "Revoke", ja: "失効" }), danger: true,
   });
   if (!ok) return;
-  const r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(t.id) + "/revoke", {}, _ENROL_PLANE);
+  let r;
+  try { r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(t.id) + "/revoke", {}, _ENROL_PLANE); }
+  catch (e) { uiToast(String(e), "err"); return; }
   if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
   // An admin who revokes AFTER the device enrolled is reaching for the wrong control, and the API says so.
   // Surfacing that is the difference between them fixing the problem and believing it is already fixed.

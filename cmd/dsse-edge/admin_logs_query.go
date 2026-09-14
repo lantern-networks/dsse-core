@@ -131,19 +131,7 @@ func adminLogSearchWithLimitBounds(store hotstore.Store, tenantID, stream string
 		return adminLogSearchResult{}, err
 	}
 
-	var coverage *adminLogRegionCoverage
-	if strings.TrimSpace(searchQuery.Filters["edge_region_id"]) != "" {
-		coverage = &adminLogRegionCoverage{Status: "unavailable"}
-		if counter, ok := store.(hotstore.UnknownRegionCounter); ok {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			count, countErr := counter.CountUnknownRegion(ctx, searchQuery)
-			cancel()
-			if countErr == nil && count >= 0 {
-				coverage.Status = "available"
-				coverage.UnknownRegionCount = &count
-			}
-		}
-	}
+	coverage := countAdminLogRegionCoverage(context.Background(), store, searchQuery)
 	return adminLogSearchResult{
 		regionCoverage: coverage,
 		stream:         result.Stream,
@@ -277,4 +265,20 @@ func statusForAdminLogQueryError(err error) int {
 		return http.StatusNotFound
 	}
 	return http.StatusBadRequest
+}
+
+func countAdminLogRegionCoverage(ctx context.Context, store hotstore.Store, query hotstore.SearchQuery) *adminLogRegionCoverage {
+	if strings.TrimSpace(query.Filters["edge_region_id"]) == "" {
+		return nil
+	}
+	coverage := &adminLogRegionCoverage{Status: "unavailable"}
+	if counter, ok := store.(hotstore.UnknownRegionCounter); ok {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if count, err := counter.CountUnknownRegion(ctx, query); err == nil && count >= 0 {
+			coverage.Status = "available"
+			coverage.UnknownRegionCount = &count
+		}
+	}
+	return coverage
 }

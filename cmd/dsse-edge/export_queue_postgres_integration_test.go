@@ -378,7 +378,8 @@ func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
 	if _, err := store.MarkProgress(job.ID, 7, "exporting", now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("MarkProgress returned error: %v", err)
 	}
-	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", now.Add(3*time.Minute))
+	coverage := &adminExportRegionCoverage{Schema: "dsse.export-region-coverage.v1", RegionFilterApplied: true, Status: "unavailable", Notice: "Records without a region are excluded."}
+	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", coverage, now.Add(3*time.Minute))
 	if err != nil {
 		t.Fatalf("MarkCompleted returned error: %v", err)
 	}
@@ -386,6 +387,14 @@ func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
 		t.Fatalf("completed = %#v", completed)
 	}
 	runtimeJob, ok := store.Get(job.ID)
+	coverageJSON, err := json.Marshal(runtimeJob.Metadata["region_coverage"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restoredCoverage adminExportRegionCoverage
+	if err := json.Unmarshal(coverageJSON, &restoredCoverage); err != nil || restoredCoverage.Schema != coverage.Schema || !restoredCoverage.RegionFilterApplied || restoredCoverage.UnknownRegionCount != nil {
+		t.Fatalf("coverage not durably restored: %s %v", coverageJSON, err)
+	}
 	if !ok || runtimeJob.Status != "completed" || runtimeJob.RowCount != 7 {
 		t.Fatalf("runtime job = %#v, ok=%v", runtimeJob, ok)
 	}

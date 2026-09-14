@@ -169,7 +169,7 @@ func (store postgresAdminExportJobStore) MarkProgress(id string, rowsExported in
 	})
 }
 
-func (store postgresAdminExportJobStore) MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, now time.Time) (adminExportJob, error) {
+func (store postgresAdminExportJobStore) MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, coverage *adminExportRegionCoverage, now time.Time) (adminExportJob, error) {
 	return store.updateByID(id, now, func(job *adminExportJob) error {
 		if job.Status != "running" {
 			return fmt.Errorf("export job %s cannot transition from %s to completed", id, job.Status)
@@ -182,6 +182,9 @@ func (store postgresAdminExportJobStore) MarkCompleted(id string, rowCount, tota
 		job.CompletedAt = &completedAt
 		if job.Metadata == nil {
 			job.Metadata = map[string]any{}
+		}
+		if coverage != nil {
+			job.Metadata["region_coverage"] = coverage
 		}
 		job.Metadata["total_matches"] = totalMatches
 		job.Metadata["truncated"] = truncated

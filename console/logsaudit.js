@@ -846,7 +846,7 @@ async function laExports(section) {
   section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
   if (!jobs.length) { section.appendChild(emptyBox(bl({ en: "No exports yet.", ja: "エクスポートがありません。" }))); return; }
   section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" })], jobs.map((j) => [
-    el("span", { text: j.stream || "—" }), el("span", { text: j.format || "—" }), uiBadge(j.status || "—", /done|complete|ready/i.test(j.status || "") ? "ok" : "off"), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+    el("div", {}, [el("span", { text: j.stream || "—" }), ...(j.filters && j.filters.edge_region_id ? [el("p", { class: "ui-view-desc", text: laRegionCoverageText(j.metadata && j.metadata.region_coverage) })] : [])]), el("span", { text: j.format || "—" }), uiBadge(j.status || "—", /done|complete|ready/i.test(j.status || "") ? "ok" : "off"), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
   ])));
 }
 

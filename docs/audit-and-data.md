@@ -164,6 +164,40 @@ count. The Console displays that uncertainty instead of zero.
 
 The synchronous preview export includes `X-DSSE-Region-Coverage`,
 `X-DSSE-Region-Notice`, and, when available, `X-DSSE-Unknown-Region-Count` headers.
-These headers are not embedded in exported log rows. Asynchronous export artifacts
-do not yet carry this coverage information; retain that limitation when using a
-regional export to assess completeness.
+These headers are not embedded in exported log rows.
+
+New asynchronous regional exports persist `metadata.region_coverage` on the completed
+job and embed the same JSON in the gzip file's Comment header. The manifest identifies
+`dsse.export-region-coverage.v1`, states that unknown-region records are excluded,
+and records the available count or unavailable/null, the check time, and
+`snapshot_consistent: false`. The job's existing filters and time range retain the
+full request scope. The count is a separate live query, not proof of a frozen snapshot
+or of complete retention across all stores.
+
+The gzip checksum covers the header and the original NDJSON together. No annotation
+rows are inserted, and an empty export still carries its header. Download tokens
+carry the same compressed bytes. Both built-in generated-file stores support this;
+a regional export fails if its object store cannot preserve the header. Non-regional
+exports keep their existing format. Existing artifacts are not retroactively changed;
+missing coverage in older jobs is unknown, never zero.
+
+Keep the original `.gz` file when sharing evidence: decompression or recompression
+can discard the Comment header. Many gzip tools do not display it automatically.
+For example, save this as `read-export-note.go` and run
+`go run read-export-note.go export.ndjson.gz` to inspect the note without altering logs:
+
+```go
+package main
+import ("compress/gzip"; "fmt"; "os")
+func main() {
+    if len(os.Args) != 2 { panic("provide one .gz export") }
+    f, err := os.Open(os.Args[1]); if err != nil { panic(err) }; defer f.Close()
+    r, err := gzip.NewReader(f); if err != nil { panic(err) }; defer r.Close()
+    if r.Comment == "" { fmt.Println("No embedded coverage information"); return }
+    fmt.Println(r.Comment)
+}
+```
+
+The Console export list also displays regional coverage or explicitly marks it
+unavailable, including for older jobs. A completed status means the requested export
+finished; it does not imply that unknown-region records were included.

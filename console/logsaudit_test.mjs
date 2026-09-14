@@ -103,3 +103,16 @@ test('failed hold mutations reload authoritative state and handle network errors
     assert.equal(states[0][1],'error');
   }
 });
+
+test('export list shows regional exclusions for completed and legacy jobs', async () => {
+  for (const coverage of [undefined,{status:'available',unknown_region_count:0}]) {
+    const texts=[];
+    const context=vm.createContext({section:{appendChild(){},innerHTML:''},freshRender:()=>()=>true,
+      uiState(){},bl:v=>v.en,uiBadge:()=>({}),simpleTable:()=>({}),
+      el:(tag,props)=>{if(props && props.text)texts.push(props.text);return {};},
+      apiFetch:async()=>({ok:true,body:{jobs:[{stream:'access',status:'completed',filters:{edge_region_id:'region-a'},metadata:{region_coverage:coverage}}]}})});
+    vm.runInContext(source,context);
+    await vm.runInContext('laExports(section)',context);
+    assert.ok(texts.some(t=>coverage ? /: 0$/.test(t) : /could not be determined/.test(t)));
+  }
+});

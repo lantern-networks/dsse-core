@@ -704,7 +704,7 @@ type adminExportJobRuntimeStore interface {
 	Get(id string) (adminExportJob, bool)
 	MarkRunning(id string, now time.Time) (adminExportJob, error)
 	MarkProgress(id string, rowsExported int, phase string, now time.Time) (adminExportJob, error)
-	MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, now time.Time) (adminExportJob, error)
+	MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, coverage *adminExportRegionCoverage, now time.Time) (adminExportJob, error)
 	MarkFailed(id, code string, now time.Time) (adminExportJob, error)
 	MarkFailedWithMetadata(id, code string, metadata map[string]any, now time.Time) (adminExportJob, error)
 	MarkCancelled(id, tenantID, cancelledBy, reason string, now time.Time) (adminExportJob, error)
@@ -1057,7 +1057,7 @@ func (s *adminExportJobStore) MarkProgress(id string, rowsExported int, phase st
 	return job, nil
 }
 
-func (s *adminExportJobStore) MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, now time.Time) (adminExportJob, error) {
+func (s *adminExportJobStore) MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, coverage *adminExportRegionCoverage, now time.Time) (adminExportJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	job, ok := s.jobs[id]
@@ -1075,6 +1075,9 @@ func (s *adminExportJobStore) MarkCompleted(id string, rowCount, totalMatches in
 	job.CompletedAt = &completedAt
 	if job.Metadata == nil {
 		job.Metadata = map[string]any{}
+	}
+	if coverage != nil {
+		job.Metadata["region_coverage"] = coverage
 	}
 	job.Metadata["total_matches"] = totalMatches
 	job.Metadata["truncated"] = truncated
@@ -1308,6 +1311,10 @@ func runAdminExportJob(ctx context.Context, writer *logs.Writer, adminAuditOutbo
 		}
 		return adminExportJob{}, err
 	}
+	coverage := exportRegionCoverage(ctx, hotStore, searchQuery)
+	if coverage != nil {
+		objectStore = exportCommentObjectStore{adminExportObjectStore: objectStore, coverage: coverage}
+	}
 	checksum, exportResult, err := writeHotStoreExportRows(ctx, hotStore, searchQuery, objectStore, localFilename, func(rowsExported int) error {
 		if rowsExported == 1 || rowsExported%1000 == 0 {
 			_, err := store.MarkProgress(job.ID, rowsExported, "exporting", time.Now())
@@ -1333,7 +1340,7 @@ func runAdminExportJob(ctx context.Context, writer *logs.Writer, adminAuditOutbo
 		return adminExportJob{}, err
 	}
 	truncated := exportResult.TotalMatches > exportResult.RowsExported
-	completed, err := store.MarkCompleted(job.ID, exportResult.RowsExported, exportResult.TotalMatches, truncated, objectRef, checksum, now)
+	completed, err := store.MarkCompleted(job.ID, exportResult.RowsExported, exportResult.TotalMatches, truncated, objectRef, checksum, coverage, now)
 	if err != nil {
 		return adminExportJob{}, err
 	}

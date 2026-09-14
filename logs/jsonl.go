@@ -573,6 +573,10 @@ func (w *Writer) WriteGzipJSONL(filename string, values []map[string]any) (strin
 }
 
 func (w *Writer) WriteGzipJSONLStream(filename string, next func() (map[string]any, bool, error)) (string, error) {
+	return w.WriteGzipJSONLStreamWithComment(filename, "", next)
+}
+
+func (w *Writer) WriteGzipJSONLStreamWithComment(filename, comment string, next func() (map[string]any, bool, error)) (string, error) {
 	if next == nil {
 		return "", fmt.Errorf("jsonl export stream source is required")
 	}
@@ -601,6 +605,7 @@ func (w *Writer) WriteGzipJSONLStream(filename string, next func() (map[string]a
 
 	hash := sha256.New()
 	gzipWriter := gzip.NewWriter(io.MultiWriter(file, hash))
+	gzipWriter.Comment = comment
 	encoder := json.NewEncoder(gzipWriter)
 	for {
 		value, ok, err := next()

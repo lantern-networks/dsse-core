@@ -91,6 +91,10 @@ func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) 
 }
 
 func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
+	if err := cfg.override.Health(); err != nil {
+		log.Printf("retention paused: %v", err)
+		return
+	}
 	if err := cfg.legalHold.Health(); err != nil {
 		log.Printf("retention paused: %v", err)
 		return

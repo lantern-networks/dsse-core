@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
@@ -17,6 +21,7 @@ import (
 type retentionOverrideStore struct {
 	mu        sync.RWMutex
 	days      map[string]int // stream -> retention days (0 = keep forever)
+	loadErr   error
 	persister blobstore.Persister
 }
 
@@ -27,26 +32,83 @@ func newRetentionOverrideStore(p blobstore.Persister) *retentionOverrideStore {
 	}
 	data, err := p.Load()
 	if err != nil {
+		s.loadErr = fmt.Errorf("retention settings could not be loaded")
 		log.Printf("retention-override store load: %v", err)
 		return s
 	}
 	if len(data) == 0 {
 		return s
 	}
-	if err := json.Unmarshal(data, &s.days); err != nil {
+	loaded, err := decodeRetentionOverrides(data)
+	if err != nil {
+		s.loadErr = fmt.Errorf("retention settings could not be loaded")
 		log.Printf("retention-override store parse: %v", err)
-		s.days = map[string]int{}
+	} else {
+		s.days = loaded
 	}
+
 	return s
 }
 
-// Get returns the override retention (days) for a stream and whether one is set.
+const maxRetentionDays = int((1<<63 - 1) / (24 * time.Hour))
+
+func decodeRetentionOverrides(data []byte) (map[string]int, error) {
+	d := json.NewDecoder(bytes.NewReader(data))
+	token, err := d.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("expected retention object")
+	}
+	result := map[string]int{}
+	for d.More() {
+		token, err := d.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := token.(string)
+		if !ok || strings.TrimSpace(key) == "" || key != strings.TrimSpace(key) {
+			return nil, fmt.Errorf("invalid stream key")
+		}
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("duplicate stream key")
+		}
+		var value *int
+		if err := d.Decode(&value); err != nil {
+			return nil, err
+		}
+		if value == nil || *value < 0 || *value > maxRetentionDays {
+			return nil, fmt.Errorf("invalid retention days")
+		}
+		result[key] = *value
+	}
+	if _, err := d.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, fmt.Errorf("trailing retention data")
+	}
+	return result, nil
+}
+
+// Health is nil for an optional, unconfigured store; failed loads require a clean reload.
+func (s *retentionOverrideStore) Health() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.loadErr
+}
+
+// Get returns the override retention (days). Unknown configuration preserves every stream.
 func (s *retentionOverrideStore) Get(stream string) (int, bool) {
 	if s == nil {
 		return 0, false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return 0, true // Preserve every stream while configuration is unknown.
+	}
 	d, ok := s.days[stream]
 	return d, ok
 }
@@ -58,6 +120,12 @@ func (s *retentionOverrideStore) Set(stream string, days int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return s.loadErr
+	}
+	if strings.TrimSpace(stream) != stream || days > maxRetentionDays {
+		return fmt.Errorf("invalid retention setting")
+	}
 	previous, existed := s.days[stream]
 	if days < 0 {
 		delete(s.days, stream)

@@ -51,7 +51,7 @@ func TestRetentionOverrideSaveOutcome(t *testing.T) {
 }
 
 func TestRetentionOverrideRejectsInvalidDays(t *testing.T) {
-	for _, body := range []string{`{"stream":"audit","days":-2}`, `{"stream":"audit","days":106752}`} {
+	for _, body := range []string{`{"stream":"audit"}`, `{"stream":"audit","days":null}`, `{"stream":"audit","days":0.5}`, `{"stream":"audit","days":-2}`, `{"stream":"audit","days":106752}`} {
 		store := newRetentionOverrideStore(nil)
 		writer, err := logs.NewWriter(t.TempDir())
 		if err != nil {

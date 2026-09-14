@@ -117,12 +117,16 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	}))
 	// Admin-configurable per-stream retention (days), overriding the startup flags at runtime (no redeploy).
 	mux.HandleFunc("GET /admin/retention-config", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if retentionOverride == nil || retentionOverride.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Stream string `json:"stream"`
-			Days   int    `json:"days"`
+			Days   *int   `json:"days"`
 			Clear  bool   `json:"clear"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
@@ -146,14 +150,21 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 				"log retention is set for this deployment, not per organization, so it is the operator's to change"))
 			return
 		}
-		if retentionOverride == nil {
+		if retentionOverride == nil || retentionOverride.Health() != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
 		}
-		days := req.Days
+		days := -1
+		if !req.Clear && req.Days == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are required"))
+			return
+		}
+		if req.Days != nil {
+			days = *req.Days
+		}
 		if req.Clear {
 			days = -1
-		} else if days < 0 || int64(days) > int64((1<<63-1)/(24*time.Hour)) {
+		} else if days < 0 || days > maxRetentionDays {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are out of range"))
 			return
 		}

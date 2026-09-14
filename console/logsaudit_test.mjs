@@ -136,3 +136,52 @@ test('audit writer read failure offers retry; forbidden scope shows no statistic
   else {assert.equal(states.length,0);assert.match(texts[0],/deployment administrators/);}
  }
 });
+
+function retentionHarness(api) {
+ const calls=[], states=[], toasts=[], buttons=[], fields={};
+ const host={innerHTML:'',appendChild(){}};
+ const context=vm.createContext({host,bl:v=>v.en,freshRender:()=>()=>true,
+  apiFetch:async(...args)=>{calls.push(args);return api(...args);},
+  uiState:(...args)=>states.push(args),uiToast:(...args)=>toasts.push(args),
+  uiField:spec=>{const f={el:{style:{}},value:spec.value,get(){return this.value;}};fields[spec.name]=f;return f;},
+  el:(tag,props)=>{const e={...props,addEventListener:(event,handler)=>{e.click=handler;}};if(tag==='button')buttons.push(e);return e;}});
+ vm.runInContext(source,context);
+ return {calls,states,toasts,buttons,fields,render:()=>vm.runInContext('laRetentionConfig(host)',context)};
+}
+
+test('unavailable retention never masquerades as defaults or offers mutation controls',async()=>{
+ for(const response of [{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{overrides_days:null}},{ok:true,body:{overrides_days:{audit:-1}}},new Error('offline')]){
+  const h=retentionHarness(async()=>{if(response instanceof Error)throw response;return response;});
+  await h.render();assert.equal(h.buttons.length,0);assert.equal(h.states[0][1],'error');assert.equal(typeof h.states[0][3].onClick,'function');
+ }
+});
+
+test('retention day entry rejects truncation and preserves explicit zero',async()=>{
+ for(const value of ['', '0.5', '1.9', '2oops', '-1', '106752', '9007199254740993', '0','365','106751']){
+  const h=retentionHarness(async()=>({ok:true,body:{overrides_days:{audit:0}}}));
+  await h.render();h.fields.d.value=value;await h.buttons[0].click();
+  const posts=h.calls.filter(c=>c[0]==='POST');
+  if(['0','365','106751'].includes(value)){assert.equal(posts.length,1);assert.equal(posts[0][2].days,Number(value));}
+  else {assert.equal(posts.length,0,value);assert.equal(h.toasts[0][1],'err');}
+ }
+});
+
+test('retention mutations disable both actions and reload after HTTP or network failure',async()=>{
+ for(const reset of [false,true])for(const failure of [{ok:false,status:500},new Error('offline')]){
+  let finish;
+  const pending=new Promise(resolve=>{finish=resolve;});
+  let reads=0;
+  const h=retentionHarness(async(method)=>{
+   if(method==='GET'){reads++;return reads===1?{ok:true,body:{overrides_days:{audit:0}}}:{ok:false,status:503};}
+   await pending;if(failure instanceof Error)throw failure;return failure;
+  });
+  await h.render();h.fields.d.value='90';
+  const clicked=h.buttons[reset?1:0].click();
+  assert.ok(h.buttons[0].disabled && h.buttons[1].disabled);
+  await h.buttons[reset?0:1].click();
+  assert.equal(h.calls.filter(c=>c[0]==='POST').length,1);
+  finish();await clicked;
+  assert.deepEqual(h.calls.map(c=>c[0]),['GET','POST','GET']);
+  assert.equal(h.toasts[0][1],'err');assert.equal(h.states[0][1],'error');
+ }
+});

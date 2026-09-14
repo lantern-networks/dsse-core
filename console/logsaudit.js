@@ -543,8 +543,20 @@ async function laVolume(section) {
 
 // Admin-configurable per-stream retention (days) — overrides the built-in defaults at runtime, no redeploy.
 async function laRetentionConfig(host) {
-  let ov = {};
-  try { const r = await apiFetch("GET", "/admin/retention-config", undefined, _LA_PLANE); if (r.ok && r.body) ov = r.body.overrides_days || {}; } catch (e) { /* optional */ }
+  const current = freshRender(host);
+  let ov;
+  try {
+    const r = await apiFetch("GET", "/admin/retention-config", undefined, _LA_PLANE);
+    ov = r.body && r.body.overrides_days;
+    if (!r.ok || !ov || typeof ov !== "object" || Array.isArray(ov) ||
+        Object.values(ov).some(v => !Number.isSafeInteger(v) || v < 0 || v > 106751)) {
+      throw new Error((r.body && r.body.error) || "Retention settings are unavailable");
+    }
+  } catch (e) {
+    if (current()) uiState(host, "error", String(e), {label:bl({en:"Retry",ja:"再試行"}),onClick:()=>laRetentionConfig(host)});
+    return;
+  }
+  if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Retention (per stream)", ja: "保持（ストリーム別）" }) }));
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Override how long each stream is kept in hot storage (days) — no redeploy. 0 = keep forever; unset = the built-in default (audit/approvals/grants 365d, others 30d).", ja: "各ストリームの短期保持日数を上書き（再デプロイ不要）。0=無期限、未設定=組込既定（audit/承認/grant は365日、他は30日）。" }) }));
@@ -556,17 +568,29 @@ async function laRetentionConfig(host) {
   const save = el("button", { class: "ui-btn ui-btn-primary ui-btn-sm", text: bl({ en: "Save", ja: "保存" }) });
   const clr = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reset to default", ja: "既定に戻す" }) });
   host.appendChild(el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:4px" }, [streamF.el, daysF.el, save, clr]));
+  const mutate = async (payload, message) => {
+    if (!current() || save.disabled || clr.disabled) return;
+    save.disabled = clr.disabled = true;
+    try {
+      const r = await apiFetch("POST", "/admin/retention-config", payload, _LA_PLANE);
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+      if (current()) uiToast(message, "ok");
+    } catch (e) {
+      if (current()) uiToast(String(e), "err");
+    } finally {
+      if (current()) await laRetentionConfig(host);
+    }
+  };
   save.addEventListener("click", async () => {
-    const days = parseInt(daysF.get(), 10);
-    if (isNaN(days) || days < 0) { uiToast(bl({ en: "Enter a day count (0 = forever).", ja: "日数を入力（0=無期限）。" }), "err"); return; }
-    const r = await apiFetch("POST", "/admin/retention-config", { stream: streamF.get(), days: days }, _LA_PLANE);
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Retention saved.", ja: "保持を保存しました。" }), "ok"); laRetentionConfig(host);
+    const raw = String(daysF.get()).trim();
+    const days = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(days) || days > 106751) {
+      uiToast(bl({ en: "Enter whole days from 0 to 106751 (0 = forever).", ja: "0〜106751の整数で日数を入力（0=無期限）。" }), "err"); return;
+    }
+    await mutate({stream:streamF.get(),days}, bl({en:"Retention saved.",ja:"保持を保存しました。"}));
   });
   clr.addEventListener("click", async () => {
-    const r = await apiFetch("POST", "/admin/retention-config", { stream: streamF.get(), clear: true }, _LA_PLANE);
-    if (!r.ok) { uiToast("HTTP " + r.status, "err"); return; }
-    uiToast(bl({ en: "Reset to default.", ja: "既定に戻しました。" }), "ok"); laRetentionConfig(host);
+    await mutate({stream:streamF.get(),clear:true}, bl({en:"Reset to default.",ja:"既定に戻しました。"}));
   });
 }
 

@@ -8656,10 +8656,12 @@ paths:
   /admin/retention-config:
     get:
       summary: Read the admin-configured per-stream retention overrides.
-      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default.
+      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default. A failed persisted-settings load returns 503 and pauses retention until a clean reload.
       tags:
         - AdminRetention
       responses:
+        "503":
+          description: Retention settings could not be loaded or are unavailable.
         "200":
           description: Current per-stream retention overrides (days).
           content:
@@ -8673,7 +8675,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Set (or clear) a per-stream retention override.
-      description: Requires admin.retention.write. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
+      description: Requires admin.retention.write and deployment-wide administration. An unavailable store returns 503 without overwriting persisted settings. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
       tags:
         - AdminRetention
       requestBody:
@@ -8688,11 +8690,15 @@ paths:
                   description: The log stream (e.g. access, audit).
                 days:
                   type: integer
-                  description: Retention in days; 0 keeps the stream forever.
+                  minimum: 0
+                  maximum: 106751
+                  description: Whole days, required unless clear=true; explicit 0 keeps the stream forever.
                 clear:
                   type: boolean
                   description: If true, remove the override and revert to the flag default.
       responses:
+        "503":
+          description: Retention settings could not be loaded or are unavailable.
         "200":
           description: Resulting overrides.
           content:

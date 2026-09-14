@@ -64,7 +64,17 @@ The pruner starts where PostgreSQL is configured and performs work on the contro
 leader. Setup failure is logged and startup can continue without pruning. Hot-event
 retention precedence is **Console override, then per-stream startup override, then global
 default**. Zero keeps that stream indefinitely. Clearing a Console override restores the
-startup setting; it does not erase records immediately.
+startup setting; it does not erase records immediately. Enter whole days (0–106751);
+an omitted or null day count is rejected unless clearing an override.
+
+If persisted retention overrides cannot be read or validated, this process pauses the
+retention sweep, including its outbox cleanup. It does not substitute default TTLs or
+accept changes over the unreadable snapshot. The Console reports an unavailable state
+and offers retry instead of showing empty overrides. Repair the backing data and reload
+the store (normally by restarting the affected process); retrying the page alone does not
+clear a startup load failure. A missing initial snapshot or an empty object is valid and
+uses startup defaults. This protection applies to this pruner, not external lifecycle jobs
+or explicit tenant erasure. Preserve storage capacity while pruning is paused.
 
 Console per-stream retention changes affect the **whole node**, not just the selected
 customer, and require the deployment-wide administration boundary. Do not promise a

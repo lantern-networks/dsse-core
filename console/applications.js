@@ -26,7 +26,7 @@ function renderApplicationsView(content) {
   const typeF = uiField({ name: "type", type: "select", value: _appsState.type, options: [
     { value: "all", label: bl({ en: "All types", ja: "全種別" }) },
     { value: "private_app", label: bl({ en: "Internal app", ja: "社内アプリ" }) },
-    { value: "saas_app", label: bl({ en: "SaaS app", ja: "SaaS アプリ" }) },
+    { value: "saas", label: bl({ en: "SaaS app", ja: "SaaS アプリ" }) },
   ] });
   typeF.el.style.marginBottom = "0";
   typeF.el.querySelector("select").addEventListener("change", () => { _appsState.type = typeF.get(); renderAppList(host); });
@@ -38,7 +38,7 @@ function renderApplicationsView(content) {
 }
 
 function appTypeLabel(t) {
-  return t === "saas_app" ? bl({ en: "SaaS app", ja: "SaaS アプリ" }) : t === "private_app" ? bl({ en: "Internal app", ja: "社内アプリ" }) : (t || "—");
+  return t === "saas" ? bl({ en: "SaaS app", ja: "SaaS アプリ" }) : t === "private_app" ? bl({ en: "Internal app", ja: "社内アプリ" }) : (t || "—");
 }
 
 async function renderAppList(host) {
@@ -107,7 +107,7 @@ function openAppForm(content, existing) {
   const nameF = uiField({ name: "name", label: bl({ en: "Display name", ja: "表示名" }), required: true, value: existing ? existing.name : "", placeholder: bl({ en: "Wiki", ja: "社内 Wiki" }) });
   const typeF = uiField({ name: "type", label: bl({ en: "Type", ja: "種別" }), type: "select", value: existing ? existing.application_type : "private_app", options: [
     { value: "private_app", label: bl({ en: "Internal app", ja: "社内アプリ" }) },
-    { value: "saas_app", label: bl({ en: "SaaS app", ja: "SaaS アプリ" }) },
+    { value: "saas", label: bl({ en: "SaaS app", ja: "SaaS アプリ" }) },
   ] });
   const sensF = uiField({ name: "sensitivity", label: bl({ en: "Sensitivity", ja: "重要度" }), type: "select", value: existing ? existing.application_sensitivity : "normal", options: [
     { value: "low", label: bl({ en: "Low", ja: "低" }) },

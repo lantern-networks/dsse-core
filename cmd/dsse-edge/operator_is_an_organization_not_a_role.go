@@ -37,13 +37,14 @@ import (
 // populated-by: assertion — set once from the flag at start-up, never inferred from a request.
 // restart-durability: derived — this is a copy of a start-up flag, not state; a restart re-reads the flag.
 var operatorTenantAuthority atomic.Value // string
-var operatorTenantModelInUse atomic.Bool
+// Zero value denies unscoped authority until startup explicitly declares legacy mode.
+var operatorTenantlessMode atomic.Bool
 
 // declareOperatorTenant records which organization operates this deployment. Called once, at start-up.
 func declareOperatorTenant(tenantID string, tenantModelInUse bool) {
 	id := strings.ToLower(strings.TrimSpace(tenantID))
 	operatorTenantAuthority.Store(id)
-	operatorTenantModelInUse.Store(tenantModelInUse)
+	operatorTenantlessMode.Store(!tenantModelInUse)
 	switch {
 	case id != "":
 		log.Printf("operator organization: %q — only its administrators holding admin.tenant.admin may act "+
@@ -82,7 +83,7 @@ func adminIdentityMayActAcrossOrganizations(identity adminIdentity) bool {
 	// Retain the legacy single-tenant behavior only when startup actually declared that mode.
 	home := strings.ToLower(strings.TrimSpace(identity.TenantID))
 	if home == "" {
-		return !operatorTenantModelInUse.Load() || strings.EqualFold(strings.TrimSpace(identity.AuthMethod), adminLabBypassAuthMethod)
+		return operatorTenantlessMode.Load() || strings.EqualFold(strings.TrimSpace(identity.AuthMethod), adminLabBypassAuthMethod)
 	}
 	// ★ AND A DEPLOYMENT WITH NO ADMINISTRATOR AUTHENTICATION AT ALL IS NOT MAKING THIS DISTINCTION (2026-08-22).
 	// -lab-mode synthesises an identity for every unauthenticated request and stamps it with the node's own

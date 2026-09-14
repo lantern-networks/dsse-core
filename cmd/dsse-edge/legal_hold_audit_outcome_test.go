@@ -92,3 +92,30 @@ func TestLegalHoldHTTPOutcomeAndAudit(t *testing.T) {
 		}
 	}
 }
+
+func TestLegalHoldMissingTenantIsForbidden(t *testing.T) {
+	p := &holdOutcomePersister{}
+	holds := newLegalHoldStore(p)
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	evaluator := testEvaluator()
+	evaluator.PolicyBundle.TenantID = ""
+	handler := newServerWithConfig(serverConfig{Evaluator: evaluator, Writer: writer, Registry: connector.NewRegistry(), LegalHold: holds})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/admin/legal-hold", strings.NewReader(`{"active":true}`)))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if p.data != nil || len(holds.List()) != 0 {
+		t.Fatal("unscoped operation changed state")
+	}
+	rows, err := writer.ReadJSONL("audit.log.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0]["event_type"] != "admin_config_change" || rows[0]["metadata"].(map[string]any)["status_code"] != float64(403) {
+		t.Fatalf("wrong audit: %#v", rows)
+	}
+}

@@ -342,6 +342,18 @@ func (s *localAdminCredentialStore) ActivationEmail(rawToken string, now time.Ti
 	return cred.Email, nil
 }
 
+// activationAuditTarget copies only the account identifiers of a valid activation token.
+// The bearer is not yet an authenticated administrator; this identifies the target, not the actor.
+func (s *localAdminCredentialStore) activationAuditTarget(token string, now time.Time) (string, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cred, err := s.credentialForActivation(token, now)
+	if err != nil {
+		return "", ""
+	}
+	return cred.TenantID, cred.PrincipalID
+}
+
 // SetActivationPassword sets the password during activation (policy enforced).
 func (s *localAdminCredentialStore) SetActivationPassword(rawToken, newPassword string, now time.Time) error {
 	s.mu.Lock()

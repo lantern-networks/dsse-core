@@ -76,6 +76,10 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
+		if tenantID == "" {
+			writeError(w, http.StatusForbidden, fmt.Errorf("tenant scope is required"))
+			return
+		}
 		if err := legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
 			logErrorf("legal hold update failed: %v", err)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))

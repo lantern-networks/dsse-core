@@ -238,3 +238,13 @@ func TestTheTenantListShowsACustomerOnlyItsOwnOrganization(t *testing.T) {
 			"not the route", whole)
 	}
 }
+
+func TestUndeclaredTenantModeDeniesUnscopedAuthority(t *testing.T) {
+	previous := operatorTenantlessMode.Load()
+	defer operatorTenantlessMode.Store(previous)
+	// Restore the atomic Boolean's initial value, simulating omitted startup declaration.
+	operatorTenantlessMode.Store(false)
+	if adminIdentityMayActAcrossOrganizations(adminIdentity{Roles: []string{"super_admin"}}) {
+		t.Fatal("uninitialized mode must not grant unscoped authority")
+	}
+}

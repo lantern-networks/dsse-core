@@ -240,3 +240,23 @@ func main() {
 The Console export list also displays regional coverage or explicitly marks it
 unavailable, including for older jobs. A completed status means the requested export
 finished; it does not imply that unknown-region records were included.
+
+## Archive chain verification scope
+
+The Console chain verifier checks the audit segments returned by the archive listing.
+It requires a valid chain header, contiguous sequence numbers starting at zero, matching
+previous-object hashes, and readable gzip data through the trailer. Missing or malformed
+headers and gzip checksum/truncation failures are verification failures. An empty listing
+is reported as **no segments to verify**, not an intact archive.
+
+A successful result (`links_verified`, `scope: listed_segments_only`) confirms these checks
+on the listed objects. It does not compare against an independently trusted final hash or
+expected segment count. Removing the last segment(s), rewriting a complete internally
+consistent chain, or an incomplete archive listing can escape detection. Retain independent
+checkpoints and verify storage retention controls before relying on completeness claims.
+A reported failure is not by itself proof of malicious tampering; incomplete writes or a
+legacy unchained segment also fail verification.
+
+Audit writer health displays the browser retrieval time and does not refresh automatically.
+Its failure counters describe append operations, not a count of missing audit records;
+rotation can fail after record bytes have already been written.

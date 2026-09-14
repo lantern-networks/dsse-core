@@ -185,3 +185,34 @@ test('retention mutations disable both actions and reload after HTTP or network 
   assert.equal(h.toasts[0][1],'err');assert.equal(h.states[0][1],'error');
  }
 });
+
+test('archive verification distinguishes empty, broken, limited success and malformed results',async()=>{
+ for(const body of [
+  {ok:false,status:'empty',scope:'listed_segments_only',segments:0},
+  {ok:true,status:'links_verified',scope:'listed_segments_only',segments:2},
+  {ok:false,status:'broken',scope:'listed_segments_only',segments:1,detail:'invalid header'},
+  {},{ok:true,status:'links_verified',scope:'listed_segments_only',segments:0},
+  {ok:'true',status:'links_verified',scope:'listed_segments_only',segments:1},
+  {ok:true,status:'empty',scope:'listed_segments_only',segments:0},
+ ]) {
+  let click;const badges=[],toasts=[];
+  const context=vm.createContext({host:{innerHTML:'',appendChild(){}},bl:v=>v.en,
+   apiFetch:async()=>({ok:true,body}),uiBadge:(...args)=>{badges.push(args);return {};},uiToast:(...args)=>toasts.push(args),
+   el:()=>({appendChild(){},addEventListener:(event,fn)=>{click=fn;}})});
+  vm.runInContext(source,context);vm.runInContext('laAuditChain(host)',context);await click();
+  if(body.status==='empty' && body.ok===false){assert.equal(badges[0][1],'off');assert.match(badges[0][0],/No segments/);}
+  else if(body.status==='links_verified' && body.ok===true && body.segments===2){assert.match(badges[0][0],/Listed links/);}
+  else if(body.status==='broken'){assert.equal(badges[0][1],'danger');}
+  else {assert.equal(badges.length,0);assert.equal(toasts[0][1],'err');}
+ }
+});
+
+test('audit writer snapshot states retrieval time and avoids missing-record interpretation',async()=>{
+ const texts=[];
+ const context=vm.createContext({host:{innerHTML:'',appendChild(){}},bl:v=>v.en,freshRender:()=>()=>true,
+  apiFetch:async()=>({ok:true,body:{status:'degraded',primary_failures:2,hook_failures:0}}),
+  uiBadge:()=>({}),el:(tag,p)=>{texts.push(p.text);return {};}});
+ vm.runInContext(source,context);await vm.runInContext('laAuditWriterHealth(host)',context);
+ assert.ok(texts.some(t=>/not missing-record counts/.test(t)));
+ assert.ok(texts.some(t=>/Retrieved at .*T.*Z.*does not refresh automatically/.test(t)));
+});

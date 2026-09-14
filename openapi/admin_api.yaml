@@ -8715,7 +8715,7 @@ paths:
   /admin/audit-chain/verify:
     get:
       summary: Verify the audit cold-archive tamper-evident hash chain.
-      description: Requires admin.retention.read. Walks the tenant's archived audit segments and checks the hash chain — each segment embeds the SHA-256 of the previous one, so a deleted / altered / reordered segment breaks the chain and is reported. Returns ok=true when the chain is intact.
+      description: Requires admin.retention.read. Checks the listed tenant audit segments for valid headers, contiguous sequence numbers, previous-object hashes and complete gzip integrity. Status is empty (ok=false), broken (ok=false), or links_verified (ok=true). Scope is listed_segments_only. Success does not establish completeness against a trusted checkpoint, detect a removed suffix or detect a consistently rewritten chain.
       tags:
         - AdminRetention
       responses:

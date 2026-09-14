@@ -598,7 +598,7 @@ async function laRetentionConfig(host) {
 function laAuditChain(host) {
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Audit integrity", ja: "監査の完全性" }) }));
-  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Verify the tamper-evident hash chain of the archived audit segments — detects any deleted, altered, or reordered segment.", ja: "アーカイブ済み監査セグメントの改ざん検知ハッシュチェーンを検証 ── 削除・改ざん・並べ替えを検出。" }) }));
+  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Verify links, sequence and gzip integrity for listed audit segments. This does not prove completeness or detect removal of the final segments.", ja: "取得できた監査セグメントの連結・連番・gzip整合性を検証します。全記録の存在や末尾の削除までは証明しません。" }) }));
   const out = el("span", { class: "ui-view-desc" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Verify chain", ja: "チェーン検証" }) });
   host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [btn, el("span", { class: "ui-spacer" }), out]));
@@ -607,9 +607,18 @@ function laAuditChain(host) {
     let r; try { r = await apiFetch("GET", "/admin/audit-chain/verify", undefined, _LA_PLANE); } catch (e) { btn.disabled = false; out.textContent = ""; uiToast(String(e), "err"); return; }
     btn.disabled = false;
     if (!r.ok) { out.textContent = ""; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    const b = r.body || {}; out.innerHTML = "";
-    out.appendChild(uiBadge(b.ok ? bl({ en: "Intact", ja: "整合" }) : bl({ en: "BROKEN", ja: "破損" }), b.ok ? "ok" : "danger"));
-    out.appendChild(el("span", { style: "margin-left:8px", text: (b.segments || 0) + bl({ en: " segment(s)", ja: " セグメント" }) + (b.ok ? "" : " — " + (b.detail || b.broken_at || "")) }));
+    const b = r.body;
+    if (!b || !Number.isSafeInteger(b.segments) || b.segments < 0 || typeof b.ok !== "boolean" ||
+        b.scope !== "listed_segments_only" || !["empty", "broken", "links_verified"].includes(b.status) ||
+        (b.ok !== (b.status === "links_verified")) || (b.status === "empty" ? b.segments !== 0 : b.segments === 0)) {
+      out.textContent = ""; uiToast(bl({en:"Verification result is unavailable.",ja:"検証結果を確認できません。"}), "err"); return;
+    }
+    out.innerHTML = "";
+    const label = b.status === "empty" ? bl({en:"No segments to verify",ja:"検証対象なし"}) :
+      b.ok ? bl({en:"Listed links verified",ja:"取得した連結を確認"}) : bl({en:"Verification failed",ja:"検証失敗"});
+    out.appendChild(uiBadge(label, b.status === "empty" ? "off" : b.ok ? "ok" : "danger"));
+    out.appendChild(el("span", {style:"margin-left:8px",text:b.segments + bl({en:" segment(s)",ja:" セグメント"}) +
+      (b.status === "broken" ? " — " + (b.detail || b.broken_at || "") : "")}));
   });
 }
 
@@ -917,7 +926,7 @@ function laAuditWriterHealthText(h) {
   if (h.status === "unknown") return title + ": " + bl({en:"No completed writes observed yet",ja:"保存完了の観測はまだありません"});
   return title + ": " + bl({en:"Write failures",ja:"保存失敗"}) + " " + h.primary_failures +
     " / " + bl({en:"Post-write hook failures",ja:"保存後の転送処理失敗"}) + " " + h.hook_failures +
-    ". " + bl({en:"This process only; restart resets observations. Outbox delivery is separate.",ja:"このプロセスの観測です。再起動でリセットされます。配送待ちの状態とは別です。"});
+    ". " + bl({en:"This process only; restart resets observations. Outbox delivery is separate. Failure counts are not missing-record counts.",ja:"このプロセスの観測です。再起動でリセットされます。配送待ちの状態とは別です。失敗件数は欠落レコード数ではありません。"});
 }
 
 async function laAuditWriterHealth(host) {
@@ -935,6 +944,8 @@ async function laAuditWriterHealth(host) {
     host.innerHTML = "";
     if (r.body.primary_failures > 0 || r.body.hook_failures > 0) host.appendChild(uiBadge(bl({en:"Attention needed",ja:"要確認"}), "danger"));
     host.appendChild(el("p", {class:"ui-view-desc",text}));
+    host.appendChild(el("p", {class:"ui-view-desc",text:bl({en:"Retrieved at",ja:"取得時刻"}) + " " + new Date().toISOString() +
+      ". " + bl({en:"Snapshot; does not refresh automatically.",ja:"自動更新されない取得時点の表示です。"})}));
   } catch (e) {
     if (!current()) return;
     uiState(host, "error", String(e), {label:bl({en:"Retry",ja:"再試行"}),onClick:()=>laAuditWriterHealth(host)});

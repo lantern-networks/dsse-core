@@ -181,8 +181,12 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 			return
 		}
 		objects, err := cfg.archive.List(ctx, "hot_events/"+tenant+"/audit/", 0)
-		if err != nil || len(objects) != seq {
-			log.Printf("cold-archive paused: archive count and saved chain position cannot be reconciled: %v", err)
+		if err != nil {
+			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
+			return
+		}
+		if len(objects) != seq {
+			log.Printf("cold-archive paused tenant=%q: archive count mismatch expected=%d actual=%d; reconcile archive objects and saved chain state", tenant, seq, len(objects))
 			return
 		}
 	}

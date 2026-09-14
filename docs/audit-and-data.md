@@ -280,6 +280,10 @@ A state-save error leaves hot rows in place and pauses further chained writes in
 process. Each attempt checks the listed archive count against the saved chain position;
 a mismatch also pauses writes, including after a restart. This is a reconciliation guard,
 not a transactional or completeness guarantee across the database and archive backend.
+Diagnostics distinguish `archive listing failed` (the listing could not be obtained;
+the next sweep retries) from `archive count mismatch` (a successful listing disagreed
+with the saved position). A mismatch includes the tenant and expected/actual counts.
+Neither message alone establishes malicious tampering.
 Repair requires inspecting the saved head and archived objects together. Do not reset the
 chain to zero or delete retained hot rows to clear the error.
 

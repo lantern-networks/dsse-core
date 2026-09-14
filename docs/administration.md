@@ -64,20 +64,29 @@ recovery-code consumption is also saved before sign-in succeeds. A credential wr
 failure refuses sign-in rather than issuing a session whose replay protection was not saved.
 
 For PostgreSQL, the component startup migration includes
-`048_admin_local_credentials_totp_counter.sql`. The default
+`048_admin_local_credentials_totp_counter.sql` and
+`049_admin_local_credentials_revision.sql`. The default
 `-postgres-run-migrations=true` applies it before credential loading. If migrations
-are disabled, apply this migration through your database upgrade procedure before
+are disabled, apply these migrations through your database upgrade procedure before
 starting the updated binary. Back up the credential store and validate the upgrade
 on a separate environment first.
 
 Older file snapshots and database rows have no consumed-step history; the new field
 starts at zero and protection is established by the first successful sign-in after
-upgrade. Previously consumed codes cannot be reconstructed. Upgrade all authentication
-authorities before relying on the new behavior; an older binary still has its previous
-behavior. This persistence change alone does not serialize simultaneous sign-ins
-through independent authorities sharing a database. This limitation also applies to
-the current three-region topology when more than one authority accepts sign-ins; it
-is not limited to a future two-node-per-region deployment.
+upgrade. Previously consumed codes cannot be reconstructed. Stop all authentication authorities for this upgrade, apply the migrations, and
+restart them with the updated binary. Do not run mixed versions: older binaries do
+not participate in the concurrency checks.
+
+PostgreSQL credential writes compare a database generation before accepting a
+change. Simultaneous consumption of the same TOTP or recovery code through separate
+authorities sharing this database permits only one successful save. A stale write
+is refused, the local credential snapshot is refreshed for the next request, and
+the failed operation is not automatically retried. A sign-in conflict returns a
+storage-unavailable response; restart the sign-in flow with a fresh code.
+
+This does not provide continuous synchronization of existing session authorization
+across authorities. Independent databases and shared JSON files are not coordinated
+by this mechanism. Deletion remains tenant-scoped but is not generation-checked.
 
 Credential persistence calls carry a five-second deadline. PostgreSQL honors that
 deadline; filesystem operations are not guaranteed to be interruptible. Existing

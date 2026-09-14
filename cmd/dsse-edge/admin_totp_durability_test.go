@@ -177,6 +177,7 @@ func TestTOTPCounterPostgresUpgradeAndRestart(t *testing.T) {
 		t.Fatal("legacy PostgreSQL row was not upgraded")
 	}
 	exerciseTOTPRestartProtection(t, func() credentialPersistence { return persistence })
+	exerciseConcurrentCredentialConsumption(t, persistence)
 	store, err := newLocalAdminCredentialStoreWithPersistence("DSSE", persistence)
 	if err != nil {
 		t.Fatal(err)
@@ -234,4 +235,98 @@ func TestTOTPCounterPostgresUpgradeAndRestart(t *testing.T) {
 		}
 	}
 
+}
+
+func exerciseConcurrentCredentialConsumption(t *testing.T, p credentialPersistence) {
+	t.Helper()
+	load := func() *localAdminCredentialStore {
+		s, e := newLocalAdminCredentialStoreWithPersistence("DSSE", p)
+		if e != nil {
+			t.Fatal(e)
+		}
+		return s
+	}
+	s := load()
+	now := time.Now().UTC()
+	email := "concurrent@example.invalid"
+	token, e := s.Invite(email, "tenant_cas", "adm_cas", []string{"admin"}, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = s.SetActivationPassword(token, "long-test-password", now); e != nil {
+		t.Fatal(e)
+	}
+	secret, _, e := s.BeginTOTPEnrollment(token, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	code, _ := totpCodeForCounter(secret, uint64(now.Unix())/totpPeriod)
+	recovery, e := s.CompleteActivation(token, code, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, value := range []string{code, recovery[0]} {
+		a, b := load(), load()
+		start := make(chan struct{})
+		results := make(chan error, 2)
+		for _, node := range []*localAdminCredentialStore{a, b} {
+			go func(n *localAdminCredentialStore) { <-start; _, e := n.VerifyTOTP(email, value, now); results <- e }(node)
+		}
+		close(start)
+		success := 0
+		for i := 0; i < 2; i++ {
+			if <-results == nil {
+				success++
+			}
+		}
+		if success != 1 {
+			t.Fatalf("same code accepted by %d authorities", success)
+		}
+		// The losing authority refreshes on conflict; both now refuse replay.
+		for _, node := range []*localAdminCredentialStore{a, b} {
+			if c, e := node.VerifyTOTP(email, value, now); e == nil || c != nil {
+				t.Fatal("replay after conflict accepted")
+			}
+		}
+	}
+	a, b := load(), load()
+	if _, e := a.SetStatus("tenant_cas", "adm_cas", credentialStatusSuspended, now); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := b.SetRoles("tenant_cas", "adm_cas", []string{"analyst"}, now); !errors.Is(e, errCredentialPersistence) {
+		t.Fatal("stale role write accepted")
+	}
+	if b.byEmail[email].Status != credentialStatusSuspended {
+		t.Fatal("conflict did not refresh suspension")
+	}
+	if _, e := b.SetRoles("tenant_cas", "adm_cas", []string{"analyst"}, now); e != nil {
+		t.Fatal(e)
+	}
+	// An existing row deleted elsewhere must never be reinserted by a stale upsert.
+	a, b = load(), load()
+	oldGeneration := cloneCredential(a.byEmail[email])
+	if _, e := a.Delete("tenant_cas", "adm_cas", now); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := b.SetStatus("tenant_cas", "adm_cas", credentialStatusActive, now); !errors.Is(e, errCredentialPersistence) {
+		t.Fatal("stale write resurrected deleted account")
+	}
+	if load().byEmail[email] != nil {
+		t.Fatal("deleted account exists")
+	}
+	// A stale generation must also fail after the same address is recreated.
+	stale := oldGeneration
+	fresh := load()
+	if _, e := fresh.Invite(email, "tenant_cas", "adm_recreated", []string{"admin"}, now); e != nil {
+		t.Fatal(e)
+	}
+	if e := p.Upsert(context.Background(), stale); !errors.Is(e, errCredentialConflict) {
+		t.Fatal("stale generation replaced recreated account")
+	}
+	if load().byEmail[email].PrincipalID != "adm_recreated" {
+		t.Fatal("recreated identity overwritten")
+	}
+	if _, e := fresh.Delete("tenant_cas", "adm_recreated", now); e != nil {
+		t.Fatal(e)
+	}
 }

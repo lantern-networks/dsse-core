@@ -24,7 +24,7 @@ func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdm
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
 		       recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
-		       activation_expires_at, created_at, updated_at, last_totp_counter
+		       activation_expires_at, created_at, updated_at, last_totp_counter, revision
 		FROM admin_local_credentials`)
 	if err != nil {
 		return nil, err
@@ -37,7 +37,7 @@ func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdm
 		var lockedUntil, activationExpiresAt sql.NullTime
 		if err := rows.Scan(&c.Email, &c.PrincipalID, &c.TenantID, &rolesJSON, &c.Status, &c.PasswordHash,
 			&c.TOTPSecret, &c.TOTPEnrolled, &recoveryJSON, &c.FailedAttempts, &lockedUntil,
-			&c.ActivationTokenHash, &activationExpiresAt, &c.CreatedAt, &c.UpdatedAt, &c.LastTOTPCounter); err != nil {
+			&c.ActivationTokenHash, &activationExpiresAt, &c.CreatedAt, &c.UpdatedAt, &c.LastTOTPCounter, &c.Revision); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal(rolesJSON, &c.Roles); err != nil {
@@ -77,23 +77,32 @@ func (p postgresCredentialPersistence) Upsert(ctx context.Context, c *localAdmin
 	if err != nil {
 		return err
 	}
-	_, err = p.db.ExecContext(ctx, `
-		INSERT INTO admin_local_credentials (
-			email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
-			recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
-			activation_expires_at, created_at, updated_at, last_totp_counter)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
-		ON CONFLICT (email) DO UPDATE SET
-			principal_id=EXCLUDED.principal_id, tenant_id=EXCLUDED.tenant_id, roles=EXCLUDED.roles,
-			status=EXCLUDED.status, password_hash=EXCLUDED.password_hash, totp_secret=EXCLUDED.totp_secret,
-			totp_enrolled=EXCLUDED.totp_enrolled, recovery_code_hashes=EXCLUDED.recovery_code_hashes,
-			failed_attempts=EXCLUDED.failed_attempts, locked_until=EXCLUDED.locked_until,
-			activation_token_hash=EXCLUDED.activation_token_hash,
-			activation_expires_at=EXCLUDED.activation_expires_at, updated_at=EXCLUDED.updated_at,
-            last_totp_counter=EXCLUDED.last_totp_counter`,
-		c.Email, c.PrincipalID, c.TenantID, roles, c.Status, c.PasswordHash, sealedTOTP, c.TOTPEnrolled,
+	args := []any{c.Email, c.PrincipalID, c.TenantID, roles, c.Status, c.PasswordHash, sealedTOTP, c.TOTPEnrolled,
 		recovery, c.FailedAttempts, nullTime(c.LockedUntil), c.ActivationTokenHash,
-		nullTime(c.ActivationExpiresAt), c.CreatedAt, c.UpdatedAt, c.LastTOTPCounter)
+		nullTime(c.ActivationExpiresAt), c.CreatedAt, c.UpdatedAt, c.LastTOTPCounter}
+	query := `INSERT INTO admin_local_credentials (
+ email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
+ recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
+ activation_expires_at, created_at, updated_at, last_totp_counter)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+ ON CONFLICT (email) DO NOTHING RETURNING revision`
+	if c.Revision != 0 {
+		args = append(args, c.Revision)
+		query = `UPDATE admin_local_credentials SET
+ principal_id=$2, tenant_id=$3, roles=$4, status=$5, password_hash=$6, totp_secret=$7,
+ totp_enrolled=$8, recovery_code_hashes=$9, failed_attempts=$10, locked_until=$11,
+ activation_token_hash=$12, activation_expires_at=$13, created_at=$14, updated_at=$15,
+ last_totp_counter=$16, revision=nextval('admin_local_credentials_revision_seq')
+ WHERE email=$1 AND tenant_id=$3 AND revision=$17 RETURNING revision`
+	}
+	var revision int64
+	err = p.db.QueryRowContext(ctx, query, args...).Scan(&revision)
+	if err == sql.ErrNoRows {
+		return errCredentialConflict
+	}
+	if err == nil {
+		c.Revision = revision
+	}
 	return err
 }
 
@@ -137,7 +146,7 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 				db.Close()
 				return nil, nil, fmt.Errorf("load local-credential migrations: %w", err)
 			}
-			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials, postgresMigrationCredentialTOTP)
+			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials, postgresMigrationCredentialTOTP, postgresMigrationCredentialRevision)
 			if err != nil {
 				db.Close()
 				return nil, nil, err

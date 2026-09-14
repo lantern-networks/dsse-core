@@ -29,6 +29,7 @@ const (
 	postgresMigrationAgentTelemetry            = "019"
 	postgresMigrationLocalCredentials          = "020"
 	postgresMigrationCredentialTOTP            = "048"
+	postgresMigrationCredentialRevision        = "049"
 	postgresMigrationSteerExclusions           = "021"
 	postgresMigrationConfigVersions            = "022"
 	postgresMigrationAdminTenantModel          = "023"

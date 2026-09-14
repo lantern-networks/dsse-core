@@ -8,6 +8,7 @@ import (
 	"crypto/subtle"
 	"encoding/base32"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
@@ -178,6 +179,8 @@ type localAdminCredential struct {
 	// cannot be reused within its validity window, including after a restart with durable credentials.
 	// A newly enrolled TOTP secret starts a separate counter history.
 	LastTOTPCounter uint64
+	// Revision is the PostgreSQL optimistic concurrency token; zero means a new row.
+	Revision int64
 }
 
 func (c *localAdminCredential) locked(now time.Time) bool {
@@ -234,6 +237,8 @@ func newLocalAdminCredentialStoreWithPersistence(issuer string, persistence cred
 
 const credentialPersistenceTimeout = 5 * time.Second
 
+var errCredentialConflict = errors.New("administrator credential changed concurrently")
+
 var errCredentialPersistence = fmt.Errorf("admin credential storage is unavailable")
 
 // persistLocked publishes a candidate only after the durable store accepts it.
@@ -245,6 +250,20 @@ func (s *localAdminCredentialStore) persistLocked(cred *localAdminCredential) er
 		defer cancel()
 		if err := s.persistence.Upsert(ctx, cred); err != nil {
 			log.Printf("admin credential persistence failed: %v", err)
+			if errors.Is(err, errCredentialConflict) {
+				// Refresh for the next request, but never retry a security mutation implicitly.
+				rows, loadErr := s.persistence.LoadAll(ctx)
+				if loadErr == nil {
+					fresh := make(map[string]*localAdminCredential, len(rows))
+					for _, row := range rows {
+						fresh[credentialEmailKey(row.Email)] = row
+					}
+					s.byEmail = fresh
+					s.publishAuthorityLocked()
+				} else {
+					log.Printf("admin credential conflict refresh failed: %v", loadErr)
+				}
+			}
 			return errCredentialPersistence
 		}
 	}

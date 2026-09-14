@@ -261,3 +261,73 @@ test('export statuses use exact outcomes rather than substring success',async()=
  assert.equal(badges.find(x=>x.label==='completed').kind,'ok');
  assert.equal(badges.find(x=>x.label==='queued').kind,'off');
 });
+
+function volumeHarness(fetch) {
+  const states=[], controls=[], nodes=[];
+  const el=(tag,attrs={},children=[])=>{
+    const node={tag,...attrs,children:[...children],appendChild(child){this.children.push(child);}};
+    nodes.push(node);return node;
+  };
+  const host=el('section');
+  const context=vm.createContext({host,el,bl:v=>v.en,freshRender:()=>()=>true,
+    apiFetch:fetch,uiState:(...args)=>states.push(args),controls});
+  vm.runInContext(source,context);
+  vm.runInContext(`laLegalHold=h=>controls.push(['hold',h]);
+    laAuditChain=h=>controls.push(['chain',h]);
+    laRetentionConfig=h=>controls.push(['retention',h]);`,context);
+  return {host,states,controls,nodes,render:()=>vm.runInContext('laVolume(host)',context)};
+}
+
+test('volume request failure or a pending request cannot hide retention and audit controls',async()=>{
+  let finish;
+  const pending=new Promise(resolve=>{finish=resolve;});
+  const h=volumeHarness(async(method,path)=>path.startsWith('/admin/logs/')?pending:{ok:true,body:{identities:[]}});
+  const rendering=h.render();
+  assert.deepEqual(h.controls.map(c=>c[0]),['hold','chain','retention']);
+  assert.equal(h.host.children.length,4);
+  finish({ok:false,status:503});await rendering;
+  const failure=h.states.find(s=>s[1]==='error');
+  assert.equal(failure[0],h.host.children[0]);
+  assert.match(failure[2],/503/);
+  assert.equal(h.host.children.length,4);
+});
+
+test('volume count validates numeric data and retries only the failed estimate',async()=>{
+  for(const value of [undefined,null,'12',NaN,Infinity,-1,1.5,Number.MAX_SAFE_INTEGER+1,0,12]){
+    let recovery=false;
+    const h=volumeHarness(async(method,path)=>path.startsWith('/admin/logs/')?
+      {ok:true,body:{total_matches:recovery?20:value}}:{ok:true,body:{identities:[]}});
+    await h.render();
+    const failure=h.states.find(s=>s[1]==='error');
+    if(value===0 || value===12){
+      assert.equal(failure,undefined);assert.ok(h.nodes.some(n=>n.text===value.toLocaleString()));
+    }else{
+      assert.ok(failure,String(value));
+      assert.equal(h.nodes.some(n=>n.text==='Access decisions / 24h'),false);
+      const controls=[...h.controls];recovery=true;await failure[3].onClick();
+      assert.deepEqual(h.controls,controls);
+      assert.ok(h.nodes.some(n=>n.text==='20'));
+    }
+  }
+});
+
+test('volume transport failure remains local to the estimate',async()=>{
+  const h=volumeHarness(async()=>{throw new Error('offline');});
+  await h.render();
+  assert.match(h.states.find(s=>s[1]==='error')[2],/offline/);
+  assert.equal(h.controls.length,3);
+});
+
+test('access decision summary never labels other streams with an allow rate',()=>{
+  const nodes=[];
+  const host={innerHTML:'stale',appendChild:n=>nodes.push(n)};
+  const context=vm.createContext({host,bl:v=>v.en,
+    el:(tag,attrs={},children=[])=>({tag,...attrs,children}),uiBadge:()=>({})});
+  vm.runInContext(source,context);
+  for(const stream of ['audit','inspection','human_approval_events','access']){
+    nodes.length=0;context.stream=stream;
+    vm.runInContext('laSummary(host,[{decision:"allow"},{decision:"deny"}],stream)',context);
+    assert.equal(host.innerHTML,'');assert.equal(nodes.length,stream==='access'?1:0);
+    if(stream==='access')assert.match(JSON.stringify(nodes),/50%/);
+  }
+});

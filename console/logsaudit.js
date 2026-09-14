@@ -493,21 +493,38 @@ function laHumanBytes(b) {
   return (b >= 100 || i === 0 ? Math.round(b) : b.toFixed(1)) + " " + u[i];
 }
 async function laVolume(section) {
+  section.innerHTML = "";
+  const estimateHost = el("div");
+  section.appendChild(estimateHost);
+  const lhHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(lhHost);
+  laLegalHold(lhHost);
+  const acHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(acHost);
+  laAuditChain(acHost);
+  const rcHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(rcHost);
+  laRetentionConfig(rcHost);
+  await laVolumeEstimate(estimateHost);
+}
+
+// A failed volume estimate must not hide independent retention and audit controls.
+async function laVolumeEstimate(section) {
   uiState(section, "loading");
   const current = freshRender(section);
   const from = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   let flows24 = null, users = null, errMsg = null;
   try {
     const r = await apiFetch("GET", "/admin/logs/access?from=" + encodeURIComponent(from) + "&limit=1", undefined, _LA_PLANE);
-    if (r.ok && r.body && r.body.total_matches != null) flows24 = Number(r.body.total_matches);
-    else errMsg = "HTTP " + (r && r.status);
+    if (r.ok && r.body && Number.isSafeInteger(r.body.total_matches) && r.body.total_matches >= 0) flows24 = r.body.total_matches;
+    else errMsg = r.ok ? "Invalid access record count" : "HTTP " + r.status;
   } catch (e) { errMsg = String(e); }
   try {
     const dr = await apiFetch("GET", "/admin/human-identities", null, "control");
     const items = (dr && dr.ok && dr.body) ? (dr.body.identities || dr.body.items || []) : [];
     if (items.length) users = items.length;
   } catch (e) { /* optional */ }
-  if (flows24 == null) { if (!current()) return; uiState(section, "error", errMsg || bl({ en: "no data", ja: "データなし" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laVolume(section) }); return; }
+  if (flows24 == null) { if (!current()) return; uiState(section, "error", errMsg || bl({ en: "no data", ja: "データなし" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laVolumeEstimate(section) }); return; }
 
   const RAW = 1024, COMP = 4; // planning constants: ~1 KB/access record raw, ~4x compression (design doc)
   const storedDay = (flows24 * RAW) / COMP;
@@ -530,15 +547,6 @@ async function laVolume(section) {
     const perUser = Math.round(flows24 / users);
     section.appendChild(el("p", { class: "ui-view-desc", style: "margin-top:6px", text: bl({ en: "Design-model assumption was 3,000 flows/user/day — your measured " + perUser.toLocaleString() + " calibrates it (per user ≈ " + laHumanBytes((perUser * RAW) / COMP) + "/day stored).", ja: "設計モデルの仮定は 3,000 flows/user/日 ── 実測 " + perUser.toLocaleString() + " で較正できます（1ユーザー ≈ 保存 " + laHumanBytes((perUser * RAW) / COMP) + "/日）。" }) }));
   }
-  const lhHost = el("div", { style: "margin-top:18px" });
-  section.appendChild(lhHost);
-  laLegalHold(lhHost);
-  const acHost = el("div", { style: "margin-top:18px" });
-  section.appendChild(acHost);
-  laAuditChain(acHost);
-  const rcHost = el("div", { style: "margin-top:18px" });
-  section.appendChild(rcHost);
-  laRetentionConfig(rcHost);
 }
 
 // Admin-configurable per-stream retention (days) — overrides the built-in defaults at runtime, no redeploy.
@@ -728,7 +736,7 @@ function laQueryString(cursor) {
 // Client-side summary over the loaded window (no extra endpoint): decision mix + allow rate.
 function laSummary(summaryHost, rows, stream) {
   summaryHost.innerHTML = "";
-  if (!stream === "access" || !rows.length) return;
+  if (stream !== "access" || !rows.length) return;
   const counts = {}; let allow = 0, total = 0;
   rows.forEach((r) => { const d = String(r.decision || "").toLowerCase(); if (!d) return; counts[d] = (counts[d] || 0) + 1; total++; if (d === "allow") allow++; });
   if (!total) return;

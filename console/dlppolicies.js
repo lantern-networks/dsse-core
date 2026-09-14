@@ -12,6 +12,18 @@ function dlpInstanceScopeLabel(s) {
   return { corporate: bl({ en: "Corporate only", ja: "自社のみ" }), personal: bl({ en: "Personal / outside only", ja: "個人/社外のみ" }) }[s] || bl({ en: "Any account", ja: "すべて" });
 }
 
+// Every dependency is required for a safe edit: an unavailable detector library
+// must not turn an existing selection into an empty one on the next save.
+function dlpEditorList(response, key, validItem) {
+  if (!response || !response.ok) throw new Error(key + ": HTTP " + (response && response.status || "unavailable"));
+  const body = response.body;
+  if (!body || !Object.hasOwn(body, key) ||
+      (body[key] !== null && !Array.isArray(body[key]))) throw new Error(key + ": invalid response");
+  const list = body[key] || []; // These APIs may encode an empty slice as null.
+  if (!list.every(validItem)) throw new Error(key + ": invalid entry");
+  return list;
+}
+
 async function renderDLPPoliciesView(content) {
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, el("div", {}, [
@@ -28,14 +40,20 @@ async function renderDLPPoliciesView(content) {
   let _orgDomains = []; // the "our company" domains that decide corporate vs personal (S6)
 
   async function load() {
+    const current = freshRender(section);
     uiState(section, "loading");
     try {
       const [pr, cr, fr, od] = await Promise.all([apiFetch("GET", "/admin/dlp-policies"), apiFetch("GET", "/admin/dlp-classifiers"), apiFetch("GET", "/admin/dlp-fingerprints"), apiFetch("GET", "/admin/organization-domains")]);
-      if (!pr.ok) throw new Error("HTTP " + pr.status);
-      _policies = (pr.body && pr.body.policies) || [];
-      _library = { custom: (cr.ok && cr.body && cr.body.classifiers) || [], edm: (fr.ok && fr.body && fr.body.datasets) || [] };
-      _orgDomains = (od.ok && od.body && od.body.domains) || [];
-    } catch (e) { uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
+      const named = (x) => x && typeof x.name === "string" && x.name.trim() !== "";
+      const policies = dlpEditorList(pr, "policies", (x) => named(x) && typeof x.id === "string" && x.id && Array.isArray(x.identifiers) && x.identifiers.every((id) => typeof id === "string" && id));
+      const custom = dlpEditorList(cr, "classifiers", named);
+      const edm = dlpEditorList(fr, "datasets", named);
+      const domains = dlpEditorList(od, "domains", (x) => typeof x === "string" && x.trim() !== "");
+      if (!current()) return;
+      _policies = policies;
+      _library = { custom, edm };
+      _orgDomains = domains;
+    } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
     render();
   }
 
@@ -192,5 +210,5 @@ async function renderDLPPoliciesView(content) {
     } catch (e) { uiToast(String(e.message || e), "danger"); }
   }
 
-  load();
+  await load();
 }

@@ -164,6 +164,10 @@ components:
           items:
             type: object
             additionalProperties: true
+    ExportFormat:
+      type: string
+      enum: [ndjson]
+      default: ndjson
     ExportJob:
       type: object
       required:
@@ -198,10 +202,7 @@ components:
             - tool_call_events
             - inspection_events
         format:
-          type: string
-          enum:
-            - ndjson
-            - csv
+          $ref: "#/components/schemas/ExportFormat"
         filters:
           type: object
           additionalProperties:
@@ -7102,6 +7103,49 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+    delete:
+      summary: Retire a PROVISIONED per-tenant interception root that is not signing anything.
+      description: >-
+        Requires admin.policy.write for your OWN organization, or admin.tenant.admin for another's.
+
+
+        POST on this path creates a per-tenant root so it can be DISTRIBUTED before per-tenant signing is
+        enabled. Nothing removed them, so a deployment that later went a different way keeps certificates that
+        sign nothing — and two of them on the reference lab carried the same common name, which is exactly what
+        an operator cannot resolve from a trust store. Leaving them is not neutral: they may have been handed
+        to a customer.
+
+
+        Refused with 409 while per-tenant roots are IN FORCE: that root either signs the organization's leaves
+        now or would be regenerated for the next flow, so removing it would change what its devices must trust
+        without telling them — replace it through the announced overlap instead. Also refused for the node's
+        primary tenant, whose root is the deployment anchor rather than a provisioned per-tenant one. 404 when
+        the organization has no provisioned root here.
+
+
+        No traffic changes: it was signing nothing. A device that was given the certificate keeps trusting an
+        authority no leaf chains to.
+      tags:
+        - AdminInterceptionRoots
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Retired from this node, in memory and on disk.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No provisioned interception root for this organization.
+        "409":
+          description: That root is, or would become, the signer for this organization.
+        "503":
+          description: Interception is not enabled on this edge.
   /admin/interception-intermediate:
     get:
       summary: Interception intermediate status.
@@ -7285,50 +7329,6 @@ paths:
           description: Not announced as a retiring root for this organization.
         "409":
           description: That root is the one currently signing for this organization.
-        "503":
-          description: Interception is not enabled on this edge.
-  /admin/interception-roots/{tenant}:
-    delete:
-      summary: Retire a PROVISIONED per-tenant interception root that is not signing anything.
-      description: >-
-        Requires admin.policy.write for your OWN organization, or admin.tenant.admin for another's.
-
-
-        POST on this path creates a per-tenant root so it can be DISTRIBUTED before per-tenant signing is
-        enabled. Nothing removed them, so a deployment that later went a different way keeps certificates that
-        sign nothing — and two of them on the reference lab carried the same common name, which is exactly what
-        an operator cannot resolve from a trust store. Leaving them is not neutral: they may have been handed
-        to a customer.
-
-
-        Refused with 409 while per-tenant roots are IN FORCE: that root either signs the organization's leaves
-        now or would be regenerated for the next flow, so removing it would change what its devices must trust
-        without telling them — replace it through the announced overlap instead. Also refused for the node's
-        primary tenant, whose root is the deployment anchor rather than a provisioned per-tenant one. 404 when
-        the organization has no provisioned root here.
-
-
-        No traffic changes: it was signing nothing. A device that was given the certificate keeps trusting an
-        authority no leaf chains to.
-      tags:
-        - AdminInterceptionRoots
-      parameters:
-        - name: tenant
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Retired from this node, in memory and on disk.
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          description: No provisioned interception root for this organization.
-        "409":
-          description: That root is, or would become, the signer for this organization.
         "503":
           description: Interception is not enabled on this edge.
   /admin/interception-intermediate/{tenant}:
@@ -7722,7 +7722,7 @@ paths:
   /admin/internal-cas/all:
     get:
       summary: Every organization's internal certificate authorities.
-      description: Requires admin.policy.read AND the operator organization. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy.
+      description: "Requires admin.policy.read AND the operator organization. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy."
       tags:
         - AdminInternalCAs
       responses:
@@ -11268,6 +11268,23 @@ paths:
         "400": { description: The chain does not link, the key does not match, or it is not a CA. }
         "403": { description: Naming another organization without the rights the envelope requires. }
 
+    get:
+      summary: Whose root this organization's traffic is inspected under, and whether a replacement is staged.
+      description: >
+        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority.
+
+
+        A staged authority is NOT signing, and the answer says so: promoting before every device holds the
+        incoming root took every HTTPS site away from a fleet for eighteen minutes on 2026-08-19. Read
+        GET /admin/interception-authority-rotation on an Edge before promoting; withdrawing takes nothing away.
+
+
+        Never returns key material, and the root key is not here at all — it is the organization's.
+      responses:
+        "200":
+          description: The authority, or has_authority false when the deployment's own root is used.
+        "409":
+          description: This node holds no per-organization interception authorities.
   /admin/tenant-transport-authority:
     get:
       summary: Where this organization's transport authority stands.
@@ -11291,6 +11308,54 @@ paths:
                   rotating: { type: boolean }
                   incoming_since: { type: string }
         "403": { description: Not permitted for this organization. }
+    post:
+      summary: Create this organization's transport authority, if it has none.
+      description: >
+        Requires admin.enrollment.write or admin.tenant.admin; naming another organization additionally goes through the operator
+        envelope, like every other cross-organization PKI act.
+
+
+        The authority is the CA that signs the certificate this organization's devices meet when they connect,
+        and it is held on the CONTROL PLANE rather than on the Edges. That is what lets an Edge added under
+        load serve the organization at all: it is handed short-lived server material on request instead of
+        having a five-year key placed on it as a file, which is what every per-organization certificate was
+        until 2026-08-20 — measured, on this repository's own scale-out definition, as carrying none of them.
+
+
+        The NAME is given here, at the moment the authority is created, because the name devices are told to
+        send and the certificate they meet have to stay together. Asking again returns the authority that
+        already exists: replacing one is a rotation (publish the new anchor, measure adoption, withdraw the
+        old), never a side effect of a second call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_name]
+              properties:
+                tenant_id:
+                  type: string
+                  description: Operators only; a tenant admin's own organization is taken from the session.
+                server_name:
+                  type: string
+                  description: The name this organization's agents will send, e.g. northwind.dsse.invalid.
+      responses:
+        "200":
+          description: The authority, existing or newly created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  server_name: { type: string }
+                  anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
+                  created_at: { type: string }
+                  applies_to: { type: string }
+        "400": { description: No name was given, or it could not be created. }
+        "403": { description: Naming another organization without the rights the envelope requires. }
+
   /admin/tenant-transport-authority/rotate:
     post:
       summary: Give this organization a SECOND transport authority, beside the one in force.
@@ -11437,6 +11502,37 @@ paths:
           description: The caller may not act on that organization's PKI, or holds no active elevation over it.
         "501":
           description: This control plane holds no device-identity authorities.
+    get:
+      summary: What this organization's devices are enrolled under, and whether it is moving.
+      description: >
+        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority — a
+        control plane. An Edge says so rather than reporting every organization as having none.
+
+
+        Three tiers of per-organization authority had grown a full set of acts and a readiness answer each,
+        and only the transport tier could be READ. A screen could say nothing about the tier that decides
+        whether an organization's devices are admitted at all.
+
+
+        During a rotation the signer is NOT the authority in force — the incoming one signs, because that is
+        how devices migrate. After an abandonment it is the authority in force again while both stay admitted.
+        Those are opposite states, so the answer names which, rather than only "rotating".
+
+        With readiness=1 during a rotation, retirement_readiness contains allowed, reason and checked_at.
+        This read-only preview uses the same shared inventory, observation freshness and regional TLS evidence
+        as the retirement POST. It does not reserve permission; the POST always checks again.
+      parameters:
+        - in: query
+          name: readiness
+          schema: { type: string, enum: ["1"] }
+          description: Include the control plane's read-only retirement verification during a rotation.
+      responses:
+        "200":
+          description: The authority, or has_authority false when this organization uses the deployment's own.
+        "409":
+          description: This node holds no per-organization device-identity authorities.
+        "503":
+          description: The durable authority snapshot could not be read; stale metadata is not returned.
   /admin/tenant-device-authority/rotate:
     post:
       summary: Begin moving this organization's devices onto a new device-identity authority.
@@ -11489,56 +11585,6 @@ paths:
           description: This organization has no device-identity authority, or is already mid-rotation.
         "501":
           description: This control plane holds no device-identity authorities.
-  /admin/tenant-device-authority:
-    get:
-      summary: What this organization's devices are enrolled under, and whether it is moving.
-      description: >
-        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority — a
-        control plane. An Edge says so rather than reporting every organization as having none.
-
-
-        Three tiers of per-organization authority had grown a full set of acts and a readiness answer each,
-        and only the transport tier could be READ. A screen could say nothing about the tier that decides
-        whether an organization's devices are admitted at all.
-
-
-        During a rotation the signer is NOT the authority in force — the incoming one signs, because that is
-        how devices migrate. After an abandonment it is the authority in force again while both stay admitted.
-        Those are opposite states, so the answer names which, rather than only "rotating".
-
-        With readiness=1 during a rotation, retirement_readiness contains allowed, reason and checked_at.
-        This read-only preview uses the same shared inventory, observation freshness and regional TLS evidence
-        as the retirement POST. It does not reserve permission; the POST always checks again.
-      parameters:
-        - in: query
-          name: readiness
-          schema: { type: string, enum: ["1"] }
-          description: Include the control plane's read-only retirement verification during a rotation.
-      responses:
-        "200":
-          description: The authority, or has_authority false when this organization uses the deployment's own.
-        "409":
-          description: This node holds no per-organization device-identity authorities.
-        "503":
-          description: The durable authority snapshot could not be read; stale metadata is not returned.
-  /admin/tenant-interception-authority:
-    get:
-      summary: Whose root this organization's traffic is inspected under, and whether a replacement is staged.
-      description: >
-        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority.
-
-
-        A staged authority is NOT signing, and the answer says so: promoting before every device holds the
-        incoming root took every HTTPS site away from a fleet for eighteen minutes on 2026-08-19. Read
-        GET /admin/interception-authority-rotation on an Edge before promoting; withdrawing takes nothing away.
-
-
-        Never returns key material, and the root key is not here at all — it is the organization's.
-      responses:
-        "200":
-          description: The authority, or has_authority false when the deployment's own root is used.
-        "409":
-          description: This node holds no per-organization interception authorities.
   /admin/tenant-device-authority/abandon-rotation:
     post:
       summary: Give up on a device-identity rotation without refusing the devices that already moved.
@@ -11876,55 +11922,6 @@ paths:
                   never_reported: { type: array, items: { type: string } }
                   may_retire_previous: { type: boolean }
                   note: { type: string }
-  /admin/tenant-transport-authority:
-    post:
-      summary: Create this organization's transport authority, if it has none.
-      description: >
-        Requires admin.enrollment.write or admin.tenant.admin; naming another organization additionally goes through the operator
-        envelope, like every other cross-organization PKI act.
-
-
-        The authority is the CA that signs the certificate this organization's devices meet when they connect,
-        and it is held on the CONTROL PLANE rather than on the Edges. That is what lets an Edge added under
-        load serve the organization at all: it is handed short-lived server material on request instead of
-        having a five-year key placed on it as a file, which is what every per-organization certificate was
-        until 2026-08-20 — measured, on this repository's own scale-out definition, as carrying none of them.
-
-
-        The NAME is given here, at the moment the authority is created, because the name devices are told to
-        send and the certificate they meet have to stay together. Asking again returns the authority that
-        already exists: replacing one is a rotation (publish the new anchor, measure adoption, withdraw the
-        old), never a side effect of a second call.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [server_name]
-              properties:
-                tenant_id:
-                  type: string
-                  description: Operators only; a tenant admin's own organization is taken from the session.
-                server_name:
-                  type: string
-                  description: The name this organization's agents will send, e.g. northwind.dsse.invalid.
-      responses:
-        "200":
-          description: The authority, existing or newly created.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  tenant_id: { type: string }
-                  server_name: { type: string }
-                  anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
-                  created_at: { type: string }
-                  applies_to: { type: string }
-        "400": { description: No name was given, or it could not be created. }
-        "403": { description: Naming another organization without the rights the envelope requires. }
-
   /admin/tenant-cas:
     get:
       summary: List the CAs that identify each tenant's devices.
@@ -14055,10 +14052,7 @@ paths:
                   additionalProperties:
                     type: string
                 format:
-                  type: string
-                  enum:
-                    - ndjson
-                  default: ndjson
+                  $ref: "#/components/schemas/ExportFormat"
                 limit:
                   type: integer
                   minimum: 0

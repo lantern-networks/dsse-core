@@ -488,3 +488,22 @@ test('export download stays on the control proxy and blocks concurrent clicks', 
   await vm.runInContext('laDownloadExport({id:"job/id"},button)',c);assert.equal(calls.length,1);release();await first;
   assert.equal(calls[0][1],'/admin/export-jobs/job%2Fid/download-url');assert.equal(calls[0][3],'control');assert.equal(clicked,1);assert.equal(button.disabled,false);
 });
+
+test('export cancellation refreshes authoritative state after success or uncertainty', async () => {
+ for(const mode of ['dismiss','success','http','network','wrong-job','wrong-status']) {
+  const calls=[],messages=[];let refresh=0;const button={disabled:false};
+  const c=vm.createContext({button,bl:v=>v.en,uiConfirm:async()=>mode!=='dismiss',uiToast:(...a)=>messages.push(a),
+   apiFetch:async(...a)=>{calls.push(a);if(mode==='network')throw Error('offline');return {ok:mode!=='http',status:403,body:{id:mode==='wrong-job'?'other':'job',status:mode==='wrong-status'?'completed':'cancelled'}};},refresh:async()=>refresh++});
+  vm.runInContext(source,c);vm.runInContext('laExports=refresh',c);await vm.runInContext('laCancelExport({id:"job"},button,{})',c);
+  assert.equal(button.disabled,false);assert.equal(calls.length,mode==='dismiss'?0:1);assert.equal(refresh,mode==='dismiss'?0:1);
+  if(mode!=='dismiss'){assert.equal(calls[0][1],'/admin/export-jobs/job/cancel');assert.equal(calls[0][3],'control');assert.equal(messages[0][1],mode==='success'?'ok':'err');}
+ }
+});
+
+test('export details refuse a mismatched or failed response rather than showing another job', async () => {
+ for(const mode of ['http','wrong-job','network']) {
+  const button={disabled:false};let messages=0;
+  const c=vm.createContext({button,bl:v=>v.en,uiToast:()=>messages++,uiModal:()=>assert.fail('must not open details'),apiFetch:async()=>{if(mode==='network')throw Error('offline');return {ok:mode!=='http',body:{id:'other',status:'completed'}};}});
+  vm.runInContext(source,c);await vm.runInContext('laExportDetails({id:"job"},button)',c);assert.equal(messages,1);assert.equal(button.disabled,false);
+ }
+});

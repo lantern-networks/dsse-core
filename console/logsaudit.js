@@ -909,8 +909,47 @@ async function laExports(section) {
   if (!jobs.length) { section.appendChild(emptyBox(bl({ en: "No exports yet.", ja: "エクスポートがありません。" }))); return; }
   section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" }), bl({ en: "Actions", ja: "操作" })], jobs.map((j) => [
     el("div", {}, [el("span", { text: j.stream || "—" }), ...(j.filters && j.filters.edge_region_id ? [el("p", { class: "ui-view-desc", text: laRegionCoverageText(j.metadata && j.metadata.region_coverage) })] : [])]), el("span", { text: j.format || "—" }), laResultBadge(j.status), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
-    j.status === "completed" && typeof j.id === "string" && j.id ? el("button", { class: "ui-btn", text: bl({en:"Download",ja:"ダウンロード"}), onClick: event => laDownloadExport(j, event.currentTarget) }) : el("span", {text:"—"}),
+    typeof j.id === "string" && j.id ? el("div", {class:"ui-toolbar"}, [
+      el("button", {class:"ui-btn",text:bl({en:"Details",ja:"詳細"}),onClick:event=>laExportDetails(j,event.currentTarget)}),
+      ...(j.status === "completed" ? [el("button", { class: "ui-btn", text: bl({en:"Download",ja:"ダウンロード"}), onClick: event => laDownloadExport(j, event.currentTarget) })] : []),
+      ...(["queued","running"].includes(j.status) ? [el("button", {class:"ui-btn",text:bl({en:"Cancel",ja:"取消"}),onClick:event=>laCancelExport(j,event.currentTarget,section)})] : []),
+    ]) : el("span", {text:"—"}),
   ])));
+}
+
+async function laCancelExport(job, button, section) {
+  if (button.disabled) return;
+  button.disabled = true;
+  let attempted = false;
+  try {
+    if (!await uiConfirm({title:bl({en:"Cancel this export?",ja:"このエクスポートを取り消しますか？"}),body:bl({en:"The queued or running export will be stopped. A job that has already finished cannot be cancelled.",ja:"待機中または実行中の処理を停止します。すでに完了した処理は取り消せません。"}),confirmLabel:bl({en:"Cancel export",ja:"エクスポートを取消"}),danger:true})) return;
+    attempted = true;
+    const r = await apiFetch("POST", "/admin/export-jobs/" + encodeURIComponent(job.id) + "/cancel", {}, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.body || r.body.id !== job.id || r.body.status !== "cancelled") throw new Error("Invalid cancellation response");
+    uiToast(bl({en:"Export cancelled.",ja:"エクスポートを取り消しました。"}),"ok");
+  } catch (e) { uiToast(bl({en:"Cancellation could not be confirmed. Check the refreshed status before trying again.",ja:"取消を確認できませんでした。更新後の状態を確認してから再操作してください。"}),"err"); }
+  finally { button.disabled = false; if (attempted) await laExports(section); }
+}
+
+async function laExportDetails(job, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const r = await apiFetch("GET", "/admin/export-jobs/" + encodeURIComponent(job.id), undefined, _LA_PLANE);
+    const j = r.body;
+    if (!r.ok || !j || j.id !== job.id || typeof j.status !== "string") throw new Error("Invalid export detail response");
+    const fields = [
+      [bl({en:"Job",ja:"ジョブ"}),j.id], [bl({en:"Status",ja:"状態"}),j.status],
+      [bl({en:"From",ja:"開始"}),j.from], [bl({en:"To",ja:"終了"}),j.to],
+      [bl({en:"Progress",ja:"進行状況"}),j.metadata && j.metadata.progress_phase],
+      [bl({en:"Rows exported",ja:"出力済み行数"}),j.metadata && j.metadata.rows_exported],
+      [bl({en:"Last progress",ja:"最終進行時刻"}),j.metadata && j.metadata.last_progress_at],
+      [bl({en:"Error code",ja:"エラーコード"}),j.error_code],
+    ];
+    const m = uiModal({title:bl({en:"Export details",ja:"エクスポート詳細"}),body:fields.map(([label,value])=>el("p",{text:label+": "+(value == null ? "—" : String(value))})),footer:[el("button",{class:"ui-btn",text:bl({en:"Close",ja:"閉じる"}),onClick:()=>m.close()})]});
+  } catch (e) { uiToast(bl({en:"Could not load export details. Try again.",ja:"エクスポート詳細を取得できませんでした。再試行してください。"}),"err"); }
+  finally { button.disabled = false; }
 }
 
 // Resolve only the token path against the Console control-plane proxy. The server's

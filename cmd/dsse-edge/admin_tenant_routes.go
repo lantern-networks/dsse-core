@@ -536,7 +536,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		result := purgeAdminTenantData(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore,
 			config.TenantCARegistry, strings.TrimSpace(config.TenantCARegistryPath),
-			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), config.LegalHold, now)
 		// Recorded in the OPERATOR's audit, not the customer's.
 		//
 		// ★ AND THAT DISTINCTION IS LOAD-BEARING, WHICH THIS CODE LEARNED THE HARD WAY (2026-08-15). The audit

@@ -5285,6 +5285,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					logWriter:           writer,
 					localCredentials:    config.LocalCredentials,
 					purgeDB:             adminAuthPostgresDB(adminAuth),
+					legalHold:           config.LegalHold,
 					enforcementTenantID: config.Evaluator.PolicyBundle.TenantID,
 					nodeName:            adminFootprintNodeName(config.ConfigSourceURL),
 					erasureOrders:       &tenantErasureOrders{},

@@ -534,11 +534,12 @@ type configApplyTargets struct {
 	// went on enforcing the ones it compiled at boot — the same divergence this section exists to end, moved one
 	// layer inward where no admin surface would show it at all.
 	onRulesApplied func()
-	// The four below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
+	// The fields below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
 	// own copy of a terminated tenant's data — the logs on its disk above all, which nothing else can reach.
 	logWriter           *logs.Writer
 	localCredentials    *localAdminCredentialStore
 	purgeDB             *sql.DB
+	legalHold           *legalHoldStore
 	enforcementTenantID string
 	// nodeName labels this node in the erasure log, so "which node erased what" is answerable afterwards.
 	nodeName string
@@ -1361,7 +1362,7 @@ func applyCarriedTenantPurges(ctx context.Context, t configApplyTargets, payload
 			t.deviceCAs, t.deviceCARegistryPath, t.deviceTrust, t.vlan,
 			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants,
 				DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, t.enrolled, tenantID).DeviceIDs},
-			now)
+			t.legalHold, now)
 		if len(result.Erased) == 0 && result.Complete {
 			continue // nothing here: already erased, or this node never served the tenant. Silence is correct.
 		}

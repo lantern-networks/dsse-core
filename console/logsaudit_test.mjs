@@ -78,3 +78,28 @@ test('regional coverage distinguishes zero from unavailable', () => {
     assert.match(vm.runInContext('laRegionCoverageText(coverage)',context),new RegExp(': '+count+'$'));
   }
 });
+
+test('failed hold mutations reload authoritative state and handle network errors', async () => {
+  for (const failure of [{ok:false,status:503,body:{error:'unavailable'}},new Error('offline')]) {
+    let click;
+    const calls=[],states=[],toasts=[];
+    const host={appendChild(){},innerHTML:''};
+    const context=vm.createContext({host,freshRender:()=>()=>true,bl:v=>v.en,
+      uiConfirm:async()=>true,uiBadge:()=>({}),uiToast:(...args)=>toasts.push(args),
+      uiState:(...args)=>states.push(args),
+      el:(tag)=>({addEventListener:(event,handler)=>{if(tag==='button')click=handler;}}),
+      apiFetch:async(method)=>{
+        calls.push(method);
+        if(calls.length===1)return {ok:true,body:{tenant_held:true}};
+        if(method==='POST'){if(failure instanceof Error)throw failure;return failure;}
+        return {ok:false,status:503,body:{error:'unavailable'}};
+      }});
+    vm.runInContext(source,context);
+    await vm.runInContext('laLegalHold(host)',context);
+    await click();
+    assert.deepEqual(calls,['GET','POST','GET']);
+    assert.equal(toasts.length,1);
+    assert.equal(toasts[0][1],'err');
+    assert.equal(states[0][1],'error');
+  }
+});

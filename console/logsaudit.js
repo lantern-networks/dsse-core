@@ -608,11 +608,17 @@ async function laLegalHold(host) {
   host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
   btn.addEventListener("click", async () => {
     const ok = await uiConfirm({ title: held ? bl({ en: "Release the legal hold?", ja: "リーガルホールドを解除?" }) : bl({ en: "Place a legal hold?", ja: "リーガルホールドを設定?" }), body: held ? bl({ en: "Retention resumes — aged logs expire / tier to cold again per policy.", ja: "保持が再開し、古いログはポリシーに従い失効/cold 階層化されます。" }) : bl({ en: "ALL logs for this tenant will be preserved (no deletion, no tiering) until released.", ja: "このテナントの全ログが解除まで保持（削除も階層化もしない）されます。" }), confirmLabel: held ? bl({ en: "Release", ja: "解除" }) : bl({ en: "Place hold", ja: "設定" }), danger: !held });
-    if (!ok) return;
-    const r = await apiFetch("POST", "/admin/legal-hold", { active: !held }, _LA_PLANE);
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(held ? bl({ en: "Legal hold released.", ja: "リーガルホールドを解除しました。" }) : bl({ en: "Legal hold placed.", ja: "リーガルホールドを設定しました。" }), "ok");
-    laLegalHold(host);
+    if (!ok || !current() || btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const r = await apiFetch("POST", "/admin/legal-hold", { active: !held }, _LA_PLANE);
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+      if (current()) uiToast(held ? bl({ en: "Legal hold released.", ja: "リーガルホールドを解除しました。" }) : bl({ en: "Legal hold placed.", ja: "リーガルホールドを設定しました。" }), "ok");
+    } catch (e) {
+      if (current()) uiToast(String(e), "err");
+    } finally {
+      if (current()) await laLegalHold(host);
+    }
   });
 }
 

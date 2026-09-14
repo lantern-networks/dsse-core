@@ -60,7 +60,7 @@ type adminTenantPurgeRow struct {
 func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB, writer *logs.Writer,
 	credentials *localAdminCredentialStore, ledger *enrolledinventory.Ledger, rules *policyrule.Store,
 	deviceCAs *tenantca.TenantCARegistry, deviceCARegistryPath string, deviceTrust transportTrustAnchorStore,
-	namedNetworks *vlan.Store, extra adminTenantExtraStores, now time.Time) adminTenantPurgeResult {
+	namedNetworks *vlan.Store, extra adminTenantExtraStores, holds *legalHoldStore, now time.Time) adminTenantPurgeResult {
 
 	tenantID = strings.TrimSpace(tenantID)
 	started := time.Now()
@@ -70,6 +70,17 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		PurgedAt: now.UTC().Format(time.RFC3339),
 		Erased:   []adminTenantPurgeRow{},
 		Failures: []string{},
+	}
+
+	// Recheck at the shared destructive boundary, including signed remote orders.
+	// A failed check must leave all stores and the standing order untouched.
+	if err := holds.Health(); err != nil {
+		result.Failures = append(result.Failures, "legal_hold: state unavailable; restore storage and restart")
+		return result
+	}
+	if holds.IsHeld(tenantID) {
+		result.Failures = append(result.Failures, "legal_hold: tenant is held")
+		return result
 	}
 
 	if credentials != nil {

@@ -134,6 +134,16 @@ verified snapshot, then restart the affected service so it can load the complete
 state. Refreshing the page alone does not clear the protection. Do not replace an
 unreadable snapshot with an empty list to regain access: that would discard holds.
 
+The same protection applies when this node receives a signed tenant-erasure order.
+An active hold or unavailable hold state stops the shared purge operation before
+any store is erased. The order remains outstanding; the service reports an
+incomplete erasure in its logs and retries when the bundle is applied again.
+Release the hold explicitly, or repair the state and restart, before retrying.
+A signature authorizes the order but does not override local preservation.
+
+After a failed hold change, the Console fetches the current status again. If that
+read also fails, it shows an error rather than leaving the old status and controls.
+
 A failed hold change records an error through the normal HTTP audit path, provided
 the audit writer is available. Audit outbox health describes delivery processing;
 it is not proof that every primary audit-file write succeeded. Inspect service

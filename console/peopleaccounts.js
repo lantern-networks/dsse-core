@@ -408,83 +408,124 @@ function openAccountForm(section) {
   idF.focus();
 }
 
-// ---- Delegations: NHI acts on behalf of a person; the decision checks validity/scope/expiry. ----
+// ---- Delegations: NHI acts on behalf of a person. ----
+function paSafeGrantRef(value) { return paText(value) && /^[A-Za-z0-9_.:@-]+$/.test(value); }
+function paGrant(g) {
+  return paObject(g) && ["id", "tenant_id", "actor_nhi_id", "subject_user_id"].every(k => paText(g[k])) &&
+    ["active", "revoked", "expired"].includes(g.status) && typeof g.expires_at === "string" &&
+    (!g.expires_at || Number.isFinite(Date.parse(g.expires_at))) &&
+    ["tool_ids", "scopes"].every(k => g[k] == null || (Array.isArray(g[k]) && g[k].every(paText))) &&
+    ["application_id", "revoked_at"].every(k => g[k] == null || typeof g[k] === "string");
+}
+function paGrantStatus(g) { return g.status === "active" && g.expires_at && Date.parse(g.expires_at) <= Date.now() ? "expired" : g.status; }
+function paCountedRows(body, key, valid, tenant) {
+  const rows = paArray(body, key);
+  if (!Number.isSafeInteger(body.count) || body.count < rows.length || body.count < 0 || (body.count > 0 && rows.length === 0) ||
+      !rows.every(row => valid(row) && row.tenant_id === tenant) || new Set(rows.map(r => r.id)).size !== rows.length) throw new Error("Invalid " + key + " response");
+  return rows;
+}
+function paGrantNotice(section, id, message) {
+  const notices = section.__paGrantNotices || (section.__paGrantNotices = new Map());
+  if (message) notices.set(id, message); else notices.delete(id);
+}
+function paDrawGrantNotices(section) {
+  for (const [id, message] of section.__paGrantNotices || []) section.appendChild(el("div", {class: "ui-callout ui-callout-warn", role: "alert"}, [el("strong", {text:id}), el("div", {text:message})]));
+}
+function paCoverage(section, shown, count) {
+  if (shown < count) section.appendChild(el("p", {class:"ui-view-desc", role:"status", text:bl({en:`Showing ${shown} of ${count} records.`, ja:`${count}件中${shown}件を表示しています。`})}));
+}
 async function paDelegations(section) {
-  uiState(section, "loading");
-  const current = freshRender(section);
-  let grants;
-  try { grants = await paList("/admin/delegated-grants", "grants", _PA_ENF); }
-  catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paDelegations(section) }); return; }
-  if (!current()) return;
-  section.innerHTML = "";
-  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-view-desc", text: bl({ en: "Lets a service account act on behalf of a person; the decision checks the grant is valid, in scope, and unexpired.", ja: "サービスアカウントが人の代理で動作することを許可。判定では、その許可が有効で・範囲内で・失効していないかを確認します。" }) }), el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add delegation", ja: "+ 委譲を追加" }), onClick: () => openDelegationForm(section) })]));
-  const scopeText = (g) => {
-    const parts = [];
-    if (g.tool_ids && g.tool_ids.length) parts.push((g.tool_ids.length) + bl({ en: " tool(s)", ja: " ツール" }));
-    if (g.scopes && g.scopes.length) parts.push((g.scopes.length) + bl({ en: " scope(s)", ja: " スコープ" }));
-    if (g.application_id) parts.push("app:" + g.application_id);
-    return parts.length ? parts.join(", ") : bl({ en: "any", ja: "制限なし" });
-  };
-  const delRow = (g) => el("tr", {}, [
-    el("td", { text: g.actor_nhi_id || "—" }),
-    el("td", { text: g.subject_user_id || "—" }),
-    el("td", {}, el("span", { class: "ui-view-desc", text: scopeText(g) })),
-    el("td", {}, el("span", { class: "ui-view-desc", text: g.expires_at ? window.dsseFormatTime(g.expires_at) : "—" })),
-    el("td", {}, uiBadge(g.status === "active" ? bl({ en: "Active", ja: "有効" }) : (g.status || "—"), g.status === "active" ? "ok" : "off")),
-    el("td", { class: "ui-row-actions" }, g.status === "active" ? el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Revoke", ja: "失効" }), onClick: async () => {
-      const ok = await uiConfirm({ title: bl({ en: "Revoke this delegation?", ja: "この委譲を失効?" }), confirmLabel: bl({ en: "Revoke", ja: "失効" }), danger: true });
-      if (!ok) return; const r = await paWriteEnforcement("POST", "/admin/delegated-grants/" + encodeURIComponent(g.id) + "/revoke", {});
-      if (!r.ok) { uiToast("HTTP " + r.status, "err"); return; } uiToast(bl({ en: "Revoked.", ja: "失効しました。" }), "ok"); paDelegations(section);
-    } }) : el("span", { class: "ui-view-desc", text: "—" })),
-  ]);
-  section.appendChild(paSearchTable(
-    bl({ en: "Search delegations by account or person…", ja: "アカウント・代理対象で検索…" }),
-    grants,
-    (g) => [g.actor_nhi_id, g.subject_user_id, g.application_id].filter(Boolean).join(" "),
-    (gs) => el("table", { class: "ui-table" }, [el("thead", {}, el("tr", {}, [bl({ en: "Account", ja: "アカウント" }), bl({ en: "Acts as", ja: "代理対象" }), bl({ en: "Scope", ja: "スコープ" }), bl({ en: "Expires", ja: "失効" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Actions", ja: "操作" })].map((x) => el("th", { text: x })))), el("tbody", {}, gs.map(delRow))]),
-    bl({ en: "No delegations yet.", ja: "委譲がありません。" })
-  ));
+  uiState(section, "loading"); const current = freshRender(section);
+  let grants, body;
+  try {
+    const [g, tenant] = await Promise.all([paGet("/admin/delegated-grants?limit=1000", _PA_ENF), paGet("/admin/tenant", _PA_ENF)]);
+    if (!paObject(tenant) || !paText(tenant.tenant_id)) throw new Error("Invalid tenant response");
+    grants = paCountedRows(g,"grants",paGrant,tenant.tenant_id); body = g;
+    if (!current()) return; section.__paGrantTenant = tenant.tenant_id;
+  } catch (e) { if (!current()) return; uiState(section,"error",String(e),{label:bl({en:"Retry",ja:"再試行"}),onClick:()=>paDelegations(section)}); paDrawGrantNotices(section); return; }
+  if (!current()) return; section.innerHTML = ""; paDrawGrantNotices(section);
+  section.appendChild(el("div", {class:"ui-toolbar"}, [el("span", {class:"ui-view-desc",text:bl({en:"Delegations let an account act for a person, subject to policy, scope and expiry checks.",ja:"委譲はアカウントが人の代理で動作するための設定です。ポリシー・範囲・有効期限の確認が適用されます。"})}),el("span",{class:"ui-spacer"}),el("button",{class:"ui-btn ui-btn-primary",text:bl({en:"+ Add delegation",ja:"+ 委譲を追加"}),onClick:()=>openDelegationForm(section)})]));
+  paCoverage(section,grants.length,body.count);
+  const scopeText = g => [g.tool_ids?.length ? g.tool_ids.length + bl({en:" tool(s)",ja:" ツール"}) : "",g.scopes?.length ? g.scopes.length + bl({en:" scope(s)",ja:" スコープ"}) : "",g.application_id ? `app:${g.application_id}` : ""].filter(Boolean).join(", ") || bl({en:"No additional scope",ja:"追加の範囲制限なし"});
+  section.appendChild(paSearchTable(bl({en:"Search delegations by account or person…",ja:"アカウント・代理対象で検索…"}),grants,g=>[g.id,g.actor_nhi_id,g.subject_user_id,g.application_id].filter(Boolean).join(" "),gs=>simpleTable([bl({en:"Account",ja:"アカウント"}),bl({en:"Acts as",ja:"代理対象"}),bl({en:"Scope",ja:"スコープ"}),bl({en:"Expires",ja:"失効"}),bl({en:"Status",ja:"状態"}),bl({en:"Actions",ja:"操作"})],gs.map(g=>[
+    el("span",{text:g.actor_nhi_id}),el("span",{text:g.subject_user_id}),el("span",{text:scopeText(g)}),el("span",{text:g.expires_at?window.dsseFormatTime(g.expires_at):"—"}),uiBadge(paGrantStatus(g),paGrantStatus(g)==="active"?"ok":"off"),g.status==="active"?paRevokeGrant(section,g):el("span",{text:"—"}),
+  ])),bl({en:"No delegations yet.",ja:"委譲がありません。"})));
+}
+function paConfirmGrant(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  const g=r.body;
+  if (!paGrant(g) || ["id","tenant_id","actor_nhi_id","subject_user_id","status"].some(k=>expected[k] && g[k]!==expected[k]) ||
+      (expected.tool_ids && JSON.stringify([...(g.tool_ids||[])].sort())!==JSON.stringify([...expected.tool_ids].sort())) ||
+      (expected.expires_at && Date.parse(g.expires_at)!==Date.parse(expected.expires_at)) ||
+      (expected.status==="revoked" && (!paText(g.revoked_at)||!Number.isFinite(Date.parse(g.revoked_at))))) throw new Error(paUnconfirmedChange());
+  return g;
+}
+function paRevokeGrant(section,g) {
+  let pending=false;
+  const error=el("span",{class:"ui-field-error-msg",style:"display:block",role:"alert"});
+  const button=el("button",{class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Revoke",ja:"失効"}),onClick:async()=>{
+    if(pending)return;pending=true;button.disabled=true;error.textContent="";
+    try {
+      if(!await uiConfirm({title:bl({en:"Revoke this delegation?",ja:"この委譲を失効?"}),confirmLabel:bl({en:"Revoke",ja:"失効"}),danger:true}))return;
+      let r;try{r=await paWriteEnforcement("POST","/admin/delegated-grants/"+encodeURIComponent(g.id)+"/revoke",{});}catch(_){throw new Error(paUnconfirmedChange());}
+      paConfirmGrant(r,{...g,status:"revoked"});paGrantNotice(section,g.id,"");
+      uiToast(bl({en:"Revoked.",ja:"失効しました。"}),"ok");await paDelegations(section);
+    }catch(e){const message=e.message||String(e);error.textContent=message;paGrantNotice(section,g.id,message);}
+    finally{pending=false;button.disabled=false;}
+  }});
+  return el("span",{},[button,error]);
 }
 function openDelegationForm(section) {
-  const idF = uiField({ name: "id", label: bl({ en: "ID", ja: "ID" }), required: true, placeholder: "grant-1" });
-  const nhiF = uiField({ name: "nhi", label: bl({ en: "Service account", ja: "サービスアカウント" }), required: true, placeholder: "nhi-1" });
-  const subjF = uiField({ name: "subj", label: bl({ en: "Acts as (person ID)", ja: "代理対象(ユーザー ID)" }), required: true, placeholder: "u1" });
-  const toolsF = uiField({ name: "tools", label: bl({ en: "Tool scope", ja: "ツールスコープ" }), placeholder: "read_repo, open_pr", hint: bl({ en: "The tools this delegation permits (within the agent's boundary). Leave empty for the agent's full boundary.", ja: "この委譲が許すツール(エージェント境界内)。空ならエージェント境界の全て。" }) });
-  const expF = uiField({ name: "exp", label: bl({ en: "Expires (optional)", ja: "失効(任意)" }), type: "datetime-local", hint: bl({ en: "After this the delegation is denied. Leave empty for no expiry.", ja: "これ以降この委譲は拒否。空なら無期限。" }) });
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add delegation", ja: "委譲を追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a delegation", ja: "委譲を追加" }), body: [idF.el, nhiF.el, subjF.el, toolsF.el, expF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
-  submit.addEventListener("click", async () => {
-    if (!idF.validate() || !nhiF.validate() || !subjF.validate()) return; submit.disabled = true;
-    const tools = toolsF.get().split(",").map((s) => s.trim()).filter(Boolean);
-    const body = { id: idF.get(), actor_nhi_id: nhiF.get(), subject_user_id: subjF.get(), tool_ids: tools, status: "active" };
-    if (expF.get()) body.expires_at = new Date(expF.get()).toISOString();
-    const r = await paWriteEnforcement("POST", "/admin/delegated-grants", body);
-    if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    m.close(); uiToast(bl({ en: "Delegation added.", ja: "委譲を追加しました。" }), "ok"); paDelegations(section);
-  });
-  idF.focus();
+  const idF=uiField({name:"id",label:"ID",required:true,placeholder:"grant-1"});
+  const nhiF=uiField({name:"nhi",label:bl({en:"Service account",ja:"サービスアカウント"}),required:true,placeholder:"nhi-1"});
+  const subjF=uiField({name:"subj",label:bl({en:"Acts as (person ID)",ja:"代理対象(ユーザー ID)"}),required:true,placeholder:"u1"});
+  const toolsF=uiField({name:"tools",label:bl({en:"Tool scope",ja:"ツールスコープ"}),placeholder:"read_repo, open_pr",hint:bl({en:"Permitted tools within the selected policy's boundary. Empty adds no tool restriction.",ja:"選択されるポリシーの境界内で許可するツール。空欄ならツール制限を追加しません。"})});
+  const expF=uiField({name:"exp",label:bl({en:"Expires (optional)",ja:"失効(任意)"}),type:"datetime-local",hint:bl({en:"Leave empty to use the server's default lifetime. Check the returned expiry after saving.",ja:"空欄ではサーバーの既定の有効期間を使用します。保存後に有効期限を確認してください。"})});
+  const error=el("div",{class:"ui-field-error-msg",style:"display:block;white-space:pre-wrap",role:"alert"});
+  const submit=el("button",{class:"ui-btn ui-btn-primary",text:bl({en:"Add delegation",ja:"委譲を追加"})});
+  let pending=false,closed=false,completed=false,draft;
+  const m=uiModal({title:bl({en:"Add a delegation",ja:"委譲を追加"}),body:[idF.el,nhiF.el,subjF.el,toolsF.el,expF.el,error],footer:[el("button",{class:"ui-btn",text:bl({en:"Cancel",ja:"キャンセル"}),onClick:()=>m.close()}),submit],onClose:()=>{closed=true;if(pending&&!completed){paGrantNotice(section,draft.id,paUnconfirmedChange());paDelegations(section);}}});
+  const controls=m.el.querySelectorAll("input,select,button");
+  submit.addEventListener("click",async()=>{
+    if(pending||closed)return;
+    if(!idF.validate()||!nhiF.validate()||!subjF.validate())return;
+    error.textContent="";
+    const tools=[...new Set(toolsF.get().split(",").map(s=>s.trim()).filter(Boolean))];
+    if(/[\/\x00]/.test(idF.get())||![nhiF.get(),subjF.get(),...tools].every(paSafeGrantRef)){error.textContent=bl({en:"Check the ID, account, person and tool identifiers.",ja:"ID・アカウント・代理対象・ツールの識別子を確認してください。"});return;}
+    const expiry=expF.get();if(expiry&&!Number.isFinite(Date.parse(expiry))){expF.setError(bl({en:"Enter a valid date and time.",ja:"有効な日時を入力してください。"}));return;}
+    draft={id:idF.get(),actor_nhi_id:nhiF.get(),subject_user_id:subjF.get(),tool_ids:tools,status:"active",tenant_id:section.__paGrantTenant};
+    if(expiry)draft.expires_at=new Date(expiry).toISOString();
+    pending=true;controls.forEach(c=>{c.disabled=true;});
+    try{
+      let r;try{r=await paWriteEnforcement("POST","/admin/delegated-grants",draft);}catch(_){throw new Error(paUnconfirmedChange());}
+      paConfirmGrant(r,draft);completed=true;paGrantNotice(section,draft.id,"");
+      if(!closed){m.close();uiToast(bl({en:"Delegation added.",ja:"委譲を追加しました。"}),"ok");}await paDelegations(section);
+    }catch(e){const message=e.message||String(e);paGrantNotice(section,draft.id,message);if(!closed)error.textContent=message;else await paDelegations(section);}
+    finally{pending=false;controls.forEach(c=>{c.disabled=false;});}
+  });idF.focus();
 }
 
-// ---- Activity: tool calls the agentic boundary evaluated + step-up approvals. ----
+// ---- Activity: recorded calls and approvals; unavailable sources remain unknown. ----
+function paActivityBadge(result, approval=false) {
+  const value=typeof result==="string"?result:"—";
+  return uiBadge(value,(approval?["approved"]:["allow","ok","success"]).includes(value.toLowerCase())?"ok":"off");
+}
 async function paActivity(section) {
-  uiState(section, "loading");
-  const current = freshRender(section);
-  let events, approvals;
-  try { [events, approvals] = await Promise.all([paList("/admin/tool-call-events", "events", _PA_ENF).catch(() => []), paList("/admin/human-approval-events", "approvals", _PA_ENF).catch(() => [])]); }
-  catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paActivity(section) }); return; }
-  if (!current()) return;
-  section.innerHTML = "";
-  section.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Tool calls the agentic boundary evaluated, and step-up approvals — the audit trail behind the decisions above.", ja: "AIエージェントの境界が評価したツール呼び出しと、ステップアップ承認 ── 上の判定の監査証跡。" }) }));
-  section.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Recent tool calls", ja: "最近のツール呼び出し" }) }));
-  if (!events.length) section.appendChild(emptyBox(bl({ en: "No tool activity.", ja: "ツール活動なし。" })));
-  else section.appendChild(simpleTable([bl({ en: "When", ja: "日時" }), bl({ en: "Account", ja: "アカウント" }), bl({ en: "Tool", ja: "ツール" }), bl({ en: "Result", ja: "結果" })], events.slice(0, 100).map((e2) => [
-    el("span", { class: "ui-view-desc", text: (e2.created_at || e2.timestamp) ? window.dsseFormatTime(e2.created_at || e2.timestamp) : "—" }), el("span", { text: e2.actor_nhi_id || e2.actor || "—" }), el("code", { text: e2.tool_id || e2.tool || "—" }), uiBadge(e2.decision || e2.result || "—", /allow|ok|success/i.test(e2.decision || e2.result || "") ? "ok" : "off"),
-  ])));
-  section.appendChild(el("h3", { class: "ui-field-label", style: "margin-top:20px", text: bl({ en: "Recent approvals", ja: "最近の承認" }) }));
-  if (!approvals.length) section.appendChild(emptyBox(bl({ en: "No approvals.", ja: "承認なし。" })));
-  else section.appendChild(simpleTable([bl({ en: "When", ja: "日時" }), bl({ en: "Who", ja: "対象" }), bl({ en: "Decision", ja: "判定" })], approvals.slice(0, 100).map((a) => [
-    el("span", { class: "ui-view-desc", text: a.created_at ? window.dsseFormatTime(a.created_at) : "—" }), el("span", { text: a.subject_user_id || a.subject || "—" }), uiBadge(a.decision || "—", /approve|allow/i.test(a.decision || "") ? "ok" : "off"),
-  ])));
+  uiState(section,"loading");const current=freshRender(section);let events,approvals,eventBody,approvalBody;
+  try{
+    const [e,a,tenant]=await Promise.all([paGet("/admin/tool-call-events",_PA_ENF),paGet("/admin/human-approval-events",_PA_ENF),paGet("/admin/tenant",_PA_ENF)]);
+    if(!paObject(tenant)||!paText(tenant.tenant_id))throw new Error("Invalid tenant response");
+    const time=v=>typeof v==="string"&&Number.isFinite(Date.parse(v));
+    events=paCountedRows(e,"events",r=>paObject(r)&&["id","tenant_id","actor_nhi_id","tool_id"].every(k=>paText(r[k]))&&time(r.timestamp)&&(r.decision==null||typeof r.decision==="string"),tenant.tenant_id);
+    approvals=paCountedRows(a,"approvals",r=>paObject(r)&&["id","tenant_id","approval_result"].every(k=>paText(r[k]))&&time(r.created_at)&&(r.subject_user_id==null||typeof r.subject_user_id==="string"),tenant.tenant_id);
+    eventBody=e;approvalBody=a;
+  }catch(e){if(!current())return;uiState(section,"error",String(e),{label:bl({en:"Retry",ja:"再試行"}),onClick:()=>paActivity(section)});return;}
+  if(!current())return;section.innerHTML="";
+  section.appendChild(el("p",{class:"ui-view-desc",text:bl({en:"Recorded tool calls and approval decisions.",ja:"記録されたツール呼び出しと承認結果。"})}));
+  section.appendChild(el("h3",{class:"ui-field-label",text:bl({en:"Recent tool calls",ja:"最近のツール呼び出し"})}));paCoverage(section,events.length,eventBody.count);
+  section.appendChild(events.length?simpleTable([bl({en:"When",ja:"日時"}),bl({en:"Account",ja:"アカウント"}),bl({en:"Tool",ja:"ツール"}),bl({en:"Result",ja:"結果"})],events.map(e=>[el("span",{text:window.dsseFormatTime(e.timestamp)}),el("span",{text:e.actor_nhi_id}),el("code",{text:e.tool_id}),paActivityBadge(e.decision)])):emptyBox(bl({en:"No tool activity.",ja:"ツール活動なし。"})));
+  section.appendChild(el("h3",{class:"ui-field-label",style:"margin-top:20px",text:bl({en:"Recent approvals",ja:"最近の承認"})}));paCoverage(section,approvals.length,approvalBody.count);
+  section.appendChild(approvals.length?simpleTable([bl({en:"When",ja:"日時"}),bl({en:"Who",ja:"対象"}),bl({en:"Decision",ja:"判定"})],approvals.map(a=>[el("span",{text:window.dsseFormatTime(a.created_at)}),el("span",{text:a.subject_user_id||"—"}),paActivityBadge(a.approval_result,true)])):emptyBox(bl({en:"No approvals.",ja:"承認なし。"})));
 }
 
 // paRemoveBtn — a "Remove" action that soft-removes a record (the model has no hard delete; removal is a status

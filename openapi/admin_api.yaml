@@ -10610,7 +10610,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Delegated Access Grant.
-      description: Requires admin.delegated_grants.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata-only Admin API does not issue tokens, broker delegated sessions, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.delegated_grants.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata API does not issue tokens or broker delegated sessions. A confirmed change updates the store generation; delivery through the configured bundle synchronization is asynchronous. Empty expiry uses the server default lifetime (30 minutes).
       tags:
         - AdminDelegatedAccessGrant
       requestBody:
@@ -10634,6 +10634,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          description: Delegated grant persistence failed; the candidate was not published to live state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/delegated-grants/{grant_id}:
     get:
       summary: Get a tenant-scoped Delegated Access Grant.
@@ -10665,7 +10674,7 @@ paths:
   /admin/delegated-grants/{grant_id}/revoke:
     post:
       summary: Revoke a tenant-scoped Delegated Access Grant.
-      description: Requires admin.delegated_grants.revoke. The revoke action updates grant status only; token revocation, session brokering, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.delegated_grants.revoke. The revoke action updates grant status and the store generation. It does not revoke a separately issued token or terminate a session. Verify asynchronous bundle delivery and enforcement on each Edge separately.
       tags:
         - AdminDelegatedAccessGrant
       parameters:
@@ -10696,6 +10705,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Delegated grant persistence failed; the candidate was not published to live state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/human-approval-events:
     get:
       summary: List tenant-scoped Human Approval Events.

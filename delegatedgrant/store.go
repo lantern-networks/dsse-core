@@ -2,7 +2,10 @@ package delegatedgrant
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,7 +24,7 @@ type Store struct {
 	order      []string
 	capacity   int
 	persister  blobstore.Persister
-	generation uint64 // monotonic config version (bumped on each Upsert); folded into the config-bundle generation
+	generation uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
 }
 
 // NewStore builds a delegated-grant store with the given FIFO capacity. The bound is injected by
@@ -61,49 +64,92 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	if snap != nil {
-		s.grants = snap
-		s.order = s.order[:0]
-		for id := range snap {
-			s.order = append(s.order, id)
+	fresh := make(map[string]model.DelegatedAccessGrant, len(snap))
+	order := make([]string, 0, len(snap))
+	for _, grant := range snap {
+		if err := validKey(grant.TenantID, grant.ID); err != nil {
+			return err
+		}
+		key := grantKey(grant.TenantID, grant.ID)
+		if _, found := fresh[key]; found {
+			return fmt.Errorf("duplicate saved delegated grant")
+		}
+		fresh[key] = grant
+		order = append(order, key)
+	}
+	// Legacy snapshots did not retain FIFO order. Use a deterministic fallback.
+	sort.Strings(order)
+	s.grants, s.order = fresh, order
+
+	return nil
+}
+
+var ErrPersistence = errors.New("delegated grants could not be saved")
+
+func grantKey(tenant, id string) string { return tenant + "\x00" + id }
+func validKey(tenant, id string) error {
+	if tenant == "" || id == "" || strings.TrimSpace(tenant) != tenant || strings.TrimSpace(id) != id || strings.ContainsRune(tenant, '\x00') || strings.ContainsRune(id, '\x00') {
+		return fmt.Errorf("invalid delegated grant tenant or ID")
+	}
+	return nil
+}
+func cloneGrants(in map[string]model.DelegatedAccessGrant) map[string]model.DelegatedAccessGrant {
+	out := make(map[string]model.DelegatedAccessGrant, len(in)+1)
+	for key, grant := range in {
+		out[key] = grant
+	}
+	return out
+}
+
+// The caller holds the write lock. Failed candidates never reach live state.
+func (s *Store) saveLocked(grants map[string]model.DelegatedAccessGrant) error {
+	if s.persister == nil {
+		return nil
+	}
+	data, err := json.MarshalIndent(grants, "", "  ")
+	if err == nil {
+		err = s.persister.Save(data)
+	}
+	if err != nil {
+		log.Printf("delegated grants save: %v", err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return ErrPersistence
 		}
 	}
 	return nil
 }
 
-// persistLocked atomically write-throughs the current grant set. Caller holds s.mu. Best-effort: a write
-// error leaves the in-memory state authoritative (durability at risk, but never blocks the mutation).
-func (s *Store) persistLocked() {
-	if s.persister == nil {
-		return
-	}
-	data, err := json.MarshalIndent(s.grants, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = s.persister.Save(data)
-}
+// Tenant removal retains its existing best-effort contract.
+func (s *Store) persistLocked() { _ = s.saveLocked(s.grants) }
 
 func (s *Store) Upsert(grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
+	if err := validKey(grant.TenantID, grant.ID); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing, ok := s.grants[grant.ID]
+	key := grantKey(grant.TenantID, grant.ID)
+	existing, ok := s.grants[key]
 	if ok {
 		if err := validateTransition(existing, grant); err != nil {
 			return model.DelegatedAccessGrant{}, err
 		}
 	}
+	candidate, order := cloneGrants(s.grants), append([]string(nil), s.order...)
 	if !ok {
-		s.order = append(s.order, grant.ID)
+		order = append(order, key)
 	}
-	s.grants[grant.ID] = grant
-	s.order = evictFIFO(s.order, len(s.grants), s.capacity, func(k string) { delete(s.grants, k) })
+	candidate[key] = grant
+	order = evictFIFO(order, len(candidate), s.capacity, func(k string) { delete(candidate, k) })
+	if err := s.saveLocked(candidate); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
+	s.grants, s.order = candidate, order
 	s.generation++
-	s.persistLocked()
 	return grant, nil
 }
 
-// ConfigGeneration returns the monotonic delegated-grant config version (bumped on each Upsert). A
+// ConfigGeneration returns the monotonic delegated-grant config version (bumped on each Upsert and effective Revoke). A
 // config-bundle distributor folds it into the aggregate generation so a grant change triggers a fleet re-pull.
 func (s *Store) ConfigGeneration() uint64 {
 	s.mu.RLock()
@@ -111,10 +157,30 @@ func (s *Store) ConfigGeneration() uint64 {
 	return s.generation
 }
 
+// Get is retained for callers without tenant context and refuses ambiguous IDs.
+// Authenticated callers must use GetForTenant instead.
 func (s *Store) Get(id string) (model.DelegatedAccessGrant, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	grant, ok := s.grants[id]
+	var result model.DelegatedAccessGrant
+	found := false
+	for _, grant := range s.grants {
+		if grant.ID == id {
+			if found {
+				return model.DelegatedAccessGrant{}, false
+			}
+			result, found = grant, true
+		}
+	}
+	return result, found
+}
+func (s *Store) GetForTenant(tenant, id string) (model.DelegatedAccessGrant, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if validKey(tenant, id) != nil {
+		return model.DelegatedAccessGrant{}, false
+	}
+	grant, ok := s.grants[grantKey(tenant, id)]
 	return grant, ok
 }
 
@@ -147,10 +213,31 @@ func (s *Store) Snapshot() []model.DelegatedAccessGrant {
 	return out
 }
 
+// Revoke is a compatibility entry point; ambiguous IDs refuse mutation.
 func (s *Store) Revoke(id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	grant, ok := s.grants[id]
+	key := ""
+	for k, grant := range s.grants {
+		if grant.ID == id {
+			if key != "" {
+				return model.DelegatedAccessGrant{}, fmt.Errorf("delegated grant ID is ambiguous")
+			}
+			key = k
+		}
+	}
+	return s.revokeLocked(key, id, reason, now)
+}
+func (s *Store) RevokeForTenant(tenant, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
+	if err := validKey(tenant, id); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revokeLocked(grantKey(tenant, id), id, reason, now)
+}
+func (s *Store) revokeLocked(key, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
+	grant, ok := s.grants[key]
 	if !ok {
 		return model.DelegatedAccessGrant{}, fmt.Errorf("delegated access grant %s is absent", id)
 	}
@@ -158,11 +245,14 @@ func (s *Store) Revoke(id, reason string, now time.Time) (model.DelegatedAccessG
 		return grant, nil
 	}
 	revokedAt := now.UTC().Format(time.RFC3339)
-	grant.Status = "revoked"
-	grant.RevokedAt = &revokedAt
-	grant.RevocationReason = stringPtr(reason)
-	s.grants[id] = grant
-	s.persistLocked()
+	grant.Status, grant.RevokedAt, grant.RevocationReason = "revoked", &revokedAt, stringPtr(reason)
+	candidate := cloneGrants(s.grants)
+	candidate[key] = grant
+	if err := s.saveLocked(candidate); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
+	s.grants = candidate
+	s.generation++
 	return grant, nil
 }
 
@@ -264,6 +354,13 @@ func (s *Store) RemoveTenant(tenantID string) int {
 		}
 	}
 	if n > 0 {
+		order := s.order[:0]
+		for _, key := range s.order {
+			if _, ok := s.grants[key]; ok {
+				order = append(order, key)
+			}
+		}
+		s.order = order
 		s.persistLocked()
 	}
 	return n

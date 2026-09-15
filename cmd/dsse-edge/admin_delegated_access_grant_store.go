@@ -117,7 +117,7 @@ func adminGetDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, te
 		return adminDelegatedAccessGrant{}, false, fmt.Errorf("grant_id cannot contain slash")
 	}
 
-	grant, ok := s.Get(grantID)
+	grant, ok := s.GetForTenant(tenantID, grantID)
 	if !ok || grant.TenantID != tenantID {
 		return adminDelegatedAccessGrant{}, false, nil
 	}
@@ -156,12 +156,12 @@ func adminRevokeDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context,
 		now = time.Now().UTC()
 	}
 
-	grant, ok := s.Get(grantID)
+	grant, ok := s.GetForTenant(tenantID, grantID)
 	if !ok || grant.TenantID != tenantID {
 		return adminDelegatedAccessGrant{}, false, nil
 	}
 	if grant.Status != "revoked" {
-		revoked, err := s.Revoke(grantID, reasonCode, now)
+		revoked, err := s.RevokeForTenant(tenantID, grantID, reasonCode, now)
 		if err != nil {
 			return adminDelegatedAccessGrant{}, false, err
 		}

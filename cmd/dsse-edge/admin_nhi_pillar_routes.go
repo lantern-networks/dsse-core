@@ -147,7 +147,9 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_upserted", upserted, evaluator, now), now)
+		audit := adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_upserted", upserted, evaluator, now)
+		audit.ActorUserID = auditActorPrincipal(r)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusOK, upserted)
 	}))
 	mux.HandleFunc("POST /admin/delegated-grants/{grant_id}/revoke", adminEndpoint("admin.delegated_grants.revoke", func(w http.ResponseWriter, r *http.Request) {
@@ -169,7 +171,9 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, http.StatusNotFound, fmt.Errorf("delegated access grant %s is absent", r.PathValue("grant_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_revoked", revoked, evaluator, now), now)
+		audit := adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_revoked", revoked, evaluator, now)
+		audit.ActorUserID = auditActorPrincipal(r)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusOK, revoked)
 	}))
 	mux.HandleFunc("GET /admin/human-approval-events", adminEndpoint("admin.approval.read", func(w http.ResponseWriter, r *http.Request) {

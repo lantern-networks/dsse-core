@@ -154,3 +154,38 @@ test('account boundary falls back to control only on an explicit sourced-node re
  const f=fixture();let n=0;f.invokeWith(async()=>++n===1?{ok:false,status:409,body:{error:'authored on the control plane'}}:{ok:true,body:{}});await f.context.paWriteEnforcement('POST','/admin/policies',{});assert.equal(f.calls.length,2);assert.equal(f.calls[1].plane,'control');
  const g=fixture();g.invokeWith(async()=>({ok:false,status:409,body:{error:'different conflict'}}));await g.context.paWriteEnforcement('POST','/admin/policies',{});assert.equal(g.calls.length,1);
 });
+
+const grant={id:'grant',tenant_id:'tenant',actor_nhi_id:'agent',subject_user_id:'person',tool_ids:['read'],scopes:[],status:'active',expires_at:'2099-01-01T00:00:00Z'};
+const grantRows={grants:[grant],count:1,limit:1000};
+const activityEvent={id:'event',tenant_id:'tenant',actor_nhi_id:'agent',tool_id:'read',timestamp:'2026-01-01T00:00:00Z',decision:'allow'};
+const activityApproval={id:'approval',tenant_id:'tenant',subject_user_id:'person',created_at:'2026-01-01T00:00:00Z',approval_result:'approved'};
+function grantForm(f){f.context.paDelegations=async()=>f.refreshes.push(true);f.host.__paGrantTenant='tenant';f.context.openDelegationForm(f.host);f.fields.id.input.value='grant';f.fields.nhi.input.value='agent';f.fields.subj.input.value='person';f.fields.tools.input.value='read';return f.modals.at(-1)}
+for(const path of ['/admin/delegated-grants?limit=1000','/admin/tenant'])test(`delegation dependency ${path} refuses errors and malformed data`,async()=>{
+ for(const bad of [{ok:false,status:503},{ok:true,body:{}},new Error('offline')]){const f=fixture();f.invokeWith(async(m,p)=>{if(p===path){if(bad instanceof Error)throw bad;return bad}return{ok:true,body:p==='/admin/tenant'?{tenant_id:'tenant'}:grantRows}});await f.context.paDelegations(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(buttons(f.host).length,0);assert.equal(f.states.at(-1).retry.label,'Retry')}
+});
+test('delegation list validates ownership and counts, shows scope/expiry and truncation',async()=>{
+ for(const rows of [{grants:[{...grant,tenant_id:'foreign'}],count:1},{grants:[],count:1},{grants:[grant,grant],count:2},{grants:[{...grant,tool_ids:{}}],count:1}]){const f=fixture();f.invokeWith(async(m,p)=>({ok:true,body:p==='/admin/tenant'?{tenant_id:'tenant'}:rows}));await f.context.paDelegations(f.host);assert.equal(f.states.at(-1).state,'error')}
+ const f=fixture();f.invokeWith(async(m,p)=>({ok:true,body:p==='/admin/tenant'?{tenant_id:'tenant'}:{grants:[{...grant,expires_at:'2000-01-01T00:00:00Z'}],count:1200}}));await f.context.paDelegations(f.host);assert.match(f.host.textContent,/Showing 1 of 1200/);assert.match(f.host.textContent,/expired/);assert.equal(f.host.__paGrantTenant,'tenant');
+});
+test('delegation creation validates IDs and dates and documents default expiry',async()=>{
+ for(const [field,value]of [['nhi','bad value'],['tools','bad tool'],['id','bad/id'],['exp','not a date']]){const f=fixture(),m=grantForm(f);f.fields[field].input.value=value;await button(m.el,'Add delegation').click();assert.equal(f.calls.length,0);assert.equal(button(m.el,'Add delegation').disabled,false)}
+ const f=fixture();grantForm(f);assert.match(f.fields.exp.spec.hint,/default lifetime/);
+});
+test('delegation creation recovers HTTP/network/unconfirmed responses and retries',async()=>{
+ for(const bad of [{ok:false,status:500},new Error('offline'),{ok:true,body:{}},{ok:true,body:{...grant,tenant_id:'other'}}]){const f=fixture(),m=grantForm(f);f.invokeWith(async()=>{if(bad instanceof Error)throw bad;return bad});await button(m.el,'Add delegation').click();assert.equal(m.closed,false);assert.ok(error(m.el).textContent);assert.equal(button(m.el,'Add delegation').disabled,false);assert.equal(f.toasts.length,0);f.invokeWith(async()=>({ok:true,body:grant}));await button(m.el,'Add delegation').click();assert.equal(m.closed,true);assert.equal(f.toasts.length,1)}
+});
+test('delegation pending snapshots inputs, suppresses duplicate dispatch and handles closure',async()=>{
+ for(const close of [false,true]){const f=fixture(),m=grantForm(f);let done;f.invokeWith(async()=>new Promise(resolve=>{done=()=>resolve({ok:true,body:grant})}));const submit=button(m.el,'Add delegation'),first=submit.click();await submit.click();assert.equal(f.calls.length,1);assert.ok(m.el.querySelectorAll('input,button').every(c=>c.disabled));f.fields.id.input.value='changed';if(close)m.close();done();await first;assert.equal(f.calls[0].body.id,'grant');assert.equal(f.toasts.length,close?0:1);assert.equal(f.refreshes.length,close?2:1)}
+});
+test('delegation revoke cancels, suppresses duplicate confirmations, validates target and retries',async()=>{
+ const f=fixture();f.context.paDelegations=async()=>f.refreshes.push(true);const row=f.context.paRevokeGrant(f.host,grant),revoke=button(row,'Revoke');f.context.uiConfirm=async()=>false;await revoke.click();assert.equal(f.calls.length,0);f.context.uiConfirm=async()=>true;
+ for(const bad of [{ok:false,status:500},new Error('offline'),{ok:true,body:grant},{ok:true,body:{...grant,status:'revoked',tenant_id:'foreign',revoked_at:'2026-01-01T00:00:00Z'}}]){f.invokeWith(async()=>{if(bad instanceof Error)throw bad;return bad});await revoke.click();assert.ok(error(row).textContent);assert.equal(revoke.disabled,false);assert.equal(f.toasts.length,0)}
+ let finish;f.invokeWith(async()=>new Promise(resolve=>{finish=()=>resolve({ok:true,body:{...grant,status:'revoked',revoked_at:'2026-01-01T00:00:00Z'}})}));const first=revoke.click();await new Promise(resolve=>setImmediate(resolve));const n=f.calls.length;await revoke.click();assert.equal(f.calls.length,n);finish();await first;assert.equal(f.toasts.length,1);assert.equal(f.refreshes.length,1);
+});
+for(const path of ['/admin/tool-call-events','/admin/human-approval-events','/admin/tenant'])test(`Activity dependency ${path} never turns unavailable data into empty activity`,async()=>{
+ for(const bad of [{ok:false,status:503},{ok:true,body:{}},new Error('offline')]){const f=fixture();f.invokeWith(async(m,p)=>{if(p===path){if(bad instanceof Error)throw bad;return bad}return{ok:true,body:p==='/admin/tenant'?{tenant_id:'tenant'}:p.includes('tool-call')?{events:[activityEvent],count:1}:{approvals:[activityApproval],count:1}}});await f.context.paActivity(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(f.host.textContent.includes('No approvals'),false)}
+});
+test('Activity reads approval_result and uses exact success labels with visible coverage',async()=>{
+ const f=fixture();f.invokeWith(async(m,p)=>({ok:true,body:p==='/admin/tenant'?{tenant_id:'tenant'}:p.includes('tool-call')?{events:[activityEvent],count:200}:{approvals:[activityApproval],count:1}}));await f.context.paActivity(f.host);assert.match(f.host.textContent,/approved/);assert.match(f.host.textContent,/Showing 1 of 200/);
+ f.context.uiBadge=(value,kind)=>({value,kind});for(const value of ['disallowed','not_ok','unsuccessful'])assert.equal(f.context.paActivityBadge(value).kind,'off');for(const value of ['unapproved','not_approved','revoked'])assert.equal(f.context.paActivityBadge(value,true).kind,'off');assert.equal(f.context.paActivityBadge('approved',true).kind,'ok');
+});

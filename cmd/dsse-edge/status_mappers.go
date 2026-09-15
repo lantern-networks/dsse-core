@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"github.com/lantern-networks/dsse-core/delegatedgrant"
 	"net/http"
 	_ "net/http/pprof" // DIAGNOSTIC: registers /debug/pprof on http.DefaultServeMux; served only when -pprof-listen is set
 	"strings"
@@ -29,6 +31,9 @@ func statusForAdminDecisionDetailError(err error) int {
 }
 
 func statusForDelegatedGrantError(err error) int {
+	if errors.Is(err, delegatedgrant.ErrPersistence) {
+		return http.StatusInternalServerError
+	}
 	if strings.Contains(err.Error(), "cannot transition") {
 		return http.StatusConflict
 	}

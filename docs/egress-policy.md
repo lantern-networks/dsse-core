@@ -39,7 +39,9 @@ the effective list and a real decision instead of assuming deletion means deny.
 An unresolved source does not become Any. A destination that resolves to nothing
 is shown as **matches nothing** and cannot enforce a deny for that destination.
 Repair the catalog reference. A named service resolving to no ports currently
-falls back to port 443 in the egress compiler; it is not equivalent to Any.
+falls back to port 443 in the access-policy compiler; it is not equivalent to Any.
+The inspection host compiler instead requires the named service to contain
+TCP/443. An unresolved service adds neither an inspection target nor a bypass.
 
 Egress compiles person and IdP-group selectors into user identity conditions and
 device selectors into device conditions. When different source selector kinds
@@ -83,10 +85,13 @@ enable DLP. Deny does not forward traffic, and the rule validator rejects
 Deny combined with inspection bypass.
 
 **Current authored inspection selection is destination-host based.** The bypass
-compiler collects active bypass destinations into the engine's host set; it does
-not apply the rule's source, service, risk condition, or access priority to that
-selection. Do not promise a bypass only for one person or one source device because
-the access rule names them. Inspect rules do not cancel a separately selected
+compiler collects active bypass destinations whose service is Any or includes
+TCP/443 into the engine's host set. The inspect host compiler uses the same
+service check. SSH, UDP-only services (including UDP/443), and unresolved named
+services do not alter TCP/443 inspection. These host projections do not apply
+the rule's source, risk condition, or access priority to that selection. Do not
+promise a bypass only for one person or one source device because the access
+rule names them. Inspect rules do not cancel a separately selected
 host bypass merely by having a higher access priority. Review other device-profile,
 static, and approved certificate-pinning exclusions as well.
 

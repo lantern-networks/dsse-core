@@ -637,7 +637,9 @@ func deferredAuditEmitterInvariantFunctions() map[string]bool {
 		// Its HTTP audit contract checks that credentials and unrelated request fields stay out.
 		// IdP changes deliberately identify the administrator. The dedicated attribution/privacy
 		// test checks that identity, then applies the shared non-secret invariant to the rest.
-		"adminIdPChangeAuditLog":             true,
+		"adminIdPChangeAuditLog": true,
+		// Attributed CRUD/partial outcomes; dedicated publication tests apply the shared privacy invariant.
+		"adminPolicyMutationAuditLog":        true,
 		"transportAdmissionAuditLog":         true,
 		"deviceRiskAuditLog":                 true,
 		"userRiskAuditLog":                   true,

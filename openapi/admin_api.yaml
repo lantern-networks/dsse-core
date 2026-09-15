@@ -2510,6 +2510,25 @@ components:
             - require_reauthentication
             - require_workload_attestation
       additionalProperties: false
+    PolicyMutationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          enum: [partial]
+        applied:
+          type: boolean
+          description: The policy store accepted the operation; this is not a guarantee of durable storage or fleet delivery.
+        policy_id:
+          type: string
+        tenant_id:
+          type: string
+        ne_snapshot_status:
+          type: string
+          enum: [unconfirmed]
     Policy:
       type: object
       required:
@@ -6823,7 +6842,7 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "500":
-          description: The configured store rejected the save. Live configuration and generation were not changed by this rejected write.
+          description: A rejected store save leaves live configuration and generation unchanged. If the store accepted the change but Network Extension snapshot publication failed, the response has status partial and applied true. Publication may have written some files; fleet delivery is not established.
           content:
             application/json:
               schema:
@@ -12678,15 +12697,11 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "500":
-          description: The configured store rejected the save. Live configuration and generation were not changed by this rejected write.
+          description: A rejected store save leaves live configuration and generation unchanged. If the store accepted the change but Network Extension snapshot publication failed, the response has status partial and applied true. Publication may have written some files; fleet delivery is not established.
           content:
             application/json:
               schema:
-                type: object
-                required: [error]
-                properties:
-                  error:
-                    type: string
+                $ref: "#/components/schemas/PolicyMutationError"
   /admin/effective-policy:
     get:
       summary: Explain the precedence-ordered policy basis for a destination ("Why").
@@ -13079,6 +13094,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: The policy exists but is bundle-sourced; it cannot be deleted through the Admin API.
+        "500":
+          description: Deletion is applied on this server, but Network Extension snapshot publication is unconfirmed. Reload before retrying; the removed policy now returns 404. This does not establish durable deletion or delivery to every endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyMutationError"
   /admin/rbac/catalog:
     get:
       summary: Return Admin RBAC role and API token scope catalog.

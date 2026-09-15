@@ -341,6 +341,11 @@ function paConfirmAccount(r, expected) {
   return r.body;
 }
 function paConfirmBoundary(r, expected) {
+  const outcome = r && r.body;
+  if (r && !r.ok && r.status === 500 && paObject(outcome) && outcome.status === "partial" && outcome.applied === true &&
+      outcome.policy_id === expected.id && outcome.tenant_id === expected.tenant_id && outcome.ne_snapshot_status === "unconfirmed") {
+    throw new Error(bl({en: "The tool boundary is applied on the administration server, but its endpoint configuration publication is unconfirmed. Retry the boundary and verify distribution before using the account.", ja: "ツール境界は管理側に反映済みですが、端末向け設定の発行を確認できません。境界設定を再試行し、配布状態を確認してから利用してください。"}));
+  }
   if (!r || !r.ok) throw new Error(paMutationError(r));
   const b = r.body;
   if (!paObject(b) || b.id !== expected.id || b.tenant_id !== expected.tenant_id || b.status !== "active" ||

@@ -189,3 +189,15 @@ test('Activity reads approval_result and uses exact success labels with visible 
  const f=fixture();f.invokeWith(async(m,p)=>({ok:true,body:p==='/admin/tenant'?{tenant_id:'tenant'}:p.includes('tool-call')?{events:[activityEvent],count:200}:{approvals:[activityApproval],count:1}}));await f.context.paActivity(f.host);assert.match(f.host.textContent,/approved/);assert.match(f.host.textContent,/Showing 1 of 200/);
  f.context.uiBadge=(value,kind)=>({value,kind});for(const value of ['disallowed','not_ok','unsuccessful'])assert.equal(f.context.paActivityBadge(value).kind,'off');for(const value of ['unapproved','not_approved','revoked'])assert.equal(f.context.paActivityBadge(value,true).kind,'off');assert.equal(f.context.paActivityBadge('approved',true).kind,'ok');
 });
+
+test('boundary publication partial identifies the applied policy and retries without another account', async()=>{
+ const f=fixture();f.context.paAccounts=async()=>{};const modal=accountForm(f);f.fields.tools.input.value='read';
+ f.invokeWith(async(m,p,body)=>p===accountPaths[0]?{ok:true,body}:{ok:false,status:500,body:{error:'internal detail must not replace the explanation',status:'partial',applied:true,policy_id:body.id,tenant_id:body.tenant_id,ne_snapshot_status:'unconfirmed'}});
+ await button(modal.el,'Add account').click();assert.match(error(modal.el).textContent,/The tool boundary is applied/);assert.match(error(modal.el).textContent,/publication is unconfirmed/);assert.doesNotMatch(error(modal.el).textContent,/internal detail/);assert.equal(f.toasts.length,0);assert.equal(f.fields.tools.input.disabled,true);
+ f.invokeWith(async(m,p,body)=>({ok:true,body}));await button(modal.el,'Retry boundary').click();assert.equal(f.calls.filter(c=>c.path===accountPaths[0]).length,1);assert.equal(modal.closed,true);
+});
+test('a partial outcome only confirms the matching tenant and policy with explicit applied status',()=>{
+ const f=fixture(),expected={id:'policy-one',tenant_id:'tenant'},body={status:'partial',applied:true,policy_id:'policy-one',tenant_id:'tenant',ne_snapshot_status:'unconfirmed',error:'unconfirmed generic outcome'};
+ for(const changed of [{policy_id:'other'},{tenant_id:'other'},{applied:'true'},{applied:false},{status:'success'},{ne_snapshot_status:'published'}])assert.throws(()=>f.context.paConfirmBoundary({ok:false,status:500,body:{...body,...changed}},expected),/^Error: unconfirmed generic outcome$/);
+ assert.throws(()=>f.context.paConfirmBoundary({ok:false,status:400,body},expected),/^Error: unconfirmed generic outcome$/);
+});

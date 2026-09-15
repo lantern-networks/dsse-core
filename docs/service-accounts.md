@@ -41,6 +41,30 @@ the acting administrator, target policy and tool count; it omits the tool values
 Rejected writes appear in the common administrative audit stream. A successful
 configuration audit does not prove delivery or enforcement on every Edge.
 
+Policy changes and Network Extension snapshot publication are separate steps. If
+publication fails after the policy store accepts a change, the API returns HTTP
+500 with `status: "partial"`, `applied: true`, the tenant and policy IDs, and
+`ne_snapshot_status: "unconfirmed"`. The Console explains that the boundary is
+already applied on the administration server and offers **Retry boundary**.
+This outcome does not mean that nothing changed: some snapshot files may have
+been written while others still contain their previous contents. Verify the
+configuration on the endpoints before using the account.
+
+Accepted policy updates and removals are audited as `admin_policy_upserted` and
+`admin_policy_deleted`. Their result is `partial` when snapshot publication is
+unconfirmed; the common administrative record also retains the HTTP error. The
+domain record identifies the administrator, tenant, policy and operation, with
+`applied` and `ne_snapshot_status`. A `published` snapshot status describes the
+local publisher's successful return, not endpoint delivery; `not_requested` means
+no publisher was configured.
+
+For deletion, `applied` describes removal from the live store. The file-backed
+delete path still uses best-effort persistence, so this flag does not guarantee
+durability. Reload the policy before retrying a partial deletion: it may already
+be absent, in which case another DELETE returns 404 and does not retry snapshot
+publication. Reconcile the deployment's snapshot output separately. Do not
+recreate a removed policy merely to retry publication.
+
 ## File-store upgrade
 
 Account snapshots are indexed by tenant and account ID. On loading an older

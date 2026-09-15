@@ -114,6 +114,18 @@ func (s *Store) Get(id string) (model.HumanApprovalEvent, bool) {
 	return event, ok
 }
 
+// GetForTenant treats another tenant's record as absent, including its status.
+func (s *Store) GetForTenant(tenantID, id string) (model.HumanApprovalEvent, bool) {
+	if s == nil || strings.TrimSpace(tenantID) == "" {
+		return model.HumanApprovalEvent{}, false
+	}
+	event, ok := s.Get(id)
+	if !ok || event.TenantID != tenantID {
+		return model.HumanApprovalEvent{}, false
+	}
+	return event, true
+}
+
 func (s *Store) GetActive(id string, now time.Time) (model.HumanApprovalEvent, bool) {
 	event, ok := s.Get(id)
 	if !ok || !IsActive(event, now) {

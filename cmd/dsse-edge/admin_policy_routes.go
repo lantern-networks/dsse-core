@@ -26,6 +26,26 @@ import (
 )
 
 func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policystore.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string)) {
+	publishAndAudit := func(w http.ResponseWriter, r *http.Request, item model.Policy, operation string, now time.Time) bool {
+		snapshotStatus := "not_requested"
+		if networkExtensionPublisher != nil {
+			snapshotStatus = "published"
+			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
+			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), item.TenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
+				snapshotStatus = "unconfirmed"
+				logInfof("admin policy snapshot publication: %v", err)
+			}
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyMutationAuditLog(r, item, evaluator, now, operation, snapshotStatus), now)
+		if snapshotStatus == "unconfirmed" {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":  "Policy change applied on this server; Network Extension snapshot publication is unconfirmed. Reload the policy state and check distribution before retrying.",
+				"status": "partial", "applied": true, "policy_id": item.ID, "tenant_id": item.TenantID, "ne_snapshot_status": snapshotStatus,
+			})
+			return false
+		}
+		return true
+	}
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		options := policystore.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
@@ -433,17 +453,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if networkExtensionPublisher != nil {
-			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), tenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("publish network extension policy snapshot: %w", err))
-				return
-			}
+		if !publishAndAudit(w, r, created, "upsert", now) {
+			return
 		}
-		audit := adminPolicyAuditLog(created, evaluator, now)
-		audit.ActorUserID = auditActorPrincipal(r)
-		audit.Metadata["allowed_tool_id_count"] = len(created.AllowedToolIDs)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusOK, created)
 	}))
 	// The missing half of POST: an authored policy could be created and disabled but never removed, so a
@@ -464,15 +476,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusNotFound, fmt.Errorf("no admin-authored policy %s", r.PathValue("policy_id")))
 			return
 		}
-		if networkExtensionPublisher != nil {
-			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), tenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("publish network extension policy snapshot: %w", err))
-				return
-			}
+		if !publishAndAudit(w, r, removed, "delete", now) {
+			return
 		}
 		logInfof("admin_policy_deleted id=%q name=%q tenant=%q", removed.ID, removed.Name, tenantID)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyAuditLog(removed, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_policies.v1",
 			"deleted":        removed.ID,

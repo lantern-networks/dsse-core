@@ -243,6 +243,7 @@ function renderAgentProfileForm(host) {
   const errHost = el("div", {});
 
   submit.addEventListener("click", async () => {
+    if (submit.disabled) return;
     errHost.innerHTML = "";
     const chosen = _profileEndpoints.filter((e) => e.on).map((e) => e.value);
     if (!chosen.length) {
@@ -259,10 +260,12 @@ function renderAgentProfileForm(host) {
       vmAckF.setError(bl({ en: "This has to be chosen deliberately.", ja: "これは明示的に選ぶ必要があります。" }));
       return;
     }
+    // Keep the profile and its later tokens bound to the same submitted group.
+    const group = groupF.get();
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/agent-profile", {
-        group: groupF.get(),
+        group,
         transport_endpoints: chosen,
         posture: failOpen ? "fail-open" : "fail-closed",
         ack_fail_open: failOpen,
@@ -277,7 +280,7 @@ function renderAgentProfileForm(host) {
         uiToast(msg, "err");
         return;
       }
-      showAgentProfileMade(r.body, groupF.get());
+      showAgentProfileMade(r.body, group);
     } catch (e) {
       submit.disabled = false;
       uiToast(String(e), "err");

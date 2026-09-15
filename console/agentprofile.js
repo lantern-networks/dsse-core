@@ -432,6 +432,8 @@ function showAgentProfileMade(envelope, group) {
       ? bl({ en: "One token per device, for the group “" + group + "”.",
              ja: "1台につき1枚、グループ「" + group + "」で作ります。" })
       : bl({ en: "One token per device.", ja: "1台につき1枚です。" }) });
+  const tokenError = el("div", { class: "ui-callout ui-callout-warn", role: "alert" });
+  tokenError.style.display = "none";
   const makeTokens = el("button", { class: "ui-btn",
     text: bl({ en: "Make the tokens", ja: "まとめて作る" }) });
 
@@ -516,6 +518,7 @@ function showAgentProfileMade(envelope, group) {
         ja: "端末はまだ証明書を持っていません。この設定は「どこへ・どう繋ぐか」だけで、身元は運びません"
           + "（グループの全端末で同じものだからです）。1台ごとに一度きりのトークンが1枚要ります。" }) }),
       countF.el,
+      tokenError,
       makeTokens,
       el("hr", {}),
       el("p", { class: "ui-view-desc", text: bl({
@@ -558,24 +561,41 @@ function showAgentProfileMade(envelope, group) {
   });
 
   makeTokens.addEventListener("click", async () => {
-    const count = Math.max(1, Number(countF.get()) || 1);
+    if (makeTokens.disabled) return;
+    const count = enrolTokenCount(countF);
+    if (count === null) return;
+    tokenError.style.display = "none";
+    const showError = (message) => {
+      tokenError.textContent = message;
+      tokenError.style.display = "";
+      uiToast(message, "err");
+    };
     makeTokens.disabled = true;
     try {
-      // The SAME group the configuration was made for. A profile for one group and tokens for another is the
-      // mismatch nobody notices until the devices are built.
       const r = await apiFetch("POST", "/admin/enrolment-tokens", {
         label: group ? group : bl({ en: "Device configuration", ja: "端末の設定" }),
         group, expires_in_hours: 168, count,
       }, _PROFILE_PLANE);
-      makeTokens.disabled = false;
-      if (!r.ok) {
-        uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err");
+      if (!r.ok && r.status === 409 && r.body && r.body.partial === true &&
+          Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
+        showError(enrolTokenResponseWarning());
+        showEnrolTokenOnce({ ...r.body, requested_count: count });
         return;
       }
-      if (typeof showEnrolTokenOnce === "function") showEnrolTokenOnce(r.body);
+      if (!r.ok) {
+        const uncertain = r.status >= 500 || (r.status === 409 && r.body && r.body.partial === true);
+        showError(uncertain ? enrolTokenResponseWarning() :
+          (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+        return;
+      }
+      if (!enrolTokenCompleteBody(r.body, count)) {
+        showError(enrolTokenResponseWarning()); return;
+      }
+      showEnrolTokenOnce(r.body);
     } catch (e) {
+      showError(enrolTokenResponseWarning());
+    } finally {
       makeTokens.disabled = false;
-      uiToast(String(e), "err");
     }
   });
 }

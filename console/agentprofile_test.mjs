@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 const source = readFileSync(new URL('./agentprofile.js', import.meta.url), 'utf8');
-function fixture() {
+function fixture(realResult = false) {
   const fields = {}, nodes = [], calls = [], made = [], notices = [];
   function el(tag, props = {}, children = []) {
     const node = {tag, ...props, style: {}, disabled: false, children: [], listeners: {},
@@ -28,7 +28,7 @@ function fixture() {
   });
   vm.runInContext(source, context);
   vm.runInContext('_profileOptions = {device_groups:[{name:"group-a"},{name:"group-b"}]}; _profileEndpoints = [{value:"a=https://a.example.test",on:true},{value:"b=https://b.example.test",on:true}];', context);
-  context.showAgentProfileMade = (body, group) => made.push({body, group});
+  if (!realResult) context.showAgentProfileMade = (body, group) => made.push({body, group});
   context.renderAgentProfileForm(el('div'));
   fields.group.set('group-a');
   const submit = nodes.find(n => n.text === 'Make the configuration');
@@ -85,4 +85,60 @@ test('acknowledged choices and destination order are submitted unchanged', async
   assert.equal(body.posture, 'fail-open'); assert.equal(body.ack_fail_open, true);
   assert.equal(body.virtual_machine_egress, 'allowed'); assert.equal(body.ack_virtual_machine_egress, true);
   assert.deepEqual(body.transport_endpoints, ['b=https://b.example.test', 'a=https://a.example.test']);
+});
+
+
+function tokenFixture() {
+  const f = fixture(true);
+  vm.runInContext(readFileSync(new URL('./enrolmenttokens.js', import.meta.url), 'utf8'), f.context);
+  f.context.uiModal = () => ({close() {}});
+  f.context.navigator = {userAgent: 'test'};
+  f.context.showEnrolTokenOnce = body => f.made.push(body);
+  f.context.showAgentProfileMade({}, 'group-a');
+  f.tokenButton = f.nodes.find(n => n.text === 'Make the tokens');
+  f.tokenError = f.nodes.find(n => n.role === 'alert');
+  f.send = () => f.tokenButton.listeners.click();
+  return f;
+}
+
+test('profile token issuance rejects invalid counts before posting', async () => {
+  const f = tokenFixture();
+  for (const raw of ['0', '-1', '1.5', 'abc', '501', '']) {
+    f.fields.count.set(raw); await f.send(); assert.equal(f.calls.length, 0);
+    assert.match(f.fields.count.error, /1 to 500/);
+  }
+});
+
+test('profile partial issuance preserves returned secrets and the requested count without reentry', async () => {
+  const f = tokenFixture(); f.fields.count.set('3'); let finish;
+  f.context.apiFetch = (...args) => { f.calls.push(args); return new Promise(resolve => { finish = resolve; }); };
+  const pending = f.send(); f.fields.count.set('5'); await f.send(); assert.equal(f.calls.length, 1);
+  const tokens = [{token: {id: 'one'}, secret: 'exact-secret'}];
+  finish({ok: false, status: 409, body: {partial: true, tokens}}); await pending;
+  assert.equal(f.made.length, 1); assert.equal(f.made[0].tokens, tokens);
+  assert.equal(f.made[0].requested_count, 3); assert.equal(f.made[0].partial, true);
+  assert.match(f.tokenError.textContent, /may already have been created/); assert.equal(f.tokenButton.disabled, false);
+  assert.equal(f.calls[0][2].group, 'group-a'); assert.equal(f.calls[0][3], 'control');
+});
+
+test('profile uncertain and malformed responses stay visible without disclosure or automatic retry', async () => {
+  for (const reply of [new Error('offline'), {ok: false, status: 503},
+    {ok: false, status: 409, body: {partial: true, tokens: []}},
+    {ok: false, status: 409, body: {partial: true, tokens: [{}]}},
+    {ok: true, body: {}}, {ok: true, body: {tokens: []}}]) {
+    const f = tokenFixture(); f.context.apiFetch = async (...args) => {
+      f.calls.push(args); if (reply instanceof Error) throw reply; return reply;
+    };
+    await f.send(); assert.equal(f.calls.length, 1); assert.equal(f.made.length, 0);
+    assert.match(f.tokenError.textContent, /reload the unused-token list/);
+    assert.equal(f.tokenError.style.display, ''); assert.equal(f.tokenButton.disabled, false);
+  }
+});
+
+test('profile definitive refusal can be retried and success clears the previous error', async () => {
+  const f = tokenFixture();
+  f.context.apiFetch = async () => ({ok: false, status: 400, body: {error: '<b>invalid request</b>'}});
+  await f.send(); assert.equal(f.tokenError.textContent, '<b>invalid request</b>'); assert.equal(f.made.length, 0);
+  f.context.apiFetch = async () => ({ok: true, body: {tokens: [{token: {id: 'one'}, secret: 'secret'}]}});
+  await f.send(); assert.equal(f.made.length, 1); assert.equal(f.tokenError.style.display, 'none');
 });

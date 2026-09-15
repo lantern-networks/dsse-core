@@ -270,9 +270,10 @@ async function openEnrolTokenForm(content) {
   });
   submit.addEventListener("click", async () => {
     if (submit.disabled || !labelF.validate()) return;
+    const count = enrolTokenCount(countF);
+    if (count === null) return;
     submit.disabled = true;
     try {
-      const count = Math.max(1, Number(countF.get()) || 1);
       const r = await apiFetch("POST", "/admin/enrolment-tokens",
         { label: labelF.get(), group: groupF.get(), expires_in_hours: Number(validF.get()), count },
         _ENROL_PLANE);
@@ -285,17 +286,41 @@ async function openEnrolTokenForm(content) {
       }
       if (!r.ok) {
         submit.disabled = false;
-        const uncertainPartial = r.status === 409 && r.body && r.body.partial === true;
+        const uncertainPartial = (r.status === 409 && r.body && r.body.partial === true) || r.status >= 500;
         const msg = uncertainPartial ? enrolTokenResponseWarning() :
           (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
         labelF.setError(msg); uiToast(msg, "err"); return;
       }
+      if (!enrolTokenCompleteBody(r.body, count)) {
+        const msg = enrolTokenResponseWarning();
+        submit.disabled = false; labelF.setError(msg); uiToast(msg, "err"); return;
+      }
       m.close();
       showEnrolTokenOnce(r.body);
       renderEnrolmentTokensView(content);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) {
+      submit.disabled = false; const msg = enrolTokenResponseWarning();
+      labelF.setError(msg); uiToast(msg, "err");
+    }
   });
   labelF.focus();
+}
+
+// Keep the two issuance forms within the API's per-request bound without silently changing the count.
+function enrolTokenCount(field) {
+  const raw = String(field.get()).trim();
+  const count = /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(count) || count < 1 || count > 500) {
+    field.setError(bl({ en: "Enter a whole number from 1 to 500.", ja: "1から500までの整数を入力してください。" }));
+    return null;
+  }
+  field.setError("");
+  return count;
+}
+
+function enrolTokenCompleteBody(body, count) {
+  return !!body && body.partial !== true && Array.isArray(body.tokens) && body.tokens.length === count &&
+    enrolTokenRowsValid(body.tokens);
 }
 
 // A batch cannot be read off a screen. Fifty secrets in a modal is a list nobody can transcribe without losing

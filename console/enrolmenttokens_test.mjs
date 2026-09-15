@@ -90,6 +90,49 @@ test('malformed partial issuance warns of saved tokens without disclosure or aut
   assert.equal(calls,1);assert.equal(closed,0);assert.equal(errors.length,1);
   assert.match(errors[0][0],/may already have been created/);
   assert.match(errors[0][0],/reload the unused-token list/);
-  assert.equal(fieldErrors[0],errors[0][0]);assert.equal(errors[0][1],'err');
+  assert.equal(fieldErrors.at(-1),errors[0][0]);assert.equal(errors[0][1],'err');
+ }
+});
+
+
+test('issuance counts require decimal whole numbers in the API range', () => {
+ const c=vm.createContext({bl:v=>v.en});vm.runInContext(source,c);
+ for(const raw of ['', '0', '-1', '1.5', 'abc', '1e2', '501', 'Infinity', '9007199254740992']) {
+  const errors=[];assert.equal(c.enrolTokenCount({get:()=>raw,setError:e=>errors.push(e)}),null,raw);assert.ok(errors[0]);
+ }
+ for(const [raw,want] of [['1',1],['500',500],[' 12 ',12],['002',2]]) {
+  assert.equal(c.enrolTokenCount({get:()=>raw,setError:e=>assert.equal(e,'')}),want);
+ }
+});
+
+test('success requires a complete count of well-formed one-time credentials', () => {
+ const c=vm.createContext({});vm.runInContext(source,c);
+ const body={tokens:[{token:{id:'one'},secret:'secret'}]};assert.equal(c.enrolTokenCompleteBody(body,1),true);
+ for(const value of [undefined,{}, {tokens:[]}, {tokens:[{}]}, {...body,partial:true}])assert.equal(c.enrolTokenCompleteBody(value,1),false);
+ assert.equal(c.enrolTokenCompleteBody(body,2),false);
+});
+
+function issuanceForm() {
+ const fields={},nodes=[],calls=[],disclosures=[];let closed=0;
+ const c=vm.createContext({bl:v=>v.en,uiToast(){},
+  uiField:spec=>{const field={el:{},value:spec.value||'label',get(){return this.value;},validate:()=>true,focus(){},setError(error){this.error=error;}};fields[spec.name]=field;return field;},
+  el:(tag,attrs={})=>{const node={tag,...attrs,addEventListener(event,fn){this[event]=fn;}};nodes.push(node);return node;},
+  uiModal:()=>({close:()=>closed++}),apiFetch:async(...args)=>{calls.push(args);return {ok:true,body:{tokens:[]}};}});
+ vm.runInContext(source,c);c.showEnrolTokenOnce=body=>disclosures.push(body);c.renderEnrolmentTokensView=()=>{};
+ c.openEnrolTokenForm({});const button=nodes.find(n=>n.text==='Approve device');
+ return {c,fields,button,calls,disclosures,closed:()=>closed};
+}
+
+test('standalone form does not send invalid counts or silently approve one device',async()=>{
+ const f=issuanceForm();
+ for(const value of ['0','-1','1.5','abc','501','']){f.fields.count.value=value;await f.button.click();assert.equal(f.calls.length,0);assert.equal(f.closed(),0);assert.match(f.fields.count.error,/1 to 500/);}
+});
+
+test('standalone uncertain responses keep the form open and require an explicit retry',async()=>{
+ for(const response of [new Error('offline'),{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{tokens:[]}}]){
+  const f=issuanceForm();f.fields.count.value='2';f.c.apiFetch=async(...args)=>{f.calls.push(args);if(response instanceof Error)throw response;return response;};
+  await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.closed(),0);assert.equal(f.disclosures.length,0);assert.equal(f.button.disabled,false);assert.match(f.fields.label.error,/may already have been created/);
+  f.c.apiFetch=async(...args)=>{f.calls.push(args);return {ok:true,body:{tokens:[{token:{id:'one'},secret:'a'},{token:{id:'two'},secret:'b'}]}};};
+  await f.button.click();assert.equal(f.calls.length,2);assert.equal(f.calls[1][2].count,2);assert.equal(f.closed(),1);assert.equal(f.disclosures.length,1);
  }
 });

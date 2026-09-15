@@ -63,7 +63,7 @@ function laResultBadge(res) {
   // Match whole outcomes: "revoked" contains "ok", and "incomplete" contains "complete".
   // Unknown outcomes retain their text and remain neutral rather than implying success.
   const kind = /^(ok|success|allow|allowed|approved|done|complete|completed)$/.test(r) ? "ok"
-    : /^(fail|failed|failure|deny|denied|error|reject|rejected|revoked|expired|cancelled|canceled|withdrawn|timeout|timed_out)$/.test(r) ? "danger" : "off";
+    : /^(fail|failed|failure|deny|denied|error|reject|rejected|revoked|expired|cancelled|canceled|withdrawn|timeout|timed_out)$/.test(r) ? "danger" : r === "partial" ? "warn" : "off";
   return uiBadge(laDash(res), kind);
 }
 

@@ -507,3 +507,15 @@ test('export details refuse a mismatched or failed response rather than showing 
   vm.runInContext(source,c);await vm.runInContext('laExportDetails({id:"job"},button)',c);assert.equal(messages,1);assert.equal(button.disabled,false);
  }
 });
+
+
+test('partial outcomes use a warning color while pending and unknown outcomes stay neutral', () => {
+  for (const value of ['partial', ' PARTIAL ']) {
+    const result = badge(value);
+    assert.equal(result.kind, 'warn');
+    assert.equal(result.label, value);
+  }
+  for (const value of ['pending', 'queued', 'running', 'partial_success', 'partially_failed']) {
+    assert.equal(badge(value).kind, 'off', value);
+  }
+});

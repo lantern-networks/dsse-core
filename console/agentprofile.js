@@ -551,13 +551,18 @@ function showAgentProfileMade(envelope, group) {
   // that way. Changing the machine changes what the button would produce, so it goes back to offering it.
   const bundleLabel = bundle.textContent;
   platformF.el.addEventListener("change", () => {
+    if (bundle.__bundlePending) return;
     bundle.textContent = bundleLabel;
     bundle.disabled = false;
   });
 
-  bundle.addEventListener("click", () => {
+  bundle.addEventListener("click", async () => {
+    if (bundle.__bundlePending) return;
     const [platform, arch] = String(platformF.get() || guessedPlatform).split("/");
-    downloadDeviceBundle(envelope, group, platform, arch, bundle);
+    const select = platformF.el.querySelector("select");
+    if (select) select.disabled = true;
+    try { await downloadDeviceBundle(envelope, group, platform, arch, bundle); }
+    finally { if (select) select.disabled = false; }
   });
 
   makeTokens.addEventListener("click", async () => {

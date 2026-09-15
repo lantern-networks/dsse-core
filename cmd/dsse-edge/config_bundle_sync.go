@@ -972,8 +972,12 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// device-CA registry, because they are the same kind of fact from opposite directions: that one says which
 	// organization a client certificate belongs to, this one says which server certificates an organization's
 	// own flows may accept.
-	if payload.InternalCAs != nil && t.internalCAs != nil {
-		if count, applied := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf); applied {
+	if payload.InternalCAs != nil {
+		count, applied, err := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf)
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("internal authorities: %w", err))
+		}
+		if applied {
 			log.Printf("config_bundle_internal_cas applied=%d", count)
 		}
 	}

@@ -7770,13 +7770,15 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Add or replace one internal certificate authority.
-      description: Requires admin.policy.write. The material must be a CA certificate that has not expired; a server's own certificate is refused with the reason. An operator may name another organization in tenant_id; a customer naming one is refused rather than redirected.
+      description: Requires admin.policy.write. Supply exactly one public CA certificate that has not expired. Private keys, additional certificates, other PEM material and trailing JSON are refused. Requests are limited to 1 MiB. Live trust changes only after persistence reports success. A stable id permits retry of the same submission; omitting id generates a new one. An operator may name another organization in tenant_id; a customer naming one is refused rather than redirected.
       tags:
         - AdminInternalCAs
       requestBody:
@@ -7796,6 +7798,12 @@ paths:
                 additionalProperties: true
         "400":
           description: The material is not an authority this deployment can use, with the reason.
+        "409":
+          description: This node receives configuration from a source and refuses local writes.
+        "500":
+          description: Persistence is unconfirmed. This request did not adopt a live change; restore storage, reload and retry.
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7803,7 +7811,7 @@ paths:
   /admin/internal-cas/all:
     get:
       summary: Every organization's internal certificate authorities.
-      description: "Requires admin.policy.read AND the operator organization. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy."
+      description: "Requires admin.policy.read AND a configured operator organization matching the caller. An unconfigured operator is denied. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy."
       tags:
         - AdminInternalCAs
       responses:
@@ -7814,6 +7822,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7821,7 +7831,7 @@ paths:
   /admin/internal-cas/{id}:
     delete:
       summary: Remove one internal certificate authority.
-      description: Requires admin.policy.write. Scoped to the authenticated organization. Private assets whose certificates it issued stop being reachable on the next request, not the next restart.
+      description: Requires admin.policy.write. Scoped to the authenticated organization. The durable delete must report success before live trust changes. Other servers must receive the configuration update. This operation does not forcibly close established connections.
       tags:
         - AdminInternalCAs
       parameters:
@@ -7832,13 +7842,19 @@ paths:
             type: string
       responses:
         "200":
-          description: Removed.
+          description: Removed; the response includes deleted=true, id, and tenant_id.
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           description: No such authority in this organization.
+        "409":
+          description: This node receives configuration from a source and refuses local writes.
+        "500":
+          description: Persistence is unconfirmed. This request did not remove live trust; restore storage, reload and retry.
   /admin/steer-exclusions:
     get:
       summary: List admin-managed steer exclusions.

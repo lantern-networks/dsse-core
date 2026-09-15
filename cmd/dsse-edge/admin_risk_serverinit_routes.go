@@ -19,8 +19,8 @@ import (
 func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, configSourceURL string) {
 	mux.HandleFunc("POST /admin/risk-signals", adminEndpoint("admin.risk.write", func(w http.ResponseWriter, r *http.Request) {
 		// Risk State: ingest a risk signal (incl. Manual High Risk Marking). High risk folds into
-		// the device's risk state (decisions react via risk_state_severity/admin_high_risk) and revokes
-		// the device's standing east-west grants (acceleration). Phase 3: the high-risk marking is
+		// the device's risk state (decisions react via risk_state_severity/admin_high_risk); enforcement
+		// is determined by policy, not by ingesting the signal. Phase 3: the high-risk marking is
 		// CP-authoritative + fleet-distributed, so author it on the control plane.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "risk signals (high-risk marking)") {
 			return
@@ -61,6 +61,17 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			default:
 				config.HighRiskOverlay.Clear(resp.EntityID)
 			}
+		}
+		if resp.EntityType == "device" {
+			tenantID := adminTenantIDFromRequest(r)
+			if config.EnrolledLedger != nil {
+				if entry, ok := config.EnrolledLedger.EntryFor(resp.EntityID); ok && strings.TrimSpace(entry.TenantID) != "" {
+					tenantID = entry.TenantID
+				}
+			}
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
+				deviceRiskAuditLog(r, tenantID, resp, evaluator, now), now)
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}))

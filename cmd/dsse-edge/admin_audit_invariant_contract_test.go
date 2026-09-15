@@ -636,6 +636,7 @@ func deferredAuditEmitterInvariantFunctions() map[string]bool {
 		// Transport admission names the affected device and acting administrator deliberately.
 		// Its HTTP audit contract checks that credentials and unrelated request fields stay out.
 		"transportAdmissionAuditLog":         true,
+		"deviceRiskAuditLog":                 true,
 		"agentStatusAuditLog":                true,
 		"agentUpdateAuditLog":                true,
 		"authenticationEventAuditLog":        true,

@@ -257,7 +257,9 @@ function overflowMenu(d, host, sev, grpSev) {
   const wrap = el("span", { class: "dev-ov" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: "⋯", title: bl({ en: "More", ja: "その他" }) });
   btn.setAttribute("data-device-admission-control", "1");
-  btn.disabled = !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity));
+  btn.setAttribute("data-device-risk-control", "1");
+  btn.disabled = !!((host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity)) ||
+    (host.__deviceRiskPending && host.__deviceRiskPending.has(d.identity)));
   let menu = null;
   const onDoc = (e) => { if (!wrap.contains(e.target)) close(); };
   function close() { if (menu) { menu.remove(); menu = null; document.removeEventListener("click", onDoc, true); } }
@@ -986,7 +988,10 @@ async function deleteGroup(g, host) {
 function deviceAdmissionBusy(host, identity, busy) {
   for (const row of host.querySelectorAll("[data-device-identity]")) {
     if (row.getAttribute("data-device-identity") !== identity) continue;
-    for (const button of row.querySelectorAll("[data-device-admission-control]")) button.disabled = busy;
+    for (const button of row.querySelectorAll("[data-device-admission-control]")) {
+      button.disabled = busy || !!(button.getAttribute("data-device-risk-control") &&
+        host.__deviceRiskPending && host.__deviceRiskPending.has(identity));
+    }
   }
 }
 
@@ -1064,11 +1069,65 @@ async function enableDevice(d, host) { return changeDeviceAdmission(d, host, tru
 
 // setDeviceRisk marks / clears a device's risk from its own row (no free-text id) — replaces the Device Risk
 // page. "high" marks high-risk (a risk-gated policy then bites, e.g. re-auth); "none" clears it.
+function deviceRiskBusy(host, identity, busy) {
+  for (const row of host.querySelectorAll("[data-device-identity]")) {
+    if (row.getAttribute("data-device-identity") !== identity) continue;
+    for (const button of row.querySelectorAll("[data-device-risk-control]")) {
+      button.disabled = busy || !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(identity));
+    }
+  }
+}
+
+function deviceRiskNotice(host, d, severity, message) {
+  const notices = host.__deviceRiskNotices || (host.__deviceRiskNotices = new Map());
+  const previous = notices.get(d.identity);
+  if (previous) { previous.remove(); notices.delete(d.identity); }
+  if (!message) return;
+  const box = el("div", { class: "ui-callout ui-callout-warn", role: "alert", style: "margin-bottom:12px" }, [
+    el("strong", { text: d.identity }),
+    el("div", { text: message, style: "white-space:pre-wrap" }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }),
+      onClick: () => setDeviceRisk(d, severity, host) }),
+  ]);
+  (host.__deviceAdmissionMessages || host).appendChild(box);
+  notices.set(d.identity, box);
+}
+
 async function setDeviceRisk(d, severity, host) {
-  const r = await apiFetch("POST", "/admin/risk-signals", { entity_type: "device", entity_id: d.identity, severity: severity, evidence_ref: "console" });
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); renderList(host); return; }
-  uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" }) : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
-  renderList(host);
+  const pending = host.__deviceRiskPending || (host.__deviceRiskPending = new Set());
+  if (pending.has(d.identity)) return;
+  pending.add(d.identity);
+  deviceRiskBusy(host, d.identity, true);
+  deviceRiskNotice(host, d, severity, "");
+  let notice = "";
+  try {
+    const r = await apiFetch("POST", "/admin/risk-signals", {
+      entity_type: "device", entity_id: d.identity, severity, evidence_ref: "console",
+    }, "control");
+    if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    const b = r.body;
+    if (!b || b.entity_type !== "device" || typeof b.entity_id !== "string" ||
+        b.entity_id.trim().toLowerCase() !== d.identity.trim().toLowerCase() || b.severity !== severity ||
+        b.applied !== true || b.high_risk !== (severity === "high" || severity === "critical") ||
+        (b.not_stored_durably !== undefined && typeof b.not_stored_durably !== "string")) {
+      throw new Error(bl({ en: "The response did not confirm the requested device risk.",
+        ja: "応答から、指定した端末のリスク変更を確認できません。" }));
+    }
+    if (b.not_stored_durably && b.not_stored_durably.trim()) {
+      notice = bl({ en: "Risk applied, but saving was not confirmed. Retry once the store is healthy.",
+        ja: "リスクは反映されましたが、保存を確認できません。保存先の復旧後に再試行してください。" }) + "\n" + b.not_stored_durably;
+    }
+  } catch (e) {
+    notice = bl({ en: "The risk change could not be confirmed. It may already be applied. Reload the state and retry when the error is resolved.",
+      ja: "リスク変更を確認できません。反映済みの可能性があります。状態を再読込し、エラー解消後に再試行してください。" }) + "\n" + String(e);
+  } finally {
+    pending.delete(d.identity);
+    deviceRiskBusy(host, d.identity, false);
+  }
+  if (notice) deviceRiskNotice(host, d, severity, notice);
+  else uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" })
+    : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
+  try { await renderList(host); } catch (e) { uiToast(String(e), "err"); }
 }
 
 async function removeDevice(d, host) {

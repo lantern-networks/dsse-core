@@ -48,7 +48,7 @@ function fixture() {
   const addRow = id => {
     const row = el('tr', {'data-device-identity': id});
     const primary = el('button', {'data-device-admission-control': '1'});
-    const overflow = el('button', {'data-device-admission-control': '1'});
+    const overflow = el('button', {'data-device-admission-control': '1', 'data-device-risk-control': '1'});
     const unrelated = el('button');
     row.appendChild(primary); row.appendChild(overflow); row.appendChild(unrelated); host.appendChild(row);
     rows.set(id, {row, primary, overflow, unrelated}); return row;
@@ -268,4 +268,88 @@ test('restore refusal through the existing enable wrapper never falls through to
   assert.equal(f.calls.some(call => call[1].endsWith('/enable')), false);
   assert.equal(f.toasts.some(toast => toast.kind === 'ok'), false);
   assertFailure(f, false);
+});
+
+function riskResponse(severity, id = identity, warning) {
+  return {ok: true, status: 200, body: {entity_type: 'device', entity_id: id, severity,
+    applied: true, high_risk: severity === 'high' || severity === 'critical',
+    ...(warning === undefined ? {} : {not_stored_durably: warning})}};
+}
+const riskSend = (f, severity = 'high', d = device) => f.context.setDeviceRisk(d, severity, f.host);
+const riskNotice = (f, id = identity) => f.host.__deviceRiskNotices?.get(id);
+
+test('device risk sends all four UI severities through control and confirms matching outcomes', async () => {
+  for (const severity of ['none', 'medium', 'high', 'critical']) {
+    const f = fixture(); f.invokeWith(() => riskResponse(severity)); await riskSend(f, severity);
+    assert.equal(f.calls.length, 1); const [method,path,body,plane] = f.calls[0];
+    assert.equal(method, 'POST'); assert.equal(path, '/admin/risk-signals'); assert.equal(plane, 'control');
+    assert.equal(body.entity_type, 'device'); assert.equal(body.entity_id, identity); assert.equal(body.severity, severity);
+    assert.equal(f.toasts.filter(t => t.kind === 'ok').length, 1); assert.equal(riskNotice(f), undefined);
+  }
+});
+
+test('runtime persistence warning stays visible through refresh and explicit retry repairs it', async () => {
+  for (const severity of ['none', 'high']) {
+    const f = fixture(); f.invokeWith(() => riskResponse(severity, identity, '<b>save failed</b>'));
+    await riskSend(f, severity); assert.equal(f.toasts.length, 0);
+    assert.match(riskNotice(f).textContent, /Risk applied, but saving was not confirmed/);
+    assert.match(riskNotice(f).textContent, /<b>save failed<\/b>/); assert.equal(riskNotice(f).getAttribute('role'), 'alert');
+    assert.equal(riskNotice(f).parentNode, f.messages); assert.equal(f.refreshes.length, 1);
+    f.invokeWith(() => riskResponse(severity)); await riskNotice(f).querySelector('button').click();
+    assert.equal(f.calls.length, 2); assert.equal(riskNotice(f), undefined); assert.equal(f.toasts[0].kind, 'ok');
+  }
+});
+
+test('risk HTTP, transport and malformed success never announce confirmed success', async () => {
+  const good = riskResponse('high').body;
+  for (const reply of [
+    {ok:false,status:403,body:{error:'denied'}}, {ok:false,status:503,body:{}}, new Error('lost response'),
+    ...[null, {}, {...good,entity_id:'someone-else'}, {...good,entity_type:'user'},
+      {...good,severity:'none'}, {...good,applied:false}, {...good,applied:'true'},
+      {...good,high_risk:false}, {...good,not_stored_durably:{}}, {...good,not_stored_durably:null}]
+      .map(body=>({ok:true,status:200,body}))
+  ]) {
+    const f = fixture(); f.invokeWith(()=>{if(reply instanceof Error)throw reply;return reply;});
+    await riskSend(f); assert.equal(f.calls.length,1); assert.equal(f.toasts.filter(t=>t.kind==='ok').length,0);
+    assert.match(riskNotice(f).textContent,/may already be applied/); assert.equal(f.rows.get(identity).overflow.disabled,false);
+  }
+});
+
+test('risk suppresses repeated and opposite risk changes while allowing another device', async () => {
+  const f = fixture(); let resolve;
+  f.invokeWith((method,path,body)=>body.entity_id===identity?new Promise(r=>resolve=r):riskResponse(body.severity,body.entity_id));
+  const first=riskSend(f); assert.equal(f.rows.get(identity).overflow.disabled,true);
+  await riskSend(f); await riskSend(f,'none'); assert.equal(f.calls.length,1);
+  await riskSend(f,'medium',otherDevice); assert.equal(f.calls.length,2);
+  resolve(riskResponse('high')); await first; assert.equal(f.rows.get(identity).overflow.disabled,false);
+});
+
+test('overlapping admission and risk keep the More button disabled until both finish', async () => {
+  for (const riskFirst of [true,false]) {
+    const f = fixture(); let riskResolve,transportResolve;
+    f.invokeWith((method,path,body)=>path==='/admin/risk-signals'?new Promise(r=>riskResolve=r)
+      :path.includes('transport-admission')?new Promise(r=>transportResolve=r):responseFor(method,path,body));
+    const risk=riskSend(f); const admission=f.send(true);
+    assert.equal(f.rows.get(identity).overflow.disabled,true);
+    if(riskFirst){riskResolve(riskResponse('high'));await risk;assert.equal(f.rows.get(identity).overflow.disabled,true);transportResolve(responseFor('POST','/admin/transport-admission/restore',{identity}));await admission;}
+    else{transportResolve(responseFor('POST','/admin/transport-admission/restore',{identity}));await admission;assert.equal(f.rows.get(identity).overflow.disabled,true);riskResolve(riskResponse('high'));await risk;}
+    assert.equal(f.rows.get(identity).overflow.disabled,false);
+  }
+});
+
+test('risk notices are separate from admission notices and from other devices', async () => {
+  const f=fixture();f.invokeWith(()=>({ok:false,status:503,body:{error:'unavailable'}}));
+  await f.send(); const admissionNotice=f.notice();await riskSend(f); const first=riskNotice(f);
+  await riskSend(f,'none',otherDevice); assert.equal(f.notice(),admissionNotice);assert.equal(riskNotice(f),first);
+  f.invokeWith(()=>riskResponse('high'));await riskSend(f);assert.equal(riskNotice(f),undefined);
+  assert.ok(riskNotice(f,otherDevice.identity));assert.equal(f.notice(),admissionNotice);
+});
+
+test('risk refresh failure does not reclassify a confirmed operation or discard persistence warning', async () => {
+  for(const warning of [undefined,'runtime save failed']) {
+    const f=fixture();f.invokeWith(()=>riskResponse('high',identity,warning));
+    f.context.renderList=async()=>{throw new Error('refresh unavailable');};await riskSend(f);
+    assert.equal(f.calls.length,1);assert.equal(f.toasts.filter(t=>t.kind==='ok').length,warning?0:1);
+    if(warning)assert.match(riskNotice(f).textContent,/saving was not confirmed/);else assert.equal(riskNotice(f),undefined);
+  }
 });

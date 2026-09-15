@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,9 +56,12 @@ type adminSiteModel struct {
 	UpdatedAt                *string `json:"updated_at"`
 }
 
+var errAdminSitePersistence = errors.New("site storage unavailable")
+
 // adminSiteStore is the tenant-scoped Site persistence surface. Satisfied by *adminSiteFileStore (file/in-memory)
 // and *postgresAdminSiteStore. Every method is tenant-scoped: a tenant can never read/write another tenant's
 // Sites (the projection's cross-tenant fail-closed behavior is preserved end to end).
+
 type adminSiteStore interface {
 	List(ctx context.Context, tenantID string) ([]adminSiteModel, error)
 	Get(ctx context.Context, tenantID, siteID string) (adminSiteModel, bool, error)
@@ -142,18 +146,19 @@ func loadAdminSiteSnapshot(path string) ([]adminSiteModel, bool) {
 	return snapshot.Sites, true
 }
 
-// persistLocked atomically rewrites the durable snapshot. The caller must hold store.mu. No-op when path is "".
-// mutatedLocked records that the catalog changed and writes it out. Both, always: a change that persists
-// without advancing the generation is invisible to the fleet, and one that advances without persisting is
-// forgotten on restart. Called with the write lock held.
-func (store *adminSiteFileStore) mutatedLocked() {
+// mutatedLocked persists before advancing the generation. The caller holds the
+// write lock and restores its mutation if persistence fails.
+func (store *adminSiteFileStore) mutatedLocked() error {
+	if err := store.persistLocked(); err != nil {
+		return fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
 	store.generation++
-	store.persistLocked()
+	return nil
 }
 
-func (store *adminSiteFileStore) persistLocked() {
+func (store *adminSiteFileStore) persistLocked() error {
 	if store.path == "" {
-		return
+		return nil
 	}
 	sites := make([]adminSiteModel, 0, len(store.sites))
 	for _, site := range store.sites {
@@ -167,16 +172,16 @@ func (store *adminSiteFileStore) persistLocked() {
 	})
 	data, err := json.MarshalIndent(adminSiteSnapshot{Sites: sites}, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	tmp := store.path + ".tmp"
 	if err := os.MkdirAll(filepath.Dir(store.path), 0o750); err != nil {
-		return
+		return err
 	}
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
+		return err
 	}
-	_ = os.Rename(tmp, store.path)
+	return os.Rename(tmp, store.path)
 }
 
 func (store *adminSiteFileStore) List(_ context.Context, tenantID string) ([]adminSiteModel, error) {
@@ -236,8 +241,16 @@ func (store *adminSiteFileStore) Upsert(_ context.Context, site adminSiteModel, 
 	if err != nil {
 		return adminSiteModel{}, err
 	}
+	previous, existed := store.sites[key]
 	store.sites[key] = normalized
-	store.mutatedLocked()
+	if err := store.mutatedLocked(); err != nil {
+		if existed {
+			store.sites[key] = previous
+		} else {
+			delete(store.sites, key)
+		}
+		return adminSiteModel{}, err
+	}
 	return normalized, nil
 }
 
@@ -256,8 +269,12 @@ func (store *adminSiteFileStore) Delete(_ context.Context, tenantID, siteID stri
 	if _, ok := store.sites[key]; !ok {
 		return nil // idempotent
 	}
+	previous := store.sites[key]
 	delete(store.sites, key)
-	store.mutatedLocked()
+	if err := store.mutatedLocked(); err != nil {
+		store.sites[key] = previous
+		return err
+	}
 	return nil
 }
 

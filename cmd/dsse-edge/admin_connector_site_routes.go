@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -316,7 +318,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		saved, err := siteStore.Upsert(r.Context(), site, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_upserted", saved, evaluator, now), now)
@@ -357,7 +359,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		now := time.Now()
 		if err := siteStore.Delete(r.Context(), tenantID, siteID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_deleted", adminSiteModel{SiteID: siteID, TenantID: tenantID}, evaluator, now), now)
@@ -551,7 +553,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		result, found, err := adminSiteEnrollmentCommandIssue(r.Context(), siteStore, tenantID, r.PathValue("site_id"), params, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		if !found {
@@ -587,4 +589,14 @@ func namedNetworkVisibleToTenant(o model.VLANObject, ok bool, tenant string) boo
 	}
 	owner := strings.TrimSpace(o.TenantID)
 	return owner == "" || strings.TrimSpace(tenant) == "" || strings.EqualFold(owner, strings.TrimSpace(tenant))
+}
+
+// Keep storage paths and internal error details out of the administrative response.
+func writeAdminSiteStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAdminSitePersistence) {
+		log.Printf("site storage error: %v", err)
+		writeError(w, http.StatusInternalServerError, errAdminSitePersistence)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }

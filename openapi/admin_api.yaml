@@ -10708,6 +10708,15 @@ paths:
                 properties:
                   error:
                     type: string
+        "503":
+          description: New organization-and-ID record refused because the store is at capacity. Existing authorization and revocation records are retained; existing-ID mutations remain subject to validation and persistence checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/delegated-grants/{grant_id}:
     get:
       summary: Get a tenant-scoped Delegated Access Grant.
@@ -10869,6 +10878,15 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HumanApprovalMutationError"
+        "503":
+          description: New organization-and-ID record refused because the store is at capacity. Existing authorization and revocation records are retained; existing-ID mutations remain subject to validation and persistence checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/human-approval-events/{approval_id}:
     get:
       summary: Get a tenant-scoped Human Approval Event.

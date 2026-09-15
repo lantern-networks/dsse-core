@@ -32,6 +32,9 @@ func statusForAdminDecisionDetailError(err error) int {
 }
 
 func statusForDelegatedGrantError(err error) int {
+	if errors.Is(err, delegatedgrant.ErrCapacity) {
+		return http.StatusServiceUnavailable
+	}
 	if errors.Is(err, delegatedgrant.ErrPersistence) {
 		return http.StatusInternalServerError
 	}
@@ -65,6 +68,9 @@ func statusForToolCallEventError(err error) int {
 }
 
 func statusForHumanApprovalEventError(err error) int {
+	if errors.Is(err, humanapproval.ErrCapacity) {
+		return http.StatusServiceUnavailable
+	}
 	if errors.Is(err, humanapproval.ErrPersistence) {
 		return http.StatusInternalServerError
 	}

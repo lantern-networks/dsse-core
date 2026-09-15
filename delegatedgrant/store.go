@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,19 +14,19 @@ import (
 )
 
 // Store is the in-memory delegated-access-grant store: OOB-authenticated, short-lived east-west grants
-// (upsert / lookup / active-check / revoke), FIFO-bounded by capacity (capacity<=0 disables the bound).
+// (upsert / lookup / active-check / revoke), admission-bounded by capacity (capacity<=0 disables the bound).
+// Existing records, including revoked grants, are never evicted for a new ID.
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation write-throughs, so a
 // revoked grant stays revoked across a restart and in-flight grants are not lost.
 type Store struct {
 	mu         sync.RWMutex
 	grants     map[string]model.DelegatedAccessGrant
-	order      []string
 	capacity   int
 	persister  blobstore.Persister
 	generation uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
 }
 
-// NewStore builds a delegated-grant store with the given FIFO capacity. The bound is injected by
+// NewStore builds a delegated-grant store with the given admission capacity. The bound is injected by
 // cmd/edge (which reads it from the environment) so this package stays env-name-free.
 func NewStore(capacity int) *Store {
 	return &Store{grants: map[string]model.DelegatedAccessGrant{}, capacity: capacity}
@@ -65,7 +64,6 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	fresh := make(map[string]model.DelegatedAccessGrant, len(snap))
-	order := make([]string, 0, len(snap))
 	for _, grant := range snap {
 		if err := validKey(grant.TenantID, grant.ID); err != nil {
 			return err
@@ -75,14 +73,15 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 			return fmt.Errorf("duplicate saved delegated grant")
 		}
 		fresh[key] = grant
-		order = append(order, key)
 	}
-	// Legacy snapshots did not retain FIFO order. Use a deterministic fallback.
-	sort.Strings(order)
-	s.grants, s.order = fresh, order
+	// Preserve all records even when the configured capacity has been lowered.
+	s.grants = fresh
 
 	return nil
 }
+
+// ErrCapacity rejects a new identity without discarding authorization or revocation state.
+var ErrCapacity = errors.New("delegated grant store capacity reached; existing records retained")
 
 var ErrPersistence = errors.New("delegated grants could not be saved")
 
@@ -135,16 +134,17 @@ func (s *Store) Upsert(grant model.DelegatedAccessGrant) (model.DelegatedAccessG
 			return model.DelegatedAccessGrant{}, err
 		}
 	}
-	candidate, order := cloneGrants(s.grants), append([]string(nil), s.order...)
-	if !ok {
-		order = append(order, key)
+	// Forgetting a terminal record would allow a later upsert to reactivate the same ID.
+	// Reserve capacity only for new keys; updates and revocations must remain possible when full.
+	if !ok && s.capacity > 0 && len(s.grants) >= s.capacity {
+		return model.DelegatedAccessGrant{}, ErrCapacity
 	}
+	candidate := cloneGrants(s.grants)
 	candidate[key] = grant
-	order = evictFIFO(order, len(candidate), s.capacity, func(k string) { delete(candidate, k) })
 	if err := s.saveLocked(candidate); err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
-	s.grants, s.order = candidate, order
+	s.grants = candidate
 	s.generation++
 	return grant, nil
 }
@@ -198,7 +198,7 @@ func (s *Store) Count() int {
 	return len(s.grants)
 }
 
-// Capacity returns the configured FIFO capacity bound (<=0 means unbounded).
+// Capacity returns the configured admission capacity bound (<=0 means unbounded).
 func (s *Store) Capacity() int { return s.capacity }
 
 // Snapshot returns a copy of every grant. Admin list views (in cmd/edge) filter/sort/convert over this
@@ -284,23 +284,6 @@ func IsActive(grant model.DelegatedAccessGrant, now time.Time) bool {
 	return true
 }
 
-// evictFIFO drops oldest keys until liveLen <= capacity (replicated package-local FIFO bound).
-func evictFIFO(order []string, liveLen, capacity int, del func(key string)) []string {
-	if capacity <= 0 {
-		return order
-	}
-	for liveLen > capacity && len(order) > 0 {
-		oldest := order[0]
-		order = order[1:]
-		del(oldest)
-		liveLen--
-	}
-	if len(order) > 2*capacity {
-		order = append([]string(nil), order...)
-	}
-	return order
-}
-
 func stringPtr(value string) *string {
 	if value == "" {
 		return nil
@@ -354,13 +337,6 @@ func (s *Store) RemoveTenant(tenantID string) int {
 		}
 	}
 	if n > 0 {
-		order := s.order[:0]
-		for _, key := range s.order {
-			if _, ok := s.grants[key]; ok {
-				order = append(order, key)
-			}
-		}
-		s.order = order
 		s.persistLocked()
 	}
 	return n

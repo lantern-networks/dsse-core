@@ -815,8 +815,8 @@ func (config serverConfig) withDefaults() serverConfig {
 }
 
 // inMemoryEventStoreDefaultCapacity bounds the per-event in-memory stores (inspection / human-approval /
-// delegated-grant) so a long-running Edge does not grow them until OOM. Generous enough that active
-// TTL'd entries are never evicted within their window. Override via DSSE_EVENT_STORE_CAPACITY
+// delegated-grant). Inspection history uses FIFO; human approvals and delegated grants refuse new IDs
+// at capacity so authorization and revocation state is retained. Override via DSSE_EVENT_STORE_CAPACITY
 // (<=0 disables the bound; tests that construct the store directly stay unbounded).
 const inMemoryEventStoreDefaultCapacity = 50000
 

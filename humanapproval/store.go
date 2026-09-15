@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -15,18 +14,18 @@ import (
 )
 
 // Store is the in-memory human-approval-event store: out-of-band approval ceremony outcomes
-// (upsert / lookup / active-check / revoke) backing east-west step-up authorization, FIFO-bounded by
-// capacity (capacity<=0 disables the bound). Optionally durable: SetStatePath rehydrates from a JSON
-// snapshot and each mutation write-throughs, so approval outcomes survive a restart.
+// (upsert / lookup / active-check / revoke) backing east-west step-up authorization, admission-bounded by
+// capacity (capacity<=0 disables the bound). Existing records are never evicted for a new ID.
+// Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation writes through,
+// so approval outcomes survive a restart.
 type Store struct {
 	mu        sync.RWMutex
 	events    map[string]model.HumanApprovalEvent
-	order     []string
 	capacity  int
 	persister blobstore.Persister
 }
 
-// NewStore builds a human-approval-event store with the given FIFO capacity. The bound is injected by
+// NewStore builds a human-approval-event store with the given admission capacity. The bound is injected by
 // cmd/edge (which reads it from the environment) so this package stays env-name-free.
 func NewStore(capacity int) *Store {
 	return &Store{events: map[string]model.HumanApprovalEvent{}, capacity: capacity}
@@ -68,7 +67,6 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return fmt.Errorf("invalid human approval snapshot")
 	}
 	fresh := make(map[string]model.HumanApprovalEvent, len(snap))
-	order := make([]string, 0, len(snap))
 	for savedKey, event := range snap {
 		if err := validKey(event.TenantID, event.ID); err != nil {
 			return err
@@ -81,13 +79,14 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 			return fmt.Errorf("duplicate saved human approval")
 		}
 		fresh[key] = event
-		order = append(order, key)
 	}
-	// Existing snapshots do not retain insertion order. Do not silently discard records on load.
-	sort.Strings(order)
-	s.events, s.order, s.persister = fresh, order, p
+	// Preserve all records even when the configured capacity has been lowered.
+	s.events, s.persister = fresh, p
 	return nil
 }
+
+// ErrCapacity rejects a new identity without discarding authorization or revocation state.
+var ErrCapacity = errors.New("human approval store capacity reached; existing records retained")
 
 var ErrPersistence = errors.New("human approvals could not be saved")
 
@@ -138,16 +137,17 @@ func (s *Store) Upsert(event model.HumanApprovalEvent) (model.HumanApprovalEvent
 			return model.HumanApprovalEvent{}, err
 		}
 	}
-	candidate, order := cloneEvents(s.events), append([]string(nil), s.order...)
-	if !ok {
-		order = append(order, key)
+	// Forgetting a terminal record would allow a later upsert to reactivate the same ID.
+	// Reserve capacity only for new keys; updates and revocations must remain possible when full.
+	if !ok && s.capacity > 0 && len(s.events) >= s.capacity {
+		return model.HumanApprovalEvent{}, ErrCapacity
 	}
+	candidate := cloneEvents(s.events)
 	candidate[key] = event
-	order = evictFIFO(order, len(candidate), s.capacity, func(k string) { delete(candidate, k) })
 	if err := s.saveLocked(candidate); err != nil {
 		return model.HumanApprovalEvent{}, err
 	}
-	s.events, s.order = candidate, order
+	s.events = candidate
 	return event, nil
 }
 
@@ -192,7 +192,7 @@ func (s *Store) Count() int {
 	return len(s.events)
 }
 
-// Capacity returns the configured FIFO capacity bound (<=0 means unbounded).
+// Capacity returns the configured admission capacity bound (<=0 means unbounded).
 func (s *Store) Capacity() int { return s.capacity }
 
 // Snapshot returns a copy of every event. Admin list views (in cmd/edge) filter/sort/convert over this
@@ -294,23 +294,6 @@ func IsActive(event model.HumanApprovalEvent, now time.Time) bool {
 	return true
 }
 
-// evictFIFO drops oldest keys until liveLen <= capacity (replicated package-local FIFO bound).
-func evictFIFO(order []string, liveLen, capacity int, del func(key string)) []string {
-	if capacity <= 0 {
-		return order
-	}
-	for liveLen > capacity && len(order) > 0 {
-		oldest := order[0]
-		order = order[1:]
-		del(oldest)
-		liveLen--
-	}
-	if len(order) > 2*capacity {
-		order = append([]string(nil), order...)
-	}
-	return order
-}
-
 func stringPtr(value string) *string {
 	if value == "" {
 		return nil
@@ -364,13 +347,6 @@ func (s *Store) RemoveTenant(tenantID string) int {
 		}
 	}
 	if n > 0 {
-		order := s.order[:0]
-		for _, key := range s.order {
-			if _, ok := s.events[key]; ok {
-				order = append(order, key)
-			}
-		}
-		s.order = order
 		s.persistLocked()
 	}
 	return n

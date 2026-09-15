@@ -951,7 +951,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		} else {
 			for _, grant := range payload.DelegatedGrants.Grants {
 				if _, err := t.delegatedGrants.Upsert(grant); err != nil {
-					log.Printf("config-bundle sync: skipping invalid delegated grant %q from the control plane: %v", grant.ID, err)
+					// Continue so updates/revocations of retained IDs can still be applied at capacity.
+					// A rejected grant must leave the generation unapplied and eligible for retry.
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("delegated grant %q: %w", grant.ID, err))
 				}
 			}
 		}

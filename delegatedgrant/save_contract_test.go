@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
 
@@ -40,12 +39,15 @@ func TestRejectedGrantMutationsDoNotPublishOrEvict(t *testing.T) {
 	}
 	before, _ := p.Load()
 	gen := s.ConfigGeneration()
-	order := append([]string(nil), s.order...)
 	p.fail = true
 	for _, id := range []string{"first", "rejected"} {
 		g := sampleGrant("tenant", id)
 		g.ToolIDs = []string{"unwanted"}
-		if _, e := s.Upsert(g); !errors.Is(e, ErrPersistence) {
+		want := ErrPersistence
+		if id == "rejected" {
+			want = ErrCapacity
+		}
+		if _, e := s.Upsert(g); !errors.Is(e, want) {
 			t.Fatalf("upsert: %v", e)
 		}
 	}
@@ -54,7 +56,7 @@ func TestRejectedGrantMutationsDoNotPublishOrEvict(t *testing.T) {
 	}
 	after, _ := p.Load()
 	g, _ := s.GetForTenant("tenant", "first")
-	if string(before) != string(after) || s.ConfigGeneration() != gen || g.Status != "active" || len(g.ToolIDs) != 0 || s.Count() != 2 || !reflect.DeepEqual(s.order, order) {
+	if string(before) != string(after) || s.ConfigGeneration() != gen || g.Status != "active" || len(g.ToolIDs) != 0 || s.Count() != 2 {
 		t.Fatal("failed write published or evicted prior state")
 	}
 	p.fail = false
@@ -136,17 +138,23 @@ func TestGrantNamespaceRejectsInvalidAndDuplicateRecords(t *testing.T) {
 		t.Fatal("failed load replaced memory")
 	}
 }
-func TestRemovedGrantDoesNotCorruptCapacityOrder(t *testing.T) {
+func TestExplicitTenantRemovalReleasesAdmissionCapacity(t *testing.T) {
 	s := NewStore(2)
-	s.Upsert(sampleGrant("removed", "first"))
-	s.Upsert(sampleGrant("kept", "second"))
-	s.RemoveTenant("removed")
-	s.Upsert(sampleGrant("kept", "third"))
-	s.Upsert(sampleGrant("kept", "fourth"))
-	if s.Count() != 2 {
-		t.Fatalf("capacity corrupted by stale order: %d", s.Count())
+	for _, g := range []model.DelegatedAccessGrant{sampleGrant("removed", "first"), sampleGrant("kept", "second")} {
+		if _, e := s.Upsert(g); e != nil {
+			t.Fatal(e)
+		}
 	}
-	if _, ok := s.GetForTenant("kept", "second"); ok {
-		t.Fatal("oldest surviving record not evicted")
+	if n := s.RemoveTenant("removed"); n != 1 {
+		t.Fatalf("removed %d", n)
+	}
+	if _, e := s.Upsert(sampleGrant("kept", "third")); e != nil {
+		t.Fatal(e)
+	}
+	if _, e := s.Upsert(sampleGrant("kept", "fourth")); !errors.Is(e, ErrCapacity) {
+		t.Fatalf("admission: %v", e)
+	}
+	if _, ok := s.GetForTenant("kept", "second"); !ok || s.Count() != 2 {
+		t.Fatal("unrelated retained grant lost")
 	}
 }

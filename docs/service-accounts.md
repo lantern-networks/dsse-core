@@ -114,6 +114,34 @@ ID keys and reindexes them from record attribution; invalid/conflicting entries 
 loading instead of being discarded. Old writers must not share an upgraded snapshot,
 and downgrading the binary alone is unsupported. Previously overwritten records need a
 verified backup or deliberate re-registration. Empty/in-memory stores, non-atomic save
-warnings, tenant-removal persistence, shared capacity, FIFO order across restarts and
-retention of terminal outcomes remain separate operational limits. This index change
-does not establish multi-writer consistency or complete revocation retention.
+warnings, tenant-removal persistence and multiple writers remain separate operational
+limits. The index change does not establish multi-writer consistency.
+
+## Approval and delegation capacity
+
+Human approvals and delegated grants retain their existing records, including explicit
+revoked, denied or expired outcomes. New records do not evict old authorization state.
+When either store reaches its limit, a new organization-and-ID pair returns HTTP 503
+with a `store capacity reached; existing records retained` error. Existing-ID updates
+and revocations remain possible, subject to their normal validation and storage checks.
+A terminal record cannot be reactivated by sending the same ID with a fresh expiry.
+
+`DSSE_EVENT_STORE_CAPACITY` defaults to 50,000 records **per store**, shared across the
+organizations on that process. This setting also controls inspection history, which
+still uses FIFO retention. It is not a per-organization quota. A value of zero or less
+removes the limit and needs memory planning.
+
+Approval and delegation records are not automatically pruned when they expire. Inspect
+store counts, then increase the configured capacity on the control plane and affected
+Edges as needed, preserving the existing snapshots. A restart with a lower limit loads
+all saved records and refuses new IDs until there is room; it does not truncate saved
+revocations. Do not delete authorization snapshots to make room. Backups and durable
+storage remain necessary: an empty in-memory store cannot retain revocations across a
+restart. This change does not recover records already lost to earlier eviction.
+
+If an Edge rejects a delegated grant during configuration synchronization, that
+configuration generation stays unapplied and is retried. Other grants in that bundle,
+including revocations of retained IDs, are still attempted. Some sections can already
+have changed; a synchronization error is not a rollback. Check fleet synchronization
+status after increasing capacity or repairing storage. Control-plane acceptance alone
+does not confirm every Edge has adopted a change.

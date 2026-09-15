@@ -89,7 +89,7 @@ func TestApprovalRejectedUpsertDoesNotPublishOrEvict(t *testing.T) {
 				}
 			}
 			p.fail = false
-			putApproval(t, s, "a", "other")
+			putApproval(t, s, "a", "existing")
 			reloaded := NewStore(0)
 			if e := reloaded.SetPersister(p); e != nil {
 				t.Fatal(e)

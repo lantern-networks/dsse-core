@@ -179,6 +179,27 @@ Console also displays other effective contributions. A saved rule is configurati
 evidence, and the application's allow/deny result plus logs is enforcement evidence.
 Use [Verification](verification.md) to record them separately.
 
+### Save failures and retries
+
+With persistence configured, an authored rule is published and recompiled only
+after its snapshot save succeeds. A failed create, edit, disable, or delete returns
+an error and keeps the previous live rule set. Restore storage and reload the list
+before retrying. A storage error can still follow an uncertain commit, so reconcile
+the saved state before restarting the process. In-memory stores provide no restart
+durability.
+
+If the response is lost or incomplete, do not assume that nothing was saved. The
+Console keeps the draft and its rule ID for a retry within the same editor. API
+clients should also reuse the same ID after checking the current rule. A new draft
+with another ID can create a duplicate. The Console refuses incomplete catalog
+responses and requires the current customer context before submitting a change.
+
+In **Logs & Audit**, the audit stream records `admin_authored_rule_changed` with
+the actor, customer, rule ID, operation, result, and a digest of the rule. Rule names
+and destination selectors are omitted. `saved` confirms the rule-store operation;
+`persistence_unconfirmed` requires reconciliation. Neither result proves that a
+remote Edge or an existing connection has adopted the change.
+
 Implementation references: [rule model](../policyrule/policyrule.go),
 [egress compilation](../policyrule/compile_egress.go),
 [inspection selection](../policyrule/compile.go), [Console editor](../console/rules.js),

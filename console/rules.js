@@ -65,8 +65,8 @@ function renderEgressView(content) {
         // ★ WRITTEN FOR THE PERSON WHO HAS TO USE IT (2026-08-17, read as a customer administrator). It said
         // "north-south access", "there is no observe mode here" and "source → destination : service" — three
         // pieces of our own vocabulary in two sentences, on the screen a customer reaches for first.
-        en: "Everything your people reach on the internet is allowed and inspected. Add a rule to block a destination, or to let one through uninspected.",
-        ja: "社内の人がインターネットで開くものは、すべて許可され、内容を検査します。特定の宛先を遮断する、または検査せずに通す場合はルールを追加します。",
+        en: "Manage access and inspection rules for internet destinations. Actual inspection also depends on Inspection Settings, device configuration and other exclusions.",
+        ja: "インターネットの宛先へのアクセスと検査ルールを管理します。実際の検査範囲は傍受設定・端末設定・他の除外にも従います。",
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add rule", ja: "+ ルールを追加" }),
@@ -82,7 +82,8 @@ function renderEgressView(content) {
 async function loadList(path) {
   const r = await apiFetch("GET", path);
   if (!r.ok) throw new Error("HTTP " + r.status + (typeof r.body === "string" && r.body ? " " + r.body : ""));
-  return Array.isArray(r.body) ? r.body : [];
+  if (!Array.isArray(r.body)) throw new Error("Invalid catalog response");
+  return r.body;
 }
 
 // catalogIndex loads the asset catalog once and returns lookups for display + editor pickers.
@@ -273,25 +274,33 @@ function authoredRow(r, idx, section, plane, direction) {
   const edit = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }),
     onClick: () => openRuleEditor(plane, direction, () => renderRuleList(section, plane, direction), r) });
 
-  const toggle = el("button", { class: "ui-btn ui-btn-sm", text: active ? bl({ en: "Disable", ja: "無効化" }) : bl({ en: "Enable", ja: "有効化" }),
-    title: active ? bl({ en: "Currently active — turn off (the rule is kept, just inert)", ja: "現在有効 — 無効化(ルールは残り、効かなくなるだけ)" }) : bl({ en: "Currently disabled — turn on", ja: "現在無効 — 有効化" }),
-    onClick: async () => {
-      toggle.disabled = true;
-      const resp = await apiFetch("POST", "/admin/rules", Object.assign({}, r, { status: active ? "disabled" : "active" }));
-      if (!resp.ok) { toggle.disabled = false; uiToast(httpErr(resp), "err"); return; }
-      uiToast(active ? bl({ en: "Rule disabled.", ja: "ルールを無効化しました。" }) : bl({ en: "Rule enabled.", ja: "ルールを有効化しました。" }), "ok");
-      renderRuleList(section, plane, direction);
-    } });
-
-  const del = el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }),
-    onClick: async () => {
-      const ok = await uiConfirm({ title: bl({ en: "Delete this rule?", ja: "このルールを削除しますか?" }), body: r.name || r.id, confirmLabel: bl({ en: "Delete", ja: "削除" }), danger: true });
-      if (!ok) return;
-      const resp = await apiFetch("DELETE", "/admin/rules/" + encodeURIComponent(r.id));
-      if (!resp.ok) { uiToast(httpErr(resp), "err"); return; }
-      uiToast(bl({ en: "Rule deleted.", ja: "ルールを削除しました。" }), "ok");
-      renderRuleList(section, plane, direction);
-    } });
+  let pending = false;
+  const run = async operation => {
+    if (pending || section.isConnected === false) return;
+    pending = true;
+    const controls = [edit,toggle,del]; controls.forEach(e => e.disabled = true);
+    try {
+      if (await ruleEditorTenant() !== r.tenant_id) throw new Error(ruleUnknownOutcome());
+      if (section.isConnected === false) return;
+      if (await operation() === true) await renderRuleList(section,plane,direction);
+    } catch(e) { uiToast((e.message || String(e))+" "+ruleUnknownOutcome(),"err"); }
+    finally { pending = false; controls.forEach(e => e.disabled = false); }
+  };
+  const toggle = el("button", { class:"ui-btn ui-btn-sm", text:active ? bl({en:"Disable",ja:"無効化"}) : bl({en:"Enable",ja:"有効化"}), onClick:()=>run(async()=>{
+    const body = Object.assign({},r,{status:active ? "disabled" : "active"});
+    const resp = await apiFetch("POST","/admin/rules",body);
+    validateRuleSave(resp,body,r.tenant_id);
+    uiToast(bl({en:"Rule status saved.",ja:"ルールの状態を保存しました。"}),"ok");
+    return true;
+  })});
+  const del = el("button", {class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Delete",ja:"削除"}),onClick:()=>run(async()=>{
+    if (!await uiConfirm({title:bl({en:"Delete this rule?",ja:"このルールを削除しますか?"}),body:r.name || r.id,confirmLabel:bl({en:"Delete",ja:"削除"}),danger:true})) return false;
+    if (section.isConnected === false || await ruleEditorTenant() !== r.tenant_id) throw new Error(ruleUnknownOutcome());
+    const resp = await apiFetch("DELETE","/admin/rules/"+encodeURIComponent(r.id));
+    if (!resp?.ok) throw new Error(httpErr(resp));
+    if (resp.status!==200 || resp.body?.status!=="deleted" || resp.body?.id!==r.id) throw new Error(ruleUnknownOutcome());
+    uiToast(bl({en:"Rule deleted.",ja:"ルールを削除しました。"}),"ok");return true;
+  })});
 
   return el("tr", {}, [
     el("td", {}, [
@@ -563,15 +572,17 @@ function openCertPinDetails(rules, idx, section, plane, direction) {
 // (upsert) — i.e. Edit; otherwise it creates a new rule.
 async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) {
   existing = existing || null;
+  let savePending = false, writeAttempted = false;
   let savedOk = false; // set true on a successful save so onCancelled (below) does NOT fire on close
-  let idx;
-  try { idx = await catalogIndex(); }
+  let idx, editorTenant;
+  try { [idx, editorTenant] = await Promise.all([catalogIndex(), ruleEditorTenant()]); }
   catch (e) { uiToast(bl({ en: "Could not load the catalog: ", ja: "カタログを読み込めません: " }) + (e.message || e), "err"); return; }
 
   const eAction = (existing && existing.action) || {};
   // existing WITH an id = Edit; existing WITHOUT an id = a PRE-FILLED new rule (e.g. adopting an observed flow) —
   // review + Save creates it. No existing = a blank new rule.
   const isEdit = !!(existing && existing.id);
+  const draftRuleID = isEdit ? existing.id : "rule-" + crypto.randomUUID();
   const title = isEdit
     ? bl({ en: "Edit rule", ja: "ルールを編集" })
     : existing
@@ -836,12 +847,14 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   ] });
   const m = uiModal({ title, body: [prioF.el, nameF.el, src.el, agentWrap, dst.el, svcF.el, accessF.el, assuranceWrap, inspF.el, riskF.el].concat(plane === "east_west" ? [stageF.el] : []).concat(plane === "egress" ? [dlpWrap] : []),
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-    // If the editor is dismissed WITHOUT a successful save (Cancel / Esc / backdrop), let the caller undo any
-    // object it pre-created for this editor (e.g. an adopted-flow destination endpoint) — nothing applied.
-    onClose: () => { if (!savedOk && typeof onCancelled === "function") onCancelled(); } });
+    // Clean up a pre-created dependency only if no write was attempted. An unconfirmed response
+    // may follow a committed rule that still references that dependency.
+    onClose: () => { if (!savedOk && !writeAttempted && typeof onCancelled === "function") onCancelled(); } });
 
   submit.addEventListener("click", async () => {
-    if (!prioF.validate()) return;
+    if (savePending || !m.el.isConnected || !prioF.validate()) return;
+    const priority = Number(prioF.get());
+    if (!/^-?\d+$/.test(prioF.get().trim()) || !Number.isSafeInteger(priority)) { uiToast(bl({en:"Priority must be a whole number.",ja:"優先度は整数で入力してください。"}),"err"); return; }
     const source = src.selected();
     let destination = dst.selected();
     const agentRule = source.some((s) => typeof s === "string" && s.indexOf(AGENT_PREFIX) === 0);
@@ -849,7 +862,8 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
     if (agentRule && !destination.length) destination = [SUBJECT_ANY];
     if (!source.length || !destination.length) { uiToast(bl({ en: "Pick a source and a destination.", ja: "送信元と宛先を選択してください。" }), "err"); return; }
 
-    const action = { access: accessF.get(), inspection: inspF.get() };
+    const action = Object.assign({}, eAction, { access: accessF.get(), inspection: inspF.get() });
+    for (const key of ["required_idp_id","min_acr","required_amr","max_age_seconds","device_attested_auto","dlp"]) delete action[key];
     if (plane === "egress" && dlpPolicyF.get()) {
       // DLP is applied by referencing a named DLP policy (the only model) — it supplies detectors + action + scope.
       action.dlp = { policy_id: dlpPolicyF.get() };
@@ -864,25 +878,43 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
       if (deviceAttestedF.get()) action.device_attested_auto = true; // machine/non-interactive: device attestation in lieu of a human ceremony
     }
 
-    const body = { plane, priority: parseInt(prioF.get(), 10) || 0, name: nameF.get(), source, destination, service_id: svcF.get() || undefined, action };
+    const body = { plane, priority, name: nameF.get(), source, destination, service_id: svcF.get() || undefined, action };
     if (riskF.get()) body.risk_at_least = riskF.get(); // risk gate → compiles to a risk_state_severity condition
     // Agent rule: carry the tool boundary → compiles to the policy's allowed_tool_ids.
     if (agentRule) { const tools = toolsF.get().split(",").map((s) => s.trim()).filter(Boolean); if (tools.length) body.allowed_tool_ids = tools; }
     if (plane === "east_west") body.direction = (existing && existing.direction) || direction;
     if (plane === "east_west") body.stage = stageF.get(); // learning-lifecycle stage (enforce|warn)
-    // Edit (existing WITH an id): keep the same rule id (upsert) + preserve status. A PRE-FILLED new rule
-    // (existing without an id, e.g. adopting an observed flow) sets no id ⇒ the backend creates a fresh rule.
-    if (existing && existing.id) { body.id = existing.id; body.status = existing.status; }
+    // Preserve the rule ID on edits and retries, including a new draft with an unconfirmed response.
+    body.id = draftRuleID;
+    if (existing && existing.id) body.status = existing.status;
 
-    submit.disabled = true;
-    const resp = await apiFetch("POST", "/admin/rules", body);
-    if (!resp.ok) { submit.disabled = false; uiToast(httpErr(resp), "err"); return; }
-    savedOk = true; // a real save — onClose must NOT undo the pre-created endpoint
-    m.close();
-    const warning = resp.body && resp.body.warning;
-    if (warning) uiToast(bl({ en: "Saved with a warning: ", ja: "警告付きで保存: " }) + warning, "info");
-    else uiToast(bl({ en: "Rule saved.", ja: "ルールを保存しました。" }), "ok");
-    onSaved();
+    savePending = true;
+    const controls = [...m.el.querySelectorAll("button,input,select,textarea")].map(e => [e,e.disabled]);
+    controls.forEach(([e]) => e.disabled = true);
+    m.el.querySelectorAll(".rule-save-error").forEach(e => e.remove());
+    try {
+      if (await ruleEditorTenant() !== editorTenant) throw new Error(ruleUnknownOutcome());
+      if (!m.el.isConnected) return;
+      writeAttempted = true;
+      const resp = await apiFetch("POST", "/admin/rules", body);
+      validateRuleSave(resp, body, editorTenant);
+      savedOk = true;
+      m.close();
+      const warning = resp.body && resp.body.warning;
+      if (warning) uiToast(bl({ en: "Saved with a warning: ", ja: "警告付きで保存: " }) + warning, "info");
+      else uiToast(bl({ en: "Rule saved.", ja: "ルールを保存しました。" }), "ok");
+      onSaved();
+    } catch(e) {
+      if (m.el.isConnected) {
+        const message = e.message || String(e), guidance = ruleUnknownOutcome();
+        const notice = el("p",{class:"rule-save-error ui-callout ui-callout-warn",role:"alert",text:message.includes(guidance) ? message : message+" "+guidance});
+        m.el.querySelector(".ui-modal-body").prepend(notice);
+        notice.scrollIntoView({block:"nearest"});
+      }
+    } finally {
+      savePending = false;
+      controls.forEach(([e,disabled]) => e.disabled = disabled);
+    }
   });
 
   syncAgent(); // reflect an agent source (show the tool-boundary field) on open, incl. Edit of an existing agent rule
@@ -1144,4 +1176,41 @@ function ruleFlowText(entry) {
     ? bl({ en: parts.length + " destination groups", ja: "宛先 " + parts.length + " グループ" })
     : dest;
   return entry.source_text + " → " + shown + " : " + entry.service_text;
+}
+
+function ruleUnknownOutcome() {
+  return bl({en:"The outcome is unconfirmed. Reload the rule list and check it before creating or retrying a rule.",ja:"結果を確認できません。作成や再試行の前にルール一覧を再読込して確認してください。"});
+}
+async function ruleEditorTenant() {
+  const r = await apiFetch("GET","/admin/tenant");
+  if (!r?.ok || typeof r.body?.tenant_id !== "string" || !r.body.tenant_id) throw new Error(ruleUnknownOutcome());
+  return r.body.tenant_id;
+}
+function validateRuleSave(response, expected, tenant) {
+  if (!response?.ok) throw new Error(httpErr(response));
+  const saved = response.body;
+  if (response.status!==200 || !saved || typeof saved.id!=="string" || !saved.id || saved.tenant_id!==tenant || (expected.id && saved.id!==expected.id)) throw new Error(ruleUnknownOutcome());
+  for (const key of ["plane","direction","priority","name","service_id","status","stage","risk_at_least"]) {
+    let value = expected[key];
+    if (key==="status" && !value) value="active";
+    if (key==="stage" && !value) value="enforce";
+    if (key==="direction" && expected.plane==="east_west" && !value) value="outbound";
+    if ((saved[key] ?? "") !== (value ?? "")) throw new Error(ruleUnknownOutcome());
+  }
+  for (const key of ["source","destination","allowed_tool_ids"]) {
+    const want = expected[key] || [];
+    if (JSON.stringify(saved[key] || []) !== JSON.stringify(want)) throw new Error(ruleUnknownOutcome());
+  }
+  const action = Object.assign({},expected.action,{inspection:expected.action?.inspection || "inspect"});
+  for (const [key,value] of Object.entries(action)) {
+    if (value===false || value===0 || value==="" || value==null) { if (saved.action?.[key] && saved.action[key]!==value) throw new Error(ruleUnknownOutcome()); }
+    else if (!ruleExpectedValue(saved.action?.[key],value)) throw new Error(ruleUnknownOutcome());
+  }
+  return saved;
+}
+
+function ruleExpectedValue(actual, expected) {
+  if (Array.isArray(expected)) return JSON.stringify(actual) === JSON.stringify(expected);
+  if (expected && typeof expected === "object") return actual && Object.entries(expected).every(([key,value]) => ruleExpectedValue(actual[key],value));
+  return actual === expected;
 }

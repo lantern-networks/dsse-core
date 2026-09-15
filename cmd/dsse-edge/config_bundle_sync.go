@@ -1049,6 +1049,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// assetcatalog/distribution.go and policyrule/distribution.go. Briefly: the catalog has three owners (CP,
 	// enrolled-device sync, built-ins) so replacing it would delete the other two every pull; the rule set has
 	// one owner, and an authored allow/bypass that survives its own deletion fails permissive.
+	if payload.Rules != nil && t.rules == nil {
+		criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rule target is unavailable"))
+	}
 	if payload.Rules != nil && t.rules != nil {
 		// ★ PRESENT-BUT-EMPTY CLEARS, and this is the one section where it must — reversing the rule every
 		// other section follows, after live testing showed the alternative is broken (2026-08-10).

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	assetcatalog "github.com/lantern-networks/dsse-core/assetcatalog"
 	policyrule "github.com/lantern-networks/dsse-core/policyrule"
@@ -67,7 +68,8 @@ func adoptServiceIDForObservation(assets *assetcatalog.Store, tenant string, por
 // logs reference the named authored rule); these reuse the admin.policy.* RBAC scope (rules are policy
 // authoring). East-west INBOUND rules are validated against their receivers' platforms (resolved from the
 // asset catalog) — inbound enforces on Windows WFP only.
-func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, rules *policyrule.Store, assets *assetcatalog.Store, onRulesChanged func(), onRuleDeleted func(tenantID, ruleID string), configSourceURL string) {
+func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, rules *policyrule.Store, assets *assetcatalog.Store, onRulesChanged func(), onRuleDeleted func(tenantID, ruleID string), configSourceURL string, auditMutation func(*http.Request, policyrule.Rule, string, string)) {
+	var mutationMu sync.Mutex
 	mux.HandleFunc("GET /admin/rules", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		tenant := adminTenantIDFromRequest(r)
 		listed := rules.List(tenant, r.URL.Query().Get("plane"))
@@ -110,9 +112,29 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			writeError(w, http.StatusBadRequest, verr)
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := rules.Upsert(rule)
+		if auditMutation != nil {
+			result := "saved"
+			if err != nil {
+				result = "rejected"
+				if errors.Is(err, policyrule.ErrPersistence) {
+					result = "persistence_unconfirmed"
+				}
+			}
+			item := stored
+			if err != nil {
+				item = rule
+			}
+			auditMutation(r, item, "upsert", result)
+		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, policyrule.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Saving the rule was not confirmed. The previous live rules remain active. Restore storage, reload and retry."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		// Say it at the moment it is written, too. An administrator who has just typed a hostname into a field
@@ -141,9 +163,22 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		}
 		tenant := adminTenantIDFromRequest(r)
 		id := r.PathValue("id")
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
+		previous, _ := rules.Get(tenant, id)
+		previous.TenantID, previous.ID = tenant, id
 		ok, err := rules.Delete(tenant, id)
+		if auditMutation != nil {
+			result := "saved"
+			if err != nil {
+				result = "persistence_unconfirmed"
+			} else if !ok {
+				result = "not_found"
+			}
+			auditMutation(r, previous, "delete", result)
+		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err) // deleted in memory but not persisted — would resurrect on restart
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("Saving the rule deletion was not confirmed. The previous live rules remain active. Restore storage, reload and retry."))
 			return
 		}
 		if !ok {

@@ -43,7 +43,7 @@ func (s *Store) Snapshot() []Rule {
 	out := []Rule{}
 	for _, byID := range s.rules {
 		for _, r := range byID {
-			out = append(out, r)
+			out = append(out, cloneRule(r))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -70,6 +70,7 @@ func (s *Store) Snapshot() []Rule {
 func (s *Store) ReplaceAll(rules []Rule) error {
 	next := map[string]map[string]Rule{}
 	for _, r := range rules {
+		r = cloneRule(r)
 		if err := r.normalizeAndValidate(); err != nil {
 			return fmt.Errorf("rule %s (tenant %s): %w", r.ID, r.TenantID, err)
 		}
@@ -79,14 +80,12 @@ func (s *Store) ReplaceAll(rules []Rule) error {
 		if next[r.TenantID] == nil {
 			next[r.TenantID] = map[string]Rule{}
 		}
+		if _, exists := next[r.TenantID][r.ID]; exists {
+			return fmt.Errorf("duplicate distributed rule id")
+		}
 		next[r.TenantID][r.ID] = r
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.rules = next
-	s.generation++
-	if err := s.persistLocked(); err != nil {
-		return fmt.Errorf("distributed rule set applied in memory but not persisted (would revert on restart): %w", err)
-	}
-	return nil
+	return s.saveCandidateLocked(next, s.seq)
 }

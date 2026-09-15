@@ -10444,7 +10444,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create or update a unified rule.
-      description: Requires admin.policy.write. Upserts a rule and recompiles enforcement (egress bypass set + compiled east-west rule set). `service_id` is optional; omitted or empty means Any — no service scope (east-west matches every service family, egress matches every destination port). Inbound rules are validated against their receivers' platforms (inbound enforces on Windows WFP only); a non-fatal warning may be returned.
+      description: Requires admin.policy.write. With persistence configured, saves a candidate before publishing it and recompiling enforcement. A save error keeps the previous live rules. After an unconfirmed response, reload and reconcile the rule before retrying with the same ID. Config-sourced nodes reject direct writes. `service_id` is optional; omitted or empty means Any — no service scope (east-west matches every service family, egress matches every destination port). Inbound rules are validated against their receivers' platforms (inbound enforces on Windows WFP only); a non-fatal warning may be returned.
       tags:
         - AdminRules
       requestBody:
@@ -10462,10 +10462,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Authored rules are managed by the configuration source.
+        "500":
+          description: Rule persistence was not confirmed; previous live rules remain active. Reconcile storage before retrying or restarting.
   /admin/rules/{id}:
     delete:
       summary: Delete an authored rule.
-      description: Requires admin.policy.write. Removes the rule and recompiles enforcement.
+      description: Requires admin.policy.write. With persistence configured, saves the deletion before removing the live rule and recompiling enforcement. Config-sourced nodes reject direct writes.
       tags:
         - AdminRules
       parameters:
@@ -10483,6 +10487,10 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: Authored rules are managed by the configuration source.
+        "500":
+          description: Deletion persistence was not confirmed; the previous live rule remains active. Reconcile storage before retrying or restarting.
   /admin/agent-tools:
     get:
       summary: List tenant-scoped Agent Tool Registry entries.

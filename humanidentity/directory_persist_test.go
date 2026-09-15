@@ -150,20 +150,19 @@ func TestPersistErrorIsReportedNotSwallowed(t *testing.T) {
 	if err := s.SetPersister(failingPersister{err: errTestDiskFull}); err != nil {
 		t.Fatalf("SetPersister: %v", err)
 	}
-	if _, err := s.Upsert(ctx, model.HumanIdentity{ID: "u1", TenantID: "acme", Subject: "alice@acme.example"}, "acme", time.Now()); err != nil {
-		t.Fatalf("Upsert: %v", err)
+	if _, err := s.Upsert(ctx, model.HumanIdentity{ID: "u1", TenantID: "acme", Subject: "alice@acme.example"}, "acme", time.Now()); !errors.Is(err, ErrDirectoryPersistence) {
+		t.Fatalf("Upsert error = %v, want persistence failure", err)
 	}
 	if got == nil {
 		t.Fatal("a failed save was swallowed; the operator would believe the directory is durable when it is not")
 	}
-	// The mutation itself still applies: the in-memory store is serving, and refusing the operator's change
-	// because the disk is unhappy is a different and worse failure.
+	// A rejected save must neither publish the identity nor advance the bundle version.
 	users, err := s.List(ctx, "acme")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(users) != 1 {
-		t.Fatalf("identities = %#v, want the mutation to still apply", users)
+	if len(users) != 0 || s.ConfigGeneration() != 0 {
+		t.Fatalf("rejected mutation was published: identities=%#v generation=%d", users, s.ConfigGeneration())
 	}
 }
 

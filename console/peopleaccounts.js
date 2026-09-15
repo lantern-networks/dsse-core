@@ -47,6 +47,51 @@ function renderPeopleView(content) {
 async function paGet(path, plane) { const r = await apiFetch("GET", path, undefined, plane); if (!r.ok) throw new Error("HTTP " + r.status); return r.body || {}; }
 async function paList(path, key, plane) { const b = await paGet(path, plane); return (b && b[key]) || []; }
 
+// People dependencies are required: unavailable health/risk is not an empty or
+// normal directory. Validate before exposing mutation controls.
+function paObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function paArray(body, key) {
+  if (!paObject(body) || !Object.hasOwn(body, key) || (body[key] !== null && !Array.isArray(body[key]))) throw new Error("Invalid directory response");
+  return body[key] || [];
+}
+function paText(value) { return typeof value === "string" && value.trim() !== ""; }
+function paPerson(value) {
+  return paObject(value) && ["id", "tenant_id", "subject", "source"].every(key => paText(value[key])) &&
+    ["active", "suspended", "deleted"].includes(value.status) &&
+    ["email", "display_name", "department", "last_seen_at", "expires_at"].every(key => value[key] == null || typeof value[key] === "string");
+}
+async function paLoadPeople() {
+  const [health, sourceBody, runBody, peopleBody, risk] = await Promise.all([
+    paGet("/admin/human-identities/sources/health", _PA_DIR),
+    paGet("/admin/human-identities/sources", _PA_DIR),
+    paGet("/admin/human-identities/import-runs", _PA_DIR),
+    paGet("/admin/human-identities", _PA_DIR),
+    paGet("/admin/risk-signals", _PA_ENF),
+  ]);
+  const sources = paArray(sourceBody, "sources"), runs = paArray(runBody, "runs"), people = paArray(peopleBody, "identities");
+  const healthSources = paArray(health, "sources");
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  if (!paText(health.status) || !count(health.source_count) || health.source_count !== healthSources.length ||
+      !Number.isFinite(health.stale_after_seconds) || health.stale_after_seconds <= 0 ||
+      !healthSources.every(row => paObject(row) && paText(row.source) && paText(row.status)) ||
+      !sources.every(row => paObject(row) && paText(row.source) && ["total", "active", "expired"].every(key => count(row[key])) && (row.observed_at == null || typeof row.observed_at === "string")) ||
+      !runs.every(row => paObject(row) && paText(row.import_run_id) && (row.source == null || typeof row.source === "string") && count(row.upserted) && count(row.deactivated)) ||
+      !people.every(paPerson) || !paObject(risk) || !paObject(risk.high_risk) ||
+      !Object.values(risk.high_risk).every(value => ["medium", "high", "critical"].includes(value))) throw new Error("Invalid directory response");
+  return {health, sources, runs, people, riskMap: risk.high_risk};
+}
+function paMutationError(r) {
+  const detail = r && r.body && (r.body.error || r.body.message);
+  return typeof detail === "string" ? detail : "HTTP " + (r && r.status || "unknown");
+}
+function paUnconfirmedChange() {
+  return bl({ en: "The directory change could not be confirmed. Reload the list before trying again; the change may already have been applied.", ja: "変更結果を確認できません。一覧を再読込してから再試行してください。変更は反映済みの可能性があります。" });
+}
+function paConfirmPerson(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  if (!paPerson(r.body) || r.body.id !== expected.id || r.body.subject !== expected.subject || r.body.source !== expected.source || r.body.status !== expected.status || (expected.tenant_id && r.body.tenant_id !== expected.tenant_id) || (r.body.email || "") !== (expected.email || "")) throw new Error(paUnconfirmedChange());
+}
+
 // paWriteEnforcement writes an enforcement-config resource (delegated grant, service account / NHI, agent policy).
 // It goes to the ENFORCEMENT Edge by default — where this single-edge lab decides, so a grant lands exactly where
 // the decision engine reads it. If the Edge is a config-PULLER (a fleet: -config-source-url set) it rejects the
@@ -75,21 +120,11 @@ async function setUserRisk(u, severity, section) {
 async function paPeople(section) {
   uiState(section, "loading");
   const current = freshRender(section);
-  let health, sources, runs, people;
+  let health, sources, runs, people, riskMap;
   try {
-    [health, sources, runs, people] = await Promise.all([
-      paGet("/admin/human-identities/sources/health", _PA_DIR).catch(() => ({})),
-      paList("/admin/human-identities/sources", "sources", _PA_DIR).catch(() => []),
-      paList("/admin/human-identities/import-runs", "runs", _PA_DIR).catch(() => []),
-      paList("/admin/human-identities", "identities", _PA_DIR),
-    ]);
+    ({health, sources, runs, people, riskMap} = await paLoadPeople());
   } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); return; }
-  // Removed identities (the sync's soft-delete terminal state) are not part of the live directory — hide them.
-  people = (people || []).filter((u) => (u.status || "").toLowerCase() !== "deleted");
-  // Current high-risk marks (the shared overlay lives on the enforcement Edge), so each person's own row shows +
-  // sets their risk — no free-text id. Best-effort. Keyed by the person's id (the IdP subject the decision uses).
-  let riskMap = {};
-  try { const rk = await apiFetch("GET", "/admin/risk-signals", null, _PA_ENF); if (rk && rk.ok && rk.body && rk.body.high_risk) riskMap = rk.body.high_risk; } catch (e) { /* best-effort */ }
+  people = people.filter((u) => u.status !== "deleted");
   if (!current()) return;
   section.innerHTML = "";
 
@@ -99,10 +134,10 @@ async function paPeople(section) {
   const hb = el("div", { class: "pa-health " + (health.status === "ok" ? "pa-health-ok" : health.status ? "pa-health-warn" : "") });
   hb.appendChild(el("strong", { text: synced
     ? bl({ en: (health.source_count) + " identity source(s) · ", ja: "identity ソース " + (health.source_count) + " 件 · " }) + (health.status === "ok" ? bl({ en: "healthy", ja: "健全" }) : (health.status || "—"))
-    : bl({ en: "No identity source connected", ja: "identity ソース未接続" }) }));
+    : bl({ en: "No identity sources recorded", ja: "identity ソースの記録がありません" }) }));
   hb.appendChild(el("div", { class: "ui-view-desc", text: synced
-    ? bl({ en: "People are synced from your IdP/HR directory" + (staleDays ? "; a source is stale after " + staleDays + " day(s)." : "."), ja: "ユーザーは IdP/HR ディレクトリから同期されます" + (staleDays ? "; " + staleDays + " 日で stale 扱い。" : "。") })
-    : bl({ en: "People are normally synced from an IdP/HR directory. None is connected yet — the list below is manual entries only.", ja: "ユーザーは通常 IdP/HR ディレクトリから同期します。未接続のため、下の一覧は手動エントリのみです。" }) }));
+    ? bl({ en: "Source health includes manual entries and imported identities" + (staleDays ? "; a source is stale after " + staleDays + " day(s)." : "."), ja: "手動エントリと取り込んだユーザーのソース状態です" + (staleDays ? "; " + staleDays + " 日で stale 扱い。" : "。") })
+    : bl({ en: "No directory entries or source configuration have been recorded yet.", ja: "ユーザーやソース設定はまだ記録されていません。" }) }));
   section.appendChild(hb);
 
   // Sources (per-source counts + freshness) — the value that was previously hidden.
@@ -146,8 +181,8 @@ async function paPeople(section) {
             paRemoveBtn(
               bl({ en: "Remove this identity from the directory?", ja: "この identity をディレクトリから除去?" }),
               bl({ en: "It leaves the live directory (soft-remove). Access is decided by sign-in + rules, so this does not change access.", ja: "ライブディレクトリから外れます(ソフト除去)。アクセスはサインイン+ルールで決まるため変わりません。" }),
-              () => apiFetch("POST", "/admin/human-identities", { id: u.id, subject: u.subject, email: u.email, source: u.source || "manual", status: "deleted" }, _PA_DIR),
-              () => paPeople(section)),
+              () => apiFetch("POST", "/admin/human-identities", { ...u, status: "deleted" }, _PA_DIR),
+              () => paPeople(section), r => paConfirmPerson(r, { ...u, status: "deleted" })),
           ]),
         ];
       })
@@ -166,14 +201,30 @@ function openPersonForm(section) {
   const idF = uiField({ name: "id", label: bl({ en: "ID", ja: "ID" }), required: true, placeholder: "u1" });
   const subjF = uiField({ name: "subj", label: bl({ en: "Username / subject", ja: "ユーザー名 / subject" }), required: true, placeholder: "alice" });
   const emailF = uiField({ name: "email", label: bl({ en: "Email", ja: "メール" }), placeholder: "alice@example.com" });
-  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "disabled", label: bl({ en: "Disabled", ja: "無効" }) }] });
+  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "suspended", label: bl({ en: "Suspended", ja: "停止" }) }] });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add person", ja: "ユーザー追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a person (manual fallback)", ja: "ユーザーを追加(手動フォールバック)" }), body: [el("p", { class: "ui-field-hint", text: bl({ en: "Recording an identity here does not grant any access — access is decided by sign-in + rules.", ja: "ここで identity を記録してもアクセスは付与されません ── アクセスはサインイン + ルールで決まります。" }) }), idF.el, subjF.el, emailF.el, statusF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
+  let pending = false, closed = false;
+  const error = el("div", { class: "ui-field-error-msg", style: "display:block", role: "alert" });
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() });
+  const m = uiModal({ title: bl({ en: "Add a person (manual fallback)", ja: "ユーザーを追加(手動フォールバック)" }),
+    body: [el("p", { class: "ui-field-hint", text: bl({ en: "Recording an identity here does not grant any access — access is decided by sign-in + rules.", ja: "ここで identity を記録してもアクセスは付与されません ── アクセスはサインイン + ルールで決まります。" }) }), idF.el, subjF.el, emailF.el, statusF.el, error],
+    footer: [cancel, submit], onClose: () => { closed = true; if (pending) uiToast(paUnconfirmedChange(), "err"); } });
   submit.addEventListener("click", async () => {
-    if (!idF.validate() || !subjF.validate()) return; submit.disabled = true;
-    const r = await apiFetch("POST", "/admin/human-identities", { id: idF.get(), subject: subjF.get(), email: emailF.get(), source: "manual", status: statusF.get() }, _PA_DIR);
-    if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    m.close(); uiToast(bl({ en: "Person added.", ja: "ユーザーを追加しました。" }), "ok"); paPeople(section);
+    if (pending || closed || !idF.validate() || !subjF.validate()) return;
+    const body = { id: idF.get(), subject: subjF.get(), email: emailF.get(), source: "manual", status: statusF.get() };
+    pending = true; error.textContent = "";
+    const controls = [...m.el.querySelectorAll("input,select,button")];
+    const disabled = controls.map(control => control.disabled);
+    controls.forEach(control => { control.disabled = true; });
+    try {
+      let r;
+      try { r = await apiFetch("POST", "/admin/human-identities", body, _PA_DIR); }
+      catch (_) { throw new Error(paUnconfirmedChange()); }
+      paConfirmPerson(r, body);
+      if (closed) return;
+      pending = false; m.close(); uiToast(bl({ en: "Person added.", ja: "ユーザーを追加しました。" }), "ok"); await paPeople(section);
+    } catch (e) { if (!closed) error.textContent = e.message || String(e); }
+    finally { pending = false; controls.forEach((control, index) => { control.disabled = disabled[index]; }); }
   });
   idF.focus();
 }
@@ -336,14 +387,24 @@ async function paActivity(section) {
 
 // paRemoveBtn — a "Remove" action that soft-removes a record (the model has no hard delete; removal is a status
 // change) after a confirm. doAction returns the apiFetch promise; onDone re-renders.
-function paRemoveBtn(confirmTitle, bodyMsg, doAction, onDone) {
-  return el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "除去" }), onClick: async () => {
-    const ok = await uiConfirm({ title: confirmTitle, body: bodyMsg, confirmLabel: bl({ en: "Remove", ja: "除去" }), danger: true });
-    if (!ok) return;
-    const r = await doAction();
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Removed.", ja: "除去しました。" }), "ok"); onDone();
+function paRemoveBtn(confirmTitle, bodyMsg, doAction, onDone, validateResult) {
+  let pending = false;
+  const error = el("span", { class: "ui-field-error-msg", style: "display:block", role: "alert" });
+  const button = el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "除去" }), onClick: async () => {
+    if (pending) return;
+    pending = true; button.disabled = true; error.textContent = "";
+    try {
+      const ok = await uiConfirm({ title: confirmTitle, body: bodyMsg, confirmLabel: bl({ en: "Remove", ja: "除去" }), danger: true });
+      if (!ok) return;
+      let r;
+      try { r = await doAction(); } catch (_) { throw new Error(paUnconfirmedChange()); }
+      if (!r || !r.ok) throw new Error(paMutationError(r));
+      validateResult(r);
+      uiToast(bl({ en: "Removed.", ja: "除去しました。" }), "ok"); await onDone();
+    } catch (e) { error.textContent = e.message || String(e); }
+    finally { pending = false; button.disabled = false; }
   } });
+  return el("span", {}, [button, error]);
 }
 
 // searchTable — a search box over a list that filters client-side on a per-item haystack, then re-renders via

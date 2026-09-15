@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -44,12 +45,9 @@ type humanIdentityDirectorySnapshot struct {
 	SourcePolicies map[string]HumanIdentitySourcePolicy `json:"source_policies"`
 }
 
-// OnPersistError, when set, is called if a snapshot fails to save. A dropped save is invisible and expensive:
-// the mutation returns success, the Console shows the directory, and the next Edge restart forgets it — silently
-// recreating the exact loss this persistence prevents while looking healthy. Must not panic.
-//
-// It does NOT fail the mutation: the in-memory store is already serving the write, and rejecting an import
-// because the disk is unhappy is the worse failure.
+// OnPersistError reports storage failures or weakened save guarantees to the host.
+// Must not panic. Identity Upsert also returns ErrDirectoryPersistence on rejected
+// saves; source-policy and import-state writes still report errors best-effort.
 var OnPersistError func(error)
 
 func reportPersistError(err error) {
@@ -351,24 +349,39 @@ func (store *HumanIdentityDirectoryStore) SetPersister(p blobstore.Persister) er
 	return nil
 }
 
-// persistLocked writes the full directory snapshot. The CALLER must hold store.mu. No-op without a persister. A
-// failed save is routed to reportPersistError, never returned: it must not fail the mutation that triggered it.
-func (store *HumanIdentityDirectoryStore) persistLocked() {
+// ErrDirectoryPersistence is safe to return to API callers. The underlying storage
+// error is reported through OnPersistError and may contain private deployment paths.
+var ErrDirectoryPersistence = errors.New("human identity directory could not be saved")
+
+// saveSnapshotLocked saves a candidate while the caller holds store.mu. A reported
+// in-place save is already committed; treating it as rejected would diverge memory
+// from disk. Stores without a persister remain intentionally in-memory.
+func (store *HumanIdentityDirectoryStore) saveSnapshotLocked(users map[string]model.HumanIdentity) error {
 	if store.persister == nil {
-		return
+		return nil
 	}
 	data, err := json.Marshal(humanIdentityDirectorySnapshot{
-		Users:          store.users,
+		Users:          users,
 		SourceStates:   store.sourceStates,
 		SourcePolicies: store.sourcePolicies,
 	})
 	if err != nil {
 		reportPersistError(fmt.Errorf("marshal human identity directory snapshot: %w", err))
-		return
+		return ErrDirectoryPersistence
 	}
 	if err := store.persister.Save(data); err != nil {
 		reportPersistError(fmt.Errorf("save human identity directory snapshot: %w", err))
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return ErrDirectoryPersistence
+		}
 	}
+	return nil
+}
+
+// Source-policy and import-state writes retain their existing best-effort contract.
+// Identity Upsert below instead publishes only after its candidate is saved.
+func (store *HumanIdentityDirectoryStore) persistLocked() {
+	_ = store.saveSnapshotLocked(store.users)
 }
 
 func (store *HumanIdentityDirectoryStore) Upsert(_ context.Context, user model.HumanIdentity, tenantID string, now time.Time) (model.HumanIdentity, error) {
@@ -378,11 +391,15 @@ func (store *HumanIdentityDirectoryStore) Upsert(_ context.Context, user model.H
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.users == nil {
-		store.users = map[string]model.HumanIdentity{}
+	candidate := make(map[string]model.HumanIdentity, len(store.users)+1)
+	for key, existing := range store.users {
+		candidate[key] = existing
 	}
-	store.users[HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)] = normalized
-	store.persistLocked()
+	candidate[HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)] = normalized
+	if err := store.saveSnapshotLocked(candidate); err != nil {
+		return model.HumanIdentity{}, err
+	}
+	store.users = candidate
 	store.generation.Add(1)
 	return normalized, nil
 }

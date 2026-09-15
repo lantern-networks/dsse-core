@@ -6490,6 +6490,17 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: The configured directory persister rejected the save. The candidate identity and configuration generation were not published. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /admin/human-identities/import-runs:
     get:
       summary: List Human Identity import run summaries.
@@ -6692,6 +6703,17 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: An identity save failed. Imports may have committed earlier items; inspect the directory before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /identity-sources/due:
     get:
       summary: List Human Identity sources due for connector import.
@@ -6748,6 +6770,17 @@ paths:
           description: Invalid import request.
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: An identity save failed. Imports may have committed earlier items; inspect the directory before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /admin/non-human-identities:
     get:
       summary: List tenant-scoped Non-Human Identities.

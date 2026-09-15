@@ -139,6 +139,7 @@ func (networkExtensionLabTLSProbeOnlyDroppedConn) RuntimeCopySessionDone() <-cha
 }
 
 type NetworkExtensionLabTLSInterception struct {
+	hostMu       sync.RWMutex // protects runtime inspection and bypass pattern snapshots
 	mu           sync.Mutex
 	rootCert     *x509.Certificate               // the DEFAULT root cert (surfaced to admin / clients)
 	rootRegistry *tenantInterceptionRootRegistry // resolves the signing provider per tenant (behind the HSM seam)
@@ -534,7 +535,10 @@ func (interception *NetworkExtensionLabTLSInterception) Matches(route NetworkExt
 	// Edge-side bypass takes precedence: bypass hosts are never intercepted
 	// (fall through to raw_forward) — e.g. the AI dev-agent control plane and
 	// cert-pinned apps. In SNI mode this matches on the SNI too.
-	if networkExtensionLabTLSHostMatchesAnyPattern(host, interception.bypassHosts) {
+	interception.hostMu.RLock()
+	bypass, hosts := interception.bypassHosts, interception.hosts
+	interception.hostMu.RUnlock()
+	if networkExtensionLabTLSHostMatchesAnyPattern(host, bypass) {
 		return false
 	}
 	// A destination learned to be certificate-pinning is raw-forwarded rather than intercepted; it stays
@@ -542,7 +546,7 @@ func (interception *NetworkExtensionLabTLSInterception) Matches(route NetworkExt
 	if interception.isPinnedHost(host) {
 		return false
 	}
-	return networkExtensionLabTLSHostMatchesAnyPattern(host, interception.hosts)
+	return networkExtensionLabTLSHostMatchesAnyPattern(host, hosts)
 }
 
 // decisionHost returns the normalised host the intercept/bypass decision is made on. In SNI mode the peeked
@@ -740,6 +744,8 @@ func (interception *NetworkExtensionLabTLSInterception) SetBypassHosts(patterns 
 	if interception == nil {
 		return
 	}
+	interception.hostMu.Lock()
+	defer interception.hostMu.Unlock()
 	interception.bypassHosts = NormalizedNetworkExtensionLabTLSHostPatterns(patterns)
 }
 
@@ -751,6 +757,8 @@ func (interception *NetworkExtensionLabTLSInterception) SetInterceptHosts(patter
 	if interception == nil {
 		return
 	}
+	interception.hostMu.Lock()
+	defer interception.hostMu.Unlock()
 	interception.hosts = NormalizedNetworkExtensionLabTLSHostPatterns(patterns)
 }
 
@@ -761,6 +769,8 @@ func (interception *NetworkExtensionLabTLSInterception) BypassHosts() []string {
 	if interception == nil {
 		return []string{}
 	}
+	interception.hostMu.RLock()
+	defer interception.hostMu.RUnlock()
 	out := make([]string, len(interception.bypassHosts))
 	copy(out, interception.bypassHosts)
 	return out
@@ -774,6 +784,8 @@ func (interception *NetworkExtensionLabTLSInterception) InterceptHosts() []strin
 	if interception == nil {
 		return []string{}
 	}
+	interception.hostMu.RLock()
+	defer interception.hostMu.RUnlock()
 	out := make([]string, len(interception.hosts))
 	copy(out, interception.hosts)
 	return out

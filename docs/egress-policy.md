@@ -103,6 +103,49 @@ Use synthetic data for blocked and allowed upload tests. Account restrictions fo
 supported SaaS services are a separate feature in
 [SaaS tenant restriction](saas-tenant-restriction.md).
 
+## Save and verify inspection defaults
+
+**Inspection Settings** configures defaults for the whole deployment. Only the
+operator organization, outside a customer operation context, can change the mode,
+host allowlist, sign-in/AI presets and operating-system bypass switch. Customer
+administrators can view the defaults and manage their own Internet Access rules.
+An Edge that pulls configuration from a control plane rejects local writes.
+
+Select the required sign-in and AI presets, save the list, then choose the desired
+mode. Under **Inspect only what I list**, destinations absent from the allowlist
+are not decrypted. Removing a service bypass rule does not add that service to the
+allowlist or override other exclusions. **No service bypass** describes that
+service's rule state; it is not proof that traffic is being inspected.
+
+Use DNS hostnames, `*.example.com`, `*` or IPv4 literals in the explicit list,
+without schemes, paths or ports. IPv6 literal patterns are not supported by the
+current selector; use a DNS hostname for that destination. Unknown preset names
+are rejected rather than silently removed. The remaining settings are preserved
+when you change one field.
+
+The server saves a candidate before adopting it in memory. If storage reports a
+failure, the previous live posture remains active and the Console keeps the draft.
+Restore storage, reload to check the current state, then retry. A lost or malformed
+response can follow a successful save; it does not prove that nothing was saved.
+An ambiguous storage commit or multiple independent writers requires separate
+reconciliation. The server refuses empty, incomplete or invalid stored posture
+snapshots during loading; restore or repair the authoritative snapshot rather than
+silently replacing it with defaults. Missing snapshots still use initialization
+settings. Preserve a backup before correcting older invalid data.
+
+A control plane without an interception engine shows saved defaults and marks
+live coverage unavailable. After saving, check configuration synchronization and
+the serving Edge: a successful control-plane response does not establish fleet
+convergence or actual DLP/tenant-restriction enforcement. Failed posture saves on
+an Edge keep that bundle generation pending for retry.
+
+In **Logs & Audit**, look for `admin_inspection_posture_changed` and the common
+`admin_config_change` event. The dedicated event contains the actor, tenant,
+deployment scope, requested mode, selection counts, a posture digest and
+`saved`/`persistence_unconfirmed` outcome. It excludes destination lists. Input and
+permission refusals appear in the common audit. These configuration records do not
+replace traffic logs or confirmation that the audit storage itself is healthy.
+
 ## Authenticate on different traffic paths
 
 On the inspected HTTP browser path, an authentication decision can redirect to

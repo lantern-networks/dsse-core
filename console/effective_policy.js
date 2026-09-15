@@ -302,21 +302,28 @@ function renderInspectionPostureView(content) {
     ]),
   ]));
   const result = el("div", {});
+  content.appendChild(el("button",{class:"ui-btn",text:bl({en:"Reload",ja:"再読込"}),onClick:()=>loadInspectionPosture(result)}));
   content.appendChild(result);
   loadInspectionPosture(result);
 }
 
 async function loadInspectionPosture(result) {
+  if(result.__posturePending)return;
   uiState(result, "loading");
   const current = freshRender(result);
   let data;
   try {
-    const r = await apiFetch("GET", "/admin/inspection-posture");
+    const [r,tenant] = await Promise.all([apiFetch("GET", "/admin/inspection-posture"),apiFetch("GET","/admin/tenant")]);
+ if(!tenant?.ok)throw new Error("Organization unavailable");
     if (!r.ok) { if (!current()) return; uiState(result, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadInspectionPosture(result) }); return; }
-    data = r.body || {};
+    data = validatedInspectionPosture(r.body,tenant.body);
   } catch (e) { if (!current()) return; uiState(result, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadInspectionPosture(result) }); return; }
   if (!current()) return;
   result.innerHTML = "";
+  result.__postureData=data;
+  result.appendChild(el("p",{class:"ui-callout",text:bl({en:"These defaults apply to the whole deployment. Only the deployment operator can change them outside a customer context.",ja:"この既定値は配備全体に適用されます。顧客の操作画面を離れた運営管理者だけが変更できます。"})}));
+  if(!data.runtime_available)result.appendChild(el("p",{class:"ui-callout ui-callout-warn",text:bl({en:"This server has no interception engine. The saved defaults are shown; live traffic coverage is unavailable here.",ja:"このサーバーには傍受エンジンがありません。保存された既定値を表示しています。実通信の検査範囲はここでは確認できません。"})}));
+
 
   // Safety warnings (e.g. allowlist-only with no sign-in decrypted -> tenant restriction at risk).
   (data.warnings || []).forEach((w) => result.appendChild(el("div", { style: "margin:6px 0;display:flex;gap:8px;align-items:flex-start" }, [
@@ -332,21 +339,21 @@ async function loadInspectionPosture(result) {
   // Current mode summary.
   const decryptedHosts = data.intercept_hosts || [];
   result.appendChild(el("div", { class: "ui-preview", style: "font-family:inherit;font-size:14px" }, [
-    el("div", { class: "ui-field-label", style: "margin-bottom:6px", text: bl({ en: "What is inspected right now", ja: "いま検査しているもの" }) }),
+    el("div", { class: "ui-field-label", style: "margin-bottom:6px", text: data.runtime_available ? bl({ en: "What is inspected right now", ja: "いま検査しているもの" }) : bl({en:"Configured inspection default",ja:"保存された検査の既定値"}) }),
     el("div", {}, uiBadge(modeLabel, data.default_mode === "decrypt_all" ? "warn" : "ok")),
     bypassDefault ? el("div", { class: "ui-view-desc", style: "margin-top:8px" }, [
       el("span", { text: bl({ en: "Decrypted hosts: ", ja: "復号するホスト: " }) }),
       decryptedHosts.length ? el("code", { text: decryptedHosts.join(", ") }) : el("span", { text: bl({ en: "none", ja: "なし" }) }),
     ]) : null,
     el("div", { class: "ui-view-desc", style: "margin-top:6px",
-      text: bl({ en: "Destinations never inspected: ", ja: "検査しない宛先の数: " }) + (data.effective_bypass || []).length }),
+      text: bl({ en: "Explicit bypass patterns: ", ja: "明示的な検査除外パターン数: " }) + (data.effective_bypass || []).length }),
   ]));
 
   // Mode switch.
   const mkModeBtn = (mode, label) => {
     const b = el("button", { class: "ui-btn", style: "margin-right:8px", text: label });
-    b.disabled = data.default_mode === mode;
-    b.addEventListener("click", async () => {
+    b.disabled = !data.configurable || data.default_mode === mode;
+    b.addEventListener("click", () => inspectionPostureMutation(result, async () => {
       // Footgun guard: switching to allowlist-only with an EMPTY allowlist decrypts nothing — all interception,
       // tenant restriction and DLP turn off until hosts / sign-in groups are added.
       if (mode === "bypass_default") {
@@ -363,12 +370,8 @@ async function loadInspectionPosture(result) {
           if (!ok) return;
         }
       }
-      b.disabled = true;
-      const resp = await apiFetch("POST", "/admin/inspection-posture", { mode });
-      if (!resp.ok) { b.disabled = false; uiToast((resp.body && (resp.body.error || resp.body.message)) || ("HTTP " + resp.status), "err"); return; }
-      uiToast(bl({ en: "Inspection mode changed.", ja: "傍受モードを変更しました。" }), "ok");
-      loadInspectionPosture(result);
-    });
+      return await saveInspectionPatch(result,data,{mode},bl({en:"Inspection mode changed.",ja:"傍受モードを変更しました。"}));
+    }));
     return b;
   };
   result.appendChild(el("div", { class: "ui-toolbar" }, [
@@ -385,21 +388,18 @@ async function loadInspectionPosture(result) {
   const tbtn = el("button", { class: "ui-btn",
     text: enabled ? bl({ en: "Inspect the operating-system traffic too", ja: "OS の通信も検査する" })
                   : bl({ en: "Stop inspecting the operating-system traffic", ja: "OS の通信は検査しない" }) });
-  tbtn.addEventListener("click", async () => {
-    tbtn.disabled = true;
-    const r = await apiFetch("POST", "/admin/inspection-posture", { known_bypass_enabled: !enabled });
-    if (!r.ok) { tbtn.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Updated.", ja: "更新しました。" }), "ok");
-    loadInspectionPosture(result);
-  });
+  tbtn.disabled=!data.configurable;
+  tbtn.addEventListener("click",()=>inspectionPostureMutation(result,()=>saveInspectionPatch(result,data,{known_bypass_enabled:!enabled},bl({en:"Updated.",ja:"更新しました。"}))));
   result.appendChild(el("div", { class: "ui-toolbar" }, [
     tbtn,
-    uiBadge(enabled ? bl({ en: "OS traffic: not inspected", ja: "OS の通信: 検査しない" }) : bl({ en: "OS traffic: inspected", ja: "OS の通信: 検査する" }), enabled ? "ok" : "warn"),
+    uiBadge(enabled ? bl({ en: "OS bypass enabled", ja: "OS の検査除外: 有効" }) : bl({ en: "OS bypass disabled", ja: "OS の検査除外: 無効" }), enabled ? "ok" : "warn"),
   ]));
 
   // SaaS bypass groups (authored as egress rules).
   if ((data.saas_bypass_groups || []).length) {
-    result.appendChild(await buildSaasBypassSection(data, result));
+    try { const section=await buildSaasBypassSection(data,result);if(!current() || result.isConnected===false)return;result.appendChild(section); }
+    catch(e){if(!current() || result.isConnected===false)return;const failure=el("div",{});uiState(failure,"error",bl({en:"Could not load service inspection rules. Their inspection state is unknown.",ja:"サービスの検査ルールを読み込めません。検査状態は不明です。"}),{label:bl({en:"Retry",ja:"再試行"}),onClick:()=>loadInspectionPosture(result)});result.appendChild(failure);}
+
   }
 
   // ★ THE API'S NOTE IS FOR AN API CONSUMER (2026-08-17, read as a customer administrator). It explains the
@@ -439,7 +439,7 @@ function buildDecryptAllowlistEditor(data, bypassDefault, result) {
     checklist.appendChild(el("div", { class: "ui-field-label", style: "margin:6px 0 2px;font-size:12px", text: catLabels[cat] || cat }));
     groups.forEach((g) => {
       const cb = el("input", { type: "checkbox" });
-      cb.checked = !!g.selected;
+      cb.checked = !!g.selected;cb.disabled=!data.configurable;
       cb.dataset.group = g.name;
       groupBoxes.push(cb);
       // Same words as the list below it — the two are the same groups, and reading one name here and another
@@ -461,15 +461,12 @@ function buildDecryptAllowlistEditor(data, bypassDefault, result) {
   body.push(hostsF.el);
 
   const apply = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save this list", ja: "この一覧を保存" }) });
-  apply.addEventListener("click", async () => {
-    apply.disabled = true;
-    const hosts = hostsF.get().split("\n").map((s) => s.trim()).filter(Boolean);
-    const groups = groupBoxes.filter((c) => c.checked).map((c) => c.dataset.group);
-    const resp = await apiFetch("POST", "/admin/inspection-posture", { decrypt_allowlist_hosts: hosts, decrypt_allowlist_groups: groups });
-    if (!resp.ok) { apply.disabled = false; uiToast((resp.body && (resp.body.error || resp.body.message)) || ("HTTP " + resp.status), "err"); return; }
-    uiToast(bl({ en: "Saved.", ja: "保存しました。" }), "ok");
-    loadInspectionPosture(result);
-  });
+  apply.disabled=!data.configurable;
+  hostsF.el.querySelectorAll("input,textarea").forEach(e=>e.disabled=!data.configurable);
+  apply.addEventListener("click",()=>inspectionPostureMutation(result,async()=>{
+    const hosts=hostsF.get().split("\n").map(s=>s.trim()).filter(Boolean),groups=groupBoxes.filter(c=>c.checked).map(c=>c.dataset.group);
+    return await saveInspectionPatch(result,data,{decrypt_allowlist_hosts:hosts,decrypt_allowlist_groups:groups},bl({en:"Saved.",ja:"保存しました。"}));
+  }));
   body.push(el("div", { class: "ui-toolbar" }, apply));
 
   return el("div", { class: "ui-preview", style: "font-family:inherit;font-size:14px;margin-top:12px" }, body);
@@ -480,16 +477,17 @@ async function buildSaasBypassSection(data, result) {
   // editable in the Access Rules / Egress view — the rule is the single source of truth. A legacy posture
   // selection is migrated to a rule on toggle.
   const er = await apiFetch("GET", "/admin/rules?plane=egress");
-  const egressRules = (er && er.ok && Array.isArray(er.body)) ? er.body : [];
+  if(!er?.ok || !Array.isArray(er.body) || er.body.some(r=>!r || typeof r.id!=="string" || !Array.isArray(r.destination) || r.destination.some(d=>typeof d!=="string") || !r.action || (r.tenant_id && r.tenant_id!==data.tenant_id)))throw new Error("Invalid service rules");
+ const egressRules=er.body;
   const bypassRuleFor = (name) => egressRules.filter((r) =>
-    (r.destination || []).indexOf("bi-grp-" + name) !== -1 && r.action && r.action.inspection === "bypass");
+    (r.destination || []).indexOf("bi-grp-" + name) !== -1 && r.action && r.action.inspection === "bypass" && r.status === "active");
   const postureSelected = (data.saas_bypass_groups || []).filter((g) => g.selected).map((g) => g.name);
 
   const body = [];
   body.push(el("div", { class: "ui-field-label", text: bl({ en: "Services you can leave uninspected", ja: "検査しないでおけるサービス" }) }));
   body.push(el("p", { class: "ui-view-desc", text: bl({
-    en: "Marking one as not inspected writes a single rule that lets that destination through unread. You can also edit it on the Internet Access screen.",
-    ja: "「検査しない」にすると、その宛先を検査せずに通すルールが1本できます(インターネットアクセスの画面でも編集できます)。",
+    en: "Marking one as not inspected writes a rule for that service. Removing its bypass does not guarantee inspection: the default, allowlist and other exclusions still apply. You can also edit the rule on the Internet Access screen.",
+    ja: "「検査しない」にすると、そのサービスの検査除外ルールができます。除外を消した後も、既定値・検査対象の一覧・他の除外設定に従います。ルールはインターネットアクセス画面でも編集できます。",
   }) }));
 
   (data.saas_bypass_groups || []).forEach((g) => {
@@ -499,23 +497,22 @@ async function buildSaasBypassSection(data, result) {
       text: on ? bl({ en: "Inspect it", ja: "検査する" }) : bl({ en: "Do not inspect it", ja: "検査しない" }) });
     const state = on
       ? uiBadge(rules.length ? bl({ en: "Not inspected", ja: "検査しない" }) : bl({ en: "Not inspected (older setting)", ja: "検査しない(以前の設定)" }), "warn")
-      : uiBadge(bl({ en: "Inspected", ja: "検査中" }), "ok");
-    tog.addEventListener("click", async () => {
-      tog.disabled = true;
-      if (on) {
-        for (const r of rules) { await apiFetch("DELETE", "/admin/rules/" + encodeURIComponent(r.id)); }
-        if (g.selected) await apiFetch("POST", "/admin/inspection-posture", { bypass_groups: postureSelected.filter((n) => n !== g.name) });
-      } else {
-        const resp = await apiFetch("POST", "/admin/rules", {
-          plane: "egress", priority: 60, name: "Bypass: " + g.name,
-          source: ["*"], destination: ["bi-grp-" + g.name],
-          action: { access: "allow", inspection: "bypass" }, status: "active",
-        });
-        if (!resp.ok) { tog.disabled = false; uiToast((resp.body && (resp.body.error || resp.body.message)) || ("HTTP " + resp.status), "err"); return; }
+      : uiBadge(bl({ en: "No service bypass", ja: "サービスの検査除外なし" }), "ok");
+    tog.disabled=!data.can_manage_rules || (g.selected && !data.configurable);
+    tog.addEventListener("click",()=>inspectionPostureMutation(result,async()=>{
+      if(on){
+        const confirmed=await uiConfirm({title:bl({en:"Inspect this service again?",ja:"このサービスを再び検査しますか？"}),body:bl({en:"The matching bypass rules will be removed. Review the Internet Access page if a rule also covers other destinations.",ja:"該当する検査除外ルールを削除します。他の宛先も含む場合はインターネットアクセス画面で確認してください。"}),confirmLabel:bl({en:"Inspect it",ja:"検査する"})});if(!confirmed || result.isConnected===false)return;
+        if(rules.some(r=>r.destination.length!==1))throw new Error(bl({en:"A bypass rule also covers other destinations. Edit it on the Internet Access page.",ja:"他の宛先も含む検査除外ルールがあります。インターネットアクセス画面で編集してください。"}));
+        for(const rule of rules){const response=await apiFetch("DELETE","/admin/rules/"+encodeURIComponent(rule.id));if(!response?.ok)throw new Error(postureHTTPError(response));}
+        if(g.selected){const response=await apiFetch("POST","/admin/inspection-posture",{bypass_groups:postureSelected.filter(n=>n!==g.name)});validatedInspectionMutation(response,data,{bypass_groups:postureSelected.filter(n=>n!==g.name)});}
+      }else{
+        const response=await apiFetch("POST","/admin/rules",{plane:"egress",priority:60,name:"Bypass: "+g.name,source:["*"],destination:["bi-grp-"+g.name],action:{access:"allow",inspection:"bypass"},status:"active"});if(!response?.ok)throw new Error(postureHTTPError(response));
       }
-      uiToast(bl({ en: "Updated.", ja: "更新しました。" }), "ok");
-      loadInspectionPosture(result);
-    });
+      // Re-read the authored rules: a 2xx or partial multi-write result is not proof of the desired state.
+      const verify=await apiFetch("GET","/admin/rules?plane=egress");if(!verify?.ok || !Array.isArray(verify.body))throw new Error(postureUnknown());
+      const bypass=verify.body.some(r=>r && r.status==="active" && r.action?.inspection==="bypass" && r.destination?.includes("bi-grp-"+g.name));if(bypass===on)throw new Error(postureUnknown());
+      uiToast(bl({en:"Updated.",ja:"更新しました。"}),"ok");return true;
+    }));
     // ★ THE NAME A CUSTOMER READS, NOT OUR IDENTIFIER, AND NOT ENGLISH PROSE IN A JAPANESE CONSOLE
     // (2026-08-17, read as a customer administrator). This printed the group key in monospace —
     // google_auth, okta_auth, salesforce_auth — beside an English sentence from the API. The API text
@@ -606,4 +603,36 @@ function posturePlainNote(data) {
       ja: "下に挙げたものだけを検査し、それ以外は中身を見ずに通します。サインインのサービスは検査したままにしてください。外すと、どの会社アカウントを使えるかの制限が効かなくなります。" });
   }
   return (data && data.note) || "";
+}
+
+function postureUnknown(){return bl({en:"The outcome is unconfirmed. Reload to check the current settings before retrying.",ja:"結果を確認できません。再読込して現在の設定を確認してから再試行してください。"})}
+function postureHTTPError(r){return typeof r?.body?.error==="string"?r.body.error:postureUnknown()}
+function validatedInspectionPosture(body,tenant){
+ if(!body || typeof body!=="object" || !tenant || typeof tenant.tenant_id!=="string" || !tenant.tenant_id || body.tenant_id!==tenant.tenant_id || body.scope!=="deployment" || !["decrypt_all","bypass_default"].includes(body.default_mode))throw new Error("Invalid inspection settings or organization response");
+ const data={...body};for(const key of ["configurable","runtime_available","can_manage_rules","known_bypass_enabled"]){if(typeof data[key]!=="boolean")throw new Error("Invalid inspection capability")}
+ for(const key of ["decrypt_allowlist_hosts","decrypt_allowlist_groups","bypass_groups","intercept_hosts","effective_bypass","warnings"]){if(key!=="warnings" && !Object.hasOwn(data,key))throw new Error("Incomplete inspection list");if(data[key]==null)data[key]=[];if(!Array.isArray(data[key]) || data[key].some(v=>typeof v!=="string"))throw new Error("Invalid inspection list")}
+ for(const key of ["auth_decrypt_groups","saas_bypass_groups"]){if(!Array.isArray(data[key]) || data[key].some(g=>!g || typeof g.name!=="string" || !g.name || typeof g.selected!=="boolean" || !Array.isArray(g.patterns) || g.patterns.some(p=>typeof p!=="string")))throw new Error("Invalid inspection presets")}
+ return data;
+}
+function validatedInspectionMutation(r,before,patch){
+ if(!r?.ok)throw new Error(postureHTTPError(r));if(r.status!==200)throw new Error(postureUnknown());
+ const saved=validatedInspectionPosture(r.body,{tenant_id:before.tenant_id});
+ for(const [key,value]of Object.entries(patch)){
+  const actual=saved[key==="mode"?"default_mode":key];
+  if(Array.isArray(value)){const expected=[...new Set(value.map(v=>key==="decrypt_allowlist_hosts"?v.trim().toLowerCase():v.trim()).filter(Boolean))];if(JSON.stringify(expected)!==JSON.stringify(actual))throw new Error(postureUnknown())}
+  else if(value!==actual)throw new Error(postureUnknown());
+ }
+ return saved;
+}
+async function saveInspectionPatch(result,data,patch,message){
+ if(result.isConnected===false)return false;
+ const r=await apiFetch("POST","/admin/inspection-posture",patch);validatedInspectionMutation(r,data,patch);if(result.isConnected!==false)uiToast(message,"ok");return true;
+}
+async function inspectionPostureMutation(result,operation){
+ if(result.__posturePending || result.isConnected===false)return;result.__posturePending=true;
+ const controls=[...result.querySelectorAll("button,input,textarea")].map(e=>[e,e.disabled]);controls.forEach(([e])=>e.disabled=true);
+ result.querySelectorAll(".posture-error").forEach(e=>e.remove());let reload=false;
+ try{reload=await operation()===true}catch(e){if(result.isConnected!==false)result.prepend(el("p",{class:"posture-error ui-callout ui-callout-warn",role:"alert",text:(e.message||String(e))+" "+postureUnknown()}))}
+ finally{result.__posturePending=false;controls.forEach(([e,disabled])=>e.disabled=disabled)}
+ if(reload && result.isConnected!==false)await loadInspectionPosture(result);
 }

@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/decision"
@@ -224,11 +227,12 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// decrypt allowlist (explicit hosts + SaaS auth-group presets), and the curated known-bypass list. The
 	// "make the hidden default visible and editable" of docs/invisible_effective_configuration.md.
 	mux.HandleFunc("GET /admin/inspection-posture", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config))
+		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 	// Change the inspection posture (partial update — only provided fields change). bypass_default decrypts ONLY
 	// the allowlist and raw-forwards the rest (still steered + policy-gated); keep a SaaS auth group selected to
 	// keep tenant restriction working. Persisted; the engine's intercept + bypass sets are re-applied instantly.
+	var postureWriteMu sync.Mutex
 	mux.HandleFunc("POST /admin/inspection-posture", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
 		// ★★★ AND AN EDGE THAT PULLS ITS CONFIG IS NOT AN AUTHOR OF IT (2026-08-23). The posture now travels in
 		// the config bundle, so a change written here would be overwritten by the next poll — silently, and only
@@ -237,8 +241,12 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "inspection posture") {
 			return
 		}
+		if !inspectionPostureMayWrite(r) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("only the deployment operator, outside a customer context, may change deployment inspection defaults"))
+			return
+		}
 		if config.SetInspectionPosture == nil || config.InspectionPosture == nil {
-			writeError(w, http.StatusConflict, fmt.Errorf("inspection posture is not configurable on this edge (no interception engine wired)"))
+			writeError(w, http.StatusConflict, fmt.Errorf("inspection posture storage is not configured on this server"))
 			return
 		}
 		var body struct {
@@ -252,7 +260,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode posture request: %w", err))
 			return
 		}
-		next := config.InspectionPosture()
+		postureWriteMu.Lock()
+		defer postureWriteMu.Unlock()
+		before := config.InspectionPosture()
+		next := before
 		if body.Mode != nil {
 			next.Mode = strings.TrimSpace(*body.Mode)
 		}
@@ -272,11 +283,27 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("mode must be %q or %q", inspectionposture.ModeDecryptAll, inspectionposture.ModeBypassDefault))
 			return
 		}
-		if _, err := config.SetInspectionPosture(next, adminTenantIDFromRequest(r)); err != nil {
-			writeError(w, http.StatusInternalServerError, err) // applied in memory but not persisted — would revert on restart
+		next, err := inspectionposture.Validate(next)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config))
+		_, err = config.SetInspectionPosture(next, adminTenantIDFromRequest(r))
+		result := "saved"
+		if err != nil {
+			result = "persistence_unconfirmed"
+		}
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, inspectionPostureAuditLog(r, before, next, result, evaluator, now), now)
+		if err != nil {
+			if errors.Is(err, inspectionposture.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Storage did not confirm the inspection change. The previous live settings remain active. Restore storage and retry."))
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Inspection settings could not be updated. Reload and retry."))
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 
 	// Predefined pinned-bypass catalog: the curated set of well-known un-interceptable services (no-decrypt

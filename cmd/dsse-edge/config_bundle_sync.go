@@ -1022,8 +1022,10 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		applyLicenceBundleSection(payload.Licence, t.licenceStore, t.licensingGate, t.licenceAcceptedKeys,
 			t.licenceMSSPID, time.Now().UTC().Format(time.RFC3339), log.Printf)
 	}
-	if payload.InspectionPosture != nil && t.inspectionPosture != nil && t.setInspectionPosture != nil {
-		applyInspectionPostureBundleSection(payload.InspectionPosture, t.inspectionPosture, t.setInspectionPosture, log.Printf)
+	if payload.InspectionPosture != nil {
+		if _, err := applyInspectionPostureBundleSection(payload.InspectionPosture, t.inspectionPosture, t.setInspectionPosture, log.Printf); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("inspection posture: %w", err))
+		}
 	}
 	// THE SITE CATALOG. Applied before the rules block below purely so it sits beside the connector catalog it
 	// belongs with; nothing here depends on ordering. See config_bundle_sites.go for why it REPLACES within the

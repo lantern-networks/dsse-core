@@ -13066,7 +13066,10 @@ paths:
         mode (decrypt_all = decrypt every steered HTTPS flow except the bypass set; bypass_default = decrypt ONLY
         the allowlist and raw-forward the rest), the decrypt allowlist (explicit hosts + selected SaaS auth-group
         presets), the curated hardcoded known-bypass groups (each marked active when in the live bypass set), and
-        the engine's actual intercept/bypass sets. Read-only. Metadata-only.
+        the local engine's intercept/bypass sets. scope=deployment: these are shared defaults, not tenant-specific
+        settings. configurable indicates whether this caller can edit them; runtime_available is false on a
+        server without an interception engine. can_manage_rules is separate and covers tenant-authored SaaS
+        bypass rules. A control-plane response does not confirm that every Edge has applied the settings.
       tags:
         - AdminPolicy
       responses:
@@ -13077,6 +13080,11 @@ paths:
               schema:
                 type: object
                 properties:
+                  tenant_id: { type: string }
+                  scope: { type: string, enum: [deployment] }
+                  configurable: { type: boolean }
+                  runtime_available: { type: boolean }
+                  can_manage_rules: { type: boolean }
                   default_mode: { type: string, enum: [decrypt_all, bypass_default] }
                   intercept_hosts: { type: array, items: { type: string } }
                   effective_bypass: { type: array, items: { type: string } }
@@ -13122,11 +13130,18 @@ paths:
     post:
       summary: Change the inspection posture (deployment mode + decrypt allowlist + known-bypass).
       description: >
-        Requires admin.policy.write. Partial update — only the provided fields change. Set mode=bypass_default to
+        Requires admin.policy.write and the deployment operator outside an X-Operate-Tenant customer context.
+        Customer administrators cannot edit deployment defaults. Config-sourced nodes reject local writes. Partial update — only the provided fields change. Set mode=bypass_default to
         decrypt ONLY the allowlist (decrypt_allowlist_hosts + decrypt_allowlist_groups, e.g. m365_auth/google_auth)
         and raw-forward everything else; a bypassed flow is still steered and policy-gated, so keep a SaaS auth
         group selected to keep tenant restriction working. known_bypass_enabled toggles the curated raw-forward
-        list. Persisted; the engine's intercept + bypass sets are re-applied instantly. Returns the updated posture.
+        list. Known presets and DNS host patterns (or IPv4 literals) are validated. URLs, ports, unknown presets
+        and unsupported IPv6 literals are rejected. The candidate is saved before the local live settings and
+        engine callback are updated. A storage failure returns 500 and retains the previous live settings.
+        Re-read after uncertain responses and retry once storage is restored. Edges receive the change through
+        configuration synchronization; failed persistence keeps the bundle generation pending for retry.
+        Returns the updated posture. A dedicated audit event records the scope, mode, counts, digest and outcome
+        without recording destination lists, in addition to the common HTTP mutation audit.
       tags:
         - AdminPolicy
       requestBody:
@@ -13155,7 +13170,9 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "409":
-          description: Inspection posture is not configurable on this edge (no interception engine wired).
+          description: Posture storage is not configured, or this node pulls its configuration from an authority.
+        "500":
+          description: Saving the candidate was not confirmed; the previous live settings remain active. Reload and retry after storage recovers.
   /admin/policies/{policy_id}:
     get:
       summary: Get a tenant-scoped Policy Engine policy.

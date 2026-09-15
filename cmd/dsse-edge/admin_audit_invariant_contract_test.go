@@ -19,6 +19,7 @@ import (
 	toolcallaudit "github.com/lantern-networks/dsse-core/toolcallaudit"
 
 	"github.com/lantern-networks/dsse-core/grantstore"
+	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/internalca"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -177,6 +178,7 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 			}, evaluator, now),
 		},
 		{name: "internalAuthorityAuditLog", audit: internalAuthorityAuditLog(httptest.NewRequest("POST", "/admin/internal-cas", nil), internalca.Authority{ID: "authority", TenantID: "tenant_audit_cp0020", Name: rawSubject, CertificatePEM: rawPayloadRef}, "upsert", "rejected", evaluator, now)},
+		{name: "inspectionPostureAuditLog", audit: inspectionPostureAuditLog(httptest.NewRequest("POST", "/admin/inspection-posture", nil), inspectionposture.DefaultPosture(), inspectionposture.Posture{Mode: inspectionposture.ModeBypassDefault, DecryptAllowlistHosts: []string{rawDestination}}, "saved", evaluator, now)},
 		{
 			name:  "adminAccessGrantRevocationAuditLog",
 			audit: adminAccessGrantRevocationAuditLog(httptest.NewRequest("POST", "/admin/grants/target/revoke", nil), grantstore.Grant{GrantID: rawTokenAudience, TenantID: "tenant_audit_cp0020", UserID: rawSubject, UserEmail: rawMetadataValue, DeviceID: rawDestination, Scope: rawPayloadRef}, evaluator, now, true),
@@ -601,6 +603,7 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 		"adminHumanApprovalEventAuditLog":    true,
 		"adminHumanApprovalMutationAuditLog": true,
 		"adminAccessGrantRevocationAuditLog": true,
+		"inspectionPostureAuditLog":          true,
 		"internalAuthorityAuditLog":          true,
 		"adminPolicyAuditLog":                true,
 		"adminPolicyCandidateAuditLog":       true,

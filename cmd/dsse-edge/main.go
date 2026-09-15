@@ -4630,14 +4630,8 @@ func main() {
 		InspectionPosture:              func() inspectionposture.Posture { return postureStore.Get() },
 		// So a posture change moves the config bundle's VERSION and not only its contents — without this the
 		// section below would be published in every bundle and applied by nobody.
-		InspectionPostureGeneration: postureStore.ConfigGeneration,
-		SetInspectionPosture: func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error) {
-			updated, err := postureStore.Set(p)
-			// The in-memory posture IS applied either way (the engine must match what the store holds);
-			// the error tells the admin the change will not survive a restart.
-			applyInspectionPosture(tenantID)
-			return updated, err
-		},
+		InspectionPostureGeneration:  postureStore.ConfigGeneration,
+		SetInspectionPosture:         newInspectionPostureSetter(postureStore, applyInspectionPosture),
 		AssetStore:                   assetStore,
 		RuleStore:                    ruleStore,
 		TenantModelStore:             tenantModelStore,

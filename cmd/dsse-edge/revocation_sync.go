@@ -48,10 +48,12 @@ func (s revocationSource) baseURL() string {
 // bundle: the puller re-applies on a newer generation OR a changed epoch (a CP restart resets the in-memory
 // generation; the persisted revoked set is still authoritative, so re-baselining is safe and fail-closed).
 type revocationFeed struct {
-	Generation uint64            `json:"generation"`
-	Epoch      string            `json:"epoch,omitempty"`
-	Revoked    map[string]string `json:"revoked"`             // identity -> non-secret reason code
-	HighRisk   map[string]string `json:"high_risk,omitempty"` // deviceID -> severity (decision-path)
+	Generation      uint64                `json:"generation"`
+	Epoch           string                `json:"epoch,omitempty"`
+	Revoked         map[string]string     `json:"revoked"` // identity -> non-secret reason code
+	UserRiskVersion int                   `json:"user_risk_version,omitempty"`
+	UserRisk        []revocation.UserRisk `json:"user_risk,omitempty"`
+	HighRisk        map[string]string     `json:"high_risk,omitempty"` // deviceID -> severity (decision-path)
 	// Authoritative marks this as a COMPLETE set from the config authority, which is what makes an EMPTY one
 	// meaningful. Zero revocations and "I could not tell you" are the same bytes otherwise, so a puller had to
 	// assume the worse of the two and keep whatever it held — correct, but it also meant releasing the LAST
@@ -265,6 +267,13 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 		// answer, and the safe reading is to keep what we hold. That safe reading used to be the ONLY one, so
 		// releasing the last revocation propagated to nobody and the device stayed locked out until the Edge
 		// was restarted — a kill-switch that could be pressed but not released by the path that pressed it.
+		// Validate the typed user set before changing admission or device state.
+		// Older feeds preserve cached users; an empty set clears only when complete.
+		if err := applyUserRiskFeed(highRisk, feed); err != nil {
+			s.status.recordFailure(err, time.Now())
+			log.Printf("revocation sync: rejected user risk feed: %v", err)
+			return
+		}
 		keptLocal := false
 		if len(feed.Revoked) == 0 && overlay.SyncedCount() > 0 && !feed.Authoritative {
 			keptLocal = true
@@ -300,4 +309,26 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 			pull(false)
 		}
 	}
+}
+
+func applyUserRiskFeed(overlay *revocation.HighRiskOverlay, feed revocationFeed) error {
+	if feed.UserRiskVersion != 0 && feed.UserRiskVersion != 1 {
+		return fmt.Errorf("unsupported user risk feed version")
+	}
+	if feed.UserRiskVersion == 0 {
+		if len(feed.UserRisk) > 0 {
+			return fmt.Errorf("user risk feed version is missing")
+		}
+		return nil
+	}
+	if overlay == nil {
+		return nil
+	}
+	if err := overlay.Health(); err != nil {
+		return fmt.Errorf("local risk state is not ready")
+	}
+	if len(feed.UserRisk) == 0 && !feed.Authoritative {
+		return nil
+	}
+	return overlay.ReplaceSyncedUsers(feed.UserRisk)
 }

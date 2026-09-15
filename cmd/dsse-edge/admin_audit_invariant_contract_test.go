@@ -637,6 +637,7 @@ func deferredAuditEmitterInvariantFunctions() map[string]bool {
 		// Its HTTP audit contract checks that credentials and unrelated request fields stay out.
 		"transportAdmissionAuditLog":         true,
 		"deviceRiskAuditLog":                 true,
+		"userRiskAuditLog":                   true,
 		"agentStatusAuditLog":                true,
 		"agentUpdateAuditLog":                true,
 		"authenticationEventAuditLog":        true,

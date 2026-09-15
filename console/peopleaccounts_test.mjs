@@ -4,21 +4,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 const source=readFileSync(new URL('./peopleaccounts.js',import.meta.url),'utf8');
 const person={id:'alice',tenant_id:'tenant',subject:'alice',email:'alice@example.test',source:'manual',status:'active',department:'Engineering',metadata:{note:'keep'}};
-const paths=['/admin/human-identities/sources/health','/admin/human-identities/sources','/admin/human-identities/import-runs','/admin/human-identities','/admin/risk-signals'];
+const paths=['/admin/human-identities/sources/health','/admin/human-identities/sources','/admin/human-identities/import-runs','/admin/human-identities','/admin/risk-signals?entity_type=user'];
 const bodyFor=path=>({
  [paths[0]]:{status:'ok',source_count:0,stale_after_seconds:86400,sources:[]},
- [paths[1]]:{sources:[]},[paths[2]]:{runs:[]},[paths[3]]:{identities:[]},[paths[4]]:{high_risk:{}},
+ [paths[1]]:{sources:[]},[paths[2]]:{runs:[]},[paths[3]]:{identities:[]},[paths[4]]:{entity_type:"user",tenant_id:"tenant",high_risk:{}},
 }[path]);
 function fixture() {
  const calls=[],states=[],toasts=[],modals=[],fields={},confirms=[],refreshes=[];
  function el(tag,attrs={},children=[]) {
   if(typeof tag!=='string')throw Error('invalid tag');
   let text=attrs.text||'';const listeners={};
-  const n={tag,attrs,style:{},children:[],disabled:!!attrs.disabled,value:attrs.value||'',
+  const n={tag,attrs,style:{},children:[],disabled:Object.hasOwn(attrs,"disabled") && attrs.disabled != null,value:attrs.value||'',
    appendChild(child){if(child!=null){if(typeof child!=='object')child=el('text',{text:String(child)});this.children.push(child)};return child},
    addEventListener(event,fn){listeners[event]=fn},
    click(){return (listeners.click||attrs.onClick)?.()}, input(){return listeners.input?.()},
-   querySelectorAll(selector){const tags=selector.split(',');return this.children.flatMap(c=>[c,...c.querySelectorAll('*')]).filter(c=>selector==='*'||tags.includes(c.tag))},
+   getAttribute(name){return attrs[name]},
+   querySelectorAll(selector){const tags=selector.split(',');return this.children.flatMap(c=>[c,...c.querySelectorAll('*')]).filter(c=>selector==='*'||tags.includes(c.tag)||(selector.startsWith('[')&&Object.hasOwn(c.attrs,selector.slice(1,-1))))},
   };
   Object.defineProperty(n,'textContent',{get(){return text+this.children.map(c=>c.textContent).join('')},set(v){text=String(v);this.children=[]}});
   Object.defineProperty(n,'innerHTML',{set(v){assert.equal(v,'');n.textContent=''}});
@@ -91,4 +92,32 @@ test('Remove cancellation, failure, bad response and retry preserve actionable r
 });
 test('Remove suppresses duplicate confirmation and sends only one write',async()=>{
  const f=fixture();let confirm;f.context.uiConfirm=()=>new Promise(resolve=>{confirm=resolve});let writes=0;const row=f.context.paRemoveBtn('remove','body',async()=>{writes++;return {ok:true,body:{...person,status:'deleted'}}},()=>f.refreshes.push(true),r=>f.context.paConfirmPerson(r,{...person,status:'deleted'}));const first=button(row,'Remove').click();await button(row,'Remove').click();confirm(true);await first;assert.equal(writes,1);assert.equal(f.refreshes.length,1);assert.equal(button(row,'Remove').disabled,false);
+});
+
+const riskReply=(severity,extra={})=>({ok:true,body:{tenant_id:'tenant',entity_type:'user',entity_id:'alice',severity,applied:true,high_risk:['high','critical'].includes(severity),...extra}});
+test('user risk verifies all levels and the selected tenant on the control plane',async()=>{
+ for(const severity of ['medium','high','critical','none']){
+  const f=fixture();f.mockRefresh();f.invokeWith(async()=>riskReply(severity));await f.context.setUserRisk(person,severity,f.host);
+  assert.deepEqual(json(f.calls[0]),{method:'POST',path:'/admin/risk-signals',body:{entity_type:'user',entity_id:'alice',severity},plane:'control'});assert.equal(f.toasts.at(-1).kind,'ok');assert.equal(f.refreshes.length,1);assert.equal(f.host.__paRiskNotices.size,0);
+ }
+});
+test('user risk refuses errors and mismatched success, retaining a retry notice through reload',async()=>{
+ for(const response of [{ok:false,status:503},new Error('offline'),{ok:true,body:{}},riskReply('high',{entity_id:'bob'}),riskReply('high',{tenant_id:'other'}),riskReply('high',{severity:'none'}),riskReply('high',{applied:false}),riskReply('high',{high_risk:false}),riskReply('high',{not_stored_durably:true})]){
+  const f=fixture();f.invokeWith(async(method,path)=>{if(method==='GET')return {ok:true,body:bodyFor(path)};if(response instanceof Error)throw response;return response});
+  await f.context.setUserRisk(person,'high',f.host);assert.equal(f.toasts.length,0);assert.match(error(f.host).textContent,/may already/);assert.ok(button(f.host,'Retry risk change'));
+  await f.context.paPeople(f.host);assert.ok(button(f.host,'Retry risk change'));
+  f.invokeWith(async(method,path)=>method==='POST'?riskReply('high'):{ok:true,body:bodyFor(path)});await button(f.host,'Retry risk change').click();assert.equal(f.host.__paRiskNotices.size,0);assert.equal(f.toasts.at(-1).kind,'ok');
+ }
+});
+test('user risk weak save remains visible even when reload fails and clears only after retry',async()=>{
+ const f=fixture();f.invokeWith(async(method)=>method==='POST'?riskReply('high',{not_stored_durably:'warning'}):{ok:false,status:503});await f.context.setUserRisk(person,'high',f.host);
+ assert.equal(f.states.at(-1).state,'error');assert.match(error(f.host).textContent,/durable saving is not confirmed/);assert.equal(f.toasts.length,0);
+ f.invokeWith(async(method,path)=>method==='POST'?riskReply('high'):{ok:true,body:bodyFor(path)});await button(f.host,'Retry risk change').click();assert.equal(f.host.__paRiskNotices.size,0);
+});
+test('pending risk disables its own selector and suppresses duplicate writes',async()=>{
+ const f=fixture();f.mockRefresh();const own=f.el('select',{'data-person-risk-id':'alice'}),other=f.el('select',{'data-person-risk-id':'bob'});f.host.appendChild(own);f.host.appendChild(other);let finish;
+ f.invokeWith(async()=>new Promise(resolve=>{finish=()=>resolve(riskReply('high'))}));const first=f.context.setUserRisk(person,'high',f.host);await f.context.setUserRisk(person,'critical',f.host);assert.equal(f.calls.length,1);assert.equal(own.disabled,true);assert.equal(other.disabled,false);finish();await first;assert.equal(own.disabled,false);
+});
+test('a risk snapshot from another tenant never renders clean people',async()=>{
+ const f=fixture();f.invokeWith(async(method,path)=>({ok:true,body:path===paths[3]?{identities:[person]}:path===paths[4]?{entity_type:'user',tenant_id:'other',high_risk:{}}:bodyFor(path)}));await f.context.paPeople(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(buttons(f.host).length,0);
 });

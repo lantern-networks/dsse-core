@@ -743,3 +743,30 @@ func buildPostgresHumanIdentityImportRunDetailStatement(tenantID, importRunID st
 		Args: []any{tenantID, importRunID},
 	}, nil
 }
+
+// RiskIdentitySnapshot is used only by the startup migration of untyped risk IDs.
+func (store postgresHumanIdentityDirectoryStore) RiskIdentitySnapshot(ctx context.Context) ([]model.HumanIdentity, error) {
+	if store.DB == nil {
+		return nil, fmt.Errorf("identity directory database is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, postgresHumanIdentityDirectoryTimeout)
+	defer cancel()
+	rows, err := store.DB.QueryContext(ctx, "SELECT payload FROM human_identities ORDER BY tenant_id, human_identity_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	people := []model.HumanIdentity{}
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		var person model.HumanIdentity
+		if err := json.Unmarshal(payload, &person); err != nil {
+			return nil, err
+		}
+		people = append(people, person)
+	}
+	return people, rows.Err()
+}

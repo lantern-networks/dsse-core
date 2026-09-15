@@ -28,6 +28,7 @@ type riskSignalDeviceApplier interface {
 }
 
 type adminRiskSignalResponse struct {
+	TenantID          string `json:"tenant_id,omitempty"`
 	SchemaVersion     string `json:"schema_version"`
 	EntityType        string `json:"entity_type"`
 	EntityID          string `json:"entity_id"`
@@ -35,7 +36,7 @@ type adminRiskSignalResponse struct {
 	HighRisk          bool   `json:"high_risk"`
 	StandingGrantsCut int    `json:"standing_grants_revoked"`
 	Applied           bool   `json:"applied"`
-	// NotStoredDurably reports a runtime inventory save failure. An empty value does not attest to
+	// NotStoredDurably reports a device runtime save failure or an unconfirmed user-risk save. An empty value does not attest to
 	// overlay durability or independent fleet delivery; those stores have separate lifecycles.
 	NotStoredDurably    string `json:"not_stored_durably,omitempty"`
 	NoSecretAttestation bool   `json:"no_secret_attestation"`

@@ -9,21 +9,25 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
-// HighRiskOverlay is the shared HIGH-RISK device overlay, distributed on the same fast
+// HighRiskOverlay holds separate device and tenant-scoped user risk sets on the same fast
 // feed as admission revocations (revocation-class: a device marked high-risk on the control plane must be
 // treated high-risk by EVERY node's decision path, so risk-based deny/re-auth is fleet-consistent and the
 // device can't reconnect elsewhere to dodge it). Unlike admission revocations there is no node-local/auto
-// layer — high-risk is admin-marked (CP-authoritative). One `devices` map serves both roles: authoritative on
-// the CP (Mark/Clear), synced on a puller (ReplaceSynced). Persisted so a CP restart can't silently clear it.
+// layer — high-risk is admin-marked (CP-authoritative). Both sets are authoritative on
+// the CP and synced on pullers. Persistence keeps marks across a CP restart.
 type HighRiskOverlay struct {
 	mu         sync.RWMutex
 	devices    map[string]string // deviceID (normalized) -> severity (high|critical)
+	users      map[string]UserRisk
+	userIndex  map[string]string
+	loadErr    error
+	legacy     bool
 	persister  blobstore.Persister
 	generation atomic.Uint64
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
-	return &HighRiskOverlay{devices: map[string]string{}}
+	return &HighRiskOverlay{devices: map[string]string{}, users: map[string]UserRisk{}, userIndex: map[string]string{}}
 }
 
 // NormalizeDeviceID trims but PRESERVES case — device ids are opaque, case-sensitive identifiers and must

@@ -42,3 +42,16 @@ func deviceRiskAuditLog(r *http.Request, tenantID string, response adminRiskSign
 	}
 	return record
 }
+
+func userRiskAuditLog(r *http.Request, tenant string, response adminRiskSignalResponse, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+	record := deviceRiskAuditLog(r, tenant, response, evaluator, now)
+	record.ID = randomEdgeID("audit_user_risk_", now)
+	record.EventType = "user_risk_changed"
+	record.TargetType = stringPtr("human_identity")
+	record.TargetID = stringPtr(response.EntityID)
+	record.Action = stringPtr("set_user_risk")
+	delete(record.Metadata, "identity")
+	delete(record.Metadata, "runtime_persistence_warning")
+	record.Metadata["user_persistence_warning"] = response.NotStoredDurably != ""
+	return record
+}

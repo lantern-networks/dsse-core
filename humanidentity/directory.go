@@ -1797,3 +1797,15 @@ func newDirectoryID(prefix string, fallback time.Time) string {
 	}
 	return prefix + strconv.FormatInt(fallback.UnixNano(), 16)
 }
+
+// RiskIdentitySnapshot is an internal upgrade read, not a tenant-facing API. It
+// supplies complete attribution for legacy risk marks before the server starts.
+func (store *HumanIdentityDirectoryStore) RiskIdentitySnapshot(_ context.Context) ([]model.HumanIdentity, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	people := make([]model.HumanIdentity, 0, len(store.users))
+	for _, person := range store.users {
+		people = append(people, person)
+	}
+	return people, nil
+}

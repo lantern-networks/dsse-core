@@ -791,6 +791,9 @@ func (config serverConfig) withDefaults() serverConfig {
 	if config.HumanIdentities == nil {
 		config.HumanIdentities = humanidentity.NewHumanIdentityDirectoryStore()
 	}
+	if err := prepareUserRiskState(context.Background(), config.HighRiskOverlay, config.EnrolledLedger, config.HumanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
 	if config.HotStore == nil && config.Writer != nil {
 		config.HotStore = hotstore.NewJSONLStore(config.Writer, adminLogStreamFilenameMap())
 	}
@@ -3234,6 +3237,7 @@ func main() {
 	// The FAST revocation poller's status, so /healthz can be asked whether this node has ever held a set from
 	// the control plane. nil = no -config-source-url, i.e. no CP→Edge sync configured at all.
 	var revocationSyncState *revocationSyncStatus
+	var sharedRevocationSource *revocationSource
 	var configBundlePuller *configBundleSource // launched inside newServerWithConfig, where the DNS resolver exists too
 	// enrolmentCPReport tells the control plane about enrolments completed HERE. Constructed only when this
 	// Edge follows a control plane, because that is exactly when the omission bites: the config bundle
@@ -3354,7 +3358,7 @@ func main() {
 		revocationSyncState = &revocationSyncStatus{}
 		revSrc := revocationSource{url: cfgURL, endpoints: cpEndpointSel, token: token, interval: *revocationSourcePoll,
 			client: cfgClient, status: revocationSyncState}
-		go revSrc.run(context.Background(), livenessRevocations, highRiskOverlay)
+		sharedRevocationSource = &revSrc
 		// This node reports what it observes to the control plane, which RECORDS it for an administrator. It
 		// does not revoke anything, here or there.
 		livenessRevocations.SetReporter(revSrc.reportFunc())
@@ -3996,6 +4000,9 @@ func main() {
 	}
 
 	if lerr := enrolledLedger.SetPersisterChecked(mustCPStateBlobPersister(*enrolledInventoryStore, "enrolled_inventory")); lerr != nil {
+		if highRiskOverlay.NeedsMigration() {
+			log.Fatalf("legacy risk migration requires readable enrolled inventory: %v", lerr)
+		}
 		if enrollSigner != nil {
 			log.Fatalf("REFUSING TO START: this Edge issues device certificates and its enrolled inventory could "+
 				"not be read (%v). Continuing would treat every identity in the fleet as never enrolled, claim "+
@@ -4003,6 +4010,14 @@ func main() {
 		}
 		log.Printf("enrolled_inventory: the durable store could not be read (%v) — this Edge does not issue "+
 			"certificates, so it continues on the static seed and the control plane's next bundle", lerr)
+	}
+	// Resolve old untyped marks only after both inventories are loaded, and before
+	// any feed worker can replace the state being classified.
+	if err := prepareUserRiskState(context.Background(), highRiskOverlay, enrolledLedger, humanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
+	if sharedRevocationSource != nil {
+		go sharedRevocationSource.run(context.Background(), livenessRevocations, highRiskOverlay)
 	}
 	// ★★★ AND READ AGAIN, BECAUSE A STANDBY THAT ONLY LEARNS BY RESTARTING IS NOT WARM (2026-08-25). Two
 	// control planes share one database precisely so the standby holds what the leader authored. This store

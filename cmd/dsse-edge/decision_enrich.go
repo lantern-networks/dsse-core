@@ -138,18 +138,22 @@ func enrichDecisionRequestWithDeviceRisk(req model.DecisionRequest, deviceStore 
 	// lookup so it bites regardless of local registration (reconnect-elsewhere can't dodge a high-risk mark).
 	if highRisk != nil && req.DeviceID != "" {
 		if sev, ok := highRisk.IsHighRisk(req.DeviceID); ok {
-			req.RiskStateSeverity = valueOrDefault(req.RiskStateSeverity, sev)
+			if riskSeverityRank(sev) > riskSeverityRank(req.RiskStateSeverity) {
+				req.RiskStateSeverity = sev
+			}
 			if sev == "high" || sev == "critical" { // AdminHighRisk (revocation-class behaviours) is high/critical only
 				req.AdminHighRisk = true
 			}
 		}
 	}
-	// A USER marked at ANY level sets risk_state_severity on ANY device (the overlay is keyed by the user id too),
+	// User marks are matched within the authenticated tenant and the separate user namespace,
 	// so a risk-gated policy (e.g. risk >= high -> re-authenticate, or >= medium -> something) bites regardless of
 	// which device they use; high/critical additionally raise AdminHighRisk.
 	if highRisk != nil && req.UserID != "" {
-		if sev, ok := highRisk.IsHighRisk(req.UserID); ok {
-			req.RiskStateSeverity = valueOrDefault(req.RiskStateSeverity, sev)
+		if sev, ok := highRisk.UserSeverity(req.TenantID, req.UserID); ok {
+			if riskSeverityRank(sev) > riskSeverityRank(req.RiskStateSeverity) {
+				req.RiskStateSeverity = sev
+			}
 			if sev == "high" || sev == "critical" {
 				req.AdminHighRisk = true
 			}

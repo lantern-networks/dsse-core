@@ -66,7 +66,7 @@ async function paLoadPeople() {
     paGet("/admin/human-identities/sources", _PA_DIR),
     paGet("/admin/human-identities/import-runs", _PA_DIR),
     paGet("/admin/human-identities", _PA_DIR),
-    paGet("/admin/risk-signals", _PA_ENF),
+    paGet("/admin/risk-signals?entity_type=user", _PA_DIR),
   ]);
   const sources = paArray(sourceBody, "sources"), runs = paArray(runBody, "runs"), people = paArray(peopleBody, "identities");
   const healthSources = paArray(health, "sources");
@@ -76,7 +76,8 @@ async function paLoadPeople() {
       !healthSources.every(row => paObject(row) && paText(row.source) && paText(row.status)) ||
       !sources.every(row => paObject(row) && paText(row.source) && ["total", "active", "expired"].every(key => count(row[key])) && (row.observed_at == null || typeof row.observed_at === "string")) ||
       !runs.every(row => paObject(row) && paText(row.import_run_id) && (row.source == null || typeof row.source === "string") && count(row.upserted) && count(row.deactivated)) ||
-      !people.every(paPerson) || !paObject(risk) || !paObject(risk.high_risk) ||
+      !people.every(paPerson) || !paObject(risk) || risk.entity_type !== "user" || !paText(risk.tenant_id) || !paObject(risk.high_risk) ||
+      !people.every(person => person.tenant_id === risk.tenant_id) ||
       !Object.values(risk.high_risk).every(value => ["medium", "high", "critical"].includes(value))) throw new Error("Invalid directory response");
   return {health, sources, runs, people, riskMap: risk.high_risk};
 }
@@ -108,12 +109,44 @@ async function paWriteEnforcement(method, path, body) {
 
 // setUserRisk marks / clears a person's risk from their own row (no free-text id) — replaces the Device Risk
 // page's user option. "high" makes a risk-gated policy bite (e.g. force re-authentication) for that user on ANY
-// device; "none" clears it. Keyed by the person's id (the IdP subject the decision request carries).
+// device within the same tenant; "none" clears it. The server resolves the directory ID and subject.
+function paRiskNotice(section, u, severity, message) {
+  const notices = section.__paRiskNotices || (section.__paRiskNotices = new Map());
+  if (message) notices.set(u.id, {u, severity, message}); else notices.delete(u.id);
+}
+function paDrawRiskNotices(section) {
+  for (const notice of (section.__paRiskNotices || new Map()).values()) {
+    section.appendChild(el("div", { class: "ui-callout ui-callout-warn", role: "alert" }, [
+      el("strong", {text: notice.u.display_name || notice.u.subject || notice.u.id}),
+      el("div", {text: notice.message, style: "white-space:pre-wrap"}),
+      el("button", {class: "ui-btn ui-btn-sm", text: bl({en: "Retry risk change", ja: "リスク変更を再試行"}),
+        disabled: section.__paRiskPending?.has(notice.u.id) ? "" : null, onClick: () => setUserRisk(notice.u, notice.severity, section)}),
+    ]));
+  }
+}
 async function setUserRisk(u, severity, section) {
-  const r = await apiFetch("POST", "/admin/risk-signals", { entity_type: "user", entity_id: u.id, severity: severity, evidence_ref: "console" }, _PA_ENF);
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); paPeople(section); return; }
-  uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" }) : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
-  paPeople(section);
+  const pending = section.__paRiskPending || (section.__paRiskPending = new Set());
+  if (pending.has(u.id)) return;
+  pending.add(u.id); paRiskNotice(section, u, severity, "");
+  for (const control of section.querySelectorAll("[data-person-risk-id]")) if (control.getAttribute("data-person-risk-id") === u.id) control.disabled = true;
+  let notice = "";
+  try {
+    const r = await apiFetch("POST", "/admin/risk-signals", {entity_type: "user", entity_id: u.id, severity}, _PA_DIR);
+    if (!r || !r.ok) throw new Error(paMutationError(r));
+    const b = r.body;
+    if (!paObject(b) || b.entity_type !== "user" || b.entity_id !== u.id || b.tenant_id !== u.tenant_id || b.severity !== severity || b.applied !== true ||
+        b.high_risk !== (severity === "high" || severity === "critical") ||
+        (b.not_stored_durably !== undefined && typeof b.not_stored_durably !== "string")) throw new Error("Invalid user risk response");
+    if (b.not_stored_durably) notice = bl({en: "Risk applied, but durable saving is not confirmed. Retry after storage recovers.", ja: "リスクは反映されましたが、永続保存を確認できません。保存先の復旧後に再試行してください。"});
+  } catch (e) {
+    notice = bl({en: "The risk change could not be confirmed. Reload the state before retrying; the change may already be applied.", ja: "リスク変更を確認できません。反映済みの可能性があるため、状態を再読込してから再試行してください。"}) + "\n" + (e.message || String(e));
+  } finally {
+    pending.delete(u.id);
+    for (const control of section.querySelectorAll("[data-person-risk-id]")) if (control.getAttribute("data-person-risk-id") === u.id) control.disabled = false;
+  }
+  paRiskNotice(section, u, severity, notice);
+  if (!notice) uiToast(severity === "none" ? bl({en: "Risk cleared.", ja: "リスクを解除しました。"}) : bl({en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。"}), "ok");
+  await paPeople(section);
 }
 
 // ---- People: a synced directory (health + sources + import runs + identities), manual add demoted ----
@@ -123,10 +156,11 @@ async function paPeople(section) {
   let health, sources, runs, people, riskMap;
   try {
     ({health, sources, runs, people, riskMap} = await paLoadPeople());
-  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); return; }
+  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); paDrawRiskNotices(section); return; }
   people = people.filter((u) => u.status !== "deleted");
   if (!current()) return;
   section.innerHTML = "";
+  paDrawRiskNotices(section);
 
   // Directory-sync health banner: this is a SYNCED directory; the operator should see freshness, not a raw list.
   const synced = (health.source_count || 0) > 0;
@@ -162,7 +196,7 @@ async function paPeople(section) {
       [bl({ en: "Person", ja: "ユーザー" }), bl({ en: "Email", ja: "メール" }), bl({ en: "Dept", ja: "部門" }), bl({ en: "Source", ja: "出所" }), bl({ en: "Last seen", ja: "最終確認" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Risk", ja: "リスク" }), bl({ en: "", ja: "" })],
       rows.map((u) => {
         const sev = riskMap[u.id];
-        const riskSel = el("select", { class: "ui-input", style: "width:auto;padding:2px 4px" }, [
+        const riskSel = el("select", { "data-person-risk-id": u.id, disabled: section.__paRiskPending?.has(u.id) ? "" : null, class: "ui-input", style: "width:auto;padding:2px 4px" }, [
           el("option", { value: "none", text: bl({ en: "Normal", ja: "通常" }) }),
           el("option", { value: "medium", text: bl({ en: "Medium", ja: "中" }) }),
           el("option", { value: "high", text: bl({ en: "High", ja: "高" }) }),

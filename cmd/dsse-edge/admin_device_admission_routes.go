@@ -100,6 +100,8 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if config.HighRiskOverlay != nil {
 			feed.Generation += config.HighRiskOverlay.ConfigGeneration() // aggregate: a high-risk change advances the feed too
 			feed.HighRisk = config.HighRiskOverlay.Snapshot()
+			feed.UserRiskVersion = 1
+			feed.UserRisk = config.HighRiskOverlay.UserSnapshot()
 		}
 		writeJSON(w, http.StatusOK, feed)
 	}))

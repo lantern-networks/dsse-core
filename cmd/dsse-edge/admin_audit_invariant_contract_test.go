@@ -635,6 +635,9 @@ func deferredAuditEmitterInvariantFunctions() map[string]bool {
 		"enrolledInventoryAuditLog":  true,
 		// Transport admission names the affected device and acting administrator deliberately.
 		// Its HTTP audit contract checks that credentials and unrelated request fields stay out.
+		// IdP changes deliberately identify the administrator. The dedicated attribution/privacy
+		// test checks that identity, then applies the shared non-secret invariant to the rest.
+		"adminIdPChangeAuditLog":             true,
 		"transportAdmissionAuditLog":         true,
 		"deviceRiskAuditLog":                 true,
 		"userRiskAuditLog":                   true,

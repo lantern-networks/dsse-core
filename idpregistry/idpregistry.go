@@ -148,8 +148,9 @@ func (s *Store) Upsert(c Connection) (Connection, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.connections[normalized.TenantID] == nil {
-		s.connections[normalized.TenantID] = map[string]Connection{}
+	candidate := s.snapshotLocked()
+	if candidate.Connections[normalized.TenantID] == nil {
+		candidate.Connections[normalized.TenantID] = map[string]Connection{}
 	}
 	// ★★★ THE SCREEN PROMISES THE SECRET SURVIVES A BLANK FIELD, AND THIS USED TO DELETE IT (2026-09-03,
 	// measured on a live deployment while a step-up ceremony failed at the last hop).
@@ -171,12 +172,15 @@ func (s *Store) Upsert(c Connection) (Connection, error) {
 			normalized.ClientSecret = existing.ClientSecret
 		}
 	}
-	s.connections[normalized.TenantID][normalized.IdPID] = normalized
-	if strings.TrimSpace(s.defaults[normalized.TenantID]) == "" {
-		s.defaults[normalized.TenantID] = normalized.IdPID
+	candidate.Connections[normalized.TenantID][normalized.IdPID] = normalized
+	if strings.TrimSpace(candidate.Defaults[normalized.TenantID]) == "" {
+		candidate.Defaults[normalized.TenantID] = normalized.IdPID
 	}
+	if err := s.saveLocked(candidate); err != nil {
+		return Connection{}, err
+	}
+	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
-	s.persistLocked()
 	return normalized, nil
 }
 
@@ -213,12 +217,16 @@ func (s *Store) Delete(tenantID, idpID string) (bool, error) {
 	if s.defaults[tenantID] == idpID && len(s.connections[tenantID]) > 1 {
 		return false, fmt.Errorf("cannot delete the default IdP %q while others exist; set a new default first", idpID)
 	}
-	delete(s.connections[tenantID], idpID)
-	if s.defaults[tenantID] == idpID {
-		delete(s.defaults, tenantID)
+	candidate := s.snapshotLocked()
+	delete(candidate.Connections[tenantID], idpID)
+	if candidate.Defaults[tenantID] == idpID {
+		delete(candidate.Defaults, tenantID)
 	}
+	if err := s.saveLocked(candidate); err != nil {
+		return false, err
+	}
+	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
-	s.persistLocked()
 	return true, nil
 }
 
@@ -231,9 +239,13 @@ func (s *Store) SetDefault(tenantID, idpID string) error {
 	if _, ok := s.connections[tenantID][idpID]; !ok {
 		return fmt.Errorf("idp %q is not registered for the tenant", idpID)
 	}
-	s.defaults[tenantID] = idpID
+	candidate := s.snapshotLocked()
+	candidate.Defaults[tenantID] = idpID
+	if err := s.saveLocked(candidate); err != nil {
+		return err
+	}
+	s.defaults = candidate.Defaults
 	s.generation++
-	s.persistLocked()
 	return nil
 }
 

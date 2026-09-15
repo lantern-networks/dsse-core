@@ -71,6 +71,37 @@ match. A successful provider login without these claims is rejected by DSSE.
 The allowed-domain list is an operator assertion; saving it is not DNS ownership
 verification or an invitation to every user in that domain.
 
+## Saving, changing the default and deleting
+
+The Console reads and writes this registry through the control plane. Required
+provider and organization reads must succeed before editing; unavailable or
+malformed responses are shown with **Retry**, not as an empty registry. Changes
+are confirmed against the submitted provider identity and metadata. If a request
+is interrupted, reload before retrying because it may already have been applied.
+Closing a pending form does not cancel the server request. In-page warnings are
+not durable across a full reload.
+
+Creation, editing, changing the default and deleting save the candidate registry
+before changing live connections, defaults or configuration generation. A rejected
+save returns HTTP 500 and retains the previous live state. An empty client secret
+on edit preserves the current secret. The first connection becomes the default;
+choose another default before deleting it while other connections remain. Deleting
+the final connection removes the default too.
+
+Accepted changes appear in **Logs & Audit** as `idp_connection_upserted`,
+`idp_connection_default_set` or `idp_connection_deleted`, with the acting
+administrator, tenant, target provider and result. Connection secrets, endpoint
+URLs and claim values are not copied into these domain records. A rejected save
+has a common administrative error record and no successful domain record. A
+configuration audit does not prove that all Edges received the change or that a
+real sign-in succeeded.
+
+In-memory operation remains non-durable. Saved-without-atomicity results are logged
+and accepted without a separate Console durability indicator. Partial physical
+writes or ambiguous commits still require storage-level recovery. Tenant erasure
+and bundle replacement retain separate best-effort persistence behavior; concurrent
+writers and independent fleet delivery need deployment validation.
+
 ## TLS and reachability
 
 There are two independent HTTPS paths:

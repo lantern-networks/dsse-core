@@ -9994,6 +9994,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}:
     delete:
       summary: Remove an end-user IdP connection.
@@ -10017,6 +10026,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}/default:
     post:
       summary: Set a registered connection as the tenant default IdP.
@@ -10038,6 +10056,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}/test:
     get:
       summary: Test a registered IdP connection (non-interactive).

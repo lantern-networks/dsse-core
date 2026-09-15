@@ -54,6 +54,79 @@ Administrator OIDC configuration and customer end-user IdP connections are separ
 Successfully configuring the customer's IdP does not configure Console sign-in or prove
 the administrator's MFA behavior. Verify the actual administration login path you use.
 
+## Durable first-party authentication
+
+Use a durable `-first-party-store` (a file path or `postgres`) when administrator
+credentials must survive a restart. `memory` does not provide restart persistence.
+Successful TOTP sign-in records the consumed time step alongside the credential, so
+restarting with the same durable state does not make that code reusable. One-time
+recovery-code consumption is also saved before sign-in succeeds. A credential write
+failure refuses sign-in rather than issuing a session whose replay protection was not saved.
+
+For PostgreSQL, the component startup migration includes
+`048_admin_local_credentials_totp_counter.sql`,
+`049_admin_local_credentials_revision.sql`, and
+`051_admin_credentials_writer_protocol.sql`. The default
+`-postgres-run-migrations=true` applies it before credential loading. If migrations
+are disabled, apply these migrations through your database upgrade procedure before
+starting the updated binary. Back up the credential store and validate the upgrade
+on a separate environment first.
+
+Older file snapshots and database rows have no consumed-step history; the new field
+starts at zero and protection is established by the first successful sign-in after
+upgrade. Previously consumed codes cannot be reconstructed. Stop all authentication authorities for this upgrade, apply the migrations, and
+restart them with the updated binary. Do not run mixed versions: older binaries do
+not participate in the concurrency checks. After migration 051, the database rejects
+credential INSERT, UPDATE, DELETE and TRUNCATE statements that do not declare the
+supported transaction-local writer protocol. This makes writes from older binaries
+fail explicitly instead of silently overwriting newer state. It also affects manual
+maintenance scripts; review and update them before this migration. Do not disable
+the trigger or set a session-wide protocol value to keep old writers running.
+
+The writer protocol is a compatibility guard, not an authorization boundary against
+a database owner or arbitrary SQL access. Reads from an old process are not blocked,
+and a process retaining old in-memory credentials may still serve stale state.
+Stop all authorities during upgrade even though legacy database writes are refused.
+The guard requires migration 051 and applies only to PostgreSQL, not shared files.
+
+PostgreSQL credential writes compare a database generation before accepting a
+change. Simultaneous consumption of the same TOTP or recovery code through separate
+authorities sharing this database permits only one successful save. A stale write
+is refused, the local credential snapshot is refreshed for the next request, and
+the failed operation is not automatically retried. A sign-in conflict returns a
+storage-unavailable response; restart the sign-in flow with a fresh code.
+
+This does not provide continuous synchronization of existing session authorization
+across authorities. Independent databases and shared JSON files are not coordinated
+by this mechanism. PostgreSQL deletion is tenant-scoped and generation-checked as well: a stale
+individual or tenant-cascade deletion cannot erase an account recreated at the same
+email address. Conflicts fail the request and refresh local state without retrying
+the deletion automatically. A tenant cascade stops at its first failure and can
+have already removed earlier accounts; inspect the reported outcome before retrying.
+
+Full tenant erasure also sweeps residual database rows on the local node. Its
+credential-table batches use the same transaction-local writer protocol and count
+only committed deletions, including a successful zero-row cleanup. If the preceding
+account-deletion phase fails, the residual credential sweep is skipped rather than
+bypassing its refusal. Failures keep the tenant deletion/erasure records for retry.
+This operation is not one atomic transaction across all tenant stores.
+
+Credential persistence calls carry a five-second deadline. PostgreSQL honors that
+deadline; filesystem operations are not guaranteed to be interruptible. Existing
+session checks and principal labels read the last committed account snapshot without
+waiting for a credential write. Suspension and role changes take effect after a
+successful save; a failed save does not publish the requested change.
+
+An authenticator replacement starts a new step history. Account activation still
+allows immediate sign-in with the current code; the first successful sign-in consumes
+it for subsequent authentication attempts.
+
+Activation attempts with a valid invitation are audited under the target account's
+organization. Invalid or expired invitations cannot establish an organization; review
+those failures in the node organization's audit trail, rather than expecting them in
+a customer's account history. Audit records do not contain invitation tokens,
+passwords, authenticator secrets, or recovery codes.
+
 ## Delegated operation inside a customer
 
 When creating an organization, **Who runs it → We run it for them** establishes the

@@ -13,8 +13,8 @@ import (
 // tamper / auth anomaly / abnormal access) is folded into the entity's risk state. For devices the
 // state lives in device metadata, which the decision path already reads
 // (enrichDecisionRequestWithDeviceRisk -> risk_state_severity / admin_high_risk policy conditions), so
-// risk drives decisions with no evaluator change. A HIGH-risk signal also revokes the entity's
-// standing east-west grants (acceleration: emergency access reduction), reusing the E5/G-04 path.
+// risk drives decisions with no evaluator change. Marking does not revoke standing grants; policy
+// determines the access decision from the resulting risk state.
 
 // riskSignalDeviceApplier is implemented by the in-memory device store.
 //
@@ -28,6 +28,7 @@ type riskSignalDeviceApplier interface {
 }
 
 type adminRiskSignalResponse struct {
+	TenantID          string `json:"tenant_id,omitempty"`
 	SchemaVersion     string `json:"schema_version"`
 	EntityType        string `json:"entity_type"`
 	EntityID          string `json:"entity_id"`
@@ -35,8 +36,8 @@ type adminRiskSignalResponse struct {
 	HighRisk          bool   `json:"high_risk"`
 	StandingGrantsCut int    `json:"standing_grants_revoked"`
 	Applied           bool   `json:"applied"`
-	// NotStoredDurably is empty when the mark reached the disk. When it does not, the mark is still in force on
-	// this node AND in the fleet overlay, and this sentence says what an operator has to do about it.
+	// NotStoredDurably reports a device runtime save failure or an unconfirmed user-risk save. An empty value does not attest to
+	// overlay durability or independent fleet delivery; those stores have separate lifecycles.
 	NotStoredDurably    string `json:"not_stored_durably,omitempty"`
 	NoSecretAttestation bool   `json:"no_secret_attestation"`
 }
@@ -89,8 +90,8 @@ func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig m
 		// reads, rather than in place of the action.
 		notStored := ""
 		if perr != nil {
-			notStored = "applied here and NOT stored durably (" + perr.Error() + ") — it will be gone if this " +
-				"process restarts, so re-apply it once the store is healthy"
+			notStored = "Device runtime metadata was updated but its save failed. The risk overlay is updated separately " +
+				"and may retain the change after restart. Re-apply once the runtime store is healthy."
 			log.Printf("★ risk signal for %s applied in memory and NOT persisted: %v", entityID, perr)
 		}
 		if !found {

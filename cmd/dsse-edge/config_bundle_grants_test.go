@@ -58,7 +58,7 @@ func TestApplyingTheAuthoritysGrantsDoesNotDeleteAFreshOne(t *testing.T) {
 		GrantID: "g-other", TenantID: "t1", UserID: "v", IdPID: "idp",
 		IssuedAt: now.Format(time.RFC3339), ExpiresAt: now.Add(time.Hour).Format(time.RFC3339),
 	}}}
-	if added, _ := applyGrantBundleSection(local, authority, now); added != 1 {
+	if added, _, err := applyGrantBundleSection(local, authority, now); err != nil || added != 1 {
 		t.Fatalf("added=%d, want 1", added)
 	}
 	if _, ok := local.Get("g-local"); !ok {
@@ -69,8 +69,8 @@ func TestApplyingTheAuthoritysGrantsDoesNotDeleteAFreshOne(t *testing.T) {
 	// A revocation authored on the authority DOES reach this node.
 	revoked := fresh
 	revoked.Revoked = true
-	if _, updated := applyGrantBundleSection(local, &grantBundle{Complete: true,
-		Grants: []grantstore.Grant{revoked}}, now); updated != 1 {
+	if _, updated, err := applyGrantBundleSection(local, &grantBundle{Complete: true,
+		Grants: []grantstore.Grant{revoked}}, now); err != nil || updated != 1 {
 		t.Fatalf("updated=%d, want 1", updated)
 	}
 	if local.Valid("g-local", now) {
@@ -80,8 +80,8 @@ func TestApplyingTheAuthoritysGrantsDoesNotDeleteAFreshOne(t *testing.T) {
 	// An expired grant is not carried forward.
 	old := grantstore.Grant{GrantID: "g-old", TenantID: "t1", UserID: "w", IdPID: "idp",
 		IssuedAt: now.Add(-2 * time.Hour).Format(time.RFC3339), ExpiresAt: now.Add(-time.Hour).Format(time.RFC3339)}
-	if added, _ := applyGrantBundleSection(local, &grantBundle{Complete: true,
-		Grants: []grantstore.Grant{old}}, now); added != 0 {
+	if added, _, err := applyGrantBundleSection(local, &grantBundle{Complete: true,
+		Grants: []grantstore.Grant{old}}, now); err != nil || added != 0 {
 		t.Error("an expired grant was merged, so the set grows forever")
 	}
 }

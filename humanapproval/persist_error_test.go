@@ -1,11 +1,10 @@
 package humanapproval
 
 import (
+	"errors"
 	"fmt"
-	"strings"
-	"testing"
-
 	"github.com/lantern-networks/dsse-core/model"
+	"testing"
 )
 
 type failingPersister struct{}
@@ -13,32 +12,32 @@ type failingPersister struct{}
 func (failingPersister) Load() ([]byte, error) { return nil, nil }
 func (failingPersister) Save([]byte) error     { return fmt.Errorf("disk full") }
 
-// Review #17: the most security-relevant persist failure here is a REVOKE that never hits disk — the
-// approval silently resurrects on restart. Both Upsert and Revoke must surface the failure (the in-memory
-// state stays applied: the running edge already enforces it).
+// Creation is save-before-publication. Explicit revocation retains the denial and every retry must save.
 func TestUpsertAndRevokeSurfacePersistFailure(t *testing.T) {
 	s := NewStore(0)
-	if err := s.SetPersister(failingPersister{}); err != nil {
-		t.Fatalf("SetPersister: %v", err)
+	if e := s.SetPersister(failingPersister{}); e != nil {
+		t.Fatal(e)
 	}
-
-	_, err := s.Upsert(model.HumanApprovalEvent{ID: "h1", TenantID: "t1", ApprovalResult: "approved"})
-	if err == nil || !strings.Contains(err.Error(), "not persisted") {
-		t.Fatalf("Upsert must surface the persist failure, got %v", err)
+	event := model.HumanApprovalEvent{ID: "h1", TenantID: "t1", ApprovalResult: "approved"}
+	if _, e := s.Upsert(event); !errors.Is(e, ErrPersistence) {
+		t.Fatal(e)
 	}
-	if _, ok := s.Get("h1"); !ok {
-		t.Fatal("event should still be live in memory after a persist failure")
+	if _, ok := s.Get("h1"); ok {
+		t.Fatal("failed approval became live")
 	}
-
-	revoked, ok, err := s.Revoke("h1", "compromised")
-	if !ok || err == nil || !strings.Contains(err.Error(), "resurrect") {
-		t.Fatalf("Revoke must surface the persist failure, got ok=%v err=%v", ok, err)
+	if e := s.SetPersister(nil); e != nil {
+		t.Fatal(e)
 	}
-	if revoked.ApprovalResult != "revoked" {
-		t.Fatal("revoke must still be applied in memory")
+	if _, e := s.Upsert(event); e != nil {
+		t.Fatal(e)
 	}
-	// Idempotent second revoke: already revoked in memory, no new save attempted, no error.
-	if _, ok, err := s.Revoke("h1", "again"); !ok || err != nil {
-		t.Fatalf("second revoke should be a clean no-op, got ok=%v err=%v", ok, err)
+	if e := s.SetPersister(failingPersister{}); e != nil {
+		t.Fatal(e)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		revoked, ok, e := s.Revoke("h1", "compromised")
+		if !ok || !errors.Is(e, ErrPersistence) || revoked.ApprovalResult != "revoked" {
+			t.Fatalf("attempt %d: %+v %v %v", attempt, revoked, ok, e)
+		}
 	}
 }

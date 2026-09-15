@@ -71,6 +71,37 @@ match. A successful provider login without these claims is rejected by DSSE.
 The allowed-domain list is an operator assertion; saving it is not DNS ownership
 verification or an invitation to every user in that domain.
 
+## Saving, changing the default and deleting
+
+The Console reads and writes this registry through the control plane. Required
+provider and organization reads must succeed before editing; unavailable or
+malformed responses are shown with **Retry**, not as an empty registry. Changes
+are confirmed against the submitted provider identity and metadata. If a request
+is interrupted, reload before retrying because it may already have been applied.
+Closing a pending form does not cancel the server request. In-page warnings are
+not durable across a full reload.
+
+Creation, editing, changing the default and deleting save the candidate registry
+before changing live connections, defaults or configuration generation. A rejected
+save returns HTTP 500 and retains the previous live state. An empty client secret
+on edit preserves the current secret. The first connection becomes the default;
+choose another default before deleting it while other connections remain. Deleting
+the final connection removes the default too.
+
+Accepted changes appear in **Logs & Audit** as `idp_connection_upserted`,
+`idp_connection_default_set` or `idp_connection_deleted`, with the acting
+administrator, tenant, target provider and result. Connection secrets, endpoint
+URLs and claim values are not copied into these domain records. A rejected save
+has a common administrative error record and no successful domain record. A
+configuration audit does not prove that all Edges received the change or that a
+real sign-in succeeded.
+
+In-memory operation remains non-durable. Saved-without-atomicity results are logged
+and accepted without a separate Console durability indicator. Partial physical
+writes or ambiguous commits still require storage-level recovery. Tenant erasure
+and bundle replacement retain separate best-effort persistence behavior; concurrent
+writers and independent fleet delivery need deployment validation.
+
 ## TLS and reachability
 
 There are two independent HTTPS paths:
@@ -119,6 +150,74 @@ Pending browser authentication state is process-local and expires after ten
 minutes. A restart or a callback reaching a different process can require a fresh
 attempt. The broker's federated grant has a default lifetime of eight hours;
 this is distinct from the East-West challenge/grant API's lifetimes.
+
+## Review and revoke access approvals
+
+Open **Access Approvals** inside the customer organization. **Active** shows
+unexpired approvals; **All (incl. revoked/expired)** includes history. Search by
+person, email, device, destination or provider. The table includes captured
+identity, binding, scope, assurance, sign-in method and validity. These are recorded
+claims, not proof that every flow-policy requirement listed above is enforced.
+An invalid or missing expiry is **Unknown expiry**, never Active. Failed or
+malformed required reads show **Retry** instead of an empty list.
+
+The page lists and revokes approvals; it has no manual creation or editing form.
+**Revoke** asks for confirmation. Cancel sends no revocation request. The API
+checks the exact tenant and grant together before applying the denial. Repeated
+requests while a confirmation or write is pending are suppressed in the page.
+
+If storage fails, the API returns HTTP 500 with `status: partial`, `applied: true`
+and `persistence: unconfirmed`. The grant remains revoked in this server's memory,
+but a restart can restore the older saved grant. Restore the storage service and
+use **Retry saving revocation** before restarting. That retry saves an already
+revoked grant again. A lost response has an unknown outcome; check the approval
+and use **Retry revocation**. Warnings are held only in the current page and do not
+survive navigation or a browser reload. A normal response confirms local acceptance;
+it does not prove that all serving nodes received the revocation.
+
+**Logs & Audit** records `admin_access_grant_revoked` with result `revoked` or
+`partial`, the acting administrator, tenant, time and a SHA-256 grant reference.
+The common administrative write record retains the HTTP result and the same
+reference. Grant IDs also serve as bearer-cookie values: the revocation route is
+redacted in common, operator and break-glass audit records. Do not paste the ID
+into tickets or public diagnostics. Existing audit records are not rewritten.
+
+A configured successful persister is needed for restart retention. In-memory
+operation and saved-without-atomicity fallbacks are not full durability guarantees.
+Grant IDs are not reusable while their records remain in the store. Minting an
+existing ID is refused, including a revoked or expired one. New approvals are
+saved before they become active. A failed mint returns an error before the broker
+issues its grant cookie.
+
+Grant reports and configuration bundles preserve revocations. A stale active copy
+cannot reactivate a retained revoked ID, change its tenant, or extend/change an
+existing active approval's claims. A valid revocation retains the original claims.
+Unknown expired active reports are ignored; revoked records are retained even
+after expiry. Empty reports and omitted records do not delete existing approvals.
+
+The entire incoming batch is validated before mutation. Invalid identities or
+lifetimes return a report error (400); conflicting tenant/active claims return 409.
+Correct the conflicting input before retrying: a rejected batch, including any
+revocations inside it, has not been applied. A storage failure after validation
+returns 500: denials stay effective locally, but new active approvals are not
+adopted. The response counts local changes in that attempt, not durable completion.
+The reporter retries on its next reconciliation; configuration sync leaves a failed
+generation unapplied and retries it. A clean replay does not rewrite the store or
+advance its generation. Upgrade all authorities and Edges before relying on this
+behavior; an older node still has the earlier merge behavior.
+
+Startup refuses an existing empty file, `null`, malformed data, mismatched saved
+keys or invalid grant lifetimes. A rejected load leaves an already running store
+and its writer intact. Restore a verified backup rather than deleting the file or
+replacing it with `{}` to bypass the check; a genuinely missing initial snapshot
+and an explicitly configured empty object remain valid inputs. This cannot recover
+revocations already lost from every retained copy.
+
+These controls do not establish shared-storage writer coordination or a fleet-wide
+transaction. Partial physical writes, ambiguous commits, tenant erasure, unbounded
+retention, duplicate JSON object members and global generation continuity still
+need separate validation. Real IdP sign-in, independently running nodes, complete
+machine-certificate authorization and existing connections require deployment tests.
 
 ## Verify and troubleshoot
 

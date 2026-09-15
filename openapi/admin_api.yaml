@@ -164,6 +164,10 @@ components:
           items:
             type: object
             additionalProperties: true
+    ExportFormat:
+      type: string
+      enum: [ndjson]
+      default: ndjson
     ExportJob:
       type: object
       required:
@@ -198,10 +202,7 @@ components:
             - tool_call_events
             - inspection_events
         format:
-          type: string
-          enum:
-            - ndjson
-            - csv
+          $ref: "#/components/schemas/ExportFormat"
         filters:
           type: object
           additionalProperties:
@@ -2509,6 +2510,25 @@ components:
             - require_reauthentication
             - require_workload_attestation
       additionalProperties: false
+    PolicyMutationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          enum: [partial]
+        applied:
+          type: boolean
+          description: The policy store accepted the operation; this is not a guarantee of durable storage or fleet delivery.
+        policy_id:
+          type: string
+        tenant_id:
+          type: string
+        ne_snapshot_status:
+          type: string
+          enum: [unconfirmed]
     Policy:
       type: object
       required:
@@ -3291,6 +3311,25 @@ components:
         limit:
           type: integer
           minimum: 1
+    HumanApprovalMutationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          enum: [partial]
+        applied:
+          type: boolean
+          description: Revocation is effective on this server; persistence is unconfirmed.
+        approval_id:
+          type: string
+        tenant_id:
+          type: string
+        persistence:
+          type: string
+          enum: [unconfirmed]
     HumanApprovalEventRevokeRequest:
       type: object
       properties:
@@ -6489,6 +6528,17 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: The configured directory persister rejected the save. The candidate identity and configuration generation were not published. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /admin/human-identities/import-runs:
     get:
       summary: List Human Identity import run summaries.
@@ -6691,6 +6741,17 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: An identity save failed. Imports may have committed earlier items; inspect the directory before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /identity-sources/due:
     get:
       summary: List Human Identity sources due for connector import.
@@ -6747,6 +6808,17 @@ paths:
           description: Invalid import request.
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: An identity save failed. Imports may have committed earlier items; inspect the directory before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /admin/non-human-identities:
     get:
       summary: List tenant-scoped Non-Human Identities.
@@ -6788,6 +6860,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: A rejected store save leaves live configuration and generation unchanged. If the store accepted the change but Network Extension snapshot publication failed, the response has status partial and applied true. Publication may have written some files; fleet delivery is not established.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
   /admin/non-human-identities/risk:
     get:
       summary: Report Non-Human Identity risk signals (/).
@@ -7102,6 +7184,49 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+    delete:
+      summary: Retire a PROVISIONED per-tenant interception root that is not signing anything.
+      description: >-
+        Requires admin.policy.write for your OWN organization, or admin.tenant.admin for another's.
+
+
+        POST on this path creates a per-tenant root so it can be DISTRIBUTED before per-tenant signing is
+        enabled. Nothing removed them, so a deployment that later went a different way keeps certificates that
+        sign nothing — and two of them on the reference lab carried the same common name, which is exactly what
+        an operator cannot resolve from a trust store. Leaving them is not neutral: they may have been handed
+        to a customer.
+
+
+        Refused with 409 while per-tenant roots are IN FORCE: that root either signs the organization's leaves
+        now or would be regenerated for the next flow, so removing it would change what its devices must trust
+        without telling them — replace it through the announced overlap instead. Also refused for the node's
+        primary tenant, whose root is the deployment anchor rather than a provisioned per-tenant one. 404 when
+        the organization has no provisioned root here.
+
+
+        No traffic changes: it was signing nothing. A device that was given the certificate keeps trusting an
+        authority no leaf chains to.
+      tags:
+        - AdminInterceptionRoots
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Retired from this node, in memory and on disk.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No provisioned interception root for this organization.
+        "409":
+          description: That root is, or would become, the signer for this organization.
+        "503":
+          description: Interception is not enabled on this edge.
   /admin/interception-intermediate:
     get:
       summary: Interception intermediate status.
@@ -7285,50 +7410,6 @@ paths:
           description: Not announced as a retiring root for this organization.
         "409":
           description: That root is the one currently signing for this organization.
-        "503":
-          description: Interception is not enabled on this edge.
-  /admin/interception-roots/{tenant}:
-    delete:
-      summary: Retire a PROVISIONED per-tenant interception root that is not signing anything.
-      description: >-
-        Requires admin.policy.write for your OWN organization, or admin.tenant.admin for another's.
-
-
-        POST on this path creates a per-tenant root so it can be DISTRIBUTED before per-tenant signing is
-        enabled. Nothing removed them, so a deployment that later went a different way keeps certificates that
-        sign nothing — and two of them on the reference lab carried the same common name, which is exactly what
-        an operator cannot resolve from a trust store. Leaving them is not neutral: they may have been handed
-        to a customer.
-
-
-        Refused with 409 while per-tenant roots are IN FORCE: that root either signs the organization's leaves
-        now or would be regenerated for the next flow, so removing it would change what its devices must trust
-        without telling them — replace it through the announced overlap instead. Also refused for the node's
-        primary tenant, whose root is the deployment anchor rather than a provisioned per-tenant one. 404 when
-        the organization has no provisioned root here.
-
-
-        No traffic changes: it was signing nothing. A device that was given the certificate keeps trusting an
-        authority no leaf chains to.
-      tags:
-        - AdminInterceptionRoots
-      parameters:
-        - name: tenant
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Retired from this node, in memory and on disk.
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          description: No provisioned interception root for this organization.
-        "409":
-          description: That root is, or would become, the signer for this organization.
         "503":
           description: Interception is not enabled on this edge.
   /admin/interception-intermediate/{tenant}:
@@ -7689,13 +7770,15 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Add or replace one internal certificate authority.
-      description: Requires admin.policy.write. The material must be a CA certificate that has not expired; a server's own certificate is refused with the reason. An operator may name another organization in tenant_id; a customer naming one is refused rather than redirected.
+      description: Requires admin.policy.write. Supply exactly one public CA certificate that has not expired. Private keys, additional certificates, other PEM material and trailing JSON are refused. Requests are limited to 1 MiB. Live trust changes only after persistence reports success. A stable id permits retry of the same submission; omitting id generates a new one. An operator may name another organization in tenant_id; a customer naming one is refused rather than redirected.
       tags:
         - AdminInternalCAs
       requestBody:
@@ -7715,6 +7798,12 @@ paths:
                 additionalProperties: true
         "400":
           description: The material is not an authority this deployment can use, with the reason.
+        "409":
+          description: This node receives configuration from a source and refuses local writes.
+        "500":
+          description: Persistence is unconfirmed. This request did not adopt a live change; restore storage, reload and retry.
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7722,7 +7811,7 @@ paths:
   /admin/internal-cas/all:
     get:
       summary: Every organization's internal certificate authorities.
-      description: Requires admin.policy.read AND the operator organization. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy.
+      description: "Requires admin.policy.read AND a configured operator organization matching the caller. An unconfigured operator is denied. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy."
       tags:
         - AdminInternalCAs
       responses:
@@ -7733,6 +7822,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7740,7 +7831,7 @@ paths:
   /admin/internal-cas/{id}:
     delete:
       summary: Remove one internal certificate authority.
-      description: Requires admin.policy.write. Scoped to the authenticated organization. Private assets whose certificates it issued stop being reachable on the next request, not the next restart.
+      description: Requires admin.policy.write. Scoped to the authenticated organization. The durable delete must report success before live trust changes. Other servers must receive the configuration update. This operation does not forcibly close established connections.
       tags:
         - AdminInternalCAs
       parameters:
@@ -7751,13 +7842,19 @@ paths:
             type: string
       responses:
         "200":
-          description: Removed.
+          description: Removed; the response includes deleted=true, id, and tenant_id.
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           description: No such authority in this organization.
+        "409":
+          description: This node receives configuration from a source and refuses local writes.
+        "500":
+          description: Persistence is unconfirmed. This request did not remove live trust; restore storage, reload and retry.
   /admin/steer-exclusions:
     get:
       summary: List admin-managed steer exclusions.
@@ -8656,10 +8753,12 @@ paths:
   /admin/retention-config:
     get:
       summary: Read the admin-configured per-stream retention overrides.
-      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default.
+      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default. A failed persisted-settings load returns 503 and pauses retention until a clean reload.
       tags:
         - AdminRetention
       responses:
+        "503":
+          description: Retention settings could not be loaded or are unavailable.
         "200":
           description: Current per-stream retention overrides (days).
           content:
@@ -8673,7 +8772,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Set (or clear) a per-stream retention override.
-      description: Requires admin.retention.write. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
+      description: Requires admin.retention.write and deployment-wide administration. An unavailable store returns 503 without overwriting persisted settings. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
       tags:
         - AdminRetention
       requestBody:
@@ -8688,11 +8787,15 @@ paths:
                   description: The log stream (e.g. access, audit).
                 days:
                   type: integer
-                  description: Retention in days; 0 keeps the stream forever.
+                  minimum: 0
+                  maximum: 106751
+                  description: Whole days, required unless clear=true; explicit 0 keeps the stream forever.
                 clear:
                   type: boolean
                   description: If true, remove the override and revert to the flag default.
       responses:
+        "503":
+          description: Retention settings could not be loaded or are unavailable.
         "200":
           description: Resulting overrides.
           content:
@@ -8709,7 +8812,7 @@ paths:
   /admin/audit-chain/verify:
     get:
       summary: Verify the audit cold-archive tamper-evident hash chain.
-      description: Requires admin.retention.read. Walks the tenant's archived audit segments and checks the hash chain — each segment embeds the SHA-256 of the previous one, so a deleted / altered / reordered segment breaks the chain and is reported. Returns ok=true when the chain is intact.
+      description: Requires admin.retention.read. Checks the listed tenant audit segments for valid headers, contiguous sequence numbers, previous-object hashes and complete gzip integrity. Status is empty (ok=false), broken (ok=false), or links_verified (ok=true). Scope is listed_segments_only. Success does not establish completeness against a trusted checkpoint, detect a removed suffix or detect a consistently rewritten chain.
       tags:
         - AdminRetention
       responses:
@@ -9904,7 +10007,7 @@ paths:
   /admin/idp-connections:
     get:
       summary: List the tenant's end-user IdP connections + the default.
-      description: Requires admin.idp.read. Returns the per-tenant federated-auth IdP connections (RP client_secret redacted) and the default_idp_id. See docs/idp_federated_authentication_design.md.
+      description: Requires admin.idp.read. Returns the per-tenant federated-auth IdP connections (RP client_secret redacted) and the default_idp_id. See docs/idp.md.
       tags:
         - AdminIdPConnections
       responses:
@@ -9945,6 +10048,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}:
     delete:
       summary: Remove an end-user IdP connection.
@@ -9968,6 +10080,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}/default:
     post:
       summary: Set a registered connection as the tenant default IdP.
@@ -9989,6 +10110,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}/test:
     get:
       summary: Test a registered IdP connection (non-interactive).
@@ -10024,7 +10154,7 @@ paths:
   /admin/grants:
     get:
       summary: List the federated-auth grants minted by the clientless broker.
-      description: Requires admin.grants.read. Returns the tenant's grants (user, idp_id, acr/amr, issued/expires, revoked). See docs/idp_federated_authentication_design.md.
+      description: Requires admin.grants.read. Returns the tenant's grants (user, idp_id, acr/amr, issued/expires, revoked). See docs/idp.md.
       tags:
         - AdminGrants
       responses:
@@ -10046,7 +10176,14 @@ paths:
   /admin/grants/{id}/revoke:
     post:
       summary: Revoke a federated-auth grant (continuous revocation).
-      description: Requires admin.grants.write. A revoked grant denies the next flow and stays revoked across a restart.
+      description: >-
+        Requires admin.grants.write. Checks the exact caller tenant and grant under
+        one lock. Revokes locally and attempts persistence; a save failure retains
+        local denial and returns partial, requiring a retry before restart. A repeat
+        retries saving even if already revoked. Success confirms local acceptance,
+        not fleet delivery or durable storage when no persister is configured.
+        The grant ID is a bearer credential; audit records use a SHA-256 reference.
+        See docs/idp.md for distribution and persistence limits.
       tags:
         - AdminGrants
       parameters:
@@ -10057,7 +10194,48 @@ paths:
             type: string
       responses:
         "200":
-          description: Revoked.
+          description: Revocation accepted locally.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, grant_id, tenant_id, audit_ref]
+                properties:
+                  status:
+                    type: string
+                    enum: [revoked]
+                  grant_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  audit_ref:
+                    type: string
+                    description: SHA-256 reference, not the bearer grant ID.
+        "500":
+          description: Local denial applied but persistence is unconfirmed; restore storage and retry before restarting.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, applied, grant_id, tenant_id, audit_ref, persistence, error]
+                properties:
+                  status:
+                    type: string
+                    enum: [partial]
+                  applied:
+                    type: boolean
+                    enum: [true]
+                  grant_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  audit_ref:
+                    type: string
+                  persistence:
+                    type: string
+                    enum: [unconfirmed]
+                  error:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10561,7 +10739,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Delegated Access Grant.
-      description: Requires admin.delegated_grants.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata-only Admin API does not issue tokens, broker delegated sessions, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.delegated_grants.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata API does not issue tokens or broker delegated sessions. A confirmed change updates the store generation; delivery through the configured bundle synchronization is asynchronous. Empty expiry uses the server default lifetime (30 minutes).
       tags:
         - AdminDelegatedAccessGrant
       requestBody:
@@ -10585,6 +10763,24 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          description: Delegated grant persistence failed; the candidate was not published to live state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: New organization-and-ID record refused because the store is at capacity. Existing authorization and revocation records are retained; existing-ID mutations remain subject to validation and persistence checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/delegated-grants/{grant_id}:
     get:
       summary: Get a tenant-scoped Delegated Access Grant.
@@ -10616,7 +10812,7 @@ paths:
   /admin/delegated-grants/{grant_id}/revoke:
     post:
       summary: Revoke a tenant-scoped Delegated Access Grant.
-      description: Requires admin.delegated_grants.revoke. The revoke action updates grant status only; token revocation, session brokering, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.delegated_grants.revoke. The revoke action updates grant status and the store generation. It does not revoke a separately issued token or terminate a session. Verify asynchronous bundle delivery and enforcement on each Edge separately.
       tags:
         - AdminDelegatedAccessGrant
       parameters:
@@ -10647,6 +10843,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Delegated grant persistence failed; the candidate was not published to live state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/human-approval-events:
     get:
       summary: List tenant-scoped Human Approval Events.
@@ -10707,7 +10912,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Human Approval Event.
-      description: Requires admin.approval.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata-only Admin API does not send notifications, perform approval UI workflows, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.approval.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. A rejected save returns 500 before the candidate becomes available to local lookups. This metadata API does not send notifications, perform approval UI workflows, compile bundles, or distribute outcomes to other servers.
       tags:
         - AdminHumanApprovalEvent
       requestBody:
@@ -10731,6 +10936,21 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          description: Approval candidate could not be saved; it was not published in this process.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanApprovalMutationError"
+        "503":
+          description: New organization-and-ID record refused because the store is at capacity. Existing authorization and revocation records are retained; existing-ID mutations remain subject to validation and persistence checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/human-approval-events/{approval_id}:
     get:
       summary: Get a tenant-scoped Human Approval Event.
@@ -10762,7 +10982,7 @@ paths:
   /admin/human-approval-events/{approval_id}/revoke:
     post:
       summary: Revoke a tenant-scoped Human Approval Event.
-      description: Requires admin.approval.write. The revoke action updates approval_result only; notification workflows, runtime domain event emission, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.approval.write. Revocation is applied to this server before saving. If saving fails, 500 reports partial, applied=true and persistence=unconfirmed; retry the same revoke before restarting. An already-revoked record still retries saving and retains the original reason. This metadata API does not perform notification workflows or distribute revocation to other servers.
       tags:
         - AdminHumanApprovalEvent
       parameters:
@@ -10793,6 +11013,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Revocation is active on this server but persistence is unconfirmed. Retry before restarting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanApprovalMutationError"
   /admin/endpoints:
     get:
       summary: List tenant-scoped Endpoint Inventory entries.
@@ -11262,6 +11488,23 @@ paths:
         "400": { description: The chain does not link, the key does not match, or it is not a CA. }
         "403": { description: Naming another organization without the rights the envelope requires. }
 
+    get:
+      summary: Whose root this organization's traffic is inspected under, and whether a replacement is staged.
+      description: >
+        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority.
+
+
+        A staged authority is NOT signing, and the answer says so: promoting before every device holds the
+        incoming root took every HTTPS site away from a fleet for eighteen minutes on 2026-08-19. Read
+        GET /admin/interception-authority-rotation on an Edge before promoting; withdrawing takes nothing away.
+
+
+        Never returns key material, and the root key is not here at all — it is the organization's.
+      responses:
+        "200":
+          description: The authority, or has_authority false when the deployment's own root is used.
+        "409":
+          description: This node holds no per-organization interception authorities.
   /admin/tenant-transport-authority:
     get:
       summary: Where this organization's transport authority stands.
@@ -11285,6 +11528,54 @@ paths:
                   rotating: { type: boolean }
                   incoming_since: { type: string }
         "403": { description: Not permitted for this organization. }
+    post:
+      summary: Create this organization's transport authority, if it has none.
+      description: >
+        Requires admin.enrollment.write or admin.tenant.admin; naming another organization additionally goes through the operator
+        envelope, like every other cross-organization PKI act.
+
+
+        The authority is the CA that signs the certificate this organization's devices meet when they connect,
+        and it is held on the CONTROL PLANE rather than on the Edges. That is what lets an Edge added under
+        load serve the organization at all: it is handed short-lived server material on request instead of
+        having a five-year key placed on it as a file, which is what every per-organization certificate was
+        until 2026-08-20 — measured, on this repository's own scale-out definition, as carrying none of them.
+
+
+        The NAME is given here, at the moment the authority is created, because the name devices are told to
+        send and the certificate they meet have to stay together. Asking again returns the authority that
+        already exists: replacing one is a rotation (publish the new anchor, measure adoption, withdraw the
+        old), never a side effect of a second call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_name]
+              properties:
+                tenant_id:
+                  type: string
+                  description: Operators only; a tenant admin's own organization is taken from the session.
+                server_name:
+                  type: string
+                  description: The name this organization's agents will send, e.g. northwind.dsse.invalid.
+      responses:
+        "200":
+          description: The authority, existing or newly created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  server_name: { type: string }
+                  anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
+                  created_at: { type: string }
+                  applies_to: { type: string }
+        "400": { description: No name was given, or it could not be created. }
+        "403": { description: Naming another organization without the rights the envelope requires. }
+
   /admin/tenant-transport-authority/rotate:
     post:
       summary: Give this organization a SECOND transport authority, beside the one in force.
@@ -11431,6 +11722,37 @@ paths:
           description: The caller may not act on that organization's PKI, or holds no active elevation over it.
         "501":
           description: This control plane holds no device-identity authorities.
+    get:
+      summary: What this organization's devices are enrolled under, and whether it is moving.
+      description: >
+        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority — a
+        control plane. An Edge says so rather than reporting every organization as having none.
+
+
+        Three tiers of per-organization authority had grown a full set of acts and a readiness answer each,
+        and only the transport tier could be READ. A screen could say nothing about the tier that decides
+        whether an organization's devices are admitted at all.
+
+
+        During a rotation the signer is NOT the authority in force — the incoming one signs, because that is
+        how devices migrate. After an abandonment it is the authority in force again while both stay admitted.
+        Those are opposite states, so the answer names which, rather than only "rotating".
+
+        With readiness=1 during a rotation, retirement_readiness contains allowed, reason and checked_at.
+        This read-only preview uses the same shared inventory, observation freshness and regional TLS evidence
+        as the retirement POST. It does not reserve permission; the POST always checks again.
+      parameters:
+        - in: query
+          name: readiness
+          schema: { type: string, enum: ["1"] }
+          description: Include the control plane's read-only retirement verification during a rotation.
+      responses:
+        "200":
+          description: The authority, or has_authority false when this organization uses the deployment's own.
+        "409":
+          description: This node holds no per-organization device-identity authorities.
+        "503":
+          description: The durable authority snapshot could not be read; stale metadata is not returned.
   /admin/tenant-device-authority/rotate:
     post:
       summary: Begin moving this organization's devices onto a new device-identity authority.
@@ -11483,56 +11805,6 @@ paths:
           description: This organization has no device-identity authority, or is already mid-rotation.
         "501":
           description: This control plane holds no device-identity authorities.
-  /admin/tenant-device-authority:
-    get:
-      summary: What this organization's devices are enrolled under, and whether it is moving.
-      description: >
-        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority — a
-        control plane. An Edge says so rather than reporting every organization as having none.
-
-
-        Three tiers of per-organization authority had grown a full set of acts and a readiness answer each,
-        and only the transport tier could be READ. A screen could say nothing about the tier that decides
-        whether an organization's devices are admitted at all.
-
-
-        During a rotation the signer is NOT the authority in force — the incoming one signs, because that is
-        how devices migrate. After an abandonment it is the authority in force again while both stay admitted.
-        Those are opposite states, so the answer names which, rather than only "rotating".
-
-        With readiness=1 during a rotation, retirement_readiness contains allowed, reason and checked_at.
-        This read-only preview uses the same shared inventory, observation freshness and regional TLS evidence
-        as the retirement POST. It does not reserve permission; the POST always checks again.
-      parameters:
-        - in: query
-          name: readiness
-          schema: { type: string, enum: ["1"] }
-          description: Include the control plane's read-only retirement verification during a rotation.
-      responses:
-        "200":
-          description: The authority, or has_authority false when this organization uses the deployment's own.
-        "409":
-          description: This node holds no per-organization device-identity authorities.
-        "503":
-          description: The durable authority snapshot could not be read; stale metadata is not returned.
-  /admin/tenant-interception-authority:
-    get:
-      summary: Whose root this organization's traffic is inspected under, and whether a replacement is staged.
-      description: >
-        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority.
-
-
-        A staged authority is NOT signing, and the answer says so: promoting before every device holds the
-        incoming root took every HTTPS site away from a fleet for eighteen minutes on 2026-08-19. Read
-        GET /admin/interception-authority-rotation on an Edge before promoting; withdrawing takes nothing away.
-
-
-        Never returns key material, and the root key is not here at all — it is the organization's.
-      responses:
-        "200":
-          description: The authority, or has_authority false when the deployment's own root is used.
-        "409":
-          description: This node holds no per-organization interception authorities.
   /admin/tenant-device-authority/abandon-rotation:
     post:
       summary: Give up on a device-identity rotation without refusing the devices that already moved.
@@ -11870,55 +12142,6 @@ paths:
                   never_reported: { type: array, items: { type: string } }
                   may_retire_previous: { type: boolean }
                   note: { type: string }
-  /admin/tenant-transport-authority:
-    post:
-      summary: Create this organization's transport authority, if it has none.
-      description: >
-        Requires admin.enrollment.write or admin.tenant.admin; naming another organization additionally goes through the operator
-        envelope, like every other cross-organization PKI act.
-
-
-        The authority is the CA that signs the certificate this organization's devices meet when they connect,
-        and it is held on the CONTROL PLANE rather than on the Edges. That is what lets an Edge added under
-        load serve the organization at all: it is handed short-lived server material on request instead of
-        having a five-year key placed on it as a file, which is what every per-organization certificate was
-        until 2026-08-20 — measured, on this repository's own scale-out definition, as carrying none of them.
-
-
-        The NAME is given here, at the moment the authority is created, because the name devices are told to
-        send and the certificate they meet have to stay together. Asking again returns the authority that
-        already exists: replacing one is a rotation (publish the new anchor, measure adoption, withdraw the
-        old), never a side effect of a second call.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [server_name]
-              properties:
-                tenant_id:
-                  type: string
-                  description: Operators only; a tenant admin's own organization is taken from the session.
-                server_name:
-                  type: string
-                  description: The name this organization's agents will send, e.g. northwind.dsse.invalid.
-      responses:
-        "200":
-          description: The authority, existing or newly created.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  tenant_id: { type: string }
-                  server_name: { type: string }
-                  anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
-                  created_at: { type: string }
-                  applies_to: { type: string }
-        "400": { description: No name was given, or it could not be created. }
-        "403": { description: Naming another organization without the rights the envelope requires. }
-
   /admin/tenant-cas:
     get:
       summary: List the CAs that identify each tenant's devices.
@@ -12564,7 +12787,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Policy Engine policy.
-      description: Requires admin.policy.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This endpoint manages process-local control-plane policy definitions in this increment; bundle compilation/signing and live runtime hot reload are deferred.
+      description: Requires admin.policy.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. With a configured persistent store, the authored policy is saved before publication to the live policy store. Successful local publication does not establish delivery to every Edge.
       tags:
         - AdminPolicy
       requestBody:
@@ -12586,6 +12809,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: A rejected store save leaves live configuration and generation unchanged. If the store accepted the change but Network Extension snapshot publication failed, the response has status partial and applied true. Publication may have written some files; fleet delivery is not established.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyMutationError"
   /admin/effective-policy:
     get:
       summary: Explain the precedence-ordered policy basis for a destination ("Why").
@@ -12978,6 +13207,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: The policy exists but is bundle-sourced; it cannot be deleted through the Admin API.
+        "500":
+          description: Deletion is applied on this server, but Network Extension snapshot publication is unconfirmed. Reload before retrying; the removed policy now returns 404. This does not establish durable deletion or delivery to every endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyMutationError"
   /admin/rbac/catalog:
     get:
       summary: Return Admin RBAC role and API token scope catalog.
@@ -13476,6 +13711,62 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /admin/audit-writer/health:
+    get:
+      summary: Report observed primary audit-file write failures.
+      description: >-
+        Requires admin.logs.read and deployment-wide administration. Tenant-scoped
+        sessions and requests operating on a tenant receive 403. Counters describe
+        completed audit appends in this node's current Writer instance, reset on
+        recreation, and do not prove durable storage or fleet-wide completeness.
+        Primary failures remain degraded after successful writes. Hook failures
+        are counted separately and do not change primary status. Reading does not
+        append an audit event or clear failures.
+      tags:
+        - AdminLog
+      responses:
+        "200":
+          description: In-memory writer observations, including unknown or unavailable states.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, scope, attempts, primary_successes, primary_failures, hook_failures]
+                properties:
+                  status:
+                    type: string
+                    enum: [unknown, unavailable, healthy, degraded]
+                  scope:
+                    type: string
+                    enum: [writer_process_lifetime]
+                  attempts:
+                    type: integer
+                    minimum: 0
+                  primary_successes:
+                    type: integer
+                    minimum: 0
+                  primary_failures:
+                    type: integer
+                    minimum: 0
+                  hook_failures:
+                    type: integer
+                    minimum: 0
+                  last_success_at:
+                    type: string
+                    format: date-time
+                  last_primary_failure_at:
+                    type: string
+                    format: date-time
+                  last_hook_failure_at:
+                    type: string
+                    format: date-time
+                  last_primary_failure_phase:
+                    type: string
+                    enum: [encode, open, write, rotation]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /admin/hot-store/health:
     get:
       summary: Return Edge Hot Store mirror health.
@@ -13957,7 +14248,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create asynchronous log export job.
-      description: Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF.
+      description: Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Both bounds are required; to must not precede from. Only ndjson is supported. Validation occurs before worker submission.
       tags:
         - AdminExport
       requestBody:
@@ -13993,17 +14284,15 @@ paths:
                   additionalProperties:
                     type: string
                 format:
-                  type: string
-                  enum:
-                    - ndjson
-                    - csv
-                  default: ndjson
+                  $ref: "#/components/schemas/ExportFormat"
                 limit:
                   type: integer
                   minimum: 0
                   maximum: 1000000
-                  description: Omit or set 0 to use the server-side Phase 1 default of 1000000 rows. Alpha should make the default explicit per plan.
+                  description: Omit or set 0 to use the default of 1000000 rows.
       responses:
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "202":
           description: Export job accepted.
           content:

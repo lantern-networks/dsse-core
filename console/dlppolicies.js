@@ -12,6 +12,25 @@ function dlpInstanceScopeLabel(s) {
   return { corporate: bl({ en: "Corporate only", ja: "自社のみ" }), personal: bl({ en: "Personal / outside only", ja: "個人/社外のみ" }) }[s] || bl({ en: "Any account", ja: "すべて" });
 }
 
+// Every dependency is required for a safe edit: an unavailable detector library
+// must not turn an existing selection into an empty one on the next save.
+function dlpEditorList(response, key, validItem) {
+  if (!response || !response.ok) throw new Error(key + ": HTTP " + (response && response.status || "unavailable"));
+  const body = response.body;
+  if (!body || !Object.hasOwn(body, key) ||
+      (body[key] !== null && !Array.isArray(body[key]))) throw new Error(key + ": invalid response");
+  const list = body[key] || []; // These APIs may encode an empty slice as null.
+  if (!list.every(validItem)) throw new Error(key + ": invalid entry");
+  return list;
+}
+
+function dlpWholeCount(raw) {
+  const text = String(raw).trim();
+  if (!/^\d+$/.test(text)) return null;
+  const value = Number(text);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
 async function renderDLPPoliciesView(content) {
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, el("div", {}, [
@@ -28,14 +47,20 @@ async function renderDLPPoliciesView(content) {
   let _orgDomains = []; // the "our company" domains that decide corporate vs personal (S6)
 
   async function load() {
+    const current = freshRender(section);
     uiState(section, "loading");
     try {
       const [pr, cr, fr, od] = await Promise.all([apiFetch("GET", "/admin/dlp-policies"), apiFetch("GET", "/admin/dlp-classifiers"), apiFetch("GET", "/admin/dlp-fingerprints"), apiFetch("GET", "/admin/organization-domains")]);
-      if (!pr.ok) throw new Error("HTTP " + pr.status);
-      _policies = (pr.body && pr.body.policies) || [];
-      _library = { custom: (cr.ok && cr.body && cr.body.classifiers) || [], edm: (fr.ok && fr.body && fr.body.datasets) || [] };
-      _orgDomains = (od.ok && od.body && od.body.domains) || [];
-    } catch (e) { uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
+      const named = (x) => x && typeof x.name === "string" && x.name.trim() !== "";
+      const policies = dlpEditorList(pr, "policies", (x) => named(x) && typeof x.id === "string" && x.id && Array.isArray(x.identifiers) && x.identifiers.every((id) => typeof id === "string" && id));
+      const custom = dlpEditorList(cr, "classifiers", named);
+      const edm = dlpEditorList(fr, "datasets", named);
+      const domains = dlpEditorList(od, "domains", (x) => typeof x === "string" && x.trim() !== "");
+      if (!current()) return;
+      _policies = policies;
+      _library = { custom, edm };
+      _orgDomains = domains;
+    } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
     render();
   }
 
@@ -118,13 +143,15 @@ async function renderDLPPoliciesView(content) {
     const syncDr = () => { drBox.style.display = drEnableF.get() ? "" : "none"; };
     drEnableF.el.querySelector("input").addEventListener("change", syncDr);
 
+    const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }), onClick: onSave });
+    const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
     const m = uiModal({
       title: existing ? bl({ en: "Edit DLP policy", ja: "DLP ポリシーを編集" }) : bl({ en: "Add DLP policy", ja: "DLP ポリシーを追加" }),
       body: [nameF.el, actionF.el, scopeF.el, orgBox, el("div", { class: "ui-view-desc", style: "margin:0.4rem 0 0.15rem", text: bl({ en: "Detect", ja: "検出対象" }) }), idBox,
-        el("div", { class: "ui-view-desc", style: "margin:0.6rem 0 0.15rem", text: bl({ en: "Device risk (optional)", ja: "デバイスリスク(任意)" }) }), drEnableF.el, drBox],
+        el("div", { class: "ui-view-desc", style: "margin:0.6rem 0 0.15rem", text: bl({ en: "Device risk (optional)", ja: "デバイスリスク(任意)" }) }), drEnableF.el, drBox, saveError],
       footer: [
         el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }),
-        el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }), onClick: onSave }),
+        submit,
       ],
     });
     nameF.focus();
@@ -156,19 +183,34 @@ async function renderDLPPoliciesView(content) {
     }
 
     async function onSave() {
+      if (submit.disabled) return;
+      saveError.style.display = "none";
       if (!nameF.validate()) { nameF.focus(); return; }
       const ids = idFields.filter((x) => x.f.get()).map((x) => x.id);
       if (!ids.length) { uiToast(bl({ en: "Pick at least one identifier to detect.", ja: "検出する識別子を 1 つ以上選んでください。" }), "err"); return; }
+      let minCount = 0, minTypes = 0;
+      if (drEnableF.get()) {
+        minCount = dlpWholeCount(drCountF.get());
+        minTypes = dlpWholeCount(drTypesF.get());
+        drCountF.setError(""); drTypesF.setError("");
+        const invalid = bl({ en: "Enter a whole number of 0 or more.", ja: "0以上の整数を入力してください。" });
+        if (minCount === null) { drCountF.setError(invalid); drCountF.focus(); return; }
+        if (minTypes === null) { drTypesF.setError(invalid); drTypesF.focus(); return; }
+        if (minCount === 0 && minTypes === 0) {
+          drCountF.setError(bl({ en: "At least one detection threshold must be greater than 0.", ja: "少なくとも一方の検出しきい値を1以上にしてください。" })); drCountF.focus(); return;
+        }
+      }
       const obj = { name: nameF.get(), identifiers: ids, on_match: actionF.get(), instance_scope: scopeF.get() === "any" ? "" : scopeF.get() };
       if (existing) obj.id = existing.id;
       obj.device_risk = drEnableF.get() ? [{
-        min_count: parseInt(drCountF.get(), 10) || 0,
-        min_distinct_types: parseInt(drTypesF.get(), 10) || 0,
+        min_count: minCount,
+        min_distinct_types: minTypes,
         same_destination: drSameF.get(),
         window_seconds: parseInt(drWinF.get(), 10) || 300,
         destination_class: drClassF.get() === "any" ? "" : drClassF.get(),
         severity: "high",
       }] : [];
+      submit.disabled = true;
       try {
         const r = await apiFetch("POST", "/admin/dlp-policies", obj);
         if (!r.ok) throw new Error((r.body && r.body.error) || ("HTTP " + r.status));
@@ -176,7 +218,11 @@ async function renderDLPPoliciesView(content) {
         uiToast(bl({ en: "Policy saved", ja: "ポリシーを保存しました" }), "ok");
         m.close();
         render();
-      } catch (e) { uiToast(String(e.message || e), "danger"); }
+      } catch (e) {
+        saveError.textContent = String(e.message || e);
+        saveError.style.display = "";
+        saveError.scrollIntoView({ block: "nearest" });
+      } finally { submit.disabled = false; }
     }
   }
 
@@ -192,5 +238,5 @@ async function renderDLPPoliciesView(content) {
     } catch (e) { uiToast(String(e.message || e), "danger"); }
   }
 
-  load();
+  await load();
 }

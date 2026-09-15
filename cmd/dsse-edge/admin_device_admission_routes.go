@@ -100,6 +100,8 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if config.HighRiskOverlay != nil {
 			feed.Generation += config.HighRiskOverlay.ConfigGeneration() // aggregate: a high-risk change advances the feed too
 			feed.HighRisk = config.HighRiskOverlay.Snapshot()
+			feed.UserRiskVersion = 1
+			feed.UserRisk = config.HighRiskOverlay.UserSnapshot()
 		}
 		writeJSON(w, http.StatusOK, feed)
 	}))
@@ -325,6 +327,14 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			config.TransportConnRegistry.logCloseIdentity(req.Identity, reason)
 		}
 		logInfof("transport_admission_revoked_by_admin identity=%q reason=%q", req.Identity, reason)
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
+			transportAdmissionAuditLog(r, tenantID, "revoke", req.Identity, reason, evaluator, time.Now().UTC()), time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "identity": strings.TrimSpace(req.Identity), "reason": reason})
 	}))
 	mux.HandleFunc("POST /admin/transport-admission/restore", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -358,6 +368,14 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		config.AdmissionRevocations.Restore(req.Identity)
 		logInfof("transport_admission_restored_by_admin identity=%q", strings.TrimSpace(req.Identity))
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
+			transportAdmissionAuditLog(r, tenantID, "restore", req.Identity, "", evaluator, time.Now().UTC()), time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "restored": true, "identity": strings.TrimSpace(req.Identity)})
 	}))
 	// management ledger: the Admin Console device list for the Enrolled Inventory. Enroll a device,

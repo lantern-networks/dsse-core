@@ -114,12 +114,14 @@ func TestDecisionEvaluateRecordsUsageMeterPostgresE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWriter returned error: %v", err)
 	}
+	tenantCAs, connectorTLS := postgresTestConnectorIdentity(t, "tenant_lab_001", "conn_usage")
 	handler := newServerWithConfig(serverConfig{
-		Evaluator:       testEvaluator(),
-		Writer:          writer,
-		UsageMeters:     store,
-		ConnectorSecret: defaultConnectorSecret,
-		LabMode:         boolPtr(false),
+		TenantCARegistry: tenantCAs,
+		Evaluator:        testEvaluator(),
+		Writer:           writer,
+		UsageMeters:      store,
+		ConnectorSecret:  defaultConnectorSecret,
+		LabMode:          boolPtr(false),
 	})
 	body := []byte(`{
 		"tenant_id":"tenant_lab_001",
@@ -142,6 +144,8 @@ func TestDecisionEvaluateRecordsUsageMeterPostgresE2E(t *testing.T) {
 		"destination_role":"private_app"
 	}`)
 	req := httptest.NewRequest(http.MethodPost, "/decisions/evaluate", bytes.NewReader(body))
+	req.TLS = connectorTLS
+	req.Header.Set(connectorIDHeader, "conn_usage")
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(connectorSecretHeader, defaultConnectorSecret)
 	rec := httptest.NewRecorder()

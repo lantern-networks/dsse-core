@@ -174,15 +174,25 @@ func (store *Store) Upsert(_ context.Context, application Entry, tenantID string
 	return copyEntry(normalized), nil
 }
 
-// putLocked stores the application and snapshots. A non-nil error means the entry IS live in memory but
-// durability failed (it would vanish on restart) — callers propagate it to the API layer.
+// putLocked snapshots while holding store.mu. Failed persistence restores the previous
+// entry before readers or a subsequent writer can observe the attempted change.
 func (store *Store) putLocked(application Entry) error {
-	if store.applications[application.TenantID] == nil {
-		store.applications[application.TenantID] = map[string]Entry{}
+	tenant, id := application.TenantID, application.ApplicationID
+	previous, existed := store.applications[tenant][id]
+	if store.applications[tenant] == nil {
+		store.applications[tenant] = map[string]Entry{}
 	}
-	store.applications[application.TenantID][application.ApplicationID] = copyEntry(application)
+	store.applications[tenant][id] = copyEntry(application)
 	if err := store.persistLocked(); err != nil {
-		return fmt.Errorf("application %s stored in memory but not persisted (will not survive a restart): %w", application.ApplicationID, err)
+		if existed {
+			store.applications[tenant][id] = previous
+		} else {
+			delete(store.applications[tenant], id)
+			if len(store.applications[tenant]) == 0 {
+				delete(store.applications, tenant)
+			}
+		}
+		return fmt.Errorf("persist application %s: %w", id, err)
 	}
 	return nil
 }
@@ -210,12 +220,17 @@ func (store *Store) Delete(_ context.Context, tenantID, applicationID string) er
 	if _, ok := store.applications[tenantID][applicationID]; !ok {
 		return ErrApplicationNotFound
 	}
+	previous := store.applications[tenantID][applicationID]
 	delete(store.applications[tenantID], applicationID)
 	if len(store.applications[tenantID]) == 0 {
 		delete(store.applications, tenantID)
 	}
 	if err := store.persistLocked(); err != nil {
-		return fmt.Errorf("application %s deleted in memory but not persisted (would resurrect on restart): %w", applicationID, err)
+		if store.applications[tenantID] == nil {
+			store.applications[tenantID] = map[string]Entry{}
+		}
+		store.applications[tenantID][applicationID] = previous
+		return fmt.Errorf("persist application deletion %s: %w", applicationID, err)
 	}
 	return nil
 }

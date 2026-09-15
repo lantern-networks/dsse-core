@@ -143,38 +143,76 @@ func (s *dlpPolicyObjectStore) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-// PersistIfDirty writes a snapshot when there are unsaved changes.
-func (s *dlpPolicyObjectStore) PersistIfDirty() error {
-	s.mu.Lock()
-	if !s.dirty || s.persister == nil {
-		s.mu.Unlock()
+// snapshotLocked copies the maps so a failed save cannot publish the proposed edit.
+func (s *dlpPolicyObjectStore) snapshotLocked() dlpPolicyObjectSnapshot {
+	next := dlpPolicyObjectSnapshot{ByTenant: map[string]map[string]model.DLPPolicyObject{}}
+	for tenant, items := range s.byTenant {
+		next.ByTenant[tenant] = map[string]model.DLPPolicyObject{}
+		for id, p := range items {
+			next.ByTenant[tenant][id] = p
+		}
+	}
+	return next
+}
+
+func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) error {
+	if s.persister == nil {
 		return nil
 	}
-	snap := dlpPolicyObjectSnapshot{ByTenant: map[string]map[string]model.DLPPolicyObject{}}
-	for t, m := range s.byTenant {
-		cp := map[string]model.DLPPolicyObject{}
-		for id, p := range m {
-			cp[id] = p
-		}
-		snap.ByTenant[t] = cp
-	}
-	data, err := json.Marshal(snap)
-	pr := s.persister
-	if err == nil {
-		s.dirty = false
-	}
-	s.mu.Unlock()
+	raw, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	if err := pr.Save(data); err != nil {
-		// dirty was cleared optimistically (Save runs outside the lock); re-mark so the next periodic
-		// flush retries instead of silently dropping the snapshot (review #17).
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
+	return s.persister.Save(raw)
+}
+
+// UpsertDurable acknowledges an admin edit only after the configured store accepts it.
+func (s *dlpPolicyObjectStore) UpsertDurable(p model.DLPPolicyObject) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.snapshotLocked()
+	if next.ByTenant[p.TenantID] == nil {
+		next.ByTenant[p.TenantID] = map[string]model.DLPPolicyObject{}
+	}
+	next.ByTenant[p.TenantID][p.ID] = p
+	if err := s.saveSnapshotLocked(next); err != nil {
 		return err
 	}
+	s.byTenant = next.ByTenant
+	s.dirty = false
+	s.generation++
+	return nil
+}
+
+func (s *dlpPolicyObjectStore) DeleteDurable(tenant, id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.byTenant[tenant][id]; !ok {
+		return false, nil
+	}
+	next := s.snapshotLocked()
+	delete(next.ByTenant[tenant], id)
+	if err := s.saveSnapshotLocked(next); err != nil {
+		return false, err
+	}
+	s.byTenant = next.ByTenant
+	s.dirty = false
+	s.generation++
+	return true, nil
+}
+
+// Serialize periodic flushes with admin writes, so an older snapshot cannot
+// overwrite a newer acknowledged edit. Failed flushes retain the dirty flag.
+func (s *dlpPolicyObjectStore) PersistIfDirty() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty || s.persister == nil {
+		return nil
+	}
+	if err := s.saveSnapshotLocked(s.snapshotLocked()); err != nil {
+		return err
+	}
+	s.dirty = false
 	return nil
 }
 

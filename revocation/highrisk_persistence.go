@@ -3,6 +3,7 @@ package revocation
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 
@@ -15,11 +16,12 @@ import (
 // persister also carries it across a CP failover.
 
 type highRiskOverlayStateFile struct {
-	SchemaVersion string            `json:"schema_version"`
-	Devices       map[string]string `json:"devices"`
+	SchemaVersion string              `json:"schema_version"`
+	Devices       map[string]string   `json:"devices"`
+	Users         map[string]UserRisk `json:"users,omitempty"`
 }
 
-const highRiskOverlayStateSchemaVersion = "high_risk_overlay_state.v1"
+const highRiskOverlayStateSchemaVersion = "high_risk_overlay_state.v2"
 
 // SetStatePath enables durable file persistence at path (historical behaviour). A back-compat convenience over
 // SetPersister(blobstore.FilePersister{...}).
@@ -54,7 +56,8 @@ func (o *HighRiskOverlay) loadLocked() {
 	}
 	data, err := o.persister.Load()
 	if err != nil {
-		log.Printf("high_risk_overlay load: cannot read store (starting empty): %v", err)
+		o.loadErr = fmt.Errorf("read risk state: %w", err)
+		log.Printf("high_risk_overlay load: %v", o.loadErr)
 		return
 	}
 	if len(data) == 0 {
@@ -62,32 +65,60 @@ func (o *HighRiskOverlay) loadLocked() {
 	}
 	var f highRiskOverlayStateFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		log.Printf("high_risk_overlay load: ignoring unparseable store: %v", err)
+		o.loadErr = fmt.Errorf("decode risk state: %w", err)
+		log.Printf("high_risk_overlay load: %v", o.loadErr)
 		return
 	}
-	if f.Devices != nil {
-		o.devices = f.Devices
+	if f.SchemaVersion != highRiskOverlayStateSchemaVersion && f.SchemaVersion != "high_risk_overlay_state.v1" {
+		o.loadErr = fmt.Errorf("unsupported risk state version")
+		return
 	}
+	users := make(map[string]UserRisk, len(f.Users))
+	for key, mark := range f.Users {
+		normalized, err := normalizeUserRisk(mark)
+		if err != nil || riskRank(normalized.Severity) == 0 || key != userRiskKey(normalized.TenantID, normalized.ID) {
+			o.loadErr = fmt.Errorf("invalid saved user risk")
+			return
+		}
+		users[key] = normalized
+	}
+	devices := make(map[string]string, len(f.Devices))
+	for id, severity := range f.Devices {
+		if id == "" || id != NormalizeDeviceID(id) || riskRank(severity) == 0 {
+			o.loadErr = fmt.Errorf("invalid saved device risk")
+			return
+		}
+		devices[id] = severity
+	}
+	if f.SchemaVersion == "high_risk_overlay_state.v1" && len(users) > 0 {
+		o.loadErr = fmt.Errorf("typed users in legacy risk state")
+		return
+	}
+	o.users, o.devices = users, devices
+	o.loadErr = nil
+	o.rebuildUserIndexLocked()
+	o.legacy = f.SchemaVersion == "high_risk_overlay_state.v1" && len(devices) > 0
 	log.Printf("high_risk_overlay load: restored %d high-risk device(s) from the durable store", len(o.devices))
 }
 
-func (o *HighRiskOverlay) persistLocked() {
-	if o == nil || o.persister == nil {
-		return
+// saveStateLocked also serves checked user writes and legacy migration. A nil
+// persister means volatile operation and is reported as a warning to user writes.
+func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[string]UserRisk) (bool, error) {
+	if o.persister == nil {
+		return true, nil
 	}
-	data, err := json.Marshal(highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: o.devices})
+	data, err := json.Marshal(highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: devices, Users: users})
 	if err != nil {
-		log.Printf("high_risk_overlay persist: marshal failed: %v", err)
-		return
+		log.Printf("risk state encode: %v", err)
+		return false, ErrRiskSave
 	}
-	if err := o.persister.Save(data); err != nil {
-		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
-		// change was lost when it was written; saying nothing would hide that an interrupted write could
-		// truncate it. Both are worth exactly one accurate sentence.
+	if err = o.persister.Save(data); err != nil {
+		log.Printf("risk state save: %v", err)
 		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
-			log.Printf("high_risk_overlay persist: saved, but NOT atomically — %v", err)
-		} else {
-			log.Printf("high_risk_overlay persist: save failed: %v", err)
+			return true, nil
 		}
+		return false, ErrRiskSave
 	}
+	return false, nil
 }
+func (o *HighRiskOverlay) persistLocked() { _, _ = o.saveStateLocked(o.devices, o.users) }

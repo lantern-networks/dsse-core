@@ -642,37 +642,65 @@ SCHEMA="__CONFIG_SCHEMA__"
 # Either way: no terminal, no sudo, no root-only path. The one Apple click that remains (approving the system
 # extension) is removed only by an MDM system-extension-policy payload — see build_macos_mdm_profile.sh.
 #
-# ★ IT NEVER OVERRIDES WHAT IS ALREADY HERE. A machine an MDM has configured, or one an operator placed files
-# on deliberately, has answered this question already; a package that adopts whatever happens to sit in
-# Downloads on top of that would re-point a managed device from a folder. Absent means "adopt", present means
-# "somebody already answered".
-#
-# ★ AND ADOPTION IS NOT TRUST. What is copied here is checked in postinstall exactly as before: the profile is
-# verified against the key beside it before one field is read, and with no key nothing is derived and the
-# device stays inert. This moves WHERE the artefacts are picked up, not WHETHER they are proven.
-# dsse_profile_tenant reads the organization out of a signed profile without verifying it. The signature is
-# checked later by the derivation; here the question is only "is this the same organization", and a wrong
-# answer costs a preserved-or-moved file rather than trust.
+# A changed sidecar profile replaces the current configuration. Read both organizations before moving
+# any existing files or removing trust. An unreadable profile is not evidence of a different organization.
+# Signature verification still occurs in postinstall, before configuration derivation; this preflight
+# checks readability and required inputs only. Operators must verify sidecars before supplying them.
+profile_adoption_refuse() {
+	echo "REFUSING TO INSTALL: $1" >&2
+	echo "Existing configuration, enrolment material and trust have not been changed by profile adoption." >&2
+	exit 1
+}
+
 dsse_profile_tenant() {
-	[ -f "${1:-}" ] || return 0
-	/usr/bin/python3 - "$1" <<'PYEOF' 2>/dev/null || true
+	[ -f "${1:-}" ] && [ -r "$1" ] || return 1
+	/usr/bin/python3 - "$1" <<'PYEOF' 2>/dev/null
 import base64, json, sys
+
+def tenant(value):
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("invalid tenant")
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("invalid tenant")
+    return value
+
 try:
-    env = json.load(open(sys.argv[1]))
-    body = json.loads(base64.b64decode(env["payload_b64"]))
-    print((body.get("tenant_id") or (body.get("organization") or {}).get("tenant_id") or "").strip())
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        env = json.load(stream)
+    if not isinstance(env, dict) or not isinstance(env.get("payload_b64"), str):
+        raise ValueError("invalid envelope")
+    body = json.loads(base64.b64decode(env["payload_b64"], validate=True))
+    if not isinstance(body, dict):
+        raise ValueError("invalid payload")
+    organization = body.get("organization", {})
+    if not isinstance(organization, dict):
+        raise ValueError("invalid organization")
+    nested = tenant(organization["tenant_id"]) if "tenant_id" in organization else ""
+    legacy = tenant(body["tenant_id"]) if "tenant_id" in body else ""
+    if not (nested or legacy) or (nested and legacy and nested != legacy):
+        raise ValueError("missing or conflicting tenant")
+    print(nested or legacy)
 except Exception:
-    pass
+    sys.exit(1)
 PYEOF
 }
 
 adopt_artefacts_from_beside_the_package() {
+	here_tenant=""
+	if [ -e "$CONFIG_DIR/install_profile.json" ]; then
+		here_tenant="$(dsse_profile_tenant "$CONFIG_DIR/install_profile.json")" ||
+			profile_adoption_refuse "Cannot read the current profile's organization. Check the profile and that /usr/bin/python3 can run; retry with the existing files intact."
+	fi
 	pkg_path="${1:-}"
 	[ -n "$pkg_path" ] || return 0
 	beside="$(dirname "$pkg_path")"
 	[ -d "$beside" ] || return 0
-	[ -f "$beside/install_profile.json" ] || return 0
-	mkdir -p "$CONFIG_DIR"
+	[ -e "$beside/install_profile.json" ] || return 0
+	beside_tenant="$(dsse_profile_tenant "$beside/install_profile.json")" ||
+		profile_adoption_refuse "Cannot read the supplied profile's organization. Check the profile and that /usr/bin/python3 can run; obtain verified setup files before retrying."
+	if [ -z "$here_tenant" ] && { [ -e "$CONFIG" ] || [ -e "$CONFIG_DIR/device_identity_pointer.json" ]; }; then
+		profile_adoption_refuse "This Mac has an existing configuration or identity without its original install profile. Restore and verify that profile before replacing the configuration."
+	fi
 
 	# ★★★ A MACHINE THAT ALREADY HOLDS A PROFILE IS THE ORDINARY CASE, NOT A REASON TO IGNORE THE OPERATOR
 	# (2026-08-31, measured — this installer re-armed a Mac against a deployment that had been destroyed the
@@ -692,6 +720,19 @@ adopt_artefacts_from_beside_the_package() {
 	   && cmp -s "$beside/install_profile.json" "$CONFIG_DIR/install_profile.json"; then
 		return 0   # the same profile: a re-install, nothing to adopt
 	fi
+	[ -r "$beside/profile_signing_key.txt" ] && [ -s "$beside/profile_signing_key.txt" ] ||
+		profile_adoption_refuse "The supplied profile needs its nonempty profile_signing_key.txt beside the package."
+	keep_token=0
+	if [ "$beside_tenant" = "$here_tenant" ] && [ -r "$CONFIG_DIR/enrolment_token.txt" ] \
+	   && [ -n "$(tr -d '\n\r' < "$CONFIG_DIR/enrolment_token.txt")" ]; then
+		keep_token=1
+	fi
+	if [ "$keep_token" -eq 0 ]; then
+		[ -r "$beside/enrolment_token.txt" ] && [ -s "$beside/enrolment_token.txt" ] \
+		   && [ -n "$(tr -d '\n\r' < "$beside/enrolment_token.txt")" ] ||
+			profile_adoption_refuse "The supplied profile needs a nonempty enrolment_token.txt beside the package."
+	fi
+	mkdir -p "$CONFIG_DIR"
 	if [ -f "$CONFIG_DIR/install_profile.json" ] || [ -f "$CONFIG_DIR/agent_config.json" ]; then
 		stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 		echo "==> this Mac already held a configuration, and a DIFFERENT profile was placed beside this"
@@ -705,8 +746,6 @@ adopt_artefacts_from_beside_the_package() {
 		# the rule down: on a same-organization profile replacement, do not touch the enrolment material.
 		#
 		# So what moves aside depends on whether the ORGANIZATION changed, which the profile states.
-		beside_tenant="$(dsse_profile_tenant "$beside/install_profile.json")"
-		here_tenant="$(dsse_profile_tenant "$CONFIG_DIR/install_profile.json")"
 		replaced="install_profile.json agent_config.json profile_signing_key.txt interception-root.pem applied_install_profile.json"
 		if [ -n "$beside_tenant" ] && [ "$beside_tenant" = "$here_tenant" ]; then
 			echo "      (the same organization: the device identity and its token are KEPT)"
@@ -741,7 +780,7 @@ adopt_artefacts_from_beside_the_package() {
 	fi
 	# The one-time approval is a credential: it lands mode 600, and a trailing newline from a browser download
 	# would otherwise be sent as part of the token.
-	if [ -f "$beside/enrolment_token.txt" ]; then
+	if [ "$keep_token" -eq 0 ]; then
 		tr -d '\n\r' < "$beside/enrolment_token.txt" > "$CONFIG_DIR/enrolment_token.txt"
 		chmod 600 "$CONFIG_DIR/enrolment_token.txt"
 		echo "    enrolment_token.txt       this device's one-time approval"

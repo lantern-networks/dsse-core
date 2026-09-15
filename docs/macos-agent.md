@@ -15,6 +15,9 @@ its WKWebView authentication window; the Network Extension alone does not show i
   running [deployment](deployment.md) with a configured [customer organization](organizations.md).
 - A signed, notarized package appropriate for that Mac and the deployment's expected publisher.
 - Working DNS for the regional transport and recovery URLs in the profile.
+- A working `/usr/bin/python3` from Apple's developer tools. The current installer uses it
+  to read and derive configuration from the signed profile. Check it before installation;
+  a missing runtime or unfinished developer-tool setup can prevent it from starting.
 - Approval for the system extension: interactive approval by an authorized user or the
   appropriate MDM policy. Root access over SSH alone does not supply that approval.
 
@@ -71,15 +74,29 @@ without verification is not a substitute for this check.
 
 ## Install and approve
 
-From the directory containing the verified files:
+Keep the three verified setup files in the same directory as the generic PKG, then open
+the PKG in Finder. The installer adopts the files from beside the package. Do not first
+overwrite an existing Mac's protected profile or enrolment files: the installer needs the
+original profile to determine whether to preserve its identity and token.
+
+Alternatively, from that directory, replace `<version>` with the downloaded filename's
+version and run:
 
 ```sh
-sudo install -d -m 755 "/Library/Application Support/Dsse"
-sudo install -m 644 install_profile.json profile_signing_key.txt \
-  "/Library/Application Support/Dsse/"
-sudo install -m 600 enrolment_token.txt "/Library/Application Support/Dsse/"
-sudo installer -pkg LanternDsseAgent-<version>.pkg -target /
+sudo installer -pkg "$PWD/LanternDsseAgent-<version>.pkg" -target /
 ```
+
+MDM administrators can supply configuration to `/Library/Application Support/Dsse`
+through their managed provisioning workflow. Coordinate replacement of an existing
+profile with that workflow rather than copying over an enrolled device's files manually.
+
+If profile adoption reports **REFUSING TO INSTALL**, resolve the reported input or runtime
+problem before retrying. An unreadable or conflicting organization is not treated as a new
+organization. Adoption leaves the existing files and trust unchanged in these refusal cases.
+Restore the original verified profile if it is missing from an already configured device.
+For a runtime error, check `/usr/bin/python3 --version` and complete the Mac's developer-tool
+setup as its administrator. Installing another Python on `PATH` does not replace the
+installer's explicit `/usr/bin/python3` dependency.
 
 The package derives the configuration, enrols the device, installs the agent and updater,
 and requests system-extension activation. Complete any system-extension and network
@@ -179,6 +196,25 @@ an identity claim belonging to another tenant.
 For reassignment, coordinate removal of the old enrolment and a fresh install with the
 new organization's material. Verify that a new identity has been provisioned; reusing
 residual identity files can cause the same refusal again.
+
+## Restore normal networking
+
+Before retiring a deployment, disable the installed transparent proxy from the logged-in
+Mac user account. This operation works without the deployment. Run it **without sudo**:
+
+```sh
+"/Applications/LanternDsseAgent.app/Contents/MacOS/LanternDsseAgent" --disable
+```
+
+Wait for `disable completed error=none`. The app stops the tunnel and saves the proxy
+configuration as disabled so its connection watchdog does not restart it. This keeps
+the app, enrolment, and trust material installed; it is not an uninstall or a device
+revocation. Verify ordinary browsing after the command completes. If an error is reported,
+keep the installed app and include the full output when requesting help.
+
+The preference belongs to the logged-in user's session. Running a separate root copy
+is not a substitute for disabling that user's proxy. Deactivating or uninstalling the
+system extension is a separate operation that can require OS approval or a restart.
 
 ## Removing it
 

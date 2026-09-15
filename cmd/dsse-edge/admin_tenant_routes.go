@@ -345,6 +345,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// removes the row that says whose data this is; a preservation order that permits that is not a
 		// preservation order. Refusing is the fail-safe direction — a hold that is genuinely finished is lifted
 		// deliberately, and that lifting is itself on the record.
+		if err := config.LegalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so it cannot be deleted; lift the hold first "+
@@ -486,6 +490,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// a hold is for. Nothing about an operator being authorised to erase makes the hold irrelevant: the
 		// hold is what says this particular organization must not be erased YET, and it is released by lifting
 		// it, deliberately and on the record.
+		if err := config.LegalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so its data must be preserved and cannot be erased; "+
@@ -528,7 +536,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		result := purgeAdminTenantData(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore,
 			config.TenantCARegistry, strings.TrimSpace(config.TenantCARegistryPath),
-			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), config.LegalHold, now)
 		// Recorded in the OPERATOR's audit, not the customer's.
 		//
 		// ★ AND THAT DISTINCTION IS LOAD-BEARING, WHICH THIS CODE LEARNED THE HARD WAY (2026-08-15). The audit
@@ -571,7 +579,11 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentialStore, adminAuth adminAuthRuntimeStore, ledger *enrolledinventory.Ledger, tenantID string, now time.Time) map[string]any {
 	result := map[string]any{}
 	if credentials != nil {
-		if removed := credentials.DeleteAllForTenant(tenantID); len(removed) > 0 {
+		removed, err := credentials.DeleteAllForTenant(tenantID)
+		if err != nil {
+			result["administrators_error"] = "credential deletion incomplete: storage unavailable"
+		}
+		if len(removed) > 0 {
 			result["administrators"] = removed
 			log.Printf("tenant %q deleted: removed %d administrator account(s): %s", tenantID, len(removed), strings.Join(removed, ", "))
 		}

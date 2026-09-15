@@ -18,6 +18,7 @@ const (
 	postgresMigrationUsageMeter                = "008"
 	postgresMigrationNonHumanIdentity          = "009"
 	postgresMigrationHotEventsText             = "010"
+	postgresMigrationHotEventsRegion           = "050"
 	postgresMigrationWorkloadNonce             = "011"
 	postgresMigrationHumanIdentity             = "012"
 	postgresMigrationHumanIdentityImportRun    = "013"
@@ -28,6 +29,9 @@ const (
 	postgresMigrationDeviceInventory           = "018"
 	postgresMigrationAgentTelemetry            = "019"
 	postgresMigrationLocalCredentials          = "020"
+	postgresMigrationCredentialTOTP            = "048"
+	postgresMigrationCredentialRevision        = "049"
+	postgresMigrationCredentialWriterProtocol  = "051"
 	postgresMigrationSteerExclusions           = "021"
 	postgresMigrationConfigVersions            = "022"
 	postgresMigrationAdminTenantModel          = "023"
@@ -127,6 +131,7 @@ func postgresHotStoreMigrationVersions() []string {
 	return []string{
 		postgresMigrationHotEvents,
 		postgresMigrationHotEventsText,
+		postgresMigrationHotEventsRegion,
 	}
 }
 

@@ -98,6 +98,10 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("enrolment tokens are not configured on this Edge"))
 			return false
 		}
+		if health, ok := tokens.(interface{ Health() error }); ok && health.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+			return false
+		}
 		// ★★★ AN EDGE THAT ASKS THE AUTHORITY CANNOT ANSWER FOR IT (2026-08-25, measured on the two-region lab
 		// while walking the new Device configuration screen). This node holds no enrolment tokens by design —
 		// it forwards the one act that matters, spending one, to the control plane. The ADMIN surface was never
@@ -318,6 +322,9 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 		}
 		tok, ok := tokens.Revoke(id, adminOf(r), time.Now().UTC())
 		if !ok {
+			if !ready(w) {
+				return
+			}
 			writeError(w, http.StatusConflict, fmt.Errorf("enrolment token is already revoked"))
 			return
 		}

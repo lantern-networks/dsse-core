@@ -791,6 +791,9 @@ func (config serverConfig) withDefaults() serverConfig {
 	if config.HumanIdentities == nil {
 		config.HumanIdentities = humanidentity.NewHumanIdentityDirectoryStore()
 	}
+	if err := prepareUserRiskState(context.Background(), config.HighRiskOverlay, config.EnrolledLedger, config.HumanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
 	if config.HotStore == nil && config.Writer != nil {
 		config.HotStore = hotstore.NewJSONLStore(config.Writer, adminLogStreamFilenameMap())
 	}
@@ -812,8 +815,8 @@ func (config serverConfig) withDefaults() serverConfig {
 }
 
 // inMemoryEventStoreDefaultCapacity bounds the per-event in-memory stores (inspection / human-approval /
-// delegated-grant) so a long-running Edge does not grow them until OOM. Generous enough that active
-// TTL'd entries are never evicted within their window. Override via DSSE_EVENT_STORE_CAPACITY
+// delegated-grant). Inspection history uses FIFO; human approvals and delegated grants refuse new IDs
+// at capacity so authorization and revocation state is retained. Override via DSSE_EVENT_STORE_CAPACITY
 // (<=0 disables the bound; tests that construct the store directly stay unbounded).
 const inMemoryEventStoreDefaultCapacity = 50000
 
@@ -1186,7 +1189,7 @@ func main() {
 	oidcIDPID := flag.String("oidc-idp-id", "idp_keycloak_lab", "server-side IdP id recorded on sessions minted by the OIDC callback (matched by policy required_idp_id). Operator config, never taken from the callback request")
 	firstPartyAccounts := flag.Bool("first-party-accounts", false, "enable SaaS-issued first-party admin accounts (invite -> activation link -> password + TOTP 2FA -> email+password+TOTP login)")
 	firstPartyIssuer := flag.String("first-party-issuer", "Lantern DSSE", "issuer label shown in the TOTP authenticator app for first-party admin accounts")
-	firstPartyStore := flag.String("first-party-store", "memory", "durable store for first-party admin credentials: memory (lost on restart) or postgres (survives restart; control plane).")
+	firstPartyStore := flag.String("first-party-store", "memory", "store for first-party admin credentials: memory (lost on restart), postgres, or a JSON snapshot file path.")
 	firstPartyStorePostgresDSN := flag.String("first-party-store-postgres-dsn", "", "PostgreSQL DSN for first-party-store=postgres; defaults to -postgres-dsn when omitted")
 	connectorRouteGovernanceStorePath := flag.String("connector-route-governance-store", "", "durable + SHARED store for connector route-governance DECISIONS (held/approved/authored): a file path. Survives restart; on a mount shared across the HA fleet (e.g. the reference's ./dataplane-ne, mounted by every region's Edge) all Edges read the SAME decisions, so routing + /connectors/{id}/effective-routes are consistent fleet-wide. Empty = in-memory per-Edge.")
 	vlanObjectStorePath := flag.String("vlan-object-store", "", "durable store for Named Networks (VLAN/Subnet objects, /admin/vlan-objects) + boundary policies: \"postgres\" or a FILE PATH. These are ADMIN-CONFIGURED definitions — what the Console's Network Zones page writes and what connector bindings reference by id. Empty = in-memory, meaning every restart ERASES them: that is why the Console's Networks page read permanently empty, since the lab rebuilds the Edge on every change. On a mount shared across the HA fleet (e.g. the reference's ./dataplane-ne) every Edge reads the same definitions.")
@@ -3234,6 +3237,7 @@ func main() {
 	// The FAST revocation poller's status, so /healthz can be asked whether this node has ever held a set from
 	// the control plane. nil = no -config-source-url, i.e. no CP→Edge sync configured at all.
 	var revocationSyncState *revocationSyncStatus
+	var sharedRevocationSource *revocationSource
 	var configBundlePuller *configBundleSource // launched inside newServerWithConfig, where the DNS resolver exists too
 	// enrolmentCPReport tells the control plane about enrolments completed HERE. Constructed only when this
 	// Edge follows a control plane, because that is exactly when the omission bites: the config bundle
@@ -3354,7 +3358,7 @@ func main() {
 		revocationSyncState = &revocationSyncStatus{}
 		revSrc := revocationSource{url: cfgURL, endpoints: cpEndpointSel, token: token, interval: *revocationSourcePoll,
 			client: cfgClient, status: revocationSyncState}
-		go revSrc.run(context.Background(), livenessRevocations, highRiskOverlay)
+		sharedRevocationSource = &revSrc
 		// This node reports what it observes to the control plane, which RECORDS it for an administrator. It
 		// does not revoke anything, here or there.
 		livenessRevocations.SetReporter(revSrc.reportFunc())
@@ -3996,6 +4000,9 @@ func main() {
 	}
 
 	if lerr := enrolledLedger.SetPersisterChecked(mustCPStateBlobPersister(*enrolledInventoryStore, "enrolled_inventory")); lerr != nil {
+		if highRiskOverlay.NeedsMigration() {
+			log.Fatalf("legacy risk migration requires readable enrolled inventory: %v", lerr)
+		}
 		if enrollSigner != nil {
 			log.Fatalf("REFUSING TO START: this Edge issues device certificates and its enrolled inventory could "+
 				"not be read (%v). Continuing would treat every identity in the fleet as never enrolled, claim "+
@@ -4003,6 +4010,14 @@ func main() {
 		}
 		log.Printf("enrolled_inventory: the durable store could not be read (%v) — this Edge does not issue "+
 			"certificates, so it continues on the static seed and the control plane's next bundle", lerr)
+	}
+	// Resolve old untyped marks only after both inventories are loaded, and before
+	// any feed worker can replace the state being classified.
+	if err := prepareUserRiskState(context.Background(), highRiskOverlay, enrolledLedger, humanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
+	if sharedRevocationSource != nil {
+		go sharedRevocationSource.run(context.Background(), livenessRevocations, highRiskOverlay)
 	}
 	// ★★★ AND READ AGAIN, BECAUSE A STANDBY THAT ONLY LEARNS BY RESTARTING IS NOT WARM (2026-08-25). Two
 	// control planes share one database precisely so the standby holds what the leader authored. This store
@@ -5285,6 +5300,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					logWriter:           writer,
 					localCredentials:    config.LocalCredentials,
 					purgeDB:             adminAuthPostgresDB(adminAuth),
+					legalHold:           config.LegalHold,
 					enforcementTenantID: config.Evaluator.PolicyBundle.TenantID,
 					nodeName:            adminFootprintNodeName(config.ConfigSourceURL),
 					erasureOrders:       &tenantErasureOrders{},
@@ -5372,7 +5388,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return false, false
 			}
 			return counts.Principals > 0, true
-		})
+		}, config.LocalCredentials)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)
@@ -6379,7 +6395,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	} else if err := idpConnectionStore.SetPersister(p); err != nil {
 		log.Fatalf("load idp connection store: %v", err)
 	}
-	registerIdPConnectionsAdmin(mux, adminEndpoint, idpConnectionStore, config.ConfigSourceURL)
+	registerIdPConnectionsAdmin(mux, adminEndpoint, idpConnectionStore, config.ConfigSourceURL, func(r *http.Request, tenant, id, action string) {
+		now := time.Now().UTC()
+		audit := adminIdPChangeAuditLog(r, tenant, id, action, evaluator, now)
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, audit, now)
+	})
 
 	// Organization Domains (S6): the explicit, multi-value "these domains are US" setting DLP instance-aware action
 	// references. Durable; the corporate-domain resolver is Organization Domains ∪ IdP verified_domains.
@@ -6431,7 +6451,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		log.Fatalf("load grant store: %v", err)
 	}
 	theGrantStore.Store(grantStore)
-	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator.PolicyBundle.TenantID)
+	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox)
 	// ★ AND THE AUTHORITY RECEIVES WHAT THE FLEET MINTED. Registered only on a node that does not pull its
 	// own configuration — the same rule the connector report states. See grant_cp_report.go.
 	registerGrantReportRoute(mux, grantStore, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
@@ -7434,7 +7454,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		event, ok := humanApprovals.Get(r.PathValue("approval_id"))
+		event, ok := humanApprovals.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("approval_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
@@ -7480,7 +7500,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		grant, ok := delegatedGrants.Get(r.PathValue("grant_id"))
+		grant, ok := delegatedGrants.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("delegated access grant %s is absent", r.PathValue("grant_id")))
 			return
@@ -7497,7 +7517,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode delegated access grant revoke request: %w", err))
 			return
 		}
-		grant, err := delegatedGrants.Revoke(r.PathValue("grant_id"), req.RevocationReason, now)
+		grant, err := delegatedGrants.RevokeForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"), req.RevocationReason, now)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
@@ -8801,9 +8821,6 @@ func writeEastWestCeremonySuccess(w http.ResponseWriter) {
 	_, _ = w.Write([]byte("<!doctype html><html><body><h2>Authentication complete</h2><p>You may now retry your connection.</p></body></html>"))
 }
 
-// adminLoginTenantCookie carries the tenant resolved by home-realm discovery from /admin/login/discover to
-// the /admin/oidc/callback so the callback validates against (and binds the session to) the right tenant IdP.
-
 func randomURLToken(size int) (string, error) {
 	buf := make([]byte, size)
 	if _, err := rand.Read(buf); err != nil {
@@ -8914,7 +8931,7 @@ var connectorRouteCPConfigured bool
 func deriveDecisionRequestActor(req model.DecisionRequest, delegatedGrants *delegatedgrant.Store) model.DecisionRequest {
 	req.ActorType = ""
 	if grantID := strings.TrimSpace(req.DelegatedAccessGrantID); grantID != "" && delegatedGrants != nil {
-		if grant, ok := delegatedGrants.Get(grantID); ok && strings.TrimSpace(grant.TenantID) == strings.TrimSpace(req.TenantID) {
+		if grant, ok := delegatedGrants.GetForTenant(strings.TrimSpace(req.TenantID), grantID); ok && strings.TrimSpace(grant.TenantID) == strings.TrimSpace(req.TenantID) {
 			if strings.TrimSpace(req.ActorNHIID) == "" {
 				req.ActorNHIID = strings.TrimSpace(grant.ActorNHIID)
 			}
@@ -9800,7 +9817,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if grantID == "" {
 		return denyRuntimeEvidence(dec, "Delegated Access Grant is required for delegated agent access.", []string{"policy_matched", "delegated_grant_absent"}, "delegated_grant_absent")
 	}
-	grant, ok := delegatedGrants.Get(grantID)
+	grant, ok := delegatedGrants.GetForTenant(dec.TenantID, grantID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Delegated Access Grant was not found.", []string{"policy_matched", "delegated_grant_absent"}, "delegated_grant_absent")
 	}
@@ -9829,7 +9846,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if approvalID == "" {
 		return denyRuntimeEvidence(dec, "Human Approval Event is required for this delegated agent access.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
-	approval, ok := humanApprovals.Get(approvalID)
+	approval, ok := humanApprovals.GetForTenant(dec.TenantID, approvalID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Human Approval Event was not found.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
@@ -10370,7 +10387,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.DelegatedAccessGrantID != nil && *event.DelegatedAccessGrantID != "" {
-		grant, ok := delegatedGrants.Get(*event.DelegatedAccessGrantID)
+		grant, ok := delegatedGrants.GetForTenant(event.TenantID, *event.DelegatedAccessGrantID)
 		if !ok {
 			return fmt.Errorf("delegated access grant %s is absent", *event.DelegatedAccessGrantID)
 		}
@@ -10385,7 +10402,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.HumanApprovalEventID != nil && *event.HumanApprovalEventID != "" {
-		approval, ok := humanApprovals.Get(*event.HumanApprovalEventID)
+		approval, ok := humanApprovals.GetForTenant(event.TenantID, *event.HumanApprovalEventID)
 		if !ok {
 			return fmt.Errorf("human approval event %s is absent", *event.HumanApprovalEventID)
 		}

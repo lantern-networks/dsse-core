@@ -38,17 +38,23 @@ func (s *Store) SetStateFile(path string) {
 
 func (s *Store) loadLocked() {
 	data, err := s.persister.Load()
-	if err != nil || len(data) == 0 {
+	if err != nil {
+		s.stateErr = ErrStateUnavailable
+		return
+	}
+	if len(data) == 0 {
 		return
 	}
 	var state stateFile
 	if err := json.Unmarshal(data, &state); err != nil {
-		// Refuse to start from a half-understood state: silently continuing with an EMPTY token set would mark
-		// every previously-spent token unspent again.
+		// Do not treat corrupt persistence as a clean empty registry: accepting new mutations could
+		// overwrite the saved issuance, consumption and revocation history.
+		s.stateErr = ErrStateUnavailable
 		log.Printf("enrolment_tokens persist: load failed, keeping current state: %v", err)
 		return
 	}
-	if state.Tokens == nil {
+	if state.Tokens == nil || state.SchemaVersion != stateSchemaVersion {
+		s.stateErr = ErrStateUnavailable
 		return
 	}
 	s.tokens = state.Tokens
@@ -60,23 +66,47 @@ func (s *Store) loadLocked() {
 	}
 }
 
-func (s *Store) persistLocked() {
-	if s == nil || s.persister == nil {
-		return
+// Health reports a latched persistence failure. Recreate and reconcile the store before resuming.
+func (s *Store) Health() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stateErr
+}
+
+func (s *Store) copyTokensLocked() map[string]Token {
+	next := make(map[string]Token, len(s.tokens))
+	for id, tok := range s.tokens {
+		next[id] = tok
 	}
-	data, err := json.Marshal(stateFile{SchemaVersion: stateSchemaVersion, Tokens: s.tokens})
-	if err != nil {
-		log.Printf("enrolment_tokens persist: marshal failed: %v", err)
-		return
+	return next
+}
+
+// Persist before publishing any issuance, consumption, revocation or removal.
+func (s *Store) commitTokensLocked(next map[string]Token) error {
+	if s.stateErr != nil {
+		return s.stateErr
 	}
-	if err := s.persister.Save(data); err != nil {
-		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
-		// change was lost when it was written; saying nothing would hide that an interrupted write could
-		// truncate it. Both are worth exactly one accurate sentence.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
-			log.Printf("enrolment_tokens persist: saved, but NOT atomically — %v", err)
-		} else {
+	if s.persister != nil {
+		data, err := json.Marshal(stateFile{SchemaVersion: stateSchemaVersion, Tokens: next})
+		if err == nil {
+			err = s.persister.Save(data)
+		}
+		if err != nil && !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			s.stateErr = ErrStateUnavailable
 			log.Printf("enrolment_tokens persist: save failed: %v", err)
+			return s.stateErr
+		}
+		if err != nil {
+			log.Printf("enrolment_tokens persist: saved, but NOT atomically — %v", err)
 		}
 	}
+	s.tokens = next
+	s.byHash = make(map[string]string, len(next))
+	for id, tok := range next {
+		if tok.Hash != "" {
+			s.byHash[tok.Hash] = id
+		}
+	}
+	s.generation.Add(1)
+	return nil
 }

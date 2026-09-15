@@ -41,6 +41,13 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, statusForAdminLogQueryError(err), err)
 			return
 		}
+		if result.regionCoverage != nil {
+			w.Header().Set("X-DSSE-Region-Coverage", result.regionCoverage.Status)
+			w.Header().Set("X-DSSE-Region-Notice", "Records without a region are excluded")
+			if result.regionCoverage.UnknownRegionCount != nil {
+				w.Header().Set("X-DSSE-Unknown-Region-Count", fmt.Sprint(*result.regionCoverage.UnknownRegionCount))
+			}
+		}
 		writeAdminPreviewJSONL(w, http.StatusOK, result.rows, result.limit)
 	}))
 	// Legal hold (litigation / e-discovery): freeze retention for the tenant so ALL its logs are preserved.
@@ -64,9 +71,17 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		return mine
 	}
 	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := legalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		if err := legalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		var req struct {
 			Active bool   `json:"active"`
 			Reason string `json:"reason"`
@@ -76,7 +91,15 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
-		legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now())
+		if tenantID == "" {
+			writeError(w, http.StatusForbidden, fmt.Errorf("tenant scope is required"))
+			return
+		}
+		if err := legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
+			logErrorf("legal hold update failed: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(tenantID)})
 	}))
 	// Verify the tamper-evident hash chain of the tenant's archived audit segments (compliance integrity check).
@@ -94,12 +117,16 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	}))
 	// Admin-configurable per-stream retention (days), overriding the startup flags at runtime (no redeploy).
 	mux.HandleFunc("GET /admin/retention-config", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if retentionOverride == nil || retentionOverride.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Stream string `json:"stream"`
-			Days   int    `json:"days"`
+			Days   *int   `json:"days"`
 			Clear  bool   `json:"clear"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
@@ -123,10 +150,28 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 				"log retention is set for this deployment, not per organization, so it is the operator's to change"))
 			return
 		}
+		if retentionOverride == nil || retentionOverride.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
+			return
+		}
+		days := -1
+		if !req.Clear && req.Days == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are required"))
+			return
+		}
+		if req.Days != nil {
+			days = *req.Days
+		}
 		if req.Clear {
-			retentionOverride.Set(req.Stream, -1) // revert to the flag default
-		} else {
-			retentionOverride.Set(req.Stream, req.Days)
+			days = -1
+		} else if days < 0 || days > maxRetentionDays {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are out of range"))
+			return
+		}
+		if err := retentionOverride.Set(strings.TrimSpace(req.Stream), days); err != nil {
+			logErrorf("retention override update failed: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("retention settings could not be saved"))
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))

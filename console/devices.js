@@ -70,7 +70,10 @@ function renderDevicesTab(content) {
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderList(listHost) }),
   ]));
 
+  const messages = el("div", {});
+  content.appendChild(messages);
   const listHost = el("div", {});
+  listHost.__deviceAdmissionMessages = messages;
   content.appendChild(listHost);
   renderList(listHost);
 }
@@ -253,6 +256,10 @@ function deviceStateOf(d, obs, rt, effSev) {
 function overflowMenu(d, host, sev, grpSev) {
   const wrap = el("span", { class: "dev-ov" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: "⋯", title: bl({ en: "More", ja: "その他" }) });
+  btn.setAttribute("data-device-admission-control", "1");
+  btn.setAttribute("data-device-risk-control", "1");
+  btn.disabled = !!((host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity)) ||
+    (host.__deviceRiskPending && host.__deviceRiskPending.has(d.identity)));
   let menu = null;
   const onDoc = (e) => { if (!wrap.contains(e.target)) close(); };
   function close() { if (menu) { menu.remove(); menu = null; document.removeEventListener("click", onDoc, true); } }
@@ -579,10 +586,12 @@ async function renderList(host) {
     const primary = d.enabled
       ? el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Block", ja: "ブロック" }), onClick: () => disableDevice(d, host) })
       : el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Allow", ja: "許可" }), onClick: () => enableDevice(d, host) });
+    primary.setAttribute("data-device-admission-control", "1");
+    primary.disabled = !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity));
     const signals = st.signals.length
       ? st.signals.map((s) => el("span", { class: "dev-chip" + (s.tone ? " dev-chip-" + s.tone : ""), text: s.text, title: s.title || undefined }))
       : [el("span", { class: "dev-risk-ok", text: "—" })];
-    return el("tr", { class: st.severity ? "dev-sev-" + st.severity : "" }, [
+    return el("tr", { class: st.severity ? "dev-sev-" + st.severity : "", "data-device-identity": d.identity }, [
       el("td", { class: "dev-lead" }, [el("div", { class: "dev-id", text: d.identity || "" }), meta]),
       el("td", {}, [uiBadge(st.pill.text, st.pill.tone), el("div", { class: "dev-sub", text: st.sub })]),
       el("td", {}, deviceCertCell(certMap[deviceKey(d.identity)])),
@@ -976,31 +985,149 @@ async function deleteGroup(g, host) {
   } catch (e) { uiToast(String(e), "err"); }
 }
 
-async function disableDevice(d, host) {
-  const ok = await uiConfirm({
-    title: bl({ en: "Turn off this device?", ja: "このデバイスをオフにしますか?" }),
-    body: bl({ en: "\"" + d.identity + "\" will be blocked from connecting right away, and any active sessions end shortly after. You can turn it back on at any time.", ja: "「" + d.identity + "」はすぐに接続できなくなり、進行中のセッションも間もなく終了します。いつでも再びオンにできます。" }),
-    confirmLabel: bl({ en: "Turn off", ja: "オフにする" }), danger: true,
-  });
-  if (!ok) return;
-  // Emergency block folds in "Block a Device Now": cut it at the transport layer (immediate) AND disable
-  // enrolment, so an active session ends now and it can't reconnect. Transport call is best-effort.
-  try { await apiFetch("POST", "/admin/transport-admission/revoke", { identity: d.identity, reason: "blocked from Devices" }); } catch (e) { /* best-effort */ }
-  await act("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/disable", host, bl({ en: "Device blocked.", ja: "デバイスを遮断しました。" }));
+function deviceAdmissionBusy(host, identity, busy) {
+  for (const row of host.querySelectorAll("[data-device-identity]")) {
+    if (row.getAttribute("data-device-identity") !== identity) continue;
+    for (const button of row.querySelectorAll("[data-device-admission-control]")) {
+      button.disabled = busy || !!(button.getAttribute("data-device-risk-control") &&
+        host.__deviceRiskPending && host.__deviceRiskPending.has(identity));
+    }
+  }
 }
 
-async function enableDevice(d, host) {
-  try { await apiFetch("POST", "/admin/transport-admission/restore", { identity: d.identity }); } catch (e) { /* best-effort */ }
-  await act("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/enable", host, bl({ en: "Device allowed.", ja: "デバイスを許可しました。" }));
+function deviceAdmissionNotice(host, d, enabled, message) {
+  const notices = host.__deviceAdmissionNotices || (host.__deviceAdmissionNotices = new Map());
+  const previous = notices.get(d.identity);
+  if (previous) { previous.remove(); notices.delete(d.identity); }
+  if (!message) return;
+  const box = el("div", { class: "ui-callout ui-callout-warn", role: "alert", style: "margin-bottom:12px" }, [
+    el("strong", { text: d.identity }),
+    el("div", { text: message, style: "white-space:pre-wrap" }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }),
+      onClick: () => changeDeviceAdmission(d, host, enabled) }),
+  ]);
+  (host.__deviceAdmissionMessages || host).appendChild(box);
+  notices.set(d.identity, box);
 }
+
+async function changeDeviceAdmission(d, host, enabled) {
+  const pending = host.__deviceAdmissionPending || (host.__deviceAdmissionPending = new Set());
+  if (pending.has(d.identity)) return;
+  pending.add(d.identity);
+  deviceAdmissionBusy(host, d.identity, true);
+  let transportDone = false, failure = "";
+  try {
+    if (!enabled) {
+      const ok = await uiConfirm({
+        title: bl({ en: "Turn off this device?", ja: "このデバイスをオフにしますか?" }),
+        body: bl({ en: "\"" + d.identity + "\" will be blocked from connecting right away, and any active sessions end shortly after. You can turn it back on at any time.", ja: "「" + d.identity + "」はすぐに接続できなくなり、進行中のセッションも間もなく終了します。いつでも再びオンにできます。" }),
+        confirmLabel: bl({ en: "Turn off", ja: "オフにする" }), danger: true,
+      });
+      if (!ok) return;
+    }
+    deviceAdmissionNotice(host, d, enabled, "");
+    const replyError = r => new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    const identityMatches = value => typeof value === "string" && value.trim().toLowerCase() === d.identity.trim().toLowerCase();
+    // Do not change admission after an unconfirmed transport operation. A retry is explicit and repeats
+    // the same intended state; it never reverses a possibly applied operation as an automatic rollback.
+    const transport = await apiFetch("POST", "/admin/transport-admission/" + (enabled ? "restore" : "revoke"),
+      enabled ? { identity: d.identity } : { identity: d.identity, reason: "blocked from Devices" }, "control");
+    if (!transport.ok) throw replyError(transport);
+    if (!transport.body || !identityMatches(transport.body.identity) ||
+        transport.body[enabled ? "restored" : "revoked"] !== true) {
+      throw new Error(bl({ en: "The transport response did not confirm the requested device state.",
+        ja: "接続制御の応答から、指定した端末の変更を確認できません。" }));
+    }
+    transportDone = true;
+    const inventory = await apiFetch("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) +
+      (enabled ? "/enable" : "/disable"), undefined, "control");
+    if (!inventory.ok) throw replyError(inventory);
+    const device = inventory.body && inventory.body.device;
+    if (!device || !identityMatches(device.identity) || device.enabled !== enabled) {
+      throw new Error(bl({ en: "The inventory response did not confirm the requested device state.",
+        ja: "デバイス一覧の応答から、指定した端末の変更を確認できません。" }));
+    }
+  } catch (e) {
+    failure = (transportDone
+      ? bl({ en: "The transport change was acknowledged, but the device admission update could not be confirmed. The operation may be partly applied. Reload the state and retry when the error is resolved.",
+          ja: "接続制御の変更は受け付けられましたが、デバイスの接続許可の更新を確認できません。一部だけ反映された可能性があります。状態を再読込し、エラー解消後に再試行してください。" })
+      : bl({ en: "The transport change could not be confirmed, so the device admission update was not sent. The transport may already have changed. Reload the state and retry when the error is resolved.",
+          ja: "接続制御の変更を確認できないため、デバイスの接続許可の更新は送信していません。接続制御だけ変更済みの可能性があります。状態を再読込し、エラー解消後に再試行してください。" })) + "\n" + String(e);
+  } finally {
+    pending.delete(d.identity);
+    deviceAdmissionBusy(host, d.identity, false);
+  }
+  if (failure) deviceAdmissionNotice(host, d, enabled, failure);
+  else uiToast(enabled ? bl({ en: "Device allowed.", ja: "デバイスを許可しました。" })
+    : bl({ en: "Device blocked.", ja: "デバイスを遮断しました。" }), "ok");
+  // A refresh failure must not turn an acknowledged write into a failed mutation or discard its warning.
+  try { await renderList(host); } catch (e) { uiToast(String(e), "err"); }
+}
+
+async function disableDevice(d, host) { return changeDeviceAdmission(d, host, false); }
+async function enableDevice(d, host) { return changeDeviceAdmission(d, host, true); }
 
 // setDeviceRisk marks / clears a device's risk from its own row (no free-text id) — replaces the Device Risk
 // page. "high" marks high-risk (a risk-gated policy then bites, e.g. re-auth); "none" clears it.
+function deviceRiskBusy(host, identity, busy) {
+  for (const row of host.querySelectorAll("[data-device-identity]")) {
+    if (row.getAttribute("data-device-identity") !== identity) continue;
+    for (const button of row.querySelectorAll("[data-device-risk-control]")) {
+      button.disabled = busy || !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(identity));
+    }
+  }
+}
+
+function deviceRiskNotice(host, d, severity, message) {
+  const notices = host.__deviceRiskNotices || (host.__deviceRiskNotices = new Map());
+  const previous = notices.get(d.identity);
+  if (previous) { previous.remove(); notices.delete(d.identity); }
+  if (!message) return;
+  const box = el("div", { class: "ui-callout ui-callout-warn", role: "alert", style: "margin-bottom:12px" }, [
+    el("strong", { text: d.identity }),
+    el("div", { text: message, style: "white-space:pre-wrap" }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }),
+      onClick: () => setDeviceRisk(d, severity, host) }),
+  ]);
+  (host.__deviceAdmissionMessages || host).appendChild(box);
+  notices.set(d.identity, box);
+}
+
 async function setDeviceRisk(d, severity, host) {
-  const r = await apiFetch("POST", "/admin/risk-signals", { entity_type: "device", entity_id: d.identity, severity: severity, evidence_ref: "console" });
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); renderList(host); return; }
-  uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" }) : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
-  renderList(host);
+  const pending = host.__deviceRiskPending || (host.__deviceRiskPending = new Set());
+  if (pending.has(d.identity)) return;
+  pending.add(d.identity);
+  deviceRiskBusy(host, d.identity, true);
+  deviceRiskNotice(host, d, severity, "");
+  let notice = "";
+  try {
+    const r = await apiFetch("POST", "/admin/risk-signals", {
+      entity_type: "device", entity_id: d.identity, severity, evidence_ref: "console",
+    }, "control");
+    if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    const b = r.body;
+    if (!b || b.entity_type !== "device" || typeof b.entity_id !== "string" ||
+        b.entity_id.trim().toLowerCase() !== d.identity.trim().toLowerCase() || b.severity !== severity ||
+        b.applied !== true || b.high_risk !== (severity === "high" || severity === "critical") ||
+        (b.not_stored_durably !== undefined && typeof b.not_stored_durably !== "string")) {
+      throw new Error(bl({ en: "The response did not confirm the requested device risk.",
+        ja: "応答から、指定した端末のリスク変更を確認できません。" }));
+    }
+    if (b.not_stored_durably && b.not_stored_durably.trim()) {
+      notice = bl({ en: "Risk applied, but saving was not confirmed. Retry once the store is healthy.",
+        ja: "リスクは反映されましたが、保存を確認できません。保存先の復旧後に再試行してください。" }) + "\n" + b.not_stored_durably;
+    }
+  } catch (e) {
+    notice = bl({ en: "The risk change could not be confirmed. It may already be applied. Reload the state and retry when the error is resolved.",
+      ja: "リスク変更を確認できません。反映済みの可能性があります。状態を再読込し、エラー解消後に再試行してください。" }) + "\n" + String(e);
+  } finally {
+    pending.delete(d.identity);
+    deviceRiskBusy(host, d.identity, false);
+  }
+  if (notice) deviceRiskNotice(host, d, severity, notice);
+  else uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" })
+    : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
+  try { await renderList(host); } catch (e) { uiToast(String(e), "err"); }
 }
 
 async function removeDevice(d, host) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -162,5 +163,56 @@ func signedPayloadWithPurgeOrder(tenantID string) configBundlePayload {
 			Deleted:     []tenantDeletion{{TenantID: tenantID}},
 			PurgeOrders: []tenantPurgeOrder{{TenantID: tenantID, OrderedAt: time.Now().UTC().Format(time.RFC3339)}},
 		},
+	}
+}
+
+func TestCarriedErasurePreservesHeldOrUnknownDataUntilResolved(t *testing.T) {
+	for _, state := range []string{"held", "unreadable", "malformed"} {
+		t.Run(state, func(t *testing.T) {
+			targets, dir := purgeTargetsForTest(t, "tenant_edge")
+			p := &unreadableHoldPersister{data: []byte(`[]`)}
+			if state == "unreadable" {
+				p.err = fmt.Errorf("storage unavailable")
+			}
+			if state == "malformed" {
+				p.data = []byte(`null`)
+			}
+			targets.legalHold = newLegalHoldStore(p)
+			if state == "held" {
+				if err := targets.legalHold.Set("tenant_gone", "review", "", true, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			payload := signedPayloadWithPurgeOrder("tenant_gone")
+			for i := 0; i < 2; i++ {
+				applyCarriedTenantPurges(context.Background(), targets, payload, "node", time.Now())
+				if _, err := os.Stat(filepath.Join(dir, "tenants", logs.SafeTenantSegment("tenant_gone"))); err != nil {
+					t.Fatalf("protected logs erased: %v", err)
+				}
+				if !targets.enrolled.IsAdmitted("device-gone") || len(targets.localCredentials.List("tenant_gone")) == 0 {
+					t.Fatal("protected identities erased")
+				}
+			}
+			// The shared boundary reports an incomplete operation, never successful emptiness.
+			result := purgeAdminTenantData(context.Background(), "node", "tenant_gone", nil, nil, nil, nil, nil, nil, "", nil, nil, adminTenantExtraStores{}, targets.legalHold, time.Now())
+			if result.Complete || len(result.Failures) != 1 || len(result.Erased) != 0 {
+				t.Fatalf("blocked result: %+v", result)
+			}
+			if state == "held" {
+				if err := targets.legalHold.Set("tenant_gone", "review", "", false, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				// Loading a repaired snapshot represents a restart, not clearing the poisoned store.
+				targets.legalHold = newLegalHoldStore(&unreadableHoldPersister{data: []byte(`[]`)})
+			}
+			applyCarriedTenantPurges(context.Background(), targets, payload, "node", time.Now())
+			if _, err := os.Stat(filepath.Join(dir, "tenants", logs.SafeTenantSegment("tenant_gone"))); !os.IsNotExist(err) {
+				t.Fatalf("standing order not retried after release/repair: %v", err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "tenants", logs.SafeTenantSegment("tenant_stays"))); err != nil {
+				t.Fatalf("unrelated tenant erased: %v", err)
+			}
+		})
 	}
 }

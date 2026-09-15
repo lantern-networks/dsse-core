@@ -386,7 +386,7 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 	add("human_approvals", e.HumanApprovals != nil, e.HumanApprovals.CountForTenant(f.TenantID), "no human-approval store on this node")
 	add("clientless_grants", e.ClientlessGrants != nil, e.ClientlessGrants.CountForTenant(f.TenantID), "no clientless grant store on this node")
 	add("end_user_idp_connections", e.IdPConnections != nil, e.IdPConnections.CountForTenant(f.TenantID), "no end-user IdP registry on this node")
-	add("high_risk_marks", e.HighRisk != nil, e.HighRisk.CountDevices(e.DeviceIDs), "no high-risk overlay on this node")
+	add("high_risk_marks", e.HighRisk != nil, e.HighRisk.CountDevices(e.DeviceIDs)+e.HighRisk.CountUsers(f.TenantID), "no high-risk overlay on this node")
 	add("admission_kill_switches", e.Admissions != nil, e.Admissions.CountDevices(e.DeviceIDs), "no admission revocation store on this node")
 	add("bypass_catalog_overrides", e.CatalogOverrides != nil, e.CatalogOverrides.CountForTenant(f.TenantID), "no bypass-catalog override store on this node")
 	add("connector_route_governance", e.ConnectorRoutes != nil, e.ConnectorRoutes.CountForTenant(f.TenantID), "no connector route governance on this node")
@@ -447,7 +447,11 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		add("end_user_idp_connections", e.IdPConnections.RemoveTenant(tenantID))
 	}
 	if e.HighRisk != nil {
-		add("high_risk_marks", e.HighRisk.RemoveDevices(e.DeviceIDs))
+		if n, err := e.HighRisk.RemoveUsers(tenantID); err != nil {
+			result.Failures = append(result.Failures, "user risk removal failed")
+		} else {
+			add("high_risk_marks", n+e.HighRisk.RemoveDevices(e.DeviceIDs))
+		}
 	}
 	if e.Admissions != nil {
 		add("admission_kill_switches", e.Admissions.RemoveDevices(e.DeviceIDs))
@@ -479,7 +483,12 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.EnrolmentTokens != nil {
-		add("enrolment_tokens_store", e.EnrolmentTokens.RemoveTenant(tenantID))
+		n := e.EnrolmentTokens.RemoveTenant(tenantID)
+		if err := e.EnrolmentTokens.Health(); err != nil {
+			result.Failures = append(result.Failures, "enrolment_tokens_store: "+err.Error())
+		} else {
+			add("enrolment_tokens_store", n)
+		}
 	}
 	if e.AgentRolloutPlans != nil {
 		add("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenant(tenantID))

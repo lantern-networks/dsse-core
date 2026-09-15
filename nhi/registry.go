@@ -35,8 +35,8 @@ type registryPersistSnapshot struct {
 // Upsert returns success, the Console shows the NHI, and the next Edge restart forgets it. That is the outage this
 // persistence prevents, silently recreated while looking healthy. Must not panic.
 //
-// It does NOT fail the mutation: the in-memory registry is already serving the identity, and rejecting an
-// operator's change because the disk is unhappy is the worse failure.
+// Upsert rejects a failed save before publishing. Usage timestamps retain their
+// existing best-effort persistence contract.
 var OnPersistError func(error)
 
 // SetPersister enables durable persistence so registered non-human identities survive an Edge restart. It loads
@@ -62,27 +62,48 @@ func (store *Store) SetPersister(p blobstore.Persister) error {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	if snap.Identities != nil {
-		store.identities = snap.Identities
+	fresh := make(map[string]model.NonHumanIdentity, len(snap.Identities))
+	// Legacy files used bare IDs. Attribution comes from each record, never its
+	// old map key. Duplicate tenant/ID records are ambiguous and refuse loading.
+	for _, identity := range snap.Identities {
+		if identity.TenantID == "" || identity.ID == "" || strings.ContainsRune(identity.TenantID, '\x00') || strings.ContainsRune(identity.ID, '\x00') {
+			return fmt.Errorf("invalid saved non-human identity key")
+		}
+		key := identityKey(identity.TenantID, identity.ID)
+		if _, duplicate := fresh[key]; duplicate {
+			return fmt.Errorf("duplicate saved non-human identity")
+		}
+		fresh[key] = identity
+	}
+	store.identities = fresh
+	return nil
+}
+
+var ErrPersistence = errors.New("non-human identity registry could not be saved")
+
+func identityKey(tenant, id string) string { return tenant + "\x00" + id }
+
+// The caller holds store.mu. Rejected candidates never reach the live registry.
+func (store *Store) saveSnapshotLocked(identities map[string]model.NonHumanIdentity) error {
+	if store.persister == nil {
+		return nil
+	}
+	data, err := json.Marshal(registryPersistSnapshot{Identities: identities})
+	if err == nil {
+		err = store.persister.Save(data)
+	}
+	if err != nil {
+		reportPersistError(fmt.Errorf("save NHI registry snapshot: %w", err))
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return nil
+		}
+		return ErrPersistence
 	}
 	return nil
 }
 
-// persistLocked writes the full snapshot. The CALLER must hold store.mu. No-op without a persister. A save error
-// is surfaced via OnPersistError but does NOT fail the mutation.
-func (store *Store) persistLocked() {
-	if store.persister == nil {
-		return
-	}
-	data, err := json.Marshal(registryPersistSnapshot{Identities: store.identities})
-	if err != nil {
-		reportPersistError(fmt.Errorf("marshal NHI registry snapshot: %w", err))
-		return
-	}
-	if err := store.persister.Save(data); err != nil {
-		reportPersistError(fmt.Errorf("save NHI registry snapshot: %w", err))
-	}
-}
+// Usage timestamps still report persistence faults without rolling back usage.
+func (store *Store) persistLocked() { _ = store.saveSnapshotLocked(store.identities) }
 
 func reportPersistError(err error) {
 	if OnPersistError != nil {
@@ -136,7 +157,7 @@ func NewStore(items ...model.NonHumanIdentity) *Store {
 	for _, item := range items {
 		normalized, err := Normalize(item, item.TenantID, now)
 		if err == nil {
-			store.identities[normalized.ID] = normalized
+			store.identities[identityKey(normalized.TenantID, normalized.ID)] = normalized
 		}
 	}
 	return store
@@ -149,9 +170,16 @@ func (store *Store) Upsert(_ context.Context, identity model.NonHumanIdentity, t
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.identities[normalized.ID] = normalized
+	candidate := make(map[string]model.NonHumanIdentity, len(store.identities)+1)
+	for key, current := range store.identities {
+		candidate[key] = current
+	}
+	candidate[identityKey(normalized.TenantID, normalized.ID)] = normalized
+	if err := store.saveSnapshotLocked(candidate); err != nil {
+		return model.NonHumanIdentity{}, err
+	}
+	store.identities = candidate
 	store.generation++
-	store.persistLocked()
 	return normalized, nil
 }
 
@@ -203,13 +231,13 @@ func (store *Store) MarkUsed(_ context.Context, tenantID, actorNHIID string, now
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	identity, ok := store.identities[actorNHIID]
+	identity, ok := store.identities[identityKey(tenantID, actorNHIID)]
 	if !ok || identity.TenantID != tenantID {
 		return false, nil
 	}
 	lastUsedAt := now.UTC().Format(time.RFC3339)
 	identity.LastUsedAt = &lastUsedAt
-	store.identities[actorNHIID] = identity
+	store.identities[identityKey(tenantID, actorNHIID)] = identity
 	store.persistLocked()
 	return true, nil
 }
@@ -387,6 +415,9 @@ func Normalize(identity model.NonHumanIdentity, tenantID string, _ time.Time) (m
 	}
 	if identity.TenantID == "" {
 		return model.NonHumanIdentity{}, fmt.Errorf("non-human identity tenant_id is required")
+	}
+	if strings.ContainsRune(identity.TenantID, '\x00') || strings.ContainsRune(identity.ID, '\x00') {
+		return model.NonHumanIdentity{}, fmt.Errorf("non-human identity tenant_id and id cannot contain NUL")
 	}
 	identity.Name = strings.TrimSpace(identity.Name)
 	if identity.Name == "" {

@@ -36,7 +36,8 @@ import (
 // CP→Edge config distribution (Phase 1 — docs/edge_config_distribution_phase1_design.md). The control plane
 // is the source of truth for runtime admin config; each Edge PULLS a versioned config bundle and applies it
 // to its in-memory stores so a fleet enforces identically. Generalizes steer_exclusion_sync. Fail-safe: a
-// fetch/decode error keeps the last good config. Atomic per generation: a bundle applies whole or not at all.
+// fetch/decode error keeps the last good config. Required section errors leave a generation unapplied
+// for retry; sections already changed are not rolled back.
 // Slice 1 carries access policies; further resources (east-west, dns, …) fold into the bundle.
 
 type configBundleSource struct {
@@ -534,11 +535,12 @@ type configApplyTargets struct {
 	// went on enforcing the ones it compiled at boot — the same divergence this section exists to end, moved one
 	// layer inward where no admin surface would show it at all.
 	onRulesApplied func()
-	// The four below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
+	// The fields below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
 	// own copy of a terminated tenant's data — the logs on its disk above all, which nothing else can reach.
 	logWriter           *logs.Writer
 	localCredentials    *localAdminCredentialStore
 	purgeDB             *sql.DB
+	legalHold           *legalHoldStore
 	enforcementTenantID string
 	// nodeName labels this node in the erasure log, so "which node erased what" is answerable afterwards.
 	nodeName string
@@ -950,7 +952,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		} else {
 			for _, grant := range payload.DelegatedGrants.Grants {
 				if _, err := t.delegatedGrants.Upsert(grant); err != nil {
-					log.Printf("config-bundle sync: skipping invalid delegated grant %q from the control plane: %v", grant.ID, err)
+					// Continue so updates/revocations of retained IDs can still be applied at capacity.
+					// A rejected grant must leave the generation unapplied and eligible for retry.
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("delegated grant %q: %w", grant.ID, err))
 				}
 			}
 		}
@@ -968,15 +972,23 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// device-CA registry, because they are the same kind of fact from opposite directions: that one says which
 	// organization a client certificate belongs to, this one says which server certificates an organization's
 	// own flows may accept.
-	if payload.InternalCAs != nil && t.internalCAs != nil {
-		if count, applied := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf); applied {
+	if payload.InternalCAs != nil {
+		count, applied, err := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf)
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("internal authorities: %w", err))
+		}
+		if applied {
 			log.Printf("config_bundle_internal_cas applied=%d", count)
 		}
 	}
 	// What the fleet has already approved out of band, so a flow held on a node that did not run the
 	// ceremony is released by the grant that ceremony earned.
 	if payload.Grants != nil {
-		if added, updated := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC()); added > 0 || updated > 0 {
+		added, updated, err := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC())
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grants: %w", err))
+		}
+		if added > 0 || updated > 0 {
 			log.Printf("config_bundle_grants added=%d updated=%d", added, updated)
 		}
 	}
@@ -1361,7 +1373,7 @@ func applyCarriedTenantPurges(ctx context.Context, t configApplyTargets, payload
 			t.deviceCAs, t.deviceCARegistryPath, t.deviceTrust, t.vlan,
 			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants,
 				DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, t.enrolled, tenantID).DeviceIDs},
-			now)
+			t.legalHold, now)
 		if len(result.Erased) == 0 && result.Complete {
 			continue // nothing here: already erased, or this node never served the tenant. Silence is correct.
 		}

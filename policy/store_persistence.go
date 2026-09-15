@@ -227,3 +227,28 @@ func eastWestModeLabel(enabled, allowUnmatched bool) string {
 	}
 	return "full"
 }
+
+var ErrPolicyPersistence = errors.New("policy could not be saved")
+
+// Only the private authored snapshot changes while saving; the live policy and
+// evaluator cache are published by Upsert after the save succeeds.
+func (store *Store) saveAuthoredPolicyLocked(item model.Policy) error {
+	before := store.adminAuthoredPolicies
+	next := make(map[string]map[string]model.Policy, len(before)+1)
+	for tenant, rows := range before {
+		next[tenant] = rows
+	}
+	rows := make(map[string]model.Policy, len(before[item.TenantID])+1)
+	for id, row := range before[item.TenantID] {
+		rows[id] = row
+	}
+	rows[item.ID] = copyAdminPolicy(item)
+	next[item.TenantID] = rows
+	store.adminAuthoredPolicies = next
+	if err := store.persistLockedChecked(); err != nil {
+		store.adminAuthoredPolicies = before
+		log.Printf("admin policy save: %v", err)
+		return ErrPolicyPersistence
+	}
+	return nil
+}

@@ -100,6 +100,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be hold | unhold | approve | unapprove | add | remove"))
 			return
 		}
+		var bindingErr error
 		switch action {
 		case "hold":
 			connectorRouteGov.SetHeld(tenant, cid, req.CIDR, true)
@@ -110,16 +111,21 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		case "unapprove":
 			connectorRouteGov.SetApproved(tenant, cid, req.CIDR, false)
 		case "add":
-			connectorRouteGov.AddAuthored(tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthored(tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case isNetwork:
-				connectorRouteGov.RemoveAuthored(tenant, cid, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, "net:"+req.NetworkID)
 			case isFQDN:
-				connectorRouteGov.RemoveAuthored(tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				connectorRouteGov.RemoveAuthored(tenant, cid, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, req.CIDR)
 			}
+		}
+		if bindingErr != nil {
+			log.Printf("admin network binding: %v", bindingErr)
+			writeError(w, http.StatusInternalServerError, errors.New("Could not save network binding."))
+			return
 		}
 		declared, declaredFQDNs, _ := connectorDeclaredRoutes(r.Context(), tenant, cid)
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "routes": connectorRouteGov.Routes(tenant, cid, declared, declaredFQDNs)})
@@ -436,20 +442,26 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				return
 			}
 		}
+		var bindingErr error
 		switch action {
 		case "add":
-			connectorRouteGov.AddAuthored(tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthored(tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case req.NetworkID != "":
-				connectorRouteGov.RemoveAuthored(tenant, siteID, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, "net:"+req.NetworkID)
 			case req.FQDN != "":
-				connectorRouteGov.RemoveAuthored(tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				connectorRouteGov.RemoveAuthored(tenant, siteID, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, req.CIDR)
 			}
 		default:
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be add | remove"))
+			return
+		}
+		if bindingErr != nil {
+			log.Printf("admin network binding: %v", bindingErr)
+			writeError(w, http.StatusInternalServerError, errors.New("Could not save network binding."))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "networks": connectorRouteGov.Routes(tenant, siteID, nil, nil)})

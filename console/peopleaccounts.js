@@ -269,18 +269,17 @@ async function paAccounts(section) {
   const current = freshRender(section);
   let accts, risk, policies;
   try {
-    [accts, risk, policies] = await Promise.all([
-      paList("/admin/non-human-identities", "identities", _PA_ENF),
-      paGet("/admin/non-human-identities/risk", _PA_ENF).catch(() => ({ identities: [] })),
-      paList("/admin/policies", "policies", _PA_ENF).catch(() => []),
-    ]);
-  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paAccounts(section) }); return; }
-  const sevById = {}; (risk.identities || []).forEach((r) => (sevById[r.id] = r.severity));
-  // Tool-boundary (ceiling) per agent — the policy pol-agent-<id> authored alongside the NHI (S3). Enforcement
-  // reads this policy's AllowedToolIDs; showing it here makes the boundary visible where the agent lives.
-  const boundaryById = {}; (policies || []).forEach((p) => { const t = agentBoundaryTools(p); if (t) boundaryById[t.nhi] = t.tools; });
+    const data = await paLoadAccounts();
+    ({accts, risk, policies} = data);
+    if (!current()) return;
+    section.__paAccountTenant = data.tenant;
+  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paAccounts(section) }); paDrawAccountNotices(section); return; }
+  const sevById = new Map(risk.map(row => [row.id, row.severity]));
+  const boundaryById = new Map();
+  policies.forEach(p => { const boundary = agentBoundaryTools(p); if (boundary) boundaryById.set(boundary.nhi, boundary.tools); });
   if (!current()) return;
   section.innerHTML = "";
+  paDrawAccountNotices(section);
   section.appendChild(el("div", { class: "ui-toolbar" }, [
     el("span", { class: "ui-view-desc", text: bl({ en: "The automated actors in agentic decisions — risk gates access, and out-of-boundary tool calls are denied.", ja: "エージェントとして判断する主体 ── リスクがアクセスを絞り、境界外のツール呼び出しは拒否されます。" }) }),
     el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add account", ja: "+ アカウント追加" }), onClick: () => openAccountForm(section) }),
@@ -293,8 +292,8 @@ async function paAccounts(section) {
       [bl({ en: "Account", ja: "アカウント" }), bl({ en: "Type", ja: "種別" }), bl({ en: "Owner", ja: "所有者" }), bl({ en: "Allowed tools", ja: "許可ツール" }), bl({ en: "Risk", ja: "リスク" }), bl({ en: "Status", ja: "状態" })],
       rows.map((a) => [
         el("strong", { text: a.name || a.id }), el("span", { text: a.nhi_type || "—" }), el("span", { text: a.owner_user_id || "—" }),
-        boundaryById[a.id] ? el("code", { text: boundaryById[a.id].join(", ") }) : el("span", { class: "ui-view-desc", text: bl({ en: "any (no boundary)", ja: "制限なし" }) }),
-        severityBadge(sevById[a.id]),
+        boundaryById.has(a.id) ? el("code", { text: boundaryById.get(a.id).join(", ") }) : el("span", { class: "ui-view-desc", text: bl({ en: "No account boundary", ja: "アカウント境界なし" }) }),
+        severityBadge(sevById.get(a.id)),
         uiBadge(a.status === "active" ? bl({ en: "Active", ja: "有効" }) : (a.status || "—"), a.status === "active" ? "ok" : "off"),
       ])
     ),
@@ -304,11 +303,51 @@ async function paAccounts(section) {
 // The agent tool-boundary is authored as a policy pol-agent-<nhi> keyed on actor_nhi_id, carrying AllowedToolIDs.
 const AGENT_POLICY_PREFIX = "pol-agent-";
 function agentBoundaryTools(p) {
-  if (!p || !p.id || p.id.indexOf(AGENT_POLICY_PREFIX) !== 0) return null;
-  const nhi = (p.conditions && p.conditions.actor_nhi_id) || p.id.slice(AGENT_POLICY_PREFIX.length);
-  const tools = p.allowed_tool_ids || [];
-  return { nhi, tools };
+  if (!p.id.startsWith(AGENT_POLICY_PREFIX) || p.status !== "active") return null;
+  return {nhi: p.conditions.actor_nhi_id, tools: p.allowed_tool_ids};
 }
+function paAccount(value) {
+  return paObject(value) && ["id", "tenant_id", "name", "nhi_type", "owner_user_id"].every(key => paText(value[key])) &&
+    ["active", "suspended", "expired", "revoked"].includes(value.status);
+}
+async function paLoadAccounts() {
+  const [body, report, policyBody] = await Promise.all([
+    paGet("/admin/non-human-identities", _PA_ENF), paGet("/admin/non-human-identities/risk", _PA_ENF), paGet("/admin/policies?limit=1000", _PA_ENF),
+  ]);
+  const accts = paArray(body, "identities"), risk = paArray(report, "identities"), policies = paArray(policyBody, "policies");
+  const strings = list => Array.isArray(list) && list.every(paText);
+  if (!paText(body.tenant_id) || report.tenant_id !== body.tenant_id || body.count !== accts.length || report.total !== risk.length || policyBody.count !== policies.length ||
+      !accts.every(a => paAccount(a) && a.tenant_id === body.tenant_id) || new Set(accts.map(a => a.id)).size !== accts.length ||
+      !risk.every(r => paObject(r) && paText(r.id) && ["none", "low", "medium", "high", "critical"].includes(r.severity)) ||
+      new Set(risk.map(r => r.id)).size !== risk.length || !accts.every(a => risk.some(r => r.id === a.id)) ||
+      !policies.every(p => paObject(p) && paText(p.id) && p.tenant_id === body.tenant_id && paText(p.status))) throw new Error("Invalid account state response");
+  for (const p of policies.filter(p => p.id.startsWith(AGENT_POLICY_PREFIX) && p.status === "active")) {
+    if (!paObject(p.conditions) || !paText(p.conditions.actor_nhi_id) || p.id !== AGENT_POLICY_PREFIX + p.conditions.actor_nhi_id ||
+        !strings(p.allowed_tool_ids) || p.allowed_tool_ids.length === 0 || !paObject(p.action) || p.action.decision !== "allow") throw new Error("Invalid account boundary response");
+  }
+  return {accts, risk, policies, tenant: body.tenant_id};
+}
+function paAccountNotice(section, id, message) {
+  const notices = section.__paAccountNotices || (section.__paAccountNotices = new Map());
+  if (message) notices.set(id, message); else notices.delete(id);
+}
+function paDrawAccountNotices(section) {
+  for (const [id, message] of section.__paAccountNotices || []) section.appendChild(el("div", {class: "ui-callout ui-callout-warn", role: "alert"}, [el("strong", {text: id}), el("div", {text: message})]));
+}
+function paConfirmAccount(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  if (!paAccount(r.body) || ["id", "name", "nhi_type", "owner_user_id", "status"].some(k => r.body[k] !== expected[k]) ||
+      (expected.tenant_id && r.body.tenant_id !== expected.tenant_id)) throw new Error("Account result is unconfirmed; it may already be saved. Reload before retrying.");
+  return r.body;
+}
+function paConfirmBoundary(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  const b = r.body;
+  if (!paObject(b) || b.id !== expected.id || b.tenant_id !== expected.tenant_id || b.status !== "active" ||
+      !paObject(b.conditions) || b.conditions.actor_nhi_id !== expected.conditions.actor_nhi_id || !paObject(b.action) || b.action.decision !== "allow" ||
+      !Array.isArray(b.allowed_tool_ids) || JSON.stringify([...b.allowed_tool_ids].sort()) !== JSON.stringify([...expected.allowed_tool_ids].sort())) throw new Error("Boundary result is unconfirmed; it may already be saved. Reload before retrying.");
+}
+
 function severityBadge(sev) {
   sev = (sev || "none").toLowerCase();
   const kind = (sev === "high" || sev === "critical") ? "danger" : sev === "medium" ? "warn" : "off";
@@ -321,21 +360,50 @@ function openAccountForm(section) {
   const typeF = uiField({ name: "type", label: bl({ en: "Type", ja: "種別" }), type: "select", value: "service_account", options: [{ value: "service_account", label: bl({ en: "Service account", ja: "サービスアカウント" }) }, { value: "ai_agent", label: bl({ en: "AI agent", ja: "AI エージェント" }) }, { value: "workload", label: bl({ en: "Workload", ja: "ワークロード" }) }] });
   const ownerF = uiField({ name: "owner", label: bl({ en: "Owner (person ID)", ja: "所有者(ユーザー ID)" }), required: true, placeholder: "u1", hint: bl({ en: "Every automated account is owned by a person — accountability for its actions.", ja: "自動アカウントは必ず人が所有 ── 行動の説明責任。" }) });
   const toolsF = uiField({ name: "tools", label: bl({ en: "Allowed tools (boundary)", ja: "許可ツール(境界)" }), placeholder: "read_repo, open_pr", hint: bl({ en: "The tools this agent may ever call. Any tool outside this list is denied before it runs (leave empty for no boundary).", ja: "このエージェントが呼べるツールの上限。ここに無いツールは実行前に拒否(空なら境界なし)。" }) });
-  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "disabled", label: bl({ en: "Disabled", ja: "無効" }) }] });
+  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "suspended", label: bl({ en: "Suspended", ja: "停止" }) }] });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add account", ja: "アカウント追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a service account", ja: "サービスアカウントを追加" }), body: [idF.el, nameF.el, typeF.el, ownerF.el, toolsF.el, statusF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
+  const error = el("div", {class: "ui-field-error-msg", style: "display:block;white-space:pre-wrap", role: "alert"});
+  let pending = false, closed = false, saved = false, completed = false, draft;
+  const partial = () => bl({en: "Account saved; its tool boundary is not confirmed. Review the account before using it.", ja: "アカウントは保存されましたが、ツール境界を確認できません。利用前に設定を確認してください。"});
+  const uncertain = () => bl({en: "The account operation is unconfirmed and may already be applied. Reload its state before retrying.", ja: "処理結果を確認できません。反映済みの可能性があるため、状態を再読込してから再試行してください。"});
+  const cancel = el("button", {class: "ui-btn", text: bl({en: "Cancel", ja: "キャンセル"}), onClick: () => m.close()});
+  const m = uiModal({ title: bl({ en: "Add a service account", ja: "サービスアカウントを追加" }), body: [idF.el, nameF.el, typeF.el, ownerF.el, toolsF.el, statusF.el, error], footer: [cancel, submit], onClose: () => {
+    closed = true;
+    if (!completed && (pending || saved)) { paAccountNotice(section, draft.account.id, saved ? partial() : uncertain()); paAccounts(section); }
+  }});
+  const fields = [idF, nameF, typeF, ownerF, toolsF, statusF];
+  const controls = m.el.querySelectorAll("input,select,button");
   submit.addEventListener("click", async () => {
-    if (!idF.validate() || !nameF.validate() || !ownerF.validate()) return; submit.disabled = true;
-    const r = await paWriteEnforcement("POST", "/admin/non-human-identities", { id: idF.get(), name: nameF.get(), nhi_type: typeF.get(), owner_user_id: ownerF.get(), status: statusF.get() });
-    if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    // Author the agent's tool boundary as a policy (S3): pol-agent-<id> keyed on actor_nhi_id, allow with an
-    // AllowedToolIDs allowlist. The evaluator denies any tool outside it before execution.
-    const tools = toolsF.get().split(",").map((s) => s.trim()).filter(Boolean);
-    if (tools.length) {
-      const pr = await paWriteEnforcement("POST", "/admin/policies", { id: AGENT_POLICY_PREFIX + idF.get(), name: "Agent tool boundary: " + nameF.get(), priority: 50, conditions: { actor_nhi_id: idF.get() }, action: { decision: "allow" }, allowed_tool_ids: tools, status: "active" });
-      if (!pr.ok) { submit.disabled = false; uiToast(bl({ en: "Account saved but boundary failed: ", ja: "アカウントは保存、境界は失敗: " }) + ((pr.body && (pr.body.error || pr.body.message)) || ("HTTP " + pr.status)), "err"); return; }
+    if (pending || closed) return;
+    if (!saved) {
+      if (!idF.validate() || !nameF.validate() || !ownerF.validate()) return;
+      draft = {account: {id: idF.get(), name: nameF.get(), nhi_type: typeF.get(), owner_user_id: ownerF.get(), status: statusF.get()}, tools: [...new Set(toolsF.get().split(",").map(s => s.trim()).filter(Boolean))]};
+      if (section.__paAccountTenant) draft.account.tenant_id = section.__paAccountTenant;
+      if (draft.tools.length && draft.account.id.includes("/")) { idF.setError(bl({en: "An account with a tool boundary cannot use / in its ID.", ja: "ツール境界を設定するアカウントのIDに / は使用できません。"})); return; }
     }
-    m.close(); uiToast(bl({ en: "Account added.", ja: "アカウントを追加しました。" }), "ok"); paAccounts(section);
+    pending = true; error.textContent = ""; controls.forEach(c => { c.disabled = true; });
+    try {
+      if (!saved) {
+        let r; try { r = await paWriteEnforcement("POST", "/admin/non-human-identities", draft.account); } catch (_) { throw new Error(uncertain()); }
+        const account = paConfirmAccount(r, draft.account); draft.account.tenant_id = account.tenant_id; saved = true;
+      }
+      if (closed) { paAccountNotice(section, draft.account.id, draft.tools.length ? partial() : ""); await paAccounts(section); return; }
+      if (draft.tools.length) {
+        const expected = {id: AGENT_POLICY_PREFIX + draft.account.id, tenant_id: draft.account.tenant_id, name: "Agent tool boundary: " + draft.account.name, priority: 50, conditions: {actor_nhi_id: draft.account.id}, action: {decision: "allow"}, allowed_tool_ids: draft.tools, status: "active"};
+        let r; try { r = await paWriteEnforcement("POST", "/admin/policies", expected); } catch (_) { throw new Error(uncertain()); }
+        paConfirmBoundary(r, expected);
+      }
+      completed = true; paAccountNotice(section, draft.account.id, "");
+      if (!closed) { m.close(); uiToast(bl({en: "Account added.", ja: "アカウントを追加しました。"}), "ok"); }
+      await paAccounts(section);
+    } catch (e) {
+      const message = (saved ? partial() + "\n" : "") + (e.message || String(e));
+      paAccountNotice(section, draft.account.id, message);
+      if (!closed) error.textContent = message; else await paAccounts(section);
+    } finally {
+      pending = false; controls.forEach(c => { c.disabled = false; });
+      if (saved && !completed) { fields.forEach(f => { f.el.querySelectorAll("input,select").forEach(input => { input.disabled = true; }); }); submit.textContent = bl({en: "Retry boundary", ja: "境界設定を再試行"}); }
+    }
   });
   idF.focus();
 }

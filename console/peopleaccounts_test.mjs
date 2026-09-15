@@ -30,7 +30,7 @@ function fixture() {
   uiState:(host,state,message,retry)=>{host.innerHTML='';states.push({state,message,retry})},
   freshRender:host=>{const n=(host.seq||0)+1;host.seq=n;return()=>host.seq===n},
   uiToast:(message,kind)=>toasts.push({message,kind}),uiBadge:(text)=>el('span',{text}),emptyBox:text=>el('div',{text}),
-  uiField:spec=>{const input=el(spec.type==='select'?'select':'input',{value:spec.value||''});let error='';const f={spec,input,el:el('div',{},[input]),get:()=>input.value.trim(),validate:()=>!spec.required||input.value.trim()!=='',focus(){},setError:v=>{error=v},error:()=>error};fields[spec.name]=f;return f},
+  uiField:spec=>{const input=el(spec.type==='select'?'select':'input',{value:spec.value||''});let error='';const f={spec,input,el:el('div',{},[input]),get:()=>input.value.trim(),validate:()=>!spec.required||input.value.trim()!=='',focus(){},setError:v=>{error=v},error:()=>error};fields[spec.name]=f;const {input:fixtureInput,...publicField}=f;return publicField},
   uiModal:spec=>{const modal={spec,el:el('div',{},[spec.body,spec.footer]),closed:false,close(){if(this.closed)return;this.closed=true;spec.onClose?.()}};modals.push(modal);return modal},
   uiConfirm:async spec=>{confirms.push(spec);return true},
  });
@@ -120,4 +120,37 @@ test('pending risk disables its own selector and suppresses duplicate writes',as
 });
 test('a risk snapshot from another tenant never renders clean people',async()=>{
  const f=fixture();f.invokeWith(async(method,path)=>({ok:true,body:path===paths[3]?{identities:[person]}:path===paths[4]?{entity_type:'user',tenant_id:'other',high_risk:{}}:bodyFor(path)}));await f.context.paPeople(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(buttons(f.host).length,0);
+});
+
+const account={id:'account-one',tenant_id:'tenant',name:'Account one',nhi_type:'service_account',owner_user_id:'alice',status:'active'};
+const accountPaths=['/admin/non-human-identities','/admin/non-human-identities/risk','/admin/policies?limit=1000'];
+const accountBodies=path=>({[accountPaths[0]]:{tenant_id:'tenant',count:1,identities:[account]},[accountPaths[1]]:{tenant_id:'tenant',total:1,identities:[{id:account.id,severity:'high'}]},[accountPaths[2]]:{count:0,policies:[]}}[path]);
+const accountForm=f=>{f.host.__paAccountTenant='tenant';f.context.openAccountForm(f.host);f.fields.id.input.value=account.id;f.fields.name.input.value=account.name;f.fields.owner.input.value=account.owner_user_id;f.fields.status.input.value=account.status;return f.modals.at(-1)};
+for(const path of accountPaths)test(`accounts require ${path}, including malformed and foreign responses`,async()=>{
+ for(const reply of [{ok:false,status:503},{ok:true,body:{}},{ok:true,body:[]},new Error('offline')]){const f=fixture();f.invokeWith(async(m,p)=>{if(p===path){if(reply instanceof Error)throw reply;return reply}return{ok:true,body:accountBodies(p)}});await f.context.paAccounts(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(buttons(f.host).length,0);assert.equal(f.host.textContent.includes('No account boundary'),false);f.invokeWith(async(m,p)=>({ok:true,body:accountBodies(p)}));await f.states.at(-1).retry.onClick();assert.ok(button(f.host,'+ Add account'));assert.match(f.host.textContent,/High/)}
+});
+test('account list refuses truncated policies, missing risk, foreign tenant and malformed active boundaries',async()=>{
+ for(const [path,body] of [[accountPaths[0],{...accountBodies(accountPaths[0]),identities:[{...account,tenant_id:'other'}]}],[accountPaths[1],{tenant_id:'tenant',total:0,identities:[]}],[accountPaths[2],{count:101,policies:[]}],[accountPaths[2],{count:1,policies:[{id:'pol-agent-account-one',tenant_id:'tenant',status:'active',conditions:{actor_nhi_id:'other'},allowed_tool_ids:['read'],action:{decision:'allow'}}]}]]){const f=fixture();f.invokeWith(async(m,p)=>({ok:true,body:p===path?body:accountBodies(p)}));await f.context.paAccounts(f.host);assert.equal(f.states.at(-1).state,'error')}
+});
+test('account form validates suspended status and invalid boundary ID before writing',async()=>{
+ const f=fixture();f.context.paAccounts=async()=>{};f.context.openAccountForm(f.host);await button(f.modals[0].el,'Add account').click();assert.equal(f.calls.length,0);assert.deepEqual(json(f.fields.status.spec.options.map(o=>o.value)),['active','suspended']);f.fields.id.input.value='bad/id';f.fields.name.input.value='name';f.fields.owner.input.value='alice';f.fields.tools.input.value='read';await button(f.modals[0].el,'Add account').click();assert.equal(f.calls.length,0);assert.match(f.fields.id.error(),/cannot use/);
+});
+test('account creation handles errors and mismatched replies without attempting the boundary',async()=>{
+ for(const reply of [{ok:false,status:500},new Error('offline'),{ok:true,body:{}},{ok:true,body:{...account,tenant_id:'other'}},{ok:true,body:{...account,owner_user_id:'other'}}]){const f=fixture();f.context.paAccounts=async()=>{};const modal=accountForm(f);f.fields.tools.input.value='read';f.invokeWith(async()=>{if(reply instanceof Error)throw reply;return reply});await button(modal.el,'Add account').click();assert.equal(modal.closed,false);assert.equal(f.calls.length,1);assert.ok(error(modal.el).textContent);assert.equal(button(modal.el,'Add account').disabled,false);assert.equal(f.fields.id.get(),account.id);assert.equal(f.toasts.length,0)}
+});
+test('boundary failure freezes the saved account and retries only the original policy',async()=>{
+ for(const reply of [{ok:false,status:500},new Error('offline'),{ok:true,body:{}},{ok:true,body:{id:'wrong'}}]){
+  const f=fixture();f.context.paAccounts=async()=>{};const modal=accountForm(f);f.fields.tools.input.value='read, write, read';f.invokeWith(async(m,p,body)=>{if(p===accountPaths[0])return{ok:true,body:{...body}};if(reply instanceof Error)throw reply;return reply});await button(modal.el,'Add account').click();assert.equal(f.calls.length,2);assert.match(error(modal.el).textContent,/Account saved/);assert.equal(f.fields.id.input.disabled,true);assert.equal(f.toasts.length,0);assert.ok(button(modal.el,'Retry boundary'));
+  f.fields.id.input.value='changed';f.fields.tools.input.value='danger';f.invokeWith(async(m,p,body)=>({ok:true,body}));await button(modal.el,'Retry boundary').click();assert.equal(f.calls.filter(c=>c.path===accountPaths[0]).length,1);assert.equal(f.calls.at(-1).body.id,'pol-agent-account-one');assert.deepEqual(json(f.calls.at(-1).body.allowed_tool_ids),['read','write']);assert.equal(modal.closed,true);assert.equal(f.toasts.at(-1).kind,'ok');
+ }
+});
+test('account submit snapshots all inputs and suppresses repeated events during its two writes',async()=>{
+ const f=fixture();f.context.paAccounts=async()=>{};const modal=accountForm(f);f.fields.tools.input.value='read';let finish;f.invokeWith(async(m,p,body)=>p===accountPaths[0]?new Promise(resolve=>finish=()=>resolve({ok:true,body})):{ok:true,body});const first=button(modal.el,'Add account').click();await button(modal.el,'Add account').click();assert.equal(f.calls.length,1);assert.ok(modal.el.querySelectorAll('input,select,button').every(c=>c.disabled));f.fields.id.input.value='other';f.fields.tools.input.value='other';finish();await first;assert.equal(f.calls.length,2);assert.equal(f.calls[1].body.conditions.actor_nhi_id,'account-one');assert.deepEqual(json(f.calls[1].body.allowed_tool_ids),['read']);assert.equal(modal.closed,true);
+});
+test('closing a pending account operation retains its result without sending a new boundary',async()=>{
+ const f=fixture();f.context.paAccounts=async()=>{f.refreshes.push(true)};const modal=accountForm(f);f.fields.tools.input.value='read';let finish;f.invokeWith(async(m,p,body)=>new Promise(resolve=>finish=()=>resolve({ok:true,body})));const first=button(modal.el,'Add account').click();modal.close();finish();await first;assert.equal(f.calls.length,1);assert.equal(f.toasts.length,0);assert.match(f.host.__paAccountNotices.get(account.id),/Account saved/);
+});
+test('account boundary falls back to control only on an explicit sourced-node response',async()=>{
+ const f=fixture();let n=0;f.invokeWith(async()=>++n===1?{ok:false,status:409,body:{error:'authored on the control plane'}}:{ok:true,body:{}});await f.context.paWriteEnforcement('POST','/admin/policies',{});assert.equal(f.calls.length,2);assert.equal(f.calls[1].plane,'control');
+ const g=fixture();g.invokeWith(async()=>({ok:false,status:409,body:{error:'different conflict'}}));await g.context.paWriteEnforcement('POST','/admin/policies',{});assert.equal(g.calls.length,1);
 });

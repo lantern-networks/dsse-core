@@ -210,24 +210,13 @@ func (store *Store) Upsert(_ context.Context, policy model.Policy, tenantID stri
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
+	if err := store.saveAuthoredPolicyLocked(normalized); err != nil {
+		return model.Policy{}, err
+	}
 	store.putLocked(normalized)
-	store.recordAdminAuthoredLocked(normalized)
 	store.generation++
 	store.rebuildPolicyCacheLocked()
-	store.persistLocked() // durable: an admin-authored policy must survive a restart (was in-memory-only)
 	return copyAdminPolicy(normalized), nil
-}
-
-// recordAdminAuthoredLocked marks a policy as admin-authored (created via the Admin API) so persistLocked can
-// persist ONLY these — not the bundle-seeded set — and restore them as an overlay on boot. Caller holds store.mu.
-func (store *Store) recordAdminAuthoredLocked(policy model.Policy) {
-	if store.adminAuthoredPolicies == nil {
-		store.adminAuthoredPolicies = map[string]map[string]model.Policy{}
-	}
-	if store.adminAuthoredPolicies[policy.TenantID] == nil {
-		store.adminAuthoredPolicies[policy.TenantID] = map[string]model.Policy{}
-	}
-	store.adminAuthoredPolicies[policy.TenantID][policy.ID] = copyAdminPolicy(policy)
 }
 
 // Delete removes an ADMIN-AUTHORED policy, its authored record, and any status override for it. Only

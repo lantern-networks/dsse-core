@@ -6,6 +6,7 @@ package main
 // constructor's locals so the handler bodies are untouched.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -268,6 +269,10 @@ func registerNHIRegistryRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		now := time.Now()
 		created, err := nonHumanIdentities.Upsert(r.Context(), identity, adminTenantIDFromRequest(r), now)
 		if err != nil {
+			if errors.Is(err, nhi.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, nhi.ErrPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

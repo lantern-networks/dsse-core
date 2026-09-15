@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -19,14 +20,14 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
-	"github.com/lantern-networks/dsse-core/policy"
+	policystore "github.com/lantern-networks/dsse-core/policy"
 	policyrule "github.com/lantern-networks/dsse-core/policyrule"
 	"github.com/lantern-networks/dsse-core/vlan"
 )
 
-func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string)) {
+func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policystore.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string)) {
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		options := policy.ListOptions{
+		options := policystore.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
 			Limit:  boundedIntQuery(r.URL.Query().Get("limit"), 100, 1, 1000),
 		}
@@ -197,7 +198,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// EVERY tenant's enforcement config, not just the puller's. The two fields above stay for an Edge that
 		// predates this section; a current Edge reads this one and applies each tenant it names, leaving any
 		// tenant it does NOT name alone — absence is not a instruction here either.
-		if concrete, ok := policyStore.(*policy.Store); ok && concrete != nil {
+		if concrete, ok := policyStore.(*policystore.Store); ok && concrete != nil {
 			for _, id := range concrete.Tenants() {
 				cfg := concrete.SnapshotTenantConfig(id)
 				bundle.TenantPolicies = append(bundle.TenantPolicies, tenantPolicySection{
@@ -401,7 +402,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, fmt.Errorf("status must be active or disabled"))
 			return
 		}
-		concrete, ok := policyStore.(*policy.Store)
+		concrete, ok := policyStore.(*policystore.Store)
 		if !ok {
 			writeError(w, http.StatusConflict, fmt.Errorf("policy status toggle is not supported on this edge"))
 			return
@@ -425,6 +426,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		created, err := policyStore.Upsert(r.Context(), policy, tenantID, now)
 		if err != nil {
+			if errors.Is(err, policystore.ErrPolicyPersistence) {
+				writeError(w, http.StatusInternalServerError, policystore.ErrPolicyPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -435,7 +440,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 				return
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyAuditLog(created, evaluator, now), now)
+		audit := adminPolicyAuditLog(created, evaluator, now)
+		audit.ActorUserID = auditActorPrincipal(r)
+		audit.Metadata["allowed_tool_id_count"] = len(created.AllowedToolIDs)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusOK, created)
 	}))
 	// The missing half of POST: an authored policy could be created and disabled but never removed, so a

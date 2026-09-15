@@ -83,3 +83,37 @@ The tab requests up to 1,000 policies and refuses a truncated result rather than
 asserting that omitted accounts have no boundary. Larger catalogs need a paginated
 workflow. Complete role coverage, concurrent administration and independent
 control-plane/Edge acceptance remain separate checks.
+
+## Human approvals shown in Activity
+
+**Activity** lists recorded approval outcomes for the current organization. It does
+not perform the human approval ceremony. The Admin API exposes the corresponding
+`/admin/human-approval-events` operations. Store lookups and revocation use both the
+organization and approval ID, so identical IDs in different organizations remain separate.
+
+An upsert is saved before publication to local lookups. A rejected save returns HTTP
+500; that candidate is not activated in this process. An ambiguous storage error does
+not establish that the storage backend rolled back. For explicit revocation of an
+existing approval, use `POST /admin/human-approval-events/{approval_id}/revoke`.
+That operation keeps the approval revoked locally even if saving fails. The failure
+returns HTTP 500 with `status: "partial"`, `applied: true`, the organization/approval
+IDs and `persistence: "unconfirmed"`. Restore the persistence service and retry the
+same revoke before restarting; otherwise the older saved approval can return.
+The retry attempts saving even when Activity already displays **revoked**, and keeps
+the original revocation reason.
+
+**Logs & Audit** records these incomplete revocations as `partial`, naming the
+administrator, organization and approval, without including the supplied reason text.
+Accepted upserts and revocations also name the administrator. Activity's decision badge
+reports the current local outcome; it does not attest to persistence or fleet delivery.
+The Admin API does not send approval notifications or distribute outcomes to other servers.
+
+Approval snapshots, whether files or shared JSON blobs, now use organization-and-ID
+keys. Back up the store and upgrade all writers together. The loader accepts valid old
+ID keys and reindexes them from record attribution; invalid/conflicting entries stop
+loading instead of being discarded. Old writers must not share an upgraded snapshot,
+and downgrading the binary alone is unsupported. Previously overwritten records need a
+verified backup or deliberate re-registration. Empty/in-memory stores, non-atomic save
+warnings, tenant-removal persistence, shared capacity, FIFO order across restarts and
+retention of terminal outcomes remain separate operational limits. This index change
+does not establish multi-writer consistency or complete revocation retention.

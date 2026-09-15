@@ -2,7 +2,10 @@ package humanapproval
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -45,8 +48,8 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
@@ -54,76 +57,125 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		s.persister = p
 		return nil
 	}
 	var snap map[string]model.HumanApprovalEvent
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	if snap != nil {
-		s.events = snap
-		s.order = s.order[:0]
-		for id := range snap {
-			s.order = append(s.order, id)
+	if snap == nil {
+		return fmt.Errorf("invalid human approval snapshot")
+	}
+	fresh := make(map[string]model.HumanApprovalEvent, len(snap))
+	order := make([]string, 0, len(snap))
+	for savedKey, event := range snap {
+		if err := validKey(event.TenantID, event.ID); err != nil {
+			return err
+		}
+		key := approvalKey(event.TenantID, event.ID)
+		if savedKey != event.ID && savedKey != key {
+			return fmt.Errorf("invalid saved human approval key")
+		}
+		if _, found := fresh[key]; found {
+			return fmt.Errorf("duplicate saved human approval")
+		}
+		fresh[key] = event
+		order = append(order, key)
+	}
+	// Existing snapshots do not retain insertion order. Do not silently discard records on load.
+	sort.Strings(order)
+	s.events, s.order, s.persister = fresh, order, p
+	return nil
+}
+
+var ErrPersistence = errors.New("human approvals could not be saved")
+
+func approvalKey(tenant, id string) string { return tenant + "\x00" + id }
+func validKey(tenant, id string) error {
+	if tenant == "" || id == "" || strings.TrimSpace(tenant) != tenant || strings.TrimSpace(id) != id || strings.ContainsRune(tenant, '\x00') || strings.ContainsRune(id, '\x00') {
+		return fmt.Errorf("invalid human approval tenant or ID")
+	}
+	return nil
+}
+func cloneEvents(events map[string]model.HumanApprovalEvent) map[string]model.HumanApprovalEvent {
+	result := make(map[string]model.HumanApprovalEvent, len(events)+1)
+	for key, event := range events {
+		result[key] = event
+	}
+	return result
+}
+func (s *Store) saveLocked(events map[string]model.HumanApprovalEvent) error {
+	if s.persister == nil {
+		return nil
+	}
+	data, err := json.MarshalIndent(events, "", "  ")
+	if err == nil {
+		err = s.persister.Save(data)
+	}
+	if err != nil {
+		log.Printf("human approvals save: %v", err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return ErrPersistence
 		}
 	}
 	return nil
 }
 
-// persistLocked write-throughs the current event set. The error MUST reach the mutating caller: a swallowed
-// Save meant an approval outcome — or worse, a REVOKE — was acknowledged while nothing hit disk, so a
-// revoked approval silently resurrected on restart. Caller holds s.mu.
-func (s *Store) persistLocked() error {
-	if s.persister == nil {
-		return nil
-	}
-	data, err := json.MarshalIndent(s.events, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal human-approval snapshot: %w", err)
-	}
-	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist human approvals: %w", err)
-	}
-	return nil
-}
+// Tenant removal retains its separate best-effort persistence contract.
+func (s *Store) persistLocked() error { return s.saveLocked(s.events) }
 
 func (s *Store) Upsert(event model.HumanApprovalEvent) (model.HumanApprovalEvent, error) {
+	if err := validKey(event.TenantID, event.ID); err != nil {
+		return model.HumanApprovalEvent{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing, ok := s.events[event.ID]
+	key := approvalKey(event.TenantID, event.ID)
+	existing, ok := s.events[key]
 	if ok {
 		if err := validateTransition(existing, event); err != nil {
 			return model.HumanApprovalEvent{}, err
 		}
 	}
+	candidate, order := cloneEvents(s.events), append([]string(nil), s.order...)
 	if !ok {
-		s.order = append(s.order, event.ID)
+		order = append(order, key)
 	}
-	s.events[event.ID] = event
-	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k) })
-	if err := s.persistLocked(); err != nil {
-		return event, fmt.Errorf("approval event %s stored in memory but not persisted (will not survive a restart): %w", event.ID, err)
+	candidate[key] = event
+	order = evictFIFO(order, len(candidate), s.capacity, func(k string) { delete(candidate, k) })
+	if err := s.saveLocked(candidate); err != nil {
+		return model.HumanApprovalEvent{}, err
 	}
+	s.events, s.order = candidate, order
 	return event, nil
 }
 
+// Get is a compatibility lookup and refuses IDs shared by multiple tenants.
+// Authenticated callers must use GetForTenant.
 func (s *Store) Get(id string) (model.HumanApprovalEvent, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	event, ok := s.events[id]
-	return event, ok
+	var result model.HumanApprovalEvent
+	found := false
+	for _, event := range s.events {
+		if event.ID == id {
+			if found {
+				return model.HumanApprovalEvent{}, false
+			}
+			result, found = event, true
+		}
+	}
+	return result, found
 }
-
-// GetForTenant treats another tenant's record as absent, including its status.
 func (s *Store) GetForTenant(tenantID, id string) (model.HumanApprovalEvent, bool) {
-	if s == nil || strings.TrimSpace(tenantID) == "" {
+	if s == nil || validKey(tenantID, id) != nil {
 		return model.HumanApprovalEvent{}, false
 	}
-	event, ok := s.Get(id)
-	if !ok || event.TenantID != tenantID {
-		return model.HumanApprovalEvent{}, false
-	}
-	return event, true
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	event, ok := s.events[approvalKey(tenantID, id)]
+	return event, ok
 }
 
 func (s *Store) GetActive(id string, now time.Time) (model.HumanApprovalEvent, bool) {
@@ -155,23 +207,45 @@ func (s *Store) Snapshot() []model.HumanApprovalEvent {
 	return out
 }
 
-// Revoke marks an event as revoked (idempotent) and returns it; ok is false if the id is absent. A non-nil
-// error means the revoke IS live in memory but durability failed — the approval would RESURRECT on restart,
-// which is the most security-relevant persist failure this store has, so callers must surface it.
+// Revoke is a compatibility entry point and refuses ambiguous IDs.
 func (s *Store) Revoke(id, reason string) (model.HumanApprovalEvent, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	event, ok := s.events[id]
+	key := ""
+	for k, event := range s.events {
+		if event.ID == id {
+			if key != "" {
+				return model.HumanApprovalEvent{}, false, fmt.Errorf("human approval ID is ambiguous")
+			}
+			key = k
+		}
+	}
+	return s.revokeLocked(key, reason)
+}
+
+// RevokeForTenant checks attribution and mutates under the same lock.
+func (s *Store) RevokeForTenant(tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
+	if err := validKey(tenant, id); err != nil {
+		return model.HumanApprovalEvent{}, false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revokeLocked(approvalKey(tenant, id), reason)
+}
+func (s *Store) revokeLocked(key, reason string) (model.HumanApprovalEvent, bool, error) {
+	event, ok := s.events[key]
 	if !ok {
 		return model.HumanApprovalEvent{}, false, nil
 	}
+	// Keep an effective denial even when saving fails. Never restore an approval on a failed revoke.
 	if event.ApprovalResult != "revoked" {
 		event.ApprovalResult = "revoked"
 		event.Reason = stringPtr(reason)
-		s.events[id] = event
-		if err := s.persistLocked(); err != nil {
-			return event, true, fmt.Errorf("approval %s revoked in memory but not persisted (would resurrect on restart): %w", id, err)
-		}
+		s.events[key] = event
+	}
+	// Even an already-revoked event must retry the save: the previous attempt may be memory-only.
+	if err := s.saveLocked(s.events); err != nil {
+		return event, true, err
 	}
 	return event, true, nil
 }
@@ -259,7 +333,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	defer s.mu.RUnlock()
 	n := 0
 	for _, v := range s.events {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
+		if v.TenantID == tenantID {
 			n++
 		}
 	}
@@ -284,12 +358,19 @@ func (s *Store) RemoveTenant(tenantID string) int {
 	defer s.mu.Unlock()
 	n := 0
 	for id, v := range s.events {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
+		if v.TenantID == tenantID {
 			delete(s.events, id)
 			n++
 		}
 	}
 	if n > 0 {
+		order := s.order[:0]
+		for _, key := range s.order {
+			if _, ok := s.events[key]; ok {
+				order = append(order, key)
+			}
+		}
+		s.order = order
 		s.persistLocked()
 	}
 	return n

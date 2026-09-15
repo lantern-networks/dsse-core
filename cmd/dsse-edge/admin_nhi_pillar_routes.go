@@ -215,7 +215,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalEventAuditLog("admin_human_approval_event_upserted", upserted, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalMutationAuditLog(r, "admin_human_approval_event_upserted", upserted, evaluator, now, false), now)
 		writeJSON(w, http.StatusOK, upserted)
 	}))
 	mux.HandleFunc("POST /admin/human-approval-events/{approval_id}/revoke", adminEndpoint("admin.approval.write", func(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +227,11 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		now := time.Now()
 		revoked, found, err := adminRevokeHumanApprovalEvent(humanApprovals, r.Context(), adminTenantIDFromRequest(r), r.PathValue("approval_id"), request, now)
 		if err != nil {
+			if found && errors.Is(err, humanapproval.ErrPersistence) {
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalMutationAuditLog(r, "admin_human_approval_event_revoked", revoked, evaluator, now, true), now)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": revoked.TenantID, "approval_id": revoked.ID, "persistence": "unconfirmed", "error": "Approval revoked on this server, but persistence is unconfirmed. Retry revocation before restarting."})
+				return
+			}
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
@@ -234,7 +239,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalEventAuditLog("admin_human_approval_event_revoked", revoked, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalMutationAuditLog(r, "admin_human_approval_event_revoked", revoked, evaluator, now, false), now)
 		writeJSON(w, http.StatusOK, revoked)
 	}))
 }

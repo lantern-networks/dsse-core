@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"github.com/lantern-networks/dsse-core/delegatedgrant"
+	"github.com/lantern-networks/dsse-core/humanapproval"
 	"net/http"
 	_ "net/http/pprof" // DIAGNOSTIC: registers /debug/pprof on http.DefaultServeMux; served only when -pprof-listen is set
 	"strings"
@@ -64,6 +65,9 @@ func statusForToolCallEventError(err error) int {
 }
 
 func statusForHumanApprovalEventError(err error) int {
+	if errors.Is(err, humanapproval.ErrPersistence) {
+		return http.StatusInternalServerError
+	}
 	if strings.Contains(err.Error(), "cannot transition") {
 		return http.StatusConflict
 	}

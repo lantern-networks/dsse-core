@@ -3311,6 +3311,25 @@ components:
         limit:
           type: integer
           minimum: 1
+    HumanApprovalMutationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          enum: [partial]
+        applied:
+          type: boolean
+          description: Revocation is effective on this server; persistence is unconfirmed.
+        approval_id:
+          type: string
+        tenant_id:
+          type: string
+        persistence:
+          type: string
+          enum: [unconfirmed]
     HumanApprovalEventRevokeRequest:
       type: object
       properties:
@@ -10820,7 +10839,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Human Approval Event.
-      description: Requires admin.approval.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata-only Admin API does not send notifications, perform approval UI workflows, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.approval.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. A rejected save returns 500 before the candidate becomes available to local lookups. This metadata API does not send notifications, perform approval UI workflows, compile bundles, or distribute outcomes to other servers.
       tags:
         - AdminHumanApprovalEvent
       requestBody:
@@ -10844,6 +10863,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          description: Approval candidate could not be saved; it was not published in this process.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanApprovalMutationError"
   /admin/human-approval-events/{approval_id}:
     get:
       summary: Get a tenant-scoped Human Approval Event.
@@ -10875,7 +10900,7 @@ paths:
   /admin/human-approval-events/{approval_id}/revoke:
     post:
       summary: Revoke a tenant-scoped Human Approval Event.
-      description: Requires admin.approval.write. The revoke action updates approval_result only; notification workflows, runtime domain event emission, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.approval.write. Revocation is applied to this server before saving. If saving fails, 500 reports partial, applied=true and persistence=unconfirmed; retry the same revoke before restarting. An already-revoked record still retries saving and retains the original reason. This metadata API does not perform notification workflows or distribute revocation to other servers.
       tags:
         - AdminHumanApprovalEvent
       parameters:
@@ -10906,6 +10931,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Revocation is active on this server but persistence is unconfirmed. Retry before restarting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanApprovalMutationError"
   /admin/endpoints:
     get:
       summary: List tenant-scoped Endpoint Inventory entries.

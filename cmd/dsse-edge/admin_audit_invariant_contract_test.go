@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -172,6 +173,27 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				ReasonCode:             &rawMetadataValue,
 				ApprovalResult:         "approved",
 			}, evaluator, now),
+		},
+		{
+			name: "adminHumanApprovalMutationAuditLog",
+			audit: adminHumanApprovalMutationAuditLog(httptest.NewRequest("POST", "/admin/human-approval-events/target/revoke", nil), "admin_human_approval_event_upserted", adminHumanApprovalEvent{
+				ID:                     auditID,
+				TenantID:               "tenant_audit_cp0020",
+				ApproverUserID:         &rawActorUserID,
+				SubjectUserID:          &rawSubject,
+				ActorNHIID:             &rawActorNHIID,
+				DelegatedAccessGrantID: &rawMetadataValue,
+				AgentTaskSessionID:     &rawSession,
+				ApplicationID:          &rawDestination,
+				Audience:               &rawTokenAudience,
+				Resource:               &rawPayloadRef,
+				ActionType:             &actionType,
+				TaskID:                 &rawMetadataValue,
+				RunID:                  &rawMetadataValue,
+				RequestedScopes:        []string{rawTokenAudience},
+				ReasonCode:             &rawMetadataValue,
+				ApprovalResult:         "approved",
+			}, evaluator, now, true),
 		},
 		{
 			name: "adminEndpointInventoryAuditLog",
@@ -562,28 +584,29 @@ func mustAuditEmitterFunctionNames(t *testing.T) []string {
 
 func coveredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
-		"adminAgentToolAuditLog":            true,
-		"adminApplicationCatalogAuditLog":   true,
-		"adminApplicationDeleteAuditLog":    true,
-		"adminApplicationPublishAuditLog":   true,
-		"adminConnectorManagementAuditLog":  true,
-		"adminDelegatedAccessGrantAuditLog": true,
-		"adminEndpointInventoryAuditLog":    true,
-		"adminHumanApprovalEventAuditLog":   true,
-		"adminPolicyAuditLog":               true,
-		"adminPolicyCandidateAuditLog":      true,
-		"adminSiteAuditLog":                 true,
-		"adminTenantModelAuditLog":          true,
-		"adminTenantModelLifecycleAuditLog": true,
-		"adminToolCallEventAuditLog":        true,
-		"delegatedAccessGrantAuditLog":      true,
-		"humanApprovalEventAuditLog":        true,
-		"humanIdentityAuditLog":             true,
-		"humanIdentityImportAuditLog":       true,
-		"humanIdentitySourcePolicyAuditLog": true,
-		"inspectionEventAuditLog":           true,
-		"nonHumanIdentityAuditLog":          true,
-		"toolCallEventAuditLog":             true,
+		"adminAgentToolAuditLog":             true,
+		"adminApplicationCatalogAuditLog":    true,
+		"adminApplicationDeleteAuditLog":     true,
+		"adminApplicationPublishAuditLog":    true,
+		"adminConnectorManagementAuditLog":   true,
+		"adminDelegatedAccessGrantAuditLog":  true,
+		"adminEndpointInventoryAuditLog":     true,
+		"adminHumanApprovalEventAuditLog":    true,
+		"adminHumanApprovalMutationAuditLog": true,
+		"adminPolicyAuditLog":                true,
+		"adminPolicyCandidateAuditLog":       true,
+		"adminSiteAuditLog":                  true,
+		"adminTenantModelAuditLog":           true,
+		"adminTenantModelLifecycleAuditLog":  true,
+		"adminToolCallEventAuditLog":         true,
+		"delegatedAccessGrantAuditLog":       true,
+		"humanApprovalEventAuditLog":         true,
+		"humanIdentityAuditLog":              true,
+		"humanIdentityImportAuditLog":        true,
+		"humanIdentitySourcePolicyAuditLog":  true,
+		"inspectionEventAuditLog":            true,
+		"nonHumanIdentityAuditLog":           true,
+		"toolCallEventAuditLog":              true,
 	}
 }
 

@@ -143,7 +143,7 @@ func (p loadedApprovalPersister) Load() ([]byte, error) { return p.data, p.loadE
 func (p loadedApprovalPersister) Save([]byte) error     { return fmt.Errorf("wrong persister") }
 func TestApprovalLoadValidationDoesNotReplaceLiveStateOrWriter(t *testing.T) {
 	for _, fixture := range []loadedApprovalPersister{
-		{loadError: fmt.Errorf("load failed")}, {data: []byte(`{bad`)},
+		{loadError: fmt.Errorf("load failed")}, {data: []byte{}}, {data: []byte(`null`)}, {data: []byte(`{bad`)},
 		{data: []byte(`{"same":{"id":"same","tenant_id":"a"},"a\u0000same":{"id":"same","tenant_id":"a"}}`)},
 		{data: []byte(`{"x":{"id":"same","tenant_id":" a "}}`)},
 	} {

@@ -145,3 +145,27 @@ including revocations of retained IDs, are still attempted. Some sections can al
 have changed; a synchronization error is not a rollback. Check fleet synchronization
 status after increasing capacity or repairing storage. Control-plane acceptance alone
 does not confirm every Edge has adopted a change.
+
+## Loading saved approval and delegation state
+
+Delegation snapshots accept the current organization-and-ID keys and valid legacy ID
+keys. A stored key must match its record; conflicting organization/ID entries are
+rejected. A failed load keeps the previous live records and persistence writer when
+there is already a running store. Subsequent mutations continue using that accepted
+writer. Invalid input is not repaired by discarding records.
+
+Both approval and delegation startup reject a zero-byte existing snapshot, JSON
+`null`, malformed JSON, or invalid record keys. The server records a
+`load human-approval event store` or `load delegated-grant store` error and stops
+startup, rather than serving an apparently empty authorization store. Preserve the
+failed snapshot for diagnosis, restore a verified backup for the same organization,
+and restart. Confirm retained revocations in **Activity** or **Delegations**, then
+check the server log and configuration synchronization status.
+
+A missing first-boot snapshot and an explicit empty JSON object (`{}`) are distinct
+from those errors. They remain supported as empty-store inputs; the loader cannot
+infer that a missing file or `{}` unexpectedly replaced previous data. Do not remove
+or empty a store containing revocations to make startup succeed. Back up state before
+upgrades and coordinate all writers; this validation does not establish multi-writer
+consistency or recover already-lost records. There is no Console action for switching
+these persistence writers at runtime.

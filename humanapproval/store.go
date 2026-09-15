@@ -56,6 +56,9 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data != nil {
+			return fmt.Errorf("empty human approval snapshot")
+		}
 		s.persister = p
 		return nil
 	}

@@ -36,7 +36,8 @@ import (
 // CP→Edge config distribution (Phase 1 — docs/edge_config_distribution_phase1_design.md). The control plane
 // is the source of truth for runtime admin config; each Edge PULLS a versioned config bundle and applies it
 // to its in-memory stores so a fleet enforces identically. Generalizes steer_exclusion_sync. Fail-safe: a
-// fetch/decode error keeps the last good config. Atomic per generation: a bundle applies whole or not at all.
+// fetch/decode error keeps the last good config. Required section errors leave a generation unapplied
+// for retry; sections already changed are not rolled back.
 // Slice 1 carries access policies; further resources (east-west, dns, …) fold into the bundle.
 
 type configBundleSource struct {

@@ -48,8 +48,8 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
@@ -57,25 +57,36 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data != nil {
+			return fmt.Errorf("empty delegated grant snapshot")
+		}
+		s.persister = p
 		return nil
 	}
 	var snap map[string]model.DelegatedAccessGrant
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
+	if snap == nil {
+		return fmt.Errorf("invalid delegated grant snapshot")
+	}
 	fresh := make(map[string]model.DelegatedAccessGrant, len(snap))
-	for _, grant := range snap {
+	for savedKey, grant := range snap {
 		if err := validKey(grant.TenantID, grant.ID); err != nil {
 			return err
 		}
 		key := grantKey(grant.TenantID, grant.ID)
+		if savedKey != grant.ID && savedKey != key {
+			return fmt.Errorf("invalid saved delegated grant key")
+		}
 		if _, found := fresh[key]; found {
 			return fmt.Errorf("duplicate saved delegated grant")
 		}
 		fresh[key] = grant
 	}
 	// Preserve all records even when the configured capacity has been lowered.
-	s.grants = fresh
+	// Replace the accepted state and writer together only after a complete, valid load.
+	s.grants, s.persister = fresh, p
 
 	return nil
 }

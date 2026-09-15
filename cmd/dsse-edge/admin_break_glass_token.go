@@ -124,6 +124,7 @@ func adminBreakGlassReport() map[string]any {
 // suspected it.
 func adminBreakGlassUseAuditLog(identity adminIdentity, method, path string, evaluator decision.Evaluator,
 	tenantID, sourceIP, userAgent string) model.AuditLog {
+	path, _ = accessGrantAuditPath(path)
 	action := "admin_break_glass"
 	result := "success"
 	reason := "shared break-glass token accepted"

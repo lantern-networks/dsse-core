@@ -6451,7 +6451,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		log.Fatalf("load grant store: %v", err)
 	}
 	theGrantStore.Store(grantStore)
-	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator.PolicyBundle.TenantID)
+	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox)
 	// ★ AND THE AUTHORITY RECEIVES WHAT THE FLEET MINTED. Registered only on a node that does not pull its
 	// own configuration — the same rule the connector report states. See grant_cp_report.go.
 	registerGrantReportRoute(mux, grantStore, tcaReg, strings.TrimSpace(config.ConfigSourceURL),

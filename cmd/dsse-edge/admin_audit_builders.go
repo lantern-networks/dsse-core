@@ -238,6 +238,7 @@ func stampOperatorActor(meta map[string]any, identity adminIdentity) {
 // the TARGET tenant (so it surfaces in that tenant's operator-access transparency view) and names the operator
 // principal + their home tenant. Non-sensitive fields only; no secrets are carried.
 func adminOperateWithinTenantAuditLog(identity adminIdentity, targetTenant, method, path string, evaluator decision.Evaluator, sourceIP, userAgent string) model.AuditLog {
+	path, grantRef := accessGrantAuditPath(path)
 	action := "admin_operate_within_tenant"
 	result := "success"
 	targetTenant = strings.TrimSpace(targetTenant)
@@ -270,6 +271,9 @@ func adminOperateWithinTenantAuditLog(identity adminIdentity, targetTenant, meth
 	// screen. Written through the shared stamp, because the other two emitters of this same fact each invented
 	// their own key names and the screen only reads one set.
 	stampOperatorActor(record.Metadata, identity)
+	if grantRef != "" {
+		record.Metadata["grant_ref"] = grantRef
+	}
 	return record
 }
 
@@ -301,6 +305,7 @@ func (rec *adminAuditStatusRecorder) statusOrDefault() int {
 // Console session, named API token, or the legacy owner bearer — leaves a trail, independent of whether the
 // handler also emits a richer domain-specific audit.
 func adminConfigChangeAuditLog(identity adminIdentity, email, displayName, method, path string, status int, evaluator decision.Evaluator, tenantID, sourceIP, userAgent string) model.AuditLog {
+	path, grantRef := accessGrantAuditPath(path)
 	action := strings.ToUpper(strings.TrimSpace(method))
 	result := "success"
 	if status >= 400 {
@@ -318,6 +323,9 @@ func adminConfigChangeAuditLog(identity adminIdentity, email, displayName, metho
 		"status_code":  status,
 		"roles":        identity.Roles,
 		"user_agent":   userAgent,
+	}
+	if grantRef != "" {
+		meta["grant_ref"] = grantRef
 	}
 	if strings.TrimSpace(email) != "" {
 		meta["email"] = email

@@ -9991,7 +9991,7 @@ paths:
   /admin/idp-connections:
     get:
       summary: List the tenant's end-user IdP connections + the default.
-      description: Requires admin.idp.read. Returns the per-tenant federated-auth IdP connections (RP client_secret redacted) and the default_idp_id. See docs/idp_federated_authentication_design.md.
+      description: Requires admin.idp.read. Returns the per-tenant federated-auth IdP connections (RP client_secret redacted) and the default_idp_id. See docs/idp.md.
       tags:
         - AdminIdPConnections
       responses:
@@ -10138,7 +10138,7 @@ paths:
   /admin/grants:
     get:
       summary: List the federated-auth grants minted by the clientless broker.
-      description: Requires admin.grants.read. Returns the tenant's grants (user, idp_id, acr/amr, issued/expires, revoked). See docs/idp_federated_authentication_design.md.
+      description: Requires admin.grants.read. Returns the tenant's grants (user, idp_id, acr/amr, issued/expires, revoked). See docs/idp.md.
       tags:
         - AdminGrants
       responses:
@@ -10160,7 +10160,14 @@ paths:
   /admin/grants/{id}/revoke:
     post:
       summary: Revoke a federated-auth grant (continuous revocation).
-      description: Requires admin.grants.write. A revoked grant denies the next flow and stays revoked across a restart.
+      description: >-
+        Requires admin.grants.write. Checks the exact caller tenant and grant under
+        one lock. Revokes locally and attempts persistence; a save failure retains
+        local denial and returns partial, requiring a retry before restart. A repeat
+        retries saving even if already revoked. Success confirms local acceptance,
+        not fleet delivery or durable storage when no persister is configured.
+        The grant ID is a bearer credential; audit records use a SHA-256 reference.
+        See docs/idp.md for distribution and persistence limits.
       tags:
         - AdminGrants
       parameters:
@@ -10171,7 +10178,48 @@ paths:
             type: string
       responses:
         "200":
-          description: Revoked.
+          description: Revocation accepted locally.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, grant_id, tenant_id, audit_ref]
+                properties:
+                  status:
+                    type: string
+                    enum: [revoked]
+                  grant_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  audit_ref:
+                    type: string
+                    description: SHA-256 reference, not the bearer grant ID.
+        "500":
+          description: Local denial applied but persistence is unconfirmed; restore storage and retry before restarting.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, applied, grant_id, tenant_id, audit_ref, persistence, error]
+                properties:
+                  status:
+                    type: string
+                    enum: [partial]
+                  applied:
+                    type: boolean
+                    enum: [true]
+                  grant_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  audit_ref:
+                    type: string
+                  persistence:
+                    type: string
+                    enum: [unconfirmed]
+                  error:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

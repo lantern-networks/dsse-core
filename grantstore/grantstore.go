@@ -6,7 +6,9 @@ package grantstore
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -108,20 +110,45 @@ func (s *Store) Valid(grantID string, now time.Time) bool {
 	return now.UTC().Before(exp)
 }
 
-// Revoke marks a grant revoked (continuous revocation). Reports whether it existed.
+// Revoke is the compatibility entry point: the boolean reports existence, not durability.
+// Tenant-authenticated callers must use RevokeForTenant and handle its persistence error.
 func (s *Store) Revoke(grantID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, found, _ := s.revokeLocked(strings.TrimSpace(grantID))
+	return found
+}
+
+// RevokeForTenant checks exact attribution and revokes under the same lock.
+// Denial is retained locally on save failure; repeating the call retries persistence.
+func (s *Store) RevokeForTenant(tenantID, grantID string) (Grant, bool, error) {
+	tenantID = strings.TrimSpace(tenantID)
 	grantID = strings.TrimSpace(grantID)
+	if tenantID == "" {
+		return Grant{}, false, fmt.Errorf("tenant_id is required")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	g, ok := s.grants[grantID]
-	if !ok {
-		return false
+	if !ok || g.TenantID != tenantID {
+		return Grant{}, false, nil
 	}
-	g.Revoked = true
-	s.grants[grantID] = g
-	s.generation++
-	s.persistLocked()
-	return true
+	return s.revokeLocked(grantID)
+}
+func (s *Store) revokeLocked(grantID string) (Grant, bool, error) {
+	g, ok := s.grants[grantID]
+	if !ok {
+		return Grant{}, false, nil
+	}
+	if !g.Revoked {
+		g.Revoked = true
+		s.grants[grantID] = g
+		s.generation++
+	}
+	if err := s.persistLocked(); err != nil {
+		return g, true, err
+	}
+	return g, true, nil
 }
 
 // List returns the tenant's grants, newest first.
@@ -174,15 +201,23 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-func (s *Store) persistLocked() {
+var ErrPersistence = errors.New("access-grant revocation persistence is unconfirmed")
+
+func (s *Store) persistLocked() error {
 	if s.persister == nil {
-		return
+		return nil
 	}
 	data, err := json.MarshalIndent(s.grants, "", "  ")
-	if err != nil {
-		return
+	if err == nil {
+		err = s.persister.Save(data)
 	}
-	_ = s.persister.Save(data)
+	if err != nil {
+		log.Printf("access grants save: %v", err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return ErrPersistence
+		}
+	}
+	return nil
 }
 
 // CountForTenant returns how many records this store still holds for a tenant — what a tenant DATA FOOTPRINT

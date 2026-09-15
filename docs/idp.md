@@ -151,6 +151,45 @@ minutes. A restart or a callback reaching a different process can require a fres
 attempt. The broker's federated grant has a default lifetime of eight hours;
 this is distinct from the East-West challenge/grant API's lifetimes.
 
+## Review and revoke access approvals
+
+Open **Access Approvals** inside the customer organization. **Active** shows
+unexpired approvals; **All (incl. revoked/expired)** includes history. Search by
+person, email, device, destination or provider. The table includes captured
+identity, binding, scope, assurance, sign-in method and validity. These are recorded
+claims, not proof that every flow-policy requirement listed above is enforced.
+An invalid or missing expiry is **Unknown expiry**, never Active. Failed or
+malformed required reads show **Retry** instead of an empty list.
+
+The page lists and revokes approvals; it has no manual creation or editing form.
+**Revoke** asks for confirmation. Cancel sends no revocation request. The API
+checks the exact tenant and grant together before applying the denial. Repeated
+requests while a confirmation or write is pending are suppressed in the page.
+
+If storage fails, the API returns HTTP 500 with `status: partial`, `applied: true`
+and `persistence: unconfirmed`. The grant remains revoked in this server's memory,
+but a restart can restore the older saved grant. Restore the storage service and
+use **Retry saving revocation** before restarting. That retry saves an already
+revoked grant again. A lost response has an unknown outcome; check the approval
+and use **Retry revocation**. Warnings are held only in the current page and do not
+survive navigation or a browser reload. A normal response confirms local acceptance;
+it does not prove that all serving nodes received the revocation.
+
+**Logs & Audit** records `admin_access_grant_revoked` with result `revoked` or
+`partial`, the acting administrator, tenant, time and a SHA-256 grant reference.
+The common administrative write record retains the HTTP result and the same
+reference. Grant IDs also serve as bearer-cookie values: the revocation route is
+redacted in common, operator and break-glass audit records. Do not paste the ID
+into tickets or public diagnostics. Existing audit records are not rewritten.
+
+A configured successful persister is needed for restart retention. In-memory
+operation and saved-without-atomicity fallbacks are not full durability guarantees.
+Other mutation and distribution paths still need validation: reminting an existing
+ID or merging an active copy can currently overwrite a revocation, and those paths
+retain best-effort saving. Do not treat this page's local acceptance as a verified
+fleet-wide denial. Concurrent writers, real IdP sign-in, independent nodes and
+existing connections require separate testing.
+
 ## Verify and troubleshoot
 
 Use test accounts and a disposable target. Record the tenant, serving Edge,

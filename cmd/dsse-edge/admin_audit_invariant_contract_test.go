@@ -631,8 +631,11 @@ func deferredAuditEmitterInvariantFunctions() map[string]bool {
 		// tenant deliberately, because the question after a bad release is WHO put it in front of the fleet —
 		// and it carries the artifact digest and signing key id, which are public identifiers of a signed
 		// artifact, not secrets.
-		"agentUpdatePublishAuditLog":         true,
-		"enrolledInventoryAuditLog":          true,
+		"agentUpdatePublishAuditLog": true,
+		"enrolledInventoryAuditLog":  true,
+		// Transport admission names the affected device and acting administrator deliberately.
+		// Its HTTP audit contract checks that credentials and unrelated request fields stay out.
+		"transportAdmissionAuditLog":         true,
 		"agentStatusAuditLog":                true,
 		"agentUpdateAuditLog":                true,
 		"authenticationEventAuditLog":        true,

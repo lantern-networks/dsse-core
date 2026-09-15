@@ -1,7 +1,7 @@
 // Package grantstore holds the short-lived, continuously-revocable GRANTS minted after a successful
 // federated authentication: a grant binds a verified user (and optionally a device + scope) to a tenant for
 // a bounded TTL. A flow is permitted only while a live, non-revoked, unexpired grant exists — so revoking a
-// grant (or its expiry) denies the next flow. See docs/idp_federated_authentication_design.md.
+// grant (or its expiry) denies the next flow. See docs/idp.md.
 package grantstore
 
 import (
@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -37,11 +38,12 @@ type Grant struct {
 	Revoked         bool     `json:"revoked,omitempty"`
 }
 
-// Store is a per-tenant set of grants, safe for concurrent use, optionally persisted (SetStatePath).
+// Store holds tenant-attributed grants with globally unique bearer IDs, safe for concurrent use.
 type Store struct {
 	mu        sync.RWMutex
 	grants    map[string]Grant // grant_id -> grant
 	persister blobstore.Persister
+	dirty     bool // a locally applied denial still needs persistence
 	// generation advances on every change. The config bundle SUMS it, and an Edge applies a bundle only when
 	// that sum is newer — see ConfigGeneration.
 	generation uint64
@@ -83,10 +85,20 @@ func (s *Store) Mint(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
 	g.Revoked = false
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.grants[g.GrantID] = g
+	if _, exists := s.grants[g.GrantID]; exists {
+		return Grant{}, ErrConflict
+	}
+	if err := validateGrant(g); err != nil {
+		return Grant{}, err
+	}
+	candidate := cloneGrants(s.grants)
+	candidate[g.GrantID] = cloneGrant(g)
+	if err := s.saveLocked(candidate); err != nil {
+		return Grant{}, err
+	}
+	s.grants, s.dirty = candidate, false
 	s.generation++
-	s.persistLocked()
-	return g, nil
+	return cloneGrant(g), nil
 }
 
 // Get returns a grant by id.
@@ -94,7 +106,7 @@ func (s *Store) Get(grantID string) (Grant, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	g, ok := s.grants[strings.TrimSpace(grantID)]
-	return g, ok
+	return cloneGrant(g), ok
 }
 
 // Valid reports whether the grant exists, is not revoked, and has not expired at now.
@@ -144,11 +156,12 @@ func (s *Store) revokeLocked(grantID string) (Grant, bool, error) {
 		g.Revoked = true
 		s.grants[grantID] = g
 		s.generation++
+		s.dirty = true
 	}
 	if err := s.persistLocked(); err != nil {
-		return g, true, err
+		return cloneGrant(g), true, err
 	}
-	return g, true, nil
+	return cloneGrant(g), true, nil
 }
 
 // List returns the tenant's grants, newest first.
@@ -159,7 +172,7 @@ func (s *Store) List(tenantID string) []Grant {
 	out := make([]Grant, 0)
 	for _, g := range s.grants {
 		if g.TenantID == tenantID {
-			out = append(out, g)
+			out = append(out, cloneGrant(g))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].IssuedAt > out[j].IssuedAt })
@@ -175,13 +188,13 @@ func (s *Store) SetStatePath(path string) error {
 	return s.SetPersister(blobstore.FilePersister{Path: path})
 }
 
-// SetPersister enables durable persistence via any Persister (file or shared Postgres): grants (and their
-// revoked state) survive a restart — and, on a shared persister, a CP failover.
+// SetPersister adopts a validated snapshot and its writer together. A failed load preserves both.
+// Successful saves can be reloaded; coordination between independent writers is external to this store.
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
@@ -189,25 +202,44 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data != nil {
+			return ErrInvalidGrant
+		}
+		s.persister = p
+		s.dirty = len(s.grants) > 0
 		return nil
 	}
-	var snap map[string]Grant
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
+	var fresh map[string]Grant
+	if err := json.Unmarshal(data, &fresh); err != nil {
+		return ErrInvalidGrant
 	}
-	if snap != nil {
-		s.grants = snap
+	if fresh == nil {
+		return ErrInvalidGrant
 	}
+	for key, g := range fresh {
+		if key != g.GrantID {
+			return ErrInvalidGrant
+		}
+		if err := validateGrant(g); err != nil {
+			return err
+		}
+		fresh[key] = cloneGrant(g)
+	}
+	if !reflect.DeepEqual(s.grants, fresh) {
+		s.generation++
+	}
+	s.grants, s.persister, s.dirty = fresh, p, false
 	return nil
 }
 
-var ErrPersistence = errors.New("access-grant revocation persistence is unconfirmed")
+var ErrPersistence = errors.New("access-grant persistence is unconfirmed")
 
-func (s *Store) persistLocked() error {
+// saveLocked writes a candidate without exposing new authorization in memory.
+func (s *Store) saveLocked(candidate map[string]Grant) error {
 	if s.persister == nil {
 		return nil
 	}
-	data, err := json.MarshalIndent(s.grants, "", "  ")
+	data, err := json.MarshalIndent(candidate, "", "  ")
 	if err == nil {
 		err = s.persister.Save(data)
 	}
@@ -217,6 +249,13 @@ func (s *Store) persistLocked() error {
 			return ErrPersistence
 		}
 	}
+	return nil
+}
+func (s *Store) persistLocked() error {
+	if err := s.saveLocked(s.grants); err != nil {
+		return err
+	}
+	s.dirty = false
 	return nil
 }
 
@@ -267,6 +306,7 @@ func (s *Store) RemoveTenant(tenantID string) int {
 	}
 	if n > 0 {
 		s.generation++
+		s.dirty = true
 		s.persistLocked()
 	}
 	return n
@@ -290,42 +330,18 @@ func (s *Store) ListAll() []Grant {
 	defer s.mu.RUnlock()
 	out := make([]Grant, 0, len(s.grants))
 	for _, g := range s.grants {
-		out = append(out, g)
+		out = append(out, cloneGrant(g))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].GrantID < out[j].GrantID })
 	return out
 }
 
-// Merge folds another node's view into this one. Incoming wins for a grant both hold — the control plane is
-// where a revocation is recorded, and a stale local copy must never un-revoke it.
-//
-// ★ A UNION, NOT A REPLACEMENT, AND THAT IS THE WHOLE DESIGN. Revocation MARKS a grant rather than removing
-// it, so "the other side does not have this one" never means "it was withdrawn" — it means the other side has
-// not heard yet. That is exactly the case for a grant minted here a second ago, and replacing would delete it
-// before the ceremony that earned it had finished.
-//
-// Grants already expired are dropped rather than merged: they satisfy nothing and would accumulate forever.
+// Merge is the compatibility entry point. Counts describe live changes, not durability.
+// Production ingestion must use MergeChecked and handle its error.
 func (s *Store) Merge(incoming []Grant, now time.Time) (added, updated int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, g := range incoming {
-		id := strings.TrimSpace(g.GrantID)
-		if id == "" || strings.TrimSpace(g.TenantID) == "" {
-			continue
-		}
-		if exp, err := time.Parse(time.RFC3339, g.ExpiresAt); err == nil && !now.Before(exp) {
-			continue
-		}
-		if _, ok := s.grants[id]; ok {
-			updated++
-		} else {
-			added++
-		}
-		s.grants[id] = g
-	}
-	if added > 0 || updated > 0 {
-		s.generation++
-		s.persistLocked()
+	added, updated, err := s.MergeChecked(incoming, now)
+	if err != nil {
+		log.Printf("access grants merge rejected: %v", err)
 	}
 	return added, updated
 }

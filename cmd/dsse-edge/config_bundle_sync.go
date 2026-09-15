@@ -980,7 +980,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// What the fleet has already approved out of band, so a flow held on a node that did not run the
 	// ceremony is released by the grant that ceremony earned.
 	if payload.Grants != nil {
-		if added, updated := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC()); added > 0 || updated > 0 {
+		added, updated, err := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC())
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grants: %w", err))
+		}
+		if added > 0 || updated > 0 {
 			log.Printf("config_bundle_grants added=%d updated=%d", added, updated)
 		}
 	}

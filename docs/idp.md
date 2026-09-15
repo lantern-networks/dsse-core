@@ -184,11 +184,40 @@ into tickets or public diagnostics. Existing audit records are not rewritten.
 
 A configured successful persister is needed for restart retention. In-memory
 operation and saved-without-atomicity fallbacks are not full durability guarantees.
-Other mutation and distribution paths still need validation: reminting an existing
-ID or merging an active copy can currently overwrite a revocation, and those paths
-retain best-effort saving. Do not treat this page's local acceptance as a verified
-fleet-wide denial. Concurrent writers, real IdP sign-in, independent nodes and
-existing connections require separate testing.
+Grant IDs are not reusable while their records remain in the store. Minting an
+existing ID is refused, including a revoked or expired one. New approvals are
+saved before they become active. A failed mint returns an error before the broker
+issues its grant cookie.
+
+Grant reports and configuration bundles preserve revocations. A stale active copy
+cannot reactivate a retained revoked ID, change its tenant, or extend/change an
+existing active approval's claims. A valid revocation retains the original claims.
+Unknown expired active reports are ignored; revoked records are retained even
+after expiry. Empty reports and omitted records do not delete existing approvals.
+
+The entire incoming batch is validated before mutation. Invalid identities or
+lifetimes return a report error (400); conflicting tenant/active claims return 409.
+Correct the conflicting input before retrying: a rejected batch, including any
+revocations inside it, has not been applied. A storage failure after validation
+returns 500: denials stay effective locally, but new active approvals are not
+adopted. The response counts local changes in that attempt, not durable completion.
+The reporter retries on its next reconciliation; configuration sync leaves a failed
+generation unapplied and retries it. A clean replay does not rewrite the store or
+advance its generation. Upgrade all authorities and Edges before relying on this
+behavior; an older node still has the earlier merge behavior.
+
+Startup refuses an existing empty file, `null`, malformed data, mismatched saved
+keys or invalid grant lifetimes. A rejected load leaves an already running store
+and its writer intact. Restore a verified backup rather than deleting the file or
+replacing it with `{}` to bypass the check; a genuinely missing initial snapshot
+and an explicitly configured empty object remain valid inputs. This cannot recover
+revocations already lost from every retained copy.
+
+These controls do not establish shared-storage writer coordination or a fleet-wide
+transaction. Partial physical writes, ambiguous commits, tenant erasure, unbounded
+retention, duplicate JSON object members and global generation continuity still
+need separate validation. Real IdP sign-in, independently running nodes, complete
+machine-certificate authorization and existing connections require deployment tests.
 
 ## Verify and troubleshoot
 

@@ -77,7 +77,7 @@ func registerInterceptionPKIRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeJSON(w, http.StatusOK, []string{})
 			return
 		}
-		writeJSON(w, http.StatusOK, config.NetworkExtensionLabTLS.BypassHosts())
+		writeJSON(w, http.StatusOK, config.NetworkExtensionLabTLS.InspectionPatternsForTenant(adminTenantIDFromRequest(r)).Bypass)
 	}))
 	// Interception-root PKI: the default (anchor) root + any per-tenant roots known this run, so an operator can
 	// distribute each tenant's interception root to that tenant's devices. POST provisions a tenant's root (and

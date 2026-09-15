@@ -101,6 +101,22 @@ func (s *OverrideStore) List(tenantID string) []Override {
 	return out
 }
 
+// Snapshot copies every tenant's overrides for an atomic engine rebuild.
+func (s *OverrideStore) Snapshot() map[string][]Override {
+	out := map[string][]Override{}
+	if s == nil {
+		return out
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for tenant, entries := range s.overrides {
+		for _, entry := range entries {
+			out[tenant] = append(out[tenant], entry)
+		}
+	}
+	return out
+}
+
 // EffectiveBypassHosts returns the tenant's effective bypass host set over the built-in default catalog: the
 // default minus any entries the tenant overrode to force_inspect/disabled.
 func (s *OverrideStore) EffectiveBypassHosts(tenantID string) []string {

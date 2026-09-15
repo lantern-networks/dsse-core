@@ -33,15 +33,15 @@ func catalogGroups() []catalogGroupView {
 
 // inspectionPostureSnapshot gathers the live posture view: the configured posture plus the engine's actual
 // intercept + bypass sets. Used by both the GET and POST handlers.
-func inspectionPostureSnapshot(config serverConfig) inspectionPostureResponse {
+func inspectionPostureSnapshot(config serverConfig, tenant string) inspectionPostureResponse {
 	posture := inspectionposture.DefaultPosture()
 	if config.InspectionPosture != nil {
 		posture = config.InspectionPosture()
 	}
 	var interceptHosts, effectiveBypass []string
 	if config.NetworkExtensionLabTLS != nil {
-		interceptHosts = config.NetworkExtensionLabTLS.InterceptHosts()
-		effectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
+		patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
+		interceptHosts, effectiveBypass = patterns.Intercept, patterns.Bypass
 	}
 	return buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
 }
@@ -185,7 +185,7 @@ func buildInspectionPosture(p inspectionposture.Posture, interceptHosts, effecti
 		AuthDecryptGroups:      authViews,
 		SaaSBypassGroups:       bypassGroupViews,
 		KnownBypassGroups:      knownViews,
-		Note:                   "decrypt_all decrypts every steered HTTPS flow EXCEPT the bypass set; bypass_default decrypts ONLY the allowlist (hosts + selected SaaS auth groups) and raw-forwards the rest. A bypassed flow is still steered and policy-gated. Keep a SaaS auth group selected under bypass_default to keep tenant restriction working.",
+		Note:                   "Default posture is deployment-wide; effective host lists are selected for the requesting tenant. decrypt_all decrypts every steered HTTPS flow EXCEPT the bypass set; bypass_default decrypts ONLY the allowlist (hosts + selected SaaS auth groups) and raw-forwards the rest. A bypassed flow is still steered and policy-gated. Keep a SaaS auth group selected under bypass_default to keep tenant restriction working.",
 	}
 }
 
@@ -193,7 +193,7 @@ func inspectionPostureMayWrite(r *http.Request) bool {
 	return adminCallerIsOperator(r) && strings.TrimSpace(r.Header.Get("X-Operate-Tenant")) == ""
 }
 func inspectionPostureForRequest(config serverConfig, r *http.Request) inspectionPostureResponse {
-	result := inspectionPostureSnapshot(config)
+	result := inspectionPostureSnapshot(config, adminTenantIDFromRequest(r))
 	result.TenantID = adminTenantIDFromRequest(r)
 	result.Scope = "deployment"
 	writable := true

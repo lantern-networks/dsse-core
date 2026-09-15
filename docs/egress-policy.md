@@ -117,6 +117,26 @@ are not decrypted. Removing a service bypass rule does not add that service to t
 allowlist or override other exclusions. **No service bypass** describes that
 service's rule state; it is not proof that traffic is being inspected.
 
+Deployment defaults and tenant exceptions have separate scopes. Authored
+inspection/bypass destinations and curated-catalog overrides apply to their owning
+tenant. The serving Edge selects a complete host set using the authenticated
+connection's tenant; updating another tenant does not replace that selection.
+Changing deployment mode rebuilds all tenant selections together. Deleting a last
+rule removes its contribution, including after restart or a rule-bundle refresh.
+
+Inspection Settings, Policy decision check and the bypass-host listing show the
+effective host selection for the current customer context. Their host lists do not
+include other customers' exceptions. The `scope=deployment` field describes the
+shared posture settings; `intercept_hosts` and `effective_bypass` describe that
+requesting tenant's local engine configuration. A missing tenant-specific entry
+uses deployment defaults; this fallback is not an authorization decision.
+
+Certificate-pinning failure counts, successful-handshake history and optional
+automatic bypasses are also isolated by connection tenant. Candidate proposals
+carry that tenant into review. Detection alone does not enable automatic bypass.
+Host selection still needs separate verification against source/service/risk
+conditions and the actual traffic path; it is not a full policy decision.
+
 Use DNS hostnames, `*.example.com`, `*` or IPv4 literals in the explicit list,
 without schemes, paths or ports. IPv6 literal patterns are not supported by the
 current selector; use a DNS hostname for that destination. Unknown preset names

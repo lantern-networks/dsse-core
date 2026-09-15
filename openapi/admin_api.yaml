@@ -9311,13 +9311,13 @@ paths:
           $ref: "#/components/responses/Forbidden"
   /admin/intercept/bypass-hosts:
     get:
-      summary: List the live decrypt-bypass (never-decrypted) host patterns.
-      description: Requires admin.swg.read. Returns the host patterns the interception engine raw-forwards (never decrypts) — the shipped known-bypass compatibility list (Apple/iCloud/GitHub/OS-update/OCSP) plus any materialized cert-pinning recommendations. Observability for the Pinned Sites view ("what is NOT being decrypted").
+      summary: List configured decrypt-bypass host patterns for the requesting tenant.
+      description: Requires admin.swg.read. Returns the local engine's tenant-specific host selection, including deployment defaults, that tenant's curated-catalog overrides and authored bypass rules. It excludes other tenants' rules. This configuration listing does not include dynamic pin-learning state or prove independent Edge delivery or actual traffic inspection.
       tags:
         - AdminPolicyCandidateReview
       responses:
         "200":
-          description: Host patterns currently bypassed (raw-forwarded, never decrypted).
+          description: Configured bypass patterns for the requesting tenant; empty if this node has no interception engine.
           content:
             application/json:
               schema:
@@ -13074,8 +13074,9 @@ paths:
         mode (decrypt_all = decrypt every steered HTTPS flow except the bypass set; bypass_default = decrypt ONLY
         the allowlist and raw-forward the rest), the decrypt allowlist (explicit hosts + selected SaaS auth-group
         presets), the curated hardcoded known-bypass groups (each marked active when in the live bypass set), and
-        the local engine's intercept/bypass sets. scope=deployment: these are shared defaults, not tenant-specific
-        settings. configurable indicates whether this caller can edit them; runtime_available is false on a
+        the local engine's intercept/bypass sets selected for the requesting tenant. scope=deployment describes
+        the shared posture settings; the effective host lists include only this tenant's contributions.
+        configurable indicates whether this caller can edit the defaults; runtime_available is false on a
         server without an interception engine. can_manage_rules is separate and covers tenant-authored SaaS
         bypass rules. A control-plane response does not confirm that every Edge has applied the settings.
       tags:

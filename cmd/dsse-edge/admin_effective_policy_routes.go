@@ -139,8 +139,8 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// docs/invisible_effective_configuration.md).
 		bypassSources := inspectionSources{KnownGroups: knownbypass.Groups, InterceptHosts: []string{"*"}}
 		if config.NetworkExtensionLabTLS != nil {
-			bypassSources.EffectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
-			bypassSources.InterceptHosts = config.NetworkExtensionLabTLS.InterceptHosts()
+			patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
+			bypassSources.EffectiveBypass, bypassSources.InterceptHosts = patterns.Bypass, patterns.Intercept
 		}
 		// Attribute SaaS Optimize bypass: pass the groups enabled in the live posture.
 		if config.InspectionPosture != nil {
@@ -197,7 +197,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			UnresolvedRuleIDs:   unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
 		}
 		if config.NetworkExtensionLabTLS != nil {
-			in.EffectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
+			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass
 		}
 		if config.InspectionPosture != nil {
 			p := config.InspectionPosture()

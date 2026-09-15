@@ -139,10 +139,11 @@ func (networkExtensionLabTLSProbeOnlyDroppedConn) RuntimeCopySessionDone() <-cha
 }
 
 type NetworkExtensionLabTLSInterception struct {
-	hostMu       sync.RWMutex // protects runtime inspection and bypass pattern snapshots
-	mu           sync.Mutex
-	rootCert     *x509.Certificate               // the DEFAULT root cert (surfaced to admin / clients)
-	rootRegistry *tenantInterceptionRootRegistry // resolves the signing provider per tenant (behind the HSM seam)
+	hostMu         sync.RWMutex // protects runtime inspection and bypass pattern snapshots
+	tenantPatterns map[string]InspectionPatterns
+	mu             sync.Mutex
+	rootCert       *x509.Certificate               // the DEFAULT root cert (surfaced to admin / clients)
+	rootRegistry   *tenantInterceptionRootRegistry // resolves the signing provider per tenant (behind the HSM seam)
 	// custodyChecker answers "where does the signing key live, and can it still sign?" for the admin surface.
 	// Cached, because the check is a real signing operation and will cost HSM throughput once one is wired.
 	custodyChecker *KeyCustodyChecker
@@ -309,7 +310,8 @@ type NetworkExtensionLabTLSInterception struct {
 	// The secure default is off. With it off, the failure learning and the candidate proposal through
 	// certPinEmitter still run: DETECTING is safe, because a candidate bypasses nothing until an
 	// administrator approves it.
-	autoPinEnabled bool
+	autoPinEnabled       bool
+	certPinTenantEmitter func(tenant, host string)
 	// certPinEmitter is called when the threshold is reached and proposes the destination as a bypass
 	// candidate awaiting administrator review. Setting it does not enable auto-bypass: only approval and
 	// materialisation make a candidate a bypass.
@@ -536,17 +538,17 @@ func (interception *NetworkExtensionLabTLSInterception) Matches(route NetworkExt
 	// (fall through to raw_forward) — e.g. the AI dev-agent control plane and
 	// cert-pinned apps. In SNI mode this matches on the SNI too.
 	interception.hostMu.RLock()
-	bypass, hosts := interception.bypassHosts, interception.hosts
+	patterns := interception.inspectionPatternsLocked(route.TenantID)
 	interception.hostMu.RUnlock()
-	if networkExtensionLabTLSHostMatchesAnyPattern(host, bypass) {
+	if networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.Bypass) {
 		return false
 	}
 	// A destination learned to be certificate-pinning is raw-forwarded rather than intercepted; it stays
 	// steered.
-	if interception.isPinnedHost(host) {
+	if interception.isPinnedHostForTenant(route.TenantID, host) {
 		return false
 	}
-	return networkExtensionLabTLSHostMatchesAnyPattern(host, hosts)
+	return networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.Intercept)
 }
 
 // decisionHost returns the normalised host the intercept/bypass decision is made on. In SNI mode the peeked
@@ -566,12 +568,16 @@ func (interception *NetworkExtensionLabTLSInterception) decisionHost(route Netwo
 
 // isPinnedHost reports whether host is in the set learned to be certificate-pinning.
 func (interception *NetworkExtensionLabTLSInterception) isPinnedHost(host string) bool {
-	if interception == nil || interception.pinDetectThreshold <= 0 || host == "" {
+	return interception.isPinnedHostForTenant("", host)
+}
+
+func (interception *NetworkExtensionLabTLSInterception) isPinnedHostForTenant(tenant, host string) bool {
+	if interception == nil || host == "" {
 		return false
 	}
 	interception.mu.Lock()
 	defer interception.mu.Unlock()
-	return interception.pinnedHosts[host]
+	return interception.pinDetectThreshold > 0 && interception.pinnedHosts[pinStateKey(tenant, host)]
 }
 
 // recordIntoHandshakeOutcome records whether an intercepted TLS handshake succeeded and learns certificate
@@ -579,49 +585,62 @@ func (interception *NetworkExtensionLabTLSInterception) isPinnedHost(host string
 // failures reach the threshold is added to pinnedHosts, and Matches() chooses a raw forward for it from then
 // on. It returns true only when a destination becomes pinned for the first time.
 func (interception *NetworkExtensionLabTLSInterception) recordHandshakeOutcome(host string, success bool) bool {
-	if interception == nil || interception.pinDetectThreshold <= 0 || host == "" {
+	return interception.recordHandshakeOutcomeForTenant("", host, success)
+}
+
+func (interception *NetworkExtensionLabTLSInterception) recordHandshakeOutcomeForTenant(tenant, host string, success bool) bool {
+	if interception == nil || host == "" {
 		return false
 	}
+	key := pinStateKey(tenant, host)
 	interception.mu.Lock()
+	if interception.pinDetectThreshold <= 0 {
+		interception.mu.Unlock()
+		return false
+	}
 	if success {
 		// A destination whose intercepted handshake has succeeded once is settled as decryptable and is never
 		// pinned afterwards. Without this, a handshake EOF from Chrome abandoning a preconnect, or from the
 		// churn of a steering restart, is mistaken for certificate pinning and a perfectly decryptable host
 		// — accounts.google.com, say — starts being raw-forwarded. A destination that really does pin, such
 		// as an Apple daemon, never succeeds even once.
-		interception.everSucceededHosts[host] = true
-		delete(interception.handshakeFailures, host)
+		interception.everSucceededHosts[key] = true
+		delete(interception.handshakeFailures, key)
 		interception.mu.Unlock()
 		return false
 	}
-	if interception.pinnedHosts[host] {
+	if interception.pinnedHosts[key] {
 		interception.mu.Unlock()
 		return false
 	}
 	// A destination with a successful handshake behind it is never falsely pinned.
-	if interception.everSucceededHosts[host] {
-		delete(interception.handshakeFailures, host)
+	if interception.everSucceededHosts[key] {
+		delete(interception.handshakeFailures, key)
 		interception.mu.Unlock()
 		return false
 	}
-	interception.handshakeFailures[host]++
-	reached := interception.handshakeFailures[host] >= interception.pinDetectThreshold
+	interception.handshakeFailures[key]++
+	reached := interception.handshakeFailures[key] >= interception.pinDetectThreshold
 	var emitter func(string)
+	var tenantEmitter func(string, string)
 	newlyPinned := false
 	if reached {
-		delete(interception.handshakeFailures, host)
+		delete(interception.handshakeFailures, key)
 		// Detected: the threshold was reached. Whether or not auto-pin is on, an emitter is told about the
 		// bypass candidate.
 		emitter = interception.certPinEmitter
+		tenantEmitter = interception.certPinTenantEmitter
 		// Auto-bypass only when it has been enabled explicitly; the default is off. A proposal on its own
 		// bypasses no traffic.
 		if interception.autoPinEnabled {
-			interception.pinnedHosts[host] = true
+			interception.pinnedHosts[key] = true
 			newlyPinned = true
 		}
 	}
 	interception.mu.Unlock()
-	if emitter != nil {
+	if tenantEmitter != nil {
+		tenantEmitter(tenant, host)
+	} else if emitter != nil {
 		// The proposal is emitted outside the lock: the candidate store has its own locking and file
 		// persistence. A candidate becomes a bypass only when an administrator approves and materialises it.
 		emitter(host)
@@ -739,7 +758,7 @@ func networkExtensionLabTLSHostMatchesAnyPattern(host string, patterns []string)
 	return false
 }
 
-// SetBypassHosts sets the destination patterns the Edge raw-forwards instead of intercepting.
+// SetBypassHosts replaces the deployment fallback bypass. Tenant snapshots remain separate.
 func (interception *NetworkExtensionLabTLSInterception) SetBypassHosts(patterns []string) {
 	if interception == nil {
 		return
@@ -762,9 +781,8 @@ func (interception *NetworkExtensionLabTLSInterception) SetInterceptHosts(patter
 	interception.hosts = NormalizedNetworkExtensionLabTLSHostPatterns(patterns)
 }
 
-// BypassHosts returns the live raw-forward (never-decrypted) host pattern set the interception engine uses —
-// the shipped known-bypass compatibility list (Apple/iCloud/GitHub/OS-update/OCSP …) plus any materialized
-// cert-pinning recommendations. Observability only (a copy; the GUI shows "what is NOT being decrypted").
+// BypassHosts returns the deployment fallback bypass patterns. Administrative tenant
+// views must use InspectionPatternsForTenant instead. The returned slice is a copy.
 func (interception *NetworkExtensionLabTLSInterception) BypassHosts() []string {
 	if interception == nil {
 		return []string{}
@@ -776,7 +794,7 @@ func (interception *NetworkExtensionLabTLSInterception) BypassHosts() []string {
 	return out
 }
 
-// InterceptHosts returns the live intercept (decrypt) host pattern set. A set containing "*" means the default
+// InterceptHosts returns the deployment fallback intercept patterns. A set containing "*" means the default
 // posture is decrypt-all (everything is decrypted except the bypass set); a narrower set means selective
 // decryption. Observability only (a copy) — surfaced so the Console can SHOW the otherwise-invisible default
 // inspection posture (docs/invisible_effective_configuration.md).
@@ -1243,7 +1261,7 @@ func (interception *NetworkExtensionLabTLSInterception) serve(conn net.Conn, rou
 		// The client refused the interception certificate, which may mean it pins. Learn it, and once the
 		// threshold is reached raw-forward that destination from then on — still steered, only undecrypted.
 		// That is what stops a pinning application's reconnect storm without a static list.
-		newlyPinned := interception.recordHandshakeOutcome(decisionHost, false)
+		newlyPinned := interception.recordHandshakeOutcomeForTenant(route.TenantID, decisionHost, false)
 		if newlyPinned {
 			// Actionable: the edge just learned this destination is cert-pinned and will now bypass decryption
 			// for it — a real state change worth an INFO breadcrumb.
@@ -1256,7 +1274,7 @@ func (interception *NetworkExtensionLabTLSInterception) serve(conn net.Conn, rou
 		}
 		return
 	}
-	interception.recordHandshakeOutcome(decisionHost, true)
+	interception.recordHandshakeOutcomeForTenant(route.TenantID, decisionHost, true)
 	state := tlsConn.ConnectionState()
 	NetworkExtensionHotPathLog(
 		"network_extension_lab_tls progress=handshake_completed alpn_category=%s sni_match_category=%s",

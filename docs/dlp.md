@@ -42,6 +42,35 @@ The known-safe **allowlist retains its authored values in readable form** for ad
 Use it only for deliberate non-sensitive exceptions, and test that nearby real matches
 remain detectable. Custom keywords are also authored configuration, not secret storage.
 
+## Managing known-safe exceptions
+
+Use **Sensitive Data → Allowlist** only for confirmed non-sensitive values. Numeric
+identifiers accept digits with spaces, hyphens, parentheses or periods as grouping;
+email addresses ignore case. All other detector types, including custom identifiers,
+EDM and secrets, compare the trimmed literal value exactly. An alphanumeric value such
+as `ORDER-4111111111111111` does not authorize the card number embedded inside it.
+
+With `-dlp-allowlist-store` configured, an edit is published only after the save succeeds.
+An error retains the previous live exceptions, but cannot prove disk rollback if storage
+wrote before reporting failure. Check saved configuration before retrying. With no store,
+changes are in memory only. The API replaces the whole list: `{"values":[]}` clears it;
+a missing/null field, blank entry or more than 1,000 entries is rejected. Exact duplicates
+are removed. Reload before editing when other administrators may be changing the list;
+there is no revision-based conflict detection.
+
+The signed configuration bundle carries authored known-safe values, and receivers compile
+them with their local allowlist salt. Protect configuration access and backups. Update
+both the publisher and receiving nodes to use this distribution support: older receivers
+ignore the section. A section missing from an older publisher preserves the receiver's
+existing exceptions; an explicit empty map clears them. A receiving save failure leaves
+the DLP library unapplied so the same generation can be retried. This is not a transaction
+across every configuration store. Verify the applied generation and both an exempted
+sample and an unlisted control through each Edge.
+
+The administration audit records actor, tenant, endpoint and outcome without values.
+It is not a per-value change diff. A suppressed finding produces no DLP finding event;
+confirm the upload result and access logs as well as an unsuppressed control.
+
 ## Saving custom identifiers
 
 Use **Sensitive Data → Identifiers** to add, edit, or delete patterns and keyword lists.

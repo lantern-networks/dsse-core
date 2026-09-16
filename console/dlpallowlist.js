@@ -2,20 +2,20 @@
 
 // dlpallowlist.js — "DLP Allowlist" (Web & Traffic): the operator list of KNOWN-SAFE values DLP should ignore, to
 // cut false positives (a test card 4111 1111 1111 1111, a sample My Number used in a template, a benign shared
-// mailbox). A matched value equal to an allowlisted one (after normalization — grouping/case ignored) raises no
+// mailbox). Numeric grouping and email case normalize; other values compare exactly. An allowed value raises no
 // finding and never trips a block. Backend: GET/POST /admin/dlp-allowlist (the whole list POSTed atomically). The
-// data plane keeps only salted hashes; values are stored so the operator can manage the list — so the UI warns
+// scanner keeps only salted hashes; values are stored and distributed for management — so the UI warns
 // against entering real secrets.
 
 async function renderDLPAllowlistView(content, opts) {
   content.innerHTML = "";
   if (!(opts && opts.embedded)) content.appendChild(el("div", { class: "ui-view-head" }, el("div", {}, [
     el("h2", { class: "ui-view-title", text: bl({ en: "DLP Allowlist", ja: "DLP 許可リスト" }) }),
-    el("p", { class: "ui-view-desc", text: bl({
-      en: "Values DLP should treat as known-safe and ignore — a test card, a sample My Number in a template, a benign shared mailbox. Grouping and letter case are ignored when matching. This trims false positives without weakening detection of real data.",
-      ja: "DLP が既知の安全な値として無視する値 — テストカード、テンプレート内のサンプルのマイナンバー、無害な共有メールなど。照合時は区切りや大文字小文字を無視します。実データの検出を弱めずに誤検知を減らせます。",
-    }) }),
   ])));
+  content.appendChild(el("p", { class: "ui-view-desc", text: bl({
+    en: "Values DLP should treat as known-safe and ignore — a test card, a sample My Number in a template, a benign shared mailbox. Numeric identifiers ignore grouping, and email addresses ignore case. Other values, including custom identifiers and secrets, must match exactly. Other matches remain detectable.",
+    ja: "DLP が既知の安全な値として無視する値 — テストカード、テンプレート内のサンプルのマイナンバー、無害な共有メールなど。数値の識別子は区切り、メールアドレスは大文字小文字を無視します。カスタム識別子や秘密情報を含む他の値は完全一致で照合し、別の値の検出は維持します。",
+  }) }));
   // Safety note: these are stored to let you manage them — do not paste real secrets.
   content.appendChild(el("div", { class: "ui-view-desc", style: "border-left:3px solid var(--ui-warn,#c60);padding:0.4rem 0.75rem;margin:0.25rem 0 0.75rem", text: bl({
     en: "⚠ Only add values you have confirmed are NOT sensitive. Do not paste real tenant data or live secrets here.",
@@ -59,19 +59,25 @@ async function renderDLPAllowlistView(content, opts) {
     ));
   }
 
-  async function addValue() {
-    const v = await uiPrompt({
-      title: bl({ en: "Add a known-safe value", ja: "既知の安全な値を追加" }),
-      label: bl({ en: "Value DLP should ignore (e.g. a test card)", ja: "DLP が無視する値(例: テストカード)" }),
-      placeholder: "4111 1111 1111 1111",
-      confirmLabel: bl({ en: "Add", ja: "追加" }),
-    });
-    if (v == null) return;
-    const val = String(v).trim();
-    if (!val) return;
-    if (_values.some((x) => x === val)) { uiToast(bl({ en: "Already on the list.", ja: "既に登録済みです。" }), "warn"); return; }
-    try { await save(_values.concat([val]), bl({ en: "Value allowlisted", ja: "値を許可リストに追加しました" })); }
-    catch (e) { uiToast(String(e.message || e), "danger"); }
+  function addValue() {
+    const valueF = uiField({ name: "value", label: bl({ en: "Value DLP should ignore (e.g. a test card)", ja: "DLP が無視する値(例: テストカード)" }), placeholder: "4111 1111 1111 1111" });
+    const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add", ja: "追加" }), onClick: onSave });
+    const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
+    const modal = uiModal({ title: bl({ en: "Add a known-safe value", ja: "既知の安全な値を追加" }), body: [valueF.el, saveError], footer: [
+      el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }), submit,
+    ] });
+    valueF.focus();
+    async function onSave() {
+      if (submit.disabled) return;
+      saveError.style.display = "none";
+      const val = String(valueF.get()).trim();
+      if (!val) { valueF.focus(); return; }
+      if (_values.some((x) => x === val)) { uiToast(bl({ en: "Already on the list.", ja: "既に登録済みです。" }), "info"); return; }
+      submit.disabled = true;
+      try { await save(_values.concat([val]), bl({ en: "Value allowlisted", ja: "値を許可リストに追加しました" })); modal.close(); }
+      catch (e) { saveError.textContent = String(e.message || e); saveError.style.display = ""; saveError.scrollIntoView({ block: "nearest" }); }
+      finally { submit.disabled = false; }
+    }
   }
 
   async function remove(i) {
@@ -82,7 +88,7 @@ async function renderDLPAllowlistView(content, opts) {
     });
     if (!ok) return;
     try { await save(_values.filter((_, idx) => idx !== i), bl({ en: "Removed", ja: "削除しました" })); }
-    catch (e) { uiToast(String(e.message || e), "danger"); }
+    catch (e) { uiToast(String(e.message || e), "err"); }
   }
 
   load();

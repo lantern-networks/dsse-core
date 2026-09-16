@@ -5169,7 +5169,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	dlpPolicyObjects := dlpRT.policyObjects
 	dlpFingerprintStore := dlpRT.fingerprints
 	dlpClassifierStore := dlpRT.classifiers
-	config.DLPDistribution = &dlpConfigStores{policies: dlpPolicyObjects, classifiers: dlpClassifierStore, fingerprints: dlpFingerprintStore}
+	config.DLPDistribution = &dlpConfigStores{policies: dlpPolicyObjects, classifiers: dlpClassifierStore, fingerprints: dlpFingerprintStore, allowlist: dlpAllowlistStore}
 	trustedKeyring := config.TrustedKeyring
 	routeProfiles := config.RouteProfiles
 	swgRuntime := config.SWGRuntime

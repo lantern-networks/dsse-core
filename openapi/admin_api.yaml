@@ -5347,7 +5347,7 @@ paths:
   /admin/dlp-allowlist:
     get:
       summary: Read the tenant's DLP allowlist (known-safe values, slice F).
-      description: Requires admin.dlp.read. Returns the operator-declared known-safe values whose DLP matches are suppressed (test cards, sample My Numbers, benign emails). These are values the operator asserts are non-sensitive; the data plane keeps only salted hashes.
+      description: Requires admin.dlp.read. Returns the operator-declared known-safe values whose DLP matches are suppressed (test cards, sample My Numbers, benign emails). These are values the operator asserts are non-sensitive. The compiled scanner holds hashes; administration stores and signed configuration bundles retain authored values.
       tags:
         - AdminDLPPolicy
       responses:
@@ -5355,7 +5355,7 @@ paths:
           description: Current allowlist values for the tenant.
     post:
       summary: Hot-apply the tenant's DLP allowlist (false-positive tuning, slice F).
-      description: Requires admin.dlp.write. Atomically replaces the tenant's whole allowlist (empty = clear), recompiling it into the live salted-hash suppression set (no restart). A matched value equal (after normalization — digits-only for cards/numbers, lowercased email) to an allowlisted value raises no finding and never trips a block. Do NOT enter real secrets. Max 1000 values. The tenant is taken from the admin identity.
+      description: Requires admin.dlp.write. Replaces the tenant's whole list after configured storage confirms the save; without a store it is memory-only. An explicit empty array clears the list. Numeric identifiers normalize digits with spaces, hyphens, parentheses or periods; email ignores case; other detector types use exact trimmed literals. Digits embedded in arbitrary text do not authorize a numeric match. Exact duplicates are removed. There is no revision-based conflict detection. Known-safe authored values are distributed in signed configuration bundles; update publisher and receivers together. Do NOT enter real secrets. Max 1000 values. The tenant is taken from the admin identity.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5364,9 +5364,11 @@ paths:
           application/json:
             schema:
               type: object
+              required: [values]
               properties:
                 values:
                   type: array
+                  maxItems: 1000
                   items:
                     type: string
                   description: Known-safe values to suppress (e.g. a test card, a sample My Number).
@@ -5374,7 +5376,9 @@ paths:
         "200":
           description: Allowlist applied; returns the new live values.
         "400":
-          description: Invalid request (over the 1000-value cap).
+          description: Invalid request (missing/null values, blank entry or over the 1000-value cap).
+        "500":
+          description: Saving could not be confirmed. Live exceptions are unchanged; disk may already have changed. Check storage before retrying.
   /admin/dlp-fingerprints:
     get:
       summary: List the tenant's Exact-Data-Match datasets (slice E).

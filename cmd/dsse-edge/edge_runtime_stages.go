@@ -151,7 +151,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve dlp policy object store %q: %v", config.DLPPolicyObjectStorePath, e)
 		} else if p != nil {
 			if lerr := dlpPolicyObjects.SetPersister(p); lerr != nil {
-				log.Printf("dlp policy object store: load prior policies failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp policy object store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {

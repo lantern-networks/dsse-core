@@ -3,7 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -15,11 +18,8 @@ import (
 // EDM dataset name — resolved against the tenant's library), a valid instance scope, and sane device-risk
 // conditions.
 func validateDLPPolicyObject(obj model.DLPPolicyObject, custom *dlp.ClassifierSet, edm *dlp.FingerprintSet) error {
-	if !dlp.KnownAction(dlp.Action(obj.OnMatch)) {
-		return fmt.Errorf("invalid on_match %q (want observe|warn|block|authenticate)", obj.OnMatch)
-	}
-	if len(obj.Identifiers) == 0 {
-		return fmt.Errorf("at least one identifier is required")
+	if err := validateDLPPolicyShape(obj); err != nil {
+		return err
 	}
 	edmNames := map[string]bool{}
 	for _, n := range edm.Names() {
@@ -30,10 +30,39 @@ func validateDLPPolicyObject(obj model.DLPPolicyObject, custom *dlp.ClassifierSe
 			return fmt.Errorf("unknown identifier %q (not a built-in, custom identifier, or EDM dataset)", id)
 		}
 	}
+	return nil
+}
+
+// Shape validation is independent of library load order. Linked detector
+// existence is checked by the admin and bundle validators once libraries exist.
+func validateDLPPolicyShape(obj model.DLPPolicyObject) error {
+	if obj.ID != "" && !validDLPLibraryTenant(obj.ID) {
+		return fmt.Errorf("invalid policy id")
+	}
+	if !dlp.KnownAction(dlp.Action(obj.OnMatch)) {
+		return fmt.Errorf("invalid on_match %q (want observe|warn|block|authenticate)", obj.OnMatch)
+	}
+	if len(obj.Identifiers) == 0 {
+		return fmt.Errorf("at least one identifier is required")
+	}
+	for _, id := range obj.Identifiers {
+		if id != strings.TrimSpace(id) || (!dlp.KnownIdentifier(dlp.IdentifierType(id)) && !dlp.ValidIdentifierName(id)) {
+			return fmt.Errorf("invalid identifier name")
+		}
+	}
+	if obj.MinCount < 0 {
+		return fmt.Errorf("min_count must not be negative")
+	}
 	if !dlpKnownInstanceScope(obj.InstanceScope) {
 		return fmt.Errorf("invalid instance_scope %q (want any|corporate|personal)", obj.InstanceScope)
 	}
+	if obj.Status != "" && !strings.EqualFold(obj.Status, "active") && !strings.EqualFold(obj.Status, "disabled") {
+		return fmt.Errorf("invalid policy status (want active|disabled)")
+	}
 	for i, c := range obj.DeviceRisk {
+		if c.MinCount < 0 || c.MinDistinctTypes < 0 || c.WindowSeconds < 0 {
+			return fmt.Errorf("device_risk[%d]: thresholds and window must not be negative", i)
+		}
 		if c.MinCount <= 0 && c.MinDistinctTypes <= 0 {
 			return fmt.Errorf("device_risk[%d]: set min_count and/or min_distinct_types", i)
 		}
@@ -42,6 +71,64 @@ func validateDLPPolicyObject(obj model.DLPPolicyObject, custom *dlp.ClassifierSe
 		}
 	}
 	return nil
+}
+
+// Normalize metadata at the write boundary to the same JSON values used by
+// disk and bundle restores; reject unsupported values before changing state.
+func prepareDLPPolicyObject(p model.DLPPolicyObject) (model.DLPPolicyObject, error) {
+	if !validDLPLibraryTenant(p.TenantID) || !validDLPLibraryTenant(p.ID) {
+		return model.DLPPolicyObject{}, fmt.Errorf("invalid policy identity")
+	}
+	if err := validateDLPPolicyShape(p); err != nil {
+		return model.DLPPolicyObject{}, err
+	}
+	if p.Metadata != nil {
+		raw, err := json.Marshal(p.Metadata)
+		if err != nil {
+			return model.DLPPolicyObject{}, fmt.Errorf("policy metadata must be JSON")
+		}
+		p.Metadata = nil
+		if err := json.Unmarshal(raw, &p.Metadata); err != nil {
+			return model.DLPPolicyObject{}, fmt.Errorf("policy metadata must be JSON")
+		}
+	}
+	p.Identifiers = slices.Clone(p.Identifiers)
+	p.DeviceRisk = slices.Clone(p.DeviceRisk)
+	return p, nil
+}
+
+func cloneDLPPolicyJSON(v any) any {
+	switch value := v.(type) {
+	case map[string]any:
+		if value == nil {
+			return value
+		}
+		out := make(map[string]any, len(value))
+		for k, item := range value {
+			out[k] = cloneDLPPolicyJSON(item)
+		}
+		return out
+	case []any:
+		if value == nil {
+			return value
+		}
+		out := make([]any, len(value))
+		for i, item := range value {
+			out[i] = cloneDLPPolicyJSON(item)
+		}
+		return out
+	default:
+		return v // Stored metadata contains only decoded JSON scalars here.
+	}
+}
+
+func cloneDLPPolicyObject(p model.DLPPolicyObject) model.DLPPolicyObject {
+	p.Identifiers = slices.Clone(p.Identifiers)
+	p.DeviceRisk = slices.Clone(p.DeviceRisk)
+	if p.Metadata != nil {
+		p.Metadata = cloneDLPPolicyJSON(p.Metadata).(map[string]any)
+	}
+	return p
 }
 
 // dlpPolicyObjectStore holds the reusable NAMED DLP Policy objects per tenant (S5, docs/dlp_policy_ux_integration.md
@@ -67,7 +154,10 @@ func (s *dlpPolicyObjectStore) Get(tenantID, id string) (model.DLPPolicyObject, 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	p, ok := s.byTenant[tenantID][id]
-	return p, ok
+	if !ok || p.TenantID != tenantID || p.ID != id {
+		return model.DLPPolicyObject{}, false
+	}
+	return cloneDLPPolicyObject(p), true
 }
 
 // List returns a tenant's policies, ordered by name.
@@ -78,8 +168,11 @@ func (s *dlpPolicyObjectStore) List(tenantID string) []model.DLPPolicyObject {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]model.DLPPolicyObject, 0, len(s.byTenant[tenantID]))
-	for _, p := range s.byTenant[tenantID] {
-		out = append(out, p)
+	for id, p := range s.byTenant[tenantID] {
+		if p.TenantID != tenantID || p.ID != id {
+			continue
+		}
+		out = append(out, cloneDLPPolicyObject(p))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Name != out[j].Name {
@@ -91,7 +184,12 @@ func (s *dlpPolicyObjectStore) List(tenantID string) []model.DLPPolicyObject {
 }
 
 // Upsert creates or replaces a named policy (id assumed set by the caller).
-func (s *dlpPolicyObjectStore) Upsert(p model.DLPPolicyObject) {
+func (s *dlpPolicyObjectStore) Upsert(p model.DLPPolicyObject) error {
+	var err error
+	p, err = prepareDLPPolicyObject(p)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if s.byTenant[p.TenantID] == nil {
 		s.byTenant[p.TenantID] = map[string]model.DLPPolicyObject{}
@@ -100,6 +198,7 @@ func (s *dlpPolicyObjectStore) Upsert(p model.DLPPolicyObject) {
 	s.dirty = true
 	s.generation++
 	s.mu.Unlock()
+	return nil
 }
 
 // Delete removes a policy by id; reports whether it existed.
@@ -119,27 +218,45 @@ type dlpPolicyObjectSnapshot struct {
 	ByTenant map[string]map[string]model.DLPPolicyObject `json:"by_tenant"`
 }
 
-// SetPersister attaches durable storage and rehydrates on boot.
+// SetPersister validates the complete snapshot before adopting state or writer.
+// An unreadable or invalid file must not erase protection or redirect later saves.
 func (s *dlpPolicyObjectStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty {
+		return fmt.Errorf("save pending DLP policy changes before replacing the persistence store")
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
-	if err != nil || len(data) == 0 {
+	if err != nil {
 		return err
+	}
+	if data == nil {
+		s.persister = p
+		s.dirty = len(s.byTenant) > 0
+		return nil
 	}
 	var snap dlpPolicyObjectSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	if err := decodeDLPLibrarySnapshot(data, "by_tenant", &snap); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if snap.ByTenant != nil {
-		s.byTenant = snap.ByTenant
+	for tenant, policies := range snap.ByTenant {
+		if !validDLPLibraryTenant(tenant) || policies == nil {
+			return fmt.Errorf("invalid DLP policy snapshot")
+		}
+		for id, obj := range policies {
+			if !validDLPLibraryTenant(id) || obj.ID != id || obj.TenantID != tenant || validateDLPPolicyShape(obj) != nil {
+				return fmt.Errorf("invalid DLP policy snapshot") // Never log saved content.
+			}
+		}
 	}
+	if !reflect.DeepEqual(s.byTenant, snap.ByTenant) {
+		s.generation++
+	}
+	s.byTenant, s.persister, s.dirty = snap.ByTenant, p, false
 	return nil
 }
 
@@ -149,7 +266,7 @@ func (s *dlpPolicyObjectStore) snapshotLocked() dlpPolicyObjectSnapshot {
 	for tenant, items := range s.byTenant {
 		next.ByTenant[tenant] = map[string]model.DLPPolicyObject{}
 		for id, p := range items {
-			next.ByTenant[tenant][id] = p
+			next.ByTenant[tenant][id] = cloneDLPPolicyObject(p)
 		}
 	}
 	return next
@@ -168,6 +285,11 @@ func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) 
 
 // UpsertDurable acknowledges an admin edit only after the configured store accepts it.
 func (s *dlpPolicyObjectStore) UpsertDurable(p model.DLPPolicyObject) error {
+	var err error
+	p, err = prepareDLPPolicyObject(p)
+	if err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	next := s.snapshotLocked()
@@ -187,7 +309,8 @@ func (s *dlpPolicyObjectStore) UpsertDurable(p model.DLPPolicyObject) error {
 func (s *dlpPolicyObjectStore) DeleteDurable(tenant, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.byTenant[tenant][id]; !ok {
+	_, existed := s.byTenant[tenant][id]
+	if !existed && !s.dirty {
 		return false, nil
 	}
 	next := s.snapshotLocked()
@@ -197,8 +320,10 @@ func (s *dlpPolicyObjectStore) DeleteDurable(tenant, id string) (bool, error) {
 	}
 	s.byTenant = next.ByTenant
 	s.dirty = false
-	s.generation++
-	return true, nil
+	if existed {
+		s.generation++
+	}
+	return existed, nil
 }
 
 // Serialize periodic flushes with admin writes, so an older snapshot cannot

@@ -126,6 +126,30 @@ The administration write audit records the actor, tenant, endpoint and outcome, 
 classifier patterns, keyword values or preview text. It is not a per-identifier change diff
 or a detection event. Follow the traffic checks below to confirm actual DLP coverage.
 
+## Restoring named DLP policies
+
+With `-dlp-policy-object-store` configured, startup validates the complete saved
+`by_tenant` collection before loading any named policy. Each policy's tenant and ID
+must match its map keys. Invalid actions, detector names, scopes, statuses, negative
+thresholds or invalid device-risk conditions reject the whole snapshot. Empty status
+remains compatible with older active policies. A missing file permits first startup;
+an existing empty or malformed file, missing/null collection, unknown fields or null
+tenant map prevents startup. An explicit empty map clears the corresponding collection.
+
+Preserve a rejected file for diagnosis and restore a known-good copy or repair its
+source. Startup refusal is reported in the process log, not an administrator write
+audit. Failed loading keeps the previous live state and storage writer; pending changes
+must be saved before changing that writer. Edits and returned policy values no longer
+share mutable detector, risk-condition or metadata collections with the runtime store.
+The snapshot format is unchanged, but older invalid data that was previously accepted
+now needs correction before startup.
+
+This restoration check validates each policy's own fields. It does not verify that
+all referenced custom identifiers or datasets still exist after all libraries load,
+or that every Internet Access rule references a present policy. Check these references
+and actual detection after restart. It also does not provide an atomic transaction
+across all DLP stores or revision-based protection against concurrent administrators.
+
 ## Saving exact-match datasets
 
 Use **Sensitive Data → Exact-Data-Match** to create or replace a named dataset.

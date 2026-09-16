@@ -114,3 +114,70 @@ func TestAdminDLPPolicySaveFailureKeepsAcknowledgedState(t *testing.T) {
 		})
 	}
 }
+
+func TestAdminDLPPolicyRejectsValuesThatCannotRestore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "policies.json")
+	tenant := testEvaluator().PolicyBundle.TenantID
+	writer, err := logs.NewWriter(filepath.Join(dir, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := newAdminAuthStore()
+	auth.UpsertPrincipal(adminPrincipal{ID: "reviewer", TenantID: tenant, Roles: []string{"admin", "super_admin"}, Status: "active"})
+	auth.UpsertSession(adminSession{ID: "review-session", TenantID: tenant, AdminPrincipalID: "reviewer", Roles: []string{"admin", "super_admin"}, Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339), Metadata: map[string]any{adminCSRFTokenKey: "review-csrf"}})
+	cfg := serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, OperatorTenantID: tenant, DLPPolicyObjectStorePath: path}
+	handler := newServerWithConfig(cfg)
+	request := func(method, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, "/admin/dlp-policies", strings.NewReader(body))
+		req.AddCookie(&http.Cookie{Name: "admin_session", Value: "review-session"})
+		req.Header.Set("X-CSRF-Token", "review-csrf")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := request("POST", `{"name":"Valid","identifiers":["email"],"on_match":"observe","tenant_id":"forged"}`); rec.Code != 200 {
+		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := request("GET", "").Body.String()
+	for _, extra := range []string{`"id":" bad"`, `"status":"typo"`, `"min_count":-1`, `"device_risk":[{"min_count":1,"window_seconds":-1}]`} {
+		body := `{"name":"Bad","identifiers":["email"],"on_match":"observe",` + extra + `}`
+		if rec := request("POST", body); rec.Code != 400 {
+			t.Fatalf("invalid policy: %d %s", rec.Code, rec.Body.String())
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(data, saved) || request("GET", "").Body.String() != before {
+			t.Fatal("invalid write changed state")
+		}
+	}
+	handler = newServerWithConfig(cfg)
+	if request("GET", "").Body.String() != before {
+		t.Fatal("valid generated identity was not retained on restart")
+	}
+	var snapshot dlpPolicyObjectSnapshot
+	if err := json.Unmarshal(saved, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.ByTenant) != 1 || len(snapshot.ByTenant[tenant]) != 1 {
+		t.Fatal("body tenant escaped authenticated scope")
+	}
+	rows, err := writer.ReadJSONL("audit.log.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 5 {
+		t.Fatalf("audit count=%d", len(rows))
+	}
+	for i, row := range rows {
+		if row["actor_user_id"] != "reviewer" || row["tenant_id"] != tenant || row["target_id"] != "/admin/dlp-policies" {
+			t.Fatal("audit attribution")
+		}
+		if (row["result"] == "success") != (i == 0) {
+			t.Fatal("audit result differs from write outcome")
+		}
+	}
+}

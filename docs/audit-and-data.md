@@ -42,6 +42,16 @@ Edge. Store contents, recent-window limits, and delivery delay can therefore dif
 Access decisions carry decision-trace fields; there is no separate current decision-trace
 stream. DLP Findings is not a record of every scanned or skipped request.
 
+A default denial with `no_policy_match` has no matching policy: the decision API's
+`policy_id` and the explanation's `final_policy_id` are empty, and the access log's
+`policy_id` is null. A nearest-candidate rule mentioned in the reason is diagnostic,
+not a matched rule. Actual matches retain their policy ID even if a later check
+requires authentication or attestation. Dedicated east-west and server-initiated
+authorization paths retain their own policy identifiers. Ordinary access decisions
+are access records; delegated-access decisions also produce a correlated audit record.
+Older records are not rewritten by an upgrade. For historical `no_policy_match`
+records, do not treat a populated policy ID alone as proof that the rule matched.
+
 The default `-access-log-all=true` records routine egress decisions as well as policy
 actions. Selective logging changes this coverage. A DLP finding write is best effort:
 logging failure does not turn an otherwise permitted request into a denial.

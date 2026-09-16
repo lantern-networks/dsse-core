@@ -152,6 +152,38 @@ result. It does not currently retain the override's previous/new mode or reason.
 For a successful retry, verify the saved override and the effective selection in
 addition to the audit result. Signed catalog feed updates are a separate operation.
 
+### Restoring override snapshots
+
+A configured override snapshot must be an object mapping organization IDs to entry
+IDs. Each record must have the matching entry ID and an exact `force_inspect` or
+`disabled` mode. Organization and entry keys cannot be blank or contain surrounding
+whitespace. Restoration checks the complete snapshot before changing live state or
+its persistence writer. Duplicate keys, unknown or alternate-case fields, null
+containers or fields, malformed values and trailing JSON are rejected.
+
+`reason` and `updated_at` remain optional. A supplied nonempty timestamp must be
+valid RFC 3339; missing historical times are retained without inventing one. The
+Console can read such historical records, but a new override write must acknowledge
+its saved timestamp. Overrides for IDs absent from the current catalog are retained:
+they take effect if that ID returns in a subsequent feed. They are not corruption
+merely because the current catalog does not list the ID.
+
+Invalid configured data stops startup with `invalid catalog override snapshot`.
+Preserve the rejected file or database record and restore a complete known-good
+snapshot. Do not delete inspection overrides to make startup succeed. Rejected
+replacement leaves the live configuration and previous writer unchanged; later
+changes still save through that writer. Explicit `{}` removes all overrides from
+this store, restoring each catalog default where no other policy excludes it.
+An existing zero-byte file or JSON `null` is invalid. An absent snapshot retains
+initial/live state and attaches the writer, without persisting that state until
+the next confirmed change. Attachment alone is not a completed migration.
+
+Update readers and snapshot formats together; unsupported fields are rejected
+rather than silently removed on a later save. This validates record consistency,
+not who authored or moved a valid record between organizations, nor protection
+against replacement by a complete older valid snapshot. Verify distribution and
+effective inspection on the serving Edges separately.
+
 ### Signed catalog updates
 
 Only the deployment operator, outside an entered customer organization, can apply

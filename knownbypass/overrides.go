@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
@@ -56,7 +57,7 @@ func (s *OverrideStore) Set(tenantID string, o Override, now time.Time) (Overrid
 // Callers must provide a trusted catalog and serialize catalog updates with this call.
 func (s *OverrideStore) SetFromCatalog(tenantID string, o Override, entries []Group, now time.Time) (Override, error) {
 	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
+	if tenantID == "" || !utf8.ValidString(tenantID) {
 		return Override{}, fmt.Errorf("tenant_id is required")
 	}
 	o.EntryID = strings.TrimSpace(o.EntryID)
@@ -78,6 +79,9 @@ func (s *OverrideStore) SetFromCatalog(tenantID string, o Override, entries []Gr
 		now = time.Now().UTC()
 	}
 	o.UpdatedAt = now.UTC().Format(time.RFC3339)
+	if !validStoredOverride(o) {
+		return Override{}, fmt.Errorf("invalid catalog override fields")
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -179,17 +183,15 @@ func (s *OverrideStore) SetPersister(p blobstore.Persister) error {
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if data == nil {
 		s.persister = p
 		return nil
 	}
-	var snapshot map[string]map[string]Override
-	if err := json.Unmarshal(data, &snapshot); err != nil {
+	snapshot, err := decodeOverrideSnapshot(data)
+	if err != nil {
 		return err
 	}
-	if snapshot != nil {
-		s.overrides = snapshot
-	}
+	s.overrides = snapshot
 	s.persister = p
 	return nil
 }

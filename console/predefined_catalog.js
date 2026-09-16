@@ -249,15 +249,16 @@ function catalogEntries(rows) {
       (e.patterns === undefined || e.patterns === null || Array.isArray(e.patterns) && e.patterns.every(p => typeof p === "string"));
   });
 }
-function catalogOverride(o) {
+function catalogOverride(o, requireTimestamp = true) {
   return catalogObject(o) && catalogText(o.entry_id) && ["force_inspect", "disabled"].includes(o.mode) &&
-    (o.reason === undefined || typeof o.reason === "string") && catalogText(o.updated_at) && Number.isFinite(Date.parse(o.updated_at));
+    (o.reason === undefined || typeof o.reason === "string") &&
+    ((!requireTimestamp && (o.updated_at === undefined || o.updated_at === "")) || catalogText(o.updated_at) && Number.isFinite(Date.parse(o.updated_at)));
 }
 function catalogDocument(d) {
   if (!catalogObject(d) || !catalogVersion(d.version) || !["builtin", "feed"].includes(d.source) || !catalogEntries(d.entries) || !Array.isArray(d.overrides)) return false;
   const ids = new Set();
   // Overrides for entries absent from the currently selected feed are legitimate.
-  return d.overrides.every(o => { if (!catalogOverride(o) || ids.has(o.entry_id)) return false; ids.add(o.entry_id); return true; });
+  return d.overrides.every(o => { if (!catalogOverride(o, false) || ids.has(o.entry_id)) return false; ids.add(o.entry_id); return true; });
 }
 function catalogEnvelope(e) {
   return catalogObject(e) && e.type === "predefined_catalog_feed" && e.status === "active" &&

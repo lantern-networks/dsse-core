@@ -47,3 +47,6 @@ test('pending operations suppress duplicate POST and reload; failed transport re
 test('confirmed writes carry context and require a fresh read',async()=>{const f=fixture();await f.view.load();assert.equal(await f.write(),true);assert.match(f.requests.at(-1).path,/\?scoped=1&expected_tenant_id=own$/);assert.equal(f.controls[0].disabled,true);await f.view.load();assert.equal(f.controls[0].disabled,false)});
 
 for (const change of [{created_at: 123}, {expires_at: "invalid"}, {metadata: []}]) test('malformed envelope metadata or timestamps are not valid feed acknowledgements', () => { const f = fixture(); assert.equal(f.ctx.catalogEnvelope({...envelope(), ...change}), false); });
+
+for (const updated_at of [undefined, '']) test('legacy optional override timestamp is readable but not a fresh write acknowledgement', () => { const f = fixture(), o = {entry_id:'service', mode:'disabled', updated_at}; assert.equal(f.ctx.catalogDocument({...doc(), overrides:[o]}), true); assert.equal(f.ctx.catalogOverride(o), false); });
+test('malformed optional override timestamp still rejects the complete read', () => { const f = fixture(); for (const updated_at of [null, 'invalid', 123]) assert.equal(f.ctx.catalogDocument({...doc(), overrides:[{entry_id:'service',mode:'disabled',updated_at}]}), false); });

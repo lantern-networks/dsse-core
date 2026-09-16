@@ -132,6 +132,26 @@ Use synthetic data for blocked and allowed upload tests. Account restrictions fo
 supported SaaS services are a separate feature in
 [SaaS tenant restriction](saas-tenant-restriction.md).
 
+## Built-in bypass overrides
+
+In **Built-in Bypass List**, **Force-inspect** and **Disable** remove an entry's
+curated bypass for the selected organization. **Restore default** removes that
+override. These controls change the catalog's contribution; they do not override
+other bypass rules or force inspection when the deployment posture excludes a host.
+Test new connections and check the effective inspection selection.
+
+With override persistence configured, changes are saved before the live selection
+is rebuilt. A storage failure returns an error, leaves the current live selection
+in place, and records the administration request as failed. Repair storage, reload
+the page and retry the intended change. An error can occur after storage was
+written, so restarting is not a substitute for a successful retry. Without
+persistence, overrides last only for the running process.
+
+The common administration audit records the actor, organization, request path and
+result. It does not currently retain the override's previous/new mode or reason.
+For a successful retry, verify the saved override and the effective selection in
+addition to the audit result. Signed catalog feed updates are a separate operation.
+
 ## Save and verify inspection defaults
 
 **Inspection Settings** configures defaults for the whole deployment. Only the

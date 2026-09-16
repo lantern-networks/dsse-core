@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -139,6 +140,10 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		tenant := adminTenantIDFromRequest(r)
 		o, err := config.CatalogOverrides.Set(tenant, req, time.Now().UTC())
 		if err != nil {
+			if errors.Is(err, knownbypass.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog override save could not be confirmed; reload and retry"))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -154,7 +159,11 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		}
 		tenant := adminTenantIDFromRequest(r)
 		id := strings.TrimSpace(r.PathValue("id"))
-		cleared := config.CatalogOverrides.Clear(tenant, id)
+		cleared, err := config.CatalogOverrides.Clear(tenant, id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog override removal could not be confirmed; reload and retry"))
+			return
+		}
 		if config.ApplyMaterializedCertPinBypass != nil {
 			config.ApplyMaterializedCertPinBypass(tenant)
 		}

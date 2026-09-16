@@ -2,13 +2,18 @@ package knownbypass
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
+
+// ErrPersistence means the requested snapshot could not be confirmed saved.
+var ErrPersistence = errors.New("catalog override persistence failed")
 
 // Override is a per-tenant decision on a single predefined catalog entry. The default (no override) leaves the
 // entry as a no-decrypt bypass; an override re-asserts inspection (force_inspect) or disables the bypass.
@@ -26,6 +31,7 @@ type OverrideStore struct {
 	mu        sync.RWMutex
 	overrides map[string]map[string]Override // tenant -> entryID -> override
 	persister blobstore.Persister
+	dirty     bool // a failed save may have changed storage; retry even an otherwise empty deletion
 }
 
 func NewOverrideStore() *OverrideStore {
@@ -62,31 +68,37 @@ func (s *OverrideStore) Set(tenantID string, o Override, now time.Time) (Overrid
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.overrides[tenantID] == nil {
-		s.overrides[tenantID] = map[string]Override{}
+	next := s.cloneLocked()
+	if next[tenantID] == nil {
+		next[tenantID] = map[string]Override{}
 	}
-	s.overrides[tenantID][o.EntryID] = o
-	s.persistLocked()
+	next[tenantID][o.EntryID] = o
+	if err := s.commitLocked(next); err != nil {
+		return Override{}, err
+	}
 	return o, nil
 }
 
-// Clear removes a tenant's override for an entry, restoring the catalog default (bypass). Returns whether an
-// override existed.
-func (s *OverrideStore) Clear(tenantID, entryID string) bool {
+// Clear removes a tenant's override, restoring the catalog default, only after saving.
+// The returned bool reports a confirmed removal, never an unconfirmed write.
+func (s *OverrideStore) Clear(tenantID, entryID string) (bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	entryID = strings.TrimSpace(entryID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m := s.overrides[tenantID]
-	if m == nil {
-		return false
+	_, exists := s.overrides[tenantID][entryID]
+	if !exists && !s.dirty {
+		return false, nil
 	}
-	if _, ok := m[entryID]; !ok {
-		return false
+	next := s.cloneLocked()
+	delete(next[tenantID], entryID)
+	if len(next[tenantID]) == 0 {
+		delete(next, tenantID)
 	}
-	delete(m, entryID)
-	s.persistLocked()
-	return true
+	if err := s.commitLocked(next); err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 // List returns a tenant's overrides.
@@ -143,8 +155,11 @@ func (s *OverrideStore) SetStatePath(path string) error {
 func (s *OverrideStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
+	if s.dirty {
+		return fmt.Errorf("%w: retry saving before replacing storage", ErrPersistence)
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
@@ -152,6 +167,7 @@ func (s *OverrideStore) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		s.persister = p
 		return nil
 	}
 	var snapshot map[string]map[string]Override
@@ -161,18 +177,35 @@ func (s *OverrideStore) SetPersister(p blobstore.Persister) error {
 	if snapshot != nil {
 		s.overrides = snapshot
 	}
+	s.persister = p
 	return nil
 }
 
-func (s *OverrideStore) persistLocked() {
-	if s.persister == nil {
-		return
+func (s *OverrideStore) cloneLocked() map[string]map[string]Override {
+	next := make(map[string]map[string]Override, len(s.overrides))
+	for tenant, entries := range s.overrides {
+		next[tenant] = maps.Clone(entries)
 	}
-	data, err := json.MarshalIndent(s.overrides, "", "  ")
-	if err != nil {
-		return
+	return next
+}
+
+// Hold the lock across save and publication so a later mutation cannot persist an
+// unconfirmed change. Save errors can include an uncertain commit; keep live state
+// and require a successful retry before changing writers or acknowledging no-op removal.
+func (s *OverrideStore) commitLocked(next map[string]map[string]Override) error {
+	if s.persister != nil {
+		data, err := json.MarshalIndent(next, "", "  ")
+		if err == nil {
+			err = s.persister.Save(data)
+		}
+		if err != nil {
+			s.dirty = true
+			return fmt.Errorf("%w: %w", ErrPersistence, err)
+		}
 	}
-	_ = s.persister.Save(data)
+	s.overrides = next
+	s.dirty = false
+	return nil
 }
 
 // CountForTenant returns how many bypass-catalog overrides this organization still has, and RemoveTenant
@@ -192,21 +225,25 @@ func (s *OverrideStore) CountForTenant(tenantID string) int {
 	return len(s.overrides[tenantID])
 }
 
-func (s *OverrideStore) RemoveTenant(tenantID string) int {
+// RemoveTenant reports erasure only after the resulting snapshot is saved.
+func (s *OverrideStore) RemoveTenant(tenantID string) (int, error) {
 	if s == nil {
-		return 0
+		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return 0
+		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := len(s.overrides[tenantID])
-	if n == 0 {
-		return 0
+	if n == 0 && !s.dirty {
+		return 0, nil
 	}
-	delete(s.overrides, tenantID)
-	s.persistLocked()
-	return n
+	next := s.cloneLocked()
+	delete(next, tenantID)
+	if err := s.commitLocked(next); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

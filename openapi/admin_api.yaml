@@ -7767,7 +7767,7 @@ paths:
   /admin/predefined-catalog/overrides:
     post:
       summary: Override a predefined catalog entry for this tenant.
-      description: Requires admin.policy.write. Sets a per-tenant override on a catalog entry — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). The live bypass set is rebuilt immediately.
+      description: Requires admin.policy.write. Sets a per-tenant override on a catalog entry — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
       tags:
         - AdminPredefinedCatalog
       requestBody:
@@ -7791,10 +7791,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the requested override state could not be confirmed. The current live selection is retained; reload and retry.
+        "503":
+          description: The catalog override store is not configured.
   /admin/predefined-catalog/overrides/{id}/clear:
     post:
       summary: Clear a tenant's override on a predefined catalog entry.
-      description: Requires admin.policy.write. Removes the override and restores the catalog default (the entry is bypassed again). The live bypass set is rebuilt immediately.
+      description: Requires admin.policy.write. Removes the override and restores the catalog default (the entry is bypassed again). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
       tags:
         - AdminPredefinedCatalog
       parameters:
@@ -7815,6 +7819,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the requested override state could not be confirmed. The current live selection is retained; reload and retry.
+        "503":
+          description: The catalog override store is not configured.
   /admin/internal-cas:
     get:
       summary: List the certificate authorities this organization vouches for over its own private assets.

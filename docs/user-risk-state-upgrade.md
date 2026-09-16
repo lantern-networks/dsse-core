@@ -66,12 +66,22 @@ leaves the live user-risk map and generation unchanged. The Console retains an
 error and an explicit retry action; a transport failure may mean that a write
 already reached the server. Reload its state before retrying.
 
-When a store accepts a write without confirming its durability or atomicity,
-the response includes `not_stored_durably`. The Console keeps a visible warning,
+An in-memory store without a persister, or a completed and synced in-place save
+without atomic replacement, returns `not_stored_durably`. The Console keeps a visible warning,
 and `user_risk_changed` records the accepted operation as `partial`. A confirmed
 save records `success`. These records name the actor, tenant, canonical target,
 severity and persistence warning, without copying the signal body or subject
 aliases. Rejected HTTP writes appear in the common administrative audit stream.
+
+An unconfirmed flush after file replacement is rejected, even when the storage
+compatibility error also identifies a non-atomic save. The API returns 503, does
+not publish the attempted user-risk change or advance its generation, and emits
+no applied-user-risk audit. The common administrative audit records the error.
+The same distinction applies to legacy user-risk migration and tenant user-risk
+removal: an unconfirmed save cannot complete either operation. The saved bytes
+may already differ from the retained live state. Investigate storage and reconcile
+the intended change before explicitly reapplying it or restarting; restarting
+alone does not prove that a failed change was saved or rolled back.
 
 Check these records in **Logs & Audit** and confirm state after restart. A
 successful save is not evidence that every Edge has received it. Store errors

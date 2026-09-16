@@ -114,7 +114,9 @@ func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[s
 	}
 	if err = o.persister.Save(data); err != nil {
 		log.Printf("risk state save: %v", err)
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		// The legacy compatibility warning also matches an unconfirmed flush.
+		// Only a completed, synced in-place save may publish checked changes.
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return true, nil
 		}
 		return false, ErrRiskSave

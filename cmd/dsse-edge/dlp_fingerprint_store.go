@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -19,16 +22,17 @@ import (
 type dlpFingerprintRuntimeStore struct {
 	mu sync.RWMutex
 	// tenant -> dataset name -> salted hashes (durable)
-	datasets   map[string]map[string][]string
-	sets       map[string]*dlp.FingerprintSet // compiled per tenant (data path)
-	salt       string
-	persister  blobstore.Persister
-	dirty      bool
-	generation uint64
+	datasets    map[string]map[string][]string
+	sets        map[string]*dlp.FingerprintSet // compiled per tenant (data path)
+	salt        string
+	startupSalt string // Legacy snapshots omitted salt; use the original constructor value.
+	persister   blobstore.Persister
+	dirty       bool
+	generation  uint64
 }
 
 func newDLPFingerprintRuntimeStore(salt string) *dlpFingerprintRuntimeStore {
-	return &dlpFingerprintRuntimeStore{datasets: map[string]map[string][]string{}, sets: map[string]*dlp.FingerprintSet{}, salt: salt}
+	return &dlpFingerprintRuntimeStore{datasets: map[string]map[string][]string{}, sets: map[string]*dlp.FingerprintSet{}, salt: salt, startupSalt: salt}
 }
 
 // FingerprintSetForTenant returns the live compiled EDM set for a tenant (nil = none), for the scan path.
@@ -166,7 +170,7 @@ func (s *dlpFingerprintRuntimeStore) RemoveDatasetDurable(tenantID, name string)
 }
 
 func (s *dlpFingerprintRuntimeStore) snapshotLocked() fingerprintStoreSnapshot {
-	next := fingerprintStoreSnapshot{Datasets: map[string]map[string][]string{}}
+	next := fingerprintStoreSnapshot{Version: 1, Salt: s.salt, Datasets: map[string]map[string][]string{}}
 	for tenant, datasets := range s.datasets {
 		next.Datasets[tenant] = map[string][]string{}
 		for name, hashes := range datasets {
@@ -212,35 +216,92 @@ func (s *dlpFingerprintRuntimeStore) Tenants() []string {
 }
 
 type fingerprintStoreSnapshot struct {
+	Version  int                            `json:"version"`
+	Salt     string                         `json:"salt"`
 	Datasets map[string]map[string][]string `json:"datasets"` // tenant -> name -> hashes
 }
 
-// SetPersister attaches durable storage and rehydrates + recompiles the datasets on boot (hashes only).
+// SetPersister adopts a complete validated snapshot and its writer together.
+// Loading never rewrites storage. Legacy snapshots use the constructor salt;
+// version 1 preserves an adopted salt, including an explicitly empty salt.
 func (s *dlpFingerprintRuntimeStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty {
+		return fmt.Errorf("save pending EDM changes before replacing the persistence store")
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
-	if err != nil || len(data) == 0 {
+	if err != nil {
 		return err
+	}
+	if data == nil { // No snapshot exists; preserve live state for the new writer.
+		s.persister = p
+		s.dirty = len(s.datasets) > 0
+		return nil
+	}
+	snap, sets, err := decodeFingerprintSnapshot(data, s.startupSalt)
+	if err != nil {
+		return err
+	}
+	if s.salt != snap.Salt || !reflect.DeepEqual(s.datasets, snap.Datasets) {
+		s.generation++
+	}
+	s.datasets, s.sets, s.salt = snap.Datasets, sets, snap.Salt
+	s.persister, s.dirty = p, false
+	return nil
+}
+
+func decodeFingerprintSnapshot(data []byte, legacySalt string) (fingerprintStoreSnapshot, map[string]*dlp.FingerprintSet, error) {
+	invalid := func() (fingerprintStoreSnapshot, map[string]*dlp.FingerprintSet, error) {
+		// Never echo stored hashes, salts, names or source bytes into startup logs.
+		return fingerprintStoreSnapshot{}, nil, fmt.Errorf("invalid EDM snapshot")
+	}
+	var shape map[string]json.RawMessage
+	if json.Unmarshal(data, &shape) != nil || shape == nil || shape["datasets"] == nil {
+		return invalid()
 	}
 	var snap fingerprintStoreSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&snap) != nil || snap.Datasets == nil {
+		return invalid()
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for tenant, ds := range snap.Datasets {
-		if len(ds) == 0 {
-			continue
+	if shape["version"] == nil {
+		if shape["salt"] != nil {
+			return invalid()
 		}
-		s.datasets[tenant] = ds
-		s.recompileLocked(tenant)
+		snap.Salt = legacySalt
+	} else if snap.Version != 1 || shape["salt"] == nil || bytes.Equal(bytes.TrimSpace(shape["salt"]), []byte("null")) {
+		return invalid()
 	}
-	return nil
+	sets := map[string]*dlp.FingerprintSet{}
+	for tenant, datasets := range snap.Datasets {
+		if tenant == "" || strings.TrimSpace(tenant) != tenant || strings.ContainsRune(tenant, '\x00') || datasets == nil {
+			return invalid()
+		}
+		var fps []*dlp.Fingerprint
+		for name, hashes := range datasets {
+			if !dlp.ValidIdentifierName(name) || len(hashes) == 0 || len(hashes) > maxFingerprintValues {
+				return invalid()
+			}
+			seen := map[string]bool{}
+			for _, hash := range hashes {
+				if len(hash) != 64 || seen[hash] || strings.Trim(hash, "0123456789abcdef") != "" {
+					return invalid()
+				}
+				seen[hash] = true
+			}
+			fps = append(fps, dlp.NewFingerprintFromHashes(name, snap.Salt+"\x00"+tenant, hashes))
+		}
+		if len(fps) > 0 {
+			sets[tenant] = dlp.NewFingerprintSet(fps)
+		}
+	}
+	return snap, sets, nil
 }
 
 // PersistIfDirty serializes staged saves with admin commits, so an old flush

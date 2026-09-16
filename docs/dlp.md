@@ -127,6 +127,29 @@ storage, changes are in memory only. These local outcomes do not confirm deliver
 other Edges or inspection of traffic. The write audit records endpoint, actor, tenant
 and outcome without submitted values; it is not a dataset-level change history.
 
+EDM snapshots now save a format version, the hashing salt and the dataset hashes
+together. A restarted node restores that salt even when it differs from its startup
+default. Hashes cannot be moved to a different salt without the original values.
+Protect snapshots and backups: salts and hashes still permit guessing attacks.
+
+Existing snapshots without a version use the node's original startup salt. They are
+not rewritten during loading; a subsequent save writes the versioned format. If an
+older receiver previously saved hashes from a different salt, that lost salt cannot
+be recovered from the snapshot. Restore the correct source configuration or reimport
+the original values. Do not downgrade a node that adopted a different salt: older
+binaries ignore the stored salt and may silently stop matching those datasets.
+
+A missing configured snapshot permits first startup, but an existing empty, malformed,
+unsupported-version or invalid dataset snapshot now prevents startup. Preserve the
+file, investigate the storage failure and restore a known-good backup or the authoritative
+configuration; deleting it would discard the detectors. A valid explicit empty dataset
+map represents a cleared library. Runtime store replacement validates the whole candidate
+before replacing its state and writer; failed loads retain both. Pending unsaved changes
+must reach the existing writer before it can be replaced or detached.
+
+This restoration guarantee applies to the EDM store. Other DLP library stores and the
+atomic persistence of a received configuration bundle require separate validation.
+
 ## Actions and account scope
 
 | Action | Current behavior on a qualifying match |

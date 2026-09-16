@@ -170,7 +170,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve dlp fingerprint store %q: %v", config.DLPFingerprintStorePath, e)
 		} else if p != nil {
 			if lerr := dlpFingerprintStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp fingerprint store: load prior datasets failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp fingerprint store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {

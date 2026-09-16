@@ -23,12 +23,11 @@ type effectivePolicyEntry struct {
 // inspectionBasis is the inspect/bypass layer of the effective-config view for a destination: whether the Edge
 // decrypts (inspects) the flow or raw-forwards (bypasses) it, and WHICH source decided that. A bypassed flow is
 // still steered and policy-gated — the Edge merely declines to terminate its TLS — so this is orthogonal to the
-// policy decision (allow/deny/authenticate) above. The bypass sources are exactly the hidden surfaces from
-// docs/invisible_effective_configuration.md: the static known-bypass list, authored egress bypass, and
-// materialized cert-pin candidates; "inspect" means none matched and the decrypt-all default applies.
+// policy decision (allow/deny/authenticate) above. Attribution follows the current posture, known-bypass
+// catalog, authored rules and configured host sets. Candidate history does not authorize inspection bypass.
 type inspectionBasis struct {
 	Decision string `json:"decision"`         // "inspect" | "bypass" | "depends_on_device"
-	Source   string `json:"source"`           // default_decrypt_all | decrypt_allowlist | known_bypass | saas_optimize | authored_bypass | cert_pin_materialized | static_bypass | bypass_default
+	Source   string `json:"source"`           // default_decrypt_all | decrypt_allowlist | known_bypass | saas_optimize | authored_bypass | static_bypass | bypass_default
 	Detail   string `json:"detail,omitempty"` // e.g. the known-bypass group name
 }
 
@@ -41,7 +40,6 @@ type inspectionSources struct {
 	KnownGroups     []knownbypass.Group                  // curated named bypass groups, for attribution
 	OptimizeGroups  []inspectionposture.AuthDecryptGroup // enabled SaaS Optimize bypass groups, for attribution
 	AuthoredBypass  []string                             // authored egress rules whose inspection axis is bypass, for attribution
-	CertPinBypass   []string                             // materialized (admin-approved) cert-pin candidates, for attribution
 	DeviceIntercept map[string][]string
 	DeviceBypass    map[string][]string
 }
@@ -151,9 +149,6 @@ func classifyInspection(host string, src inspectionSources) inspectionBasis {
 		}
 		if interception.HostMatchesPatterns(host, src.AuthoredBypass) {
 			return inspectionBasis{Decision: "bypass", Source: "authored_bypass"}
-		}
-		if interception.HostMatchesPatterns(host, src.CertPinBypass) {
-			return inspectionBasis{Decision: "bypass", Source: "cert_pin_materialized"}
 		}
 		return inspectionBasis{Decision: "bypass", Source: "static_bypass"}
 	}

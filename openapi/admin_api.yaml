@@ -13066,7 +13066,7 @@ paths:
                     description: Whether the Edge decrypts (inspect) or raw-forwards (bypass) the flow, and which source decided it. Orthogonal to the policy decision — a bypassed flow is still steered and policy-gated.
                     properties:
                       decision: { type: string, enum: [inspect, bypass] }
-                      source: { type: string, enum: [default_decrypt_all, known_bypass, authored_bypass, cert_pin_materialized, static_bypass] }
+                      source: { type: string, enum: [default_decrypt_all, known_bypass, authored_bypass, static_bypass] }
                       detail: { type: string }
                   trace:
                     type: array
@@ -13167,8 +13167,9 @@ paths:
       description: >
         Requires admin.policy.read. Aggregates every egress rule the edge owns into one precedence-ordered list,
         not just authored ones: authored rules (editable), the built-in catch-all default (toggleable), the
-        known-bypass OS/cert floor (master-toggleable), legacy SaaS Optimize posture selections, and approved
-        cert-pin bypasses — each normalized to one source -> destination : service => access x inspection shape
+        known-bypass OS/cert floor (master-toggleable), and legacy SaaS Optimize posture selections.
+        Cert-pin bypasses are ordinary authored rules; candidate history does not synthesize active rules
+        or restore deleted/disabled rules on restart. Each entry is normalized to one source -> destination : service => access x inspection shape
         with a kind tag and capability flags (editable / deletable / toggle_kind). Phase B-3 of the unified policy
         model. Read-only. Metadata-only. An authored entry with service_unresolved=true matches no traffic,
         including deny/authenticate rules. Repair its service reference; other rules and defaults still apply.
@@ -13188,7 +13189,7 @@ paths:
                     items:
                       type: object
                       properties:
-                        kind: { type: string, enum: [authored, builtin_default, known_bypass, optimize_bypass, cert_pin_bypass] }
+                        kind: { type: string, enum: [authored, builtin_default, known_bypass, optimize_bypass] }
                         id: { type: string }
                         name: { type: string }
                         priority: { type: integer }

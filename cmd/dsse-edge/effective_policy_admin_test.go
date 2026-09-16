@@ -72,22 +72,21 @@ func TestPolicyProvenanceTag(t *testing.T) {
 }
 
 // classifyInspection: the engine's effective bypass set is authoritative for inspect-vs-bypass; when bypassed,
-// the source is attributed to the matching known-bypass group / authored bypass / cert-pin, else static_bypass.
+// the source is attributed to the matching known-bypass group / authored bypass, else static_bypass.
 func TestClassifyInspectionDecryptAll(t *testing.T) {
 	// decrypt-all: intercept "*", so everything not bypassed is decrypted.
 	src := inspectionSources{
 		InterceptHosts:  []string{"*"},
 		EffectiveBypass: []string{"*.icloud.com", "pinned.example.com", "authored.example.com", "static.example.com"},
 		KnownGroups:     []knownbypass.Group{{Name: "apple_push_icloud", Patterns: []string{"*.icloud.com"}}},
-		AuthoredBypass:  []string{"authored.example.com"},
-		CertPinBypass:   []string{"pinned.example.com"},
+		AuthoredBypass:  []string{"authored.example.com", "pinned.example.com"},
 	}
 	cases := []struct{ host, wantDecision, wantSource string }{
 		{"accounts.google.com", "inspect", "default_decrypt_all"}, // not bypassed, intercept "*" → decrypted
 		{"x.icloud.com", "bypass", "known_bypass"},                // *.icloud.com curated group (apex+subdomain)
 		{"icloud.com", "bypass", "known_bypass"},                  // *.suffix matches the apex too
 		{"authored.example.com", "bypass", "authored_bypass"},
-		{"pinned.example.com", "bypass", "cert_pin_materialized"},
+		{"pinned.example.com", "bypass", "authored_bypass"},
 		{"static.example.com", "bypass", "static_bypass"}, // in the bypass set but no tracked source
 	}
 	for _, c := range cases {

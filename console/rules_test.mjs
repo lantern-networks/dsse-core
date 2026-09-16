@@ -44,3 +44,18 @@ test('tenant verification rejects missing context and propagates transport failu
   assert.equal(await context.ruleEditorTenant(),'customer-a');
 });
 test('unsupported inspection sources explain the remaining access and inspection scopes',()=>{assert.match(context.inspectionSourceWarningText('identity_context_unavailable'),/Only device sources/);assert.match(context.inspectionSourceWarningText('identity_context_unavailable'),/access rules still apply/);assert.match(context.inspectionSourceWarningText('no_resolved_device'),/No source device/);assert.match(context.inspectionSourceWarningText('future_reason'),/Check the inspection source/)});
+
+
+test('cert-pin summary only represents unmodified unrestricted allow/bypass rules',()=>{
+ const r={id:'certpin-rule-saved',plane:'egress',source:['*'],destination:['endpoint'],action:{access:'allow',inspection:'bypass'},status:'active'};
+ assert.equal(context.isCertPinSummaryRule(r),true);
+ assert.equal(context.isCertPinSummaryRule({...r,status:'disabled'}),true);
+ for(const changed of [
+  {...r,action:{access:'allow',inspection:'inspect'}},
+  {...r,action:{access:'deny',inspection:'bypass'}},
+  {...r,action:{...r.action,require_workload_attestation:true}},
+  {...r,source:['device-a']}, {...r,destination:['a','b']},
+  {...r,service_id:'ssh'}, {...r,risk_at_least:'high'}, {...r,allowed_tool_ids:['tool']},
+  {...r,id:'ordinary-rule'}, {...r,plane:'eastwest'},
+ ]) assert.equal(context.isCertPinSummaryRule(changed),false,JSON.stringify(changed));
+});

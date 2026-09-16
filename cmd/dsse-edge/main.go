@@ -2444,33 +2444,13 @@ func main() {
 		func() []knownbypass.Group { return catalogFeed.EffectiveCatalog().Entries }, configuredInterceptHosts, operatorStaticBypass)
 	applyMaterializedCertPinBypass := applyInspectionPosture
 
-	// Migrate cert-pin bypasses materialized before they became first-class rules: emit each as an authored Egress
-	// rule now (idempotent) so every pinned-site bypass is one consistent rule and the single bypass source above
-	// covers them. Done before the first applyInspectionPosture so the migrated rules are in place when the bypass
-	// set is first built.
-	//
-	// ★ NOT ON A CONFIG-PULLING EDGE (2026-08-11). This migration authors rules and endpoint assets from a store
-	// only this instance has, and on a CP-authoritative deployment that is a resurrection: the control plane
-	// removes them on the next pull, this code recreates them on the next restart, and the two take turns. It was
-	// visible in the lab — six cert-pin rules emitted at startup and deleted minutes later by the bundle, every
-	// time the Edge came up.
-	//
-	// Adoption is authored on the control plane now (admin_policy_candidate_routes.go), so a materialized
-	// candidate here is a LOCAL OBSERVATION whose authored consequence already lives, or does not live, upstream.
-	// An Edge is a replaceable instance; letting one reinstate an inspection bypass out of its own history is
-	// exactly the authority this deployment decided the CP holds.
-	if strings.TrimSpace(*configSourceURL) == "" {
-		for _, c := range materializedCertPinCandidates(policyCandidateStore, pb.TenantID) {
-			if err := emitCertPinBypassRule(assetStore, ruleStore, c); err != nil {
-				log.Printf("migrate cert-pin bypass %s to rule: %v", c.CandidateID, err)
-			}
-		}
-	} else if n := len(materializedCertPinCandidates(policyCandidateStore, pb.TenantID)); n > 0 {
-		// Said out loud, because these bypasses were real decisions someone made on this instance and they are
-		// NOT being reinstated. Silence here would read as "there were none".
-		log.Printf("cert-pin: %d materialized candidate(s) in this Edge's local store are NOT being re-authored — "+
-			"the control plane authors bypasses on this deployment. If one of them should still be in force, add it "+
-			"there (POST /admin/cert-pin-bypass) or it does not exist for the fleet.", n)
+	// Candidate status is history, not current authored intent. Recreating a rule
+	// here would undo deletion, disabling, inspection edits or an incomplete save.
+	// This applies to local stores as well as configuration-pulling Edges.
+	if n := len(materializedCertPinCandidates(policyCandidateStore, pb.TenantID)); n > 0 {
+		log.Printf("cert-pin: %d materialized candidate(s) retained as history; startup does not recreate bypass rules. "+
+			"Saved Egress rules determine bypass. Review Sites to Bypass and Internet Access; "+
+			"explicitly register a still-required legacy bypass at the configuration authority.", n)
 	}
 	// Likewise migrate any legacy SaaS Optimize bypass selection (posture.bypass_groups) to authored rules, so the
 	// engine reads ONE bypass source (authored rules) and the Optimize toggle is a real, visible rule. No-op when
@@ -5032,61 +5012,8 @@ func configWriteRejectedWhenSourced(w http.ResponseWriter, configSourceURL, reso
 	return true
 }
 
-// materializedCertPinBypassHosts returns the host/SNI of every materialized cert-pinning candidate for
-// the tenant — the destinations the interception engine should raw-forward (decrypt-bypass). Only
-// candidates that an admin has approved and materialized appear here; pending/approved ones do not.
-func materializedCertPinBypassHosts(store *policycandidate.Store, tenantID string) []string {
-	if store == nil {
-		return nil
-	}
-	resp, err := store.List(context.Background(), tenantID, policycandidate.ListOptions{Status: "materialized", Limit: 1000})
-	if err != nil {
-		return nil
-	}
-	hosts := []string{}
-	for _, c := range resp.Candidates {
-		if c.Source != policycandidate.SourceCertPinningDetection {
-			continue
-		}
-		if h := strings.TrimSpace(c.SNI); h != "" {
-			hosts = append(hosts, h)
-		}
-		if h := strings.TrimSpace(c.Host); h != "" {
-			hosts = append(hosts, h)
-		}
-	}
-	return hosts
-}
-
-// materializedCertPinBypassRefs is materializedCertPinBypassHosts paired with the candidate id of each bypass, so
-// the Egress view can offer a Revoke (suppress the candidate → re-intercept the host), not just display it.
-func materializedCertPinBypassRefs(store *policycandidate.Store, tenantID string) []certPinBypassRef {
-	if store == nil {
-		return nil
-	}
-	resp, err := store.List(context.Background(), tenantID, policycandidate.ListOptions{Status: "materialized", Limit: 1000})
-	if err != nil {
-		return nil
-	}
-	refs := []certPinBypassRef{}
-	for _, c := range resp.Candidates {
-		if c.Source != policycandidate.SourceCertPinningDetection {
-			continue
-		}
-		host := strings.TrimSpace(c.SNI)
-		if host == "" {
-			host = strings.TrimSpace(c.Host)
-		}
-		if host != "" {
-			refs = append(refs, certPinBypassRef{Host: host, CandidateID: c.CandidateID})
-		}
-	}
-	return refs
-}
-
-// materializedCertPinCandidates returns the full materialized cert-pinning candidates for a tenant — used at
-// startup to migrate any that predate the cert-pin-bypass-as-rule model into emitted Egress rules, so every
-// pinned-site bypass is a single, consistent authored rule (the rule is the bypass's only source).
+// materializedCertPinCandidates returns historical adoption requests for a tenant.
+// Startup reports their presence without recreating authored rules from them.
 func materializedCertPinCandidates(store *policycandidate.Store, tenantID string) []policycandidate.Candidate {
 	if store == nil {
 		return nil
@@ -6540,7 +6467,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// a no-op. This is the bridge that lets the uncovered-flow count fall to 0, the readiness signal for disabling
 	// Allow-all (S5). It reuses the exact same ruleStore.Upsert + recompile as POST /admin/rules, so an adopted
 	// rule is indistinguishable from a hand-authored one and is editable/deletable in the normal Rules UI.
-	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)
+	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, recompileAuthoredRules)
 	registerPredefinedCatalogRoutes(mux, adminEndpoint, config, evaluator, writer)
 	// The one file every endpoint needs, issued by the deployment that already holds the key to sign it.
 	// See admin_agent_profile_routes.go.

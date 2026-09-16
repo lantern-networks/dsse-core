@@ -133,7 +133,7 @@ async function renderRuleList(section, plane, direction) {
     const certPins = [];
     entries.forEach((entry) => {
       if (entry.kind === "authored" && entry.rule) {
-        if (entry.rule.id && entry.rule.id.startsWith("certpin-rule-")) { certPins.push(entry.rule); return; }
+        if (isCertPinSummaryRule(entry.rule) && !entry.destination_unresolved && !entry.service_unresolved && !entry.inspection_source_warning) { certPins.push(entry.rule); return; }
         rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved, service_unresolved: entry.service_unresolved, inspection_source_warning: entry.inspection_source_warning }), idx, section, plane, direction));
         return;
       }
@@ -489,6 +489,17 @@ function derivedRow(entry, section, plane, direction) {
   ]);
 }
 
+// Only the original unrestricted allow/bypass shape fits the compact presentation.
+// Edited rules must retain their ordinary row and editor instead of hiding intent.
+function isCertPinSummaryRule(rule) {
+  return !!rule && typeof rule.id === "string" && rule.id.startsWith("certpin-rule-") &&
+    rule.plane === "egress" && rule.action?.access === "allow" && rule.action?.inspection === "bypass" &&
+    Object.keys(rule.action).every(key => key === "access" || key === "inspection") &&
+    Array.isArray(rule.source) && rule.source.length === 1 && rule.source[0] === "*" &&
+    Array.isArray(rule.destination) && rule.destination.length === 1 &&
+    !rule.service_id && !rule.risk_at_least && !rule.allowed_tool_ids?.length;
+}
+
 // certPinSummaryRow collapses the per-host cert-pin bypass rules (authored egress rules whose id starts with
 // "certpin-rule-") into a single row. The per-host list + controls live in the Details modal so the Internet
 // Access view isn't flooded with one row per site. Access/Inspection are fixed (Allow + Bypass).
@@ -506,7 +517,7 @@ function certPinSummaryRow(rules, idx, section, plane, direction) {
       el("strong", { text: bl({ en: "Cert-pin bypass", ja: "ピンニングによる検査除外" }) }),
       el("div", { class: "ui-view-desc" }, uiBadge(bl({ en: n + " sites", ja: n + " 件のサイト" }), "off")),
     ]),
-    el("td", {}, el("span", { class: "rule-expr", text: bl({ en: n + " sites where TLS inspection is skipped", ja: "TLS 傍受を省略する " + n + " 件のサイト" }) })),
+    el("td", {}, el("span", { class: "rule-expr", text: bl({ en: n + " saved bypass rules", ja: "保存済みの検査除外ルール " + n + " 件" }) })),
     el("td", {}, accessBadge("allow")),
     el("td", {}, inspectionBadge("bypass")),
     el("td", {}, statusCell),

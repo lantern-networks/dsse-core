@@ -21,11 +21,11 @@ const systemBypassFloorPriority = 900000
 // effectiveEgressRuleEntry is ONE row of the unified Egress view: every effective egress rule, whatever surface
 // it lives on, normalized to the same source → destination : service ⇒ access × inspection shape. An operator
 // expects the Egress view to be the single pane for all egress decisions — not just authored rules but also the
-// bypass that is scattered across the inspection posture (known-bypass OS/cert floor, SaaS Optimize) and the
-// cert-pin approval queue. Each entry is tagged by Kind and carries the capability flags the Console needs to
+// bypass from inspection posture (known-bypass OS/cert floor, SaaS Optimize). Cert-pin bypasses are authored
+// rules. Each entry is tagged by Kind and carries the capability flags the Console needs to
 // render the right control (edit a rule, toggle a policy, toggle the known-bypass floor, or info-only).
 type effectiveEgressRuleEntry struct {
-	Kind        string `json:"kind"` // authored | builtin_default | known_bypass | optimize_bypass | cert_pin_bypass
+	Kind        string `json:"kind"` // authored | builtin_default | known_bypass | optimize_bypass
 	ID          string `json:"id"`
 	Name        string `json:"name,omitempty"`
 	Priority    int    `json:"priority"`
@@ -52,13 +52,6 @@ type effectiveEgressRuleEntry struct {
 	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
 }
 
-// certPinBypassRef pairs a materialized cert-pin bypass host with its candidate id, so the Egress view can offer
-// a Revoke action (suppress the candidate → the host is re-intercepted) — not just display it read-only.
-type certPinBypassRef struct {
-	Host        string
-	CandidateID string
-}
-
 type effectiveEgressRuleListResponse struct {
 	Rules []effectiveEgressRuleEntry `json:"rules"`
 	Note  string                     `json:"note"`
@@ -74,11 +67,6 @@ type effectiveEgressInputs struct {
 	KnownEnabled    bool                                 // the known-bypass master toggle
 	EffectiveBypass []string                             // engine's live raw-forward set, to mark a known group active
 	OptimizeLegacy  []inspectionposture.AuthDecryptGroup // SaaS Optimize groups still selected via posture.bypass_groups (pre-B-1)
-	CertPinBypasses []certPinBypassRef                   // admin-approved (materialized) cert-pin bypasses (host + candidate id)
-	// AuthoredBypassHosts is the resolved destination set of authored bypass rules (EgressBypassFQDNs). A cert-pin
-	// host that now has an authored bypass rule (Phase C) is shown once — as that rule — not also as a derived
-	// cert_pin_bypass row, so the unified view does not double-list it.
-	AuthoredBypassHosts []string
 	// UnresolvedRuleIDs are the authored rules whose destination resolves to NO address for this tenant. The
 	// compiler emits a match-nothing sentinel for those and logs "a DENY here is NOT enforcing"; this carries
 	// the same fact to the screen, where a rule was showing as Active with no hint that it enforces nothing.
@@ -109,11 +97,11 @@ func subjectText(ids []string, aliasByID map[string]string) string {
 
 // buildEffectiveEgressRules assembles the unified, precedence-aware list of every effective egress rule across
 // all surfaces. Authored rules and the built-in default are decisions (allow/deny/authenticate); known-bypass,
-// Optimize, and cert-pin entries are inspection=bypass rows (raw-forward, still steered + policy-gated). The
+// and Optimize entries are inspection=bypass rows (raw-forward, still steered + policy-gated). The
 // engine merges all of these at runtime — this view just makes them all visible and toggleable in one place.
 func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleListResponse {
 	out := effectiveEgressRuleListResponse{
-		Note: "Every effective egress rule, normalized to source → destination : service ⇒ access × inspection. Authored rules are editable; the built-in default and the known-bypass floor are toggleable; cert-pin bypass is managed in the approval queue. Bypass means the Edge raw-forwards without decrypting (still steered + policy-gated).",
+		Note: "Every effective egress rule, normalized to source → destination : service ⇒ access × inspection. Authored rules are editable; the built-in default and the known-bypass floor are toggleable; cert-pin bypasses are authored rules. Bypass means the Edge raw-forwards without decrypting (still steered + policy-gated).",
 	}
 
 	// 1. Authored egress rules (editable, deletable).
@@ -213,28 +201,8 @@ func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleList
 		})
 	}
 
-	// 5. Cert-pin bypass — admin-approved (materialized) cert-pinned hosts, managed in the approval queue. A host
-	// that now has an authored bypass rule (Phase C emits one on materialize) is skipped here — it is already
-	// shown above as that authored rule, so the unified view lists it once.
-	authoredBypass := map[string]bool{}
-	for _, h := range in.AuthoredBypassHosts {
-		authoredBypass[strings.TrimSpace(strings.ToLower(h))] = true
-	}
-	seen := map[string]bool{}
-	for _, ref := range in.CertPinBypasses {
-		h := strings.TrimSpace(strings.ToLower(ref.Host))
-		if h == "" || seen[h] || authoredBypass[h] {
-			continue
-		}
-		seen[h] = true
-		out.Rules = append(out.Rules, effectiveEgressRuleEntry{
-			Kind: "cert_pin_bypass", ID: "certpin-" + h, Name: h, Priority: systemBypassFloorPriority,
-			SourceText: "Any", DestText: h, ServiceText: "HTTPS",
-			Access: "allow", Inspection: "bypass", Status: "active",
-			Editable: false, Deletable: false, ToggleKind: "cert_pin_revoke", CandidateID: ref.CandidateID,
-			Detail: "Admin-approved cert-pin bypass. Revoke re-intercepts the host (suppresses the candidate).",
-		})
-	}
+	// Cert-pin bypasses are ordinary authored rules above. Candidate history
+	// must not synthesize an active row after a rule is deleted or disabled.
 
 	// Stable order: by ascending priority, then kind, then id — authored low-priority rules first, the catch-all
 	// default (priority 1000000) last, bypass floors grouped by their nominal priority in between.

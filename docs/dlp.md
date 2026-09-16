@@ -42,6 +42,25 @@ The known-safe **allowlist retains its authored values in readable form** for ad
 Use it only for deliberate non-sensitive exceptions, and test that nearby real matches
 remain detectable. Custom keywords are also authored configuration, not secret storage.
 
+## Saving custom identifiers
+
+Use **Sensitive Data → Identifiers** to add, edit, or delete patterns and keyword lists.
+When `-dlp-classifier-store` is configured, these edits must be accepted by that store
+before the authored definitions and compiled scanner are updated. A failed or unconfirmed
+save returns an error and leaves the current live definitions in place. A storage error
+can occur after bytes were written: the error does not prove that the on-disk snapshot
+is unchanged. Check storage health and the saved configuration before retrying. Without
+a configured store, changes are in memory only and do not survive a restart.
+
+The API replaces the entire tenant list; send `{"classifiers":[]}` to clear it explicitly.
+A missing or null `classifiers` field is rejected. Concurrent administrators should reload
+before editing: this endpoint does not provide revision-based conflict detection.
+Successful local saving does not establish delivery to another Edge or inspection of traffic.
+
+The administration write audit records the actor, tenant, endpoint and outcome, without
+classifier patterns, keyword values or preview text. It is not a per-identifier change diff
+or a detection event. Follow the traffic checks below to confirm actual DLP coverage.
+
 ## Actions and account scope
 
 | Action | Current behavior on a qualifying match |

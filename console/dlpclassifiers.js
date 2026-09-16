@@ -91,7 +91,7 @@ async function renderDLPClassifiersView(content, opts) {
     if (!ok) return;
     const next = _specs.filter((_, idx) => idx !== i);
     try { await save(next, bl({ en: "Identifier deleted", ja: "識別子を削除しました" })); }
-    catch (e) { uiToast(String(e.message || e), "danger"); }
+    catch (e) { uiToast(String(e.message || e), "err"); }
   }
 
   // openEditor(index|null): add (null) or edit an existing classifier. Builds the whole next-set on save and POSTs.
@@ -156,18 +156,22 @@ async function renderDLPClassifiersView(content, opts) {
       } catch (e) { previewOut.textContent = bl({ en: "Pattern not valid yet: " + e.message, ja: "パターンが未完成: " + e.message }); }
     }
 
+    const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }), onClick: onSave });
+    const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
     const modal = uiModal({
       title: editing ? bl({ en: "Edit identifier", ja: "識別子を編集" }) : bl({ en: "Add custom identifier", ja: "カスタム識別子を追加" }),
-      body: [nameF.el, descF.el, kindF.el, regexWrap, keywordWrap, sampleF.el, previewOut],
+      body: [nameF.el, descF.el, kindF.el, regexWrap, keywordWrap, sampleF.el, previewOut, saveError],
       footer: [
         el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }),
-        el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }), onClick: onSave }),
+        submit,
       ],
     });
     syncKind();
     nameF.focus();
 
     async function onSave() {
+      if (submit.disabled) return;
+      saveError.style.display = "none";
       if (!nameF.validate()) { nameF.focus(); return; }
       const kind = kindF.get();
       const spec = { name: nameF.get(), description: descF.get(), kind };
@@ -186,8 +190,13 @@ async function renderDLPClassifiersView(content, opts) {
       if (dupe) { nameF.setError(bl({ en: "An identifier with this name already exists.", ja: "同じ名前の識別子が既に存在します。" })); return; }
       const next = _specs.slice();
       if (index != null) next[index] = spec; else next.push(spec);
+      submit.disabled = true;
       try { await save(next, editing ? bl({ en: "Identifier updated", ja: "識別子を更新しました" }) : bl({ en: "Identifier added", ja: "識別子を追加しました" })); modal.close(); }
-      catch (e) { uiToast(String(e.message || e), "danger"); }
+      catch (e) {
+        saveError.textContent = String(e.message || e);
+        saveError.style.display = "";
+        saveError.scrollIntoView({ block: "nearest" });
+      } finally { submit.disabled = false; }
     }
   }
 

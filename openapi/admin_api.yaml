@@ -5302,7 +5302,7 @@ paths:
           description: Current custom classifiers for the tenant.
     post:
       summary: Hot-apply the tenant's operator-defined custom DLP classifiers (slice C).
-      description: Requires admin.dlp.write. Atomically replaces the tenant's whole custom-classifier set (empty = clear), recompiling it into the live scan set (no restart). Rejects a reserved/malformed name, an over-cap or un-compilable regex (RE2, no backreferences), a regex that matches the empty string, and an empty/over-cap keyword dictionary. Caps — 64 classifiers, 512-char pattern, 256 keywords. The tenant is taken from the admin identity, not the body.
+      description: Requires admin.dlp.write. Replaces the tenant's whole custom-classifier set ([] = clear) after validation and acceptance by configured storage, then recompiles it into the live scan set (no restart). Missing or null classifiers is rejected. Without configured storage, changes remain in memory only. Concurrent writes have no revision conflict detection. A save error may follow an on-disk write and does not prove disk rollback. Rejects a reserved/malformed name, an over-cap or un-compilable regex (RE2, no backreferences), a regex that matches the empty string, and an empty/over-cap keyword dictionary. Caps — 64 classifiers, 512-char pattern, 256 keywords. The tenant is taken from the admin identity, not the body.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5311,6 +5311,7 @@ paths:
           application/json:
             schema:
               type: object
+              required: [classifiers]
               properties:
                 classifiers:
                   type: array
@@ -5338,9 +5339,11 @@ paths:
                         description: Regex kind only — match case-insensitively.
       responses:
         "200":
-          description: Classifiers applied; returns the new live set.
+          description: Classifiers saved to configured storage and applied locally (in-memory only when no store is configured); returns the current live set.
         "400":
           description: Invalid classifiers (bad name, un-compilable/too-broad regex, empty/over-cap dictionary, or over the 64-classifier cap).
+        "500":
+          description: Saving could not be confirmed. Live definitions are unchanged; the on-disk result may be uncertain. Check storage before retrying.
   /admin/dlp-allowlist:
     get:
       summary: Read the tenant's DLP allowlist (known-safe values, slice F).

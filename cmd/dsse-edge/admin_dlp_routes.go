@@ -291,8 +291,8 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	}))
 	// DLP custom classifiers (slice C): read/hot-apply the operator-defined identifiers (regex + keyword
 	// dictionaries) the DLP scan detects alongside the built-ins. Non-secret: a classifier emits only its name +
-	// a count, never the matched bytes. POST replaces the whole tenant set (empty = clear); per-classifier
-	// compile errors are reported so the admin sees which were rejected while the rest still apply.
+	// a count, never the matched bytes. POST replaces the whole tenant set ([] = clear);
+	// validation and configured storage must succeed before the live set changes.
 	mux.HandleFunc("GET /admin/dlp-classifiers", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"classifiers": dlpClassifierStore.SpecsForTenant(adminTenantIDFromRequest(r))})
 	}))
@@ -304,18 +304,22 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Classifiers []dlp.ClassifierSpec `json:"classifiers"`
+			Classifiers *[]dlp.ClassifierSpec `json:"classifiers"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp classifiers: %w", err))
 			return
 		}
-		if len(body.Classifiers) > dlp.MaxClassifiers {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("too many classifiers: %d (max %d)", len(body.Classifiers), dlp.MaxClassifiers))
+		if body.Classifiers == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("classifiers must be an array; use [] to clear"))
+			return
+		}
+		if len(*body.Classifiers) > dlp.MaxClassifiers {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("too many classifiers: %d (max %d)", len(*body.Classifiers), dlp.MaxClassifiers))
 			return
 		}
 		// Validate up-front so a malformed set is rejected atomically (all-or-nothing), never partially applied.
-		if _, errs := dlp.NewClassifierSet(body.Classifiers); len(errs) > 0 {
+		if _, errs := dlp.NewClassifierSet(*body.Classifiers); len(errs) > 0 {
 			msgs := make([]string, 0, len(errs))
 			for _, e := range errs {
 				msgs = append(msgs, e.Error())
@@ -324,8 +328,12 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		dlpClassifierStore.SetSpecs(tenant, body.Classifiers)
-		logInfof("dlp_classifiers_applied_by_admin tenant=%s classifiers=%d", tenant, len(body.Classifiers))
+		if err := dlpClassifierStore.SetSpecsDurable(tenant, *body.Classifiers); err != nil {
+			logInfof("dlp_classifiers_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving identifiers could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
+		logInfof("dlp_classifiers_applied_by_admin tenant=%s classifiers=%d", tenant, len(*body.Classifiers))
 		writeJSON(w, http.StatusOK, map[string]any{"classifiers": dlpClassifierStore.SpecsForTenant(tenant)})
 	}))
 	// DLP allowlist (slice F, false-positive tuning): the operator-declared KNOWN-SAFE values whose DLP matches are

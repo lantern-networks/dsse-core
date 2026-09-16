@@ -183,7 +183,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 	}
 	dlpClassifierStore := newDLPClassifierRuntimeStore()
 	// Durable custom classifiers (optional): rehydrate + recompile on boot + flush periodically so operator-defined
-	// identifiers survive an Edge restart. SetSpecs only marks dirty, so a background ticker does the I/O.
+	// identifiers survive an Edge restart. Admin writes save synchronously; the ticker flushes staged updates.
 	if storeShouldBeWired(config.DLPClassifierStorePath) {
 		if p, e := cpStateBlobPersister(config.DLPClassifierStorePath, cpStateBlobDB, "dlp_classifiers"); e != nil {
 			log.Fatalf("resolve dlp classifier store %q: %v", config.DLPClassifierStorePath, e)

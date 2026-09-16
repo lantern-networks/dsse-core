@@ -106,7 +106,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve dlp allowlist store %q: %v", config.DLPAllowlistStorePath, e)
 		} else if p != nil {
 			if lerr := dlpAllowlistStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp allowlist store: load prior values failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp allowlist store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
@@ -189,7 +189,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve dlp classifier store %q: %v", config.DLPClassifierStorePath, e)
 		} else if p != nil {
 			if lerr := dlpClassifierStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp classifier store: load prior classifiers failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp classifier store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {

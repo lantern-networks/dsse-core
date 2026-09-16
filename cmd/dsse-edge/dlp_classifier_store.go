@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -149,33 +150,50 @@ type classifierStoreSnapshot struct {
 	Specs map[string][]dlp.ClassifierSpec `json:"specs"`
 }
 
-// SetPersister attaches durable storage and rehydrates + recompiles the specs on boot (so operator classifiers
-// survive a restart). Call once at startup; pair with a periodic PersistIfDirty flush. A load error is non-fatal.
+// SetPersister validates the complete library before adopting either state or
+// writer. It must not publish a partly compiled snapshot or discard pending edits.
 func (s *dlpClassifierRuntimeStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty {
+		return fmt.Errorf("save pending classifier changes before replacing the persistence store")
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
-	if err != nil || len(data) == 0 {
+	if err != nil {
 		return err
+	}
+	if data == nil {
+		s.persister = p
+		s.dirty = len(s.specs) > 0
+		return nil
 	}
 	var snap classifierStoreSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	if err := decodeDLPLibrarySnapshot(data, "specs", &snap); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	next := map[string][]dlp.ClassifierSpec{}
+	sets := map[string]*dlp.ClassifierSet{}
 	for tenant, specs := range snap.Specs {
-		if len(specs) == 0 {
-			continue
+		if !validDLPLibraryTenant(tenant) || len(specs) > dlp.MaxClassifiers {
+			return fmt.Errorf("invalid classifier snapshot")
 		}
-		set, _ := dlp.NewClassifierSet(specs) // invalid entries are skipped; the set holds what compiled
-		s.specs[tenant] = specs
-		s.sets[tenant] = set
+		if len(specs) == 0 {
+			continue // Explicit [] or null for a tenant clears its definitions.
+		}
+		set, errs := dlp.NewClassifierSet(specs)
+		if len(errs) > 0 {
+			return fmt.Errorf("invalid classifier snapshot")
+		}
+		next[tenant], sets[tenant] = specs, set
 	}
+	if !reflect.DeepEqual(s.specs, next) {
+		s.generation++
+	}
+	s.specs, s.sets, s.persister, s.dirty = next, sets, p, false
 	return nil
 }
 

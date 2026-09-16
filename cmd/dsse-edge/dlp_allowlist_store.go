@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -151,31 +152,51 @@ type allowlistStoreSnapshot struct {
 	Values map[string][]string `json:"values"`
 }
 
-// SetPersister attaches durable storage and rehydrates + recompiles on boot (so the allowlist survives a restart).
+// SetPersister validates the whole snapshot before replacing state and writer.
+// Values are recompiled with the local salt; the saved values are authoritative.
 func (s *dlpAllowlistRuntimeStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty {
+		return fmt.Errorf("save pending allowlist changes before replacing the persistence store")
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
-	if err != nil || len(data) == 0 {
+	if err != nil {
 		return err
+	}
+	if data == nil {
+		s.persister = p
+		s.dirty = len(s.values) > 0
+		return nil
 	}
 	var snap allowlistStoreSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	if err := decodeDLPLibrarySnapshot(data, "values", &snap); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	next := map[string][]string{}
+	sets := map[string]*dlp.Allowlist{}
 	for tenant, vals := range snap.Values {
-		if len(vals) == 0 {
+		if !validDLPLibraryTenant(tenant) {
+			return fmt.Errorf("invalid allowlist snapshot")
+		}
+		values, err := validatedAllowlistValues(vals)
+		if err != nil {
+			return fmt.Errorf("invalid allowlist snapshot")
+		}
+		if len(values) == 0 {
 			continue
 		}
-		s.values[tenant] = vals
-		s.sets[tenant] = dlp.NewAllowlist(s.salt+"\x00"+tenant, vals)
+		next[tenant] = values
+		sets[tenant] = dlp.NewAllowlist(s.salt+"\x00"+tenant, values)
 	}
+	if !reflect.DeepEqual(s.values, next) {
+		s.generation++
+	}
+	s.values, s.sets, s.persister, s.dirty = next, sets, p, false
 	return nil
 }
 

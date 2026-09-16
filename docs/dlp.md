@@ -103,6 +103,25 @@ A missing or null `classifiers` field is rejected. Concurrent administrators sho
 before editing: this endpoint does not provide revision-based conflict detection.
 Successful local saving does not establish delivery to another Edge or inspection of traffic.
 
+Configured identifier and allowlist stores now validate the entire saved collection
+before adopting it. An invalid regex, classifier definition or allowlist value prevents
+restoration of the whole candidate; it is not silently omitted from the scanner while
+remaining visible in the Console. Loading failure retains the previous runtime state
+and writer, and configured startup fails instead of continuing with an empty library.
+Startup refusals appear in the process log; no administrator mutation has occurred.
+
+A missing file permits first startup. An existing empty file, missing or null top-level
+collection, unknown fields or invalid tenant keys are rejected. The existing `specs`
+and `values` snapshot formats are retained. An explicit empty collection replaces the
+previous library; an empty or null tenant list clears that tenant. Allowlist values use
+the same whitespace trimming and exact deduplication as administrator writes, and are
+compiled with the local salt. Loading does not rewrite the snapshot.
+
+Keep a failed snapshot for diagnosis and restore a known-good copy or correct the source
+configuration; removing the file would discard its definitions. Pending unsaved changes
+must be saved before replacing or detaching the writer. This does not provide conflict
+detection between independent writers or prevent selection of an older valid snapshot.
+
 The administration write audit records the actor, tenant, endpoint and outcome, without
 classifier patterns, keyword values or preview text. It is not a per-identifier change diff
 or a detection event. Follow the traffic checks below to confirm actual DLP coverage.
@@ -147,8 +166,9 @@ map represents a cleared library. Runtime store replacement validates the whole 
 before replacing its state and writer; failed loads retain both. Pending unsaved changes
 must reach the existing writer before it can be replaced or detached.
 
-This restoration guarantee applies to the EDM store. Other DLP library stores and the
-atomic persistence of a received configuration bundle require separate validation.
+This restoration guarantee applies to the EDM store; identifier and allowlist restoration
+is described above. Named DLP policy restoration and the atomic persistence of a received
+configuration bundle require separate validation.
 
 ## Actions and account scope
 

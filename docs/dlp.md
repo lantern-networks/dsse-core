@@ -42,6 +42,23 @@ The known-safe **allowlist retains its authored values in readable form** for ad
 Use it only for deliberate non-sensitive exceptions, and test that nearby real matches
 remain detectable. Custom keywords are also authored configuration, not secret storage.
 
+## Loading and confirming library changes
+
+The three **Sensitive Data** tabs require a valid list and matching organization before
+editing. A failed or malformed response displays a reload action instead of an editable
+empty list. If a save response is missing, malformed or does not match the submitted
+change, the Console keeps the draft and reports an unconfirmed result. The server may
+already have saved it. Close the editor, reload the list and inspect the saved state before
+making another change. Administrative audit records describe the server's outcome, so a
+committed change can have a successful audit even when its browser response was lost.
+
+List and mutation responses include `tenant_id`. The Console sends `expected_tenant_id`
+on writes (a query parameter for dataset deletion); a nonempty value that differs from
+the authenticated request context is rejected without changing the library. Older API
+clients may omit this precondition and remain scoped to their authenticated request context. Serve the Console and API from
+compatible versions: the updated editors refuse responses without organization identity.
+This guards context changes, not simultaneous edits by administrators in one tenant.
+
 ## Managing known-safe exceptions
 
 Use **Sensitive Data → Allowlist** only for confirmed non-sensitive values. Numeric

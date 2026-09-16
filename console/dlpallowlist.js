@@ -25,17 +25,15 @@ async function renderDLPAllowlistView(content, opts) {
   content.appendChild(section);
   let _values = [];
 
-  async function load() {
-    uiState(section, "loading");
-    try { const r = await apiFetch("GET", "/admin/dlp-allowlist"); if (!r.ok) throw new Error("HTTP " + r.status); _values = (r.body && r.body.values) || []; }
-    catch (e) { uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
-    render();
-  }
+  const library = dlpLibraryView(content, section, "values", "/admin/dlp-allowlist", rows => { _values = rows; render(); });
+  async function load() { return library.load(); }
 
-  async function save(next, okMsg) {
-    const r = await apiFetch("POST", "/admin/dlp-allowlist", { values: next });
-    if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
-    _values = (r.body && r.body.values) || next;
+  async function save(next, okMsg, stamp) {
+    const expected = [...new Set(next.map(v => v.trim()))];
+    const rows = await library.write("POST", "/admin/dlp-allowlist", {values:next}, stamp,
+      actual => JSON.stringify(actual) === JSON.stringify(expected));
+    if (!library.current()) return;
+    _values = rows;
     uiToast(okMsg || bl({ en: "Saved", ja: "保存しました" }), "ok");
     render();
   }
@@ -60,6 +58,7 @@ async function renderDLPAllowlistView(content, opts) {
   }
 
   function addValue() {
+    const stamp = library.stamp();
     const valueF = uiField({ name: "value", label: bl({ en: "Value DLP should ignore (e.g. a test card)", ja: "DLP が無視する値(例: テストカード)" }), placeholder: "4111 1111 1111 1111" });
     const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add", ja: "追加" }), onClick: onSave });
     const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
@@ -74,22 +73,23 @@ async function renderDLPAllowlistView(content, opts) {
       if (!val) { valueF.focus(); return; }
       if (_values.some((x) => x === val)) { uiToast(bl({ en: "Already on the list.", ja: "既に登録済みです。" }), "info"); return; }
       submit.disabled = true;
-      try { await save(_values.concat([val]), bl({ en: "Value allowlisted", ja: "値を許可リストに追加しました" })); modal.close(); }
-      catch (e) { saveError.textContent = String(e.message || e); saveError.style.display = ""; saveError.scrollIntoView({ block: "nearest" }); }
+      try { await save(_values.concat([val]), bl({ en: "Value allowlisted", ja: "値を許可リストに追加しました" }), stamp); if (library.current()) modal.close(); }
+      catch (e) { if (!library.current()) return; saveError.textContent = String(e.message || e); saveError.style.display = ""; saveError.scrollIntoView({ block: "nearest" }); }
       finally { submit.disabled = false; }
     }
   }
 
   async function remove(i) {
+    const stamp = library.stamp();
     const ok = await uiConfirm({
       title: bl({ en: "Remove from allowlist?", ja: "許可リストから削除?" }),
       body: bl({ en: 'DLP will resume flagging "' + _values[i] + '".', ja: '「' + _values[i] + '」を DLP が再び検出するようになります。' }),
       confirmLabel: bl({ en: "Remove", ja: "削除" }), danger: true,
     });
     if (!ok) return;
-    try { await save(_values.filter((_, idx) => idx !== i), bl({ en: "Removed", ja: "削除しました" })); }
-    catch (e) { uiToast(String(e.message || e), "err"); }
+    try { await save(_values.filter((_, idx) => idx !== i), bl({ en: "Removed", ja: "削除しました" }), stamp); }
+    catch (e) { if (library.current()) uiToast(String(e.message || e), "err"); }
   }
 
-  load();
+  return load();
 }

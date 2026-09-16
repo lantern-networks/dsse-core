@@ -295,7 +295,7 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// a count, never the matched bytes. POST replaces the whole tenant set ([] = clear);
 	// validation and configured storage must succeed before the live set changes.
 	mux.HandleFunc("GET /admin/dlp-classifiers", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"classifiers": dlpClassifierStore.SpecsForTenant(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "classifiers": dlpClassifierStore.SpecsForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-classifiers", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP classifiers") {
@@ -305,7 +305,8 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Classifiers *[]dlp.ClassifierSpec `json:"classifiers"`
+			Classifiers      *[]dlp.ClassifierSpec `json:"classifiers"`
+			ExpectedTenantID string                `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp classifiers: %w", err))
@@ -329,20 +330,24 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
 		if err := dlpClassifierStore.SetSpecsDurable(tenant, *body.Classifiers); err != nil {
 			logInfof("dlp_classifiers_save_unconfirmed tenant=%s", tenant)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving identifiers could not be confirmed; check the saved configuration before retrying"))
 			return
 		}
 		logInfof("dlp_classifiers_applied_by_admin tenant=%s classifiers=%d", tenant, len(*body.Classifiers))
-		writeJSON(w, http.StatusOK, map[string]any{"classifiers": dlpClassifierStore.SpecsForTenant(tenant)})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "classifiers": dlpClassifierStore.SpecsForTenant(tenant)})
 	}))
 	// DLP allowlist (slice F, false-positive tuning): the operator-declared KNOWN-SAFE values whose DLP matches are
 	// suppressed (a test card, a sample My Number used in docs, a benign email). POST replaces the whole tenant
 	// list (empty = clear). These are values the operator asserts are non-sensitive; the Console warns not to enter
 	// real secrets. The scanner keeps hashes; authored values are stored and distributed for management.
 	mux.HandleFunc("GET /admin/dlp-allowlist", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"values": dlpAllowlistStore.ValuesForTenant(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "values": dlpAllowlistStore.ValuesForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-allowlist", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP allowlist") {
@@ -352,7 +357,8 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Values *[]string `json:"values"`
+			Values           *[]string `json:"values"`
+			ExpectedTenantID string    `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp allowlist: %w", err))
@@ -368,13 +374,17 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
 		if err := dlpAllowlistStore.SetValuesDurable(tenant, values); err != nil {
 			logInfof("dlp_allowlist_save_unconfirmed tenant=%s", tenant)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving the allowlist could not be confirmed; check the saved configuration before retrying"))
 			return
 		}
 		logInfof("dlp_allowlist_applied_by_admin tenant=%s values=%d", tenant, len(values))
-		writeJSON(w, http.StatusOK, map[string]any{"values": dlpAllowlistStore.ValuesForTenant(tenant)})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "values": dlpAllowlistStore.ValuesForTenant(tenant)})
 	}))
 	// DLP fingerprints (slice E, Exact-Data-Match): fingerprint a SENSITIVE dataset (a list of exact values —
 	// customer record ids, employee numbers) into salted hashes under a named identifier; the scan then detects any
@@ -382,7 +392,7 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// stored and only the dataset name + value count are ever returned — the values are never persisted or shown
 	// back. GET lists datasets; POST creates/replaces one; DELETE removes one.
 	mux.HandleFunc("GET /admin/dlp-fingerprints", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"datasets": dlpFingerprintStore.DatasetsForTenant(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "datasets": dlpFingerprintStore.DatasetsForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-fingerprints", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP fingerprints") {
@@ -392,8 +402,9 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Name   string   `json:"name"`
-			Values []string `json:"values"`
+			Name             string   `json:"name"`
+			Values           []string `json:"values"`
+			ExpectedTenantID string   `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp fingerprints: %w", err))
@@ -408,6 +419,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
 		count, err := dlpFingerprintStore.SetDatasetDurable(tenant, body.Name, body.Values)
 		if err != nil {
 			if errors.Is(err, errInvalidFingerprintDataset) {
@@ -419,7 +434,7 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		logInfof("dlp_fingerprints_applied_by_admin tenant=%s dataset=%s values=%d", tenant, body.Name, count)
-		writeJSON(w, http.StatusOK, map[string]any{"dataset": dlpFingerprintDataset{Name: body.Name, Count: count}, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "dataset": dlpFingerprintDataset{Name: body.Name, Count: count}, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
 	}))
 	mux.HandleFunc("DELETE /admin/dlp-fingerprints", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP fingerprints") {
@@ -434,6 +449,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
+		if expected := r.URL.Query().Get("expected_tenant_id"); expected != "" && expected != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
 		removed, err := dlpFingerprintStore.RemoveDatasetDurable(tenant, name)
 		if err != nil {
 			logInfof("dlp_fingerprints_save_unconfirmed tenant=%s", tenant)
@@ -441,6 +460,6 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		logInfof("dlp_fingerprints_removed_by_admin tenant=%s dataset=%s removed=%t", tenant, name, removed)
-		writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "removed": removed, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
 	}))
 }

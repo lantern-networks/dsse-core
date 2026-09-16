@@ -5294,7 +5294,7 @@ paths:
   /admin/dlp-classifiers:
     get:
       summary: Read the tenant's operator-defined custom DLP classifiers (slice C).
-      description: Requires admin.dlp.read. Returns the tenant's custom identifiers — each a name plus either a regex pattern or a keyword dictionary — that the DLP scan detects alongside the built-in identifiers. NON-SECRET (a classifier only ever reports its name + a count, never matched bytes). See docs/dlp_vision_and_roadmap.md slice C.
+      description: Returns tenant_id alongside the list. Requires admin.dlp.read. Returns the tenant's custom identifiers — each a name plus either a regex pattern or a keyword dictionary — that the DLP scan detects alongside the built-in identifiers. NON-SECRET (a classifier only ever reports its name + a count, never matched bytes). See docs/dlp_vision_and_roadmap.md slice C.
       tags:
         - AdminDLPPolicy
       responses:
@@ -5302,7 +5302,7 @@ paths:
           description: Current custom classifiers for the tenant.
     post:
       summary: Hot-apply the tenant's operator-defined custom DLP classifiers (slice C).
-      description: Requires admin.dlp.write. Replaces the tenant's whole custom-classifier set ([] = clear) after validation and acceptance by configured storage, then recompiles it into the live scan set (no restart). Missing or null classifiers is rejected. Without configured storage, changes remain in memory only. Concurrent writes have no revision conflict detection. A save error may follow an on-disk write and does not prove disk rollback. Rejects a reserved/malformed name, an over-cap or un-compilable regex (RE2, no backreferences), a regex that matches the empty string, and an empty/over-cap keyword dictionary. Caps — 64 classifiers, 512-char pattern, 256 keywords. The tenant is taken from the admin identity, not the body.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Replaces the tenant's whole custom-classifier set ([] = clear) after validation and acceptance by configured storage, then recompiles it into the live scan set (no restart). Missing or null classifiers is rejected. Without configured storage, changes remain in memory only. Concurrent writes have no revision conflict detection. A save error may follow an on-disk write and does not prove disk rollback. Rejects a reserved/malformed name, an over-cap or un-compilable regex (RE2, no backreferences), a regex that matches the empty string, and an empty/over-cap keyword dictionary. Caps — 64 classifiers, 512-char pattern, 256 keywords. The tenant is taken from the admin identity, not the body.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5313,6 +5313,9 @@ paths:
               type: object
               required: [classifiers]
               properties:
+                expected_tenant_id:
+                  type: string
+                  description: Optional precondition. If nonempty, it must equal the authenticated tenant; it never selects a different tenant.
                 classifiers:
                   type: array
                   items:
@@ -5338,6 +5341,8 @@ paths:
                         type: boolean
                         description: Regex kind only — match case-insensitively.
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No mutation applied here.
         "200":
           description: Classifiers saved to configured storage and applied locally (in-memory only when no store is configured); returns the current live set.
         "400":
@@ -5347,7 +5352,7 @@ paths:
   /admin/dlp-allowlist:
     get:
       summary: Read the tenant's DLP allowlist (known-safe values, slice F).
-      description: Requires admin.dlp.read. Returns the operator-declared known-safe values whose DLP matches are suppressed (test cards, sample My Numbers, benign emails). These are values the operator asserts are non-sensitive. The compiled scanner holds hashes; administration stores and signed configuration bundles retain authored values.
+      description: Returns tenant_id alongside the list. Requires admin.dlp.read. Returns the operator-declared known-safe values whose DLP matches are suppressed (test cards, sample My Numbers, benign emails). These are values the operator asserts are non-sensitive. The compiled scanner holds hashes; administration stores and signed configuration bundles retain authored values.
       tags:
         - AdminDLPPolicy
       responses:
@@ -5355,7 +5360,7 @@ paths:
           description: Current allowlist values for the tenant.
     post:
       summary: Hot-apply the tenant's DLP allowlist (false-positive tuning, slice F).
-      description: Requires admin.dlp.write. Replaces the tenant's whole list after configured storage confirms the save; without a store it is memory-only. An explicit empty array clears the list. Numeric identifiers normalize digits with spaces, hyphens, parentheses or periods; email ignores case; other detector types use exact trimmed literals. Digits embedded in arbitrary text do not authorize a numeric match. Exact duplicates are removed. There is no revision-based conflict detection. Known-safe authored values are distributed in signed configuration bundles; update publisher and receivers together. Do NOT enter real secrets. Max 1000 values. The tenant is taken from the admin identity.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Replaces the tenant's whole list after configured storage confirms the save; without a store it is memory-only. An explicit empty array clears the list. Numeric identifiers normalize digits with spaces, hyphens, parentheses or periods; email ignores case; other detector types use exact trimmed literals. Digits embedded in arbitrary text do not authorize a numeric match. Exact duplicates are removed. There is no revision-based conflict detection. Known-safe authored values are distributed in signed configuration bundles; update publisher and receivers together. Do NOT enter real secrets. Max 1000 values. The tenant is taken from the admin identity.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5366,6 +5371,9 @@ paths:
               type: object
               required: [values]
               properties:
+                expected_tenant_id:
+                  type: string
+                  description: Optional precondition. If nonempty, it must equal the authenticated tenant; it never selects a different tenant.
                 values:
                   type: array
                   maxItems: 1000
@@ -5373,6 +5381,8 @@ paths:
                     type: string
                   description: Known-safe values to suppress (e.g. a test card, a sample My Number).
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No mutation applied here.
         "200":
           description: Allowlist applied; returns the new live values.
         "400":
@@ -5382,7 +5392,7 @@ paths:
   /admin/dlp-fingerprints:
     get:
       summary: List the tenant's Exact-Data-Match datasets (slice E).
-      description: Requires admin.dlp.read. Returns each fingerprinted dataset as name + value count — NON-SECRET (the values themselves are never persisted or returned; only salted hashes are stored).
+      description: Returns tenant_id alongside the list. Requires admin.dlp.read. Returns each fingerprinted dataset as name + value count — NON-SECRET (the values themselves are never persisted or returned; only salted hashes are stored).
       tags:
         - AdminDLPPolicy
       responses:
@@ -5390,7 +5400,7 @@ paths:
           description: Datasets (name + count) for the tenant.
     post:
       summary: Fingerprint a sensitive dataset for Exact-Data-Match (slice E).
-      description: Requires admin.dlp.write. Creates or replaces a named dataset by fingerprinting the supplied exact values into salted hashes; the scan then raises a finding under that name whenever one of the values appears in egress. Only hashes are stored; protect hashes and salts against guessing of source values. Values must be single ASCII tokens (letters, digits, - _ . @ +) up to 128 bytes. Matching lowercases letters and removes - and _. Normalized duplicates count once and values shorter than five normalized characters are ignored. Unsupported or zero-usable-value replacements are rejected without deleting the old dataset. Configured storage must accept the update before the local scanner changes; without storage this is in-memory only. A storage error may follow a disk write and does not prove rollback. Name must be lowercase snake_case (2–40 chars), not a reserved identifier. Max 100000 values. Tenant from the admin identity.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Creates or replaces a named dataset by fingerprinting the supplied exact values into salted hashes; the scan then raises a finding under that name whenever one of the values appears in egress. Only hashes are stored; protect hashes and salts against guessing of source values. Values must be single ASCII tokens (letters, digits, - _ . @ +) up to 128 bytes. Matching lowercases letters and removes - and _. Normalized duplicates count once and values shorter than five normalized characters are ignored. Unsupported or zero-usable-value replacements are rejected without deleting the old dataset. Configured storage must accept the update before the local scanner changes; without storage this is in-memory only. A storage error may follow a disk write and does not prove rollback. Name must be lowercase snake_case (2–40 chars), not a reserved identifier. Max 100000 values. Tenant from the admin identity.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5401,6 +5411,9 @@ paths:
               type: object
               required: [name, values]
               properties:
+                expected_tenant_id:
+                  type: string
+                  description: Optional precondition. If nonempty, it must equal the authenticated tenant; it never selects a different tenant.
                 name:
                   type: string
                   description: The identifier name the dataset detections are reported under.
@@ -5412,6 +5425,8 @@ paths:
                   maxItems: 100000
                   description: Single-token values to fingerprint; at least one must remain after normalization and short-value filtering. Hashed, never stored raw.
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No mutation applied here.
         "200":
           description: Dataset accepted by configured storage and applied locally; returns the dataset (name + count) and the tenant's datasets.
         "400":
@@ -5420,10 +5435,23 @@ paths:
           description: Saving could not be confirmed. Previous live dataset retained; the disk result may be uncertain.
     delete:
       summary: Remove an Exact-Data-Match dataset (slice E).
-      description: Requires admin.dlp.write. Deletes the named dataset (?name=) after acceptance by configured storage. A missing name is a no-op, with any pending staged changes saved first. Without storage this is in-memory only. Tenant from the admin identity.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Deletes the named dataset (?name=) after acceptance by configured storage. An absent dataset is a no-op, with any pending staged changes saved first. Without storage this is in-memory only. Tenant from the admin identity.
       tags:
         - AdminDLPPolicy
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema: { type: string }
+          description: Dataset identifier to remove.
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Optional nonempty tenant precondition, compared with the authenticated context before deletion.
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No deletion applied here.
         "200":
           description: Removed (or not present); returns the tenant's remaining datasets.
         "400":

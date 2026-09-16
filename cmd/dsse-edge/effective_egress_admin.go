@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/decision"
-	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/knownbypass"
 	"github.com/lantern-networks/dsse-core/policyrule"
 )
@@ -21,11 +20,11 @@ const systemBypassFloorPriority = 900000
 // effectiveEgressRuleEntry is ONE row of the unified Egress view: every effective egress rule, whatever surface
 // it lives on, normalized to the same source → destination : service ⇒ access × inspection shape. An operator
 // expects the Egress view to be the single pane for all egress decisions — not just authored rules but also the
-// bypass from inspection posture (known-bypass OS/cert floor, SaaS Optimize). Cert-pin bypasses are authored
+// bypass from inspection posture (known-bypass OS/cert floor). SaaS and cert-pin bypasses are authored
 // rules. Each entry is tagged by Kind and carries the capability flags the Console needs to
 // render the right control (edit a rule, toggle a policy, toggle the known-bypass floor, or info-only).
 type effectiveEgressRuleEntry struct {
-	Kind        string `json:"kind"` // authored | builtin_default | known_bypass | optimize_bypass
+	Kind        string `json:"kind"` // authored | builtin_default | known_bypass
 	ID          string `json:"id"`
 	Name        string `json:"name,omitempty"`
 	Priority    int    `json:"priority"`
@@ -62,11 +61,10 @@ type effectiveEgressInputs struct {
 	Eval            decision.Evaluator
 	Tenant          string
 	AuthoredRules   []policyrule.Rule
-	AliasByID       map[string]string                    // asset-catalog id -> alias, for authored source/destination display
-	KnownGroups     []knownbypass.Group                  // the OS/cert known-bypass floor
-	KnownEnabled    bool                                 // the known-bypass master toggle
-	EffectiveBypass []string                             // engine's live raw-forward set, to mark a known group active
-	OptimizeLegacy  []inspectionposture.AuthDecryptGroup // SaaS Optimize groups still selected via posture.bypass_groups (pre-B-1)
+	AliasByID       map[string]string   // asset-catalog id -> alias, for authored source/destination display
+	KnownGroups     []knownbypass.Group // the OS/cert known-bypass floor
+	KnownEnabled    bool                // the known-bypass master toggle
+	EffectiveBypass []string            // engine's live raw-forward set, to mark a known group active
 	// UnresolvedRuleIDs are the authored rules whose destination resolves to NO address for this tenant. The
 	// compiler emits a match-nothing sentinel for those and logs "a DENY here is NOT enforcing"; this carries
 	// the same fact to the screen, where a rule was showing as Active with no hint that it enforces nothing.
@@ -96,8 +94,8 @@ func subjectText(ids []string, aliasByID map[string]string) string {
 }
 
 // buildEffectiveEgressRules assembles the unified, precedence-aware list of every effective egress rule across
-// all surfaces. Authored rules and the built-in default are decisions (allow/deny/authenticate); known-bypass,
-// and Optimize entries are inspection=bypass rows (raw-forward, still steered + policy-gated). The
+// all surfaces. Authored rules and the built-in default are decisions (allow/deny/authenticate); known-bypass
+// entries are inspection=bypass rows (raw-forward, still steered + policy-gated). The
 // engine merges all of these at runtime — this view just makes them all visible and toggleable in one place.
 func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleListResponse {
 	out := effectiveEgressRuleListResponse{
@@ -186,18 +184,6 @@ func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleList
 			Editable: false, Deletable: false, ToggleKind: "known_bypass_master",
 			Patterns: allPatterns,
 			Detail:   "OS/cert infrastructure that pins its certificates — decrypting it breaks the OS. One all-or-nothing toggle.",
-		})
-	}
-
-	// 4. SaaS Optimize bypass still selected via the legacy posture field (pre-B-1). Post-B-1 these are authored
-	// rules and already appear above; this only surfaces a deployment that set posture.bypass_groups directly.
-	for _, g := range in.OptimizeLegacy {
-		out.Rules = append(out.Rules, effectiveEgressRuleEntry{
-			Kind: "optimize_bypass", ID: "optimize-" + g.Name, Name: g.Name, Priority: systemBypassFloorPriority,
-			SourceText: "Any", DestText: g.Name, ServiceText: "HTTPS",
-			Access: "allow", Inspection: "bypass", Status: "active",
-			Editable: false, Deletable: false, ToggleKind: "none",
-			Patterns: g.Patterns, Detail: "Legacy posture bypass — toggle it as a rule in the SaaS Optimize section to make it a first-class Egress rule.",
 		})
 	}
 

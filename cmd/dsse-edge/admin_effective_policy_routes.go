@@ -142,18 +142,6 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			bypassSources.EffectiveBypass, bypassSources.InterceptHosts = patterns.Bypass, patterns.Intercept
 			bypassSources.DeviceIntercept, bypassSources.DeviceBypass = patterns.InterceptByDevice, patterns.BypassByDevice
 		}
-		// Attribute SaaS Optimize bypass: pass the groups enabled in the live posture.
-		if config.InspectionPosture != nil {
-			enabled := map[string]bool{}
-			for _, name := range config.InspectionPosture().BypassGroups {
-				enabled[name] = true
-			}
-			for _, g := range inspectionposture.SaaSBypassGroups {
-				if enabled[g.Name] {
-					bypassSources.OptimizeGroups = append(bypassSources.OptimizeGroups, g)
-				}
-			}
-		}
 		bypassSources.AuthoredBypass = policyrule.EgressBypassFQDNs(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore)
 		// ★ The preview must be the answer THIS organization would get. Measured while operating inside a newly
 		// created organization: the trace listed another organization's policies and named one of them as the
@@ -170,7 +158,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, effectivePolicyList(evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r)))
 	}))
 	// The unified Egress view's data source: EVERY effective egress rule across all surfaces — authored rules,
-	// the built-in default, the known-bypass OS/cert floor, legacy SaaS Optimize posture bypass, and authored
+	// the built-in default, the known-bypass OS/cert floor, and authored SaaS Optimize or
 	// cert-pin bypass — normalized to one source → destination : service ⇒ access × inspection shape. An operator
 	// expects the Egress view to reflect all egress decisions in one place, not just authored rules; this gathers
 	// them (the edge owns every surface) so the Console renders a single list. Read-only aggregation.
@@ -203,18 +191,9 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if config.NetworkExtensionLabTLS != nil {
 			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass
 		}
+
 		if config.InspectionPosture != nil {
-			p := config.InspectionPosture()
-			in.KnownEnabled = p.KnownBypassEnabled
-			enabled := map[string]bool{}
-			for _, name := range p.BypassGroups {
-				enabled[name] = true
-			}
-			for _, g := range inspectionposture.SaaSBypassGroups {
-				if enabled[g.Name] {
-					in.OptimizeLegacy = append(in.OptimizeLegacy, g)
-				}
-			}
+			in.KnownEnabled = config.InspectionPosture().KnownBypassEnabled
 		}
 		writeJSON(w, http.StatusOK, buildEffectiveEgressRules(in))
 	}))
@@ -288,6 +267,14 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
+		}
+		// Legacy selections are cleanup-only. Do not accept a dormant grant that a
+		// different or older node could turn into a bypass during startup.
+		for _, name := range next.BypassGroups {
+			if !stringInSetFold(name, before.BypassGroups) {
+				writeError(w, http.StatusConflict, fmt.Errorf("Legacy bypass selections can only be removed. Create a tenant Egress bypass rule through Inspection Settings or Internet Access."))
+				return
+			}
 		}
 		_, err = config.SetInspectionPosture(next, adminTenantIDFromRequest(r))
 		result := "saved"

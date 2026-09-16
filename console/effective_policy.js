@@ -483,7 +483,7 @@ function buildDecryptAllowlistEditor(data, bypassDefault, result) {
 async function buildSaasBypassSection(data, result) {
   // Toggling a group AUTHORS a real Egress bypass rule (Any → group ⇒ allow, not decrypted), visible and
   // editable in the Access Rules / Egress view — the rule is the single source of truth. A legacy posture
-  // selection is migrated to a rule on toggle.
+  // selection remains cleanup-only and never grants tenant bypass.
   const er = await apiFetch("GET", "/admin/rules?plane=egress");
   if(!er?.ok || !Array.isArray(er.body) || er.body.some(r=>!r || typeof r.id!=="string" || !Array.isArray(r.destination) || r.destination.some(d=>typeof d!=="string") || !r.action || (r.tenant_id && r.tenant_id!==data.tenant_id)))throw new Error("Invalid service rules");
  const egressRules=er.body;
@@ -500,19 +500,18 @@ async function buildSaasBypassSection(data, result) {
 
   (data.saas_bypass_groups || []).forEach((g) => {
     const rules = bypassRuleFor(g.name);
-    const on = rules.length > 0 || g.selected;
+    const on = rules.length > 0;
     const tog = el("button", { class: "ui-btn ui-btn-sm",
       text: on ? bl({ en: "Inspect it", ja: "検査する" }) : bl({ en: "Do not inspect it", ja: "検査しない" }) });
     const state = on
-      ? uiBadge(rules.length ? bl({ en: "Not inspected", ja: "検査しない" }) : bl({ en: "Not inspected (older setting)", ja: "検査しない(以前の設定)" }), "warn")
+      ? uiBadge(bl({ en: "Bypass rule saved", ja: "検査除外ルールあり" }), "warn")
       : uiBadge(bl({ en: "No service bypass", ja: "サービスの検査除外なし" }), "ok");
-    tog.disabled=!data.can_manage_rules || (g.selected && !data.configurable);
+    tog.disabled=!data.can_manage_rules;
     tog.addEventListener("click",()=>inspectionPostureMutation(result,async()=>{
       if(on){
         const confirmed=await uiConfirm({title:bl({en:"Inspect this service again?",ja:"このサービスを再び検査しますか？"}),body:bl({en:"The matching bypass rules will be removed. Review the Internet Access page if a rule also covers other destinations.",ja:"該当する検査除外ルールを削除します。他の宛先も含む場合はインターネットアクセス画面で確認してください。"}),confirmLabel:bl({en:"Inspect it",ja:"検査する"})});if(!confirmed || result.isConnected===false)return;
         if(rules.some(r=>r.destination.length!==1))throw new Error(bl({en:"A bypass rule also covers other destinations. Edit it on the Internet Access page.",ja:"他の宛先も含む検査除外ルールがあります。インターネットアクセス画面で編集してください。"}));
         for(const rule of rules){const response=await apiFetch("DELETE","/admin/rules/"+encodeURIComponent(rule.id));if(!response?.ok)throw new Error(postureHTTPError(response));}
-        if(g.selected){const response=await apiFetch("POST","/admin/inspection-posture",{bypass_groups:postureSelected.filter(n=>n!==g.name)});validatedInspectionMutation(response,data,{bypass_groups:postureSelected.filter(n=>n!==g.name)});}
       }else{
         const response=await apiFetch("POST","/admin/rules",{plane:"egress",priority:60,name:"Bypass: "+g.name,source:["*"],destination:["bi-grp-"+g.name],action:{access:"allow",inspection:"bypass"},status:"active"});if(!response?.ok)throw new Error(postureHTTPError(response));
       }
@@ -521,16 +520,25 @@ async function buildSaasBypassSection(data, result) {
       const bypass=verify.body.some(r=>r && r.status==="active" && r.action?.inspection==="bypass" && r.destination?.includes("bi-grp-"+g.name));if(bypass===on)throw new Error(postureUnknown());
       uiToast(bl({en:"Updated.",ja:"更新しました。"}),"ok");return true;
     }));
+    let legacy = null;
+    if (g.selected) {
+      const clear = el("button", {class:"ui-btn ui-btn-sm", text:bl({en:"Clear older selection",ja:"以前の選択を削除"})});
+      clear.disabled = !data.configurable;
+      clear.addEventListener("click",()=>inspectionPostureMutation(result,()=>saveInspectionPatch(result,data,
+        {bypass_groups:postureSelected.filter(n=>n!==g.name)},bl({en:"Older selection cleared. Saved rules were kept.",ja:"以前の選択を削除しました。保存済みルールは維持されています。"}))));
+      legacy = el("div", {class:"ui-callout ui-callout-warn"},[
+        el("span",{text:bl({en:"An older deployment selection is retained for review. It does not grant a bypass. Save a rule for this organization if needed. Clearing it leaves saved rules unchanged.",ja:"配備全体の以前の選択が残っています。この選択だけでは検査を除外しません。必要ならこの組織のルールを保存してください。以前の選択を削除しても保存済みルールは変わりません。"})}), clear]);
+    }
     // ★ THE NAME A CUSTOMER READS, NOT OUR IDENTIFIER, AND NOT ENGLISH PROSE IN A JAPANESE CONSOLE
     // (2026-08-17, read as a customer administrator). This printed the group key in monospace —
     // google_auth, okta_auth, salesforce_auth — beside an English sentence from the API. The API text
     // stays as the fallback for a group this screen does not know, so a row is never blank.
     const words = bypassGroupWords(g.name);
-    body.push(el("div", { style: "display:flex;align-items:center;gap:8px;margin:6px 0" }, [
+    body.push(el("div", {class:"saas-bypass-group"}, [el("div", { style: "display:flex;align-items:center;gap:8px;margin:6px 0" }, [
       tog, state,
       el("strong", { text: words ? bl(words.label) : g.name }),
       el("span", { class: "ui-view-desc", title: g.name, text: words ? bl(words.what) : (g.description || "") }),
-    ]));
+    ]), legacy]));
   });
 
   return el("div", { class: "ui-preview", style: "font-family:inherit;font-size:14px;margin-top:12px" }, body);

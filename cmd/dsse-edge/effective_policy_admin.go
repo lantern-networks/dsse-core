@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/decision"
-	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/interception"
 	"github.com/lantern-networks/dsse-core/knownbypass"
 	"github.com/lantern-networks/dsse-core/model"
@@ -27,7 +26,7 @@ type effectivePolicyEntry struct {
 // catalog, authored rules and configured host sets. Candidate history does not authorize inspection bypass.
 type inspectionBasis struct {
 	Decision string `json:"decision"`         // "inspect" | "bypass" | "depends_on_device"
-	Source   string `json:"source"`           // default_decrypt_all | decrypt_allowlist | known_bypass | saas_optimize | authored_bypass | static_bypass | bypass_default
+	Source   string `json:"source"`           // default_decrypt_all | decrypt_allowlist | known_bypass | authored_bypass | static_bypass | bypass_default
 	Detail   string `json:"detail,omitempty"` // e.g. the known-bypass group name
 }
 
@@ -35,11 +34,10 @@ type inspectionBasis struct {
 // engine's shared and device-specific patterns. A host-only preview cannot choose a source device.
 // The per-bypass-source fields are only for attribution — labelling WHICH source put a host in the bypass set.
 type inspectionSources struct {
-	InterceptHosts  []string                             // the engine's live intercept set ("*" = decrypt-all; narrower = decrypt allowlist)
-	EffectiveBypass []string                             // the engine's live raw-forward set — always wins over intercept
-	KnownGroups     []knownbypass.Group                  // curated named bypass groups, for attribution
-	OptimizeGroups  []inspectionposture.AuthDecryptGroup // enabled SaaS Optimize bypass groups, for attribution
-	AuthoredBypass  []string                             // authored egress rules whose inspection axis is bypass, for attribution
+	InterceptHosts  []string            // the engine's live intercept set ("*" = decrypt-all; narrower = decrypt allowlist)
+	EffectiveBypass []string            // the engine's live raw-forward set — always wins over intercept
+	KnownGroups     []knownbypass.Group // curated named bypass groups, for attribution
+	AuthoredBypass  []string            // authored egress rules whose inspection axis is bypass, for attribution
 	DeviceIntercept map[string][]string
 	DeviceBypass    map[string][]string
 }
@@ -140,11 +138,6 @@ func classifyInspection(host string, src inspectionSources) inspectionBasis {
 		for _, g := range src.KnownGroups {
 			if interception.HostMatchesPatterns(host, g.Patterns) {
 				return inspectionBasis{Decision: "bypass", Source: "known_bypass", Detail: g.Name}
-			}
-		}
-		for _, g := range src.OptimizeGroups {
-			if interception.HostMatchesPatterns(host, g.Patterns) {
-				return inspectionBasis{Decision: "bypass", Source: "saas_optimize", Detail: g.Name}
 			}
 		}
 		if interception.HostMatchesPatterns(host, src.AuthoredBypass) {

@@ -154,8 +154,8 @@ type Posture struct {
 	Mode                   string   `json:"mode"`
 	DecryptAllowlistHosts  []string `json:"decrypt_allowlist_hosts"`
 	DecryptAllowlistGroups []string `json:"decrypt_allowlist_groups"`
-	// BypassGroups names enabled SaaSBypassGroups whose hosts are raw-forwarded in ANY mode (the Optimize=Bypass
-	// preset) — e.g. bypass Teams/OneDrive even while decrypt-all is the default.
+	// BypassGroups retains legacy deployment-wide selections for operator cleanup.
+	// Current runtimes use tenant-authored rules; these selections do not grant bypass.
 	BypassGroups       []string `json:"bypass_groups"`
 	KnownBypassEnabled bool     `json:"known_bypass_enabled"`
 }

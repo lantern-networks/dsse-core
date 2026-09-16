@@ -4,7 +4,6 @@ import (
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/decision"
-	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/knownbypass"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -102,14 +101,14 @@ func TestClassifyInspectionBypassDefault(t *testing.T) {
 		InterceptHosts:  []string{"login.microsoftonline.com", "accounts.google.com"},
 		EffectiveBypass: []string{"*.icloud.com", "*.teams.microsoft.com"},
 		KnownGroups:     []knownbypass.Group{{Name: "apple_push_icloud", Patterns: []string{"*.icloud.com"}}},
-		OptimizeGroups:  []inspectionposture.AuthDecryptGroup{{Name: "m365_optimize", Patterns: []string{"*.teams.microsoft.com"}}},
+		AuthoredBypass:  []string{"*.teams.microsoft.com"},
 	}
 	cases := []struct{ host, wantDecision, wantSource string }{
 		{"accounts.google.com", "inspect", "decrypt_allowlist"},       // in the allowlist → decrypted
 		{"login.microsoftonline.com", "inspect", "decrypt_allowlist"}, // in the allowlist → decrypted
 		{"www.example.com", "bypass", "bypass_default"},               // NOT in the allowlist → bypassed by default
 		{"x.icloud.com", "bypass", "known_bypass"},                    // bypass set still wins, attributed
-		{"x.teams.microsoft.com", "bypass", "saas_optimize"},          // SaaS Optimize bypass group attributed
+		{"x.teams.microsoft.com", "bypass", "authored_bypass"},        // SaaS Optimize bypass group attributed
 	}
 	for _, c := range cases {
 		if got := classifyInspection(c.host, src); got.Decision != c.wantDecision || got.Source != c.wantSource {

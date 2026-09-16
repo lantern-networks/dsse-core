@@ -167,7 +167,7 @@ type certPinRefuseSave struct{}
 func (*certPinRefuseSave) Load() ([]byte, error) { return nil, nil }
 func (*certPinRefuseSave) Save([]byte) error     { return errors.New("injected rule-save refusal") }
 
-func startCertPinMain(t *testing.T, dir string, sourced bool) (string, func()) {
+func startCertPinMain(t *testing.T, dir string, sourced bool, extraArgs ...string) (string, func()) {
 	t.Helper()
 	l, e := net.Listen("tcp", "127.0.0.1:0")
 	if e != nil {
@@ -180,6 +180,7 @@ func startCertPinMain(t *testing.T, dir string, sourced bool) (string, func()) {
 		t.Fatal(e)
 	}
 	args := []string{"-listen", addr, "-no-control-plane", "-lab-mode", "-policy", filepath.Join(dir, "policy.json"), "-bundle", filepath.Join(dir, "bundle.json"), "-schema-dir", filepath.Join(module, "schemas"), "-log-dir", filepath.Join(dir, "logs"), "-edge-region-id", "region-a", "-admin-token", "startup-test-token", "-admin-token-break-glass-armed", "-policy-candidate-store", filepath.Join(dir, "candidates.json"), "-asset-catalog-store", filepath.Join(dir, "assets.json"), "-policy-rule-store", filepath.Join(dir, "rules.json"), "-network-extension-runtime-copy-lab-tls-interception-hosts", "*"}
+	args = append(args, extraArgs...)
 	if sourced {
 		args = append(args, "-config-source-url", "http://127.0.0.1:1")
 	}

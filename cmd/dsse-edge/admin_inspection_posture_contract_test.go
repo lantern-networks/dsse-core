@@ -30,7 +30,11 @@ func TestInspectionPostureOperatorScopePersistenceRuntimeAndAudit(t *testing.T) 
 	store := inspectionposture.NewStore()
 	p := &riskAuditPersister{base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "posture.json")}}
 	store.SetPersister(p)
-	store.Set(inspectionposture.DefaultPosture())
+	legacy := inspectionposture.DefaultPosture()
+	legacy.BypassGroups = []string{"m365_optimize", "google_optimize"}
+	if _, err := store.Set(legacy); err != nil {
+		t.Fatal(err)
+	}
 	engine := edgeplane.NewNetworkExtensionLabTLSInterceptionMatchOnly([]string{"*"})
 	setter := newInspectionPostureSetter(store, func(_ string) { engine.SetInterceptHosts(inspectionposture.EffectiveInterceptHosts(store.Get())) })
 	auth := newAdminAuthStore()
@@ -83,6 +87,26 @@ func TestInspectionPostureOperatorScopePersistenceRuntimeAndAudit(t *testing.T) 
 	}
 	call("POST", `{"decrypt_allowlist_groups":["unknown"]}`, "operator", 400)
 	call("POST", `{"decrypt_allowlist_hosts":["https://wrong.invalid/path"]}`, "operator", 400)
+	beforeCleanup := store.Get()
+	call("POST", `{"bypass_groups":["m365_optimize","google_optimize","zoom_media"]}`, "operator", 409)
+	if !reflect.DeepEqual(store.Get(), beforeCleanup) {
+		t.Fatal("new legacy selection was accepted")
+	}
+	p.fail.Store(true)
+	call("POST", `{"bypass_groups":["m365_optimize"]}`, "operator", 500)
+	if !reflect.DeepEqual(store.Get(), beforeCleanup) {
+		t.Fatal("failed cleanup changed legacy selections")
+	}
+	p.fail.Store(false)
+	call("POST", `{"bypass_groups":["m365_optimize"]}`, "operator", 200)
+	if !reflect.DeepEqual(store.Get().BypassGroups, []string{"m365_optimize"}) {
+		t.Fatal("cleanup did not persist")
+	}
+	call("POST", `{"bypass_groups":[]}`, "operator", 200)
+	call("POST", `{"bypass_groups":["m365_optimize"]}`, "operator", 409)
+	if len(store.Get().BypassGroups) != 0 {
+		t.Fatal("removed legacy selection was reinstated")
+	}
 	reloaded := inspectionposture.NewStore()
 	if ok, e := reloaded.SetPersister(p); !ok || e != nil || !reflect.DeepEqual(store.Get(), reloaded.Get()) {
 		t.Fatal("restart differs", e)
@@ -101,7 +125,7 @@ func TestInspectionPostureOperatorScopePersistenceRuntimeAndAudit(t *testing.T) 
 			failed++
 		}
 	}
-	if domain != 3 || failed != 1 {
+	if domain != 6 || failed != 2 {
 		t.Fatal("audit counts", domain, failed)
 	}
 	raw, _ := json.Marshal(rows)

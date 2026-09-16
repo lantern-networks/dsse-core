@@ -2452,11 +2452,10 @@ func main() {
 			"Saved Egress rules determine bypass. Review Sites to Bypass and Internet Access; "+
 			"explicitly register a still-required legacy bypass at the configuration authority.", n)
 	}
-	// Likewise migrate any legacy SaaS Optimize bypass selection (posture.bypass_groups) to authored rules, so the
-	// engine reads ONE bypass source (authored rules) and the Optimize toggle is a real, visible rule. No-op when
-	// no Optimize group is enabled (the default), so the decrypt-all North Star path is unchanged.
-	if n := migratePostureOptimizeBypassToRules(postureStore, ruleStore, pb.TenantID); n > 0 {
-		log.Printf("migrated %d legacy SaaS Optimize bypass group(s) to authored Egress rules", n)
+	// Deployment-wide legacy selections cannot author tenant rules on startup.
+	// Keep them available for operator review; current authored rules govern bypass.
+	if n := len(postureStore.Get().BypassGroups); n > 0 {
+		log.Printf("inspection: %d legacy SaaS bypass selection(s) retained but not applied. Review Inspection Settings; explicitly author any required tenant bypass and clear obsolete selections at the configuration authority.", n)
 	}
 
 	applyInspectionPosture(pb.TenantID)

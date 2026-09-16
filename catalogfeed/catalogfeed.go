@@ -92,23 +92,12 @@ func (s *Store) Apply(raw []byte, now time.Time) (AppliedFeed, error) {
 		now = time.Now().UTC()
 	}
 	var env signedconfig.Envelope
-	if err := json.Unmarshal(raw, &env); err != nil {
+	if err := feedJSON(raw, &env); err != nil {
 		return AppliedFeed{}, fmt.Errorf("parse feed envelope: %w", err)
 	}
-	if err := signedconfig.Validate(env, FeedType, now, s.trustedKeys); err != nil {
-		return AppliedFeed{}, fmt.Errorf("feed validation failed (current catalog kept): %w", err)
-	}
-	doc, err := signedconfig.PayloadInto[knownbypass.CatalogDocument](env)
+	doc, err := s.validateEnvelope(env, now)
 	if err != nil {
-		return AppliedFeed{}, fmt.Errorf("parse feed payload: %w", err)
-	}
-	if len(doc.Entries) == 0 {
-		return AppliedFeed{}, fmt.Errorf("refusing to apply an empty catalog (never fall back to no bypass)")
-	}
-	for _, e := range doc.Entries {
-		if strings.TrimSpace(e.ID) == "" {
-			return AppliedFeed{}, fmt.Errorf("feed catalog entry is missing an id")
-		}
+		return AppliedFeed{}, fmt.Errorf("feed validation failed (current catalog kept): %w", err)
 	}
 
 	s.writeMu.Lock()
@@ -220,12 +209,8 @@ func (s *Store) SetStatePath(path string) error {
 		}
 		return err
 	}
-	if len(data) == 0 {
-		s.statePath = path
-		return nil
-	}
-	var snap snapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	snap, err := s.decodeSnapshot(data)
+	if err != nil {
 		return err
 	}
 	s.mu.Lock()

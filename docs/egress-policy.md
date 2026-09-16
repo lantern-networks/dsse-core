@@ -178,6 +178,39 @@ This confirms a local update, not its delivery to other nodes. Check the effecti
 catalog and inspection selection on every serving Edge. The common mutation audit
 records actor, organization, request path and result; it is not a feed-content diff.
 
+#### Restoring a signed catalog
+
+A configured feed snapshot is verified before its catalog, rollback history or
+persistence path is adopted. Every retained envelope must have a trusted signature
+and matching checksum, and each saved catalog, version and signer/timestamp field
+must match that envelope. The current record must match the last history record;
+repeated versions caused by explicit rollback are valid. Verification preserves
+signed JSON numbers and the normal formatted snapshot representation.
+
+Previously applied expired feeds remain available as last-known-good and for
+explicit rollback. Restoration checks their signature without requiring a new
+expiry window; this does not permit applying a new expired feed. Keep the public
+verification keys for retained history as well as the current feed. Removing a
+signer from the configured keyring makes a snapshot containing that signer's
+records invalid, including otherwise valid historical records.
+
+Invalid configured snapshots stop startup with `invalid catalog feed snapshot`.
+Preserve the file, restore a complete verified backup and the intended trusted-key
+configuration, and restart. Do not discard verification or silently replace a bad
+feed with defaults. During a rejected reload, the current catalog, history and
+writer remain unchanged. Attaching a missing file keeps live state but does not
+save it until a subsequent confirmed mutation. An existing empty file or JSON
+`null` is invalid. Deliberate `{}` or an object with a null current record and empty
+history selects the built-in catalog; tenant overrides remain separate.
+
+Feed admission and restoration reject duplicate JSON keys, unknown or
+alternate-case fields, nonpositive catalog versions and duplicate/blank entry IDs.
+Envelope metadata keys remain extensible. Update formats and binaries together;
+fields from an unsupported newer format are rejected rather than dropped. These
+checks establish signed-content integrity, not the authenticity of unsigned
+application timestamps, protection against replacement with a complete older
+valid snapshot, or the suitability of a trusted publisher's bypass patterns.
+
 
 ## Save and verify inspection defaults
 

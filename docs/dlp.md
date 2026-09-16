@@ -61,6 +61,26 @@ The administration write audit records the actor, tenant, endpoint and outcome, 
 classifier patterns, keyword values or preview text. It is not a per-identifier change diff
 or a detection event. Follow the traffic checks below to confirm actual DLP coverage.
 
+## Saving exact-match datasets
+
+Use **Sensitive Data → Exact-Data-Match** to create or replace a named dataset.
+Values must be single ASCII tokens containing letters, digits, or `- _ . @ +`, up to
+128 bytes after surrounding whitespace is trimmed. Matching lowercases letters and
+removes `-` and `_`. Normalized duplicates count once; values shorter than five
+normalized characters are ignored. Multiword phrases, other character sets and longer
+tokens are unsupported and rejected. A replacement with no usable values is rejected
+without deleting the previous dataset. Use **Delete** to remove it explicitly.
+Previously stored hashes cannot reveal whether the original values met these rules.
+Reimport an older dataset from its source values to apply the current validation.
+
+With `-dlp-fingerprint-store` configured, creation, replacement and deletion confirm
+storage before updating the local scanner. A rejected or unconfirmed save leaves the
+previous live dataset in place and reports an error. As with custom identifiers, an
+error may follow a disk write; inspect storage before retrying. Without configured
+storage, changes are in memory only. These local outcomes do not confirm delivery to
+other Edges or inspection of traffic. The write audit records endpoint, actor, tenant
+and outcome without submitted values; it is not a dataset-level change history.
+
 ## Actions and account scope
 
 | Action | Current behavior on a qualifying match |

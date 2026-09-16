@@ -6,6 +6,7 @@ package main
 // constructor's locals so the handler bodies are untouched.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -394,13 +395,21 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			writeError(w, http.StatusBadRequest, fmt.Errorf("dataset name %q must be lowercase snake_case (2–40 chars) and not a reserved identifier", body.Name))
 			return
 		}
-		const maxFingerprintValues = 100000
 		if len(body.Values) > maxFingerprintValues {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("too many values: %d (max %d)", len(body.Values), maxFingerprintValues))
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		count := dlpFingerprintStore.SetDataset(tenant, body.Name, body.Values)
+		count, err := dlpFingerprintStore.SetDatasetDurable(tenant, body.Name, body.Values)
+		if err != nil {
+			if errors.Is(err, errInvalidFingerprintDataset) {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			logInfof("dlp_fingerprints_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving the dataset could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
 		logInfof("dlp_fingerprints_applied_by_admin tenant=%s dataset=%s values=%d", tenant, body.Name, count)
 		writeJSON(w, http.StatusOK, map[string]any{"dataset": dlpFingerprintDataset{Name: body.Name, Count: count}, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
 	}))
@@ -417,7 +426,12 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		removed := dlpFingerprintStore.RemoveDataset(tenant, name)
+		removed, err := dlpFingerprintStore.RemoveDatasetDurable(tenant, name)
+		if err != nil {
+			logInfof("dlp_fingerprints_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving the dataset deletion could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
 		logInfof("dlp_fingerprints_removed_by_admin tenant=%s dataset=%s removed=%t", tenant, name, removed)
 		writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
 	}))

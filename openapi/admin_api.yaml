@@ -5386,7 +5386,7 @@ paths:
           description: Datasets (name + count) for the tenant.
     post:
       summary: Fingerprint a sensitive dataset for Exact-Data-Match (slice E).
-      description: Requires admin.dlp.write. Creates or replaces a named dataset by fingerprinting the supplied exact values into salted hashes; the scan then raises a finding under that name whenever one of the values appears in egress. The raw values are transit-only — only hashes are stored, so the dataset cannot be recovered from config. Name must be lowercase snake_case (2–40 chars), not a reserved identifier. Max 100000 values. Tenant from the admin identity.
+      description: Requires admin.dlp.write. Creates or replaces a named dataset by fingerprinting the supplied exact values into salted hashes; the scan then raises a finding under that name whenever one of the values appears in egress. Only hashes are stored; protect hashes and salts against guessing of source values. Values must be single ASCII tokens (letters, digits, - _ . @ +) up to 128 bytes. Matching lowercases letters and removes - and _. Normalized duplicates count once and values shorter than five normalized characters are ignored. Unsupported or zero-usable-value replacements are rejected without deleting the old dataset. Configured storage must accept the update before the local scanner changes; without storage this is in-memory only. A storage error may follow a disk write and does not prove rollback. Name must be lowercase snake_case (2–40 chars), not a reserved identifier. Max 100000 values. Tenant from the admin identity.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5395,6 +5395,7 @@ paths:
           application/json:
             schema:
               type: object
+              required: [name, values]
               properties:
                 name:
                   type: string
@@ -5403,15 +5404,19 @@ paths:
                   type: array
                   items:
                     type: string
-                  description: The exact sensitive values to fingerprint (hashed, never stored raw).
+                  minItems: 1
+                  maxItems: 100000
+                  description: Single-token values to fingerprint; at least one must remain after normalization and short-value filtering. Hashed, never stored raw.
       responses:
         "200":
-          description: Dataset fingerprinted; returns the dataset (name + count) and the tenant's datasets.
+          description: Dataset accepted by configured storage and applied locally; returns the dataset (name + count) and the tenant's datasets.
         "400":
-          description: Invalid request (bad name or over the value cap).
+          description: Invalid name, missing/empty values, unsupported tokens, no usable values, or over the value cap. No replacement is applied.
+        "500":
+          description: Saving could not be confirmed. Previous live dataset retained; the disk result may be uncertain.
     delete:
       summary: Remove an Exact-Data-Match dataset (slice E).
-      description: Requires admin.dlp.write. Deletes the named dataset (?name=). Tenant from the admin identity.
+      description: Requires admin.dlp.write. Deletes the named dataset (?name=) after acceptance by configured storage. A missing name is a no-op, with any pending staged changes saved first. Without storage this is in-memory only. Tenant from the admin identity.
       tags:
         - AdminDLPPolicy
       responses:
@@ -5419,6 +5424,8 @@ paths:
           description: Removed (or not present); returns the tenant's remaining datasets.
         "400":
           description: Missing name.
+        "500":
+          description: Deletion save could not be confirmed. Previous live dataset retained; the disk result may be uncertain.
   /admin/dlp-policies:
     get:
       summary: List the reusable named DLP Policy objects (S5).

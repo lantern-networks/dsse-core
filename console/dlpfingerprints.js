@@ -29,7 +29,7 @@ async function renderDLPFingerprintsView(content, opts) {
   function render() {
     section.innerHTML = "";
     section.appendChild(el("div", { class: "ui-toolbar" }, [
-      el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add dataset", ja: "+ データセットを追加" }), onClick: addDataset }),
+      el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add dataset", ja: "+ データセットを追加" }), onClick: () => addDataset() }),
       el("span", { class: "ui-view-desc", text: _datasets.length + " " + bl({ en: "datasets", ja: "データセット" }) }),
     ]));
     if (!_datasets.length) {
@@ -65,22 +65,27 @@ async function renderDLPFingerprintsView(content, opts) {
     const valuesF = uiField({
       name: "values", label: bl({ en: "Exact values (one per line)", ja: "完全一致の値(1 行に 1 件)" }), type: "textarea",
       placeholder: "CUST-100482\nCUST-100915\nEMP-556677",
-      hint: bl({ en: "Each value is fingerprinted (hashed) — it is NOT stored or shown again. Short values (< 5 chars) are ignored.", ja: "各値はフィンガープリント化(ハッシュ化)され、保存も再表示もされません。5 文字未満の値は無視されます。" }),
+      hint: bl({ en: "Use single ASCII tokens (letters, digits, - _ . @ +), up to 128 characters. Case, - and _ are normalized; values shorter than 5 normalized characters are ignored. At least one supported value is required. Only hashes are stored.", ja: "半角英数字と - _ . @ + の単一語句を128文字以内で入力します。大文字小文字と - _ を正規化し、正規化後5文字未満の値は無視します。有効な値が1件以上必要です。保存されるのはハッシュのみです。" }),
     });
+    const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Fingerprint", ja: "登録" }), onClick: onSave });
+    const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
     const modal = uiModal({
       title: existingName ? bl({ en: "Replace dataset", ja: "データセットを再登録" }) : bl({ en: "Add Exact-Data-Match dataset", ja: "完全一致データセットを追加" }),
-      body: [nameF.el, valuesF.el],
+      body: [nameF.el, valuesF.el, saveError],
       footer: [
         el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }),
-        el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Fingerprint", ja: "登録" }), onClick: onSave }),
+        submit,
       ],
     });
     nameF.focus();
 
     async function onSave() {
+      if (submit.disabled) return;
+      saveError.style.display = "none";
       if (!nameF.validate()) { nameF.focus(); return; }
       const values = valuesF.get().split("\n").map((s) => s.trim()).filter(Boolean);
       if (!values.length) { valuesF.setError(bl({ en: "Add at least one value.", ja: "値を 1 件以上入力してください。" })); return; }
+      submit.disabled = true;
       try {
         const r = await apiFetch("POST", "/admin/dlp-fingerprints", { name: nameF.get(), values });
         if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
@@ -89,7 +94,11 @@ async function renderDLPFingerprintsView(content, opts) {
         uiToast(bl({ en: cnt + " values fingerprinted", ja: cnt + " 件を登録しました" }), "ok");
         modal.close();
         render();
-      } catch (e) { uiToast(String(e.message || e), "danger"); }
+      } catch (e) {
+        saveError.textContent = String(e.message || e);
+        saveError.style.display = "";
+        saveError.scrollIntoView({ block: "nearest" });
+      } finally { submit.disabled = false; }
     }
   }
 
@@ -102,11 +111,11 @@ async function renderDLPFingerprintsView(content, opts) {
     if (!ok) return;
     try {
       const r = await apiFetch("DELETE", "/admin/dlp-fingerprints?name=" + encodeURIComponent(name));
-      if (!r.ok) throw new Error("HTTP " + r.status);
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
       _datasets = (r.body && r.body.datasets) || _datasets.filter((d) => d.name !== name);
       uiToast(bl({ en: "Dataset deleted", ja: "データセットを削除しました" }), "ok");
       render();
-    } catch (e) { uiToast(String(e.message || e), "danger"); }
+    } catch (e) { uiToast(String(e.message || e), "err"); }
   }
 
   load();

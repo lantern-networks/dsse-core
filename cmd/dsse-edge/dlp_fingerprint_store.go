@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 
@@ -11,12 +13,12 @@ import (
 
 // dlpFingerprintRuntimeStore holds operator Exact-Data-Match datasets per tenant (slice E). Each named dataset is
 // an operator's sensitive value list (customer record ids, employee numbers, …) fingerprinted into SALTED HASHES.
-// Unlike the classifier/allowlist stores it NEVER keeps the raw values — only the hashes — so the sensitive
-// dataset is safe to persist on the edge and cannot be recovered from config; the admin API therefore exposes
-// only each dataset's name + value count, never the values. Per-tenant, atomic hot-swap, durable.
+// It retains hashes rather than raw values. Hashes and salts still require protection
+// against guessing; the admin API exposes only dataset names and counts. Admin
+// mutations confirm configured storage before changing the compiled scan set.
 type dlpFingerprintRuntimeStore struct {
 	mu sync.RWMutex
-	// tenant -> dataset name -> salted hashes (durable, non-secret)
+	// tenant -> dataset name -> salted hashes (durable)
 	datasets   map[string]map[string][]string
 	sets       map[string]*dlp.FingerprintSet // compiled per tenant (data path)
 	salt       string
@@ -68,9 +70,9 @@ func (s *dlpFingerprintRuntimeStore) tenantSalt(tenantID string) string {
 // SetDataset fingerprints raw values (transit only) into dataset `name` for a tenant, storing ONLY the hashes,
 // and recompiles the tenant's live set. Returns the resulting value count.
 func (s *dlpFingerprintRuntimeStore) SetDataset(tenantID, name string, values []string) int {
+	s.mu.Lock()
 	fp := dlp.NewFingerprint(name, s.tenantSalt(tenantID), values)
 	hashes := fp.Hashes()
-	s.mu.Lock()
 	if s.datasets[tenantID] == nil {
 		s.datasets[tenantID] = map[string][]string{}
 	}
@@ -101,6 +103,87 @@ func (s *dlpFingerprintRuntimeStore) RemoveDataset(tenantID, name string) bool {
 	s.dirty = true
 	s.generation++
 	return true
+}
+
+const maxFingerprintValues = 100000
+
+var errInvalidFingerprintDataset = errors.New("invalid fingerprint dataset")
+
+// SetDatasetDurable refuses empty or unscannable replacements and confirms the
+// configured store before publishing the new compiled set. No raw values are saved.
+func (s *dlpFingerprintRuntimeStore) SetDatasetDurable(tenantID, name string, values []string) (int, error) {
+	if !dlp.ValidIdentifierName(name) || len(values) > maxFingerprintValues {
+		return 0, fmt.Errorf("%w: invalid name or too many values", errInvalidFingerprintDataset)
+	}
+	if err := dlp.ValidateFingerprintValues(values); err != nil {
+		return 0, fmt.Errorf("%w: %v", errInvalidFingerprintDataset, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	hashes := dlp.NewFingerprint(name, s.tenantSalt(tenantID), values).Hashes()
+	if len(hashes) == 0 {
+		return 0, fmt.Errorf("%w: supply at least one supported value of five or more characters after normalization; use Delete to remove a dataset", errInvalidFingerprintDataset)
+	}
+	next := s.snapshotLocked()
+	if next.Datasets[tenantID] == nil {
+		next.Datasets[tenantID] = map[string][]string{}
+	}
+	next.Datasets[tenantID][name] = hashes
+	if err := s.saveSnapshotLocked(next); err != nil {
+		return 0, err
+	}
+	s.datasets = next.Datasets
+	s.recompileLocked(tenantID)
+	s.dirty = false
+	s.generation++
+	return len(hashes), nil
+}
+
+// RemoveDatasetDurable saves before removing a live dataset. A missing name is a
+// no-op, but pending staged changes still have to reach the configured store.
+func (s *dlpFingerprintRuntimeStore) RemoveDatasetDurable(tenantID, name string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, exists := s.datasets[tenantID][name]
+	if !exists && !s.dirty {
+		return false, nil
+	}
+	next := s.snapshotLocked()
+	delete(next.Datasets[tenantID], name)
+	if len(next.Datasets[tenantID]) == 0 {
+		delete(next.Datasets, tenantID)
+	}
+	if err := s.saveSnapshotLocked(next); err != nil {
+		return false, err
+	}
+	s.datasets = next.Datasets
+	s.recompileLocked(tenantID)
+	s.dirty = false
+	if exists {
+		s.generation++
+	}
+	return exists, nil
+}
+
+func (s *dlpFingerprintRuntimeStore) snapshotLocked() fingerprintStoreSnapshot {
+	next := fingerprintStoreSnapshot{Datasets: map[string]map[string][]string{}}
+	for tenant, datasets := range s.datasets {
+		next.Datasets[tenant] = map[string][]string{}
+		for name, hashes := range datasets {
+			next.Datasets[tenant][name] = append([]string(nil), hashes...)
+		}
+	}
+	return next
+}
+func (s *dlpFingerprintRuntimeStore) saveSnapshotLocked(next fingerprintStoreSnapshot) error {
+	if s.persister == nil {
+		return nil
+	}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	return s.persister.Save(data)
 }
 
 // recompileLocked rebuilds the tenant's compiled FingerprintSet from the stored hashes. Caller holds the lock.
@@ -160,38 +243,18 @@ func (s *dlpFingerprintRuntimeStore) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-// PersistIfDirty writes a snapshot when there are unsaved changes. Cheap no-op when clean or persister-less.
+// PersistIfDirty serializes staged saves with admin commits, so an old flush
+// cannot overwrite an acknowledged mutation. Failed saves retain the dirty flag.
 func (s *dlpFingerprintRuntimeStore) PersistIfDirty() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.dirty || s.persister == nil {
-		s.mu.Unlock()
 		return nil
 	}
-	snap := fingerprintStoreSnapshot{Datasets: map[string]map[string][]string{}}
-	for t, ds := range s.datasets {
-		cp := map[string][]string{}
-		for n, h := range ds {
-			cp[n] = h
-		}
-		snap.Datasets[t] = cp
-	}
-	data, err := json.Marshal(snap)
-	p := s.persister
-	if err == nil {
-		s.dirty = false
-	}
-	s.mu.Unlock()
-	if err != nil {
+	if err := s.saveSnapshotLocked(s.snapshotLocked()); err != nil {
 		return err
 	}
-	if err := p.Save(data); err != nil {
-		// dirty was cleared optimistically (Save runs outside the lock); re-mark so the next periodic
-		// flush retries instead of silently dropping the snapshot (review #17).
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
-		return err
-	}
+	s.dirty = false
 	return nil
 }
 

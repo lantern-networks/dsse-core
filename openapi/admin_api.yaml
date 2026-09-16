@@ -2747,10 +2747,14 @@ components:
     PolicyCandidateList:
       type: object
       required:
+        - tenant_id
         - candidates
         - count
         - limit
       properties:
+        tenant_id:
+          type: string
+          description: Authenticated effective organization for this list, including an empty result.
         candidates:
           type: array
           items:
@@ -9390,15 +9394,44 @@ paths:
       description: Requires admin.swg.read. Returns the local engine's tenant-specific host selection, including deployment defaults, that tenant's curated-catalog overrides and authored bypass rules applying to any source. Device-specific exceptions are applied separately using the authenticated source device and are not flattened into this list. It excludes other tenants' rules. This configuration listing does not include dynamic pin-learning state or prove independent Edge delivery or actual traffic inspection.
       tags:
         - AdminPolicyCandidateReview
+      parameters:
+        - name: scoped
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ["1"]
+          description: Return an object containing tenant_id and hosts. Without this option the legacy bare array is returned. Scoped reads refuse nodes without an inspection engine instead of reporting empty state.
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
       responses:
+        "503":
+          description: A scoped query cannot be answered because interception is unavailable on this node.
+        "409":
+          description: The authenticated organization differs from expected_tenant_id, or a scoped query was made to a control plane that serves no traffic.
         "200":
-          description: Configured bypass patterns for the requesting tenant; empty if this node has no interception engine.
+          description: Configured bypass patterns. Only the legacy bare-array mode reports an empty array when this node has no interception engine.
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  type: string
+                oneOf:
+                  - type: array
+                    items:
+                      type: string
+                  - type: object
+                    required: [tenant_id, hosts]
+                    properties:
+                      tenant_id:
+                        type: string
+                      hosts:
+                        type: array
+                        nullable: true
+                        items:
+                          type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -9777,6 +9810,12 @@ paths:
       tags:
         - AdminPolicyCandidateReview
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
         - name: status
           in: query
           required: false
@@ -9807,6 +9846,8 @@ paths:
             default: 100
           description: Maximum rows returned. Values outside 1..1000 are clamped by the server.
       responses:
+        "409":
+          description: The authenticated organization differs from expected_tenant_id, or a scoped query was made to a control plane that serves no traffic.
         "200":
           description: Tenant policy candidate list.
           content:
@@ -9873,6 +9914,13 @@ paths:
                 host:
                   type: string
                   description: The named host to decrypt-bypass (e.g. gateway.example.com). Raw IP literals are rejected.
+      parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
       responses:
         "200":
           description: The candidate and bypass rule were saved locally. Serving-Edge adoption and fleet propagation must be checked separately.
@@ -9881,7 +9929,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
         "409":
-          description: This rule change must be authored on the control plane, not on a configuration-pulling Edge.
+          description: The organization differs from expected_tenant_id, or this rule change must be authored on the control plane rather than a configuration-pulling Edge.
         "500":
           description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
           content:
@@ -9940,6 +9988,12 @@ paths:
       tags:
         - AdminPolicyCandidateReview
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
         - name: candidate_id
           in: path
           required: true
@@ -9959,7 +10013,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
         "409":
-          description: This rule change must be authored on the control plane, not on a configuration-pulling Edge.
+          description: The organization differs from expected_tenant_id, or this rule change must be authored on the control plane rather than a configuration-pulling Edge.
         "500":
           description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
           content:
@@ -9992,6 +10046,12 @@ paths:
       tags:
         - AdminPolicyCandidateReview
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
         - name: candidate_id
           in: path
           required: true
@@ -10005,7 +10065,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
         "409":
-          description: This rule change must be authored on the control plane, not on a configuration-pulling Edge.
+          description: The organization differs from expected_tenant_id, or this rule change must be authored on the control plane rather than a configuration-pulling Edge.
         "500":
           description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
           content:

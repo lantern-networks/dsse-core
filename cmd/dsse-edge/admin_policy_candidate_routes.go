@@ -43,6 +43,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": message, "partial": true, "failed_stage": stage, "candidate_id": c.CandidateID, "candidate_status": c.Status})
 	}
 	mux.HandleFunc("GET /admin/policy-candidates", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		options := policycandidate.ListOptions{
 			Status:        strings.TrimSpace(r.URL.Query().Get("status")),
 			CandidateType: strings.TrimSpace(r.URL.Query().Get("candidate_type")),
@@ -53,7 +56,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writePolicyCandidateError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, result)
+		writeJSON(w, http.StatusOK, struct {
+			policycandidate.ListResponse
+			TenantID string `json:"tenant_id"`
+		}{result, adminTenantIDFromRequest(r)})
 	}))
 	mux.HandleFunc("GET /admin/policy-candidates/{candidate_id}", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
 		candidate, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"))
@@ -85,6 +91,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, created)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/review", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		var review policycandidate.ReviewRequest
 		if err := decodeLimitedJSONBody(w, r, &review, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode policy candidate review: %w", err))
@@ -129,6 +138,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, reviewed)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/materialize", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		concrete, ok := policyCandidateStore.(*policycandidate.Store)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, fmt.Errorf("policy candidate store does not support materialize"))
@@ -238,6 +250,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// and the rule then reaches every Edge in the fleet, which is what an inspection bypass has to do: a site
 	// that must not be decrypted must not be decrypted by whichever Edge the device happens to reach.
 	mux.HandleFunc("POST /admin/cert-pin-bypass", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if configWriteRejectedWhenSourced(w, configSourceURL, "cert-pin bypass") {
 			return
 		}

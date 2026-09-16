@@ -69,8 +69,8 @@ function renderPinnedSitesView(content) {
   content.appendChild(bar);
 
   // Manual add: register a known pinned site directly, without waiting for the detector to surface it. Posts to
-  // /admin/cert-pin-bypass, which approves + materializes in one step, so the site is decrypt-bypassed at once
-  // and appears in both lists below exactly like a detected-then-adopted one.
+  // /admin/cert-pin-bypass, which saves a registration at the control plane.
+  // The serving Edge reports its own applied state separately.
   const addBar = document.createElement("div");
   addBar.style.cssText = "margin:0 0 8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
   const addInput = document.createElement("input");
@@ -102,20 +102,23 @@ function renderPinnedSitesView(content) {
   bypassDesc.className = "group-desc";
   bypassDesc.textContent = bl({
     en: "Bypass patterns currently reported by the serving Edge. A saved registration may still be waiting for distribution. " +
-      "Candidate status and this list are separate: if registration is incomplete, check Internet Access and retry the operation.",
+      "The observation on an Edge and the registration at the control plane may appear as separate candidates. " +
+      "Reviewing the observation does not revoke that separate rule. To remove a bypass, edit its rule in Internet Access.",
     ja: "接続先Edgeが現在報告しているバイパス対象です。保存した登録の配布がまだ完了していない場合があります。" +
-      "候補の状態とこの一覧は別です。登録が未完了の場合はインターネットアクセスのルールを確認し、操作を再試行してください。",
+      "Edgeの検出履歴と管理元の登録は別の候補として表示される場合があります。検出履歴を却下しても別の登録ルールは削除されません。" +
+      "バイパスを解除するには、インターネットアクセスの該当ルールを編集してください。",
   });
   content.appendChild(bypassDesc);
   const bypassContainer = document.createElement("div");
   content.appendChild(bypassContainer);
 
   const filterText = () => search.value.trim().toLowerCase();
-  const reloadAll = async () => { await Promise.all([reloadPinned(container, filterText()), reloadBypass(bypassContainer, filterText())]); };
+  const view = pinnedView(content, container, bypassContainer, addInput, addBtn, filterText);
+  const reloadAll = view.load;
   container._reloadAll = reloadAll;
+  container._write = view.write;
   reloadBtn.addEventListener("click", reloadAll);
-  // Re-filter from the already-loaded data on each keystroke (no re-fetch).
-  search.addEventListener("input", () => { paintPinned(container, filterText()); paintBypass(bypassContainer, filterText()); });
+  search.addEventListener("input", view.paint);
 
   const submitAdd = async () => {
     if (addBtn.disabled) return;
@@ -125,7 +128,7 @@ function renderPinnedSitesView(content) {
     addStatus.style.color = "#4b5563";
     addStatus.textContent = bl({ en: "Registering…", ja: "登録中…" });
     try {
-      const r = await apiFetch("POST", "/admin/cert-pin-bypass", { host: host });
+      const r = await container._write("/admin/cert-pin-bypass", { host: host }, c => pinnedRegistrationMatches(c, host));
       if (!r.ok) {
         let detail = "HTTP " + r.status;
         const j = r.body; // already-parsed body
@@ -146,7 +149,7 @@ function renderPinnedSitesView(content) {
       addStatus.style.color = "#b91c1c";
       addStatus.textContent = bl({ en: "Error: ", ja: "エラー: " }) + String((e && e.message) || e);
     } finally {
-      addBtn.disabled = false;
+      view.lock();
     }
   };
   addBtn.addEventListener("click", submitAdd);
@@ -155,23 +158,11 @@ function renderPinnedSitesView(content) {
   reloadAll();
 }
 
-async function reloadBypass(container, filter) {
-  container.innerHTML = `<p class="group-desc">${escapeHtml(bl({ en: "Loading…", ja: "読込中…" }))}</p>`;
-  try {
-    const r = await apiFetch("GET", "/admin/intercept/bypass-hosts");
-    if (!r.ok) { container.innerHTML = `<p class="group-desc">HTTP ${r.status}</p>`; return; }
-    container._bypassHosts = Array.isArray(r.body) ? r.body : [];
-  } catch (e) {
-    container.innerHTML = `<p class="group-desc">${escapeHtml(String(e))}</p>`;
-    return;
-  }
-  paintBypass(container, filter);
-}
-
 // paintBypass renders the cached bypass-host set filtered by substring. Split from reloadBypass so the search
 // box can re-filter without re-querying the edge.
 function paintBypass(container, filter) {
-  const all = Array.isArray(container._bypassHosts) ? container._bypassHosts : [];
+  if (!Array.isArray(container._bypassHosts)) return;
+  const all = container._bypassHosts;
   const f = String(filter || "").trim().toLowerCase();
   const hosts = f ? all.filter((h) => String(h).toLowerCase().includes(f)) : all;
   if (all.length === 0) {
@@ -190,33 +181,12 @@ function paintBypass(container, filter) {
   container.innerHTML = `<div>${chips}</div>`;
 }
 
-async function reloadPinned(container, filter) {
-  container.innerHTML = `<p class="group-desc">${escapeHtml(bl({ en: "Loading…", ja: "読込中…" }))}</p>`;
-  let data;
-  try {
-    const r = await apiFetch("GET", "/admin/policy-candidates");
-    if (!r.ok) {
-      container.innerHTML = `<p class="group-desc">HTTP ${r.status}</p>`;
-      return;
-    }
-    data = r.body; // apiFetch returns { status, ok, body } with body already parsed (NOT a fetch Response)
-  } catch (e) {
-    container.innerHTML = `<p class="group-desc">${escapeHtml(String(e))}</p>`;
-    return;
-  }
-  const all = Array.isArray(data && data.candidates) ? data.candidates : [];
-  // Cache the fetched (unfiltered) recommendations so the search box can re-filter without re-querying.
-  container._pinnedAll = all
-    .filter((c) => c.source === "cert_pinning_detection" || c.candidate_type === "bypass_policy")
-    .sort((a, b) => (b.failure_count || 0) - (a.failure_count || 0));
-  paintPinned(container, filter);
-}
-
 // paintPinned renders the cached recommendations filtered by host substring. Split from reloadPinned so the
 // search box re-filters instantly and review/materialize actions repaint without dropping the current filter.
 function paintPinned(container, filter) {
   container._filter = filter;
-  const cached = Array.isArray(container._pinnedAll) ? container._pinnedAll : [];
+  if (!Array.isArray(container._pinnedAll)) return;
+  const cached = container._pinnedAll;
   if (cached.length === 0) {
     container.innerHTML = `<p class="group-desc">${escapeHtml(bl({
       en: "No pinned-site recommendations yet. When a site repeatedly rejects the interception leaf, it will appear here.",
@@ -350,10 +320,10 @@ async function reviewPinned(id, decision, container) {
     if (!window.confirm(msg)) return;
   }
   try {
-    const r = await apiFetch("POST", "/admin/policy-candidates/" + encodeURIComponent(id) + "/review", {
+    const r = await container._write("/admin/policy-candidates/" + encodeURIComponent(id) + "/review", {
       decision: decision,
       review_reason_code: "operator_" + decision,
-    });
+    }, c => c.candidate_id === id && c.status === decision && c.source === "cert_pinning_detection" && c.candidate_type === "bypass_policy");
     if (!r.ok) {
       window.alert(pinnedRequestError(r));
       if (r.body && r.body.partial === true) await reloadPinnedView(container);
@@ -398,7 +368,7 @@ async function materializePinned(id, container, investigateOnly, host) {
     return;
   }
   try {
-    const r = await apiFetch("POST", "/admin/cert-pin-bypass", { host: host, allow_high_risk: !!body.allow_high_risk });
+    const r = await container._write("/admin/cert-pin-bypass", { host: host, allow_high_risk: !!body.allow_high_risk }, c => pinnedRegistrationMatches(c, host));
     if (!r.ok) {
       window.alert(pinnedRequestError(r));
       if (r.body && r.body.partial === true) await reloadPinnedView(container);
@@ -416,5 +386,100 @@ function pinnedRequestError(response) {
 }
 
 function reloadPinnedView(container) {
-  return typeof container._reloadAll === "function" ? container._reloadAll() : reloadPinned(container, container._filter || "");
+  return container._reloadAll();
+}
+
+
+function pinnedObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+function pinnedSelection() { return typeof operateTenant === "undefined" ? "" : (operateTenant || ""); }
+function pinnedInvalid() { return bl({en:"Could not load these lists correctly. Reload before editing.",ja:"一覧を正しく読み込めません。編集前に再読込してください。"}); }
+function pinnedChanged() { return bl({en:"The organization or page changed. Reload before editing.",ja:"組織または画面が変わりました。編集前に再読込してください。"}); }
+function pinnedUnconfirmed() { return bl({en:"Could not confirm the operation. Your input is kept. Reload before retrying.",ja:"操作結果を確認できません。入力は保持しています。再試行前に再読込してください。"}); }
+function pinnedTenant(r) {
+  if (!r?.ok || r.status !== 200 || !pinnedObject(r.body) || typeof r.body.tenant_id !== "string" || !r.body.tenant_id.trim()) throw new Error(pinnedInvalid());
+  return r.body.tenant_id;
+}
+function pinnedCandidate(c, tenant) {
+  if (!pinnedObject(c) || c.tenant_id !== tenant || typeof c.candidate_id !== "string" || !c.candidate_id.trim() ||
+      typeof c.source !== "string" || !c.source || typeof c.candidate_type !== "string" || !c.candidate_type ||
+      !Object.hasOwn(PINNED_STATUS_STYLE, c.status)) throw new Error(pinnedInvalid());
+  for (const key of ["host","sni","confidence","suggested_action","last_observed","updated_at","attribution_source","observed_ip"]) {
+    if (c[key] !== undefined && c[key] !== null && typeof c[key] !== "string") throw new Error(pinnedInvalid());
+  }
+  if ((c.failure_count !== undefined && (!Number.isSafeInteger(c.failure_count) || c.failure_count < 0)) ||
+      (c.port !== undefined && (!Number.isInteger(c.port) || c.port < 0 || c.port > 65535))) throw new Error(pinnedInvalid());
+  return c;
+}
+function pinnedLists(candidates, bypass, tenant) {
+  if (pinnedTenant(candidates) !== tenant || pinnedTenant(bypass) !== tenant) throw new Error(pinnedChanged());
+  const list = candidates.body, hosts = bypass.body.hosts;
+  if (!Array.isArray(list.candidates) || !Number.isSafeInteger(list.count) || list.count < list.candidates.length ||
+      !Number.isSafeInteger(list.limit) || list.limit < 1 || list.candidates.length > list.limit ||
+      !Object.hasOwn(bypass.body,"hosts") || (hosts !== null && !Array.isArray(hosts))) throw new Error(pinnedInvalid());
+  const ids = new Set();
+  for (const c of list.candidates) { pinnedCandidate(c,tenant); if (ids.has(c.candidate_id)) throw new Error(pinnedInvalid()); ids.add(c.candidate_id); }
+  if ((hosts || []).some(h => typeof h !== "string" || !h.trim())) throw new Error(pinnedInvalid());
+  return {candidates:list.candidates.filter(c => c.source === "cert_pinning_detection" && c.candidate_type === "bypass_policy").sort((a,b)=>(b.failure_count || 0)-(a.failure_count || 0)),hosts:hosts || []};
+}
+function pinnedRegistrationMatches(c, host) {
+  const normalize = h => String(h || "").trim().toLowerCase().replace(/\.$/, "");
+  return c.status === "materialized" && c.source === "cert_pinning_detection" && c.candidate_type === "bypass_policy" && normalize(c.host) === normalize(host);
+}
+
+// One page revision owns both lists. Failed reads discard the old action cache;
+// late reads and writes cannot act on a new organization or a replacement view.
+function pinnedView(content, candidates, bypass, input, addButton, filter) {
+  const fresh = freshRender(content);
+  const current = () => fresh() && content.isConnected !== false && candidates.isConnected !== false && bypass.isConnected !== false;
+  let loaded = false, pending = false, tenant = "", selection = "", revision = 0;
+  function active(stamp = revision) { return loaded && current() && stamp === revision && selection === pinnedSelection(); }
+  function lock() { input.disabled = addButton.disabled = !active() || pending; candidates.querySelectorAll("button[data-act]").forEach(b => {b.disabled = !active() || pending;}); }
+  function clear() { loaded = false; candidates._pinnedAll = undefined; bypass._bypassHosts = undefined; lock(); }
+  function error(message) {
+    clear();
+    if (current()) { uiState(candidates,"error",message,{label:bl({en:"Reload lists",ja:"一覧を再読込"}),onClick:load}); bypass.innerHTML = ""; }
+  }
+  function paint() {
+    if (!loaded || !current()) return;
+    if (!active()) { error(pinnedChanged()); return; }
+    paintPinned(candidates,filter()); paintBypass(bypass,filter()); lock();
+  }
+  async function load() {
+    if (pending || !current()) return;
+    clear(); const stamp = ++revision, selected = pinnedSelection();
+    uiState(candidates,"loading"); bypass.innerHTML = "";
+    try {
+      const owner = pinnedTenant(await apiFetch("GET","/admin/tenant"));
+      if (!current() || stamp !== revision) return;
+      if (selected !== pinnedSelection() || (selected && selected !== owner)) throw new Error(pinnedChanged());
+      const q = "expected_tenant_id=" + encodeURIComponent(owner);
+      const [cs, bs] = await Promise.all([apiFetch("GET","/admin/policy-candidates?"+q),apiFetch("GET","/admin/intercept/bypass-hosts?scoped=1&"+q)]);
+      if (!current() || stamp !== revision) return;
+      if (selected !== pinnedSelection()) throw new Error(pinnedChanged());
+      const lists = pinnedLists(cs,bs,owner);
+      candidates._pinnedAll = lists.candidates; bypass._bypassHosts = lists.hosts;
+      tenant = owner; selection = selected; loaded = true; paint();
+    } catch(e) { if (current() && stamp === revision) error(String(e.message || e)); }
+  }
+  async function write(path, body, matches) {
+    if (pending || !active()) throw new Error(pinnedChanged());
+    pending = true; const stamp = revision; lock();
+    try {
+      let owner;
+      try { owner = pinnedTenant(await apiFetch("GET","/admin/tenant")); }
+      catch (_) { error(pinnedChanged()); throw new Error(pinnedChanged()); }
+      if (!active(stamp) || owner !== tenant) { error(pinnedChanged()); throw new Error(pinnedChanged()); }
+      let response;
+      try { response = await apiFetch("POST",path+"?expected_tenant_id="+encodeURIComponent(tenant),body); }
+      catch (_) { error(pinnedUnconfirmed()); throw new Error(pinnedUnconfirmed()); }
+      if (!active(stamp)) { error(pinnedUnconfirmed()); throw new Error(pinnedUnconfirmed()); }
+      if (!response?.ok) return response;
+      try {
+        if (response.status !== 200 || !matches(pinnedCandidate(response.body,tenant))) throw new Error("acknowledgement mismatch");
+      } catch (_) { error(pinnedUnconfirmed()); throw new Error(pinnedUnconfirmed()); }
+      // A confirmed write still needs a fresh read before another action.
+      clear(); return response;
+    } finally { pending = false; if (current()) lock(); }
+  }
+  lock(); return {load,write,paint,lock};
 }

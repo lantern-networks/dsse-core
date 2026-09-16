@@ -20,7 +20,7 @@
 const PINNED_STATUS_STYLE = {
   pending: "background:#fef3c7;color:#92400e",
   approved: "background:#dbeafe;color:#1e40af",
-  materialized: "background:#dcfce7;color:#166534",
+  materialized: "background:#e5e7eb;color:#374151",
   rejected: "background:#fee2e2;color:#991b1b",
   suppressed: "background:#f3f4f6;color:#4b5563",
   dismissed: "background:#f3f4f6;color:#4b5563",
@@ -43,11 +43,11 @@ function renderPinnedSitesView(content) {
   d.textContent = bl({
     en: "Sites that use certificate pinning reject the decrypt-all interception leaf and break under inspection. " +
       "The edge detects them and RECOMMENDS a TLS decrypt-bypass — it never bypasses on its own. Review each " +
-      "recommendation and adopt it: Approve, then Materialize to write it into the TLS bypass policy (the only " +
-      "state in which the site is actually decrypt-bypassed). Reject or Suppress a recommendation you do not want.",
+      "recommendation and adopt it: Approve, then Materialize to request a bypass rule. Candidate status alone " +
+      "does not confirm that the serving Edge has applied it. Check the current bypass list below. Reject or Suppress a recommendation you do not want.",
     ja: "証明書ピンニングを使うサイトは復号傍受のサーバ証明書を拒否し、傍受下で壊れます。Edge はこれを検出し TLS 復号バイパスを" +
       "「推薦」します(自動でバイパスは絶対にしません)。各推薦をレビューして取り込んでください: 承認 → 取り込み" +
-      "(Materialize)で TLS バイパスポリシーに書き込まれ、初めて実際にバイパスされます。不要な推薦は却下/抑制します。",
+      "(Materialize)でバイパスルールの登録を要求します。候補の状態だけでは適用を確認できません。下の現在のバイパス一覧も確認してください。不要な推薦は却下/抑制します。",
   });
   content.appendChild(d);
 
@@ -101,23 +101,24 @@ function renderPinnedSitesView(content) {
   const bypassDesc = document.createElement("p");
   bypassDesc.className = "group-desc";
   bypassDesc.textContent = bl({
-    en: "Hosts the edge never decrypts: the shipped compatibility list (Apple/iCloud/GitHub/OS-update/OCSP…) " +
-      "plus the recommendations adopted (materialized) above. These never appear as recommendations because " +
-      "they are never intercepted — e.g. github.com is on the shipped list.",
-    ja: "Edge が一切復号しないホスト: 出荷時の互換リスト(Apple/iCloud/GitHub/OS更新/OCSP…)+ 上で取り込んだ" +
-      "(materialized)推薦。これらは傍受されないので推薦には出ません(例: github.com は出荷リスト)。",
+    en: "Bypass patterns currently reported by the serving Edge. A saved registration may still be waiting for distribution. " +
+      "Candidate status and this list are separate: if registration is incomplete, check Internet Access and retry the operation.",
+    ja: "接続先Edgeが現在報告しているバイパス対象です。保存した登録の配布がまだ完了していない場合があります。" +
+      "候補の状態とこの一覧は別です。登録が未完了の場合はインターネットアクセスのルールを確認し、操作を再試行してください。",
   });
   content.appendChild(bypassDesc);
   const bypassContainer = document.createElement("div");
   content.appendChild(bypassContainer);
 
   const filterText = () => search.value.trim().toLowerCase();
-  const reloadAll = () => { reloadPinned(container, filterText()); reloadBypass(bypassContainer, filterText()); };
+  const reloadAll = async () => { await Promise.all([reloadPinned(container, filterText()), reloadBypass(bypassContainer, filterText())]); };
+  container._reloadAll = reloadAll;
   reloadBtn.addEventListener("click", reloadAll);
   // Re-filter from the already-loaded data on each keystroke (no re-fetch).
   search.addEventListener("input", () => { paintPinned(container, filterText()); paintBypass(bypassContainer, filterText()); });
 
   const submitAdd = async () => {
+    if (addBtn.disabled) return;
     const host = addInput.value.trim();
     if (!host) return;
     addBtn.disabled = true;
@@ -132,13 +133,14 @@ function renderPinnedSitesView(content) {
         // A restarted edge invalidates the admin session, so a POST can 401/403 until the operator re-signs in.
         if (r.status === 401 || r.status === 403) detail += bl({ en: " (reload the page and sign in again)", ja: "(ページを再読込してサインインし直してください)" });
         addStatus.style.color = "#b91c1c";
-        addStatus.textContent = bl({ en: "Failed: ", ja: "失敗: " }) + detail;
+        addStatus.textContent = bl(r.body && r.body.partial === true ? { en: "Incomplete: ", ja: "未完了: " } : { en: "Failed: ", ja: "失敗: " }) + detail;
+        if (r.body && r.body.partial === true) await reloadAll();
         return;
       }
       addInput.value = "";
       addStatus.style.color = "#047857";
-      addStatus.textContent = bl({ en: host + " registered — now decrypt-bypassed.", ja: host + " を登録しました(復号バイパス有効)。" });
-      reloadAll();
+      addStatus.textContent = bl({ en: host + " — bypass rule saved. Check the serving Edge below.", ja: host + " のバイパスルールを保存しました。下のEdgeの状態も確認してください。" });
+      await reloadAll();
     } catch (e) {
       // A thrown fetch (network/TLS reset — e.g. right after an edge restart) must not fail silently.
       addStatus.style.color = "#b91c1c";
@@ -271,7 +273,7 @@ function paintPinned(container, filter) {
         `<button data-act="materialize" data-id="${id}" data-host="${escapeHtml(c.host || c.sni || "")}" data-investigate="${investigate ? "1" : ""}"><strong>${escapeHtml(bl({ en: "Materialize (apply bypass)", ja: "取り込み(バイパス適用)" }))}</strong></button> ` +
         `<button data-act="rejected" data-id="${id}">${escapeHtml(bl({ en: "Reject", ja: "却下" }))}</button>`;
     } else if (status === "materialized") {
-      actions = `<span class="group-desc">${escapeHtml(bl({ en: "bypass active", ja: "バイパス適用中" }))}</span>`;
+      actions = `<span class="group-desc">${escapeHtml(bl({ en: "registration requested; check Edge below", ja: "登録要求済み・下のEdgeの状態を確認" }))}</span>`;
     } else {
       actions = `<button data-act="approved" data-id="${id}">${escapeHtml(bl({ en: "Re-approve", ja: "再承認" }))}</button>`;
     }
@@ -347,21 +349,25 @@ async function reviewPinned(id, decision, container) {
       : bl({ en: "Suppress this recommendation?", ja: "この推薦を抑制しますか?" });
     if (!window.confirm(msg)) return;
   }
-  const r = await apiFetch("POST", "/admin/policy-candidates/" + encodeURIComponent(id) + "/review", {
-    decision: decision,
-    review_reason_code: "operator_" + decision,
-  });
-  if (!r.ok) {
-    window.alert("HTTP " + r.status);
-    return;
-  }
-  reloadPinned(container, container._filter || "");
+  try {
+    const r = await apiFetch("POST", "/admin/policy-candidates/" + encodeURIComponent(id) + "/review", {
+      decision: decision,
+      review_reason_code: "operator_" + decision,
+    });
+    if (!r.ok) {
+      window.alert(pinnedRequestError(r));
+      if (r.body && r.body.partial === true) await reloadPinnedView(container);
+      return;
+    }
+    await reloadPinnedView(container);
+  } catch (e) { window.alert(bl({ en: "Could not confirm the operation. Reload before retrying: ", ja: "操作結果を確認できません。再読込してから再試行してください: " }) + String((e && e.message) || e)); }
+
 }
 
 async function materializePinned(id, container, investigateOnly, host) {
   if (!window.confirm(bl({
-    en: "Materialize: write this site into the TLS decrypt-bypass policy? Traffic to it will no longer be decrypted/inspected.",
-    ja: "取り込み: このサイトを TLS 復号バイパスポリシーに書き込みます。以後このサイトは復号/傍受されなくなります。よろしいですか?",
+    en: "Request a TLS decrypt-bypass rule for this site? After the serving Edge applies it, traffic to this site will no longer be inspected.",
+    ja: "このサイトのTLS復号バイパスルールを登録します。接続先Edgeへの適用後は復号/傍受されなくなります。よろしいですか?",
   }))) return;
   // An unattributed (investigate_only) candidate — a raw IP with no SNI — is high-risk: you cannot tell what
   // site/app it is. The Edge blocks it unless an explicit high-risk override is sent; require a second,
@@ -391,13 +397,24 @@ async function materializePinned(id, container, investigateOnly, host) {
     }));
     return;
   }
-  const r = await apiFetch("POST", "/admin/cert-pin-bypass", { host: host, allow_high_risk: !!body.allow_high_risk });
-  if (!r.ok) {
-    let detail = "HTTP " + r.status;
-    const j = r.body; // already-parsed body
-    if (j && typeof j === "object" && j.error) detail += " — " + j.error;
-    window.alert(detail + "\n" + bl({ en: "(only an Approved recommendation can be materialized)", ja: "(承認済みの推薦のみ取り込めます)" }));
-    return;
-  }
-  reloadPinned(container, container._filter || "");
+  try {
+    const r = await apiFetch("POST", "/admin/cert-pin-bypass", { host: host, allow_high_risk: !!body.allow_high_risk });
+    if (!r.ok) {
+      window.alert(pinnedRequestError(r));
+      if (r.body && r.body.partial === true) await reloadPinnedView(container);
+      return;
+    }
+    await reloadPinnedView(container);
+  } catch (e) { window.alert(bl({ en: "Could not confirm the operation. Reload before retrying: ", ja: "操作結果を確認できません。再読込してから再試行してください: " }) + String((e && e.message) || e)); }
+}
+
+function pinnedRequestError(response) {
+  const partial = response.body && response.body.partial === true;
+  const prefix = partial ? bl({ en: "Incomplete: ", ja: "未完了: " }) : bl({ en: "Failed: ", ja: "失敗: " });
+  const detail = response.body && typeof response.body.error === "string" ? " — " + response.body.error : "";
+  return prefix + "HTTP " + response.status + detail;
+}
+
+function reloadPinnedView(container) {
+  return typeof container._reloadAll === "function" ? container._reloadAll() : reloadPinned(container, container._filter || "");
 }

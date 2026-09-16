@@ -202,3 +202,34 @@ func TestAddManualCertPinBypassApprovesAndMaterializes(t *testing.T) {
 		t.Fatalf("manual add should approve the existing candidate and keep its history: %+v", re)
 	}
 }
+
+func TestMaterializationRetryKeepsReviewAndRiskGates(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore()
+	now := time.Now()
+	c, e := s.ObserveCertPinFailure(ctx, "own", "192.0.2.10", "", 443, "rejected", now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = s.Review(ctx, "own", c.CandidateID, ReviewRequest{Decision: "approved"}, now); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = s.Materialize(ctx, "own", c.CandidateID, true, now); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = s.Materialize(ctx, "own", c.CandidateID, false, now); e == nil {
+		t.Fatal("retry dropped high-risk gate")
+	}
+	if _, _, e = s.Materialize(ctx, "own", c.CandidateID, true, now); e != nil {
+		t.Fatal("explicit retry", e)
+	}
+	if _, _, e = s.Review(ctx, "own", c.CandidateID, ReviewRequest{Decision: "rejected"}, now); e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = s.Materialize(ctx, "own", c.CandidateID, true, now); e == nil {
+		t.Fatal("retry bypassed later rejection")
+	}
+	if _, ok, e := s.Materialize(ctx, "other", c.CandidateID, true, now); ok || e != nil {
+		t.Fatal("cross-tenant retry", ok, e)
+	}
+}

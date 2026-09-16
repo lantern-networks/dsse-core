@@ -10,15 +10,27 @@ import (
 
 // adminPolicyCandidateAuditLog builds the audit record for a policy-candidate lifecycle event. Kept in
 // cmd/edge for the decision.Evaluator binding + the shared audit-id mint.
-func adminPolicyCandidateAuditLog(eventType string, candidate policycandidate.Candidate, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+type policyCandidateAuditOutcome struct {
+	actor                              *string
+	result, failedStage, ruleOperation string
+	ruleConfirmed, applied             bool
+}
+
+func adminPolicyCandidateAuditLog(eventType string, candidate policycandidate.Candidate, evaluator decision.Evaluator, now time.Time, outcomes ...policyCandidateAuditOutcome) model.AuditLog {
 	action := "upsert"
 	if eventType == "admin_policy_candidate_reviewed" {
 		action = "review"
 	}
+	if eventType == "admin_policy_candidate_materialized" {
+		action = "materialize"
+	}
+	if eventType == "admin_cert_pin_bypass_added" {
+		action = "register_bypass"
+	}
 	result := "success"
 	reason := "Policy candidate lifecycle event."
 	targetType := "admin_policy_candidate"
-	return model.AuditLog{
+	record := model.AuditLog{
 		ID:             randomEdgeID("audit_", now),
 		TenantID:       candidate.TenantID,
 		EventType:      eventType,
@@ -46,4 +58,20 @@ func adminPolicyCandidateAuditLog(eventType string, candidate policycandidate.Ca
 			"reason_codes":                      []string{"admin_policy_candidate_lifecycle"},
 		},
 	}
+	if len(outcomes) > 0 {
+		o := outcomes[0]
+		record.ActorUserID = o.actor
+		if o.result != "" {
+			record.Result = &o.result
+		}
+		record.Metadata["candidate_saved"] = true
+		record.Metadata["failed_stage"] = o.failedStage
+		record.Metadata["rule_operation"] = o.ruleOperation
+		record.Metadata["rule_state_confirmed"] = o.ruleConfirmed
+		record.Metadata["policy_materialized"] = o.ruleOperation == "upsert" && o.ruleConfirmed
+		record.Metadata["runtime_hot_reload"] = o.applied
+		record.Metadata["local_apply_requested"] = o.applied
+		record.Metadata["enforcement_scope"] = "local_callback_only"
+	}
+	return record
 }

@@ -183,9 +183,9 @@ func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host str
 	return copyCandidate(normalized), nil
 }
 
-// Materialize marks an approved candidate as materialized — its bypass has been written into the SWG TLS
-// bypass policy (the only state in which traffic is actually decrypt-bypassed). Only an approved
-// candidate can be materialized; this is what separates "approved but not applied" from "applied".
+// Materialize saves an approved candidate's adoption request. Rule creation is a
+// separate operation, so this status is not an enforcement receipt. A cert-pin
+// request can be retried after a later asset/rule save failed.
 func (store *Store) Materialize(_ context.Context, tenantID, candidateID string, allowHighRisk bool, now time.Time) (Candidate, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	candidateID = strings.TrimSpace(candidateID)
@@ -204,7 +204,7 @@ func (store *Store) Materialize(_ context.Context, tenantID, candidateID string,
 	if !ok {
 		return Candidate{}, false, nil
 	}
-	if cand.Status != "approved" {
+	if cand.Status != "approved" && !(cand.Source == SourceCertPinningDetection && cand.Status == "materialized") {
 		return Candidate{}, false, fmt.Errorf("only an approved candidate can be materialized (status=%s)", cand.Status)
 	}
 	// Safety gate: an UNATTRIBUTED candidate (a raw IP literal with no SNI -> suggested_action investigate_only)

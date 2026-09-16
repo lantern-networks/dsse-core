@@ -9875,13 +9875,30 @@ paths:
                   description: The named host to decrypt-bypass (e.g. gateway.example.com). Raw IP literals are rejected.
       responses:
         "200":
-          description: The materialized cert-pin bypass candidate.
+          description: The candidate and bypass rule were saved locally. Serving-Edge adoption and fleet propagation must be checked separately.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "409":
+          description: This rule change must be authored on the control plane, not on a configuration-pulling Edge.
         "500":
-          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  partial:
+                    type: boolean
+                  failed_stage:
+                    type: string
+                  candidate_id:
+                    type: string
+                  candidate_status:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9919,7 +9936,7 @@ paths:
   /admin/policy-candidates/{candidate_id}/review:
     post:
       summary: Review a tenant-scoped allow/bypass policy candidate.
-      description: Requires admin.policy_candidates.review. Approval alone does not enable a bypass. Candidate persistence is confirmed before publishing the review and performing dependent rule cleanup. Candidate storage and authored-rule storage are separate operations; this response is not a fleet propagation receipt.
+      description: Requires admin.policy_candidates.review. Approval alone does not enable a bypass. Candidate persistence is confirmed before publishing the review and performing dependent rule cleanup. Candidate storage and authored-rule storage are separate operations. Rule removal failure returns 500/partial with failed_stage=bypass_rule_removal and may leave the bypass active. A configuration-pulling Edge refuses a review that would remove an existing cert-pin rule with 409. This response is not a fleet propagation receipt.
       tags:
         - AdminPolicyCandidateReview
       parameters:
@@ -9941,8 +9958,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "409":
+          description: This rule change must be authored on the control plane, not on a configuration-pulling Edge.
         "500":
-          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  partial:
+                    type: boolean
+                  failed_stage:
+                    type: string
+                  candidate_id:
+                    type: string
+                  candidate_status:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9954,7 +9988,7 @@ paths:
   /admin/policy-candidates/{candidate_id}/materialize:
     post:
       summary: Materialize an approved bypass policy candidate.
-      description: Requires admin.policy_candidates.review. Applies an already-approved candidate (e.g. a cert-pinning bypass proposal) by adding its host to the interception bypass set and marking it materialized. Detection never auto-bypasses; only this explicit admin step makes a bypass live. Approving without materializing leaves the host intercepted. An unconfirmed candidate save returns 500 without creating dependent rules or applying the bypass. Candidate and rule persistence are separate operations.
+      description: Requires admin.policy_candidates.review. Records adoption of an approved candidate and, for cert-pinning candidates, saves its authored bypass rule before requesting local apply. Already-materialized cert-pin candidates can retry an incomplete rule write; high-risk confirmation remains required. Candidate status alone is not an enforcement receipt. A failure after candidate save returns 500 with partial=true and failed_stage; previously saved steps remain. Pending, rejected and suppressed candidates cannot be adopted by this endpoint. The serving Edge and fleet must be checked separately.
       tags:
         - AdminPolicyCandidateReview
       parameters:
@@ -9970,8 +10004,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "409":
+          description: This rule change must be authored on the control plane, not on a configuration-pulling Edge.
         "500":
-          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  partial:
+                    type: boolean
+                  failed_stage:
+                    type: string
+                  candidate_id:
+                    type: string
+                  candidate_status:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

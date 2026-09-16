@@ -119,7 +119,11 @@ func TestAdminCandidateSaveFailureStopsDependentChanges(t *testing.T) {
 				t.Fatal("failed candidate save changed live")
 			}
 			audit, e := writer.ReadJSONL("audit.log.jsonl")
-			if e != nil || len(audit) != 1 || audit[0]["result"] != "error" {
+			failureCount := 1
+			if op == "manual_second_save" {
+				failureCount = 2
+			}
+			if e != nil || len(audit) != failureCount || audit[failureCount-1]["result"] != "error" {
 				t.Fatal("failed write audit", audit, e)
 			}
 			if w = call(); w.Code != 200 {
@@ -148,13 +152,16 @@ func TestAdminCandidateSaveFailureStopsDependentChanges(t *testing.T) {
 				t.Fatal("candidate restart mismatch")
 			}
 			audit, e = writer.ReadJSONL("audit.log.jsonl")
-			if e != nil || len(audit) != 3 {
+			if e != nil || len(audit) != failureCount+2 {
 				t.Fatal("audit count", len(audit), e)
 			}
 			for i, a := range audit {
 				want := "success"
-				if i == 0 {
+				if i < failureCount {
 					want = "error"
+				}
+				if failureCount == 2 && i == 0 {
+					want = "partial"
 				}
 				if a["result"] != want || a["tenant_id"] != tenant {
 					t.Fatal("audit mismatch", a)

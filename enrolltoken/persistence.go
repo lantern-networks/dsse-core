@@ -91,7 +91,10 @@ func (s *Store) commitTokensLocked(next map[string]Token) error {
 		if err == nil {
 			err = s.persister.Save(data)
 		}
-		if err != nil && !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		// A completed, synced in-place save is usable despite lacking atomicity.
+		// The compatibility warning for an unconfirmed flush also matches that
+		// sentinel, but cannot authorize issuance, consumption or revocation.
+		if err != nil && (!errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
 			s.stateErr = ErrStateUnavailable
 			log.Printf("enrolment_tokens persist: save failed: %v", err)
 			return s.stateErr

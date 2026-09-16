@@ -10,14 +10,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/enrolltoken"
 	"github.com/lantern-networks/dsse-core/logs"
 )
 
 type enrolmentAuditPersister struct {
-	data []byte
-	fail bool
+	data    []byte
+	fail    bool
+	saveErr error
 }
 
 func (p *enrolmentAuditPersister) Load() ([]byte, error) { return bytes.Clone(p.data), nil }
@@ -26,11 +28,11 @@ func (p *enrolmentAuditPersister) Save(b []byte) error {
 		return errors.New("private storage detail")
 	}
 	p.data = bytes.Clone(b)
-	return nil
+	return p.saveErr
 }
 
 func TestEnrolmentRevokeHTTPStateAndAudit(t *testing.T) {
-	for _, mode := range []string{"success", "foreign", "denied", "already_revoked", "save_failure"} {
+	for _, mode := range []string{"success", "foreign", "denied", "already_revoked", "save_failure", "unconfirmed", "bridge", "synced_in_place"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Now().UTC()
 			tenant := testEvaluator().PolicyBundle.TenantID
@@ -64,18 +66,27 @@ func TestEnrolmentRevokeHTTPStateAndAudit(t *testing.T) {
 			}
 			handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, LocalCredentials: creds, EnrolmentTokens: tokens, EnrolledLedger: enrolledinventory.NewLedger()})
 			p.fail = mode == "save_failure"
+			if mode == "unconfirmed" {
+				p.saveErr = blobstore.ErrDurabilityUnconfirmed
+			}
+			if mode == "bridge" {
+				p.saveErr = errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)
+			}
+			if mode == "synced_in_place" {
+				p.saveErr = blobstore.ErrSavedWithoutAtomicity
+			}
 			path := "/admin/enrolment-tokens/" + tok.ID + "/revoke"
 			req := httptest.NewRequest(http.MethodPost, path, strings.NewReader("{}"))
 			req.AddCookie(&http.Cookie{Name: "admin_session", Value: "review-session"})
 			req.Header.Set("X-CSRF-Token", "review-csrf")
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, req)
-			want := map[string]int{"success": 200, "foreign": 404, "denied": 403, "already_revoked": 409, "save_failure": 503}[mode]
+			want := map[string]int{"success": 200, "foreign": 404, "denied": 403, "already_revoked": 409, "save_failure": 503, "unconfirmed": 503, "bridge": 503, "synced_in_place": 200}[mode]
 			if rec.Code != want {
 				t.Fatalf("status %d expected %d: %s", rec.Code, want, rec.Body.String())
 			}
 			after := tokens.List(tokenTenant)[0]
-			if mode == "success" {
+			if mode == "success" || mode == "synced_in_place" {
 				if after.RevokedAt == "" || after.RevokedBy != "reviewer" {
 					t.Fatal("revocation not attributed")
 				}
@@ -87,7 +98,7 @@ func TestEnrolmentRevokeHTTPStateAndAudit(t *testing.T) {
 				t.Fatal(err)
 			}
 			event, result, target := "admin_config_change", "error", path
-			if mode == "success" {
+			if mode == "success" || mode == "synced_in_place" {
 				result = "success"
 			}
 			if mode == "denied" {
@@ -115,7 +126,7 @@ func TestEnrolmentRevokeHTTPStateAndAudit(t *testing.T) {
 			if strings.Contains(rec.Body.String(), "private storage detail") {
 				t.Fatal("response leaked storage detail")
 			}
-			if mode == "save_failure" {
+			if mode == "save_failure" || mode == "unconfirmed" || mode == "bridge" {
 				if tokens.Health() == nil {
 					t.Fatal("store not stopped")
 				}

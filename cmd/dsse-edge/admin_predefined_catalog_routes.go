@@ -18,6 +18,9 @@ import (
 // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer) {
 	mux.HandleFunc("GET /admin/predefined-catalog", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.CatalogOverrides == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
 			return
@@ -27,12 +30,13 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		cat := knownbypass.Catalog()
 		source := "builtin"
 		if config.CatalogFeed != nil {
-			cat = config.CatalogFeed.EffectiveCatalog()
-			if config.CatalogFeed.Status(time.Now().UTC()).Source == "feed" {
+			status := config.CatalogFeed.Status(time.Now().UTC())
+			if status.Current != nil {
+				cat = knownbypass.CatalogDocument{Version: status.Current.CatalogVersion, Entries: status.Current.Entries}
 				source = "feed"
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeCatalogContextResponse(w, r, "tenant", map[string]any{
 			"version":                cat.Version,
 			"source":                 source,
 			"entries":                cat.Entries,
@@ -44,13 +48,19 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 	// and roll back to a prior version. The feed replaces the built-in default when valid; an invalid/older/
 	// expired feed is rejected and the current catalog is kept (last-known-good).
 	mux.HandleFunc("GET /admin/predefined-catalog/feed", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.CatalogFeed == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog feed is not configured on this edge"))
 			return
 		}
-		writeJSON(w, http.StatusOK, config.CatalogFeed.Status(time.Now().UTC()))
+		writeCatalogContextResponse(w, r, "deployment", config.CatalogFeed.Status(time.Now().UTC()))
 	}))
 	mux.HandleFunc("POST /admin/predefined-catalog/feed", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.CatalogFeed == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog feed is not configured on this edge"))
 			return
@@ -90,9 +100,12 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		if config.ApplyMaterializedCertPinBypass != nil {
 			config.ApplyMaterializedCertPinBypass(adminTenantIDFromRequest(r))
 		}
-		writeJSON(w, http.StatusOK, applied)
+		writeCatalogContextResponse(w, r, "deployment", applied)
 	}))
 	mux.HandleFunc("POST /admin/predefined-catalog/feed/rollback", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.CatalogFeed == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog feed is not configured on this edge"))
 			return
@@ -134,9 +147,12 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		if config.ApplyMaterializedCertPinBypass != nil {
 			config.ApplyMaterializedCertPinBypass(adminTenantIDFromRequest(r))
 		}
-		writeJSON(w, http.StatusOK, applied)
+		writeCatalogContextResponse(w, r, "deployment", applied)
 	}))
 	mux.HandleFunc("POST /admin/predefined-catalog/overrides", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.CatalogOverrides == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
 			return
@@ -165,9 +181,12 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		if config.ApplyMaterializedCertPinBypass != nil {
 			config.ApplyMaterializedCertPinBypass(tenant)
 		}
-		writeJSON(w, http.StatusOK, o)
+		writeCatalogContextResponse(w, r, "tenant", o)
 	}))
 	mux.HandleFunc("POST /admin/predefined-catalog/overrides/{id}/clear", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.CatalogOverrides == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
 			return
@@ -182,7 +201,18 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		if config.ApplyMaterializedCertPinBypass != nil {
 			config.ApplyMaterializedCertPinBypass(tenant)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"entry_id": id, "cleared": cleared})
+		writeCatalogContextResponse(w, r, "tenant", map[string]any{"entry_id": id, "cleared": cleared})
 	}))
 
+}
+
+// The optional envelope preserves existing API clients while allowing the Console
+// to verify both its authenticated context and the scope of the operation. Feed
+// changes remain deployment-wide and keep the operator authorization above.
+func writeCatalogContextResponse(w http.ResponseWriter, r *http.Request, scope string, data any) {
+	if r.URL.Query().Get("scoped") == "1" {
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "scope": scope, "data": data})
+		return
+	}
+	writeJSON(w, http.StatusOK, data)
 }

@@ -178,6 +178,28 @@ This confirms a local update, not its delivery to other nodes. Check the effecti
 catalog and inspection selection on every serving Edge. The common mutation audit
 records actor, organization, request path and result; it is not a feed-content diff.
 
+#### Confirming Console changes
+
+The Console verifies the catalog, feed status and authenticated organization before
+allowing changes. Missing or inconsistent responses are errors, not an empty
+catalog or proof that built-in defaults are active. A feed-status service error
+leaves its controls unavailable; independently verified tenant overrides remain
+usable. Feed changes affect the deployment and require operator authority;
+overrides affect the selected organization.
+
+Pending operations lock other changes and reload. If the response is lost or does
+not identify the requested override or signed feed, the Console keeps the input
+and asks you to reload and check saved state before retrying. The server may have
+completed the write and correctly recorded success even though the browser could
+not confirm it. Reload both the catalog and its feed history, and check Logs & Audit.
+
+Update the Console and serving APIs together. The Console uses `scoped=1` responses
+with `tenant_id`, `scope` and `data`, plus an `expected_tenant_id` precondition.
+Older API responses remain available to existing clients, but an older server
+without these context fields does not provide an editable view in the new Console.
+These checks bind the authenticated organization; they do not compare concurrent
+catalog revisions or provide a transaction across catalog and override stores.
+
 #### Restoring a signed catalog
 
 A configured feed snapshot is verified before its catalog, rollback history or

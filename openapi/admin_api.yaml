@@ -7688,12 +7688,23 @@ paths:
         "503":
           description: This deployment holds no agent-policy signing key, so it cannot issue a profile a device would accept.
   /admin/predefined-catalog:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     get:
       summary: View the predefined pinned-bypass catalog and this tenant's overrides.
       description: Requires admin.policy.read. Returns the versioned curated catalog of well-known un-interceptable services (vendor/category/risk per entry), the tenant's per-entry overrides (force_inspect/disabled), and the resulting effective bypass host set.
       tags:
         - AdminPredefinedCatalog
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The versioned catalog, the tenant's overrides, and the effective bypass hosts.
           content:
@@ -7706,12 +7717,23 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
   /admin/predefined-catalog/feed:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     get:
       summary: View the signed predefined-catalog feed status.
       description: Requires admin.policy.read. Returns the applied feed source (feed/builtin), catalog version, staleness, the current applied feed, and the version history available for rollback.
       tags:
         - AdminPredefinedCatalog
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: Feed status + version history.
           content:
@@ -7779,6 +7801,8 @@ paths:
                             nullable: true
                             items: {type: string, nullable: true}
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The applied feed.
           content:
@@ -7797,6 +7821,15 @@ paths:
         "503":
           description: The catalog feed store is not configured.
   /admin/predefined-catalog/feed/rollback:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     post:
       summary: Roll back the predefined-catalog feed to a prior version.
       description: Requires admin.policy.write and deployment-operator scope (not an entered customer organization). Restores a previously-applied catalog version from the feed history (the only way to move to an older version). With storage configured, saves the candidate before publishing its catalog and history; a save error retains the current live selection and permits retry.
@@ -7810,6 +7843,8 @@ paths:
               type: object
               additionalProperties: true
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The restored feed.
           content:
@@ -7828,6 +7863,15 @@ paths:
         "503":
           description: The catalog feed store is not configured.
   /admin/predefined-catalog/overrides:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     post:
       summary: Override a predefined catalog entry for this tenant.
       description: Requires admin.policy.write. Sets a per-tenant override on an entry in the effective catalog (the applied feed, or the built-in catalog when no feed is applied) — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
@@ -7841,6 +7885,8 @@ paths:
               type: object
               additionalProperties: true
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The stored override.
           content:
@@ -7859,6 +7905,15 @@ paths:
         "503":
           description: The catalog override store is not configured.
   /admin/predefined-catalog/overrides/{id}/clear:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     post:
       summary: Clear a tenant's override on a predefined catalog entry.
       description: Requires admin.policy.write. Removes the override and restores the catalog default (the entry is bypassed again). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
@@ -7871,6 +7926,8 @@ paths:
           schema:
             type: string
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: Whether an override was cleared.
           content:

@@ -49,13 +49,26 @@ func validOverrideMode(mode string) bool {
 // Set records (or replaces) a tenant's override for a catalog entry. The entry must exist in the catalog and
 // the mode must be valid; an unknown entry or mode is rejected so the override set cannot drift from the catalog.
 func (s *OverrideStore) Set(tenantID string, o Override, now time.Time) (Override, error) {
+	return s.SetFromCatalog(tenantID, o, Catalog().Entries, now)
+}
+
+// SetFromCatalog records an override for an entry in the supplied effective catalog.
+// Callers must provide a trusted catalog and serialize catalog updates with this call.
+func (s *OverrideStore) SetFromCatalog(tenantID string, o Override, entries []Group, now time.Time) (Override, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Override{}, fmt.Errorf("tenant_id is required")
 	}
 	o.EntryID = strings.TrimSpace(o.EntryID)
 	o.Mode = strings.TrimSpace(o.Mode)
-	if _, ok := EntryByID(o.EntryID); !ok {
+	found := false
+	for _, entry := range entries {
+		if entry.ID == o.EntryID {
+			found = true
+			break
+		}
+	}
+	if !found {
 		return Override{}, fmt.Errorf("unknown catalog entry %q", o.EntryID)
 	}
 	if !validOverrideMode(o.Mode) {

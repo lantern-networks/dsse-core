@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/catalogfeed"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/knownbypass"
 	"github.com/lantern-networks/dsse-core/logs"
@@ -79,6 +80,10 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		}
 		applied, err := config.CatalogFeed.Apply(raw, time.Now().UTC())
 		if err != nil {
+			if errors.Is(err, catalogfeed.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog feed save could not be confirmed; reload and retry"))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -119,6 +124,10 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		}
 		applied, err := config.CatalogFeed.Rollback(body.CatalogVersion, time.Now().UTC())
 		if err != nil {
+			if errors.Is(err, catalogfeed.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog feed save could not be confirmed; reload and retry"))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -138,7 +147,13 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		o, err := config.CatalogOverrides.Set(tenant, req, time.Now().UTC())
+		var o knownbypass.Override
+		var err error
+		if config.CatalogFeed != nil {
+			o, err = config.CatalogFeed.SetOverride(config.CatalogOverrides, tenant, req, time.Now().UTC())
+		} else {
+			o, err = config.CatalogOverrides.Set(tenant, req, time.Now().UTC())
+		}
 		if err != nil {
 			if errors.Is(err, knownbypass.ErrPersistence) {
 				writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog override save could not be confirmed; reload and retry"))

@@ -152,6 +152,33 @@ result. It does not currently retain the override's previous/new mode or reason.
 For a successful retry, verify the saved override and the effective selection in
 addition to the audit result. Signed catalog feed updates are a separate operation.
 
+### Signed catalog updates
+
+Only the deployment operator, outside an entered customer organization, can apply
+or roll back the signed feed. Customer administrators can override entries in the
+current effective catalog, including entries supplied only by a feed. An override
+is keyed by entry ID: it has no effect while that ID is absent, and applies again
+if a later feed or rollback brings the ID back.
+
+Apply checks the configured trusted signing key, signature, checksum and expiry.
+A version must be newer than the currently applied version; use **Roll back** to
+select an available historical version. The history retains at most 20 applied
+records. A previously applied feed remains in use after expiry and is shown as
+stale; this is distinct from submitting a new expired feed, which is rejected.
+
+With a feed state path configured, apply and rollback save the catalog and history
+before changing the current selection. Saving uses staged replacement and flushes.
+A storage error leaves live state unchanged and permits retry, but the destination
+may already have been replaced before a flush error. Repair storage and retry the
+intended operation before restarting or changing the state path. Keep a backup
+for recovery. Mount the containing directory rather than relying on replacement of
+a bind-mounted file. Without a state path, updates are in memory only.
+
+This confirms a local update, not its delivery to other nodes. Check the effective
+catalog and inspection selection on every serving Edge. The common mutation audit
+records actor, organization, request path and result; it is not a feed-content diff.
+
+
 ## Save and verify inspection defaults
 
 **Inspection Settings** configures defaults for the whole deployment. Only the

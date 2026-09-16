@@ -7713,7 +7713,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Apply a vendor-signed predefined-catalog feed.
-      description: Requires admin.policy.write. Validates a signed catalog feed envelope (ed25519 signature + checksum + expiry + trusted keyring) and, if it is newer than the applied version, makes it the effective catalog. An invalid/expired/older feed is rejected and the current catalog is kept (last-known-good).
+      description: Requires admin.policy.write and deployment-operator scope (not an entered customer organization). Validates a signed catalog feed envelope (ed25519 signature + checksum + expiry + trusted keyring) and, if it is newer than the applied version, makes it the effective catalog. An invalid/expired/older feed is rejected and the current catalog is kept (last-known-good). With storage configured, saves the candidate before publishing its catalog and history; a save error retains the current live selection and permits retry.
       tags:
         - AdminPredefinedCatalog
       requestBody:
@@ -7737,10 +7737,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the feed snapshot could not be confirmed. Current live catalog and history are retained; repair storage, reload and retry before restarting.
+        "503":
+          description: The catalog feed store is not configured.
   /admin/predefined-catalog/feed/rollback:
     post:
       summary: Roll back the predefined-catalog feed to a prior version.
-      description: Requires admin.policy.write. Restores a previously-applied catalog version from the feed history (the only way to move to an older version).
+      description: Requires admin.policy.write and deployment-operator scope (not an entered customer organization). Restores a previously-applied catalog version from the feed history (the only way to move to an older version). With storage configured, saves the candidate before publishing its catalog and history; a save error retains the current live selection and permits retry.
       tags:
         - AdminPredefinedCatalog
       requestBody:
@@ -7764,10 +7768,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the feed snapshot could not be confirmed. Current live catalog and history are retained; repair storage, reload and retry before restarting.
+        "503":
+          description: The catalog feed store is not configured.
   /admin/predefined-catalog/overrides:
     post:
       summary: Override a predefined catalog entry for this tenant.
-      description: Requires admin.policy.write. Sets a per-tenant override on a catalog entry — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
+      description: Requires admin.policy.write. Sets a per-tenant override on an entry in the effective catalog (the applied feed, or the built-in catalog when no feed is applied) — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
       tags:
         - AdminPredefinedCatalog
       requestBody:

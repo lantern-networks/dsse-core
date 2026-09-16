@@ -2,11 +2,15 @@ package policycandidate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
+
+// ErrPersistence means the requested candidate snapshot could not be confirmed saved.
+var ErrPersistence = errors.New("policy candidate persistence failed")
 
 // SetStatePath enables durable file persistence at path (historical behaviour); empty = in-memory only. A
 // back-compat convenience over SetPersister(blobstore.FilePersister{...}).
@@ -24,22 +28,19 @@ func (store *Store) SetStatePath(path string) error {
 func (store *Store) SetPersister(p blobstore.Persister) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.persister = p
+	if store.dirty {
+		return fmt.Errorf("%w: retry saving before replacing storage", ErrPersistence)
+	}
 	if p == nil {
+		store.persister = nil
 		return nil
 	}
-	return store.loadLocked()
-}
-
-func (store *Store) loadLocked() error {
-	if store.persister == nil {
-		return nil
-	}
-	data, err := store.persister.Load()
+	data, err := p.Load()
 	if err != nil {
 		return err
 	}
 	if len(data) == 0 {
+		store.persister = p
 		return nil
 	}
 	var snapshot map[string]map[string]Candidate
@@ -49,22 +50,35 @@ func (store *Store) loadLocked() error {
 	if snapshot != nil {
 		store.candidates = snapshot
 	}
+	store.persister = p
 	return nil
 }
 
-// persistLocked snapshots the candidates to the persister. The error MUST reach the mutating caller: a
-// swallowed Save meant a detected candidate (or an admin review verdict) was acknowledged while nothing hit
-// disk, silently vanishing on restart. Caller holds store.mu.
-func (store *Store) persistLocked() error {
-	if store.persister == nil {
-		return nil
+func (store *Store) cloneLocked() map[string]map[string]Candidate {
+	next := make(map[string]map[string]Candidate, len(store.candidates))
+	for tenant, entries := range store.candidates {
+		next[tenant] = make(map[string]Candidate, len(entries))
+		for id, candidate := range entries {
+			next[tenant][id] = copyCandidate(candidate)
+		}
 	}
-	data, err := json.MarshalIndent(store.candidates, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal policy-candidate snapshot: %w", err)
+	return next
+}
+
+// Caller holds mu across save and publication. An uncertain save leaves live state
+// unchanged and prevents changing the writer until a subsequent save is confirmed.
+func (store *Store) commitLocked(next map[string]map[string]Candidate) error {
+	if store.persister != nil {
+		data, err := json.MarshalIndent(next, "", "  ")
+		if err == nil {
+			err = store.persister.Save(data)
+		}
+		if err != nil {
+			store.dirty = true
+			return fmt.Errorf("%w: %w", ErrPersistence, err)
+		}
 	}
-	if err := store.persister.Save(data); err != nil {
-		return fmt.Errorf("persist policy candidates: %w", err)
-	}
+	store.candidates = next
+	store.dirty = false
 	return nil
 }

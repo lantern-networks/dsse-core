@@ -330,3 +330,12 @@ common HTTP audit remains separate. Neither audit proves remote delivery.
 
 The Console’s **Policy decision check** destination preview evaluates TCP/443.
 It is not a simulation of every protocol, port, identity, or existing connection.
+
+
+### Candidate persistence and bypass registration
+
+Candidate creation, observation, review and materialization publish their candidate state only after the configured store confirms the save. If saving fails, candidate write endpoints return HTTP 500 before their dependent rule creation or runtime apply step. Reload the candidate list, restore storage availability, and retry. Approval alone does not bypass traffic.
+
+A manual bypass registration saves approval and materialization separately before writing its destination asset and Egress rule. These stores do not share an atomic transaction: an earlier confirmed step can remain after a later failure. Check both the candidate and its Egress rule, and the serving Edge's bypass state. A candidate status is not a receipt that every Edge has applied the bypass. The normal HTTP change audit records the request result; specialized candidate events describe candidate lifecycle and are not fleet enforcement evidence.
+
+An unconfirmed save retains the previous live candidate snapshot and prevents replacing or detaching its writer until a later save is confirmed. It can still have changed persistent storage (for example, replacement completed but the final flush failed); do not treat an error as proof that storage is unchanged or crash recovery will select the old snapshot. Tenant erasure reports candidate-store failure as incomplete. Without a configured persister, candidates remain memory-only. Candidate observations that fail to save are not retained by the store; observation delivery is not a guaranteed audit stream.

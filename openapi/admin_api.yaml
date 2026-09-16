@@ -9773,7 +9773,7 @@ paths:
   /admin/policy-candidates:
     get:
       summary: List tenant-scoped allow/bypass policy candidates.
-      description: Requires admin.policy_candidates.read. Returns metadata-only policy candidates for operator review. Raw logs, endpoints, IPs, hosts, users, payloads, credentials, tokens, TLS/cert, Apple, and device material are intentionally excluded.
+      description: Requires admin.policy_candidates.read. Returns metadata-only policy candidates for operator review. Candidates can include destination host/SNI, port, observation counts and attribution evidence. Request payloads, credentials and certificate material are not returned.
       tags:
         - AdminPolicyCandidateReview
       parameters:
@@ -9821,7 +9821,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped allow/bypass policy candidate.
-      description: Requires admin.policy_candidates.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This process-local metadata-only candidate store does not materialize policy, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.policy_candidates.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This endpoint changes candidate metadata without creating a policy. With configured persistence, a candidate snapshot is saved before it becomes visible; unconfirmed saves return 500 and keep the previous live candidate state.
       tags:
         - AdminPolicyCandidateReview
       requestBody:
@@ -9837,6 +9837,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "500":
+          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9853,6 +9855,10 @@ paths:
         it becomes a first-class Egress bypass rule visible and revocable alongside detected ones. The host must
         be a named host, not a raw IP literal (a bypass no-decrypts its destination; you cannot attribute a bare
         IP). This is an explicit admin action, so it does not violate the never-auto-bypass invariant.
+        Candidate save failure returns 500 before proceeding to rule creation. The approval, materialization,
+        asset and rule saves are separate operations: a confirmed earlier step may remain after a later failure.
+        Reload candidate and Egress rule state before retrying; this endpoint does not provide an atomic
+        transaction across these stores or a fleet propagation receipt.
       tags:
         - AdminPolicyCandidateReview
       requestBody:
@@ -9874,6 +9880,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "500":
+          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9911,7 +9919,7 @@ paths:
   /admin/policy-candidates/{candidate_id}/review:
     post:
       summary: Review a tenant-scoped allow/bypass policy candidate.
-      description: Requires admin.policy_candidates.review. The review action updates candidate status only; policy materialization, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.policy_candidates.review. Approval alone does not enable a bypass. Candidate persistence is confirmed before publishing the review and performing dependent rule cleanup. Candidate storage and authored-rule storage are separate operations; this response is not a fleet propagation receipt.
       tags:
         - AdminPolicyCandidateReview
       parameters:
@@ -9933,6 +9941,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "500":
+          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9944,7 +9954,7 @@ paths:
   /admin/policy-candidates/{candidate_id}/materialize:
     post:
       summary: Materialize an approved bypass policy candidate.
-      description: Requires admin.policy_candidates.review. Applies an already-approved candidate (e.g. a cert-pinning bypass proposal) by adding its host to the interception bypass set and marking it materialized. Detection never auto-bypasses; only this explicit admin step makes a bypass live. Approving without materializing leaves the host intercepted.
+      description: Requires admin.policy_candidates.review. Applies an already-approved candidate (e.g. a cert-pinning bypass proposal) by adding its host to the interception bypass set and marking it materialized. Detection never auto-bypasses; only this explicit admin step makes a bypass live. Approving without materializing leaves the host intercepted. An unconfirmed candidate save returns 500 without creating dependent rules or applying the bypass. Candidate and rule persistence are separate operations.
       tags:
         - AdminPolicyCandidateReview
       parameters:
@@ -9960,6 +9970,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "500":
+          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":

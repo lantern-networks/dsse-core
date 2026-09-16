@@ -8,6 +8,7 @@ package main
 // applyMaterializedCertPinBypass / assetStore / ruleStore parameters.
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -33,7 +34,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		result, err := policyCandidateStore.List(r.Context(), adminTenantIDFromRequest(r), options)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -41,7 +42,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	mux.HandleFunc("GET /admin/policy-candidates/{candidate_id}", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
 		candidate, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -59,7 +60,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		now := time.Now()
 		created, err := policyCandidateStore.Upsert(r.Context(), candidate, adminTenantIDFromRequest(r), now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_upserted", created, evaluator, now), now)
@@ -74,7 +75,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		now := time.Now()
 		reviewed, found, err := policyCandidateStore.Review(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"), review, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -134,7 +135,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		materialized, found, err := concrete.Materialize(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"), materializeReq.AllowHighRisk, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -224,12 +225,12 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		tenantID := adminTenantIDFromRequest(r)
 		approved, err := concrete.AddManualCertPinBypass(r.Context(), tenantID, req.Host, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		materialized, found, err := concrete.Materialize(r.Context(), tenantID, approved.CandidateID, req.AllowHighRisk, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -298,7 +299,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		now := time.Now()
 		cand, found, err := policyCandidateStore.Get(r.Context(), tenantID, candidateID)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -380,4 +381,13 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			"review":         applicationPublishReview(created, evaluator, policyStore),
 		})
 	}))
+}
+
+// Storage details remain in the server, not in the response or common audit.
+func writePolicyCandidateError(w http.ResponseWriter, err error) {
+	if errors.Is(err, policycandidate.ErrPersistence) {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("candidate save could not be confirmed; reload and retry"))
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }

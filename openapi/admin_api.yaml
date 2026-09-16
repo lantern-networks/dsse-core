@@ -10268,7 +10268,9 @@ paths:
               type: object
       responses:
         "200":
-          description: Stored endpoint.
+          description: Stored endpoint. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -10301,7 +10303,9 @@ paths:
               type: object
       responses:
         "200":
-          description: Stored group.
+          description: Stored group. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -10353,7 +10357,9 @@ paths:
               type: object
       responses:
         "200":
-          description: Stored service.
+          description: Stored service. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -10374,7 +10380,9 @@ paths:
             type: string
       responses:
         "200":
-          description: Deleted.
+          description: Deleted. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10395,7 +10403,9 @@ paths:
             type: string
       responses:
         "200":
-          description: Deleted.
+          description: Deleted. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10416,7 +10426,9 @@ paths:
             type: string
       responses:
         "200":
-          description: Deleted.
+          description: Deleted. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

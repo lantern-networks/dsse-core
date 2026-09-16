@@ -1106,40 +1106,49 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		//
 		// Before the rule apply, because a rule may reference an endpoint this bundle introduces. Safe in the
 		// other order too: policyrule validation never consults the asset catalog.
+		assetsReady := true
+		if t.assets == nil && (len(payload.Rules.Endpoints)+len(payload.Rules.Groups)+len(payload.Rules.Services) > 0) {
+			assetsReady = false
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("authored asset target is unavailable"))
+		}
 		if t.assets != nil {
 			removed, aerr := t.assets.ReplaceAuthored(payload.Rules.Endpoints, payload.Rules.Groups, payload.Rules.Services)
 			if aerr != nil {
+				assetsReady = false
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored assets: %w", aerr))
 				log.Printf("config-bundle sync: the control plane's asset catalog was REFUSED, keeping the last good one: %v", aerr)
 			} else if len(removed) > 0 {
 				log.Printf("config-bundle sync: removed %d asset(s) the control plane does not author: %s",
 					len(removed), strings.Join(removed, ", "))
 			}
 		}
-		incoming := payload.Rules.Rules
-		if len(incoming) == 0 {
-			if local := t.rules.Snapshot(); len(local) > 0 {
-				log.Printf("config-bundle sync: the control plane authors NO rules; removing %d rule(s) this Edge still holds: %s", len(local), ruleIDsForLog(local))
-			}
-			if err := t.rules.ReplaceAll(nil); err != nil {
-				log.Printf("config-bundle sync: could not clear the authored rule set: %v", err)
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules (clear): %w", err))
-			} else if t.onRulesApplied != nil {
-				t.onRulesApplied()
-			}
-		} else {
-			// ★ NAME WHAT IS BEING REMOVED. The control plane is authoritative, so a rule this Edge holds and
-			// the CP does not is deleted — including one authored locally before the CP became the authority.
-			// That is correct and it is also how a cutover silently drops policy nobody migrated: on the first
-			// pull, every Edge-local rule that was never copied up simply disappears. It happened here, to the
-			// cert-pin bypass this fleet had adopted. Authority does not have to be quiet about what it erases.
-			logRemovedByDistribution(t.rules.Snapshot(), incoming)
-			// ALL-OR-NOTHING. ReplaceAll refuses the whole set if any rule is invalid, and the Edge then keeps
-			// the last good one: a half-applied policy is an access posture nobody authored.
-			if err := t.rules.ReplaceAll(payload.Rules.Rules); err != nil {
-				log.Printf("config-bundle sync: REFUSED the control plane's authored rule set, keeping the last good one: %v", err)
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules: %w", err))
-			} else if t.onRulesApplied != nil {
-				t.onRulesApplied()
+		if assetsReady {
+			incoming := payload.Rules.Rules
+			if len(incoming) == 0 {
+				if local := t.rules.Snapshot(); len(local) > 0 {
+					log.Printf("config-bundle sync: the control plane authors NO rules; removing %d rule(s) this Edge still holds: %s", len(local), ruleIDsForLog(local))
+				}
+				if err := t.rules.ReplaceAll(nil); err != nil {
+					log.Printf("config-bundle sync: could not clear the authored rule set: %v", err)
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules (clear): %w", err))
+				} else if t.onRulesApplied != nil {
+					t.onRulesApplied()
+				}
+			} else {
+				// ★ NAME WHAT IS BEING REMOVED. The control plane is authoritative, so a rule this Edge holds and
+				// the CP does not is deleted — including one authored locally before the CP became the authority.
+				// That is correct and it is also how a cutover silently drops policy nobody migrated: on the first
+				// pull, every Edge-local rule that was never copied up simply disappears. It happened here, to the
+				// cert-pin bypass this fleet had adopted. Authority does not have to be quiet about what it erases.
+				logRemovedByDistribution(t.rules.Snapshot(), incoming)
+				// ALL-OR-NOTHING. ReplaceAll refuses the whole set if any rule is invalid, and the Edge then keeps
+				// the last good one: a half-applied policy is an access posture nobody authored.
+				if err := t.rules.ReplaceAll(payload.Rules.Rules); err != nil {
+					log.Printf("config-bundle sync: REFUSED the control plane's authored rule set, keeping the last good one: %v", err)
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules: %w", err))
+				} else if t.onRulesApplied != nil {
+					t.onRulesApplied()
+				}
 			}
 		}
 	}

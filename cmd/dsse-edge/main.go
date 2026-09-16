@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -6318,7 +6319,6 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		assetStore.SyncEnrolledEndpoints(tenant, devices, time.Now().UTC())
 	}
 	syncEnrolledAssets()
-	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL)
 
 	// Per-tenant end-user IdP registry (federated-auth connections + default), managed from the Console.
 	// Durable when -idp-connection-store is set so registered IdPs survive a restart.
@@ -6479,7 +6479,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			s.SetCompiledPolicies(tenant, policyrule.CompileEgressPolicies(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore))
 		}
 	}
+	var ruleCompilationMu sync.Mutex
 	recompileAuthoredRules := func() {
+		ruleCompilationMu.Lock()
+		defer ruleCompilationMu.Unlock()
 		// ★★ EVERY ORGANIZATION WITH SOMETHING TO CLEAR, NOT ONLY ONES WITH SOMETHING TO BUILD (2026-08-17,
 		// measured). This walked the organizations that HAVE authored rules. Deleting an organization's LAST
 		// rule removes it from that list, so its compiled set was never rebuilt to empty — and went on
@@ -6499,6 +6502,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			recompileOneTenant(tenant)
 		}
 	}
+	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL, recompileAuthoredRules, func(r *http.Request, kind, id, operation, result string, value any) {
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, assetCatalogAuditLog(r, kind, id, operation, result, value, evaluator, now), now)
+	})
 	registerRulesAdmin(mux, adminEndpoint, ruleStore, assetStore, recompileAuthoredRules, func(tenant, ruleID string) {
 		// Reverse lifecycle sync: deleting a cert-pin bypass rule un-materializes the pinned-site candidate it
 		// came from, so the Pinned Sites view reflects that the bypass is gone (it does not linger "materialized").

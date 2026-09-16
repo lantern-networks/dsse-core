@@ -13,6 +13,7 @@ import (
 
 	agenttool "github.com/lantern-networks/dsse-core/agenttool"
 	appcatalog "github.com/lantern-networks/dsse-core/appcatalog"
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	endpointinventory "github.com/lantern-networks/dsse-core/endpointinventory"
 	humanidentity "github.com/lantern-networks/dsse-core/humanidentity"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
@@ -179,6 +180,9 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 			}, evaluator, now),
 		},
 		{name: "internalAuthorityAuditLog", audit: internalAuthorityAuditLog(httptest.NewRequest("POST", "/admin/internal-cas", nil), internalca.Authority{ID: "authority", TenantID: "tenant_audit_cp0020", Name: rawSubject, CertificatePEM: rawPayloadRef}, "upsert", "rejected", evaluator, now)},
+		{name: "assetCatalogAuditLog/endpoint", audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/endpoints", nil), "endpoint", "asset-audit", "upsert", "saved", assetcatalog.Endpoint{ID: "asset-audit", TenantID: "tenant_audit_cp0020", Alias: rawSubject, Address: rawDestination, Identity: rawActorUserID, Tags: []string{rawTokenAudience}}, evaluator, now)},
+		{name: "assetCatalogAuditLog/group", audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/groups", nil), "group", "asset-audit", "upsert", "persistence_unconfirmed", assetcatalog.Group{ID: "asset-audit", TenantID: "tenant_audit_cp0020", Alias: rawSubject, StaticMembers: []string{rawTokenAudience}, Dynamic: &assetcatalog.MembershipRule{Tag: rawMetadataValue, Subnet: rawSourceIP}}, evaluator, now)},
+		{name: "assetCatalogAuditLog/service", audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/services", nil), "service", "asset-audit", "upsert", "saved", assetcatalog.Service{ID: "asset-audit", TenantID: "tenant_audit_cp0020", Alias: rawSubject, Ports: []assetcatalog.PortProto{{Protocol: rawMetadataValue, Port: 443}}}, evaluator, now)},
 		{name: "authoredRuleAuditLog", audit: authoredRuleAuditLog(httptest.NewRequest("POST", "/admin/rules", nil), policyrule.Rule{ID: "rule-audit", TenantID: "tenant_audit_cp0020", Name: rawSubject, Source: []string{rawTokenAudience}, Destination: []string{rawDestination}}, "upsert", "saved", evaluator, now)},
 		{name: "inspectionPostureAuditLog", audit: inspectionPostureAuditLog(httptest.NewRequest("POST", "/admin/inspection-posture", nil), inspectionposture.DefaultPosture(), inspectionposture.Posture{Mode: inspectionposture.ModeBypassDefault, DecryptAllowlistHosts: []string{rawDestination}}, "saved", evaluator, now)},
 		{
@@ -606,6 +610,7 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 		"adminHumanApprovalMutationAuditLog": true,
 		"adminAccessGrantRevocationAuditLog": true,
 		"authoredRuleAuditLog":               true,
+		"assetCatalogAuditLog":               true,
 		"inspectionPostureAuditLog":          true,
 		"internalAuthorityAuditLog":          true,
 		"adminPolicyAuditLog":                true,

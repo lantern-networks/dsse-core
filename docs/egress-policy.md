@@ -247,3 +247,27 @@ Implementation references: [rule model](../policyrule/policyrule.go),
 [HTTP enforcement](../cmd/dsse-edge/swg_http_egress.go).
 
 For detector setup, action semantics, and file coverage, continue with [DLP](dlp.md).
+
+
+### Changes to groups, services and destinations
+
+Authored catalog writes are saved before the live catalog changes. If persistence
+is not confirmed, the API returns HTTP 500 and retains the previous live entries,
+aliases and generation. Restore storage, reload the list and retry. A transport
+error or lost response can follow a completed save; inspect the list before
+creating another entry. Enrolled-derived device entries have a separate inventory
+lifecycle and are not covered by the authored catalog persistence guarantee.
+
+Successful catalog API changes also rebuild the local compiled rules and TLS
+inspection selectors. Changing a destination address or deleting a referenced
+group no longer requires editing its rules to refresh that local projection. This
+is not confirmation that every independent Edge has applied the change. Catalog
+bundle reconciliation saves one complete candidate. If that save fails, dependent
+authored rules are not applied and the same bundle generation remains retryable.
+Catalog and rule storage are separate transactions; ambiguous commits, independent
+writers and complete fleet consistency still require deployment validation.
+
+Catalog mutations record `admin_asset_catalog_changed` with the accepted tenant,
+actor, asset kind/ID, operation and result. Upserts include a digest of the submitted
+or accepted record; names, addresses, members and storage errors are omitted. The
+common HTTP audit remains separate. Neither audit proves remote delivery.

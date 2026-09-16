@@ -36,11 +36,14 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
-	if p == nil {
-		return nil
+	next := s.candidateLocked()
+	next.persister = p
+	if err := next.loadLocked(); err != nil {
+		return err
 	}
-	return s.loadLocked()
+	s.adoptLocked(next)
+	s.persister = p
+	return nil
 }
 
 func (s *Store) loadLocked() error {

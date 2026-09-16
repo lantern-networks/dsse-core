@@ -268,7 +268,7 @@ function grantUnconfirmed() { return bl({en:"The revocation outcome is unconfirm
 function grantRevokeOutcome(r, g) {
   const b = r?.body;
   const same = accessGrantObject(b) && b.grant_id === g.grant_id && b.tenant_id === g.tenant_id;
-  if (r?.ok && r.status === 200 && same && b.status === "revoked") return {partial:false};
+  if (r?.ok && r.status === 200 && same && b.status === "revoked" && (b.persistence === undefined || b.persistence === "saved_non_atomic")) return {partial:false,nonAtomic:b.persistence === "saved_non_atomic"};
   if (!r?.ok && r?.status === 500 && same && b.status === "partial" && b.applied === true && b.persistence === "unconfirmed") return {partial:true};
   if (r?.ok || (accessGrantObject(b) && b.status === "partial")) throw new Error(grantUnconfirmed());
   throw new Error(accessGrantText(b?.error) ? b.error : grantUnconfirmed());
@@ -284,7 +284,7 @@ function drawGrantNotices(host) {
   for (const notice of (host.__grantNotices || new Map()).values()) {
     host.appendChild(el("div", {class:"ui-callout ui-callout-warn",role:"alert"}, [
       el("p",{text:(notice.label || bl({en:"Access approval",ja:"アクセス承認"})) + ": " + notice.message}),
-      grantRevokeButton(notice.grant,host,notice.label,true,notice.partial),
+      notice.retry === false ? null : grantRevokeButton(notice.grant,host,notice.label,true,notice.partial),
     ]));
   }
 }
@@ -305,6 +305,8 @@ async function revokeGrant(g, host, label, retry = false) {
     const outcome = grantRevokeOutcome(r,g);
     if (outcome.partial) {
       notices.set(key,{grant:g,label,partial:true,message:bl({en:"Revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",ja:"このサーバーでは失効済みですが、保存を確認できません。保存先を復旧し、再起動前に失効の保存を再試行してください。"})});
+    } else if (outcome.nonAtomic) {
+      notices.set(key,{grant:g,label,retry:false,message:bl({en:"Revoked and saved without atomic replacement. This save completed, but interrupted future writes could damage the snapshot. Use storage that supports atomic replacement.",ja:"失効を保存しましたが、原子的な置き換えはできませんでした。今回の保存は完了しています。今後の書き込み中断による破損を避けるため、原子的な置き換えが可能な保存先を使用してください。"})});
     } else { notices.delete(key); if (host.isConnected !== false) uiToast((label || bl({en:"Access approval",ja:"アクセス承認"})) + ": " + bl({en:"Revocation accepted.",ja:"失効を受け付けました。"}),"ok"); }
   } catch (e) { notices.set(key,{grant:g,label,message:e.message || String(e)}); }
   finally { pending.delete(key); }

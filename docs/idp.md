@@ -175,12 +175,26 @@ and use **Retry revocation**. Warnings are held only in the current page and do 
 survive navigation or a browser reload. A normal response confirms local acceptance;
 it does not prove that all serving nodes received the revocation.
 
+A completed in-place file write is reported separately: HTTP 200 with
+`persistence: saved_non_atomic`. The page warns that this save completed, but
+future interrupted writes could damage the snapshot. It does not request another
+save for that completed write; use storage that permits atomic replacement.
+If replacement completed but its final flush is unconfirmed, the API instead
+returns the partial 500 above and retains the retry requirement. The snapshot may
+already contain the change: an error is not proof that nothing was written.
+New grants are not adopted into live state on that unconfirmed result. A completed,
+synced in-place save retains the existing admission behavior.
+
 **Logs & Audit** records `admin_access_grant_revoked` with result `revoked` or
 `partial`, the acting administrator, tenant, time and a SHA-256 grant reference.
 The common administrative write record retains the HTTP result and the same
 reference. Grant IDs also serve as bearer-cookie values: the revocation route is
 redacted in common, operator and break-glass audit records. Do not paste the ID
 into tickets or public diagnostics. Existing audit records are not rewritten.
+
+The revocation audit includes `persistence: saved_non_atomic` for a completed
+non-atomic save and `persistence: unconfirmed` for a partial result. The common
+HTTP audit alone does not describe the storage guarantee.
 
 A configured successful persister is needed for restart retention. In-memory
 operation and saved-without-atomicity fallbacks are not full durability guarantees.
@@ -212,6 +226,13 @@ and its writer intact. Restore a verified backup rather than deleting the file o
 replacing it with `{}` to bypass the check; a genuinely missing initial snapshot
 and an explicitly configured empty object remain valid inputs. This cannot recover
 revocations already lost from every retained copy.
+
+A running store refuses to replace or detach its writer while changes are pending
+persistence. Repair the current storage and retry saving before switching it; a
+valid but older snapshot must not discard an unsaved local denial. This guard is
+not a restore procedure for already missing revocation history. In-memory operation,
+multiple writers, and durability handling in other approval stores remain separate
+considerations.
 
 These controls do not establish shared-storage writer coordination or a fleet-wide
 transaction. Partial physical writes, ambiguous commits, tenant erasure, unbounded

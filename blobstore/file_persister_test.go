@@ -58,6 +58,9 @@ func TestFilePersisterFallsBackToWritingInPlace(t *testing.T) {
 	t.Cleanup(func() { writeFile = original })
 
 	err := FilePersister{Path: path}.Save([]byte(`{"a":2}`))
+	if errors.Is(err, ErrDurabilityUnconfirmed) {
+		t.Fatal("synced in-place save reported unconfirmed flush")
+	}
 	if !errors.Is(err, ErrSavedWithoutAtomicity) {
 		t.Fatalf("save reported %v — data that IS written must not be reported as lost", err)
 	}
@@ -86,6 +89,28 @@ func TestSavedWithoutAtomicityIsNotAFailure(t *testing.T) {
 	}
 }
 
+func TestSingleWriterTracksCompletedReplacementWithUnconfirmedFlush(t *testing.T) {
+	p := NewSingleWriterFilePersister(FilePersister{Path: filepath.Join(t.TempDir(), "state.json")})
+	if err := p.Save([]byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	original := writeFile
+	t.Cleanup(func() { writeFile = original })
+	writeFile = func(path string, data []byte, perm os.FileMode) error {
+		if err := os.WriteFile(path, data, perm); err != nil {
+			return err
+		}
+		return durablefile.ErrReplacedNotFlushed
+	}
+	if err := p.Save([]byte("new")); !errors.Is(err, ErrDurabilityUnconfirmed) || !errors.Is(err, ErrSavedWithoutAtomicity) {
+		t.Fatalf("wrong outcome: %v", err)
+	}
+	writeFile = original
+	if err := p.Save([]byte("confirmed")); err != nil {
+		t.Fatalf("own completed write treated as foreign: %v", err)
+	}
+}
+
 // ★★ A REPLACEMENT THAT HAPPENED MUST NOT BE "REPAIRED" (2026-08-13, thirtieth review #14). The fallback was
 // written against os.Rename, whose error means the destination was untouched. durablefile.Replace is rename
 // THEN fsync on this platform, so it can fail with the new file already in place — and the recovery then
@@ -110,6 +135,9 @@ func TestAReplacementThatSucceededIsNotRewrittenByTheFallback(t *testing.T) {
 	defer func() { writeFile = original }()
 
 	err := f.Save([]byte(`{"spent":["tok_1","tok_2"]}`))
+	if !errors.Is(err, ErrDurabilityUnconfirmed) {
+		t.Fatalf("missing distinct flush outcome: %v", err)
+	}
 	if !errors.Is(err, ErrSavedWithoutAtomicity) {
 		t.Fatalf("want the weaker-promise sentinel, got %v", err)
 	}

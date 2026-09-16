@@ -114,7 +114,7 @@ func (s *Store) MergeChecked(incoming []Grant, now time.Time) (added, updated in
 	for id, g := range active {
 		candidate[id] = g
 	}
-	if err := s.saveLocked(candidate); err != nil {
+	if err := s.saveLocked(candidate); err != nil && !savedNonAtomically(err) {
 		return added, updated, err
 	}
 	s.grants, s.dirty = candidate, false

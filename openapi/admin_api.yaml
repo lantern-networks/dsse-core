@@ -10182,6 +10182,9 @@ paths:
         local denial and returns partial, requiring a retry before restart. A repeat
         retries saving even if already revoked. Success confirms local acceptance,
         not fleet delivery or durable storage when no persister is configured.
+        A completed synced in-place write returns 200 with saved_non_atomic and
+        a Console storage warning. A completed replacement with unconfirmed flush
+        returns partial 500 and remains pending for retry.
         The grant ID is a bearer credential; audit records use a SHA-256 reference.
         See docs/idp.md for distribution and persistence limits.
       tags:
@@ -10201,6 +10204,10 @@ paths:
                 type: object
                 required: [status, grant_id, tenant_id, audit_ref]
                 properties:
+                  persistence:
+                    type: string
+                    enum: [saved_non_atomic]
+                    description: Present only for a completed save without atomic replacement.
                   status:
                     type: string
                     enum: [revoked]

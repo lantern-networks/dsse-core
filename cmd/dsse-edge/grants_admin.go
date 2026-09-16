@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
 	"net/http"
@@ -41,15 +43,23 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			return
 		}
 		now := time.Now().UTC()
-		audit := adminAccessGrantRevocationAuditLog(r, grant, evaluator, now, err != nil)
+		nonAtomic := errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed)
+		audit := adminAccessGrantRevocationAuditLog(r, grant, evaluator, now, err != nil && !nonAtomic)
+		if nonAtomic {
+			audit.Metadata["persistence"] = "saved_non_atomic"
+		}
 		_ = appendAdminAudit(r.Context(), writer, outbox, audit, now)
-		if err != nil {
+		if err != nil && !nonAtomic {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
 				"status": "partial", "applied": true, "tenant_id": grant.TenantID, "grant_id": grant.GrantID, "audit_ref": accessGrantAuditReference(grant.GrantID), "persistence": "unconfirmed",
 				"error": "Access was revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",
 			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "grant_id": grant.GrantID, "tenant_id": grant.TenantID, "audit_ref": accessGrantAuditReference(grant.GrantID)})
+		result := map[string]string{"status": "revoked", "grant_id": grant.GrantID, "tenant_id": grant.TenantID, "audit_ref": accessGrantAuditReference(grant.GrantID)}
+		if nonAtomic {
+			result["persistence"] = "saved_non_atomic"
+		}
+		writeJSON(w, http.StatusOK, result)
 	}))
 }

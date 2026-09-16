@@ -93,7 +93,7 @@ func (s *Store) Mint(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
 	}
 	candidate := cloneGrants(s.grants)
 	candidate[g.GrantID] = cloneGrant(g)
-	if err := s.saveLocked(candidate); err != nil {
+	if err := s.saveLocked(candidate); err != nil && !savedNonAtomically(err) {
 		return Grant{}, err
 	}
 	s.grants, s.dirty = candidate, false
@@ -133,6 +133,8 @@ func (s *Store) Revoke(grantID string) bool {
 
 // RevokeForTenant checks exact attribution and revokes under the same lock.
 // Denial is retained locally on save failure; repeating the call retries persistence.
+// ErrSavedWithoutAtomicity is a completed-save warning, while ErrPersistence
+// means confirmation is missing and the pending denial still needs a retry.
 func (s *Store) RevokeForTenant(tenantID, grantID string) (Grant, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	grantID = strings.TrimSpace(grantID)
@@ -193,6 +195,11 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Loading even a valid older snapshot must not discard an unsaved denial.
+	// Repair and retry the existing writer before replacing or detaching it.
+	if s.dirty {
+		return ErrPendingPersistence
+	}
 	if p == nil {
 		s.persister = nil
 		return nil
@@ -233,6 +240,11 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 }
 
 var ErrPersistence = errors.New("access-grant persistence is unconfirmed")
+var ErrPendingPersistence = errors.New("save pending access-grant changes before replacing the persistence store")
+
+func savedNonAtomically(err error) bool {
+	return errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed)
+}
 
 // saveLocked writes a candidate without exposing new authorization in memory.
 func (s *Store) saveLocked(candidate map[string]Grant) error {
@@ -245,18 +257,24 @@ func (s *Store) saveLocked(candidate map[string]Grant) error {
 	}
 	if err != nil {
 		log.Printf("access grants save: %v", err)
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
-			return ErrPersistence
+		if errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			return errors.Join(ErrPersistence, blobstore.ErrDurabilityUnconfirmed)
 		}
+		if savedNonAtomically(err) {
+			return blobstore.ErrSavedWithoutAtomicity
+		}
+		return ErrPersistence
 	}
 	return nil
 }
 func (s *Store) persistLocked() error {
-	if err := s.saveLocked(s.grants); err != nil {
+	err := s.saveLocked(s.grants)
+	if err != nil && !savedNonAtomically(err) {
+		s.dirty = true
 		return err
 	}
 	s.dirty = false
-	return nil
+	return err
 }
 
 // CountForTenant returns how many records this store still holds for a tenant — what a tenant DATA FOOTPRINT

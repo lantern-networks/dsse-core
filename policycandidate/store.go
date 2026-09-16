@@ -337,6 +337,9 @@ func normalize(candidate Candidate, tenantID string, now time.Time) (Candidate, 
 	if !validStatus(candidate.Status) {
 		return Candidate{}, fmt.Errorf("candidate status %s is invalid", candidate.Status)
 	}
+	if err := validateCandidateEvidence(candidate); err != nil {
+		return Candidate{}, err
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}

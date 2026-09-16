@@ -39,17 +39,15 @@ func (store *Store) SetPersister(p blobstore.Persister) error {
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if data == nil {
 		store.persister = p
 		return nil
 	}
-	var snapshot map[string]map[string]Candidate
-	if err := json.Unmarshal(data, &snapshot); err != nil {
+	snapshot, err := decodeCandidateSnapshot(data)
+	if err != nil {
 		return err
 	}
-	if snapshot != nil {
-		store.candidates = snapshot
-	}
+	store.candidates = snapshot
 	store.persister = p
 	return nil
 }

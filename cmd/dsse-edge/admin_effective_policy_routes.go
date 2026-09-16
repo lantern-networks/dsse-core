@@ -189,8 +189,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		egressRules := ruleStore.List(tenant, policyrule.PlaneEgress)
 		sourceWarnings := map[string]string{}
+		serviceWarnings := map[string]bool{}
 		for _, rule := range egressRules {
 			sourceWarnings[rule.ID] = policyrule.InspectionSourceWarning(tenant, rule, assetStore)
+			serviceWarnings[rule.ID] = policyrule.EgressServiceUnresolved(tenant, rule.ServiceID, assetStore)
 		}
 		in := effectiveEgressInputs{
 			Eval:                     evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
@@ -201,6 +203,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			AuthoredBypassHosts:      policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
 			UnresolvedRuleIDs:        unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
 			InspectionSourceWarnings: sourceWarnings,
+			UnresolvedServiceRuleIDs: serviceWarnings,
 		}
 		if config.NetworkExtensionLabTLS != nil {
 			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass

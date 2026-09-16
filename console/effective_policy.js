@@ -140,8 +140,8 @@ function renderEffectivePolicyView(content) {
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Policy decision check", ja: "ポリシー判定確認" }) }),
       el("p", { class: "ui-view-desc", text: bl({
-        en: "See how a destination is decided: every rule that competes — your rules and the built-in policies you never authored — in precedence order, with the winner and any rules it overrode, plus whether the connection is decrypted or bypassed, and why.",
-        ja: "ある宛先に対して何が起きるかを確かめます。関係するルールを優先度の順に並べ、どれが効いたかを示し、その通信を検査するかどうかと、その理由まで表示します。",
+        en: "Preview TCP/443 for a destination: every rule that competes — your rules and the built-in policies you never authored — in precedence order, with the winner and any rules it overrode, plus whether the connection is decrypted or bypassed, and why.",
+        ja: "宛先へのTCP/443通信の判定を確認します。関係するルールを優先度の順に並べ、どれが効いたかを示し、その通信を検査するかどうかと、その理由まで表示します。",
       }) }),
     ]),
   ]));

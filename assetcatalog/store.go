@@ -157,8 +157,10 @@ func (s *Store) upsertService(svc Service) (Service, error) {
 	if svc.TenantID == "" {
 		return Service{}, fmt.Errorf("tenant_id is required")
 	}
-	if len(svc.Ports) == 0 {
-		return Service{}, fmt.Errorf("service requires at least one port")
+	var err error
+	svc, err = normalizeServiceTransports(svc)
+	if err != nil {
+		return Service{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

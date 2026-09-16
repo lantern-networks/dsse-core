@@ -38,9 +38,18 @@ the effective list and a real decision instead of assuming deletion means deny.
 
 An unresolved source does not become Any. A destination that resolves to nothing
 is shown as **matches nothing** and cannot enforce a deny for that destination.
-Repair the catalog reference. A named service resolving to no ports currently
-falls back to port 443 in the access-policy compiler; it is not equivalent to Any.
-The inspection host compiler instead requires the named service to contain
+Repair the catalog reference. An unavailable or invalid named service is shown
+as **service unavailable**. Its access rule matches no traffic: it cannot grant
+access, deny traffic, or require authentication until the service is repaired.
+It does not fall back to HTTPS. Other matching rules and the default still apply.
+
+Named services retain each TCP/UDP and port combination. For example, TCP/22 +
+UDP/443 does not authorize TCP/443 or UDP/22. **Any** service (no service selected)
+intentionally omits both restrictions. Service writes and snapshot loading
+normalize protocol case and surrounding whitespace, and reject protocols other
+than TCP/UDP or ports outside 1–65535. Invalid persisted service definitions
+must be repaired before the catalog can load; loading does not rewrite the file.
+The inspection host compiler requires the named service to contain
 TCP/443. An unresolved service adds neither an inspection target nor a bypass.
 
 Egress compiles person and IdP-group selectors into user identity conditions and
@@ -271,3 +280,6 @@ Catalog mutations record `admin_asset_catalog_changed` with the accepted tenant,
 actor, asset kind/ID, operation and result. Upserts include a digest of the submitted
 or accepted record; names, addresses, members and storage errors are omitted. The
 common HTTP audit remains separate. Neither audit proves remote delivery.
+
+The Console’s **Policy decision check** destination preview evaluates TCP/443.
+It is not a simulation of every protocol, port, identity, or existing connection.

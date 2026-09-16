@@ -187,16 +187,10 @@ func (s *Store) ServiceIncludesTransport(tenant, serviceID, protocol string, por
 	if s == nil || strings.TrimSpace(serviceID) == "" {
 		return false
 	}
-	for _, svc := range s.ListServices(tenant) {
-		if svc.ID != serviceID {
-			continue
+	for _, p := range s.ServiceTransportPorts(tenant, serviceID)[protocol] {
+		if p == port {
+			return true
 		}
-		for _, p := range svc.Ports {
-			if p.Protocol == protocol && p.Port == port {
-				return true
-			}
-		}
-		return false
 	}
 	return false
 }

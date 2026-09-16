@@ -134,7 +134,7 @@ async function renderRuleList(section, plane, direction) {
     entries.forEach((entry) => {
       if (entry.kind === "authored" && entry.rule) {
         if (entry.rule.id && entry.rule.id.startsWith("certpin-rule-")) { certPins.push(entry.rule); return; }
-        rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved, inspection_source_warning: entry.inspection_source_warning }), idx, section, plane, direction));
+        rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved, service_unresolved: entry.service_unresolved, inspection_source_warning: entry.inspection_source_warning }), idx, section, plane, direction));
         return;
       }
       if (entry.kind === "builtin_default") { rows.push(builtinRow({ policy_id: entry.policy_id, name: entry.name, priority: entry.priority, decision: entry.access, status: entry.status, service_text: entry.service_text, inspection: entry.inspection }, section, plane, direction, builtinDefaults)); return; }
@@ -213,6 +213,10 @@ function statusCellFor(rule, active) {
     cell.appendChild(el("div", { class: "ui-view-desc", text: bl({
       en: "This destination is not in the endpoint catalog, so the rule enforces nothing.",
       ja: "この宛先はエンドポイントに登録されていないため、このルールは何も強制していません。" }) }));
+  }
+  if (rule && rule.service_unresolved) {
+    cell.appendChild(uiBadge(bl({en:"service unavailable",ja:"サービス未解決"}), "danger"));
+    cell.appendChild(el("div", {class:"ui-view-desc", text:bl({en:"This service is unavailable or invalid. The rule matches no traffic, including deny and authentication rules.",ja:"サービスが存在しないか定義が不正です。このルールは通信に一致せず、拒否・認証要求も適用されません。"})}));
   }
   return cell;
 }

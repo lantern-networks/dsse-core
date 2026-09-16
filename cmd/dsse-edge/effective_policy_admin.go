@@ -213,6 +213,7 @@ func effectivePolicyForDestination(eval decision.Evaluator, tenantID string, q e
 		ActorType:         valueOrDefault(q.ActorType, "human"),
 		ServiceFamily:     family,
 		DestinationPort:   q.DestinationPort,
+		Protocol:          "tcp",
 		SNI:               q.Destination,
 		FQDN:              q.Destination,
 		SaaSApplicationID: q.SaaSApplicationID,

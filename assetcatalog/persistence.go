@@ -61,6 +61,15 @@ func (s *Store) loadLocked() error {
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
+	for tenant, services := range snap.Services {
+		for id, service := range services {
+			normalized, err := normalizeServiceTransports(service)
+			if err != nil {
+				return fmt.Errorf("invalid service transport in catalog snapshot: %w", err)
+			}
+			snap.Services[tenant][id] = normalized
+		}
+	}
 	if snap.Endpoints != nil {
 		s.endpoints = snap.Endpoints
 	}

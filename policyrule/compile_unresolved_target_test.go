@@ -43,9 +43,8 @@ func TestCompileEgressUnresolvedDestinationDoesNotVanish(t *testing.T) {
 	}
 }
 
-// TestCompileEgressNamedServiceZeroPortsDefaultsTo443 pins fail-open review finding #10 (egress ports): a NAMED
-// service that resolves to ZERO ports must NOT widen to any-port; it scopes to the documented 443 default.
-func TestCompileEgressNamedServiceZeroPortsDefaultsTo443(t *testing.T) {
+// A missing named service must not acquire an unrelated HTTPS meaning.
+func TestCompileEgressNamedServiceZeroPortsMatchesNothing(t *testing.T) {
 	resolver := fakeEgressResolver{
 		src:   map[string][]string{"grp": {"dev-a"}},
 		addr:  map[string][]string{"ep": {"site.example.com"}},
@@ -57,8 +56,8 @@ func TestCompileEgressNamedServiceZeroPortsDefaultsTo443(t *testing.T) {
 		t.Fatal("expected compiled policies")
 	}
 	for _, p := range got {
-		if p.Conditions["destination_port"] != 443 {
-			t.Fatalf("named service with zero ports must scope to 443, got destination_port=%v (any-port widening = fail-open)", p.Conditions["destination_port"])
+		if values, ok := p.Conditions["protocol"].([]any); !ok || len(values) != 0 {
+			t.Fatalf("missing service must match no protocol, got %v", p.Conditions)
 		}
 	}
 

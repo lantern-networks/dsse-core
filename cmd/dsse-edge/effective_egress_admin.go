@@ -44,8 +44,10 @@ type effectiveEgressRuleEntry struct {
 	Detail      string           `json:"detail,omitempty"`       // human note (provenance / why)
 	CandidateID string           `json:"candidate_id,omitempty"` // for cert_pin_bypass: the candidate to suppress when revoking
 	Rule        *policyrule.Rule `json:"rule,omitempty"`         // for authored entries: the raw rule so the editor can open it
+	// Unresolved catalog selectors leave the authored rule visible but unable to match.
 	// DestinationUnresolved: this authored rule names a destination the endpoint catalog does not know, so it
 	// compiles to a match-nothing policy and enforces nothing — while still reading as Active.
+	ServiceUnresolved       bool   `json:"service_unresolved,omitempty"`
 	DestinationUnresolved   bool   `json:"destination_unresolved,omitempty"`
 	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
 }
@@ -83,6 +85,7 @@ type effectiveEgressInputs struct {
 	// See rules_admin.go for how it is computed and the measurement that found it.
 	UnresolvedRuleIDs        map[string]bool
 	InspectionSourceWarnings map[string]string
+	UnresolvedServiceRuleIDs map[string]bool
 }
 
 // subjectText renders a list of asset-catalog subject ids (or the Any wildcard) to a display string.
@@ -132,6 +135,7 @@ func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleList
 			ServiceText: svc, Access: r.Action.Access, Inspection: r.Action.Inspection, Status: r.Status,
 			Editable: true, Deletable: true, ToggleKind: "rule", Rule: &rule,
 			DestinationUnresolved:   in.UnresolvedRuleIDs[r.ID],
+			ServiceUnresolved:       in.UnresolvedServiceRuleIDs[r.ID],
 			InspectionSourceWarning: in.InspectionSourceWarnings[r.ID],
 		})
 	}

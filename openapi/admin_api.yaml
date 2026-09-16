@@ -10346,7 +10346,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create or update a named service.
-      description: Requires admin.endpoints.write. Upserts a named service. Tenant is taken from the admin context.
+      description: Requires admin.endpoints.write. Upserts a named service. Tenant is taken from the admin context. Protocols are trimmed and lowercased and must be tcp or udp; ports must be integers from 1 through 65535. Invalid definitions are rejected before saving or changing runtime rules.
       tags:
         - AdminAssetCatalog
       requestBody:
@@ -10355,6 +10355,21 @@ paths:
           application/json:
             schema:
               type: object
+              required: [ports]
+              properties:
+                id: { type: string }
+                alias: { type: string }
+                ports:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [protocol, port]
+                    properties:
+                      protocol:
+                        type: string
+                        description: Must be tcp or udp after trimming and lowercasing.
+                      port: { type: integer, minimum: 1, maximum: 65535 }
       responses:
         "200":
           description: Stored service. Successful catalog mutations rebuild local authored-rule projections.
@@ -13010,7 +13025,8 @@ paths:
         known-bypass OS/cert floor (master-toggleable), legacy SaaS Optimize posture selections, and approved
         cert-pin bypasses — each normalized to one source -> destination : service => access x inspection shape
         with a kind tag and capability flags (editable / deletable / toggle_kind). Phase B-3 of the unified policy
-        model. Read-only. Metadata-only.
+        model. Read-only. Metadata-only. An authored entry with service_unresolved=true matches no traffic,
+        including deny/authenticate rules. Repair its service reference; other rules and defaults still apply.
       tags:
         - AdminPolicy
       responses:
@@ -13036,6 +13052,7 @@ paths:
                         service_text: { type: string }
                         access: { type: string, enum: [allow, deny, authenticate] }
                         inspection: { type: string, enum: [inspect, bypass] }
+                        service_unresolved: { type: boolean, description: The named service is missing or invalid; the authored rule matches no traffic. }
                         status: { type: string, enum: [active, disabled, off] }
                         editable: { type: boolean }
                         deletable: { type: boolean }

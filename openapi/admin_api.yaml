@@ -5284,13 +5284,30 @@ paths:
           description: Invalid rules (unknown on_match, identifier, or instance_scope, or no identifiers).
   /admin/dlp-findings:
     get:
-      summary: List what DLP has detected (the findings/visibility view).
-      description: Requires admin.dlp.read. Returns the tenant's DLP detections (dlp_match inspection events) — NON-SECRET (identifier types + counts, action, destination host, instance class, severity, user/device, access-decision id for drill-down, timestamp; never the raw matched value), newest first, with an aggregated summary (by_identifier, by_action, by_destination, blocked, scan_skipped). By default the binary/non-text dlp_scan_skipped events are EXCLUDED (operational noise); pass ?include_skipped=true to include them. Optional filters ?identifier= ?action= ?severity= ?since=<RFC3339> ?limit= (default 200). Drives the Console DLP findings view. See docs/dlp_vision_and_roadmap.md.
+      summary: List tenant-scoped DLP detection events.
+      description: >-
+        Requires admin.dlp.read. Returns schema_version admin_dlp_findings.v1, tenant_id,
+        no_secret_attestation, findings and summary. Only dlp_match inspection events are
+        included; include_skipped is accepted for compatibility but has no effect.
+        Rows contain identifier types and counts, action, destination, instance class,
+        user/device context, access-decision ID and timestamp, without matched values.
+        summary.total counts events before the response limit; returned counts rows in
+        this response. Each by_identifier count is events containing that type, so adding
+        these counts can count a multi-type event more than once. blocked counts block events.
+        Optional filters are identifier, action, severity, since (RFC3339) and limit
+        (default 200, accepted range 1-2000). The configured aggregate store is searched
+        over the last 30 days, up to its latest 20000 inspection rows before these filters;
+        these are bounded results, not complete retained-history totals. A configured-store
+        failure returns 503 rather than silently using a local cache. With no aggregate
+        store configured, the local inspection store is used. Findings are not a scan or
+        delivery ledger. See docs/dlp.md.
       tags:
         - AdminDLPPolicy
       responses:
         "200":
-          description: DLP findings (non-secret) + aggregated summary.
+          description: DLP findings and event-level summary for the authenticated tenant.
+        "503":
+          description: Configured findings store could not be read. Retry; no empty or partial local success is returned.
   /admin/dlp-classifiers:
     get:
       summary: Read the tenant's operator-defined custom DLP classifiers (slice C).

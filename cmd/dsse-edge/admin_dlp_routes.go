@@ -158,12 +158,16 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 		servedFromHotStore := false
 		if adminHotStore != nil {
 			from := time.Now().Add(-dlpFindingsHotStoreWindow)
-			if res, err := adminHotStore.Search(r.Context(), hotstore.SearchQuery{TenantID: tenant, Stream: dlpFindingsHotStoreStream, From: &from, Limit: dlpFindingsHotStoreScan}); err == nil {
-				servedFromHotStore = true
-				for _, row := range res.Rows {
-					if ev, ok := inspectionEventFromRow(row); ok {
-						events = append(events, ev)
-					}
+			res, err := adminHotStore.Search(r.Context(), hotstore.SearchQuery{TenantID: tenant, Stream: dlpFindingsHotStoreStream, From: &from, Limit: dlpFindingsHotStoreScan})
+			if err != nil {
+				// A local cache cannot stand in for an unavailable fleet-wide result.
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP findings are temporarily unavailable; retry the request"))
+				return
+			}
+			servedFromHotStore = true
+			for _, row := range res.Rows {
+				if ev, ok := inspectionEventFromRow(row); ok {
+					events = append(events, ev)
 				}
 			}
 		}

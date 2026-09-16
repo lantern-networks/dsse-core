@@ -245,6 +245,31 @@ no applicable policy, or no inspection. Findings carry types/counts and context 
 than the matched value; context can still identify a user or destination. See
 [Audit logs and data handling](audit-and-data.md).
 
+## Reading DLP findings
+
+The summary counts detection **events**. One upload event with both an email and a
+card counts once in the total and once in each identifier filter; adding the filter
+counts does not give the event total or the number of matched values. **Showing** is
+the number of rows returned. The configured aggregate query covers the last 30 days
+and examines at most the latest 20,000 inspection records before applying the DLP
+filters. The response defaults to 200 rows. These bounded counts do not describe the
+entire retained history. Use the log search/export tools for further investigation.
+
+A configured findings-store failure now returns HTTP 503. The Console displays Retry
+instead of showing an empty or smaller local cache as a successful result. It also
+refuses malformed results or results for another organization, and ignores obsolete
+responses after navigation or another request. A valid empty result still shows the
+normal no-detections message. If a policy was deleted or its name cannot be read, the
+recorded policy ID is displayed. That current name is not a historical name snapshot.
+
+Inspect original `inspection_events` records in **Logs & Audit** to correlate the
+identifier types, decision ID, user/device and destination. These detection records
+are distinct from administrator configuration audits; merely reading the findings
+page does not constitute a configuration mutation. Event append remains best effort:
+an upload in Observe mode is not interrupted by a logging failure. Check service
+logs and storage health, and verify forwarding and retention across your deployment.
+A surviving local JSONL record does not prove independent control-plane delivery.
+
 ## Acceptance checks
 
 Use a unique synthetic keyword such as `DSSE_DLP_DEMO_ONLY_7F29` in a custom classifier;

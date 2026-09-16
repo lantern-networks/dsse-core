@@ -56,10 +56,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writePolicyCandidateError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, struct {
-			policycandidate.ListResponse
-			TenantID string `json:"tenant_id"`
-		}{result, adminTenantIDFromRequest(r)})
+		rows := make([]policyCandidateView, 0, len(result.Candidates))
+		for _, candidate := range result.Candidates {
+			rows = append(rows, policyCandidateForView(candidate))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"candidates": rows, "count": result.Count, "limit": result.Limit, "tenant_id": adminTenantIDFromRequest(r)})
 	}))
 	mux.HandleFunc("GET /admin/policy-candidates/{candidate_id}", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
 		candidate, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"))

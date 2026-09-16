@@ -53,13 +53,15 @@ func TestCertPinAttributionConfidence(t *testing.T) {
 }
 
 // Acceptance: an unattributed (investigate_only) candidate must NOT materialize without an explicit high-risk
-// override; an attributed (review) candidate materializes normally.
+// override; an attributed (review) candidate materializes normally. The positive
+// IP case uses IPv4, which the current inspection selector can apply; IPv6-only
+// refusal even with override is covered by the target-scope regressions.
 func TestCertPinMaterializeGatesUnattributed(t *testing.T) {
 	store := NewStore()
 	ctx := context.Background()
 	now := time.Now().UTC()
 	// raw-IP, no SNI -> investigate_only
-	ip, _ := store.ObserveCertPinFailure(ctx, "acme", "2606:4700:4700::1111", "", 443, "reason", now)
+	ip, _ := store.ObserveCertPinFailure(ctx, "acme", "192.0.2.1", "", 443, "reason", now)
 	if _, ok, _ := store.Review(ctx, "acme", ip.CandidateID, ReviewRequest{Decision: "approved"}, now); !ok {
 		t.Fatal("approve ip candidate")
 	}

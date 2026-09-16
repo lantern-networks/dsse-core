@@ -383,3 +383,16 @@ Invalid configured snapshots stop product startup with a generic candidate-snaps
 When a running store rejects a replacement snapshot, it retains its current state and writer; later changes continue saving to the original destination. Changing a clean store to an absent persistence destination retains its current in-memory history and saves that complete history on the next mutation. That attachment alone is not a migration or durability acknowledgement. Unconfirmed earlier saves must be reconciled before replacing or detaching the writer.
 
 Update binaries and snapshot formats together. Unknown fields from a newer version are rejected rather than discarded during an older binary's next save. This validation checks snapshot integrity against candidate admission rules; it does not prove the authenticity of observation evidence, correlate Edge observations with control-plane registrations, or make candidate, asset and rule writes one transaction.
+
+
+### Exact destinations for pinned-site registration
+
+Sites to Bypass registers one exact DNS hostname. It rejects wildcards (including `*` and `*.example.com`), IP literals and prefixes, abbreviated numeric addresses, URLs and port suffixes. IDNA names are stored as lowercase ASCII names. A registration for `app.example.com` does not include its subdomains. Broader authored policies belong in Internet Access and must be reviewed as such.
+
+When a candidate has a named Host, that name remains the registration target. When Host is an IP address or absent, a valid named SNI is used instead. The candidate list returns this derived name as `registration_host`; the Console displays it and names it in the confirmation. That field is not stored in candidate snapshots. IP-only or malformed candidates have no hostname adoption button; identify the actual hostname before registering it. Update Console and serving APIs together.
+
+The direct materialize API retains explicit `allow_high_risk: true` support for a single IPv4-only candidate. IPv6-only candidates, including mapped IPv6 notation, are rejected before saving because the current inspection selector does not support IPv6 literal patterns; use an exact named target instead. An IPv6 Host with a valid named SNI can still register that name. It determines the risk from Host/SNI rather than trusting stored confidence, suggested-action or DNS-attribution labels. Such an override cannot enable wildcard, prefix or malformed targets. Manual hostname registration rejects raw IPs even if an override field is sent. Confirmation is checked before candidate or dependent state changes.
+
+Specialized lifecycle audits report `bypass_target_kind` (`hostname` or `ip`) and `high_risk_override_used` for a confirmed IP bypass-rule write, without copying the destination into the audit. Candidate/rule IDs and the current saved rules remain the correlation points. Local confirmation does not prove independent delivery or active-connection changes.
+
+Existing authored rules are retained on upgrade. Previously saved broad or IP-based bypasses are not automatically narrowed or revoked by the new registration checks. Review their scope in Internet Access, remove or correct unintended rules explicitly, and confirm delivery. Candidate history alone does not authorize a replacement rule or prove that an old rule has been removed.

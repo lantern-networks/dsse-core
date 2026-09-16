@@ -2673,6 +2673,8 @@ components:
         source:
           type: string
           enum:
+            - policy_learning
+            - unmatched_flow
             - operator
             - import
             - cert_pinning_detection
@@ -2689,6 +2691,10 @@ components:
         host:
           type: string
           description: Connector UX Slice 4 / cert-pinning. Non-secret destination (FQDN, CIDR, or host) the candidate proposes. For connector_discovered candidates this is the declared reachable-route destination to publish as a Private App.
+        registration_host:
+          type: string
+          readOnly: true
+          description: Derived only in list responses for cert-pin candidates with an exact DNS target. Uses a named Host or an exact SNI when Host is an IP or absent. Omitted for IP-only or malformed targets. Not stored in candidate snapshots; not an enforcement receipt.
         publish_protocol:
           type: string
           enum:
@@ -2729,6 +2735,8 @@ components:
           enum:
             - pending
             - approved
+            - materialized
+            - suppressed
             - rejected
             - dismissed
         review_reason_code:
@@ -9894,8 +9902,8 @@ paths:
         certificate, without waiting for the detector to surface it. Creates an approved cert-pinning bypass
         candidate and materializes it in one call — the same path a detected-then-adopted candidate takes — so
         it becomes a first-class Egress bypass rule visible and revocable alongside detected ones. The host must
-        be a named host, not a raw IP literal (a bypass no-decrypts its destination; you cannot attribute a bare
-        IP). This is an explicit admin action, so it does not violate the never-auto-bypass invariant.
+        be one exact DNS hostname. Wildcards, CIDRs, IP literals, abbreviated numeric addresses, URLs and
+        port suffixes are rejected before any save. IDNA names are normalized to lowercase ASCII. This is an explicit admin action, so it does not violate the never-auto-bypass invariant.
         Candidate save failure returns 500 before proceeding to rule creation. The approval, materialization,
         asset and rule saves are separate operations: a confirmed earlier step may remain after a later failure.
         Reload candidate and Egress rule state before retrying; this endpoint does not provide an atomic
@@ -9913,7 +9921,7 @@ paths:
               properties:
                 host:
                   type: string
-                  description: The named host to decrypt-bypass (e.g. gateway.example.com). Raw IP literals are rejected.
+                  description: One exact hostname to decrypt-bypass (e.g. gateway.example.com). Patterns, prefixes, IP literals, URLs and port suffixes are rejected; allow_high_risk does not expand this endpoint.
       parameters:
         - name: expected_tenant_id
           in: query
@@ -10042,7 +10050,7 @@ paths:
   /admin/policy-candidates/{candidate_id}/materialize:
     post:
       summary: Materialize an approved bypass policy candidate.
-      description: Requires admin.policy_candidates.review. Records adoption of an approved candidate and, for cert-pinning candidates, saves its authored bypass rule before requesting local apply. Already-materialized cert-pin candidates can retry an incomplete rule write; high-risk confirmation remains required. Candidate status alone is not an enforcement receipt. A failure after candidate save returns 500 with partial=true and failed_stage; previously saved steps remain. Pending, rejected and suppressed candidates cannot be adopted by this endpoint. The serving Edge and fleet must be checked separately.
+      description: Requires admin.policy_candidates.review. Records adoption of an approved candidate and, for cert-pinning candidates, saves its authored bypass rule before requesting local apply. Already-materialized cert-pin candidates can retry an incomplete rule write; high-risk confirmation remains required. Candidate status alone is not an enforcement receipt. A failure after candidate save returns 500 with partial=true and failed_stage; previously saved steps remain. Pending, rejected and suppressed candidates cannot be adopted by this endpoint. For cert-pin candidates, the target is derived from actual Host/SNI, not stored confidence or suggested_action. A named Host takes precedence; an IP/empty Host can use a named SNI. Exact IPv4-only targets require allow_high_risk=true. IPv6-only targets are refused because the current inspection selector cannot apply literal IPv6 patterns; an IPv6 Host with a named SNI can use that name. Wildcards, CIDRs and malformed targets are refused even with that override. The serving Edge and fleet must be checked separately.
       tags:
         - AdminPolicyCandidateReview
       parameters:
@@ -10057,6 +10065,17 @@ paths:
           required: true
           schema:
             type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                allow_high_risk:
+                  type: boolean
+                  default: false
+                  description: Explicit confirmation for a single IPv4-only cert-pin candidate. IPv6-only literal targets are unsupported. Does not permit patterns or prefixes and does not bypass configuration-authority checks.
       responses:
         "200":
           description: Materialized policy candidate.

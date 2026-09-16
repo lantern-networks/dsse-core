@@ -122,8 +122,14 @@ function renderPinnedSitesView(content) {
 
   const submitAdd = async () => {
     if (addBtn.disabled) return;
-    const host = addInput.value.trim();
-    if (!host) return;
+    const entered = addInput.value.trim();
+    if (!entered) return;
+    const host = pinnedExactHostname(entered);
+    if (!host) {
+      addStatus.style.color = "#b91c1c";
+      addStatus.textContent = bl({en:"Enter one exact hostname, without an IP address, wildcard, URL, port or prefix.",ja:"IPアドレス、ワイルドカード、URL、ポート、範囲指定を含めず、単一のホスト名を入力してください。"});
+      return;
+    }
     addBtn.disabled = true;
     addStatus.style.color = "#4b5563";
     addStatus.textContent = bl({ en: "Registering…", ja: "登録中…" });
@@ -213,10 +219,11 @@ function paintPinned(container, filter) {
     const last = escapeHtml(c.last_observed || c.updated_at || "—");
     const id = encodeURIComponent(c.candidate_id);
     const status = String(c.status || "pending").trim();
-    // Attribution: approve an ENTITY, not an IP. An unattributed candidate (raw IP, no SNI) is investigate_only —
-    // warn the operator and require a high-risk override to materialize (the Edge gates it too).
-    const conf = String(c.confidence || "").trim();
-    const investigate = String(c.suggested_action || "").trim() === "investigate_only";
+    // Registration requires the server's derived exact name; persisted confidence
+    // cannot make an IP-only observation actionable as a named-site bypass.
+    const registrationHost = pinnedExactHostname(c.registration_host || "");
+    const conf = registrationHost ? String(c.confidence || "").trim() : "low";
+    const investigate = !registrationHost || String(c.suggested_action || "").trim() === "investigate_only";
     const dnsCorrelated = String(c.attribution_source || "").trim() === "dns_tunnel_correlation";
     // Colour by trust: high (DNS-correlated entity) = green, medium (SNI/hostname) = grey, investigate_only
     // (unattributed raw IP) = red. Show the DNS-recovered marker + the originating IP as evidence.
@@ -239,16 +246,17 @@ function paintPinned(container, filter) {
         `<button data-act="rejected" data-id="${id}" title="${escapeHtml(bl({ en: "Decline this recommendation", ja: "この推薦を退ける" }))}">${escapeHtml(bl({ en: "Reject", ja: "却下" }))}</button> ` +
         `<button data-act="suppressed" data-id="${id}" title="${escapeHtml(bl({ en: "Stop resurfacing this destination as a candidate — it stays intercepted, NOT bypassed", ja: "今後この宛先を候補に再表示しない(傍受のまま・バイパスはしない)" }))}">${escapeHtml(bl({ en: "Suppress", ja: "抑制" }))}</button>`;
     } else if (status === "approved") {
-      actions =
-        `<button data-act="materialize" data-id="${id}" data-host="${escapeHtml(c.host || c.sni || "")}" data-investigate="${investigate ? "1" : ""}"><strong>${escapeHtml(bl({ en: "Materialize (apply bypass)", ja: "取り込み(バイパス適用)" }))}</strong></button> ` +
-        `<button data-act="rejected" data-id="${id}">${escapeHtml(bl({ en: "Reject", ja: "却下" }))}</button>`;
+      actions = registrationHost
+        ? `<button data-act="materialize" data-id="${id}" data-host="${escapeHtml(registrationHost)}" data-investigate="${investigate ? "1" : ""}"><strong>${escapeHtml(bl({ en: "Materialize (apply bypass)", ja: "取り込み(バイパス適用)" }))}</strong></button> `
+        : `<span class="group-desc">${escapeHtml(bl({en:"Identify an exact hostname before registration.",ja:"登録前に単一のホスト名を特定してください。"}))}</span> `;
+      actions += `<button data-act="rejected" data-id="${id}">${escapeHtml(bl({ en: "Reject", ja: "却下" }))}</button>`;
     } else if (status === "materialized") {
       actions = `<span class="group-desc">${escapeHtml(bl({ en: "registration requested; check Edge below", ja: "登録要求済み・下のEdgeの状態を確認" }))}</span>`;
     } else {
       actions = `<button data-act="approved" data-id="${id}">${escapeHtml(bl({ en: "Re-approve", ja: "再承認" }))}</button>`;
     }
     return `<tr>
-      <td><code>${site}${port}</code></td>
+      <td><code>${site}${port}</code>${registrationHost && registrationHost !== c.host ? `<div class="group-desc">${escapeHtml(bl({en:"Register: ",ja:"登録先: "}) + registrationHost)}</div>` : ""}</td>
       <td>${confBadge}</td>
       <td style="text-align:right">${fails}</td>
       <td>${escapeHtml(last)}</td>
@@ -264,7 +272,7 @@ function paintPinned(container, filter) {
   //   (b) still-pending candidates we have positively identified (confidence medium/high — always a named
   //       host, safe to evaluate).
   // Only the PENDING low-confidence / unclassified / raw-IP noise is tucked behind the toggle.
-  const confOf = (c) => String(c.confidence || "").trim().toLowerCase();
+  const confOf = (c) => pinnedExactHostname(c.registration_host || "") ? String(c.confidence || "").trim().toLowerCase() : "low";
   const statusOf = (c) => String(c.status || "pending").trim();
   const isActionable = (c) => statusOf(c) !== "pending" || confOf(c) === "high" || confOf(c) === "medium";
   const actionable = pinned.filter(isActionable);
@@ -335,18 +343,19 @@ async function reviewPinned(id, decision, container) {
 }
 
 async function materializePinned(id, container, investigateOnly, host) {
+  host = pinnedExactHostname(host);
+  if (!host) { window.alert(bl({en:"Identify an exact hostname before registration.",ja:"登録前に単一のホスト名を特定してください。"})); return; }
   if (!window.confirm(bl({
-    en: "Request a TLS decrypt-bypass rule for this site? After the serving Edge applies it, traffic to this site will no longer be inspected.",
-    ja: "このサイトのTLS復号バイパスルールを登録します。接続先Edgeへの適用後は復号/傍受されなくなります。よろしいですか?",
+    en: "Request a TLS decrypt-bypass rule for " + host + "? After the serving Edge applies it, traffic to this hostname will no longer be inspected.",
+    ja: host + " のTLS復号バイパスルールを登録します。接続先Edgeへの適用後はこのホスト名を復号/傍受しません。よろしいですか?",
   }))) return;
-  // An unattributed (investigate_only) candidate — a raw IP with no SNI — is high-risk: you cannot tell what
-  // site/app it is. The Edge blocks it unless an explicit high-risk override is sent; require a second,
-  // explicit confirmation and pass allow_high_risk so the operator owns that decision.
+  // A named candidate can retain a conservative legacy investigate_only label.
+  // Keep the additional confirmation for that label; IP-only rows cannot reach here.
   let body = {};
   if (investigateOnly) {
     if (!window.confirm(bl({
-      en: "HIGH RISK: this candidate is a raw IP with no attributed hostname (investigate_only). Bypassing it no-decrypts an UNKNOWN destination. Materialize anyway with a high-risk override?",
-      ja: "高リスク: この候補はホスト名が特定できない生 IP(要調査のみ)です。バイパスすると不明な宛先を非復号にします。高リスク 上書きで取り込みますか?",
+      en: "This candidate is marked investigate_only. Verify that " + host + " is the intended hostname before excluding it from inspection. Continue with this explicit confirmation?",
+      ja: "この候補は要調査と記録されています。" + host + " が意図したホスト名であることを確認してください。この名前を検査対象から除外する登録を続けますか?",
     }))) return;
     body = { allow_high_risk: true };
   }
@@ -408,6 +417,7 @@ function pinnedCandidate(c, tenant) {
   }
   if ((c.failure_count !== undefined && (!Number.isSafeInteger(c.failure_count) || c.failure_count < 0)) ||
       (c.port !== undefined && (!Number.isInteger(c.port) || c.port < 0 || c.port > 65535))) throw new Error(pinnedInvalid());
+  if (c.registration_host !== undefined && (!c.registration_host || pinnedExactHostname(c.registration_host) !== c.registration_host)) throw new Error(pinnedInvalid());
   return c;
 }
 function pinnedLists(candidates, bypass, tenant) {
@@ -421,9 +431,21 @@ function pinnedLists(candidates, bypass, tenant) {
   if ((hosts || []).some(h => typeof h !== "string" || !h.trim())) throw new Error(pinnedInvalid());
   return {candidates:list.candidates.filter(c => c.source === "cert_pinning_detection" && c.candidate_type === "bypass_policy").sort((a,b)=>(b.failure_count || 0)-(a.failure_count || 0)),hosts:hosts || []};
 }
+function pinnedExactHostname(value) {
+  if (typeof value !== "string") return "";
+  let name = value.trim().toLowerCase();
+  if (!name || /[*\\/:@?#%\[\]\s]/.test(name)) return "";
+  // Browser IDNA normalization is used only after URL syntax is excluded.
+  if (/[^\x00-\x7f]/.test(name)) { try { name = new URL("http://" + name).hostname; } catch (_) { return ""; } }
+  name = name.replace(/\.$/, "");
+  const labels = name.split("."), last = labels.at(-1);
+  if (!name || name.length > 253 || /^[0-9]+$/.test(last) || /^0x[0-9a-f]+$/.test(last)) return "";
+  if (labels.some(label => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return "";
+  return name;
+}
 function pinnedRegistrationMatches(c, host) {
-  const normalize = h => String(h || "").trim().toLowerCase().replace(/\.$/, "");
-  return c.status === "materialized" && c.source === "cert_pinning_detection" && c.candidate_type === "bypass_policy" && normalize(c.host) === normalize(host);
+  const target = pinnedExactHostname(host);
+  return !!target && c.status === "materialized" && c.source === "cert_pinning_detection" && c.candidate_type === "bypass_policy" && pinnedExactHostname(c.host) === target;
 }
 
 // One page revision owns both lists. Failed reads discard the old action cache;

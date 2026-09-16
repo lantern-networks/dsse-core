@@ -72,6 +72,16 @@ func adminPolicyCandidateAuditLog(eventType string, candidate policycandidate.Ca
 		record.Metadata["runtime_hot_reload"] = o.applied
 		record.Metadata["local_apply_requested"] = o.applied
 		record.Metadata["enforcement_scope"] = "local_callback_only"
+		if candidate.Source == policycandidate.SourceCertPinningDetection {
+			if _, highRisk, err := policycandidate.CertPinBypassTarget(candidate); err == nil {
+				kind := "hostname"
+				if highRisk {
+					kind = "ip"
+				}
+				record.Metadata["bypass_target_kind"] = kind
+				record.Metadata["high_risk_override_used"] = highRisk && o.ruleConfirmed && o.ruleOperation == "upsert"
+			}
+		}
 	}
 	return record
 }

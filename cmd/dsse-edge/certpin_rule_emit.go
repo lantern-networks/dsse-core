@@ -35,12 +35,9 @@ func certPinWriteStage(err error) string {
 // idempotent (Upsert replaces in place) rather than accumulating duplicates.
 // The runtime's source of bypass intent is the authored rule, not candidate status.
 func emitCertPinBypassRule(assets *assetcatalog.Store, rules *policyrule.Store, c policycandidate.Candidate) error {
-	host := strings.TrimSpace(c.Host)
-	if host == "" {
-		host = strings.TrimSpace(c.SNI)
-	}
-	if host == "" {
-		return fmt.Errorf("cert-pin candidate %s has no host/sni to bypass", c.CandidateID)
+	host, _, err := policycandidate.CertPinBypassTarget(c)
+	if err != nil {
+		return err
 	}
 	tenant := strings.TrimSpace(c.TenantID)
 	if tenant == "" {

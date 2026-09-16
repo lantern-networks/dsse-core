@@ -141,6 +141,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if config.NetworkExtensionLabTLS != nil {
 			patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
 			bypassSources.EffectiveBypass, bypassSources.InterceptHosts = patterns.Bypass, patterns.Intercept
+			bypassSources.DeviceIntercept, bypassSources.DeviceBypass = patterns.InterceptByDevice, patterns.BypassByDevice
 		}
 		// Attribute SaaS Optimize bypass: pass the groups enabled in the live posture.
 		if config.InspectionPosture != nil {
@@ -187,14 +188,19 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			aliasByID[g.ID] = g.Alias
 		}
 		egressRules := ruleStore.List(tenant, policyrule.PlaneEgress)
+		sourceWarnings := map[string]string{}
+		for _, rule := range egressRules {
+			sourceWarnings[rule.ID] = policyrule.InspectionSourceWarning(tenant, rule, assetStore)
+		}
 		in := effectiveEgressInputs{
-			Eval:                evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
-			Tenant:              tenant,
-			AuthoredRules:       egressRules,
-			AliasByID:           aliasByID,
-			KnownGroups:         knownbypass.Groups,
-			AuthoredBypassHosts: policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
-			UnresolvedRuleIDs:   unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
+			Eval:                     evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
+			Tenant:                   tenant,
+			AuthoredRules:            egressRules,
+			AliasByID:                aliasByID,
+			KnownGroups:              knownbypass.Groups,
+			AuthoredBypassHosts:      policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
+			UnresolvedRuleIDs:        unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
+			InspectionSourceWarnings: sourceWarnings,
 		}
 		if config.NetworkExtensionLabTLS != nil {
 			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass

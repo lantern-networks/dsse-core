@@ -23,8 +23,8 @@ func TestEgressBypassFQDNs(t *testing.T) {
 		"ep-mac":  nil, // a steered device — no address
 	}
 	rules := []Rule{
-		// An active egress bypass rule -> contributes its destination addresses.
-		{ID: "r1", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{"ep-mac"}, Destination: []string{"ep-saas", "grp-cdn"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
+		// An active Any-source egress bypass rule contributes shared host addresses.
+		{ID: "r1", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{SubjectAny}, Destination: []string{"ep-saas", "grp-cdn"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
 		// An egress rule that inspects (not bypass) -> excluded.
 		{ID: "r2", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{"ep-mac"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionInspect}},
 		// A disabled bypass rule -> excluded.

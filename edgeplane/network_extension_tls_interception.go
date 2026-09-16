@@ -543,12 +543,16 @@ func (interception *NetworkExtensionLabTLSInterception) Matches(route NetworkExt
 	if networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.Bypass) {
 		return false
 	}
+	if route.DeviceIdentity != "" && networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.BypassByDevice[route.DeviceIdentity]) {
+		return false
+	}
 	// A destination learned to be certificate-pinning is raw-forwarded rather than intercepted; it stays
 	// steered.
 	if interception.isPinnedHostForTenant(route.TenantID, host) {
 		return false
 	}
-	return networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.Intercept)
+	return networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.Intercept) ||
+		(route.DeviceIdentity != "" && networkExtensionLabTLSHostMatchesAnyPattern(host, patterns.InterceptByDevice[route.DeviceIdentity]))
 }
 
 // decisionHost returns the normalised host the intercept/bypass decision is made on. In SNI mode the peeked

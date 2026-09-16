@@ -84,16 +84,31 @@ Allow does not require leaving content uninspected. Authenticate does not itself
 enable DLP. Deny does not forward traffic, and the rule validator rejects
 Deny combined with inspection bypass.
 
-**Current authored inspection selection is destination-host based.** The bypass
-compiler collects active bypass destinations whose service is Any or includes
-TCP/443 into the engine's host set. The inspect host compiler uses the same
-service check. SSH, UDP-only services (including UDP/443), and unresolved named
-services do not alter TCP/443 inspection. These host projections do not apply
-the rule's source, risk condition, or access priority to that selection. Do not
-promise a bypass only for one person or one source device because the access
-rule names them. Inspect rules do not cancel a separately selected
-host bypass merely by having a higher access priority. Review other device-profile,
-static, and approved certificate-pinning exclusions as well.
+**Authored TLS inspection preserves tenant and device source scope.** Any-source
+rules contribute shared host patterns; a catalog device or device group contributes
+patterns only for its resolved device identities. The TLS selector uses the
+transport-authenticated tenant and device identity, never a self-reported OS user.
+An empty or unresolved source does not become Any. Both inspect and bypass host
+selection require Service=Any or a service containing TCP/443; SSH, UDP-only and
+unresolved named services do not change TCP/443 inspection.
+
+Person, IdP-group and agent source selectors require identity context that is not
+available to this pre-TLS selector. They do not create shared or device inspection
+exceptions; the Console shows that limitation. Their separate access-policy
+conditions still apply. If a rule mixes device and identity selectors, only the
+resolved device branch contributes to TLS selection.
+
+Risk conditions and authored access priority are not yet evaluated by this host
+projection. Inspect rules do not cancel a separate matching bypass merely by
+having higher access priority. Any destination is not currently expanded by this
+inspection projection. Review device-profile, static and approved certificate-pin
+exclusions as well; these controls are separate from source-scoped authored rules.
+
+Inspection Settings and the bypass-hosts API list shared host patterns, with the
+posture response flagging additional device-scoped rules. A destination-only
+Policy decision check reports **Depends on the device** when a device rule can
+change the inspection result. Confirm from included and excluded source devices;
+a destination-only preview cannot supply an authenticated source identity.
 
 A bypassed encrypted connection does not expose its plaintext to HTTP DLP.
 Protocols such as SSH are not converted into inspectable HTTP by choosing Inspect.

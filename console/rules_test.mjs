@@ -43,3 +43,4 @@ test('tenant verification rejects missing context and propagates transport failu
   context.apiFetch=async()=>({ok:true,status:200,body:{tenant_id:'customer-a'}});
   assert.equal(await context.ruleEditorTenant(),'customer-a');
 });
+test('unsupported inspection sources explain the remaining access and inspection scopes',()=>{assert.match(context.inspectionSourceWarningText('identity_context_unavailable'),/Only device sources/);assert.match(context.inspectionSourceWarningText('identity_context_unavailable'),/access rules still apply/);assert.match(context.inspectionSourceWarningText('no_resolved_device'),/No source device/);assert.match(context.inspectionSourceWarningText('future_reason'),/Check the inspection source/)});

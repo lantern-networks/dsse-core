@@ -9312,7 +9312,7 @@ paths:
   /admin/intercept/bypass-hosts:
     get:
       summary: List configured decrypt-bypass host patterns for the requesting tenant.
-      description: Requires admin.swg.read. Returns the local engine's tenant-specific host selection, including deployment defaults, that tenant's curated-catalog overrides and authored bypass rules. It excludes other tenants' rules. This configuration listing does not include dynamic pin-learning state or prove independent Edge delivery or actual traffic inspection.
+      description: Requires admin.swg.read. Returns the local engine's tenant-specific host selection, including deployment defaults, that tenant's curated-catalog overrides and authored bypass rules applying to any source. Device-specific exceptions are applied separately using the authenticated source device and are not flattened into this list. It excludes other tenants' rules. This configuration listing does not include dynamic pin-learning state or prove independent Edge delivery or actual traffic inspection.
       tags:
         - AdminPolicyCandidateReview
       responses:
@@ -10426,7 +10426,7 @@ paths:
   /admin/rules:
     get:
       summary: List the tenant's authored unified rules.
-      description: Requires admin.policy.read. Returns the authored `source → destination` rules (with their service selector and action) across the east-west and egress planes. Optional ?plane filters to one plane. See docs/policy_and_endpoint_model_design.md.
+      description: Requires admin.policy.read. Returns the authored `source → destination` rules (with their service selector and action) across the east-west and egress planes. Optional ?plane filters to one plane. inspection_source_warning identifies identity_context_unavailable or no_resolved_device for pre-TLS inspection source selection; access-policy compilation is separate. See docs/policy_and_endpoint_model_design.md.
       tags:
         - AdminRules
       parameters:
@@ -12833,8 +12833,9 @@ paths:
         each row tagged by source (authored / built_in). This surfaces the hidden competition behind a
         surprising decision (e.g. an authored Authenticate rule losing a priority tie to a built-in allow). Also
         returns the inspect/bypass basis (whether the Edge decrypts or raw-forwards the flow, and which source
-        decided it: decrypt-all default / known-bypass / authored bypass / materialized cert-pin). Response is
-        metadata-only.
+        decided it: decrypt-all default / known-bypass / authored bypass / materialized cert-pin).
+        inspection.decision may be depends_on_device when a source-device selector changes the result;
+        this destination-only request has no authenticated source device. Response is metadata-only.
       tags:
         - AdminPolicy
       parameters:
@@ -13075,7 +13076,8 @@ paths:
         the allowlist and raw-forward the rest), the decrypt allowlist (explicit hosts + selected SaaS auth-group
         presets), the curated hardcoded known-bypass groups (each marked active when in the live bypass set), and
         the local engine's intercept/bypass sets selected for the requesting tenant. scope=deployment describes
-        the shared posture settings; the effective host lists include only this tenant's contributions.
+        the shared posture settings; the host lists include only this tenant's contributions shared by all
+        source devices. device_scoped indicates additional selectors using the authenticated device identity.
         configurable indicates whether this caller can edit the defaults; runtime_available is false on a
         server without an interception engine. can_manage_rules is separate and covers tenant-authored SaaS
         bypass rules. A control-plane response does not confirm that every Edge has applied the settings.
@@ -13094,6 +13096,7 @@ paths:
                   configurable: { type: boolean }
                   runtime_available: { type: boolean }
                   can_manage_rules: { type: boolean }
+                  device_scoped: { type: boolean, description: Additional device-specific inspection selectors exist. }
                   default_mode: { type: string, enum: [decrypt_all, bypass_default] }
                   intercept_hosts: { type: array, items: { type: string } }
                   effective_bypass: { type: array, items: { type: string } }

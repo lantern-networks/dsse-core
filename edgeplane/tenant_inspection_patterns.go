@@ -10,6 +10,30 @@ import (
 type InspectionPatterns struct {
 	Intercept []string
 	Bypass    []string
+	// Keys are exact, transport-authenticated device identities within this tenant.
+	InterceptByDevice map[string][]string
+	BypassByDevice    map[string][]string
+}
+
+func copyDeviceInspectionPatterns(input map[string][]string, normalize bool) map[string][]string {
+	var out map[string][]string
+	for device, hosts := range input {
+		if device == "" || device != strings.TrimSpace(device) {
+			continue
+		}
+		copy := append([]string{}, hosts...)
+		if normalize {
+			copy = NormalizedNetworkExtensionLabTLSHostPatterns(copy)
+		}
+		if len(copy) == 0 {
+			continue
+		}
+		if out == nil {
+			out = map[string][]string{}
+		}
+		out[device] = copy
+	}
+	return out
 }
 
 // ReplaceInspectionPatterns publishes the deployment fallback and every tenant's
@@ -19,9 +43,11 @@ func (interception *NetworkExtensionLabTLSInterception) ReplaceInspectionPattern
 		return
 	}
 	normalize := func(p InspectionPatterns) InspectionPatterns {
-		return InspectionPatterns{Intercept: NormalizedNetworkExtensionLabTLSHostPatterns(p.Intercept), Bypass: NormalizedNetworkExtensionLabTLSHostPatterns(p.Bypass)}
+		return InspectionPatterns{Intercept: NormalizedNetworkExtensionLabTLSHostPatterns(p.Intercept), Bypass: NormalizedNetworkExtensionLabTLSHostPatterns(p.Bypass), InterceptByDevice: copyDeviceInspectionPatterns(p.InterceptByDevice, true), BypassByDevice: copyDeviceInspectionPatterns(p.BypassByDevice, true)}
 	}
 	defaults = normalize(defaults)
+	// Device selectors require a tenant owner; fallback state is shared.
+	defaults.InterceptByDevice, defaults.BypassByDevice = nil, nil
 	next := make(map[string]InspectionPatterns, len(tenants))
 	for tenant, patterns := range tenants {
 		// Empty/ambiguous tenant keys must never change the deployment fallback.
@@ -43,8 +69,8 @@ func (interception *NetworkExtensionLabTLSInterception) inspectionPatternsLocked
 	return InspectionPatterns{Intercept: interception.hosts, Bypass: interception.bypassHosts}
 }
 
-// InspectionPatternsForTenant exposes the same selection used by Matches. Both
-// arrays are copied under one lock so administrative reads cannot mix revisions.
+// InspectionPatternsForTenant exposes the same selection used by Matches. All
+// arrays and device maps are copied under one lock so reads cannot mix revisions.
 func (interception *NetworkExtensionLabTLSInterception) InspectionPatternsForTenant(tenant string) InspectionPatterns {
 	if interception == nil {
 		return InspectionPatterns{Intercept: []string{}, Bypass: []string{}}
@@ -52,7 +78,7 @@ func (interception *NetworkExtensionLabTLSInterception) InspectionPatternsForTen
 	interception.hostMu.RLock()
 	defer interception.hostMu.RUnlock()
 	p := interception.inspectionPatternsLocked(tenant)
-	return InspectionPatterns{Intercept: append([]string{}, p.Intercept...), Bypass: append([]string{}, p.Bypass...)}
+	return InspectionPatterns{Intercept: append([]string{}, p.Intercept...), Bypass: append([]string{}, p.Bypass...), InterceptByDevice: copyDeviceInspectionPatterns(p.InterceptByDevice, false), BypassByDevice: copyDeviceInspectionPatterns(p.BypassByDevice, false)}
 }
 
 // Length-prefixing keeps tenant and host identities distinct even for unusual IDs.

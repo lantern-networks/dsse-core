@@ -39,11 +39,15 @@ func inspectionPostureSnapshot(config serverConfig, tenant string) inspectionPos
 		posture = config.InspectionPosture()
 	}
 	var interceptHosts, effectiveBypass []string
+	deviceScoped := false
 	if config.NetworkExtensionLabTLS != nil {
 		patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
 		interceptHosts, effectiveBypass = patterns.Intercept, patterns.Bypass
+		deviceScoped = len(patterns.InterceptByDevice) > 0 || len(patterns.BypassByDevice) > 0
 	}
-	return buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
+	result := buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
+	result.DeviceScoped = deviceScoped
+	return result
 }
 
 // knownBypassGroupView is one curated known-bypass group made visible to the operator, with whether it is
@@ -76,6 +80,7 @@ type inspectionPostureResponse struct {
 	Configurable     bool   `json:"configurable"`
 	RuntimeAvailable bool   `json:"runtime_available"`
 	CanManageRules   bool   `json:"can_manage_rules"`
+	DeviceScoped     bool   `json:"device_scoped"` // additional selectors use the authenticated device identity
 
 	DefaultMode            string                 `json:"default_mode"`     // decrypt_all | bypass_default
 	InterceptHosts         []string               `json:"intercept_hosts"`  // live engine intercept set ("*" = decrypt-all)
@@ -185,7 +190,7 @@ func buildInspectionPosture(p inspectionposture.Posture, interceptHosts, effecti
 		AuthDecryptGroups:      authViews,
 		SaaSBypassGroups:       bypassGroupViews,
 		KnownBypassGroups:      knownViews,
-		Note:                   "Default posture is deployment-wide; effective host lists are selected for the requesting tenant. decrypt_all decrypts every steered HTTPS flow EXCEPT the bypass set; bypass_default decrypts ONLY the allowlist (hosts + selected SaaS auth groups) and raw-forwards the rest. A bypassed flow is still steered and policy-gated. Keep a SaaS auth group selected under bypass_default to keep tenant restriction working.",
+		Note:                   "Default posture is deployment-wide; host lists are the requesting tenant's shared selection. Additional device-scoped selectors apply when device_scoped is true. decrypt_all decrypts every steered HTTPS flow EXCEPT the bypass set; bypass_default decrypts ONLY the allowlist (hosts + selected SaaS auth groups) and raw-forwards the rest. A bypassed flow is still steered and policy-gated. Keep a SaaS auth group selected under bypass_default to keep tenant restriction working.",
 	}
 }
 

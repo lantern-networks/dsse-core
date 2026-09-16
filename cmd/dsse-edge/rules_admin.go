@@ -84,8 +84,9 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		out := make([]ruleWithEnforcement, 0, len(listed))
 		for _, rule := range listed {
 			out = append(out, ruleWithEnforcement{
-				Rule:                  rule,
-				DestinationUnresolved: destinationResolvesToNothing(rule, assets, tenant),
+				Rule:                    rule,
+				DestinationUnresolved:   destinationResolvesToNothing(rule, assets, tenant),
+				InspectionSourceWarning: policyrule.InspectionSourceWarning(tenant, rule, assets),
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -229,7 +230,8 @@ type ruleWithEnforcement struct {
 	policyrule.Rule
 	// DestinationUnresolved: the destination names nothing this organization's endpoint catalog knows, so the
 	// compiled policy is the match-nothing sentinel. The rule is present, active, and enforces nothing.
-	DestinationUnresolved bool `json:"destination_unresolved,omitempty"`
+	DestinationUnresolved   bool   `json:"destination_unresolved,omitempty"`
+	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
 }
 
 // destinationResolvesToNothing asks the compiler's own question with the compiler's own resolver: does this

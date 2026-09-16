@@ -46,7 +46,8 @@ type effectiveEgressRuleEntry struct {
 	Rule        *policyrule.Rule `json:"rule,omitempty"`         // for authored entries: the raw rule so the editor can open it
 	// DestinationUnresolved: this authored rule names a destination the endpoint catalog does not know, so it
 	// compiles to a match-nothing policy and enforces nothing — while still reading as Active.
-	DestinationUnresolved bool `json:"destination_unresolved,omitempty"`
+	DestinationUnresolved   bool   `json:"destination_unresolved,omitempty"`
+	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
 }
 
 // certPinBypassRef pairs a materialized cert-pin bypass host with its candidate id, so the Egress view can offer
@@ -80,7 +81,8 @@ type effectiveEgressInputs struct {
 	// compiler emits a match-nothing sentinel for those and logs "a DENY here is NOT enforcing"; this carries
 	// the same fact to the screen, where a rule was showing as Active with no hint that it enforces nothing.
 	// See rules_admin.go for how it is computed and the measurement that found it.
-	UnresolvedRuleIDs map[string]bool
+	UnresolvedRuleIDs        map[string]bool
+	InspectionSourceWarnings map[string]string
 }
 
 // subjectText renders a list of asset-catalog subject ids (or the Any wildcard) to a display string.
@@ -129,7 +131,8 @@ func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleList
 			SourceText: subjectText(r.Source, in.AliasByID), DestText: subjectText(r.Destination, in.AliasByID),
 			ServiceText: svc, Access: r.Action.Access, Inspection: r.Action.Inspection, Status: r.Status,
 			Editable: true, Deletable: true, ToggleKind: "rule", Rule: &rule,
-			DestinationUnresolved: in.UnresolvedRuleIDs[r.ID],
+			DestinationUnresolved:   in.UnresolvedRuleIDs[r.ID],
+			InspectionSourceWarning: in.InspectionSourceWarnings[r.ID],
 		})
 	}
 

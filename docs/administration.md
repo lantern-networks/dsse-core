@@ -121,6 +121,14 @@ During a purge, an origin admission block is removed only after its snapshot sav
 successfully, and the change advances the revocation generation. A failed save
 retains the live block and inventory ownership records for retry. Received-region
 and pulled blocks are separate authorities and are not removed by this operation.
+Tenant risk erasure saves the selected device marks and the tenant's user marks
+in one shared snapshot before publishing either removal. A failed or unconfirmed
+save keeps both live sets and their generation unchanged; the purge reports a
+failure and retains inventory ownership for retry. Completed synced in-place saves
+are accepted. An explicit retry saves again even if no matching live marks remain,
+so a prior ambiguous write can be reconciled. This does not make all tenant stores
+one transaction or confirm propagation to other nodes.
+
 Inventory ownership is erased after the preceding cleanup reports no failures.
 An incomplete purge returns `complete: false` with failures and remaining counts;
 the administrative audit records `partial`. Deletion and purge audits belong to

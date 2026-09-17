@@ -39,7 +39,7 @@ func (p *tenantPurgeSaveStore) Save(b []byte) error {
 	return nil
 }
 func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
-	for _, kind := range []string{"healthy", "admission_no_write", "admission_bridge", "retirement_no_write", "retirement_bridge", "ledger_erasure_no_write", "ledger_erasure_bridge"} {
+	for _, kind := range []string{"healthy", "admission_no_write", "admission_bridge", "retirement_no_write", "retirement_bridge", "ledger_erasure_no_write", "ledger_erasure_bridge", "risk_device_no_write", "risk_device_bridge", "risk_combined_no_write", "risk_combined_bridge"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := t.TempDir()
 			now := time.Now().UTC()
@@ -52,6 +52,9 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 			}
 			lp := &tenantPurgeSaveStore{base: blobstore.FilePersister{Path: filepath.Join(dir, "ledger.json")}}
 			ap := &tenantPurgeSaveStore{base: blobstore.FilePersister{Path: filepath.Join(dir, "admission.json")}}
+			rp := &tenantPurgeSaveStore{base: blobstore.FilePersister{Path: filepath.Join(dir, "risk.json")}}
+			risk := revocation.NewHighRiskOverlay()
+			risk.SetPersister(rp)
 			ledger := enrolledinventory.NewLedger()
 			ledger.SetPersister(lp)
 			a := revocation.NewAdmissionRevocations()
@@ -63,6 +66,15 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 					t.Fatal(err)
 				}
 				a.Revoke(x.id, "original")
+				risk.Mark(x.id, "high")
+			}
+			for _, tenant := range []string{"tenant_gone", "tenant_other"} {
+				if tenant == "tenant_gone" && strings.HasPrefix(kind, "risk_device") {
+					continue
+				}
+				if _, err := risk.SetUserRisk(revocation.UserRisk{TenantID: tenant, ID: "shared", Severity: "critical"}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			a.RevokeFromMesh("peer-kept", "peer")
 			auth := newAdminAuthStore()
@@ -73,7 +85,7 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 				t.Fatal(err)
 			}
 			handler := func() http.Handler {
-				return newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, TenantModelStore: tenantStore, OperatorTenantID: "tenant_lab_001", EnrolledLedger: ledger, AdmissionRevocations: a})
+				return newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, TenantModelStore: tenantStore, OperatorTenantID: "tenant_lab_001", EnrolledLedger: ledger, AdmissionRevocations: a, HighRiskOverlay: risk})
 			}
 			send := func(method, path string) *httptest.ResponseRecorder {
 				r := httptest.NewRequest(method, path, strings.NewReader(`{"confirm_tenant_id":"tenant_gone"}`))
@@ -105,6 +117,10 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 				lp.failAt = lp.writes + 2
 				lp.bridge = strings.HasSuffix(kind, "bridge")
 			}
+			if strings.HasPrefix(kind, "risk_") {
+				rp.fail = true
+				rp.bridge = strings.HasSuffix(kind, "bridge")
+			}
 			first := send("POST", "/admin/tenants/tenant_gone/purge")
 			var result adminTenantPurgeResult
 			if err := json.Unmarshal(first.Body.Bytes(), &result); err != nil {
@@ -118,7 +134,7 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 					t.Fatal("missing failure")
 				}
 				for _, row := range result.Erased {
-					if (strings.HasPrefix(kind, "admission") && row.Store == "admission_kill_switches") || (row.Store == "enrolled_identities") {
+					if (strings.HasPrefix(kind, "admission") && row.Store == "admission_kill_switches") || (row.Store == "enrolled_identities") || (strings.HasPrefix(kind, "risk_") && row.Store == "high_risk_marks") {
 						t.Fatal("unconfirmed erasure reported as erased")
 					}
 				}
@@ -128,6 +144,15 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 					t.Fatal("failed cleanup lost live state/attribution")
 				}
 			}
+			if strings.HasPrefix(kind, "risk_") {
+				if risk.Snapshot()["own"] != "high" || ledger.CountTenantRecords("tenant_gone") != 1 {
+					t.Fatal("risk failure lost live marks or ownership")
+				}
+				if strings.HasPrefix(kind, "risk_combined") && risk.CountUsers("tenant_gone") != 1 {
+					t.Fatal("partial user/device erasure")
+				}
+			}
+			rp.fail = false
 			lp.fail = false
 			lp.failAt = 0
 			ap.fail = false
@@ -149,6 +174,8 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 			if ledger.IsAdmitted("own") {
 				t.Fatal("retired identity re-admitted on reload")
 			}
+			risk = revocation.NewHighRiskOverlay()
+			risk.SetPersister(rp)
 			last := send("POST", "/admin/tenants/tenant_gone/purge")
 			if err := json.Unmarshal(last.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
@@ -161,6 +188,9 @@ func TestTenantDeletionPurgeSaveRetryAndAudit(t *testing.T) {
 			}
 			if a.Snapshot()["foreign"] != "original" || !ledger.IsAdmitted("foreign") || a.FeedSnapshot()["peer-kept"] != "peer" {
 				t.Fatal("foreign/mesh changed")
+			}
+			if risk.Snapshot()["own"] != "" || risk.CountUsers("tenant_gone") != 0 || risk.Snapshot()["foreign"] != "high" || risk.CountUsers("tenant_other") != 1 {
+				t.Fatal("risk erasure or isolation failed")
 			}
 			data, err := os.ReadFile(filepath.Join(dir, "logs", "audit.log.jsonl"))
 			if err != nil {

@@ -447,10 +447,10 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		add("end_user_idp_connections", e.IdPConnections.RemoveTenant(tenantID))
 	}
 	if e.HighRisk != nil {
-		if n, err := e.HighRisk.RemoveUsers(tenantID); err != nil {
-			result.Failures = append(result.Failures, "user risk removal failed")
+		if n, err := e.HighRisk.RemoveTenantRisksChecked(tenantID, e.DeviceIDs); err != nil {
+			result.Failures = append(result.Failures, "risk erasure saving could not be confirmed")
 		} else {
-			add("high_risk_marks", n+e.HighRisk.RemoveDevices(e.DeviceIDs))
+			add("high_risk_marks", n)
 		}
 	}
 	if e.Admissions != nil {

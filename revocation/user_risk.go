@@ -240,30 +240,5 @@ func (o *HighRiskOverlay) CountUsers(tenant string) int {
 	return n
 }
 func (o *HighRiskOverlay) RemoveUsers(tenant string) (int, error) {
-	if o == nil {
-		return 0, nil
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.loadErr != nil || o.legacy {
-		return 0, ErrRiskUnavailable
-	}
-	next := cloneUserRisks(o.users)
-	n := 0
-	for k, m := range next {
-		if m.TenantID == tenant {
-			delete(next, k)
-			n++
-		}
-	}
-	if n == 0 {
-		return 0, nil
-	}
-	if _, err := o.saveStateLocked(o.devices, next); err != nil {
-		return 0, err
-	}
-	o.users = next
-	o.rebuildUserIndexLocked()
-	o.generation.Add(1)
-	return n, nil
+	return o.RemoveTenantRisksChecked(tenant, nil)
 }

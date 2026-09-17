@@ -150,28 +150,9 @@ func (o *HighRiskOverlay) CountDevices(deviceIDs []string) int {
 	return n
 }
 
-// RemoveDevices clears the marks on the named devices, returning how many were removed.
-//
-// ★ ORDER MATTERS AND IT IS THE CALLER'S TO GET RIGHT (2026-08-18). The ids come from the enrolled ledger, and
-// a tenant erasure removes that ledger's entries — so the ids must be captured BEFORE the ledger is cleared or
-// this receives an empty list and silently removes nothing, which is indistinguishable from "there were none".
+// RemoveDevices is the compatibility wrapper. A failed save removes nothing from
+// live state; callers that must distinguish failure from no matches use the checked form.
 func (o *HighRiskOverlay) RemoveDevices(deviceIDs []string) int {
-	if o == nil || len(deviceIDs) == 0 {
-		return 0
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	n := 0
-	for _, id := range deviceIDs {
-		key := NormalizeDeviceID(id)
-		if _, ok := o.devices[key]; ok {
-			delete(o.devices, key)
-			n++
-		}
-	}
-	if n > 0 {
-		o.generation.Add(1)
-		o.persistLocked()
-	}
+	n, _ := o.RemoveDevicesChecked(deviceIDs)
 	return n
 }

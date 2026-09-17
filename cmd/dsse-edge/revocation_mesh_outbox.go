@@ -3,10 +3,8 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"maps"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -50,19 +48,16 @@ func newRevocationMeshOutbox(p blobstore.Persister) (*revocationMeshOutbox, erro
 	}
 	data, err := p.Load()
 	if err != nil {
-		return nil, fmt.Errorf("load revocation mesh outbox: %w", err)
+		return nil, errMeshOutboxLoad
 	}
-	if len(data) == 0 {
+	if data == nil {
 		return o, nil
 	}
-	var entries []revocationMeshOutboxEntry
-	if err := json.Unmarshal(data, &entries); err != nil {
-		return nil, fmt.Errorf("decode revocation mesh outbox: %w", err)
+	entries, err := decodeMeshOutboxSnapshot(data)
+	if err != nil {
+		return nil, err
 	}
 	for _, e := range entries {
-		if strings.TrimSpace(e.Region) == "" || strings.TrimSpace(e.Identity) == "" {
-			continue
-		}
 		o.nextSequence++
 		e.sequence = o.nextSequence
 		o.pending[revocationMeshOutboxKey(e.Region, e.Identity)] = e

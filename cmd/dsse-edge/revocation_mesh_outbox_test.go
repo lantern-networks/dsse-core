@@ -98,8 +98,9 @@ func TestRevocationMeshOutboxSurvivesRestartAndResumes(t *testing.T) {
 }
 
 // TestRevocationMeshReporterEnqueuesBeforeDelivery proves the reporter path persists the push BEFORE attempting
-// delivery, so a crash between "revoke" and "peer ack" cannot lose it. The peer here is unreachable, so delivery
-// never succeeds, yet the entry is durably enqueued.
+// delivery after a successful save. The peer here is unreachable, so delivery
+// never succeeds, yet the confirmed queue snapshot can be reloaded. Save failures
+// are covered separately and do not guarantee restart recovery.
 func TestRevocationMeshReporterEnqueuesBeforeDelivery(t *testing.T) {
 	persister := blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "revocation_mesh_outbox.json")}
 	o, err := newRevocationMeshOutbox(persister)

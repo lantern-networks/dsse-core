@@ -350,9 +350,40 @@ acceptance by every peer. Use sender system logs to distinguish those outcomes;
 automatic deliveries and cleanup retries do not create administrator audits.
 Snapshots remain readable while an outbox save is pending; other queue writers
 wait for that save. This is process-local coordination, not a transaction with
-local admission or a lock shared by several server processes. Outbox restoration
-validation and region-block withdrawal have separate limitations from admission
-snapshot validation below.
+local admission or a lock shared by several server processes. Region-block withdrawal remains separate from queue persistence.
+
+### Restoring the region delivery queue
+
+When mesh peers are configured, startup loads the complete saved outbox before
+resuming delivery. An existing empty file, `null`, malformed or trailing JSON,
+null or incomplete entries, unknown or duplicate fields, and duplicate
+region/device entries are rejected. No valid subset is adopted and the rejected
+snapshot is not rewritten. Load errors are reported without stored values or
+backend paths. Missing storage on first boot and an explicit empty array `[]`
+remain valid; deleting a lost queue is not equivalent to recovering it.
+
+Each entry requires `region`, `url` and `identity` strings. Region keys use the
+configured lowercase, trimmed form without control characters. Device identities
+use the existing admission normalization (lowercase and trimmed); this does not
+introduce a new identity character policy. Legacy entries may omit `reason`,
+`origin_region` and `enqueued_at`, or retain their existing string values. These
+metadata fields are not interpreted as a new schema or strict timestamp format.
+A present null or non-string field is rejected.
+
+Peer configuration and restored URLs require an absolute HTTP or HTTPS base URL
+with a host. Userinfo, queries, fragments and malformed URLs are refused before
+delivery. A path prefix is supported. HTTP remains available for existing lab
+configurations; these checks do not establish TLS trust, peer ownership, or bind
+a restored URL to today's configured peer list.
+
+To recover, stop the affected process and restore a complete, trusted backup of
+the pending queue. Preserve the rejected file for diagnosis. Check the configured
+peers and storage access, then restart and inspect resumed delivery and cleanup
+outcomes. A previously open Console cannot identify a startup failure's cause;
+it shows a read error until the server is available, then Retry reloads the state.
+If mesh peers are disabled, the unused outbox is not loaded or sent. Inspect it
+before enabling mesh again. Local blocks, queue storage and peer enforcement
+still have separate outcomes; a valid snapshot alone does not prove fleet delivery.
 
 ### Restoring admission state at startup
 

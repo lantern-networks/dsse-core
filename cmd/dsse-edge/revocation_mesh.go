@@ -60,6 +60,9 @@ func parseRevocationMeshPeers(raw string) ([]revocationMeshPeer, error) {
 		if !ok || region == "" || url == "" {
 			return nil, fmt.Errorf("revocation mesh peer %q must be region=URL", entry)
 		}
+		if !canonicalMeshKey(region) || !validMeshPeerURL(url) {
+			return nil, fmt.Errorf("invalid revocation mesh peer configuration")
+		}
 		if seen[region] {
 			return nil, fmt.Errorf("revocation mesh peer region %q is configured more than once", region)
 		}

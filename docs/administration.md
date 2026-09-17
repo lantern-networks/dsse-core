@@ -687,3 +687,40 @@ second request. Success requires a response confirming that device, tenant and
 group. A failed or unconfirmed response stays visible in the editor; check the
 current state before retrying. Closing a loading editor or leaving the page
 prevents its late response from reopening the old editor.
+
+
+### Steering exclusions and save failures
+
+Open **Steering Exclusions → Authored exclusions** to add an app identifier for
+an entire tenant, a device group, or one device. Group and device scopes require
+the corresponding identifier. Enter one app identifier per line. Matching rules
+are combined; deleting one rule does not remove an exclusion supplied by another
+matching rule or by an agent's built-in loop-prevention rules.
+
+The list reads the control plane. Enforcing Edges receive the authored set on
+subsequent polls. Check device observations separately: an authored rule and a
+successful save do not prove that an endpoint has applied it. If observations
+cannot be read, the Applied column shows **not known**.
+
+When storage is configured, an unconfirmed save returns HTTP 500 for creation,
+editing, deletion, and version rollback. That request keeps the previous local
+policy. This is not a guarantee that the backend is unchanged: it may have saved
+the candidate before reporting an error, and a later refresh or restart can read
+that candidate. Check the current list before retrying, particularly before
+creating another rule. A confirmed in-place save is accepted, while a warning
+that durability is unconfirmed is treated as a failure. Policy IDs cannot be
+reassigned from another tenant.
+
+In **Logs & Audit**, the `steer_exclusion_updated` event identifies the acting
+administrator, policy ID, operation (`steer_exclusion_upsert`,
+`steer_exclusion_delete`, or `steer_exclusion_rollback`), and result. Unconfirmed
+saves record `failed`, `applied_locally=false`, and `persistence_error=true`.
+The common HTTP audit records the request status separately; rejected input or
+ownership checks produce that rejection record without a policy-change event.
+Successful primary operation audits are mirrored to the configured audit outbox.
+Policy persistence, version history, and audit recording remain separate writes;
+they are not a single transaction.
+
+An operator authorized to write for another tenant also records that tenant as
+the owner of the policy's version history and operation audit. The acting
+administrator remains the operator; record ownership does not change the actor.

@@ -8073,7 +8073,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a steer-exclusion policy.
-      description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.
+      description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). An ID owned by another tenant is rejected with 403. With persistence configured, success requires a confirmed save. The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.
       tags:
         - AdminSteerExclusions
       requestBody:
@@ -8097,6 +8097,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/pki/certificates:
     get:
       summary: The certificate map — every certificate this node is configured with, as objects with relations.
@@ -8400,6 +8402,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/steer-exclusions/{id}/versions:
     get:
       summary: List the version history of a steer-exclusion policy.
@@ -8429,7 +8433,7 @@ paths:
   /admin/steer-exclusions/{id}/rollback:
     post:
       summary: Roll a steer-exclusion policy back to a prior version.
-      description: Requires admin.steering.write. Re-applies the snapshot of the given version_no as a new version.
+      description: Requires admin.steering.write. Re-applies the snapshot of the given version_no as a new version. The same tenant-ownership and save-confirmation checks as an upsert apply.
       tags:
         - AdminSteerExclusions
       parameters:
@@ -8465,6 +8469,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/config-versions:
     post:
       summary: Record a config version (generic; control plane).

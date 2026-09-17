@@ -117,6 +117,12 @@ func (c *cpConfigVersionClient) Get(ctx context.Context, resourceType, resourceI
 // recordConfigVersion appends a config version when versioning is enabled (control plane). Best-effort: a
 // recording failure is logged but never fails the admin operation (the config change already succeeded).
 func recordConfigVersion(r *http.Request, store configversion.Store, resourceType, resourceID, action, note string, payload any) {
+	recordConfigVersionForTenant(r, store, adminTenantIDFromRequest(r), resourceType, resourceID, action, note, payload)
+}
+
+// The target must already be authorized by the route, including an operator's
+// explicit body tenant when it differs from the current request context.
+func recordConfigVersionForTenant(r *http.Request, store configversion.Store, tenantID, resourceType, resourceID, action, note string, payload any) {
 	if store == nil {
 		return
 	}
@@ -128,7 +134,7 @@ func recordConfigVersion(r *http.Request, store configversion.Store, resourceTyp
 			actor = "api-token:" + identity.APITokenID
 		}
 	}
-	if _, err := store.Record(r.Context(), adminTenantIDFromRequest(r), resourceType, resourceID, action, actor, note, payload); err != nil {
+	if _, err := store.Record(r.Context(), tenantID, resourceType, resourceID, action, actor, note, payload); err != nil {
 		log.Printf("WARNING: record config version (%s/%s) failed: %v", resourceType, resourceID, err)
 	}
 }

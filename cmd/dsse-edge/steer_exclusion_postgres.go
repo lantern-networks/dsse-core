@@ -42,15 +42,26 @@ func (p postgresSteerExclusionPersistence) Upsert(ctx context.Context, e *steere
 	if err != nil {
 		return err
 	}
-	_, err = p.db.ExecContext(ctx, `
+	result, err := p.db.ExecContext(ctx, `
 		INSERT INTO steer_exclusion_policies (id, tenant_id, scope_type, scope_id, excluded_app_signing_ids, note, status, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
 		ON CONFLICT (id) DO UPDATE SET
-			tenant_id=EXCLUDED.tenant_id, scope_type=EXCLUDED.scope_type, scope_id=EXCLUDED.scope_id,
+			scope_type=EXCLUDED.scope_type, scope_id=EXCLUDED.scope_id,
 			excluded_app_signing_ids=EXCLUDED.excluded_app_signing_ids, note=EXCLUDED.note,
-			status=EXCLUDED.status, updated_at=EXCLUDED.updated_at`,
+			status=EXCLUDED.status, updated_at=EXCLUDED.updated_at
+  WHERE steer_exclusion_policies.tenant_id = EXCLUDED.tenant_id`,
 		e.ID, e.TenantID, e.ScopeType, e.ScopeID, ids, e.Note, e.Status, e.CreatedAt, e.UpdatedAt)
-	return err
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return steerexclusion.ErrTenantConflict
+	}
+	return nil
 }
 
 func (p postgresSteerExclusionPersistence) Delete(ctx context.Context, id, tenantID string) error {

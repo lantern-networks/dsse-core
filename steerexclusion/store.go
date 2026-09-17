@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -27,6 +28,19 @@ const (
 	scopeDevice      = "device"
 	statusActive     = "active"
 )
+
+// ErrTenantConflict rejects reuse of an ID owned by another tenant, including
+// conflicts discovered by persistence after this node loaded its cache.
+var ErrTenantConflict = errors.New("steer exclusion ID is unavailable for this tenant")
+
+// ErrPersistence means the write could not be confirmed. A backend may already
+// have written the candidate; callers must not describe this as a disk rollback.
+var ErrPersistence = errors.New("steer exclusion persistence could not be confirmed")
+
+func clonePolicy(p Policy) Policy {
+	p.ExcludedAppSigningIDs = append([]string(nil), p.ExcludedAppSigningIDs...)
+	return p
+}
 
 var validScope = map[string]bool{
 	scopeTenant:      true,
@@ -154,6 +168,8 @@ func normalizeSigningIDs(ids []string) []string {
 }
 
 // Upsert validates and stores a policy (creating its id if absent), write-through to the durable store.
+// On ErrPersistence, the returned candidate identifies the attempted write, not a
+// published policy. The previous local state remains in use.
 func (s *Store) Upsert(p Policy, now time.Time) (Policy, error) {
 	p.ScopeType = strings.TrimSpace(strings.ToLower(p.ScopeType))
 	if !validScope[p.ScopeType] {
@@ -182,19 +198,25 @@ func (s *Store) Upsert(p Policy, now time.Time) (Policy, error) {
 	}
 	existing := s.byID[p.ID]
 	if existing != nil {
+		if existing.TenantID != p.TenantID {
+			return Policy{}, ErrTenantConflict
+		}
 		p.CreatedAt = existing.CreatedAt
 	} else {
 		p.CreatedAt = now.UTC()
 	}
 	p.UpdatedAt = now.UTC()
-	stored := p
-	s.byID[p.ID] = &stored
+	stored := clonePolicy(p)
 	if s.persistence != nil {
 		if err := s.persistence.Upsert(context.Background(), &stored); err != nil {
-			log.Printf("WARNING: persist steer exclusion %s failed (durability at risk): %v", stored.ID, err)
+			if errors.Is(err, ErrTenantConflict) {
+				return Policy{}, ErrTenantConflict
+			}
+			return clonePolicy(stored), fmt.Errorf("%w: %w", ErrPersistence, err)
 		}
 	}
-	return stored, nil
+	s.byID[p.ID] = &stored
+	return clonePolicy(stored), nil
 }
 
 // List returns the tenant's policies (stable order).
@@ -205,7 +227,7 @@ func (s *Store) List(tenantID string) []Policy {
 	out := []Policy{}
 	for _, p := range s.byID {
 		if p.TenantID == tenantID {
-			out = append(out, *p)
+			out = append(out, clonePolicy(*p))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -218,35 +240,51 @@ func (s *Store) Get(id, tenantID string) (Policy, bool) {
 	defer s.mu.Unlock()
 	s.refreshLocked(time.Now())
 	if p := s.byID[id]; p != nil && p.TenantID == tenantID {
-		return *p, true
+		return clonePolicy(*p), true
 	}
 	return Policy{}, false
 }
 
-// Delete removes a tenant's policy by id. Returns false if absent.
+// Delete is the compatibility wrapper. Administrative callers use DeleteChecked
+// to distinguish a missing policy from an unconfirmed save.
 func (s *Store) Delete(id, tenantID string, now time.Time) bool {
+	deleted, err := s.DeleteChecked(id, tenantID, now)
+	return deleted && err == nil
+}
+
+// DeleteChecked publishes the removal only after persistence confirms it.
+func (s *Store) DeleteChecked(id, tenantID string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.byID[id]
 	if p == nil || p.TenantID != tenantID {
-		return false
+		return false, nil
 	}
-	delete(s.byID, id)
 	if s.persistence != nil {
 		if err := s.persistence.Delete(context.Background(), id, tenantID); err != nil {
-			log.Printf("WARNING: delete steer exclusion %s failed: %v", id, err)
+			return false, fmt.Errorf("%w: %w", ErrPersistence, err)
 		}
 	}
-	return true
+	delete(s.byID, id)
+	return true, nil
 }
 
 // ReplaceTenant atomically replaces ALL of a tenant's cached policies with the supplied set. Used by the
 // enforcing Edge's CP→Edge sync: the Edge keeps NO durable DB (zero-DB), so it pulls the authoritative set
 // from the control plane and caches it here. A fetch failure must NOT call this (keep the last good set).
-// Cache-only: this never write-throughs to persistence (the control plane is the source of truth).
+// A configured cache persistence is updated best-effort; this sync contract is
+// distinct from administrative write confirmation in Upsert/DeleteChecked.
 func (s *Store) ReplaceTenant(tenantID string, policies []Policy) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Validate ownership before removing any current policy. IDs are global keys.
+	for _, p := range policies {
+		if current := s.byID[p.ID]; current != nil && current.TenantID != tenantID {
+			log.Printf("steer exclusions: rejecting tenant replacement with conflicting ID")
+			return
+		}
+	}
+
 	// Persist the replace too, or the durable cache drifts from the store: this is the CP→Edge sync path, and
 	// before it also went through persistence, a synced-away policy stayed in the on-disk file and reappeared
 	// for a moment on the next restart (until the next sync corrected it). Mirror Upsert/Delete: Delete the
@@ -259,7 +297,7 @@ func (s *Store) ReplaceTenant(tenantID string, policies []Policy) {
 		}
 	}
 	for i := range policies {
-		stored := policies[i]
+		stored := clonePolicy(policies[i])
 		if strings.TrimSpace(stored.ID) == "" || stored.TenantID != tenantID {
 			continue
 		}
@@ -272,7 +310,7 @@ func (s *Store) ReplaceTenant(tenantID string, policies []Policy) {
 			}
 		}
 		for i := range policies {
-			stored := policies[i]
+			stored := clonePolicy(policies[i])
 			if strings.TrimSpace(stored.ID) == "" || stored.TenantID != tenantID {
 				continue
 			}

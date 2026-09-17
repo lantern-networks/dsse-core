@@ -54,31 +54,43 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 				return
 			}
 		}
+		_, entityID, err := validateAdminRiskSignal(deviceStore, sig)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(entityID); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		warning, err := config.HighRiskOverlay.SetDeviceRisk(entityID, sig.Severity)
+		if err != nil {
+			now := time.Now().UTC()
+			failure := deviceRiskAuditLog(r, tenantID, adminRiskSignalResponse{EntityType: "device", EntityID: entityID, Severity: strings.ToLower(strings.TrimSpace(sig.Severity))}, evaluator, now)
+			failure.EventType = "device_risk_change_failed"
+			failure.Result = stringPtr("error")
+			failure.Metadata["requested_severity"] = failure.Metadata["severity"]
+			delete(failure.Metadata, "severity")
+			delete(failure.Metadata, "high_risk")
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, failure, now)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk save was not confirmed; the live overlay and runtime were not changed"))
+			return
+		}
 		resp, err := applyAdminRiskSignal(deviceStore, adminTenantIDFromRequest(r), sig, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		// Phase 3: reflect the marking into the shared high-risk overlay so EVERY node's decision path
-		// treats the device as high-risk (fleet-consistent risk-based deny/re-auth; reconnect-elsewhere blocked).
-		if config.HighRiskOverlay != nil && strings.EqualFold(resp.EntityType, "device") {
-			// The overlay carries the GRADED severity (medium|high|critical) so a policy can gate on any level
-			// (risk_state_severity). AdminHighRisk (the high-risk behaviours) is derived from high|critical only,
-			// in the decision enrichment — a medium mark is a policy signal, not a "high-risk" device/user.
-			switch strings.ToLower(strings.TrimSpace(resp.Severity)) {
-			case "medium", "high", "critical":
-				config.HighRiskOverlay.Mark(resp.EntityID, strings.ToLower(strings.TrimSpace(resp.Severity)))
-			default:
-				config.HighRiskOverlay.Clear(resp.EntityID)
+		resp.OverlayPersistenceWarning = warning
+		if warning {
+			if resp.NotStoredDurably != "" {
+				resp.NotStoredDurably += " "
 			}
+			resp.NotStoredDurably += "Risk is applied with a volatile or non-atomic overlay save. Reapply after storage is healthy."
 		}
 		if resp.EntityType == "device" {
-			tenantID := adminTenantIDFromRequest(r)
-			if config.EnrolledLedger != nil {
-				if entry, ok := config.EnrolledLedger.EntryFor(resp.EntityID); ok && strings.TrimSpace(entry.TenantID) != "" {
-					tenantID = entry.TenantID
-				}
-			}
 			now := time.Now().UTC()
 			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
 				deviceRiskAuditLog(r, tenantID, resp, evaluator, now), now)

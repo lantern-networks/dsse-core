@@ -19,7 +19,7 @@ func deviceRiskAuditLog(r *http.Request, tenantID string, response adminRiskSign
 		result = "partial"
 	}
 	metadata := map[string]any{"identity": identity, "severity": response.Severity,
-		"applied": response.Applied, "high_risk": response.HighRisk, "runtime_persistence_warning": warning}
+		"applied": response.Applied, "high_risk": response.HighRisk, "runtime_persistence_warning": response.RuntimePersistenceWarning, "overlay_persistence_warning": response.OverlayPersistenceWarning}
 	record := model.AuditLog{
 		ID:             randomEdgeID("audit_device_risk_", now),
 		TenantID:       strings.TrimSpace(tenantID),
@@ -52,6 +52,7 @@ func userRiskAuditLog(r *http.Request, tenant string, response adminRiskSignalRe
 	record.Action = stringPtr("set_user_risk")
 	delete(record.Metadata, "identity")
 	delete(record.Metadata, "runtime_persistence_warning")
+	delete(record.Metadata, "overlay_persistence_warning")
 	record.Metadata["user_persistence_warning"] = response.NotStoredDurably != ""
 	return record
 }

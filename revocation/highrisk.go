@@ -42,37 +42,16 @@ func (o *HighRiskOverlay) ConfigGeneration() uint64 {
 	return o.generation.Load()
 }
 
-// Mark records a device as high-risk (CP-authoritative). Only a state change bumps the generation + persists.
+// Mark is the legacy automatic-signal path. Escalations remain visible before
+// saving, as existing DLP callers expect. De-escalations require a successful
+// save. Administrative callers must use SetDeviceRisk to receive save outcomes.
 func (o *HighRiskOverlay) Mark(deviceID, severity string) {
-	id := NormalizeDeviceID(deviceID)
-	if o == nil || id == "" {
-		return
-	}
-	severity = strings.ToLower(strings.TrimSpace(severity))
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if prev, ok := o.devices[id]; ok && prev == severity {
-		return
-	}
-	o.devices[id] = severity
-	o.generation.Add(1)
-	o.persistLocked()
+	_, _ = o.setDeviceRisk(deviceID, severity, true)
 }
 
-// Clear removes a device from the high-risk set (de-escalation). Only a real removal bumps + persists.
+// Clear is the compatibility wrapper; an unconfirmed clear preserves the live mark.
 func (o *HighRiskOverlay) Clear(deviceID string) {
-	id := NormalizeDeviceID(deviceID)
-	if o == nil {
-		return
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if _, ok := o.devices[id]; !ok {
-		return
-	}
-	delete(o.devices, id)
-	o.generation.Add(1)
-	o.persistLocked()
+	_, _ = o.SetDeviceRisk(deviceID, "none")
 }
 
 // IsHighRisk reports whether a device is currently marked high-risk, with its severity.

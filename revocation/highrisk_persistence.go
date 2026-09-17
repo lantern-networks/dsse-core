@@ -123,4 +123,3 @@ func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[s
 	}
 	return false, nil
 }
-func (o *HighRiskOverlay) persistLocked() { _, _ = o.saveStateLocked(o.devices, o.users) }

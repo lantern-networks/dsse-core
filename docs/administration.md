@@ -340,3 +340,39 @@ rows, or change to a new empty path merely to make startup succeed. A missing
 snapshot still means first boot under the storage contract; it is not evidence
 that previously stored blocks were intentionally removed. Backups and correct
 storage attachment remain necessary to detect and recover a missing snapshot.
+
+
+## Device risk changes and saving
+
+Use **Devices → More → Risk** to set or clear a device's risk. An administrative
+request first validates the input and confirms saving the shared risk overlay,
+then updates the device runtime metadata. An unconfirmed overlay save returns 503;
+that request does not publish the overlay change or attempt the runtime update.
+The Console retains a warning with **Retry**, and `device_risk_change_failed` records
+the target device, requested severity, actor and `applied: false`. The common
+administrative request audit also records the error. Invalid or unauthorized
+requests remain separate refusals and do not produce an applied-risk audit.
+
+When the overlay save succeeds but runtime saving fails, the response is partial:
+the live runtime metadata was updated, while its saved copy may still contain the
+old risk. The Console warns and offers **Retry**; `device_risk_changed` records
+`partial`. Response and audit fields distinguish `runtime_persistence_warning`
+from `overlay_persistence_warning`. A volatile overlay or a completed non-atomic
+save is accepted with an overlay warning. An unconfirmed flush is an error, even
+if the storage implementation also reports a non-atomic-save warning.
+
+Reapply the intended risk after restoring storage and inspect the displayed state.
+An explicit retry saves an unchanged overlay too, without advancing its generation
+again. A save error can leave old or new bytes; it does not prove disk rollback.
+Reconcile before restarting. If runtime saving failed, a restart can restore old
+runtime risk even when the overlay was cleared. The Devices risk badge includes
+runtime information, so inspect it and retry the intended change; restarting alone
+is not recovery. Browser navigation or a new session is not a durable retry queue.
+
+These two stores are not one transaction. A successful local response does not
+confirm independent-region delivery or coordinate concurrent administrators across
+processes. Automatic DLP signals use a separate legacy path: risk escalations can
+still become live before saving, while downgrades and clearing require a successful
+save. Automatic-signal persistence acknowledgement is not established by the
+administrative operation's response. Risk affects access through configured policy;
+setting risk does not itself revoke standing grants.

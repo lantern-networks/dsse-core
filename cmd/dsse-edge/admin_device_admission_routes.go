@@ -319,7 +319,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		reason := valueOrDefault(strings.TrimSpace(req.Reason), "admin_kill_switch")
-		config.AdmissionRevocations.Revoke(req.Identity, reason)
+		saveErr := config.AdmissionRevocations.RevokeChecked(req.Identity, reason)
 		// The ONE place allowed to tear down established (T) sessions: an explicit administrator block. Every
 		// other revocation path (CP feed, mesh, node-reported automatic) only denies NEW handshakes. See the
 		// invariant on transportConns where the registry is created.
@@ -333,8 +333,17 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				tenantID = entry.TenantID
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
-			transportAdmissionAuditLog(r, tenantID, "revoke", req.Identity, reason, evaluator, time.Now().UTC()), time.Now().UTC())
+		record := transportAdmissionAuditLog(r, tenantID, "revoke", req.Identity, reason, evaluator, time.Now().UTC())
+		if saveErr != nil {
+			record.Result = stringPtr("partial")
+			record.Metadata["applied_locally"] = true
+			record.Metadata["persistence_confirmed"] = false
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
+		if saveErr != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device blocked locally, but saving was not confirmed; repair storage and retry the block before restarting"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "identity": strings.TrimSpace(req.Identity), "reason": reason})
 	}))
 	mux.HandleFunc("POST /admin/transport-admission/restore", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -366,16 +375,25 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				return
 			}
 		}
-		config.AdmissionRevocations.Restore(req.Identity)
-		logInfof("transport_admission_restored_by_admin identity=%q", strings.TrimSpace(req.Identity))
+		saveErr := config.AdmissionRevocations.RestoreChecked(req.Identity)
 		tenantID := adminTenantIDFromRequest(r)
 		if config.EnrolledLedger != nil {
 			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
 				tenantID = entry.TenantID
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
-			transportAdmissionAuditLog(r, tenantID, "restore", req.Identity, "", evaluator, time.Now().UTC()), time.Now().UTC())
+		record := transportAdmissionAuditLog(r, tenantID, "restore", req.Identity, "", evaluator, time.Now().UTC())
+		if saveErr != nil {
+			record.Result = stringPtr("error")
+			record.Metadata["applied_locally"] = false
+			record.Metadata["persistence_confirmed"] = false
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
+		if saveErr != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device restore was not applied locally because saving was not confirmed; reconcile storage and retry the intended state before restarting"))
+			return
+		}
+		logInfof("transport_admission_restored_by_admin identity=%q", strings.TrimSpace(req.Identity))
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "restored": true, "identity": strings.TrimSpace(req.Identity)})
 	}))
 	// management ledger: the Admin Console device list for the Enrolled Inventory. Enroll a device,
@@ -685,13 +703,13 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if configWriteRejectedWhenSourced(w, configSourceURL, "enrolled inventory") {
 			return
 		}
-		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, evaluator, enrolledLedgerOr503, true)
+		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, adminAuditOutbox, evaluator, enrolledLedgerOr503, true)
 	}))
 	mux.HandleFunc("POST /admin/enrolled-devices/{identity}/disable", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "enrolled inventory") {
 			return
 		}
-		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, evaluator, enrolledLedgerOr503, false)
+		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, adminAuditOutbox, evaluator, enrolledLedgerOr503, false)
 	}))
 	// M7: assign/change a device's CP-authoritative group (Device Groups and their ASSIGNMENT — the union-model scope selector
 	// the agent-policy/agent-tuning resolution reads via cpAuthoritativeGroup). An empty group clears the

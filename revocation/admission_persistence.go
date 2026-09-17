@@ -78,25 +78,32 @@ func (a *AdmissionRevocations) loadLocked() {
 	log.Printf("admission_revocations load: restored %d revocation(s) + %d cross-region from the durable store", len(a.revoked), len(a.meshReceived))
 }
 
-// persistLocked atomically writes the node-local `revoked` set to the durable store. Caller holds a.mu.
-// Best-effort: write errors are logged, never fail the op. No-op when persistence is disabled.
-func (a *AdmissionRevocations) persistLocked() {
+// ErrAdmissionSave deliberately omits private storage details from callers' responses.
+var ErrAdmissionSave = errors.New("admission revocation persistence was not confirmed")
+
+// saveStateLocked saves a candidate while holding a.mu. A nil persister retains
+// the explicit in-memory mode; it does not promise persistence across a restart.
+func (a *AdmissionRevocations) saveStateLocked(revoked map[string]string) error {
 	if a == nil || a.persister == nil {
-		return
+		return nil
 	}
-	data, err := json.Marshal(admissionRevocationsStateFile{SchemaVersion: admissionRevocationsStateSchemaVersion, Revoked: a.revoked, MeshReceived: a.meshReceived})
+	data, err := json.Marshal(admissionRevocationsStateFile{SchemaVersion: admissionRevocationsStateSchemaVersion, Revoked: revoked, MeshReceived: a.meshReceived})
 	if err != nil {
 		log.Printf("admission_revocations persist: marshal failed: %v", err)
-		return
+		return ErrAdmissionSave
 	}
 	if err := a.persister.Save(data); err != nil {
-		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
-		// change was lost when it was written; saying nothing would hide that an interrupted write could
-		// truncate it. Both are worth exactly one accurate sentence.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		// A completed, synced in-place write is weaker but accepted. The legacy
+		// warning also matches an unconfirmed flush; that is NOT confirmed saving.
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("admission_revocations persist: saved, but NOT atomically — %v", err)
+			return nil
 		} else {
 			log.Printf("admission_revocations persist: save failed: %v", err)
 		}
+		return ErrAdmissionSave
 	}
+	return nil
 }
+
+func (a *AdmissionRevocations) persistLocked() error { return a.saveStateLocked(a.revoked) }

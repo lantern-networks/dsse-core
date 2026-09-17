@@ -181,3 +181,36 @@ Implementation: [role permissions](../cmd/dsse-edge/admin_auth_store.go),
 [operator organization gate](../cmd/dsse-edge/operator_is_an_organization_not_a_role.go),
 [elevated acts](../cmd/dsse-edge/operator_elevated_acts.go).
 Continue with [Audit logs and data handling](audit-and-data.md).
+
+## Device block and allow failures
+
+The Devices page changes transport admission first, then the enrolled inventory.
+These are separate operations. If the transport request fails, the Console retains
+an error and does not send the inventory change. Use **Retry** after resolving the
+error; a partial operation is not a successful device update.
+
+With admission persistence configured:
+
+- **Block:** the local transport block takes effect and registered sessions for that
+  device are closed even if saving fails. The API returns HTTP 503, and the domain
+  audit records `partial`, `applied_locally: true`, and
+  `persistence_confirmed: false`. This does not confirm enforcement on every node.
+- **Allow:** the local transport block is lifted only after saving succeeds. A save
+  failure returns HTTP 503, keeps the live block, and records an `error` domain audit
+  with `applied_locally: false` and `persistence_confirmed: false`.
+- The common request audit records `error` for either 503. Repair storage and retry
+  the intended operation explicitly. Retrying an already active local block saves
+  it again, without changing its generation or repeating propagation callbacks.
+
+A storage error can occur after new bytes were written. The live state and saved
+snapshot can therefore differ: failure does **not** guarantee disk rollback, and a
+restart alone does not prove recovery. Reconcile the saved revocations with the
+intended state and complete the retry before restarting. Preserve other devices'
+blocks when reconciling; do not delete a snapshot to bypass an error. A subsequent
+successful save also includes existing local blocks whose earlier save failed.
+
+A completed, synced in-place write is still accepted, with a server log warning
+that replacement was not atomic. An unconfirmed flush is rejected, including
+when it also carries that compatibility warning. With no persister configured,
+admission remains in-memory only and does not survive a restart. Restoring a local
+block does not clear a block received through the control-plane feed or region mesh.

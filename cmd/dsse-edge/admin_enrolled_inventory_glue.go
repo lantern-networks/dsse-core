@@ -13,7 +13,7 @@ import (
 	"github.com/lantern-networks/dsse-core/model"
 )
 
-func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledger *enrolledinventory.Ledger, writer *logs.Writer, evaluator decision.Evaluator, or503 func(http.ResponseWriter) bool, enabled bool) {
+func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledger *enrolledinventory.Ledger, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, or503 func(http.ResponseWriter) bool, enabled bool) {
 	if !or503(w) {
 		return
 	}
@@ -42,7 +42,9 @@ func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledge
 	if enabled {
 		action = "enable"
 	}
-	_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, action, entry, evaluator, sourceIPFromRequest(r)))
+	record := enrolledInventoryAuditLog(tenantID, action, entry, evaluator, sourceIPFromRequest(r))
+	record.ActorUserID = auditActorPrincipal(r)
+	_ = appendAdminAudit(r.Context(), writer, outbox, record, time.Now().UTC())
 	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 }
 

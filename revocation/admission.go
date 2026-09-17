@@ -182,9 +182,21 @@ func normalizeIdentity(identity string) string {
 // churn the feed or spam the control plane). On a new revocation the reporter (puller mode) ships it UP to the
 // control plane for fleet-wide redistribution.
 func (a *AdmissionRevocations) Revoke(identity, reason string) {
+	_ = a.revoke(identity, reason, false)
+}
+
+// RevokeChecked applies the restrictive local decision even if saving fails.
+// An error means persistence is unconfirmed, not that the block was rolled back.
+// Explicit retries save an unchanged block again without repeating callbacks or
+// bumping its generation. Automatic Revoke retains its no-churn behaviour.
+func (a *AdmissionRevocations) RevokeChecked(identity, reason string) error {
+	return a.revoke(identity, reason, true)
+}
+
+func (a *AdmissionRevocations) revoke(identity, reason string, retrySave bool) error {
 	id := normalizeIdentity(identity)
 	if id == "" {
-		return
+		return nil
 	}
 	reason = strings.TrimSpace(reason)
 	a.mu.Lock()
@@ -193,7 +205,10 @@ func (a *AdmissionRevocations) Revoke(identity, reason string) {
 	if changed {
 		a.revoked[id] = reason
 		a.generation.Add(1)
-		a.persistLocked()
+	}
+	var err error
+	if changed || retrySave {
+		err = a.persistLocked()
 	}
 	reporter := a.reporter
 	meshReporter := a.meshReporter
@@ -211,21 +226,49 @@ func (a *AdmissionRevocations) Revoke(identity, reason string) {
 	if changed && onRevoked != nil {
 		onRevoked(id, reason)
 	}
+	return err
 }
 
 // Restore clears a node-local revocation (re-admission after re-enroll/re-attest). Idempotent — only a real
 // removal bumps the generation + persists. A CP-distributed (synced) revocation can only be cleared at the
 // control plane.
 func (a *AdmissionRevocations) Restore(identity string) {
+	_ = a.restore(identity, false)
+}
+
+// RestoreChecked saves before lifting a local block. Failed or unconfirmed
+// persistence leaves the live block and generation unchanged. Storage might have
+// accepted bytes before returning an error: reconcile and explicitly retry before
+// restarting. Neither restore method clears synced or mesh revocations.
+func (a *AdmissionRevocations) RestoreChecked(identity string) error {
+	return a.restore(identity, true)
+}
+
+func (a *AdmissionRevocations) restore(identity string, retrySave bool) error {
 	id := normalizeIdentity(identity)
+	if id == "" {
+		return nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if _, existed := a.revoked[id]; !existed {
-		return
+	_, existed := a.revoked[id]
+	if !existed && !retrySave {
+		return nil
 	}
-	delete(a.revoked, id)
-	a.generation.Add(1)
-	a.persistLocked()
+	candidate := make(map[string]string, len(a.revoked))
+	for key, reason := range a.revoked {
+		if key != id {
+			candidate[key] = reason
+		}
+	}
+	if err := a.saveStateLocked(candidate); err != nil {
+		return err
+	}
+	if existed {
+		a.revoked = candidate
+		a.generation.Add(1)
+	}
+	return nil
 }
 
 // IsRevoked reports whether an identity is currently revoked (node-local OR control-plane distributed), with

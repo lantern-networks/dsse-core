@@ -6960,10 +6960,11 @@ paths:
           $ref: "#/components/responses/Forbidden"
   /admin/ai-usage-report:
     get:
-      summary: Report known generative-AI service usage ().
+      summary: Report known generative-AI service usage.
       description: >-
         Requires admin.ai.read. Identifies known generative-AI service usage from access logs and classifies each
-        (approved|tolerated|prohibited) via the SaaS catalog / built-in defaults. Non-secret enums and counts only.
+        (approved|tolerated|prohibited) via the SaaS catalog / built-in defaults. Returns counts, byte volumes, and
+        recorded user/device/app/account attribution; it does not return credentials or request bodies.
         The response carries "window" (the range asked for) and "coverage" (the range actually covered): the read is
         row-capped and newest-first, so a tenant busy enough to hit the cap is reported over a shorter span than
         requested, with coverage.truncated true and coverage.from the real start of the data. coverage.retained_from
@@ -6972,10 +6973,18 @@ paths:
         as loss: a quiet period and rotated-away records are indistinguishable from the report's position.
         coverage.source names the path that answered: "rows" loaded the window and grouped in Go; "aggregate" had
         the hot store GROUP BY (Postgres only). Both run the same aggregation and produce identical reports; on the
-        aggregate path coverage.row_cap is the group cap, since nothing is row-loaded.
+        aggregate path coverage.row_cap is zero, since nothing is row-loaded; coverage.truncated reports the group limit.
+        The response tenant_id is the authenticated tenant. Optional expected_tenant_id rejects a changed context with 409.
+        Session totals union 30-minute wall-clock buckets per service, so they are not unique-user counts or sums of activity-row sessions.
       tags:
         - AdminAIVisibility
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          description: Optional precondition; must match the authenticated tenant. It grants no authority.
+          schema:
+            type: string
         - name: window
           in: query
           required: false
@@ -7005,6 +7014,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "409":
+          description: The expected tenant does not match the authenticated context.
         "400":
           description: Unknown window preset, unparseable from/to, from at or after to, window and from/to both given, or a span beyond the 30d maximum.
         "401":

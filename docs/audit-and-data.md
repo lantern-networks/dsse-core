@@ -56,6 +56,32 @@ The default `-access-log-all=true` records routine egress decisions as well as p
 actions. Selective logging changes this coverage. A DLP finding write is best effort:
 logging failure does not turn an otherwise permitted request into a denial.
 
+## AI service usage
+
+Open **AI service usage** to summarize the selected organization's access records for
+24 hours, 7 days, or 30 days. The report reads the control plane's configured hot store.
+Known AI services are identified from the recorded service classification or destination;
+this is a report of recorded traffic, not a measurement of every AI interaction.
+
+Sessions are distinct 30-minute wall-clock buckets per service. Two users reaching the
+same service in the same bucket contribute one service session. Activity rows count
+buckets for their own user/device/app/service combination, so summing their session
+counts can exceed the service total. Sent and received values sum the available byte
+counters in the records.
+
+The coverage line shows the range represented. A limit warning means older activity
+was excluded; "records begin" states the oldest retained record without claiming why
+earlier records are absent. Neither message proves continuous collection or complete
+delivery from every region.
+
+A valid empty report shows zero usage. A failed, incomplete, inconsistent, or wrong-
+organization report shows an error with **Retry**. Optional People directory enrichment
+uses only entries from the report's organization; an unavailable or unverified directory
+leaves the recorded identifier visible. Names and departments may therefore be absent
+even when usage is available. Use **Logs & Audit → Logs → access** to inspect the source
+records. Opening or reloading this report does not change policy or create a management
+mutation audit event.
+
 ## Retention is specific to each store
 
 The following are **binary flag defaults**, not a readback of a running deployment.

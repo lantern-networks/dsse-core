@@ -85,8 +85,8 @@ func (o *HighRiskOverlay) SetUserRisk(mark UserRisk) (warning bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	if o.loadErr != nil || o.legacy {
 		return false, ErrRiskUnavailable
 	}
@@ -101,9 +101,11 @@ func (o *HighRiskOverlay) SetUserRisk(mark UserRisk) (warning bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	o.mu.Lock()
 	o.users = candidate
 	o.rebuildUserIndexLocked()
 	o.generation.Add(1)
+	o.mu.Unlock()
 	return warning, nil
 }
 func (o *HighRiskOverlay) UserSeverity(tenant, subject string) (string, bool) {
@@ -190,8 +192,8 @@ func (o *HighRiskOverlay) MigrateLegacy(resolve func(string) (*UserRisk, error))
 	if o == nil {
 		return nil
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	if o.loadErr != nil {
 		return o.loadErr
 	}
@@ -222,11 +224,13 @@ func (o *HighRiskOverlay) MigrateLegacy(resolve func(string) (*UserRisk, error))
 	if _, err := o.saveStateLocked(devices, users); err != nil {
 		return err
 	}
+	o.mu.Lock()
 	o.devices = devices
 	o.users = users
 	o.legacy = false
 	o.rebuildUserIndexLocked()
 	o.generation.Add(1)
+	o.mu.Unlock()
 	return nil
 }
 
@@ -248,6 +252,8 @@ func (o *HighRiskOverlay) ReplaceSyncedUsers(marks []UserRisk) error {
 		}
 		fresh[k] = n
 	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.users = fresh

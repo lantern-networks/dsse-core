@@ -402,3 +402,23 @@ This is not continuous monitoring of files changed outside the process.
 selected clear action. After storage recovery, retry the read and check the
 restored marks before making changes. The Console requires the API's device type,
 tenant and complete risk map; update the Console and server together.
+
+## Risk reads while storage is slow
+
+A pending risk save or explicit restoration does not hold up reading the published
+risk state. Devices, user-risk reads and risk lookup for decisions continue using
+the currently published values. An administrative risk change is not applied or
+acknowledged until saving finishes. On failure, the previous values remain and
+the existing error/retry behavior applies. A pending legacy attribution keeps its
+unavailable status until the migration succeeds.
+
+Automatic DLP escalation retains its existing immediate-publication behavior:
+readers can see the stronger mark while saving is pending, and that mark remains
+live if saving fails. That is not confirmation that the mark survived storage.
+Automatic persistence acknowledgement and retry remain a separate concern.
+
+Writes to the shared risk store are still serialized, including pulled device
+and user snapshots. A slow save can delay another write; this change does not
+introduce a storage timeout or a transaction spanning overlay and device-runtime
+stores. A successful read shows local published state, not confirmation of delivery
+to every region or completion of another administrator's pending request.

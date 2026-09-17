@@ -28,8 +28,8 @@ func (o *HighRiskOverlay) setDeviceRisk(deviceID, severity string, legacy bool) 
 	default:
 		return false, fmt.Errorf("invalid device risk severity")
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	if o.loadErr != nil || o.legacy {
 		return false, ErrRiskUnavailable
 	}
@@ -49,16 +49,20 @@ func (o *HighRiskOverlay) setDeviceRisk(deviceID, severity string, legacy bool) 
 	}
 	published := legacy && riskRank(severity) > riskRank(previous)
 	if published {
+		o.mu.Lock()
 		o.devices = candidate
 		o.generation.Add(1)
+		o.mu.Unlock()
 	}
 	warning, err := o.saveStateLocked(candidate, o.users)
 	if err != nil {
 		return false, err
 	}
 	if changed && !published {
+		o.mu.Lock()
 		o.devices = candidate
 		o.generation.Add(1)
+		o.mu.Unlock()
 	}
 	return warning, nil
 }

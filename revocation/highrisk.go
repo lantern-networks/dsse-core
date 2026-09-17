@@ -16,6 +16,10 @@ import (
 // layer — high-risk is admin-marked (CP-authoritative). Both sets are authoritative on
 // the CP and synced on pullers. Persistence keeps marks across a CP restart.
 type HighRiskOverlay struct {
+	// writeMu serializes every writer, including persistence and pulled snapshots.
+	// Lock order is writeMu then mu. Readers take only mu; storage I/O and legacy
+	// attribution never hold mu. Published maps are replaced, not edited in place.
+	writeMu    sync.Mutex
 	mu         sync.RWMutex
 	devices    map[string]string // deviceID (normalized) -> severity (high|critical)
 	users      map[string]UserRisk
@@ -91,6 +95,8 @@ func (o *HighRiskOverlay) ReplaceSynced(devices map[string]string) {
 			fresh[id] = strings.ToLower(strings.TrimSpace(v))
 		}
 	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.devices = fresh

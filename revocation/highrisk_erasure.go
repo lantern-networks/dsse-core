@@ -19,8 +19,8 @@ func (o *HighRiskOverlay) RemoveTenantRisksChecked(tenant string, deviceIDs []st
 	if o == nil || (tenant == "" && len(deviceIDs) == 0) {
 		return 0, nil
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	if o.loadErr != nil || o.legacy {
 		return 0, ErrRiskUnavailable
 	}
@@ -49,9 +49,11 @@ func (o *HighRiskOverlay) RemoveTenantRisksChecked(tenant string, deviceIDs []st
 		return 0, err
 	}
 	if n > 0 {
+		o.mu.Lock()
 		o.devices, o.users = devices, users
 		o.rebuildUserIndexLocked()
 		o.generation.Add(1)
+		o.mu.Unlock()
 	}
 	return n, nil
 }

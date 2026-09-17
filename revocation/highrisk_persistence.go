@@ -40,8 +40,8 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	if o == nil {
 		return nil
 	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	if p == nil {
 		if o.loadErr != nil {
 			return o.loadErr
@@ -51,7 +51,9 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	}
 	data, err := p.Load()
 	if err != nil {
+		o.mu.Lock()
 		o.loadErr = ErrRiskLoad
+		o.mu.Unlock()
 		return o.loadErr
 	}
 	// Persisters reserve nil for first boot; existing zero-byte files are invalid.
@@ -64,16 +66,20 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	}
 	f, err := decodeRiskSnapshot(data)
 	if err != nil {
+		o.mu.Lock()
 		o.loadErr = err
+		o.mu.Unlock()
 		return err
 	}
 	legacy := f.SchemaVersion == "high_risk_overlay_state.v1" && len(f.Devices) > 0
+	o.mu.Lock()
 	if !maps.Equal(o.devices, f.Devices) || !reflect.DeepEqual(o.users, f.Users) || o.legacy != legacy {
 		o.generation.Add(1)
 	}
 	o.devices, o.users, o.legacy = f.Devices, f.Users, legacy
 	o.persister, o.loadErr = p, nil
 	o.rebuildUserIndexLocked()
+	o.mu.Unlock()
 	log.Printf("high_risk_overlay load: restored %d device and %d user risk marks", len(o.devices), len(o.users))
 	return nil
 }
@@ -81,8 +87,9 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 // ErrRiskLoad deliberately omits paths, backend details and saved contents.
 var ErrRiskLoad = errors.New("cannot read risk snapshot")
 
-// saveStateLocked also serves checked user writes and legacy migration. A nil
-// persister means volatile operation and is reported as a warning to user writes.
+// saveStateLocked requires writeMu, never mu. All publishers hold writeMu,
+// leaving the maps stable during serialization while readers continue on the
+// last published state. A nil persister retains the volatile warning contract.
 func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[string]UserRisk) (bool, error) {
 	if o.persister == nil {
 		return true, nil

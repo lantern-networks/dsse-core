@@ -317,6 +317,43 @@ withdraw the received-region block; it reports the remaining block and leaves
 inventory admission unchanged. Fix storage and allow delivery to complete before
 restarting; deleting the snapshot is not a recovery procedure.
 
+### Sending a block to another region
+
+The sender keeps a pending entry for each peer region and device. Its system logs
+report the result of saving that queue: `saved`, `saved_non_atomic` (a completed,
+synced in-place write), `volatile` (no storage), or `unconfirmed`. Failed saves,
+including unconfirmed flushes, leave the entry in memory and are retried during
+the existing delivery loop. A later confirmed queue save includes all pending
+entries. Storage failures are reported without exposing backend paths or errors.
+
+Peer acceptance and removing the pending entry are separate outcomes. After a
+peer returns HTTP 200, `peer_accepted=true` reports that acknowledgement;
+`removed=false persistence=unconfirmed` means queue cleanup still needs saving.
+The running sender retries cleanup without resending the accepted request. It
+removes the live entry only after confirming the save. An acknowledgement for an
+older enqueue cannot remove a newer entry for the same region and device, even
+when their payloads are identical.
+
+A configured outbox only supports restart recovery for state that reached storage.
+On startup, saved pending entries are retried, so an already accepted delivery may
+be repeated after a restart. The receiver must tolerate that duplicate and still
+confirm its own save. Delivery uses the existing retry window of approximately
+ten minutes, with backoff up to thirty seconds; this is not a storage I/O timeout
+or a continuously scheduled retry service. After the window ends, a pending entry
+can remain until the process reloads the saved queue. Fix storage and inspect the
+queue outcome before restarting: a failed enqueue may have no recoverable copy.
+Do not delete the outbox to clear an error.
+
+Console Block status and successful administrator audits describe the local
+admission and inventory changes. They do not acknowledge queue durability or
+acceptance by every peer. Use sender system logs to distinguish those outcomes;
+automatic deliveries and cleanup retries do not create administrator audits.
+Snapshots remain readable while an outbox save is pending; other queue writers
+wait for that save. This is process-local coordination, not a transaction with
+local admission or a lock shared by several server processes. Outbox restoration
+validation and region-block withdrawal have separate limitations from admission
+snapshot validation below.
+
 ### Restoring admission state at startup
 
 When an admission snapshot exists, the server validates the complete local and

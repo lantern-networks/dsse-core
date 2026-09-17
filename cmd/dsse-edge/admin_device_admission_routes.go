@@ -107,9 +107,14 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		if config.HighRiskOverlay != nil {
 			feed.Generation += config.HighRiskOverlay.ConfigGeneration() // aggregate: a high-risk change advances the feed too
-			feed.HighRisk = config.HighRiskOverlay.Snapshot()
+			devices, users, err := config.HighRiskOverlay.CheckedSnapshot()
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is not available"))
+				return
+			}
+			feed.HighRisk = devices
 			feed.UserRiskVersion = 1
-			feed.UserRisk = config.HighRiskOverlay.UserSnapshot()
+			feed.UserRisk = users
 		}
 		writeJSON(w, http.StatusOK, feed)
 	}))

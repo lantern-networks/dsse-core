@@ -463,3 +463,34 @@ Console does not prove durable delivery to every region. Conversely, a missing
 outcome is not proof that no live mark was applied. Verify the local device risk
 and storage health separately; independent-region propagation and runtime state
 are separate checks.
+
+## Empty device-risk feeds
+
+The revocation feed also carries device and typed user risk. A pulling node keeps
+its current device-risk marks when the feed's `high_risk` section is missing,
+null or empty and the response does not declare `authoritative: true`. It must not
+interpret an undeclared blank response as an instruction to remove risk. A valid
+nonempty replacement retains the existing protocol behavior.
+
+An authoritative response declares a complete set. Its empty device set can clear
+the pulled marks, including when the existing wire format omits the empty map.
+If a complete-set declaration follows an ambiguous response at the same epoch
+and generation, it is processed; an older generation in the same epoch cannot use
+that declaration to roll back state. Risk-based access continues to follow the
+configured policies; synchronization does not independently revoke standing grants.
+
+A configured risk overlay that is unavailable or awaiting legacy attribution
+cannot serve a complete feed: the API returns 503. A puller with unavailable local
+risk state refuses to replace its cached state, including for older feeds without
+typed user risk, and reports a sync failure instead of clearing the error on an
+unchanged poll. Restore a complete valid snapshot and restart the affected process
+to re-establish synchronization. Startup already refuses failed risk restoration.
+
+The sync log distinguishes `device_risk=applied` from
+`device_risk=retained_unconfirmed_empty` and reports the local mark count. A
+processed generation alone does not mean an ambiguous empty section cleared the
+marks. These machine synchronization logs are separate from administrator-change
+audits. Pulled device/user sets still use the existing in-memory replacement
+contract; this change does not make them one durable transaction with admission
+or device-runtime state. Confirm the node's current risk and sync status as well
+as the saved configuration when investigating a restart.

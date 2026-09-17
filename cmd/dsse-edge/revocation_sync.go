@@ -236,6 +236,7 @@ func (s *revocationSyncStatus) snapshot() map[string]any {
 func (s revocationSource) run(ctx context.Context, overlay *revocation.AdmissionRevocations, highRisk *revocation.HighRiskOverlay) {
 	var lastApplied uint64
 	var lastEpoch string
+	var lastAuthoritative bool
 	haveApplied := false
 	pull := func(initial bool) {
 		feed, err := s.fetch(ctx)
@@ -248,7 +249,17 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 			}
 			return
 		}
-		apply := !haveApplied || feed.Epoch != lastEpoch || feed.Generation > lastApplied
+		// A failed local restoration must not be bypassed by an older feed that
+		// omits the typed user section, nor reported as a healthy unchanged poll.
+		if highRisk != nil && highRisk.Health() != nil {
+			err := fmt.Errorf("local risk state is not ready")
+			s.status.recordFailure(err, time.Now())
+			log.Printf("revocation sync: rejected feed: %v", err)
+			return
+		}
+		// A complete-set declaration can resolve an earlier ambiguous empty
+		// answer even if its generation has not advanced.
+		apply := !haveApplied || feed.Epoch != lastEpoch || feed.Generation > lastApplied || (feed.Authoritative && !lastAuthoritative && feed.Generation == lastApplied)
 		if !apply {
 			// Nothing newer, but the control plane ANSWERED — which is the difference between "up to date" and
 			// "has never heard from the authority", and the whole reason this status exists.
@@ -281,22 +292,27 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 		} else {
 			overlay.ReplaceSynced(feed.Revoked)
 		}
+		deviceRiskAction, deviceRiskCount := "disabled", 0
 		if highRisk != nil {
-			highRisk.ReplaceSynced(feed.HighRisk)
+			if len(feed.HighRisk) == 0 && !feed.Authoritative {
+				deviceRiskAction = "retained_unconfirmed_empty"
+			} else {
+				highRisk.ReplaceSynced(feed.HighRisk)
+				deviceRiskAction = "applied"
+			}
+			deviceRiskCount = len(highRisk.Snapshot())
 		}
 		lastApplied = feed.Generation
 		lastEpoch = feed.Epoch
+		lastAuthoritative = feed.Authoritative
 		haveApplied = true
-		// Report what actually happened. This line used to say "applied N revocations" even on the path that
-		// had just refused to apply them, so an operator reading the log during an incident was told the
-		// opposite of the truth at the one moment it mattered.
+		revocationAction := "applied"
 		if keptLocal {
-			s.status.recordApplied(feed.Generation, overlay.SyncedCount(), time.Now())
-			log.Printf("revocation sync: generation %d from the control plane — revocations NOT applied (kept %d local); %d high-risk device(s) applied", feed.Generation, overlay.SyncedCount(), len(feed.HighRisk))
-		} else {
-			s.status.recordApplied(feed.Generation, len(feed.Revoked), time.Now())
-			log.Printf("revocation sync: applied generation %d (%d revocation(s), %d high-risk device(s)) from the control plane", feed.Generation, len(feed.Revoked), len(feed.HighRisk))
+			revocationAction = "retained_unconfirmed_empty"
 		}
+		s.status.recordApplied(feed.Generation, overlay.SyncedCount(), time.Now())
+		log.Printf("revocation sync: generation=%d revocations=%s revocation_count=%d device_risk=%s high_risk_count=%d",
+			feed.Generation, revocationAction, overlay.SyncedCount(), deviceRiskAction, deviceRiskCount)
 	}
 	pull(true)
 	t := time.NewTicker(s.interval)

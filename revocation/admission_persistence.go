@@ -48,6 +48,23 @@ func (a *AdmissionRevocations) SetPersister(p blobstore.Persister) error {
 	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
+	return a.restoreSnapshotLocked(p, false)
+}
+
+// ReloadFromStore refreshes the authored layers before a shared-store control
+// plane becomes their writer. The caller must keep leadership unpublished until
+// this succeeds. Pulled state and callbacks are untouched; this is not an admin
+// mutation or a new revocation notification.
+func (a *AdmissionRevocations) ReloadFromStore() error {
+	if a == nil {
+		return nil
+	}
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	return a.restoreSnapshotLocked(a.persister, true)
+}
+
+func (a *AdmissionRevocations) restoreSnapshotLocked(p blobstore.Persister, refresh bool) error {
 	if p == nil {
 		a.persister = nil
 		return nil
@@ -59,6 +76,11 @@ func (a *AdmissionRevocations) SetPersister(p blobstore.Persister) error {
 	// The Persister contract reserves nil for a missing snapshot on first boot.
 	// An existing zero-byte file is not a missing snapshot and must be rejected.
 	if data == nil {
+		// Missing is only an empty first boot, never a replacement for state
+		// this process has already observed or changed.
+		if refresh && a.generation.Load() != 0 {
+			return ErrAdmissionLoad
+		}
 		a.persister = p
 		return nil
 	}

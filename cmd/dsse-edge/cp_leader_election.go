@@ -48,6 +48,9 @@ type cpLeaderElector struct {
 	conn        *sql.Conn // the dedicated connection holding the advisory lock while leader; nil when standby
 	stop        chan struct{}
 	stopped     chan struct{}
+	// Installed before Start. It refreshes shared admission state while the
+	// advisory lock is held but /leader and administrative writes remain closed.
+	prepareLeadership func() error
 }
 
 // newCPLeaderElector opens a small dedicated pool for the leader lock. Returns nil when dsn is empty (single-node
@@ -138,6 +141,23 @@ func (e *cpLeaderElector) tick() {
 	e.mu.Lock()
 	e.conn = conn // hold this connection (and thus the lock) for as long as we are leader
 	e.mu.Unlock()
+	if e.prepareLeadership != nil {
+		if err := e.prepareLeadership(); err != nil {
+			log.Printf("cp_leader: admission state could not be prepared; leadership remains unavailable")
+			e.release()
+			return
+		}
+		// A slow read may outlive the connection that held the lock. Do not
+		// publish leadership on a connection already known to be unavailable.
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), cpLeaderPingInterval)
+		err := conn.PingContext(checkCtx)
+		checkCancel()
+		if err != nil {
+			log.Printf("cp_leader: lock connection unavailable after admission refresh")
+			e.release()
+			return
+		}
+	}
 	e.leaderSince.Store(time.Now().UnixNano())
 	e.isLeader.Store(true)
 	log.Printf("cp_leader: acquired leadership (advisory lock %d)", cpLeaderAdvisoryLockKey)

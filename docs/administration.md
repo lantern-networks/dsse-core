@@ -317,6 +317,25 @@ withdraw the received-region block; it reports the remaining block and leaves
 inventory admission unchanged. Fix storage and allow delivery to complete before
 restarting; deleting the snapshot is not a recovery procedure.
 
+### Admission state when the control plane changes
+
+With a shared Postgres admission store, a control plane reloads saved admission
+state before advertising leadership. An unreadable or invalid snapshot keeps it
+on standby; restore readable, valid storage and let election retry. A missing
+snapshot after this process has observed or changed state also refuses promotion.
+An empty first boot remains supported. Shared-store migration remains an explicit
+operator action when an existing node-local snapshot takes precedence.
+
+A standby returns HTTP 409 for the revocation feed and the Console's connection
+block status. Edges retain their last applied set when that feed is unavailable.
+Devices displays a status error with Retry, rather than a successful empty list.
+After promotion succeeds, reload the Console and check the Edge synchronization
+status separately. A local administrator response is still not a fleet receipt.
+
+Reloading persisted state is not a new administrator action. Existing block and
+restore audit records remain the records of those changes; the system log reports
+failed preparation or acquired leadership.
+
 ### Limits of restoring a block in the optional admission mesh
 
 This limitation applies when `-revocation-mesh-peers` is explicitly configured.

@@ -28,6 +28,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if !pinnedTenantContextMatches(w, r) {
 			return
 		}
+		if admissionReadRefusedOnAStandby(w) {
+			return
+		}
 		// Scoped like every other per-device read (same sweep). A kill-switch list names devices and says they
 		// were cut off, which is a statement about another customer's incident when it is not the caller's.
 		//
@@ -94,6 +97,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 						"blocked in your organization are at GET /admin/transport-admission"))
 				return
 			}
+		}
+		if admissionReadRefusedOnAStandby(w) {
+			return
 		}
 		// Only the control plane may say "this is the complete set". That claim is what lets a pulling Edge
 		// treat an EMPTY set as a real release rather than as a blank answer, so a node that is merely echoing

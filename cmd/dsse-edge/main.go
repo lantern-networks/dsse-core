@@ -2391,8 +2391,6 @@ func main() {
 	if cpLeaderErr != nil {
 		log.Fatalf("start CP leader election: %v", cpLeaderErr)
 	}
-	cpLeaderElectorInstance.Start()
-	defer cpLeaderElectorInstance.Stop()
 	ruleStore := policyrule.NewStore()
 	rulePersister, rulePersisterErr := cpStateBlobPersister(*policyRuleStorePath, cpStateBlobDB, "policy_rules")
 	if rulePersisterErr != nil {
@@ -2681,6 +2679,9 @@ func main() {
 	} else if e := livenessRevocations.SetPersister(p); e != nil {
 		log.Fatalf("load admission-revocation store: %v", e)
 	}
+	configureAdmissionPromotion(cpLeaderElectorInstance, *admissionRevocationStore, livenessRevocations)
+	cpLeaderElectorInstance.Start()
+	defer cpLeaderElectorInstance.Stop()
 	// Active session revocation: track live (T) connections by identity so an ADMINISTRATOR can actively CLOSE
 	// a blocked device's established tunnels (per-handshake admission already rejects NEW connections; this
 	// bites established sessions too, so an admin kill-switch takes full effect in ~2s rather than waiting for

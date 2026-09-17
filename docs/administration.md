@@ -711,6 +711,25 @@ creating another rule. A confirmed in-place save is accepted, while a warning
 that durability is unconfirmed is treated as a failure. Policy IDs cannot be
 reassigned from another tenant.
 
+The editor verifies the organization before enabling changes and disables input
+and dismissal while a save or delete is pending. A success message requires a
+matching acknowledgement from the control plane. An unreadable, incomplete or
+mismatched response stays visible as an unconfirmed result beside your input.
+Retrying **in that same editor** reuses the policy ID, so a lost creation response
+does not create another exclusion. Each retry is still an upsert and can create
+another audit and version-history entry; this is not exactly-once processing or
+protection against another administrator's concurrent edits. If you close the
+editor, reload the list before creating a new rule.
+
+A delete acknowledgement includes the policy ID and tenant. If a response is
+lost and a retry returns 404, the Console does not assume success: close and
+reload to check whether the rule is now absent. Leaving the page or switching
+organizations discards late editor results, but cannot undo a request already
+processed by the server. Console mutations send `expected_tenant_id`; a context
+mismatch returns 409 before changing the policy. Legacy API callers may omit
+this optional check. Deploy the updated control plane before these Console
+assets, since the editor requires tenant-bearing delete acknowledgements.
+
 In **Logs & Audit**, the `steer_exclusion_updated` event identifies the acting
 administrator, policy ID, operation (`steer_exclusion_upsert`,
 `steer_exclusion_delete`, or `steer_exclusion_rollback`), and result. Unconfirmed

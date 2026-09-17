@@ -303,7 +303,7 @@ func TestAdminSteerExclusionOperatorBodyAuditOwnership(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			r := steerMutationRequest(h, "POST", "/admin/steer-exclusions", map[string]any{"id": "operator-authored", "tenant_id": "tenant_other", "scope_type": "tenant", "excluded_app_signing_ids": []string{"com.example.owned"}})
+			r := steerMutationRequest(h, "POST", "/admin/steer-exclusions?expected_tenant_id=operator", map[string]any{"id": "operator-authored", "tenant_id": "tenant_other", "scope_type": "tenant", "excluded_app_signing_ids": []string{"com.example.owned"}})
 			want := 200
 			if fail {
 				want = 500

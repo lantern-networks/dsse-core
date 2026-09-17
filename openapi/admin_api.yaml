@@ -8098,6 +8098,13 @@ paths:
       description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). An ID owned by another tenant is rejected with 403. With persistence configured, success requires a confirmed save. The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.
       tags:
         - AdminSteerExclusions
+      parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional authenticated operation context; mismatch returns 409 before mutation. This does not change an authorized operator's ability to name a different target tenant in the body.
       requestBody:
         required: true
         content:
@@ -8107,7 +8114,7 @@ paths:
               additionalProperties: true
       responses:
         "200":
-          description: The stored steer-exclusion policy.
+          description: The stored policy, including id, tenant_id, normalized scope and app identifiers, note and active status. Supplying the same id on a retry updates that policy; audits and history may record both requests.
           content:
             application/json:
               schema:
@@ -8119,6 +8126,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The expected tenant differs from the authenticated operation context, or this node pulls its configuration from another authority.
         "500":
           description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/pki/certificates:
@@ -8418,6 +8427,12 @@ paths:
           required: true
           schema:
             type: string
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional authenticated operation context; mismatch returns 409 before mutation.
       responses:
         "200":
           description: Deleted.
@@ -8425,13 +8440,23 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                required: [deleted, id, tenant_id]
+                properties:
+                  deleted:
+                    type: boolean
+                    enum: [true]
+                  id:
+                    type: string
+                  tenant_id:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: The expected tenant differs from the authenticated operation context, or this node pulls its configuration from another authority.
         "500":
           description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/steer-exclusions/{id}/versions:

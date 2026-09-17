@@ -38,6 +38,9 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": steerexclusion.ListSchema, "tenant_id": adminTenantIDFromRequest(r), "steer_exclusions": policies})
 	}))
 	mux.HandleFunc("POST /admin/steer-exclusions", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// This Edge PULLS its exclusions from a control plane, so a write accepted here lives until the next
 		// poll and is then erased with no trace — the Console showed the rule created, and it was gone fifteen
 		// seconds later. Refusing with a 409 that names where to write instead is the difference between a
@@ -72,6 +75,9 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		writeJSON(w, http.StatusOK, saved)
 	}))
 	mux.HandleFunc("DELETE /admin/steer-exclusions/{id}", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// This Edge PULLS its exclusions from a control plane, so a write accepted here lives until the next
 		// poll and is then erased with no trace — the Console showed the rule created, and it was gone fifteen
 		// seconds later. Refusing with a 409 that names where to write instead is the difference between a
@@ -99,7 +105,7 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		if hadBefore {
 			recordConfigVersion(r, config.ConfigVersions, configversion.ResourceSteerExclusion, id, configversion.ActionDelete, "deleted", before)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "tenant_id": tenantID})
 	}))
 	// Config history + rollback (V-1): list every recorded version of a steer exclusion, and roll the
 	// resource back to a prior version (which re-applies that snapshot as a NEW version — auditable, reversible).

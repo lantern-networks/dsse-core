@@ -669,7 +669,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if entry.Identity != "" {
+				appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "enroll", entry, true, err)
+				writeError(w, http.StatusInternalServerError, errEnrolledMutationPartial)
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		// Reported, not authored: an issuing node saying which machine it issued to. Recorded after the
@@ -686,7 +691,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				entry = e
 			}
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "enroll", entry, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "enroll", entry, true, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 	}))
 	// ★ RE-ENROLMENT IS ITS OWN OPERATION (2026-08-12, twenty-first review). It used to be a side effect of
@@ -787,17 +792,11 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if perr != nil {
-			// ★ THE WAVE GROUP DECIDES WHICH RING THIS DEVICE UPDATES IN (2026-08-13, thirty-first review #8).
-			// Answering 200 to a move that did not reach the disk means the next control-plane restart puts the
-			// device back in its old ring — pilot, taking a release on wave 0, which is the ring that exists to
-			// catch a bad build before the fleet does. The change IS in force until then, and the caller is told
-			// what it has to do about it.
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("%s is in group %q on this node and the "+
-				"change was NOT stored durably (%w) — it will revert on the next restart, so apply it again once "+
-				"the store is healthy", identity, req.Group, perr))
+			appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "assign_group", entry, true, perr)
+			writeError(w, http.StatusInternalServerError, errEnrolledMutationPartial)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "assign_group", entry, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "assign_group", entry, true, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 	}))
 	// Declare what an identity IS. A connector holds a transport certificate and is admitted from this same
@@ -836,12 +835,11 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if perr != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("%s is kind %q on this node and the change "+
-				"was NOT stored durably (%w) — it reverts on the next restart, and until it does the posture gate "+
-				"reads this identity under the old kind", identity, req.Kind, perr))
+			appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "set_kind", entry, true, perr)
+			writeError(w, http.StatusInternalServerError, errEnrolledMutationPartial)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "set_kind", entry, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "set_kind", entry, true, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 	}))
 	mux.HandleFunc("DELETE /admin/enrolled-devices/{identity}", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -858,11 +856,16 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		if !config.EnrolledLedger.Remove(identity, time.Now().UTC().Format(time.RFC3339)) {
+		entry, err := config.EnrolledLedger.RemoveChecked(identity, time.Now().UTC().Format(time.RFC3339))
+		if errors.Is(err, enrolledinventory.ErrIdentityNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "remove", enrolledinventory.Entry{Identity: enrolledinventory.NormalizeIdentity(identity)}, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "remove", entry, err == nil, err)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("Device removal could not be confirmed. The previous local state is still in use. Reload and retry after storage is available."))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "removed": true, "identity": enrolledinventory.NormalizeIdentity(identity)})
 	}))
 	// Device-group REGISTRY (first-class groups). Distinct from the per-device assignment (Entry.Group): this is

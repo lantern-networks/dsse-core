@@ -79,3 +79,32 @@ func enrolledInventoryAuditLog(tenantID, action string, entry enrolledinventory.
 		},
 	}
 }
+
+// A failed save can follow an applied local mutation, including an unconfirmed
+// backend write. Do not describe either local application or persistence as absent.
+var errEnrolledMutationPartial = errors.New("The change is active on this node, but saving could not be confirmed. Reload to review the current state and retry after storage is available.")
+
+func appendEnrolledMutationAudit(r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, action string, entry enrolledinventory.Entry, applied bool, saveErr error) {
+	record := enrolledInventoryAuditLog(adminTenantIDFromRequest(r), action, entry, evaluator, sourceIPFromRequest(r))
+	record.ActorUserID = auditActorPrincipal(r)
+	record.Metadata["applied_locally"] = applied
+	switch action {
+	case "enroll", "assign_group":
+		record.Metadata["group"] = entry.Group
+	case "set_kind":
+		kind := entry.Kind
+		if kind == "" {
+			kind = enrolledinventory.KindEndpoint
+		}
+		record.Metadata["kind"] = kind
+	}
+	if saveErr != nil {
+		result, reason := "failed", "Saving could not be confirmed; the previous local state is still in use."
+		if applied {
+			result, reason = "partial", errEnrolledMutationPartial.Error()
+		}
+		record.Result, record.Reason = &result, &reason
+		record.Metadata["persistence_error"] = true
+	}
+	_ = appendAdminAudit(r.Context(), writer, outbox, record, time.Now().UTC())
+}

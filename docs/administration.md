@@ -649,3 +649,29 @@ Device-group creation, editing and deletion audit records identify the acting
 administrator and use the `device_group` target type. They can be correlated with
 the HTTP audit by tenant, operation, target and timestamp. A successful local
 operation still requires separate confirmation of Edge application.
+
+
+### Device changes when saving is unconfirmed
+
+Adding a device, assigning or clearing its group, changing its declared kind and
+removing it produce device-specific audit records with the acting administrator.
+Group records include the applied group, including an empty group for clearing;
+kind records include the effective kind, including `endpoint` for the default.
+
+If adding, assigning or changing kind is applied locally but saving cannot be
+confirmed, the API returns 500 and its operation audit reports `partial`,
+`applied_locally: true` and `persistence_error: true`. That change can already
+reach pulling Edges. Reload to inspect the current state and retry after storage
+is available. An error does not prove the backend wrote nothing or that a restart
+will restore the prior value.
+
+An unconfirmed removal returns 500 and retains the previous local inventory,
+including removal history. Its operation audit reports `failed` and
+`applied_locally: false`; the backend may still contain an unconfirmed candidate.
+An absent or already removed identity returns 404. Check storage and retry the
+removal rather than treating a storage failure as a completed removal.
+
+The HTTP audit records the request's status separately from the operation outcome.
+Successful primary audit writes are also mirrored to the configured audit outbox;
+this does not make inventory saving and audit recording one transaction. Confirm
+storage health and Edge state separately from the Console response.

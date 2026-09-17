@@ -720,11 +720,9 @@ func (l *Ledger) EnrollGroupForTenant(id, claimant, assignTo, group, note, now s
 			return Entry{}, ErrIdentityOwnedByAnotherTenant
 		}
 	}
-	entry, err := l.enrollGroupLocked(k, assignTo, group, note, now, true)
-	if err != nil {
-		return Entry{}, err
-	}
-	return entry, nil
+	// A nonempty entry with an error identifies an applied local mutation whose
+	// persistence was not confirmed. Keep it available to the caller's audit.
+	return l.enrollGroupLocked(k, assignTo, group, note, now, true)
 }
 
 // AllowReenrolment is the administrator's decision that a device may enrol again.
@@ -1121,14 +1119,23 @@ func (l *Ledger) SetEnabledChecked(id string, enabled bool, now string) (Entry, 
 	}
 }
 
-// Remove deletes an identity from the ledger entirely.
+// Remove retains a removal tombstone. Use RemoveChecked to distinguish an
+// absent identity from an unconfirmed save.
 func (l *Ledger) Remove(id, now string) bool {
+	_, err := l.RemoveChecked(id, now)
+	return err == nil
+}
+
+// RemoveChecked saves a removal and expired-tombstone cleanup together. On a
+// save error it retains the complete prior local state and returns the prior
+// entry; the backend may still have written an unconfirmed candidate.
+func (l *Ledger) RemoveChecked(id, now string) (Entry, error) {
 	k := NormalizeIdentity(id)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	removed, ok := l.entries[k]
 	if !ok || removed.isTombstone() {
-		return false
+		return Entry{}, ErrIdentityNotFound
 	}
 	// ★★★ THE ENTRY STAYS AS A TOMBSTONE. Deleting it made the removal unenforceable on every other node —
 	// see Entry.RemovedAt. Enabled goes false in the same write, so every reader that already asks "is this
@@ -1143,19 +1150,19 @@ func (l *Ledger) Remove(id, now string) bool {
 		// not a device, and keeping its description would put a removed machine's details in the one place
 		// that outlives it.
 	}
+	previous := l.entries
+	l.entries = make(map[string]Entry, len(previous))
+	for key, entry := range previous {
+		l.entries[key] = entry
+	}
 	l.entries[k] = tomb
 	l.purgeExpiredTombstonesLocked(now)
-	l.generation.Add(1) // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	// ★ REMOVING A DEVICE IS A REVOCATION, SO ITS WRITE IS THE DECISION (2026-08-13, twenty-eighth review).
-	// persistLocked discards the save error, so an operator removing a compromised machine got success in
-	// memory and in the API while the durable store still held it — and the next restart put it back. The
-	// checked seam already existed in this file for SetEnabled and enrolment; this call site was not on it.
 	if perr := l.persistCheckedLocked(); perr != nil {
-		l.entries[k] = removed
-		l.generation.Add(1)
-		return false
+		l.entries = previous
+		return removed, perr
 	}
-	return true
+	l.generation.Add(1)
+	return tomb, nil
 }
 
 // tombstoneLifetime is how long a removal is carried before the entry is dropped for good.

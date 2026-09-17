@@ -383,8 +383,18 @@ func (s *AgentRolloutStore) Apply(tenantID string, in AgentRolloutPlan, now time
 		// version, and it must not release a fleet somebody halted — the same rule the schedule intent has, in
 		// the other direction.
 		merged.DesiredVersion, merged.ReleaseChannel = "", ""
-	default:
+	case AgentRolloutIntentFreeze:
+		// A halt/release changes movement, not the version already selected.
 		merged.Frozen, merged.Reason = in.Frozen, in.Reason
+		if in.DesiredVersion != "" {
+			merged.DesiredVersion = in.DesiredVersion
+		}
+		if in.ReleaseChannel != "" {
+			merged.ReleaseChannel = in.ReleaseChannel
+		}
+	default:
+		// Selecting a version must not release an incident hold. Only an explicit
+		// freeze=false decision, with its required reason, may do that.
 		merged.DesiredVersion, merged.ReleaseChannel = in.DesiredVersion, in.ReleaseChannel
 	}
 	merged.Intent = in.Intent

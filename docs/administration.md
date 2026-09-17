@@ -798,3 +798,36 @@ if a file is removed while the process is stopped, this mechanism alone cannot
 distinguish the next startup from first boot. Backups and deployment storage
 checks remain necessary. File persistence does not coordinate multiple writers,
 and synchronizing an Edge cache still uses best-effort persistence.
+
+
+### Agent rollout settings and incident holds
+
+In **Agent Releases**, the selected version, installation window and group rollout
+order are separate controls. Changing the selected version or choosing to follow
+the offered release preserves an incident hold and its reason. The page displays
+that hold beside the version preference. Only an explicit `intent=freeze` request
+with `frozen=false` and a reason releases it. A hold/release request that omits the
+version and channel preserves the existing selection.
+
+Editing the rollout order preserves each retained row's configured priority and
+the schedule's `default_delay_days`. Higher priority wins when a device belongs
+to several groups; equal priorities use the slower wave. An unlisted device uses
+the explicit default, or the slowest wave if there is no explicit default. The
+summary shows nonzero priorities and an explicit default. These existing values
+are preserved by the editor; changing them through the API requires a complete
+wave schedule. A device with no group can still receive the default delay.
+
+A pending newer manifest does not replace the active installer before its package
+arrives. The Download button obtains the active version. Saving a version
+preference does not establish that any endpoint installed it. Availability of the
+named release, incident holds, installation windows and endpoint checks still
+apply, and updates reach Edges and devices on subsequent polls.
+
+Rollout changes record `agent_rollout_plan_attempted` before changing the plan,
+then `agent_rollout_plan_applied` on success or an outcome with `failed` on a save
+failure. These records identify the administrator, tenant, target, action and
+result; the configured outbox mirrors each successfully recorded primary event.
+The common HTTP audit records the request separately. An attempt without an
+outcome needs reconciliation: saving the plan and recording audit events are
+separate operations. An outbox failure is logged and does not undo the primary
+record or the plan.

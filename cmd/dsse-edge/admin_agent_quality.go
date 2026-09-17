@@ -20,6 +20,7 @@ import (
 	_ "time/tzdata"
 
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 func adminAgentQualitySummary(tenantID string, deviceStore deviceRuntimeStore, writer *logs.Writer, agentTelemetry agenttelemetry.RuntimeStore, targetVersion string, now time.Time) (map[string]any, error) {
@@ -125,7 +126,7 @@ func adminAgentQualityStatus(deviceTotal, staleDevices int, updateEvents, agentS
 
 // Agent quality/rollout admin routes, moved verbatim out of newServerWithConfig
 // (Phase 2 route-registration split). Parameter names match the constructor's locals.
-func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, writer *logs.Writer, deviceStore deviceRuntimeStore, agentTelemetry agenttelemetry.RuntimeStore, agentRolloutPlans *agentrollout.AgentRolloutStore, agentTargetVersion string, agentReleaseChannel string, rolloutCache *agentRolloutCache, hot hotstore.Store) {
+func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, writer *logs.Writer, deviceStore deviceRuntimeStore, agentTelemetry agenttelemetry.RuntimeStore, agentRolloutPlans *agentrollout.AgentRolloutStore, agentTargetVersion string, agentReleaseChannel string, rolloutCache *agentRolloutCache, hot hotstore.Store, outbox adminAuditOutboxDeadReader) {
 	mux.HandleFunc("GET /admin/agent/quality", adminEndpoint("admin.usage.read", func(w http.ResponseWriter, r *http.Request) {
 		summary, err := adminAgentQualitySummaryFrom(hot, adminTenantIDFromRequest(r), deviceStore, writer, agentTelemetry, agentTargetVersion, time.Now().UTC())
 		if err != nil {
@@ -200,6 +201,10 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		})
 	}))
 	mux.HandleFunc("PUT /admin/agent-rollout", adminEndpoint("admin.agents.write", func(w http.ResponseWriter, r *http.Request) {
+		appendAudit := func(record model.AuditLog) error {
+			record.ActorUserID = auditActorPrincipal(r)
+			return appendAdminAudit(r.Context(), writer, outbox, record, time.Now())
+		}
 		tenantID := adminTenantIDFromRequest(r)
 		var req agentrollout.AgentRolloutUpdateRequest
 		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
@@ -222,7 +227,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				"the halt there"
 			rec := agentRolloutAuditLog(tenantID, plan, evaluator, sourceIPFromRequest(r))
 			rec.Result, rec.Reason = &refused, &why
-			if err := writer.Append("audit.log.jsonl", rec); err != nil {
+			if err := appendAudit(rec); err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
@@ -301,12 +306,15 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		// is already stored. Calling it "after" in a record written BEFORE the store is touched would be the
 		// kind of small lie an incident reader builds a wrong timeline on.
 		attempted.Metadata["schedule_requested"] = attempted.Metadata["schedule_after"]
-		attempted.Metadata["frozen_requested"] = attempted.Metadata["frozen_after"]
+		// Version and schedule edits do not request any change to the hold.
+		if plan.Intent == agentrollout.AgentRolloutIntentFreeze {
+			attempted.Metadata["frozen_requested"] = plan.Frozen
+		}
 		delete(attempted.Metadata, "schedule_after")
 		delete(attempted.Metadata, "frozen_after")
 		attemptedResult := "attempted"
 		attempted.Result = &attemptedResult
-		if err := writer.Append("audit.log.jsonl", attempted); err != nil {
+		if err := appendAudit(attempted); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("the change was NOT applied because it could "+
 				"not be recorded (%w): a halt nobody can account for afterwards is not one this system will make", err))
 			return
@@ -316,7 +324,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			failed, why := "failed", "the plan could not be stored durably: "+serr.Error()
 			rec := agentRolloutAuditLog(tenantID, plan, evaluator, sourceIPFromRequest(r))
 			rec.Result, rec.Reason = &failed, &why
-			if aerr := writer.Append("audit.log.jsonl", rec); aerr != nil {
+			if aerr := appendAudit(rec); aerr != nil {
 				log.Printf("agent_rollout_audit_outcome_lost tenant=%s err=%v (the attempt IS recorded and this "+
 					"failure is not — treat the attempt as unresolved)", tenantID, aerr)
 			}
@@ -328,7 +336,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		plan = merged
 		// The outcome, carrying WHAT CHANGED — including the schedule, which the old record could not express,
 		// so nobody could tell from the trail who moved the pilot ring or the maintenance window.
-		if err := writer.Append("audit.log.jsonl", agentRolloutScheduleAuditLog(tenantID, previous, merged, evaluator,
+		if err := appendAudit(agentRolloutScheduleAuditLog(tenantID, previous, merged, evaluator,
 			sourceIPFromRequest(r))); err != nil {
 			log.Printf("agent_rollout_audit_outcome_lost tenant=%s err=%v", tenantID, err)
 		}

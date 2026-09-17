@@ -218,8 +218,8 @@ function openAgentWindowForm(host, current) {
     if (!hhmm.test(endF.get())) { endF.setError(bl({ en: "Use HH:MM, e.g. 05:00", ja: "HH:MM 形式で入力してください(例 05:00)" })); return; }
     const idle = Number(idleF.get());
     const deadline = Number(deadlineF.get());
-    if (!Number.isFinite(idle) || idle < 0) { idleF.setError(bl({ en: "A whole number of minutes.", ja: "分を整数で入力してください。" })); return; }
-    if (!Number.isFinite(deadline) || deadline < 0) { deadlineF.setError(bl({ en: "A whole number of days.", ja: "日数を整数で入力してください。" })); return; }
+    if (!Number.isSafeInteger(idle) || idle < 0) { idleF.setError(bl({ en: "A whole number of minutes.", ja: "分を整数で入力してください。" })); return; }
+    if (!Number.isSafeInteger(deadline) || deadline < 0 || deadline > 365) { deadlineF.setError(bl({ en: "A whole number of days from 0 to 365.", ja: "日数は0から365の整数で入力してください。" })); return; }
 
     submit.disabled = true;
     // ★ intent=schedule, so the halt and the wave schedule are left exactly as they are. A form about timing
@@ -251,22 +251,27 @@ function openAgentWindowForm(host, current) {
 function arWavesSummary(waves) {
   const list = (waves && waves.waves) || [];
   if (!list.length) {
+    if (waves?.default_delay_days !== undefined && waves.default_delay_days !== null) return bl({
+      en: "all groups after " + waves.default_delay_days + "d", ja: "全グループは " + waves.default_delay_days + "日後" });
     return bl({ en: "everything at once, as soon as a release is published",
                 ja: "公開と同時に全端末へ(段階分けなし)" });
   }
   const ordered = list.slice().sort((a, b) => (a.delay_days || 0) - (b.delay_days || 0));
-  return ordered.map((w) => {
+  const summary = ordered.map((w) => {
     const d = w.delay_days || 0;
-    return d === 0
+    const when = d === 0
       ? bl({ en: w.group + " immediately", ja: w.group + " はすぐ" })
       : bl({ en: w.group + " after " + d + "d", ja: w.group + " は " + d + "日後" });
+    return when + (w.priority ? bl({ en: " (priority " + w.priority + ")", ja: "（優先度 " + w.priority + "）" }) : "");
   }).join(" → ");
+  return summary + (waves.default_delay_days !== undefined && waves.default_delay_days !== null
+    ? bl({ en: "; other groups after " + waves.default_delay_days + "d", ja: "、その他のグループは " + waves.default_delay_days + "日後" }) : "");
 }
 
 // openAgentWavesForm edits the rollout order and nothing else — intent=schedule again, so the halt and the
 // window are untouched.
 function openAgentWavesForm(host, current, groupsInUse) {
-  const rows = ((current && current.waves) || []).map((w) => ({ group: w.group || "", days: String(w.delay_days || 0) }));
+  const rows = ((current && current.waves) || []).map((w) => ({ group: w.group || "", days: String(w.delay_days || 0), priority: w.priority }));
   if (!rows.length) rows.push({ group: "", days: "0" });
 
   const list = el("div", {});
@@ -290,16 +295,14 @@ function openAgentWavesForm(host, current, groupsInUse) {
 
   // ★ THE TWO RULES AN OPERATOR HAS TO KNOW, because both are silent when they bite.
   const rules = el("div", { class: "ui-field-hint", text: bl({
-    en: "A device in several groups takes the SLOWEST of them. A group not listed here also takes the slowest " +
-        "wave — so forgetting one delays it, it never causes a same-day rollout to everybody.",
-    ja: "複数のグループに属する端末は、いちばん遅い方が適用されます。ここに無いグループも最も遅い波になります — " +
-        "書き忘れは「遅れる」方に倒れ、全端末への即日展開にはなりません。" }) });
+    en: "The highest configured group priority wins; ties take the slowest wave. Unlisted groups use the configured default, or the slowest wave if no default is set. Existing priorities and the default stay unchanged here.",
+    ja: "設定済みの優先度が高いグループを使い、同じ優先度では遅い方を使います。未指定のグループは既定の日数を使い、既定がなければ最も遅い日数を使います。この画面では既存の優先度と既定の日数を維持します。" }) });
 
   const reality = el("div", { class: "ui-field-hint", text: groupsInUse.length
     ? bl({ en: "Groups your devices currently carry: " + groupsInUse.join(", "),
            ja: "いま端末が持っているグループ: " + groupsInUse.join("、") })
-    : bl({ en: "★ No device carries a group yet, so a schedule here applies to nobody until devices are grouped.",
-           ja: "★ いまグループを持つ端末がありません。端末にグループを付けるまで、この設定は誰にも当たりません。" }) });
+    : bl({ en: "No device group memberships were available here. Unlisted devices still use the default delay.",
+           ja: "この画面では端末のグループ所属情報がありません。未指定の端末にも既定の待機日数は適用されます。" }) });
 
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
   const m = uiModal({
@@ -314,11 +317,11 @@ function openAgentWavesForm(host, current, groupsInUse) {
       const group = (row.group || "").trim();
       if (!group) continue;
       const days = Number(row.days);
-      if (!Number.isFinite(days) || days < 0) {
+      if (!Number.isSafeInteger(days) || days < 0) {
         uiToast(bl({ en: "Days must be a whole number, 0 or more.", ja: "日数は 0 以上の整数で入力してください。" }), "err");
         return;
       }
-      waves.push({ group: group, delay_days: days });
+      waves.push({ group: group, delay_days: days, ...(row.priority !== undefined ? { priority: row.priority } : {}) });
     }
     if (!waves.length) {
       uiToast(bl({ en: "Name at least one group, or cancel to leave the order as it is.",
@@ -326,7 +329,7 @@ function openAgentWavesForm(host, current, groupsInUse) {
       return;
     }
     submit.disabled = true;
-    const r = await apiFetch("PUT", "/admin/agent-rollout", { intent: "schedule", waves: { waves: waves } }, _AR_PLANE);
+    const r = await apiFetch("PUT", "/admin/agent-rollout", { intent: "schedule", waves: { ...(current || {}), waves: waves } }, _AR_PLANE);
     if (!r.ok) {
       submit.disabled = false;
       uiToast(arErrorText(r), "err");
@@ -703,6 +706,8 @@ async function arUploadConnectorProgram(bytes, platform, arch, digest, version) 
 // consequence — this tenant moves when the operator publishes — and naming a version is a different one. A
 // summary that said "not set" for the first would describe the ordinary state as a gap.
 function arRunningSummary(plan, published) {
+  if (plan?.frozen) return bl({ en: "Updates paused", ja: "更新を停止中" }) +
+    (plan.reason ? ": " + plan.reason : "") + " · " + arRunningSummary({ ...plan, frozen: false }, published);
   const want = plan && String(plan.desired_version || "").trim();
   const offered = Object.keys(published || {}).map((k) => {
     const m = arManifestOf(published[k]);
@@ -790,8 +795,8 @@ function openAgentVersionForm(host, plan, published) {
     }
     m.close();
     uiToast(want
-      ? bl({ en: "These devices run " + want + ".", ja: "端末は " + want + " を動かします。" })
-      : bl({ en: "These devices follow what this deployment offers.", ja: "端末は配備が提供するものに従います。" }), "ok");
+      ? bl({ en: "Version preference saved: " + want + ".", ja: "希望バージョンを保存しました: " + want + "。" })
+      : bl({ en: "Saved: follow the offered version. Existing update holds still apply.", ja: "提供されるバージョンに従う設定を保存しました。更新の停止状態は維持します。" }), "ok");
     renderAgentReleaseList(host);
   });
   (nameF.checked ? versionF : { focus: () => followF.focus() }).focus();

@@ -6466,7 +6466,15 @@ paths:
           description: Current rollout plan + fleet adoption summary.
     put:
       summary: Drive an agent rollout, rollback, or incident freeze ().
-      description: Requires admin.agents.write. Hot-applies a desired rollout state (no restart). intent=rollout|rollback requires desired_version (the version the fleet should converge to — a rollback simply targets a known-good version); intent=freeze halts all movement so a bad rollout can be stopped instantly. Audited.
+      description: >-
+        Requires admin.agents.write. Changes the selected version, incident hold or schedule without a restart.
+        rollout and rollback require desired_version and preserve the current hold and its reason. follow clears
+        the selected version/channel and preserves the hold. Only freeze with frozen=false and a reason releases
+        a hold. A freeze request without a version/channel keeps the prior selection. schedule changes only the
+        supplied window/waves. Edges and devices adopt the result on later polls. A named version must still be
+        available in the deployment; this endpoint does not restore an old installer or prove endpoint installation.
+        Attempt and outcome audits identify the actor and tenant and mirror to the configured audit outbox after
+        primary recording. Plan persistence and audit recording are separate writes.
       tags:
         - AdminAgentRollout
       requestBody:
@@ -6480,13 +6488,25 @@ paths:
               properties:
                 intent:
                   type: string
-                  enum: [rollout, rollback, freeze]
+                  enum: [rollout, rollback, freeze, schedule, follow]
                 desired_version:
                   type: string
                 release_channel:
                   type: string
                 reason:
                   type: string
+                  description: Required for either direction of a freeze decision.
+                frozen:
+                  type: boolean
+                  description: Used with intent=freeze. Defaults to true; false releases the hold.
+                window:
+                  type: object
+                  description: Maintenance window; omitted leaves the previous value unchanged.
+                  additionalProperties: true
+                waves:
+                  type: object
+                  description: Complete wave schedule when supplied, including any priorities and default_delay_days. Omitted preserves the previous schedule.
+                  additionalProperties: true
       responses:
         "200":
           description: Rollout plan applied.

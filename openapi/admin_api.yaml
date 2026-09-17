@@ -8091,6 +8091,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           description: The expected tenant differs from the authenticated operation context.
+        "503":
+          description: Exclusion storage could not be read or validated; retained local policies are not returned as a current authoritative set.
     post:
       summary: Upsert a steer-exclusion policy.
       description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). An ID owned by another tenant is rejected with 403. With persistence configured, success requires a confirmed save. The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.

@@ -29,7 +29,13 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steer exclusions are not enabled"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"schema_version": steerexclusion.ListSchema, "tenant_id": adminTenantIDFromRequest(r), "steer_exclusions": config.SteerExclusions.List(adminTenantIDFromRequest(r))})
+		policies, err := config.SteerExclusions.ListChecked(adminTenantIDFromRequest(r))
+		if err != nil {
+			log.Printf("steer exclusion authority read failed: %v", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steering exclusion storage could not be verified; retry after restoring storage"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": steerexclusion.ListSchema, "tenant_id": adminTenantIDFromRequest(r), "steer_exclusions": policies})
 	}))
 	mux.HandleFunc("POST /admin/steer-exclusions", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
 		// This Edge PULLS its exclusions from a control plane, so a write accepted here lives until the next

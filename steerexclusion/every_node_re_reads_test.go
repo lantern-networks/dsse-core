@@ -92,7 +92,7 @@ func TestANodeSeesWhatAnotherNodeAuthored(t *testing.T) {
 // session doing the work.
 func TestATransientFailureKeepsWhatIsHeld(t *testing.T) {
 	shared := &countingPersistence{policies: []*Policy{
-		{ID: "p1", TenantID: "tenant_a", ScopeType: "tenant", ExcludedAppSigningIDs: []string{"com.example.tool"}},
+		{ID: "p1", TenantID: "tenant_a", ScopeType: "tenant", Status: "active", ExcludedAppSigningIDs: []string{"com.example.tool"}},
 	}}
 	store, err := NewStoreWithPersistence(shared)
 	if err != nil {

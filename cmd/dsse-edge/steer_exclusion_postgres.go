@@ -31,7 +31,9 @@ func (p postgresSteerExclusionPersistence) LoadAll(ctx context.Context) ([]*stee
 		if err := rows.Scan(&e.ID, &e.TenantID, &e.ScopeType, &e.ScopeID, &idsJSON, &e.Note, &e.Status, &e.CreatedAt, &e.UpdatedAt); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(idsJSON, &e.ExcludedAppSigningIDs)
+		if err := json.Unmarshal(idsJSON, &e.ExcludedAppSigningIDs); err != nil {
+			return nil, fmt.Errorf("decode stored steering exclusion app identifiers: %w", err)
+		}
 		out = append(out, e)
 	}
 	return out, rows.Err()

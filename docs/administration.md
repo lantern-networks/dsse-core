@@ -752,3 +752,30 @@ Missing/null collections, malformed rows, duplicate policy IDs, foreign tenants,
 responses larger than 4 MiB, and interrupted reads are rejected. Rejection preserves
 the Edge's last valid set; it never changes a foreign row's tenant to make it fit.
 Cache persistence remains a separate concern from accepting a complete feed.
+
+
+### When exclusion storage cannot be verified
+
+The control plane validates the complete stored exclusion set at startup and
+before adopting a refresh. Empty files, missing/null policy arrays, duplicate
+fields or policy IDs, and invalid policy records are rejected. Existing snapshots
+written by the service keep the same format. Do not replace an unreadable snapshot
+with `{}` or `null` to make startup succeed; restore a verified backup instead.
+An explicit `{"policies":[]}` represents a deliberate empty file-backed set.
+
+If a running process cannot read or validate its storage, it retains the last
+valid local set. The authored-list API returns 503, the Console offers **Retry**,
+and pulling Edges keep their previous set. Administrative changes are refused
+while a refresh error remains known, so a save cannot silently conceal that error.
+After storage is repaired, the next successful refresh clears the error and
+normal reads and writes resume. Refresh attempts are normally up to five seconds
+apart; Retry does not bypass that interval. Enforcement using the retained local
+set is not proof that the latest stored configuration has been read.
+
+A file missing on a new process's first load is still treated as first boot.
+Once that persistence instance has loaded or saved a snapshot, disappearance is
+an error, including after an explicit empty save. That knowledge is in memory:
+if a file is removed while the process is stopped, this mechanism alone cannot
+distinguish the next startup from first boot. Backups and deployment storage
+checks remain necessary. File persistence does not coordinate multiple writers,
+and synchronizing an Edge cache still uses best-effort persistence.

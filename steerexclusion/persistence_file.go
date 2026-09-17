@@ -35,9 +35,10 @@ type filePersistSnapshot struct {
 
 // FilePersistence is a file-backed implementation of Persistence.
 type FilePersistence struct {
-	mu        sync.Mutex
-	persister blobstore.Persister
-	byID      map[string]*Policy
+	mu            sync.Mutex
+	persister     blobstore.Persister
+	byID          map[string]*Policy
+	knownSnapshot bool
 }
 
 // NewFilePersistence returns a file-backed Persistence writing its snapshot to path via an atomic temp+rename.
@@ -48,9 +49,9 @@ func NewFilePersistence(path string) *FilePersistence {
 	}
 }
 
-// LoadAll reads the snapshot and returns every persisted policy. A missing or empty snapshot (first boot) yields
-// an empty slice and no error. A parse failure RETURNS the error so the caller fails closed — refusing to start
-// is correct, because starting empty would silently drop every exclusion the admin ever set.
+// LoadAll validates the entire snapshot before replacing the backend cache. Only
+// a missing file that this instance has never loaded or saved is first boot. An
+// existing empty file, malformed data or disappearance of known state is an error.
 func (f *FilePersistence) LoadAll(ctx context.Context) ([]*Policy, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -59,25 +60,22 @@ func (f *FilePersistence) LoadAll(ctx context.Context) ([]*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load steer exclusion snapshot: %w", err)
 	}
-	if len(data) == 0 {
-		f.byID = map[string]*Policy{}
-		return nil, nil
-	}
-	var snap filePersistSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, fmt.Errorf("parse steer exclusion snapshot: %w", err)
-	}
-	fresh := map[string]*Policy{}
-	out := make([]*Policy, 0, len(snap.Policies))
-	for _, p := range snap.Policies {
-		if p == nil || p.ID == "" {
-			continue
+	if data == nil {
+		if f.knownSnapshot {
+			return nil, fmt.Errorf("%w: known snapshot is missing", ErrInvalidSnapshot)
 		}
-		stored := clonePolicy(*p)
-		fresh[p.ID] = &stored
-		copy := clonePolicy(stored)
-		out = append(out, &copy)
+		return []*Policy{}, nil
 	}
+	fresh, err := decodeFileSnapshot(data)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Policy, 0, len(fresh))
+	for _, p := range fresh {
+		copied := clonePolicy(*p)
+		out = append(out, &copied)
+	}
+	f.knownSnapshot = true
 	f.byID = fresh
 	return out, nil
 }
@@ -134,6 +132,7 @@ func (f *FilePersistence) saveLocked(candidate map[string]*Policy, op, id string
 		}
 	}
 	f.byID = candidate
+	f.knownSnapshot = true
 	return nil
 }
 

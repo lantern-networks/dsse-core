@@ -86,6 +86,7 @@ type Store struct {
 	// the STORE shared is only half of it, because a process that read it once is still answering from a
 	// snapshot.
 	refreshedAt time.Time
+	loadErr     error
 }
 
 // refreshWindow is how stale a node's copy may be. Short enough that an operator who authors a policy and
@@ -103,14 +104,15 @@ func (s *Store) refreshLocked(now time.Time) {
 	}
 	s.refreshedAt = now
 	policies, err := s.persistence.LoadAll(context.Background())
+	var fresh map[string]*Policy
+	if err == nil {
+		fresh, err = policySnapshot(policies)
+	}
+	s.loadErr = err
 	if err != nil {
 		log.Printf("steer exclusions: could not re-read the durable store (%v) — this node keeps the %d "+
 			"policy(ies) it holds rather than reporting none", err, len(s.byID))
 		return
-	}
-	fresh := make(map[string]*Policy, len(policies))
-	for _, p := range policies {
-		fresh[p.ID] = p
 	}
 	s.byID = fresh
 }
@@ -129,9 +131,11 @@ func NewStoreWithPersistence(persistence Persistence) (*Store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load persisted steer exclusions: %w", err)
 		}
-		for _, p := range policies {
-			s.byID[p.ID] = p
+		fresh, err := policySnapshot(policies)
+		if err != nil {
+			return nil, fmt.Errorf("load persisted steer exclusions: %w", err)
 		}
+		s.byID = fresh
 		s.refreshedAt = time.Now()
 		log.Printf("steer exclusions: loaded %d policy(ies) from the durable store", len(policies))
 	}
@@ -200,6 +204,10 @@ func (s *Store) Upsert(p Policy, now time.Time) (Policy, error) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.refreshLocked(time.Now())
+	if s.loadErr != nil {
+		return p, fmt.Errorf("%w: stored state unavailable: %w", ErrPersistence, s.loadErr)
+	}
 	if strings.TrimSpace(p.ID) == "" {
 		p.ID = newPolicyID(now)
 	}
@@ -231,6 +239,22 @@ func (s *Store) List(tenantID string) []Policy {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.refreshLocked(time.Now())
+	return s.listLocked(tenantID)
+}
+
+// ListChecked never advertises a retained, stale set as a successful authority
+// read. Enforcement can still use List/ResolveForDevice to retain the last set.
+func (s *Store) ListChecked(tenantID string) ([]Policy, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.refreshLocked(time.Now())
+	if s.loadErr != nil {
+		return nil, s.loadErr
+	}
+	return s.listLocked(tenantID), nil
+}
+
+func (s *Store) listLocked(tenantID string) []Policy {
 	out := []Policy{}
 	for _, p := range s.byID {
 		if p.TenantID == tenantID {
@@ -263,6 +287,10 @@ func (s *Store) Delete(id, tenantID string, now time.Time) bool {
 func (s *Store) DeleteChecked(id, tenantID string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.refreshLocked(time.Now())
+	if s.loadErr != nil {
+		return false, fmt.Errorf("%w: stored state unavailable: %w", ErrPersistence, s.loadErr)
+	}
 	p := s.byID[id]
 	if p == nil || p.TenantID != tenantID {
 		return false, nil

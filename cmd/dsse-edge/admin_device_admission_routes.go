@@ -25,6 +25,9 @@ import (
 // surface reads ~20 enrollment/licensing/mesh config fields.
 func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, deviceStore deviceRuntimeStore, registry connectorRegistryStore, tcaReg *tenantca.TenantCARegistry, tenantModelStore adminTenantModelRuntimeStore, configSourceURL string, configBundleEpoch string) {
 	mux.HandleFunc("GET /admin/transport-admission", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// Scoped like every other per-device read (same sweep). A kill-switch list names devices and says they
 		// were cut off, which is a statement about another customer's incident when it is not the caller's.
 		//
@@ -32,6 +35,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// FEED a pulling Edge applies, its caller is the deployment rather than a customer, and filtering it by
 		// a human's tenant would silently stop propagating other tenants' kill-switches — a fix that turns a
 		// disclosure into an enforcement failure. The two look alike and are not the same act.
+		if config.AdmissionRevocations == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("transport admission overlay not configured"))
+			return
+		}
 		callerTenant := adminTenantIDFromRequest(r)
 		revoked := []string{}
 		unattributable := 0
@@ -51,6 +58,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version":          "admin_transport_admission.v1",
+			"tenant_id":               callerTenant,
 			"revoked_identities":      revoked,
 			"withheld_unattributable": unattributable,
 			"no_secret_attestation":   true,
@@ -279,6 +287,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		})
 	}))
 	mux.HandleFunc("POST /admin/transport-admission/revoke", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// Phase 3: the revocation overlay is CP-authoritative + fleet-distributed, so author kill-switches on
 		// the control plane (a puller's local revoke would not propagate). The node-local W-2 auto-revocation
 		// path is separate and not gated.
@@ -344,9 +355,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device blocked locally, but saving was not confirmed; repair storage and retry the block before restarting"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "identity": strings.TrimSpace(req.Identity), "reason": reason})
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "tenant_id": adminTenantIDFromRequest(r), "identity": strings.TrimSpace(req.Identity), "reason": reason})
 	}))
 	mux.HandleFunc("POST /admin/transport-admission/restore", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if configWriteRejectedWhenSourced(w, configSourceURL, "admission revocations (restore)") {
 			return
 		}
@@ -376,6 +390,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		saveErr := config.AdmissionRevocations.RestoreChecked(req.Identity)
+		// Restore removes only the locally authored block. A peer or pulled block can
+		// still deny admission. This is a current local observation, not a fleet ACK.
+		_, transportRevoked := config.AdmissionRevocations.IsRevoked(req.Identity)
 		tenantID := adminTenantIDFromRequest(r)
 		if config.EnrolledLedger != nil {
 			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
@@ -383,6 +400,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		record := transportAdmissionAuditLog(r, tenantID, "restore", req.Identity, "", evaluator, time.Now().UTC())
+		record.Metadata["transport_revoked"] = transportRevoked
+		if saveErr == nil && transportRevoked {
+			record.Result = stringPtr("partial")
+		}
 		if saveErr != nil {
 			record.Result = stringPtr("error")
 			record.Metadata["applied_locally"] = false
@@ -394,7 +415,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		logInfof("transport_admission_restored_by_admin identity=%q", strings.TrimSpace(req.Identity))
-		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "restored": true, "identity": strings.TrimSpace(req.Identity)})
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "restored": true, "tenant_id": adminTenantIDFromRequest(r), "identity": strings.TrimSpace(req.Identity), "transport_revoked": transportRevoked})
 	}))
 	// management ledger: the Admin Console device list for the Enrolled Inventory. Enroll a device,
 	// disable it (the manual revocation path), re-enable, or remove it — consulted live at the (T) handshake,
@@ -466,6 +487,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		oversubscribe: config.LicenseAllowOversubscription,
 	}, adminEndpoint)
 	mux.HandleFunc("GET /admin/enrolled-devices", adminEndpoint("admin.enrollment.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if !enrolledLedgerOr503(w) {
 			return
 		}

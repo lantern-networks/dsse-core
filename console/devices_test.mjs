@@ -12,14 +12,14 @@ function responseFor(method, path, body) {
   assert.equal(method, 'POST');
   if (path.startsWith('/admin/transport-admission/')) {
     return {ok: true, status: 200, body: {identity: body.identity.toLowerCase(),
-      [path.endsWith('/restore') ? 'restored' : 'revoked']: true}};
+      transport_revoked: false, [path.endsWith('/restore') ? 'restored' : 'revoked']: true}};
   }
   const id = decodeURIComponent(path.slice('/admin/enrolled-devices/'.length, path.lastIndexOf('/')));
   return {ok: true, status: 200, body: {device: {identity: id.toLowerCase(), enabled: path.endsWith('/enable')}}};
 }
 
 function fixture() {
-  const calls = [], confirmations = [], toasts = [], refreshes = [], rows = new Map();
+  const calls = [], confirmations = [], toasts = [], refreshes = [], states = [], rows = new Map();
   function el(tag, attrs = {}, children = []) {
     let text = attrs.text || '';
     const node = {tag, style: {}, attributes: {...attrs}, children: [], disabled: !!attrs.disabled,
@@ -55,14 +55,17 @@ function fixture() {
   };
   addRow(identity); addRow(otherDevice.identity);
   const context = vm.createContext({el, bl: value => value.en,
+    uiState: (host, state, message) => states.push({state,message}),
+    freshRender: host => { const seq=host.renderSequence=(host.renderSequence||0)+1; return ()=>host.renderSequence===seq; },
     apiFetch: async (...args) => { calls.push(args); return responseFor(...args); },
     uiConfirm: async spec => { confirmations.push(spec); return true; },
     uiToast: (message, kind) => toasts.push({message, kind}),
   });
   vm.runInContext(source, context);
+  const actualRenderList = context.renderList;
   context.renderList = async passedHost => { assert.equal(passedHost, host); refreshes.push(passedHost); };
   const send = (enabled = true, d = device) => context.changeDeviceAdmission(d, host, enabled);
-  return {context, calls, confirmations, toasts, refreshes, rows, host, messages, send, addRow,
+  return {context, calls, confirmations, toasts, refreshes, rows, host, messages, send, addRow, states, actualRenderList,
     notice: (id = identity) => host.__deviceAdmissionNotices?.get(id),
     invokeWith: handler => { context.apiFetch = async (...args) => { calls.push(args); return handler(...args); }; },
   };
@@ -94,7 +97,7 @@ test('Allow and Block change transport before admission on control and announce 
     assertRequests(f.calls, enabled);
     assert.equal(f.confirmations.length, enabled ? 0 : 1);
     if (!enabled) assert.equal(f.confirmations[0].danger, true);
-    assert.deepEqual(f.toasts, [{message: enabled ? 'Device allowed.' : 'Device blocked.', kind: 'ok'}]);
+    assert.deepEqual(f.toasts, [{message: (enabled ? 'Device allowed: ' : 'Device blocked: ') + identity, kind: 'ok'}]);
     assert.equal(f.notice(), undefined); assert.equal(f.refreshes.length, 1);
     assert.equal(f.rows.get(identity).primary.disabled, false); assert.equal(f.rows.get(identity).overflow.disabled, false);
   }
@@ -245,7 +248,7 @@ test('refresh failure after confirmed mutation reports the read failure without 
     const f = fixture(); f.context.renderList = async () => { throw Error('refresh offline'); };
     await f.send(enabled); assertRequests(f.calls, enabled); assert.equal(f.notice(), undefined);
     assert.deepEqual(f.toasts, [
-      {message: enabled ? 'Device allowed.' : 'Device blocked.', kind: 'ok'},
+      {message: (enabled ? 'Device allowed: ' : 'Device blocked: ') + identity, kind: 'ok'},
       {message: 'Error: refresh offline', kind: 'err'},
     ]);
     assert.equal(f.rows.get(identity).primary.disabled, false);
@@ -352,4 +355,127 @@ test('risk refresh failure does not reclassify a confirmed operation or discard 
     assert.equal(f.calls.length,1);assert.equal(f.toasts.filter(t=>t.kind==='ok').length,warning?0:1);
     if(warning)assert.match(riskNotice(f).textContent,/saving was not confirmed/);else assert.equal(riskNotice(f),undefined);
   }
+});
+
+test('Allow does not enable inventory or announce success while another transport block remains', async () => {
+  const f = fixture(); f.invokeWith((...args) => {
+    const r = responseFor(...args); r.body.transport_revoked = true; return r;
+  });
+  await f.send(); assert.equal(f.calls.length, 1); assert.equal(f.toasts.length, 0);
+  assert.match(f.notice().textContent, /connection block still applies/);
+  assert.match(f.notice().textContent, /inventory admission was not changed/);
+  assert.equal(f.refreshes.length, 1);
+  f.invokeWith(responseFor); await f.notice().querySelector('button').click();
+  assertRequests(f.calls.slice(1), true); assert.equal(f.notice(), undefined);
+});
+
+test('Allow requires an explicit effective transport result, not just a local restore acknowledgement', async () => {
+  for (const value of [undefined, null, 0, 'false']) {
+    const f = fixture(); f.invokeWith((...args) => {
+      const r = responseFor(...args); r.body.transport_revoked = value; return r;
+    });
+    await f.send(); assert.equal(f.calls.length, 1); assertFailure(f, false);
+  }
+});
+
+const inventoryAnswer = () => ({schema_version: 'admin_enrolled_inventory.v1', tenant_id: 'tenant-a', unassigned: 0,
+  devices: [{identity:'LOCAL',enabled:true},{identity:'mesh',enabled:true},{identity:'synced',enabled:true},
+    {identity:'inventory-only',enabled:false},{identity:'clear',enabled:true}]});
+const transportAnswer = () => ({schema_version:'admin_transport_admission.v1', tenant_id:'tenant-a',
+  revoked_identities:['local','mesh','synced'], withheld_unattributable:1});
+
+test('device status derives from both admission gates and takes precedence over steering telemetry', () => {
+  const f = fixture(), source = inventoryAnswer();
+  const rows = f.context.deviceAdmissionRows(source, transportAnswer(), 'tenant-a');
+  assert.equal(rows.filter(d => f.context.deviceIsBlocked(d)).length, 4);
+  for (const d of rows.slice(0,4)) {
+    const st = f.context.deviceStateOf(d, {steer_active:true}, {steer_active:true}, 'none');
+    assert.equal(st.pill.text,'Blocked'); assert.equal(st.steering,false);
+    assert.equal(d.admissionContext.tenant,'tenant-a');
+  }
+  assert.equal(rows[0].enabled,true,'do not rewrite the stored inventory flag');
+  assert.equal(source.devices[0].transport_revoked,undefined,'do not mutate API data');
+  assert.equal(f.context.deviceIsBlocked(rows[4]),false);
+});
+
+test('malformed or wrong-tenant admission reads never become a known unblocked list', () => {
+  const f = fixture();
+  for (const patch of [{schema_version:'unknown'}, {tenant_id:'tenant-b'}, {revoked_identities:null},
+    {revoked_identities:['LOCAL']},{revoked_identities:['']},{revoked_identities:['mesh','mesh']},
+    {revoked_identities:[42]},{withheld_unattributable:-1},{withheld_unattributable:'0'}]) {
+    assert.throws(() => f.context.deviceAdmissionRows(inventoryAnswer(), {...transportAnswer(),...patch}, ''), /could not be verified/);
+  }
+  for (const patch of [{schema_version:'unknown'},{tenant_id:''},{devices:null},{unassigned:'0'},{unassigned:null},
+    {devices:[{identity:'one',enabled:'true'}]},{devices:[{identity:'one',enabled:true},{identity:'ONE',enabled:true}]}]) {
+    assert.throws(() => f.context.deviceAdmissionRows({...inventoryAnswer(),...patch}, transportAnswer(), ''), /could not be verified/);
+  }
+  assert.throws(() => f.context.deviceAdmissionRows(inventoryAnswer(), transportAnswer(), 'tenant-b'), /could not be verified/);
+});
+
+test('verified row context is bound into both writes and both acknowledgements', async () => {
+  const d = {...device, admissionContext:{tenant:'tenant-a',selection:'tenant-a'}};
+  for (const mismatch of ['', 'transport', 'inventory']) {
+    const f = fixture(); f.context.operateTenant = 'tenant-a';
+    f.invokeWith((method,path,body) => {
+      assert.equal(new URL(path,'https://test').searchParams.get('expected_tenant_id'),'tenant-a');
+      const r = responseFor(method,path.split('?')[0],body);
+      r.body.tenant_id = path.includes(mismatch==='transport'?'/transport-admission/':'/enrolled-devices/') && mismatch ? 'tenant-b':'tenant-a';
+      return r;
+    });
+    await f.send(true,d);
+    assert.equal(f.calls.length,mismatch==='transport'?1:2);
+    assert.equal(f.toasts.filter(t=>t.kind==='ok').length,mismatch?0:1);
+  }
+});
+
+test('navigation or tenant change during a transport write prevents a subsequent inventory write and toast', async () => {
+  for (const detached of [false,true]) {
+    const f = fixture(); f.context.operateTenant = 'tenant-a'; let finish;
+    f.invokeWith((...args)=>new Promise(resolve=>{finish=()=>resolve({...responseFor(...args),body:{identity,restored:true,transport_revoked:false,tenant_id:'tenant-a'}})}));
+    const done=f.send(true,{...device,admissionContext:{tenant:'tenant-a',selection:'tenant-a'}});
+    if(detached)f.host.isConnected=false;else f.context.operateTenant='tenant-b';
+    finish();await done;assert.equal(f.calls.length,1);assert.equal(f.refreshes.length,0);assert.equal(f.toasts.length,0);
+  }
+});
+
+test('inventory may omit the zero unassigned count as specified by the API', () => {
+  const f=fixture(), inventory=inventoryAnswer();delete inventory.unassigned;
+  assert.equal(f.context.deviceAdmissionRows(inventory,transportAnswer(),'').length,5);
+});
+
+
+test('required connection reads fail visibly without fetching optional telemetry or sending writes', async () => {
+  for (const response of [{ok:false,status:503}, {ok:true,body:{}}, new Error('network lost')]) {
+    const f=fixture();f.invokeWith((method,path)=>{
+      assert.equal(method,'GET');
+      if(path==='/admin/enrolled-devices')return {ok:true,body:inventoryAnswer()};
+      assert.equal(path,'/admin/transport-admission?expected_tenant_id=tenant-a');
+      if(response instanceof Error)throw response;return response;
+    });
+    await f.actualRenderList(f.host);assert.equal(f.calls.length,2);
+    assert.deepEqual(f.states.map(s=>s.state),['loading','error']);
+  }
+});
+
+test('stale inventory and transport replies cannot render after organization change or navigation', async () => {
+  for(const stage of ['inventory','transport'])for(const detached of [false,true]){
+    const f=fixture();let finish,reached;const waiting=new Promise(resolve=>{reached=resolve});
+    f.invokeWith((method,path)=>{
+      const r={ok:true,body:path.includes('/transport-admission')?transportAnswer():inventoryAnswer()};
+      if(path.includes(stage==='inventory'?'/enrolled-devices':'/transport-admission')){reached();return new Promise(resolve=>{finish=()=>resolve(r)})}
+      return r;
+    });
+    const pending=f.actualRenderList(f.host);await waiting;
+    if(detached)f.host.isConnected=false;else f.context.operateTenant='tenant-b';
+    finish();await pending;assert.equal(f.calls.length,stage==='inventory'?1:2);
+    assert.deepEqual(f.states.map(s=>s.state),['loading']);
+  }
+});
+
+test('a superseded list request cannot overwrite the latest load error', async () => {
+  const f=fixture();let finish;
+  f.invokeWith(()=>new Promise(resolve=>{finish=()=>resolve({ok:true,body:inventoryAnswer()})}));
+  const old=f.actualRenderList(f.host);
+  f.invokeWith(()=>({ok:false,status:503}));await f.actualRenderList(f.host);finish();await old;
+  assert.equal(f.calls.length,2);assert.deepEqual(f.states.map(s=>s.state),['loading','loading','error']);
 });

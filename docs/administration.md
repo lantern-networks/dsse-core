@@ -189,6 +189,28 @@ These are separate operations. If the transport request fails, the Console retai
 an error and does not send the inventory change. Use **Retry** after resolving the
 error; a partial operation is not a successful device update.
 
+The list, blocked count, status filters and row action combine enrollment status
+with the tenant-scoped transport block list. A failed or invalid block-list read
+shows an error with **Retry**, rather than treating unknown state as unblocked.
+These are the responding control plane's latest observations, not acknowledgements
+from every region or proof of an active endpoint connection.
+
+A successful restore removes only the locally authored transport block. The response
+includes `transport_revoked`, indicating whether a pulled or received-region block
+still applies on that server. If it is `true`, the domain audit is `partial`, the
+Console leaves inventory admission unchanged and displays the remaining-block
+warning. Resolve the originating block and verify its withdrawal, then reload or
+retry. The common HTTP audit can be `success` because the local restore itself was
+acknowledged. `restored: true` alone does not mean all admission gates are open.
+An older server without this outcome field cannot confirm an Allow action for the
+updated Console; upgrade the server and Console together.
+
+The Console binds block/allow writes to the organization of the loaded list. An
+`expected_tenant_id` mismatch returns HTTP 409 before changing state. This optional
+precondition does not grant access; normal authentication and authorization remain
+required. These separate requests do not provide a transaction or protect against
+all concurrent changes after an acknowledgement.
+
 With admission persistence configured:
 
 - **Block:** the local transport block takes effect and registered sessions for that

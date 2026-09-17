@@ -675,3 +675,15 @@ The HTTP audit records the request's status separately from the operation outcom
 Successful primary audit writes are also mirrored to the configured audit outbox;
 this does not make inventory saving and audit recording one transaction. Confirm
 storage health and Edge state separately from the Console response.
+
+
+The device-group assignment editor waits for a verified group list before enabling
+changes. A failed or malformed response shows Retry; an empty registry does not
+silently clear an existing assignment. An assignment absent from the registry is
+shown explicitly until you choose another value.
+
+While saving, the editor keeps the submitted selection fixed and prevents a
+second request. Success requires a response confirming that device, tenant and
+group. A failed or unconfirmed response stays visible in the editor; check the
+current state before retrying. Closing a loading editor or leaving the page
+prevents its late response from reopening the old editor.

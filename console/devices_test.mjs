@@ -20,9 +20,11 @@ function responseFor(method, path, body) {
 
 function fixture() {
   const calls = [], confirmations = [], toasts = [], refreshes = [], states = [], rows = new Map();
+  let body;
   function el(tag, attrs = {}, children = []) {
+    const handlers = {};
     let text = attrs.text || '';
-    const node = {tag, style: {}, attributes: {...attrs}, children: [], disabled: !!attrs.disabled,
+    const node = {tag, style: {}, attributes: {...attrs}, children: [], disabled: attrs.disabled != null,
       appendChild(child) { if (child) { this.children.push(child); child.parentNode = this; } return child; },
       setAttribute(name, value) { this.attributes[name] = value; },
       getAttribute(name) { return this.attributes[name] ?? null; },
@@ -34,8 +36,10 @@ function fixture() {
         return this.children.flatMap(child => [child, ...child.querySelectorAll('*')])
           .filter(candidate => selector === '*' || matches(candidate));
       },
-      click() { return attrs.onClick?.(); },
+      addEventListener(name, fn) { (handlers[name] ||= []).push(fn); },
+      click() { return attrs.onClick ? attrs.onClick({target: this}) : Promise.all((handlers.click || []).map(fn => fn({target: this}))); },
     };
+    Object.defineProperty(node, 'isConnected', {get() { return this.__connected ?? (this === body || !!this.parentNode?.isConnected); }, set(value) { this.__connected = value; }});
     Object.defineProperty(node, 'textContent', {
       get() { return text + this.children.map(child => child.textContent).join(''); },
       set(value) { text = String(value); this.children = []; },
@@ -44,7 +48,8 @@ function fixture() {
     for (const child of [children].flat(Infinity)) node.appendChild(child);
     return node;
   }
-  const host = el('div'), messages = el('div'); host.__deviceAdmissionMessages = messages;
+  body = el('body');
+  const host = el('div'), messages = el('div'); body.appendChild(host); host.__deviceAdmissionMessages = messages;
   const addRow = id => {
     const row = el('tr', {'data-device-identity': id});
     const primary = el('button', {'data-device-admission-control': '1'});
@@ -54,8 +59,8 @@ function fixture() {
     rows.set(id, {row, primary, overflow, unrelated}); return row;
   };
   addRow(identity); addRow(otherDevice.identity);
-  const context = vm.createContext({el, bl: value => value.en,
-    uiState: (host, state, message) => states.push({state,message}),
+  const context = vm.createContext({el, document: {body}, bl: value => value.en,
+    uiState: (host, state, message, retry) => states.push({state,message,retry}),
     freshRender: host => { const seq=host.renderSequence=(host.renderSequence||0)+1; return ()=>host.renderSequence===seq; },
     apiFetch: async (...args) => { calls.push(args); return responseFor(...args); },
     uiConfirm: async spec => { confirmations.push(spec); return true; },
@@ -65,7 +70,7 @@ function fixture() {
   const actualRenderList = context.renderList;
   context.renderList = async passedHost => { assert.equal(passedHost, host); refreshes.push(passedHost); };
   const send = (enabled = true, d = device) => context.changeDeviceAdmission(d, host, enabled);
-  return {context, calls, confirmations, toasts, refreshes, rows, host, messages, send, addRow, states, actualRenderList,
+  return {context, body, calls, confirmations, toasts, refreshes, rows, host, messages, send, addRow, states, actualRenderList,
     notice: (id = identity) => host.__deviceAdmissionNotices?.get(id),
     invokeWith: handler => { context.apiFetch = async (...args) => { calls.push(args); return handler(...args); }; },
   };
@@ -518,4 +523,100 @@ test('stale risk reads cannot render after a tenant switch or navigation',async(
 test('risk read errors are translated without displaying backend detail', async()=>{
  const f=fixture();f.context.bl=value=>value.ja;f.invokeWith((method,path)=>path.includes('/risk-signals')?{ok:false,status:503,body:{error:'PRIVATE_PATH'}}:answerBeforeRisk(path));
  await f.actualRenderList(f.host);assert.match(f.states[1].message,/リスク状態を取得できません/);assert.ok(!f.states[1].message.includes('PRIVATE_PATH'));
+});
+
+
+const assignmentDevice = {...device, tenant_id: 'tenant_a', group: 'QA', admissionContext: {tenant: 'tenant_a', selection: ''}};
+const groupList = {schema_version: 'admin_device_group_registry.v1', tenant_id: 'tenant_a', groups: [
+  {id: 'qa', name: 'QA', tenant_id: 'tenant_a'}, {id: 'pilot', name: 'Pilot', tenant_id: 'tenant_a'},
+]};
+function assignmentFixture() {
+  const f = fixture();
+  f.invokeWith((method, path, body) => method === 'GET' ? {ok: true, body: structuredClone(groupList)} :
+    {ok: true, body: {schema_version: 'admin_enrolled_inventory.v1', device: {identity, tenant_id: 'tenant_a', group: body.group}}});
+  f.dialog = () => f.body.querySelectorAll('div').find(n => n.attributes.role === 'dialog');
+  f.button = label => f.dialog().querySelectorAll('button').find(n => n.textContent === label);
+  f.open = (d = assignmentDevice) => f.context.openAssignGroupForm(d, f.host);
+  return f;
+}
+
+test('assignment read failures refuse editing and Retry preserves the existing selection', async () => {
+  for (const bad of [{ok: false, status: 503}, {ok: true, body: {}}, {ok: true, body: {...groupList, groups: null}},
+    {ok: true, body: {...groupList, groups: {}}}, new Error('offline')]) {
+    const f = assignmentFixture(); f.invokeWith(() => { if (bad instanceof Error) throw bad; return bad; });
+    await f.open(); assert.equal(f.states.at(-1).state, 'error'); assert.equal(f.states.at(-1).retry.label, 'Retry');
+    assert.equal(f.button('Assign').disabled, true); assert.equal(f.button('Unassigned'), undefined); assert.equal(f.button('+ New'), undefined);
+    await f.button('Assign').click(); assert.equal(f.calls.filter(c => c[0] === 'POST').length, 0);
+    f.invokeWith(() => ({ok: true, body: groupList})); await f.states.at(-1).retry.onClick();
+    assert.equal(f.button('Assign').disabled, false); assert.ok(f.button('QA').attributes.class.includes('ui-btn-primary'));
+    assert.ok(f.calls.every(c => c[3] === 'control' && c[1].endsWith('?expected_tenant_id=tenant_a')));
+  }
+});
+
+test('assignment registry rejects wrong context, malformed entries and duplicate choices', () => {
+  const f = assignmentFixture();
+  for (const body of [{...groupList, schema_version:'wrong'}, {...groupList, tenant_id:'tenant_b'},
+    ...[null, [], {}, {id:'g',name:42}, {id:'',name:'QA'}, {id:'g',name:' '}, {id:'g',name:'QA',description:{}},
+      {id:'g',name:'QA',tenant_id:'tenant_b'}].map(g => ({...groupList,groups:[g]})),
+    {...groupList,groups:[{id:'one',name:'QA'},{id:'two',name:' qa '}]},
+    {...groupList,groups:[{id:'one',name:'QA'},{id:'one',name:'Pilot'}]},
+  ]) assert.throws(() => f.context.deviceAssignmentGroups({ok:true,body}, 'tenant_a'), /could not be verified/);
+});
+
+test('a valid empty registry keeps an older assignment until explicitly cleared', async () => {
+  const f = assignmentFixture();f.invokeWith((method, _path, body) => method==='GET' ? {ok:true,body:{...groupList,groups:[]}} :
+    {ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity,tenant_id:'tenant_a',group:body.group}}});
+  await f.open();assert.equal(f.button('Assign').disabled,false);assert.ok(f.button('QA'));assert.match(f.dialog().textContent,/not in the group list/);
+  await f.button('Assign').click();assert.equal(f.calls.at(-1)[2].group,'QA');assert.equal(f.toasts.at(-1).message,'Group set: QA.');
+  await f.open();await f.button('Unassigned').click();await f.button('Assign').click();assert.equal(f.calls.at(-1)[2].group,'');assert.equal(f.toasts.at(-1).message,'Group cleared.');
+});
+
+test('assignment loading can be cancelled and a detached or changed tenant cannot open a late editor', async () => {
+  for (const action of ['cancel','detach','tenant']) for (const fail of [false,true]) {
+    const f = assignmentFixture();let finish;f.invokeWith(()=>new Promise((resolve,reject)=>{finish=()=>fail?reject(Error('late')):resolve({ok:true,body:groupList});}));
+    const loading=f.open();assert.ok(f.dialog());assert.equal(f.button('Assign').disabled,true);
+    if(action==='cancel')await f.button('Cancel').click();else if(action==='detach')f.host.remove();else f.context.operateTenant='tenant_b';
+    finish();await loading;assert.equal(f.dialog(),undefined);assert.equal(f.toasts.length,0);assert.equal(f.calls.filter(c=>c[0]==='POST').length,0);
+  }
+});
+
+test('assignment saving captures one selection and locks all controls against overlap', async () => {
+  const f=assignmentFixture();await f.open();await f.button('Pilot').click();let finish;
+  f.invokeWith((_method,_path,body)=>new Promise(resolve=>{finish=()=>resolve({ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity,tenant_id:'tenant_a',group:body.group}}});}));
+  const submit=f.button('Assign');const saving=submit.click();assert.ok(f.dialog().querySelectorAll('button').every(b=>b.disabled));
+  await f.button('Unassigned').click();await submit.click();assert.equal(f.calls.filter(c=>c[0]==='POST').length,1);assert.equal(f.calls.at(-1)[2].group,'Pilot');
+  finish();await saving;assert.deepEqual(f.toasts,[{message:'Group set: Pilot.',kind:'ok'}]);assert.equal(f.refreshes.length,1);assert.equal(f.dialog(),undefined);
+});
+
+test('failed or unconfirmed assignment stays open with a literal persistent error and can retry', async () => {
+  for(const bad of [{ok:false,status:500,body:{error:'<b>saving unconfirmed</b>'}},new Error('lost response'),
+    {ok:true,body:{}}, {ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity:'other',tenant_id:'tenant_a',group:'QA'}}},
+    {ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity,tenant_id:'tenant_b',group:'QA'}}},
+    {ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity,tenant_id:'tenant_a',group:'Pilot'}}},
+  ]){
+    const f=assignmentFixture();await f.open();f.invokeWith(()=>{if(bad instanceof Error)throw bad;return bad});await f.button('Assign').click();
+    assert.ok(f.dialog());assert.equal(f.button('Assign').disabled,false);assert.equal(f.toasts.length,0);assert.equal(f.refreshes.length,0);
+    const error=f.dialog().querySelectorAll('div').find(n=>n.attributes.role==='alert');assert.ok(error.textContent);assert.equal(error.style.display,'');assert.equal(error.querySelectorAll('b').length,0);
+    f.invokeWith((_method,_path,body)=>({ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity,tenant_id:'tenant_a',group:body.group}}}));await f.button('Assign').click();assert.equal(f.dialog(),undefined);assert.equal(f.toasts.length,1);
+  }
+});
+
+test('detached assignment saves cannot refresh another page or show a late success or failure', async () => {
+  for(const fail of [false,true]){
+    const f=assignmentFixture();await f.open();let finish;f.invokeWith(()=>new Promise((resolve,reject)=>{finish=()=>fail?reject(Error('late')):resolve({ok:true,body:{schema_version:'admin_enrolled_inventory.v1',device:{identity,tenant_id:'tenant_a',group:'QA'}}});}));
+    const saving=f.button('Assign').click();f.host.remove();finish();await saving;assert.equal(f.dialog(),undefined);assert.equal(f.toasts.length,0);assert.equal(f.refreshes.length,0);
+  }
+});
+
+test('assignment New hands the confirmed group name back to a freshly loaded editor', async () => {
+  const f=assignmentFixture();await f.open();let created;f.context.openCreateGroupForm=fn=>{created=fn};await f.button('+ New').click();assert.equal(f.dialog(),undefined);assert.ok(created);
+  await created('Pilot');assert.ok(f.button('Pilot').attributes.class.includes('ui-btn-primary'));assert.equal(f.calls.filter(c=>c[0]==='GET').length,2);
+});
+
+test('a late registry retry cannot replace a newer retry failure', async () => {
+  const f=assignmentFixture();f.invokeWith(()=>({ok:false,status:503}));await f.open();const retry=f.states.at(-1).retry.onClick;
+  let first;let n=0;f.invokeWith(()=>++n===1?new Promise(resolve=>{first=resolve}):{ok:false,status:403});
+  const old=retry();await retry();first({ok:true,body:groupList});await old;
+  assert.match(f.states.at(-1).message,/HTTP 403/);assert.equal(f.button('Assign').disabled,true);assert.equal(f.button('QA'),undefined);
+  assert.equal(f.calls.filter(c=>c[0]==='POST').length,0);
 });

@@ -766,6 +766,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// the agent-policy/agent-tuning resolution reads via cpAuthoritativeGroup). An empty group clears the
 	// assignment (tenant-scope only). Same admin-scope + config-sourced guard as the other ledger mutations.
 	mux.HandleFunc("POST /admin/enrolled-devices/{identity}/group", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if configWriteRejectedWhenSourced(w, configSourceURL, "enrolled inventory") {
 			return
 		}
@@ -872,6 +875,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// the authoritative catalog of groups that EXIST, so the Console offers created groups for tab-select
 	// assignment instead of free-form typing. Reuses the enrolled ledger's durable store (no new plumbing).
 	mux.HandleFunc("GET /admin/device-groups", adminEndpoint("admin.enrollment.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if !enrolledLedgerOr503(w) {
 			return
 		}

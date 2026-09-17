@@ -821,68 +821,127 @@ function openEnrollForm(content) {
 // from the created groups (the registry) instead of free-typing a name. Tabs = Unassigned + each registry group
 // + "+ New" (create then reselect). Empty selection clears the assignment (device → tenant scope). The Edge
 // still reads the group from the enrolled ledger (NOT device-reported metadata) to resolve per-group policies.
-async function openAssignGroupForm(d, host, preselect) {
-  let groups = [];
-  try {
-    const r = await apiFetch("GET", "/admin/device-groups");
-    if (r.ok && r.body && r.body.groups) groups = r.body.groups;
-  } catch (e) { /* fall back to just the current assignment */ }
-  // preselect (a group NAME) is passed after the inline "+ New" flow so the just-created group is selected.
+function deviceAssignmentGroups(response, tenant) {
+  const body = response && response.body;
+  if (!response || !response.ok) throw new Error("HTTP " + (response && response.status || 0));
+  const text = value => typeof value === "string" && value.trim() !== "";
+  if (!body || body.schema_version !== "admin_device_group_registry.v1" || !text(body.tenant_id) ||
+      (tenant && body.tenant_id !== tenant) || !Array.isArray(body.groups) ||
+      body.groups.some(g => !g || !text(g.id) || !text(g.name) ||
+        (g.description != null && typeof g.description !== "string") ||
+        (g.tenant_id != null && g.tenant_id !== body.tenant_id)) ||
+      new Set(body.groups.map(g => g.id)).size !== body.groups.length ||
+      new Set(body.groups.map(g => g.name.trim().toLowerCase())).size !== body.groups.length) {
+    throw new Error(bl({ en: "The group list could not be verified. Retry before changing the assignment.",
+      ja: "グループ一覧を確認できません。割当を変更する前に再試行してください。" }));
+  }
+  return body.groups;
+}
+
+// Read the registry before offering edits. A failed read cannot stand in for an
+// empty registry, and a detached editor must not publish a late response.
+function openAssignGroupForm(d, host, preselect) {
+  const context = d.admissionContext;
+  const sameContext = () => host.isConnected !== false && (!context || context.selection === deviceTenantSelection());
+  if (!sameContext()) return;
+  const tenant = context ? context.tenant : d.tenant_id;
+  const path = value => deviceContextPath(value, tenant);
+  let groups = [], ready = false, saving = false, sequence = 0, closed = false;
   let selected = (typeof preselect === "string" ? preselect : (d.group || "")).trim();
   const tabsHost = el("div", { style: "display:flex;flex-wrap:wrap;gap:6px;margin:10px 0" });
   const info = el("p", { class: "ui-view-desc" });
-  const renderTabs = () => {
-    tabsHost.innerHTML = "";
-    const mk = (label, value) => el("button", {
-      class: "ui-btn ui-btn-sm" + (selected === value ? " ui-btn-primary" : ""),
-      text: label,
-      onClick: () => { selected = value; renderTabs(); },
-    });
-    tabsHost.appendChild(mk(bl({ en: "Unassigned", ja: "未割当" }), ""));
-    groups.forEach((g) => tabsHost.appendChild(mk(g.name, g.name)));
-    tabsHost.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "+ New", ja: "+ 新規作成" }), onClick: () => {
-      backdrop.remove();
-      // create, then reopen the assign modal with the new group already selected.
-      openCreateGroupForm((createdName) => openAssignGroupForm(d, host, createdName));
-    } }));
-    const cur = groups.find((g) => g.name === selected);
-    info.textContent = selected
-      ? (bl({ en: "Selected: ", ja: "選択中: " }) + selected + (cur && cur.description ? " — " + cur.description : ""))
-      : bl({ en: "No group (tenant scope).", ja: "グループなし(テナントスコープ)。" });
-  };
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Assign", ja: "割当" }) });
-  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: (e) => { if (e.target === backdrop) backdrop.remove(); } }, [
+  const loadState = el("div");
+  const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
+  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Assign", ja: "割当" }), disabled: true });
+  const close = () => { closed = true; sequence++; backdrop.remove(); };
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: close });
+  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: e => { if (e.target === backdrop && !saving) close(); } }, [
     el("div", { class: "ui-modal", role: "dialog" }, [
       el("div", { class: "ui-modal-head", text: bl({ en: "Device group", ja: "デバイスグループ" }) }),
       el("div", { class: "ui-modal-body" }, [
         el("p", { class: "ui-view-desc", text: bl({
           en: "Assign \"" + d.identity + "\" to a group. Pick a created group (or Unassigned to remove it). Group-scoped steer-exclusion / captive-tuning policies then apply to the device.",
           ja: "「" + d.identity + "」をグループに割当てます。作成済みグループを選択(未割当で解除)。このグループ対象の steer 除外・キャプティブ調整ポリシーがデバイスに適用されます。",
-        }) }),
-        tabsHost, info,
+        }) }), loadState, tabsHost, info, saveError,
       ]),
-      el("div", { class: "ui-modal-foot" }, [
-        el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => backdrop.remove() }),
-        submit,
-      ]),
+      el("div", { class: "ui-modal-foot" }, [cancel, submit]),
     ]),
   ]);
-  submit.addEventListener("click", async () => {
-    submit.disabled = true;
+  const active = () => {
+    if (!sameContext()) { close(); return false; }
+    return !closed && backdrop.isConnected;
+  };
+  const renderTabs = () => {
+    tabsHost.innerHTML = "";
+    const mk = (label, value) => el("button", {
+      class: "ui-btn ui-btn-sm" + (selected === value ? " ui-btn-primary" : ""),
+      text: label, disabled: saving || undefined,
+      onClick: () => { if (!active() || !ready || saving) return; selected = value; renderTabs(); },
+    });
+    tabsHost.appendChild(mk(bl({ en: "Unassigned", ja: "未割当" }), ""));
+    groups.forEach(g => tabsHost.appendChild(mk(g.name, g.name)));
+    // Existing assignments can predate the registry. Retain them explicitly;
+    // absence from a valid registry is not permission to clear an assignment.
+    const current = groups.find(g => g.name === selected);
+    if (selected && !current) tabsHost.appendChild(mk(selected, selected));
+    tabsHost.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "+ New", ja: "+ 新規作成" }), disabled: saving || undefined, onClick: () => {
+      if (!active() || !ready || saving) return;
+      close();
+      openCreateGroupForm(createdName => { if (sameContext()) return openAssignGroupForm(d, host, createdName); });
+    } }));
+    info.textContent = selected
+      ? bl({ en: "Selected: ", ja: "選択中: " }) + selected + (current && current.description ? " — " + current.description : "") +
+        (!current ? bl({ en: " (not in the group list; kept until you choose another assignment)", ja: "（一覧にありません。別の割当を選ぶまで保持します）" }) : "")
+      : bl({ en: "No group (tenant scope).", ja: "グループなし(テナントスコープ)。" });
+  };
+  const load = async () => {
+    if (!active() || saving) return;
+    const seq = ++sequence;
+    ready = false; submit.disabled = true; tabsHost.innerHTML = ""; info.textContent = "";
+    uiState(loadState, "loading");
     try {
-      const r = await apiFetch("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/group", { group: selected });
-      if (!r.ok) {
-        submit.disabled = false;
-        uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err");
-        return;
+      const response = await apiFetch("GET", path("/admin/device-groups"), undefined, "control");
+      if (!active() || seq !== sequence) return;
+      groups = deviceAssignmentGroups(response, tenant);
+      ready = true; loadState.innerHTML = ""; renderTabs(); submit.disabled = false;
+    } catch (e) {
+      if (!active() || seq !== sequence) return;
+      uiState(loadState, "error", bl({ en: "Could not load device groups. ", ja: "デバイスグループを取得できません。" }) + String(e.message || e),
+        { label: bl({ en: "Retry", ja: "再試行" }), onClick: load });
+    }
+  };
+  submit.addEventListener("click", async () => {
+    if (!active() || !ready || saving) return;
+    saving = true;
+    const assigned = selected;
+    const controls = Array.from(backdrop.querySelectorAll("button"));
+    controls.forEach(control => { control.disabled = true; });
+    saveError.textContent = ""; saveError.style.display = "none";
+    try {
+      const r = await apiFetch("POST", path("/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/group"), { group: assigned }, "control");
+      if (!active()) return;
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+      const device = r.body && r.body.device;
+      if (!r.body || r.body.schema_version !== "admin_enrolled_inventory.v1" || !device ||
+          typeof device.identity !== "string" || device.identity.trim().toLowerCase() !== d.identity.trim().toLowerCase() ||
+          (tenant && device.tenant_id !== tenant) || (device.group !== undefined && typeof device.group !== "string") ||
+          (device.group || "") !== assigned) {
+        throw new Error(bl({ en: "The response did not confirm this assignment. It may already be applied; reload to review the current state before retrying.",
+          ja: "応答から割当を確認できません。反映済みの可能性があります。再読込で現在の状態を確認してから再試行してください。" }));
       }
-      backdrop.remove();
-      uiToast(selected ? bl({ en: "Group set: " + selected + ".", ja: "グループを設定: " + selected + "。" }) : bl({ en: "Group cleared.", ja: "グループを解除しました。" }), "ok");
+      close();
+      uiToast(assigned ? bl({ en: "Group set: " + assigned + ".", ja: "グループを設定: " + assigned + "。" }) : bl({ en: "Group cleared.", ja: "グループを解除しました。" }), "ok");
       renderList(host);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) {
+      if (!active()) return;
+      saveError.textContent = String(e.message || e); saveError.style.display = "";
+    } finally {
+      saving = false;
+      if (active()) controls.forEach(control => { control.disabled = false; });
+    }
   });
   document.body.appendChild(backdrop);
-  renderTabs();
+  return load();
 }
 
 // ---- Device groups TAB (registry: list + create + delete) ----------------------------------------------

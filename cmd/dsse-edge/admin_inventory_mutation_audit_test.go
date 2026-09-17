@@ -250,3 +250,40 @@ func TestInventoryMutationRefusalsDoNotMutateOrMirrorSuccess(t *testing.T) {
 		})
 	}
 }
+
+func TestDeviceAssignmentPinnedTenantContext(t *testing.T) {
+	for _, method := range []string{"GET", "POST"} {
+		t.Run(method, func(t *testing.T) {
+			h, l, p, _, root := inventoryMutationFixture(t)
+			path := "/admin/device-groups"
+			body := ""
+			if method == "POST" {
+				path = "/admin/enrolled-devices/target-device/group"
+				body = `{"group":"QA"}`
+			}
+			before := l.Authoritative()
+			saved, _ := p.file.Load()
+			gen := l.ConfigGeneration()
+			r := inventoryMutationRequest(h, method, path+"?expected_tenant_id=another-tenant", body)
+			if r.Code != http.StatusConflict {
+				t.Fatalf("mismatched context: %d %s", r.Code, r.Body.String())
+			}
+			after, _ := p.file.Load()
+			if !bytes.Equal(saved, after) || !reflect.DeepEqual(before, l.Authoritative()) || gen != l.ConfigGeneration() {
+				t.Fatal("context refusal mutated inventory")
+			}
+			if method == "POST" {
+				rows := inventoryMutationAudits(t, root)
+				if len(rows) != 1 || rows[0]["result"] != "error" || rows[0]["actor_user_id"] != "mutation_admin" {
+					t.Fatalf("refusal audit: %v", rows)
+				}
+			}
+			for _, suffix := range []string{"?expected_tenant_id=tenant_lab_001", ""} {
+				r = inventoryMutationRequest(h, method, path+suffix, body)
+				if r.Code != http.StatusOK {
+					t.Fatalf("matching/legacy context: %d %s", r.Code, r.Body.String())
+				}
+			}
+		})
+	}
+}

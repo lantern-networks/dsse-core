@@ -2726,8 +2726,8 @@ func main() {
 	highRiskOverlay := revocation.NewHighRiskOverlay()
 	if p, e := cpStateBlobPersister(*highRiskStore, cpStateBlobDB, "high_risk_overlay"); e != nil {
 		log.Fatalf("resolve high-risk store: %v", e)
-	} else {
-		highRiskOverlay.SetPersister(p) // Phase 3: persist high-risk markings across a restart
+	} else if err := highRiskOverlay.SetPersister(p); err != nil {
+		log.Fatalf("load high-risk store: %v", err)
 	}
 	// management ledger: created here (empty) so BOTH the admin endpoints (via serverConfig) and the
 	// (T) listener (via secureTransportConfig below) share one instance; seeded from the static inventory

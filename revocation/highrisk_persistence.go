@@ -3,8 +3,9 @@ package revocation
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
+	"maps"
+	"reflect"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -23,83 +24,62 @@ type highRiskOverlayStateFile struct {
 
 const highRiskOverlayStateSchemaVersion = "high_risk_overlay_state.v2"
 
-// SetStatePath enables durable file persistence at path (historical behaviour). A back-compat convenience over
-// SetPersister(blobstore.FilePersister{...}).
-func (o *HighRiskOverlay) SetStatePath(path string) {
-	if o == nil {
-		return
+// SetStatePath restores a complete file snapshot before adopting its writer.
+func (o *HighRiskOverlay) SetStatePath(path string) error {
+	if o == nil || strings.TrimSpace(path) == "" {
+		return nil
 	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return
-	}
-	o.SetPersister(blobstore.FilePersister{Path: path})
+	return o.SetPersister(blobstore.FilePersister{Path: strings.TrimSpace(path)})
 }
 
-// SetPersister enables durable persistence via any Persister (file or shared Postgres) and loads existing state.
-func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) {
+// SetPersister is for initialization or explicit recovery. Invalid replacements
+// retain both live namespaces, generation and the previous writer, but mark the
+// store unavailable until a complete valid snapshot is restored. Callers must
+// refuse startup on error. Missing/nil storage cannot clear a prior load failure.
+func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	if o == nil {
-		return
+		return nil
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.persister = p
 	if p == nil {
-		return
+		if o.loadErr != nil {
+			return o.loadErr
+		}
+		o.persister = nil
+		return nil
 	}
-	o.loadLocked()
+	data, err := p.Load()
+	if err != nil {
+		o.loadErr = ErrRiskLoad
+		return o.loadErr
+	}
+	// Persisters reserve nil for first boot; existing zero-byte files are invalid.
+	if data == nil {
+		if o.loadErr != nil {
+			return o.loadErr
+		}
+		o.persister = p
+		return nil
+	}
+	f, err := decodeRiskSnapshot(data)
+	if err != nil {
+		o.loadErr = err
+		return err
+	}
+	legacy := f.SchemaVersion == "high_risk_overlay_state.v1" && len(f.Devices) > 0
+	if !maps.Equal(o.devices, f.Devices) || !reflect.DeepEqual(o.users, f.Users) || o.legacy != legacy {
+		o.generation.Add(1)
+	}
+	o.devices, o.users, o.legacy = f.Devices, f.Users, legacy
+	o.persister, o.loadErr = p, nil
+	o.rebuildUserIndexLocked()
+	log.Printf("high_risk_overlay load: restored %d device and %d user risk marks", len(o.devices), len(o.users))
+	return nil
 }
 
-func (o *HighRiskOverlay) loadLocked() {
-	if o.persister == nil {
-		return
-	}
-	data, err := o.persister.Load()
-	if err != nil {
-		o.loadErr = fmt.Errorf("read risk state: %w", err)
-		log.Printf("high_risk_overlay load: %v", o.loadErr)
-		return
-	}
-	if len(data) == 0 {
-		return
-	}
-	var f highRiskOverlayStateFile
-	if err := json.Unmarshal(data, &f); err != nil {
-		o.loadErr = fmt.Errorf("decode risk state: %w", err)
-		log.Printf("high_risk_overlay load: %v", o.loadErr)
-		return
-	}
-	if f.SchemaVersion != highRiskOverlayStateSchemaVersion && f.SchemaVersion != "high_risk_overlay_state.v1" {
-		o.loadErr = fmt.Errorf("unsupported risk state version")
-		return
-	}
-	users := make(map[string]UserRisk, len(f.Users))
-	for key, mark := range f.Users {
-		normalized, err := normalizeUserRisk(mark)
-		if err != nil || riskRank(normalized.Severity) == 0 || key != userRiskKey(normalized.TenantID, normalized.ID) {
-			o.loadErr = fmt.Errorf("invalid saved user risk")
-			return
-		}
-		users[key] = normalized
-	}
-	devices := make(map[string]string, len(f.Devices))
-	for id, severity := range f.Devices {
-		if id == "" || id != NormalizeDeviceID(id) || riskRank(severity) == 0 {
-			o.loadErr = fmt.Errorf("invalid saved device risk")
-			return
-		}
-		devices[id] = severity
-	}
-	if f.SchemaVersion == "high_risk_overlay_state.v1" && len(users) > 0 {
-		o.loadErr = fmt.Errorf("typed users in legacy risk state")
-		return
-	}
-	o.users, o.devices = users, devices
-	o.loadErr = nil
-	o.rebuildUserIndexLocked()
-	o.legacy = f.SchemaVersion == "high_risk_overlay_state.v1" && len(devices) > 0
-	log.Printf("high_risk_overlay load: restored %d high-risk device(s) from the durable store", len(o.devices))
-}
+// ErrRiskLoad deliberately omits paths, backend details and saved contents.
+var ErrRiskLoad = errors.New("cannot read risk snapshot")
 
 // saveStateLocked also serves checked user writes and legacy migration. A nil
 // persister means volatile operation and is reported as a warning to user writes.

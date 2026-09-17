@@ -100,24 +100,21 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 	// GET /admin/risk-signals: the current high-risk overlay (entity id -> severity), so the console can show a
 	// current-risk badge on its own row. The explicit user query uses a tenant-scoped namespace.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
+		snap, users, err := config.HighRiskOverlay.CheckedSnapshot()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is unavailable"))
+			return
+		}
 		if r.URL.Query().Get("entity_type") == "user" {
-			if config.HighRiskOverlay == nil || config.HighRiskOverlay.Health() != nil {
-				writeError(w, 503, fmt.Errorf("user risk state is unavailable"))
-				return
-			}
 			tenant := adminTenantIDFromRequest(r)
 			snap := map[string]string{}
-			for _, mark := range config.HighRiskOverlay.UserSnapshot() {
+			for _, mark := range users {
 				if mark.TenantID == tenant {
 					snap[mark.ID] = mark.Severity
 				}
 			}
 			writeJSON(w, 200, map[string]any{"entity_type": "user", "tenant_id": tenant, "high_risk": snap})
 			return
-		}
-		snap := map[string]string{}
-		if config.HighRiskOverlay != nil {
-			snap = config.HighRiskOverlay.Snapshot()
 		}
 		// ★★ SCOPED, LIKE THE KILL-SWITCH LIST NEXT DOOR (2026-08-18). This overlay names every entity the
 		// deployment currently considers high risk, with the severity, and it was handed whole to any caller
@@ -149,7 +146,9 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			snap = mine
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"high_risk": snap,
+			"entity_type": "device",
+			"tenant_id":   adminTenantIDFromRequest(r),
+			"high_risk":   snap,
 			// Named rather than dropped, so a customer is never shown a smaller version of their own risk
 			// picture without being told a smaller version is what they are looking at.
 			"withheld_unattributable": withheld,

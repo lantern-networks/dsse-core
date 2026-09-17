@@ -330,11 +330,22 @@ function overflowMenu(d, host, sev, grpSev) {
   return wrap;
 }
 
+function deviceRiskSnapshot(body, tenant) {
+  const map = body && body.high_risk;
+  if (!body || body.entity_type !== "device" || body.tenant_id !== tenant || !tenant ||
+      !map || typeof map !== "object" || Array.isArray(map) ||
+      !Number.isSafeInteger(body.withheld_unattributable) || body.withheld_unattributable < 0 ||
+      Object.entries(map).some(([id, severity]) => !id || id !== id.trim() || !["medium", "high", "critical"].includes(severity))) {
+    throw new Error("Invalid device risk response");
+  }
+  return map;
+}
+
 async function renderList(host) {
   uiState(host, "loading");
   const selection = deviceTenantSelection(), renderCurrent = freshRender(host);
   const current = () => renderCurrent() && host.isConnected !== false && selection === deviceTenantSelection();
-  let devices;
+  let devices, tenant;
   // ★ unassigned IS PART OF THE ANSWER (2026-08-12, seventeenth review). The endpoint withholds devices that
   // belong to no tenant — they are nobody's to see or act on — and reports how many. Reading only `devices`
   // threw that number away, so the guarantee that made withholding safe ("nothing vanishes, it becomes a
@@ -346,7 +357,7 @@ async function renderList(host) {
     const r = await apiFetch("GET", deviceContextPath("/admin/enrolled-devices", selection), undefined, "control");
     if (!current()) return;
     if (!r.ok) throw new Error("HTTP " + r.status);
-    const tenant = r.body && r.body.tenant_id;
+    tenant = r.body && r.body.tenant_id;
     if (typeof tenant !== "string" || !tenant.trim() || (selection && selection !== tenant)) {
       throw new Error(bl({en: "The device organization could not be verified. Reload before continuing.",
         ja: "デバイスの所属組織を確認できません。再読込してください。"}));
@@ -411,13 +422,21 @@ async function renderList(host) {
       if (ru.body.frozen) updateFrozen = ru.body.frozen_reason || bl({ en: "rollout halted", ja: "配布停止中" });
     }
   } catch (e) { /* best-effort */ }
-  // Current high-risk marks (the shared overlay, keyed by entity id), so a device's OWN row shows + sets its
-  // risk — no free-text id (this replaces the standalone Device Risk page). Best-effort.
-  let riskMap = {};
+  // Risk is required for both the badge and the current value in the action menu.
+  // A failed/foreign/malformed read must not turn into "Normal" or a clear selection.
+  let riskMap;
   try {
-    const rk = await apiFetch("GET", "/admin/risk-signals");
-    if (rk.ok && rk.body && rk.body.high_risk) riskMap = rk.body.high_risk;
-  } catch (e) { /* best-effort */ }
+    const rk = await apiFetch("GET", deviceContextPath("/admin/risk-signals", tenant), undefined, "control");
+    if (!current()) return;
+    if (!rk.ok) throw new Error("HTTP " + rk.status);
+    riskMap = deviceRiskSnapshot(rk.body, tenant);
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", bl({ en: "Risk status could not be read. Reload before changing device risk.",
+      ja: "リスク状態を取得できません。変更する前に再読込してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
+    return;
+  }
   // Device-group RISK FLOOR: a group can carry a risk floor, and a member device's EFFECTIVE risk is
   // max(its own overlay risk, its group's floor). Fetch the registry so this list REFLECTS the group floor.
   // NOTE: this is the display (R3). Enforcement — the decision engine acting on the floor — is the separate R1

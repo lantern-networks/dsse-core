@@ -376,3 +376,29 @@ still become live before saving, while downgrades and clearing require a success
 save. Automatic-signal persistence acknowledgement is not established by the
 administrative operation's response. Risk affects access through configured policy;
 setting risk does not itself revoke standing grants.
+
+## Restoring saved risk state
+
+The high-risk store contains device marks and tenant-scoped user marks in one
+snapshot. Startup refuses unreadable, empty or malformed existing snapshots,
+including duplicate fields or identities, missing/null device maps, invalid user
+records, field aliases and unsupported versions. A valid `v2` snapshot may omit
+`users` when there are no user marks. Device identifiers remain case-sensitive.
+Legacy `v1` marks still require attribution against the enrolled inventory and
+identity directory before serving; ambiguous marks are not silently cleared.
+
+Keep the rejected file or database record for diagnosis. Restore a complete,
+known-good snapshot and verify its ownership and storage attachment before
+restarting. Do not delete the snapshot or replace it with an empty map to make
+startup succeed. A missing snapshot still means first boot under the storage
+contract; the application cannot distinguish that from a previously saved file
+being lost. Backups and checks of the configured storage remain necessary.
+
+An explicit failed restoration in a running process retains the previous live
+marks and writer but marks the store unavailable. Administrative risk reads return
+503 and risk changes are refused until a complete valid snapshot is restored.
+This is not continuous monitoring of files changed outside the process.
+**Devices** shows a read error and **Retry** instead of a normal risk badge or a
+selected clear action. After storage recovery, retry the read and check the
+restored marks before making changes. The Console requires the API's device type,
+tenant and complete risk map; update the Console and server together.

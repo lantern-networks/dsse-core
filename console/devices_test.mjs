@@ -479,3 +479,40 @@ test('a superseded list request cannot overwrite the latest load error', async (
   f.invokeWith(()=>({ok:false,status:503}));await f.actualRenderList(f.host);finish();await old;
   assert.equal(f.calls.length,2);assert.deepEqual(f.states.map(s=>s.state),['loading','loading','error']);
 });
+
+const riskReadAnswer = () => ({entity_type:'device',tenant_id:'tenant-a',high_risk:{LOCAL:'high',local:'medium'},withheld_unattributable:0});
+test('risk reads require a matching tenant, typed map and explicit withheld count', () => {
+ const f=fixture(),good=riskReadAnswer();assert.equal(f.context.deviceRiskSnapshot(good,'tenant-a'),good.high_risk);
+ for(const patch of [{entity_type:undefined},{entity_type:'user'},{tenant_id:'tenant-b'},{tenant_id:undefined},
+ {high_risk:null},{high_risk:[]},{high_risk:'invalid'},{high_risk:{LOCAL:'none'}},{high_risk:{LOCAL:null}},
+ {high_risk:{' LOCAL ':'high'}},{high_risk:{'':'high'}},{withheld_unattributable:undefined},{withheld_unattributable:-1},{withheld_unattributable:'0'},{withheld_unattributable:0.5}]){
+ assert.throws(()=>f.context.deviceRiskSnapshot({...good,...patch},'tenant-a'),/Invalid device risk response/);
+ }
+ const empty={...good,high_risk:{}};assert.equal(f.context.deviceRiskSnapshot(empty,'tenant-a'),empty.high_risk);
+});
+function answerBeforeRisk(path) {
+ if(path.includes('/enrolled-devices'))return {ok:true,body:inventoryAnswer()};
+ if(path.includes('/transport-admission'))return {ok:true,body:transportAnswer()};
+ return {ok:false,status:503};
+}
+test('risk HTTP, network and malformed reads stop the list instead of displaying Normal', async()=>{
+ for(const reply of [{ok:false,status:403},{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{...riskReadAnswer(),tenant_id:'tenant-b'}},new Error('network')]){
+ const f=fixture();f.invokeWith((method,path,body,plane)=>{
+ assert.equal(method,'GET');if(!path.includes('/risk-signals'))return answerBeforeRisk(path);
+ assert.equal(path,'/admin/risk-signals?expected_tenant_id=tenant-a');assert.equal(plane,'control');if(reply instanceof Error)throw reply;return reply;
+ });await f.actualRenderList(f.host);assert.deepEqual(f.states.map(x=>x.state),['loading','error']);assert.match(f.states[1].message,/Risk status could not be read/);assert.equal(f.toasts.length,0);
+ assert.ok(!f.calls.some(c=>c[1].includes('/device-groups')));
+ }
+});
+test('stale risk reads cannot render after a tenant switch or navigation',async()=>{
+ for(const detached of [false,true]){
+ const f=fixture();let finish,reached;const waiting=new Promise(resolve=>reached=resolve);
+ f.invokeWith((method,path)=>{if(!path.includes('/risk-signals'))return answerBeforeRisk(path);reached();return new Promise(resolve=>finish=()=>resolve({ok:true,body:riskReadAnswer()}))});
+ const pending=f.actualRenderList(f.host);await waiting;if(detached)f.host.isConnected=false;else f.context.operateTenant='tenant-b';finish();await pending;
+ assert.deepEqual(f.states.map(x=>x.state),['loading']);assert.ok(!f.calls.some(c=>c[1].includes('/device-groups')));
+ }
+});
+test('risk read errors are translated without displaying backend detail', async()=>{
+ const f=fixture();f.context.bl=value=>value.ja;f.invokeWith((method,path)=>path.includes('/risk-signals')?{ok:false,status:503,body:{error:'PRIVATE_PATH'}}:answerBeforeRisk(path));
+ await f.actualRenderList(f.host);assert.match(f.states[1].message,/リスク状態を取得できません/);assert.ok(!f.states[1].message.includes('PRIVATE_PATH'));
+});

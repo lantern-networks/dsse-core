@@ -137,6 +137,9 @@ func (o *HighRiskOverlay) Health() error {
 	}
 	o.mu.RLock()
 	defer o.mu.RUnlock()
+	return o.healthLocked()
+}
+func (o *HighRiskOverlay) healthLocked() error {
 	if o.loadErr != nil {
 		return o.loadErr
 	}
@@ -144,6 +147,32 @@ func (o *HighRiskOverlay) Health() error {
 		return fmt.Errorf("legacy risk state requires attribution before serving")
 	}
 	return nil
+}
+
+// CheckedSnapshot returns both namespaces and their availability under one
+// lock. An unavailable store must not be presented as an empty, healthy set.
+func (o *HighRiskOverlay) CheckedSnapshot() (map[string]string, []UserRisk, error) {
+	if o == nil {
+		return nil, nil, ErrRiskUnavailable
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	if err := o.healthLocked(); err != nil {
+		return nil, nil, ErrRiskUnavailable
+	}
+	devices := make(map[string]string, len(o.devices))
+	for id, severity := range o.devices {
+		devices[id] = severity
+	}
+	users := make([]UserRisk, 0, len(o.users))
+	for _, mark := range o.users {
+		mark.Subjects = append([]string(nil), mark.Subjects...)
+		users = append(users, mark)
+	}
+	sort.Slice(users, func(i, j int) bool {
+		return userRiskKey(users[i].TenantID, users[i].ID) < userRiskKey(users[j].TenantID, users[j].ID)
+	})
+	return devices, users, nil
 }
 func (o *HighRiskOverlay) NeedsMigration() bool {
 	if o == nil {

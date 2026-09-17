@@ -22,11 +22,14 @@ import (
 // reverse-telemetry view). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer) {
 	mux.HandleFunc("GET /admin/steer-exclusions", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.SteerExclusions == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steer exclusions are not enabled"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"steer_exclusions": config.SteerExclusions.List(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": steerexclusion.ListSchema, "tenant_id": adminTenantIDFromRequest(r), "steer_exclusions": config.SteerExclusions.List(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/steer-exclusions", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
 		// This Edge PULLS its exclusions from a control plane, so a write accepted here lives until the next
@@ -157,6 +160,9 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 	// is the forward preview: the admin-authored set the Edge WOULD serve a given device (layer 3 only), so an
 	// admin can check a policy's reach before the device next polls. Both are read-only and tenant-scoped.
 	mux.HandleFunc("GET /admin/steer-exclusions/observed", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.ObservedExclusions == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steer-exclusion telemetry is not enabled"))
 			return
@@ -193,6 +199,7 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			nextCursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(next)))
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
+			"tenant_id":      adminTenantIDFromRequest(r),
 			"observed":       res.Entries,
 			"total_estimate": res.Total,
 			"next_cursor":    nextCursor,

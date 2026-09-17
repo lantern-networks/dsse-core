@@ -724,3 +724,31 @@ they are not a single transaction.
 An operator authorized to write for another tenant also records that tenant as
 the owner of the policy's version history and operation audit. The acting
 administrator remains the operator; record ownership does not change the actor.
+
+
+### Verifying exclusion lists and device observations
+
+The authored list verifies the control plane's response format, tenant and policy
+rows before displaying settings. A failed or invalid response shows **Retry**;
+it does not mean the tenant has no exclusions. Retry reads the current settings
+again. Responses from an older reload or a page you have left cannot replace the
+current list.
+
+The Applied column needs a complete, verifiable observation set. It shows
+**not known** if that read fails, contains another tenant's data, or only returns
+the first page of the device reports. The authored list requests up to 200 reports;
+a larger fleet therefore needs the separate **Observed on devices** view for
+filtered, paginated inspection. Authored rules remain visible when their device
+observations are unavailable. These observations are reported by devices and are
+not an independent confirmation of endpoint enforcement.
+
+Update the control plane before its enforcing Edges and Console assets. The
+exclusion feed now identifies its format as `admin_steer_exclusions.v1` and names
+the authenticated `tenant_id`. New readers reject older responses that omit these
+fields, retaining their last valid cache or showing Retry. Additional response
+fields are compatible with older readers. A correctly scoped, explicit empty
+`steer_exclusions` array is the only wire representation of clearing the set.
+Missing/null collections, malformed rows, duplicate policy IDs, foreign tenants,
+responses larger than 4 MiB, and interrupted reads are rejected. Rejection preserves
+the Edge's last valid set; it never changes a foreign row's tenant to make it fit.
+Cache persistence remains a separate concern from accepting a complete feed.

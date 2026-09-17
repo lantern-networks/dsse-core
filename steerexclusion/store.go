@@ -171,6 +171,13 @@ func normalizeSigningIDs(ids []string) []string {
 // On ErrPersistence, the returned candidate identifies the attempted write, not a
 // published policy. The previous local state remains in use.
 func (s *Store) Upsert(p Policy, now time.Time) (Policy, error) {
+	// Authored records must satisfy the canonical identity contract used by readers.
+	if strings.TrimSpace(p.ID) != "" && strings.TrimSpace(p.ID) != p.ID {
+		return Policy{}, fmt.Errorf("id must not contain surrounding whitespace")
+	}
+	if strings.TrimSpace(p.TenantID) != p.TenantID {
+		return Policy{}, fmt.Errorf("tenant_id must not contain surrounding whitespace")
+	}
 	p.ScopeType = strings.TrimSpace(strings.ToLower(p.ScopeType))
 	if !validScope[p.ScopeType] {
 		return Policy{}, fmt.Errorf("scope_type must be one of tenant, device_group, device")
@@ -275,13 +282,23 @@ func (s *Store) DeleteChecked(id, tenantID string, now time.Time) (bool, error) 
 // A configured cache persistence is updated best-effort; this sync contract is
 // distinct from administrative write confirmation in Upsert/DeleteChecked.
 func (s *Store) ReplaceTenant(tenantID string, policies []Policy) {
+	if err := s.ReplaceTenantChecked(tenantID, policies); err != nil {
+		log.Printf("steer exclusions: tenant replacement rejected: %v", err)
+	}
+}
+
+// ReplaceTenantChecked rejects invalid or conflicting sets before touching the
+// cache. Configured cache persistence remains best-effort, as in ReplaceTenant.
+func (s *Store) ReplaceTenantChecked(tenantID string, policies []Policy) error {
+	if err := ValidateTenantPolicies(tenantID, policies); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Validate ownership before removing any current policy. IDs are global keys.
 	for _, p := range policies {
 		if current := s.byID[p.ID]; current != nil && current.TenantID != tenantID {
-			log.Printf("steer exclusions: rejecting tenant replacement with conflicting ID")
-			return
+			return ErrTenantConflict
 		}
 	}
 
@@ -319,6 +336,7 @@ func (s *Store) ReplaceTenant(tenantID string, policies []Policy) {
 			}
 		}
 	}
+	return nil
 }
 
 // ResolveForDevice returns the effective excluded signing identifiers for a device: the union of the tenant-,

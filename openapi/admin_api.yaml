@@ -8059,6 +8059,13 @@ paths:
       description: Requires admin.steering.read. Returns the tenant's steer-exclusion policies (which app code-signing identifiers are excluded from steering, per tenant/device-group/device).
       tags:
         - AdminSteerExclusions
+      parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional expected tenant context; a mismatch returns 409 before reading the policy store.
       responses:
         "200":
           description: Steer-exclusion policies for the authenticated tenant.
@@ -8066,11 +8073,24 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                required: [schema_version, tenant_id, steer_exclusions]
+                properties:
+                  schema_version:
+                    type: string
+                    enum: [admin_steer_exclusions.v1]
+                  tenant_id:
+                    type: string
+                  steer_exclusions:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The expected tenant differs from the authenticated operation context.
     post:
       summary: Upsert a steer-exclusion policy.
       description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). An ID owned by another tenant is rejected with 403. With persistence configured, success requires a confirmed save. The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.
@@ -8279,10 +8299,16 @@ paths:
   /admin/steer-exclusions/observed:
     get:
       summary: Query devices' self-reported effective steer-exclusion sets (reverse telemetry; filtered + paginated).
-      description: Requires admin.steering.read. Returns a FILTERED, PAGINATED page (never the whole fleet — see docs/steer_exclusions_observed_telemetry_scale_design.md) of per-device reports of the merged exclusion set each endpoint actually applies, with each entry classified admin / floor / unmanaged. Each report carries admin_app_signing_ids and unmanaged_app_signing_ids (the flagged, non-admin non-floor entries). Response includes total_estimate and next_cursor. Observability only — never feeds enforcement. Tenant-scoped.
+      description: Requires admin.steering.read. Returns a FILTERED, PAGINATED page (never the whole fleet — see docs/steer_exclusions_observed_telemetry_scale_design.md) of per-device reports of the merged exclusion set each endpoint actually applies, with each entry classified admin / floor / unmanaged. Each report carries admin_app_signing_ids and unmanaged_app_signing_ids (the flagged, non-admin non-floor entries). Response includes the authenticated tenant_id, total_estimate and next_cursor. Observability only — never feeds enforcement. Tenant-scoped.
       tags:
         - AdminSteerExclusions
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional expected tenant context; a mismatch returns 409 before querying observations.
         - name: device
           in: query
           schema:
@@ -8325,6 +8351,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The expected tenant differs from the authenticated operation context.
   /admin/steer-exclusions/observed/by-app:
     get:
       summary: Aggregate observed exclusions by AppID across the fleet (drift view).

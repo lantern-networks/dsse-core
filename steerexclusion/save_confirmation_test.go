@@ -159,7 +159,11 @@ func TestSteerExclusionOwnershipAtBothLayers(t *testing.T) {
 		t.Fatal(err)
 	}
 	own := s.List("t1")
-	s.ReplaceTenant("t1", []Policy{policyForSave("same", "t1", "attack")})
+	collision := policyForSave("same", "t1", "attack")
+	collision.Status = statusActive
+	if err := s.ReplaceTenantChecked("t1", []Policy{collision}); !errors.Is(err, ErrTenantConflict) {
+		t.Fatal("sync ownership conflict", err)
+	}
 	if !reflect.DeepEqual(own, s.List("t1")) {
 		t.Fatal("rejected sync removed own policies")
 	}

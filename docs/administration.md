@@ -214,3 +214,27 @@ that replacement was not atomic. An unconfirmed flush is rejected, including
 when it also carries that compatibility warning. With no persister configured,
 admission remains in-memory only and does not survive a restart. Restoring a local
 block does not clear a block received through the control-plane feed or region mesh.
+
+### Restoring admission state at startup
+
+When an admission snapshot exists, the server validates the complete local and
+received-region revocation maps before using them. A read error, empty file,
+malformed JSON, unsupported schema, duplicate or unexpected field, null map/reason,
+or noncanonical identity stops startup. Identities must match the lowercase,
+trimmed form written by the server; reasons must be strings in their stored,
+trimmed form. Empty reason strings remain valid. Older `v1` snapshots without
+`mesh_received` are supported and restore an empty received-region layer.
+
+A failed restore does not replace an existing in-memory state or its storage
+writer. Restore errors use fixed messages without saved identities or reasons.
+A valid replacement replaces both persisted layers together; the runtime feed
+layer is separate. Loading a snapshot does not trigger an administrator kill switch
+or send new revocation reports.
+
+Check the configured path/database, access permissions and retained backup when
+startup reports an admission restore error. Recover a valid complete snapshot with
+the intended blocks before starting the server again. Do not clear a file, remove
+rows, or change to a new empty path merely to make startup succeed. A missing
+snapshot still means first boot under the storage contract; it is not evidence
+that previously stored blocks were intentionally removed. Backups and correct
+storage attachment remain necessary to detect and recover a missing snapshot.

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"maps"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -25,58 +26,57 @@ type admissionRevocationsStateFile struct {
 
 const admissionRevocationsStateSchemaVersion = "admission_revocations_state.v1"
 
-// SetStatePath enables durable file persistence at path (historical behaviour) and immediately loads existing
-// state. Best-effort. A back-compat convenience over SetPersister(blobstore.FilePersister{...}).
-func (a *AdmissionRevocations) SetStatePath(path string) {
+// SetStatePath loads a file snapshot using the same checked restoration as SetPersister.
+func (a *AdmissionRevocations) SetStatePath(path string) error {
 	if a == nil {
-		return
+		return nil
 	}
 	path = strings.TrimSpace(path)
 	if path == "" {
-		return
+		return nil
 	}
-	a.SetPersister(blobstore.FilePersister{Path: path})
+	return a.SetPersister(blobstore.FilePersister{Path: path})
 }
 
-// SetPersister enables durable persistence via any Persister (file or shared Postgres) and loads existing state.
-func (a *AdmissionRevocations) SetPersister(p blobstore.Persister) {
+// SetPersister restores a complete snapshot before adopting its writer. Callers
+// must refuse startup on error; it is never safe to interpret that error as an
+// empty revocation set. Failed restoration preserves the old writer and all live
+// layers. Use at initialization or during explicit recovery, not as a mutation API.
+func (a *AdmissionRevocations) SetPersister(p blobstore.Persister) error {
 	if a == nil {
-		return
+		return nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.persister = p
 	if p == nil {
-		return
+		a.persister = nil
+		return nil
 	}
-	a.loadLocked()
+	data, err := p.Load()
+	if err != nil {
+		return ErrAdmissionLoad
+	}
+	// The Persister contract reserves nil for a missing snapshot on first boot.
+	// An existing zero-byte file is not a missing snapshot and must be rejected.
+	if data == nil {
+		a.persister = p
+		return nil
+	}
+	f, err := decodeAdmissionSnapshot(data)
+	if err != nil {
+		return err
+	}
+	if !maps.Equal(a.revoked, f.Revoked) || !maps.Equal(a.meshReceived, f.MeshReceived) {
+		a.generation.Add(1)
+	}
+	a.revoked, a.meshReceived = f.Revoked, f.MeshReceived
+	a.persister = p
+	log.Printf("admission_revocations load: restored %d revocation(s) + %d cross-region from the durable store", len(a.revoked), len(a.meshReceived))
+	return nil
 }
 
-func (a *AdmissionRevocations) loadLocked() {
-	if a.persister == nil {
-		return
-	}
-	data, err := a.persister.Load()
-	if err != nil {
-		log.Printf("admission_revocations load: cannot read store (starting empty): %v", err)
-		return
-	}
-	if len(data) == 0 {
-		return
-	}
-	var f admissionRevocationsStateFile
-	if err := json.Unmarshal(data, &f); err != nil {
-		log.Printf("admission_revocations load: ignoring unparseable store: %v", err)
-		return
-	}
-	if f.Revoked != nil {
-		a.revoked = f.Revoked
-	}
-	if f.MeshReceived != nil {
-		a.meshReceived = f.MeshReceived
-	}
-	log.Printf("admission_revocations load: restored %d revocation(s) + %d cross-region from the durable store", len(a.revoked), len(a.meshReceived))
-}
+// ErrAdmissionLoad omits private paths, backend details and saved contents.
+var ErrAdmissionLoad = errors.New("cannot read admission revocation snapshot")
 
 // ErrAdmissionSave deliberately omits private storage details from callers' responses.
 var ErrAdmissionSave = errors.New("admission revocation persistence was not confirmed")

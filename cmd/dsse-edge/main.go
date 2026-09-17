@@ -2678,8 +2678,8 @@ func main() {
 	livenessRevocations := revocation.NewAdmissionRevocations()
 	if p, e := cpStateBlobPersister(*admissionRevocationStore, cpStateBlobDB, "admission_revocations"); e != nil {
 		log.Fatalf("resolve admission-revocation store: %v", e)
-	} else {
-		livenessRevocations.SetPersister(p) // Phase 3: persist kill-switches across a restart
+	} else if e := livenessRevocations.SetPersister(p); e != nil {
+		log.Fatalf("load admission-revocation store: %v", e)
 	}
 	// Active session revocation: track live (T) connections by identity so an ADMINISTRATOR can actively CLOSE
 	// a blocked device's established tunnels (per-handshake admission already rejects NEW connections; this

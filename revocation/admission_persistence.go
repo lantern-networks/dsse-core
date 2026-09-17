@@ -46,8 +46,8 @@ func (a *AdmissionRevocations) SetPersister(p blobstore.Persister) error {
 	if a == nil {
 		return nil
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
 	if p == nil {
 		a.persister = nil
 		return nil
@@ -66,12 +66,14 @@ func (a *AdmissionRevocations) SetPersister(p blobstore.Persister) error {
 	if err != nil {
 		return err
 	}
+	a.mu.Lock()
 	if !maps.Equal(a.revoked, f.Revoked) || !maps.Equal(a.meshReceived, f.MeshReceived) {
 		a.generation.Add(1)
 	}
 	a.revoked, a.meshReceived = f.Revoked, f.MeshReceived
 	a.persister = p
-	log.Printf("admission_revocations load: restored %d revocation(s) + %d cross-region from the durable store", len(a.revoked), len(a.meshReceived))
+	a.mu.Unlock()
+	log.Printf("admission_revocations load: restored %d revocation(s) + %d cross-region from the durable store", len(f.Revoked), len(f.MeshReceived))
 	return nil
 }
 
@@ -81,8 +83,10 @@ var ErrAdmissionLoad = errors.New("cannot read admission revocation snapshot")
 // ErrAdmissionSave deliberately omits private storage details from callers' responses.
 var ErrAdmissionSave = errors.New("admission revocation persistence was not confirmed")
 
-// saveStateLocked saves a candidate while holding a.mu. A nil persister retains
-// the explicit in-memory mode; it does not promise persistence across a restart.
+// saveStateLocked requires writeMu, but never mu. All writers to revoked,
+// meshReceived and persister hold writeMu, so serialization can read these maps
+// while concurrent live-state readers continue. ReplaceSynced changes only the
+// separate synced map. A nil persister retains explicit in-memory operation.
 func (a *AdmissionRevocations) saveStateLocked(revoked map[string]string) error {
 	if a == nil || a.persister == nil {
 		return nil

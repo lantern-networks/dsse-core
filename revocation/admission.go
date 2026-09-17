@@ -24,6 +24,10 @@ import (
 // still bites locally. The CP serves its `revoked` set as the feed; persistence keeps it across a CP restart
 // (a restart must NOT silently un-revoke). generation is bumped on every node-local change for the feed.
 type AdmissionRevocations struct {
+	// Persisted-layer writers and persister replacement serialize here. Readers
+	// and the independently pulled synced layer never wait for storage I/O.
+	// Lock order: writeMu, then mu. No callback runs under either lock.
+	writeMu sync.Mutex
 	mu      sync.RWMutex
 	revoked map[string]string // node-local / ORIGIN: this region's admin kill-switches + its own W-2 auto-revocations
 	synced  map[string]string // control-plane distributed (Phase 3, intra-region): identity -> reason
@@ -31,7 +35,7 @@ type AdmissionRevocations struct {
 	// plane). They deny on this node's edges (folded into the edge feed) but are NEVER re-pushed — only an ORIGIN
 	// pushes, so a received item does not bounce back (the no-loop discipline).
 	meshReceived map[string]string
-	persister    blobstore.Persister // durable snapshot of `revoked` + `meshReceived`; nil = in-memory only
+	persister    blobstore.Persister // guarded by writeMu; snapshot of revoked + meshReceived; nil = volatile
 	generation   atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
 	// reporter, when set (puller mode), is called on a NEW node-local revocation so this node's own W-2
 	// auto-revocation propagates UP to the control plane, which redistributes it fleet-wide (slice 3b: a dark
@@ -94,16 +98,21 @@ func (a *AdmissionRevocations) RevokeFromMesh(identity, reason string) bool {
 		return false
 	}
 	reason = strings.TrimSpace(reason)
+	a.writeMu.Lock()
 	a.mu.Lock()
 	if prev, existed := a.meshReceived[id]; existed && prev == reason {
 		a.mu.Unlock()
+		a.writeMu.Unlock()
 		return false
 	}
 	a.meshReceived[id] = reason
 	a.generation.Add(1)
-	a.persistLocked()
-	onRevoked := a.onRevoked
 	a.mu.Unlock()
+	_ = a.persistLocked()
+	a.mu.RLock()
+	onRevoked := a.onRevoked
+	a.mu.RUnlock()
+	a.writeMu.Unlock()
 	// Active session revocation: close the identity's live connections (fired outside the lock; idempotent).
 	if onRevoked != nil {
 		onRevoked(id, reason)
@@ -199,6 +208,7 @@ func (a *AdmissionRevocations) revoke(identity, reason string, retrySave bool) e
 		return nil
 	}
 	reason = strings.TrimSpace(reason)
+	a.writeMu.Lock()
 	a.mu.Lock()
 	prev, existed := a.revoked[id]
 	changed := !existed || prev != reason
@@ -206,14 +216,17 @@ func (a *AdmissionRevocations) revoke(identity, reason string, retrySave bool) e
 		a.revoked[id] = reason
 		a.generation.Add(1)
 	}
+	a.mu.Unlock()
 	var err error
 	if changed || retrySave {
 		err = a.persistLocked()
 	}
+	a.mu.RLock()
 	reporter := a.reporter
 	meshReporter := a.meshReporter
 	onRevoked := a.onRevoked
-	a.mu.Unlock()
+	a.mu.RUnlock()
+	a.writeMu.Unlock()
 	if changed && reporter != nil {
 		reporter(id, reason)
 	}
@@ -249,10 +262,12 @@ func (a *AdmissionRevocations) restore(identity string, retrySave bool) error {
 	if id == "" {
 		return nil
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.mu.RLock()
 	_, existed := a.revoked[id]
 	if !existed && !retrySave {
+		a.mu.RUnlock()
 		return nil
 	}
 	candidate := make(map[string]string, len(a.revoked))
@@ -261,12 +276,15 @@ func (a *AdmissionRevocations) restore(identity string, retrySave bool) error {
 			candidate[key] = reason
 		}
 	}
+	a.mu.RUnlock()
 	if err := a.saveStateLocked(candidate); err != nil {
 		return err
 	}
 	if existed {
+		a.mu.Lock()
 		a.revoked = candidate
 		a.generation.Add(1)
+		a.mu.Unlock()
 	}
 	return nil
 }
@@ -400,18 +418,29 @@ func (a *AdmissionRevocations) RemoveDevices(deviceIDs []string) int {
 	if a == nil || len(deviceIDs) == 0 {
 		return 0
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.mu.RLock()
+	candidate := make(map[string]string, len(a.revoked))
+	for id, reason := range a.revoked {
+		candidate[id] = reason
+	}
+	a.mu.RUnlock()
 	n := 0
 	for _, id := range deviceIDs {
 		key := NormalizeDeviceID(id)
-		if _, ok := a.revoked[key]; ok {
-			delete(a.revoked, key)
+		if _, ok := candidate[key]; ok {
+			delete(candidate, key)
 			n++
 		}
 	}
 	if n > 0 {
-		a.persistLocked()
+		// Preserve this legacy API's best-effort save and generation contracts.
+		// Publish after the attempt, as before, without making readers wait for I/O.
+		_ = a.saveStateLocked(candidate)
+		a.mu.Lock()
+		a.revoked = candidate
+		a.mu.Unlock()
 	}
 	return n
 }

@@ -211,6 +211,19 @@ precondition does not grant access; normal authentication and authorization rema
 required. These separate requests do not provide a transaction or protect against
 all concurrent changes after an acknowledgement.
 
+Admission-state reads do not wait for the revocation store's save or reload I/O.
+During a pending block, the list can already show that identity as blocked before
+the administrative request returns. During a pending Allow, the previous local
+block remains visible until saving succeeds. A pending operation has not yet
+confirmed persistence or produced its completion audit.
+
+Persisted updates and store replacement still run one at a time. Slow storage can
+therefore delay administrative writes, subsequent queued writes and the callbacks
+or registered-session closure that follow them. This separation keeps admission
+reads available; it does not impose an I/O deadline or promise instant disconnection
+of existing sessions. A reload keeps the previous live state readable until the
+entire replacement has been read and validated.
+
 With admission persistence configured:
 
 - **Block:** the local transport block takes effect and registered sessions for that

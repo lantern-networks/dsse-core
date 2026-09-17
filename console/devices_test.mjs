@@ -97,7 +97,7 @@ test('Allow and Block change transport before admission on control and announce 
     assertRequests(f.calls, enabled);
     assert.equal(f.confirmations.length, enabled ? 0 : 1);
     if (!enabled) assert.equal(f.confirmations[0].danger, true);
-    assert.deepEqual(f.toasts, [{message: (enabled ? 'Device allowed: ' : 'Device blocked: ') + identity, kind: 'ok'}]);
+    assert.deepEqual(f.toasts, [{message: (enabled ? 'Local admission enabled: ' : 'Device blocked: ') + identity, kind: 'ok'}]);
     assert.equal(f.notice(), undefined); assert.equal(f.refreshes.length, 1);
     assert.equal(f.rows.get(identity).primary.disabled, false); assert.equal(f.rows.get(identity).overflow.disabled, false);
   }
@@ -248,7 +248,7 @@ test('refresh failure after confirmed mutation reports the read failure without 
     const f = fixture(); f.context.renderList = async () => { throw Error('refresh offline'); };
     await f.send(enabled); assertRequests(f.calls, enabled); assert.equal(f.notice(), undefined);
     assert.deepEqual(f.toasts, [
-      {message: (enabled ? 'Device allowed: ' : 'Device blocked: ') + identity, kind: 'ok'},
+      {message: (enabled ? 'Local admission enabled: ' : 'Device blocked: ') + identity, kind: 'ok'},
       {message: 'Error: refresh offline', kind: 'err'},
     ]);
     assert.equal(f.rows.get(identity).primary.disabled, false);
@@ -445,7 +445,7 @@ test('inventory may omit the zero unassigned count as specified by the API', () 
 
 
 test('required connection reads fail visibly without fetching optional telemetry or sending writes', async () => {
-  for (const response of [{ok:false,status:503}, {ok:true,body:{}}, new Error('network lost')]) {
+  for (const response of [{ok:false,status:503}, {ok:true,body:{}}, new Error('network lost'), new TypeError('Failed to fetch'), new TypeError('Load failed'), new TypeError('NetworkError when attempting to fetch resource.'), new TypeError('unexpected programming error')]) {
     const f=fixture();f.invokeWith((method,path)=>{
       assert.equal(method,'GET');
       if(path==='/admin/enrolled-devices')return {ok:true,body:inventoryAnswer()};
@@ -454,6 +454,9 @@ test('required connection reads fail visibly without fetching optional telemetry
     });
     await f.actualRenderList(f.host);assert.equal(f.calls.length,2);
     assert.deepEqual(f.states.map(s=>s.state),['loading','error']);
+    if(response instanceof TypeError && response.message !== 'unexpected programming error') {
+      assert.equal(f.states[1].message,'Cannot reach the management server. Check your connection, then retry.');
+    } else if(response instanceof Error) assert.equal(f.states[1].message,String(response));
   }
 });
 

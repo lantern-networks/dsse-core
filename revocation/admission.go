@@ -12,7 +12,8 @@ import (
 // AdmissionRevocations is the dynamic overlay on top of the static Enrolled Inventory: a thread-safe set of
 // transport identities the Edge has AUTO-revoked (e.g. an agent-dark device). The (T) mTLS admission check
 // consults it so a revoked identity is rejected at the handshake even though it is still present in the
-// (static) enrolled file. Restore — re-enroll / re-attest — clears it (the re-admission gate).
+// (static) enrolled file. Restore clears a locally authored block. It does not
+// withdraw a received-region or pulled block; enrollment alone is not a mesh restore.
 //
 // Keyed on the TRANSPORT IDENTITY (the cert CN/SAN that admission matches), not the device store id; the
 // wiring layer maps a dark device to its transport identity before calling Revoke.
@@ -386,7 +387,8 @@ func (a *AdmissionRevocations) List() []string {
 // one transport identity. revoked is a snapshot set; requireEnrolled mirrors cfg.RequireEnrolledIdentity.
 // Returns (admit, non-secret reason code). Auto-revocation WINS over enrolment: a revoked identity is denied
 // even if it is still in the enrolled file (that is the whole point — disabling the file edit is not how you
-// un-revoke; re-enrolment is). Reason codes mirror the live handshake log vocabulary.
+// un-revoke; local restore handles the locally authored layer). Reason codes mirror
+// the live handshake log vocabulary.
 func admitDecision(enrolled map[string]struct{}, revoked map[string]struct{}, requireEnrolled bool, identity string) (bool, string) {
 	id := normalizeIdentity(identity)
 	if _, gone := revoked[id]; gone && id != "" {

@@ -317,6 +317,35 @@ withdraw the received-region block; it reports the remaining block and leaves
 inventory admission unchanged. Fix storage and allow delivery to complete before
 restarting; deleting the snapshot is not a recovery procedure.
 
+### Limits of restoring a block in the optional admission mesh
+
+This limitation applies when `-revocation-mesh-peers` is explicitly configured.
+The generated deployment does not enable this mesh: its control planes use a
+shared database, and Edges pull revocations from the active control plane. That
+pull path can remove a synced block when it receives the authority's complete
+updated set. Mesh-received blocks are a separate layer. Existing node-local
+state can also override the shared-store default and needs deliberate migration.
+
+Allow changes the locally authored block and inventory admission on the management
+server handling the request. It does not send a withdrawal to the other regions.
+After A blocks a device and B receives it, allowing the device at A can leave it
+blocked at B. The received block survives a restart. Allow at B still reports a
+remaining block and a partial domain audit; the Console does not send an inventory
+enable request in that case. Repeated Allow requests do not withdraw that entry.
+
+The current admission mesh carries revocations only. It does not implement
+versioned withdrawals or retain separate ownership for each origin's received
+block. Re-enrollment does not supply that missing withdrawal protocol. Do not
+interpret successful local admission or an empty sender queue as a fleet-wide
+restore. A received block requires deliberate state reconciliation; deleting the
+whole admission snapshot or enabling inventory alone is not a safe substitute.
+Preserve unrelated local and received blocks during any operator recovery.
+
+The Block confirmation explains this limitation, and the Allow success message
+names local admission. Devices shows a connection error with Retry when the
+management server cannot be reached. Retry reloads current state; it does not
+establish that every region is reachable or has completed an update.
+
 ### Sending a block to another region
 
 The sender keeps a pending entry for each peer region and device. Its system logs

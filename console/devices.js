@@ -341,6 +341,16 @@ function deviceRiskSnapshot(body, tenant) {
   return map;
 }
 
+// Fetch rejects with a TypeError on a lost connection. Keep other errors intact,
+// including validation failures and programming errors, so they remain diagnosable.
+function deviceReadFailure(e) {
+  if (e && e.name === "TypeError" && ["Failed to fetch", "Load failed", "NetworkError when attempting to fetch resource."].includes(e.message)) {
+    return bl({en: "Cannot reach the management server. Check your connection, then retry.",
+      ja: "管理サーバーに接続できません。接続を確認してから再試行してください。"});
+  }
+  return String(e);
+}
+
 async function renderList(host) {
   uiState(host, "loading");
   const selection = deviceTenantSelection(), renderCurrent = freshRender(host);
@@ -370,7 +380,7 @@ async function renderList(host) {
     withheldBlocks = transport.body.withheld_unattributable;
   } catch (e) {
     if (!current()) return;
-    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
+    uiState(host, "error", deviceReadFailure(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
     return;
   }
   // Runtime facts the endpoint agent reports over the steer transport (OS, logged-in user, steer state, posture),
@@ -1091,7 +1101,7 @@ async function changeDeviceAdmission(d, host, enabled) {
     if (!enabled) {
       const ok = await uiConfirm({
         title: bl({ en: "Turn off this device?", ja: "このデバイスをオフにしますか?" }),
-        body: bl({ en: "\"" + d.identity + "\" will be blocked from connecting right away, and any active sessions end shortly after. You can turn it back on at any time.", ja: "「" + d.identity + "」はすぐに接続できなくなり、進行中のセッションも間もなく終了します。いつでも再びオンにできます。" }),
+        body: bl({ en: "Blocks \"" + d.identity + "\" locally and requests closure of its active sessions. Other regions may keep a propagated block after you allow the device here.", ja: "「" + d.identity + "」をここで遮断し、既存の接続の終了を要求します。ここで許可に戻しても、他リージョンへ伝わった遮断は残ることがあります。" }),
         confirmLabel: bl({ en: "Turn off", ja: "オフにする" }), danger: true,
       });
       if (!ok || !active()) return;
@@ -1138,7 +1148,7 @@ async function changeDeviceAdmission(d, host, enabled) {
   }
   if (!active()) return;
   if (failure) deviceAdmissionNotice(host, d, enabled, failure);
-  else uiToast((enabled ? bl({ en: "Device allowed: ", ja: "デバイスを許可しました: " })
+  else uiToast((enabled ? bl({ en: "Local admission enabled: ", ja: "この管理サーバーで接続を許可しました: " })
     : bl({ en: "Device blocked: ", ja: "デバイスを遮断しました: " })) + d.identity, "ok");
   // A refresh failure must not turn an acknowledged write into a failed mutation or discard its warning.
   try { await renderList(host); } catch (e) { uiToast(String(e), "err"); }

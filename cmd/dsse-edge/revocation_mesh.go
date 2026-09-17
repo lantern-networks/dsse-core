@@ -76,7 +76,8 @@ func parseRevocationMeshPeers(raw string) ([]revocationMeshPeer, error) {
 // pushFunc returns the overlay mesh reporter: on a NEW ORIGIN revocation, ENQUEUE the push for every peer CP
 // (durably, when an outbox is configured) then deliver async + retry-until-acked. Best-effort delivery: a peer
 // blip never blocks the local revoke (which already applied + denies instantly in the origin region); the item is
-// monotonic, so a duplicate delivery is a no-op.
+// monotonic, so an unchanged duplicate does not change enforcement. The receiver
+// still retries saving before acknowledging it.
 func (s revocationMeshSource) pushFunc() func(identity, reason string) {
 	return func(identity, reason string) {
 		item := revocationMeshItem{Identity: identity, Reason: reason, OriginRegion: s.originRegion}
@@ -104,7 +105,7 @@ func (s revocationMeshSource) deliverToPeer(peer revocationMeshPeer, item revoca
 
 // resumePendingDeliveries re-drives every push that was enqueued but not acked before a restart: it
 // is called once at boot after the outbox is loaded. Returns the number of pending pushes resumed. A duplicate
-// delivery is a monotonic no-op on the peer.
+// delivery does not change enforcement on the peer, but retries saving there.
 func (s revocationMeshSource) resumePendingDeliveries() int {
 	if s.outbox == nil {
 		return 0
@@ -124,7 +125,8 @@ func (s revocationMeshSource) resumePendingDeliveries() int {
 
 // pushToPeerWithRetry pushes a revocation to one peer CP, retrying with exponential backoff for a long window so a
 // transient peer/network outage converges (a security kill-switch must not give up after a blip). The item is
-// monotonic, so a duplicate delivery is a no-op. Returns true once the peer acks. On give-up the caller leaves the
+// monotonic, so an unchanged duplicate leaves enforcement unchanged while retrying the peer's save.
+// Returns true once the peer acks. On give-up the caller leaves the
 // entry in the durable outbox so the next boot's resumePendingDeliveries drives it to completion —
 // a CP restart no longer drops a not-yet-acked cross-region push.
 func (s revocationMeshSource) pushToPeerWithRetry(peer revocationMeshPeer, item revocationMeshItem) bool {

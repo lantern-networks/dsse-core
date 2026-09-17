@@ -127,7 +127,8 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		// Authenticate the peer CP. With an allowlist configured this requires a VERIFIED mTLS identity that is an
 		// AUTHORIZED sibling (secret fallback disabled) — an empty/any-cert push could revoke ANY identity.
-		if _, ok := meshIngressAuth(r, config.MeshIngressAllowedPeers, config.RevocationMeshSecret, "x-revocation-mesh-secret"); !ok {
+		peerIdentity, authenticated := meshIngressAuth(r, config.MeshIngressAllowedPeers, config.RevocationMeshSecret, "x-revocation-mesh-secret")
+		if !authenticated {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("revocation mesh push requires an authorized peer mTLS identity (allowlisted) or, in lab, a valid x-revocation-mesh-secret"))
 			return
 		}
@@ -155,10 +156,17 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("revocation mesh item requires an identity"))
 			return
 		}
-		changed := config.AdmissionRevocations.RevokeFromMesh(item.Identity, item.Reason)
-		if changed {
-			log.Printf("revocation mesh: applied cross-region revocation %q (origin region %q)", item.Identity, item.OriginRegion)
+		changed, saveErr := config.AdmissionRevocations.RevokeFromMeshChecked(item.Identity, item.Reason)
+		identity := strings.ToLower(strings.TrimSpace(item.Identity))
+		// A failed save must not drain the sender's retry queue. A fresh delivery
+		// resaves even an unchanged item, without re-firing callbacks or mesh pushes.
+		// OriginRegion is a claim in the payload, not the authenticated peer identity.
+		if saveErr != nil {
+			log.Printf("revocation mesh: persistence unconfirmed; identity=%q peer=%q claimed_origin=%q changed=%t applied_locally=true", identity, peerIdentity, item.OriginRegion, changed)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("cross-region revocation is applied locally, but saving was not confirmed; retry with a fresh authenticated request"))
+			return
 		}
+		log.Printf("revocation mesh: accepted; identity=%q peer=%q claimed_origin=%q changed=%t", identity, peerIdentity, item.OriginRegion, changed)
 		writeJSON(w, http.StatusOK, map[string]any{"applied": changed})
 	})
 	// Node→CP reporting. A node that observes something alarming about a device says so HERE, and that is all

@@ -250,6 +250,30 @@ when it also carries that compatibility warning. With no persister configured,
 admission remains in-memory only and does not survive a restart. Restoring a local
 block does not clear a block received through the control-plane feed or region mesh.
 
+### Receiving a block from another region
+
+With admission persistence configured, a mesh delivery that cannot confirm saving
+returns HTTP 503 while retaining the live block. The sender keeps that delivery
+pending and retries. An unchanged delivery also retries saving; it does not increase
+the revocation generation or repeat propagation callbacks. A successful response's
+`applied: false` means the block was already present, not that it was ignored.
+
+Shared-secret deliveries require a fresh signed request on each retry. Reusing the
+same signed request is rejected by replay protection, even if its save failed.
+The built-in sender generates fresh signatures for retries. Update receiving
+control planes to obtain these save acknowledgements; older receivers can return
+success without confirming storage. No configured persister still means volatile
+state, and no acknowledgement proves enforcement on every edge or closes an
+existing session by itself.
+
+Receiver system logs distinguish `persistence unconfirmed` from `accepted` and
+record the authenticated peer separately from the payload's `claimed_origin`.
+These machine deliveries are not administrator actions in Logs & Audit. Console
+block/allow actions retain their administrative audits. A local Allow cannot
+withdraw the received-region block; it reports the remaining block and leaves
+inventory admission unchanged. Fix storage and allow delivery to complete before
+restarting; deleting the snapshot is not a recovery procedure.
+
 ### Restoring admission state at startup
 
 When an admission snapshot exists, the server validates the complete local and

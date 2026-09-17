@@ -93,31 +93,45 @@ func (a *AdmissionRevocations) SetOnRevoked(fn func(identity, reason string)) {
 // region's edges (via the feed) but is never re-pushed cross-region (no-loop). Monotonic: only a state change
 // bumps the generation + persists, so re-delivering the same item is a no-op. Returns whether it changed state.
 func (a *AdmissionRevocations) RevokeFromMesh(identity, reason string) bool {
+	changed, _ := a.revokeFromMesh(identity, reason, false)
+	return changed
+}
+
+// RevokeFromMeshChecked retains the received block even when saving fails. Each
+// explicit delivery retries saving, including an unchanged item, so the receiver
+// acknowledges delivery only after the configured store accepts the snapshot.
+// Unchanged retries do not bump generation, invoke callbacks or re-push the item.
+func (a *AdmissionRevocations) RevokeFromMeshChecked(identity, reason string) (bool, error) {
+	return a.revokeFromMesh(identity, reason, true)
+}
+
+func (a *AdmissionRevocations) revokeFromMesh(identity, reason string, retrySave bool) (bool, error) {
 	id := normalizeIdentity(identity)
 	if id == "" {
-		return false
+		return false, nil
 	}
 	reason = strings.TrimSpace(reason)
 	a.writeMu.Lock()
 	a.mu.Lock()
-	if prev, existed := a.meshReceived[id]; existed && prev == reason {
-		a.mu.Unlock()
-		a.writeMu.Unlock()
-		return false
+	prev, existed := a.meshReceived[id]
+	changed := !existed || prev != reason
+	if changed {
+		a.meshReceived[id] = reason
+		a.generation.Add(1)
 	}
-	a.meshReceived[id] = reason
-	a.generation.Add(1)
 	a.mu.Unlock()
-	_ = a.persistLocked()
+	var err error
+	if changed || retrySave {
+		err = a.persistLocked()
+	}
 	a.mu.RLock()
 	onRevoked := a.onRevoked
 	a.mu.RUnlock()
 	a.writeMu.Unlock()
-	// Active session revocation: close the identity's live connections (fired outside the lock; idempotent).
-	if onRevoked != nil {
+	if changed && onRevoked != nil {
 		onRevoked(id, reason)
 	}
-	return true
+	return changed, err
 }
 
 // ConfigGeneration returns the monotonic revocation version (bumped on each node-local change). The control

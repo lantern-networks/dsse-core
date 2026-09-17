@@ -125,7 +125,11 @@ func TestAdmissionReadsAndSyncedUpdatesContinueDuringStorage(t *testing.T) {
 					case "legacy_restore":
 						a.Restore("target")
 					case "remove":
-						if n := a.RemoveDevices([]string{"target", "target"}); n != 1 {
+						want := 1
+						if failed {
+							want = 0
+						}
+						if n := a.RemoveDevices([]string{"target", "target"}); n != want {
 							return errors.New("wrong removal count")
 						}
 					case "load":
@@ -162,7 +166,7 @@ func TestAdmissionReadsAndSyncedUpdatesContinueDuringStorage(t *testing.T) {
 				}
 				after := admissionReadAll(a)
 				wantTarget := true
-				if action == "remove" || ((action == "checked_restore" || action == "legacy_restore") && !failed) {
+				if (action == "remove" || action == "checked_restore" || action == "legacy_restore") && !failed {
 					wantTarget = false
 				}
 				if after.target != wantTarget || !after.foreign || after.new != restrictive {
@@ -172,7 +176,7 @@ func TestAdmissionReadsAndSyncedUpdatesContinueDuringStorage(t *testing.T) {
 					t.Fatal("storage completion discarded a concurrent synced update")
 				}
 				wantGen := gen
-				if restrictive || ((action == "checked_restore" || action == "legacy_restore" || action == "load") && !failed) {
+				if restrictive || ((action == "checked_restore" || action == "legacy_restore" || action == "load" || action == "remove") && !failed) {
 					wantGen++
 				}
 				if a.ConfigGeneration() != wantGen {

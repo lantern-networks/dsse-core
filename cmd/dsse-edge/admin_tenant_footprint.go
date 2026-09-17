@@ -143,7 +143,7 @@ func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *s
 	}
 
 	if ledger != nil {
-		footprint.add(adminTenantFootprintRow{Store: "enrolled_identities", Count: int64(ledger.CountAdmitted(footprint.TenantID))})
+		footprint.add(adminTenantFootprintRow{Store: "enrolled_identities", Count: int64(ledger.CountTenantRecords(footprint.TenantID))})
 	} else {
 		footprint.NotCounted = append(footprint.NotCounted, "enrolled_identities (no ledger on this node)")
 	}
@@ -454,7 +454,11 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.Admissions != nil {
-		add("admission_kill_switches", e.Admissions.RemoveDevices(e.DeviceIDs))
+		if n, err := e.Admissions.RemoveDevicesChecked(e.DeviceIDs); err != nil {
+			result.Failures = append(result.Failures, "admission revocation erasure saving could not be confirmed")
+		} else {
+			add("admission_kill_switches", n)
+		}
 	}
 	if e.ConnectorRoutes != nil {
 		add("connector_route_governance", e.ConnectorRoutes.RemoveTenant(tenantID))
@@ -507,15 +511,20 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 }
 
 // tenantExtraStoresFor fills in the device ids the two DEVICE-KEYED stores need, from the enrolled ledger.
-// Called on the READ path; the erasure path fills them from what RemoveTenant returns, because by then the
-// ledger has already been emptied and asking it would answer "no devices" for a tenant that had them.
+// Retained removal records are included so a deleted tenant can be erased or
+// retried after restart. The ledger is cleared only after its dependent cleanup.
 func tenantExtraStoresFor(base adminTenantExtraStores, ledger *enrolledinventory.Ledger, tenantID string) adminTenantExtraStores {
 	if ledger == nil {
 		return base
 	}
-	for _, entry := range ledger.List() {
-		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) {
+	seen := make(map[string]bool, len(base.DeviceIDs))
+	for _, id := range base.DeviceIDs {
+		seen[id] = true
+	}
+	for _, entry := range ledger.Authoritative() {
+		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) && !seen[entry.Identity] {
 			base.DeviceIDs = append(base.DeviceIDs, entry.Identity)
+			seen[entry.Identity] = true
 		}
 	}
 	return base

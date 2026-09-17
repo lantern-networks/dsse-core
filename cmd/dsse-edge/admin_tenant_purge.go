@@ -82,6 +82,17 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		result.Failures = append(result.Failures, "legal_hold: tenant is held")
 		return result
 	}
+	// Deny admission and retain ownership when dependent cleanup reports a
+	// failure. A failed admission erase must keep its retry targets at restart.
+	if ledger != nil {
+		extra = tenantExtraStoresFor(extra, ledger, tenantID)
+		if _, err := ledger.RetireTenantChecked(tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+			result.Failures = append(result.Failures, "tenant identity retirement saving could not be confirmed")
+			result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now)
+			result.ElapsedMS = time.Since(started).Milliseconds()
+			return result
+		}
+	}
 
 	credentialSweepAllowed := true
 	if credentials != nil {
@@ -92,18 +103,6 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		}
 		if len(removed) > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "admin_accounts", Count: int64(len(removed))})
-		}
-	}
-	// ★ THE IDS COME OUT OF THE LEDGER AND ARE KEPT (2026-08-18). The high-risk overlay and the admission
-	// kill-switches are keyed by DEVICE, not by tenant, so the ledger is the only thing that knows whose they
-	// are — and this call is what empties it. Capturing the ids here is the difference between erasing those
-	// two stores and asking them about an empty list, which answers "there were none" either way.
-	if ledger != nil {
-		if removed := ledger.RemoveTenant(tenantID); len(removed) > 0 {
-			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "enrolled_identities", Count: int64(len(removed))})
-			if len(extra.DeviceIDs) == 0 {
-				extra.DeviceIDs = removed
-			}
 		}
 	}
 	extra.erase(&result)
@@ -144,6 +143,14 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		}
 		if policies > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "named_network_boundary_policies", Count: int64(policies)})
+		}
+	}
+	if ledger != nil && len(result.Failures) == 0 {
+		removed, err := ledger.RemoveTenantChecked(tenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, "tenant identity erasure saving could not be confirmed")
+		} else if len(removed) > 0 {
+			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "enrolled_identities", Count: int64(len(removed))})
 		}
 	}
 	if writer != nil {

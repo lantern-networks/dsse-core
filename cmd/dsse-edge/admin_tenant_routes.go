@@ -360,7 +360,6 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now), now)
 		cascade := cascadeTenantDeletion(r.Context(), config.LocalCredentials, adminAuth, config.EnrolledLedger, tenantID, now)
 
 		// ★★★ RECORDS MAY WAIT FOR THE PURGE; A LIVE CERTIFICATE AUTHORITY MAY NOT (2026-08-21, measured).
@@ -401,6 +400,26 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		remaining := countAdminTenantFootprint(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore, config.TenantCARegistry, namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now)
+		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		cascadeComplete := true
+		for key, value := range cascade {
+			if strings.HasSuffix(key, "_error") {
+				cascadeComplete = false
+			}
+			if key == "sessions_revoked" {
+				if _, ok := value.(int); !ok {
+					cascadeComplete = false
+				}
+			}
+		}
+		outcome := "success"
+		if !cascadeComplete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["cascade_complete"] = cascadeComplete
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		body := map[string]any{
 			"tenant_id": tenantID,
 			"deleted":   true,
@@ -550,6 +569,14 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// was authorised and carried out must not live inside the thing that was erased.
 		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "purge", evaluator, now)
 		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		outcome := "success"
+		if !result.Complete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["complete"] = result.Complete
+		auditRecord.Metadata["remaining_records"] = result.Remaining.Total
+		auditRecord.Metadata["failure_count"] = len(result.Failures)
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		writeJSON(w, http.StatusOK, result)
 	}))
@@ -589,9 +616,12 @@ func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentia
 		}
 	}
 	if ledger != nil {
-		if removed := ledger.RemoveTenant(tenantID); len(removed) > 0 {
-			result["enrolled_identities"] = len(removed)
-			log.Printf("tenant %q deleted: removed %d enrolled identity/identities from the ledger", tenantID, len(removed))
+		if n, err := ledger.RetireTenantChecked(tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+			result["enrolled_identities_error"] = "identity retirement saving could not be confirmed"
+		} else if n > 0 {
+			result["enrolled_identities"] = n
+			result["identity_records_retained_for_purge"] = n
+			log.Printf("tenant %q deleted: retired %d identities; ownership retained for erasure", tenantID, n)
 		}
 	}
 	revoker, ok := adminAuth.(interface {

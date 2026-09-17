@@ -111,6 +111,41 @@ account-deletion phase fails, the residual credential sweep is skipped rather th
 bypassing its refusal. Failures keep the tenant deletion/erasure records for retry.
 This operation is not one atomic transaction across all tenant stores.
 
+Tenant deletion retires inventory identities as disabled removal records. They
+retain the tenant association needed to find device-keyed records during erasure
+and retries. These removals are carried in inventory distribution; they are not
+active devices. The local footprint counts disabled and removal records as retained
+data, rather than counting admitted devices only.
+
+During a purge, an origin admission block is removed only after its snapshot saves
+successfully, and the change advances the revocation generation. A failed save
+retains the live block and inventory ownership records for retry. Received-region
+and pulled blocks are separate authorities and are not removed by this operation.
+Inventory ownership is erased after the preceding cleanup reports no failures.
+An incomplete purge returns `complete: false` with failures and remaining counts;
+the administrative audit records `partial`. Deletion and purge audits belong to
+the acting operator's organization, with the removed tenant as their target.
+
+The Tenants page keeps **Retry erasure** after an unconfirmed purge, including a
+connection failure. It retries the purge without deleting the organization again.
+Success requires a matching tenant and footprint, `complete: true`, zero remaining
+records and no failures. This confirms the reported local scope only: review
+`not_counted` storage and other nodes separately. Pending notices survive page
+navigation within the open Console, but are not a durable work queue. If the
+browser session is lost, use the authenticated `POST /admin/tenants/{tenant_id}/purge`
+endpoint with the matching `confirm_tenant_id` after inspecting its footprint.
+Do not recreate an organization merely to retry its erasure.
+
+If inventory retirement cannot confirm saving, it retains a restrictive live
+removal but stops the purge before other stores are erased. A storage error may
+leave either old or new bytes. Reconcile and retry before restarting; restoring
+storage or restarting alone is not confirmation. Completed synced in-place writes
+remain accepted with a warning, while an unconfirmed flush is rejected even when
+it also carries that warning. Existing removal-record retention limits still
+apply, so resolve pending erasures promptly. For tenants deleted by an older
+version, ownership may already be missing: recover that mapping from trustworthy
+records before concluding that unassigned device-keyed data has been erased.
+
 Credential persistence calls carry a five-second deadline. PostgreSQL honors that
 deadline; filesystem operations are not guaranteed to be interruptible. Existing
 session checks and principal labels read the last committed account snapshot without

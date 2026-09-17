@@ -1199,9 +1199,15 @@ func (l *Ledger) purgeExpiredTombstonesLocked(now string) {
 // devices. Release is best-effort by construction (an unreleased claim is safe and inconvenient, the other way
 // round is not), so a failure is logged with the identity in it rather than swallowed.
 func (l *Ledger) RemoveTenant(tenantID string) []string {
+	removed, _ := l.RemoveTenantChecked(tenantID)
+	return removed
+}
+
+// RemoveTenantChecked reports an unconfirmed save separately from an empty tenant.
+func (l *Ledger) RemoveTenantChecked(tenantID string) ([]string, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return nil
+		return nil, nil
 	}
 	l.mu.Lock()
 	removed := map[string]Entry{}
@@ -1212,23 +1218,22 @@ func (l *Ledger) RemoveTenant(tenantID string) []string {
 	}
 	if len(removed) == 0 {
 		l.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	for k := range removed {
 		delete(l.entries, k)
 	}
-	l.generation.Add(1) // distributed via the config bundle: advance so Edges re-pull
 	if perr := l.persistCheckedLocked(); perr != nil {
 		// Same rule as Remove: a de-admission that only happened in memory comes back on the next restart, so
 		// it did not happen at all. Put them back and report nothing removed.
 		for k, entry := range removed {
 			l.entries[k] = entry
 		}
-		l.generation.Add(1)
 		l.mu.Unlock()
 		log.Printf("enrolled_inventory: removing tenant %q was NOT durable (%v) — nothing was removed", tenantID, perr)
-		return nil
+		return nil, fmt.Errorf("tenant identity erasure saving could not be confirmed")
 	}
+	l.generation.Add(1) // publish the confirmed erasure to config consumers
 	claimer := l.claimer
 	l.mu.Unlock()
 
@@ -1248,7 +1253,7 @@ func (l *Ledger) RemoveTenant(tenantID string) []string {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ReplaceAll atomically replaces the WHOLE ledger with the given entries (Phase 1 config distribution: a

@@ -429,8 +429,16 @@ func (a *AdmissionRevocations) CountDevices(deviceIDs []string) int {
 // ★ The ids must be captured BEFORE the enrolled ledger is cleared, or this receives an empty list and removes
 // nothing, which reads identically to "there were none".
 func (a *AdmissionRevocations) RemoveDevices(deviceIDs []string) int {
+	n, _ := a.RemoveDevicesChecked(deviceIDs)
+	return n
+}
+
+// RemoveDevicesChecked publishes origin erasure only after saving. Explicit
+// retries also resave an unchanged candidate after an ambiguous storage outcome.
+// Received and pulled revocations are not owned by this operation.
+func (a *AdmissionRevocations) RemoveDevicesChecked(deviceIDs []string) (int, error) {
 	if a == nil || len(deviceIDs) == 0 {
-		return 0
+		return 0, nil
 	}
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
@@ -448,13 +456,14 @@ func (a *AdmissionRevocations) RemoveDevices(deviceIDs []string) int {
 			n++
 		}
 	}
+	if err := a.saveStateLocked(candidate); err != nil {
+		return 0, err
+	}
 	if n > 0 {
-		// Preserve this legacy API's best-effort save and generation contracts.
-		// Publish after the attempt, as before, without making readers wait for I/O.
-		_ = a.saveStateLocked(candidate)
 		a.mu.Lock()
 		a.revoked = candidate
+		a.generation.Add(1)
 		a.mu.Unlock()
 	}
-	return n
+	return n, nil
 }

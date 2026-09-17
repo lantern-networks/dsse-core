@@ -155,6 +155,8 @@ type Ledger struct {
 	// persistBlocked latches a failed LOAD: this process has not seen what is in the store, so it must not
 	// write over it. Cleared only by a successful load.
 	persistBlocked error
+	// A known snapshot may not later disappear and masquerade as first boot.
+	snapshotKnown bool
 }
 
 func NewLedger() *Ledger {

@@ -627,3 +627,25 @@ audits. Pulled device/user sets still use the existing in-memory replacement
 contract; this change does not make them one durable transaction with admission
 or device-runtime state. Confirm the node's current risk and sync status as well
 as the saved configuration when investigating a restart.
+
+
+### Enrolled inventory during control-plane promotion
+
+A control plane using shared inventory storage reloads both device entries and
+device groups before it becomes leader. The existing admission and risk checks
+must also succeed. Background standby refreshes cannot overlap that promotion.
+If a required read fails, retry through the active management server; Devices,
+Device groups and the configuration bundle remain unavailable on the standby.
+
+Restoration requires a complete inventory snapshot. It rejects malformed records
+and a missing snapshot after this process has confirmed stored state. A genuinely
+new store retains its static seed. Version 1 and unversioned legacy entries still
+receive the conservative previous-enrolment marker. An omitted group registry is
+an empty registry, matching the existing file writer. Successful reloads update
+the distribution generation for device or group changes without rewriting storage.
+A valid reload also clears a failed-read write latch.
+
+Device-group creation, editing and deletion audit records identify the acting
+administrator and use the `device_group` target type. They can be correlated with
+the HTTP audit by tenant, operation, target and timestamp. A successful local
+operation still requires separate confirmation of Edge application.

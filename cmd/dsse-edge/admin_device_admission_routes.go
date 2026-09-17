@@ -441,6 +441,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// no restart. Replaces the static signed-file inventory with a managed ledger (cert-profile enforcement
 	// is intentionally NOT included — out of scope).
 	enrolledLedgerOr503 := func(w http.ResponseWriter) bool {
+		if admissionReadRefusedOnAStandby(w) {
+			return false
+		}
 		if config.EnrolledLedger == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("enrolled inventory ledger not configured"))
 			return false
@@ -920,7 +923,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "create_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r)))
+		record := enrolledInventoryAuditLog(tenantID, "create_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r))
+		record.ActorUserID = auditActorPrincipal(r)
+		targetType := "device_group"
+		record.TargetType = &targetType
+		delete(record.Metadata, "enabled")
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_device_group_registry.v1", "group": g})
 	}))
 	mux.HandleFunc("DELETE /admin/device-groups/{id}", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -968,7 +976,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				"on the next restart", id, derr))
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(callerTenant, "delete_group", enrolledinventory.Entry{Identity: id, Group: grp.Name}, evaluator, sourceIPFromRequest(r)))
+		record := enrolledInventoryAuditLog(callerTenant, "delete_group", enrolledinventory.Entry{Identity: id, Group: grp.Name}, evaluator, sourceIPFromRequest(r))
+		record.ActorUserID = auditActorPrincipal(r)
+		targetType := "device_group"
+		record.TargetType = &targetType
+		delete(record.Metadata, "enabled")
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_device_group_registry.v1", "removed": true, "id": id})
 	}))
 	mux.HandleFunc("PATCH /admin/device-groups/{id}", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -1008,7 +1021,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(callerTenant, "update_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r)))
+		record := enrolledInventoryAuditLog(callerTenant, "update_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r))
+		record.ActorUserID = auditActorPrincipal(r)
+		targetType := "device_group"
+		record.TargetType = &targetType
+		delete(record.Metadata, "enabled")
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_device_group_registry.v1", "group": g, "reassigned_devices": reassigned})
 	}))
 	// admin DNS-policy API: read + hot-apply the Edge DNS ruleset (deny/sinkhole/stub/ECH-strip) at

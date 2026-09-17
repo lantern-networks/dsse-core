@@ -51,6 +51,8 @@ type cpLeaderElector struct {
 	// Installed before Start. It refreshes shared revocation state while the
 	// advisory lock is held but /leader and administrative writes remain closed.
 	prepareLeadership func() error
+	// Serialize standby refreshes with the entire promotion, including publication.
+	stateRefreshMu sync.Mutex
 }
 
 // newCPLeaderElector opens a small dedicated pool for the leader lock. Returns nil when dsn is empty (single-node
@@ -104,6 +106,8 @@ func (e *cpLeaderElector) loop() {
 }
 
 func (e *cpLeaderElector) tick() {
+	e.stateRefreshMu.Lock()
+	defer e.stateRefreshMu.Unlock()
 	if e.isLeader.Load() {
 		// Verify the lock-holding connection is still alive; a dead connection = lost session = lost lock.
 		e.mu.Lock()
@@ -143,7 +147,7 @@ func (e *cpLeaderElector) tick() {
 	e.mu.Unlock()
 	if e.prepareLeadership != nil {
 		if err := e.prepareLeadership(); err != nil {
-			log.Printf("cp_leader: shared revocation state could not be prepared; leadership remains unavailable")
+			log.Printf("cp_leader: shared state could not be prepared; leadership remains unavailable")
 			e.release()
 			return
 		}

@@ -3955,67 +3955,19 @@ func main() {
 		log.Fatalf("prepare risk state: %v", err)
 	}
 	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
+	configureInventoryPromotion(cpLeaderElectorInstance, *enrolledInventoryStore, enrolledLedger)
 	cpLeaderElectorInstance.Start()
 	defer cpLeaderElectorInstance.Stop()
 	if sharedRevocationSource != nil {
 		go sharedRevocationSource.run(context.Background(), livenessRevocations, highRiskOverlay)
 	}
-	// ★★★ AND READ AGAIN, BECAUSE A STANDBY THAT ONLY LEARNS BY RESTARTING IS NOT WARM (2026-08-25). Two
-	// control planes share one database precisely so the standby holds what the leader authored. This store
-	// was read once at start-up and never again: measured, a device enrolled while both were running appeared
-	// on the leader, not on the standby, and appeared on the standby the moment it was restarted. A failover
-	// then handed the deployment to a node that had forgotten the fleet.
-	//
-	// This deployment has now found the same defect in the transport trust store, the export download tokens,
-	// the tenant CA registry and here.
-	//
-	// ★★ ONLY WHEN THIS NODE IS NOT THE ONE WRITING. Administration reaches whichever node holds leadership,
-	// so the leader is the author and a leader re-reading could only overwrite itself with an older snapshot.
-	// A node with no election — a single control plane — is always the leader and never reloads, which is
-	// right: there is nobody else to learn from.
-	// storeBackend, not a raw compare: "postgres+import:<path>" selects the SAME backend, and a raw comparison
-	// is false for it — which here would silently leave the standby cold on exactly the deployments that were
-	// migrated onto shared state.
+	// Keep a standby warm, but serialize each read with promotion. The final
+	// required read is in prepareLeadership, before any authority is published.
 	if storeBackend(*enrolledInventoryStore) == "postgres" {
 		go func(l *enrolledinventory.Ledger) {
-			// ★★★ AND THE LAST READ IT DOES IS THE ONE ON PROMOTION (2026-08-25, measured).
-			//
-			// The loop below stops re-reading the moment this node becomes the leader, which is correct —
-			// from then on it is the author. But the snapshot it becomes the author OF is whatever it last
-			// read, up to one interval old. Measured on the generated deployment while a device was being
-			// enrolled: the leader named 1 and the standby named 0, and the check said what that costs — an
-			// Edge that receives a roster missing a device stops admitting it.
-			//
-			// So the transition is where the read belongs: one final reload at the instant of promotion,
-			// before this node starts answering as the authority. Fifteen seconds of staleness is not much
-			// until it is the fifteen seconds containing somebody's enrolment.
-			wasLeader := cpLeaderElectorInstance != nil && cpLeaderElectorInstance.IsLeader()
 			for range time.Tick(15 * time.Second) {
-				nowLeader := cpLeaderElectorInstance != nil && cpLeaderElectorInstance.IsLeader()
-				if nowLeader {
-					if wasLeader {
-						continue
-					}
-					// Just promoted: read once more, as the standby, before acting as the leader.
-					wasLeader = true
-					if changed, rerr := l.ReloadFromStore(); rerr != nil {
-						log.Printf("enrolled_inventory: this node was PROMOTED and could not re-read the "+
-							"fleet's roster (%v) — it is now the authority for a roster it knows is older "+
-							"than the one it is replacing", rerr)
-					} else if changed {
-						log.Printf("enrolled_inventory: took up the leader's roster at promotion")
-					}
-					continue
-				}
-				wasLeader = false
-				changed, rerr := l.ReloadFromStore()
-				if rerr != nil {
-					log.Printf("enrolled_inventory: this standby could not re-read the fleet's roster (%v) — it "+
-						"is serving an older one, and a failover would hand the deployment that", rerr)
-					continue
-				}
-				if changed {
-					log.Printf("enrolled_inventory: this standby took up the roster the leader authored")
+				if _, err := cpLeaderElectorInstance.refreshStandbyInventory(l); err != nil {
+					log.Printf("enrolled_inventory: standby refresh unavailable; promotion requires a successful retry")
 				}
 			}
 		}(enrolledLedger)

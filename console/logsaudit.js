@@ -181,6 +181,7 @@ const _LA_EVENT = {
   private_app_web_session_started: { en: "Web session started", ja: "Webセッション開始" },
   // inspection findings
   saas_tenant_restriction_rewrite: { en: "Tenant-restriction rewrite", ja: "テナント制限リライト" },
+  dlp_device_risk: { en: "Automatic DLP risk outcome", ja: "DLP自動リスクの適用結果" },
   dlp_match: { en: "DLP match", ja: "DLP一致" },
 };
 function laPretty(code) {

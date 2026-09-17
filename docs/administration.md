@@ -371,10 +371,10 @@ is not recovery. Browser navigation or a new session is not a durable retry queu
 
 These two stores are not one transaction. A successful local response does not
 confirm independent-region delivery or coordinate concurrent administrators across
-processes. Automatic DLP signals use a separate legacy path: risk escalations can
-still become live before saving, while downgrades and clearing require a successful
-save. Automatic-signal persistence acknowledgement is not established by the
-administrative operation's response. Risk affects access through configured policy;
+processes. Automatic DLP signals use a separate checked escalation path: stronger marks
+become live before saving and are retained if saving fails. Automatic detections
+do not lower or clear an existing mark. Their application and persistence outcomes
+are recorded separately from administrative changes (see below). Risk affects access through configured policy;
 setting risk does not itself revoke standing grants.
 
 ## Restoring saved risk state
@@ -415,10 +415,51 @@ unavailable status until the migration succeeds.
 Automatic DLP escalation retains its existing immediate-publication behavior:
 readers can see the stronger mark while saving is pending, and that mark remains
 live if saving fails. That is not confirmation that the mark survived storage.
-Automatic persistence acknowledgement and retry remain a separate concern.
+The automatic outcome record distinguishes application from persistence, and a
+subsequent matching detection retries an unconfirmed save.
 
 Writes to the shared risk store are still serialized, including pulled device
 and user snapshots. A slow save can delay another write; this change does not
 introduce a storage timeout or a transaction spanning overlay and device-runtime
 stores. A successful read shows local published state, not confirmation of delivery
 to every region or completion of another administrator's pending request.
+
+## Automatic DLP risk outcomes
+
+When a named DLP policy's device-risk conditions match, the strongest matching
+severity is requested. An existing stronger device mark is retained. Risk affects
+subsequent access through the configured risk policies; an `observe` upload stays
+an observation and its body is not changed by this reporting path.
+
+**DLP Findings** contains the original `dlp_match` detection once. **Logs & Audit →
+Logs → Inspection / DLP** also contains a separate `dlp_device_risk` outcome.
+Search by decision or device identity, open **Details**, and use **View raw** to
+compare `condition_severity`, `applied`, `applied_severity`, `changed`, `persistence`
+and `result`. The applied severity may be stronger than the triggering condition.
+These are inspection events, not administrator-change audit records. They contain
+non-secret detection metadata, never the matched confidential values.
+
+| Persistence | Meaning of this attempt |
+| --- | --- |
+| `saved` | The configured store accepted the snapshot. |
+| `saved_non_atomic` | The store reported a completed, synced in-place save; the outcome is partial to retain the warning. |
+| `volatile` | No persistent store is configured; the live mark is not restart-safe. |
+| `unconfirmed` | Saving failed or its durability could not be confirmed; the stronger live mark remains, but the outcome is partial. |
+| `not_attempted` | No save was attempted. Check `applied` and `result`: an already sufficient mark can succeed without another save, while an unavailable overlay reports an error without applying the signal. This value does not assert persistence. |
+
+The original detection is recorded before risk saving begins. If saving is slow,
+readers can already see the stronger mark while its outcome is pending. After an
+unconfirmed save, the next matching detection retries the shared snapshot without
+incrementing its generation again. A successful shared risk save also resolves
+that pending retry. Once confirmed, unchanged detections avoid repeated storage
+writes. This is an in-process retry flag, not a timer, persistent queue or guarantee
+that another detection will arrive. Recover storage and explicitly retry the mark
+through **Devices** before restarting when persistence is unconfirmed. If the
+store itself is unavailable after a failed restoration, restore its complete valid
+snapshot first; a detection cannot clear that error.
+
+Inspection recording and forwarding remain best effort. An event in the local
+Console does not prove durable delivery to every region. Conversely, a missing
+outcome is not proof that no live mark was applied. Verify the local device risk
+and storage health separately; independent-region propagation and runtime state
+are separate checks.

@@ -47,6 +47,7 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 			return o.loadErr
 		}
 		o.persister = nil
+		o.riskSavePending = true
 		return nil
 	}
 	data, err := p.Load()
@@ -62,6 +63,7 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 			return o.loadErr
 		}
 		o.persister = p
+		o.riskSavePending = len(o.devices) > 0 || len(o.users) > 0
 		return nil
 	}
 	f, err := decodeRiskSnapshot(data)
@@ -78,6 +80,7 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	}
 	o.devices, o.users, o.legacy = f.Devices, f.Users, legacy
 	o.persister, o.loadErr = p, nil
+	o.riskSavePending = false
 	o.rebuildUserIndexLocked()
 	o.mu.Unlock()
 	log.Printf("high_risk_overlay load: restored %d device and %d user risk marks", len(o.devices), len(o.users))
@@ -91,6 +94,8 @@ var ErrRiskLoad = errors.New("cannot read risk snapshot")
 // leaving the maps stable during serialization while readers continue on the
 // last published state. A nil persister retains the volatile warning contract.
 func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[string]UserRisk) (bool, error) {
+	// Failed or volatile attempts remain eligible for a later automatic retry.
+	o.riskSavePending = true
 	if o.persister == nil {
 		return true, nil
 	}
@@ -104,9 +109,11 @@ func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[s
 		// The legacy compatibility warning also matches an unconfirmed flush.
 		// Only a completed, synced in-place save may publish checked changes.
 		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			o.riskSavePending = false
 			return true, nil
 		}
 		return false, ErrRiskSave
 	}
+	o.riskSavePending = false
 	return false, nil
 }

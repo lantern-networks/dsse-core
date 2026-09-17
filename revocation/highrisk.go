@@ -28,6 +28,8 @@ type HighRiskOverlay struct {
 	legacy     bool
 	persister  blobstore.Persister
 	generation atomic.Uint64
+	// writeMu protects this conservative retry flag for the shared snapshot.
+	riskSavePending bool
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
@@ -47,7 +49,7 @@ func (o *HighRiskOverlay) ConfigGeneration() uint64 {
 }
 
 // Mark is the legacy automatic-signal path. Escalations remain visible before
-// saving, as existing DLP callers expect. De-escalations require a successful
+// saving for compatibility. DLP uses RaiseDeviceRisk to receive outcomes. De-escalations require a successful
 // save. Administrative callers must use SetDeviceRisk to receive save outcomes.
 func (o *HighRiskOverlay) Mark(deviceID, severity string) {
 	_, _ = o.setDeviceRisk(deviceID, severity, true)

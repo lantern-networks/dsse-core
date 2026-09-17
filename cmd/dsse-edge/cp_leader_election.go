@@ -48,7 +48,7 @@ type cpLeaderElector struct {
 	conn        *sql.Conn // the dedicated connection holding the advisory lock while leader; nil when standby
 	stop        chan struct{}
 	stopped     chan struct{}
-	// Installed before Start. It refreshes shared admission state while the
+	// Installed before Start. It refreshes shared revocation state while the
 	// advisory lock is held but /leader and administrative writes remain closed.
 	prepareLeadership func() error
 }
@@ -143,7 +143,7 @@ func (e *cpLeaderElector) tick() {
 	e.mu.Unlock()
 	if e.prepareLeadership != nil {
 		if err := e.prepareLeadership(); err != nil {
-			log.Printf("cp_leader: admission state could not be prepared; leadership remains unavailable")
+			log.Printf("cp_leader: shared revocation state could not be prepared; leadership remains unavailable")
 			e.release()
 			return
 		}
@@ -153,7 +153,7 @@ func (e *cpLeaderElector) tick() {
 		err := conn.PingContext(checkCtx)
 		checkCancel()
 		if err != nil {
-			log.Printf("cp_leader: lock connection unavailable after admission refresh")
+			log.Printf("cp_leader: lock connection unavailable after revocation refresh")
 			e.release()
 			return
 		}

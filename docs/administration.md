@@ -317,10 +317,10 @@ withdraw the received-region block; it reports the remaining block and leaves
 inventory admission unchanged. Fix storage and allow delivery to complete before
 restarting; deleting the snapshot is not a recovery procedure.
 
-### Admission state when the control plane changes
+### Revocation and risk state when the control plane changes
 
-With a shared Postgres admission store, a control plane reloads saved admission
-state before advertising leadership. An unreadable or invalid snapshot keeps it
+With shared Postgres stores, a control plane reloads saved admission and typed
+device/user risk state before advertising leadership. An unreadable or invalid snapshot keeps it
 on standby; restore readable, valid storage and let election retry. A missing
 snapshot after this process has observed or changed state also refuses promotion.
 An empty first boot remains supported. Shared-store migration remains an explicit
@@ -331,6 +331,23 @@ block status. Edges retain their last applied set when that feed is unavailable.
 Devices displays a status error with Retry, rather than a successful empty list.
 After promotion succeeds, reload the Console and check the Edge synchronization
 status separately. A local administrator response is still not a fleet receipt.
+
+New control planes use the shared database for risk when a database is configured
+and no local risk snapshot exists. Existing local entries, including empty files
+and directories, stay selected for inspection and recovery. An inaccessible local
+path does not silently select the shared database instead. The existing
+`high_risk_devices.json` filename
+and shared `high_risk_overlay` row remain compatible. A local snapshot still takes
+precedence; migrate it explicitly with `-high-risk-store=postgres+import:<path>`
+after backing it up and coordinating a single writer. Confirm shared state before
+resuming the other control planes. For admission, the corresponding flag is
+`-admission-revocation-store=postgres+import:<path>`.
+
+Nonempty legacy risk snapshots need device/user attribution using the enrollment
+ledger and identity directory. Startup retains that migration path; promotion
+refuses a newly encountered unattributed legacy snapshot. Resolve the attribution
+through controlled startup or recovery before retrying. Do not clear the snapshot
+to make a standby appear ready.
 
 Reloading persisted state is not a new administrator action. Existing block and
 restore audit records remain the records of those changes; the system log reports

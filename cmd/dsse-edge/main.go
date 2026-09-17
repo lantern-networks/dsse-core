@@ -1235,7 +1235,7 @@ func main() {
 	allowVolatileConfig := flag.Bool("allow-volatile-config", false, "escape hatch for a deliberately EPHEMERAL Edge: permit OPERATOR-CONFIG stores to run in-memory in production instead of FAILING startup. Off by default — a node that owns operator-authored config must not silently lose it on restart, so a volatile CONFIG store is now a startup ERROR, not a warning. Set this only for a throwaway/test Edge; its use is logged. (Runtime stores — sessions, metering — may be volatile regardless; only CONFIG is gated.) Supersedes the old -require-durable-stores, which was opt-in the wrong way round.")
 	revocationSourcePoll := flag.Duration("revocation-source-poll", 2*time.Second, "CP→Edge SHARED REVOCATION overlay (Phase 3): FAST pull interval for the admission-revocation feed (kept low so a kill-switch bites fleet-wide within seconds). Uses the same -config-source-url base.")
 	admissionRevocationStore := flag.String("admission-revocation-store", "", "durable JSON store for the admission revocation set (Phase 3): the control plane persists its kill-switches here so a restart cannot silently un-revoke. Empty = in-memory only.")
-	highRiskStore := flag.String("high-risk-store", "", "durable JSON store for the shared high-risk device overlay (Phase 3): the control plane persists its high-risk markings here so a restart cannot silently clear them. Empty = in-memory only.")
+	highRiskStore := flag.String("high-risk-store", "", "durable device/user risk store: postgres | postgres+import:<path> | file path. Empty uses the shared database when configured and no local snapshot exists, otherwise the state directory; without either it remains in memory.")
 	// Cross-region revocation mesh: peer-region CPs an ORIGIN revocation propagates to. Empty = single-region.
 	revocationMeshPeers := flag.String("revocation-mesh-peers", "", "cross-region revocation mesh: peer-region CP base URLs 'region=URL;region=URL'. On an origin revocation this CP pushes to each peer (no-loop). Empty = single-region")
 	revocationMeshSecret := flag.String("revocation-mesh-secret", "", "shared secret for the cross-region revocation mesh (x-revocation-mesh-secret header); empty = no check (lab)")
@@ -2680,8 +2680,6 @@ func main() {
 		log.Fatalf("load admission-revocation store: %v", e)
 	}
 	configureAdmissionPromotion(cpLeaderElectorInstance, *admissionRevocationStore, livenessRevocations)
-	cpLeaderElectorInstance.Start()
-	defer cpLeaderElectorInstance.Stop()
 	// Active session revocation: track live (T) connections by identity so an ADMINISTRATOR can actively CLOSE
 	// a blocked device's established tunnels (per-handshake admission already rejects NEW connections; this
 	// bites established sessions too, so an admin kill-switch takes full effect in ~2s rather than waiting for
@@ -3956,6 +3954,9 @@ func main() {
 	if err := prepareUserRiskState(context.Background(), highRiskOverlay, enrolledLedger, humanIdentities); err != nil {
 		log.Fatalf("prepare risk state: %v", err)
 	}
+	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
+	cpLeaderElectorInstance.Start()
+	defer cpLeaderElectorInstance.Stop()
 	if sharedRevocationSource != nil {
 		go sharedRevocationSource.run(context.Background(), livenessRevocations, highRiskOverlay)
 	}

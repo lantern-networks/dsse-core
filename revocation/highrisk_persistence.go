@@ -42,6 +42,22 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	}
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
+	return o.restoreSnapshotLocked(p, false)
+}
+
+// ReloadFromStore refreshes both risk namespaces before a shared-store authority
+// publishes leadership. A newly encountered legacy mark needs attribution at
+// startup or explicit recovery; promotion must not guess its tenant or type.
+func (o *HighRiskOverlay) ReloadFromStore() error {
+	if o == nil {
+		return ErrRiskUnavailable
+	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+	return o.restoreSnapshotLocked(o.persister, true)
+}
+
+func (o *HighRiskOverlay) restoreSnapshotLocked(p blobstore.Persister, refresh bool) error {
 	if p == nil {
 		if o.loadErr != nil {
 			return o.loadErr
@@ -59,6 +75,12 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	}
 	// Persisters reserve nil for first boot; existing zero-byte files are invalid.
 	if data == nil {
+		if refresh && o.generation.Load() != 0 {
+			o.mu.Lock()
+			o.loadErr = ErrRiskLoad
+			o.mu.Unlock()
+			return ErrRiskLoad
+		}
 		if o.loadErr != nil {
 			return o.loadErr
 		}
@@ -74,6 +96,12 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	legacy := f.SchemaVersion == "high_risk_overlay_state.v1" && len(f.Devices) > 0
+	if refresh && legacy {
+		o.mu.Lock()
+		o.loadErr = ErrRiskUnavailable
+		o.mu.Unlock()
+		return ErrRiskUnavailable
+	}
 	o.mu.Lock()
 	if !maps.Equal(o.devices, f.Devices) || !reflect.DeepEqual(o.users, f.Users) || o.legacy != legacy {
 		o.generation.Add(1)

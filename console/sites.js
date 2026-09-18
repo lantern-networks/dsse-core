@@ -556,8 +556,9 @@ function connectorProgramsLoader(host, render, parentCurrent = () => true) {
   const selection = () => typeof operateTenant === "string" ? operateTenant : "";
   const session = () => typeof idpSession === "undefined" ? null : idpSession;
   const base = () => baseForPlane("control");
-  const selected = selection(), signedIn = session(), authority = base();
-  const context = () => selected === selection() && signedIn === session() && authority === base() && parentCurrent();
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const selected = selection(), signedIn = session(), authority = base(), credential = token();
+  const context = () => selected === selection() && signedIn === session() && authority === base() && credential === token() && parentCurrent();
   const refresh = async () => {
     if (!context()) return;
     const fresh = freshRender(host), current = () => fresh() && host.isConnected !== false && context();
@@ -566,7 +567,7 @@ function connectorProgramsLoader(host, render, parentCurrent = () => true) {
       const programs = await connectorProgramsFetch();
       if (!current()) return;
       host.innerHTML = "";
-      render(programs);
+      render(programs, current);
     } catch (_) {
       if (!current()) return;
       uiState(host, "error", connectorProgramsReadError(), {
@@ -576,28 +577,60 @@ function connectorProgramsLoader(host, render, parentCurrent = () => true) {
   return refresh;
 }
 
-// downloadConnectorProgram takes the bytes away. A raw fetch rather than apiFetch, for the same reason the
-// agent release screen uses one: apiFetch reads every answer as text, and a program is not text.
-async function downloadConnectorProgram(program) {
-  const base = baseForPlane("control");
-  const token = localStorage.getItem("adminToken") || "";
-  const signedIn = idpSession && idpSession.auth_method === "admin_session";
-  const headers = {};
-  if (!signedIn && token) headers["authorization"] = "Bearer " + token;
-  if (operateTenant) headers["x-operate-tenant"] = operateTenant;
-  const path = "/admin/connector-program?platform=" + encodeURIComponent(program.platform) +
-    "&arch=" + encodeURIComponent(program.arch);
-  const res = await fetch(base + path, { method: "GET", headers, credentials: "include" });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = program.file_name || ("dsse-connector-" + program.platform + "-" + program.arch);
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+// The displayed catalogue is the expected content, not a promise that the next
+// GET returns the same bytes. Never save a partial, changed or unverified program.
+function connectorProgramDownloadError(reason) {
+  if (reason === "size" || reason === "digest") return bl({
+    en: "Download blocked: the connector program " + (reason === "size" ? "size" : "SHA-256 digest") + " does not match the displayed catalogue. Do not distribute this program. Ask the deployment operator to investigate the stored file and delivery path, including intervening publication.",
+    ja: "ダウンロードを停止しました。コネクタのプログラムの" + (reason === "size" ? "サイズ" : "SHA-256 ハッシュ") + "が表示中の一覧と一致しません。このプログラムは配布せず、配備の運用者に保存ファイル・配信経路・公開内容の変更を確認してもらってください。" });
+  if (reason === "verification") return bl({
+    en: "The connector program integrity check could not be completed. No program was saved. Check browser support and try again; this does not establish that the program is corrupt.",
+    ja: "コネクタのプログラムの完全性確認を完了できず、保存していません。ブラウザの対応状況を確認して再試行してください。破損を確認したわけではありません。" });
+  return bl({ en: "The connector program transfer could not be verified. No program was saved. Check your connection and access, then reload the program list and try again.",
+    ja: "コネクタのプログラムを取得・確認できず、保存していません。接続とアクセス権を確認し、プログラム一覧を再読込してから再試行してください。" });
+}
+
+async function downloadConnectorProgram(program, parentCurrent) {
+  if (typeof parentCurrent !== "function" || !parentCurrent()) return false;
+  const base = baseForPlane("control"), selected = operateTenant, session = idpSession;
+  const token = localStorage.getItem("adminToken") || "", expected = { ...program };
+  const current = () => parentCurrent() && base === baseForPlane("control") &&
+    selected === operateTenant && session === idpSession && token === (localStorage.getItem("adminToken") || "");
+  let failure = "transfer";
+  try {
+    if (!Number.isSafeInteger(expected.size) || expected.size < 0 || expected.size > 64 * 1024 * 1024 ||
+        typeof expected.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(expected.sha256) ||
+        ![expected.platform, expected.arch].every(v => typeof v === "string" && /^[a-z0-9._-]+$/.test(v) && ![".", ".."].includes(v)) ||
+        typeof expected.file_name !== "string" || !expected.file_name.trim() || expected.file_name.trim() !== expected.file_name ||
+        expected.file_name.length > 120 || /[\\/]/.test(expected.file_name) || [".", ".."].includes(expected.file_name)) throw new Error();
+    const headers = {};
+    if (session?.auth_method !== "admin_session" && token) headers["authorization"] = "Bearer " + token;
+    if (selected) headers["x-operate-tenant"] = selected;
+    const path = "/admin/connector-program?platform=" + encodeURIComponent(expected.platform) + "&arch=" + encodeURIComponent(expected.arch);
+    const res = await fetch(base + path, { method: "GET", headers, credentials: "include", redirect: "error", cache: "no-store" });
+    if (!current()) return false;
+    if (!res.ok || res.status !== 200 || res.redirected) throw new Error();
+    const blob = await res.blob();
+    if (!current()) return false;
+    failure = "size";
+    if (blob.size !== expected.size) throw new Error();
+    failure = "verification";
+    const bytes = await blob.arrayBuffer();
+    if (!current()) return false;
+    const sum = await crypto.subtle.digest("SHA-256", bytes);
+    if (!current()) return false;
+    failure = "digest";
+    const digest = [...new Uint8Array(sum)].map(b => b.toString(16).padStart(2, "0")).join("");
+    if (digest !== expected.sha256.toLowerCase()) throw new Error();
+    const url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = expected.file_name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    return true;
+  } catch (_) {
+    if (current()) uiToast(connectorProgramDownloadError(failure), "err");
+    return false;
+  }
 }
 
 function connectorProgramSize(n) {
@@ -713,7 +746,7 @@ async function showEnrollmentCommand(siteID) {
     // wiring inside the one modal rather than on window.
     const programHost = el("div", { style: "margin:6px 0 10px 0" });
     host.appendChild(programHost);
-    const refreshPrograms = connectorProgramsLoader(programHost, (programs) => {
+    const refreshPrograms = connectorProgramsLoader(programHost, (programs, current) => {
       programHost.innerHTML = "";
       if (!programs.length) {
         // ★ A ZERO THE READER CAN ACT ON. Not "0 programs" — what the zero means for the person about to walk
@@ -753,10 +786,15 @@ async function showEnrollmentCommand(siteID) {
       };
       pick.addEventListener("change", describe);
       const dlProgram = el("button", { class: "ui-btn", text: bl({ en: "Download the program", ja: "プログラムをダウンロード" }), onClick: async () => {
+        if (dlProgram.disabled || !current()) return;
+        dlProgram.disabled = true; pick.disabled = true;
+        dlProgram.textContent = bl({ en: "Download the program", ja: "プログラムをダウンロード" });
         try {
-          await downloadConnectorProgram(chosen());
-          dlProgram.textContent = bl({ en: "Downloaded — download again", ja: "ダウンロード済み — 再ダウンロード" });
-        } catch (e) { uiToast(String(e && e.message || e), "err"); }
+          const saved = await downloadConnectorProgram(chosen(), current);
+          if (saved && current()) dlProgram.textContent = bl({ en: "Downloaded — download again", ja: "ダウンロード済み — 再ダウンロード" });
+        } finally {
+          dlProgram.disabled = false; pick.disabled = false;
+        }
       } });
       programHost.appendChild(el("div", { style: "display:flex;align-items:center;gap:10px" }, [dlProgram, pick]));
       programHost.appendChild(detail);

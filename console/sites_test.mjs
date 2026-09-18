@@ -156,10 +156,53 @@ test('program read error offers a read-only retry and clears old content',async(
  await refresh();assert.equal(f.states.at(-1).state,'error');assert.equal(rendered.length,0);assert.doesNotMatch(f.states.at(-1).message,/private/);
  fail=false;await f.states.at(-1).retry.onClick();assert.equal(rendered.length,1);assert.deepEqual(methods,['GET','GET']);
 });
-for(const kind of ['selection','session','authority','disconnected','parent','newer'])for(const fail of [true,false])test(`program read discards ${kind} late ${fail?'failure':'success'}`,async()=>{
+for(const kind of ['selection','session','authority','token','disconnected','parent','newer'])for(const fail of [true,false])test(`program read discards ${kind} late ${fail?'failure':'success'}`,async()=>{
  const f=programFixture();let done,parent=true,rendered=0;
  f.context.connectorProgramsFetch=()=>new Promise((resolve,reject)=>{done=()=>fail?reject(Error('old')):resolve([])});
  const refresh=f.context.connectorProgramsLoader(f.host,()=>rendered++,()=>parent),pending=refresh();
- if(kind==='selection')f.context.operateTenant='other';if(kind==='session')f.context.idpSession={id:'new'};if(kind==='authority')f.context.baseForPlane=()=>'/other';if(kind==='disconnected')f.host.isConnected=false;if(kind==='parent')parent=false;if(kind==='newer')f.context.freshRender(f.host);
+ if(kind==='token')f.context.localStorage={getItem:()=> 'new'};if(kind==='selection')f.context.operateTenant='other';if(kind==='session')f.context.idpSession={id:'new'};if(kind==='authority')f.context.baseForPlane=()=>'/other';if(kind==='disconnected')f.host.isConnected=false;if(kind==='parent')parent=false;if(kind==='newer')f.context.freshRender(f.host);
  done();await pending;assert.equal(rendered,0);assert.equal(f.states.some(s=>s.state==='error'),false);
+});
+
+function programDownloadFixture() {
+ const f=programFixture(),downloads=[],toasts=[],requests=[],timers=[];let valid=true;
+ const bytes=new Uint8Array([1,2,3]);f.p.sha256='039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81';
+ const response={ok:true,status:200,blob:async()=>new Blob([bytes])};
+ Object.assign(f.context,{crypto:globalThis.crypto,localStorage:{getItem:()=>''},fetch:async(...a)=>{requests.push(a);return response},uiToast:m=>toasts.push(m),URL:{createObjectURL:()=> 'blob:program',revokeObjectURL(){}},setTimeout:fn=>timers.push(fn),document:{body:{appendChild(){}},createElement:()=>{const a={click(){downloads.push(a.download)},remove(){}};return a}}});
+ return {...f,response,downloads,toasts,requests,timers,invalidate:()=>valid=false,run:()=>f.context.downloadConnectorProgram(f.p,()=>valid)};
+}
+test('connector download checks original bytes and request options',async()=>{
+ const f=programDownloadFixture();assert.equal(await f.run(),true);assert.deepEqual(f.downloads,['connector.tar.gz']);assert.equal(f.toasts.length,0);
+ const [url,opts]=f.requests[0];assert.match(url,/platform=linux&arch=amd64/);assert.equal(opts.redirect,'error');assert.equal(opts.cache,'no-store');assert.equal(opts.credentials,'include');assert.equal(f.timers.length,1);
+});
+for(const kind of ['size','digest','partial','redirect','http','network','blob','hash','metadata','filename'])test('connector refuses unverified download '+kind,async()=>{
+ const f=programDownloadFixture();
+ if(kind==='size')f.response.blob=async()=>new Blob(['x']);if(kind==='digest')f.response.blob=async()=>new Blob(['bad']);
+ if(kind==='partial')f.response.status=206;if(kind==='redirect')f.response.redirected=true;if(kind==='http')f.response.ok=false;
+ if(kind==='network')f.context.fetch=async()=>{throw Error('private-path')};if(kind==='blob')f.response.blob=async()=>{throw Error('private-path')};
+ if(kind==='hash')f.context.crypto={subtle:{digest:async()=>{throw Error('private-path')}}};
+ if(kind==='metadata')f.p.sha256='invalid';if(kind==='filename')f.p.file_name='../bad';
+ assert.equal(await f.run(),false);assert.equal(f.downloads.length,0);assert.equal(f.toasts.length,1);assert.doesNotMatch(f.toasts[0],/private-path/);
+ if(['size','digest'].includes(kind))assert.match(f.toasts[0],/Do not distribute/);
+ if(kind==='hash')assert.match(f.toasts[0],/does not establish.*corrupt/);
+});
+for(const stage of ['fetch','blob','bytes','hash'])for(const failure of [false,true])test(`connector discards late ${stage} ${failure?'failure':'success'}`,async()=>{
+ const f=programDownloadFixture();let finish,enter;const entered=new Promise(r=>enter=r);
+ const wait=value=>{enter();return new Promise((resolve,reject)=>{finish=()=>failure?reject(Error('late private-path')):resolve(value)})};
+ if(stage==='fetch')f.context.fetch=()=>wait(f.response);
+ if(stage==='blob')f.response.blob=()=>wait(new Blob([new Uint8Array([1,2,3])]));
+ if(stage==='bytes')f.response.blob=async()=>({size:3,arrayBuffer:()=>wait(new Uint8Array([1,2,3]).buffer)});
+ if(stage==='hash')f.context.crypto={subtle:{digest:()=>wait(new Uint8Array(32).buffer)}};
+ const pending=f.run();await entered;f.invalidate();finish();assert.equal(await pending,false);assert.equal(f.downloads.length,0);assert.equal(f.toasts.length,0);
+});
+for(const key of ['selection','session','authority','token'])test('connector discards changed '+key,async()=>{
+ const f=programDownloadFixture();let finish;f.context.fetch=()=>new Promise(r=>finish=()=>r(f.response));const run=f.run();
+ if(key==='selection')f.context.operateTenant='other';if(key==='session')f.context.idpSession={};if(key==='authority')f.context.baseForPlane=()=>'/new';if(key==='token')f.context.localStorage.getItem=()=> 'new';
+ finish();await run;assert.equal(f.downloads.length,0);assert.equal(f.toasts.length,0);
+});
+test('connector captures displayed metadata before asynchronous work',async()=>{
+ const f=programDownloadFixture();let finish;f.context.fetch=()=>new Promise(r=>finish=()=>r(f.response));const run=f.run();f.p.file_name='changed';f.p.sha256='b'.repeat(64);finish();assert.equal(await run,true);assert.deepEqual(f.downloads,['connector.tar.gz']);
+});
+for(const reason of ['size','digest','verification','transfer'])test('connector guidance has safe Japanese '+reason,()=>{
+ const f=programDownloadFixture();f.context.bl=x=>x.ja;assert.match(f.context.connectorProgramDownloadError(reason),/[ぁ-んァ-ン一-龥]/);
 });

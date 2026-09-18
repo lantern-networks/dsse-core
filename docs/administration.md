@@ -1143,3 +1143,9 @@ the authentication layer; this identifies the credential owner, not a separately
 verified person holding the token. Calls without a resolved principal retain a null
 actor. Bootstrap secrets and their hashes are not added to these audit records,
 and historical records with missing actors are not backfilled.
+
+### Verifying a connector program download
+
+The Console checks the downloaded program's size and SHA-256 against the displayed catalogue before offering it as a file. Partial responses and redirects are refused. A mismatch can indicate damaged storage or delivery, or a publication change since the list was loaded: do not distribute the rejected program; ask the deployment operator to investigate. If browser hashing is unavailable, the Console refuses to save without claiming corruption. Connection/access failures can be retried after reloading the list.
+
+The program selection is locked during download. Closing the dialog or changing the active organization, credentials or authority discards late results. Download retries do not issue enrollment credentials; opening Add connector again remains a separate enrollment operation. This browser check does not add a publisher signature, make catalogue publication atomic, or verify programs fetched directly outside the Console. Server response scope pins and download lookup behavior are unchanged.

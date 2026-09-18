@@ -125,7 +125,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLog(updated, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLogFor(r, updated, evaluator, now), now)
 		writeJSON(w, http.StatusOK, updated)
 	}))
 	// Cross-tenant (super-admin) tenant administration: list every tenant, create/upsert an arbitrary tenant,

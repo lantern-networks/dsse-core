@@ -195,7 +195,7 @@ function operatorDelegationFootnote(data) {
 }
 
 function operatorElevationRow(e, reload) {
-  const state = e.state === "active" && e.approval_required && !e.approved_at ? "awaiting_approval" : e.state;
+  const state = e.state === "pending_approval" || (e.state === "active" && e.approval_required && !e.approved_at) ? "awaiting_approval" : e.state;
   const meta = OPERATOR_ELEVATION_STATE[state] || { tone: "off", t: { en: state || "—", ja: state || "—" } };
   const actions = [];
   if (state === "awaiting_approval") {

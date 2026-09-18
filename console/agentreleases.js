@@ -124,6 +124,24 @@ function arSigningBody(response, scope) {
 
 function arRolloutSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
 function arRolloutReadError() { return bl({ en: "Could not verify rollout settings. Retry before making changes.", ja: "配布設定を確認できません。変更する前に再試行してください。" }); }
+// Membership hints come from the tenant inventory, not from a failed or partial read.
+function arDeviceGroupsBody(response, tenant) {
+  const b = response?.body;
+  if (!response?.ok || response.status !== 200 || !arReadObject(b) ||
+      b.schema_version !== "admin_enrolled_inventory.v1" || b.tenant_id !== tenant || !Array.isArray(b.devices)) throw new Error();
+  const identities = new Set(), groups = new Set();
+  for (const d of b.devices) {
+    if (!arReadObject(d) || typeof d.identity !== "string" || !d.identity || d.identity.trim() !== d.identity ||
+        identities.has(d.identity) || (d.tenant_id === undefined ? "" : d.tenant_id) !== tenant ||
+        (d.group !== undefined && (typeof d.group !== "string" || d.group.trim() !== d.group))) throw new Error();
+    identities.add(d.identity);
+    if (d.group) groups.add(d.group);
+  }
+  return [...groups].sort();
+}
+function arDeviceGroupsReadError() { return bl({
+  en: "Device group memberships could not be verified. Retry before changing rollout order.",
+  ja: "端末のグループ所属を確認できません。配布の順番を変更する前に再試行してください。" }); }
 function arReadObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 function arRolloutPlanBody(response, tenant) {
   const d = response?.body, p = d?.plan;
@@ -450,10 +468,10 @@ function openAgentWavesForm(host, current, groupsInUse, context) {
     ja: "設定済みの優先度が高いグループを使い、同じ優先度では遅い方を使います。未指定のグループは既定の日数を使い、既定がなければ最も遅い日数を使います。この画面では既存の優先度と既定の日数を維持します。" }) });
 
   const reality = el("div", { class: "ui-field-hint", text: groupsInUse.length
-    ? bl({ en: "Groups your devices currently carry: " + groupsInUse.join(", "),
-           ja: "いま端末が持っているグループ: " + groupsInUse.join("、") })
-    : bl({ en: "No device group memberships were available here. Unlisted devices still use the default delay.",
-           ja: "この画面では端末のグループ所属情報がありません。未指定の端末にも既定の待機日数は適用されます。" }) });
+    ? bl({ en: "Groups in the enrolled-device inventory: " + groupsInUse.join(", "),
+           ja: "登録端末の一覧にあるグループ: " + groupsInUse.join("、") })
+    : bl({ en: "No group assignments were reported in this inventory snapshot. Unlisted devices still use the default delay.",
+           ja: "取得した登録端末の一覧にはグループ所属がありません。未指定の端末にも既定の待機日数は適用されます。" }) });
 
   arRolloutDialog({ host, context,
     title: bl({ en: "Rollout order", ja: "配布の順番" }),
@@ -524,7 +542,10 @@ async function renderAgentReleaseList(host) {
   if (host.isConnected === false) return;
   uiState(host, "loading");
   const fresh = freshRender(host), selection = arRolloutSelection(), deployment = answeringForTheDeployment();
-  const current = () => fresh() && host.isConnected !== false && selection === arRolloutSelection() && deployment === answeringForTheDeployment();
+  const session = typeof idpSession === "undefined" ? null : idpSession, authority = baseForPlane(_AR_PLANE);
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "", credential = token();
+  const current = () => fresh() && host.isConnected !== false && selection === arRolloutSelection() && deployment === answeringForTheDeployment() &&
+    session === (typeof idpSession === "undefined" ? null : idpSession) && authority === baseForPlane(_AR_PLANE) && credential === token();
   // Publication caches belong to this verified page/context. An unavailable new
   // read must not leave a previous tenant's data available to the publish form.
   delete window._arLastPublished;
@@ -562,19 +583,15 @@ async function renderAgentReleaseList(host) {
   } catch (_) { planUnread = true; }
   if (!current()) return;
 
-  // Which groups devices ACTUALLY carry. A rollout order naming groups nothing is in is a schedule that
-  // applies to nobody, and that is invisible from the schedule itself.
-  let groupsInUse = [];
+  // Show the groups recorded in the same tenant inventory. An unreadable roster
+  // cannot establish that no devices belong to a configured wave.
+  let groupsInUse = null;
   try {
-    const g = await apiFetch("GET", "/admin/enrolled-devices", undefined, _AR_PLANE);
-    const seen = {};
-    ((g.body && (g.body.devices || g.body.entries)) || []).forEach((d) => {
-      const name = ((d && d.group) || "").trim();
-      if (name) seen[name] = true;
-    });
-    groupsInUse = Object.keys(seen).sort();
-  } catch (e) {
-    groupsInUse = [];
+    const g = await apiFetch("GET", "/admin/enrolled-devices?expected_tenant_id=" + encodeURIComponent(rolloutTenant), undefined, _AR_PLANE);
+    if (!current()) return;
+    groupsInUse = arDeviceGroupsBody(g, rolloutTenant);
+  } catch (_) {
+    if (!current()) return;
   }
 
   const published = catalogue.envelopes, pending = catalogue.pending;
@@ -586,6 +603,11 @@ async function renderAgentReleaseList(host) {
 
   if (planUnread) host.appendChild(el("div", { class: "ui-state ui-state-error" }, [
     el("p", { text: arRolloutReadError() }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
+  ]));
+
+  if (groupsInUse === null) host.appendChild(el("div", { class: "ui-state ui-state-warn", role: "alert" }, [
+    el("p", { text: arDeviceGroupsReadError() }),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
   ]));
 
@@ -724,9 +746,9 @@ async function renderAgentReleaseList(host) {
     el("span", { class: "ui-spacer" }),
     el("button", {
       class: "ui-btn ui-btn-sm",
-      disabled: plan === null ? "disabled" : undefined,
+      disabled: plan === null || groupsInUse === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => { if (current() && plan !== null) openAgentWavesForm(host, plan.waves, groupsInUse, { tenant: rolloutTenant, current }); },
+      onClick: () => { if (current() && plan !== null && groupsInUse !== null) openAgentWavesForm(host, plan.waves, groupsInUse, { tenant: rolloutTenant, current }); },
     }),
   ]));
 

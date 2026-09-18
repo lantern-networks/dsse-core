@@ -48,7 +48,7 @@ test('valid holds, explicit defaults and nullable optional schedules remain read
 function readFixture(){
  const f=fixture();let api;
  Object.assign(f.c,{window:{},connectorProgramsFetch:async()=>[],operateTenant:'',answeringForTheDeployment:()=>false,signedInAsOperator:()=>false,uiBadge:(text)=>({text}),uiWhen:x=>x,atob:s=>Buffer.from(s,'base64').toString(),uiState:(host,type,text)=>{host.innerHTML='';host.state={type,text}},freshRender:host=>{const n=host.seq=(host.seq||0)+1;return()=>host.seq===n},apiFetch:(...args)=>{f.requests.push(args);return api(args[0], args[1].replace(/\?expected_tenant_id=.*$/, ""), ...args.slice(2))}});
- const responses=path=>path.startsWith('/admin/agent-rollout')?planResponse(fullPlan()):{ok:true,status:200,body:path==='/admin/tenant'?{tenant_id:'own'}:path==='/admin/agent-updates'?{schema_version:'admin_agent_updates.v1',tenant_id:'own',envelopes:{},pending:{}}:path==='/admin/enrolled-devices'?{devices:[]}:{schema_version:'admin_agent_update_sign_floor.v1',tenant_id:'own',floors:{},signing_public_key:'no'}};
+ const responses=path=>path.startsWith('/admin/agent-rollout')?planResponse(fullPlan()):{ok:true,status:200,body:path==='/admin/tenant'?{tenant_id:'own'}:path==='/admin/agent-updates'?{schema_version:'admin_agent_updates.v1',tenant_id:'own',envelopes:{},pending:{}}:path==='/admin/enrolled-devices'?{schema_version:'admin_enrolled_inventory.v1',tenant_id:'own',devices:[]}:{schema_version:'admin_agent_update_sign_floor.v1',tenant_id:'own',floors:{},signing_public_key:'no'}};
  api=async(method,path)=>responses(path);const host={isConnected:true,children:[],appendChild(n){this.children.push(n)}};Object.defineProperty(host,'innerHTML',{set(){this.children=[]}});
  return{...f,host,responses,setAPI(fn){api=fn}};
 }
@@ -59,7 +59,7 @@ for(const name of ['missing','foreign-selection','unavailable'])test('organizati
 const deferred=()=>{let resolve;const promise=new Promise(r=>resolve=r);return{promise,resolve}};
 test('late old render cannot replace shared publication cache',async()=>{const f=readFixture(),wait=deferred();let n=0,entered;const ready=new Promise(r=>entered=r);f.setAPI(async(m,p)=>{if(p==='/admin/agent-updates'){if(++n===1){entered();return wait.promise}return catalogueResponse('own','0.3.2')}return f.responses(p)});const old=f.c.renderAgentReleaseList(f.host);await ready;await f.c.renderAgentReleaseList(f.host);wait.resolve(catalogueResponse('own','0.3.0'));await old;assert.equal(f.c.arManifestOf(f.c.window._arLastPublished['windows/amd64']).version,'0.3.2')});
 for(const name of ['departed','tenant-changed','deployment-changed'])test('late rollout response discarded after '+name,async()=>{const f=readFixture(),wait=deferred();let entered;const started=new Promise(r=>entered=r);f.setAPI(async(m,p)=>{if(p.startsWith('/admin/agent-rollout')){entered();return wait.promise}return f.responses(p)});const render=f.c.renderAgentReleaseList(f.host);await started;if(name==='departed')f.host.isConnected=false;if(name==='tenant-changed')f.c.operateTenant='other';if(name==='deployment-changed')f.c.answeringForTheDeployment=()=>true;wait.resolve(planResponse(fullPlan()));await render;assert.equal(f.c.window._arLastPublished,undefined);assert.equal(f.host.children.length,0)});
-test('explicit legacy empty tenant remains bound to its own response',async()=>{const f=readFixture();f.setAPI(async(m,p)=>{const r=f.responses(p);if(p==='/admin/tenant'||p.startsWith('/admin/agent-rollout')||p==='/admin/agent-updates'||p==='/admin/agent-update-sign-floor')r.body.tenant_id='';return r});await f.c.renderAgentReleaseList(f.host);assert.ok(f.requests.some(x=>x[1]==='/admin/agent-rollout?expected_tenant_id='));assert.ok(allNodes(f.host).some(x=>String(x.text).includes('Updates paused: incident')))});
+test('explicit legacy empty tenant remains bound to its own response',async()=>{const f=readFixture();f.setAPI(async(m,p)=>{const r=f.responses(p);if(p==='/admin/tenant'||p==='/admin/enrolled-devices'||p.startsWith('/admin/agent-rollout')||p==='/admin/agent-updates'||p==='/admin/agent-update-sign-floor')r.body.tenant_id='';return r});await f.c.renderAgentReleaseList(f.host);assert.ok(f.requests.some(x=>x[1]==='/admin/agent-rollout?expected_tenant_id='));assert.ok(allNodes(f.host).some(x=>String(x.text).includes('Updates paused: incident')))});
 
 
 const editorRequests={
@@ -350,3 +350,31 @@ for(const lang of ['en','ja'])test('connector publication identifies the verifie
  const f=connectorUploadFixture();f.c.bl=x=>x[lang];const tenant='<test & organization>';const card=f.c.arConnectorProgramsSection(()=>true,tenant),code=allNodes(card).find(n=>n.tag==='code');assert.equal(code.text,tenant);assert.equal(code.html,undefined);
  await f.run();assert.match(f.toasts[0][0],/own/);assert.doesNotMatch(f.toasts[0][0],/A location|の拠点/);
 });
+
+function inventoryResponse(devices=[{identity:'device-a',tenant_id:'own',group:'Pilot'},{identity:'device-b',tenant_id:'own',group:'General'}]){return{ok:true,status:200,body:{schema_version:'admin_enrolled_inventory.v1',tenant_id:'own',devices}}}
+const badMemberships={
+ 'HTTP':r=>r.ok=false,'partial status':r=>r.status=206,'empty body':r=>r.body={},'array body':r=>r.body=[],
+ 'schema':r=>r.body.schema_version='unknown','missing tenant':r=>delete r.body.tenant_id,'foreign tenant':r=>r.body.tenant_id='other',
+ 'missing devices':r=>delete r.body.devices,'null devices':r=>r.body.devices=null,'legacy entries only':r=>{r.body.entries=r.body.devices;delete r.body.devices},
+ 'null row':r=>r.body.devices[0]=null,'empty identity':r=>r.body.devices[0].identity='', 'identity type':r=>r.body.devices[0].identity=42,
+ 'duplicate identity':r=>r.body.devices.push({...r.body.devices[0]}),'row tenant missing':r=>delete r.body.devices[0].tenant_id,'foreign row':r=>r.body.devices[0].tenant_id='other',
+ 'null group':r=>r.body.devices[0].group=null,'group type':r=>r.body.devices[0].group={},'group whitespace':r=>r.body.devices[0].group=' Pilot ',
+};
+for(const [name,change] of Object.entries(badMemberships))test('rollout group read rejects '+name,()=>{const f=fixture(),r=inventoryResponse();change(r);assert.throws(()=>f.c.arDeviceGroupsBody(r,'own'))});
+test('group membership deduplication preserves reserved property names and optional unassigned groups',()=>{
+ const f=fixture(),r=inventoryResponse(['__proto__','constructor','Pilot','Pilot','',undefined].map((group,i)=>({identity:'device-'+i,tenant_id:'own',group})));
+ assert.deepEqual(json(f.c.arDeviceGroupsBody(r,'own')),['Pilot','__proto__','constructor']);assert.deepEqual(json(f.c.arDeviceGroupsBody(inventoryResponse([]),'own')),[]);
+ const legacy=inventoryResponse([{identity:'legacy',group:'Pilot'}]);legacy.body.tenant_id='';assert.deepEqual(json(f.c.arDeviceGroupsBody(legacy,'')),['Pilot']);
+});
+test('failed inventory disables only order changes and retry restores verified membership hints',async()=>{
+ const f=readFixture();let fail=true,opened=0;f.c.openAgentWavesForm=()=>opened++;f.setAPI(async(m,p)=>p==='/admin/enrolled-devices'?(fail?{ok:false,status:503,body:{}}:inventoryResponse()):f.responses(p));await f.c.renderAgentReleaseList(f.host);
+ let changes=allNodes(f.host).filter(n=>n.text==='Change');assert.ok(!changes[0].disabled&&!changes[1].disabled&&changes[2].disabled);changes[2].onClick();assert.equal(opened,0);assert.ok(allNodes(f.host).some(n=>String(n.text).includes('memberships could not be verified')));
+ fail=false;allNodes(f.host).find(n=>n.text==='Retry').onClick();for(let i=0;i<20;i++)await Promise.resolve();changes=allNodes(f.host).filter(n=>n.text==='Change');assert.ok(changes.every(n=>!n.disabled));changes[2].onClick();assert.equal(opened,1);assert.ok(f.requests.some(r=>r[1]==='/admin/enrolled-devices?expected_tenant_id=own'));assert.ok(f.requests.every(r=>r[0]==='GET'));
+});
+for(const key of ['session','authority','token','selection','detached','deployment','new-render'])for(const failure of [false,true])test(`obsolete inventory cannot render ${key}, failure=${failure}`,async()=>{
+ const f=readFixture(),wait=deferred();let entered;const ready=new Promise(r=>entered=r);f.setAPI(async(m,p)=>{if(p==='/admin/enrolled-devices'){entered();await wait.promise;if(failure)throw Error('private storage detail');return inventoryResponse()}return f.responses(p)});
+ const task=f.c.renderAgentReleaseList(f.host);await ready;
+ if(key==='session')f.c.idpSession={};if(key==='authority')f.c.baseForPlane=()=>'/other';if(key==='token')f.c.localStorage={getItem:()=> 'changed'};if(key==='selection')f.c.operateTenant='other';if(key==='detached')f.host.isConnected=false;if(key==='deployment')f.c.answeringForTheDeployment=()=>true;if(key==='new-render')f.host.seq++;
+ wait.resolve();await task;assert.equal(f.host.children.length,0);assert.equal(f.c.window._arLastPublished,undefined);
+});
+test('verified group hints and failures have distinct Japanese text',()=>{const f=fixture();f.c.bl=x=>x.ja;assert.match(f.c.arDeviceGroupsReadError(),/確認できません/);f.c.openAgentWavesForm({},schedule(),[]);assert.ok(f.nodes.some(n=>String(n.text).includes('取得した登録端末の一覧にはグループ所属がありません')))});

@@ -742,26 +742,16 @@ async function renderAgentReleaseList(host) {
     el("tbody", {}, rows),
   ]));
 
-  // ★★★ AND THE CONNECTOR PROGRAM HAD NO SCREEN AT ALL (2026-09-06, found by walking a connector onto a
-  // machine in a customer's own network). Add connector lists only what this deployment holds, and when it
-  // holds nothing for that machine's platform it says so plainly and ends with "ask whoever runs this
-  // deployment to add one". The person asked is the operator — and the operator, on their own screens, had
-  // nowhere to add one either. The API's refusal names the remedy as an HTTP call:
-  //
-  //	404 this deployment holds no connector program for linux-amd64: an operator publishes one
-  //	    with PUT /admin/connector-program
-  //
-  // A deployment seeds ONE program from its own image, its own architecture and no other, so a branch office
-  // on a different architecture is the ordinary case and not an edge one. This is the same chain that pointed
-  // at itself on the device lane this morning, one screen along.
-  if (answeringForTheDeployment()) {
-    host.appendChild(arConnectorProgramsSection(current));
+  // Operators publish a tenant replacement here, including while managing a customer.
+  // Tenant administrators obtain programs from Sites; this does not grant publication rights.
+  if (signedInAsOperator()) {
+    host.appendChild(arConnectorProgramsSection(current, rolloutTenant));
   }
 }
 
-// arConnectorProgramsSection lists what this deployment can put on a connector machine, and lets the operator
-// add one. The bytes live with the authority, like agent artifacts, so both calls are control-plane.
-function arConnectorProgramsSection(parentCurrent = () => true) {
+// Connector publication writes one tenant override, including in the deployment view.
+// Use the verified tenant read; the selected-tenant string is empty in that view.
+function arConnectorProgramsSection(parentCurrent = () => true, tenant) {
   const selection = arRolloutSelection(), session = typeof idpSession === "undefined" ? null : idpSession;
   const authority = baseForPlane(_AR_PLANE), token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
   const credential = token();
@@ -770,21 +760,33 @@ function arConnectorProgramsSection(parentCurrent = () => true) {
   const current = () => card.isConnected !== false && context();
   const card = el("div", { class: "ui-card", style: "margin-top:18px" });
   card.appendChild(el("strong", { text: bl({ en: "Connector programs", ja: "コネクタのプログラム" }) }));
+  if (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant) {
+    card.appendChild(el("div", { role: "alert", text: bl({
+      en: "The publication organization could not be verified. Reload before uploading.",
+      ja: "公開先のテナントを確認できません。アップロード前に再読込してください。" }) }));
+    return card;
+  }
+  card.appendChild(el("div", { class: "ui-field-hint", style: "margin-top:8px" }, [
+    el("span", { text: bl({ en: "Publication organization: ", ja: "公開先テナント: " }) }),
+    el("code", { text: tenant }),
+  ]));
   card.appendChild(el("div", { class: "ui-view-desc", text: bl({
-    en: "What an administrator can put on a machine in a customer's own network, from Sites → Add connector. "
-      + "This deployment seeded one from its own image — its own architecture, and no other — so a location "
-      + "on a different one has nothing to install until it is added here.",
-    ja: "顧客側のネットワークにあるマシンへ、管理者が「サイト → コネクタを追加」から置けるものです。この配備は"
-      + "自身のイメージから1つだけ用意しています（自身のアーキテクチャのみ）。異なるものを使う拠点は、ここで"
-      + "追加するまで導入するものがありません。" }) }));
+    en: "These programs are available to this organization from Sites → Add connector. Uploading replaces "
+      + "the program for the selected platform and architecture in this organization only. It does not change "
+      + "other organizations or the shared deployment programs. Shared programs remain available where this "
+      + "organization has no replacement. To publish for another organization, choose Exit tenant if needed, then open Tenants and choose Manage.",
+    ja: "このテナントでは「サイト → コネクタを追加」から以下のプログラムを取得できます。アップロードすると、"
+      + "選択したOS・アーキテクチャのプログラムをこのテナントだけで置き換えます。他のテナントや配備共通の"
+      + "プログラムは変更しません。このテナントで置き換えていない対象には共通プログラムが表示されます。"
+      + "別のテナントへ公開するには、必要に応じて「テナントを出る」を選び、「テナント」で対象の「管理」を選んでください。" }) }));
   const list = el("div", { style: "margin-top:8px" });
   card.appendChild(list);
 
   const refresh = connectorProgramsLoader(list, (programs) => {
     if (!programs.length) {
       list.appendChild(el("div", { class: "ui-view-desc", text: bl({
-        en: "None yet — no location can install a connector until one is added.",
-        ja: "まだありません。1つ追加するまで、どの拠点もコネクタを導入できません。" }) }));
+        en: "None yet for this organization. Add a program before installing a connector here.",
+        ja: "このテナントで取得できるプログラムはまだありません。コネクタの導入前に追加してください。" }) }));
     }
     for (const p of programs) {
       list.appendChild(el("div", { style: "margin-top:4px" }, [
@@ -828,8 +830,8 @@ function arConnectorProgramsSection(parentCurrent = () => true) {
       const r = await arUploadConnectorProgram(bytes, platform, arch, digest, version);
       if (!current()) return;
       arConnectorProgramAck(r, { platform, arch, version, sha256: digest, size: bytes.byteLength });
-      uiToast(bl({ en: "Added. A location on " + platform + "/" + arch + " can install a connector now.",
-                   ja: "追加しました。" + platform + "/" + arch + " の拠点はコネクタを導入できます。" }), "ok");
+      uiToast(bl({ en: "Added for organization " + tenant + " (" + platform + "/" + arch + ").",
+                   ja: "テナント " + tenant + " に追加しました（" + platform + "/" + arch + "）。" }), "ok");
       fileF.value = "";
       refresh();
     } catch (_) {

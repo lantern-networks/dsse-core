@@ -47,7 +47,7 @@ for(const name of ['foreign','schema','status','body'])test('rollout read refuse
 test('valid holds, explicit defaults and nullable optional schedules remain readable',()=>{const f=fixture();const variants=[fullPlan(),{desired_version:'',release_channel:'',frozen:false,intent:'',reason:'',updated_at:''},{...fullPlan(),window:null,waves:{waves:null,default_delay_days:null}}];for(const p of variants)assert.deepEqual(json(f.c.arRolloutPlanBody(planResponse(p),'own')),p)});
 function readFixture(){
  const f=fixture();let api;
- Object.assign(f.c,{window:{},connectorProgramsFetch:async()=>[],operateTenant:'',answeringForTheDeployment:()=>false,uiBadge:(text)=>({text}),uiWhen:x=>x,atob:s=>Buffer.from(s,'base64').toString(),uiState:(host,type,text)=>{host.innerHTML='';host.state={type,text}},freshRender:host=>{const n=host.seq=(host.seq||0)+1;return()=>host.seq===n},apiFetch:(...args)=>{f.requests.push(args);return api(args[0], args[1].replace(/\?expected_tenant_id=.*$/, ""), ...args.slice(2))}});
+ Object.assign(f.c,{window:{},connectorProgramsFetch:async()=>[],operateTenant:'',answeringForTheDeployment:()=>false,signedInAsOperator:()=>false,uiBadge:(text)=>({text}),uiWhen:x=>x,atob:s=>Buffer.from(s,'base64').toString(),uiState:(host,type,text)=>{host.innerHTML='';host.state={type,text}},freshRender:host=>{const n=host.seq=(host.seq||0)+1;return()=>host.seq===n},apiFetch:(...args)=>{f.requests.push(args);return api(args[0], args[1].replace(/\?expected_tenant_id=.*$/, ""), ...args.slice(2))}});
  const responses=path=>path.startsWith('/admin/agent-rollout')?planResponse(fullPlan()):{ok:true,status:200,body:path==='/admin/tenant'?{tenant_id:'own'}:path==='/admin/agent-updates'?{schema_version:'admin_agent_updates.v1',tenant_id:'own',envelopes:{},pending:{}}:path==='/admin/enrolled-devices'?{devices:[]}:{schema_version:'admin_agent_update_sign_floor.v1',tenant_id:'own',floors:{},signing_public_key:'no'}};
  api=async(method,path)=>responses(path);const host={isConnected:true,children:[],appendChild(n){this.children.push(n)}};Object.defineProperty(host,'innerHTML',{set(){this.children=[]}});
  return{...f,host,responses,setAPI(fn){api=fn}};
@@ -303,7 +303,7 @@ function connectorUploadFixture(){
  const f=fixture(),uploads=[];let valid=true,refreshes=0;
  Object.assign(f.c,{operateTenant:'',idpSession:{auth_method:'admin_session'},localStorage:{getItem:()=>''},crypto:{subtle:{digest:async()=>new Uint8Array(32).buffer}},connectorProgramsLoader:()=>async()=>refreshes++});
  f.c.arUploadConnectorProgram=async(bytes,platform,arch,sha256,version)=>{uploads.push({bytes,platform,arch,sha256,version});return{ok:true,status:200,body:{platform,arch,sha256,version,size:bytes.byteLength,file_name:`dsse-connector-${platform}-${arch}.tar.gz`,published_at:'2026-09-18T00:00:00Z'}}};
- const card=f.c.arConnectorProgramsSection(()=>valid),nodes=allNodes(card),file=nodes.find(n=>n.type==='file'),pair=nodes.find(n=>n.tag==='select'),version=nodes.find(n=>n.type==='text'),submit=nodes.find(n=>n.text==='Add it'),error=nodes.find(n=>n.role==='alert');
+ const card=f.c.arConnectorProgramsSection(()=>valid,"own"),nodes=allNodes(card),file=nodes.find(n=>n.type==='file'),pair=nodes.find(n=>n.tag==='select'),version=nodes.find(n=>n.type==='text'),submit=nodes.find(n=>n.text==='Add it'),error=nodes.find(n=>n.role==='alert');
  error.style={};file.value='selected';file.files=[{size:3,arrayBuffer:async()=>new Uint8Array([1,2,3]).buffer}];pair.value='linux/amd64';version.value='build-1';
  return{...f,card,file,pair,version,submit,error,uploads,invalidate:()=>valid=false,get refreshes(){return refreshes},run:()=>submit.handlers.click()};
 }
@@ -330,7 +330,23 @@ test('connector upload Japanese distinguishes unsent and uncertain',()=>{const f
 test('connector catalogue starts before its card is attached',async()=>{
  const f=fixture(),el=f.c.el;let reads=0;
  Object.assign(f.c,{operateTenant:'',idpSession:{},freshRender:()=>()=>true,uiState(){},apiFetch:async()=>{reads++;return{ok:true,status:200,body:{programs:[],count:0}}},el:(...a)=>{const n=el(...a);if(n.class==='ui-card')n.isConnected=false;return n}});
- const card=f.c.arConnectorProgramsSection();assert.equal(reads,1);card.isConnected=true;for(let i=0;i<6;i++)await Promise.resolve();assert.ok(allNodes(card).some(n=>String(n.text).includes('None yet')));
+ const card=f.c.arConnectorProgramsSection(()=>true,"own");assert.equal(reads,1);card.isConnected=true;for(let i=0;i<6;i++)await Promise.resolve();assert.ok(allNodes(card).some(n=>String(n.text).includes('None yet')));
 });
 test('connector acknowledgement accepts omitted empty version but rejects null',()=>{const f=fixture(),expected={platform:'linux',arch:'amd64',sha256:'a'.repeat(64),size:0,version:''},body={...expected,file_name:'dsse-connector-linux-amd64.tar.gz',published_at:'2026-09-18T00:00:00Z'};delete body.version;assert.ok(f.c.arConnectorProgramAck({ok:true,status:200,body},expected));body.version=null;assert.throws(()=>f.c.arConnectorProgramAck({ok:true,status:200,body},expected))});
 for(const phase of ['hash','upload'])test('connector suppresses obsolete failure '+phase,async()=>{const f=connectorUploadFixture();let reject,enter;const entered=new Promise(r=>enter=r),wait=()=>{enter();return new Promise((_,r)=>reject=r)};if(phase==='hash')f.c.crypto.subtle.digest=wait;else f.c.arUploadConnectorProgram=wait;const run=f.run();await entered;f.invalidate();reject(Error('late private detail'));await run;assert.equal(f.error.textContent,'');assert.equal(f.toasts.length,0)});
+
+for (const mode of ['deployment', 'selected', 'customer']) test('connector publication visibility follows operator authority: '+mode,async()=>{
+ const f=readFixture();f.c.signedInAsOperator=()=>mode!=='customer';f.c.answeringForTheDeployment=()=>mode==='deployment';if(mode==='selected')f.c.operateTenant='own';
+ f.c.connectorProgramsLoader=()=>()=>{};
+ if(mode==='deployment')f.setAPI(async(m,p)=>p==='/admin/agent-updates'?catalogueResponse('deployment'):p==='/admin/agent-update-sign-floor'?floorResponse('deployment'):f.responses(p));
+ await f.c.renderAgentReleaseList(f.host);const nodes=allNodes(f.host),cards=nodes.filter(n=>n.text==='Connector programs');assert.equal(cards.length,mode==='customer'?0:1);
+ if(mode!=='customer'){assert.ok(nodes.some(n=>n.tag==='code'&&n.text==='own'));assert.ok(nodes.some(n=>n.text==='Add it'))}
+});
+for(const tenant of [undefined,'',' bad '])test('unverified publication tenant exposes no upload or catalogue: '+String(tenant),()=>{
+ const f=fixture();let reads=0;f.c.connectorProgramsLoader=()=>()=>reads++;const card=f.c.arConnectorProgramsSection(()=>true,tenant),nodes=allNodes(card);
+ assert.ok(nodes.some(n=>n.role==='alert'));assert.ok(!nodes.some(n=>n.type==='file'||n.text==='Add it'));assert.equal(reads,0);
+});
+for(const lang of ['en','ja'])test('connector publication identifies the verified tenant safely in '+lang,async()=>{
+ const f=connectorUploadFixture();f.c.bl=x=>x[lang];const tenant='<test & organization>';const card=f.c.arConnectorProgramsSection(()=>true,tenant),code=allNodes(card).find(n=>n.tag==='code');assert.equal(code.text,tenant);assert.equal(code.html,undefined);
+ await f.run();assert.match(f.toasts[0][0],/own/);assert.doesNotMatch(f.toasts[0][0],/A location|の拠点/);
+});

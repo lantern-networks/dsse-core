@@ -1152,6 +1152,10 @@ The program selection is locked during download. Closing the dialog or changing 
 
 ### Confirming a connector program upload
 
+In Agent Releases, the Connector programs card names the tenant that will receive the upload. In the deployment view this is the operator’s own tenant, not every tenant. To publish for a customer, choose Exit tenant if already managing another tenant, open Tenants, choose Manage for that customer, and then open Agent Releases. The card is available to operators in either view; customer administrators still obtain programs through Sites.
+
+An upload replaces only that tenant’s program for the chosen platform and architecture. Other tenants and shared deployment programs are unchanged. The catalogue combines shared programs with this tenant’s replacements, with a replacement taking precedence for the same target. The displayed tenant comes from the verified tenant read; it does not add a server-enforced scope pin to this API.
+
 Connector uploads hold the file, target and build fixed while reading, hashing and sending. The Console only clears the selected file after HTTP 200 metadata confirms the submitted target, filename, size, digest and build. A failed or incomplete acknowledgement may follow a completed save: the Console retains the input, shows a persistent uncertainty notice and refreshes only the catalogue for inspection. Choose Add it deliberately to retry; each retry is another audited upload. A preparation failure means nothing was sent. Reloading or leaving the page discards the form, and leaving after dispatch cannot undo a write already sent.
 
 These checks do not change the server's authenticated-tenant override destination, shared seeded programs, or publication authorization. The existing response contains no tenant scope pin. Confirmed metadata is not an atomic publication transaction or protection against a later concurrent writer. Existing common API audits record the operation and principal; the publication detail event described below identifies the saved program.

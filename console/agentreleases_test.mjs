@@ -186,3 +186,52 @@ for (const kind of ['agent', 'connector']) test(kind + ' raw upload preserves it
  assert.equal(opts.headers['x-csrf-token'], 'csrf'); assert.equal(opts.headers['x-operate-tenant'], 'selected'); assert.equal(opts.headers.authorization, undefined);
  if (kind === 'connector') { assert.equal(opts.headers['x-artifact-sha256'], 'c'.repeat(64)); assert.equal(opts.headers['x-artifact-version'], '0.3.2'); }
 });
+
+function resumeFixture(signed=true) {
+ const f=publishFixture({},!signed);
+ if(!signed){f.inputs[1].files=[];f.inputs[1].handlers.change();f.fields.target.set('windows/amd64');f.fields.version.set('0.3.3')}
+ return f;
+}
+async function failedPackage(f,mode='http') {
+ const upload=f.c.arUploadArtifact;
+ f.c.arUploadArtifact=async(...args)=>{const r=await upload(...args);if(mode==='network')throw Error('lost response');if(mode==='ack')r.body.active=false;else {r.ok=false;r.status=500}return r};
+ await f.submit.handlers.click();f.c.arUploadArtifact=upload;
+ assert.equal(f.closed,0);assert.equal(f.requests.length,1);assert.equal(f.uploads.length,1);
+}
+for(const signed of [true,false])test('confirmed publication retries only its package signed='+signed,async()=>{
+ const f=resumeFixture(signed);await failedPackage(f);
+ assert.equal(f.submit.textContent,'Retry package');assert.equal(f.submit.disabled,false);assert.equal(f.modal.footer[0].disabled,false);
+ assert.ok(f.nodes.filter(n=>['input','select'].includes(n.tag)).every(n=>n.disabled));
+ f.c.arHash=async()=>{throw Error('must not hash/sign a second publication')};f.signedFile.text=async()=>{throw Error('must not reopen signed manifest')};
+ await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.uploads.length,2);assert.equal(f.uploads[1][0],f.file);assert.deepEqual(json(f.uploads[1][3]),json(f.uploads[0][3]));assert.equal(f.closed,1);
+});
+for(const signed of [true,false])test('upload resume ignores changed form and file references signed='+signed,async()=>{
+ const f=resumeFixture(signed);await failedPackage(f);const first=f.uploads[0];
+ f.inputs[0].files=[{name:'other.pkg',size:99}];f.inputs[0].handlers.change();f.inputs[1].files=[];f.inputs[1].handlers.change();f.fields.target.set('darwin/amd64');f.fields.version.set('');f.fields.url.set('');
+ await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.uploads.length,2);assert.equal(f.uploads[1][0],first[0]);assert.deepEqual(json(f.uploads[1].slice(1)),json(first.slice(1)));assert.equal(f.closed,1);
+});
+for(const mode of ['network','ack','http'])test('unconfirmed package result retains one publication across retries '+mode,async()=>{
+ const f=resumeFixture();await failedPackage(f,mode);const upload=f.c.arUploadArtifact;
+ f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a);r.ok=false;r.status=409;return r};await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.uploads.length,2);assert.equal(f.closed,0);assert.equal(f.toasts.length,0);assert.equal(f.submit.textContent,'Retry package');
+ f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a);r.body.activated=false;return r};await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.uploads.length,3);assert.equal(f.closed,1);
+});
+for(const phase of ['before','during'])test('upload resume discards changed context '+phase,async()=>{
+ const f=resumeFixture();await failedPackage(f);let valid=true;f.c.window._arReleaseReadContext.current=()=>valid;const wait=deferred(),upload=f.c.arUploadArtifact;
+ if(phase==='before')valid=false;else f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a);await wait.promise;return r};
+ const run=f.submit.handlers.click();await Promise.resolve();valid=false;f.mutation();wait.resolve();await run;
+ assert.equal(f.closed,1);assert.equal(f.requests.length,1);assert.equal(f.uploads.length,phase==='before'?1:2);assert.equal(f.rendered,0);assert.equal(f.toasts.length,0);
+});
+for(const kind of ['cancel','escape','backdrop'])test('unconfirmed package can be dismissed without another write '+kind,async()=>{
+ const f=resumeFixture();await failedPackage(f);assert.equal(f.submit.textContent,'Retry package');
+ if(kind==='cancel')f.modal.footer[0].onClick();if(kind==='escape')f.listeners.get('keydown')({key:'Escape'});if(kind==='backdrop'){const b=f.nodes.findLast(n=>n.class==='ui-modal-backdrop');b.onClick({target:b})}
+ assert.equal(f.closed,1);assert.equal(f.requests.length,1);assert.equal(f.uploads.length,1);
+});
+for(const signed of [true,false])test('unconfirmed publication cannot become an upload-only retry signed='+signed,async()=>{
+ const f=resumeFixture(signed),api=f.c.apiFetch;f.c.apiFetch=async(...a)=>{const r=await api(...a);r.body={};return r};await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.uploads.length,0);assert.equal(f.submit.textContent??f.submit.text,'Publish');assert.ok(f.nodes.filter(n=>['input','select'].includes(n.tag)).every(n=>!n.disabled));
+ f.c.apiFetch=api;await f.submit.handlers.click();assert.equal(f.requests.length,2);assert.equal(f.uploads.length,1);assert.equal(f.closed,1);
+});
+test('package resume locks dismissal and ignores another submit until upload settles',async()=>{
+ const f=resumeFixture();await failedPackage(f);const upload=f.c.arUploadArtifact,wait=deferred();
+ f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a);await wait.promise;return r};const run=f.submit.handlers.click();await Promise.resolve();
+ const b=f.nodes.findLast(n=>n.class==='ui-modal-backdrop');assert.ok(allNodes(b).filter(n=>['input','select','button'].includes(n.tag)).every(n=>n.disabled));f.modal.footer[0].onClick();f.listeners.get('keydown')({key:'Escape'});b.onClick({target:b});await f.submit.handlers.click();assert.equal(f.closed,0);assert.equal(f.requests.length,1);assert.equal(f.uploads.length,2);wait.resolve();await run;assert.equal(f.closed,1);
+});

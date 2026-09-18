@@ -1013,12 +1013,24 @@ An already-active upload can succeed with `activated=false` and `active=true`;
 Neither field establishes that endpoints have installed the release.
 
 On a failed or unverifiable response, the form retains its selected files and
-entered values, unlocks and displays a persistent message. Publication or activation
-may already have happened. Retry with Publish, or cancel and reload before another
-change. Retrying still resubmits the publication and package; it is not an
-upload-only resume or exactly-once operation and can add audit records. A failed
-acknowledgement does not roll back saved data. A verified publication followed by
-an uncertain upload is not automatically described as still pending.
+entered values and displays a persistent message. Publication or activation may
+already have happened; a failed acknowledgement does not roll back saved data.
+
+When publication was confirmed but upload was not, the fields remain locked and
+the button becomes **Retry package**. It sends the original package with the same
+acknowledged manifest hash, without hashing, signing or publishing again. Cancel
+is available between attempts. If another publication has replaced that manifest,
+the existing hash pin rejects the stale upload; cancel and reload before making
+another change. A verified publication followed by an uncertain upload is not
+automatically described as still pending, and an already-active upload may be
+confirmed by the retry.
+
+When publication itself could not be confirmed, no trusted manifest hash is
+available for upload-only resume. The fields unlock and **Publish** remains an
+explicit publication retry. Cancel and reload to reconcile saved state before
+changing the release. Closing the form or leaving the page discards its remembered
+upload stage; it does not cancel server-side changes. No stage is saved across
+browser reloads. Retries can add audit records and are not exactly-once operations.
 
 `POST`/`PUT /admin/agent-updates` and `PUT /admin/agent-update-artifact` accept
 `expected_tenant_id`; artifact upload also accepts `expected_manifest_sha256`.

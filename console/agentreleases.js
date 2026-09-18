@@ -1022,7 +1022,7 @@ function openAgentReleaseForm(host) {
     if (prev && prev.artifact_url) urlF.set(prev.artifact_url);
   });
 
-  let pending = false, closed = false, observer;
+  let pending = false, closed = false, staged = null, observer;
   const progress = el("div", { class: "ui-muted", role: "status" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Publish", ja: "公開" }) });
   const close = () => {
@@ -1046,43 +1046,55 @@ function openAgentReleaseForm(host) {
   ]);
   const controller = { active };
   window._arReleaseDialog = controller;
-  const lock = () => backdrop.querySelectorAll("input,select,textarea,button").forEach(n => { n.disabled = pending; });
+  const lock = () => {
+    backdrop.querySelectorAll("input,select,textarea").forEach(n => { n.disabled = pending || staged !== null; });
+    cancel.disabled = submit.disabled = pending;
+    submit.textContent = staged
+      ? bl({ en: "Retry package", ja: "パッケージ送信を再試行" })
+      : bl({ en: "Publish", ja: "公開" });
+  };
   document.body.appendChild(backdrop); document.addEventListener("keydown", onKey);
   submit.addEventListener("click", async () => {
     if (!active() || pending) return;
     // Capture this attempt before the first await; programmatic input changes
     // must not substitute another file even while the controls are disabled.
-    const file = chosen, signedFile = chosenEnvelope;
-    let version = versionF.get();
+    const file = staged ? staged.file : chosen, signedFile = chosenEnvelope;
+    let version = staged ? staged.manifest.version : versionF.get();
     const artifactURL = urlF.get(), parts = String(targetF.get()).split("/");
     if (!file) { uiToast(bl({ en: "Choose the package file.", ja: "パッケージファイルを選んでください。" }), "err"); return; }
-    if (!canSign && !signedFile) {
+    if (!staged && !canSign && !signedFile) {
       uiToast(bl({ en: "Choose the signed release file — this control plane cannot sign one.", ja: "署名済みリリースファイルを選んでください。この管理サーバーは署名できません。" }), "err"); return;
     }
-    if (!signedFile && (!versionF.validate() || !urlF.validate())) return;
+    if (!staged && !signedFile && (!versionF.validate() || !urlF.validate())) return;
     pending = true; lock(); progress.setAttribute("role", "status");
-    let sent = false, published = false;
+    let sent = staged !== null, published = staged !== null;
     try {
-      progress.textContent = bl({ en: "Checking the package…", ja: "パッケージを確認中…" });
-      const digest = await arHash(file);
-      if (!active()) return;
-      const now = new Date(), iso = d => d.toISOString().replace(/\.\d+Z$/, "Z");
-      let envelope, manifest = { version, platform: parts[0], arch: parts[1], channel: "stable", delivery: "dsse",
-        artifact_kind: parts[0] === "windows" ? "msi" : "pkg", artifact_url: artifactURL,
-        artifact_sha256: digest, artifact_size: file.size, released_at: iso(now), not_after: iso(new Date(now.getTime() + 180 * 24 * 3600 * 1000)) };
-      if (signedFile) {
-        progress.textContent = bl({ en: "Checking the signed file…", ja: "署名済みファイルを確認中…" });
-        try { envelope = JSON.parse(await signedFile.text()); }
-        catch (_) { throw new Error(bl({ en: "That is not a signed release file.", ja: "署名済みリリースファイルではありません。" })); }
+      if (!staged) {
+        progress.textContent = bl({ en: "Checking the package…", ja: "パッケージを確認中…" });
+        const digest = await arHash(file);
         if (!active()) return;
-        manifest = arSignedPackage(envelope, file, digest); version = manifest.version;
+        const now = new Date(), iso = d => d.toISOString().replace(/\.\d+Z$/, "Z");
+        let envelope, manifest = { version, platform: parts[0], arch: parts[1], channel: "stable", delivery: "dsse",
+          artifact_kind: parts[0] === "windows" ? "msi" : "pkg", artifact_url: artifactURL,
+          artifact_sha256: digest, artifact_size: file.size, released_at: iso(now), not_after: iso(new Date(now.getTime() + 180 * 24 * 3600 * 1000)) };
+        if (signedFile) {
+          progress.textContent = bl({ en: "Checking the signed file…", ja: "署名済みファイルを確認中…" });
+          try { envelope = JSON.parse(await signedFile.text()); }
+          catch (_) { throw new Error(bl({ en: "That is not a signed release file.", ja: "署名済みリリースファイルではありません。" })); }
+          if (!active()) return;
+          manifest = arSignedPackage(envelope, file, digest); version = manifest.version;
+        }
+        if (!active()) return;
+        progress.textContent = bl({ en: "Publishing…", ja: "公開中…" }); sent = true;
+        const signed = await apiFetch(signedFile ? "PUT" : "POST", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(read.scope), signedFile ? envelope : manifest, _AR_PLANE);
+        if (!active()) return;
+        const manifestSHA256 = arPublicationAck(signed, read.scope, manifest, signedFile ? envelope.payload_sha256 : undefined);
+        published = true;
+        // Keep the acknowledged file and manifest for this dialog. An upload retry
+        // must not sign or publish again, or replace another writer's newer release.
+        staged = { file, manifest, manifestSHA256 };
       }
-      if (!active()) return;
-      progress.textContent = bl({ en: "Publishing…", ja: "公開中…" }); sent = true;
-      const signed = await apiFetch(signedFile ? "PUT" : "POST", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(read.scope), signedFile ? envelope : manifest, _AR_PLANE);
-      if (!active()) return;
-      const manifestSHA256 = arPublicationAck(signed, read.scope, manifest, signedFile ? envelope.payload_sha256 : undefined);
-      published = true;
+      const { manifest, manifestSHA256 } = staged;
       progress.textContent = bl({ en: "Sending the package…", ja: "パッケージを送信中…" });
       const upload = await arUploadArtifact(file, manifest.platform, manifest.arch, { scope: read.scope, manifestSHA256 });
       if (!active()) return;
@@ -1096,8 +1108,8 @@ function openAgentReleaseForm(host) {
       else {
         progress.setAttribute("role", "alert");
         progress.textContent = published
-          ? bl({ en: version + " was published, but package delivery could not be confirmed. It may already be active. Retry with Publish, or cancel and reload before making another change.",
-                 ja: version + " の公開後、パッケージ送信の結果を確認できません。すでに有効な可能性があります。公開ボタンで再試行するか、キャンセルして再読込してから次の変更を行ってください。" })
+          ? bl({ en: version + " was published, but package delivery could not be confirmed. It may already be active. Retry package sends the same file without publishing again. If the release changed, cancel and reload before continuing.",
+                 ja: version + " の公開後、パッケージ送信の結果を確認できません。すでに有効な可能性があります。「パッケージ送信を再試行」で同じファイルを送信します。再公開はしません。公開内容が変わった場合はキャンセルして再読込してください。" })
           : bl({ en: "Publication could not be confirmed. The release may already be saved. Retry with Publish, or cancel and reload before making another change.",
                  ja: "公開結果を確認できません。すでに保存済みの可能性があります。公開ボタンで再試行するか、キャンセルして再読込してから次の変更を行ってください。" });
       }

@@ -140,6 +140,9 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 	// current plan + the fleet adoption summary (who has moved); PUT drives a rollout, a rollback to a
 	// known-good version, or an incident freeze — hot-applied (the runtime rollout endpoint consults it).
 	mux.HandleFunc("GET /admin/agent-rollout", adminEndpoint("admin.agents.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		tenantID := adminTenantIDFromRequest(r)
 		var fleet map[string]any
 		if agentTelemetry != nil {

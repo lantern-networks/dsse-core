@@ -802,6 +802,15 @@ and synchronizing an Edge cache still uses best-effort persistence.
 
 ### Agent rollout settings and incident holds
 
+The Console confirms the rollout plan's format, tenant and complete settings
+before enabling its three editors. An unavailable, incomplete or foreign response
+shows Retry and disables editing; it is not shown as an unset window or an absent
+hold. Retry reloads the settings without changing them. A valid unset plan still
+displays the device defaults. Late reads from a departed page or changed tenant
+are discarded. The published-release catalogue is a separate scope: an operator
+outside a tenant may see the deployment catalogue while the rollout plan remains
+scoped to the authenticated tenant.
+
 In **Agent Releases**, the selected version, installation window and group rollout
 order are separate controls. Changing the selected version or choosing to follow
 the offered release preserves an incident hold and its reason. The page displays

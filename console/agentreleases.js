@@ -85,6 +85,38 @@ function arErrorText(r) {
   return bl({ en: "unknown error", ja: "不明なエラー" });
 }
 
+function arRolloutSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
+function arRolloutReadError() { return bl({ en: "Could not verify rollout settings. Retry before making changes.", ja: "配布設定を確認できません。変更する前に再試行してください。" }); }
+function arReadObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+function arRolloutPlanBody(response, tenant) {
+  const d = response?.body, p = d?.plan;
+  const invalid = () => { throw new Error(arRolloutReadError()); };
+  if (!response?.ok || response.status !== 200 || !arReadObject(d) || d.schema_version !== "admin_agent_rollout.v1" ||
+      d.tenant_id !== tenant || !arReadObject(p) || typeof p.frozen !== "boolean" ||
+      ["desired_version", "release_channel", "intent", "reason", "updated_at"].some(k => typeof p[k] !== "string") ||
+      !["", "rollout", "rollback", "freeze", "follow", "schedule"].includes(p.intent)) invalid();
+  const whole = n => Number.isSafeInteger(n) && n >= 0;
+  if (p.window !== undefined && p.window !== null) {
+    const w = p.window, clock = v => typeof v === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(v.trim());
+    if (!arReadObject(w) || !clock(w.local_start) || !clock(w.local_end) ||
+        typeof w.require_ac_power !== "boolean" || typeof w.require_unattended !== "boolean" ||
+        !whole(w.require_idle_minutes) || !whole(w.deadline_days) || w.deadline_days > 365) invalid();
+  }
+  if (p.waves !== undefined && p.waves !== null) {
+    const w = p.waves, groups = new Set();
+    if (!arReadObject(w) || (w.waves !== null && !Array.isArray(w.waves)) ||
+        (w.default_delay_days !== undefined && w.default_delay_days !== null && !whole(w.default_delay_days))) invalid();
+    for (const row of w.waves || []) {
+      if (!arReadObject(row) || typeof row.group !== "string" || !row.group.trim() || !whole(row.delay_days) ||
+          (row.priority !== undefined && !Number.isSafeInteger(row.priority))) invalid();
+      const key = row.group.trim().toLowerCase();
+      if (groups.has(key)) invalid();
+      groups.add(key);
+    }
+  }
+  return p;
+}
+
 // The artifact upload is raw bytes, so it cannot go through apiFetch (which sends JSON). The session and the
 // headers are built from the same globals rather than copied, so a change to how the Console authenticates
 // does not leave this one call behind.
@@ -382,8 +414,10 @@ function renderAgentReleasesView(content) {
 }
 
 async function renderAgentReleaseList(host) {
+  if (host.isConnected === false) return;
   uiState(host, "loading");
-  const current = freshRender(host);
+  const fresh = freshRender(host), selection = arRolloutSelection(), deployment = answeringForTheDeployment();
+  const current = () => fresh() && host.isConnected !== false && selection === arRolloutSelection() && deployment === answeringForTheDeployment();
   let updates, floor;
   try {
     updates = await apiFetch("GET", "/admin/agent-updates", undefined, _AR_PLANE);
@@ -392,6 +426,7 @@ async function renderAgentReleaseList(host) {
     uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
     return;
   }
+  if (!current()) return;
   if (!updates.ok) {
     if (!current()) return;
     uiState(host, "error", arErrorText(updates), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
@@ -404,16 +439,24 @@ async function renderAgentReleaseList(host) {
   } catch (e) {
     floor = { ok: false };
   }
+  if (!current()) return;
 
-  // The timing rule, read from the same control plane. Best-effort: a page about releases must not go blank
-  // because the schedule could not be read, but it must not pretend there is no rule either.
-  let plan = null;
+  // A valid empty plan states its defaults explicitly. An incomplete or foreign
+  // response is not an empty plan that an editor may overwrite with defaults.
+  let plan = null, planUnread = false;
   try {
-    const r = await apiFetch("GET", "/admin/agent-rollout", undefined, _AR_PLANE);
-    if (r.ok && r.body && r.body.plan) plan = r.body.plan;
+    const organization = await apiFetch("GET", "/admin/tenant", undefined, _AR_PLANE);
+    if (!current()) return;
+    const tenant = organization?.body?.tenant_id;
+    if (!organization?.ok || organization.status !== 200 || !arReadObject(organization.body) ||
+        typeof tenant !== "string" || tenant.trim() !== tenant || (selection && selection !== tenant)) throw new Error(arRolloutReadError());
+    const r = await apiFetch("GET", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(tenant), undefined, _AR_PLANE);
+    if (!current()) return;
+    plan = arRolloutPlanBody(r, tenant);
   } catch (e) {
-    plan = null;
+    planUnread = true;
   }
+  if (!current()) return;
 
   // Which groups devices ACTUALLY carry. A rollout order naming groups nothing is in is a schedule that
   // applies to nobody, and that is invisible from the schedule itself.
@@ -434,10 +477,14 @@ async function renderAgentReleaseList(host) {
   const pending = (updates.body && updates.body.pending) || {};
   const floors = (floor && floor.ok && floor.body && floor.body.floors) || {};
   const signingKey = (floor && floor.ok && floor.body && floor.body.signing_public_key) || "";
-  window._arLastPublished = published; // so the form can reuse the address this target used last time
-
   if (!current()) return;
+  window._arLastPublished = published; // so the form can reuse the address this target used last time
   host.innerHTML = "";
+
+  if (planUnread) host.appendChild(el("div", { class: "ui-state ui-state-error" }, [
+    el("p", { text: arRolloutReadError() }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
+  ]));
 
   // ★ SAID BEFORE THE TABLE, NOT AFTER A FAILED ATTEMPT. A control plane with no signing key cannot publish
   // from this screen at all, and finding that out by filling in a form and pressing the button is the version
@@ -532,7 +579,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => openAgentWindowForm(host, w),
+      onClick: () => { if (current() && plan !== null) openAgentWindowForm(host, w); },
     }),
   ]));
 
@@ -553,7 +600,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => openAgentVersionForm(host, plan, published),
+      onClick: () => { if (current() && plan !== null) openAgentVersionForm(host, plan, published); },
     }),
   ]));
 
@@ -569,7 +616,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => openAgentWavesForm(host, plan && plan.waves, groupsInUse),
+      onClick: () => { if (current() && plan !== null) openAgentWavesForm(host, plan.waves, groupsInUse); },
     }),
   ]));
 

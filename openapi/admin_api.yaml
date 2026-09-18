@@ -6458,12 +6458,26 @@ paths:
   /admin/agent-rollout:
     get:
       summary: Read the tenant's agent rollout/rollback plan + fleet adoption ().
-      description: Requires admin.agents.read. Returns the admin-managed rollout plan (desired version, release channel, intent, freeze) the runtime per-device rollout endpoint consults, plus the fleet update-adoption summary (which versions devices have moved to).
+      description: >-
+        Requires admin.agents.read. Returns schema_version=admin_agent_rollout.v1, the authenticated tenant_id,
+        and the admin-managed plan plus fleet adoption summary. An unset plan still includes explicit scalar
+        defaults, including frozen=false. Missing or malformed data must not be treated as unset settings.
+        The optional expected_tenant_id checks the authenticated operating context before reading the plan;
+        it does not select a tenant or grant access. Legacy clients may omit it.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Reject a nonempty value that differs from the authenticated tenant.
       responses:
         "200":
           description: Current rollout plan + fleet adoption summary.
+        "409":
+          description: The operating tenant changed. Reload before continuing.
     put:
       summary: Drive an agent rollout, rollback, or incident freeze ().
       description: >-

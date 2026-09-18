@@ -404,28 +404,18 @@ async function renderSiteList(host) {
   }
 
   const cid = (c) => c.id || c.connector_id || "";
-  // connTable lists a site's connectors. In HA mode it shows the active-standby role: exactly one online
-  // connector is ACTIVE (the one routing sends traffic to — the stable pick among the online ones); the other
-  // online connectors are STANDBY (ready to take over); offline ones are OFFLINE. Non-HA (unassigned) shows plain
-  // connected/offline.
-  const connTable = (list, ha) => {
+  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Availability is reported by the server using tunnel state or recent heartbeats.", ja: "サーバーがトンネルの状態または最近のハートビートから判定した稼働状態です。" }) }));
+  // Availability is a server answer, not a site-wide routing role inferred from connector IDs.
+  const connTable = (list) => {
     if (!list.length) return el("p", { class: "ui-view-desc", style: "margin:6px 0 2px", text: bl({ en: "No connectors yet — use “Add connector”.", ja: "コネクタ未導入 —「コネクタを追加」から。" }) });
-    // ★ THE SERVER'S ANSWER, NOT ITS INGREDIENTS (2026-09-01). This read tunnel_connected as a boolean, and
-    // that field has three states: held here, unknown, and — never — false. A control plane holds no connector
-    // tunnel at all, so it answers unknown for every connector, and this screen showed "Healthy … 0 / 2
-    // connectors online" with a heartbeat eight seconds old beside each Offline row, while the API it had just
-    // called said online=2. `online` is that same answer, decided once, on the server.
-    const activeId = list.filter((c) => c.online).map(cid).sort()[0] || null;
-    const roleBadge = (c) => {
-      if (!c.online) return uiBadge(bl({ en: "Offline", ja: "オフライン" }), "danger");
-      if (!ha) return uiBadge(bl({ en: "Connected", ja: "接続中" }), "ok");
-      return cid(c) === activeId ? uiBadge(bl({ en: "Active", ja: "アクティブ" }), "ok") : uiBadge(bl({ en: "Standby", ja: "スタンバイ" }), "off");
-    };
+    const availabilityBadge = (c) => c.online
+      ? uiBadge(bl({ en: "Online", ja: "オンライン" }), "ok")
+      : uiBadge(bl({ en: "Offline", ja: "オフライン" }), "danger");
     const rows = list.map((c) => {
       const id = cid(c);
       return el("tr", {}, [
         el("td", {}, [el("div", { style: "font-weight:600", text: c.name || id }), el("code", { class: "ui-view-desc", text: id })]),
-        el("td", {}, roleBadge(c)),
+        el("td", {}, availabilityBadge(c)),
         el("td", { text: c.last_heartbeat_at || bl({ en: "never", ja: "なし" }) }),
         el("td", { class: "ui-row-actions" }, [
           el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Rename", ja: "名前変更" }), onClick: () => renameConnector(id, c.name, host) }),
@@ -434,7 +424,7 @@ async function renderSiteList(host) {
       ]);
     });
     return el("table", { class: "ui-table", style: "margin-top:6px" }, [
-      el("thead", {}, el("tr", {}, [bl({ en: "Connector", ja: "コネクタ" }), bl({ en: "Role", ja: "役割" }), bl({ en: "Last heartbeat", ja: "最終ハートビート" }), bl({ en: "Manage", ja: "操作" })].map((x) => el("th", { text: x })))),
+      el("thead", {}, el("tr", {}, [bl({ en: "Connector", ja: "コネクタ" }), bl({ en: "Availability", ja: "稼働状態" }), bl({ en: "Last heartbeat", ja: "最終ハートビート" }), bl({ en: "Manage", ja: "操作" })].map((x) => el("th", { text: x })))),
       el("tbody", {}, rows),
     ]);
   };
@@ -461,7 +451,7 @@ async function renderSiteList(host) {
       ].filter(Boolean)),
       el("div", { class: "ui-row-actions" }, actions),
     ]));
-    wrap.appendChild(connTable(list, !opts.orphan));
+    wrap.appendChild(connTable(list));
     return wrap;
   };
 

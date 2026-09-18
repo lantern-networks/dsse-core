@@ -1215,3 +1215,15 @@ does not require additional tenant-model permissions.
 The catalogues are separate reads, so their counts and status may reflect different
 moments. These checks do not provide an atomic fleet snapshot or prove that a
 connector can carry traffic. Closing or navigating away discards late page updates.
+
+
+Connector availability in Sites is shown as **Online** or **Offline**, using the
+server's `online` answer. When tunnel state is known, it takes precedence;
+otherwise recent heartbeat information determines availability. The same meaning
+applies to connectors assigned to a site and those not assigned to a site.
+
+The page does not designate a fixed active or standby connector. Routing candidates
+depend on the destination and route specificity, with ID ordering used to break
+ties between otherwise equal candidates; reachability also matters when dialing.
+Availability alone does not verify application traffic or failover. Test the
+intended destination separately when validating connectivity.

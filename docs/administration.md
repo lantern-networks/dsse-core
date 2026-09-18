@@ -828,6 +828,14 @@ download controls remain visible; signing availability and minimum versions read
 signing key is different: the form can accept a manifest signed elsewhere.
 **Minimum version to sign** is a signing restriction, not a device rollback limit.
 
+When publishing an externally signed release, the manifest supplies the target OS,
+architecture and version. The form's filename guesses or manually entered values
+do not override it. The Console checks the selected package's size and digest
+before publication, then sends that same file to the manifest's target. The
+selected files and entered fields are captured when Publish is pressed, so a
+change made while hashing does not replace the package being checked. Signature
+verification remains on the control plane.
+
 Catalogue and signing-floor GET requests accept an optional `expected_tenant_id`.
 A mismatch returns HTTP 409 before reading either set; the parameter checks the
 server's verified scope and does not select a tenant or grant permission. A present

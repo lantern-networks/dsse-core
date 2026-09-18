@@ -907,6 +907,22 @@ function openAgentVersionForm(host, plan, published, context) {
   (nameF.checked ? versionF : { focus: () => followF.focus() }).focus();
 }
 
+// The external manifest names the upload target and version. Match its declared
+// bytes against the selected package before asking the authority to verify and
+// publish its signature. This is not browser-side signature verification.
+function arSignedPackage(env, file, digest) {
+  const m = arManifestOf(env);
+  if (!arReadObject(m) || !arKnownTarget(arTargetKey(m.platform, m.arch)) ||
+      typeof m.version !== "string" || !m.version.trim() || !Number.isSafeInteger(m.artifact_size) ||
+      m.artifact_size <= 0 || m.artifact_size !== file.size || typeof m.artifact_sha256 !== "string" ||
+      m.artifact_sha256.toLowerCase() !== digest.toLowerCase()) {
+    throw new Error(bl({
+      en: "The signed file must name a supported target and version, and its package size and digest must match the selected file.",
+      ja: "署名済みファイルの対象端末・バージョンを確認してください。パッケージのサイズとハッシュ値は、選んだファイルとの一致が必要です。" }));
+  }
+  return m;
+}
+
 // ★ THE FORM IS THE SCREEN'S REASON TO EXIST. A page that shows what is published and cannot publish sends the
 // reader back to a terminal — which is exactly where the risk this lane was built to remove lives.
 function openAgentReleaseForm(host) {
@@ -993,25 +1009,30 @@ function openAgentReleaseForm(host) {
   });
 
   submit.addEventListener("click", async () => {
-    if (!chosen) {
+    // File and field references belong to this attempt. Changes while hashing
+    // cannot replace the checked package or reinterpret an external manifest.
+    const file = chosen, signedFile = chosenEnvelope;
+    let version = versionF.get();
+    const artifactURL = urlF.get();
+    if (!file) {
       uiToast(bl({ en: "Choose the package file.", ja: "パッケージファイルを選んでください。" }), "err");
       return;
     }
-    if (!window._arCanSign && !chosenEnvelope) {
+    if (!window._arCanSign && !signedFile) {
       uiToast(bl({ en: "Choose the signed release file — this control plane cannot sign one.",
                    ja: "署名済みリリースファイルを選んでください。この管理サーバーは署名できません。" }), "err");
       return;
     }
-    if (!chosenEnvelope && (!versionF.validate() || !urlF.validate())) return;
+    if (!signedFile && (!versionF.validate() || !urlF.validate())) return;
     const parts = String(targetF.get()).split("/");
-    const platform = parts[0];
-    const arch = parts[1];
+    let platform = parts[0];
+    let arch = parts[1];
 
     submit.disabled = true;
     progress.textContent = bl({ en: "Checking the package…", ja: "パッケージを確認中…" });
     let digest;
     try {
-      digest = await arHash(chosen);
+      digest = await arHash(file);
     } catch (e) {
       submit.disabled = false;
       progress.textContent = "";
@@ -1026,15 +1047,15 @@ function openAgentReleaseForm(host) {
       // place to be wrong. It was wrong — the first version of this file sent "schema_version" where the
       // document says "schema", and the endpoint refused it rather than signing a manifest with a field the
       // operator never meant to set. That refusal is the strict decode doing its job.
-      version: versionF.get(),
+      version: version,
       platform: platform,
       arch: arch,
       channel: "stable",
       delivery: "dsse",
       artifact_kind: platform === "windows" ? "msi" : "pkg",
-      artifact_url: urlF.get(),
+      artifact_url: artifactURL,
       artifact_sha256: digest,
-      artifact_size: chosen.size,
+      artifact_size: file.size,
       released_at: iso(now),
       // How long the DOCUMENT may be acted on — a bound on a stolen copy, not a support window. Set here
       // rather than asked: a field whose right answer is always "a few months" is a question that only
@@ -1043,7 +1064,7 @@ function openAgentReleaseForm(host) {
     };
 
     let signed;
-    if (chosenEnvelope) {
+    if (signedFile) {
       // ★★★ THE ENVELOPE MUST DESCRIBE THE BYTES BEING UPLOADED, AND THIS IS THE ONLY MOMENT BOTH ARE HERE.
       // A manifest signed for a different copy of the package publishes cleanly and is refused by every device
       // in the fleet at download time — days later, as "the update is broken", with the cause in no screen.
@@ -1052,33 +1073,26 @@ function openAgentReleaseForm(host) {
       progress.textContent = bl({ en: "Checking the signed file…", ja: "署名済みファイルを確認中…" });
       let envelope;
       try {
-        envelope = JSON.parse(await chosenEnvelope.text());
+        envelope = JSON.parse(await signedFile.text());
       } catch (e) {
         submit.disabled = false;
         progress.textContent = "";
         uiToast(bl({ en: "That is not a signed release file.", ja: "署名済みリリースファイルではありません。" }), "err");
         return;
       }
-      const said = arManifestOf(envelope);
-      if (!said) {
+      let said;
+      try {
+        said = arSignedPackage(envelope, file, digest);
+      } catch (e) {
         submit.disabled = false;
         progress.textContent = "";
-        uiToast(bl({ en: "That file carries no release manifest.",
-                     ja: "そのファイルにリリースマニフェストが入っていません。" }), "err");
+        uiToast(e.message, "err");
         return;
       }
-      if (String(said.artifact_sha256 || "").toLowerCase() !== String(digest).toLowerCase()) {
-        submit.disabled = false;
-        progress.textContent = "";
-        uiToast(bl({
-          en: "The signed file describes a different package (" + String(said.artifact_sha256 || "—").slice(0, 12) +
-              "…) than the one chosen. Publishing it would give every device a download it refuses.",
-          ja: "署名済みファイルが指しているのは、選んだパッケージとは別のもの（" +
-              String(said.artifact_sha256 || "—").slice(0, 12) + "…）です。このまま公開すると、" +
-              "全端末がダウンロードを拒否します。" }), "err");
-        return;
-      }
-      // The envelope names its own target and version; the form's are not consulted, so the two cannot disagree.
+      platform = said.platform;
+      arch = said.arch;
+      version = said.version;
+      // The form's guesses are not authoritative for an external manifest.
       progress.textContent = bl({ en: "Publishing…", ja: "公開中…" });
       signed = await apiFetch("PUT", "/admin/agent-updates", envelope, _AR_PLANE);
     } else {
@@ -1095,7 +1109,7 @@ function openAgentReleaseForm(host) {
     }
 
     progress.textContent = bl({ en: "Sending the package…", ja: "パッケージを送信中…" });
-    const up = await arUploadArtifact(chosen, platform, arch);
+    const up = await arUploadArtifact(file, platform, arch);
     if (!up.ok) {
       // ★ THE HALF-DONE STATE, NAMED. The manifest is stored and devices are still on the previous release.
       // The fix is to send the file again — NOT to publish again — and saying so is the difference between a
@@ -1103,9 +1117,9 @@ function openAgentReleaseForm(host) {
       submit.disabled = false;
       progress.textContent = "";
       uiToast(bl({
-        en: versionF.get() + " is published and waiting for its package — sending it failed (" + arErrorText(up) +
+        en: version + " is published and waiting for its package — sending it failed (" + arErrorText(up) +
             "). Press Publish again with the same file; the version does not change.",
-        ja: versionF.get() + " は公開済みでパッケージ待ちです。送信に失敗しました(" + arErrorText(up) +
+        ja: version + " は公開済みでパッケージ待ちです。送信に失敗しました(" + arErrorText(up) +
             ")。同じファイルで再度「公開」してください。バージョンは変わりません。" }), "err");
       renderAgentReleaseList(host);
       return;
@@ -1113,8 +1127,8 @@ function openAgentReleaseForm(host) {
 
     m.close();
     uiToast(bl({
-      en: versionF.get() + " is now what these devices are offered.",
-      ja: versionF.get() + " をこれらの端末に配布します。" }), "ok");
+      en: version + " is now what these devices are offered.",
+      ja: version + " をこれらの端末に配布します。" }), "ok");
     renderAgentReleaseList(host);
   });
 }

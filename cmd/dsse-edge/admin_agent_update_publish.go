@@ -1075,12 +1075,32 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 	// manifest); THIS one is admin-only, because it is how an Edge asks the control plane for bytes it does not
 	// have and there is no reason to widen that.
 	mux.HandleFunc("GET /admin/agent-update-artifact", adminEndpoint("admin.agents.read", func(w http.ResponseWriter, r *http.Request) {
+		// Existing bundle and replication clients read the tenant-effective package.
+		// The catalogue explicitly asks for its publication view; the request never
+		// supplies a tenant to read outside verified identity/operator context.
+		tenantID := adminTenantIDFromRequest(r)
+		if views, present := r.URL.Query()["artifact_scope"]; present {
+			if len(views) != 1 || (views[0] != "tenant" && views[0] != "publication") {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("artifact_scope must be tenant or publication"))
+				return
+			}
+			if views[0] == "publication" {
+				tenantID = agentUpdatePublishScope(r)
+			}
+		}
+		if !agentUpdateReadContextMatches(w, r, tenantID) {
+			return
+		}
 		platform := strings.TrimSpace(r.URL.Query().Get("platform"))
 		arch := strings.TrimSpace(r.URL.Query().Get("arch"))
-		tenantID := adminTenantIDFromRequest(r)
 		env, ok := store.ForTenant(tenantID)[updateTargetKey(platform, arch)]
 		if !ok {
 			http.Error(w, "nothing is published for that target", http.StatusNotFound)
+			return
+		}
+		if pins, present := r.URL.Query()["expected_manifest_sha256"]; present &&
+			(len(pins) != 1 || !strings.EqualFold(pins[0], env.PayloadSHA256)) {
+			writeError(w, http.StatusConflict, fmt.Errorf("the published release changed; reload before downloading"))
 			return
 		}
 		m, oerr := agentupdate.Open(env, trustedKeys, time.Now())
@@ -1097,6 +1117,9 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		defer f.Close()
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set(agentupdate.ArtifactVersionHeader, m.Version)
+		w.Header().Set("X-Dsse-Agent-Update-Scope", tenantID)
+		w.Header().Set("X-Dsse-Agent-Update-Manifest-SHA256", env.PayloadSHA256)
+		w.Header().Set("Cache-Control", "no-store")
 		http.ServeContent(w, r, filepath.Base(path), time.Time{}, f)
 	}))
 }

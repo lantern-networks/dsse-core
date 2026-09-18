@@ -1045,3 +1045,34 @@ transaction, provide shared-writer conflict resolution, or confirm delivery to
 every Edge. Publication, package storage, activation and their audit records remain
 separate operations. Reconcile an unresolved attempt against the catalogue and
 stored package before changing the offered release.
+
+### Downloading a published agent package
+
+**Download** retrieves the active release shown in the catalogue, even when a newer
+manifest is still waiting for its package. The Console pins the verified publication
+scope and active manifest hash. Before saving a file, it checks the response scope,
+version and manifest hash, then compares the actual package size and SHA-256 with
+that manifest. Partial responses, redirects and unverifiable packages are refused.
+Only one download per row can be pending. Leaving or reloading the page, or changing
+the organization while a request or hash check is pending, discards the old result.
+
+If verification fails, reload the release list and try again. Another administrator
+may have replaced the active release since the list was loaded. The Console does
+not save newly returned bytes under an older release's filename.
+
+`GET /admin/agent-update-artifact` retains its tenant-effective default for bundle
+and replication clients. The Console adds `artifact_scope=publication`, with
+`expected_tenant_id` and `expected_manifest_sha256` as consistency pins. These
+parameters do not grant access or select an arbitrary tenant. The publication view
+is resolved from the authenticated operator and selected organization. Successful
+responses include `X-Dsse-Agent-Update-Scope`,
+`X-Dsse-Agent-Update-Manifest-SHA256`, `X-Dsse-Agent-Update-Version` and
+`Cache-Control: no-store`. Existing Range clients remain supported; the Console
+requires a complete HTTP 200 response. Update the control plane before or with the
+Console: a response missing the verification headers is not saved.
+
+These checks establish consistency with the displayed manifest, not native installer
+signature validation, successful installation, delivery to every region, or concurrent
+writer serialization. The control plane verifies the manifest envelope; the browser
+does not independently verify its signature. Normal downloads do not create write
+audit records.

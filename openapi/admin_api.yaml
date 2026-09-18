@@ -6300,11 +6300,13 @@ paths:
           description: The programs, with their digests and sizes.
   /admin/agent-update-artifact:
     get:
-      summary: The bytes of the currently published release, for an Edge that does not hold them.
+      summary: Download the active release package in the verified tenant or publication view.
       description: >-
-        Requires admin.agents.read. Admin-only, unlike the device-facing artifact route: this is how an
-        enforcing Edge asks the control plane for a release it publishes but has not got, and there is no reason
-        to widen it. The response carries X-Dsse-Agent-Update-Version.
+        Requires admin.agents.read. The default tenant-effective lookup is unchanged for
+        bundles and Edge replication. The Console explicitly requests the publication
+        view and pins its displayed active manifest; pending manifests are not served.
+        Authentication and permissions run before these optional consistency checks.
+        Normal reads do not create operation audit records. Range requests remain supported.
       tags:
         - AdminAgentRollout
       parameters:
@@ -6316,11 +6318,53 @@ paths:
           name: arch
           required: true
           schema: { type: string }
+        - in: query
+          name: artifact_scope
+          required: false
+          schema: { type: string, enum: [tenant, publication], default: tenant }
+          description: >-
+            Omitted or tenant uses the authenticated/selected tenant's effective package.
+            Publication uses deployment scope for an operator outside an organization,
+            otherwise the verified selected/authenticated tenant. This parameter does
+            not select an arbitrary tenant or grant access. Empty, unknown or repeated
+            values are refused with 400.
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the resolved view scope. A mismatched or repeated value returns 409.
+            An explicitly empty value matches only the empty legacy scope.
+        - in: query
+          name: expected_manifest_sha256
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the active envelope's payload hash, compared case-insensitively.
+            Empty, mismatched or repeated values return 409 before opening the artifact.
       responses:
         "200":
           description: The artifact bytes.
+          headers:
+            X-Dsse-Agent-Update-Version:
+              schema: { type: string }
+              description: The active manifest version.
+            X-Dsse-Agent-Update-Scope:
+              schema: { type: string }
+              description: The resolved view scope, including when using a fallback artifact.
+            X-Dsse-Agent-Update-Manifest-SHA256:
+              schema: { type: string }
+              description: The active envelope payload hash.
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+        "206":
+          description: Requested byte range; the same release metadata headers are included.
+        "400":
+          description: Invalid or repeated artifact_scope.
         "404":
           description: Nothing published for that target, or the control plane does not hold its artifact.
+        "409":
+          description: The scope or active manifest no longer matches the supplied pin.
     put:
       summary: Upload the bytes a published manifest authorises.
       description: >-

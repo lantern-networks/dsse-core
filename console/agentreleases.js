@@ -250,45 +250,47 @@ async function arUploadArtifact(file, platform, arch, context) {
   }
 }
 
-// arDownloadArtifact hands the operator the package this deployment published.
-//
-// ★★★ A DEPLOYMENT COULD PUBLISH A RELEASE AND HAD NO WAY TO HAND ANYONE THE INSTALLER (2026-08-29, found by
-// trying to put an agent on a Mac using only this Console). The device-facing route needs a verified device
-// transport identity — which a machine that has no agent yet does not have — so the update path serves
-// devices that are ALREADY enrolled and says nothing about the first install. The Device configuration screen
-// hands out the profile and the tokens and tells the operator to "install this on the devices it is for",
-// without ever giving them the thing to install. Every first install had to come from outside the product.
-//
-// The bytes were always reachable at GET /admin/agent-update-artifact, authenticated as the operator. What was
-// missing was the button.
-async function arDownloadArtifact(platform, arch, version) {
-  const base = baseForPlane(_AR_PLANE);
-  const token = localStorage.getItem("adminToken") || "";
-  const signedIn = idpSession && idpSession.auth_method === "admin_session";
-  const headers = {};
-  if (!signedIn && token) headers["authorization"] = "Bearer " + token;
-  if (signedIn && idpSession.csrf_token) headers["x-csrf-token"] = idpSession.csrf_token;
-  if (operateTenant) headers["x-operate-tenant"] = operateTenant;
-  const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
-    "&arch=" + encodeURIComponent(arch);
-  const res = await fetch(base + path, { headers, credentials: "include" });
-  if (!res.ok) {
-    let why = "";
-    try { why = (await res.text()).slice(0, 300); } catch (e) { why = ""; }
-    uiToast(bl({ en: "Could not download it: " + (why || res.status),
-                 ja: "取得できませんでした: " + (why || res.status) }), "err");
-    return;
+// Download the active package described by this verified catalogue snapshot.
+// Header checks bind the response context; the selected manifest's digest and
+// size decide which bytes may be handed to the browser as a download.
+async function arDownloadArtifact(platform, arch, manifest, context) {
+  const current = context?.current;
+  if (typeof current !== "function" || !current()) return;
+  const scope = context.scope, manifestSHA256 = context.manifestSHA256, expected = { ...manifest };
+  try {
+    if (typeof scope !== "string" || !/^[a-f0-9]{64}$/.test(manifestSHA256) ||
+        expected.platform !== platform || expected.arch !== arch || !arKnownTarget(arTargetKey(platform, arch)) ||
+        typeof expected.version !== "string" || !expected.version ||
+        !Number.isSafeInteger(expected.artifact_size) || expected.artifact_size <= 0 ||
+        !/^[a-fA-F0-9]{64}$/.test(expected.artifact_sha256)) throw new Error();
+    const headers = {}, token = localStorage.getItem("adminToken") || "";
+    const signedIn = idpSession && idpSession.auth_method === "admin_session";
+    if (!signedIn && token) headers["authorization"] = "Bearer " + token;
+    if (signedIn && idpSession.csrf_token) headers["x-csrf-token"] = idpSession.csrf_token;
+    if (operateTenant) headers["x-operate-tenant"] = operateTenant;
+    const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
+      "&arch=" + encodeURIComponent(arch) + "&artifact_scope=publication&expected_tenant_id=" + encodeURIComponent(scope) +
+      "&expected_manifest_sha256=" + encodeURIComponent(manifestSHA256);
+    const res = await fetch(baseForPlane(_AR_PLANE) + path, { headers, credentials: "include", redirect: "error", cache: "no-store" });
+    if (!current()) return;
+    if (!res.ok || res.status !== 200 || !res.headers.has("X-Dsse-Agent-Update-Scope") ||
+        res.headers.get("X-Dsse-Agent-Update-Scope") !== scope ||
+        res.headers.get("X-Dsse-Agent-Update-Manifest-SHA256") !== manifestSHA256 ||
+        res.headers.get("X-Dsse-Agent-Update-Version") !== expected.version) throw new Error();
+    const blob = await res.blob();
+    if (!current()) return;
+    if (blob.size !== expected.artifact_size) throw new Error();
+    const digest = await arHash(blob);
+    if (!current()) return;
+    if (digest !== expected.artifact_sha256.toLowerCase()) throw new Error();
+    const ext = platform === "windows" ? "msi" : "pkg", url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = "dsse-agent-" + expected.version + "-" + platform + "-" + arch + "." + ext;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (_) {
+    if (current()) uiToast(bl({ en: "The package could not be verified. Reload the release list and try again.",
+      ja: "パッケージを確認できません。配布一覧を再読込してから、もう一度ダウンロードしてください。" }), "err");
   }
-  const blob = await res.blob();
-  // The name says what it is and which deployment it came from, because an installer in a downloads folder
-  // with a generic name is the one an operator installs on the wrong fleet.
-  const ext = platform === "windows" ? "msi" : "pkg";
-  const name = "dsse-agent-" + (version || "release") + "-" + platform + "-" + arch + "." + ext;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // ★ THE WINDOW IS A RULE AN OPERATOR OWNS, AND IT HAD NO SCREEN (2026-08-13, raised by the operator). The plan
@@ -620,6 +622,14 @@ async function renderAgentReleaseList(host) {
     }
 
     const floorFor = floors[key];
+    let downloading = false;
+    const download = active ? el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Download", ja: "ダウンロード" }) }) : null;
+    if (download) download.addEventListener("click", async () => {
+      if (downloading || !current()) return;
+      downloading = true; download.disabled = true;
+      try { await arDownloadArtifact(target.platform, target.arch, active, { current, scope: catalogue.tenant_id, manifestSHA256: published[key].payload_sha256 }); }
+      finally { downloading = false; if (current()) download.disabled = false; }
+    });
     return el("tr", {}, [
       el("td", {}, [el("div", { text: arTargetLabel(target.platform, target.arch) })]),
       el("td", {}, [el("div", { text: version }), second].filter(Boolean)),
@@ -632,13 +642,7 @@ async function renderAgentReleaseList(host) {
       // it has no transport identity yet — so without this the operator is told to install something the
       // product never hands them. Only an ACTIVE release: a manifest whose package has not arrived would
       // download nothing and look like a broken button.
-      el("td", {}, active
-        ? el("button", {
-            class: "ui-btn ui-btn-sm",
-            text: bl({ en: "Download", ja: "ダウンロード" }),
-            onClick: () => arDownloadArtifact(target.platform, target.arch, active.version),
-          })
-        : el("span", { class: "ui-muted", text: "—" })),
+      el("td", {}, download || el("span", { class: "ui-muted", text: "—" })),
     ]);
   });
 

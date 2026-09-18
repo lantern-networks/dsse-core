@@ -973,17 +973,60 @@ async function showEnrollmentCommand(siteID) {
   }
 }
 
-// deleteSite removes the persistent Site record (its connectors are not deleted) after a danger confirm.
-async function deleteSite(siteID, name, detailModal, host) {
-  const ok = await uiConfirm({
+// A deleted persistent Site may remain in the merged catalogue as an unmanaged connector group.
+function siteDeleteReadback(response, siteID, tenant) {
+  const emptyConnectors = { ok: true, status: 200, body: { connectors: [], count: 0 } };
+  const { sites } = siteListData(response, emptyConnectors, tenant);
+  return !sites.some(site => site.site_id === siteID && site.managed === true);
+}
+
+// Deletion confirmation belongs to the context in which it was opened, including the confirmation wait.
+// Keep an uncertain result visible and ask the operator to reload before another destructive attempt.
+function deleteSite(siteID, name, detailModal, host) {
+  if (!host || host.isConnected === false) return;
+  const pending = host.__siteDeletions || (host.__siteDeletions = new Set());
+  if (pending.has(siteID)) return;
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: baseForPlane("control"), token: token(), seq: host.__renderSeq };
+  const tenant = initial.selection || (initial.session && initial.session.auth_method === "admin_session" ? initial.session.tenant_id : null);
+  if ((tenant != null || (initial.session && initial.session.auth_method === "admin_session")) &&
+      (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant)) return;
+  let closed = false, busy = false, attempted = false;
+  const current = () => !closed && host.isConnected !== false && host.__renderSeq === initial.seq &&
+    (!detailModal || detailModal.el.isConnected !== false) && selection() === initial.selection &&
+    session() === initial.session && baseForPlane("control") === initial.authority && token() === initial.token;
+  pending.add(siteID);
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  const confirm = el("button", { class: "ui-btn ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }) });
+  const modal = uiModal({
     title: bl({ en: "Delete this site?", ja: "このサイトを削除?" }),
-    body: bl({ en: "\"" + (name || siteID) + "\" is removed. Connectors are not deleted, but the Site's name, region, and HA settings are lost.", ja: "「" + (name || siteID) + "」を削除します。コネクタは削除されませんが、サイトの名前・リージョン・HA 設定は失われます。" }),
-    confirmLabel: bl({ en: "Delete", ja: "削除" }), danger: true,
+    body: [el("p", { text: bl({ en: "\"" + (name || siteID) + "\" is removed. Connectors are not deleted, but the Site's name, region, and HA settings are lost.", ja: "「" + (name || siteID) + "」を削除します。コネクタは削除されませんが、サイトの名前・リージョン・HA 設定は失われます。" }) }), notice],
+    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }), confirm],
+    onClose: () => { closed = true; if (!busy) pending.delete(siteID); },
   });
-  if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/sites/" + encodeURIComponent(siteID));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Site deleted.", ja: "サイトを削除しました。" }), "ok");
-  if (detailModal) detailModal.close();
-  if (host) renderSiteList(host);
+  confirm.onclick = async () => {
+    if (busy || attempted || !current()) return;
+    busy = true; attempted = true; confirm.disabled = true;
+    try {
+      const r = await apiFetch("DELETE", "/admin/sites/" + encodeURIComponent(siteID), undefined, "control");
+      if (!current()) return;
+      if (!r || !r.ok || r.status !== 200 || !r.body || Array.isArray(r.body) || r.body.site_id !== siteID || r.body.deleted !== true) throw new Error("Unconfirmed site deletion");
+      const readback = await apiFetch("GET", "/admin/sites", undefined, "control");
+      if (!current()) return;
+      if (!siteDeleteReadback(readback, siteID, tenant)) throw new Error("Site is still managed");
+      modal.close();
+      if (detailModal) detailModal.close();
+      uiToast(bl({ en: "Site deleted.", ja: "サイトを削除しました。" }), "ok");
+      renderSiteList(host);
+    } catch (_) {
+      if (!current()) return;
+      notice.textContent = bl({ en: "The deletion could not be confirmed. It may already have been applied. Cancel and reload to check the site before trying again.", ja: "削除を確認できませんでした。すでに反映されている可能性があります。キャンセルして再読込し、サイトの状態を確認してから操作してください。" });
+      notice.style.display = "";
+    } finally {
+      busy = false;
+      if (closed) pending.delete(siteID);
+    }
+  };
 }

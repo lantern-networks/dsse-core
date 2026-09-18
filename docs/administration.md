@@ -1227,3 +1227,23 @@ depend on the destination and route specificity, with ID ordering used to break
 ties between otherwise equal candidates; reachability also matters when dialing.
 Availability alone does not verify application traffic or failover. Test the
 intended destination separately when validating connectivity.
+
+
+### Deleting a site
+
+Deleting a site removes its saved name, region, HA settings and enrollment
+credential record. It does not delete or revoke its connectors. A group reported
+by connectors may therefore still appear as an unmanaged site.
+
+The Console confirms deletion only after receiving an acknowledgement for the
+selected site and reloading the catalogue to verify that its saved record is
+absent. If either response cannot be verified, the dialog stays open with a
+notice and the Delete button remains disabled. Cancel and reload to check the
+current state before attempting another deletion: the first request may already
+have succeeded.
+
+Changing organization or connection context while the confirmation is open
+invalidates that confirmation. Cancel, Escape or navigation after sending a
+request does not undo it; obsolete responses do not report success or refresh the
+old page. Deletion and its verification are separate operations and do not lock
+out concurrent administrators.

@@ -209,10 +209,12 @@ for(const reason of ['size','digest','verification','transfer'])test('connector 
 
 function siteEditorFixture(existing, language = 'en') {
   const fields = {}, writes = [], notices = [];
-  let modal;
+  let modal, closed = 0, reloads = 0;
+  const host = {isConnected: true}, state = {authority: '', token: ''};
   const context = vm.createContext({
+    baseForPlane: () => state.authority, localStorage: {getItem: () => state.token},
     bl: text => text[language],
-    el: (tag, props) => ({tag, ...props}),
+    el: (tag, props) => ({tag, ...props, style: {}}),
     uiToast: (...args) => notices.push(args),
     uiField(spec) {
       const input = {disabled: false, validity: {badInput: false}};
@@ -222,12 +224,13 @@ function siteEditorFixture(existing, language = 'en') {
       };
       fields[spec.name] = field; return field;
     },
-    uiModal(spec) {modal = spec; return {close() {throw Error('unexpected confirmed write');}};},
+    uiModal(spec) {modal = spec; return {close() {closed++; spec.onClose?.();}};},
     async apiFetch(method, path, body) {writes.push({method, path, body: JSON.parse(JSON.stringify(body))}); return {ok: false, status: 503};},
   });
   vm.runInContext(source, context);
-  context.openSiteForm({}, existing);
-  return {context, fields, writes, notices, get modal() {return modal;}, submit: () => modal.footer.at(-1).onclick()};
+  context.renderSiteList = () => {reloads++;};
+  context.openSiteForm(host, existing);
+  return {context, fields, writes, notices, host, state, get closed() {return closed;}, get reloads() {return reloads;}, get modal() {return modal;}, submit: () => modal.footer.at(-1).onclick()};
 }
 
 for (const value of ['1.5', '-1', '1e2', '+2', '0x10', '9007199254740992', 'NaN', 'Infinity', 'two']) {
@@ -276,4 +279,69 @@ test('site editor provides Japanese validation and hidden-setting read errors', 
 test('site editor displays a zero target omitted by the site list projection', () => {
   const edit = siteEditorFixture({site_id: 's'}); assert.equal(edit.fields.expected.value, '0');
   const create = siteEditorFixture(); assert.equal(create.fields.expected.value, '');
+});
+
+const siteRequest = {site_id: 's', name: 'Name', region: 'region-a', deployment_type: 'vm', expected_connector_count: 2, routing_namespace: 'route', ha_policy: 'active-passive'};
+const savedSite = () => ({managed: true, ...siteRequest});
+const siteResponse = body => ({ok: true, status: 200, body});
+for (const [name, response] of [
+  ['empty body', siteResponse({})], ['array', siteResponse([])], ['null', siteResponse(null)],
+  ['204', {ok: true, status: 204, body: savedSite()}], ['HTTP failure', {ok: false, status: 500, body: savedSite()}],
+  ['other ID', siteResponse({...savedSite(), site_id: 'other'})], ['unmanaged', siteResponse({...savedSite(), managed: false})],
+  ['wrong count', siteResponse({...savedSite(), expected_connector_count: 1})], ['string count', siteResponse({...savedSite(), expected_connector_count: '2'})],
+  ['lost policy', siteResponse({...savedSite(), ha_policy: undefined})], ['wrong name', siteResponse({...savedSite(), name: 'old'})],
+  ['null name', siteResponse({...savedSite(), name: null})], ['lost routing', siteResponse({...savedSite(), routing_namespace: undefined})],
+]) test(`site acknowledgement rejects ${name}`, () => {
+  const f = siteEditorFixture(siteRequest); assert.equal(f.context.siteSaveAcknowledged(response, siteRequest), false);
+});
+test('site acknowledgement accepts real detail shape while readback confirms configured region', () => {
+  const f = siteEditorFixture(siteRequest);
+  assert.equal(f.context.siteSaveAcknowledged(siteResponse({...savedSite(), region: {home_regions: []}}), siteRequest), true);
+  assert.equal(f.context.siteSaveReadback(siteResponse({sites: [savedSite()]}), siteRequest), true);
+  for (const sites of [null, {}, [], [null], [savedSite(), savedSite()], [{...savedSite(), region: 'wrong'}], [{...savedSite(), region: {}}]])
+    assert.equal(f.context.siteSaveReadback(siteResponse({sites}), siteRequest), false);
+  assert.equal(f.context.siteSaveReadback({ok: false, status: 503, body: {sites: [savedSite()]}}, siteRequest), false);
+});
+test('site save accepts omitted optional empty fields and zero count, but not null', () => {
+  const f = siteEditorFixture(); const request = {site_id: 's', name: '', region: '', deployment_type: '', expected_connector_count: 0};
+  const row = {site_id: 's', managed: true};
+  assert.equal(f.context.siteSaveAcknowledged(siteResponse(row), request), true);
+  assert.equal(f.context.siteSaveReadback(siteResponse({sites: [row]}), request), true);
+  assert.equal(f.context.siteSaveAcknowledged(siteResponse({...row, expected_connector_count: null}), request), false);
+});
+function deferredSiteReply() {let resolve, reject; const promise = new Promise((a,b) => {resolve = a; reject = b;}); return {promise,resolve,reject};}
+test('site save locks fields, suppresses duplicate submit and confirms readback before success', async () => {
+  const f = siteEditorFixture(siteRequest), post = deferredSiteReply(), read = deferredSiteReply(), calls = [];
+  f.context.apiFetch = async (method, path, body, plane) => {calls.push({method,path,body,plane}); return method === 'POST' ? post.promise : read.promise;};
+  const pending = f.submit(); assert.ok(Object.values(f.fields).every(field => field.input.disabled)); await f.submit(); assert.equal(calls.length,1);
+  f.fields.name.value = 'changed after submit'; post.resolve(siteResponse(savedSite())); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length,2); assert.equal(calls[0].body.name, 'Name'); assert.equal(calls[1].method,'GET'); assert.equal(calls[1].plane,'control'); assert.equal(f.closed,0);
+  read.resolve(siteResponse({sites:[savedSite()]})); await pending; assert.equal(f.closed,1); assert.equal(f.reloads,1); assert.equal(f.notices.at(-1)[1],'ok');
+});
+for (const failure of ['empty', 'network', 'http', 'readback', 'read-network']) test(`site ${failure} failure retains input and shows safe uncertainty`, async () => {
+  const f = siteEditorFixture(siteRequest);let posts = 0;
+  f.context.apiFetch = async method => {if(method==='POST'){posts++;if(failure==='network')throw Error('sensitive backend');if(failure==='empty')return siteResponse({});if(failure==='http')return {ok:false,status:500,body:{error:'sensitive backend'}};return siteResponse(savedSite());}if(failure==='read-network')throw Error('sensitive backend');return siteResponse({sites:[]});};
+  await f.submit(); assert.equal(posts,1);assert.equal(f.closed,0);assert.equal(f.reloads,0);assert.equal(f.fields.name.value,'Name');assert.equal(f.fields.name.input.disabled,false);assert.equal(f.fields.site_id.input.disabled,true);
+  const alert=f.modal.body.at(-1);assert.match(alert.textContent,/may already have been applied/);assert.ok(!alert.textContent.includes('sensitive backend'));assert.equal(f.notices.length,0);
+});
+const siteContextChanges = {
+  selection: f => {f.context.operateTenant='other';}, session: f => {f.context.idpSession={user:'other'};},
+  authority: f => {f.state.authority='other';}, credential: f => {f.state.token='other';},
+  generation: f => {f.host.__renderSeq=2;}, detached: f => {f.host.isConnected=false;}, closed: f => {f.modal.onClose();},
+};
+for (const [name, change] of Object.entries(siteContextChanges)) {
+  test(`site ${name} change before submit prevents writes`, async () => {
+    const f=siteEditorFixture(siteRequest);change(f);await f.submit();assert.equal(f.writes.length,0);assert.equal(f.notices.length,0);
+  });
+  for (const stage of ['POST','GET']) test(`site ${name} change during ${stage} discards late success and failure`, async () => {
+    for(const fail of [false,true]){
+      const f=siteEditorFixture(siteRequest),gate=deferredSiteReply(),calls=[];
+      f.context.apiFetch=async method=>{calls.push(method);return method===stage?gate.promise:siteResponse(savedSite());};
+      const pending=f.submit();await new Promise(resolve=>setImmediate(resolve));change(f);if(fail)gate.reject(Error('private error'));else gate.resolve(stage==='POST'?siteResponse(savedSite()):siteResponse({sites:[savedSite()]}));await pending;
+      assert.equal(f.notices.length,0);assert.equal(f.reloads,0);assert.equal(calls.length,stage==='POST'?1:2);assert.ok(!f.modal.body.at(-1).textContent);
+    }
+  });
+}
+test('site uncertain save guidance is Japanese and inputs remain available for explicit retry', async () => {
+  const f=siteEditorFixture(siteRequest,'ja');await f.submit();assert.match(f.modal.body.at(-1).textContent,/すでに反映/);assert.match(f.modal.body.at(-1).textContent,/新たな保存操作/);assert.equal(f.modal.footer.at(-1).disabled,false);
 });

@@ -1188,3 +1188,16 @@ that connectors are online or that failover has been tested.
 
 Edits use the values loaded when the editor opened. Reload before editing if another
 administrator has changed the site; the editor does not detect concurrent writes.
+
+
+The editor keeps its inputs locked while saving and verifying the stored values.
+A success message requires both a matching save response and a fresh site-list
+read showing the submitted settings, including the configured region. An empty,
+unexpected, or failed response leaves the editor open with its input retained;
+the save may already have happened. Cancel and reload to check the saved site
+before retrying. Retrying sends a separate save and can produce another audit record.
+
+Cancel, Escape, or leaving the page does not undo a request already sent. Late
+responses from a closed editor or a changed page, organization, session, authority,
+or API credential do not display success or refresh the old page. These checks do
+not cancel a server write or make saving and readback an atomic transaction.

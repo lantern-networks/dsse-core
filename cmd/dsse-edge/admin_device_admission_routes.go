@@ -489,6 +489,16 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return nodeIssuesDeviceIdentitiesFor(config.TenantDeviceAuthority, tenant)
 		}, config.ConfigSourceURL, config.OperatorTenantID)
 	registerAdminLicenseEndpoints(mux, adminLicenseDeps{
+		auditAllocation: func(r *http.Request, target, action, result string, seats *int) {
+			now := time.Now().UTC()
+			identity, _ := adminIdentityFromRequest(r)
+			meta := map[string]any{"target_tenant_id": target, "auth_method": identity.AuthMethod}
+			if seats != nil {
+				meta["requested_seats"] = *seats
+			}
+			row := model.AuditLog{ID: randomEdgeID("audit_seat_allocation_", now), TenantID: adminTenantIDFromRequest(r), ActorUserID: auditActorPrincipal(r), EventType: "admin_seat_allocation_changed", TargetType: stringPtr("tenant_seat_allocation"), TargetID: stringPtr(target), Action: stringPtr(action), Result: stringPtr(result), Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID, Metadata: meta}
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, row, now)
+		},
 		licence:     config.VendorLicense,
 		allocations: config.SeatAllocations,
 		licensing:   config.EnrolmentLicensing,

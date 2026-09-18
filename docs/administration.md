@@ -1269,3 +1269,20 @@ persistence and audit delivery are separate operations.
 Removing a connector record does not revoke a running connector. It may reappear
 when it registers again. Stop or decommission it separately when permanent removal
 is intended.
+
+
+### Licence and seat-allocation saves
+
+When persistence is configured, applying a licence or changing an allocation waits
+for storage confirmation before publishing the new in-process state. A failed save
+returns a service-unavailable response. Reload to check the saved state before
+retrying: a storage error can occur after bytes were written. A rejected licence
+save does not consume its serial in the running process. Without a persister,
+these changes remain in memory only.
+
+Assigning and taking back a customer's seats both require `admin.quota.write`;
+customer administrators cannot raise or remove their own quota. Allocation audit
+records identify the acting principal, target tenant, requested seat count (for
+allocation), and outcome. Operator invitation records identify both the inviting
+principal and the new account, without recording the activation link. Management
+saves and audit delivery are separate operations.

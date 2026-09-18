@@ -1032,7 +1032,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		if err := sendActivationEmail(config.AdminInviteEmailSinkPath, req.Email, link, now); err != nil {
 			log.Printf("send admin invite email: %v", err)
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_account_invited", nil, nil, evaluator, r, req.Email), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAccountLifecycleAuditLog("admin_account_invited", inviteTenantID, adminPrincipalIDFromRequest(r), principalID, roles, evaluator, r), now)
 		// The assembled invitation travels in the response, because the caller is the one who will deliver it.
 		// activation_link stays for compatibility with anything already reading it; `invitation` is what the
 		// screen shows. See buildAdminInvitation for why this product hands over rather than sends.

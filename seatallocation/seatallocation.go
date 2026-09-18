@@ -102,9 +102,16 @@ func (s *Store) Allocate(policy Policy, tenantID string, seats int, by, note, no
 		UpdatedBy: strings.TrimSpace(by),
 		Note:      strings.TrimSpace(note),
 	}
-	s.allocations[strings.ToLower(tenantID)] = a
+	candidate := make(map[string]Allocation, len(s.allocations)+1)
+	for key, value := range s.allocations {
+		candidate[key] = value
+	}
+	candidate[strings.ToLower(tenantID)] = a
+	if err := s.saveCandidateLocked(candidate); err != nil {
+		return Allocation{}, err
+	}
+	s.allocations = candidate
 	s.generation.Add(1)
-	s.persistLocked()
 	return a, nil
 }
 
@@ -168,16 +175,30 @@ func (s *Store) List() []Allocation {
 
 // Remove drops a tenant's allocation entirely, returning its seats to the pool.
 func (s *Store) Remove(tenantID string) bool {
+	removed, _ := s.RemoveConfirmed(tenantID)
+	return removed
+}
+
+// RemoveConfirmed distinguishes absent allocations from unconfirmed storage writes.
+func (s *Store) RemoveConfirmed(tenantID string) (bool, error) {
 	k := strings.ToLower(strings.TrimSpace(tenantID))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.allocations[k]; !ok {
-		return false
+		return false, nil
 	}
-	delete(s.allocations, k)
+	candidate := make(map[string]Allocation, len(s.allocations))
+	for key, value := range s.allocations {
+		if key != k {
+			candidate[key] = value
+		}
+	}
+	if err := s.saveCandidateLocked(candidate); err != nil {
+		return false, err
+	}
+	s.allocations = candidate
 	s.generation.Add(1)
-	s.persistLocked()
-	return true
+	return true, nil
 }
 
 // Verdict is the answer to "may this tenant enrol another device", with enough detail to say why.

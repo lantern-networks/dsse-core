@@ -72,3 +72,25 @@ func (s *Store) persistLocked() {
 		}
 	}
 }
+
+// ErrPersistence means the management change was not confirmed by storage.
+var ErrPersistence = errors.New("seat allocation persistence failed")
+
+func (s *Store) saveCandidateLocked(candidate map[string]Allocation) error {
+	if s.persister == nil {
+		return nil
+	}
+	raw, err := json.Marshal(stateFile{SchemaVersion: stateSchemaVersion, Allocations: candidate})
+	if err == nil {
+		err = s.persister.Save(raw)
+	}
+	if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		log.Printf("seat_allocations persist: saved without atomic replacement: %v", err)
+		return nil
+	}
+	if err != nil {
+		log.Printf("seat_allocations persist: save failed: %v", err)
+		return ErrPersistence
+	}
+	return nil
+}

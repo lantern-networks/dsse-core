@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
@@ -45,7 +46,29 @@ func assertStandbyAudit(t *testing.T, a model.AuditLog, permission string) {
 		t.Fatalf("untruthful routing audit: %+v", a)
 	}
 	want := map[string]any{"audit_scope": "node", "authentication": "not_evaluated", "request_tenant": "not_evaluated", "required_permission": permission, "http_status": float64(409)}
-	if !reflect.DeepEqual(a.Metadata, want) {
+	metadata := make(map[string]any)
+	for k, v := range a.Metadata {
+		metadata[k] = v
+	}
+	if metadata["aggregation"] != "permission_window" || metadata["interval_seconds"] != float64(60) {
+		t.Fatalf("missing aggregation contract: %#v", metadata)
+	}
+	count, ok := metadata["request_count"].(float64)
+	if !ok || count < 1 {
+		t.Fatal("invalid count", metadata)
+	}
+	first, err := time.Parse(time.RFC3339Nano, metadata["first_seen"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := time.Parse(time.RFC3339Nano, metadata["last_seen"].(string))
+	if err != nil || last.Before(first) {
+		t.Fatal("invalid observation interval", metadata)
+	}
+	for _, k := range []string{"aggregation", "interval_seconds", "request_count", "first_seen", "last_seen"} {
+		delete(metadata, k)
+	}
+	if !reflect.DeepEqual(metadata, want) {
 		t.Fatalf("unexpected metadata: %#v", a.Metadata)
 	}
 }
@@ -56,7 +79,8 @@ func TestStandbyWriteAuditDoesNotAuthenticateReadBodyOrMirror(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mw := newAdminEndpointMiddleware(testEvaluator(), w, standbyNoOutboxCalls{}, standbyNoAuthCalls{}, "", false, nil, nil, nil)
+	recorder := newAdminStandbyAudit(w, testEvaluator())
+	mw := newAdminEndpointMiddleware(testEvaluator(), w, standbyNoOutboxCalls{}, standbyNoAuthCalls{}, "", false, nil, nil, nil, recorder)
 	for _, permission := range []string{"admin.endpoints.write", "admin.tenant.admin", "admin.export.create", "admin.export.cancel"} {
 		for _, credentials := range []string{"anonymous", "bearer", "cookie"} {
 			r := httptest.NewRequest("POST", "/admin/private-path?token=private-query", nil)
@@ -84,9 +108,17 @@ func TestStandbyWriteAuditDoesNotAuthenticateReadBodyOrMirror(t *testing.T) {
 			assertStandbyAudit(t, rows[len(rows)-1], permission)
 		}
 	}
+	recorder.flush(true)
 	rows := readTransportAudits(t, w)
-	if len(rows) != 12 {
-		t.Fatalf("want one record per refusal: %d", len(rows))
+	if len(rows) != 8 {
+		t.Fatalf("want initial and summary per permission: %d", len(rows))
+	}
+	var count float64
+	for _, row := range rows {
+		count += row.Metadata["request_count"].(float64)
+	}
+	if count != 12 {
+		t.Fatal("lost refusal counts", count)
 	}
 	b, _ := json.Marshal(rows)
 	if bytes.Contains(b, []byte("private-")) || len(b) > 16000 {
@@ -116,8 +148,8 @@ func TestStandbyWriteAuditActualRoutePreservesStateAndResumes(t *testing.T) {
 		t.Fatal("refused request changed state or contacted outbox")
 	}
 	rows := readTransportAudits(t, w)
-	if len(rows) != 3 {
-		t.Fatalf("want three refusals, got %d", len(rows))
+	if len(rows) != 1 {
+		t.Fatalf("want immediate refusal record, got %d", len(rows))
 	}
 	for _, a := range rows {
 		assertStandbyAudit(t, a, "admin.risk.write")
@@ -131,10 +163,10 @@ func TestStandbyWriteAuditActualRoutePreservesStateAndResumes(t *testing.T) {
 		t.Fatalf("leader failed %d %s", r.Code, r.Body)
 	}
 	rows = readTransportAudits(t, w)
-	if len(rows) != 5 || len(out.insertedAudits) != 1 {
+	if len(rows) != 3 || len(out.insertedAudits) != 1 {
 		t.Fatalf("leader audit changed: %d / %d", len(rows), len(out.insertedAudits))
 	}
-	for _, a := range rows[3:] {
+	for _, a := range rows[1:] {
 		if stringPtrValue(a.ActorUserID) != "transport-admin" {
 			t.Fatal("leader lost verified actor")
 		}
@@ -160,7 +192,8 @@ func TestStandbyWriteAuditStorageFailureKeepsRefusal(t *testing.T) {
 			previous := log.Writer()
 			log.SetOutput(&captured)
 			defer log.SetOutput(previous)
-			mw := newAdminEndpointMiddleware(testEvaluator(), w, standbyNoOutboxCalls{}, standbyNoAuthCalls{}, "", false, nil, nil, nil)
+			recorder := newAdminStandbyAudit(w, testEvaluator())
+			mw := newAdminEndpointMiddleware(testEvaluator(), w, standbyNoOutboxCalls{}, standbyNoAuthCalls{}, "", false, nil, nil, nil, recorder)
 			r := httptest.NewRequest("POST", "/admin/private-path", nil)
 			r.Header.Set("Authorization", "Bearer private-token")
 			rec := httptest.NewRecorder()
@@ -184,7 +217,8 @@ func TestStandbyWriteAuditConcurrentRefusals(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mw := newAdminEndpointMiddleware(testEvaluator(), w, standbyNoOutboxCalls{}, standbyNoAuthCalls{}, "", false, nil, nil, nil)
+	recorder := newAdminStandbyAudit(w, testEvaluator())
+	mw := newAdminEndpointMiddleware(testEvaluator(), w, standbyNoOutboxCalls{}, standbyNoAuthCalls{}, "", false, nil, nil, nil, recorder)
 	h := mw("admin.policy.write", func(http.ResponseWriter, *http.Request) { panic("handler called") })
 	var wg sync.WaitGroup
 	for i := 0; i < 64; i++ {
@@ -199,9 +233,16 @@ func TestStandbyWriteAuditConcurrentRefusals(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	if attempts := w.AuditHealth().Attempts; attempts != 1 {
+		t.Fatal("burst amplified writes", attempts)
+	}
+	recorder.flush(true)
 	rows := readTransportAudits(t, w)
-	if len(rows) != 64 {
-		t.Fatalf("lost refusals: %d", len(rows))
+	if len(rows) != 2 {
+		t.Fatalf("want first and summary: %d", len(rows))
+	}
+	if rows[0].Metadata["request_count"].(float64)+rows[1].Metadata["request_count"].(float64) != 64 {
+		t.Fatal("lost request count")
 	}
 	ids := map[string]bool{}
 	for _, a := range rows {

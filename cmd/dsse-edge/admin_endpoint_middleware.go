@@ -21,8 +21,13 @@ import (
 )
 
 func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, adminAuth adminAuthRuntimeStore, adminToken string, devMode bool, tenantModelStore adminTenantModelRuntimeStore,
-	hasAdministrators func(context.Context, string) (bool, bool), credentials *localAdminCredentialStore) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+	hasAdministrators func(context.Context, string) (bool, bool), credentials *localAdminCredentialStore, refusalAudit ...*adminStandbyAudit) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+	refusals := newAdminStandbyAudit(writer, evaluator)
+	if len(refusalAudit) > 0 && refusalAudit[0] != nil {
+		refusals = refusalAudit[0]
+	}
 	return func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+		recordRefusal := refusals.forPermission(permission)
 		return func(w http.ResponseWriter, r *http.Request) {
 			// ★★★ BEFORE ANYTHING ELSE: a change written to a node that does not lead is accepted and then
 			// discarded. See admin_writes_belong_to_the_leader.go — measured with its control, a device blocked
@@ -30,7 +35,7 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			// fifteen seconds. Checked here because this is the one place every administrative route passes
 			// through, and a rule enforced anywhere else is a rule with holes in it.
 			if adminWriteRefusedOnAStandby(w, permission) {
-				recordAdminStandbyRefusal(r.Context(), writer, evaluator, permission)
+				recordRefusal()
 				return
 			}
 			identity, ok, err := adminRequestIdentity(r, evaluator.PolicyBundle.TenantID, adminToken, adminAuth, devMode, time.Now())

@@ -949,11 +949,35 @@ active management server does not show the event. A primary write failure is
 reported through the writer health and process error log; an unconfigured writer
 is reported in the process error log. Neither failure permits the request.
 
-One record is attempted for each request reaching this guard, including anonymous
-requests. Existing JSONL rotation/retention settings apply; optional admin request
-rate limiting is disabled by default. No sampling or new rate limiter is added.
-Local storage and append hooks can still delay request completion. These records
-do not claim that every incoming HTTP request, read refusal or upstream rate-limit
+The first refusal for each registered permission is recorded immediately. Further
+refusals share a per-node, per-permission write budget of one attempt per minute.
+They are accumulated into a summary with `aggregation=permission_window`,
+`request_count`, `first_seen`, `last_seen` and `interval_seconds=60`. The row's
+`timestamp` is its emission time. Sum `request_count` to count refused requests;
+the number of audit rows is not the number of requests. Individual request IDs
+and timestamps inside a summary are not retained.
+
+The running server checks pending summaries every five seconds, including when
+requests stop or the node becomes leader. A due summary is normally attempted
+within 60–65 seconds of the preceding attempt; slow storage or append hooks can
+delay this. Normal process return attempts a final flush and waits for it. The
+counters and budgets reset on restart. They are held in memory: a crash, forced
+kill, fatal exit or requests still in flight at process exit can lose an unflushed
+tail. They are not a durable queue.
+
+A failed append consumes the same budget, so filesystem or hook failures cannot
+produce an error message for every request. Writer health and a bounded process
+error report expose the unconfirmed summary's count. Failed batches are not
+replayed automatically: a hook failure may follow a successful local append,
+and replay could double-count those requests. An unconfigured writer is reported
+in the process log with the same budget. Refusals always remain HTTP 409.
+
+Only server-registered permissions create counters; source addresses, paths and
+credentials cannot create new aggregation keys. Existing JSONL rotation/retention
+and optional request-rate limiting still apply. The latter is disabled by default;
+this audit budget is always enabled and does not change request admission. Local
+storage and append hooks can still delay request completion. These records do not
+claim that every incoming HTTP request, read refusal or upstream rate-limit
 rejection is audited, or that local append is a crash-durable transaction.
 
 

@@ -567,6 +567,7 @@ type serverConfig struct {
 	ColdArchive         archive.ColdArchive     // sovereign cold-archive backend (for the audit-chain verify API; nil = none)
 	RetentionOverride   *retentionOverrideStore // admin-configurable per-stream retention (shared with the pruner; nil = flags only)
 	Writer              *logs.Writer
+	StandbyAudit        *adminStandbyAudit // main owns periodic flush and final drain; tests may drive its clock explicitly
 	ExportObjectStore   adminExportObjectStore
 	OIDC                oidcConfig
 	LocalCredentials    *localAdminCredentialStore // first-party admin accounts (nil = feature off): invite -> activation link -> password + TOTP -> email+password+TOTP login
@@ -4506,7 +4507,11 @@ func main() {
 	if storeBackend(*transportAnchorAckStorePath) == "postgres" {
 		transportAnchorAckShared = mustCPStateBlobPersister(*transportAnchorAckStorePath, "transport_anchor_acks")
 	}
+	standbyAudit := newAdminStandbyAudit(writer, evaluator)
+	stopStandbyAudit := standbyAudit.start()
+	defer stopStandbyAudit()
 	mux := newServerWithConfig(serverConfig{
+		StandbyAudit:                   standbyAudit,
 		DNSConntrack:                   edgeDNSConntrack,
 		VLANObjectStorePath:            strings.TrimSpace(*vlanObjectStorePath),
 		PeerEdges:                      meshPeerEdges,
@@ -5222,7 +5227,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return false, false
 			}
 			return counts.Principals > 0, true
-		}, config.LocalCredentials)
+		}, config.LocalCredentials, config.StandbyAudit)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)

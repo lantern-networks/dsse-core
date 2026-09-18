@@ -60,12 +60,12 @@ func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool 
 // only the node's configured audit scope and the server-registered permission are
 // known. Deliberately accept no request, so bodies, paths, credentials, user-agent,
 // forwarded addresses and claimed tenant/actor cannot enter this record.
-func recordAdminStandbyRefusal(ctx context.Context, writer *logs.Writer, evaluator decision.Evaluator, permission string) {
+func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator, permission string, now, first, last time.Time, count uint64) {
 	if writer == nil {
 		logErrorf("admin_audit_write_failed event=%q: audit writer is not configured", "admin_write_refused_on_standby")
+		logErrorf("standby audit summary unconfirmed permission=%q request_count=%d", permission, count)
 		return
 	}
-	now := time.Now().UTC()
 	audit := model.AuditLog{
 		ID:            randomEdgeID("audit_admin_write_refused_on_standby_", now),
 		TenantID:      evaluator.PolicyBundle.TenantID,
@@ -76,19 +76,26 @@ func recordAdminStandbyRefusal(ctx context.Context, writer *logs.Writer, evaluat
 		Reason:        stringPtr("not_leader"),
 		EdgeRegionID:  &evaluator.EdgeRegionID,
 		EdgeClusterID: &evaluator.EdgeClusterID,
-		Timestamp:     now.Format(time.RFC3339Nano),
+		Timestamp:     now.UTC().Format(time.RFC3339Nano),
 		Metadata: map[string]any{
 			"audit_scope":         "node",
 			"authentication":      "not_evaluated",
 			"request_tenant":      "not_evaluated",
 			"required_permission": permission,
 			"http_status":         http.StatusConflict,
+			"aggregation":         "permission_window",
+			"request_count":       count,
+			"first_seen":          first.UTC().Format(time.RFC3339Nano),
+			"last_seen":           last.UTC().Format(time.RFC3339Nano),
+			"interval_seconds":    int(adminStandbyAuditInterval / time.Second),
 		},
 	}
 	// No synchronous authority/outbox call on this pre-authentication path. The
 	// node-local JSONL and its configured append hooks remain in use. Local failure
 	// is reported by the shared writer health/error path and cannot undo the 409.
-	_ = appendAdminAudit(ctx, writer, nil, audit, now)
+	if err := appendAdminAudit(context.Background(), writer, nil, audit, now); err != nil {
+		logErrorf("standby audit summary unconfirmed permission=%q request_count=%d first_seen=%s last_seen=%s", permission, count, first.UTC().Format(time.RFC3339Nano), last.UTC().Format(time.RFC3339Nano))
+	}
 }
 
 // adminPermissionWrites reports whether a permission names a change rather than a question.

@@ -1080,9 +1080,20 @@ that manifest. Partial responses, redirects and unverifiable packages are refuse
 Only one download per row can be pending. Leaving or reloading the page, or changing
 the organization while a request or hash check is pending, discards the old result.
 
-If verification fails, reload the release list and try again. Another administrator
-may have replaced the active release since the list was loaded. The Console does
-not save newly returned bytes under an older release's filename.
+The error identifies the next action:
+
+- A scope mismatch requires checking the selected organization before reloading.
+- A release version or manifest mismatch requires reloading the release list;
+  another administrator may have replaced the active release.
+- A package size or SHA-256 mismatch blocks the download. Do not distribute that
+  package. Ask the deployment operator to investigate the stored artifact and its
+  delivery path. Reloading alone does not repair inconsistent bytes.
+- A failed transfer or an unavailable browser integrity check is reported separately;
+  neither establishes that the stored package is corrupt.
+
+The Console does not save newly returned bytes under an older release's filename.
+These messages do not automatically quarantine an artifact, change the rollout plan,
+or add an audit record. An operator must investigate a reported byte mismatch.
 
 `GET /admin/agent-update-artifact` retains its tenant-effective default for bundle
 and replication clients. The Console adds `artifact_scope=publication`, with

@@ -250,6 +250,25 @@ async function arUploadArtifact(file, platform, arch, context) {
   }
 }
 
+// Keep remediation tied to the failed check. A byte mismatch is not evidence
+// that refreshing the catalogue will repair the stored package.
+function arArtifactDownloadError(reason) {
+  if (reason === "scope") return bl({
+    en: "Download blocked: the package response does not match the selected organization. Check the organization selection and reload the release list.",
+    ja: "ダウンロードを停止しました。応答の組織が選択中の組織と一致しません。組織の選択を確認し、配布一覧を再読込してください。" });
+  if (reason === "size" || reason === "digest") return bl({
+    en: "Download blocked: the package " + (reason === "size" ? "size" : "SHA-256 digest") + " does not match the published release. Do not distribute this package. Ask the deployment operator to investigate the stored artifact and delivery path.",
+    ja: "ダウンロードを停止しました。パッケージの" + (reason === "size" ? "サイズ" : "SHA-256 ハッシュ") + "が公開済みリリースと一致しません。このパッケージは配布せず、配備の運用者に保存されたファイルと配信経路の調査を依頼してください。" });
+  if (reason === "verification") return bl({
+    en: "The package integrity check could not be completed. No package was saved. Check browser support and try again; this does not establish that the package is corrupt.",
+    ja: "パッケージの完全性確認を完了できず、保存していません。ブラウザの対応状況を確認して再試行してください。パッケージの破損を確認したわけではありません。" });
+  if (reason === "transfer") return bl({
+    en: "The package transfer could not be completed. No package was saved. Check your connection and access, then reload the release list and try again.",
+    ja: "パッケージを取得できず、保存していません。接続とアクセス権を確認し、配布一覧を再読込してから再試行してください。" });
+  return bl({ en: "The package could not be verified. Reload the release list and try again.",
+    ja: "パッケージを確認できません。配布一覧を再読込してから、もう一度ダウンロードしてください。" });
+}
+
 // Download the active package described by this verified catalogue snapshot.
 // Header checks bind the response context; the selected manifest's digest and
 // size decide which bytes may be handed to the browser as a download.
@@ -257,6 +276,7 @@ async function arDownloadArtifact(platform, arch, manifest, context) {
   const current = context?.current;
   if (typeof current !== "function" || !current()) return;
   const scope = context.scope, manifestSHA256 = context.manifestSHA256, expected = { ...manifest };
+  let failure = "catalogue";
   try {
     if (typeof scope !== "string" || !/^[a-f0-9]{64}$/.test(manifestSHA256) ||
         expected.platform !== platform || expected.arch !== arch || !arKnownTarget(arTargetKey(platform, arch)) ||
@@ -271,25 +291,32 @@ async function arDownloadArtifact(platform, arch, manifest, context) {
     const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
       "&arch=" + encodeURIComponent(arch) + "&artifact_scope=publication&expected_tenant_id=" + encodeURIComponent(scope) +
       "&expected_manifest_sha256=" + encodeURIComponent(manifestSHA256);
+    failure = "transfer";
     const res = await fetch(baseForPlane(_AR_PLANE) + path, { headers, credentials: "include", redirect: "error", cache: "no-store" });
     if (!current()) return;
-    if (!res.ok || res.status !== 200 || !res.headers.has("X-Dsse-Agent-Update-Scope") ||
-        res.headers.get("X-Dsse-Agent-Update-Scope") !== scope ||
-        res.headers.get("X-Dsse-Agent-Update-Manifest-SHA256") !== manifestSHA256 ||
+    if (!res.ok || res.status !== 200) throw new Error();
+    failure = "scope";
+    if (!res.headers.has("X-Dsse-Agent-Update-Scope") || res.headers.get("X-Dsse-Agent-Update-Scope") !== scope) throw new Error();
+    failure = "catalogue";
+    if (res.headers.get("X-Dsse-Agent-Update-Manifest-SHA256") !== manifestSHA256 ||
         res.headers.get("X-Dsse-Agent-Update-Version") !== expected.version) throw new Error();
+    failure = "transfer";
     const blob = await res.blob();
     if (!current()) return;
+    failure = "size";
     if (blob.size !== expected.artifact_size) throw new Error();
+    failure = "verification";
     const digest = await arHash(blob);
     if (!current()) return;
+    failure = "digest";
     if (digest !== expected.artifact_sha256.toLowerCase()) throw new Error();
+    failure = "catalogue";
     const ext = platform === "windows" ? "msi" : "pkg", url = URL.createObjectURL(blob), a = document.createElement("a");
     a.href = url; a.download = "dsse-agent-" + expected.version + "-" + platform + "-" + arch + "." + ext;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 10000);
   } catch (_) {
-    if (current()) uiToast(bl({ en: "The package could not be verified. Reload the release list and try again.",
-      ja: "パッケージを確認できません。配布一覧を再読込してから、もう一度ダウンロードしてください。" }), "err");
+    if (current()) uiToast(arArtifactDownloadError(failure), "err");
   }
 }
 

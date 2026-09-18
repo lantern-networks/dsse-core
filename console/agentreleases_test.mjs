@@ -265,3 +265,34 @@ test('download ignores departed context before any request',async()=>{const f=do
 for(const present of [true,false])test('download distinguishes an explicit empty legacy scope header present='+present,async()=>{const f=downloadFixture();f.context.scope='';if(present)f.response.headers.set('X-Dsse-Agent-Update-Scope','');else f.response.headers.delete('X-Dsse-Agent-Update-Scope');await f.run();assert.equal(f.downloads.length,present?1:0)});
 test('download carries selected tenant and bearer authentication without a session',async()=>{const f=downloadFixture();f.context.scope='other';f.response.headers.set('X-Dsse-Agent-Update-Scope','other');f.c.idpSession=null;f.c.operateTenant='other';await f.run();assert.equal(f.downloads.length,1);const headers=f.raw[0][1].headers;assert.equal(headers.authorization,'Bearer token');assert.equal(headers['x-operate-tenant'],'other');assert.equal(headers['x-csrf-token'],undefined)});
 test('catalogue download prevents concurrent clicks and unlocks afterward',async()=>{const f=readFixture(),wait=deferred(),calls=[];f.c.arDownloadArtifact=async(...args)=>{calls.push(args);await wait.promise};f.setAPI(async(m,p)=>p==='/admin/agent-updates'?catalogueResponse('own','0.3.0'):f.responses(p));await f.c.renderAgentReleaseList(f.host);const button=allNodes(f.host).find(n=>n.text==='Download');assert.ok(button);const click=button.handlers.click||button.onClick;const run=click();assert.equal(button.disabled,true);await click();assert.equal(calls.length,1);assert.equal(calls[0][2].version,'0.3.0');assert.equal(calls[0][3].scope,'own');wait.resolve();await run;assert.equal(button.disabled,false)});
+
+for (const language of ['en', 'ja']) {
+  for (const kind of ['size', 'digest', 'scope', 'catalogue', 'verification', 'transfer']) {
+    test(`download remediation identifies ${kind} in ${language} without saving`, async () => {
+      const f = downloadFixture(); f.c.bl = text => text[language];
+      if (kind === 'size') f.response.blob = async () => new Blob(['x']);
+      if (kind === 'digest') f.response.blob = async () => new Blob(['bad']);
+      if (kind === 'scope') f.response.headers.set('X-Dsse-Agent-Update-Scope', 'other');
+      if (kind === 'catalogue') f.response.headers.set('X-Dsse-Agent-Update-Version', 'other');
+      if (kind === 'verification') f.c.arHash = async () => { throw Error('sensitive browser detail'); };
+      if (kind === 'transfer') f.response.blob = async () => { throw Error('sensitive network detail'); };
+      await f.run(); assert.equal(f.downloads.length, 0); assert.equal(f.toasts.length, 1);
+      const message = f.toasts[0][0]; assert.doesNotMatch(message, /sensitive/);
+      const expected = language === 'en'
+        ? {size: /size does not match/, digest: /SHA-256 digest does not match/, scope: /selected organization/, catalogue: /Reload the release list/, verification: /check could not be completed/, transfer: /transfer could not be completed/}
+        : {size: /サイズが公開済み/, digest: /SHA-256 ハッシュが公開済み/, scope: /選択中の組織/, catalogue: /配布一覧を再読込/, verification: /完全性確認を完了できず/, transfer: /取得できず/};
+      assert.match(message, expected[kind]);
+      if (kind === 'size' || kind === 'digest') {
+        assert.match(message, language === 'en' ? /Do not distribute.*investigate/ : /配布せず.*調査/);
+        assert.doesNotMatch(message, /reload|try again|再読込|再試行/i);
+      }
+    });
+  }
+}
+for (const phase of ['blob', 'hash']) test('late rejected '+phase+' does not warn a different context', async () => {
+  const f=downloadFixture(), wait=deferred(); let entered; const ready=new Promise(r=>entered=r);
+  const reject=async()=>{entered();await wait.promise;throw Error('late');};
+  if(phase==='blob')f.response.blob=reject;else f.c.arHash=reject;
+  const run=f.run();await ready;f.invalidate();wait.resolve();await run;
+  assert.equal(f.downloads.length,0);assert.equal(f.toasts.length,0);
+});

@@ -30,6 +30,7 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			// fifteen seconds. Checked here because this is the one place every administrative route passes
 			// through, and a rule enforced anywhere else is a rule with holes in it.
 			if adminWriteRefusedOnAStandby(w, permission) {
+				recordAdminStandbyRefusal(r.Context(), writer, evaluator, permission)
 				return
 			}
 			identity, ok, err := adminRequestIdentity(r, evaluator.PolicyBundle.TenantID, adminToken, adminAuth, devMode, time.Now())

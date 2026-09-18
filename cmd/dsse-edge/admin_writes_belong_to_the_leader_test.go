@@ -16,7 +16,8 @@ func TestEveryChangingPermissionIsRecognisedAsAWrite(t *testing.T) {
 			t.Fatalf("%q was not recognised as a change — a standby would accept it and discard it", p)
 		}
 	}
-	// The guard: reads must stay readable on a standby, which is what a standby is for.
+	// Read permissions are not writes. Individual routes can still refuse stale
+	// standby reads (for example risk/admission); this tests classification only.
 	reads := []string{
 		"admin.state.read", "admin.policy.read", "admin.enrollment.read", "admin.logs.read",
 		"admin.steering.read", "admin.connectors.read",

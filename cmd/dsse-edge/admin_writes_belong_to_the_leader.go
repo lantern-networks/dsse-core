@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 // admin_writes_belong_to_the_leader.go — an administrative write is authored where leadership is.
@@ -47,6 +53,42 @@ func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool 
 			"this one re-reads it. Send this to the leader: the Console reaches it through the front door, and "+
 			"GET /leader answers 200 only there"))
 	return true
+}
+
+// recordAdminStandbyRefusal records a routing decision, not a judged credential or
+// attempted configuration change. The guard runs before identity/tenant resolution:
+// only the node's configured audit scope and the server-registered permission are
+// known. Deliberately accept no request, so bodies, paths, credentials, user-agent,
+// forwarded addresses and claimed tenant/actor cannot enter this record.
+func recordAdminStandbyRefusal(ctx context.Context, writer *logs.Writer, evaluator decision.Evaluator, permission string) {
+	if writer == nil {
+		logErrorf("admin_audit_write_failed event=%q: audit writer is not configured", "admin_write_refused_on_standby")
+		return
+	}
+	now := time.Now().UTC()
+	audit := model.AuditLog{
+		ID:            randomEdgeID("audit_admin_write_refused_on_standby_", now),
+		TenantID:      evaluator.PolicyBundle.TenantID,
+		EventType:     "admin_write_refused_on_standby",
+		TargetType:    stringPtr("admin_endpoint"),
+		Action:        stringPtr("admin_route"),
+		Result:        stringPtr("refused"),
+		Reason:        stringPtr("not_leader"),
+		EdgeRegionID:  &evaluator.EdgeRegionID,
+		EdgeClusterID: &evaluator.EdgeClusterID,
+		Timestamp:     now.Format(time.RFC3339Nano),
+		Metadata: map[string]any{
+			"audit_scope":         "node",
+			"authentication":      "not_evaluated",
+			"request_tenant":      "not_evaluated",
+			"required_permission": permission,
+			"http_status":         http.StatusConflict,
+		},
+	}
+	// No synchronous authority/outbox call on this pre-authentication path. The
+	// node-local JSONL and its configured append hooks remain in use. Local failure
+	// is reported by the shared writer health/error path and cannot undo the 409.
+	_ = appendAdminAudit(ctx, writer, nil, audit, now)
 }
 
 // adminPermissionWrites reports whether a permission names a change rather than a question.

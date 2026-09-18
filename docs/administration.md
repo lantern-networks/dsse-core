@@ -886,3 +886,34 @@ file or absent shared row still means first boot for a new process, so external
 backups and storage attachment checks remain necessary. This validation does not
 detect a syntactically valid replacement with different settings, or implement
 live shared-writer refresh and conflict resolution.
+
+## Administrative writes refused by a standby
+
+A standby control plane refuses routes requiring a write permission with HTTP
+409 before resolving credentials, tenant context or request contents. Retry
+through the active management server. The refusal does not mean that a token is
+invalid, and it does not authorize or apply the requested change.
+
+The refusing node records `admin_write_refused_on_standby` in its local audit
+log. In **Logs & Audit → Logs → Admin audit**, search for this event and open
+**Details → View raw**. `result=refused` and `reason=not_leader` describe the
+routing decision. `authentication=not_evaluated` and
+`request_tenant=not_evaluated` explain why no actor, session or target ID is
+attached. The row uses the node's configured tenant scope with
+`audit_scope=node`; it is not attributed to a tenant named by the request.
+The registered permission and status are recorded, without request bodies,
+credentials, URLs, user-agent strings or forwarded addresses.
+
+This early refusal does not call the audit outbox synchronously. The local
+writer's configured append hooks still apply; local recording does not guarantee
+delivery to another node or a webhook. Inspect the refusing node's logs if the
+active management server does not show the event. A primary write failure is
+reported through the writer health and process error log; an unconfigured writer
+is reported in the process error log. Neither failure permits the request.
+
+One record is attempted for each request reaching this guard, including anonymous
+requests. Existing JSONL rotation/retention settings apply; optional admin request
+rate limiting is disabled by default. No sampling or new rate limiter is added.
+Local storage and append hooks can still delay request completion. These records
+do not claim that every incoming HTTP request, read refusal or upstream rate-limit
+rejection is audited, or that local append is a crash-durable transaction.

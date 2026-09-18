@@ -755,13 +755,13 @@ async function renderAgentReleaseList(host) {
   // on a different architecture is the ordinary case and not an edge one. This is the same chain that pointed
   // at itself on the device lane this morning, one screen along.
   if (answeringForTheDeployment()) {
-    host.appendChild(arConnectorProgramsSection());
+    host.appendChild(arConnectorProgramsSection(current));
   }
 }
 
 // arConnectorProgramsSection lists what this deployment can put on a connector machine, and lets the operator
 // add one. The bytes live with the authority, like agent artifacts, so both calls are control-plane.
-function arConnectorProgramsSection() {
+function arConnectorProgramsSection(current = () => true) {
   const card = el("div", { class: "ui-card", style: "margin-top:18px" });
   card.appendChild(el("strong", { text: bl({ en: "Connector programs", ja: "コネクタのプログラム" }) }));
   card.appendChild(el("div", { class: "ui-view-desc", text: bl({
@@ -774,9 +774,7 @@ function arConnectorProgramsSection() {
   const list = el("div", { style: "margin-top:8px" });
   card.appendChild(list);
 
-  const refresh = async () => {
-    list.innerHTML = "";
-    const programs = await connectorProgramsFetch();
+  const refresh = connectorProgramsLoader(list, (programs) => {
     if (!programs.length) {
       list.appendChild(el("div", { class: "ui-view-desc", text: bl({
         en: "None yet — no location can install a connector until one is added.",
@@ -791,7 +789,7 @@ function arConnectorProgramsSection() {
                           : bl({ en: "build not stated", ja: "ビルド不明" }) }),
       ]));
     }
-  };
+  }, current);
   refresh();
 
   const fileF = el("input", { class: "ui-input", type: "file", style: "max-width:340px" });

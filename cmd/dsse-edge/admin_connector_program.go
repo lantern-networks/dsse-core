@@ -143,33 +143,70 @@ func readConnectorProgramMeta(dir string) (connectorProgramMeta, bool) {
 	return m, true
 }
 
-// listConnectorPrograms is every target published for this organization, in a stable order.
-//
-// ★ AN EMPTY LIST IS AN ANSWER, NOT AN ERROR. It means the screen must say that this deployment holds no
-// program yet — which is a thing the operator can fix — rather than showing a download that 404s.
-func listConnectorPrograms(root, tenantID string) []connectorProgramMeta {
+// listConnectorPrograms returns a complete effective catalogue or an error. Missing
+// scope directories are valid on first use; unreadable stores and incomplete target
+// records must not masquerade as an empty catalogue or a deployment fallback.
+func listConnectorPrograms(root, tenantID string) ([]connectorProgramMeta, error) {
+	if strings.TrimSpace(root) == "" {
+		return nil, fmt.Errorf("connector-program storage is not configured")
+	}
 	byTarget := map[string]connectorProgramMeta{}
-	collect := func(dir string) {
+	collect := func(dir string) error {
 		entries, err := os.ReadDir(dir)
+		if os.IsNotExist(err) {
+			return nil
+		}
 		if err != nil {
-			return
+			return err
 		}
 		for _, e := range entries {
 			if !e.IsDir() {
 				continue
 			}
-			if m, ok := readConnectorProgramMeta(filepath.Join(dir, e.Name())); ok {
-				byTarget[e.Name()] = m
+			path := filepath.Join(dir, e.Name())
+			raw, err := os.ReadFile(filepath.Join(path, connectorProgramMetaName))
+			if err != nil {
+				return err
 			}
+			var m connectorProgramMeta
+			if err := json.Unmarshal(raw, &m); err != nil {
+				return err
+			}
+			target, err := connectorProgramTarget(m.Platform, m.Arch)
+			digest, derr := hex.DecodeString(m.SHA256)
+			if err != nil || target != e.Name() || derr != nil || len(digest) != sha256.Size ||
+				m.Platform != strings.ToLower(strings.TrimSpace(m.Platform)) || m.Arch != strings.ToLower(strings.TrimSpace(m.Arch)) ||
+				m.Size < 0 || m.Size > connectorProgramMaxBytes || m.FileName == "" || connectorProgramFileName(m.FileName, target) != m.FileName {
+				return fmt.Errorf("invalid connector-program metadata")
+			}
+			info, err := os.Stat(filepath.Join(path, connectorProgramBytesName))
+			if err != nil {
+				return err
+			}
+			if !info.Mode().IsRegular() || info.Size() != m.Size {
+				return fmt.Errorf("incomplete connector-program bytes")
+			}
+			byTarget[e.Name()] = m
 		}
+		return nil
 	}
-	// The deployment's own first, then this organization's over the top of it: an operator who published a
-	// program FOR an organization meant that one to be used.
-	if dir, err := connectorProgramDeploymentDir(root, "x"); err == nil {
-		collect(filepath.Dir(dir))
+	deployment, err := connectorProgramDeploymentDir(root, "x")
+	if err != nil {
+		return nil, err
 	}
-	if dir, err := connectorProgramDir(root, tenantID, "x"); err == nil {
-		collect(filepath.Dir(dir))
+	if err := collect(filepath.Dir(deployment)); err != nil {
+		return nil, err
+	}
+	// Legacy unscoped reads can still see shared seed programs. A named tenant's
+	// override directory must be readable before shared entries are offered.
+	if strings.TrimSpace(tenantID) != "" {
+		dir, err := connectorProgramDir(root, tenantID, "x")
+		if err != nil {
+			return nil, err
+		}
+		if err := collect(filepath.Dir(dir)); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]connectorProgramMeta, 0, len(byTarget))
 	for _, m := range byTarget {
@@ -181,7 +218,7 @@ func listConnectorPrograms(root, tenantID string) []connectorProgramMeta {
 		}
 		return out[i].Arch < out[j].Arch
 	})
-	return out
+	return out, nil
 }
 
 // resolveConnectorProgram finds the directory a download should be served from: this organization's own copy
@@ -275,9 +312,10 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			PublishedBy: actorOf(r).PrincipalID,
 		}
 		sidecar, _ := json.MarshalIndent(meta, "", "  ")
-		// ★ THE METADATA LANDS AFTER THE BYTES. A sidecar naming a digest whose file is not there yet is a
-		// screen offering a download that 404s; the other order is a file nothing points at, which is invisible
-		// and harmless until the next publish replaces it.
+		// Metadata lands after the bytes. This is not an atomic pair: an interrupted
+		// publish can leave a missing sidecar or an older sidecar beside new bytes.
+		// Catalogue reads reject missing metadata and size mismatches; they do not
+		// hash every file or establish serialization with concurrent publishers.
 		if err := durablefile.Write(filepath.Join(dir, connectorProgramMetaName), sidecar, 0o640); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -286,7 +324,12 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 	}))
 
 	mux.HandleFunc("GET /admin/connector-programs", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
-		programs := listConnectorPrograms(root, adminTenantIDFromRequest(r))
+		programs, err := listConnectorPrograms(root, adminTenantIDFromRequest(r))
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("connector programs could not be verified; ask the deployment operator to check program storage and retry"))
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]any{
 			"programs": programs,
 			"count":    len(programs),

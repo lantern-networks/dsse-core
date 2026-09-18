@@ -7,6 +7,8 @@ function fixture(){
  const nodes=[],fields={},toasts=[],requests=[],listeners=new Map();let modal,observed;
  const el=(tag,props={},children=[])=>{const n={tag,...props,isConnected:true,children:Array.isArray(children)?children:[children],handlers:{},appendChild(x){this.children.push(x)},remove(){this.isConnected=false},setAttribute(k,v){this[k]=v},focus(){},addEventListener(k,f){this.handlers[k]=f},querySelectorAll(selector){const tags=selector.split(',');return allNodes(this).filter(n=>tags.includes(n.tag))}};Object.defineProperty(n,'innerHTML',{set(){this.children=[]}});nodes.push(n);return n};
  const c=vm.createContext({el,bl:x=>x.en,uiField:opts=>{const f={el:el('input'),value:opts.value,get(){return this.value},setError(error){this.error=error},focus(){}};fields[opts.name]=f;return f},uiModal:opts=>{modal=opts;return{close(){}}},uiToast:(...a)=>toasts.push(a),apiFetch:async(...a)=>{requests.push(a);return{ok:false,status:500}},document:{body:el('body'),createTextNode:s=>s,addEventListener:(k,f)=>listeners.set(k,f),removeEventListener:k=>listeners.delete(k)},MutationObserver:class {constructor(f){observed=f} observe(){} disconnect(){observed=null}}});
+ vm.runInContext(readFileSync(new URL('./sites.js',import.meta.url),'utf8'),c);
+ c.baseForPlane=()=>'/control';
  vm.runInContext(source,c);
  // Legacy preservation tests open forms directly; production receives this verified
  // context from renderAgentReleaseList. Lifecycle tests below exercise invalidation.

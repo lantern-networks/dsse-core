@@ -524,12 +524,56 @@ async function enrollmentCommandFetch(siteID) {
 
 // connectorProgramsFetch asks the control plane what programs this deployment holds. The bytes live with the
 // authority, the same way agent release artifacts do, so this read is explicitly control-plane.
+function connectorProgramsReadError() {
+  return bl({ en: "Could not verify the available connector programs. Retry; an unavailable list does not mean that no programs are published.",
+    ja: "利用可能なコネクタのプログラムを確認できません。再試行してください。一覧の取得失敗は、プログラムが未公開であることを意味しません。" });
+}
+
 async function connectorProgramsFetch() {
-  try {
-    const r = await apiFetch("GET", "/admin/connector-programs", undefined, "control");
-    if (!r || !r.ok || !r.body) return [];
-    return Array.isArray(r.body.programs) ? r.body.programs : [];
-  } catch (e) { return []; }
+  const r = await apiFetch("GET", "/admin/connector-programs", undefined, "control");
+  const d = r?.body, object = v => v !== null && typeof v === "object" && !Array.isArray(v);
+  const target = v => typeof v === "string" && /^[a-z0-9._-]+$/.test(v) && v !== "." && v !== "..";
+  const seen = new Set();
+  if (!r?.ok || r.status !== 200 || !object(d) || !Array.isArray(d.programs) ||
+      !Number.isSafeInteger(d.count) || d.count !== d.programs.length) throw new Error(connectorProgramsReadError());
+  for (const p of d.programs) {
+    if (!object(p) || !target(p.platform) || !target(p.arch) ||
+        typeof p.file_name !== "string" || !p.file_name.trim() || p.file_name.trim() !== p.file_name ||
+        p.file_name.length > 120 || /[\\/]/.test(p.file_name) || [".", ".."].includes(p.file_name) ||
+        typeof p.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(p.sha256) ||
+        !Number.isSafeInteger(p.size) || p.size < 0 || p.size > 64 * 1024 * 1024 ||
+        ["version", "published_at", "published_by"].some(k => p[k] !== undefined && typeof p[k] !== "string")) throw new Error(connectorProgramsReadError());
+    const key = p.platform + "/" + p.arch;
+    if (seen.has(key)) throw new Error(connectorProgramsReadError());
+    seen.add(key);
+  }
+  return d.programs;
+}
+
+// Both publication and enrollment screens distinguish verified empty data from
+// failed reads. Retrying this read never issues another enrollment credential.
+function connectorProgramsLoader(host, render, parentCurrent = () => true) {
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const base = () => baseForPlane("control");
+  const selected = selection(), signedIn = session(), authority = base();
+  const context = () => selected === selection() && signedIn === session() && authority === base() && parentCurrent();
+  const refresh = async () => {
+    if (!context()) return;
+    const fresh = freshRender(host), current = () => fresh() && host.isConnected !== false && context();
+    uiState(host, "loading");
+    try {
+      const programs = await connectorProgramsFetch();
+      if (!current()) return;
+      host.innerHTML = "";
+      render(programs);
+    } catch (_) {
+      if (!current()) return;
+      uiState(host, "error", connectorProgramsReadError(), {
+        label: bl({ en: "Retry", ja: "再試行" }), onClick: refresh });
+    }
+  };
+  return refresh;
 }
 
 // downloadConnectorProgram takes the bytes away. A raw fetch rather than apiFetch, for the same reason the
@@ -669,7 +713,7 @@ async function showEnrollmentCommand(siteID) {
     // wiring inside the one modal rather than on window.
     const programHost = el("div", { style: "margin:6px 0 10px 0" });
     host.appendChild(programHost);
-    connectorProgramsFetch().then((programs) => {
+    const refreshPrograms = connectorProgramsLoader(programHost, (programs) => {
       programHost.innerHTML = "";
       if (!programs.length) {
         // ★ A ZERO THE READER CAN ACT ON. Not "0 programs" — what the zero means for the person about to walk
@@ -718,6 +762,7 @@ async function showEnrollmentCommand(siteID) {
       programHost.appendChild(detail);
       describe();
     });
+    refreshPrograms();
 
     const dl = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Download the settings", ja: "設定をダウンロード" }), onClick: () => {
       try {

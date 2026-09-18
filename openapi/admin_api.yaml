@@ -6292,12 +6292,18 @@ paths:
       description: >-
         Requires admin.connectors.read. Returns the deployment's own program together with anything published
         for this organization, and a note saying what an empty list means for somebody about to walk to a
-        machine — a screen showing "0" cannot be acted on by the person reading it.
+        machine. A verified empty catalogue is programs: [] and count: 0. Unconfigured or unreadable
+        storage, invalid target metadata and missing or size-inconsistent program bytes return 503,
+        without a partial list or a fallback hiding a broken organization override. Missing scope
+        directories remain valid on first use. This read does not hash every artifact or provide
+        a transactional snapshot across concurrent publication.
       tags:
         - AdminConnectors
       responses:
         "200":
-          description: The programs, with their digests and sizes.
+          description: The complete effective catalogue, with digests, sizes, count and Cache-Control no-store.
+        "503":
+          description: The catalogue could not be verified. No storage paths are exposed; retry after investigation.
   /admin/agent-update-artifact:
     get:
       summary: Download the active release package in the verified tenant or publication view.

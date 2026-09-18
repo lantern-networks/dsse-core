@@ -131,3 +131,35 @@ test('successful mutation followed by unavailable reads shows Retry without cont
   assert.equal(f.host.__siteNetworkEditor, null);
   assert.equal(f.host.querySelectorAll('button,input,select').length, 0);
 });
+
+function programFixture() {
+ const f=fixture();Object.assign(f.context,{baseForPlane:()=>'/control',operateTenant:'',idpSession:{id:'admin'}});
+ const p={platform:'linux',arch:'amd64',file_name:'connector.tar.gz',size:3,sha256:'a'.repeat(64)};
+ const response={ok:true,status:200,body:{programs:[p],count:1}};
+ f.context.apiFetch=async()=>response;
+ return {...f,p,response};
+}
+for(const mode of ['http','partial','network','body','array','count','row','digest','size','target','filename','version','duplicate'])test('program catalogue rejects '+mode+' instead of empty',async()=>{
+ const f=programFixture(),r=f.response,p=f.p;
+ if(mode==='http')r.ok=false;if(mode==='partial')r.status=206;if(mode==='network')f.context.apiFetch=async()=>{throw Error('offline')};
+ if(mode==='body')delete r.body;if(mode==='array')r.body.programs=null;if(mode==='count')r.body.count=3;if(mode==='row')r.body.programs=[null];
+ if(mode==='digest')p.sha256='bad';if(mode==='size')p.size=-1;if(mode==='target')p.platform='..';if(mode==='filename')p.file_name='../bad';if(mode==='version')p.version={};if(mode==='duplicate'){r.body.programs.push({...p});r.body.count=2}
+ await assert.rejects(f.context.connectorProgramsFetch());
+});
+test('program catalogue accepts explicit empty, legacy zero bytes and optional metadata',async()=>{
+ const f=programFixture();f.p.size=0;assert.equal((await f.context.connectorProgramsFetch()).length,1);f.response.body={programs:[],count:0};assert.equal((await f.context.connectorProgramsFetch()).length,0);
+});
+test('program read error offers a read-only retry and clears old content',async()=>{
+ const f=programFixture(),rendered=[],methods=[];let fail=true;
+ f.context.apiFetch=async(method)=>{methods.push(method);if(fail)throw Error('private storage path');return f.response};
+ const refresh=f.context.connectorProgramsLoader(f.host,p=>rendered.push(p));
+ await refresh();assert.equal(f.states.at(-1).state,'error');assert.equal(rendered.length,0);assert.doesNotMatch(f.states.at(-1).message,/private/);
+ fail=false;await f.states.at(-1).retry.onClick();assert.equal(rendered.length,1);assert.deepEqual(methods,['GET','GET']);
+});
+for(const kind of ['selection','session','authority','disconnected','parent','newer'])for(const fail of [true,false])test(`program read discards ${kind} late ${fail?'failure':'success'}`,async()=>{
+ const f=programFixture();let done,parent=true,rendered=0;
+ f.context.connectorProgramsFetch=()=>new Promise((resolve,reject)=>{done=()=>fail?reject(Error('old')):resolve([])});
+ const refresh=f.context.connectorProgramsLoader(f.host,()=>rendered++,()=>parent),pending=refresh();
+ if(kind==='selection')f.context.operateTenant='other';if(kind==='session')f.context.idpSession={id:'new'};if(kind==='authority')f.context.baseForPlane=()=>'/other';if(kind==='disconnected')f.host.isConnected=false;if(kind==='parent')parent=false;if(kind==='newer')f.context.freshRender(f.host);
+ done();await pending;assert.equal(rendered,0);assert.equal(f.states.some(s=>s.state==='error'),false);
+});

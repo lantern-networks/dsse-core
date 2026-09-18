@@ -1111,3 +1111,25 @@ signature validation, successful installation, delivery to every region, or conc
 writer serialization. The control plane verifies the manifest envelope; the browser
 does not independently verify its signature. Normal downloads do not create write
 audit records.
+
+
+### Reading the connector program catalogue
+
+Agent Releases and Sites → Add connector read the control plane's shared programs
+and the current organization's overrides. A successful empty response means no
+programs are currently listed. An unavailable or malformed response shows an error
+and **Retry** instead of advising that programs must be uploaded. Retrying this list
+inside Add connector does not issue a new enrollment profile or rotate its key.
+
+The server rejects incomplete catalogue reads with HTTP 503: unreadable scope
+storage, malformed target metadata, missing program files and size mismatches do
+not become an empty or partial list. A broken organization override is not silently
+replaced by the shared program in that list. The error omits local storage paths.
+The Console also validates the response count and each entry, and discards reads
+from departed pages, sessions, control-plane addresses or organization selections.
+
+New, absent scope directories can produce a valid empty catalogue. This read does
+not remember whether a missing directory existed before a process restart, hash
+every stored program or make publication atomic with its metadata. It does not
+change the raw download endpoint's lookup rules. Verify program bytes separately;
+catalogue validation is not acceptance of a native installer or a running connector.

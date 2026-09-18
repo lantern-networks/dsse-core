@@ -6234,7 +6234,10 @@ paths:
         and a connector has no identity until the program it does not have has enrolled it — so it is carried
         by the same person, in the same visit to the same screen. The organization's own published program is
         served if it has one, otherwise the program this deployment itself runs. The response carries
-        X-Artifact-Sha256 so whoever carries the bytes can check what arrived.
+        X-Artifact-Sha256 so whoever carries the bytes can check what arrived. X-Dsse-Connector-Program-Tenant
+        identifies the authenticated request tenant; X-Dsse-Connector-Program-Source identifies the resolved
+        publication source (tenant or deployment). The Console checks both against its verified catalogue,
+        even when two publications contain identical bytes. Responses use Cache-Control: no-store.
       tags:
         - AdminConnectors
       parameters:
@@ -6249,6 +6252,18 @@ paths:
       responses:
         "200":
           description: The program bytes.
+          headers:
+            X-Dsse-Connector-Program-Tenant:
+              description: The authenticated request tenant, including when serving a shared program.
+              schema: { type: string }
+            X-Dsse-Connector-Program-Source:
+              description: Resolved publication source; not taken from uploaded metadata.
+              schema: { type: string, enum: [tenant, deployment] }
+            X-Artifact-Sha256:
+              description: SHA-256 declared by the resolved publication metadata.
+              schema: { type: string }
+        "403":
+          description: This request names no organization.
         "404":
           description: This deployment holds no connector program for that platform and architecture.
     put:
@@ -6292,7 +6307,9 @@ paths:
       description: >-
         Requires admin.connectors.read. Returns the deployment's own program together with anything published
         for this organization, and a note saying what an empty list means for somebody about to walk to a
-        machine. A verified empty catalogue is programs: [] and count: 0. Unconfigured or unreadable
+        machine. The response tenant_id identifies the request tenant; each program's source is tenant for
+        an organization override or deployment for a shared program. Source is derived from the store
+        location, not uploaded metadata. A verified empty catalogue is programs: [] and count: 0. Unconfigured or unreadable
         storage, invalid target metadata and missing or size-inconsistent program bytes return 503,
         without a partial list or a fallback hiding a broken organization override. Missing scope
         directories remain valid on first use. This read does not hash every artifact or provide

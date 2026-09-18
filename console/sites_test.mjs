@@ -134,8 +134,8 @@ test('successful mutation followed by unavailable reads shows Retry without cont
 
 function programFixture() {
  const f=fixture();Object.assign(f.context,{baseForPlane:()=>'/control',operateTenant:'',idpSession:{id:'admin'}});
- const p={platform:'linux',arch:'amd64',file_name:'connector.tar.gz',size:3,sha256:'a'.repeat(64)};
- const response={ok:true,status:200,body:{programs:[p],count:1}};
+ const p={platform:'linux',arch:'amd64',file_name:'connector.tar.gz',size:3,sha256:'a'.repeat(64),source:'deployment',tenant_id:'own'};
+ const response={ok:true,status:200,body:{programs:[p],count:1,tenant_id:'own'}};
  f.context.apiFetch=async()=>response;
  return {...f,p,response};
 }
@@ -147,7 +147,7 @@ for(const mode of ['http','partial','network','body','array','count','row','dige
  await assert.rejects(f.context.connectorProgramsFetch());
 });
 test('program catalogue accepts explicit empty, legacy zero bytes and optional metadata',async()=>{
- const f=programFixture();f.p.size=0;assert.equal((await f.context.connectorProgramsFetch()).length,1);f.response.body={programs:[],count:0};assert.equal((await f.context.connectorProgramsFetch()).length,0);
+ const f=programFixture();f.p.size=0;assert.equal((await f.context.connectorProgramsFetch()).length,1);f.response.body={programs:[],count:0,tenant_id:'own'};assert.equal((await f.context.connectorProgramsFetch()).length,0);
 });
 test('program read error offers a read-only retry and clears old content',async()=>{
  const f=programFixture(),rendered=[],methods=[];let fail=true;
@@ -167,7 +167,7 @@ for(const kind of ['selection','session','authority','token','disconnected','par
 function programDownloadFixture() {
  const f=programFixture(),downloads=[],toasts=[],requests=[],timers=[];let valid=true;
  const bytes=new Uint8Array([1,2,3]);f.p.sha256='039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81';
- const response={ok:true,status:200,blob:async()=>new Blob([bytes])};
+ const response={ok:true,status:200,headers:new Headers({'X-Dsse-Connector-Program-Tenant':'own','X-Dsse-Connector-Program-Source':'deployment','x-artifact-sha256':f.p.sha256}),blob:async()=>new Blob([bytes])};
  Object.assign(f.context,{crypto:globalThis.crypto,localStorage:{getItem:()=>''},fetch:async(...a)=>{requests.push(a);return response},uiToast:m=>toasts.push(m),URL:{createObjectURL:()=> 'blob:program',revokeObjectURL(){}},setTimeout:fn=>timers.push(fn),document:{body:{appendChild(){}},createElement:()=>{const a={click(){downloads.push(a.download)},remove(){}};return a}}});
  return {...f,response,downloads,toasts,requests,timers,invalidate:()=>valid=false,run:()=>f.context.downloadConnectorProgram(f.p,()=>valid)};
 }
@@ -548,4 +548,42 @@ test('invalid cookie tenant refuses a site deletion dialog; scoped API token nee
   const f = siteDeleteFixture(); f.modal.close(); f.context.idpSession = null; f.open();
   await f.modals.at(-1).opts.footer[1].onclick(); assert.equal(f.state.reloads, 1);
   assert.equal(f.calls.some(c => c[1] === '/admin/tenant'), false);
+});
+
+for (const tenant of [undefined, null, '', ' ', 42, 'other']) test('connector catalogue rejects unverified tenant '+String(tenant), async () => {
+ const f=programFixture(); f.context.idpSession={auth_method:'admin_session',tenant_id:'own'};f.response.body.tenant_id=tenant;
+ await assert.rejects(f.context.connectorProgramsFetch());
+});
+for (const source of [undefined,null,'','shared',42]) test('connector catalogue rejects unverified source '+String(source),async()=>{
+ const f=programFixture();f.p.source=source;await assert.rejects(f.context.connectorProgramsFetch());
+});
+test('connector catalogue binds rows to selected tenant and preserves mixed publication sources',async()=>{
+ const f=programFixture();f.context.idpSession={auth_method:'admin_session',tenant_id:'operator'};f.context.operateTenant='own';
+ f.response.body.programs.push({...f.p,arch:'arm64',source:'tenant',tenant_id:'untrusted-row'});f.response.body.count=2;
+ const rows=await f.context.connectorProgramsFetch();assert.deepEqual(Array.from(rows,p=>[p.source,p.tenant_id]),[['deployment','own'],['tenant','own']]);
+ f.context.operateTenant='other';await assert.rejects(f.context.connectorProgramsFetch());
+});
+test('connector catalogue refuses invalid cookie scope before reading and allows scoped tokens without extra permissions',async()=>{
+ const f=programFixture();let reads=0;const reply=f.context.apiFetch;f.context.apiFetch=(...a)=>{reads++;return reply(...a)};
+ f.context.idpSession={auth_method:'admin_session'};await assert.rejects(f.context.connectorProgramsFetch());assert.equal(reads,0);
+ f.context.idpSession=null;assert.equal((await f.context.connectorProgramsFetch())[0].tenant_id,'own');assert.equal(reads,1);
+});
+for(const [header,value] of [['X-Dsse-Connector-Program-Tenant',null],['X-Dsse-Connector-Program-Tenant','other'],['X-Dsse-Connector-Program-Source',null],['X-Dsse-Connector-Program-Source','tenant']])test('connector refuses identical bytes with mismatched '+header+' '+value,async()=>{
+ const f=programDownloadFixture();let bodies=0;const blob=f.response.blob;f.response.blob=()=>{bodies++;return blob()};
+ if(value===null)f.response.headers.delete(header);else f.response.headers.set(header,value);
+ assert.equal(await f.run(),false);assert.equal(bodies,0);assert.equal(f.downloads.length,0);assert.match(f.toasts[0],/organization or publication source/);
+});
+for(const value of [null,'bad','b'.repeat(64)])test('connector rejects changed catalogue digest header '+value,async()=>{
+ const f=programDownloadFixture();if(value===null)f.response.headers.delete('x-artifact-sha256');else f.response.headers.set('x-artifact-sha256',value);
+ assert.equal(await f.run(),false);assert.equal(f.downloads.length,0);assert.match(f.toasts[0],/no longer matches the displayed catalogue/);
+});
+for(const kind of ['tenant','source','session','selection'])test('connector checks captured expected '+kind+' before sending',async()=>{
+ const f=programDownloadFixture();if(kind==='tenant')delete f.p.tenant_id;if(kind==='source')delete f.p.source;if(kind==='session')f.context.idpSession={auth_method:'admin_session',tenant_id:'other'};if(kind==='selection')f.context.operateTenant='other';
+ assert.equal(await f.run(),false);assert.equal(f.requests.length,0);assert.equal(f.downloads.length,0);
+});
+test('connector accepts tenant publication and case-normalized digest headers',async()=>{
+ const f=programDownloadFixture();f.p.source='tenant';f.response.headers.set('X-Dsse-Connector-Program-Source','tenant');f.response.headers.set('x-artifact-sha256',f.p.sha256.toUpperCase());assert.equal(await f.run(),true);
+});
+for(const reason of ['scope','catalogue'])test('connector has Japanese '+reason+' recovery guidance',()=>{
+ const f=programDownloadFixture();f.context.bl=x=>x.ja;assert.match(f.context.connectorProgramDownloadError(reason),/再読込/);assert.doesNotMatch(f.context.connectorProgramDownloadError(reason),/破損/);
 });

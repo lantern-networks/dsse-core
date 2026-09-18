@@ -329,7 +329,7 @@ for(const mode of ['oversized','file','hash'])test('connector preparation failur
 test('connector upload Japanese distinguishes unsent and uncertain',()=>{const f=connectorUploadFixture();f.c.bl=x=>x.ja;assert.match(f.c.arConnectorUploadError(true),/保存済み/);assert.match(f.c.arConnectorUploadError(false),/送信していません/)});
 test('connector catalogue starts before its card is attached',async()=>{
  const f=fixture(),el=f.c.el;let reads=0;
- Object.assign(f.c,{operateTenant:'',idpSession:{},freshRender:()=>()=>true,uiState(){},apiFetch:async()=>{reads++;return{ok:true,status:200,body:{programs:[],count:0}}},el:(...a)=>{const n=el(...a);if(n.class==='ui-card')n.isConnected=false;return n}});
+ Object.assign(f.c,{operateTenant:'',idpSession:{},freshRender:()=>()=>true,uiState(){},apiFetch:async()=>{reads++;return{ok:true,status:200,body:{programs:[],count:0,tenant_id:'own'}}},el:(...a)=>{const n=el(...a);if(n.class==='ui-card')n.isConnected=false;return n}});
  const card=f.c.arConnectorProgramsSection(()=>true,"own");assert.equal(reads,1);card.isConnected=true;for(let i=0;i<6;i++)await Promise.resolve();assert.ok(allNodes(card).some(n=>String(n.text).includes('None yet')));
 });
 test('connector acknowledgement accepts omitted empty version but rejects null',()=>{const f=fixture(),expected={platform:'linux',arch:'amd64',sha256:'a'.repeat(64),size:0,version:''},body={...expected,file_name:'dsse-connector-linux-amd64.tar.gz',published_at:'2026-09-18T00:00:00Z'};delete body.version;assert.ok(f.c.arConnectorProgramAck({ok:true,status:200,body},expected));body.version=null;assert.throws(()=>f.c.arConnectorProgramAck({ok:true,status:200,body},expected))});

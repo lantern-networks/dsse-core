@@ -63,6 +63,13 @@ type connectorProgramMeta struct {
 	PublishedBy string `json:"published_by,omitempty"`
 }
 
+// connectorProgramListing describes the resolved publication source, not a value
+// trusted from the uploaded sidecar. The selected tenant is carried by the response.
+type connectorProgramListing struct {
+	connectorProgramMeta
+	Source string `json:"source"`
+}
+
 // connectorProgramTarget is one platform/arch pair, normalised. Both halves are required: a program with no
 // architecture is one somebody has to guess about, and the guess is made on the machine where it fails.
 func connectorProgramTarget(platform, arch string) (string, error) {
@@ -149,12 +156,12 @@ func readConnectorProgramMeta(dir string) (connectorProgramMeta, bool) {
 // listConnectorPrograms returns a complete effective catalogue or an error. Missing
 // scope directories are valid on first use; unreadable stores and incomplete target
 // records must not masquerade as an empty catalogue or a deployment fallback.
-func listConnectorPrograms(root, tenantID string) ([]connectorProgramMeta, error) {
+func listConnectorPrograms(root, tenantID string) ([]connectorProgramListing, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, fmt.Errorf("connector-program storage is not configured")
 	}
-	byTarget := map[string]connectorProgramMeta{}
-	collect := func(dir string) error {
+	byTarget := map[string]connectorProgramListing{}
+	collect := func(dir, source string) error {
 		entries, err := os.ReadDir(dir)
 		if os.IsNotExist(err) {
 			return nil
@@ -189,7 +196,7 @@ func listConnectorPrograms(root, tenantID string) ([]connectorProgramMeta, error
 			if !info.Mode().IsRegular() || info.Size() != m.Size {
 				return fmt.Errorf("incomplete connector-program bytes")
 			}
-			byTarget[e.Name()] = m
+			byTarget[e.Name()] = connectorProgramListing{connectorProgramMeta: m, Source: source}
 		}
 		return nil
 	}
@@ -197,7 +204,7 @@ func listConnectorPrograms(root, tenantID string) ([]connectorProgramMeta, error
 	if err != nil {
 		return nil, err
 	}
-	if err := collect(filepath.Dir(deployment)); err != nil {
+	if err := collect(filepath.Dir(deployment), "deployment"); err != nil {
 		return nil, err
 	}
 	// Legacy unscoped reads can still see shared seed programs. A named tenant's
@@ -207,11 +214,11 @@ func listConnectorPrograms(root, tenantID string) ([]connectorProgramMeta, error
 		if err != nil {
 			return nil, err
 		}
-		if err := collect(filepath.Dir(dir)); err != nil {
+		if err := collect(filepath.Dir(dir), "tenant"); err != nil {
 			return nil, err
 		}
 	}
-	out := make([]connectorProgramMeta, 0, len(byTarget))
+	out := make([]connectorProgramListing, 0, len(byTarget))
 	for _, m := range byTarget {
 		out = append(out, m)
 	}
@@ -226,18 +233,18 @@ func listConnectorPrograms(root, tenantID string) ([]connectorProgramMeta, error
 
 // resolveConnectorProgram finds the directory a download should be served from: this organization's own copy
 // if it published one, otherwise the deployment's.
-func resolveConnectorProgram(root, tenantID, target string) (string, connectorProgramMeta, bool) {
+func resolveConnectorProgram(root, tenantID, target string) (string, connectorProgramMeta, string, bool) {
 	if dir, err := connectorProgramDir(root, tenantID, target); err == nil {
 		if m, ok := readConnectorProgramMeta(dir); ok {
-			return dir, m, true
+			return dir, m, "tenant", true
 		}
 	}
 	if dir, err := connectorProgramDeploymentDir(root, target); err == nil {
 		if m, ok := readConnectorProgramMeta(dir); ok {
-			return dir, m, true
+			return dir, m, "deployment", true
 		}
 	}
-	return "", connectorProgramMeta{}, false
+	return "", connectorProgramMeta{}, "", false
 }
 
 func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
@@ -340,8 +347,9 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]any{
-			"programs": programs,
-			"count":    len(programs),
+			"tenant_id": adminTenantIDFromRequest(r),
+			"programs":  programs,
+			"count":     len(programs),
 			// ★ THE CONSEQUENCE, NOT THE COUNT. A screen showing "0" cannot be acted on by the person reading
 			// it; this says what the zero means for the customer standing in front of a machine.
 			"note": connectorProgramNote(len(programs)),
@@ -359,7 +367,7 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			writeError(w, http.StatusForbidden, fmt.Errorf("this request names no organization"))
 			return
 		}
-		dir, meta, ok := resolveConnectorProgram(root, tenantID, target)
+		dir, meta, source, ok := resolveConnectorProgram(root, tenantID, target)
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("this deployment holds no connector program for %s: "+
 				"an operator publishes one with PUT /admin/connector-program", target))
@@ -376,6 +384,9 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		// The digest travels with the bytes, so whoever carries them can check what arrived without going
 		// back to the screen that offered them.
 		w.Header().Set("x-artifact-sha256", meta.SHA256)
+		w.Header().Set("X-Dsse-Connector-Program-Tenant", tenantID)
+		w.Header().Set("X-Dsse-Connector-Program-Source", source)
+		w.Header().Set("Cache-Control", "no-store")
 		http.ServeContent(w, r, meta.FileName, time.Time{}, f)
 	}))
 }

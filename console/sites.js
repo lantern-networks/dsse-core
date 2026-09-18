@@ -643,15 +643,27 @@ function connectorProgramsReadError() {
     ja: "利用可能なコネクタのプログラムを確認できません。再試行してください。一覧の取得失敗は、プログラムが未公開であることを意味しません。" });
 }
 
+function connectorProgramTenant() {
+  const selected = typeof operateTenant === "string" ? operateTenant : "";
+  const session = typeof idpSession === "undefined" ? null : idpSession;
+  const tenant = selected || (session?.auth_method === "admin_session" ? session.tenant_id : null);
+  if ((tenant != null || session?.auth_method === "admin_session") &&
+      (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant)) throw new Error(connectorProgramsReadError());
+  return tenant;
+}
+
 async function connectorProgramsFetch() {
+  const tenant = connectorProgramTenant();
   const r = await apiFetch("GET", "/admin/connector-programs", undefined, "control");
   const d = r?.body, object = v => v !== null && typeof v === "object" && !Array.isArray(v);
   const target = v => typeof v === "string" && /^[a-z0-9._-]+$/.test(v) && v !== "." && v !== "..";
   const seen = new Set();
   if (!r?.ok || r.status !== 200 || !object(d) || !Array.isArray(d.programs) ||
-      !Number.isSafeInteger(d.count) || d.count !== d.programs.length) throw new Error(connectorProgramsReadError());
+      !Number.isSafeInteger(d.count) || d.count !== d.programs.length ||
+      typeof d.tenant_id !== "string" || !d.tenant_id || d.tenant_id.trim() !== d.tenant_id ||
+      (tenant !== null && d.tenant_id !== tenant)) throw new Error(connectorProgramsReadError());
   for (const p of d.programs) {
-    if (!object(p) || !target(p.platform) || !target(p.arch) ||
+    if (!object(p) || !["deployment", "tenant"].includes(p.source) || !target(p.platform) || !target(p.arch) ||
         typeof p.file_name !== "string" || !p.file_name.trim() || p.file_name.trim() !== p.file_name ||
         p.file_name.length > 120 || /[\\/]/.test(p.file_name) || [".", ".."].includes(p.file_name) ||
         typeof p.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(p.sha256) ||
@@ -661,7 +673,7 @@ async function connectorProgramsFetch() {
     if (seen.has(key)) throw new Error(connectorProgramsReadError());
     seen.add(key);
   }
-  return d.programs;
+  return d.programs.map(p => ({ ...p, tenant_id: d.tenant_id }));
 }
 
 // Both publication and enrollment screens distinguish verified empty data from
@@ -694,6 +706,12 @@ function connectorProgramsLoader(host, render, parentCurrent = () => true) {
 // The displayed catalogue is the expected content, not a promise that the next
 // GET returns the same bytes. Never save a partial, changed or unverified program.
 function connectorProgramDownloadError(reason) {
+  if (reason === "scope") return bl({
+    en: "The connector program organization or publication source could not be verified. No program was saved. Check the selected organization and reload the program list; ask the deployment operator to investigate if this persists.",
+    ja: "コネクタのプログラムの対象組織または公開元を確認できず、保存していません。選択中の組織を確認してプログラム一覧を再読込してください。解消しない場合は配備の運用者に調査を依頼してください。" });
+  if (reason === "catalogue") return bl({
+    en: "The connector program response no longer matches the displayed catalogue. No program was saved. Reload the program list and check for a changed publication before downloading again.",
+    ja: "コネクタのプログラムの応答が表示中の一覧と一致せず、保存していません。プログラム一覧を再読込し、公開内容の変更を確認してから再度取得してください。" });
   if (reason === "size" || reason === "digest") return bl({
     en: "Download blocked: the connector program " + (reason === "size" ? "size" : "SHA-256 digest") + " does not match the displayed catalogue. Do not distribute this program. Ask the deployment operator to investigate the stored file and delivery path, including intervening publication.",
     ja: "ダウンロードを停止しました。コネクタのプログラムの" + (reason === "size" ? "サイズ" : "SHA-256 ハッシュ") + "が表示中の一覧と一致しません。このプログラムは配布せず、配備の運用者に保存ファイル・配信経路・公開内容の変更を確認してもらってください。" });
@@ -712,6 +730,11 @@ async function downloadConnectorProgram(program, parentCurrent) {
     selected === operateTenant && session === idpSession && token === (localStorage.getItem("adminToken") || "");
   let failure = "transfer";
   try {
+    failure = "scope";
+    const tenant = connectorProgramTenant();
+    if (typeof expected.tenant_id !== "string" || !expected.tenant_id || expected.tenant_id.trim() !== expected.tenant_id ||
+        (tenant !== null && tenant !== expected.tenant_id) || !["deployment", "tenant"].includes(expected.source)) throw new Error();
+    failure = "transfer";
     if (!Number.isSafeInteger(expected.size) || expected.size < 0 || expected.size > 64 * 1024 * 1024 ||
         typeof expected.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(expected.sha256) ||
         ![expected.platform, expected.arch].every(v => typeof v === "string" && /^[a-z0-9._-]+$/.test(v) && ![".", ".."].includes(v)) ||
@@ -724,6 +747,12 @@ async function downloadConnectorProgram(program, parentCurrent) {
     const res = await fetch(base + path, { method: "GET", headers, credentials: "include", redirect: "error", cache: "no-store" });
     if (!current()) return false;
     if (!res.ok || res.status !== 200 || res.redirected) throw new Error();
+    failure = "scope";
+    if (res.headers.get("X-Dsse-Connector-Program-Tenant") !== expected.tenant_id ||
+        res.headers.get("X-Dsse-Connector-Program-Source") !== expected.source) throw new Error();
+    failure = "catalogue";
+    if ((res.headers.get("x-artifact-sha256") || "").toLowerCase() !== expected.sha256.toLowerCase()) throw new Error();
+    failure = "transfer";
     const blob = await res.blob();
     if (!current()) return false;
     failure = "size";

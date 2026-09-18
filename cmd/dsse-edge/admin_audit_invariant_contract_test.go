@@ -272,6 +272,7 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				MetadataKeyCount:        1,
 			}, evaluator, now),
 		},
+		{name: "connectorProgramPublishedAuditLog", audit: connectorProgramPublishedAuditLog(nil, "tenant_audit_cp0020", connectorProgramMeta{Platform: "linux", Arch: "amd64", SHA256: strings.Repeat("a", 64), Version: "test-build", FileName: "program.tar.gz", PublishedBy: rawActorUserID}, evaluator, now)},
 		{
 			name: "adminSiteAuditLog",
 			audit: adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{
@@ -616,6 +617,7 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 		"adminPolicyAuditLog":                true,
 		"adminPolicyCandidateAuditLog":       true,
 		"adminSiteAuditLog":                  true,
+		"connectorProgramPublishedAuditLog":  true,
 		"adminTenantModelAuditLog":           true,
 		"adminTenantModelLifecycleAuditLog":  true,
 		"adminToolCallEventAuditLog":         true,

@@ -18,7 +18,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/durablefile"
+	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 // admin_connector_program.go — the deployment holds the programs a customer runs on the machine inside their
@@ -238,7 +241,7 @@ func resolveConnectorProgram(root, tenantID, target string) (string, connectorPr
 }
 
 func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
-	root string, isEnforcingEdge bool) {
+	root string, isEnforcingEdge bool, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator) {
 
 	// control-plane-only: the bytes live with the authority, the same way agent release artifacts do. An
 	// enforcing Edge holds no copy and says where to write instead of accepting a write it would lose.
@@ -319,6 +322,12 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		if err := durablefile.Write(filepath.Join(dir, connectorProgramMetaName), sidecar, 0o640); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		// Record the verified bytes and completed metadata, not the untrusted
+		// request declaration. Publication and audit delivery remain separate writes.
+		if writer != nil {
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, outbox, connectorProgramPublishedAuditLog(r, adminTenantIDFromRequest(r), meta, evaluator, now), now)
 		}
 		writeJSON(w, http.StatusOK, meta)
 	}))
@@ -555,4 +564,27 @@ func registerConnectorProgramFlag() *string {
 		"where this deployment holds the connector PROGRAMS an administrator downloads from \"Add connector\" "+
 			"and carries to the machine inside the customer's network. Empty and -state-dir set = "+
 			"‹state-dir›/connector-programs, so the lane is not dark on a deployment that never named it")
+}
+
+// The artifact digest identifies public program content. The raw bytes,
+// credentials, arbitrary request headers and storage paths never enter this row.
+func connectorProgramPublishedAuditLog(r *http.Request, tenant string, meta connectorProgramMeta, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+	record := model.AuditLog{
+		ID: randomEdgeID("audit_connector_program_published_", now), TenantID: tenant,
+		ActorUserID: auditActorPrincipal(r), EventType: "admin_connector_program_published",
+		TargetType: stringPtr("connector_program"), TargetID: stringPtr(meta.Platform + "/" + meta.Arch),
+		Action: stringPtr("publish"), Result: stringPtr("success"),
+		EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID,
+		Timestamp: now.UTC().Format(time.RFC3339),
+		Metadata: map[string]any{"publication_scope": "tenant_override", "platform": meta.Platform, "arch": meta.Arch,
+			"version": meta.Version, "artifact_sha256": meta.SHA256, "artifact_size": meta.Size,
+			"file_name": meta.FileName, "published_at": meta.PublishedAt},
+	}
+	if r != nil {
+		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(tenant) != "" && !strings.EqualFold(strings.TrimSpace(tenant), strings.TrimSpace(identity.TenantID)) {
+			stampOperatorActor(record.Metadata, identity)
+		}
+	}
+	return record
+
 }

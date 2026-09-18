@@ -25,7 +25,7 @@ func connectorProgramTestMux(root string, enforcingEdge bool, tenantID string) *
 			h(w, r.WithContext(ctx))
 		}
 	}
-	registerConnectorProgramRoutes(mux, as, root, enforcingEdge)
+	registerConnectorProgramRoutes(mux, as, root, enforcingEdge, nil, nil, testEvaluator())
 	return mux
 }
 

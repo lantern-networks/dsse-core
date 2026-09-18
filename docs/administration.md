@@ -1201,3 +1201,17 @@ Cancel, Escape, or leaving the page does not undo a request already sent. Late
 responses from a closed editor or a changed page, organization, session, authority,
 or API credential do not display success or refresh the old page. These checks do
 not cancel a server write or make saving and readback an atomic transaction.
+
+
+The Sites page validates both site and connector catalogues before showing
+management controls. An unavailable or malformed
+catalogue produces a retry message rather than “no sites” or “no connectors”; site
+creation is disabled until the reads succeed. A confirmed empty catalogue still
+allows creation. Connector rows must match the selected organization or authenticated browser
+session when available. With a scoped API token and no browser session, the
+Console relies on server authorization and rejects mixed-organization rows; it
+does not require additional tenant-model permissions.
+
+The catalogues are separate reads, so their counts and status may reflect different
+moments. These checks do not provide an atomic fleet snapshot or prove that a
+connector can carry traffic. Closing or navigating away discards late page updates.

@@ -11,13 +11,15 @@
 function renderSitesView(content) {
   content.innerHTML = "";
   const host = el("div", {});
+  const create = el("button", { class: "ui-btn ui-btn-primary ui-btn-sm", text: bl({ en: "+ Create Site", ja: "+ サイト作成" }), onClick: () => { if (host.__siteListReady) openSiteForm(host); } });
+  create.disabled = true; host.__siteCreateButton = create;
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Sites", ja: "サイト" }) }),
       el("p", { class: "ui-view-desc", text: bl({ en: "Your locations and the connectors in each.", ja: "拠点と、各拠点のコネクタ。" }) }),
     ]),
     el("div", { style: "display:flex; gap:8px; flex-wrap:wrap;" }, [
-      el("button", { class: "ui-btn ui-btn-primary ui-btn-sm", text: bl({ en: "+ Create Site", ja: "+ サイト作成" }), onClick: () => openSiteForm(host) }),
+      create,
       el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderSiteList(host) }),
     ]),
   ]));
@@ -320,22 +322,78 @@ function siteRouteCount(routeSummary) {
   return bl({ en: f + " fqdn / " + c + " cidr", ja: "FQDN " + f + " / CIDR " + c });
 }
 
+// Validate both catalogues before combining them; unavailable data is never an empty catalogue.
+function siteListRows(response, key) {
+  const body = response && response.body;
+  if (!response || !response.ok || response.status !== 200 || !body || typeof body !== "object" || Array.isArray(body) ||
+      !Object.hasOwn(body, key) || (body[key] !== null && !Array.isArray(body[key]))) throw new Error("Invalid site catalogue");
+  const rows = body[key] || [];
+  if (body.count !== rows.length || rows.some(row => !row || typeof row !== "object" || Array.isArray(row))) throw new Error("Invalid site catalogue rows");
+  return rows;
+}
+
+function siteListData(siteResponse, connectorResponse, tenant) {
+  const sites = siteListRows(siteResponse, "sites"), conns = siteListRows(connectorResponse, "connectors");
+  const id = value => typeof value === "string" && value.length > 0 && value.trim() === value;
+  const optionalText = value => value === undefined || typeof value === "string";
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  const siteIDs = new Set(), connectorIDs = new Set();
+  let rowTenant = tenant || null;
+  for (const site of sites) {
+    if (!id(site.site_id) || siteIDs.has(site.site_id) ||
+        ![site.name, site.region, site.deployment_type, site.routing_namespace, site.ha_policy].every(optionalText) ||
+        (site.tenant_id !== undefined && (!id(site.tenant_id) || (rowTenant !== null && site.tenant_id !== rowTenant))) ||
+        (site.managed !== undefined && typeof site.managed !== "boolean") ||
+        (site.expected_connector_count !== undefined && !count(site.expected_connector_count)) ||
+        !count(site.connector_count) || !count(site.online_count) || site.online_count > site.connector_count ||
+        !["healthy", "degraded", "down", "unknown"].includes(site.health) ||
+        (site.regions != null && (!Array.isArray(site.regions) || !site.regions.every(id)))) throw new Error("Invalid site row");
+    if (site.tenant_id !== undefined) rowTenant = site.tenant_id;
+    siteIDs.add(site.site_id);
+  }
+  for (const conn of conns) {
+    if (!id(conn.id) || connectorIDs.has(conn.id) || (!id(conn.tenant_id) || (rowTenant !== null && conn.tenant_id !== rowTenant)) || typeof conn.online !== "boolean" ||
+        ![conn.name, conn.connector_group_id, conn.last_heartbeat_at].every(optionalText) ||
+        (conn.connector_group_id && conn.connector_group_id.trim() !== conn.connector_group_id)) throw new Error("Invalid connector row");
+    rowTenant = conn.tenant_id;
+    connectorIDs.add(conn.id);
+  }
+  return { sites, conns };
+}
+
 // renderSiteList shows every site as a CARD with its connectors + live status INLINE, so opening the page shows
 // the connector situation at a glance (no drill-in needed). Connectors are grouped by connector_group_id; per
 // connector you can rename it, see its Connected/Offline status + last heartbeat, and open its Networks.
 async function renderSiteList(host) {
+  const fresh = freshRender(host);
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: baseForPlane("control"), token: token() };
+  const current = () => fresh() && host.isConnected !== false && selection() === initial.selection &&
+    session() === initial.session && baseForPlane("control") === initial.authority && token() === initial.token;
+  host.__siteListReady = false;
+  if (host.__siteCreateButton) host.__siteCreateButton.disabled = true;
   uiState(host, "loading");
-  const current = freshRender(host);
-  let sites = [], conns = [];
+  let sites, conns;
   try {
-    const [rs, rc] = await Promise.all([apiFetch("GET", "/admin/sites"), apiFetch("GET", "/admin/connectors")]);
-    if (!rs.ok) { if (!current()) return; uiState(host, "error", "HTTP " + rs.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) }); return; }
-    sites = (rs.body && rs.body.sites) || [];
-    conns = (rc.ok && rc.body && rc.body.connectors) || [];
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) }); return; }
+    // A connector-scoped API token need not have permission to read the tenant model.
+    // Use the selected tenant or authenticated cookie session when known; otherwise require row consistency.
+    const tenant = initial.selection || (initial.session && initial.session.auth_method === "admin_session" ? initial.session.tenant_id : null);
+    if ((tenant != null || (initial.session && initial.session.auth_method === "admin_session")) && (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant)) throw new Error("Invalid site context");
+    const [rs, rc] = await Promise.all([apiFetch("GET", "/admin/sites", undefined, "control"), apiFetch("GET", "/admin/connectors", undefined, "control")]);
+    if (!current()) return;
+    ({ sites, conns } = siteListData(rs, rc, tenant));
+  } catch (_) {
+    if (!current()) return;
+    uiState(host, "error", bl({ en: "Sites and connectors could not be verified. Retry before making changes.", ja: "サイトとコネクタを確認できませんでした。変更前に再試行してください。" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) });
+    return;
+  }
 
-  const bySite = {};
-  conns.forEach((c) => { const g = c.connector_group_id || ""; (bySite[g] = bySite[g] || []).push(c); });
+  const bySite = new Map();
+  conns.forEach(conn => { const group = conn.connector_group_id || ""; if (!bySite.has(group)) bySite.set(group, []); bySite.get(group).push(conn); });
+  host.__siteListReady = true;
+  if (host.__siteCreateButton) host.__siteCreateButton.disabled = false;
 
   if (!current()) return;
   host.innerHTML = "";
@@ -384,7 +442,7 @@ async function renderSiteList(host) {
   const card = (s, opts) => {
     opts = opts || {};
     const sid = s.site_id || s.id || "";
-    const list = opts.list || bySite[sid] || [];
+    const list = opts.list || bySite.get(sid) || [];
     const online = list.filter((c) => c.online).length;
     const total = list.length || s.connector_count || 0;
     const wrap = el("div", { style: "border:1px solid var(--ui-line);border-radius:10px;padding:14px 16px;margin-bottom:14px;background:var(--panel)" });
@@ -411,8 +469,8 @@ async function renderSiteList(host) {
 
   // Connectors whose group id matches no site — surface them so they are never hidden.
   const siteIds = new Set(sites.map((s) => s.site_id || s.id));
-  const orphanIds = Object.keys(bySite).filter((g) => g && !siteIds.has(g));
-  const orphans = (bySite[""] || []).concat(...orphanIds.map((g) => bySite[g]));
+  const orphanIds = [...bySite.keys()].filter((g) => g && !siteIds.has(g));
+  const orphans = (bySite.get("") || []).concat(...orphanIds.map((g) => bySite.get(g)));
   if (orphans.length) {
     host.appendChild(card({ site_id: "", regions: [] }, { orphan: true, list: orphans, title: bl({ en: "Connectors not assigned to a site", ja: "サイト未割り当てのコネクタ" }) }));
   }

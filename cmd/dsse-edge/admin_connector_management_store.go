@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -293,17 +294,15 @@ func adminConnectorMetadataKeyCount(metadata map[string]any) int {
 	return count
 }
 
-func adminConnectorManagementAuditLog(eventType string, conn adminConnector, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+func adminConnectorManagementAuditLog(eventType string, conn adminConnector, r *http.Request, evaluator decision.Evaluator, now time.Time) model.AuditLog {
 	action := strings.TrimPrefix(eventType, "admin_connector_")
-	result := conn.Status
-	if result == "" {
-		result = "updated"
-	}
+	result := "success"
 	reason := "Connector management admin metadata updated."
 	targetType := "admin_connector"
 	return model.AuditLog{
 		ID:             randomEdgeID("audit_", now),
 		TenantID:       conn.TenantID,
+		ActorUserID:    auditActorPrincipal(r),
 		EventType:      eventType,
 		TargetType:     &targetType,
 		TargetID:       &conn.ID,

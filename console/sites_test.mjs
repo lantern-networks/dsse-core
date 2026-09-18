@@ -587,3 +587,14 @@ test('connector accepts tenant publication and case-normalized digest headers',a
 for(const reason of ['scope','catalogue'])test('connector has Japanese '+reason+' recovery guidance',()=>{
  const f=programDownloadFixture();f.context.bl=x=>x.ja;assert.match(f.context.connectorProgramDownloadError(reason),/再読込/);assert.doesNotMatch(f.context.connectorProgramDownloadError(reason),/破損/);
 });
+
+for(const action of ['rename','remove'])for(const failure of ['http','transport'])for(const language of ['en','ja'])test(`connector ${action} retains state and reports safe ${language} ${failure} failure`,async()=>{
+ const f=fixture(),toasts=[];let modal,reloads=0,closed=false;
+ f.context.bl=x=>x[language];f.context.uiToast=(m,kind)=>toasts.push([m,kind]);f.context.renderSiteList=()=>reloads++;
+ f.context.uiConfirm=async()=>true;f.context.uiField=()=>({el:f.context.el('input'),get:()=> 'Changed',focus(){}});
+ f.context.uiModal=opts=>{modal=opts;return{close(){closed=true}}};
+ f.context.apiFetch=async()=>{if(failure==='transport')throw Error('private diagnostic');return{ok:false,status:503,body:{error:'private diagnostic'}}};
+ if(action==='rename'){await f.context.renameConnector('connector','Original',f.host);await modal.footer[1].onclick();assert.equal(modal.footer[1].disabled,false);assert.equal(closed,false)}
+ else await f.context.removeConnector('connector','Original',f.host);
+ assert.equal(toasts.length,1);assert.equal(toasts[0][1],'err');assert.doesNotMatch(toasts[0][0],/private diagnostic/);assert.match(toasts[0][0],language==='ja'?/再読込/:/Reload/);assert.equal(reloads,0);
+});

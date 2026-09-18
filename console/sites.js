@@ -274,6 +274,11 @@ async function siteNetworkAction(siteID, payload, bodyHost, listHost) {
   }
 }
 
+function connectorManagementError() {
+  return bl({ en: "The connector change could not be confirmed. Reload to check its state before retrying.",
+    ja: "コネクタの変更を確認できませんでした。再読込して状態を確認してから再試行してください。" });
+}
+
 // renameConnector opens a small modal to set an operator display name for a connector (survives reconnection).
 async function renameConnector(id, current, host) {
   const f = uiField({ name: "name", label: bl({ en: "Connector name", ja: "コネクタ名" }), value: current || "", placeholder: bl({ en: "Tokyo DC connector", ja: "東京DC コネクタ" }), hint: bl({ en: "A friendly name shown in the console. Leave empty to clear.", ja: "コンソール表示用の分かりやすい名前。空で解除。" }) });
@@ -283,9 +288,9 @@ async function renameConnector(id, current, host) {
     save.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/connectors/" + encodeURIComponent(id) + "/name", { name: f.get() });
-      if (!r.ok) { save.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      if (!r.ok) { save.disabled = false; uiToast(connectorManagementError(), "err"); return; }
       m.close(); uiToast(bl({ en: "Renamed.", ja: "名前を変更しました。" }), "ok"); renderSiteList(host);
-    } catch (e) { save.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) { save.disabled = false; uiToast(connectorManagementError(), "err"); }
   };
   f.focus();
 }
@@ -295,9 +300,11 @@ async function renameConnector(id, current, host) {
 async function removeConnector(id, name, host) {
   const ok = await uiConfirm({ title: bl({ en: "Remove this connector?", ja: "このコネクタを削除?" }), body: bl({ en: "\"" + name + "\" is removed from this site. A connector that is still running will re-appear when it next checks in.", ja: "「" + name + "」をこの拠点から削除します。稼働中のコネクタは次回チェックインで再登場します。" }), confirmLabel: bl({ en: "Remove", ja: "削除" }), danger: true });
   if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/connectors/" + encodeURIComponent(id));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
+  try {
+    const r = await apiFetch("DELETE", "/admin/connectors/" + encodeURIComponent(id));
+    if (!r.ok) { uiToast(connectorManagementError(), "err"); return; }
+    uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
+  } catch (_) { uiToast(connectorManagementError(), "err"); }
 }
 
 // siteHealthBadge maps a Site health label to a coloured badge. healthy -> ok, degraded -> warn,

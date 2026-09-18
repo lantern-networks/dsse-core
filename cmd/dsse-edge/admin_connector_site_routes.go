@@ -11,6 +11,7 @@ import (
 	"time"
 
 	appcatalog "github.com/lantern-networks/dsse-core/appcatalog"
+	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
@@ -182,7 +183,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusNotFound, fmt.Errorf("connector %s is absent", r.PathValue("connector_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_runtime_secret_rotated", result.Connector, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_runtime_secret_rotated", result.Connector, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, result)
 	}))
 	// Operator display name for a connector (rename). Stored as server-managed metadata (survives re-registration
@@ -207,7 +208,11 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		cid := r.PathValue("connector_id")
 		conn, found, err := reg.SetDisplayNameForTenant(tenant, cid, req.Name)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector change could not be confirmed in storage. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		if !found {
@@ -217,7 +222,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		dto := adminConnectorFromModel(conn)
 		applyConnectorTunnelStatus(&dto, connectorTunnelStatus)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_renamed", dto, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_renamed", dto, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, dto)
 	}))
 	// Decommission a connector: remove it from the registry (Console "Remove"). A live connector that keeps
@@ -235,14 +240,18 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		cid := r.PathValue("connector_id")
 		removed, err := reg.RemoveForTenant(tenant, cid)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector change could not be confirmed in storage. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		if !removed {
 			writeError(w, http.StatusNotFound, fmt.Errorf("connector %s is absent", cid))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_removed", adminConnector{ID: cid, TenantID: tenant}, evaluator, time.Now()), time.Now())
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_removed", adminConnector{ID: cid, TenantID: tenant}, r, evaluator, time.Now()), time.Now())
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "removed": true})
 	}))
 	// Connector UX Slice 1 (/) + Slice 1b: a Site /

@@ -270,7 +270,7 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				Status:                  "healthy",
 				RuntimeSecretConfigured: true,
 				MetadataKeyCount:        1,
-			}, evaluator, now),
+			}, nil, evaluator, now),
 		},
 		{name: "connectorProgramPublishedAuditLog", audit: connectorProgramPublishedAuditLog(nil, "tenant_audit_cp0020", connectorProgramMeta{Platform: "linux", Arch: "amd64", SHA256: strings.Repeat("a", 64), Version: "test-build", FileName: "program.tar.gz", PublishedBy: rawActorUserID}, evaluator, now)},
 		{

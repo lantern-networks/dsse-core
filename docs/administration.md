@@ -1249,3 +1249,23 @@ invalidates that confirmation. Cancel, Escape or navigation after sending a
 request does not undo it; obsolete responses do not report success or refresh the
 old page. Deletion and its verification are separate operations and do not lock
 out concurrent administrators.
+
+
+### Renaming or removing a connector
+
+With file-backed registry persistence configured, a connector rename, display-name
+clear, or removal must complete its storage save before the server reports success
+and changes the in-process registry. A save failure returns a service-unavailable
+response and the Console asks you to reload before retrying. A storage error can
+occur after bytes were written; it does not prove that the disk is unchanged.
+Without a configured persister, the in-memory registry does not survive a restart.
+
+Successful connector-management audit events record the authenticated principal
+and `result: success`. Connection status is separate metadata, not the operation
+result. A failed rename or removal does not emit its success domain event; the
+common request audit records the error when auditing is configured. Registry
+persistence and audit delivery are separate operations.
+
+Removing a connector record does not revoke a running connector. It may reappear
+when it registers again. Stop or decommission it separately when permanent removal
+is intended.

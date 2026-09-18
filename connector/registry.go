@@ -2,6 +2,7 @@ package connector
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -406,8 +407,15 @@ func (r *Registry) SetDisplayNameForTenant(tenantID, id, name string) (model.Con
 		return model.ConnectorRegistration{}, false, fmt.Errorf("connector %s belongs to another tenant", id)
 	}
 	conn = SetDisplayName(conn, name)
-	r.connectors[id] = conn
-	r.persistLocked()
+	candidate := make(map[string]model.ConnectorRegistration, len(r.connectors))
+	for key, value := range r.connectors {
+		candidate[key] = value
+	}
+	candidate[id] = conn
+	if err := r.saveManagementCandidateLocked(candidate); err != nil {
+		return model.ConnectorRegistration{}, true, err
+	}
+	r.connectors = candidate
 	return conn, true, nil
 }
 
@@ -428,10 +436,40 @@ func (r *Registry) RemoveForTenant(tenantID, id string) (bool, error) {
 	if tenantID != "" && conn.TenantID != tenantID {
 		return false, fmt.Errorf("connector %s belongs to another tenant", id)
 	}
-	delete(r.connectors, id)
+	candidate := make(map[string]model.ConnectorRegistration, len(r.connectors))
+	for key, value := range r.connectors {
+		if key != id {
+			candidate[key] = value
+		}
+	}
+	if err := r.saveManagementCandidateLocked(candidate); err != nil {
+		return false, err
+	}
+	r.connectors = candidate
 	r.catalogGen++
-	r.persistLocked()
 	return true, nil
+}
+
+// ErrRegistryPersistence distinguishes a management save failure from invalid input.
+var ErrRegistryPersistence = errors.New("connector registry persistence failed")
+
+// Management changes must be confirmed by storage before becoming visible in this
+// process. Unlike registration/heartbeat continuity, a rename/removal can be retried.
+// Save errors can be ambiguous on disk; callers must not report confirmed success.
+// The caller holds r.mu, and the candidate must not mutate the resident metadata.
+func (r *Registry) saveManagementCandidateLocked(candidate map[string]model.ConnectorRegistration) error {
+	if r.persister == nil {
+		return nil
+	}
+	data, err := json.Marshal(registryPersistSnapshot{Connectors: candidate})
+	if err == nil {
+		err = r.persister.Save(data)
+	}
+	if err != nil {
+		reportRegistryPersistError(err)
+		return fmt.Errorf("%w: %v", ErrRegistryPersistence, err)
+	}
+	return nil
 }
 
 // SetDisplayName sets (or clears, when name is empty) the operator display name on a registration.
@@ -441,9 +479,11 @@ func (r *Registry) RemoveForTenant(tenantID, id string) (bool, error) {
 // the two stores came to disagree about whether a connector could be renamed at all.
 func SetDisplayName(conn model.ConnectorRegistration, name string) model.ConnectorRegistration {
 	name = strings.TrimSpace(name)
-	if conn.Metadata == nil {
-		conn.Metadata = map[string]any{}
+	metadata := make(map[string]any, len(conn.Metadata)+1)
+	for key, value := range conn.Metadata {
+		metadata[key] = value
 	}
+	conn.Metadata = metadata
 	if name == "" {
 		delete(conn.Metadata, connectorDisplayNameKey)
 	} else {

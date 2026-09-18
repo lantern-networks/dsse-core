@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -633,7 +634,7 @@ func enrollmentDoorList(p enrollmentTokenParams) []string {
 // adminSiteAuditLog records a Site lifecycle action (create / update / delete / enrollment-command) with the same
 // non-secret metadata boundary as the connector management audit: the bootstrap secret and its hash are never
 // recorded (only a boolean that one is configured).
-func adminSiteAuditLog(eventType string, site adminSiteModel, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+func adminSiteAuditLog(eventType string, site adminSiteModel, r *http.Request, evaluator decision.Evaluator, now time.Time) model.AuditLog {
 	action := strings.TrimPrefix(eventType, "admin_site_")
 	result := "success"
 	reason := "Site lifecycle action by admin."
@@ -642,6 +643,7 @@ func adminSiteAuditLog(eventType string, site adminSiteModel, evaluator decision
 	return model.AuditLog{
 		ID:             randomEdgeID("audit_", now),
 		TenantID:       site.TenantID,
+		ActorUserID:    auditActorPrincipal(r),
 		EventType:      eventType,
 		TargetType:     &targetType,
 		TargetID:       &siteID,

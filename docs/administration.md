@@ -1133,3 +1133,13 @@ not remember whether a missing directory existed before a process restart, hash
 every stored program or make publication atomic with its metadata. It does not
 change the raw download endpoint's lookup rules. Verify program bytes separately;
 catalogue validation is not acceptance of a native installer or a running connector.
+
+
+Successful Site create/update, delete and enrollment-command audit entries include
+`actor_user_id` from the authenticated administrator principal. When an operator
+works inside another organization, the event belongs to that target organization
+and still names the requesting principal. API tokens use the principal resolved by
+the authentication layer; this identifies the credential owner, not a separately
+verified person holding the token. Calls without a resolved principal retain a null
+actor. Bootstrap secrets and their hashes are not added to these audit records,
+and historical records with missing actors are not backfilled.

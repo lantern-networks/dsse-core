@@ -85,6 +85,43 @@ function arErrorText(r) {
   return bl({ en: "unknown error", ja: "不明なエラー" });
 }
 
+function arReleaseReadError() { return bl({ en: "Could not verify release information. Retry before publishing or choosing a version.", ja: "配布情報を確認できません。公開やバージョンの選択前に再試行してください。" }); }
+function arSigningReadError() { return bl({ en: "Signing information could not be verified. Retry before publishing; the signing key and minimum versions are unknown.", ja: "署名情報を確認できません。署名鍵と最低バージョンは不明です。公開前に再試行してください。" }); }
+function arKnownTarget(key) { return _AR_TARGETS.some(t => arTargetKey(t.platform, t.arch) === key); }
+function arReleaseResponse(response, schema, scope) {
+  const d = response?.body;
+  if (!response?.ok || response.status !== 200 || !arReadObject(d) || d.schema_version !== schema || d.tenant_id !== scope) throw new Error(arReleaseReadError());
+  return d;
+}
+// This checks the display contract, not cryptographic trust or installer bytes.
+// Signature verification remains the authority's and the endpoint's responsibility.
+function arCatalogueBody(response, scope) {
+  const d = arReleaseResponse(response, "admin_agent_updates.v1", scope);
+  const text = v => typeof v === "string" && v.trim() !== "";
+  const date = v => typeof v === "string" && Number.isFinite(Date.parse(v));
+  for (const map of [d.envelopes, d.pending]) {
+    if (!arReadObject(map)) throw new Error(arReleaseReadError());
+    for (const [key, envelope] of Object.entries(map)) {
+      if (!arKnownTarget(key) || !arReadObject(envelope) || envelope.type !== "dsse_agent_update_manifest.v1" || envelope.version !== "1" ||
+          !text(envelope.signing_key_id) || !date(envelope.created_at) || !text(envelope.signature) ||
+          !/^[a-f0-9]{64}$/.test(envelope.payload_sha256) || typeof envelope.payload_b64 !== "string" || !envelope.payload_b64) throw new Error(arReleaseReadError());
+      const m = arManifestOf(envelope);
+      if (!arReadObject(m) || m.schema !== "1" || arTargetKey(m.platform, m.arch) !== key || !text(m.version) ||
+          !text(m.channel) || !["dsse", "mdm"].includes(m.delivery) || !["pkg", "msi"].includes(m.artifact_kind) ||
+          typeof m.artifact_url !== "string" || (m.delivery === "dsse" && !text(m.artifact_url)) ||
+          !/^[a-f0-9]{64}$/.test(m.artifact_sha256) || !Number.isSafeInteger(m.artifact_size) || m.artifact_size <= 0 ||
+          !date(m.released_at) || !date(m.not_after)) throw new Error(arReleaseReadError());
+    }
+  }
+  return d;
+}
+function arSigningBody(response, scope) {
+  const d = arReleaseResponse(response, "admin_agent_update_sign_floor.v1", scope), key = d.signing_public_key;
+  if (!arReadObject(d.floors) || typeof key !== "string" || !(key === "no" || /^[a-f0-9]{64}$/.test(key) || /^04[a-f0-9]{128}$/.test(key)) ||
+      Object.entries(d.floors).some(([target, version]) => !arKnownTarget(target) || typeof version !== "string" || !version.trim())) throw new Error(arSigningReadError());
+  return d;
+}
+
 function arRolloutSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
 function arRolloutReadError() { return bl({ en: "Could not verify rollout settings. Retry before making changes.", ja: "配布設定を確認できません。変更する前に再試行してください。" }); }
 function arReadObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
@@ -458,45 +495,41 @@ async function renderAgentReleaseList(host) {
   uiState(host, "loading");
   const fresh = freshRender(host), selection = arRolloutSelection(), deployment = answeringForTheDeployment();
   const current = () => fresh() && host.isConnected !== false && selection === arRolloutSelection() && deployment === answeringForTheDeployment();
-  let updates, floor;
-  try {
-    updates = await apiFetch("GET", "/admin/agent-updates", undefined, _AR_PLANE);
-  } catch (e) {
-    if (!current()) return;
-    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
-    return;
-  }
-  if (!current()) return;
-  if (!updates.ok) {
-    if (!current()) return;
-    uiState(host, "error", arErrorText(updates), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
-    return;
-  }
-  // The floor is a newer endpoint than the published set. A control plane without it must not blank this page
-  // — but it must not be shown a floor it never reported either, so the column simply stays empty.
-  try {
-    floor = await apiFetch("GET", "/admin/agent-update-sign-floor", undefined, _AR_PLANE);
-  } catch (e) {
-    floor = { ok: false };
-  }
-  if (!current()) return;
-
-  // A valid empty plan states its defaults explicitly. An incomplete or foreign
-  // response is not an empty plan that an editor may overwrite with defaults.
-  let plan = null, planUnread = false, rolloutTenant;
+  // Publication caches belong to this verified page/context. An unavailable new
+  // read must not leave a previous tenant's data available to the publish form.
+  delete window._arLastPublished;
+  delete window._arCanSign;
+  window._arReleaseReadContext = null;
+  let catalogue, signing = null, rolloutTenant;
   try {
     const organization = await apiFetch("GET", "/admin/tenant", undefined, _AR_PLANE);
     if (!current()) return;
     const tenant = organization?.body?.tenant_id;
     if (!organization?.ok || organization.status !== 200 || !arReadObject(organization.body) ||
-        typeof tenant !== "string" || tenant.trim() !== tenant || (selection && selection !== tenant)) throw new Error(arRolloutReadError());
-    const r = await apiFetch("GET", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(tenant), undefined, _AR_PLANE);
-    if (!current()) return;
-    plan = arRolloutPlanBody(r, tenant);
+        typeof tenant !== "string" || tenant.trim() !== tenant || (selection && selection !== tenant)) throw new Error();
     rolloutTenant = tenant;
-  } catch (e) {
-    planUnread = true;
+    const scope = deployment ? "deployment" : tenant;
+    const updates = await apiFetch("GET", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(scope), undefined, _AR_PLANE);
+    if (!current()) return;
+    catalogue = arCatalogueBody(updates, scope);
+    try {
+      const floor = await apiFetch("GET", "/admin/agent-update-sign-floor?expected_tenant_id=" + encodeURIComponent(scope), undefined, _AR_PLANE);
+      if (!current()) return;
+      signing = arSigningBody(floor, scope);
+    } catch (_) { signing = null; }
+  } catch (_) {
+    if (!current()) return;
+    uiState(host, "error", arReleaseReadError(), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
+    return;
   }
+  if (!current()) return;
+
+  let plan = null, planUnread = false;
+  try {
+    const r = await apiFetch("GET", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(rolloutTenant), undefined, _AR_PLANE);
+    if (!current()) return;
+    plan = arRolloutPlanBody(r, rolloutTenant);
+  } catch (_) { planUnread = true; }
   if (!current()) return;
 
   // Which groups devices ACTUALLY carry. A rollout order naming groups nothing is in is a schedule that
@@ -514,10 +547,9 @@ async function renderAgentReleaseList(host) {
     groupsInUse = [];
   }
 
-  const published = (updates.body && updates.body.envelopes) || {};
-  const pending = (updates.body && updates.body.pending) || {};
-  const floors = (floor && floor.ok && floor.body && floor.body.floors) || {};
-  const signingKey = (floor && floor.ok && floor.body && floor.body.signing_public_key) || "";
+  const published = catalogue.envelopes, pending = catalogue.pending;
+  const floors = signing?.floors || {};
+  const signingKey = signing?.signing_public_key;
   if (!current()) return;
   window._arLastPublished = published; // so the form can reuse the address this target used last time
   host.innerHTML = "";
@@ -530,7 +562,12 @@ async function renderAgentReleaseList(host) {
   // ★ SAID BEFORE THE TABLE, NOT AFTER A FAILED ATTEMPT. A control plane with no signing key cannot publish
   // from this screen at all, and finding that out by filling in a form and pressing the button is the version
   // of this that wastes an operator's afternoon.
-  window._arCanSign = !(!signingKey || signingKey === "no");
+  window._arCanSign = signing ? signingKey !== "no" : undefined;
+  window._arReleaseReadContext = { host, current, signingKnown: signing !== null };
+  if (!signing) host.appendChild(el("div", { class: "ui-state ui-state-warn" }, [
+    el("p", { text: arSigningReadError() }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
+  ]));
   // ★★ AND IT IS SAID ONLY TO WHOEVER CAN ACT ON IT (2026-08-28, caught the same day it was written). The
   // sentence below tells the reader to sign a manifest with the deployment's key and choose the file "below" —
   // and the form it names is rendered only for the operator, because publishing is the operator's. A customer
@@ -539,7 +576,7 @@ async function renderAgentReleaseList(host) {
   //
   // What an organization needs from this screen is which version its devices are being offered. That the
   // deployment cannot sign is the operator's problem to fix and nobody else's to read.
-  if (!window._arCanSign && answeringForTheDeployment()) {
+  if (signing && !window._arCanSign && answeringForTheDeployment()) {
     // ★★★ IT SAID "NOTHING CAN BE PUBLISHED FROM HERE" AND THAT WAS NOT TRUE (2026-08-28, measured on a
     // deployment this product's own installer built). The signing key has NO on-disk fallback by design — it
     // belongs in a token — so a control plane without one cannot SIGN. Publishing an envelope signed elsewhere
@@ -581,13 +618,13 @@ async function renderAgentReleaseList(host) {
       badge = uiBadge(bl({ en: "Nothing published", ja: "未公開" }), "off");
     }
 
-    const floorFor = floors[key] || floors["|" + key];
+    const floorFor = floors[key];
     return el("tr", {}, [
       el("td", {}, [el("div", { text: arTargetLabel(target.platform, target.arch) })]),
       el("td", {}, [el("div", { text: version }), second].filter(Boolean)),
       el("td", {}, badge),
       el("td", { class: "ui-muted", text: active && active.not_after ? uiWhen(active.not_after) : "—" }),
-      el("td", { class: "ui-muted", text: floorFor
+      el("td", { class: "ui-muted", text: !signing ? bl({ en: "Unknown", ja: "不明" }) : floorFor
         ? bl({ en: "no older than " + floorFor, ja: floorFor + " より古いものは不可" })
         : "—" }),
       // ★ THE FIRST INSTALL HAS NO OTHER SOURCE. A device with no agent cannot use the device-facing route —
@@ -667,7 +704,7 @@ async function renderAgentReleaseList(host) {
       el("th", { text: bl({ en: "Version", ja: "バージョン" }) }),
       el("th", { text: bl({ en: "State", ja: "状態" }) }),
       el("th", { text: bl({ en: "Stops being offered", ja: "配布終了" }) }),
-      el("th", { text: bl({ en: "Can go back to", ja: "戻せる範囲" }) }),
+      el("th", { text: bl({ en: "Minimum version to sign", ja: "署名できる最低バージョン" }) }),
       el("th", { text: bl({ en: "The installer", ja: "インストーラ" }) }),
     ])),
     el("tbody", {}, rows),
@@ -873,6 +910,11 @@ function openAgentVersionForm(host, plan, published, context) {
 // ★ THE FORM IS THE SCREEN'S REASON TO EXIST. A page that shows what is published and cannot publish sends the
 // reader back to a terminal — which is exactly where the risk this lane was built to remove lives.
 function openAgentReleaseForm(host) {
+  const read = window._arReleaseReadContext;
+  if (!read || read.host !== host || !read.current() || !read.signingKnown) {
+    uiToast(arReleaseReadError(), "err");
+    return;
+  }
   let chosen = null;
 
   const fileInput = el("input", { class: "ui-input", type: "file", accept: ".pkg,.msi" });

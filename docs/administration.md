@@ -812,6 +812,36 @@ checks remain necessary. File persistence does not coordinate multiple writers,
 and synchronizing an Edge cache still uses best-effort persistence.
 
 
+### Published agent releases and signing information
+
+**Agent Releases** verifies the response format and publication scope before
+showing the active and pending releases. For an operator outside any selected
+tenant, both the catalogue and signing floors use the deployment scope. When
+operating inside a tenant, they use that tenant. The rollout plan remains scoped
+to the authenticated operating tenant, including on the deployment screen.
+
+An unavailable or incomplete catalogue shows **Retry**, not **Nothing published**.
+An explicitly empty, valid catalogue still means that nothing has been published.
+If only signing information is unavailable, the verified catalogue and its existing
+download controls remain visible; signing availability and minimum versions read
+**Unknown**. Retry before opening the publication form. A confirmed absence of a
+signing key is different: the form can accept a manifest signed elsewhere.
+**Minimum version to sign** is a signing restriction, not a device rollback limit.
+
+Catalogue and signing-floor GET requests accept an optional `expected_tenant_id`.
+A mismatch returns HTTP 409 before reading either set; the parameter checks the
+server's verified scope and does not select a tenant or grant permission. A present
+empty value pins legacy empty scope. Omitting it preserves existing client behavior.
+Update the control plane before or together with the Console: a missing endpoint
+or an older signing-floor response without `tenant_id` is shown as unknown.
+
+These screen checks validate the display contract. They do not verify signatures
+or installer bytes; cryptographic checks remain with the authority and endpoints.
+Leaving the page or changing its operating context discards late read responses.
+Reading or retrying these public release metadata does not change configuration or
+create a configuration-change audit record.
+
+
 ### Agent rollout settings and incident holds
 
 The Console confirms the rollout plan's format, tenant and complete settings

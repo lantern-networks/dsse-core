@@ -6370,18 +6370,28 @@ paths:
     get:
       summary: The signed release manifests this control plane publishes to the fleet.
       description: >-
-        Requires admin.agents.read. Returns the CALLER'S TENANT's signed manifest envelopes, keyed platform/arch,
-        alongside the tenant_id they are for. `envelopes` holds only releases whose ARTIFACT is present — it is
-        what an edge adopts. `pending` holds releases that are published and verified but still waiting for their
-        bytes; nothing offers them to a device until the artifact upload activates them. Enforcing edges PULL this and verify each envelope against their own
-        pinned update key — and check the tenant — before relaying it: an edge that trusted the channel would let a
-        compromised control plane choose what its fleet runs, and one that ignored the tenant could hand another
-        tenant's build to its own devices.
+        Requires admin.agents.read. Returns schema_version=admin_agent_updates.v1, tenant_id and the
+        envelopes and pending maps, keyed platform/arch. Both maps are present, including when empty.
+        An operator outside a selected tenant reads the deployment scope; a selected tenant or a customer
+        identity reads its authenticated operating tenant. envelopes contains releases whose artifact is
+        present; pending contains verified manifests waiting for bytes, which are not yet offered to devices.
+        Enforcing edges verify each envelope and its scope against their pinned update key before relaying it.
+        The optional expected_tenant_id checks the verified publication scope before reading either map;
+        it does not select a tenant or grant access. Legacy clients may omit it.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Reject a present value that differs from the verified publication scope. An empty value pins legacy empty scope.
       responses:
         "200":
-          description: The published set.
+          description: The active and pending published sets for the verified scope.
+        "409":
+          description: The publication scope changed. Reload before continuing.
     put:
       summary: Publish a signed release manifest to the fleet.
       description: >-
@@ -6443,18 +6453,31 @@ paths:
           description: This control plane holds no update-signing key, or pins none.
   /admin/agent-update-sign-floor:
     get:
-      summary: The versions this control plane will not sign below, per target.
+      summary: The minimum versions this control plane can sign, per target.
       description: >-
-        Requires admin.agents.read. Returns the highest version signed for each tenant/platform/arch and the
-        public key this control plane signs with, so a refusal is something an operator can anticipate rather
-        than work around by inventing a version number. The floor is raised by every successful publication
-        through either door and is never lowered — withdrawing a release is exactly what an attacker who wanted
-        to re-sign an old version would do first.
+        Requires admin.agents.read. Returns schema_version=admin_agent_update_sign_floor.v1, tenant_id,
+        floors keyed platform/arch and signing_public_key. Uses the same verified publication scope as
+        GET /admin/agent-updates: deployment for an operator outside a selected tenant, otherwise the
+        authenticated operating tenant. An empty floors object is valid. signing_public_key is the signer's
+        public key in hexadecimal or the explicit string "no" when no signer is available.
+        The floor is raised by successful publication and never lowered. It restricts signing, not rollback
+        using an already available release. A missing or failed response is unknown, not proof of no signer.
+        The optional expected_tenant_id checks the scope before reading floors; it does not select a tenant
+        or grant access. Legacy clients may omit it.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Reject a present value that differs from the verified publication scope. An empty value pins legacy empty scope.
       responses:
         "200":
-          description: The per-target signing floor.
+          description: The per-target signing floors and signer availability for the verified scope.
+        "409":
+          description: The publication scope changed. Reload before continuing.
   /admin/agent-rollout:
     get:
       summary: Read the tenant's agent rollout/rollback plan + fleet adoption ().

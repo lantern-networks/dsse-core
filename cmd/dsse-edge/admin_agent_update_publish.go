@@ -342,6 +342,17 @@ func agentUpdatePublishScope(r *http.Request) string {
 	return adminTenantIDFromRequest(r)
 }
 
+// A present empty pin also names a scope (legacy single-tenant deployments).
+// Resolve from verified identity/operator context, never from the pin itself.
+func agentUpdateReadContextMatches(w http.ResponseWriter, r *http.Request, scope string) bool {
+	q := r.URL.Query()
+	if q.Has("expected_tenant_id") && q.Get("expected_tenant_id") != scope {
+		writeError(w, http.StatusConflict, fmt.Errorf("the release scope changed; reload before continuing"))
+		return false
+	}
+	return true
+}
+
 func tenantTargetKey(tenantID, platform, arch string) string {
 	return strings.ToLower(strings.TrimSpace(tenantID)) + "|" + updateTargetKey(platform, arch)
 }
@@ -1094,6 +1105,9 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 		tenantID := agentUpdatePublishScope(r)
 		// envelopes is what an EDGE adopts, and it holds only releases whose bytes are here. pending is for the
 		// operator: published, verified, and waiting on its artifact.
+		if !agentUpdateReadContextMatches(w, r, tenantID) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_agent_updates.v1",
 			"tenant_id":      tenantID,
@@ -1283,13 +1297,18 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 	// What this control plane will not sign below, per target. Readable because a refusal an operator cannot
 	// anticipate is one they work around by inventing a version number.
 	mux.HandleFunc("GET /admin/agent-update-sign-floor", adminEndpoint("admin.agents.read", func(w http.ResponseWriter, r *http.Request) {
+		tenantID := agentUpdatePublishScope(r)
+		if !agentUpdateReadContextMatches(w, r, tenantID) {
+			return
+		}
 		holds := "no"
 		if signer != nil {
 			holds = signer.PublicKeyHex()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version":     "admin_agent_update_sign_floor.v1",
-			"floors":             ratchet.FloorsForTenant(adminTenantIDFromRequest(r)),
+			"tenant_id":          tenantID,
+			"floors":             ratchet.FloorsForTenant(tenantID),
 			"signing_public_key": holds,
 			"rule": "this control plane signs a version equal to or newer than the floor for that target, never " +
 				"older. Rolling a device BACK does not need a manifest and is unaffected.",

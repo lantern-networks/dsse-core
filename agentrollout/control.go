@@ -359,7 +359,9 @@ func (s *AgentRolloutStore) Get(tenantID string) AgentRolloutPlan {
 // The merge rules are the operator's expectations, stated once:
 //   - a schedule change does NOT touch the halt (that is what intent=schedule is for),
 //   - a halt change does NOT touch the schedule (an incident is not the moment to restate a wave plan),
-//   - anything the request does not carry keeps its previous value.
+//   - version selection (rollout/rollback) replaces version and channel together;
+//     an omitted channel clears the old channel. Follow clears both fields,
+//   - freeze keeps version/channel when omitted, and absent window/waves stay unchanged.
 func (s *AgentRolloutStore) Apply(tenantID string, in AgentRolloutPlan, now time.Time) (AgentRolloutPlan, error) {
 	if s == nil {
 		return AgentRolloutPlan{}, nil

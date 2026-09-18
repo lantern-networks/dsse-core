@@ -811,6 +811,21 @@ are discarded. The published-release catalogue is a separate scope: an operator
 outside a tenant may see the deployment catalogue while the rollout plan remains
 scoped to the authenticated tenant.
 
+During a rollout save, the editor locks its fields, group-row buttons and dismissal
+controls. Success requires a complete response for the verified tenant and matching
+values for the settings sent. If the response is missing, malformed or inconsistent,
+the editor keeps the input and displays an unconfirmed-save message. The change may
+already be stored: retry with Save, or cancel and reload before editing again.
+Retries can add audit records; they are not an exactly-once operation. A concurrent
+administrator can change other settings, which are merged by the authority.
+
+The editor is bound to the page and operating context that loaded its settings.
+Leaving that context closes it and suppresses late notifications; this does not
+undo a server-side write. Rollout GET and PUT accept `expected_tenant_id` and refuse
+a mismatch with HTTP 409. A present empty value pins legacy empty-tenant scope;
+omitting the parameter preserves existing API behavior. Update the Console and
+control plane together to apply both the screen and server checks.
+
 In **Agent Releases**, the selected version, installation window and group rollout
 order are separate controls. Changing the selected version or choosing to follow
 the offered release preserves an incident hold and its reason. The page displays

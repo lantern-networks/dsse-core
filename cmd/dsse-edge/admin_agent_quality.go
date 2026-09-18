@@ -140,7 +140,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 	// current plan + the fleet adoption summary (who has moved); PUT drives a rollout, a rollback to a
 	// known-good version, or an incident freeze — hot-applied (the runtime rollout endpoint consults it).
 	mux.HandleFunc("GET /admin/agent-rollout", adminEndpoint("admin.agents.read", func(w http.ResponseWriter, r *http.Request) {
-		if !pinnedTenantContextMatches(w, r) {
+		if !rolloutTenantContextMatches(w, r) {
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
@@ -204,6 +204,9 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		})
 	}))
 	mux.HandleFunc("PUT /admin/agent-rollout", adminEndpoint("admin.agents.write", func(w http.ResponseWriter, r *http.Request) {
+		if !rolloutTenantContextMatches(w, r) {
+			return
+		}
 		appendAudit := func(record model.AuditLog) error {
 			record.ActorUserID = auditActorPrincipal(r)
 			return appendAdminAudit(r.Context(), writer, outbox, record, time.Now())
@@ -349,4 +352,14 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			"reaches_devices": "edges pull this plan on their next poll, and devices ask their edge on theirs; a " +
 				"halt is in force fleet-wide within both intervals"})
 	}))
+}
+
+// Unlike a missing pin, a present empty pin identifies the legacy deployment scope.
+func rolloutTenantContextMatches(w http.ResponseWriter, r *http.Request) bool {
+	q := r.URL.Query()
+	if q.Has("expected_tenant_id") && q.Get("expected_tenant_id") != adminTenantIDFromRequest(r) {
+		writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload before continuing"))
+		return false
+	}
+	return true
 }

@@ -19,9 +19,9 @@ func TestAgentRolloutReadPinnedTenantContext(t *testing.T) {
 	}
 	plan := store.Get("tenant_lab_001")
 	foreign := store.Get("other")
-	for _, query := range []string{"", "?expected_tenant_id=tenant_lab_001", "?tenant_id=other", "?expected_tenant_id=other"} {
+	for _, query := range []string{"", "?expected_tenant_id=tenant_lab_001", "?tenant_id=other", "?expected_tenant_id=other", "?expected_tenant_id="} {
 		r := steerMutationRequest(h, "GET", "/admin/agent-rollout"+query, nil)
-		if strings.Contains(query, "expected_tenant_id=other") {
+		if strings.Contains(query, "expected_tenant_id=other") || query == "?expected_tenant_id=" {
 			if r.Code != 409 || strings.Contains(r.Body.String(), "incident hold") || strings.Contains(r.Body.String(), "desired_version") {
 				t.Fatal("foreign context returned plan", r.Code, r.Body)
 			}

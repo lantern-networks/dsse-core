@@ -117,6 +117,77 @@ function arRolloutPlanBody(response, tenant) {
   return p;
 }
 
+// Check the fields this editor requested. The authority merges unrelated settings
+// under its lock; comparing them with the old form would falsely imply a CAS.
+function arRolloutSaveConfirmed(response, tenant, request) {
+  let p;
+  try { p = arRolloutPlanBody(response, tenant); } catch (_) { return false; }
+  if (p.intent !== request.intent) return false;
+  if (request.intent === "rollout") return p.desired_version === request.desired_version && p.release_channel === (request.release_channel || "");
+  if (request.intent === "follow") return p.desired_version === "" && p.release_channel === "";
+  if (request.intent !== "schedule") return false;
+  if (request.window && (!p.window || Object.keys(request.window).some(k => p.window[k] !== request.window[k]))) return false;
+  if (request.waves) {
+    const expected = request.waves, actual = p.waves;
+    if (!actual || (expected.default_delay_days ?? null) !== (actual.default_delay_days ?? null) ||
+        (expected.waves || []).length !== (actual.waves || []).length) return false;
+    if ((expected.waves || []).some((w, i) => {
+      const a = actual.waves[i];
+      return a.group !== w.group || a.delay_days !== w.delay_days || (a.priority ?? 0) !== (w.priority ?? 0);
+    })) return false;
+  }
+  return !!(request.window || request.waves);
+}
+
+// The verified read owns this dialog's tenant and render context. Leaving it
+// suppresses late UI completion, but cannot cancel a write already on the server.
+function arRolloutDialog(opts) {
+  let closed = false, pending = false, observer;
+  const notice = el("div", { role: "status" });
+  const close = () => { if (closed) return; closed = true; observer?.disconnect(); backdrop.remove(); document.removeEventListener("keydown", onKey); };
+  const active = () => {
+    if (closed) return false;
+    if (opts.host.isConnected === false || typeof opts.context?.tenant !== "string" || !opts.context.current()) { close(); return false; }
+    return true;
+  };
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => { if (!pending) close(); } });
+  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
+  const onKey = e => { if (e.key === "Escape" && !pending) close(); };
+  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: e => { if (e.target === backdrop && !pending) close(); } }, [
+    el("div", { class: "ui-modal", role: "dialog" }, [
+      el("div", { class: "ui-modal-head", text: opts.title }),
+      el("div", { class: "ui-modal-body" }, [...opts.body, notice]),
+      el("div", { class: "ui-modal-foot" }, [cancel, submit]),
+    ]),
+  ]);
+  const lock = () => backdrop.querySelectorAll("input,select,textarea,button").forEach(n => { n.disabled = pending; });
+  document.body.appendChild(backdrop);
+  document.addEventListener("keydown", onKey);
+  submit.addEventListener("click", async () => {
+    if (!active() || pending) return;
+    const request = opts.request();
+    if (!request) return;
+    pending = true; lock(); notice.textContent = ""; notice.setAttribute("role", "status");
+    try {
+      const r = await apiFetch("PUT", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(opts.context.tenant), request, _AR_PLANE);
+      if (!active()) return;
+      if (!arRolloutSaveConfirmed(r, opts.context.tenant, request)) throw new Error();
+      close();
+      uiToast(bl({ en: "Saved. Devices pick it up on their next check.", ja: "保存しました。端末は次の確認時に反映します。" }), "ok");
+      renderAgentReleaseList(opts.host);
+    } catch (_) {
+      if (active()) {
+        notice.setAttribute("role", "alert");
+        notice.textContent = bl({ en: "The save could not be confirmed. The change may already be saved. Retry with Save, or cancel and reload the settings before making another change.",
+          ja: "保存結果を確認できません。変更は保存済みの可能性があります。保存ボタンで再試行するか、キャンセルして設定を再読込してから次の変更を行ってください。" });
+      }
+    } finally { pending = false; if (active()) lock(); }
+  });
+  observer = new MutationObserver(() => { active(); });
+  observer.observe(document.body, { childList: true, subtree: true });
+  active();
+}
+
 // The artifact upload is raw bytes, so it cannot go through apiFetch (which sends JSON). The session and the
 // headers are built from the same globals rather than copied, so a change to how the Console authenticates
 // does not leave this one call behind.
@@ -214,7 +285,7 @@ function arWindowSummary(w) {
 
 // openAgentWindowForm edits the window and nothing else: intent=schedule leaves the halt and the wave schedule
 // exactly as they were, which is why this form cannot accidentally release a frozen fleet.
-function openAgentWindowForm(host, current) {
+function openAgentWindowForm(host, current, context) {
   const w = current || {};
   const startF = uiField({ name: "start", label: bl({ en: "From", ja: "開始" }), value: w.local_start || "00:00",
     placeholder: "01:00", hint: bl({ en: "The device's own local time, not yours.", ja: "端末のローカル時刻です(管理者の時刻ではありません)。" }) });
@@ -237,42 +308,23 @@ function openAgentWindowForm(host, current) {
     ja: "端末は「この設定」と「端末自身の設定」の厳しい方を使います。ここでチェックを外しても、端末側が" +
         "禁じているインストールが許可されるわけではありません。" }) });
 
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({
+  arRolloutDialog({ host, context,
     title: bl({ en: "When updates may install", ja: "更新してよいとき" }),
     body: [startF.el, endF.el, acF.el, unattendedF.el, idleF.el, deadlineF.el, note],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
+    request: () => {
+      const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
+      if (!hhmm.test(startF.get())) { startF.setError(bl({ en: "Use HH:MM, e.g. 01:00", ja: "HH:MM 形式で入力してください(例 01:00)" })); return; }
+      if (!hhmm.test(endF.get())) { endF.setError(bl({ en: "Use HH:MM, e.g. 05:00", ja: "HH:MM 形式で入力してください(例 05:00)" })); return; }
+      const idle = Number(idleF.get());
+      const deadline = Number(deadlineF.get());
+      if (!Number.isSafeInteger(idle) || idle < 0) { idleF.setError(bl({ en: "A whole number of minutes.", ja: "分を整数で入力してください。" })); return; }
+      if (!Number.isSafeInteger(deadline) || deadline < 0 || deadline > 365) { deadlineF.setError(bl({ en: "A whole number of days from 0 to 365.", ja: "日数は0から365の整数で入力してください。" })); return; }
 
-  submit.addEventListener("click", async () => {
-    const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
-    if (!hhmm.test(startF.get())) { startF.setError(bl({ en: "Use HH:MM, e.g. 01:00", ja: "HH:MM 形式で入力してください(例 01:00)" })); return; }
-    if (!hhmm.test(endF.get())) { endF.setError(bl({ en: "Use HH:MM, e.g. 05:00", ja: "HH:MM 形式で入力してください(例 05:00)" })); return; }
-    const idle = Number(idleF.get());
-    const deadline = Number(deadlineF.get());
-    if (!Number.isSafeInteger(idle) || idle < 0) { idleF.setError(bl({ en: "A whole number of minutes.", ja: "分を整数で入力してください。" })); return; }
-    if (!Number.isSafeInteger(deadline) || deadline < 0 || deadline > 365) { deadlineF.setError(bl({ en: "A whole number of days from 0 to 365.", ja: "日数は0から365の整数で入力してください。" })); return; }
-
-    submit.disabled = true;
-    // ★ intent=schedule, so the halt and the wave schedule are left exactly as they are. A form about timing
-    // must not be able to release a fleet somebody stopped.
-    const r = await apiFetch("PUT", "/admin/agent-rollout", {
-      intent: "schedule",
-      window: {
-        local_start: startF.get(), local_end: endF.get(),
-        require_idle_minutes: idle, require_unattended: unattendedF.get(),
-        require_ac_power: acF.get(), deadline_days: deadline,
-      },
-    }, _AR_PLANE);
-    if (!r.ok) {
-      submit.disabled = false;
-      startF.setError(arErrorText(r));
-      uiToast(arErrorText(r), "err");
-      return;
-    }
-    m.close();
-    uiToast(bl({ en: "Saved. Devices pick it up on their next check.", ja: "保存しました。端末は次の確認時に反映します。" }), "ok");
-    renderAgentReleaseList(host);
+      return { intent: "schedule", window: {
+        local_start: startF.get(), local_end: endF.get(), require_idle_minutes: idle,
+        require_unattended: unattendedF.get(), require_ac_power: acF.get(), deadline_days: deadline,
+      } };
+    },
   });
 }
 
@@ -302,7 +354,7 @@ function arWavesSummary(waves) {
 
 // openAgentWavesForm edits the rollout order and nothing else — intent=schedule again, so the halt and the
 // window are untouched.
-function openAgentWavesForm(host, current, groupsInUse) {
+function openAgentWavesForm(host, current, groupsInUse, context) {
   const rows = ((current && current.waves) || []).map((w) => ({ group: w.group || "", days: String(w.delay_days || 0), priority: w.priority }));
   if (!rows.length) rows.push({ group: "", days: "0" });
 
@@ -336,40 +388,28 @@ function openAgentWavesForm(host, current, groupsInUse) {
     : bl({ en: "No device group memberships were available here. Unlisted devices still use the default delay.",
            ja: "この画面では端末のグループ所属情報がありません。未指定の端末にも既定の待機日数は適用されます。" }) });
 
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({
+  arRolloutDialog({ host, context,
     title: bl({ en: "Rollout order", ja: "配布の順番" }),
     body: [list, rules, reality],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
-
-  submit.addEventListener("click", async () => {
-    const waves = [];
-    for (const row of rows) {
-      const group = (row.group || "").trim();
-      if (!group) continue;
-      const days = Number(row.days);
-      if (!Number.isSafeInteger(days) || days < 0) {
-        uiToast(bl({ en: "Days must be a whole number, 0 or more.", ja: "日数は 0 以上の整数で入力してください。" }), "err");
+    request: () => {
+      const waves = [];
+      for (const row of rows) {
+        const group = (row.group || "").trim();
+        if (!group) continue;
+        const days = Number(row.days);
+        if (!Number.isSafeInteger(days) || days < 0) {
+          uiToast(bl({ en: "Days must be a whole number, 0 or more.", ja: "日数は 0 以上の整数で入力してください。" }), "err");
+          return;
+        }
+        waves.push({ group: group, delay_days: days, ...(row.priority !== undefined ? { priority: row.priority } : {}) });
+      }
+      if (!waves.length) {
+        uiToast(bl({ en: "Name at least one group, or cancel to leave the order as it is.",
+                     ja: "グループを1つ以上入力してください(変更しない場合はキャンセル)。" }), "err");
         return;
       }
-      waves.push({ group: group, delay_days: days, ...(row.priority !== undefined ? { priority: row.priority } : {}) });
-    }
-    if (!waves.length) {
-      uiToast(bl({ en: "Name at least one group, or cancel to leave the order as it is.",
-                   ja: "グループを1つ以上入力してください(変更しない場合はキャンセル)。" }), "err");
-      return;
-    }
-    submit.disabled = true;
-    const r = await apiFetch("PUT", "/admin/agent-rollout", { intent: "schedule", waves: { ...(current || {}), waves: waves } }, _AR_PLANE);
-    if (!r.ok) {
-      submit.disabled = false;
-      uiToast(arErrorText(r), "err");
-      return;
-    }
-    m.close();
-    uiToast(bl({ en: "Saved. Devices pick it up on their next check.", ja: "保存しました。端末は次の確認時に反映します。" }), "ok");
-    renderAgentReleaseList(host);
+      return { intent: "schedule", waves: { ...(current || {}), waves } };
+    },
   });
 }
 
@@ -443,7 +483,7 @@ async function renderAgentReleaseList(host) {
 
   // A valid empty plan states its defaults explicitly. An incomplete or foreign
   // response is not an empty plan that an editor may overwrite with defaults.
-  let plan = null, planUnread = false;
+  let plan = null, planUnread = false, rolloutTenant;
   try {
     const organization = await apiFetch("GET", "/admin/tenant", undefined, _AR_PLANE);
     if (!current()) return;
@@ -453,6 +493,7 @@ async function renderAgentReleaseList(host) {
     const r = await apiFetch("GET", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(tenant), undefined, _AR_PLANE);
     if (!current()) return;
     plan = arRolloutPlanBody(r, tenant);
+    rolloutTenant = tenant;
   } catch (e) {
     planUnread = true;
   }
@@ -579,7 +620,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => { if (current() && plan !== null) openAgentWindowForm(host, w); },
+      onClick: () => { if (current() && plan !== null) openAgentWindowForm(host, w, { tenant: rolloutTenant, current }); },
     }),
   ]));
 
@@ -600,7 +641,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => { if (current() && plan !== null) openAgentVersionForm(host, plan, published); },
+      onClick: () => { if (current() && plan !== null) openAgentVersionForm(host, plan, published, { tenant: rolloutTenant, current }); },
     }),
   ]));
 
@@ -616,7 +657,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => { if (current() && plan !== null) openAgentWavesForm(host, plan.waves, groupsInUse); },
+      onClick: () => { if (current() && plan !== null) openAgentWavesForm(host, plan.waves, groupsInUse, { tenant: rolloutTenant, current }); },
     }),
   ]));
 
@@ -780,7 +821,7 @@ function arRunningSummary(plan, published) {
 // ★ IT OFFERS WHAT IS PUBLISHED AND ACCEPTS ANY VERSION. Choosing from the list is the ordinary act; typing
 // one that is not offered is how a fleet is HELD where it is, deliberately, and refusing that would take away
 // the one control a tenant has when a release is going badly.
-function openAgentVersionForm(host, plan, published) {
+function openAgentVersionForm(host, plan, published, context) {
   const offered = Object.keys(published || {}).map((k) => {
     const m = arManifestOf(published[k]);
     return m && m.version;
@@ -797,8 +838,7 @@ function openAgentVersionForm(host, plan, published) {
       ? bl({ en: "Offered now: " + offered.join(", "), ja: "現在提供中: " + offered.join(", ") })
       : bl({ en: "Nothing is published yet.", ja: "まだ何も公開されていません。" }),
   });
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({
+  arRolloutDialog({ host, context,
     title: bl({ en: "The version this tenant runs", ja: "このテナントが動かすバージョン" }),
     body: [
       el("div", { class: "ui-field" }, [
@@ -817,34 +857,15 @@ function openAgentVersionForm(host, plan, published) {
       ]),
       versionF.el,
     ],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
-  submit.addEventListener("click", async () => {
-    const want = nameF.checked ? versionF.get().trim() : "";
-    if (nameF.checked && !want) {
-      versionF.setError(bl({ en: "Name the version, or follow what is offered.",
-                             ja: "バージョンを入力するか、提供されるものに従ってください。" }));
-      return;
-    }
-    submit.disabled = true;
-    // intent=rollout carries the version and leaves the halt and the schedule alone — a form about WHICH
-    // version must not release a fleet somebody stopped, for the same reason the window form says so.
-    // ★ FOLLOWING IS ITS OWN ACT, not "rollout to nothing": rollout requires a version, so sending an empty one
-    // was refused and the control was one-way — an organization could hold its fleet and never release it.
-    const r = want
-      ? await apiFetch("PUT", "/admin/agent-rollout", { intent: "rollout", desired_version: want }, _AR_PLANE)
-      : await apiFetch("PUT", "/admin/agent-rollout", { intent: "follow" }, _AR_PLANE);
-    if (!r.ok) {
-      submit.disabled = false;
-      versionF.setError(arErrorText(r));
-      uiToast(arErrorText(r), "err");
-      return;
-    }
-    m.close();
-    uiToast(want
-      ? bl({ en: "Version preference saved: " + want + ".", ja: "希望バージョンを保存しました: " + want + "。" })
-      : bl({ en: "Saved: follow the offered version. Existing update holds still apply.", ja: "提供されるバージョンに従う設定を保存しました。更新の停止状態は維持します。" }), "ok");
-    renderAgentReleaseList(host);
+    request: () => {
+      const want = nameF.checked ? versionF.get().trim() : "";
+      if (nameF.checked && !want) {
+        versionF.setError(bl({ en: "Name the version, or follow what is offered.",
+                               ja: "バージョンを入力するか、提供されるものに従ってください。" }));
+        return;
+      }
+      return want ? { intent: "rollout", desired_version: want } : { intent: "follow" };
+    },
   });
   (nameF.checked ? versionF : { focus: () => followF.focus() }).focus();
 }

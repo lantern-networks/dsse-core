@@ -6472,7 +6472,7 @@ paths:
           required: false
           schema:
             type: string
-          description: Reject a nonempty value that differs from the authenticated tenant.
+          description: Reject a present value that differs from the authenticated tenant. An empty value pins the legacy empty scope.
       responses:
         "200":
           description: Current rollout plan + fleet adoption summary.
@@ -6488,9 +6488,20 @@ paths:
         supplied window/waves. Edges and devices adopt the result on later polls. A named version must still be
         available in the deployment; this endpoint does not restore an old installer or prove endpoint installation.
         Attempt and outcome audits identify the actor and tenant and mirror to the configured audit outbox after
-        primary recording. Plan persistence and audit recording are separate writes.
+        primary recording. Plan persistence and audit recording are separate writes. The response contains
+        schema_version=admin_agent_rollout.v1, tenant_id and the complete merged plan. A lost response does not
+        prove that saving failed; retries can create additional audit records. The optional expected_tenant_id
+        must match the authenticated tenant, including a present empty value for legacy deployment scope.
+        A mismatch is refused before validation, domain audit or mutation; omission retains legacy behavior.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Bind the write to the tenant verified when the settings were loaded. Does not grant access.
       requestBody:
         required: true
         content:
@@ -6523,9 +6534,11 @@ paths:
                   additionalProperties: true
       responses:
         "200":
-          description: Rollout plan applied.
+          description: Complete merged rollout plan applied and returned with its schema and tenant.
         "400":
           description: Invalid plan (bad intent, or missing desired_version for rollout/rollback).
+        "409":
+          description: The operating tenant changed, or this Edge is not the rollout authority.
   /admin/agent-rollouts:
     get:
       summary: Read every organization's agent rollout plan.

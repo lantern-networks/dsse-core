@@ -298,3 +298,39 @@ for (const phase of ['blob', 'hash']) test('late rejected '+phase+' does not war
   const run=f.run();await ready;f.invalidate();wait.resolve();await run;
   assert.equal(f.downloads.length,0);assert.equal(f.toasts.length,0);
 });
+
+function connectorUploadFixture(){
+ const f=fixture(),uploads=[];let valid=true,refreshes=0;
+ Object.assign(f.c,{operateTenant:'',idpSession:{auth_method:'admin_session'},localStorage:{getItem:()=>''},crypto:{subtle:{digest:async()=>new Uint8Array(32).buffer}},connectorProgramsLoader:()=>async()=>refreshes++});
+ f.c.arUploadConnectorProgram=async(bytes,platform,arch,sha256,version)=>{uploads.push({bytes,platform,arch,sha256,version});return{ok:true,status:200,body:{platform,arch,sha256,version,size:bytes.byteLength,file_name:`dsse-connector-${platform}-${arch}.tar.gz`,published_at:'2026-09-18T00:00:00Z'}}};
+ const card=f.c.arConnectorProgramsSection(()=>valid),nodes=allNodes(card),file=nodes.find(n=>n.type==='file'),pair=nodes.find(n=>n.tag==='select'),version=nodes.find(n=>n.type==='text'),submit=nodes.find(n=>n.text==='Add it'),error=nodes.find(n=>n.role==='alert');
+ error.style={};file.value='selected';file.files=[{size:3,arrayBuffer:async()=>new Uint8Array([1,2,3]).buffer}];pair.value='linux/amd64';version.value='build-1';
+ return{...f,card,file,pair,version,submit,error,uploads,invalidate:()=>valid=false,get refreshes(){return refreshes},run:()=>submit.handlers.click()};
+}
+test('connector upload confirms exact metadata and clears only confirmed file',async()=>{const f=connectorUploadFixture();await f.run();assert.equal(f.uploads.length,1);assert.equal(f.file.value,'');assert.equal(f.toasts.at(-1)[1],'ok');assert.equal(f.refreshes,2);assert.equal(f.submit.disabled,false)});
+for(const mode of ['empty','status','target','version','null-version','size','digest','filename','timestamp','publisher','network'])test('connector upload retains uncertain '+mode,async()=>{
+ const f=connectorUploadFixture(),upload=f.c.arUploadConnectorProgram;
+ f.c.arUploadConnectorProgram=async(...a)=>{const r=await upload(...a),b=r.body;if(mode==='empty')r.body={};if(mode==='status')r.status=206;if(mode==='target')b.arch='arm64';if(mode==='version')b.version='other';if(mode==='null-version'){f.version.value='';b.version=null}if(mode==='size')b.size++;if(mode==='digest')b.sha256='b'.repeat(64);if(mode==='filename')b.file_name='wrong';if(mode==='timestamp')b.published_at='invalid';if(mode==='publisher')b.published_by={};if(mode==='network')throw Error('private-path');return r};
+ await f.run();assert.equal(f.uploads.length,1);assert.equal(f.file.value,'selected');assert.match(f.error.textContent,/may already be saved/);assert.doesNotMatch(f.error.textContent,/private-path/);assert.equal(f.toasts.length,0);assert.equal(f.refreshes,2);assert.ok([f.file,f.pair,f.version,f.submit].every(n=>!n.disabled));
+ f.c.arUploadConnectorProgram=upload;await f.run();assert.equal(f.uploads.length,2);assert.equal(f.file.value,'');
+});
+test('connector upload freezes original fields and prevents overlapping submissions',async()=>{
+ const f=connectorUploadFixture(),wait=deferred();f.c.crypto.subtle.digest=()=>wait.promise;const run=f.run();await Promise.resolve();assert.ok([f.file,f.pair,f.version,f.submit].every(n=>n.disabled));await f.run();f.pair.value='linux/arm64';f.version.value='changed';wait.resolve(new Uint8Array(32).buffer);await run;assert.equal(f.uploads.length,1);assert.equal(f.uploads[0].arch,'amd64');assert.equal(f.uploads[0].version,'build-1');
+});
+for(const key of ['parent','session','selection','authority','token','detached'])for(const phase of ['hash','upload'])test(`connector ignores obsolete ${key} during ${phase}`,async()=>{
+ const f=connectorUploadFixture(),wait=deferred();let enter;const entered=new Promise(r=>enter=r);const upload=f.c.arUploadConnectorProgram;
+ if(phase==='hash')f.c.crypto.subtle.digest=()=>{enter();return wait.promise};else f.c.arUploadConnectorProgram=async(...a)=>{const r=await upload(...a);enter();await wait.promise;return r};
+ const run=f.run();await entered;if(key==='parent')f.invalidate();if(key==='session')f.c.idpSession={};if(key==='selection')f.c.operateTenant='other';if(key==='authority')f.c.baseForPlane=()=>'/new';if(key==='token')f.c.localStorage.getItem=()=> 'new';if(key==='detached')f.card.isConnected=false;
+ wait.resolve(new Uint8Array(32).buffer);await run;assert.equal(f.uploads.length,phase==='hash'?0:1);assert.equal(f.toasts.length,0);assert.equal(f.error.textContent,'');assert.equal(f.file.value,'selected');assert.equal(f.refreshes,1);
+});
+for(const mode of ['oversized','file','hash'])test('connector preparation failure never sends '+mode,async()=>{
+ const f=connectorUploadFixture();if(mode==='oversized')f.file.files[0].size=64*1024*1024+1;if(mode==='file')f.file.files[0].arrayBuffer=async()=>{throw Error('private-path')};if(mode==='hash')f.c.crypto.subtle.digest=async()=>{throw Error('private-path')};await f.run();assert.equal(f.uploads.length,0);assert.match(f.error.textContent,/no upload was sent/);assert.equal(f.file.value,'selected');assert.equal(f.submit.disabled,false);
+});
+test('connector upload Japanese distinguishes unsent and uncertain',()=>{const f=connectorUploadFixture();f.c.bl=x=>x.ja;assert.match(f.c.arConnectorUploadError(true),/保存済み/);assert.match(f.c.arConnectorUploadError(false),/送信していません/)});
+test('connector catalogue starts before its card is attached',async()=>{
+ const f=fixture(),el=f.c.el;let reads=0;
+ Object.assign(f.c,{operateTenant:'',idpSession:{},freshRender:()=>()=>true,uiState(){},apiFetch:async()=>{reads++;return{ok:true,status:200,body:{programs:[],count:0}}},el:(...a)=>{const n=el(...a);if(n.class==='ui-card')n.isConnected=false;return n}});
+ const card=f.c.arConnectorProgramsSection();assert.equal(reads,1);card.isConnected=true;for(let i=0;i<6;i++)await Promise.resolve();assert.ok(allNodes(card).some(n=>String(n.text).includes('None yet')));
+});
+test('connector acknowledgement accepts omitted empty version but rejects null',()=>{const f=fixture(),expected={platform:'linux',arch:'amd64',sha256:'a'.repeat(64),size:0,version:''},body={...expected,file_name:'dsse-connector-linux-amd64.tar.gz',published_at:'2026-09-18T00:00:00Z'};delete body.version;assert.ok(f.c.arConnectorProgramAck({ok:true,status:200,body},expected));body.version=null;assert.throws(()=>f.c.arConnectorProgramAck({ok:true,status:200,body},expected))});
+for(const phase of ['hash','upload'])test('connector suppresses obsolete failure '+phase,async()=>{const f=connectorUploadFixture();let reject,enter;const entered=new Promise(r=>enter=r),wait=()=>{enter();return new Promise((_,r)=>reject=r)};if(phase==='hash')f.c.crypto.subtle.digest=wait;else f.c.arUploadConnectorProgram=wait;const run=f.run();await entered;f.invalidate();reject(Error('late private detail'));await run;assert.equal(f.error.textContent,'');assert.equal(f.toasts.length,0)});

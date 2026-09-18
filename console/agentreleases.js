@@ -761,7 +761,13 @@ async function renderAgentReleaseList(host) {
 
 // arConnectorProgramsSection lists what this deployment can put on a connector machine, and lets the operator
 // add one. The bytes live with the authority, like agent artifacts, so both calls are control-plane.
-function arConnectorProgramsSection(current = () => true) {
+function arConnectorProgramsSection(parentCurrent = () => true) {
+  const selection = arRolloutSelection(), session = typeof idpSession === "undefined" ? null : idpSession;
+  const authority = baseForPlane(_AR_PLANE), token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const credential = token();
+  const context = () => parentCurrent() && selection === arRolloutSelection() &&
+    session === (typeof idpSession === "undefined" ? null : idpSession) && authority === baseForPlane(_AR_PLANE) && credential === token();
+  const current = () => card.isConnected !== false && context();
   const card = el("div", { class: "ui-card", style: "margin-top:18px" });
   card.appendChild(el("strong", { text: bl({ en: "Connector programs", ja: "コネクタのプログラム" }) }));
   card.appendChild(el("div", { class: "ui-view-desc", text: bl({
@@ -789,7 +795,7 @@ function arConnectorProgramsSection(current = () => true) {
                           : bl({ en: "build not stated", ja: "ビルド不明" }) }),
       ]));
     }
-  }, current);
+  }, context);
   refresh();
 
   const fileF = el("input", { class: "ui-input", type: "file", style: "max-width:340px" });
@@ -797,28 +803,44 @@ function arConnectorProgramsSection(current = () => true) {
   for (const t of ["linux/amd64", "linux/arm64"]) pairF.appendChild(el("option", { value: t, text: t }));
   const verF = el("input", { class: "ui-input", type: "text", style: "max-width:200px", placeholder: "0.3.0+9d0ccdb" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add it", ja: "追加する" }) });
+  const error = el("div", { role: "alert", class: "ui-callout ui-callout-warn", style: "display:none;margin-top:8px" });
+  card.appendChild(error);
+  let pending = false;
   submit.addEventListener("click", async () => {
+    if (pending || !current()) return;
     const file = fileF.files && fileF.files[0];
     if (!file) { uiToast(bl({ en: "Choose the program first.", ja: "先にプログラムを選んでください。" }), "err"); return; }
-    submit.disabled = true;
+    const [platform, arch] = String(pairF.value).split("/"), version = String(verF.value || "").trim();
+    pending = true;
+    for (const c of [fileF, pairF, verF, submit]) c.disabled = true;
+    error.textContent = ""; error.style.display = "none";
+    let sent = false;
     try {
-      // ★ THE DIGEST IS COMPUTED HERE AND DECLARED, because the route refuses an upload without one: without
-      // something to check against it is a place to stage anything and call it published. A truncated upload
-      // is then refused at the deployment rather than carried to a machine and run.
+      if (platform !== "linux" || !["amd64", "arm64"].includes(arch) ||
+          !Number.isSafeInteger(file.size) || file.size < 0 || file.size > 64 * 1024 * 1024) throw new Error();
       const bytes = await file.arrayBuffer();
+      if (!current()) return;
+      if (bytes.byteLength !== file.size) throw new Error();
       const sum = await crypto.subtle.digest("SHA-256", bytes);
-      const digest = [...new Uint8Array(sum)].map((b) => b.toString(16).padStart(2, "0")).join("");
-      const [platform, arch] = String(pairF.value).split("/");
-      const r = await arUploadConnectorProgram(bytes, platform, arch, digest, String(verF.value || "").trim());
-      if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      if (!current()) return;
+      const digest = [...new Uint8Array(sum)].map(b => b.toString(16).padStart(2, "0")).join("");
+      sent = true;
+      const r = await arUploadConnectorProgram(bytes, platform, arch, digest, version);
+      if (!current()) return;
+      arConnectorProgramAck(r, { platform, arch, version, sha256: digest, size: bytes.byteLength });
       uiToast(bl({ en: "Added. A location on " + platform + "/" + arch + " can install a connector now.",
                    ja: "追加しました。" + platform + "/" + arch + " の拠点はコネクタを導入できます。" }), "ok");
       fileF.value = "";
       refresh();
-    } catch (e) {
-      uiToast(String(e && e.message || e), "err");
+    } catch (_) {
+      if (current()) {
+        error.textContent = arConnectorUploadError(sent);
+        error.style.display = "";
+        if (sent) refresh();
+      }
     } finally {
-      submit.disabled = false;
+      pending = false;
+      for (const c of [fileF, pairF, verF, submit]) c.disabled = false;
     }
   });
   card.appendChild(el("div", { style: "display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap" },
@@ -829,6 +851,25 @@ function arConnectorProgramsSection(current = () => true) {
     ja: "ビルドの記入は任意ですが、書く価値があります。-verify は全ノードが同じビルドかを問うので、名前の無い"
       + "プログラムから入れたコネクタはその問いの外に出ます。" }) }));
   return card;
+}
+
+function arConnectorUploadError(sent) {
+  return sent ? bl({
+    en: "The connector upload could not be confirmed. It may already be saved. Your file and settings are retained; check the catalogue before choosing Add it to retry. A retry is another audited upload.",
+    ja: "コネクタのアップロード結果を確認できません。保存済みの可能性があります。ファイルと入力を保持しています。一覧を確認してから「追加する」で再試行してください。再試行は別のアップロードとして監査されます。" }) : bl({
+    en: "The connector program could not be prepared; no upload was sent. Check the selected file (maximum 64 MiB) and browser hashing support, then try again.",
+    ja: "コネクタのプログラムを準備できず、送信していません。選択ファイル（最大67,108,864バイト）とブラウザのハッシュ計算対応を確認して再試行してください。" });
+}
+
+function arConnectorProgramAck(response, expected) {
+  const p = response?.body;
+  if (!response?.ok || response.status !== 200 || !arReadObject(p) ||
+      p.platform !== expected.platform || p.arch !== expected.arch ||
+      p.file_name !== "dsse-connector-" + expected.platform + "-" + expected.arch + ".tar.gz" ||
+      p.sha256 !== expected.sha256 || p.size !== expected.size || (p.version === undefined ? "" : p.version) !== expected.version ||
+      typeof p.published_at !== "string" || !Number.isFinite(Date.parse(p.published_at)) ||
+      (p.published_by !== undefined && typeof p.published_by !== "string")) throw new Error();
+  return p;
 }
 
 // arUploadConnectorProgram publishes the bytes. Raw, like the agent artifact beside it, and for the same
@@ -845,11 +886,11 @@ async function arUploadConnectorProgram(bytes, platform, arch, digest, version) 
   const path = "/admin/connector-program?platform=" + encodeURIComponent(platform) +
     "&arch=" + encodeURIComponent(arch);
   try {
-    const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", body: bytes });
+    const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", redirect: "error", cache: "no-store", body: bytes });
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
-    return { ok: res.ok, status: res.status, body: parsed };
+    return { ok: res.ok && !res.redirected, status: res.status, body: parsed };
   } catch (e) {
     return { ok: false, status: 0, body: { error: String(e) } };
   }

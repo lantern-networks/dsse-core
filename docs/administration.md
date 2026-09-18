@@ -1172,3 +1172,19 @@ The existing common API audit remains separate. Rejected uploads and metadata-wr
 Agent Releases verifies the enrolled-device inventory before offering a change to rollout order. The read names the verified tenant, and the response must be HTTP 200 with the expected inventory schema, tenant and well-formed device identities, tenant ownership and group names. An unavailable or inconsistent response shows a retry notice and disables only the rollout-order editor. Existing saved order remains visible; maintenance-window and version controls still depend on their own verified reads.
 
 Retry reloads the page’s read-only data; it does not save a rollout plan. A verified empty list is described as an inventory snapshot with no reported group assignments. These hints describe the enrollment inventory, not live endpoint telemetry or proof that a group currently has connected devices. Special group names are retained and repeated names are listed once. Obsolete reads after navigation, a newer render, tenant, session, authority or API-token changes are discarded. This does not add a new server permission, a storage snapshot transaction, or a concurrency lock between the inventory and a later schedule save.
+
+## Editing site settings
+
+The Sites editor preserves a site's existing routing namespace and HA policy when
+you change its display name, region, deployment type, or expected connector count.
+These two hidden settings are not editable in this form. The server continues to
+manage enrollment credentials and creation timestamps.
+
+Enter the expected connector count using decimal digits for a non-negative whole
+number (at most 9007199254740991). Fractions, negative values, and exponent notation
+are rejected before saving. Blank or `0` clears the target; reopening an existing
+site displays `0` for no target. The count is a configured target, not evidence
+that connectors are online or that failover has been tested.
+
+Edits use the values loaded when the editor opened. Reload before editing if another
+administrator has changed the site; the editor does not detect concurrent writes.

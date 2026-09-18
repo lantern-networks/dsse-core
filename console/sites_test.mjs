@@ -206,3 +206,74 @@ test('connector captures displayed metadata before asynchronous work',async()=>{
 for(const reason of ['size','digest','verification','transfer'])test('connector guidance has safe Japanese '+reason,()=>{
  const f=programDownloadFixture();f.context.bl=x=>x.ja;assert.match(f.context.connectorProgramDownloadError(reason),/[ぁ-んァ-ン一-龥]/);
 });
+
+function siteEditorFixture(existing, language = 'en') {
+  const fields = {}, writes = [], notices = [];
+  let modal;
+  const context = vm.createContext({
+    bl: text => text[language],
+    el: (tag, props) => ({tag, ...props}),
+    uiToast: (...args) => notices.push(args),
+    uiField(spec) {
+      const input = {disabled: false, validity: {badInput: false}};
+      const field = {spec, value: String(spec.value || ''), error: '', input,
+        el: {querySelector: () => input}, get() {return this.value.trim();}, focus() {},
+        validate() {this.error = spec.required && !this.get() ? 'required' : spec.validate?.(this.get()) || ''; return !this.error;},
+      };
+      fields[spec.name] = field; return field;
+    },
+    uiModal(spec) {modal = spec; return {close() {throw Error('unexpected confirmed write');}};},
+    async apiFetch(method, path, body) {writes.push({method, path, body: JSON.parse(JSON.stringify(body))}); return {ok: false, status: 503};},
+  });
+  vm.runInContext(source, context);
+  context.openSiteForm({}, existing);
+  return {context, fields, writes, notices, get modal() {return modal;}, submit: () => modal.footer.at(-1).onclick()};
+}
+
+for (const value of ['1.5', '-1', '1e2', '+2', '0x10', '9007199254740992', 'NaN', 'Infinity', 'two']) {
+  test(`site editor rejects invalid connector count ${value} without writing`, async () => {
+    const f = siteEditorFixture({site_id: 's', expected_connector_count: 3});
+    f.fields.expected.value = value; await f.submit();
+    assert.equal(f.writes.length, 0); assert.ok(f.fields.expected.error); assert.ok(!f.modal.footer.at(-1).disabled);
+  });
+}
+for (const [value, expected] of [['', 0], ['0', 0], ['0002', 2], [' 3 ', 3], ['9007199254740991', 9007199254740991]]) {
+  test(`site editor sends exact connector count ${JSON.stringify(value)}`, async () => {
+    const f = siteEditorFixture({site_id: 's'}); f.fields.expected.value = value; await f.submit();
+    assert.equal(f.writes[0].body.expected_connector_count, expected);
+  });
+}
+test('site editor preserves hidden metadata captured when opened, excluding server-managed fields', async () => {
+  const site = {site_id: 's', name: 'old', region: 'r', deployment_type: 'vm', expected_connector_count: 0,
+    routing_namespace: 'route', ha_policy: 'active-passive', bootstrap_secret_hash: 'secret', created_at: 'old', tenant_id: 'other'};
+  const f = siteEditorFixture(site); assert.equal(f.fields.expected.value, '0'); assert.equal(f.fields.site_id.input.disabled, true);
+  site.ha_policy = 'changed'; site.routing_namespace = 'changed'; site.site_id = 'changed';
+  f.fields.name.value = 'new'; await f.submit();
+  assert.deepEqual(f.writes, [{method: 'POST', path: '/admin/sites', body: {site_id: 's', name: 'new', region: 'r', deployment_type: 'vm', routing_namespace: 'route', ha_policy: 'active-passive', expected_connector_count: 0}}]);
+});
+for (const key of ['routing_namespace', 'ha_policy']) {
+  test(`site editor refuses malformed hidden ${key}`, () => {
+    for (const value of [42, {}, [], false]) {const f = siteEditorFixture({site_id: 's', [key]: value}); assert.equal(f.modal, undefined); assert.equal(f.writes.length, 0); assert.equal(f.notices[0][1], 'err');}
+  });
+}
+test('site editor accepts absent or empty hidden metadata without inventing policy', async () => {
+  for (const value of [undefined, null, '']) {const f = siteEditorFixture({site_id: 's', routing_namespace: value, ha_policy: value}); await f.submit(); assert.equal(f.writes[0].body.ha_policy, undefined); assert.equal(f.writes[0].body.routing_namespace, undefined);}
+});
+test('site editor does not treat native number input badInput as an intentionally blank target', async () => {
+  const f = siteEditorFixture({site_id: 's'}); f.fields.expected.value = ''; f.fields.expected.input.validity.badInput = true;
+  await f.submit(); assert.equal(f.writes.length, 0); assert.ok(f.fields.expected.error);
+});
+test('site creation validates the target and required identity before writing', async () => {
+  const f = siteEditorFixture(); f.fields.expected.value = '2'; await f.submit(); assert.equal(f.writes.length, 0);
+  f.fields.site_id.value = 'new-site'; await f.submit(); assert.equal(f.writes[0].body.expected_connector_count, 2); assert.equal(f.writes[0].body.site_id, 'new-site');
+});
+test('site editor provides Japanese validation and hidden-setting read errors', async () => {
+  const f = siteEditorFixture({site_id: 's'}, 'ja'); f.fields.expected.value = '-1'; await f.submit();
+  assert.match(f.fields.expected.error, /整数/); assert.match(f.fields.expected.spec.hint, /空欄/);
+  const bad = siteEditorFixture({site_id: 's', ha_policy: {}}, 'ja'); assert.match(bad.notices[0][0], /再読込/);
+});
+
+test('site editor displays a zero target omitted by the site list projection', () => {
+  const edit = siteEditorFixture({site_id: 's'}); assert.equal(edit.fields.expected.value, '0');
+  const create = siteEditorFixture(); assert.equal(create.fields.expected.value, '');
+});

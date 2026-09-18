@@ -28,15 +28,31 @@ function renderSitesView(content) {
 // openSiteForm opens the Create Site modal (Connector UX): name, region, expected connector count, routing
 // namespace, deployment type. The site_id (= connector_group_id) is required and binds enrolled connectors.
 // Pass `existing` (a site row) to EDIT it — the Site ID is fixed (it is the connector group id); the rest is
-// pre-filled and saved via upsert. The out-of-scope "routing namespace" isn't shown; on edit it is preserved.
+// pre-filled and saved via upsert. Hidden routing namespace and HA policy are preserved on edit.
+function siteExpectedConnectorCount(value) {
+  if (value === "") return 0;
+  if (!/^[0-9]+$/.test(value)) return null;
+  const count = Number(value);
+  return Number.isSafeInteger(count) ? count : null;
+}
+
 function openSiteForm(host, existing) {
   const editing = !!existing;
-  const s = existing || {};
+  const s = { ...(existing || {}) };
+  // Do not turn an unreadable hidden setting into an empty setting during a visible-field edit.
+  if ([s.routing_namespace, s.ha_policy].some(value => value != null && typeof value !== "string")) {
+    uiToast(bl({ en: "Site settings could not be read. Reload before editing.", ja: "サイト設定を読み取れませんでした。再読込してから編集してください。" }), "err");
+    return;
+  }
   const idF = uiField({ name: "site_id", label: bl({ en: "Site ID", ja: "サイト ID" }), required: true, value: s.site_id || "", placeholder: "tokyo-dc", hint: editing ? bl({ en: "Fixed — this is the connector group id.", ja: "変更不可 — コネクタグループ ID です。" }) : bl({ en: "Stable id; also the connector group id. Connectors enrolled with this id join this site.", ja: "安定した ID(コネクタグループ ID を兼ねる)。この ID で登録したコネクタがこのサイトに入ります。" }) });
   if (editing) { const inp = idF.el.querySelector("input,select,textarea"); if (inp) inp.disabled = true; }
   const nameF = uiField({ name: "name", label: bl({ en: "Display name", ja: "表示名" }), value: s.name || "", placeholder: bl({ en: "Tokyo DC", ja: "東京 DC" }) });
   const regionF = uiField({ name: "region", label: bl({ en: "Region / location", ja: "リージョン / 拠点" }), value: s.region || "", placeholder: "ap-northeast-1 / Tokyo office" });
-  const expectedF = uiField({ name: "expected", label: bl({ en: "Expected connectors (HA target)", ja: "想定コネクタ数 (HA 目標)" }), type: "number", value: s.expected_connector_count || "", placeholder: "2", hint: bl({ en: "The site shows Degraded when fewer than this are online.", ja: "オンラインがこれ未満のときサイトは「一部障害」になります。" }) });
+  const expectedF = uiField({ name: "expected", label: bl({ en: "Expected connectors (HA target)", ja: "想定コネクタ数 (HA 目標)" }), type: "number", value: String(s.expected_connector_count ?? (editing ? 0 : "")), placeholder: "2", hint: bl({ en: "The site shows Degraded when fewer than this are online. Blank or 0 means no target.", ja: "オンラインがこれ未満のときサイトは「一部障害」になります。空欄または 0 は目標なしです。" }), validate: value => {
+    const input = expectedF.el.querySelector("input");
+    return (input && input.validity && input.validity.badInput) || siteExpectedConnectorCount(value) === null
+      ? bl({ en: "Enter a non-negative whole number in decimal digits, up to 9007199254740991, or leave blank.", ja: "0 以上 9007199254740991 以下の整数を数字だけで入力するか、空欄にしてください。" }) : "";
+  } });
   const deployF = uiField({ name: "deployment_type", label: bl({ en: "Deployment type", ja: "デプロイ種別" }), value: s.deployment_type || "", placeholder: "vm / container / appliance" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: editing ? bl({ en: "Save", ja: "保存" }) : bl({ en: "Create", ja: "作成" }) });
   const m = uiModal({
@@ -46,11 +62,12 @@ function openSiteForm(host, existing) {
   });
   submit.onclick = async () => {
     if (!editing && !idF.validate()) return;
+    if (!expectedF.validate()) return;
     submit.disabled = true;
     const body = { site_id: editing ? s.site_id : idF.get(), name: nameF.get(), region: regionF.get(), deployment_type: deployF.get() };
     if (s.routing_namespace) body.routing_namespace = s.routing_namespace; // preserve (not shown; out of scope)
-    const expected = parseInt(expectedF.get(), 10);
-    if (!isNaN(expected) && expected >= 0) body.expected_connector_count = expected;
+    if (s.ha_policy) body.ha_policy = s.ha_policy;
+    body.expected_connector_count = siteExpectedConnectorCount(expectedF.get());
     try {
       const r = await apiFetch("POST", "/admin/sites", body);
       if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }

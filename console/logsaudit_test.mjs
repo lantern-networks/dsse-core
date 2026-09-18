@@ -519,3 +519,30 @@ test('partial outcomes use a warning color while pending and unknown outcomes st
     assert.equal(badge(value).kind, 'off', value);
   }
 });
+
+function scopeHarness({operator=true,stream='audit',scope='deployment'}={}) {
+ const nodes=[],fields={},requests=[],states=[];let revision=0,api=async()=>({ok:true,status:200,body:{rows:[],total_matches:0,next_cursor:null,filters:{tenant_id:'deployment'}}});
+ const el=(tag,props={},children=[])=>{const n={tag,...props,style:{},children:Array.isArray(children)?children:[children],isConnected:true,handlers:{},appendChild(x){this.children.push(x)},addEventListener(k,fn){this.handlers[k]=fn},querySelector(){return this},remove(){this.isConnected=false}};Object.defineProperty(n,'innerHTML',{set(){this.children=[]}});nodes.push(n);return n};
+ const c=vm.createContext({bl:v=>v.en,el,URLSearchParams,operateTenant:'',answeringForTheDeployment:()=>operator,
+  window:{dsseFormatTime:x=>x},uiBadge:(label,kind)=>({label,kind}),uiState:(...a)=>states.push(a),
+  freshRender:()=>{const own=++revision;return()=>own===revision},apiFetch:async(...a)=>{requests.push(a);return a[1]==='/admin/admins'?{ok:true,body:{admins:[]}}:api(...a)},
+  uiField:spec=>{const f={el:el(spec.type==='select'?'select':'input'),value:spec.value,get(){return this.value}};fields[spec.name]=f;return f}});
+ vm.runInContext(source,c);vm.runInContext('_laStream='+JSON.stringify(stream)+';_laAuditScope='+JSON.stringify(scope),c);
+ return{c,nodes,fields,requests,states,host:el('div'),filter:el('div'),summary:el('div'),setAPI(fn){api=fn},set(code){vm.runInContext(code,c)},get(code){return vm.runInContext(code,c)}};
+}
+for(const [operator,stream] of [[true,'audit'],[false,'audit'],[true,'access']])test('deployment audit choice only appears in operator audit view '+operator+'/'+stream,()=>{const f=scopeHarness({operator,stream});f.c.laLoadStream=()=>{};f.c.laLogs(f.host);assert.equal(Boolean(f.fields.audit_scope),operator&&stream==='audit')});
+for(const [operator,stream] of [[true,'audit'],[false,'audit'],[true,'access']])test('deployment query scope cannot survive leaving its operator audit view '+operator+'/'+stream,()=>{const f=scopeHarness({operator,stream});f.set('_laFilters={audit_scope:"deployment",q:"record"}');const q=new URLSearchParams(f.c.laQueryString('cursor'));assert.equal(q.get('audit_scope'),operator&&stream==='audit'?'deployment':null);assert.equal(q.get('q'),'record');assert.equal(q.get('cursor'),'cursor')});
+test('scope switch clears filters and reloads without carrying old query',()=>{const f=scopeHarness({scope:'tenant'});let reads=0;f.c.laLoadStream=()=>reads++;f.c.laLogs(f.host);f.set('_laFilters={q:"old"}');f.fields.audit_scope.value='deployment';f.fields.audit_scope.el.handlers.change();assert.equal(f.get('_laAuditScope'),'deployment');assert.deepEqual(JSON.parse(JSON.stringify(f.get('_laFilters'))),{});assert.equal(reads,2)});
+test('stream switch resets audit scope and rebuilds its matching filter controls',()=>{const f=scopeHarness();f.c.laLoadStream=()=>{};f.c.laLogs(f.host);f.fields.stream.value='access';f.fields.stream.el.handlers.change();assert.equal(f.get('_laAuditScope'),'tenant');assert.equal(f.get('_laStream'),'access');assert.ok(f.fields.decision)});
+for(const mode of ['foreign-filter','missing-filter','foreign-row','missing-row-tenant','partial-status','failure'])test('deployment audit response refuses '+mode,async()=>{
+ const f=scopeHarness();f.setAPI(async()=>{const r={ok:true,status:200,body:{rows:[],total_matches:0,next_cursor:null,filters:{tenant_id:'deployment'}}};if(mode==='foreign-filter')r.body.filters.tenant_id='other';if(mode==='missing-filter')delete r.body.filters;if(mode==='foreign-row')r.body.rows=[{tenant_id:'other'}];if(mode==='missing-row-tenant')r.body.rows=[{}];if(mode==='partial-status')r.status=206;if(mode==='failure')r.ok=false;return r});await f.c.laLoadStream(f.host,f.filter,f.summary);assert.equal(f.states.at(-1)[1],'error');assert.equal(f.get('_laRows.length'),0);assert.equal(typeof f.states.at(-1)[3].onClick,'function');
+});
+test('verified empty deployment audit search remains explicitly empty and uses its scope',async()=>{const f=scopeHarness();await f.c.laLoadStream(f.host,f.filter,f.summary);assert.equal(f.states.at(-1)[1],'empty');assert.match(f.requests[0][1],/audit_scope=deployment/)});
+for(const mode of ['departed','tenant','stream','scope','operator'])test('late deployment audit response discarded after '+mode,async()=>{const f=scopeHarness();let release;f.setAPI(async()=>new Promise(r=>release=r));const pending=f.c.laLoadStream(f.host,f.filter,f.summary);if(mode==='departed')f.host.isConnected=false;if(mode==='tenant')f.c.operateTenant='other';if(mode==='stream')f.set('_laStream="access"');if(mode==='scope')f.set('_laAuditScope="tenant"');if(mode==='operator')f.c.answeringForTheDeployment=()=>false;release({ok:true,status:200,body:{rows:[{id:'old',tenant_id:'deployment'}],total_matches:1,next_cursor:null,filters:{tenant_id:'deployment'}}});await pending;assert.equal(f.get('_laRows.length'),0);assert.equal(f.requests.length,1);assert.ok(f.states.every(s=>s[1]==='loading'))});
+
+test('deployment search does not direct readers to tenant-scoped archive exports', async () => {
+ const f=scopeHarness();f.setAPI(async()=>({ok:true,status:200,body:{rows:[{id:'deployment-record',tenant_id:'deployment',timestamp:'2026-09-18T00:00:00Z'}],total_matches:1,next_cursor:null,filters:{tenant_id:'deployment'}}}));
+ await f.c.laLoadStream(f.host,f.filter,f.summary);
+ const text=f.nodes.map(n=>n.text||'').join(' ');
+ assert.match(text,/end of matches in this server's hot audit log/);assert.doesNotMatch(text,/use Exports/);
+});

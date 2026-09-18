@@ -955,3 +955,39 @@ rate limiting is disabled by default. No sampling or new rate limiter is added.
 Local storage and append hooks can still delay request completion. These records
 do not claim that every incoming HTTP request, read refusal or upstream rate-limit
 rejection is audited, or that local append is a crash-durable transaction.
+
+
+## Finding deployment operation audits
+
+In **Logs & Audit → Logs → Admin audit**, a deployment operator outside a selected
+organization can choose **Audit scope → Deployment operations**. This reads only
+the reserved deployment audit namespace. It does not combine customer logs.
+**Current organization** remains the default and shows the authenticated
+organization's records; entering an organization uses that selected organization's
+records and removes the deployment option. Access requires the route's log-read
+permission and the operator's cross-organization administrative authority.
+
+For example, publishing a deployment-wide agent release records the publication
+and activation events under `deployment`, while the common HTTP request audit
+belongs to the acting administrator's organization. Search each scope separately
+and use **Details → View raw** to inspect the actor, target, result and timestamp.
+Changing the stream or audit scope clears the previous search filters. A failed
+or unverifiable deployment response shows Retry instead of an empty result; late
+responses from a previous scope or departed page are discarded. Update the Console
+and control plane together: an older server may ignore the new scope parameter,
+and the updated Console refuses to label that tenant response as deployment data.
+
+The search API accepts `audit_scope=deployment` on `GET /admin/logs/audit`.
+The same explicit scope and authorization apply to the bounded NDJSON preview at
+`GET /admin/logs/audit/export`, with its separate preview-export permission.
+Omitting `audit_scope`, or using `tenant`, preserves the ordinary tenant-scoped
+query. Invalid, empty or repeated scope values return 400. Deployment scope on
+another stream returns 400; a customer, an operator without cross-organization
+authority, or an operator currently inside an organization receives 403.
+
+This selector applies to hot-log search and the bounded preview API. It does not
+change queued archive exports, legal hold, retention or audit-chain verification;
+those operations retain their existing scope. Search results describe records
+available to the queried management server, not proof of complete collection from
+every region. Reading these records does not itself create a configuration-change
+audit event.

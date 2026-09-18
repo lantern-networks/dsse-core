@@ -13965,7 +13965,7 @@ paths:
           $ref: "#/components/responses/NotFound"
   /admin/logs/{stream}:
     get:
-      summary: Search tenant-scoped log stream.
+      summary: Search an authorized log stream.
       tags:
         - AdminLog
       parameters:
@@ -13983,6 +13983,21 @@ paths:
               - delegated_access_grants
               - tool_call_events
               - inspection_events
+        - name: audit_scope
+          in: query
+          schema:
+            type: string
+            enum: [tenant, deployment]
+            default: tenant
+          description: >-
+            Omitted or tenant uses the authenticated organization, including an
+            authorized X-Operate-Tenant selection. Deployment is valid only for
+            stream=audit and an authenticated deployment operator with
+            cross-organization authority, outside any selected organization.
+            It reads only the reserved deployment namespace, not customer logs.
+            Unknown, empty or repeated values are rejected with 400; an
+            unauthorized deployment scope is rejected with 403. The existing
+            route-specific read or preview-export permission is still required.
         - name: q
           in: query
           schema:
@@ -13991,7 +14006,7 @@ paths:
           in: query
           schema:
             type: string
-          description: Direct field filter. tenant_id is always forced by auth context.
+          description: Direct field filter. tenant_id is forced by the authorized audit scope or authenticated organization.
         - name: application_id
           in: query
           schema:
@@ -14100,6 +14115,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/LogSearchResponse"
+        "400":
+          description: Invalid query, audit scope, or deployment scope on a non-audit stream.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -14108,7 +14125,7 @@ paths:
           $ref: "#/components/responses/NotFound"
   /admin/logs/{stream}/export:
     get:
-      summary: Preview export for tenant-scoped log stream.
+      summary: Preview an authorized log stream as bounded NDJSON.
       tags:
         - AdminLog
       parameters:
@@ -14133,6 +14150,21 @@ paths:
             minimum: 1
             maximum: 200
             default: 25
+        - name: audit_scope
+          in: query
+          schema:
+            type: string
+            enum: [tenant, deployment]
+            default: tenant
+          description: >-
+            Omitted or tenant uses the authenticated organization, including an
+            authorized X-Operate-Tenant selection. Deployment is valid only for
+            stream=audit and an authenticated deployment operator with
+            cross-organization authority, outside any selected organization.
+            It reads only the reserved deployment namespace, not customer logs.
+            Unknown, empty or repeated values are rejected with 400; an
+            unauthorized deployment scope is rejected with 403. The existing
+            route-specific read or preview-export permission is still required.
         - name: q
           in: query
           schema:
@@ -14141,7 +14173,7 @@ paths:
           in: query
           schema:
             type: string
-          description: Direct field filter. tenant_id is always forced by auth context.
+          description: Direct field filter. tenant_id is forced by the authorized audit scope or authenticated organization.
         - name: application_id
           in: query
           schema:
@@ -14248,6 +14280,8 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
+        "400":
+          description: Invalid query, audit scope, or deployment scope on a non-audit stream.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":

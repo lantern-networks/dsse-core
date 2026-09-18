@@ -18,6 +18,7 @@ const _LA_SHIPPED_STREAMS = new Set(["audit", "access", "device_state", "inspect
 function laPlaneFor(stream) { return _LA_SHIPPED_STREAMS.has(stream) ? _LA_PLANE : "edge"; }
 let _laTab = "logs";
 let _laStream = "access";
+let _laAuditScope = "tenant";
 let _laFilters = {}; // active facet filters (field -> value) + q/from/to
 
 // Stream ids MUST match the backend aliases (adminLogStreamFilenameMap): the old ids
@@ -667,13 +668,30 @@ async function laLegalHold(host) {
   });
 }
 
+function laCanReadDeploymentAudit() {
+  return _laStream === "audit" && typeof answeringForTheDeployment === "function" && answeringForTheDeployment();
+}
+
 function laLogs(section) {
   section.innerHTML = "";
+  if (!laCanReadDeploymentAudit()) _laAuditScope = "tenant";
   const sel = uiField({ name: "stream", label: bl({ en: "Stream", ja: "ストリーム" }), type: "select", value: _laStream, options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
   sel.el.style.marginBottom = "0";
-  sel.el.querySelector("select").addEventListener("change", () => { _laStream = sel.get(); _laFilters = {}; laLoadStream(host, filterHost, summaryHost); });
+  sel.el.querySelector("select").addEventListener("change", () => { _laStream = sel.get(); _laFilters = {}; _laAuditScope = "tenant"; laLogs(section); });
+  const scopes = [];
+  if (laCanReadDeploymentAudit()) {
+    const scope = uiField({ name: "audit_scope", label: bl({ en: "Audit scope", ja: "監査の範囲" }), type: "select", value: _laAuditScope,
+      options: [{ value: "tenant", label: bl({ en: "Current organization", ja: "現在の組織" }) },
+                { value: "deployment", label: bl({ en: "Deployment operations", ja: "配備全体の操作" }) }] });
+    scope.el.style.marginBottom = "0";
+    scope.el.querySelector("select").addEventListener("change", () => {
+      _laAuditScope = scope.get(); _laFilters = {};
+      laFilterBar(filterHost, host, summaryHost); laLoadStream(host, filterHost, summaryHost);
+    });
+    scopes.push(scope.el);
+  }
   section.appendChild(el("div", { class: "ui-toolbar" }, [
-    sel.el,
+    sel.el, ...scopes,
     el("span", { class: "ui-spacer" }),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }),
   ]));
@@ -729,6 +747,9 @@ let _laTotal = 0;     // total_matches for the active query (across the whole ho
 function laQueryString(cursor) {
   const p = new URLSearchParams();
   Object.keys(_laFilters).forEach((k) => { if (k.charAt(0) === "_") return; const v = _laFilters[k]; if (v) p.set(k, v); });
+  // Never reuse a deployment scope after leaving the operator's audit view.
+  p.delete("audit_scope");
+  if (laCanReadDeploymentAudit() && _laAuditScope === "deployment") p.set("audit_scope", "deployment");
   p.set("limit", String(_LA_PAGE));
   if (cursor) p.set("cursor", cursor); // page forward to OLDER rows (server orders newest-first)
   return p.toString();
@@ -757,7 +778,12 @@ function laSummary(summaryHost, rows, stream) {
 async function laLoadStream(host, filterHost, summaryHost, append) {
   // The guard is taken for EVERY call, not only the fresh ones: "Load older" appends to the same host, and an
   // append that lands after a newer query started would concatenate two different result sets.
-  const current = freshRender(host);
+  const fresh = freshRender(host), stream = _laStream, scope = _laAuditScope;
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const selected = selection(), operatorAudit = laCanReadDeploymentAudit();
+  const current = () => fresh() && host.isConnected !== false && stream === _laStream && scope === _laAuditScope &&
+    selected === selection() && operatorAudit === laCanReadDeploymentAudit();
+  const deploymentAudit = operatorAudit && scope === "deployment";
   if (!append) { _laRows = []; _laCursor = ""; _laTotal = 0; if (summaryHost) summaryHost.innerHTML = ""; uiState(host, "loading"); }
   let coverage;
   try {
@@ -770,6 +796,10 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
         !Number.isSafeInteger(body.total_matches) || body.total_matches < 0 ||
         (body.next_cursor != null && typeof body.next_cursor !== "string")) {
       throw new Error("Invalid log search response");
+    }
+    if (deploymentAudit && (r.status !== 200 || body.filters?.tenant_id !== "deployment" ||
+        body.rows.some(row => row.tenant_id !== "deployment"))) {
+      throw new Error(bl({ en: "Could not verify deployment audit records. Retry the search.", ja: "配備全体の監査情報を確認できません。検索を再試行してください。" }));
     }
     coverage = body.region_coverage;
     const rows = body.rows;
@@ -813,7 +843,9 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
     : bl({ en: "Showing ", ja: "表示 " }) + _laRows.length;
   const footer = el("div", { style: "display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:8px 0 2px" }, [el("span", { class: "ui-view-desc", text: countTxt })]);
   if (_laCursor) footer.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Load older", ja: "さらに古いものを読み込む" }), onClick: () => laLoadStream(host, filterHost, summaryHost, true) }));
-  else footer.appendChild(el("span", { class: "ui-view-desc", text: bl({ en: "— end of matches (older data past retention is in cold archive; use Exports)", ja: "— 一致の末尾（保持期間を過ぎた古いデータはコールドアーカイブ。エクスポートを利用）" }) }));
+  else footer.appendChild(el("span", { class: "ui-view-desc", text: deploymentAudit
+    ? bl({ en: "— end of matches in this server's hot audit log", ja: "— このサーバーで検索できる監査記録の末尾" })
+    : bl({ en: "— end of matches (older data past retention is in cold archive; use Exports)", ja: "— 一致の末尾（保持期間を過ぎた古いデータはコールドアーカイブ。エクスポートを利用）" }) }));
   host.appendChild(footer);
 }
 

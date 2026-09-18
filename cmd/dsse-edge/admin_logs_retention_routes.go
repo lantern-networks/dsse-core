@@ -18,6 +18,35 @@ import (
 	"github.com/lantern-networks/dsse-core/hotstore"
 )
 
+// A deployment audit query reads only the reserved deployment namespace. It is
+// not an all-tenant query, and selecting a customer disables this operating mode.
+// Default queries keep their existing authenticated-tenant scope.
+func adminLogReadScope(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenant := adminTenantIDFromRequest(r)
+	values, present := r.URL.Query()["audit_scope"]
+	if !present {
+		return tenant, true
+	}
+	if len(values) != 1 || (values[0] != "tenant" && values[0] != "deployment") {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("audit_scope must be tenant or deployment"))
+		return "", false
+	}
+	if values[0] == "tenant" {
+		return tenant, true
+	}
+	file, known := adminLogStreamFilename(r.PathValue("stream"))
+	if !known || file != "audit.log.jsonl" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("deployment scope is available only for audit records"))
+		return "", false
+	}
+	identity, authenticated := adminIdentityFromRequest(r)
+	if !authenticated || !adminIdentityMayActAcrossOrganizations(identity) || !adminAnsweringForTheDeployment(r) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("deployment audit records require an operator outside a selected organization"))
+		return "", false
+	}
+	return agentUpdateCatalogueScope, true
+}
+
 func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, adminHotStore hotstore.Store, decisionStore *accessdecision.Store, coldArchive archive.ColdArchive, legalHold *legalHoldStore, retentionOverride *retentionOverrideStore) {
 	mux.HandleFunc("GET /admin/access-decisions/{decision_id}", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
 		detail, err := adminAccessDecisionDetail(adminHotStore, decisionStore, adminTenantIDFromRequest(r), r.PathValue("decision_id"))
@@ -28,7 +57,11 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, detail)
 	}))
 	mux.HandleFunc("GET /admin/logs/{stream}", adminEndpoint("admin.logs.read", func(w http.ResponseWriter, r *http.Request) {
-		result, err := adminLogQuery(adminHotStore, adminTenantIDFromRequest(r), r.PathValue("stream"), r.URL.Query())
+		tenant, allowed := adminLogReadScope(w, r)
+		if !allowed {
+			return
+		}
+		result, err := adminLogQuery(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
 			writeError(w, statusForAdminLogQueryError(err), err)
 			return
@@ -36,7 +69,11 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, result)
 	}))
 	mux.HandleFunc("GET /admin/logs/{stream}/export", adminEndpoint("admin.logs.export.preview", func(w http.ResponseWriter, r *http.Request) {
-		result, err := adminLogExport(adminHotStore, adminTenantIDFromRequest(r), r.PathValue("stream"), r.URL.Query())
+		tenant, allowed := adminLogReadScope(w, r)
+		if !allowed {
+			return
+		}
+		result, err := adminLogExport(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
 			writeError(w, statusForAdminLogQueryError(err), err)
 			return

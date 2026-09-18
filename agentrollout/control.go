@@ -268,16 +268,18 @@ func (s *AgentRolloutStore) LoadFromPersister(blob Persister) error {
 	if err != nil {
 		return fmt.Errorf("read the shared agent rollout store: %w", err)
 	}
-	var plans map[string]AgentRolloutPlan
-	if len(raw) > 0 {
-		if jerr := json.Unmarshal(raw, &plans); jerr != nil {
-			return fmt.Errorf("the shared agent rollout store is unreadable (%w) — refusing to start with an "+
-				"unknown halt state rather than answering \"not frozen\" to every edge", jerr)
+	// Only nil denotes an absent snapshot under the Persister contract. An
+	// existing zero-byte file is corrupt, not a new deployment.
+	plans := make(map[string]AgentRolloutPlan)
+	if raw != nil {
+		plans, err = decodeRolloutSnapshot(raw)
+		if err != nil {
+			return fmt.Errorf("read the shared agent rollout store: %w", err)
 		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if plans != nil {
+	if raw != nil {
 		s.plans = plans
 	}
 	s.blob = blob
@@ -300,8 +302,8 @@ func (s *AgentRolloutStore) LoadFrom(path string) error {
 	if err != nil {
 		return fmt.Errorf("read the agent rollout store %s: %w", path, err)
 	}
-	var plans map[string]AgentRolloutPlan
-	if jerr := json.Unmarshal(raw, &plans); jerr != nil {
+	plans, jerr := decodeRolloutSnapshot(raw)
+	if jerr != nil {
 		// ★ NOT ignored. A halt that cannot be read is not "no halt": the caller decides, and the edge-facing
 		// answer for an unreadable authority is to hold, not to release.
 		return fmt.Errorf("the agent rollout store %s is unreadable (%w) — refusing to start with an unknown "+
@@ -309,9 +311,7 @@ func (s *AgentRolloutStore) LoadFrom(path string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if plans != nil {
-		s.plans = plans
-	}
+	s.plans = plans
 	s.path = path
 	return nil
 }

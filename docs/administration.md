@@ -831,3 +831,22 @@ The common HTTP audit records the request separately. An attempt without an
 outcome needs reconciliation: saving the plan and recording audit events are
 separate operations. An outbox failure is logged and does not undo the primary
 record or the plan.
+
+The persisted rollout tenant map is validated before startup adopts it. A `null`
+map or plan, a missing/null `frozen` decision, duplicate JSON names, unknown or
+case-aliased fields and invalid wave/window values are errors, not permission to
+resume updates. Existing zero-byte files also fail startup, including through the
+shared-store adapter. Startup reports invalid snapshot data without printing saved
+tenant names or incident reasons, and leaves the source unchanged.
+
+The existing tenant-map format remains supported: `{}` is an explicit empty map;
+legacy plans may omit metadata but must state `frozen`. Absent/null optional
+schedules, nil wave lists and omitted/null default delays keep their existing
+meaning. The empty tenant key used by legacy single-deployment installations is
+retained in its original scope. A present maintenance window must carry all its
+fields. No migration or automatic reset is performed. Recover the complete intended snapshot from a
+trusted backup before restarting; deleting it is not a safe repair. A missing
+file or absent shared row still means first boot for a new process, so external
+backups and storage attachment checks remain necessary. This validation does not
+detect a syntactically valid replacement with different settings, or implement
+live shared-writer refresh and conflict resolution.

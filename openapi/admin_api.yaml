@@ -8965,9 +8965,23 @@ paths:
   /admin/risk-signals:
     get:
       summary: Return the current high-risk device/identity snapshot ().
-      description: Requires admin.risk.read. Returns the set of devices/identities currently marked high-risk (severity per entity) that the decision engine reads on the live path.
+      description: >-
+        Requires admin.risk.read. Returns tenant-scoped device risk or, with entity_type=user, the user namespace.
+        Both responses include tenant_id, entity_type and high_risk. A control-plane standby refuses with 409
+        because its held snapshot is refreshed at promotion, not continuously. Readable local data alone does
+        not make the standby authoritative. A leader or local authority with unavailable risk storage returns 503.
+        Refusals do not clear saved or held risk. No election configured and enforcing-Edge reads retain their
+        existing behavior. Reads create no administrator-change audit events.
       tags:
         - AdminRiskState
+      parameters:
+        - in: query
+          name: entity_type
+          required: false
+          schema:
+            type: string
+            enum: [device, user]
+          description: Omission selects device risk. User risk is scoped to the authenticated tenant.
       responses:
         "200":
           description: Current high-risk snapshot.
@@ -8980,6 +8994,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This control plane is on standby. Retry through the active management server.
+        "503":
+          description: The local risk snapshot cannot be verified. Restore storage before retrying.
     post:
       summary: Ingest a device/identity risk signal ().
       description: Requires admin.risk.write. Ingests a risk signal (including Manual High Risk Marking). A high-risk signal folds into the device's risk state and revokes the device's standing east-west grants.

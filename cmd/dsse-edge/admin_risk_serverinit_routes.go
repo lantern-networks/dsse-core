@@ -100,6 +100,9 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 	// GET /admin/risk-signals: the current high-risk overlay (entity id -> severity), so the console can show a
 	// current-risk badge on its own row. The explicit user query uses a tenant-scoped namespace.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
+		if riskReadRefusedOnAStandby(w) {
+			return
+		}
 		snap, users, err := config.HighRiskOverlay.CheckedSnapshot()
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is unavailable"))

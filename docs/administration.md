@@ -326,11 +326,23 @@ snapshot after this process has observed or changed state also refuses promotion
 An empty first boot remains supported. Shared-store migration remains an explicit
 operator action when an existing node-local snapshot takes precedence.
 
-A standby returns HTTP 409 for the revocation feed and the Console's connection
-block status. Edges retain their last applied set when that feed is unavailable.
-Devices displays a status error with Retry, rather than a successful empty list.
-After promotion succeeds, reload the Console and check the Edge synchronization
-status separately. A local administrator response is still not a fleet receipt.
+A standby returns HTTP 409 for the revocation feed, the Console's connection
+block status, and both device and user risk snapshots (`GET /admin/risk-signals`).
+Risk is refreshed during promotion; a healthy snapshot held by a standby can
+still predate another administrator's change and is not an authoritative read.
+Devices and People show an error with Retry and withhold risk-change controls.
+Use the active management server through the deployment's front door, or retry
+after promotion succeeds. A leader with unreadable risk storage instead returns
+HTTP 503. Standby refusals do not change the held risk, storage health or saved
+settings, and reads do not create administrator-change audit events.
+
+Edges retain their last applied set when the revocation feed is unavailable.
+Check Edge synchronization separately after recovery: a local administrator
+response is not a fleet receipt. These read checks do not change the traffic
+engine's handling of retained state or add periodic risk refreshes on standbys.
+Single control planes without election and enforcing Edges retain their existing
+read behavior. The check uses locally known leadership; it does not fence a
+response already in flight or eliminate the election loop's detection interval.
 
 New control planes use the shared database for risk when a database is configured
 and no local risk snapshot exists. Existing local entries, including empty files

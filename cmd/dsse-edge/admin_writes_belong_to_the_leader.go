@@ -29,8 +29,9 @@ import (
 
 // adminWriteRefusedOnAStandby reports the refusal and returns true when the caller must stop.
 //
-// Reads only apply to WRITE permissions: a standby answering questions is exactly what a standby is for, and
-// its answers are the authority's own state, one re-read behind at worst.
+// This guard applies only to write permissions. Individual read routes must also
+// check authority when their state is not refreshed on a standby, as admission
+// and risk do; a healthy local snapshot alone does not establish currentness.
 func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool {
 	if !adminPermissionWrites(permission) {
 		return false

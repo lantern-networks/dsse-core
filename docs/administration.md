@@ -991,3 +991,45 @@ those operations retain their existing scope. Search results describe records
 available to the queried management server, not proof of complete collection from
 every region. Reading these records does not itself create a configuration-change
 audit event.
+
+
+### Publication in progress and unconfirmed results
+
+The agent publication form belongs to the verified page and publication scope
+that opened it. During package verification, publication and upload, its inputs,
+Cancel, Escape and backdrop dismissal are locked. Opening the form again does not
+start a second operation. Leaving the page or changing organization closes the
+form and suppresses later UI completion; it cannot undo a write already sent.
+The Console checks that context again after each asynchronous step and sends an
+explicit scope pin to the control plane for both publication and package upload.
+
+HTTP success alone is insufficient. Before sending the package, the Console checks
+the acknowledged organization, target, version, package digest/size and manifest
+hash. The upload carries that same manifest hash, so a superseded manifest can be
+refused before the package is read or stored. Success requires a matching upload
+acknowledgement and confirmation that this manifest is active in the catalogue.
+An already-active upload can succeed with `activated=false` and `active=true`;
+`activated` describes this request's promotion, not the catalogue's current state.
+Neither field establishes that endpoints have installed the release.
+
+On a failed or unverifiable response, the form retains its selected files and
+entered values, unlocks and displays a persistent message. Publication or activation
+may already have happened. Retry with Publish, or cancel and reload before another
+change. Retrying still resubmits the publication and package; it is not an
+upload-only resume or exactly-once operation and can add audit records. A failed
+acknowledgement does not roll back saved data. A verified publication followed by
+an uncertain upload is not automatically described as still pending.
+
+`POST`/`PUT /admin/agent-updates` and `PUT /admin/agent-update-artifact` accept
+`expected_tenant_id`; artifact upload also accepts `expected_manifest_sha256`.
+These optional parameters bind a request, not its authority. Mismatched or repeated
+pins return 409 before the corresponding side effects. Authentication and route
+permissions still run first. Existing clients may omit them. Update the control
+plane before or with the Console: older acknowledgements without the new scope,
+package and active-state fields are reported as unconfirmed.
+
+These checks do not serialize concurrent administrators, make the two requests a
+transaction, provide shared-writer conflict resolution, or confirm delivery to
+every Edge. Publication, package storage, activation and their audit records remain
+separate operations. Reconcile an unresolved attempt against the catalogue and
+stored package before changing the offered release.

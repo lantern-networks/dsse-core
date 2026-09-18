@@ -6324,13 +6324,31 @@ paths:
     put:
       summary: Upload the bytes a published manifest authorises.
       description: >-
-        Requires admin.agents.write. The manifest must be published FIRST — bytes with nothing to check them
+        Requires admin.platform.write. The manifest must be published FIRST — bytes with nothing to check them
         against would make this a place to stage anything — and the body is verified against that manifest's
         size and digest before it is stored. Refused on an enforcing edge, which pulls artifacts rather than
         holding authority for them.
       tags:
         - AdminAgentRollout
       parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the verified publication scope (deployment for an operator outside
+            an organization, otherwise the selected/authenticated tenant). A
+            present mismatched, empty-for-nonempty, or repeated value is refused
+            with 409 before signing, publication or artifact writes. This does
+            not select a tenant or grant permission. Older clients may omit it.
+        - in: query
+          name: expected_manifest_sha256
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the acknowledged manifest payload hash. A present mismatched,
+            empty or repeated value is refused with 409 before reading/storing
+            package bytes. Existing requests may omit this parameter.
         - in: query
           name: platform
           required: true
@@ -6346,11 +6364,17 @@ paths:
             schema: { type: string, format: binary }
       responses:
         "200":
-          description: Stored; edges fetch it when they find they do not hold it.
+          description: >-
+            Stored acknowledgement includes schema_version=admin_agent_updates.v1,
+            tenant_id, manifest_sha256 and stored platform/arch/version/bytes/artifact_sha256.
+            activated states whether this call promoted the manifest; active states
+            whether that same manifest is currently offered by the catalogue. They
+            are distinct: retrying an already-active upload may have activated=false
+            and active=true. This is not confirmation of endpoint installation.
         "400":
           description: These bytes are not the ones the published manifest authorises.
         "409":
-          description: This process is an enforcing edge; upload on the control plane.
+          description: Enforcing edge, changed publication scope, or a stale/ambiguous manifest pin.
         "412":
           description: Nothing published for that target yet, or no artifact directory here.
   /admin/agent/device-updates:
@@ -6395,13 +6419,24 @@ paths:
     put:
       summary: Publish a signed release manifest to the fleet.
       description: >-
-        Requires admin.agents.write. The body is a manifest envelope signed ELSEWHERE — this control plane never
+        Requires admin.platform.write. The body is a manifest envelope signed ELSEWHERE — this control plane never
         signs, it verifies against -agent-update-pin and stores. Refused on an enforcing edge, which pulls its
         published set and would overwrite a local write on the next poll. Persisted before it is acknowledged;
         a wrongly-signed or expired manifest fails here, on the machine where the release was made, rather than
         on every endpoint that stages it and then refuses. Publishing needs no edge restart.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the verified publication scope (deployment for an operator outside
+            an organization, otherwise the selected/authenticated tenant). A
+            present mismatched, empty-for-nonempty, or repeated value is refused
+            with 409 before signing, publication or artifact writes. This does
+            not select a tenant or grant permission. Older clients may omit it.
       requestBody:
         required: true
         content:
@@ -6411,17 +6446,21 @@ paths:
               description: A dsse_agent_update_manifest.v1 signed envelope.
       responses:
         "200":
-          description: Published; edges adopt it on their next poll.
+          description: >-
+            Acknowledgement includes schema_version=admin_agent_updates.v1, tenant_id,
+            manifest_sha256, published platform/arch/version/artifact_sha256/artifact_size
+            and state (pending or active). A pending manifest is not yet offered to
+            devices. Upload its package using the same scope and manifest hash.
         "400":
           description: The manifest will not verify, or is expired.
         "409":
-          description: This process is an enforcing edge; publish on the control plane.
+          description: An enforcing edge, or changed/ambiguous publication scope.
         "412":
           description: No update-signing key is pinned here, so nothing can be checked.
     post:
       summary: Sign and publish a release — the key stays in the token.
       description: >-
-        Requires admin.agents.write. The body is the manifest FIELDS, not an envelope: this control plane signs
+        Requires admin.platform.write. The body is the manifest FIELDS, not an envelope: this control plane signs
         them with the update-signing key held in a PKCS#11 token (-agent-update-hsm-agent-socket) and then takes
         the identical path as PUT — verify against the pinned key, record the audit attempt before the store is
         touched, activate or hold for the artifact. It exists so that publishing does not require the most
@@ -6435,6 +6474,17 @@ paths:
         the SAME version is allowed, because manifests expire and rolling a device back needs no manifest at all.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the verified publication scope (deployment for an operator outside
+            an organization, otherwise the selected/authenticated tenant). A
+            present mismatched, empty-for-nonempty, or repeated value is refused
+            with 409 before signing, publication or artifact writes. This does
+            not select a tenant or grant permission. Older clients may omit it.
       requestBody:
         required: true
         content:
@@ -6444,11 +6494,15 @@ paths:
               description: The agentupdate.Manifest fields (version, platform, arch, delivery, artifact digest/size, validity).
       responses:
         "200":
-          description: Signed and published; edges adopt it on their next poll.
+          description: >-
+            Acknowledgement includes schema_version=admin_agent_updates.v1, tenant_id,
+            manifest_sha256, published platform/arch/version/artifact_sha256/artifact_size
+            and state (pending or active). A pending manifest is not yet offered to
+            devices. Upload its package using the same scope and manifest hash.
         "400":
           description: The fields are not a valid manifest, or carry an unknown field.
         "409":
-          description: An enforcing edge, or a version older than the signing floor for that target.
+          description: An enforcing edge, changed/ambiguous publication scope, or a version older than the signing floor.
         "412":
           description: This control plane holds no update-signing key, or pins none.
   /admin/agent-update-sign-floor:

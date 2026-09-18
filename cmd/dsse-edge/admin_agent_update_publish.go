@@ -346,7 +346,7 @@ func agentUpdatePublishScope(r *http.Request) string {
 // Resolve from verified identity/operator context, never from the pin itself.
 func agentUpdateReadContextMatches(w http.ResponseWriter, r *http.Request, scope string) bool {
 	q := r.URL.Query()
-	if q.Has("expected_tenant_id") && q.Get("expected_tenant_id") != scope {
+	if values, present := q["expected_tenant_id"]; present && (len(values) != 1 || values[0] != scope) {
 		writeError(w, http.StatusConflict, fmt.Errorf("the release scope changed; reload before continuing"))
 		return false
 	}
@@ -885,6 +885,10 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 	store *publishedAgentUpdateStore, trustedKeys []string, dir string, isEnforcingEdge bool, writer *logs.Writer,
 	evaluator decision.Evaluator, deviceFacing *publishedUpdates) {
 	mux.HandleFunc("PUT /admin/agent-update-artifact", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
+		tenantID := agentUpdatePublishScope(r)
+		if !agentUpdateReadContextMatches(w, r, tenantID) {
+			return
+		}
 		if isEnforcingEdge {
 			writeError(w, http.StatusConflict, fmt.Errorf("this edge pulls release artifacts from the control "+
 				"plane; upload there instead"))
@@ -897,8 +901,7 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		}
 		platform := strings.TrimSpace(r.URL.Query().Get("platform"))
 		arch := strings.TrimSpace(r.URL.Query().Get("arch"))
-		// the bytes land on the shelf the manifest was published to — see agentUpdateCatalogueScope.
-		tenantID := agentUpdatePublishScope(r)
+		// The bytes land on the same verified publication shelf.
 		// ★ PENDING FIRST. A release published a moment ago is waiting for exactly these bytes; the active
 		// entry is the PREVIOUS release, whose artifact is already here. Checking the bytes against the active
 		// manifest would reject the upload that is supposed to activate the new one.
@@ -913,6 +916,12 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 				"the signed manifest first, then the artifact it names", platform, arch))
 			return
 		}
+		if pins, present := r.URL.Query()["expected_manifest_sha256"]; present &&
+			(len(pins) != 1 || !strings.EqualFold(pins[0], env.PayloadSHA256)) {
+			writeError(w, http.StatusConflict, fmt.Errorf("the release waiting for this package changed; reload before uploading"))
+			return
+		}
+
 		// OpenWithKey, so the audit below names the key that ACTUALLY verified this envelope rather than the
 		// unsigned label attached to it. Resolved here rather than remembered from the publish, because a
 		// control plane that restarted between the two would otherwise record "unknown" for an ordinary upload.
@@ -1053,9 +1062,13 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 				return
 			}
 		}
+		current, present := store.ForTenant(tenantID)[updateTargetKey(m.Platform, m.Arch)]
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_agent_updates.v1",
-			"stored":    map[string]any{"platform": m.Platform, "arch": m.Arch, "version": m.Version, "bytes": written},
-			"activated": activated})
+			"tenant_id": tenantID, "manifest_sha256": env.PayloadSHA256,
+			"stored": map[string]any{"platform": m.Platform, "arch": m.Arch, "version": m.Version,
+				"bytes": written, "artifact_sha256": got},
+			"activated": activated,
+			"active":    present && strings.EqualFold(current.PayloadSHA256, env.PayloadSHA256)})
 	}))
 
 	// The device-facing artifact route is unauthenticated by design (its integrity is the digest in the signed
@@ -1203,14 +1216,20 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"schema_version":  "admin_agent_updates.v1",
-			"published":       map[string]string{"platform": m.Platform, "arch": m.Arch, "version": m.Version},
+			"schema_version": "admin_agent_updates.v1",
+			"tenant_id":      tenantID, "manifest_sha256": env.PayloadSHA256,
+			"published": map[string]any{"platform": m.Platform, "arch": m.Arch, "version": m.Version,
+				"artifact_sha256": m.ArtifactSHA256, "artifact_size": m.ArtifactSize},
 			"state":           state,
 			"reaches_devices": reach,
 		})
 	}
 
 	mux.HandleFunc("PUT /admin/agent-updates", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
+		tenantID := agentUpdatePublishScope(r)
+		if !agentUpdateReadContextMatches(w, r, tenantID) {
+			return
+		}
 		// The same authority rule as the halt: an edge that PULLS is not the place to author, because a write
 		// here would be overwritten by the next poll and reach nobody meanwhile.
 		if isEnforcingEdge {
@@ -1228,7 +1247,7 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode the signed manifest envelope: %w", err))
 			return
 		}
-		publish(w, r, env, agentUpdatePublishScope(r))
+		publish(w, r, env, tenantID)
 	}))
 
 	// POST /admin/agent-updates — the operator states WHAT to release and this control plane signs it.
@@ -1242,6 +1261,10 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 	// start if the two key ids or public keys coincide, because one key signing both the release and the rollout
 	// plan means a compromised release key can also lift the freeze that would stop it.
 	mux.HandleFunc("POST /admin/agent-updates", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
+		tenantID := agentUpdatePublishScope(r)
+		if !agentUpdateReadContextMatches(w, r, tenantID) {
+			return
+		}
 		if isEnforcingEdge {
 			writeError(w, http.StatusConflict, fmt.Errorf("this edge pulls its published releases from the control "+
 				"plane; publish there instead"))
@@ -1266,8 +1289,7 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode the manifest fields: %w", err))
 			return
 		}
-		// signing publishes to the same shelf the envelope path does — see agentUpdateCatalogueScope.
-		tenantID := agentUpdatePublishScope(r)
+		// Signing uses the publication scope verified before the body was decoded.
 		// ★ CHECKED BEFORE THE SIGNATURE, not after. A signed downgrade that is then refused has still been
 		// signed, and an envelope that exists can be replayed at any edge that pins the key.
 		if ratchet != nil {

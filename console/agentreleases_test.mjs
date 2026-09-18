@@ -121,31 +121,68 @@ test('late signing response cannot restore publication caches after context depa
 
 // Publishing a signed file must use that file's target/version and the package
 // that was checked, regardless of form defaults or input changes during hashing.
-function publishFixture(manifestChanges={}) {
+function publishFixture(manifestChanges={},canSign=false) {
  const f=fixture(),uploads=[];let closed=0,rendered=0;
  const m={schema:'1',version:'0.3.2',platform:'windows',arch:'arm64',channel:'stable',delivery:'dsse',artifact_kind:'msi',artifact_url:'https://example.test/package.msi',artifact_sha256:'a'.repeat(64),artifact_size:32,released_at:'2026-09-18T00:00:00Z',not_after:'2026-10-18T00:00:00Z',...manifestChanges};
- const env={type:'dsse_agent_update_manifest.v1',version:'1',payload_b64:Buffer.from(JSON.stringify(m)).toString('base64')};
+ const env={type:'dsse_agent_update_manifest.v1',version:'1',payload_b64:Buffer.from(JSON.stringify(m)).toString('base64'),payload_sha256:'b'.repeat(64)};
  const file={name:'package.msi',size:32},signedFile={text:async()=>JSON.stringify(env)},host={};
- f.c.atob=s=>Buffer.from(s,'base64').toString('binary');f.c.window={_arCanSign:false,_arLastPublished:{},_arReleaseReadContext:{host,current:()=>true,signingKnown:true}};
+ f.c.atob=s=>Buffer.from(s,'base64').toString('binary');f.c.window={_arCanSign:canSign,_arLastPublished:{},_arReleaseReadContext:{host,scope:'deployment',current:()=>true,signingKnown:true,canSign}};
  f.c.uiField=opts=>{const field={el:f.c.el(opts.type==='select'?'select':'input'),value:opts.value??'',get(){return this.value},set(v){this.value=v},validate(){return Boolean(this.value)},setError(error){this.error=error}};f.fields[opts.name]=field;return field};
  f.c.uiModal=opts=>{f.dialog=opts;return{close(){closed++}}};f.c.renderAgentReleaseList=()=>rendered++;f.c.arHash=async()=>m.artifact_sha256;
- f.c.apiFetch=async(...a)=>{f.requests.push(a);return{ok:true,status:200}};
- f.c.arUploadArtifact=async(...a)=>{uploads.push(a);return{ok:true,status:200}};
+ let sent=m;
+ f.c.apiFetch=async(...a)=>{f.requests.push(a);sent=a[0]==='PUT'?JSON.parse(Buffer.from(a[2].payload_b64,'base64').toString()):a[2];return{ok:true,status:200,body:{schema_version:'admin_agent_updates.v1',tenant_id:'deployment',manifest_sha256:'b'.repeat(64),published:{platform:sent.platform,arch:sent.arch,version:sent.version,artifact_size:sent.artifact_size,artifact_sha256:sent.artifact_sha256},state:'pending'}}};
+ f.c.arUploadArtifact=async(...a)=>{uploads.push(a);return{ok:true,status:200,body:{schema_version:'admin_agent_updates.v1',tenant_id:'deployment',manifest_sha256:'b'.repeat(64),stored:{platform:sent.platform,arch:sent.arch,version:sent.version,bytes:sent.artifact_size,artifact_sha256:sent.artifact_sha256},activated:true,active:true}}};
  f.c.openAgentReleaseForm(host);const inputs=f.nodes.filter(n=>n.type==='file');inputs[0].files=[file];inputs[0].handlers.change();inputs[1].files=[signedFile];inputs[1].handlers.change();
  f.fields.target.set('darwin/arm64');f.fields.version.set('9.9.9');f.fields.url.set('https://wrong.example.test/form.pkg');
- return{...f,m,env,file,signedFile,inputs,uploads,submit:f.dialog.footer[1],get closed(){return closed},get rendered(){return rendered}};
+ return{...f,m,env,file,signedFile,inputs,uploads,host,submit:(f.modal||f.dialog).footer[1],get closed(){const b=f.nodes.findLast(n=>n.class==='ui-modal-backdrop');return b?Number(!b.isConnected):closed},get rendered(){return rendered}};
 }
 for(const platform of ['windows','darwin'])for(const arch of ['amd64','arm64'])test('signed publication uses manifest identity for '+platform+'/'+arch,async()=>{
- const f=publishFixture({platform,arch,artifact_kind:platform==='windows'?'msi':'pkg'});await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.requests[0][0],'PUT');assert.deepEqual(json(f.requests[0][2]),f.env);assert.deepEqual(f.uploads[0],[f.file,platform,arch]);assert.equal(f.closed,1);assert.ok(f.toasts.some(x=>x[0]==='0.3.2 is now what these devices are offered.'));assert.ok(f.toasts.every(x=>!x[0].includes('9.9.9')));
+ const f=publishFixture({platform,arch,artifact_kind:platform==='windows'?'msi':'pkg'});await f.submit.handlers.click();assert.equal(f.requests.length,1);assert.equal(f.requests[0][0],'PUT');assert.deepEqual(json(f.requests[0][2]),f.env);assert.deepEqual(f.uploads[0].slice(0,3),[f.file,platform,arch]);assert.equal(f.closed,1);assert.ok(f.toasts.some(x=>x[0]==='0.3.2 is now what these devices are offered.'));assert.ok(f.toasts.every(x=>!x[0].includes('9.9.9')));
 });
 for(const [name,change] of Object.entries({size:m=>m.artifact_size=31,'string size':m=>m.artifact_size='32','unsafe size':m=>m.artifact_size=Number.MAX_SAFE_INTEGER+1,digest:m=>m.artifact_sha256='b'.repeat(64),platform:m=>m.platform='linux',arch:m=>m.arch='386',version:m=>m.version=''}))test('signed package rejects mismatched '+name+' before publication',async()=>{
  const f=publishFixture();const m={...f.m};change(m);f.signedFile.text=async()=>JSON.stringify({...f.env,payload_b64:Buffer.from(JSON.stringify(m)).toString('base64')});await f.submit.handlers.click();assert.equal(f.requests.length,0);assert.equal(f.uploads.length,0);assert.equal(f.closed,0);assert.equal(f.submit.disabled,false);assert.equal(f.toasts.length,1);
 });
-test('signed publication reports actual version when upload fails',async()=>{const f=publishFixture();f.c.arUploadArtifact=async()=>({ok:false,status:500,body:{error:'offline'}});await f.submit.handlers.click();assert.equal(f.closed,0);assert.ok(f.toasts.some(x=>x[0].startsWith('0.3.2 is published and waiting')));assert.ok(f.toasts.every(x=>!x[0].includes('9.9.9')))});
+test('signed publication reports actual version when upload fails',async()=>{const f=publishFixture();f.c.arUploadArtifact=async()=>({ok:false,status:500,body:{error:'offline'}});await f.submit.handlers.click();assert.equal(f.closed,0);assert.ok(f.nodes.some(n=>String(n.textContent).startsWith('0.3.2 was published, but package delivery could not be confirmed')));assert.ok(f.toasts.every(x=>!x[0].includes('9.9.9')))});
 for(const signed of [true,false])test('publication snapshots files and fields before hashing signed='+signed,async()=>{
- const f=publishFixture(),wait=deferred();if(!signed){f.c.window._arCanSign=true;f.inputs[1].files=[];f.inputs[1].handlers.change();f.fields.target.set('windows/amd64');f.fields.version.set('0.3.3')}
+ const f=publishFixture({},!signed),wait=deferred();if(!signed){f.c.window._arCanSign=true;f.inputs[1].files=[];f.inputs[1].handlers.change();f.fields.target.set('windows/amd64');f.fields.version.set('0.3.3')}
  f.c.arHash=async file=>{assert.equal(file,f.file);return wait.promise};const first=f.submit.handlers.click();f.inputs[0].files=[{name:'other.pkg',size:99}];f.inputs[0].handlers.change();f.inputs[1].files=[{text:async()=>'{broken'}];f.inputs[1].handlers.change();f.fields.target.set('darwin/amd64');f.fields.version.set('8.8.8');f.fields.url.set('https://changed.example.test/other.pkg');wait.resolve('a'.repeat(64));await first;
- assert.equal(f.requests.length,1);assert.equal(f.uploads[0][0],f.file);assert.deepEqual(f.uploads[0].slice(1),signed?['windows','arm64']:['windows','amd64']);
+ assert.equal(f.requests.length,1);assert.equal(f.uploads[0][0],f.file);assert.deepEqual(f.uploads[0].slice(1,3),signed?['windows','arm64']:['windows','amd64']);
  if(!signed){assert.equal(f.requests[0][0],'POST');const m=f.requests[0][2];assert.equal(m.artifact_size,32);assert.equal(m.version,'0.3.3');assert.equal(m.artifact_url,'https://wrong.example.test/form.pkg')}
 });
 test('signed digest comparison remains case insensitive',async()=>{const f=publishFixture({artifact_sha256:'A'.repeat(64)});f.c.arHash=async()=> 'a'.repeat(64);await f.submit.handlers.click();assert.equal(f.uploads.length,1)});
+
+for(const phase of ['hash','signed-file','publish','upload'])test('publication pins context and discards late completion during '+phase,async()=>{
+ const f=publishFixture(),wait=deferred();let valid=true;f.c.window._arReleaseReadContext.current=()=>valid;
+ const api=f.c.apiFetch,upload=f.c.arUploadArtifact;if(phase==='hash')f.c.arHash=()=>wait.promise;if(phase==='signed-file')f.signedFile.text=()=>wait.promise;if(phase==='publish')f.c.apiFetch=async(...a)=>{const r=await api(...a);await wait.promise;return r};if(phase==='upload')f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a);await wait.promise;return r};
+ const run=f.submit.handlers.click();for(let i=0;i<12;i++)await Promise.resolve();valid=false;f.mutation();wait.resolve(phase==='hash'?'a'.repeat(64):phase==='signed-file'?JSON.stringify(f.env):null);await run;
+ assert.equal(f.closed,1);assert.equal(f.toasts.length,0);assert.equal(f.rendered,0);assert.equal(f.requests.length,['publish','upload'].includes(phase)?1:0);assert.equal(f.uploads.length,phase==='upload'?1:0);
+});
+test('publication locks every control, ignores dismissal and blocks reentry while pending',async()=>{
+ const f=publishFixture(),wait=deferred();f.c.arHash=()=>wait.promise;const run=f.submit.handlers.click();const backdrop=f.nodes.findLast(n=>n.class==='ui-modal-backdrop');assert.ok(backdrop);const controls=allNodes(backdrop).filter(n=>['input','select','textarea','button'].includes(n.tag));assert.ok(controls.length>=7&&controls.every(n=>n.disabled));const count=f.nodes.length;f.c.openAgentReleaseForm(f.host);assert.equal(f.nodes.length,count);f.modal.footer[0].onClick();f.listeners.get('keydown')({key:'Escape'});backdrop.onClick({target:backdrop});assert.equal(f.closed,0);await f.submit.handlers.click();wait.resolve('a'.repeat(64));await run;assert.equal(f.requests.length,1);assert.equal(f.closed,1);
+});
+for(const mode of ['empty','scope','schema','status','target','version','size','digest','manifest','state'])test('publication refuses unconfirmed acknowledgement '+mode,async()=>{
+ const f=publishFixture(),api=f.c.apiFetch;f.c.apiFetch=async(...a)=>{const r=await api(...a),b=r.body;if(mode==='empty')r.body={};if(mode==='scope')b.tenant_id='other';if(mode==='schema')b.schema_version='other';if(mode==='status')r.status=206;if(mode==='target')b.published.arch='amd64';if(mode==='version')b.published.version='9.9.9';if(mode==='size')b.published.artifact_size++;if(mode==='digest')b.published.artifact_sha256='c'.repeat(64);if(mode==='manifest')b.manifest_sha256='c'.repeat(64);if(mode==='state')b.state='unknown';return r};await f.submit.handlers.click();assert.equal(f.closed,0);assert.equal(f.uploads.length,0);assert.equal(f.submit.disabled,false);assert.equal(f.toasts.length,0);assert.ok(f.nodes.some(n=>n.role==='alert'&&String(n.textContent).includes('may already be saved')));
+});
+for(const mode of ['empty','scope','schema','status','target','version','bytes','digest','manifest','active','activated'])test('upload refuses unconfirmed acknowledgement '+mode,async()=>{
+ const f=publishFixture(),upload=f.c.arUploadArtifact;f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a),b=r.body;if(mode==='empty')r.body={};if(mode==='scope')b.tenant_id='other';if(mode==='schema')b.schema_version='other';if(mode==='status')r.status=206;if(mode==='target')b.stored.arch='amd64';if(mode==='version')b.stored.version='9.9.9';if(mode==='bytes')b.stored.bytes++;if(mode==='digest')b.stored.artifact_sha256='c'.repeat(64);if(mode==='manifest')b.manifest_sha256='c'.repeat(64);if(mode==='active')b.active=false;if(mode==='activated')delete b.activated;return r};await f.submit.handlers.click();assert.equal(f.closed,0);assert.equal(f.submit.disabled,false);assert.equal(f.toasts.length,0);assert.ok(f.nodes.some(n=>n.role==='alert'&&String(n.textContent).includes('may already be active')));
+});
+for(const phase of ['publish','upload'])test('network rejection unlocks publication with persistent uncertainty and explicit retry '+phase,async()=>{const f=publishFixture(),method=phase==='publish'?'apiFetch':'arUploadArtifact',original=f.c[method];f.c[method]=async()=>{throw Error('connection lost')};await f.submit.handlers.click();assert.equal(f.closed,0);assert.equal(f.submit.disabled,false);assert.ok(f.nodes.some(n=>n.role==='alert'));f.c[method]=original;await f.submit.handlers.click();assert.equal(f.closed,1);assert.equal(f.toasts.at(-1)[1],'ok')});
+test('publication and upload carry the verified scope and acknowledged manifest pin',async()=>{const f=publishFixture();await f.submit.handlers.click();assert.match(f.requests[0][1],/expected_tenant_id=deployment/);assert.deepEqual(json(f.uploads[0][3]),{scope:'deployment',manifestSHA256:'b'.repeat(64)})});
+test('upload already active is accepted without claiming this request newly activated it',async()=>{const f=publishFixture(),upload=f.c.arUploadArtifact;f.c.arUploadArtifact=async(...a)=>{const r=await upload(...a);r.body.activated=false;return r};await f.submit.handlers.click();assert.equal(f.closed,1);assert.equal(f.toasts.at(-1)[1],'ok')});
+
+for (const kind of ['agent', 'connector']) test(kind + ' raw upload preserves its own route and authentication contract', async () => {
+ const f = fixture(), requests = [], bytes = new Uint8Array([1, 2, 3]);
+ Object.assign(f.c, { baseForPlane: () => '/control', localStorage: { getItem: () => 'unused-token' }, idpSession: { auth_method: 'admin_session', csrf_token: 'csrf' }, operateTenant: 'selected', fetch: async (url, opts) => { requests.push({ url, opts }); return { ok: true, status: 200, text: async () => '{"stored":true}' }; } });
+ const response = kind === 'agent'
+   ? await f.c.arUploadArtifact(bytes, 'windows', 'arm64', { scope: 'selected', manifestSHA256: 'b'.repeat(64) })
+   : await f.c.arUploadConnectorProgram(bytes, 'windows', 'arm64', 'c'.repeat(64), '0.3.2');
+ assert.equal(response.ok, true); assert.deepEqual(json(response.body), { stored: true }); assert.equal(requests.length, 1);
+ const { url, opts } = requests[0], q = new URL(url, 'http://localhost');
+ assert.equal(q.pathname, kind === 'agent' ? '/control/admin/agent-update-artifact' : '/control/admin/connector-program');
+ assert.equal(q.searchParams.get('platform'), 'windows'); assert.equal(q.searchParams.get('arch'), 'arm64');
+ assert.equal(q.searchParams.get('expected_tenant_id'), kind === 'agent' ? 'selected' : null);
+ assert.equal(q.searchParams.get('expected_manifest_sha256'), kind === 'agent' ? 'b'.repeat(64) : null);
+ assert.equal(opts.method, 'PUT'); assert.equal(opts.body, bytes); assert.equal(opts.credentials, 'include');
+ assert.equal(opts.headers['x-csrf-token'], 'csrf'); assert.equal(opts.headers['x-operate-tenant'], 'selected'); assert.equal(opts.headers.authorization, undefined);
+ if (kind === 'connector') { assert.equal(opts.headers['x-artifact-sha256'], 'c'.repeat(64)); assert.equal(opts.headers['x-artifact-version'], '0.3.2'); }
+});

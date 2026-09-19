@@ -279,3 +279,28 @@ certificate fingerprints, and whether the import was staged. The common audit
 records rejected requests. Device CA registration records the submitted public
 certificate fingerprints and its reported durability. No private key is included
 in these audit records. Audit delivery and fleet adoption need separate verification.
+
+## Replacing a node certificate from the Console
+
+In **Certificates**, select **Replace** for the intended node and supply its leaf
+certificate chain and matching private key. This changes that node's registered
+listener files; it is not a fleet-wide CA rotation. The current trust/admission
+checks still apply to replacements and rollbacks.
+
+Before changing the files, the server must save the currently served pair in the
+control-plane version store. This includes the original pair on the first
+replacement. If versioning is unavailable or that save fails, the request is
+refused and the replacement is not applied. **History / roll back** lists versions
+without their private-key payload; choosing a version restores its certificate
+and key after validating them against current trust. The internal version store
+contains private keys and needs the same access and backup protections as other
+PKI stores. A failed replacement can still leave a retained copy of the unchanged
+previous pair in history.
+
+Both destination files must be writable. New material is staged before changing
+either file; a handled commit failure attempts to restore the previous files.
+Separate certificate and key paths do not provide atomic pair replacement across
+power loss or process termination. If interrupted during replacement, verify that
+the on-disk certificate and key match before restarting the service. A failed
+restoration retains its recovery copy and reports that failure; do not interpret
+this as a successful replacement.

@@ -85,13 +85,13 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	// Deny admission and retain ownership when dependent cleanup reports a
 	// failure. A failed admission erase must keep its retry targets at restart.
 	if ledger != nil {
-		extra = tenantExtraStoresFor(extra, ledger, tenantID)
-		if _, err := ledger.RetireTenantChecked(tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+		if _, err := ledger.RetireTenantContext(ctx, tenantID, now.UTC().Format(time.RFC3339)); err != nil {
 			result.Failures = append(result.Failures, "tenant identity retirement saving could not be confirmed")
 			result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now)
 			result.ElapsedMS = time.Since(started).Milliseconds()
 			return result
 		}
+		extra = tenantExtraStoresFor(extra, ledger, tenantID)
 	}
 
 	credentialSweepAllowed := true
@@ -105,7 +105,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "admin_accounts", Count: int64(len(removed))})
 		}
 	}
-	extra.erase(&result)
+	extra.eraseContext(ctx, &result)
 	// ★ The authored rules an organization wrote in the Console. Measured on 2026-08-17: an organization
 	// deleted through the Console left its access rule on BOTH planes, still carrying its id — the one thing
 	// it had authored outliving the organization itself.
@@ -150,7 +150,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		}
 	}
 	if ledger != nil && len(result.Failures) == 0 {
-		removed, err := ledger.RemoveTenantChecked(tenantID)
+		removed, err := ledger.RemoveTenantContext(ctx, tenantID)
 		if err != nil {
 			result.Failures = append(result.Failures, "tenant identity erasure saving could not be confirmed")
 		} else if len(removed) > 0 {

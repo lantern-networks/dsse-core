@@ -420,6 +420,10 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 
 // erase removes every record these stores hold for the tenant, appending a row per store that had any.
 func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
+	e.eraseContext(context.Background(), result)
+}
+
+func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminTenantPurgeResult) {
 	add := func(store string, n int) {
 		if n > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: store, Count: int64(n)})
@@ -447,14 +451,14 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		add("end_user_idp_connections", e.IdPConnections.RemoveTenant(tenantID))
 	}
 	if e.HighRisk != nil {
-		if n, err := e.HighRisk.RemoveTenantRisksChecked(tenantID, e.DeviceIDs); err != nil {
+		if n, err := e.HighRisk.RemoveTenantRisksContext(ctx, tenantID, e.DeviceIDs); err != nil {
 			result.Failures = append(result.Failures, "risk erasure saving could not be confirmed")
 		} else {
 			add("high_risk_marks", n)
 		}
 	}
 	if e.Admissions != nil {
-		if n, err := e.Admissions.RemoveDevicesChecked(e.DeviceIDs); err != nil {
+		if n, err := e.Admissions.RemoveDevicesContext(ctx, e.DeviceIDs); err != nil {
 			result.Failures = append(result.Failures, "admission revocation erasure saving could not be confirmed")
 		} else {
 			add("admission_kill_switches", n)
@@ -471,7 +475,7 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.SeatAllocations != nil {
-		if n, err := e.SeatAllocations.RemoveTenant(tenantID); err != nil {
+		if n, err := e.SeatAllocations.RemoveTenantContext(ctx, tenantID); err != nil {
 			result.Failures = append(result.Failures, "seat allocation erasure could not be confirmed")
 		} else {
 			add("seat_allocation", n)

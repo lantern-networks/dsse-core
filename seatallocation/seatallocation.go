@@ -244,10 +244,14 @@ func (s *Store) CountForTenant(tenantID string) int {
 }
 
 func (s *Store) RemoveTenant(tenantID string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenantID)
+}
+
+func (s *Store) RemoveTenantContext(ctx context.Context, tenantID string) (int, error) {
 	if s == nil {
 		return 0, nil
 	}
-	removed, err := s.RemoveConfirmed(tenantID)
+	removed, err := s.RemoveConfirmedContext(ctx, tenantID)
 	if err != nil {
 		return 0, err
 	}

@@ -617,7 +617,7 @@ func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentia
 		}
 	}
 	if ledger != nil {
-		if n, err := ledger.RetireTenantChecked(tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+		if n, err := ledger.RetireTenantContext(ctx, tenantID, now.UTC().Format(time.RFC3339)); err != nil {
 			result["enrolled_identities_error"] = "identity retirement saving could not be confirmed"
 		} else if n > 0 {
 			result["enrolled_identities"] = n

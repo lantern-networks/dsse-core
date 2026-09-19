@@ -157,6 +157,15 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			"withheld_unattributable": withheld,
 		})
 	}))
+	auditIncoming := func(r *http.Request, target, action string, err error) {
+		now := time.Now().UTC()
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+		row := model.AuditLog{ID: randomEdgeID("audit_incoming_", now), TenantID: adminTenantIDFromRequest(r), ActorUserID: auditActorPrincipal(r), EventType: "admin_incoming_changed", TargetType: stringPtr("incoming_policy"), TargetID: stringPtr(target), Action: stringPtr(action), Result: &result, Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID}
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, row, now)
+	}
 	mux.HandleFunc("POST /admin/server-initiated", adminEndpoint("admin.serverinitiated.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "server-initiated config") {
 			return
@@ -169,11 +178,22 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 			return
 		}
-		if s, ok := policyStore.(interface {
-			SetServerInitiatedEnabled(string, bool)
-		}); ok {
-			s.SetServerInitiatedEnabled(adminTenantIDFromRequest(r), req.Enabled)
+		setter, ok := policyStore.(interface{ SetServerInitiatedEnabledConfirmed(string, bool) error })
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
+			return
 		}
+		err := setter.SetServerInitiatedEnabledConfirmed(adminTenantIDFromRequest(r), req.Enabled)
+		action := "allow_default"
+		if req.Enabled {
+			action = "block_default"
+		}
+		auditIncoming(r, adminTenantIDFromRequest(r), action, err)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy save could not be confirmed. Reload before retrying."))
+			return
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{"server_initiated_enabled": req.Enabled})
 	}))
 	mux.HandleFunc("GET /admin/server-initiated", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
@@ -211,23 +231,43 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if s, ok := policyStore.(interface {
-			UpsertLegacyException(string, model.LegacyException)
-		}); ok {
-			s.UpsertLegacyException(ex.TenantID, ex)
+		setter, ok := policyStore.(interface {
+			UpsertLegacyExceptionConfirmed(string, model.LegacyException) error
+		})
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
+			return
 		}
+		err := setter.UpsertLegacyExceptionConfirmed(ex.TenantID, ex)
+		auditIncoming(r, ex.ID, "upsert_exception", err)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception save could not be confirmed. Reload before retrying."))
+			return
+		}
+
 		writeJSON(w, http.StatusOK, ex)
 	}))
 	mux.HandleFunc("DELETE /admin/legacy-exceptions/{id}", adminEndpoint("admin.serverinitiated.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy exceptions") {
 			return
 		}
-		removed := false
-		if s, ok := policyStore.(interface {
-			RemoveLegacyException(string, string) bool
-		}); ok {
-			removed = s.RemoveLegacyException(adminTenantIDFromRequest(r), r.PathValue("id"))
+		setter, ok := policyStore.(interface {
+			RemoveLegacyExceptionConfirmed(string, string) (bool, error)
+		})
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
+			return
 		}
+		removed, err := setter.RemoveLegacyExceptionConfirmed(adminTenantIDFromRequest(r), r.PathValue("id"))
+		if err != nil {
+			auditIncoming(r, r.PathValue("id"), "remove_exception", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception removal could not be confirmed. Reload before retrying."))
+			return
+		}
+		if removed {
+			auditIncoming(r, r.PathValue("id"), "remove_exception", nil)
+		}
+
 		if !removed {
 			writeError(w, http.StatusNotFound, fmt.Errorf("exception %s not found", r.PathValue("id")))
 			return

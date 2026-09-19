@@ -207,7 +207,7 @@ func (store *Store) persistLockedChecked() error {
 	if err := store.runtimeStatePersister.Save(data); err != nil {
 		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their change was
 		// lost when it was written; saying nothing would hide that an interrupted write could truncate it.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("admin_policy_runtime_state persist: saved, but NOT atomically — %v", err)
 		} else {
 			return fmt.Errorf("save failed: %w", err)

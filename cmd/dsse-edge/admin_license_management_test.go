@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ecdsa"
 	"errors"
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/seatallocation"
 	"github.com/lantern-networks/dsse-core/vendorlicense"
@@ -141,4 +142,27 @@ func TestSeatManagementOperatorCanReleaseCustomerButCustomerCannot(t *testing.T)
 		t.Fatalf("audit counts: allocation=%d invitation=%d", changes, invites)
 	}
 
+}
+
+type unconfirmedLicenseSave struct{ licensingFaultStore }
+
+func (p *unconfirmedLicenseSave) Save(raw []byte) error {
+	p.raw = append([]byte(nil), raw...)
+	return errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)
+}
+func TestUnconfirmedLicenseFlushDoesNotConsumeSerial(t *testing.T) {
+	_, key, _, _, d := licenceAdminFixture(t)
+	d.acceptedKeys = []*ecdsa.PublicKey{&key.PublicKey}
+	p := &unconfirmedLicenseSave{}
+	d.licence.SetPersister(p)
+	env, err := vendorlicense.Sign(testLicence(20), "review", key, licenceNow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.licence.Apply(env, d.acceptedKeys, d.msspID, "operator", licenceNow().Format(time.RFC3339)); !errors.Is(err, errLicensePersistence) {
+		t.Fatal(err)
+	}
+	if d.licence.LastAcceptedSerial() != 0 {
+		t.Fatal("unconfirmed serial consumed")
+	}
 }

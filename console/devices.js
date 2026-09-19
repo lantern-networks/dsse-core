@@ -451,7 +451,7 @@ async function renderList(host) {
   // max(its own overlay risk, its group's floor). Fetch the registry so this list REFLECTS the group floor.
   // NOTE: this is the display (R3). Enforcement — the decision engine acting on the floor — is the separate R1
   // step, see docs/device_group_risk_floor_union_resolution_design.ja.md.
-  let groupRisk = {};
+  let groupRisk = Object.create(null);
   try {
     const rg = await apiFetch("GET", "/admin/device-groups");
     if (rg.ok && rg.body && rg.body.groups) rg.body.groups.forEach((g) => { groupRisk[(g.name || "").trim().toLowerCase()] = g.risk || ""; });
@@ -495,7 +495,7 @@ async function renderList(host) {
     const rt = runtime[d.identity] || runtime[deviceKey(d.identity)] || {};
     // Every join on a device name goes through deviceKey — see ui.js for the two spellings that made this necessary.
     const obs = steerState[deviceKey(d.identity)];
-    const sev = riskMap[d.identity]; // the device's OWN overlay mark
+    const sev = Object.hasOwn(riskMap, d.identity) ? riskMap[d.identity] : undefined; // the device's OWN overlay mark
     const grpSev = groupRisk[(d.group || "").trim().toLowerCase()] || "";
     // Effective risk is resolved SERVER-SIDE (effective_risk) with the decision path's helper (folds in device-store
     // metadata the Console can't see; never reads LOWER than enforcement). Fall back to max(overlay, floor) if omitted.

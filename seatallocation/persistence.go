@@ -65,7 +65,7 @@ func (s *Store) persistLocked() {
 		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
 		// change was lost when it was written; saying nothing would hide that an interrupted write could
 		// truncate it. Both are worth exactly one accurate sentence.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("seat_allocations persist: saved, but NOT atomically — %v", err)
 		} else {
 			log.Printf("seat_allocations persist: save failed: %v", err)
@@ -84,7 +84,7 @@ func (s *Store) saveCandidateLocked(candidate map[string]Allocation) error {
 	if err == nil {
 		err = s.persister.Save(raw)
 	}
-	if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+	if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 		log.Printf("seat_allocations persist: saved without atomic replacement: %v", err)
 		return nil
 	}

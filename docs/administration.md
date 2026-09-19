@@ -1286,3 +1286,18 @@ records identify the acting principal, target tenant, requested seat count (for
 allocation), and outcome. Operator invitation records identify both the inviting
 principal and the new account, without recording the activation link. Management
 saves and audit delivery are separate operations.
+
+
+### Saving incoming-connection policy
+
+Incoming Connections saves the default and reviewed exceptions before reporting
+success or publishing their in-process state. When configured storage cannot
+confirm a save, the API returns 503 and preserves the previous live state.
+Reload before retrying: an error can occur after replacement but before a durable
+flush is confirmed. A completed, synced in-place write remains accepted.
+The same distinction applies to licence and seat-allocation saves.
+
+Incoming-policy audit events identify the tenant, acting principal, target
+exception (or tenant default), action and result. These records describe the
+management operation; they do not prove that a Windows endpoint has applied the
+firewall policy. Confirm endpoint enforcement separately.

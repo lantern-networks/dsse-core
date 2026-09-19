@@ -82,7 +82,7 @@ func (s *licenseStore) Apply(env vendorlicense.Envelope, accepted []*ecdsa.Publi
 		if mErr == nil {
 			mErr = s.persister.Save(data)
 		}
-		if mErr != nil && !errors.Is(mErr, blobstore.ErrSavedWithoutAtomicity) {
+		if mErr != nil && (!errors.Is(mErr, blobstore.ErrSavedWithoutAtomicity) || errors.Is(mErr, blobstore.ErrDurabilityUnconfirmed)) {
 			log.Printf("vendor_license persist: save failed: %v", mErr)
 			return vendorlicense.Payload{}, errLicensePersistence
 		}

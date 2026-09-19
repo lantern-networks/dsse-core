@@ -74,3 +74,27 @@ func TestConfirmedNonAtomicAllocationSaveRemainsAccepted(t *testing.T) {
 		t.Fatal("confirmed save not adopted")
 	}
 }
+
+func TestUnconfirmedFlushDoesNotPublishAllocation(t *testing.T) {
+	p := &allocationFaultStore{}
+	s := NewStore()
+	s.SetPersister(p)
+	if _, err := s.Allocate(Policy{PoolSeats: 20}, "customer", 5, "operator", "", "now"); err != nil {
+		t.Fatal(err)
+	}
+	gen := s.Generation()
+	s.SetPersister(unconfirmedAllocationSave{p})
+	if _, err := s.Allocate(Policy{PoolSeats: 20}, "customer", 10, "operator", "", "later"); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("unconfirmed flush accepted: %v", err)
+	}
+	if s.SeatsFor("customer") != 5 || s.Generation() != gen {
+		t.Fatal("unconfirmed save published")
+	}
+}
+
+type unconfirmedAllocationSave struct{ *allocationFaultStore }
+
+func (p unconfirmedAllocationSave) Save(raw []byte) error {
+	p.raw = append([]byte(nil), raw...)
+	return errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)
+}

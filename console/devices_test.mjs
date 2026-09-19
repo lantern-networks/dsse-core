@@ -620,3 +620,21 @@ test('a late registry retry cannot replace a newer retry failure', async () => {
   assert.match(f.states.at(-1).message,/HTTP 403/);assert.equal(f.button('Assign').disabled,true);assert.equal(f.button('QA'),undefined);
   assert.equal(f.calls.filter(c=>c[0]==='POST').length,0);
 });
+
+
+test('overview aggregation handles reserved property names for missing and configured groups', async () => {
+  const context = vm.createContext({ console });
+  vm.runInContext(source, context);
+  vm.runInContext(readFileSync(new URL('./overview.js', import.meta.url), 'utf8'), context);
+  context.byDeviceIdentity = () => Object.create(null);
+  context.deviceKey = x => x;
+  context.deviceStateOf = () => ({ offline: true, excluded: 0 });
+  for (const groups of [[], [{ name: '__proto__', risk: 'high' }]]) {
+    context.apiFetch = async (_, path) => ({ ok: true, status: 200, body:
+      path === '/admin/enrolled-devices' ? { devices: [{ identity: '__proto__', group: '__proto__', enabled: true }] } :
+      path === '/admin/device-groups' ? { groups } : {} });
+    const got = await context.ovDeviceAggregate();
+    assert.equal(got.total, 1);
+    assert.equal(got.risk[groups.length ? 'high' : 'none'], 1);
+  }
+});

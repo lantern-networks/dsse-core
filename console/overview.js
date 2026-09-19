@@ -316,11 +316,11 @@ async function ovDeviceAggregate() {
   const runtime = (rt.ok && rt.body && rt.body.devices) || {};
   const steer = byDeviceIdentity((ob.ok && ob.body && ob.body.observed) || []);
   const riskMap = (rk.ok && rk.body && rk.body.high_risk) || {};
-  const groupRisk = {}; ((gr.ok && gr.body && gr.body.groups) || []).forEach((g) => { groupRisk[(g.name || "").trim().toLowerCase()] = g.risk || ""; });
+  const groupRisk = Object.create(null); ((gr.ok && gr.body && gr.body.groups) || []).forEach((g) => { groupRisk[(g.name || "").trim().toLowerCase()] = g.risk || ""; });
   out.total = devices.length;
   devices.forEach((d) => {
     const r = runtime[d.identity] || runtime[deviceKey(d.identity)] || {}; const obs = steer[deviceKey(d.identity)];
-    const sev = riskMap[d.identity]; const grp = groupRisk[(d.group || "").trim().toLowerCase()] || "";
+    const sev = Object.hasOwn(riskMap, d.identity) ? riskMap[d.identity] : undefined; const grp = groupRisk[(d.group || "").trim().toLowerCase()] || "";
     const eff = (d.effective_risk && d.effective_risk.trim()) || (typeof riskMax === "function" ? riskMax(sev || "none", grp || "none") : (sev || "none"));
     out.risk[eff] = (out.risk[eff] || 0) + 1;
     const st = (typeof deviceStateOf === "function") ? deviceStateOf(d, obs, r, eff) : { steering: r.steer_active === true, offline: !obs, blocked: !d.enabled, failOpen: false, excluded: 0 };

@@ -36,6 +36,13 @@ handling. EDM datasets retain hashes after submission; see [DLP](dlp.md) and [PK
 4. When exporting, verify the job's final state and the downloaded artifact before
    treating it as evidence. Keep its tenant, filters, time interval, and access restrictions.
 
+Actor fields vary by event family. Tenant lifecycle and tenant-settings records keep
+`actor_user_id` empty under the tenant audit contract and identify the authenticated
+administrator in `metadata.actor_admin_principal_id` and `metadata.actor_tenant_id`.
+Other administrative events can use `actor_user_id`. When correlating records, inspect
+both representations; an empty top-level actor field alone does not mean the actor
+was unrecorded.
+
 The Console routes `audit`, `access`, `device_state`, `inspection_events`, and
 `config_generations` queries to the control plane; other streams can be read from the
 Edge. Store contents, recent-window limits, and delivery delay can therefore differ.

@@ -95,7 +95,7 @@ function ovPanel(title, more) {
   return { panel, body, setMore: (t) => { const m = head.querySelector(".ov-more"); if (m) m.textContent = t; else head.appendChild(el("span", { class: "ov-more", text: t })); } };
 }
 function ovEmpty(msg) { return el("div", { class: "ov-empty", text: msg }); }
-function ovGoto(view) { try { if (typeof selectView === "function") selectView(view); else location.hash = "#" + view; } catch (e) {} }
+function ovGoto(view) { renderGroup(view === "devices" ? "enrolled" : view === "connectors" ? "sites" : view); }
 function ovLeg(color, label, val, valColor) { return el("span", { class: "ov-metric" }, [el("i", { style: "display:inline-block;width:9px;height:9px;border-radius:2px;background:" + color + ";margin-right:7px" }), document.createTextNode(label), el("b", { style: "float:right;font-variant-numeric:tabular-nums;" + (valColor ? "color:" + valColor : ""), text: String(val) })]); }
 function ovLegSmall(color, text) { return el("span", {}, [el("i", { style: "display:inline-block;width:9px;height:9px;border-radius:2px;background:" + color + ";margin-right:5px;vertical-align:-1px" }), document.createTextNode(text)]); }
 

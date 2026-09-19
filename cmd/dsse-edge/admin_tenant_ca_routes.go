@@ -272,8 +272,14 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			logInfof("tenant_ca_registered_but_not_durable tenant=%s err=%v", tenantID, err)
 		}
 		now := time.Now()
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
-			adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_register", evaluator, now), now)
+		audit := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_register", evaluator, now)
+		fingerprints := []string{}
+		for _, cert := range parseAllCerts([]byte(req.CAPEM)) {
+			fingerprints = append(fingerprints, tenantca.CAAnchorKey(cert))
+		}
+		audit.Metadata["ca_sha256"] = fingerprints
+		audit.Metadata["durable"] = durable
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"tenant_id":  tenantID,
 			"ca_added":   len(added),

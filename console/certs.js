@@ -1618,7 +1618,7 @@ function tenantInterceptionCAControl(host) {
   const line = el("div", { class: "ui-view-desc", style: "margin-top:6px" });
   const add = el("button", { class: "ui-btn ui-btn-sm ui-btn-primary",
     text: bl({ en: "Load this tenant's interception CA", ja: "このテナントの傍受CAを入れる" }) });
-  add.addEventListener("click", () => openTenantInterceptionCAForm(host));
+  add.addEventListener("click", () => openTenantInterceptionCAForm(host, !!(_pkiTenantInterception && _pkiTenantInterception.has_authority)));
 
   // ★★★ THE ORDINARY CASE HAD NO BUTTON, ONLY A curl (2026-09-06, the operator: "PKI that is only completable
   // with curl should not exist — all of it belongs in the Admin Console").
@@ -1660,6 +1660,10 @@ function tenantInterceptionCAControl(host) {
   // unchanged, so a button shown beside one that exists is a control that cannot fail and teaches nothing.
   const answered = !!_pkiTenantInterception && typeof _pkiTenantInterception.has_authority === "boolean";
   const hasOwn = !!(_pkiTenantInterception && _pkiTenantInterception.has_authority);
+  // Importing another authority stages it; it does not replace the active signer.
+  // Keep that existing operation reachable once an authority has been installed.
+  if (hasOwn) add.textContent = bl({ en: "Stage a replacement CA", ja: "次のCAを登録" });
+  add.disabled = !answered || !!(_pkiTenantInterception && _pkiTenantInterception.staged);
   card.appendChild(el("div", { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap" }, [
     el("strong", { text: bl({ en: "This tenant's interception authority", ja: "このテナントの傍受の権威" }) }),
     el("span", { style: "flex:1 1 auto" }),
@@ -1675,8 +1679,8 @@ function tenantInterceptionCAControl(host) {
   const st = _pkiMapCustody || {};
   const mode = String(st.mode || "");
   const known = {
-    own_offline_root: { en: "Traffic is inspected under this tenant's own root. Replacing it takes effect immediately, so distribute the new root to its devices first.",
-                        ja: "このテナント自身のルートで傍受しています。差し替えは即時に効くので、先に新しいルートを端末へ配ってください。" },
+    own_offline_root: { en: "Traffic is inspected under this tenant's own root. A replacement is staged while devices adopt it; the current authority remains in use until promotion.",
+                        ja: "このテナント自身のルートで傍受しています。次のCAは端末の信頼設定が整うまで待機し、切り替えまで現在のCAを使います。" },
     node_intermediate: { en: "This tenant is inspected under the deployment's own intermediate — the anchor its devices already trust — rather than a root of its own.",
                          ja: "このテナントは、自前のルートではなく配備側の中間で傍受されています（端末が既に信頼しているアンカー）。" },
     none: { en: "This tenant has no interception authority of its own, so its traffic is not inspected at all — it is deliberately not signed under another tenant's CA. Two ways out, and a tenant is in one of them: let this deployment make a root for it, or load a root it already has.",
@@ -1731,8 +1735,6 @@ function tenantInterceptionCAControl(host) {
         "。実際に何で傍受されているかは Edge の答えで、この画面は制御プレーンに訊いています（制御プレーンは" +
         "権威を保持しますが通信は扱いません）。",
     });
-    // Nothing to load: offering it here is how an operator replaces an authority that already exists.
-    add.style.display = "none";
     return card;
   }
   // An unrecognised mode says what it is rather than picking the most alarming branch by default — the whole
@@ -1754,7 +1756,7 @@ function tenantInterceptionCAControl(host) {
   return card;
 }
 
-function openTenantInterceptionCAForm(host) {
+function openTenantInterceptionCAForm(host, replacing = false) {
   // uiField is the whole form vocabulary on this screen — get()/setError() and nothing invented. (An earlier
   // draft of this control called a uiTextarea that does not exist, which would have rendered an empty modal
   // and told nobody why. Same family as the response keys the Console once invented for itself.)
@@ -1770,9 +1772,11 @@ function openTenantInterceptionCAForm(host) {
   const key = field("intermediate_key_pem", { en: "Issuing private key — this is a key, not a certificate", ja: "発行用の秘密鍵 — これは証明書ではなく鍵です" },
     { en: "The key belonging to the issuing certificate. The Edge signs with it and never returns it.",
       ja: "発行証明書に対応する鍵です。Edge が署名に使い、返すことはありません。" });
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Load", ja: "入れる" }) });
+  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl(replacing
+    ? { en: "Stage replacement", ja: "次のCAを登録" } : { en: "Load", ja: "入れる" }) });
   const m = uiModal({
-    title: bl({ en: "Load this tenant's interception CA", ja: "このテナントの傍受CAを入れる" }),
+    title: bl(replacing ? { en: "Stage a replacement interception CA", ja: "次の傍受CAを登録" }
+      : { en: "Load this tenant's interception CA", ja: "このテナントの傍受CAを入れる" }),
     body: [
       el("p", { class: "ui-view-desc", text: bl({
         en: "This authority decrypts this tenant's traffic. It is issued from the tenant's own offline root, never from the provider's — the two are independent, and the provider does not hold this root. Its devices must trust the root before this takes effect.",
@@ -1808,8 +1812,11 @@ function openTenantInterceptionCAForm(host) {
     const r = await apiFetch("POST", "/admin/tenant-interception-authority", body);
     if (!r.ok) { submit.disabled = false; const msg = (r.body && r.body.error) || ("HTTP " + r.status); key.setError(msg); uiToast(msg, "err"); return; }
     m.close();
-    uiToast(bl({ en: "Loaded. This tenant's traffic is inspected under its own authority from now on.",
-                 ja: "入れました。以後、このテナントの通信は自前の権威で傍受します。" }), "ok");
+    uiToast(bl(r.body && r.body.staged === true
+      ? { en: "Replacement staged. The current authority remains in use. Wait for device adoption before switching.",
+          ja: "次のCAを登録しました。現在のCAは使用を続けます。端末の信頼設定が整ってから切り替えてください。" }
+      : { en: "Authority saved. Each Edge applies it on its next refresh; devices must trust its root before inspection.",
+          ja: "CAを保存しました。各Edgeは次回の取得で反映します。傍受には端末がルートを信頼している必要があります。" }), "ok");
     loadCertMap(host);
   });
 }

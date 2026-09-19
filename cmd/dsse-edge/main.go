@@ -5471,7 +5471,17 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerConnectorReportRoute(mux, registry, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)
 	registerTenantTransportAuthorityAdminRoute(mux, adminEndpoint, config.TenantTransportAuthority)
-	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore, newPKITransitionAdmission(config))
+	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore,
+		func(r *http.Request, tenant, action string, row *storedTenantInterceptionIssuer) {
+			root, _ := summarizeCertificatePEM(row.RootPEM)
+			issuer, _ := summarizeCertificatePEM(row.IssuingCertPEM)
+			entry := pkiMaterialAuditLog(tenant, action, "tenant_interception_authority", tenant,
+				"Interception authority saved; a staged replacement is not yet signing.",
+				map[string]any{"root_sha256": root.SHA256, "issuing_sha256": issuer.SHA256,
+					"staged": action == "interception_authority_staged"},
+				principalIDForAudit(r), sourceIPFromRequest(r), evaluator)
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, entry, time.Now())
+		}, newPKITransitionAdmission(config))
 	registerTenantDeviceAuthorityAdminRoute(mux, adminEndpoint, config.TenantDeviceAuthority,
 		strings.TrimSpace(config.ConfigSourceURL), config.TenantModelStore, newPKITransitionAdmission(config))
 	// ★ And the READS for those two tiers, which did not exist until 2026-08-22: every act had a door and

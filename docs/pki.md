@@ -257,3 +257,25 @@ a SHA-256 certificate fingerprint; certificate PEM, private keys and display nam
 are not copied into this event. The common configuration-change audit also records
 the HTTP outcome. Fleet propagation and storage/audit durability require deployment
 verification in addition to a successful Console response.
+
+
+### Importing and replacing a tenant interception CA
+
+In **Certificates**, use **Load this tenant's interception CA** for the first import.
+Provide the public root certificate, the issuing CA certificate and its matching
+issuing private key. Keep the root private key offline. Devices must trust the root
+before inspection, and each Edge receives the saved authority on its next refresh.
+
+Once an authority exists, **Stage a replacement CA** registers the next authority.
+The current authority continues signing while devices adopt the incoming root.
+The Console disables another import while a replacement is staged. Switch only
+after the adoption checks permit it. Missing fleet evidence prevents promotion
+and withdrawal; saving the replacement alone does not complete the rotation.
+If saving fails, reload the authority state after restoring storage before retrying.
+
+**Logs & Audit** records successful first imports and staged replacements as
+`pki_material_changed`, including the organization, administrator, root and issuing
+certificate fingerprints, and whether the import was staged. The common audit
+records rejected requests. Device CA registration records the submitted public
+certificate fingerprints and its reported durability. No private key is included
+in these audit records. Audit delivery and fleet adoption need separate verification.

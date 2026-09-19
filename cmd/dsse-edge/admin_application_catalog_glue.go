@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"strings"
 	"time"
 
@@ -168,4 +169,20 @@ func adminApplicationPublishAuditLog(application appcatalog.Entry, evaluator dec
 			"reason_codes":                        []string{"admin_application_publish_lifecycle"},
 		},
 	}
+}
+
+// Preserve the target application tenant while attributing the authenticated caller.
+func applicationAuditWithActor(r *http.Request, record model.AuditLog) model.AuditLog {
+	record.ActorUserID = auditActorPrincipal(r)
+	if r != nil {
+		if identity, ok := adminIdentityFromRequest(r); ok && identity.TenantID != "" && identity.TenantID != record.TenantID {
+			if record.Metadata == nil {
+				record.Metadata = map[string]any{}
+			}
+			// Application domain audits retain opaque attribution, not directory labels.
+			identity.PrincipalLabel = ""
+			stampOperatorActor(record.Metadata, identity)
+		}
+	}
+	return record
 }

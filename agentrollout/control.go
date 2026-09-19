@@ -268,16 +268,18 @@ func (s *AgentRolloutStore) LoadFromPersister(blob Persister) error {
 	if err != nil {
 		return fmt.Errorf("read the shared agent rollout store: %w", err)
 	}
-	var plans map[string]AgentRolloutPlan
-	if len(raw) > 0 {
-		if jerr := json.Unmarshal(raw, &plans); jerr != nil {
-			return fmt.Errorf("the shared agent rollout store is unreadable (%w) — refusing to start with an "+
-				"unknown halt state rather than answering \"not frozen\" to every edge", jerr)
+	// Only nil denotes an absent snapshot under the Persister contract. An
+	// existing zero-byte file is corrupt, not a new deployment.
+	plans := make(map[string]AgentRolloutPlan)
+	if raw != nil {
+		plans, err = decodeRolloutSnapshot(raw)
+		if err != nil {
+			return fmt.Errorf("read the shared agent rollout store: %w", err)
 		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if plans != nil {
+	if raw != nil {
 		s.plans = plans
 	}
 	s.blob = blob
@@ -300,8 +302,8 @@ func (s *AgentRolloutStore) LoadFrom(path string) error {
 	if err != nil {
 		return fmt.Errorf("read the agent rollout store %s: %w", path, err)
 	}
-	var plans map[string]AgentRolloutPlan
-	if jerr := json.Unmarshal(raw, &plans); jerr != nil {
+	plans, jerr := decodeRolloutSnapshot(raw)
+	if jerr != nil {
 		// ★ NOT ignored. A halt that cannot be read is not "no halt": the caller decides, and the edge-facing
 		// answer for an unreadable authority is to hold, not to release.
 		return fmt.Errorf("the agent rollout store %s is unreadable (%w) — refusing to start with an unknown "+
@@ -309,9 +311,7 @@ func (s *AgentRolloutStore) LoadFrom(path string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if plans != nil {
-		s.plans = plans
-	}
+	s.plans = plans
 	s.path = path
 	return nil
 }
@@ -359,7 +359,9 @@ func (s *AgentRolloutStore) Get(tenantID string) AgentRolloutPlan {
 // The merge rules are the operator's expectations, stated once:
 //   - a schedule change does NOT touch the halt (that is what intent=schedule is for),
 //   - a halt change does NOT touch the schedule (an incident is not the moment to restate a wave plan),
-//   - anything the request does not carry keeps its previous value.
+//   - version selection (rollout/rollback) replaces version and channel together;
+//     an omitted channel clears the old channel. Follow clears both fields,
+//   - freeze keeps version/channel when omitted, and absent window/waves stay unchanged.
 func (s *AgentRolloutStore) Apply(tenantID string, in AgentRolloutPlan, now time.Time) (AgentRolloutPlan, error) {
 	if s == nil {
 		return AgentRolloutPlan{}, nil
@@ -383,8 +385,18 @@ func (s *AgentRolloutStore) Apply(tenantID string, in AgentRolloutPlan, now time
 		// version, and it must not release a fleet somebody halted — the same rule the schedule intent has, in
 		// the other direction.
 		merged.DesiredVersion, merged.ReleaseChannel = "", ""
-	default:
+	case AgentRolloutIntentFreeze:
+		// A halt/release changes movement, not the version already selected.
 		merged.Frozen, merged.Reason = in.Frozen, in.Reason
+		if in.DesiredVersion != "" {
+			merged.DesiredVersion = in.DesiredVersion
+		}
+		if in.ReleaseChannel != "" {
+			merged.ReleaseChannel = in.ReleaseChannel
+		}
+	default:
+		// Selecting a version must not release an incident hold. Only an explicit
+		// freeze=false decision, with its required reason, may do that.
 		merged.DesiredVersion, merged.ReleaseChannel = in.DesiredVersion, in.ReleaseChannel
 	}
 	merged.Intent = in.Intent

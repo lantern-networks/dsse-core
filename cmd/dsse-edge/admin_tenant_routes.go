@@ -122,10 +122,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		updated, err := tenantModelStore.Update(r.Context(), tenant, adminTenantIDFromRequest(r), now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLog(updated, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLogFor(r, updated, evaluator, now), now)
 		writeJSON(w, http.StatusOK, updated)
 	}))
 	// Cross-tenant (super-admin) tenant administration: list every tenant, create/upsert an arbitrary tenant,
@@ -241,7 +241,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenant = preserveOperatorEnvelopeOnUpsert(r.Context(), adminStore, tenant, bodyNamesOperatorEnvelope(raw))
 		saved, err := adminStore.Put(r.Context(), tenant, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, saved, action, evaluator, now), now)
@@ -345,6 +345,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// removes the row that says whose data this is; a preservation order that permits that is not a
 		// preservation order. Refusing is the fail-safe direction — a hold that is genuinely finished is lifted
 		// deliberately, and that lifting is itself on the record.
+		if err := config.LegalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so it cannot be deleted; lift the hold first "+
@@ -353,10 +357,9 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		now := time.Now()
 		if err := adminStore.Delete(r.Context(), tenantID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now), now)
 		cascade := cascadeTenantDeletion(r.Context(), config.LocalCredentials, adminAuth, config.EnrolledLedger, tenantID, now)
 
 		// ★★★ RECORDS MAY WAIT FOR THE PURGE; A LIVE CERTIFICATE AUTHORITY MAY NOT (2026-08-21, measured).
@@ -397,6 +400,26 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		remaining := countAdminTenantFootprint(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore, config.TenantCARegistry, namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now)
+		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		cascadeComplete := true
+		for key, value := range cascade {
+			if strings.HasSuffix(key, "_error") {
+				cascadeComplete = false
+			}
+			if key == "sessions_revoked" {
+				if _, ok := value.(int); !ok {
+					cascadeComplete = false
+				}
+			}
+		}
+		outcome := "success"
+		if !cascadeComplete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["cascade_complete"] = cascadeComplete
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		body := map[string]any{
 			"tenant_id": tenantID,
 			"deleted":   true,
@@ -486,6 +509,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// a hold is for. Nothing about an operator being authorised to erase makes the hold irrelevant: the
 		// hold is what says this particular organization must not be erased YET, and it is released by lifting
 		// it, deliberately and on the record.
+		if err := config.LegalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so its data must be preserved and cannot be erased; "+
@@ -515,10 +542,11 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 					"its data with nothing to tell them — refusing rather than erasing part of it", tenantID))
 			return
 		}
-		orderer.OrderPurge(tenantID, now)
-		// Read the order back. OrderPurge cannot return an error (the file store's signature has none, and the
-		// two backends must be interchangeable), so the only way to know the order was actually recorded — a
-		// failed INSERT, a table that migration 041 never created — is to look for it.
+		if err := orderer.OrderPurge(tenantID, now); err != nil {
+			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
+			return
+		}
+		// Confirmed storage is required before local erasure; then verify visibility.
 		if !tenantPurgeOrderStands(orderer, tenantID) {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf(
 				"the erasure order for %q was not recorded, so no other node would ever be told to erase it — "+
@@ -528,7 +556,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		result := purgeAdminTenantData(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore,
 			config.TenantCARegistry, strings.TrimSpace(config.TenantCARegistryPath),
-			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), config.LegalHold, now)
 		// Recorded in the OPERATOR's audit, not the customer's.
 		//
 		// ★ AND THAT DISTINCTION IS LOAD-BEARING, WHICH THIS CODE LEARNED THE HARD WAY (2026-08-15). The audit
@@ -542,6 +570,14 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// was authorised and carried out must not live inside the thing that was erased.
 		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "purge", evaluator, now)
 		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		outcome := "success"
+		if !result.Complete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["complete"] = result.Complete
+		auditRecord.Metadata["remaining_records"] = result.Remaining.Total
+		auditRecord.Metadata["failure_count"] = len(result.Failures)
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		writeJSON(w, http.StatusOK, result)
 	}))
@@ -571,15 +607,22 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentialStore, adminAuth adminAuthRuntimeStore, ledger *enrolledinventory.Ledger, tenantID string, now time.Time) map[string]any {
 	result := map[string]any{}
 	if credentials != nil {
-		if removed := credentials.DeleteAllForTenant(tenantID); len(removed) > 0 {
+		removed, err := credentials.DeleteAllForTenant(tenantID)
+		if err != nil {
+			result["administrators_error"] = "credential deletion incomplete: storage unavailable"
+		}
+		if len(removed) > 0 {
 			result["administrators"] = removed
 			log.Printf("tenant %q deleted: removed %d administrator account(s): %s", tenantID, len(removed), strings.Join(removed, ", "))
 		}
 	}
 	if ledger != nil {
-		if removed := ledger.RemoveTenant(tenantID); len(removed) > 0 {
-			result["enrolled_identities"] = len(removed)
-			log.Printf("tenant %q deleted: removed %d enrolled identity/identities from the ledger", tenantID, len(removed))
+		if n, err := ledger.RetireTenantChecked(tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+			result["enrolled_identities_error"] = "identity retirement saving could not be confirmed"
+		} else if n > 0 {
+			result["enrolled_identities"] = n
+			result["identity_records_retained_for_purge"] = n
+			log.Printf("tenant %q deleted: retired %d identities; ownership retained for erasure", tenantID, n)
 		}
 	}
 	revoker, ok := adminAuth.(interface {

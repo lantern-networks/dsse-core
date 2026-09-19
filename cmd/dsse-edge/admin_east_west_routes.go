@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -39,7 +40,7 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			rules = rr.EffectiveEastWestRules(tenant)
 		}
 		for i := range obs {
-			req := model.DecisionRequest{Destination: obs[i].Destination, ServiceFamily: obs[i].ServiceFamily}
+			req := model.DecisionRequest{Destination: obs[i].Destination, ServiceFamily: obs[i].ServiceFamily, Protocol: "tcp", DestinationPort: obs[i].Port}
 			if obs[i].Source != eastwestobserve.SourceAny {
 				req.DeviceID = obs[i].Source
 			}
@@ -103,6 +104,10 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		resp, err := eastwest.ApplyAdminUpdate(policyStore, adminTenantIDFromRequest(r), req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Connector access policy save could not be confirmed. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -154,6 +159,10 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		resp, err := eastwest.ApplyAdminUpdate(policyStore, adminTenantIDFromRequest(r), req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Connector access policy save could not be confirmed. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

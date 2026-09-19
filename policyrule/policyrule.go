@@ -1,7 +1,7 @@
 // Package policyrule is the unified rule-authoring model an operator edits in the Console: a rule reads
 // `source → destination : service ⇒ action`, in a plane (east-west or egress) and — for east-west — a
 // direction (outbound or inbound). Source/destination reference the asset catalog (endpoints or groups) by
-// id; service references a catalog service (egress defaults to HTTPS). The action is two orthogonal axes:
+// id; service references a catalog service (empty service means Any on egress). The action is two orthogonal axes:
 // access (allow/authenticate/deny) × inspection (inspect/bypass), composable.
 //
 // This model lives in dsse-core (not the proprietary Console) so audit logs and decisions reference the
@@ -177,7 +177,7 @@ type Action struct {
 }
 
 // Rule is one authored rule. Source/Destination are asset-catalog ids (endpoints or groups); ServiceID is
-// an asset-catalog service id (optional for egress, which is HTTPS by default).
+// an asset-catalog service id (optional for egress, where empty means Any service).
 type Rule struct {
 	ID          string   `json:"id"`
 	TenantID    string   `json:"tenant_id"`

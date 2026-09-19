@@ -19,6 +19,7 @@ with values from your deployment. Use the documentation from the revision you bu
 | Control Internet traffic and content inspection | [Egress policy](egress-policy.md) |
 | Configure upload detection and interruption | [DLP](dlp.md) |
 | Manage administrators and customer delegation | [Administration](administration.md) |
+| Register service accounts and review tool boundaries | [Service accounts](service-accounts.md), [Delegations and activity](delegations.md) |
 | Locate audit evidence and manage its lifecycle | [Audit logs and data handling](audit-and-data.md) |
 | Control internal access and out-of-band authentication | [East-West policy and step-up](east-west-policy.md) |
 | Reach private applications | [Connectors](connector.md), then test both allowed and denied access |

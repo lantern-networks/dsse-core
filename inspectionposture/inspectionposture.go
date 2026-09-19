@@ -6,11 +6,18 @@
 package inspectionposture
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // Modes.
@@ -147,8 +154,8 @@ type Posture struct {
 	Mode                   string   `json:"mode"`
 	DecryptAllowlistHosts  []string `json:"decrypt_allowlist_hosts"`
 	DecryptAllowlistGroups []string `json:"decrypt_allowlist_groups"`
-	// BypassGroups names enabled SaaSBypassGroups whose hosts are raw-forwarded in ANY mode (the Optimize=Bypass
-	// preset) — e.g. bypass Teams/OneDrive even while decrypt-all is the default.
+	// BypassGroups retains legacy deployment-wide selections for operator cleanup.
+	// Current runtimes use tenant-authored rules; these selections do not grant bypass.
 	BypassGroups       []string `json:"bypass_groups"`
 	KnownBypassEnabled bool     `json:"known_bypass_enabled"`
 }
@@ -259,7 +266,8 @@ func dedupeLower(in []string) []string {
 // Store persists the posture across restarts (a posture change survives an Edge restart, unlike the previous
 // runtime-only known-bypass toggle).
 type Store struct {
-	mu        sync.Mutex
+	writeMu   sync.Mutex
+	mu        sync.RWMutex
 	posture   Posture
 	statePath string
 	// persister is the fleet-shared backend, when the deployment has one.
@@ -301,102 +309,186 @@ type persister interface {
 
 func NewStore() *Store { return &Store{posture: DefaultPosture()} }
 
-// Get returns the current posture.
+// Get returns an independent snapshot; callers cannot mutate enforcement through a returned slice.
 func (s *Store) Get() Posture {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.posture
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return clonePosture(s.posture)
 }
 
-// Set replaces the posture (normalizing it) and persists. A non-nil error means the posture IS live in
-// memory (already enforcing) but durability failed — it would revert on restart, so callers must surface it.
+var ErrPersistence = errors.New("inspection posture persistence is unconfirmed")
+
+// Set validates and saves a candidate before exposing it to enforcement or bundle readers.
 func (s *Store) Set(p Posture) (Posture, error) {
+	next, err := Validate(p)
+	if err != nil {
+		return Posture{}, err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.persist(next); err != nil {
+		return Posture{}, fmt.Errorf("%w: %v", ErrPersistence, err)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.posture = p.Normalized()
-	s.generation++
-	if err := s.persistLocked(); err != nil {
-		return s.posture, fmt.Errorf("inspection posture applied in memory but not persisted (would revert on restart): %w", err)
+	if !reflect.DeepEqual(s.posture, next) {
+		s.posture = next
+		s.generation++
 	}
-	return s.posture, nil
+	return clonePosture(s.posture), nil
 }
 
-// SetPersister enables durable persistence through a shared backend and loads any posture already there.
-// Returns whether one was loaded (false = fresh/default, so the caller may seed it from flags).
+// Configure a writer only after its existing snapshot has been validated.
 func (s *Store) SetPersister(p persister) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var data []byte
+	var err error
+	if p != nil {
+		data, err = p.Load()
+		if err != nil {
+			return false, err
+		}
+	}
+	loaded, next, err := decodeSnapshot(data, data != nil)
+	if err != nil {
+		return false, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.persister = p
-	if p == nil {
-		return false, nil
+	s.statePath = ""
+	if loaded && !reflect.DeepEqual(s.posture, next) {
+		s.posture = next
+		s.generation++
 	}
-	data, err := p.Load()
+	return loaded, nil
+}
+func (s *Store) SetStatePath(path string) (bool, error) {
+	path = strings.TrimSpace(path)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var data []byte
+	exists := false
+	if path != "" {
+		var err error
+		data, err = os.ReadFile(path)
+		if err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+		exists = err == nil
+	}
+	loaded, next, err := decodeSnapshot(data, exists)
 	if err != nil {
 		return false, err
 	}
-	if len(data) == 0 {
-		return false, nil
-	}
-	var loaded Posture
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return false, err
-	}
-	s.posture = loaded.Normalized()
-	return true, nil
-}
-
-// SetStatePath enables durable persistence and loads any existing posture. Returns whether a posture was
-// loaded from disk (false = fresh/default, so the caller may seed it from flags).
-func (s *Store) SetStatePath(path string) (bool, error) {
-	path = strings.TrimSpace(path)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.statePath = path
-	if path == "" {
-		return false, nil
+	s.persister = nil
+	if loaded && !reflect.DeepEqual(s.posture, next) {
+		s.posture = next
+		s.generation++
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, err
+	return loaded, nil
+}
+func decodeSnapshot(data []byte, exists bool) (bool, Posture, error) {
+	if !exists {
+		return false, Posture{}, nil
 	}
-	if len(data) == 0 {
-		return false, nil
+	if len(bytes.TrimSpace(data)) == 0 {
+		return false, Posture{}, fmt.Errorf("empty inspection posture snapshot")
 	}
-	var loaded Posture
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return false, err
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return false, Posture{}, err
 	}
-	s.posture = loaded.Normalized()
-	return true, nil
+	if shape == nil || shape["mode"] == nil || shape["known_bypass_enabled"] == nil || string(shape["known_bypass_enabled"]) == "null" {
+		return false, Posture{}, fmt.Errorf("incomplete inspection posture snapshot")
+	}
+	var p Posture
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&p); err != nil {
+		return false, Posture{}, err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return false, Posture{}, fmt.Errorf("unexpected trailing posture data")
+	}
+	next, err := Validate(p)
+	return err == nil, next, err
+}
+func clonePosture(p Posture) Posture {
+	p.DecryptAllowlistHosts = append([]string{}, p.DecryptAllowlistHosts...)
+	p.DecryptAllowlistGroups = append([]string{}, p.DecryptAllowlistGroups...)
+	p.BypassGroups = append([]string{}, p.BypassGroups...)
+	return p
 }
 
-// persistLocked atomically snapshots the posture. The error MUST reach the caller: a swallowed write meant a
-// posture change (e.g. raising decrypt coverage) was acknowledged while nothing hit disk, silently reverting
-// on restart. Caller holds s.mu.
-func (s *Store) persistLocked() error {
-	if s.persister != nil {
-		data, err := json.MarshalIndent(s.posture, "", "  ")
-		if err != nil {
-			return fmt.Errorf("marshal inspection-posture snapshot: %w", err)
+// Validate refuses settings that normalization would silently discard or that never match a host.
+func Validate(p Posture) (Posture, error) {
+	if p.Mode != ModeDecryptAll && p.Mode != ModeBypassDefault {
+		return Posture{}, fmt.Errorf("invalid inspection mode")
+	}
+	for _, set := range []struct {
+		values  []string
+		catalog []AuthDecryptGroup
+	}{{p.DecryptAllowlistGroups, AuthDecryptGroups}, {p.BypassGroups, SaaSBypassGroups}} {
+		for _, name := range set.values {
+			found := false
+			for _, g := range set.catalog {
+				if strings.TrimSpace(name) == g.Name {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return Posture{}, fmt.Errorf("unknown inspection preset")
+			}
 		}
+	}
+	for _, host := range p.DecryptAllowlistHosts {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "" {
+			continue
+		}
+		if host == "*" {
+			continue
+		}
+		if ip := net.ParseIP(host); ip != nil {
+			if strings.Contains(host, ":") {
+				return Posture{}, fmt.Errorf("IPv6 literal inspection patterns are not supported; use a DNS hostname")
+			}
+			continue
+		}
+		host = strings.TrimPrefix(host, "*.")
+		host = strings.TrimSuffix(host, ".")
+		if len(host) == 0 || len(host) > 253 {
+			return Posture{}, fmt.Errorf("invalid inspection host pattern")
+		}
+		for _, label := range strings.Split(host, ".") {
+			if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return Posture{}, fmt.Errorf("invalid inspection host pattern")
+			}
+			for _, r := range label {
+				if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-') {
+					return Posture{}, fmt.Errorf("use a hostname or *.suffix, without a URL, path or port")
+				}
+			}
+		}
+	}
+	return p.Normalized(), nil
+}
+func (s *Store) persist(next Posture) error {
+	data, err := json.MarshalIndent(next, "", "  ")
+	if err != nil {
+		return err
+	}
+	if s.persister != nil {
 		return s.persister.Save(data)
 	}
 	if s.statePath == "" {
 		return nil
 	}
-	data, err := json.MarshalIndent(s.posture, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal inspection-posture snapshot: %w", err)
-	}
-	tmp := s.statePath + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("persist inspection posture: %w", err)
-	}
-	if err := os.Rename(tmp, s.statePath); err != nil {
-		return fmt.Errorf("persist inspection posture (rename): %w", err)
-	}
-	return nil
+	return durablefile.Write(s.statePath, data, 0o600)
 }

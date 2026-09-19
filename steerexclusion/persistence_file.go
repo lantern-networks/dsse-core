@@ -3,6 +3,7 @@ package steerexclusion
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -22,13 +23,8 @@ import (
 // path so admin-set exclusions survive a restart, WITHOUT dragging in Postgres — the enforcement Edge is
 // deliberately zero-DB and never reads the control plane's database.
 
-// OnPersistError, when set, is called if a snapshot fails to save. A dropped save is invisible and expensive:
-// the Upsert/Delete returns success, the admin sees the change take effect, and the next Edge restart silently
-// forgets it. This hook surfaces that so it is not lost. Must not panic.
-//
-// It does NOT fail the operation: the in-memory set is already updated and serving, and rejecting an admin's
-// change because the disk is momentarily unhappy is the worse failure. (A LoadAll parse failure is different —
-// that fails closed, because starting empty would silently drop every exclusion the admin ever set.)
+// OnPersistError receives save errors and confirmed in-place-write warnings.
+// Upsert/Delete also return unconfirmed-save errors; the hook must not panic.
 var OnPersistError func(error)
 
 // filePersistSnapshot is the on-disk shape: the full policy set. The store owns its own marshaling; the blob is
@@ -39,9 +35,10 @@ type filePersistSnapshot struct {
 
 // FilePersistence is a file-backed implementation of Persistence.
 type FilePersistence struct {
-	mu        sync.Mutex
-	persister blobstore.Persister
-	byID      map[string]*Policy
+	mu            sync.Mutex
+	persister     blobstore.Persister
+	byID          map[string]*Policy
+	knownSnapshot bool
 }
 
 // NewFilePersistence returns a file-backed Persistence writing its snapshot to path via an atomic temp+rename.
@@ -52,9 +49,9 @@ func NewFilePersistence(path string) *FilePersistence {
 	}
 }
 
-// LoadAll reads the snapshot and returns every persisted policy. A missing or empty snapshot (first boot) yields
-// an empty slice and no error. A parse failure RETURNS the error so the caller fails closed — refusing to start
-// is correct, because starting empty would silently drop every exclusion the admin ever set.
+// LoadAll validates the entire snapshot before replacing the backend cache. Only
+// a missing file that this instance has never loaded or saved is first boot. An
+// existing empty file, malformed data or disappearance of known state is an error.
 func (f *FilePersistence) LoadAll(ctx context.Context) ([]*Policy, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -63,66 +60,80 @@ func (f *FilePersistence) LoadAll(ctx context.Context) ([]*Policy, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load steer exclusion snapshot: %w", err)
 	}
-	f.byID = map[string]*Policy{}
-	if len(data) == 0 {
-		return nil, nil
-	}
-	var snap filePersistSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return nil, fmt.Errorf("parse steer exclusion snapshot: %w", err)
-	}
-	out := make([]*Policy, 0, len(snap.Policies))
-	for _, p := range snap.Policies {
-		if p == nil || p.ID == "" {
-			continue
+	if data == nil {
+		if f.knownSnapshot {
+			return nil, fmt.Errorf("%w: known snapshot is missing", ErrInvalidSnapshot)
 		}
-		f.byID[p.ID] = p
-		out = append(out, p)
+		return []*Policy{}, nil
 	}
+	fresh, err := decodeFileSnapshot(data)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*Policy, 0, len(fresh))
+	for _, p := range fresh {
+		copied := clonePolicy(*p)
+		out = append(out, &copied)
+	}
+	f.knownSnapshot = true
+	f.byID = fresh
 	return out, nil
 }
 
-// Upsert stores the policy and rewrites the whole snapshot. A save failure is routed to OnPersistError and does
-// NOT fail the operation (the in-memory set is already updated and serving).
+// Upsert stages a new snapshot and publishes it only after a confirmed save.
 func (f *FilePersistence) Upsert(ctx context.Context, p *Policy) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	stored := *p
-	f.byID[stored.ID] = &stored
-	f.saveLocked("upsert", stored.ID)
-	return nil
+	if old := f.byID[p.ID]; old != nil && old.TenantID != p.TenantID {
+		return ErrTenantConflict
+	}
+	candidate := f.candidateLocked()
+	stored := clonePolicy(*p)
+	candidate[p.ID] = &stored
+	return f.saveLocked(candidate, "upsert", p.ID)
 }
 
-// Delete removes the policy and rewrites the whole snapshot. A save failure is routed to OnPersistError and does
-// NOT fail the operation.
 func (f *FilePersistence) Delete(ctx context.Context, id, tenantID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if p := f.byID[id]; p != nil && p.TenantID == tenantID {
-		delete(f.byID, id)
+	if old := f.byID[id]; old == nil || old.TenantID != tenantID {
+		return nil
 	}
-	f.saveLocked("delete", id)
-	return nil
+	candidate := f.candidateLocked()
+	delete(candidate, id)
+	return f.saveLocked(candidate, "delete", id)
 }
 
-// saveLocked re-serializes the full policy set and writes it back atomically. The CALLER must hold f.mu. A save
-// failure is reported via OnPersistError, never returned. Policies are emitted in a stable (id-sorted) order so
-// the snapshot is deterministic.
-func (f *FilePersistence) saveLocked(op, id string) {
-	policies := make([]*Policy, 0, len(f.byID))
-	for _, p := range f.byID {
+func (f *FilePersistence) candidateLocked() map[string]*Policy {
+	candidate := make(map[string]*Policy, len(f.byID))
+	for id, p := range f.byID {
+		candidate[id] = p
+	}
+	return candidate
+}
+
+// saveLocked retains the previous cache on error. This does not prove the disk
+// is unchanged: a writer can save the bytes and then report uncertain durability.
+func (f *FilePersistence) saveLocked(candidate map[string]*Policy, op, id string) error {
+	policies := make([]*Policy, 0, len(candidate))
+	for _, p := range candidate {
 		policies = append(policies, p)
 	}
 	sort.Slice(policies, func(i, j int) bool { return policies[i].ID < policies[j].ID })
-
 	data, err := json.Marshal(filePersistSnapshot{Policies: policies})
+	if err == nil {
+		err = f.persister.Save(data)
+	}
 	if err != nil {
-		reportPersistError(fmt.Errorf("marshal steer exclusion snapshot (%s %s): %w", op, id, err))
-		return
+		err = fmt.Errorf("save steer exclusion snapshot (%s %s): %w", op, id, err)
+		reportPersistError(err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			return err
+		}
 	}
-	if err := f.persister.Save(data); err != nil {
-		reportPersistError(fmt.Errorf("save steer exclusion snapshot (%s %s): %w", op, id, err))
-	}
+	f.byID = candidate
+	f.knownSnapshot = true
+	return nil
 }
 
 func reportPersistError(err error) {

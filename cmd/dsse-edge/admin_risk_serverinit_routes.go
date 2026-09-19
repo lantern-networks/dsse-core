@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -19,8 +20,8 @@ import (
 func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, configSourceURL string) {
 	mux.HandleFunc("POST /admin/risk-signals", adminEndpoint("admin.risk.write", func(w http.ResponseWriter, r *http.Request) {
 		// Risk State: ingest a risk signal (incl. Manual High Risk Marking). High risk folds into
-		// the device's risk state (decisions react via risk_state_severity/admin_high_risk) and revokes
-		// the device's standing east-west grants (acceleration). Phase 3: the high-risk marking is
+		// the device's risk state (decisions react via risk_state_severity/admin_high_risk); enforcement
+		// is determined by policy, not by ingesting the signal. Phase 3: the high-risk marking is
 		// CP-authoritative + fleet-distributed, so author it on the control plane.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "risk signals (high-risk marking)") {
 			return
@@ -37,6 +38,16 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		//
 		// 404 rather than 403, like the kill-switch and the concern report: whether an entity exists on this
 		// node is itself the answer being withheld.
+		if strings.EqualFold(strings.TrimSpace(sig.EntityType), "user") || strings.EqualFold(strings.TrimSpace(sig.EntityType), "human") {
+			resp, tenant, ok := writeUserRisk(w, r, config, sig)
+			if !ok {
+				return
+			}
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, userRiskAuditLog(r, tenant, resp, evaluator, now), now)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
 		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
 			if owned, why := riskEntityOwnedByCaller(r.Context(), sig.EntityType, sig.EntityID,
 				adminTenantIDFromRequest(r), config.EnrolledLedger, config.HumanIdentities); !owned {
@@ -44,32 +55,70 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 				return
 			}
 		}
+		_, entityID, err := validateAdminRiskSignal(deviceStore, sig)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(entityID); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		warning, err := config.HighRiskOverlay.SetDeviceRisk(entityID, sig.Severity)
+		if err != nil {
+			now := time.Now().UTC()
+			failure := deviceRiskAuditLog(r, tenantID, adminRiskSignalResponse{EntityType: "device", EntityID: entityID, Severity: strings.ToLower(strings.TrimSpace(sig.Severity))}, evaluator, now)
+			failure.EventType = "device_risk_change_failed"
+			failure.Result = stringPtr("error")
+			failure.Metadata["requested_severity"] = failure.Metadata["severity"]
+			delete(failure.Metadata, "severity")
+			delete(failure.Metadata, "high_risk")
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, failure, now)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk save was not confirmed; the live overlay and runtime were not changed"))
+			return
+		}
 		resp, err := applyAdminRiskSignal(deviceStore, adminTenantIDFromRequest(r), sig, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		// Phase 3: reflect the marking into the shared high-risk overlay so EVERY node's decision path
-		// treats the device as high-risk (fleet-consistent risk-based deny/re-auth; reconnect-elsewhere blocked).
-		if config.HighRiskOverlay != nil && (strings.EqualFold(resp.EntityType, "device") || strings.EqualFold(resp.EntityType, "user")) {
-			// The overlay carries the GRADED severity (medium|high|critical) so a policy can gate on any level
-			// (risk_state_severity). AdminHighRisk (the high-risk behaviours) is derived from high|critical only,
-			// in the decision enrichment — a medium mark is a policy signal, not a "high-risk" device/user.
-			switch strings.ToLower(strings.TrimSpace(resp.Severity)) {
-			case "medium", "high", "critical":
-				config.HighRiskOverlay.Mark(resp.EntityID, strings.ToLower(strings.TrimSpace(resp.Severity)))
-			default:
-				config.HighRiskOverlay.Clear(resp.EntityID)
+		resp.OverlayPersistenceWarning = warning
+		if warning {
+			if resp.NotStoredDurably != "" {
+				resp.NotStoredDurably += " "
 			}
+			resp.NotStoredDurably += "Risk is applied with a volatile or non-atomic overlay save. Reapply after storage is healthy."
+		}
+		if resp.EntityType == "device" {
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
+				deviceRiskAuditLog(r, tenantID, resp, evaluator, now), now)
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}))
 	// GET /admin/risk-signals: the current high-risk overlay (entity id -> severity), so the console can show a
-	// current-risk badge on the device / person's own row (no free-text id). Device and user marks share the map.
+	// current-risk badge on its own row. The explicit user query uses a tenant-scoped namespace.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
-		snap := map[string]string{}
-		if config.HighRiskOverlay != nil {
-			snap = config.HighRiskOverlay.Snapshot()
+		if riskReadRefusedOnAStandby(w) {
+			return
+		}
+		snap, users, err := config.HighRiskOverlay.CheckedSnapshot()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is unavailable"))
+			return
+		}
+		if r.URL.Query().Get("entity_type") == "user" {
+			tenant := adminTenantIDFromRequest(r)
+			snap := map[string]string{}
+			for _, mark := range users {
+				if mark.TenantID == tenant {
+					snap[mark.ID] = mark.Severity
+				}
+			}
+			writeJSON(w, 200, map[string]any{"entity_type": "user", "tenant_id": tenant, "high_risk": snap})
+			return
 		}
 		// ★★ SCOPED, LIKE THE KILL-SWITCH LIST NEXT DOOR (2026-08-18). This overlay names every entity the
 		// deployment currently considers high risk, with the severity, and it was handed whole to any caller
@@ -101,12 +150,27 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			snap = mine
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"high_risk": snap,
+			"entity_type": "device",
+			"tenant_id":   adminTenantIDFromRequest(r),
+			"high_risk":   snap,
 			// Named rather than dropped, so a customer is never shown a smaller version of their own risk
 			// picture without being told a smaller version is what they are looking at.
 			"withheld_unattributable": withheld,
 		})
 	}))
+	auditIncoming := func(r *http.Request, tenant, target, action string, err error) {
+		now := time.Now().UTC()
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+		row := model.AuditLog{ID: randomEdgeID("audit_incoming_", now), TenantID: tenant, ActorUserID: auditActorPrincipal(r), EventType: "admin_incoming_changed", TargetType: stringPtr("incoming_policy"), TargetID: stringPtr(target), Action: stringPtr(action), Result: &result, Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID}
+		row.Metadata = map[string]any{"target_tenant_id": tenant}
+		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && !strings.EqualFold(identity.TenantID, tenant) {
+			stampOperatorActor(row.Metadata, identity)
+		}
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, row, now)
+	}
 	mux.HandleFunc("POST /admin/server-initiated", adminEndpoint("admin.serverinitiated.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "server-initiated config") {
 			return
@@ -119,11 +183,22 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 			return
 		}
-		if s, ok := policyStore.(interface {
-			SetServerInitiatedEnabled(string, bool)
-		}); ok {
-			s.SetServerInitiatedEnabled(adminTenantIDFromRequest(r), req.Enabled)
+		setter, ok := policyStore.(interface{ SetServerInitiatedEnabledConfirmed(string, bool) error })
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
+			return
 		}
+		err := setter.SetServerInitiatedEnabledConfirmed(adminTenantIDFromRequest(r), req.Enabled)
+		action := "allow_default"
+		if req.Enabled {
+			action = "block_default"
+		}
+		auditIncoming(r, adminTenantIDFromRequest(r), adminTenantIDFromRequest(r), action, err)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy save could not be confirmed. Reload before retrying."))
+			return
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{"server_initiated_enabled": req.Enabled})
 	}))
 	mux.HandleFunc("GET /admin/server-initiated", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
@@ -140,44 +215,68 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy exceptions") {
 			return
 		}
-		// register/update a Legacy Exception (explicit governed allow for a server-initiated flow).
-		var ex model.LegacyException
-		if err := json.NewDecoder(r.Body).Decode(&ex); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		var patch map[string]json.RawMessage
+		if err := decodeLimitedJSONBody(w, r, &patch, maxEdgeRuntimeJSONBodyBytes); err != nil || patch == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid incoming exception object"))
 			return
 		}
-		// A legacy exception is an explicit governed ALLOW for a server-initiated flow. Whose it is comes from
-		// the caller, not from the body they wrote.
-		tenantForWrite, terr := adminTenantForWrite(r, ex.TenantID)
-		if terr != nil {
-			writeError(w, http.StatusForbidden, terr)
+		var key struct {
+			ID       string `json:"id"`
+			TenantID string `json:"tenant_id"`
+		}
+		raw, _ := json.Marshal(patch)
+		if err := json.Unmarshal(raw, &key); err != nil || strings.TrimSpace(key.ID) == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("id is required"))
 			return
 		}
-		ex.TenantID = tenantForWrite
-		if strings.TrimSpace(ex.Status) == "" {
-			ex.Status = "active"
-		}
-		if err := validateLegacyException(ex); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		tenantForWrite, err := adminTenantForWrite(r, key.TenantID)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err)
 			return
 		}
-		if s, ok := policyStore.(interface {
-			UpsertLegacyException(string, model.LegacyException)
-		}); ok {
-			s.UpsertLegacyException(ex.TenantID, ex)
+		setter, ok := policyStore.(interface {
+			MutateLegacyExceptionConfirmed(string, string, func(model.LegacyException) (model.LegacyException, error)) (model.LegacyException, error)
+		})
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
+			return
 		}
+		ex, err := setter.MutateLegacyExceptionConfirmed(tenantForWrite, key.ID, func(current model.LegacyException) (model.LegacyException, error) {
+			return mergeLegacyException(current, patch, tenantForWrite)
+		})
+		auditIncoming(r, tenantForWrite, key.ID, "upsert_exception", err)
+		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception save could not be confirmed. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
+			return
+		}
+
 		writeJSON(w, http.StatusOK, ex)
 	}))
 	mux.HandleFunc("DELETE /admin/legacy-exceptions/{id}", adminEndpoint("admin.serverinitiated.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy exceptions") {
 			return
 		}
-		removed := false
-		if s, ok := policyStore.(interface {
-			RemoveLegacyException(string, string) bool
-		}); ok {
-			removed = s.RemoveLegacyException(adminTenantIDFromRequest(r), r.PathValue("id"))
+		setter, ok := policyStore.(interface {
+			RemoveLegacyExceptionConfirmed(string, string) (bool, error)
+		})
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
+			return
 		}
+		removed, err := setter.RemoveLegacyExceptionConfirmed(adminTenantIDFromRequest(r), r.PathValue("id"))
+		if err != nil {
+			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception removal could not be confirmed. Reload before retrying."))
+			return
+		}
+		if removed {
+			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", nil)
+		}
+
 		if !removed {
 			writeError(w, http.StatusNotFound, fmt.Errorf("exception %s not found", r.PathValue("id")))
 			return
@@ -194,23 +293,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, buildLegacyExceptionList(exs, time.Now()))
 	}))
 	mux.HandleFunc("GET /admin/legacy-exceptions/export", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
-		// S2: export active Legacy Exceptions as Firewall / L3 rules (default-deny + explicit allow)
-		// for agentless / VLAN-boundary enforcement of server-initiated traffic.
-		var exs []model.LegacyException
-		if s, ok := policyStore.(interface {
-			LegacyExceptionsFor(string) []model.LegacyException
-		}); ok {
-			exs = s.LegacyExceptionsFor(adminTenantIDFromRequest(r))
-		}
-		exp := buildServerInitiatedExport(exs, time.Now())
-		// Reflect the tenant's Incoming-Connections default toggle (POST /admin/server-initiated) into the
-		// export: "allow by default" (enabled=false) => default_action=allow, telling the consuming enforcement
-		// point (e.g. the Windows firewall inbound backend) that DSSE is NOT managing inbound and its rules
-		// should be withdrawn. Enabled => the historical default-deny contract, unchanged.
-		if s, ok := policyStore.(interface {
-			ServerInitiatedEnabledFor(string) bool
-		}); ok && !s.ServerInitiatedEnabledFor(adminTenantIDFromRequest(r)) {
-			exp.DefaultAction = "allow"
+		exp, err := incomingExportForTenant(policyStore, adminTenantIDFromRequest(r), time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))
+			return
 		}
 		writeJSON(w, http.StatusOK, exp)
 	}))

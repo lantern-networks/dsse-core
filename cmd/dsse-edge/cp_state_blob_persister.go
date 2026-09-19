@@ -86,19 +86,35 @@ func (p postgresBlobPersister) Save(data []byte) error {
 // Update serializes a read-modify-write across all CP processes. The callback's
 // state becomes visible only after commit; unknown JSON fields can be preserved.
 func (p postgresBlobPersister) Update(edit func([]byte) ([]byte, error)) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+	return p.updateContext(context.Background(), edit, false)
+}
+
+// UpdateContext carries administrative leadership through to the database
+// commit. An absent row is passed as nil, distinct from a corrupt empty object.
+func (p postgresBlobPersister) UpdateContext(ctx context.Context, edit func([]byte) ([]byte, error)) error {
+	return p.updateContext(ctx, edit, true)
+}
+func (p postgresBlobPersister) updateContext(parent context.Context, edit func([]byte) ([]byte, error), absentAsNil bool) error {
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, err := p.db.BeginTx(ctx, nil)
+	tx, finish, err := beginCPWriteTransaction(ctx, p.db)
 	if err != nil {
 		return err
 	}
+	defer finish()
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key); err != nil {
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key)
+	if err != nil {
 		return err
 	}
 	var raw []byte
 	if err := tx.QueryRowContext(ctx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw); err != nil {
 		return err
+	}
+	if n, err := inserted.RowsAffected(); err != nil {
+		return err
+	} else if absentAsNil && n == 1 {
+		raw = nil
 	}
 	updated, err := edit(raw)
 	if err != nil {

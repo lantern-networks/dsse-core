@@ -40,7 +40,7 @@ func TestStorePersistenceSurvivesRestart(t *testing.T) {
 	}
 
 	// A delete also persists.
-	if !s2.DeleteObject("net-tokyo") {
+	if ok, err := s2.DeleteObject("net-tokyo"); err != nil || !ok {
 		t.Fatalf("DeleteObject returned false")
 	}
 	s3 := NewStore()
@@ -64,7 +64,7 @@ func TestStorePersistenceDeleteSurvivesRestart(t *testing.T) {
 	}
 	first.UpsertObject(model.VLANObject{ID: "vlan_a", TenantID: "t1", Name: "A", Class: "server", CIDRs: []string{"10.1.0.0/16"}})
 	first.UpsertObject(model.VLANObject{ID: "vlan_b", TenantID: "t1", Name: "B", Class: "server", CIDRs: []string{"10.2.0.0/16"}})
-	if !first.DeleteObject("vlan_a") {
+	if ok, err := first.DeleteObject("vlan_a"); err != nil || !ok {
 		t.Fatal("delete reported missing")
 	}
 
@@ -98,16 +98,14 @@ func TestStorePersistErrorIsReportedNotSwallowed(t *testing.T) {
 	if err := s.SetPersister(failingPersister{err: errTestDiskFull}); err != nil {
 		t.Fatalf("SetPersister: %v", err)
 	}
-	if _, err := s.UpsertObject(model.VLANObject{ID: "vlan_x", TenantID: "t1", Name: "X", Class: "server", CIDRs: []string{"10.9.0.0/16"}}); err != nil {
-		t.Fatalf("upsert: %v", err)
+	if _, err := s.UpsertObject(model.VLANObject{ID: "vlan_x", TenantID: "t1", Name: "X", Class: "server", CIDRs: []string{"10.9.0.0/16"}}); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("upsert should refuse unconfirmed storage: %v", err)
 	}
 	if got == nil {
 		t.Fatal("a failed save was swallowed; the operator would believe the network is durable when it is not")
 	}
-	// The mutation itself still applies: the in-memory set is serving, and refusing the operator's change
-	// because the disk is unhappy is a different and worse failure.
-	if len(s.ListObjects()) != 1 {
-		t.Fatalf("objects = %#v, want the mutation to still apply", s.ListObjects())
+	if len(s.ListObjects()) != 0 {
+		t.Fatal("failed save changed live state")
 	}
 }
 

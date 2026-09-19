@@ -326,7 +326,7 @@ func registerAPITokenRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		token, rawToken, err := adminAuth.CreateAPITokenForTenant(r.Context(), req, adminTenantIDFromRequest(r), adminPrincipalIDFromRequest(r), time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminAPITokenMutationError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAPITokenAuditLog("admin_api_token_created", token, evaluator, sourceIPFromRequest(r)), time.Now())
@@ -350,7 +350,7 @@ func registerAPITokenRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		token, ok, err := adminAuth.RevokeAPITokenForTenant(r.Context(), tokenID, adminTenantIDFromRequest(r), time.Now())
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAdminAPITokenMutationError(w, http.StatusInternalServerError, err)
 			return
 		}
 		if !ok {
@@ -383,7 +383,7 @@ func registerAPITokenRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		token, rawToken, ok, err := adminAuth.RotateAPITokenForTenant(r.Context(), tokenID, adminTenantIDFromRequest(r), adminPrincipalIDFromRequest(r), req, time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminAPITokenMutationError(w, http.StatusBadRequest, err)
 			return
 		}
 		if !ok {
@@ -405,4 +405,22 @@ func registerAPITokenRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 	// Invite is registered unconditionally (RBAC-gated) so the permission gate is always enforced; it returns
 	// 503 when first-party accounts are not enabled. The activation/login endpoints below are registered only
 	// when the feature is on.
+}
+
+// Storage failures are distinct from token input validation. Never expose database
+// details or claim a failed commit means no change reached storage.
+var errAdminAPITokenStorage = errors.New("admin api token storage unavailable")
+
+func adminAPITokenStorageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %v", errAdminAPITokenStorage, err)
+}
+func writeAdminAPITokenMutationError(w http.ResponseWriter, fallback int, err error) {
+	if errors.Is(err, errAdminAPITokenStorage) {
+		writeError(w, http.StatusServiceUnavailable, errors.New("The API token change could not be confirmed in storage. Reload the token list before retrying."))
+		return
+	}
+	writeError(w, fallback, err)
 }

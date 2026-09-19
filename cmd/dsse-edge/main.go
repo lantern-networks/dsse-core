@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -566,6 +567,7 @@ type serverConfig struct {
 	ColdArchive         archive.ColdArchive     // sovereign cold-archive backend (for the audit-chain verify API; nil = none)
 	RetentionOverride   *retentionOverrideStore // admin-configurable per-stream retention (shared with the pruner; nil = flags only)
 	Writer              *logs.Writer
+	StandbyAudit        *adminStandbyAudit // main owns periodic flush and final drain; tests may drive its clock explicitly
 	ExportObjectStore   adminExportObjectStore
 	OIDC                oidcConfig
 	LocalCredentials    *localAdminCredentialStore // first-party admin accounts (nil = feature off): invite -> activation link -> password + TOTP -> email+password+TOTP login
@@ -791,6 +793,9 @@ func (config serverConfig) withDefaults() serverConfig {
 	if config.HumanIdentities == nil {
 		config.HumanIdentities = humanidentity.NewHumanIdentityDirectoryStore()
 	}
+	if err := prepareUserRiskState(context.Background(), config.HighRiskOverlay, config.EnrolledLedger, config.HumanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
 	if config.HotStore == nil && config.Writer != nil {
 		config.HotStore = hotstore.NewJSONLStore(config.Writer, adminLogStreamFilenameMap())
 	}
@@ -812,8 +817,8 @@ func (config serverConfig) withDefaults() serverConfig {
 }
 
 // inMemoryEventStoreDefaultCapacity bounds the per-event in-memory stores (inspection / human-approval /
-// delegated-grant) so a long-running Edge does not grow them until OOM. Generous enough that active
-// TTL'd entries are never evicted within their window. Override via DSSE_EVENT_STORE_CAPACITY
+// delegated-grant). Inspection history uses FIFO; human approvals and delegated grants refuse new IDs
+// at capacity so authorization and revocation state is retained. Override via DSSE_EVENT_STORE_CAPACITY
 // (<=0 disables the bound; tests that construct the store directly stay unbounded).
 const inMemoryEventStoreDefaultCapacity = 50000
 
@@ -1186,7 +1191,7 @@ func main() {
 	oidcIDPID := flag.String("oidc-idp-id", "idp_keycloak_lab", "server-side IdP id recorded on sessions minted by the OIDC callback (matched by policy required_idp_id). Operator config, never taken from the callback request")
 	firstPartyAccounts := flag.Bool("first-party-accounts", false, "enable SaaS-issued first-party admin accounts (invite -> activation link -> password + TOTP 2FA -> email+password+TOTP login)")
 	firstPartyIssuer := flag.String("first-party-issuer", "Lantern DSSE", "issuer label shown in the TOTP authenticator app for first-party admin accounts")
-	firstPartyStore := flag.String("first-party-store", "memory", "durable store for first-party admin credentials: memory (lost on restart) or postgres (survives restart; control plane).")
+	firstPartyStore := flag.String("first-party-store", "memory", "store for first-party admin credentials: memory (lost on restart), postgres, or a JSON snapshot file path.")
 	firstPartyStorePostgresDSN := flag.String("first-party-store-postgres-dsn", "", "PostgreSQL DSN for first-party-store=postgres; defaults to -postgres-dsn when omitted")
 	connectorRouteGovernanceStorePath := flag.String("connector-route-governance-store", "", "durable + SHARED store for connector route-governance DECISIONS (held/approved/authored): a file path. Survives restart; on a mount shared across the HA fleet (e.g. the reference's ./dataplane-ne, mounted by every region's Edge) all Edges read the SAME decisions, so routing + /connectors/{id}/effective-routes are consistent fleet-wide. Empty = in-memory per-Edge.")
 	vlanObjectStorePath := flag.String("vlan-object-store", "", "durable store for Named Networks (VLAN/Subnet objects, /admin/vlan-objects) + boundary policies: \"postgres\" or a FILE PATH. These are ADMIN-CONFIGURED definitions — what the Console's Network Zones page writes and what connector bindings reference by id. Empty = in-memory, meaning every restart ERASES them: that is why the Console's Networks page read permanently empty, since the lab rebuilds the Edge on every change. On a mount shared across the HA fleet (e.g. the reference's ./dataplane-ne) every Edge reads the same definitions.")
@@ -1231,11 +1236,11 @@ func main() {
 	allowVolatileConfig := flag.Bool("allow-volatile-config", false, "escape hatch for a deliberately EPHEMERAL Edge: permit OPERATOR-CONFIG stores to run in-memory in production instead of FAILING startup. Off by default — a node that owns operator-authored config must not silently lose it on restart, so a volatile CONFIG store is now a startup ERROR, not a warning. Set this only for a throwaway/test Edge; its use is logged. (Runtime stores — sessions, metering — may be volatile regardless; only CONFIG is gated.) Supersedes the old -require-durable-stores, which was opt-in the wrong way round.")
 	revocationSourcePoll := flag.Duration("revocation-source-poll", 2*time.Second, "CP→Edge SHARED REVOCATION overlay (Phase 3): FAST pull interval for the admission-revocation feed (kept low so a kill-switch bites fleet-wide within seconds). Uses the same -config-source-url base.")
 	admissionRevocationStore := flag.String("admission-revocation-store", "", "durable JSON store for the admission revocation set (Phase 3): the control plane persists its kill-switches here so a restart cannot silently un-revoke. Empty = in-memory only.")
-	highRiskStore := flag.String("high-risk-store", "", "durable JSON store for the shared high-risk device overlay (Phase 3): the control plane persists its high-risk markings here so a restart cannot silently clear them. Empty = in-memory only.")
+	highRiskStore := flag.String("high-risk-store", "", "durable device/user risk store: postgres | postgres+import:<path> | file path. Empty uses the shared database when configured and no local snapshot exists, otherwise the state directory; without either it remains in memory.")
 	// Cross-region revocation mesh: peer-region CPs an ORIGIN revocation propagates to. Empty = single-region.
 	revocationMeshPeers := flag.String("revocation-mesh-peers", "", "cross-region revocation mesh: peer-region CP base URLs 'region=URL;region=URL'. On an origin revocation this CP pushes to each peer (no-loop). Empty = single-region")
 	revocationMeshSecret := flag.String("revocation-mesh-secret", "", "shared secret for the cross-region revocation mesh (x-revocation-mesh-secret header); empty = no check (lab)")
-	revocationMeshOutboxStore := flag.String("revocation-mesh-outbox-store", "", "durable store for PENDING cross-region revocation-mesh pushes: a not-yet-acked push survives a CP restart and is resumed on boot, so a kill-switch converges cross-region even across a restart. 'postgres' | file path | empty = in-memory only (defaults to the state dir when -state-dir is set)")
+	revocationMeshOutboxStore := flag.String("revocation-mesh-outbox-store", "", "store for PENDING cross-region revocation-mesh pushes: confirmed saved entries are retried at startup; an unconfirmed save does not guarantee restart recovery. 'postgres' | file path | empty = in-memory only (defaults to the state dir when -state-dir is set)")
 	agentPolicyNextPublicKey := flag.String("agent-policy-next-public-key", "",
 		"public key(s) (hex; Ed25519 32-byte or ECDSA-P256 uncompressed-point) to publish in the trust bundle as the NEXT policy-signing key(s) for devices to adopt, WITHOUT this node holding their private half. This is how an HSM-held ECDSA next key is advertised for the config-signing-key switch — the token has the private key, only the public one is handed in here. Comma-separated. Signing is unaffected until an operator makes one of these the active key.")
 	agentPolicyHSMAgentSocket := flag.String("agent-policy-hsm-agent-socket", "",
@@ -2317,9 +2322,8 @@ func main() {
 		}
 	}
 	// Durable inspection posture (deployment mode + decrypt allowlist + known-bypass toggle). On a fresh store
-	// the known-bypass toggle is seeded from -default-bypass-list (mode defaults to decrypt_all). staticBypass
-	// and applyInspectionPosture recompute from the live posture so a change (POST /admin/inspection-posture)
-	// reflects in the engine's bypass + intercept sets.
+	// the known-bypass toggle is seeded from -default-bypass-list (mode defaults to decrypt_all). The snapshot
+	// applier rebuilds deployment defaults and tenant-specific host selections when the posture changes.
 	postureStore := inspectionposture.NewStore()
 	// ★ THE POSTURE IS ENFORCEMENT, SO IT FOLLOWS THE FLEET (2026-08-21). An explicit path still wins; an Edge
 	// that was given none, in a deployment that has shared state, shares this rather than starting from the
@@ -2362,18 +2366,7 @@ func main() {
 			log.Fatalf("seed inspection posture store: %v", err)
 		}
 	}
-	staticBypass := func() []string {
-		p := postureStore.Get()
-		hosts := append([]string{}, operatorStaticBypass...)
-		if p.KnownBypassEnabled {
-			// Per-tenant overrides drop force-inspected/disabled entries from the curated catalog.
-			hosts = append(hosts, catalogOverrides.EffectiveBypassHostsFrom(catalogFeed.EffectiveCatalog().Entries, pb.TenantID)...)
-		}
-		// SaaS Optimize bypass groups are NO LONGER read here: they are authored Egress bypass rules (unified
-		// model Phase B-1) folded into the set via EgressBypassFQDNs below, the single source of truth. A legacy
-		// posture.bypass_groups selection is migrated to rules at startup (migratePostureOptimizeBypassToRules).
-		return hosts
-	}
+
 	// Endpoint/group/service catalog + unified rule authoring (model + storage in dsse-core). Created here so
 	// the decrypt-bypass rebuild below can include authored egress rules whose inspection axis is bypass; the
 	// admin APIs are registered later once the mux is built. The asset store is populated from the enrolled
@@ -2399,8 +2392,6 @@ func main() {
 	if cpLeaderErr != nil {
 		log.Fatalf("start CP leader election: %v", cpLeaderErr)
 	}
-	cpLeaderElectorInstance.Start()
-	defer cpLeaderElectorInstance.Stop()
 	ruleStore := policyrule.NewStore()
 	rulePersister, rulePersisterErr := cpStateBlobPersister(*policyRuleStorePath, cpStateBlobDB, "policy_rules")
 	if rulePersisterErr != nil {
@@ -2423,15 +2414,16 @@ func main() {
 	edgeDNSConntrack := dns.NewConntrackStore()
 	if networkExtensionLabTLS != nil {
 		networkExtensionLabTLS.SetProbeOnly(*networkExtensionRuntimeCopyLabTLSProbeOnly)
-		networkExtensionLabTLS.SetBypassHosts(staticBypass())
 		networkExtensionLabTLS.SetSNIBasedDecision(*networkExtensionRuntimeCopyLabTLSSNIBasedIntercept)
 		networkExtensionLabTLS.SetDynamicPinDetectionEnabled(*networkExtensionRuntimeCopyLabTLSDynamicPinDetection)
 		// Cert-pinning detection -> bypass-candidate proposal. On repeated interception handshake
 		// rejections the engine proposes the host for admin review. Detection is on by default and safe:
 		// it never auto-bypasses (auto raw_forward stays opt-in above); only admin approve+materialize
 		// applies a decrypt-bypass.
-		certPinTenant := pb.TenantID
-		networkExtensionLabTLS.SetCertPinCandidateEmitter(func(host string) {
+		networkExtensionLabTLS.SetTenantCertPinCandidateEmitter(func(certPinTenant, host string) {
+			if strings.TrimSpace(certPinTenant) == "" {
+				return
+			}
 			now := time.Now().UTC()
 			// Central point for every interception handshake rejection — count it for /metrics before the
 			// DNS-correlation branch below decides how to record the candidate.
@@ -2446,76 +2438,25 @@ func main() {
 			_, _ = policyCandidateStore.ObserveCertPinFailure(context.Background(), certPinTenant, host, "", 443, "interception_handshake_rejected", now)
 		})
 	}
-	// applyMaterializedCertPinBypass rebuilds the interception decrypt-bypass set from its sources: the static
-	// bypass list + authored egress rules whose inspection axis is bypass. A materialized cert-pinning candidate
-	// is NO LONGER a separate bypass source — on materialize it is emitted as an authored bypass rule (and legacy
-	// materialized candidates are migrated to rules at startup), so the rule is the cert-pin bypass's SINGLE
-	// source. That makes the lifecycle coherent: deleting/disabling the rule actually stops the bypass (it would
-	// not if the candidate-store path still bypassed in parallel). SetBypassHosts is a full replace, recomputed
-	// from scratch on every change. Called on cert-pin materialize, on authored-rule change, and once at startup.
-	applyMaterializedCertPinBypass := func(tenantID string) {
-		if networkExtensionLabTLS == nil {
-			return
-		}
-		hosts := staticBypass()
-		hosts = append(hosts, policyrule.EgressBypassFQDNs(tenantID, ruleStore.List(tenantID, policyrule.PlaneEgress), assetStore)...)
-		networkExtensionLabTLS.SetBypassHosts(hosts)
+	// Both rule and catalog callbacks rebuild one tenant-separated snapshot.
+	applyInspectionPosture := newTenantInspectionApplier(networkExtensionLabTLS, postureStore, ruleStore, assetStore, catalogOverrides,
+		func() []knownbypass.Group { return catalogFeed.EffectiveCatalog().Entries }, configuredInterceptHosts, operatorStaticBypass)
+	applyMaterializedCertPinBypass := applyInspectionPosture
+
+	// Candidate status is history, not current authored intent. Recreating a rule
+	// here would undo deletion, disabling, inspection edits or an incomplete save.
+	// This applies to local stores as well as configuration-pulling Edges.
+	if n := len(materializedCertPinCandidates(policyCandidateStore, pb.TenantID)); n > 0 {
+		log.Printf("cert-pin: %d materialized candidate(s) retained as history; startup does not recreate bypass rules. "+
+			"Saved Egress rules determine bypass. Review Sites to Bypass and Internet Access; "+
+			"explicitly register a still-required legacy bypass at the configuration authority.", n)
 	}
-	// Migrate cert-pin bypasses materialized before they became first-class rules: emit each as an authored Egress
-	// rule now (idempotent) so every pinned-site bypass is one consistent rule and the single bypass source above
-	// covers them. Done before the first applyInspectionPosture so the migrated rules are in place when the bypass
-	// set is first built.
-	//
-	// ★ NOT ON A CONFIG-PULLING EDGE (2026-08-11). This migration authors rules and endpoint assets from a store
-	// only this instance has, and on a CP-authoritative deployment that is a resurrection: the control plane
-	// removes them on the next pull, this code recreates them on the next restart, and the two take turns. It was
-	// visible in the lab — six cert-pin rules emitted at startup and deleted minutes later by the bundle, every
-	// time the Edge came up.
-	//
-	// Adoption is authored on the control plane now (admin_policy_candidate_routes.go), so a materialized
-	// candidate here is a LOCAL OBSERVATION whose authored consequence already lives, or does not live, upstream.
-	// An Edge is a replaceable instance; letting one reinstate an inspection bypass out of its own history is
-	// exactly the authority this deployment decided the CP holds.
-	if strings.TrimSpace(*configSourceURL) == "" {
-		for _, c := range materializedCertPinCandidates(policyCandidateStore, pb.TenantID) {
-			if err := emitCertPinBypassRule(assetStore, ruleStore, c); err != nil {
-				log.Printf("migrate cert-pin bypass %s to rule: %v", c.CandidateID, err)
-			}
-		}
-	} else if n := len(materializedCertPinCandidates(policyCandidateStore, pb.TenantID)); n > 0 {
-		// Said out loud, because these bypasses were real decisions someone made on this instance and they are
-		// NOT being reinstated. Silence here would read as "there were none".
-		log.Printf("cert-pin: %d materialized candidate(s) in this Edge's local store are NOT being re-authored — "+
-			"the control plane authors bypasses on this deployment. If one of them should still be in force, add it "+
-			"there (POST /admin/cert-pin-bypass) or it does not exist for the fleet.", n)
+	// Deployment-wide legacy selections cannot author tenant rules on startup.
+	// Keep them available for operator review; current authored rules govern bypass.
+	if n := len(postureStore.Get().BypassGroups); n > 0 {
+		log.Printf("inspection: %d legacy SaaS bypass selection(s) retained but not applied. Review Inspection Settings; explicitly author any required tenant bypass and clear obsolete selections at the configuration authority.", n)
 	}
-	// Likewise migrate any legacy SaaS Optimize bypass selection (posture.bypass_groups) to authored rules, so the
-	// engine reads ONE bypass source (authored rules) and the Optimize toggle is a real, visible rule. No-op when
-	// no Optimize group is enabled (the default), so the decrypt-all North Star path is unchanged.
-	if n := migratePostureOptimizeBypassToRules(postureStore, ruleStore, pb.TenantID); n > 0 {
-		log.Printf("migrated %d legacy SaaS Optimize bypass group(s) to authored Egress rules", n)
-	}
-	// applyInspectionPosture applies BOTH layers from the live posture: the intercept (decrypt) host set —
-	// decrypt_all restores the configured intercept hosts (typically "*"); bypass_default applies the decrypt
-	// allowlist so only those hosts are decrypted and everything else is raw-forwarded (still steered +
-	// policy-gated) — and the bypass set. Called at startup (restore a persisted posture) and on posture change.
-	applyInspectionPosture := func(tenantID string) {
-		if networkExtensionLabTLS != nil {
-			p := postureStore.Get()
-			if p.Mode == inspectionposture.ModeBypassDefault {
-				// bypass-default: the intercept set is an explicit allowlist (posture hosts/groups) UNIONED with
-				// authored `inspect` egress rules — so an operator says "decrypt these" by writing a rule, the
-				// unified-model counterpart of an authored bypass rule (Phase B-2). Under decrypt-all the intercept
-				// set is "*" already, so authored inspect rules are a no-op there and are not folded in.
-				hosts := inspectionposture.EffectiveInterceptHosts(p)
-				hosts = append(hosts, policyrule.EgressInspectFQDNs(tenantID, ruleStore.List(tenantID, policyrule.PlaneEgress), assetStore)...)
-				networkExtensionLabTLS.SetInterceptHosts(hosts)
-			} else {
-				networkExtensionLabTLS.SetInterceptHosts(configuredInterceptHosts)
-			}
-		}
-		applyMaterializedCertPinBypass(tenantID)
-	}
+
 	applyInspectionPosture(pb.TenantID)
 	policyStore := policy.NewStore(policies)
 	// Restore Admin-API runtime toggles persisted across restarts before serving, so a restart keeps
@@ -2736,9 +2677,10 @@ func main() {
 	livenessRevocations := revocation.NewAdmissionRevocations()
 	if p, e := cpStateBlobPersister(*admissionRevocationStore, cpStateBlobDB, "admission_revocations"); e != nil {
 		log.Fatalf("resolve admission-revocation store: %v", e)
-	} else {
-		livenessRevocations.SetPersister(p) // Phase 3: persist kill-switches across a restart
+	} else if e := livenessRevocations.SetPersister(p); e != nil {
+		log.Fatalf("load admission-revocation store: %v", e)
 	}
+	configureAdmissionPromotion(cpLeaderElectorInstance, *admissionRevocationStore, livenessRevocations)
 	// Active session revocation: track live (T) connections by identity so an ADMINISTRATOR can actively CLOSE
 	// a blocked device's established tunnels (per-handshake admission already rejects NEW connections; this
 	// bites established sessions too, so an admin kill-switch takes full effect in ~2s rather than waiting for
@@ -2784,8 +2726,8 @@ func main() {
 	highRiskOverlay := revocation.NewHighRiskOverlay()
 	if p, e := cpStateBlobPersister(*highRiskStore, cpStateBlobDB, "high_risk_overlay"); e != nil {
 		log.Fatalf("resolve high-risk store: %v", e)
-	} else {
-		highRiskOverlay.SetPersister(p) // Phase 3: persist high-risk markings across a restart
+	} else if err := highRiskOverlay.SetPersister(p); err != nil {
+		log.Fatalf("load high-risk store: %v", err)
 	}
 	// management ledger: created here (empty) so BOTH the admin endpoints (via serverConfig) and the
 	// (T) listener (via secureTransportConfig below) share one instance; seeded from the static inventory
@@ -2796,6 +2738,9 @@ func main() {
 	// Seat allocation: how an MSSP divides its licensed pool among the tenants it operates. Durable for a sharp
 	// reason — losing it reads as zero seats for every tenant and stops enrolment across the whole fleet.
 	seatAllocations := seatallocation.NewStore()
+	if err := seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations")); err != nil {
+		log.Fatalf("setup seat allocation store: %v", err)
+	}
 	vendorLicenceStore := newLicenseStore()
 	// EVERY vendor key this deployment accepts. Loaded once at boot; an unreadable file is fatal rather than
 	// silently unlicensed, because "no keys" and "keys we could not read" would otherwise look identical and
@@ -3234,6 +3179,7 @@ func main() {
 	// The FAST revocation poller's status, so /healthz can be asked whether this node has ever held a set from
 	// the control plane. nil = no -config-source-url, i.e. no CP→Edge sync configured at all.
 	var revocationSyncState *revocationSyncStatus
+	var sharedRevocationSource *revocationSource
 	var configBundlePuller *configBundleSource // launched inside newServerWithConfig, where the DNS resolver exists too
 	// enrolmentCPReport tells the control plane about enrolments completed HERE. Constructed only when this
 	// Edge follows a control plane, because that is exactly when the omission bites: the config bundle
@@ -3354,7 +3300,7 @@ func main() {
 		revocationSyncState = &revocationSyncStatus{}
 		revSrc := revocationSource{url: cfgURL, endpoints: cpEndpointSel, token: token, interval: *revocationSourcePoll,
 			client: cfgClient, status: revocationSyncState}
-		go revSrc.run(context.Background(), livenessRevocations, highRiskOverlay)
+		sharedRevocationSource = &revSrc
 		// This node reports what it observes to the control plane, which RECORDS it for an administrator. It
 		// does not revoke anything, here or there.
 		livenessRevocations.SetReporter(revSrc.reportFunc())
@@ -3857,7 +3803,11 @@ func main() {
 		}
 		tenantModelStore = pgTenantModel
 	} else {
-		tenantModelStore = newOperatorAwareAdminTenantModelStore(pb, time.Now().UTC(), *tenantModelStorePath, *operatorTenantID)
+		fileTenantModel, terr := openAdminTenantModelStore(pb, time.Now().UTC(), *tenantModelStorePath, *operatorTenantID)
+		if terr != nil {
+			log.Fatalf("setup tenant model store: %v", terr)
+		}
+		tenantModelStore = fileTenantModel
 	}
 
 	// Persistent Site / Connector Group catalog (Connector UX Slice 1b). Empty/file path keeps the lab default
@@ -3996,6 +3946,9 @@ func main() {
 	}
 
 	if lerr := enrolledLedger.SetPersisterChecked(mustCPStateBlobPersister(*enrolledInventoryStore, "enrolled_inventory")); lerr != nil {
+		if highRiskOverlay.NeedsMigration() {
+			log.Fatalf("legacy risk migration requires readable enrolled inventory: %v", lerr)
+		}
 		if enrollSigner != nil {
 			log.Fatalf("REFUSING TO START: this Edge issues device certificates and its enrolled inventory could "+
 				"not be read (%v). Continuing would treat every identity in the fleet as never enrolled, claim "+
@@ -4004,62 +3957,26 @@ func main() {
 		log.Printf("enrolled_inventory: the durable store could not be read (%v) — this Edge does not issue "+
 			"certificates, so it continues on the static seed and the control plane's next bundle", lerr)
 	}
-	// ★★★ AND READ AGAIN, BECAUSE A STANDBY THAT ONLY LEARNS BY RESTARTING IS NOT WARM (2026-08-25). Two
-	// control planes share one database precisely so the standby holds what the leader authored. This store
-	// was read once at start-up and never again: measured, a device enrolled while both were running appeared
-	// on the leader, not on the standby, and appeared on the standby the moment it was restarted. A failover
-	// then handed the deployment to a node that had forgotten the fleet.
-	//
-	// This deployment has now found the same defect in the transport trust store, the export download tokens,
-	// the tenant CA registry and here.
-	//
-	// ★★ ONLY WHEN THIS NODE IS NOT THE ONE WRITING. Administration reaches whichever node holds leadership,
-	// so the leader is the author and a leader re-reading could only overwrite itself with an older snapshot.
-	// A node with no election — a single control plane — is always the leader and never reloads, which is
-	// right: there is nobody else to learn from.
-	// storeBackend, not a raw compare: "postgres+import:<path>" selects the SAME backend, and a raw comparison
-	// is false for it — which here would silently leave the standby cold on exactly the deployments that were
-	// migrated onto shared state.
+	// Resolve old untyped marks only after both inventories are loaded, and before
+	// any feed worker can replace the state being classified.
+	if err := prepareUserRiskState(context.Background(), highRiskOverlay, enrolledLedger, humanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
+	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
+	configureInventoryPromotion(cpLeaderElectorInstance, *enrolledInventoryStore, enrolledLedger)
+	configureSeatPromotion(cpLeaderElectorInstance, *seatAllocationStore, seatAllocations)
+	cpLeaderElectorInstance.Start()
+	defer cpLeaderElectorInstance.Stop()
+	if sharedRevocationSource != nil {
+		go sharedRevocationSource.run(context.Background(), livenessRevocations, highRiskOverlay)
+	}
+	// Keep a standby warm, but serialize each read with promotion. The final
+	// required read is in prepareLeadership, before any authority is published.
 	if storeBackend(*enrolledInventoryStore) == "postgres" {
 		go func(l *enrolledinventory.Ledger) {
-			// ★★★ AND THE LAST READ IT DOES IS THE ONE ON PROMOTION (2026-08-25, measured).
-			//
-			// The loop below stops re-reading the moment this node becomes the leader, which is correct —
-			// from then on it is the author. But the snapshot it becomes the author OF is whatever it last
-			// read, up to one interval old. Measured on the generated deployment while a device was being
-			// enrolled: the leader named 1 and the standby named 0, and the check said what that costs — an
-			// Edge that receives a roster missing a device stops admitting it.
-			//
-			// So the transition is where the read belongs: one final reload at the instant of promotion,
-			// before this node starts answering as the authority. Fifteen seconds of staleness is not much
-			// until it is the fifteen seconds containing somebody's enrolment.
-			wasLeader := cpLeaderElectorInstance != nil && cpLeaderElectorInstance.IsLeader()
 			for range time.Tick(15 * time.Second) {
-				nowLeader := cpLeaderElectorInstance != nil && cpLeaderElectorInstance.IsLeader()
-				if nowLeader {
-					if wasLeader {
-						continue
-					}
-					// Just promoted: read once more, as the standby, before acting as the leader.
-					wasLeader = true
-					if changed, rerr := l.ReloadFromStore(); rerr != nil {
-						log.Printf("enrolled_inventory: this node was PROMOTED and could not re-read the "+
-							"fleet's roster (%v) — it is now the authority for a roster it knows is older "+
-							"than the one it is replacing", rerr)
-					} else if changed {
-						log.Printf("enrolled_inventory: took up the leader's roster at promotion")
-					}
-					continue
-				}
-				wasLeader = false
-				changed, rerr := l.ReloadFromStore()
-				if rerr != nil {
-					log.Printf("enrolled_inventory: this standby could not re-read the fleet's roster (%v) — it "+
-						"is serving an older one, and a failover would hand the deployment that", rerr)
-					continue
-				}
-				if changed {
-					log.Printf("enrolled_inventory: this standby took up the roster the leader authored")
+				if _, err := cpLeaderElectorInstance.refreshStandbyInventory(l); err != nil {
+					log.Printf("enrolled_inventory: standby refresh unavailable; promotion requires a successful retry")
 				}
 			}
 		}(enrolledLedger)
@@ -4598,7 +4515,11 @@ func main() {
 	if storeBackend(*transportAnchorAckStorePath) == "postgres" {
 		transportAnchorAckShared = mustCPStateBlobPersister(*transportAnchorAckStorePath, "transport_anchor_acks")
 	}
+	standbyAudit := newAdminStandbyAudit(writer, evaluator)
+	stopStandbyAudit := standbyAudit.start()
+	defer stopStandbyAudit()
 	mux := newServerWithConfig(serverConfig{
+		StandbyAudit:                   standbyAudit,
 		DNSConntrack:                   edgeDNSConntrack,
 		VLANObjectStorePath:            strings.TrimSpace(*vlanObjectStorePath),
 		PeerEdges:                      meshPeerEdges,
@@ -4615,14 +4536,8 @@ func main() {
 		InspectionPosture:              func() inspectionposture.Posture { return postureStore.Get() },
 		// So a posture change moves the config bundle's VERSION and not only its contents — without this the
 		// section below would be published in every bundle and applied by nobody.
-		InspectionPostureGeneration: postureStore.ConfigGeneration,
-		SetInspectionPosture: func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error) {
-			updated, err := postureStore.Set(p)
-			// The in-memory posture IS applied either way (the engine must match what the store holds);
-			// the error tells the admin the change will not survive a restart.
-			applyInspectionPosture(tenantID)
-			return updated, err
-		},
+		InspectionPostureGeneration:  postureStore.ConfigGeneration,
+		SetInspectionPosture:         newInspectionPostureSetter(postureStore, applyInspectionPosture),
 		AssetStore:                   assetStore,
 		RuleStore:                    ruleStore,
 		TenantModelStore:             tenantModelStore,
@@ -4808,7 +4723,7 @@ func main() {
 	// (T) secure transport: additive TLS listener for the encrypted endpoint↔Edge tunnel. Default
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
 	// Edge continues on -listen.
-	seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations"))
+
 	vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license"))
 	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
 	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,
@@ -5063,61 +4978,8 @@ func configWriteRejectedWhenSourced(w http.ResponseWriter, configSourceURL, reso
 	return true
 }
 
-// materializedCertPinBypassHosts returns the host/SNI of every materialized cert-pinning candidate for
-// the tenant — the destinations the interception engine should raw-forward (decrypt-bypass). Only
-// candidates that an admin has approved and materialized appear here; pending/approved ones do not.
-func materializedCertPinBypassHosts(store *policycandidate.Store, tenantID string) []string {
-	if store == nil {
-		return nil
-	}
-	resp, err := store.List(context.Background(), tenantID, policycandidate.ListOptions{Status: "materialized", Limit: 1000})
-	if err != nil {
-		return nil
-	}
-	hosts := []string{}
-	for _, c := range resp.Candidates {
-		if c.Source != policycandidate.SourceCertPinningDetection {
-			continue
-		}
-		if h := strings.TrimSpace(c.SNI); h != "" {
-			hosts = append(hosts, h)
-		}
-		if h := strings.TrimSpace(c.Host); h != "" {
-			hosts = append(hosts, h)
-		}
-	}
-	return hosts
-}
-
-// materializedCertPinBypassRefs is materializedCertPinBypassHosts paired with the candidate id of each bypass, so
-// the Egress view can offer a Revoke (suppress the candidate → re-intercept the host), not just display it.
-func materializedCertPinBypassRefs(store *policycandidate.Store, tenantID string) []certPinBypassRef {
-	if store == nil {
-		return nil
-	}
-	resp, err := store.List(context.Background(), tenantID, policycandidate.ListOptions{Status: "materialized", Limit: 1000})
-	if err != nil {
-		return nil
-	}
-	refs := []certPinBypassRef{}
-	for _, c := range resp.Candidates {
-		if c.Source != policycandidate.SourceCertPinningDetection {
-			continue
-		}
-		host := strings.TrimSpace(c.SNI)
-		if host == "" {
-			host = strings.TrimSpace(c.Host)
-		}
-		if host != "" {
-			refs = append(refs, certPinBypassRef{Host: host, CandidateID: c.CandidateID})
-		}
-	}
-	return refs
-}
-
-// materializedCertPinCandidates returns the full materialized cert-pinning candidates for a tenant — used at
-// startup to migrate any that predate the cert-pin-bypass-as-rule model into emitted Egress rules, so every
-// pinned-site bypass is a single, consistent authored rule (the rule is the bypass's only source).
+// materializedCertPinCandidates returns historical adoption requests for a tenant.
+// Startup reports their presence without recreating authored rules from them.
 func materializedCertPinCandidates(store *policycandidate.Store, tenantID string) []policycandidate.Candidate {
 	if store == nil {
 		return nil
@@ -5200,7 +5062,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	dlpPolicyObjects := dlpRT.policyObjects
 	dlpFingerprintStore := dlpRT.fingerprints
 	dlpClassifierStore := dlpRT.classifiers
-	config.DLPDistribution = &dlpConfigStores{policies: dlpPolicyObjects, classifiers: dlpClassifierStore, fingerprints: dlpFingerprintStore}
+	config.DLPDistribution = &dlpConfigStores{policies: dlpPolicyObjects, classifiers: dlpClassifierStore, fingerprints: dlpFingerprintStore, allowlist: dlpAllowlistStore}
 	trustedKeyring := config.TrustedKeyring
 	routeProfiles := config.RouteProfiles
 	swgRuntime := config.SWGRuntime
@@ -5285,6 +5147,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					logWriter:           writer,
 					localCredentials:    config.LocalCredentials,
 					purgeDB:             adminAuthPostgresDB(adminAuth),
+					legalHold:           config.LegalHold,
 					enforcementTenantID: config.Evaluator.PolicyBundle.TenantID,
 					nodeName:            adminFootprintNodeName(config.ConfigSourceURL),
 					erasureOrders:       &tenantErasureOrders{},
@@ -5372,7 +5235,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return false, false
 			}
 			return counts.Principals > 0, true
-		})
+		}, config.LocalCredentials, config.StandbyAudit)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)
@@ -5616,7 +5479,17 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerConnectorReportRoute(mux, registry, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)
 	registerTenantTransportAuthorityAdminRoute(mux, adminEndpoint, config.TenantTransportAuthority)
-	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore, newPKITransitionAdmission(config))
+	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore,
+		func(r *http.Request, tenant, action string, row *storedTenantInterceptionIssuer) {
+			root, _ := summarizeCertificatePEM(row.RootPEM)
+			issuer, _ := summarizeCertificatePEM(row.IssuingCertPEM)
+			entry := pkiMaterialAuditLog(tenant, action, "tenant_interception_authority", tenant,
+				"Interception authority saved; a staged replacement is not yet signing.",
+				map[string]any{"root_sha256": root.SHA256, "issuing_sha256": issuer.SHA256,
+					"staged": action == "interception_authority_staged"},
+				principalIDForAudit(r), sourceIPFromRequest(r), evaluator)
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, entry, time.Now())
+		}, newPKITransitionAdmission(config))
 	registerTenantDeviceAuthorityAdminRoute(mux, adminEndpoint, config.TenantDeviceAuthority,
 		strings.TrimSpace(config.ConfigSourceURL), config.TenantModelStore, newPKITransitionAdmission(config))
 	// ★ And the READS for those two tiers, which did not exist until 2026-08-22: every act had a door and
@@ -6252,7 +6125,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL)
 	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride)
 	registerUsageEventsRoutes(mux, adminEndpoint, adminAuth, usageMeters, adminHotStore, humanIdentities, nonHumanIdentities)
-	registerAgentQualityRoutes(mux, adminEndpoint, evaluator, writer, deviceStore, agentTelemetry, agentRolloutPlans, agentTargetVersion, agentReleaseChannel, config.AgentRolloutCache, adminHotStore)
+	registerAgentQualityRoutes(mux, adminEndpoint, evaluator, writer, deviceStore, agentTelemetry, agentRolloutPlans, agentTargetVersion, agentReleaseChannel, config.AgentRolloutCache, adminHotStore, config.AdminAuditOutbox)
 	// The per-device view the Devices list folds in: everything this lane does has otherwise been reachable
 	// only by curl.
 	registerAgentDeviceUpdateRoutes(mux, adminEndpoint, deviceStore, config.EnrolledLedger, agentTelemetry,
@@ -6274,7 +6147,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		seedConnectorProgramFromThisImage(config.ConnectorProgramDir, connectorProgramsBesideThisBinary(),
 			runtime.GOOS, runtime.GOARCH)
 	}
-	registerConnectorProgramRoutes(mux, adminEndpoint, config.ConnectorProgramDir, config.PullsAgentUpdates)
+	registerConnectorProgramRoutes(mux, adminEndpoint, config.ConnectorProgramDir, config.PullsAgentUpdates, writer, adminAuditOutbox, evaluator)
 	registerHumanIdentityRoutes(mux, adminEndpoint, evaluator, writer, humanIdentities, adminAuditOutbox, registry, connectorSecret, devMode, requireConnectorRuntimeSecret, configSourceURL, config.DirectoryCPReporter, config.TenantCARegistry)
 	registerNHIRegistryRoutes(mux, adminEndpoint, evaluator, writer, adminAuditOutbox, nonHumanIdentities, configSourceURL)
 	bundleGeneration := registerPolicyAdminRoutes(mux, adminEndpoint, config, evaluator, writer, adminAuditOutbox, policyStore, configSourceURL, configBundleEpoch, registry, nonHumanIdentities, humanIdentities, delegatedGrants, edgeDNSResolver, vlanBoundary, tenantModelStore, networkExtensionPublisher, ruleStore, assetStore)
@@ -6349,7 +6222,6 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		assetStore.SyncEnrolledEndpoints(tenant, devices, time.Now().UTC())
 	}
 	syncEnrolledAssets()
-	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL)
 
 	// Per-tenant end-user IdP registry (federated-auth connections + default), managed from the Console.
 	// Durable when -idp-connection-store is set so registered IdPs survive a restart.
@@ -6379,7 +6251,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	} else if err := idpConnectionStore.SetPersister(p); err != nil {
 		log.Fatalf("load idp connection store: %v", err)
 	}
-	registerIdPConnectionsAdmin(mux, adminEndpoint, idpConnectionStore, config.ConfigSourceURL)
+	registerIdPConnectionsAdmin(mux, adminEndpoint, idpConnectionStore, config.ConfigSourceURL, func(r *http.Request, tenant, id, action string) {
+		now := time.Now().UTC()
+		audit := adminIdPChangeAuditLog(r, tenant, id, action, evaluator, now)
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, audit, now)
+	})
 
 	// Organization Domains (S6): the explicit, multi-value "these domains are US" setting DLP instance-aware action
 	// references. Durable; the corporate-domain resolver is Organization Domains ∪ IdP verified_domains.
@@ -6431,7 +6307,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		log.Fatalf("load grant store: %v", err)
 	}
 	theGrantStore.Store(grantStore)
-	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator.PolicyBundle.TenantID)
+	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox)
 	// ★ AND THE AUTHORITY RECEIVES WHAT THE FLEET MINTED. Registered only on a node that does not pull its
 	// own configuration — the same rule the connector report states. See grant_cp_report.go.
 	registerGrantReportRoute(mux, grantStore, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
@@ -6506,7 +6382,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			s.SetCompiledPolicies(tenant, policyrule.CompileEgressPolicies(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore))
 		}
 	}
+	var ruleCompilationMu sync.Mutex
 	recompileAuthoredRules := func() {
+		ruleCompilationMu.Lock()
+		defer ruleCompilationMu.Unlock()
 		// ★★ EVERY ORGANIZATION WITH SOMETHING TO CLEAR, NOT ONLY ONES WITH SOMETHING TO BUILD (2026-08-17,
 		// measured). This walked the organizations that HAVE authored rules. Deleting an organization's LAST
 		// rule removes it from that list, so its compiled set was never rebuilt to empty — and went on
@@ -6526,6 +6405,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			recompileOneTenant(tenant)
 		}
 	}
+	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL, recompileAuthoredRules, func(r *http.Request, kind, id, operation, result string, value any) {
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, assetCatalogAuditLog(r, kind, id, operation, result, value, evaluator, now), now)
+	})
 	registerRulesAdmin(mux, adminEndpoint, ruleStore, assetStore, recompileAuthoredRules, func(tenant, ruleID string) {
 		// Reverse lifecycle sync: deleting a cert-pin bypass rule un-materializes the pinned-site candidate it
 		// came from, so the Pinned Sites view reflects that the bypass is gone (it does not linger "materialized").
@@ -6539,7 +6422,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				log.Printf("reverse-sync cert-pin candidate %s on rule delete: %v", candidateID, err)
 			}
 		}
-	}, configSourceURL)
+	}, configSourceURL, func(r *http.Request, rule policyrule.Rule, operation, result string) {
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, authoredRuleAuditLog(r, rule, operation, result, evaluator, now), now)
+	})
 	// Seed the compiled rule sets from the durable rule store at startup (see recompileAuthoredRules): without
 	// this, east-west per-hop authz + authored egress policy do not enforce after a restart until the next edit.
 	recompileAuthoredRules()
@@ -6557,7 +6443,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// a no-op. This is the bridge that lets the uncovered-flow count fall to 0, the readiness signal for disabling
 	// Allow-all (S5). It reuses the exact same ruleStore.Upsert + recompile as POST /admin/rules, so an adopted
 	// rule is indistinguishable from a hand-authored one and is editable/deletable in the normal Rules UI.
-	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)
+	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, recompileAuthoredRules)
 	registerPredefinedCatalogRoutes(mux, adminEndpoint, config, evaluator, writer)
 	// The one file every endpoint needs, issued by the deployment that already holds the key to sign it.
 	// See admin_agent_profile_routes.go.
@@ -7434,7 +7320,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		event, ok := humanApprovals.Get(r.PathValue("approval_id"))
+		event, ok := humanApprovals.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("approval_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
@@ -7480,7 +7366,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		grant, ok := delegatedGrants.Get(r.PathValue("grant_id"))
+		grant, ok := delegatedGrants.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("delegated access grant %s is absent", r.PathValue("grant_id")))
 			return
@@ -7497,7 +7383,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode delegated access grant revoke request: %w", err))
 			return
 		}
-		grant, err := delegatedGrants.Revoke(r.PathValue("grant_id"), req.RevocationReason, now)
+		grant, err := delegatedGrants.RevokeForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"), req.RevocationReason, now)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
@@ -8713,6 +8599,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		rotatedBy := adminPrincipalIDFromRequest(r)
 		conn, ok, err := registry.RotateRuntimeSecretHashForTenantWithMetadata(adminTenantIDFromRequest(r), connectorID, connectorRuntimeSecretHash(runtimeSecret), now, rotatedBy)
 		if err != nil {
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector secret change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -8800,9 +8690,6 @@ func writeEastWestCeremonySuccess(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte("<!doctype html><html><body><h2>Authentication complete</h2><p>You may now retry your connection.</p></body></html>"))
 }
-
-// adminLoginTenantCookie carries the tenant resolved by home-realm discovery from /admin/login/discover to
-// the /admin/oidc/callback so the callback validates against (and binds the session to) the right tenant IdP.
 
 func randomURLToken(size int) (string, error) {
 	buf := make([]byte, size)
@@ -8914,7 +8801,7 @@ var connectorRouteCPConfigured bool
 func deriveDecisionRequestActor(req model.DecisionRequest, delegatedGrants *delegatedgrant.Store) model.DecisionRequest {
 	req.ActorType = ""
 	if grantID := strings.TrimSpace(req.DelegatedAccessGrantID); grantID != "" && delegatedGrants != nil {
-		if grant, ok := delegatedGrants.Get(grantID); ok && strings.TrimSpace(grant.TenantID) == strings.TrimSpace(req.TenantID) {
+		if grant, ok := delegatedGrants.GetForTenant(strings.TrimSpace(req.TenantID), grantID); ok && strings.TrimSpace(grant.TenantID) == strings.TrimSpace(req.TenantID) {
 			if strings.TrimSpace(req.ActorNHIID) == "" {
 				req.ActorNHIID = strings.TrimSpace(grant.ActorNHIID)
 			}
@@ -9800,7 +9687,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if grantID == "" {
 		return denyRuntimeEvidence(dec, "Delegated Access Grant is required for delegated agent access.", []string{"policy_matched", "delegated_grant_absent"}, "delegated_grant_absent")
 	}
-	grant, ok := delegatedGrants.Get(grantID)
+	grant, ok := delegatedGrants.GetForTenant(dec.TenantID, grantID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Delegated Access Grant was not found.", []string{"policy_matched", "delegated_grant_absent"}, "delegated_grant_absent")
 	}
@@ -9829,7 +9716,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if approvalID == "" {
 		return denyRuntimeEvidence(dec, "Human Approval Event is required for this delegated agent access.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
-	approval, ok := humanApprovals.Get(approvalID)
+	approval, ok := humanApprovals.GetForTenant(dec.TenantID, approvalID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Human Approval Event was not found.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
@@ -10370,7 +10257,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.DelegatedAccessGrantID != nil && *event.DelegatedAccessGrantID != "" {
-		grant, ok := delegatedGrants.Get(*event.DelegatedAccessGrantID)
+		grant, ok := delegatedGrants.GetForTenant(event.TenantID, *event.DelegatedAccessGrantID)
 		if !ok {
 			return fmt.Errorf("delegated access grant %s is absent", *event.DelegatedAccessGrantID)
 		}
@@ -10385,7 +10272,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.HumanApprovalEventID != nil && *event.HumanApprovalEventID != "" {
-		approval, ok := humanApprovals.Get(*event.HumanApprovalEventID)
+		approval, ok := humanApprovals.GetForTenant(event.TenantID, *event.HumanApprovalEventID)
 		if !ok {
 			return fmt.Errorf("human approval event %s is absent", *event.HumanApprovalEventID)
 		}

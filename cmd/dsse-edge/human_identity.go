@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	tenantca "github.com/lantern-networks/dsse-core/tenantca"
 	"net/http"
@@ -140,7 +141,7 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		now := time.Now()
 		created, err := humanIdentities.Upsert(r.Context(), identity, adminTenantIDFromRequest(r), now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeHumanIdentityMutationError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, humanIdentityAuditLog(created, r, evaluator, now), now)
@@ -177,7 +178,7 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		result, err := humanidentity.HumanIdentityDirectoryImport(r.Context(), humanIdentities, request, adminTenantIDFromRequest(r), now)
 		if err != nil {
 			humanidentity.HumanIdentityDirectoryRecordSourceImportError(r.Context(), humanIdentities, request, adminTenantIDFromRequest(r), err, now)
-			writeError(w, http.StatusBadRequest, err)
+			writeHumanIdentityMutationError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, humanIdentityImportAuditLog(result, r, evaluator, now), now)
@@ -235,7 +236,7 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		result, err := humanidentity.HumanIdentityDirectoryImport(r.Context(), humanIdentities, request, evaluator.PolicyBundle.TenantID, now)
 		if err != nil {
 			humanidentity.HumanIdentityDirectoryRecordSourceImportError(r.Context(), humanIdentities, request, evaluator.PolicyBundle.TenantID, err, now)
-			writeError(w, http.StatusBadRequest, err)
+			writeHumanIdentityMutationError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, humanIdentityImportAuditLog(result, r, evaluator, now), now)
@@ -244,4 +245,14 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		directoryReporter.Report(directoryImportReport{Request: request, TenantID: evaluator.PolicyBundle.TenantID})
 		writeJSON(w, http.StatusOK, result)
 	})
+}
+
+// Storage errors are server failures, including when wrapped by an import. Keep
+// internal paths and storage details out of the client response.
+func writeHumanIdentityMutationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, humanidentity.ErrDirectoryPersistence) {
+		writeError(w, http.StatusInternalServerError, humanidentity.ErrDirectoryPersistence)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }

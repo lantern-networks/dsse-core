@@ -36,11 +36,14 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
-	if p == nil {
-		return nil
+	next := s.candidateLocked()
+	next.persister = p
+	if err := next.loadLocked(); err != nil {
+		return err
 	}
-	return s.loadLocked()
+	s.adoptLocked(next)
+	s.persister = p
+	return nil
 }
 
 func (s *Store) loadLocked() error {
@@ -57,6 +60,15 @@ func (s *Store) loadLocked() error {
 	var snap persistedCatalog
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
+	}
+	for tenant, services := range snap.Services {
+		for id, service := range services {
+			normalized, err := normalizeServiceTransports(service)
+			if err != nil {
+				return fmt.Errorf("invalid service transport in catalog snapshot: %w", err)
+			}
+			snap.Services[tenant][id] = normalized
+		}
 	}
 	if snap.Endpoints != nil {
 		s.endpoints = snap.Endpoints

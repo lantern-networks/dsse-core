@@ -4,6 +4,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -38,6 +39,8 @@ type licenseState struct {
 
 const licenseStateSchema = "dsse.vendor_license_state.v1"
 
+var errLicensePersistence = errors.New("license persistence failed")
+
 func newLicenseStore() *licenseStore { return &licenseStore{} }
 
 func (s *licenseStore) SetPersister(p blobstore.Persister) {
@@ -71,20 +74,26 @@ func (s *licenseStore) Apply(env vendorlicense.Envelope, accepted []*ecdsa.Publi
 	if err != nil {
 		return vendorlicense.Payload{}, err
 	}
-	s.envelope = &env
-	s.payload = &p
-	s.lastAcceptedSerial = p.Serial
 	if s.persister != nil {
 		data, mErr := json.Marshal(licenseState{
 			SchemaVersion: licenseStateSchema, Envelope: &env,
 			LastAcceptedSerial: p.Serial, AppliedAt: now, AppliedBy: by,
 		})
 		if mErr == nil {
-			if sErr := s.persister.Save(data); sErr != nil {
-				log.Printf("vendor_license persist: save failed: %v", sErr)
-			}
+			mErr = s.persister.Save(data)
+		}
+		if mErr != nil && (!errors.Is(mErr, blobstore.ErrSavedWithoutAtomicity) || errors.Is(mErr, blobstore.ErrDurabilityUnconfirmed)) {
+			log.Printf("vendor_license persist: save failed: %v", mErr)
+			return vendorlicense.Payload{}, errLicensePersistence
+		}
+		if mErr != nil {
+			log.Printf("vendor_license persist: saved without atomic replacement: %v", mErr)
 		}
 	}
+	// Do not consume the serial or change enrolment limits until storage confirms the save.
+	s.envelope = &env
+	s.payload = &p
+	s.lastAcceptedSerial = p.Serial
 	return p, nil
 }
 

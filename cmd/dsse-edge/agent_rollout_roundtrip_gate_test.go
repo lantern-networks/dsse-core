@@ -67,7 +67,7 @@ func newPlanGateHarnessAt(t *testing.T, storePath string) *planGateHarness {
 		Evaluator:          evaluator,
 	}
 	registerAgentQualityRoutes(h.mux, func(_ string, fn http.HandlerFunc) http.HandlerFunc { return fn },
-		evaluator, writer, nil, nil, h.plans, "0.3.0", "stable", nil, nil)
+		evaluator, writer, nil, nil, h.plans, "0.3.0", "stable", nil, nil, nil)
 	registerSteerAgentUpdatePlanRoutes(h.mux, config, agentUpdatePlanTenant{id: ""})
 	return h
 }

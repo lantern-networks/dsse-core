@@ -60,7 +60,7 @@ type adminTenantPurgeRow struct {
 func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB, writer *logs.Writer,
 	credentials *localAdminCredentialStore, ledger *enrolledinventory.Ledger, rules *policyrule.Store,
 	deviceCAs *tenantca.TenantCARegistry, deviceCARegistryPath string, deviceTrust transportTrustAnchorStore,
-	namedNetworks *vlan.Store, extra adminTenantExtraStores, now time.Time) adminTenantPurgeResult {
+	namedNetworks *vlan.Store, extra adminTenantExtraStores, holds *legalHoldStore, now time.Time) adminTenantPurgeResult {
 
 	tenantID = strings.TrimSpace(tenantID)
 	started := time.Now()
@@ -72,21 +72,37 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		Failures: []string{},
 	}
 
-	if credentials != nil {
-		if removed := credentials.DeleteAllForTenant(tenantID); len(removed) > 0 {
-			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "admin_accounts", Count: int64(len(removed))})
+	// Recheck at the shared destructive boundary, including signed remote orders.
+	// A failed check must leave all stores and the standing order untouched.
+	if err := holds.Health(); err != nil {
+		result.Failures = append(result.Failures, "legal_hold: state unavailable; restore storage and restart")
+		return result
+	}
+	if holds.IsHeld(tenantID) {
+		result.Failures = append(result.Failures, "legal_hold: tenant is held")
+		return result
+	}
+	// Deny admission and retain ownership when dependent cleanup reports a
+	// failure. A failed admission erase must keep its retry targets at restart.
+	if ledger != nil {
+		extra = tenantExtraStoresFor(extra, ledger, tenantID)
+		if _, err := ledger.RetireTenantChecked(tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+			result.Failures = append(result.Failures, "tenant identity retirement saving could not be confirmed")
+			result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now)
+			result.ElapsedMS = time.Since(started).Milliseconds()
+			return result
 		}
 	}
-	// ★ THE IDS COME OUT OF THE LEDGER AND ARE KEPT (2026-08-18). The high-risk overlay and the admission
-	// kill-switches are keyed by DEVICE, not by tenant, so the ledger is the only thing that knows whose they
-	// are — and this call is what empties it. Capturing the ids here is the difference between erasing those
-	// two stores and asking them about an empty list, which answers "there were none" either way.
-	if ledger != nil {
-		if removed := ledger.RemoveTenant(tenantID); len(removed) > 0 {
-			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "enrolled_identities", Count: int64(len(removed))})
-			if len(extra.DeviceIDs) == 0 {
-				extra.DeviceIDs = removed
-			}
+
+	credentialSweepAllowed := true
+	if credentials != nil {
+		removed, err := credentials.DeleteAllForTenant(tenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, "admin_accounts: credential deletion incomplete")
+			credentialSweepAllowed = false
+		}
+		if len(removed) > 0 {
+			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "admin_accounts", Count: int64(len(removed))})
 		}
 	}
 	extra.erase(&result)
@@ -121,12 +137,24 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	// id. It was in neither the count nor the erasure — and a store nobody counts contributes nothing to "what
 	// is left", so the answer could not have been anything else.
 	if namedNetworks != nil {
-		objects, policies := namedNetworks.RemoveTenant(tenantID)
+		objects, policies, err := namedNetworks.RemoveTenant(tenantID)
+		if err != nil {
+			log.Printf("tenant network erasure: %v", err)
+			result.Failures = append(result.Failures, "network erasure saving could not be confirmed")
+		}
 		if objects > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "named_networks", Count: int64(objects)})
 		}
 		if policies > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "named_network_boundary_policies", Count: int64(policies)})
+		}
+	}
+	if ledger != nil && len(result.Failures) == 0 {
+		removed, err := ledger.RemoveTenantChecked(tenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, "tenant identity erasure saving could not be confirmed")
+		} else if len(removed) > 0 {
+			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "enrolled_identities", Count: int64(len(removed))})
 		}
 	}
 	if writer != nil {
@@ -144,6 +172,9 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		for _, table := range adminTenantFootprintPostgresTables {
 			if tenantModelFleetCarryingTable(table) {
 				continue // last, and only if the rest worked — see below
+			}
+			if table == "admin_local_credentials" && !credentialSweepAllowed {
+				continue // Do not bypass a rejected generation-aware account deletion.
 			}
 			row := purgeTenantRows(ctx, db, table, tenantID)
 			if row.Error != "" {
@@ -217,7 +248,7 @@ func purgeTenantRows(ctx context.Context, db *sql.DB, table, tenantID string) ad
 	// and these tables do not agree on one.
 	statement := "DELETE FROM " + table + " WHERE ctid IN (SELECT ctid FROM " + table + " WHERE tenant_id = $1 LIMIT $2)"
 	for {
-		res, err := db.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
+		res, err := executeTenantPurgeBatch(ctx, db, table, statement, tenantID)
 		if err != nil {
 			if isUndefinedTableError(err) {
 				return row // this deployment does not have the table: nothing to erase, and not a failure
@@ -310,4 +341,25 @@ func purgeTenantDeviceCAs(registry *tenantca.TenantCARegistry, registryPath stri
 		return removed, fmt.Errorf("the trust set a handshake reads could not be rebuilt, so those CAs may still admit devices: %w", err)
 	}
 	return removed, nil
+}
+
+// Credential cleanup uses the same transaction-local protocol as account mutations.
+// Commit each bounded batch before counting it, without authorizing other tables.
+func executeTenantPurgeBatch(ctx context.Context, db *sql.DB, table, statement, tenantID string) (sql.Result, error) {
+	if table != "admin_local_credentials" {
+		return db.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
+	}
+	tx, err := (postgresCredentialPersistence{db: db}).beginCredentialWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

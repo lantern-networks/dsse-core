@@ -2,7 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -22,8 +25,9 @@ type dlpAllowlistRuntimeStore struct {
 	sets   map[string]*dlp.Allowlist // tenant -> compiled salted-hash allowlist (data path)
 	salt   string                    // edge-wide salt mixed into every hash
 	// persister durably stores the per-tenant values so the allowlist survives an Edge restart.
-	persister blobstore.Persister
-	dirty     bool
+	persister  blobstore.Persister
+	dirty      bool
+	generation uint64
 }
 
 func newDLPAllowlistRuntimeStore(salt string) *dlpAllowlistRuntimeStore {
@@ -61,7 +65,75 @@ func (s *dlpAllowlistRuntimeStore) SetValues(tenantID string, values []string) {
 		s.sets[tenantID] = dlp.NewAllowlist(s.salt+"\x00"+tenantID, values)
 	}
 	s.dirty = true
+	s.generation++
 	s.mu.Unlock()
+}
+
+const maxDLPAllowlistValues = 1000
+
+func validatedAllowlistValues(values []string) ([]string, error) {
+	if len(values) > maxDLPAllowlistValues {
+		return nil, fmt.Errorf("too many allowlist values (max %d)", maxDLPAllowlistValues)
+	}
+	next := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for i, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf("allowlist value %d is empty", i+1)
+		}
+		if !seen[value] {
+			next = append(next, value)
+			seen[value] = true
+		}
+	}
+	return next, nil
+}
+
+// SetValuesDurable confirms configured storage before publishing suppression rules.
+// Without a persister this remains in-memory only; errors do not prove disk rollback.
+func (s *dlpAllowlistRuntimeStore) SetValuesDurable(tenantID string, values []string) error {
+	values, err := validatedAllowlistValues(values)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.snapshotLocked()
+	if len(values) == 0 {
+		delete(next.Values, tenantID)
+	} else {
+		next.Values[tenantID] = values
+	}
+	if err := s.saveSnapshotLocked(next); err != nil {
+		return err
+	}
+	s.values = next.Values
+	if len(values) == 0 {
+		delete(s.sets, tenantID)
+	} else {
+		s.sets[tenantID] = dlp.NewAllowlist(s.salt+"\x00"+tenantID, values)
+	}
+	s.dirty = false
+	s.generation++
+	return nil
+}
+func (s *dlpAllowlistRuntimeStore) snapshotLocked() allowlistStoreSnapshot {
+	next := allowlistStoreSnapshot{Values: map[string][]string{}}
+	for tenant, values := range s.values {
+		next.Values[tenant] = append([]string(nil), values...)
+	}
+	return next
+}
+func (s *dlpAllowlistRuntimeStore) saveSnapshotLocked(next allowlistStoreSnapshot) error {
+	if s.persister == nil {
+		return nil
+	}
+	data, err := json.Marshal(next)
+	if err != nil {
+		return err
+	}
+	return s.persister.Save(data)
 }
 
 // Tenants returns the tenant ids that have an allowlist, ordered (admin listing).
@@ -80,62 +152,65 @@ type allowlistStoreSnapshot struct {
 	Values map[string][]string `json:"values"`
 }
 
-// SetPersister attaches durable storage and rehydrates + recompiles on boot (so the allowlist survives a restart).
+// SetPersister validates the whole snapshot before replacing state and writer.
+// Values are recompiled with the local salt; the saved values are authoritative.
 func (s *dlpAllowlistRuntimeStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty {
+		return fmt.Errorf("save pending allowlist changes before replacing the persistence store")
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
-	if err != nil || len(data) == 0 {
-		return err
-	}
-	var snap allowlistStoreSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for tenant, vals := range snap.Values {
-		if len(vals) == 0 {
-			continue
-		}
-		s.values[tenant] = vals
-		s.sets[tenant] = dlp.NewAllowlist(s.salt+"\x00"+tenant, vals)
-	}
-	return nil
-}
-
-// PersistIfDirty writes a snapshot when there are unsaved changes. Cheap no-op when clean or persister-less.
-func (s *dlpAllowlistRuntimeStore) PersistIfDirty() error {
-	s.mu.Lock()
-	if !s.dirty || s.persister == nil {
-		s.mu.Unlock()
-		return nil
-	}
-	snap := allowlistStoreSnapshot{Values: map[string][]string{}}
-	for t, v := range s.values {
-		snap.Values[t] = v
-	}
-	data, err := json.Marshal(snap)
-	p := s.persister
-	if err == nil {
-		s.dirty = false
-	}
-	s.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if err := p.Save(data); err != nil {
-		// dirty was cleared optimistically (Save runs outside the lock); re-mark so the next periodic
-		// flush retries instead of silently dropping the snapshot (review #17).
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
+	if data == nil {
+		s.persister = p
+		s.dirty = len(s.values) > 0
+		return nil
+	}
+	var snap allowlistStoreSnapshot
+	if err := decodeDLPLibrarySnapshot(data, "values", &snap); err != nil {
 		return err
 	}
+	next := map[string][]string{}
+	sets := map[string]*dlp.Allowlist{}
+	for tenant, vals := range snap.Values {
+		if !validDLPLibraryTenant(tenant) {
+			return fmt.Errorf("invalid allowlist snapshot")
+		}
+		values, err := validatedAllowlistValues(vals)
+		if err != nil {
+			return fmt.Errorf("invalid allowlist snapshot")
+		}
+		if len(values) == 0 {
+			continue
+		}
+		next[tenant] = values
+		sets[tenant] = dlp.NewAllowlist(s.salt+"\x00"+tenant, values)
+	}
+	if !reflect.DeepEqual(s.values, next) {
+		s.generation++
+	}
+	s.values, s.sets, s.persister, s.dirty = next, sets, p, false
+	return nil
+}
+
+// PersistIfDirty serializes staged saves with admin commits and retains dirty on error.
+func (s *dlpAllowlistRuntimeStore) PersistIfDirty() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty || s.persister == nil {
+		return nil
+	}
+	if err := s.saveSnapshotLocked(s.snapshotLocked()); err != nil {
+		return err
+	}
+	s.dirty = false
 	return nil
 }
 

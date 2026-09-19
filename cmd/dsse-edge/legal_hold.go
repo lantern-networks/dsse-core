@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +29,7 @@ type legalHoldStore struct {
 	mu        sync.RWMutex
 	held      map[string]legalHoldRecord // tenant_id -> record
 	persister blobstore.Persister
+	loadErr   error
 }
 
 func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
@@ -36,6 +39,7 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 	}
 	data, err := p.Load()
 	if err != nil {
+		s.loadErr = err
 		log.Printf("legal-hold store load: %v", err)
 		return s
 	}
@@ -44,13 +48,26 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 	}
 	var records []legalHoldRecord
 	if err := json.Unmarshal(data, &records); err != nil {
+		s.loadErr = err
 		log.Printf("legal-hold store parse: %v", err)
 		return s
 	}
+	if records == nil {
+		s.loadErr = fmt.Errorf("legal hold snapshot must be an array")
+		return s
+	}
 	for _, r := range records {
-		if r.TenantID != "" {
-			s.held[r.TenantID] = r
+		tenant := strings.TrimSpace(r.TenantID)
+		if tenant == "" {
+			s.loadErr = fmt.Errorf("legal hold record has no tenant")
+			return s
 		}
+		if _, exists := s.held[tenant]; exists {
+			s.loadErr = fmt.Errorf("duplicate legal hold tenant")
+			return s
+		}
+		r.TenantID = tenant
+		s.held[tenant] = r
 	}
 	if len(s.held) > 0 {
 		log.Printf("legal-hold store loaded: %d tenant(s) under hold", len(s.held))
@@ -65,16 +82,24 @@ func (s *legalHoldStore) IsHeld(tenantID string) bool {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return true
+	}
 	_, ok := s.held[tenantID]
 	return ok
 }
 
 // Set places or releases a legal hold on a tenant and persists the change.
-func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) {
+func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) error {
 	if s == nil || tenantID == "" {
-		return
+		return fmt.Errorf("legal hold store or tenant is unavailable")
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
+	}
+	previous, existed := s.held[tenantID]
 	if active {
 		if _, exists := s.held[tenantID]; !exists {
 			s.held[tenantID] = legalHoldRecord{TenantID: tenantID, HeldSince: now.UTC().Format(time.RFC3339), HeldBy: heldBy, Reason: reason}
@@ -82,13 +107,20 @@ func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now t
 	} else {
 		delete(s.held, tenantID)
 	}
-	s.persistLocked()
-	s.mu.Unlock()
+	if err := s.persistLocked(); err != nil {
+		if existed {
+			s.held[tenantID] = previous
+		} else {
+			delete(s.held, tenantID)
+		}
+		return err
+	}
 	if active {
 		log.Printf("legal_hold_set tenant=%s held=true by=%q", tenantID, heldBy)
 	} else {
 		log.Printf("legal_hold_set tenant=%s held=false", tenantID)
 	}
+	return nil
 }
 
 // List returns the current holds, sorted by tenant id.
@@ -106,9 +138,9 @@ func (s *legalHoldStore) List() []legalHoldRecord {
 	return out
 }
 
-func (s *legalHoldStore) persistLocked() {
+func (s *legalHoldStore) persistLocked() error {
 	if s.persister == nil {
-		return
+		return nil
 	}
 	records := make([]legalHoldRecord, 0, len(s.held))
 	for _, r := range s.held {
@@ -117,10 +149,23 @@ func (s *legalHoldStore) persistLocked() {
 	sort.Slice(records, func(i, j int) bool { return records[i].TenantID < records[j].TenantID })
 	data, err := json.Marshal(records)
 	if err != nil {
-		log.Printf("legal-hold persist marshal: %v", err)
-		return
+		return fmt.Errorf("marshal legal hold: %w", err)
 	}
 	if err := s.persister.Save(data); err != nil {
-		log.Printf("legal-hold persist save: %v", err)
+		return fmt.Errorf("persist legal hold: %w", err)
 	}
+	return nil
+}
+
+// An unavailable snapshot cannot authorize deletion or be overwritten with partial state.
+func (s *legalHoldStore) Health() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
+	}
+	return nil
 }

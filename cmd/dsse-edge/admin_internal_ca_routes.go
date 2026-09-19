@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -19,7 +21,7 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 	store, _ := config.InternalCAs.(*internalca.Store)
 
 	mux.HandleFunc("GET /admin/internal-cas", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		if store == nil {
+		if store == nil || store.Availability() != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("this deployment has no store for internal certificate authorities"))
 			return
 		}
@@ -42,12 +44,12 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 	// answered with an attribute of this node. Only the operator organization may read it, because it is every
 	// customer's list at once.
 	mux.HandleFunc("GET /admin/internal-cas/all", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		if store == nil {
+		if store == nil || store.Availability() != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("this deployment has no store for internal certificate authorities"))
 			return
 		}
 		operator := operatorTenantConfigured()
-		if operator != "" && strings.TrimSpace(adminTenantIDFromRequest(r)) != operator {
+		if operator == "" || strings.TrimSpace(adminTenantIDFromRequest(r)) != operator {
 			writeError(w, http.StatusForbidden, fmt.Errorf("only the operator organization may read every organization's authorities"))
 			return
 		}
@@ -55,7 +57,7 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 	}))
 
 	mux.HandleFunc("POST /admin/internal-cas", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
-		if store == nil {
+		if store == nil || store.Availability() != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("this deployment has no store for internal certificate authorities"))
 			return
 		}
@@ -68,8 +70,13 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 			return
 		}
 		var body internalca.Authority
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err := decoder.Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("expected one JSON object"))
 			return
 		}
 		// ★ WHOSE LIST THIS IS, DECIDED IN ONE PLACE. A customer naming another organization is REFUSED rather
@@ -86,16 +93,25 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 		if strings.TrimSpace(body.ID) == "" {
 			body.ID = fmt.Sprintf("ica-%d", time.Now().UTC().UnixNano())
 		}
-		saved, err := store.Upsert(body, time.Now().UTC())
+		now := time.Now().UTC()
+		saved, err := store.Upsert(body, now)
+		result := "saved"
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			result = "rejected"
+			if errors.Is(err, internalca.ErrPersistence) {
+				result = "persistence_unconfirmed"
+			}
+		}
+		_ = appendAdminAudit(r.Context(), config.Writer, config.AdminAuditOutbox, internalAuthorityAuditLog(r, body, "upsert", result, config.Evaluator, now), now)
+		if err != nil {
+			writeInternalCAError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, saved)
 	}))
 
 	mux.HandleFunc("DELETE /admin/internal-cas/{id}", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
-		if store == nil {
+		if store == nil || store.Availability() != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("this deployment has no store for internal certificate authorities"))
 			return
 		}
@@ -112,10 +128,36 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 			writeError(w, http.StatusForbidden, tenantErr)
 			return
 		}
-		if !store.Delete(r.PathValue("id"), tenant, time.Now().UTC()) {
+		now := time.Now().UTC()
+		id := r.PathValue("id")
+		deleted, err := store.DeleteChecked(id, tenant, now)
+		result := "deleted"
+		if err != nil {
+			result = "persistence_unconfirmed"
+		} else if !deleted {
+			result = "not_found"
+		}
+		_ = appendAdminAudit(r.Context(), config.Writer, config.AdminAuditOutbox, internalAuthorityAuditLog(r, internalca.Authority{ID: id, TenantID: tenant}, "delete", result, config.Evaluator, now), now)
+		if err != nil {
+			writeInternalCAError(w, err)
+			return
+		}
+		if !deleted {
 			writeError(w, http.StatusNotFound, fmt.Errorf("no such authority in this organization"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "tenant_id": tenant})
 	}))
+}
+
+func writeInternalCAError(w http.ResponseWriter, err error) {
+	if errors.Is(err, internalca.ErrPersistence) {
+		writeError(w, http.StatusInternalServerError, fmt.Errorf("Storage did not confirm the change. Live trust was not changed by this request. Restore storage, reload the list and retry."))
+		return
+	}
+	if errors.Is(err, internalca.ErrUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, internalca.ErrUnavailable)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }

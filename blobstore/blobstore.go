@@ -57,7 +57,9 @@ type FilePersister struct {
 func (f FilePersister) Load() ([]byte, error) {
 	data, err := os.ReadFile(f.Path)
 	if os.IsNotExist(err) {
-		return nil, nil
+		if _, statErr := os.Lstat(f.Path); os.IsNotExist(statErr) {
+			return nil, nil
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -108,7 +110,7 @@ func (f FilePersister) Save(data []byte) error {
 	// that file. The data is saved and atomically so; only the flush is missing, which is the weaker promise
 	// ErrSavedWithoutAtomicity was introduced to make honestly.
 	if errors.Is(werr, durablefile.ErrReplacedNotFlushed) {
-		return ErrSavedWithoutAtomicity
+		return savedDurabilityWarning{}
 	}
 	// ★ AND A STAGING FAILURE MUST NOT COME HERE AT ALL (2026-08-13, thirty-first review #3). The rewrite in the
 	// previous round sent EVERY non-flush error down this path, including "the temporary file could not be
@@ -135,6 +137,19 @@ var writeFile = durablefile.Write
 // replaced by a rename, so it was written through. Returned rather than swallowed because "saved" and "saved
 // safely" are different promises, and a caller logging this as a failure would be wrong in the other direction.
 var ErrSavedWithoutAtomicity = errors.New("saved in place: the destination could not be replaced atomically (a bind-mounted file?), so an interrupted write could truncate it")
+
+// ErrDurabilityUnconfirmed means replacement completed, but its durable commit
+// could not be confirmed. This differs from a completed, synced in-place save.
+var ErrDurabilityUnconfirmed = durablefile.ErrReplacedNotFlushed
+
+// Preserve the legacy weak-save classification for existing callers while
+// allowing authorization stores to distinguish the missing flush guarantee.
+type savedDurabilityWarning struct{}
+
+func (savedDurabilityWarning) Error() string { return ErrDurabilityUnconfirmed.Error() }
+func (savedDurabilityWarning) Is(target error) bool {
+	return target == ErrSavedWithoutAtomicity || target == ErrDurabilityUnconfirmed
+}
 
 // Append implements AppendPersister: append data to the file in one O_APPEND write (no full rewrite). The caller
 // frames its own records (e.g. NDJSON). A single write of a batch keeps the WAL torn-write window to one syscall;

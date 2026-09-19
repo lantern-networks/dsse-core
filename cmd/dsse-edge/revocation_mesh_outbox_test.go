@@ -98,8 +98,9 @@ func TestRevocationMeshOutboxSurvivesRestartAndResumes(t *testing.T) {
 }
 
 // TestRevocationMeshReporterEnqueuesBeforeDelivery proves the reporter path persists the push BEFORE attempting
-// delivery, so a crash between "revoke" and "peer ack" cannot lose it. The peer here is unreachable, so delivery
-// never succeeds, yet the entry is durably enqueued.
+// delivery after a successful save. The peer here is unreachable, so delivery
+// never succeeds, yet the confirmed queue snapshot can be reloaded. Save failures
+// are covered separately and do not guarantee restart recovery.
 func TestRevocationMeshReporterEnqueuesBeforeDelivery(t *testing.T) {
 	persister := blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "revocation_mesh_outbox.json")}
 	o, err := newRevocationMeshOutbox(persister)
@@ -138,27 +139,27 @@ func TestRevocationMeshOutboxEnqueueAckAndNilPersister(t *testing.T) {
 	}
 	e := revocationMeshOutboxEntry{Region: "region-b", URL: "https://cp.b", Identity: "d1", Reason: "kill", OriginRegion: "region-a"}
 	o.enqueue(e)
-	o.enqueue(e) // same key -> still 1 (monotonic overwrite)
+	e, _, _ = o.enqueue(e) // same key -> still 1; capture the latest delivery
 	o.enqueue(revocationMeshOutboxEntry{Region: "region-c", URL: "https://cp.c", Identity: "d1", Reason: "kill", OriginRegion: "region-a"})
 	if got := o.snapshot(); len(got) != 2 {
 		t.Fatalf("want 2 pending (per region), got %d: %+v", len(got), got)
 	}
-	o.ack("region-b", "d1")
+	o.ack(e)
 	if got := o.snapshot(); len(got) != 1 || got[0].Region != "region-c" {
 		t.Fatalf("ack should remove only region-b: %+v", got)
 	}
-	o.ack("region-b", "d1") // idempotent no-op
+	o.ack(e) // idempotent no-op
 
 	// nil persister: memory-only, no panic, enqueue/ack still work.
 	mem, err := newRevocationMeshOutbox(nil)
 	if err != nil {
 		t.Fatalf("nil persister: %v", err)
 	}
-	mem.enqueue(e)
+	latest, _, _ := mem.enqueue(e)
 	if len(mem.snapshot()) != 1 {
 		t.Fatal("nil-persister outbox must still hold entries in memory")
 	}
-	mem.ack("region-b", "d1")
+	mem.ack(latest)
 	if len(mem.snapshot()) != 0 {
 		t.Fatal("nil-persister ack must work")
 	}

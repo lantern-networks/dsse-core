@@ -36,7 +36,7 @@ func TestAnEdgeTakesTheControlPlanesInspectionPosture(t *testing.T) {
 	if section == nil {
 		t.Fatal("a control plane holding a posture published no section")
 	}
-	if !applyInspectionPostureBundleSection(section, edge.get, edge.set, nil) {
+	if changed, err := applyInspectionPostureBundleSection(section, edge.get, edge.set, nil); !changed || err != nil {
 		t.Fatal("the Edge did not take the control plane's posture")
 	}
 	if edge.get().Mode != inspectionposture.ModeBypassDefault {
@@ -76,7 +76,7 @@ func TestTheAllowlistTravelsAndNotOnlyTheMode(t *testing.T) {
 func TestAnUnchangedPostureIsNotReapplied(t *testing.T) {
 	cp := &postureHolder{p: bypassDefaultWith("accounts.google.com")}
 	edge := &postureHolder{p: bypassDefaultWith("accounts.google.com")}
-	if applyInspectionPostureBundleSection(inspectionPostureBundleSection(cp.get), edge.get, edge.set, nil) {
+	if changed, _ := applyInspectionPostureBundleSection(inspectionPostureBundleSection(cp.get), edge.get, edge.set, nil); changed {
 		t.Fatal("an identical posture was reported as a change")
 	}
 }
@@ -85,7 +85,7 @@ func TestAnUnchangedPostureIsNotReapplied(t *testing.T) {
 // authority question, because a posture has no "empty" that could be confused with absence.
 func TestAControlPlaneThatAuthorsNoPostureChangesNothing(t *testing.T) {
 	edge := &postureHolder{p: bypassDefaultWith("accounts.google.com")}
-	if applyInspectionPostureBundleSection(nil, edge.get, edge.set, nil) {
+	if changed, _ := applyInspectionPostureBundleSection(nil, edge.get, edge.set, nil); changed {
 		t.Fatal("an absent section changed this Edge's posture")
 	}
 	if inspectionPostureBundleSection(nil) != nil {

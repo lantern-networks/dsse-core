@@ -1,14 +1,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/blobstore"
+	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/logs"
 	"net/http"
 	"strings"
+	"time"
 
 	grantstore "github.com/lantern-networks/dsse-core/grantstore"
 )
 
-// registerGrantsAdmin wires the federated-auth GRANTS admin API (proprietary control plane): list the grants
+// registerGrantsAdmin wires the federated-auth federated access-grant admin API: list the grants
 // minted by the clientless broker and REVOKE one (continuous revocation — a revoked grant denies the next
 // flow). Model + storage live in dsse-core (grantstore). See docs/idp_federated_authentication_design.md.
 //
@@ -16,7 +21,7 @@ import (
 // (adminTenantIDFromRequest) and never a startup-fixed value — LIST returns only the caller's grants, and REVOKE
 // verifies the target grant belongs to the caller's tenant before revoking (otherwise a grant id alone would be a
 // cross-tenant IDOR: any admin could revoke any tenant's grant). Fail closed when no tenant resolves.
-func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *grantstore.Store, tenantID string) {
+func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *grantstore.Store, evaluator decision.Evaluator, writer *logs.Writer, outbox adminAuditOutboxDeadReader) {
 	mux.HandleFunc("GET /admin/grants", adminEndpoint("admin.grants.read", func(w http.ResponseWriter, r *http.Request) {
 		callerTenant := strings.TrimSpace(adminTenantIDFromRequest(r))
 		if callerTenant == "" {
@@ -32,15 +37,29 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			return
 		}
 		id := r.PathValue("id")
-		// A grant in another tenant is treated as NOT FOUND (don't leak its existence or let this admin revoke it).
-		if g, ok := store.Get(id); !ok || !strings.EqualFold(strings.TrimSpace(g.TenantID), callerTenant) {
+		grant, found, err := store.RevokeForTenant(callerTenant, id)
+		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("grant not found"))
 			return
 		}
-		if !store.Revoke(id) {
-			writeError(w, http.StatusNotFound, fmt.Errorf("grant not found"))
+		now := time.Now().UTC()
+		nonAtomic := errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed)
+		audit := adminAccessGrantRevocationAuditLog(r, grant, evaluator, now, err != nil && !nonAtomic)
+		if nonAtomic {
+			audit.Metadata["persistence"] = "saved_non_atomic"
+		}
+		_ = appendAdminAudit(r.Context(), writer, outbox, audit, now)
+		if err != nil && !nonAtomic {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status": "partial", "applied": true, "tenant_id": grant.TenantID, "grant_id": grant.GrantID, "audit_ref": accessGrantAuditReference(grant.GrantID), "persistence": "unconfirmed",
+				"error": "Access was revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",
+			})
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]string{"status": "revoked", "grant_id": id})
+		result := map[string]string{"status": "revoked", "grant_id": grant.GrantID, "tenant_id": grant.TenantID, "audit_ref": accessGrantAuditReference(grant.GrantID)}
+		if nonAtomic {
+			result["persistence"] = "saved_non_atomic"
+		}
+		writeJSON(w, http.StatusOK, result)
 	}))
 }

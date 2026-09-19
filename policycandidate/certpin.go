@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -25,15 +24,14 @@ const suggestedActionInvestigateOnly = "investigate_only"
 const attributionSourceDNSTunnel = "dns_tunnel_correlation"
 
 func certPinAttribution(host, sni, attributionSource string) (confidence, suggestedAction string) {
+	_, highRisk, err := CertPinBypassTarget(Candidate{Host: host, SNI: sni})
+	if err != nil || highRisk {
+		return "low", suggestedActionInvestigateOnly
+	}
 	if strings.TrimSpace(attributionSource) == attributionSourceDNSTunnel {
 		return "high", "review"
 	}
-	h := strings.TrimSpace(host)
-	s := strings.TrimSpace(sni)
-	if s != "" || (h != "" && net.ParseIP(h) == nil) {
-		return "medium", "review"
-	}
-	return "low", suggestedActionInvestigateOnly
+	return "medium", "review"
 }
 
 func normalizeHostValue(h string) string {
@@ -114,7 +112,9 @@ func (store *Store) observeCertPin(tenantID, host, sni, observedIP, attributionS
 	if err != nil {
 		return Candidate{}, err
 	}
-	store.putLocked(normalized)
+	if err := store.putLocked(normalized); err != nil {
+		return Candidate{}, err
+	}
 	return copyCandidate(normalized), nil
 }
 
@@ -136,12 +136,10 @@ func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host str
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
 	}
-	host = normalizeHostValue(host)
-	if host == "" {
-		return Candidate{}, fmt.Errorf("host is required")
-	}
-	if net.ParseIP(host) != nil {
-		return Candidate{}, fmt.Errorf("host %q must be a named host, not a raw IP literal", host)
+	var err error
+	host, err = NormalizeCertPinHostname(host)
+	if err != nil {
+		return Candidate{}, err
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -175,13 +173,15 @@ func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host str
 	if err != nil {
 		return Candidate{}, err
 	}
-	store.putLocked(normalized)
+	if err := store.putLocked(normalized); err != nil {
+		return Candidate{}, err
+	}
 	return copyCandidate(normalized), nil
 }
 
-// Materialize marks an approved candidate as materialized — its bypass has been written into the SWG TLS
-// bypass policy (the only state in which traffic is actually decrypt-bypassed). Only an approved
-// candidate can be materialized; this is what separates "approved but not applied" from "applied".
+// Materialize saves an approved candidate's adoption request. Rule creation is a
+// separate operation, so this status is not an enforcement receipt. A cert-pin
+// request can be retried after a later asset/rule save failed.
 func (store *Store) Materialize(_ context.Context, tenantID, candidateID string, allowHighRisk bool, now time.Time) (Candidate, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	candidateID = strings.TrimSpace(candidateID)
@@ -200,17 +200,27 @@ func (store *Store) Materialize(_ context.Context, tenantID, candidateID string,
 	if !ok {
 		return Candidate{}, false, nil
 	}
-	if cand.Status != "approved" {
+	if cand.Status != "approved" && !(cand.Source == SourceCertPinningDetection && cand.Status == "materialized") {
 		return Candidate{}, false, fmt.Errorf("only an approved candidate can be materialized (status=%s)", cand.Status)
 	}
-	// Safety gate: an UNATTRIBUTED candidate (a raw IP literal with no SNI -> suggested_action investigate_only)
-	// must not be no-decrypted without an explicit high-risk override. You cannot tell what site/app a bare
-	// IPv6/CDN address is, and no-decrypt of a raw IP/prefix is forbidden by default in the design.
-	if cand.SuggestedAction == suggestedActionInvestigateOnly && !allowHighRisk {
+	// Advisory labels are persisted/importable metadata, not an authorization
+	// boundary. Recompute the actual scope before saving an adoption request.
+	highRisk := cand.SuggestedAction == suggestedActionInvestigateOnly
+	if cand.Source == SourceCertPinningDetection {
+		_, actualRisk, err := CertPinBypassTarget(cand)
+		if err != nil {
+			return Candidate{}, true, err
+		}
+		highRisk = actualRisk
+		cand.Confidence, cand.SuggestedAction = certPinAttribution(cand.Host, cand.SNI, cand.AttributionSource)
+	}
+	if highRisk && !allowHighRisk {
 		return Candidate{}, true, fmt.Errorf("materialize blocked: unattributed candidate %q (investigate_only) requires an explicit high-risk override", candidateID)
 	}
 	cand.Status = "materialized"
 	cand.UpdatedAt = &ts
-	store.putLocked(cand)
+	if err := store.putLocked(cand); err != nil {
+		return Candidate{}, true, err
+	}
 	return copyCandidate(cand), true, nil
 }

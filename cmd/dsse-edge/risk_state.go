@@ -13,8 +13,8 @@ import (
 // tamper / auth anomaly / abnormal access) is folded into the entity's risk state. For devices the
 // state lives in device metadata, which the decision path already reads
 // (enrichDecisionRequestWithDeviceRisk -> risk_state_severity / admin_high_risk policy conditions), so
-// risk drives decisions with no evaluator change. A HIGH-risk signal also revokes the entity's
-// standing east-west grants (acceleration: emergency access reduction), reusing the E5/G-04 path.
+// risk drives decisions with no evaluator change. Marking does not revoke standing grants; policy
+// determines the access decision from the resulting risk state.
 
 // riskSignalDeviceApplier is implemented by the in-memory device store.
 //
@@ -28,6 +28,7 @@ type riskSignalDeviceApplier interface {
 }
 
 type adminRiskSignalResponse struct {
+	TenantID          string `json:"tenant_id,omitempty"`
 	SchemaVersion     string `json:"schema_version"`
 	EntityType        string `json:"entity_type"`
 	EntityID          string `json:"entity_id"`
@@ -35,36 +36,46 @@ type adminRiskSignalResponse struct {
 	HighRisk          bool   `json:"high_risk"`
 	StandingGrantsCut int    `json:"standing_grants_revoked"`
 	Applied           bool   `json:"applied"`
-	// NotStoredDurably is empty when the mark reached the disk. When it does not, the mark is still in force on
-	// this node AND in the fleet overlay, and this sentence says what an operator has to do about it.
-	NotStoredDurably    string `json:"not_stored_durably,omitempty"`
-	NoSecretAttestation bool   `json:"no_secret_attestation"`
+	// NotStoredDurably reports runtime, overlay or user-save warnings. It does not
+	// attest to independent fleet delivery or a transaction across both device stores.
+	NotStoredDurably          string `json:"not_stored_durably,omitempty"`
+	RuntimePersistenceWarning bool   `json:"runtime_persistence_warning,omitempty"`
+	OverlayPersistenceWarning bool   `json:"overlay_persistence_warning,omitempty"`
+	NoSecretAttestation       bool   `json:"no_secret_attestation"`
 }
 
 var validRiskSeverity = map[string]bool{"": true, "none": true, "low": true, "medium": true, "high": true, "critical": true}
 
-// applyAdminRiskSignal validates and applies a risk signal. It MARKS, and marking is all it does.
-//
-// It used to cut. A device or user that came back high-risk lost its standing east-west grants immediately,
-// on the theory that the next internal hop should have to re-authenticate. That was enforcement decided by an
-// ingested signal rather than by policy, and it is not how access is supposed to be decided here: a high-risk
-// device is denied when a policy says high-risk devices are denied, and not otherwise. The severity lands in
-// the risk overlay, every node's decision path reads it, and a rule that gates on risk_state_severity is what
-// turns it into a refusal — visibly, in the policy an operator wrote, at the moment of the request.
-//
-// The difference matters most when the signal is wrong. A mark that policy evaluates can be scoped, staged and
-// overridden by the rules an operator already understands; a mark that silently tore down grants could not be
-// reasoned about from the policy at all, and the person losing access had no rule to point at.
-//
-// Non-secret: raw evidence is never accepted, only a reference.
-func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig model.RiskSignal, now time.Time) (adminRiskSignalResponse, error) {
+// validateAdminRiskSignal checks input and runtime capability without changing either store.
+func validateAdminRiskSignal(deviceStore deviceRuntimeStore, sig model.RiskSignal) (string, string, error) {
 	entityType := strings.ToLower(strings.TrimSpace(sig.EntityType))
 	entityID := strings.TrimSpace(sig.EntityID)
 	if entityID == "" {
-		return adminRiskSignalResponse{}, fmt.Errorf("entity_id is required")
+		return "", "", fmt.Errorf("entity_id is required")
 	}
 	if !validRiskSeverity[strings.ToLower(strings.TrimSpace(sig.Severity))] {
-		return adminRiskSignalResponse{}, fmt.Errorf("invalid severity %q (want none|low|medium|high|critical)", sig.Severity)
+		return "", "", fmt.Errorf("invalid severity %q (want none|low|medium|high|critical)", sig.Severity)
+	}
+
+	switch entityType {
+	case "device":
+		if _, ok := deviceStore.(riskSignalDeviceApplier); !ok {
+			return "", "", fmt.Errorf("device store does not support risk signals")
+		}
+	case "user", "human":
+	default:
+		return "", "", fmt.Errorf("invalid entity_type %q (want device|user)", sig.EntityType)
+	}
+	return entityType, entityID, nil
+}
+
+// applyAdminRiskSignal updates runtime risk metadata. The HTTP handler saves the
+// shared overlay first. Risk signals do not themselves revoke standing grants;
+// configured policy determines how the resulting risk affects access.
+func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig model.RiskSignal, now time.Time) (adminRiskSignalResponse, error) {
+	entityType, entityID, err := validateAdminRiskSignal(deviceStore, sig)
+	if err != nil {
+		return adminRiskSignalResponse{}, err
 	}
 	if sig.Timestamp == "" {
 		sig.Timestamp = now.UTC().Format(time.RFC3339)
@@ -77,20 +88,13 @@ func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig m
 			return adminRiskSignalResponse{}, fmt.Errorf("device store does not support risk signals")
 		}
 		dev, found, high, perr := applier.ApplyRiskSignal(entityID, sig, now)
-		// ★★ THE DURABILITY PROBLEM IS REPORTED, BUT NOT BEFORE THE FLEET HEARS ABOUT THE MARK (2026-08-13,
-		// thirty-first review #5). The previous round returned here, and the caller sets the fleet-wide
-		// HighRiskOverlay only on a non-error response — so a compromised device was marked on THIS node,
-		// answered with an error, and left un-marked everywhere else: the other nodes went on admitting it. The
-		// clear direction was worse still: a severity=none clear skipped the overlay Clear, so the store said
-		// "cleared" while the fleet kept blocking the device.
-		//
-		// A mark that did not reach the disk is weaker than one that did. A mark that did not reach the FLEET
-		// does not exist. So the response is built and the failure travels with it, in the field an operator
-		// reads, rather than in place of the action.
+		// The HTTP handler confirms the overlay save before calling this runtime
+		// applier. Runtime errors are partial outcomes: its live metadata changed,
+		// and the already accepted overlay remains available for distribution.
 		notStored := ""
 		if perr != nil {
-			notStored = "applied here and NOT stored durably (" + perr.Error() + ") — it will be gone if this " +
-				"process restarts, so re-apply it once the store is healthy"
+			notStored = "Device runtime metadata was updated but its save failed. The risk overlay is updated separately " +
+				"and may retain the change after restart. Re-apply once the runtime store is healthy."
 			log.Printf("★ risk signal for %s applied in memory and NOT persisted: %v", entityID, perr)
 		}
 		if !found {
@@ -101,7 +105,7 @@ func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig m
 			return adminRiskSignalResponse{
 				SchemaVersion: "admin_risk_signal.v1", EntityType: "device", EntityID: entityID,
 				Severity: sev, HighRisk: sev == "high" || sev == "critical", Applied: true, NoSecretAttestation: true,
-				NotStoredDurably: notStored,
+				NotStoredDurably: notStored, RuntimePersistenceWarning: perr != nil,
 			}, nil
 		}
 		_ = dev
@@ -109,7 +113,7 @@ func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig m
 			SchemaVersion: "admin_risk_signal.v1", EntityType: "device", EntityID: entityID,
 			Severity: strings.ToLower(strings.TrimSpace(sig.Severity)), HighRisk: high,
 			StandingGrantsCut: 0, Applied: true, NoSecretAttestation: true,
-			NotStoredDurably: notStored,
+			NotStoredDurably: notStored, RuntimePersistenceWarning: perr != nil,
 		}, nil
 	case "user", "human":
 		// User-scoped marking: no device-store row, but the shared overlay (keyed by the user id) makes every

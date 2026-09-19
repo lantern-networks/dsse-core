@@ -172,11 +172,11 @@ func (store postgresAdminAuthStore) CreateAPITokenForTenant(ctx context.Context,
 	}
 	if labPrincipal != nil {
 		if err := store.PersistPrincipal(ctx, *labPrincipal); err != nil {
-			return adminAPIToken{}, "", err
+			return adminAPIToken{}, "", adminAPITokenStorageError(err)
 		}
 	}
 	if err := store.PersistAPIToken(ctx, token); err != nil {
-		return adminAPIToken{}, "", err
+		return adminAPIToken{}, "", adminAPITokenStorageError(err)
 	}
 	return token, rawToken, nil
 }
@@ -184,7 +184,7 @@ func (store postgresAdminAuthStore) CreateAPITokenForTenant(ctx context.Context,
 func (store postgresAdminAuthStore) RevokeAPITokenForTenant(ctx context.Context, id, tenantID string, now time.Time) (adminAPIToken, bool, error) {
 	token, ok, err := store.adminAPIToken(ctx, id, tenantID)
 	if err != nil || !ok {
-		return adminAPIToken{}, ok, err
+		return adminAPIToken{}, ok, adminAPITokenStorageError(err)
 	}
 	token.Status = "revoked"
 	revokedAt := now.UTC().Format(time.RFC3339)
@@ -193,23 +193,23 @@ func (store postgresAdminAuthStore) RevokeAPITokenForTenant(ctx context.Context,
 	}
 	token.Metadata["revoked_at"] = revokedAt
 	if err := store.PersistAPIToken(ctx, token); err != nil {
-		return adminAPIToken{}, false, err
+		return adminAPIToken{}, false, adminAPITokenStorageError(err)
 	}
 	return token, true, nil
 }
 
 func (store postgresAdminAuthStore) RotateAPITokenForTenant(ctx context.Context, id, tenantID, rotatedBy string, req adminAPITokenRotateRequest, now time.Time) (adminAPIToken, string, bool, error) {
 	if store.DB == nil {
-		return adminAPIToken{}, "", false, fmt.Errorf("postgres admin auth db is not configured")
+		return adminAPIToken{}, "", false, adminAPITokenStorageError(fmt.Errorf("postgres admin auth db is not configured"))
 	}
 	statement, err := buildPostgresAdminAPITokenGetForUpdateStatement(tenantID, id)
 	if err != nil {
-		return adminAPIToken{}, "", false, err
+		return adminAPIToken{}, "", false, adminAPITokenStorageError(err)
 	}
 	ctx = normalizePostgresExportTaskContext(ctx)
 	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return adminAPIToken{}, "", false, err
+		return adminAPIToken{}, "", false, adminAPITokenStorageError(err)
 	}
 	committed := false
 	defer func() {
@@ -222,11 +222,11 @@ func (store postgresAdminAuthStore) RotateAPITokenForTenant(ctx context.Context,
 		if errors.Is(err, sql.ErrNoRows) {
 			return adminAPIToken{}, "", false, nil
 		}
-		return adminAPIToken{}, "", false, err
+		return adminAPIToken{}, "", false, adminAPITokenStorageError(err)
 	}
 	existing, err := decodePostgresAdminAPITokenPayload(payload)
 	if err != nil {
-		return adminAPIToken{}, "", true, err
+		return adminAPIToken{}, "", true, adminAPITokenStorageError(err)
 	}
 	revoked, rotated, rawToken, err := rotateAdminAPIToken(existing, rotatedBy, req, now)
 	if err != nil {
@@ -235,14 +235,14 @@ func (store postgresAdminAuthStore) RotateAPITokenForTenant(ctx context.Context,
 	for _, token := range []adminAPIToken{revoked, rotated} {
 		upsert, err := buildPostgresAdminAPITokenUpsertStatement(token)
 		if err != nil {
-			return adminAPIToken{}, "", true, err
+			return adminAPIToken{}, "", true, adminAPITokenStorageError(err)
 		}
 		if _, err := tx.ExecContext(ctx, upsert.SQL, upsert.Args...); err != nil {
-			return adminAPIToken{}, "", true, err
+			return adminAPIToken{}, "", true, adminAPITokenStorageError(err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return adminAPIToken{}, "", true, err
+		return adminAPIToken{}, "", true, adminAPITokenStorageError(err)
 	}
 	committed = true
 	return rotated, rawToken, true, nil

@@ -3,6 +3,7 @@ package dlp
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -11,8 +12,8 @@ import (
 // ids, employee numbers, account keys — and the scan raises a finding (under the dataset's own identifier name)
 // whenever one of those exact values appears in egress. It reuses the allowlist's salted-hash primitive but
 // INCLUDES (detects) instead of suppressing, and — unlike the allowlist or a keyword classifier — it stores ONLY
-// salted hashes: the dataset is never kept in the clear, so the fingerprint is safe to persist on the edge and an
-// operator cannot recover the source data from the config.
+// salted hashes rather than plaintext. Protect both hashes and salts: low-entropy
+// source values can still be guessed from a dictionary.
 //
 // Scope (MVP): SINGLE-TOKEN values (ids, account numbers, emails — no internal spaces), matched exactly after a
 // light normalization (lowercase, drop '-'/'_'). Multi-token / proximity / cell-based matching is the follow-on.
@@ -30,6 +31,27 @@ type Fingerprint struct {
 	name   IdentifierType
 	salt   string
 	hashes map[string]bool
+}
+
+// ValidateFingerprintValues rejects definitions the scanner cannot tokenize.
+// Short values retain the legacy ignore behavior; callers must also refuse an
+// empty resulting dataset. Errors identify positions, never submitted values.
+func ValidateFingerprintValues(values []string) error {
+	for i, value := range values {
+		value = strings.TrimSpace(value)
+		if len(edmNormalize(value)) < edmMinTokenLen {
+			continue
+		}
+		if len(value) > edmMaxTokenLen {
+			return fmt.Errorf("value %d exceeds the 128-byte token limit", i+1)
+		}
+		for j := 0; j < len(value); j++ {
+			if !edmTokenByte(value[j]) {
+				return fmt.Errorf("value %d must be a single ASCII token using letters, digits, or - _ . @ +", i+1)
+			}
+		}
+	}
+	return nil
 }
 
 // NewFingerprint fingerprints raw dataset values (transit only) under name+salt. The values are normalized +

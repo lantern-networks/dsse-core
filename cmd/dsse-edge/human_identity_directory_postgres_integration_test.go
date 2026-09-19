@@ -5,6 +5,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"github.com/lantern-networks/dsse-core/enrolledinventory"
+	"github.com/lantern-networks/dsse-core/revocation"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -540,5 +543,70 @@ func TestAdminHumanIdentityEndpointPostgresE2E(t *testing.T) {
 	}
 	if sourceState.Count != 1 || len(sourceState.States) != 1 || sourceState.States[0].Source != "scim" || sourceState.States[0].Status != "error" || sourceState.States[0].LastImportRunID != "human_import_run_pg_failure_001" || sourceState.States[0].Checkpoint != "cursor_pg_failure_001" || sourceState.States[0].LastError == "" {
 		t.Fatalf("source state after failed import = %#v, want error checkpoint", sourceState)
+	}
+}
+
+// The risk upgrade must see every tenant and all rows, rather than a Console page.
+func TestUserRiskMigrationPostgresDirectorySnapshot(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, closeFn, err := setupEdgeHumanIdentityDirectory(ctx, edgeHumanIdentityDirectoryConfig{Mode: "postgres", DSN: dsn, MigrationDir: filepath.Join("..", "..", "migrations"), RunMigrations: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeFn()
+	const tenantA = "risk-migration-a"
+	const tenantB = "risk-migration-b"
+	defer func() {
+		_, err := store.(postgresHumanIdentityDirectoryStore).DB.ExecContext(context.Background(), "DELETE FROM human_identities WHERE tenant_id IN ($1, $2)", tenantA, tenantB)
+		if err != nil {
+			t.Errorf("clean risk directory fixture: %v", err)
+		}
+	}()
+	for i := 0; i < 205; i++ {
+		id := fmt.Sprintf("risk-%03d", i)
+		if _, err := store.Upsert(ctx, model.HumanIdentity{ID: id, Subject: id}, tenantA, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Upsert(ctx, model.HumanIdentity{ID: "risk-204", Subject: "risk-204"}, tenantB, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if person, _, err := resolveRiskPerson(ctx, store, tenantA, "risk-204"); err != nil || person.ID != "risk-204" {
+		t.Fatalf("risk lookup after first Console page: %#v %v", person, err)
+	}
+	snapshot := store.(interface {
+		RiskIdentitySnapshot(context.Context) ([]model.HumanIdentity, error)
+	})
+	people, err := snapshot.RiskIdentitySnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, p := range people {
+		if p.TenantID == tenantA || p.TenantID == tenantB {
+			count++
+		}
+	}
+	if count != 206 {
+		t.Fatalf("incomplete snapshot: %d", count)
+	}
+	path := filepath.Join(t.TempDir(), "risk.json")
+	raw := `{"schema_version":"high_risk_overlay_state.v1","devices":{"risk-204":"high"}}`
+	if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	overlay := revocation.NewHighRiskOverlay()
+	overlay.SetStatePath(path)
+	if err := prepareUserRiskState(ctx, overlay, enrolledinventory.NewLedger(), store); err == nil {
+		t.Fatal("cross-tenant collision outside the first Console page was not detected")
+	}
+	saved, _ := os.ReadFile(path)
+	if string(saved) != raw {
+		t.Fatal("rejected migration changed durable state")
 	}
 }

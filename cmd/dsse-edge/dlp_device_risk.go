@@ -1,10 +1,12 @@
 package main
 
 import (
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/revocation"
 )
 
 // DLP → device risk (S4, ). Individual DLP detections are noise; the
@@ -16,7 +18,7 @@ import (
 
 // deviceRiskMarker marks a device elevated-risk (satisfied by *revocation.HighRiskOverlay).
 type deviceRiskMarker interface {
-	Mark(deviceID, severity string)
+	RaiseDeviceRisk(deviceID, severity string) (revocation.AutomaticRiskResult, error)
 }
 
 // dlpDetectionRecord is one device's DLP detection: the identifier types found, where it was going, the
@@ -39,12 +41,19 @@ func newDLPDeviceRiskAggregator(marker deviceRiskMarker) *dlpDeviceRiskAggregato
 	return &dlpDeviceRiskAggregator{hits: map[string][]dlpDetectionRecord{}, marker: marker, maxAge: 24 * time.Hour}
 }
 
+type dlpDeviceRiskResult struct {
+	ConditionSeverity string // strongest satisfied condition, not an acknowledgement
+	revocation.AutomaticRiskResult
+	Err error
+}
+
 // Record notes a detection for a device and evaluates the given device-risk conditions (from the matched DLP
-// policy). Returns the severity if a condition is satisfied (and the device was marked), else "". No-op when the
+// policy). Separates the satisfied condition from application and storage. No-op when the
 // device id is empty, there are no conditions, or the record carries no types.
-func (a *dlpDeviceRiskAggregator) Record(deviceID string, rec dlpDetectionRecord, conditions []model.DLPDeviceRiskCondition, now time.Time) string {
+func (a *dlpDeviceRiskAggregator) Record(deviceID string, rec dlpDetectionRecord, conditions []model.DLPDeviceRiskCondition, now time.Time) dlpDeviceRiskResult {
+	result := dlpDeviceRiskResult{}
 	if a == nil || deviceID == "" || len(conditions) == 0 || len(rec.types) == 0 {
-		return ""
+		return result
 	}
 	rec.at = now
 	a.mu.Lock()
@@ -62,15 +71,23 @@ func (a *dlpDeviceRiskAggregator) Record(deviceID string, rec dlpDetectionRecord
 	marker := a.marker
 	a.mu.Unlock()
 
+	// Evaluate every condition so policy order cannot weaken the requested mark.
+	ranks := map[string]int{"medium": 1, "high": 2, "critical": 3}
 	for _, c := range conditions {
-		if severity := evaluateDeviceRiskCondition(records, c, now); severity != "" {
-			if marker != nil {
-				marker.Mark(deviceID, severity)
-			}
-			return severity
+		severity := evaluateDeviceRiskCondition(records, c, now)
+		if severity != "" && (result.ConditionSeverity == "" || ranks[severity] > ranks[result.ConditionSeverity]) {
+			result.ConditionSeverity = severity
 		}
 	}
-	return ""
+	if result.ConditionSeverity != "" {
+		result.AutomaticRiskResult.Persistence = "not_attempted"
+		if marker == nil {
+			result.Err = revocation.ErrRiskUnavailable
+		} else {
+			result.AutomaticRiskResult, result.Err = marker.RaiseDeviceRisk(deviceID, result.ConditionSeverity)
+		}
+	}
+	return result
 }
 
 // evaluateDeviceRiskCondition reports the severity to set if the device's records satisfy the condition, else "".
@@ -99,7 +116,7 @@ func evaluateDeviceRiskCondition(records []dlpDetectionRecord, c model.DLPDevice
 		return ""
 	}
 
-	severity := c.Severity
+	severity := strings.ToLower(strings.TrimSpace(c.Severity))
 	if severity == "" {
 		severity = "high"
 	}

@@ -79,7 +79,7 @@ async function adoptFlowIntoRule(o, section) {
     //    falling back to the built-in-svc-<family> convention, else no service constraint.
     let serviceId = "";
     const svcs = await loadList("/admin/assets/services");
-    const byPort = (svcs || []).find((s) => (s.ports || []).some((p) => p.port === o.port));
+    const byPort = (svcs || []).find((s) => (s.ports || []).some((p) => String(p.protocol).toLowerCase() === "tcp" && p.port === o.port));
     if (byPort) serviceId = byPort.id;
     else if (o.service_family) serviceId = "builtin-svc-" + String(o.service_family).toLowerCase();
 

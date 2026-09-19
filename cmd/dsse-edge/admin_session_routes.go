@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,10 +21,30 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 	if config.LocalCredentials != nil {
 		firstPartyChallenges := newLoginChallengeStore()
 
+		// Authentication routes bypass the configuration-change middleware. Record each
+		// activation attempt independently, including malformed bodies and repeated enrollment.
+		activationAudit := func(r *http.Request, w *adminAuditStatusRecorder, event, tenant, target string) {
+			if w.statusOrDefault() >= 400 {
+				event += "_failed"
+			}
+			audit := adminLoginAuditLog(event, nil, nil, evaluator, r, "")
+			audit.Action = stringPtr("admin_activation")
+			audit.TargetType = stringPtr("admin_account")
+			if tenant != "" {
+				audit.TenantID = tenant
+			}
+			if target != "" {
+				audit.TargetID = stringPtr(target)
+			}
+			audit.Metadata = map[string]any{"method": r.Method, "path": r.URL.Path,
+				"status_code": w.statusOrDefault(), "auth_method": "activation_token"}
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, time.Now())
+		}
+
 		mux.HandleFunc("GET /admin/activate", func(w http.ResponseWriter, r *http.Request) {
 			email, err := config.LocalCredentials.ActivationEmail(r.URL.Query().Get("token"), time.Now())
 			if err != nil {
-				writeError(w, http.StatusNotFound, err)
+				writeCredentialError(w, http.StatusNotFound, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"email": email})
@@ -34,12 +55,18 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				Token       string `json:"token"`
 				NewPassword string `json:"new_password"`
 			}
+			var tenant, target string
+			rec := &adminAuditStatusRecorder{ResponseWriter: w}
+			w = rec
+			defer func() { activationAudit(r, rec, "admin_activation_password_set", tenant, target) }()
+
 			if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 				return
 			}
+			tenant, target = config.LocalCredentials.activationAuditTarget(req.Token, time.Now())
 			if err := config.LocalCredentials.SetActivationPassword(req.Token, req.NewPassword, time.Now()); err != nil {
-				writeError(w, http.StatusBadRequest, err)
+				writeCredentialError(w, http.StatusBadRequest, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"status": "password_set"})
@@ -49,13 +76,19 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			var req struct {
 				Token string `json:"token"`
 			}
+			var tenant, target string
+			rec := &adminAuditStatusRecorder{ResponseWriter: w}
+			w = rec
+			defer func() { activationAudit(r, rec, "admin_activation_totp_started", tenant, target) }()
+
 			if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 				return
 			}
+			tenant, target = config.LocalCredentials.activationAuditTarget(req.Token, time.Now())
 			secret, uri, err := config.LocalCredentials.BeginTOTPEnrollment(req.Token, time.Now())
 			if err != nil {
-				writeError(w, http.StatusBadRequest, err)
+				writeCredentialError(w, http.StatusBadRequest, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"secret": secret, "otpauth_uri": uri})
@@ -66,16 +99,21 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				Token string `json:"token"`
 				Code  string `json:"code"`
 			}
+			var tenant, target string
+			rec := &adminAuditStatusRecorder{ResponseWriter: w}
+			w = rec
+			defer func() { activationAudit(r, rec, "admin_account_activated", tenant, target) }()
+
 			if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 				return
 			}
+			tenant, target = config.LocalCredentials.activationAuditTarget(req.Token, time.Now())
 			recovery, err := config.LocalCredentials.CompleteActivation(req.Token, req.Code, time.Now())
 			if err != nil {
-				writeError(w, http.StatusBadRequest, err)
+				writeCredentialError(w, http.StatusBadRequest, err)
 				return
 			}
-			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_account_activated", nil, nil, evaluator, r, ""), time.Now())
 			writeJSON(w, http.StatusOK, map[string]any{"status": credentialStatusActive, "recovery_codes": recovery})
 		})
 
@@ -91,13 +129,18 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			}
 			cred, err := config.LocalCredentials.VerifyPassword(req.Email, req.Password, time.Now())
 			if err != nil {
+				if errors.Is(err, errCredentialPersistence) {
+					_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_login_failed", nil, nil, evaluator, r, "credential_storage_unavailable"), time.Now())
+					writeCredentialError(w, http.StatusUnauthorized, err)
+					return
+				}
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_login_failed", nil, nil, evaluator, r, "password"), time.Now())
 				writeError(w, http.StatusUnauthorized, fmt.Errorf("invalid credentials"))
 				return
 			}
 			challenge, err := firstPartyChallenges.Issue(cred.Email, time.Now())
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, err)
+				writeCredentialError(w, http.StatusInternalServerError, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, map[string]any{"challenge_token": challenge, "totp_required": true})
@@ -119,6 +162,11 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			}
 			cred, err := config.LocalCredentials.VerifyTOTP(email, req.Code, time.Now())
 			if err != nil {
+				if errors.Is(err, errCredentialPersistence) {
+					_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_login_failed", nil, nil, evaluator, r, "credential_storage_unavailable"), time.Now())
+					writeCredentialError(w, http.StatusUnauthorized, err)
+					return
+				}
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_login_failed", nil, nil, evaluator, r, "totp"), time.Now())
 				writeError(w, http.StatusUnauthorized, fmt.Errorf("invalid credentials"))
 				return
@@ -257,7 +305,7 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			var err error
 			data, err = exportObjectStore.ReadGeneratedFile(token.LocalFilename)
 			if err != nil {
-				writeError(w, http.StatusNotFound, err)
+				writeCredentialError(w, http.StatusNotFound, err)
 				return
 			}
 		}
@@ -401,4 +449,14 @@ func signInAnswer(principal any, session any, consoleOrigin string, r *http.Requ
 		answer["session"] = session
 	}
 	return answer
+}
+
+// Storage failures are server failures, not invalid input or a rejected credential.
+// Never expose the backing store's error text to the caller.
+func writeCredentialError(w http.ResponseWriter, fallback int, err error) {
+	if errors.Is(err, errCredentialPersistence) {
+		writeError(w, http.StatusServiceUnavailable, errCredentialPersistence)
+		return
+	}
+	writeError(w, fallback, err)
 }

@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/decision"
-	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/interception"
 	"github.com/lantern-networks/dsse-core/knownbypass"
 	"github.com/lantern-networks/dsse-core/model"
@@ -23,25 +22,24 @@ type effectivePolicyEntry struct {
 // inspectionBasis is the inspect/bypass layer of the effective-config view for a destination: whether the Edge
 // decrypts (inspects) the flow or raw-forwards (bypasses) it, and WHICH source decided that. A bypassed flow is
 // still steered and policy-gated — the Edge merely declines to terminate its TLS — so this is orthogonal to the
-// policy decision (allow/deny/authenticate) above. The bypass sources are exactly the hidden surfaces from
-// docs/invisible_effective_configuration.md: the static known-bypass list, authored egress bypass, and
-// materialized cert-pin candidates; "inspect" means none matched and the decrypt-all default applies.
+// policy decision (allow/deny/authenticate) above. Attribution follows the current posture, known-bypass
+// catalog, authored rules and configured host sets. Candidate history does not authorize inspection bypass.
 type inspectionBasis struct {
-	Decision string `json:"decision"`         // "inspect" | "bypass"
-	Source   string `json:"source"`           // default_decrypt_all | decrypt_allowlist | known_bypass | saas_optimize | authored_bypass | cert_pin_materialized | static_bypass | bypass_default
+	Decision string `json:"decision"`         // "inspect" | "bypass" | "depends_on_device"
+	Source   string `json:"source"`           // default_decrypt_all | decrypt_allowlist | known_bypass | authored_bypass | static_bypass | bypass_default
 	Detail   string `json:"detail,omitempty"` // e.g. the known-bypass group name
 }
 
 // inspectionSources are the live engine pattern sets, gathered by the edge (which owns them). They mirror the
-// engine's own Matches decision: a flow is decrypted IFF it is in InterceptHosts AND not in EffectiveBypass.
+// engine's shared and device-specific patterns. A host-only preview cannot choose a source device.
 // The per-bypass-source fields are only for attribution — labelling WHICH source put a host in the bypass set.
 type inspectionSources struct {
-	InterceptHosts  []string                             // the engine's live intercept set ("*" = decrypt-all; narrower = decrypt allowlist)
-	EffectiveBypass []string                             // the engine's live raw-forward set — always wins over intercept
-	KnownGroups     []knownbypass.Group                  // curated named bypass groups, for attribution
-	OptimizeGroups  []inspectionposture.AuthDecryptGroup // enabled SaaS Optimize bypass groups, for attribution
-	AuthoredBypass  []string                             // authored egress rules whose inspection axis is bypass, for attribution
-	CertPinBypass   []string                             // materialized (admin-approved) cert-pin candidates, for attribution
+	InterceptHosts  []string            // the engine's live intercept set ("*" = decrypt-all; narrower = decrypt allowlist)
+	EffectiveBypass []string            // the engine's live raw-forward set — always wins over intercept
+	KnownGroups     []knownbypass.Group // curated named bypass groups, for attribution
+	AuthoredBypass  []string            // authored egress rules whose inspection axis is bypass, for attribution
+	DeviceIntercept map[string][]string
+	DeviceBypass    map[string][]string
 }
 
 // effectivePolicyResponse is the precedence-ordered, provenance-tagged decision basis for a destination, plus
@@ -142,18 +140,24 @@ func classifyInspection(host string, src inspectionSources) inspectionBasis {
 				return inspectionBasis{Decision: "bypass", Source: "known_bypass", Detail: g.Name}
 			}
 		}
-		for _, g := range src.OptimizeGroups {
-			if interception.HostMatchesPatterns(host, g.Patterns) {
-				return inspectionBasis{Decision: "bypass", Source: "saas_optimize", Detail: g.Name}
-			}
-		}
 		if interception.HostMatchesPatterns(host, src.AuthoredBypass) {
 			return inspectionBasis{Decision: "bypass", Source: "authored_bypass"}
 		}
-		if interception.HostMatchesPatterns(host, src.CertPinBypass) {
-			return inspectionBasis{Decision: "bypass", Source: "cert_pin_materialized"}
-		}
 		return inspectionBasis{Decision: "bypass", Source: "static_bypass"}
+	}
+	deviceHost := func(patterns map[string][]string) bool {
+		for _, hosts := range patterns {
+			if interception.HostMatchesPatterns(host, hosts) {
+				return true
+			}
+		}
+		return false
+	}
+	// A destination-only preview has no authenticated source device. Do not
+	// present one device's exception as the answer for every connection.
+	baseInspect := interception.HostMatchesPatterns(host, src.InterceptHosts)
+	if (baseInspect && deviceHost(src.DeviceBypass)) || (!baseInspect && deviceHost(src.DeviceIntercept)) {
+		return inspectionBasis{Decision: "depends_on_device", Source: "device_rule"}
 	}
 	// 2. Not bypassed: decrypted IFF in the intercept set.
 	if interception.HostMatchesPatterns(host, src.InterceptHosts) {
@@ -197,6 +201,7 @@ func effectivePolicyForDestination(eval decision.Evaluator, tenantID string, q e
 		ActorType:         valueOrDefault(q.ActorType, "human"),
 		ServiceFamily:     family,
 		DestinationPort:   q.DestinationPort,
+		Protocol:          "tcp",
 		SNI:               q.Destination,
 		FQDN:              q.Destination,
 		SaaSApplicationID: q.SaaSApplicationID,

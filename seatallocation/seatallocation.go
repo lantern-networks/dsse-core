@@ -17,6 +17,7 @@
 package seatallocation
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -74,6 +75,12 @@ var (
 // anything it already runs stops. Refusing the reduction would leave the MSSP unable to reorganise its own pool
 // without first persuading a customer to decommission machines.
 func (s *Store) Allocate(policy Policy, tenantID string, seats int, by, note, now string) (Allocation, error) {
+	return s.AllocateContext(context.Background(), policy, tenantID, seats, by, note, now)
+}
+
+// AllocateContext applies pool checks to the latest shared snapshot and carries
+// the caller's write authority through storage. Live state follows commit only.
+func (s *Store) AllocateContext(ctx context.Context, policy Policy, tenantID string, seats int, by, note, now string) (Allocation, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Allocation{}, ErrNoTenant
@@ -83,28 +90,25 @@ func (s *Store) Allocate(policy Policy, tenantID string, seats int, by, note, no
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !policy.AllowOversubscription {
-		total := 0
-		for id, a := range s.allocations {
-			if !strings.EqualFold(id, tenantID) {
-				total += a.Seats
+	a := Allocation{TenantID: tenantID, Seats: seats, UpdatedAt: now, UpdatedBy: strings.TrimSpace(by), Note: strings.TrimSpace(note)}
+	err := s.mutateLocked(ctx, func(candidate map[string]Allocation) error {
+		if !policy.AllowOversubscription {
+			total := 0
+			for id, a := range candidate {
+				if !strings.EqualFold(id, tenantID) {
+					total += a.Seats
+				}
+			}
+			if total+seats > policy.PoolSeats {
+				return fmt.Errorf("%w: %d already allocated to other tenants, %d in the pool", ErrPoolExceeded, total, policy.PoolSeats)
 			}
 		}
-		if total+seats > policy.PoolSeats {
-			return Allocation{}, fmt.Errorf("%w: %d already allocated to other tenants, %d in the pool",
-				ErrPoolExceeded, total, policy.PoolSeats)
-		}
+		candidate[strings.ToLower(tenantID)] = a
+		return nil
+	})
+	if err != nil {
+		return Allocation{}, err
 	}
-	a := Allocation{
-		TenantID:  tenantID,
-		Seats:     seats,
-		UpdatedAt: now,
-		UpdatedBy: strings.TrimSpace(by),
-		Note:      strings.TrimSpace(note),
-	}
-	s.allocations[strings.ToLower(tenantID)] = a
-	s.generation.Add(1)
-	s.persistLocked()
 	return a, nil
 }
 
@@ -168,16 +172,28 @@ func (s *Store) List() []Allocation {
 
 // Remove drops a tenant's allocation entirely, returning its seats to the pool.
 func (s *Store) Remove(tenantID string) bool {
+	removed, _ := s.RemoveConfirmed(tenantID)
+	return removed
+}
+
+// RemoveConfirmed distinguishes absent allocations from unconfirmed storage writes.
+func (s *Store) RemoveConfirmed(tenantID string) (bool, error) {
+	return s.RemoveConfirmedContext(context.Background(), tenantID)
+}
+func (s *Store) RemoveConfirmedContext(ctx context.Context, tenantID string) (bool, error) {
 	k := strings.ToLower(strings.TrimSpace(tenantID))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.allocations[k]; !ok {
-		return false
+	removed := false
+	err := s.mutateLocked(ctx, func(candidate map[string]Allocation) error {
+		_, removed = candidate[k]
+		delete(candidate, k)
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	delete(s.allocations, k)
-	s.generation.Add(1)
-	s.persistLocked()
-	return true
+	return removed, nil
 }
 
 // Verdict is the answer to "may this tenant enrol another device", with enough detail to say why.
@@ -215,7 +231,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	if s == nil {
 		return 0
 	}
-	tenantID = strings.TrimSpace(tenantID)
+	tenantID = strings.ToLower(strings.TrimSpace(tenantID))
 	if tenantID == "" {
 		return 0
 	}
@@ -227,21 +243,16 @@ func (s *Store) CountForTenant(tenantID string) int {
 	return 0
 }
 
-func (s *Store) RemoveTenant(tenantID string) int {
+func (s *Store) RemoveTenant(tenantID string) (int, error) {
 	if s == nil {
-		return 0
+		return 0, nil
 	}
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
+	removed, err := s.RemoveConfirmed(tenantID)
+	if err != nil {
+		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.allocations[tenantID]; !ok {
-		return 0
+	if removed {
+		return 1, nil
 	}
-	delete(s.allocations, tenantID)
-	s.generation.Add(1)
-	s.persistLocked()
-	return 1
+	return 0, nil
 }

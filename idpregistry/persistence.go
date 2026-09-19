@@ -2,6 +2,8 @@ package idpregistry
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -60,13 +62,42 @@ func (s *Store) loadLocked() error {
 	return nil
 }
 
-func (s *Store) persistLocked() {
+// ErrPersistence means a candidate could not be saved and was not published.
+var ErrPersistence = errors.New("identity provider settings could not be saved")
+
+func (s *Store) snapshotLocked() persistedRegistry {
+	snapshot := persistedRegistry{Connections: make(map[string]map[string]Connection, len(s.connections)), Defaults: make(map[string]string, len(s.defaults))}
+	for tenant, connections := range s.connections {
+		copied := make(map[string]Connection, len(connections))
+		for id, connection := range connections {
+			copied[id] = connection
+		}
+		snapshot.Connections[tenant] = copied
+	}
+	for tenant, id := range s.defaults {
+		snapshot.Defaults[tenant] = id
+	}
+	return snapshot
+}
+
+func (s *Store) saveLocked(snapshot persistedRegistry) error {
 	if s.persister == nil {
-		return
+		return nil
 	}
-	data, err := json.MarshalIndent(persistedRegistry{Connections: s.connections, Defaults: s.defaults}, "", "  ")
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err == nil {
+		err = s.persister.Save(data)
+	}
 	if err != nil {
-		return
+		log.Printf("identity provider settings save: %v", err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			return ErrPersistence
+		}
 	}
-	_ = s.persister.Save(data)
+	return nil
+}
+
+// Tenant removal and bundle replacement retain their separate best-effort contract.
+func (s *Store) persistLocked() {
+	_ = s.saveLocked(persistedRegistry{Connections: s.connections, Defaults: s.defaults})
 }

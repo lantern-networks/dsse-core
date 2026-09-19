@@ -1152,14 +1152,14 @@ func TestAdminExportJobStoreRejectsInvalidStatusTransitions(t *testing.T) {
 		To:     "2026-05-23T01:00:00Z",
 	}, "tenant_lab_001", "admin_lab_bypass", now)
 
-	if _, err := store.MarkCompleted(job.ID, 1, 1, false, "evidence://tenant/tenant_lab_001/export.ndjson.gz", "sha256:test", now); err == nil {
+	if _, err := store.MarkCompleted(job.ID, 1, 1, false, "evidence://tenant/tenant_lab_001/export.ndjson.gz", "sha256:test", nil, now); err == nil {
 		t.Fatalf("MarkCompleted from queued returned nil error")
 	}
 	running, err := store.MarkRunning(job.ID, now)
 	if err != nil {
 		t.Fatalf("MarkRunning returned error: %v", err)
 	}
-	completed, err := store.MarkCompleted(running.ID, 1, 1, false, "evidence://tenant/tenant_lab_001/export.ndjson.gz", "sha256:test", now)
+	completed, err := store.MarkCompleted(running.ID, 1, 1, false, "evidence://tenant/tenant_lab_001/export.ndjson.gz", "sha256:test", nil, now)
 	if err != nil {
 		t.Fatalf("MarkCompleted returned error: %v", err)
 	}

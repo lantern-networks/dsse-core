@@ -220,3 +220,87 @@ Source entry points for checking a changed revision:
 - [Customer transport authority](../cmd/dsse-edge/tenant_transport_material_authority.go), [device authority](../cmd/dsse-edge/tenant_device_material_authority.go), [inspection authority](../cmd/dsse-edge/tenant_interception_material_authority.go), and [managed inspection minting](../cmd/dsse-edge/tenant_interception_authority_mint.go).
 - [Edge material refresh and expiry](../cmd/dsse-edge/tenant_transport_material_fetch.go), [trust distribution](../cmd/dsse-edge/tenant_trust_distribution.go), and [PKI readiness](../cmd/dsse-edge/admin_pki_readiness.go).
 - [Device renewal timing](../enroll/renewal_due.go), [connector identity](../cmd/dsse-connector/identity.go), and [signer options](../cmd/dsse-edge/main.go).
+
+## Trusting certificates for internal sites
+
+Open **Internal site certificates** in the control-plane Console. Add a recognizable
+name and the public CA certificate that issued the internal site's certificate.
+Paste exactly one PEM `CERTIFICATE` block per entry. Do not paste a private key,
+a certificate chain, or the site's leaf certificate. This authority is separate
+from the inspection CA that your devices trust.
+
+The list belongs to the selected organization. A successful addition lets its
+upstream TLS connections use that CA alongside the platform's public roots. It does
+not add trust for another organization. Expired authorities remain visible but are
+excluded from the trust material. Removing an authority requires confirmation;
+private sites that rely on it may stop opening after the change reaches the
+serving Edge. Established connections are not forcibly closed by this operation.
+
+Additions, replacements and deletions change live trust only after the storage
+operation reports success. A storage error is shown as a failure, not a completed
+removal. Restore storage, reload the list and retry. The Console keeps the same
+request ID when retrying unchanged input after an uncertain response. A remote
+storage error can leave the durable outcome uncertain; recheck the list instead
+of assuming the storage operation rolled back. Nodes that receive configuration
+from a source reject local writes; make the change on the control plane.
+
+Malformed stored records or configuration sections are rejected as a whole;
+reload keeps the last valid list. If an older stored entry contains mixed PEM
+material, correct it to one public CA certificate through a controlled maintenance
+procedure before loading it with this version. This validation does not remove
+private keys from old database backups or previously distributed copies.
+
+**Logs & Audit** records `admin_internal_ca_changed` with the administrator,
+organization, authority ID, action and result. Results include `saved`, `deleted`,
+`rejected`, `not_found`, and `persistence_unconfirmed`. Addition attempts can include
+a SHA-256 certificate fingerprint; certificate PEM, private keys and display names
+are not copied into this event. The common configuration-change audit also records
+the HTTP outcome. Fleet propagation and storage/audit durability require deployment
+verification in addition to a successful Console response.
+
+
+### Importing and replacing a tenant interception CA
+
+In **Certificates**, use **Load this tenant's interception CA** for the first import.
+Provide the public root certificate, the issuing CA certificate and its matching
+issuing private key. Keep the root private key offline. Devices must trust the root
+before inspection, and each Edge receives the saved authority on its next refresh.
+
+Once an authority exists, **Stage a replacement CA** registers the next authority.
+The current authority continues signing while devices adopt the incoming root.
+The Console disables another import while a replacement is staged. Switch only
+after the adoption checks permit it. Missing fleet evidence prevents promotion
+and withdrawal; saving the replacement alone does not complete the rotation.
+If saving fails, reload the authority state after restoring storage before retrying.
+
+**Logs & Audit** records successful first imports and staged replacements as
+`pki_material_changed`, including the organization, administrator, root and issuing
+certificate fingerprints, and whether the import was staged. The common audit
+records rejected requests. Device CA registration records the submitted public
+certificate fingerprints and its reported durability. No private key is included
+in these audit records. Audit delivery and fleet adoption need separate verification.
+
+## Replacing a node certificate from the Console
+
+In **Certificates**, select **Replace** for the intended node and supply its leaf
+certificate chain and matching private key. This changes that node's registered
+listener files; it is not a fleet-wide CA rotation. The current trust/admission
+checks still apply to replacements and rollbacks.
+
+Before changing the files, the server must save the currently served pair in the
+control-plane version store. This includes the original pair on the first
+replacement. If versioning is unavailable or that save fails, the request is
+refused and the replacement is not applied. **History / roll back** lists versions
+without their private-key payload; choosing a version restores its certificate
+and key after validating them against current trust. The internal version store
+contains private keys and needs the same access and backup protections as other
+PKI stores. A failed replacement can still leave a retained copy of the unchanged
+previous pair in history.
+
+Both destination files must be writable. New material is staged before changing
+either file; a handled commit failure attempts to restore the previous files.
+Separate certificate and key paths do not provide atomic pair replacement across
+power loss or process termination. If interrupted during replacement, verify that
+the on-disk certificate and key match before restarting the service. A failed
+restoration retains its recovery copy and reports that failure; do not interpret
+this as a successful replacement.

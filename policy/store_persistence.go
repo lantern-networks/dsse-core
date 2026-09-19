@@ -207,7 +207,7 @@ func (store *Store) persistLockedChecked() error {
 	if err := store.runtimeStatePersister.Save(data); err != nil {
 		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their change was
 		// lost when it was written; saying nothing would hide that an interrupted write could truncate it.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("admin_policy_runtime_state persist: saved, but NOT atomically — %v", err)
 		} else {
 			return fmt.Errorf("save failed: %w", err)
@@ -226,4 +226,29 @@ func eastWestModeLabel(enabled, allowUnmatched bool) string {
 		return "partial"
 	}
 	return "full"
+}
+
+var ErrPolicyPersistence = errors.New("policy could not be saved")
+
+// Only the private authored snapshot changes while saving; the live policy and
+// evaluator cache are published by Upsert after the save succeeds.
+func (store *Store) saveAuthoredPolicyLocked(item model.Policy) error {
+	before := store.adminAuthoredPolicies
+	next := make(map[string]map[string]model.Policy, len(before)+1)
+	for tenant, rows := range before {
+		next[tenant] = rows
+	}
+	rows := make(map[string]model.Policy, len(before[item.TenantID])+1)
+	for id, row := range before[item.TenantID] {
+		rows[id] = row
+	}
+	rows[item.ID] = copyAdminPolicy(item)
+	next[item.TenantID] = rows
+	store.adminAuthoredPolicies = next
+	if err := store.persistLockedChecked(); err != nil {
+		store.adminAuthoredPolicies = before
+		log.Printf("admin policy save: %v", err)
+		return ErrPolicyPersistence
+	}
+	return nil
 }

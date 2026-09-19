@@ -2,7 +2,9 @@ package delegatedgrant
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -12,19 +14,19 @@ import (
 )
 
 // Store is the in-memory delegated-access-grant store: OOB-authenticated, short-lived east-west grants
-// (upsert / lookup / active-check / revoke), FIFO-bounded by capacity (capacity<=0 disables the bound).
+// (upsert / lookup / active-check / revoke), admission-bounded by capacity (capacity<=0 disables the bound).
+// Existing records, including revoked grants, are never evicted for a new ID.
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation write-throughs, so a
 // revoked grant stays revoked across a restart and in-flight grants are not lost.
 type Store struct {
 	mu         sync.RWMutex
 	grants     map[string]model.DelegatedAccessGrant
-	order      []string
 	capacity   int
 	persister  blobstore.Persister
-	generation uint64 // monotonic config version (bumped on each Upsert); folded into the config-bundle generation
+	generation uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
 }
 
-// NewStore builds a delegated-grant store with the given FIFO capacity. The bound is injected by
+// NewStore builds a delegated-grant store with the given admission capacity. The bound is injected by
 // cmd/edge (which reads it from the environment) so this package stays env-name-free.
 func NewStore(capacity int) *Store {
 	return &Store{grants: map[string]model.DelegatedAccessGrant{}, capacity: capacity}
@@ -46,8 +48,8 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
@@ -55,55 +57,110 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data != nil {
+			return fmt.Errorf("empty delegated grant snapshot")
+		}
+		s.persister = p
 		return nil
 	}
 	var snap map[string]model.DelegatedAccessGrant
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	if snap != nil {
-		s.grants = snap
-		s.order = s.order[:0]
-		for id := range snap {
-			s.order = append(s.order, id)
+	if snap == nil {
+		return fmt.Errorf("invalid delegated grant snapshot")
+	}
+	fresh := make(map[string]model.DelegatedAccessGrant, len(snap))
+	for savedKey, grant := range snap {
+		if err := validKey(grant.TenantID, grant.ID); err != nil {
+			return err
+		}
+		key := grantKey(grant.TenantID, grant.ID)
+		if savedKey != grant.ID && savedKey != key {
+			return fmt.Errorf("invalid saved delegated grant key")
+		}
+		if _, found := fresh[key]; found {
+			return fmt.Errorf("duplicate saved delegated grant")
+		}
+		fresh[key] = grant
+	}
+	// Preserve all records even when the configured capacity has been lowered.
+	// Replace the accepted state and writer together only after a complete, valid load.
+	s.grants, s.persister = fresh, p
+
+	return nil
+}
+
+// ErrCapacity rejects a new identity without discarding authorization or revocation state.
+var ErrCapacity = errors.New("delegated grant store capacity reached; existing records retained")
+
+var ErrPersistence = errors.New("delegated grants could not be saved")
+
+func grantKey(tenant, id string) string { return tenant + "\x00" + id }
+func validKey(tenant, id string) error {
+	if tenant == "" || id == "" || strings.TrimSpace(tenant) != tenant || strings.TrimSpace(id) != id || strings.ContainsRune(tenant, '\x00') || strings.ContainsRune(id, '\x00') {
+		return fmt.Errorf("invalid delegated grant tenant or ID")
+	}
+	return nil
+}
+func cloneGrants(in map[string]model.DelegatedAccessGrant) map[string]model.DelegatedAccessGrant {
+	out := make(map[string]model.DelegatedAccessGrant, len(in)+1)
+	for key, grant := range in {
+		out[key] = grant
+	}
+	return out
+}
+
+// The caller holds the write lock. Failed candidates never reach live state.
+func (s *Store) saveLocked(grants map[string]model.DelegatedAccessGrant) error {
+	if s.persister == nil {
+		return nil
+	}
+	data, err := json.MarshalIndent(grants, "", "  ")
+	if err == nil {
+		err = s.persister.Save(data)
+	}
+	if err != nil {
+		log.Printf("delegated grants save: %v", err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			return ErrPersistence
 		}
 	}
 	return nil
 }
 
-// persistLocked atomically write-throughs the current grant set. Caller holds s.mu. Best-effort: a write
-// error leaves the in-memory state authoritative (durability at risk, but never blocks the mutation).
-func (s *Store) persistLocked() {
-	if s.persister == nil {
-		return
-	}
-	data, err := json.MarshalIndent(s.grants, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = s.persister.Save(data)
-}
+// Tenant removal retains its existing best-effort contract.
+func (s *Store) persistLocked() { _ = s.saveLocked(s.grants) }
 
 func (s *Store) Upsert(grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
+	if err := validKey(grant.TenantID, grant.ID); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing, ok := s.grants[grant.ID]
+	key := grantKey(grant.TenantID, grant.ID)
+	existing, ok := s.grants[key]
 	if ok {
 		if err := validateTransition(existing, grant); err != nil {
 			return model.DelegatedAccessGrant{}, err
 		}
 	}
-	if !ok {
-		s.order = append(s.order, grant.ID)
+	// Forgetting a terminal record would allow a later upsert to reactivate the same ID.
+	// Reserve capacity only for new keys; updates and revocations must remain possible when full.
+	if !ok && s.capacity > 0 && len(s.grants) >= s.capacity {
+		return model.DelegatedAccessGrant{}, ErrCapacity
 	}
-	s.grants[grant.ID] = grant
-	s.order = evictFIFO(s.order, len(s.grants), s.capacity, func(k string) { delete(s.grants, k) })
+	candidate := cloneGrants(s.grants)
+	candidate[key] = grant
+	if err := s.saveLocked(candidate); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
+	s.grants = candidate
 	s.generation++
-	s.persistLocked()
 	return grant, nil
 }
 
-// ConfigGeneration returns the monotonic delegated-grant config version (bumped on each Upsert). A
+// ConfigGeneration returns the monotonic delegated-grant config version (bumped on each Upsert and effective Revoke). A
 // config-bundle distributor folds it into the aggregate generation so a grant change triggers a fleet re-pull.
 func (s *Store) ConfigGeneration() uint64 {
 	s.mu.RLock()
@@ -111,10 +168,30 @@ func (s *Store) ConfigGeneration() uint64 {
 	return s.generation
 }
 
+// Get is retained for callers without tenant context and refuses ambiguous IDs.
+// Authenticated callers must use GetForTenant instead.
 func (s *Store) Get(id string) (model.DelegatedAccessGrant, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	grant, ok := s.grants[id]
+	var result model.DelegatedAccessGrant
+	found := false
+	for _, grant := range s.grants {
+		if grant.ID == id {
+			if found {
+				return model.DelegatedAccessGrant{}, false
+			}
+			result, found = grant, true
+		}
+	}
+	return result, found
+}
+func (s *Store) GetForTenant(tenant, id string) (model.DelegatedAccessGrant, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if validKey(tenant, id) != nil {
+		return model.DelegatedAccessGrant{}, false
+	}
+	grant, ok := s.grants[grantKey(tenant, id)]
 	return grant, ok
 }
 
@@ -132,7 +209,7 @@ func (s *Store) Count() int {
 	return len(s.grants)
 }
 
-// Capacity returns the configured FIFO capacity bound (<=0 means unbounded).
+// Capacity returns the configured admission capacity bound (<=0 means unbounded).
 func (s *Store) Capacity() int { return s.capacity }
 
 // Snapshot returns a copy of every grant. Admin list views (in cmd/edge) filter/sort/convert over this
@@ -147,10 +224,31 @@ func (s *Store) Snapshot() []model.DelegatedAccessGrant {
 	return out
 }
 
+// Revoke is a compatibility entry point; ambiguous IDs refuse mutation.
 func (s *Store) Revoke(id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	grant, ok := s.grants[id]
+	key := ""
+	for k, grant := range s.grants {
+		if grant.ID == id {
+			if key != "" {
+				return model.DelegatedAccessGrant{}, fmt.Errorf("delegated grant ID is ambiguous")
+			}
+			key = k
+		}
+	}
+	return s.revokeLocked(key, id, reason, now)
+}
+func (s *Store) RevokeForTenant(tenant, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
+	if err := validKey(tenant, id); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revokeLocked(grantKey(tenant, id), id, reason, now)
+}
+func (s *Store) revokeLocked(key, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
+	grant, ok := s.grants[key]
 	if !ok {
 		return model.DelegatedAccessGrant{}, fmt.Errorf("delegated access grant %s is absent", id)
 	}
@@ -158,11 +256,14 @@ func (s *Store) Revoke(id, reason string, now time.Time) (model.DelegatedAccessG
 		return grant, nil
 	}
 	revokedAt := now.UTC().Format(time.RFC3339)
-	grant.Status = "revoked"
-	grant.RevokedAt = &revokedAt
-	grant.RevocationReason = stringPtr(reason)
-	s.grants[id] = grant
-	s.persistLocked()
+	grant.Status, grant.RevokedAt, grant.RevocationReason = "revoked", &revokedAt, stringPtr(reason)
+	candidate := cloneGrants(s.grants)
+	candidate[key] = grant
+	if err := s.saveLocked(candidate); err != nil {
+		return model.DelegatedAccessGrant{}, err
+	}
+	s.grants = candidate
+	s.generation++
 	return grant, nil
 }
 
@@ -192,23 +293,6 @@ func IsActive(grant model.DelegatedAccessGrant, now time.Time) bool {
 		}
 	}
 	return true
-}
-
-// evictFIFO drops oldest keys until liveLen <= capacity (replicated package-local FIFO bound).
-func evictFIFO(order []string, liveLen, capacity int, del func(key string)) []string {
-	if capacity <= 0 {
-		return order
-	}
-	for liveLen > capacity && len(order) > 0 {
-		oldest := order[0]
-		order = order[1:]
-		del(oldest)
-		liveLen--
-	}
-	if len(order) > 2*capacity {
-		order = append([]string(nil), order...)
-	}
-	return order
 }
 
 func stringPtr(value string) *string {

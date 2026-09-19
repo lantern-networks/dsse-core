@@ -11,13 +11,15 @@
 function renderSitesView(content) {
   content.innerHTML = "";
   const host = el("div", {});
+  const create = el("button", { class: "ui-btn ui-btn-primary ui-btn-sm", text: bl({ en: "+ Create Site", ja: "+ サイト作成" }), onClick: () => { if (host.__siteListReady) openSiteForm(host); } });
+  create.disabled = true; host.__siteCreateButton = create;
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Sites", ja: "サイト" }) }),
       el("p", { class: "ui-view-desc", text: bl({ en: "Your locations and the connectors in each.", ja: "拠点と、各拠点のコネクタ。" }) }),
     ]),
     el("div", { style: "display:flex; gap:8px; flex-wrap:wrap;" }, [
-      el("button", { class: "ui-btn ui-btn-primary ui-btn-sm", text: bl({ en: "+ Create Site", ja: "+ サイト作成" }), onClick: () => openSiteForm(host) }),
+      create,
       el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderSiteList(host) }),
     ]),
   ]));
@@ -28,34 +30,100 @@ function renderSitesView(content) {
 // openSiteForm opens the Create Site modal (Connector UX): name, region, expected connector count, routing
 // namespace, deployment type. The site_id (= connector_group_id) is required and binds enrolled connectors.
 // Pass `existing` (a site row) to EDIT it — the Site ID is fixed (it is the connector group id); the rest is
-// pre-filled and saved via upsert. The out-of-scope "routing namespace" isn't shown; on edit it is preserved.
+// pre-filled and saved via upsert. Hidden routing namespace and HA policy are preserved on edit.
+function siteExpectedConnectorCount(value) {
+  if (value === "") return 0;
+  if (!/^[0-9]+$/.test(value)) return null;
+  const count = Number(value);
+  return Number.isSafeInteger(count) ? count : null;
+}
+
+// The detail response's region is a runtime summary. Verify the configured region in the list readback.
+function siteSavedFields(row, request, includeRegion) {
+  if (!row || typeof row !== "object" || Array.isArray(row) || row.managed !== true || row.site_id !== request.site_id) return false;
+  const keys = ["name", "deployment_type", "routing_namespace", "ha_policy"];
+  if (includeRegion) keys.push("region");
+  if (keys.some(key => (row[key] !== undefined && typeof row[key] !== "string") ||
+      (row[key] || "") !== (request[key] || "").trim())) return false;
+  return (row.expected_connector_count === undefined ? 0 : row.expected_connector_count) === request.expected_connector_count;
+}
+
+function siteSaveAcknowledged(response, request) {
+  return !!response && response.ok && response.status === 200 && siteSavedFields(response.body, request, false);
+}
+
+function siteSaveReadback(response, request) {
+  if (!response || !response.ok || response.status !== 200 || !response.body || !Array.isArray(response.body.sites)) return false;
+  const rows = response.body.sites;
+  if (rows.some(row => !row || typeof row !== "object" || Array.isArray(row) || typeof row.site_id !== "string")) return false;
+  const matches = rows.filter(row => row.site_id === request.site_id);
+  return matches.length === 1 && siteSavedFields(matches[0], request, true);
+}
+
 function openSiteForm(host, existing) {
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const authority = () => baseForPlane("control");
+  const credential = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: authority(), credential: credential(), generation: host.__renderSeq };
+  let closed = false, busy = false;
+  const current = () => !closed && host.isConnected !== false && host.__renderSeq === initial.generation &&
+    selection() === initial.selection && session() === initial.session && authority() === initial.authority && credential() === initial.credential;
   const editing = !!existing;
-  const s = existing || {};
+  const s = { ...(existing || {}) };
+  // Do not turn an unreadable hidden setting into an empty setting during a visible-field edit.
+  if ([s.routing_namespace, s.ha_policy].some(value => value != null && typeof value !== "string")) {
+    uiToast(bl({ en: "Site settings could not be read. Reload before editing.", ja: "サイト設定を読み取れませんでした。再読込してから編集してください。" }), "err");
+    return;
+  }
   const idF = uiField({ name: "site_id", label: bl({ en: "Site ID", ja: "サイト ID" }), required: true, value: s.site_id || "", placeholder: "tokyo-dc", hint: editing ? bl({ en: "Fixed — this is the connector group id.", ja: "変更不可 — コネクタグループ ID です。" }) : bl({ en: "Stable id; also the connector group id. Connectors enrolled with this id join this site.", ja: "安定した ID(コネクタグループ ID を兼ねる)。この ID で登録したコネクタがこのサイトに入ります。" }) });
   if (editing) { const inp = idF.el.querySelector("input,select,textarea"); if (inp) inp.disabled = true; }
   const nameF = uiField({ name: "name", label: bl({ en: "Display name", ja: "表示名" }), value: s.name || "", placeholder: bl({ en: "Tokyo DC", ja: "東京 DC" }) });
   const regionF = uiField({ name: "region", label: bl({ en: "Region / location", ja: "リージョン / 拠点" }), value: s.region || "", placeholder: "ap-northeast-1 / Tokyo office" });
-  const expectedF = uiField({ name: "expected", label: bl({ en: "Expected connectors (HA target)", ja: "想定コネクタ数 (HA 目標)" }), type: "number", value: s.expected_connector_count || "", placeholder: "2", hint: bl({ en: "The site shows Degraded when fewer than this are online.", ja: "オンラインがこれ未満のときサイトは「一部障害」になります。" }) });
+  const expectedF = uiField({ name: "expected", label: bl({ en: "Expected connectors (HA target)", ja: "想定コネクタ数 (HA 目標)" }), type: "number", value: String(s.expected_connector_count ?? (editing ? 0 : "")), placeholder: "2", hint: bl({ en: "The site shows Degraded when fewer than this are online. Blank or 0 means no target.", ja: "オンラインがこれ未満のときサイトは「一部障害」になります。空欄または 0 は目標なしです。" }), validate: value => {
+    const input = expectedF.el.querySelector("input");
+    return (input && input.validity && input.validity.badInput) || siteExpectedConnectorCount(value) === null
+      ? bl({ en: "Enter a non-negative whole number in decimal digits, up to 9007199254740991, or leave blank.", ja: "0 以上 9007199254740991 以下の整数を数字だけで入力するか、空欄にしてください。" }) : "";
+  } });
   const deployF = uiField({ name: "deployment_type", label: bl({ en: "Deployment type", ja: "デプロイ種別" }), value: s.deployment_type || "", placeholder: "vm / container / appliance" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: editing ? bl({ en: "Save", ja: "保存" }) : bl({ en: "Create", ja: "作成" }) });
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  const fields = [idF, nameF, regionF, expectedF, deployF];
   const m = uiModal({
+    onClose: () => { closed = true; },
     title: editing ? bl({ en: "Edit site", ja: "サイトを編集" }) : bl({ en: "Create a site", ja: "サイトを作成" }),
-    body: [idF.el, nameF.el, regionF.el, expectedF.el, deployF.el],
+    body: [...fields.map(field => field.el), notice],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
+  const controls = fields.map(field => field.el.querySelector("input,select,textarea")).filter(Boolean).concat(submit);
+  const disabled = controls.map(control => !!control.disabled);
   submit.onclick = async () => {
+    if (!current()) { m.close(); return; }
+    if (busy) return;
     if (!editing && !idF.validate()) return;
-    submit.disabled = true;
+    if (!expectedF.validate()) return;
+    busy = true; controls.forEach(control => { control.disabled = true; });
+    notice.textContent = ""; notice.style.display = "none";
     const body = { site_id: editing ? s.site_id : idF.get(), name: nameF.get(), region: regionF.get(), deployment_type: deployF.get() };
     if (s.routing_namespace) body.routing_namespace = s.routing_namespace; // preserve (not shown; out of scope)
-    const expected = parseInt(expectedF.get(), 10);
-    if (!isNaN(expected) && expected >= 0) body.expected_connector_count = expected;
+    if (s.ha_policy) body.ha_policy = s.ha_policy;
+    body.expected_connector_count = siteExpectedConnectorCount(expectedF.get());
     try {
-      const r = await apiFetch("POST", "/admin/sites", body);
-      if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      const r = await apiFetch("POST", "/admin/sites", body, "control");
+      if (!current()) { m.close(); return; }
+      if (!siteSaveAcknowledged(r, body)) throw new Error("Unconfirmed site save");
+      const read = await apiFetch("GET", "/admin/sites", undefined, "control");
+      if (!current()) { m.close(); return; }
+      if (!siteSaveReadback(read, body)) throw new Error("Unconfirmed site readback");
       m.close(); uiToast(editing ? bl({ en: "Site saved.", ja: "サイトを保存しました。" }) : bl({ en: "Site created.", ja: "サイトを作成しました。" }), "ok"); renderSiteList(host);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (_) {
+      if (!current()) { m.close(); return; }
+      notice.textContent = bl({ en: "The save could not be confirmed. It may already have been applied. Your input is retained. Cancel and reload to check the saved site before retrying; retrying sends another save.", ja: "保存を確認できませんでした。すでに反映されている可能性があります。入力は保持しています。再試行前にキャンセルして再読込し、保存状態を確認してください。再試行は新たな保存操作になります。" });
+      notice.style.display = "";
+    } finally {
+      busy = false;
+      if (current()) controls.forEach((control, i) => { control.disabled = disabled[i]; });
+    }
   };
   if (editing) nameF.focus(); else idF.focus();
 }
@@ -63,20 +131,56 @@ function openSiteForm(host, existing) {
 // showSiteNetworks opens the site's Networks — bound once to the site and served by all its connectors. Subnets
 // are SELECTED from the catalog (defined on the Networks page); a single hostname is bound directly here.
 async function showSiteNetworks(siteID, host) {
-  const modal = uiModal({ title: bl({ en: "Networks — " + siteID, ja: siteID + " のネットワーク" }), body: [el("div", {}, uiBadge(bl({ en: "Loading…", ja: "読込中…" }), "off"))], footer: [] });
+  let bodyHost;
+  const modal = uiModal({ title: bl({ en: "Networks — " + siteID, ja: siteID + " のネットワーク" }), body: [], footer: [], onClose: () => { if (bodyHost) freshRender(bodyHost); } });
   const box = modal.el.querySelector(".ui-modal"); if (box) box.style.width = "min(720px, 94vw)";
-  const bodyHost = modal.el.querySelector(".ui-modal-body");
-  await renderSiteNetworks(bodyHost, siteID, host);
+  bodyHost = modal.el.querySelector(".ui-modal-body");
   const foot = modal.el.querySelector(".ui-modal-foot"); foot.innerHTML = "";
   foot.appendChild(el("button", { class: "ui-btn", text: bl({ en: "Done", ja: "完了" }), onClick: () => { modal.close(); renderSiteList(host); } }));
+  await renderSiteNetworks(bodyHost, siteID, host);
+}
+
+function siteNetworkRows(response, key) {
+  if (!response || !response.ok) throw new Error("HTTP " + (response && response.status));
+  if (!response.body || !Object.hasOwn(response.body, key)) throw new Error("Invalid site network response");
+  const rows = response.body[key];
+  if (rows === null) return [];
+  if (!Array.isArray(rows) || rows.some(row => !row || typeof row !== "object" || Array.isArray(row))) throw new Error("Invalid site network response");
+  return rows;
+}
+
+async function loadSiteNetworkData(siteID) {
+  const [bindings, networks, connectors] = await Promise.all([
+    apiFetch("GET", "/admin/sites/" + encodeURIComponent(siteID) + "/networks"),
+    apiFetch("GET", "/admin/vlan-objects"),
+    apiFetch("GET", "/admin/connectors"),
+  ]);
+  const rows = siteNetworkRows(bindings, "networks");
+  const catalog = siteNetworkRows(networks, "objects");
+  const conns = siteNetworkRows(connectors, "connectors");
+  const text = value => typeof value === "string" && value.length > 0;
+  const optionalText = value => value == null || typeof value === "string";
+  const optionalTexts = value => value == null || (Array.isArray(value) && value.every(v => typeof v === "string"));
+  if (rows.some(r => !["network", "fqdn", "cidr"].includes(r.kind) ||
+      (r.kind === "network" && !text(r.network_id)) || (r.kind === "fqdn" && !text(r.fqdn)) || (r.kind === "cidr" && !text(r.cidr)) ||
+      ![r.network_id, r.fqdn, r.cidr].every(optionalText) || [r.network_id, r.fqdn, r.cidr].filter(Boolean).length !== 1 ||
+      !optionalText(r.network_name) || !optionalTexts(r.network_cidrs))) throw new Error("Invalid site network binding");
+  if (catalog.some(n => !text(n.id) || !optionalText(n.name) || !optionalTexts(n.cidrs))) throw new Error("Invalid network catalog");
+  if (conns.some(c => !text(c.id) || ![c.name, c.connector_group_id, c.edge_region_id, c.attached_region_id].every(optionalText))) throw new Error("Invalid connector catalog");
+  return { rows, catalog, conns: conns.filter(c => (c.connector_group_id || "") === siteID) };
 }
 
 async function renderSiteNetworks(bodyHost, siteID, listHost) {
+  const current = freshRender(bodyHost);
+  bodyHost.__siteNetworkEditor = null;
+  uiState(bodyHost, "loading");
+  let data;
+  try { data = await loadSiteNetworkData(siteID); }
+  catch (e) { if (current()) uiState(bodyHost, "error", String(e.message || e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteNetworks(bodyHost, siteID, listHost) }); return; }
+  if (!current()) return;
+  const { rows, catalog, conns } = data;
   bodyHost.innerHTML = "";
   bodyHost.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "The networks this site serves — all its connectors serve them.", ja: "この拠点が担うネットワーク。配下の全コネクタが担います。" }) }));
-  let rows = [], catalog = [];
-  try { const r = await apiFetch("GET", "/admin/sites/" + encodeURIComponent(siteID) + "/networks"); if (r.ok && r.body) rows = r.body.networks || []; } catch (e) { /* leave empty */ }
-  try { const r = await apiFetch("GET", "/admin/vlan-objects"); if (r.ok && r.body) catalog = r.body.objects || []; } catch (e) { /* leave empty */ }
   const dest = (rt) => rt.kind === "network" ? ((rt.network_name || rt.network_id) + ((rt.network_cidrs && rt.network_cidrs.length) ? " (" + rt.network_cidrs.join(", ") + ")" : "")) : (rt.cidr || rt.fqdn || "");
   const payloadFor = (rt) => rt.kind === "network" ? { network_id: rt.network_id } : (rt.fqdn ? { fqdn: rt.fqdn } : { cidr: rt.cidr });
   const kindLabel = (rt) => rt.kind === "network" ? bl({ en: "Named network", ja: "定義済みNW" }) : (rt.fqdn ? bl({ en: "Name", ja: "名前" }) : bl({ en: "Subnet", ja: "サブネット" }));
@@ -103,16 +207,14 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
   // Subnets come from the catalog (select above — defined on the Networks page). A single hostname is bound here.
   const inp = el("input", { class: "ui-input", placeholder: bl({ en: "or a hostname — wiki.corp", ja: "またはホスト名 — wiki.corp" }) }); inp.style.maxWidth = "240px";
   bodyHost.appendChild(el("div", { class: "ui-toolbar", style: "margin-top:6px" }, [inp, el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add", ja: "追加" }), onClick: () => { const v = inp.value.trim(); if (!v) return; siteNetworkAction(siteID, { action: "add", fqdn: v }, bodyHost, listHost); } })]));
+  const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
+  bodyHost.appendChild(saveError);
+  bodyHost.__siteNetworkEditor = { current, busy: false, error: saveError, controls: Array.from(bodyHost.querySelectorAll("button,input,select")) };
 
   // (connector_network_route_advertisement_design.md): the route-governance surface lives HERE — the
   // site-first IA has no separate Connectors page, so each of the site's connectors gets its governance panel
   // (declared/discovered subnets with Routable / Discovered / Held state and Adopt / Hold / Unhold) in this
   // modal. Without it the operator cannot see or manage what actually routes (the 2026-07-16 orphaned-UI gap).
-  let conns = [];
-  try {
-    const r = await apiFetch("GET", "/admin/connectors");
-    if (r.ok && r.body) conns = (r.body.connectors || []).filter((c) => (c.connector_group_id || "") === siteID);
-  } catch (e) { /* leave empty */ }
   for (const c of conns) {
     const panel = el("div", { style: "margin-top:16px;border-top:1px solid rgba(128,128,128,.25);padding-top:10px" });
     bodyHost.appendChild(panel);
@@ -149,10 +251,32 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
 }
 
 async function siteNetworkAction(siteID, payload, bodyHost, listHost) {
-  const r = await apiFetch("POST", "/admin/sites/" + encodeURIComponent(siteID) + "/networks", payload);
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Network updated.", ja: "ネットワークを更新しました。" }), "ok");
-  renderSiteNetworks(bodyHost, siteID, listHost);
+  const editor = bodyHost.__siteNetworkEditor;
+  if (!editor || !editor.current() || editor.busy) return;
+  editor.busy = true;
+  editor.error.style.display = "none";
+  const controls = editor.controls.map(control => ({ control, disabled: control.disabled }));
+  controls.forEach(({ control }) => { control.disabled = true; });
+  try {
+    const r = await apiFetch("POST", "/admin/sites/" + encodeURIComponent(siteID) + "/networks", payload);
+    if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    if (!editor.current()) return;
+    uiToast(bl({ en: "Network updated.", ja: "ネットワークを更新しました。" }), "ok");
+    await renderSiteNetworks(bodyHost, siteID, listHost);
+  } catch (e) {
+    if (!editor.current()) return;
+    editor.error.textContent = String(e.message || e);
+    editor.error.style.display = "";
+    editor.error.scrollIntoView({ block: "nearest" });
+  } finally {
+    editor.busy = false;
+    if (editor.current()) controls.forEach(({ control, disabled }) => { control.disabled = disabled; });
+  }
+}
+
+function connectorManagementError() {
+  return bl({ en: "The connector change could not be confirmed. Reload to check its state before retrying.",
+    ja: "コネクタの変更を確認できませんでした。再読込して状態を確認してから再試行してください。" });
 }
 
 // renameConnector opens a small modal to set an operator display name for a connector (survives reconnection).
@@ -164,9 +288,9 @@ async function renameConnector(id, current, host) {
     save.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/connectors/" + encodeURIComponent(id) + "/name", { name: f.get() });
-      if (!r.ok) { save.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      if (!r.ok) { save.disabled = false; uiToast(connectorManagementError(), "err"); return; }
       m.close(); uiToast(bl({ en: "Renamed.", ja: "名前を変更しました。" }), "ok"); renderSiteList(host);
-    } catch (e) { save.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) { save.disabled = false; uiToast(connectorManagementError(), "err"); }
   };
   f.focus();
 }
@@ -176,9 +300,11 @@ async function renameConnector(id, current, host) {
 async function removeConnector(id, name, host) {
   const ok = await uiConfirm({ title: bl({ en: "Remove this connector?", ja: "このコネクタを削除?" }), body: bl({ en: "\"" + name + "\" is removed from this site. A connector that is still running will re-appear when it next checks in.", ja: "「" + name + "」をこの拠点から削除します。稼働中のコネクタは次回チェックインで再登場します。" }), confirmLabel: bl({ en: "Remove", ja: "削除" }), danger: true });
   if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/connectors/" + encodeURIComponent(id));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
+  try {
+    const r = await apiFetch("DELETE", "/admin/connectors/" + encodeURIComponent(id));
+    if (!r.ok) { uiToast(connectorManagementError(), "err"); return; }
+    uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
+  } catch (_) { uiToast(connectorManagementError(), "err"); }
 }
 
 // siteHealthBadge maps a Site health label to a coloured badge. healthy -> ok, degraded -> warn,
@@ -203,22 +329,78 @@ function siteRouteCount(routeSummary) {
   return bl({ en: f + " fqdn / " + c + " cidr", ja: "FQDN " + f + " / CIDR " + c });
 }
 
+// Validate both catalogues before combining them; unavailable data is never an empty catalogue.
+function siteListRows(response, key) {
+  const body = response && response.body;
+  if (!response || !response.ok || response.status !== 200 || !body || typeof body !== "object" || Array.isArray(body) ||
+      !Object.hasOwn(body, key) || (body[key] !== null && !Array.isArray(body[key]))) throw new Error("Invalid site catalogue");
+  const rows = body[key] || [];
+  if (body.count !== rows.length || rows.some(row => !row || typeof row !== "object" || Array.isArray(row))) throw new Error("Invalid site catalogue rows");
+  return rows;
+}
+
+function siteListData(siteResponse, connectorResponse, tenant) {
+  const sites = siteListRows(siteResponse, "sites"), conns = siteListRows(connectorResponse, "connectors");
+  const id = value => typeof value === "string" && value.length > 0 && value.trim() === value;
+  const optionalText = value => value === undefined || typeof value === "string";
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  const siteIDs = new Set(), connectorIDs = new Set();
+  let rowTenant = tenant || null;
+  for (const site of sites) {
+    if (!id(site.site_id) || siteIDs.has(site.site_id) ||
+        ![site.name, site.region, site.deployment_type, site.routing_namespace, site.ha_policy].every(optionalText) ||
+        (site.tenant_id !== undefined && (!id(site.tenant_id) || (rowTenant !== null && site.tenant_id !== rowTenant))) ||
+        (site.managed !== undefined && typeof site.managed !== "boolean") ||
+        (site.expected_connector_count !== undefined && !count(site.expected_connector_count)) ||
+        !count(site.connector_count) || !count(site.online_count) || site.online_count > site.connector_count ||
+        !["healthy", "degraded", "down", "unknown"].includes(site.health) ||
+        (site.regions != null && (!Array.isArray(site.regions) || !site.regions.every(id)))) throw new Error("Invalid site row");
+    if (site.tenant_id !== undefined) rowTenant = site.tenant_id;
+    siteIDs.add(site.site_id);
+  }
+  for (const conn of conns) {
+    if (!id(conn.id) || connectorIDs.has(conn.id) || (!id(conn.tenant_id) || (rowTenant !== null && conn.tenant_id !== rowTenant)) || typeof conn.online !== "boolean" ||
+        ![conn.name, conn.connector_group_id, conn.last_heartbeat_at].every(optionalText) ||
+        (conn.connector_group_id && conn.connector_group_id.trim() !== conn.connector_group_id)) throw new Error("Invalid connector row");
+    rowTenant = conn.tenant_id;
+    connectorIDs.add(conn.id);
+  }
+  return { sites, conns };
+}
+
 // renderSiteList shows every site as a CARD with its connectors + live status INLINE, so opening the page shows
 // the connector situation at a glance (no drill-in needed). Connectors are grouped by connector_group_id; per
 // connector you can rename it, see its Connected/Offline status + last heartbeat, and open its Networks.
 async function renderSiteList(host) {
+  const fresh = freshRender(host);
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: baseForPlane("control"), token: token() };
+  const current = () => fresh() && host.isConnected !== false && selection() === initial.selection &&
+    session() === initial.session && baseForPlane("control") === initial.authority && token() === initial.token;
+  host.__siteListReady = false;
+  if (host.__siteCreateButton) host.__siteCreateButton.disabled = true;
   uiState(host, "loading");
-  const current = freshRender(host);
-  let sites = [], conns = [];
+  let sites, conns;
   try {
-    const [rs, rc] = await Promise.all([apiFetch("GET", "/admin/sites"), apiFetch("GET", "/admin/connectors")]);
-    if (!rs.ok) { if (!current()) return; uiState(host, "error", "HTTP " + rs.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) }); return; }
-    sites = (rs.body && rs.body.sites) || [];
-    conns = (rc.ok && rc.body && rc.body.connectors) || [];
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) }); return; }
+    // A connector-scoped API token need not have permission to read the tenant model.
+    // Use the selected tenant or authenticated cookie session when known; otherwise require row consistency.
+    const tenant = initial.selection || (initial.session && initial.session.auth_method === "admin_session" ? initial.session.tenant_id : null);
+    if ((tenant != null || (initial.session && initial.session.auth_method === "admin_session")) && (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant)) throw new Error("Invalid site context");
+    const [rs, rc] = await Promise.all([apiFetch("GET", "/admin/sites", undefined, "control"), apiFetch("GET", "/admin/connectors", undefined, "control")]);
+    if (!current()) return;
+    ({ sites, conns } = siteListData(rs, rc, tenant));
+  } catch (_) {
+    if (!current()) return;
+    uiState(host, "error", bl({ en: "Sites and connectors could not be verified. Retry before making changes.", ja: "サイトとコネクタを確認できませんでした。変更前に再試行してください。" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) });
+    return;
+  }
 
-  const bySite = {};
-  conns.forEach((c) => { const g = c.connector_group_id || ""; (bySite[g] = bySite[g] || []).push(c); });
+  const bySite = new Map();
+  conns.forEach(conn => { const group = conn.connector_group_id || ""; if (!bySite.has(group)) bySite.set(group, []); bySite.get(group).push(conn); });
+  host.__siteListReady = true;
+  if (host.__siteCreateButton) host.__siteCreateButton.disabled = false;
 
   if (!current()) return;
   host.innerHTML = "";
@@ -229,37 +411,28 @@ async function renderSiteList(host) {
   }
 
   const cid = (c) => c.id || c.connector_id || "";
-  // connTable lists a site's connectors. In HA mode it shows the active-standby role: exactly one online
-  // connector is ACTIVE (the one routing sends traffic to — the stable pick among the online ones); the other
-  // online connectors are STANDBY (ready to take over); offline ones are OFFLINE. Non-HA (unassigned) shows plain
-  // connected/offline.
-  const connTable = (list, ha) => {
+  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Availability is reported by the server using tunnel state or recent heartbeats.", ja: "サーバーがトンネルの状態または最近のハートビートから判定した稼働状態です。" }) }));
+  // Availability is a server answer, not a site-wide routing role inferred from connector IDs.
+  const connTable = (list) => {
     if (!list.length) return el("p", { class: "ui-view-desc", style: "margin:6px 0 2px", text: bl({ en: "No connectors yet — use “Add connector”.", ja: "コネクタ未導入 —「コネクタを追加」から。" }) });
-    // ★ THE SERVER'S ANSWER, NOT ITS INGREDIENTS (2026-09-01). This read tunnel_connected as a boolean, and
-    // that field has three states: held here, unknown, and — never — false. A control plane holds no connector
-    // tunnel at all, so it answers unknown for every connector, and this screen showed "Healthy … 0 / 2
-    // connectors online" with a heartbeat eight seconds old beside each Offline row, while the API it had just
-    // called said online=2. `online` is that same answer, decided once, on the server.
-    const activeId = list.filter((c) => c.online).map(cid).sort()[0] || null;
-    const roleBadge = (c) => {
-      if (!c.online) return uiBadge(bl({ en: "Offline", ja: "オフライン" }), "danger");
-      if (!ha) return uiBadge(bl({ en: "Connected", ja: "接続中" }), "ok");
-      return cid(c) === activeId ? uiBadge(bl({ en: "Active", ja: "アクティブ" }), "ok") : uiBadge(bl({ en: "Standby", ja: "スタンバイ" }), "off");
-    };
+    const availabilityBadge = (c) => c.online
+      ? uiBadge(bl({ en: "Online", ja: "オンライン" }), "ok")
+      : uiBadge(bl({ en: "Offline", ja: "オフライン" }), "danger");
     const rows = list.map((c) => {
       const id = cid(c);
       return el("tr", {}, [
         el("td", {}, [el("div", { style: "font-weight:600", text: c.name || id }), el("code", { class: "ui-view-desc", text: id })]),
-        el("td", {}, roleBadge(c)),
+        el("td", {}, availabilityBadge(c)),
         el("td", { text: c.last_heartbeat_at || bl({ en: "never", ja: "なし" }) }),
         el("td", { class: "ui-row-actions" }, [
+          el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Details", ja: "詳細" }), onClick: () => showConnectorDetail(id, c) }),
           el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Rename", ja: "名前変更" }), onClick: () => renameConnector(id, c.name, host) }),
           el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "削除" }), onClick: () => removeConnector(id, c.name || id, host) }),
         ]),
       ]);
     });
     return el("table", { class: "ui-table", style: "margin-top:6px" }, [
-      el("thead", {}, el("tr", {}, [bl({ en: "Connector", ja: "コネクタ" }), bl({ en: "Role", ja: "役割" }), bl({ en: "Last heartbeat", ja: "最終ハートビート" }), bl({ en: "Manage", ja: "操作" })].map((x) => el("th", { text: x })))),
+      el("thead", {}, el("tr", {}, [bl({ en: "Connector", ja: "コネクタ" }), bl({ en: "Availability", ja: "稼働状態" }), bl({ en: "Last heartbeat", ja: "最終ハートビート" }), bl({ en: "Manage", ja: "操作" })].map((x) => el("th", { text: x })))),
       el("tbody", {}, rows),
     ]);
   };
@@ -267,7 +440,7 @@ async function renderSiteList(host) {
   const card = (s, opts) => {
     opts = opts || {};
     const sid = s.site_id || s.id || "";
-    const list = opts.list || bySite[sid] || [];
+    const list = opts.list || bySite.get(sid) || [];
     const online = list.filter((c) => c.online).length;
     const total = list.length || s.connector_count || 0;
     const wrap = el("div", { style: "border:1px solid var(--ui-line);border-radius:10px;padding:14px 16px;margin-bottom:14px;background:var(--panel)" });
@@ -286,7 +459,7 @@ async function renderSiteList(host) {
       ].filter(Boolean)),
       el("div", { class: "ui-row-actions" }, actions),
     ]));
-    wrap.appendChild(connTable(list, !opts.orphan));
+    wrap.appendChild(connTable(list));
     return wrap;
   };
 
@@ -294,8 +467,8 @@ async function renderSiteList(host) {
 
   // Connectors whose group id matches no site — surface them so they are never hidden.
   const siteIds = new Set(sites.map((s) => s.site_id || s.id));
-  const orphanIds = Object.keys(bySite).filter((g) => g && !siteIds.has(g));
-  const orphans = (bySite[""] || []).concat(...orphanIds.map((g) => bySite[g]));
+  const orphanIds = [...bySite.keys()].filter((g) => g && !siteIds.has(g));
+  const orphans = (bySite.get("") || []).concat(...orphanIds.map((g) => bySite.get(g)));
   if (orphans.length) {
     host.appendChild(card({ site_id: "", regions: [] }, { orphan: true, list: orphans, title: bl({ en: "Connectors not assigned to a site", ja: "サイト未割り当てのコネクタ" }) }));
   }
@@ -473,36 +646,142 @@ async function enrollmentCommandFetch(siteID) {
 
 // connectorProgramsFetch asks the control plane what programs this deployment holds. The bytes live with the
 // authority, the same way agent release artifacts do, so this read is explicitly control-plane.
-async function connectorProgramsFetch() {
-  try {
-    const r = await apiFetch("GET", "/admin/connector-programs", undefined, "control");
-    if (!r || !r.ok || !r.body) return [];
-    return Array.isArray(r.body.programs) ? r.body.programs : [];
-  } catch (e) { return []; }
+function connectorProgramsReadError() {
+  return bl({ en: "Could not verify the available connector programs. Retry; an unavailable list does not mean that no programs are published.",
+    ja: "利用可能なコネクタのプログラムを確認できません。再試行してください。一覧の取得失敗は、プログラムが未公開であることを意味しません。" });
 }
 
-// downloadConnectorProgram takes the bytes away. A raw fetch rather than apiFetch, for the same reason the
-// agent release screen uses one: apiFetch reads every answer as text, and a program is not text.
-async function downloadConnectorProgram(program) {
-  const base = baseForPlane("control");
-  const token = localStorage.getItem("adminToken") || "";
-  const signedIn = idpSession && idpSession.auth_method === "admin_session";
-  const headers = {};
-  if (!signedIn && token) headers["authorization"] = "Bearer " + token;
-  if (operateTenant) headers["x-operate-tenant"] = operateTenant;
-  const path = "/admin/connector-program?platform=" + encodeURIComponent(program.platform) +
-    "&arch=" + encodeURIComponent(program.arch);
-  const res = await fetch(base + path, { method: "GET", headers, credentials: "include" });
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = program.file_name || ("dsse-connector-" + program.platform + "-" + program.arch);
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+function connectorProgramTenant() {
+  const selected = typeof operateTenant === "string" ? operateTenant : "";
+  const session = typeof idpSession === "undefined" ? null : idpSession;
+  const tenant = selected || (session?.auth_method === "admin_session" ? session.tenant_id : null);
+  if ((tenant != null || session?.auth_method === "admin_session") &&
+      (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant)) throw new Error(connectorProgramsReadError());
+  return tenant;
+}
+
+async function connectorProgramsFetch() {
+  const tenant = connectorProgramTenant();
+  const r = await apiFetch("GET", "/admin/connector-programs", undefined, "control");
+  const d = r?.body, object = v => v !== null && typeof v === "object" && !Array.isArray(v);
+  const target = v => typeof v === "string" && /^[a-z0-9._-]+$/.test(v) && v !== "." && v !== "..";
+  const seen = new Set();
+  if (!r?.ok || r.status !== 200 || !object(d) || !Array.isArray(d.programs) ||
+      !Number.isSafeInteger(d.count) || d.count !== d.programs.length ||
+      typeof d.tenant_id !== "string" || !d.tenant_id || d.tenant_id.trim() !== d.tenant_id ||
+      (tenant !== null && d.tenant_id !== tenant)) throw new Error(connectorProgramsReadError());
+  for (const p of d.programs) {
+    if (!object(p) || !["deployment", "tenant"].includes(p.source) || !target(p.platform) || !target(p.arch) ||
+        typeof p.file_name !== "string" || !p.file_name.trim() || p.file_name.trim() !== p.file_name ||
+        p.file_name.length > 120 || /[\\/]/.test(p.file_name) || [".", ".."].includes(p.file_name) ||
+        typeof p.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(p.sha256) ||
+        !Number.isSafeInteger(p.size) || p.size < 0 || p.size > 64 * 1024 * 1024 ||
+        ["version", "published_at", "published_by"].some(k => p[k] !== undefined && typeof p[k] !== "string")) throw new Error(connectorProgramsReadError());
+    const key = p.platform + "/" + p.arch;
+    if (seen.has(key)) throw new Error(connectorProgramsReadError());
+    seen.add(key);
+  }
+  return d.programs.map(p => ({ ...p, tenant_id: d.tenant_id }));
+}
+
+// Both publication and enrollment screens distinguish verified empty data from
+// failed reads. Retrying this read never issues another enrollment credential.
+function connectorProgramsLoader(host, render, parentCurrent = () => true) {
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const base = () => baseForPlane("control");
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const selected = selection(), signedIn = session(), authority = base(), credential = token();
+  const context = () => selected === selection() && signedIn === session() && authority === base() && credential === token() && parentCurrent();
+  const refresh = async () => {
+    if (!context()) return;
+    const fresh = freshRender(host), current = () => fresh() && host.isConnected !== false && context();
+    uiState(host, "loading");
+    try {
+      const programs = await connectorProgramsFetch();
+      if (!current()) return;
+      host.innerHTML = "";
+      render(programs, current);
+    } catch (_) {
+      if (!current()) return;
+      uiState(host, "error", connectorProgramsReadError(), {
+        label: bl({ en: "Retry", ja: "再試行" }), onClick: refresh });
+    }
+  };
+  return refresh;
+}
+
+// The displayed catalogue is the expected content, not a promise that the next
+// GET returns the same bytes. Never save a partial, changed or unverified program.
+function connectorProgramDownloadError(reason) {
+  if (reason === "scope") return bl({
+    en: "The connector program organization or publication source could not be verified. No program was saved. Check the selected organization and reload the program list; ask the deployment operator to investigate if this persists.",
+    ja: "コネクタのプログラムの対象組織または公開元を確認できず、保存していません。選択中の組織を確認してプログラム一覧を再読込してください。解消しない場合は配備の運用者に調査を依頼してください。" });
+  if (reason === "catalogue") return bl({
+    en: "The connector program response no longer matches the displayed catalogue. No program was saved. Reload the program list and check for a changed publication before downloading again.",
+    ja: "コネクタのプログラムの応答が表示中の一覧と一致せず、保存していません。プログラム一覧を再読込し、公開内容の変更を確認してから再度取得してください。" });
+  if (reason === "size" || reason === "digest") return bl({
+    en: "Download blocked: the connector program " + (reason === "size" ? "size" : "SHA-256 digest") + " does not match the displayed catalogue. Do not distribute this program. Ask the deployment operator to investigate the stored file and delivery path, including intervening publication.",
+    ja: "ダウンロードを停止しました。コネクタのプログラムの" + (reason === "size" ? "サイズ" : "SHA-256 ハッシュ") + "が表示中の一覧と一致しません。このプログラムは配布せず、配備の運用者に保存ファイル・配信経路・公開内容の変更を確認してもらってください。" });
+  if (reason === "verification") return bl({
+    en: "The connector program integrity check could not be completed. No program was saved. Check browser support and try again; this does not establish that the program is corrupt.",
+    ja: "コネクタのプログラムの完全性確認を完了できず、保存していません。ブラウザの対応状況を確認して再試行してください。破損を確認したわけではありません。" });
+  return bl({ en: "The connector program transfer could not be verified. No program was saved. Check your connection and access, then reload the program list and try again.",
+    ja: "コネクタのプログラムを取得・確認できず、保存していません。接続とアクセス権を確認し、プログラム一覧を再読込してから再試行してください。" });
+}
+
+async function downloadConnectorProgram(program, parentCurrent) {
+  if (typeof parentCurrent !== "function" || !parentCurrent()) return false;
+  const base = baseForPlane("control"), selected = operateTenant, session = idpSession;
+  const token = localStorage.getItem("adminToken") || "", expected = { ...program };
+  const current = () => parentCurrent() && base === baseForPlane("control") &&
+    selected === operateTenant && session === idpSession && token === (localStorage.getItem("adminToken") || "");
+  let failure = "transfer";
+  try {
+    failure = "scope";
+    const tenant = connectorProgramTenant();
+    if (typeof expected.tenant_id !== "string" || !expected.tenant_id || expected.tenant_id.trim() !== expected.tenant_id ||
+        (tenant !== null && tenant !== expected.tenant_id) || !["deployment", "tenant"].includes(expected.source)) throw new Error();
+    failure = "transfer";
+    if (!Number.isSafeInteger(expected.size) || expected.size < 0 || expected.size > 64 * 1024 * 1024 ||
+        typeof expected.sha256 !== "string" || !/^[a-fA-F0-9]{64}$/.test(expected.sha256) ||
+        ![expected.platform, expected.arch].every(v => typeof v === "string" && /^[a-z0-9._-]+$/.test(v) && ![".", ".."].includes(v)) ||
+        typeof expected.file_name !== "string" || !expected.file_name.trim() || expected.file_name.trim() !== expected.file_name ||
+        expected.file_name.length > 120 || /[\\/]/.test(expected.file_name) || [".", ".."].includes(expected.file_name)) throw new Error();
+    const headers = {};
+    if (session?.auth_method !== "admin_session" && token) headers["authorization"] = "Bearer " + token;
+    if (selected) headers["x-operate-tenant"] = selected;
+    const path = "/admin/connector-program?platform=" + encodeURIComponent(expected.platform) + "&arch=" + encodeURIComponent(expected.arch);
+    const res = await fetch(base + path, { method: "GET", headers, credentials: "include", redirect: "error", cache: "no-store" });
+    if (!current()) return false;
+    if (!res.ok || res.status !== 200 || res.redirected) throw new Error();
+    failure = "scope";
+    if (res.headers.get("X-Dsse-Connector-Program-Tenant") !== expected.tenant_id ||
+        res.headers.get("X-Dsse-Connector-Program-Source") !== expected.source) throw new Error();
+    failure = "catalogue";
+    if ((res.headers.get("x-artifact-sha256") || "").toLowerCase() !== expected.sha256.toLowerCase()) throw new Error();
+    failure = "transfer";
+    const blob = await res.blob();
+    if (!current()) return false;
+    failure = "size";
+    if (blob.size !== expected.size) throw new Error();
+    failure = "verification";
+    const bytes = await blob.arrayBuffer();
+    if (!current()) return false;
+    const sum = await crypto.subtle.digest("SHA-256", bytes);
+    if (!current()) return false;
+    failure = "digest";
+    const digest = [...new Uint8Array(sum)].map(b => b.toString(16).padStart(2, "0")).join("");
+    if (digest !== expected.sha256.toLowerCase()) throw new Error();
+    const url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = expected.file_name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    return true;
+  } catch (_) {
+    if (current()) uiToast(connectorProgramDownloadError(failure), "err");
+    return false;
+  }
 }
 
 function connectorProgramSize(n) {
@@ -618,7 +897,7 @@ async function showEnrollmentCommand(siteID) {
     // wiring inside the one modal rather than on window.
     const programHost = el("div", { style: "margin:6px 0 10px 0" });
     host.appendChild(programHost);
-    connectorProgramsFetch().then((programs) => {
+    const refreshPrograms = connectorProgramsLoader(programHost, (programs, current) => {
       programHost.innerHTML = "";
       if (!programs.length) {
         // ★ A ZERO THE READER CAN ACT ON. Not "0 programs" — what the zero means for the person about to walk
@@ -658,15 +937,21 @@ async function showEnrollmentCommand(siteID) {
       };
       pick.addEventListener("change", describe);
       const dlProgram = el("button", { class: "ui-btn", text: bl({ en: "Download the program", ja: "プログラムをダウンロード" }), onClick: async () => {
+        if (dlProgram.disabled || !current()) return;
+        dlProgram.disabled = true; pick.disabled = true;
+        dlProgram.textContent = bl({ en: "Download the program", ja: "プログラムをダウンロード" });
         try {
-          await downloadConnectorProgram(chosen());
-          dlProgram.textContent = bl({ en: "Downloaded — download again", ja: "ダウンロード済み — 再ダウンロード" });
-        } catch (e) { uiToast(String(e && e.message || e), "err"); }
+          const saved = await downloadConnectorProgram(chosen(), current);
+          if (saved && current()) dlProgram.textContent = bl({ en: "Downloaded — download again", ja: "ダウンロード済み — 再ダウンロード" });
+        } finally {
+          dlProgram.disabled = false; pick.disabled = false;
+        }
       } });
       programHost.appendChild(el("div", { style: "display:flex;align-items:center;gap:10px" }, [dlProgram, pick]));
       programHost.appendChild(detail);
       describe();
     });
+    refreshPrograms();
 
     const dl = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Download the settings", ja: "設定をダウンロード" }), onClick: () => {
       try {
@@ -725,17 +1010,60 @@ async function showEnrollmentCommand(siteID) {
   }
 }
 
-// deleteSite removes the persistent Site record (its connectors are not deleted) after a danger confirm.
-async function deleteSite(siteID, name, detailModal, host) {
-  const ok = await uiConfirm({
+// A deleted persistent Site may remain in the merged catalogue as an unmanaged connector group.
+function siteDeleteReadback(response, siteID, tenant) {
+  const emptyConnectors = { ok: true, status: 200, body: { connectors: [], count: 0 } };
+  const { sites } = siteListData(response, emptyConnectors, tenant);
+  return !sites.some(site => site.site_id === siteID && site.managed === true);
+}
+
+// Deletion confirmation belongs to the context in which it was opened, including the confirmation wait.
+// Keep an uncertain result visible and ask the operator to reload before another destructive attempt.
+function deleteSite(siteID, name, detailModal, host) {
+  if (!host || host.isConnected === false) return;
+  const pending = host.__siteDeletions || (host.__siteDeletions = new Set());
+  if (pending.has(siteID)) return;
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: baseForPlane("control"), token: token(), seq: host.__renderSeq };
+  const tenant = initial.selection || (initial.session && initial.session.auth_method === "admin_session" ? initial.session.tenant_id : null);
+  if ((tenant != null || (initial.session && initial.session.auth_method === "admin_session")) &&
+      (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant)) return;
+  let closed = false, busy = false, attempted = false;
+  const current = () => !closed && host.isConnected !== false && host.__renderSeq === initial.seq &&
+    (!detailModal || detailModal.el.isConnected !== false) && selection() === initial.selection &&
+    session() === initial.session && baseForPlane("control") === initial.authority && token() === initial.token;
+  pending.add(siteID);
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  const confirm = el("button", { class: "ui-btn ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }) });
+  const modal = uiModal({
     title: bl({ en: "Delete this site?", ja: "このサイトを削除?" }),
-    body: bl({ en: "\"" + (name || siteID) + "\" is removed. Connectors are not deleted, but the Site's name, region, and HA settings are lost.", ja: "「" + (name || siteID) + "」を削除します。コネクタは削除されませんが、サイトの名前・リージョン・HA 設定は失われます。" }),
-    confirmLabel: bl({ en: "Delete", ja: "削除" }), danger: true,
+    body: [el("p", { text: bl({ en: "\"" + (name || siteID) + "\" is removed. Connectors are not deleted, but the Site's name, region, and HA settings are lost.", ja: "「" + (name || siteID) + "」を削除します。コネクタは削除されませんが、サイトの名前・リージョン・HA 設定は失われます。" }) }), notice],
+    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }), confirm],
+    onClose: () => { closed = true; if (!busy) pending.delete(siteID); },
   });
-  if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/sites/" + encodeURIComponent(siteID));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Site deleted.", ja: "サイトを削除しました。" }), "ok");
-  if (detailModal) detailModal.close();
-  if (host) renderSiteList(host);
+  confirm.onclick = async () => {
+    if (busy || attempted || !current()) return;
+    busy = true; attempted = true; confirm.disabled = true;
+    try {
+      const r = await apiFetch("DELETE", "/admin/sites/" + encodeURIComponent(siteID), undefined, "control");
+      if (!current()) return;
+      if (!r || !r.ok || r.status !== 200 || !r.body || Array.isArray(r.body) || r.body.site_id !== siteID || r.body.deleted !== true) throw new Error("Unconfirmed site deletion");
+      const readback = await apiFetch("GET", "/admin/sites", undefined, "control");
+      if (!current()) return;
+      if (!siteDeleteReadback(readback, siteID, tenant)) throw new Error("Site is still managed");
+      modal.close();
+      if (detailModal) detailModal.close();
+      uiToast(bl({ en: "Site deleted.", ja: "サイトを削除しました。" }), "ok");
+      renderSiteList(host);
+    } catch (_) {
+      if (!current()) return;
+      notice.textContent = bl({ en: "The deletion could not be confirmed. It may already have been applied. Cancel and reload to check the site before trying again.", ja: "削除を確認できませんでした。すでに反映されている可能性があります。キャンセルして再読込し、サイトの状態を確認してから操作してください。" });
+      notice.style.display = "";
+    } finally {
+      busy = false;
+      if (closed) pending.delete(siteID);
+    }
+  };
 }

@@ -86,6 +86,7 @@ type Store struct {
 	mu         sync.RWMutex
 	candidates map[string]map[string]Candidate
 	persister  blobstore.Persister // when set, candidates are persisted here so they survive a restart
+	dirty      bool                // a failed save may have replaced storage without confirming durability
 }
 
 func NewStore() *Store {
@@ -209,17 +210,14 @@ func (store *Store) Review(_ context.Context, tenantID, candidateID string, revi
 	return copyCandidate(candidate), true, nil
 }
 
-// putLocked stores the candidate and snapshots. A non-nil error means the candidate IS live in memory but
-// durability failed (it would vanish on restart) — callers propagate it to the API layer.
+// putLocked publishes only after the candidate snapshot has been saved.
 func (store *Store) putLocked(candidate Candidate) error {
-	if store.candidates[candidate.TenantID] == nil {
-		store.candidates[candidate.TenantID] = map[string]Candidate{}
+	next := store.cloneLocked()
+	if next[candidate.TenantID] == nil {
+		next[candidate.TenantID] = map[string]Candidate{}
 	}
-	store.candidates[candidate.TenantID][candidate.CandidateID] = copyCandidate(candidate)
-	if err := store.persistLocked(); err != nil {
-		return fmt.Errorf("candidate %s stored in memory but not persisted (will not survive a restart): %w", candidate.CandidateID, err)
-	}
-	return nil
+	next[candidate.TenantID][candidate.CandidateID] = copyCandidate(candidate)
+	return store.commitLocked(next)
 }
 
 func normalize(candidate Candidate, tenantID string, now time.Time) (Candidate, error) {
@@ -339,6 +337,9 @@ func normalize(candidate Candidate, tenantID string, now time.Time) (Candidate, 
 	if !validStatus(candidate.Status) {
 		return Candidate{}, fmt.Errorf("candidate status %s is invalid", candidate.Status)
 	}
+	if err := validateCandidateEvidence(candidate); err != nil {
+		return Candidate{}, err
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -429,6 +430,16 @@ func proposedActionForCandidateType(candidateType string) string {
 func copyCandidate(candidate Candidate) Candidate {
 	candidate.ReasonCodes = append([]string(nil), candidate.ReasonCodes...)
 	candidate.Evidence = append([]string(nil), candidate.Evidence...)
+	copyString := func(p *string) *string {
+		if p == nil {
+			return nil
+		}
+		value := *p
+		return &value
+	}
+	candidate.LastObserved = copyString(candidate.LastObserved)
+	candidate.ReviewedAt = copyString(candidate.ReviewedAt)
+	candidate.UpdatedAt = copyString(candidate.UpdatedAt)
 	return candidate
 }
 
@@ -486,21 +497,24 @@ func (s *Store) CountForTenant(tenantID string) int {
 	return len(s.candidates[tenantID])
 }
 
-func (s *Store) RemoveTenant(tenantID string) int {
+func (s *Store) RemoveTenant(tenantID string) (int, error) {
 	if s == nil {
-		return 0
+		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return 0
+		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := len(s.candidates[tenantID])
-	if n == 0 {
-		return 0
+	if n == 0 && !s.dirty {
+		return 0, nil
 	}
-	delete(s.candidates, tenantID)
-	s.persistLocked()
-	return n
+	next := s.cloneLocked()
+	delete(next, tenantID)
+	if err := s.commitLocked(next); err != nil {
+		return 0, err
+	}
+	return n, nil
 }

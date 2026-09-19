@@ -18,6 +18,35 @@ import (
 	"github.com/lantern-networks/dsse-core/hotstore"
 )
 
+// A deployment audit query reads only the reserved deployment namespace. It is
+// not an all-tenant query, and selecting a customer disables this operating mode.
+// Default queries keep their existing authenticated-tenant scope.
+func adminLogReadScope(w http.ResponseWriter, r *http.Request) (string, bool) {
+	tenant := adminTenantIDFromRequest(r)
+	values, present := r.URL.Query()["audit_scope"]
+	if !present {
+		return tenant, true
+	}
+	if len(values) != 1 || (values[0] != "tenant" && values[0] != "deployment") {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("audit_scope must be tenant or deployment"))
+		return "", false
+	}
+	if values[0] == "tenant" {
+		return tenant, true
+	}
+	file, known := adminLogStreamFilename(r.PathValue("stream"))
+	if !known || file != "audit.log.jsonl" {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("deployment scope is available only for audit records"))
+		return "", false
+	}
+	identity, authenticated := adminIdentityFromRequest(r)
+	if !authenticated || !adminIdentityMayActAcrossOrganizations(identity) || !adminAnsweringForTheDeployment(r) {
+		writeError(w, http.StatusForbidden, fmt.Errorf("deployment audit records require an operator outside a selected organization"))
+		return "", false
+	}
+	return agentUpdateCatalogueScope, true
+}
+
 func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, adminHotStore hotstore.Store, decisionStore *accessdecision.Store, coldArchive archive.ColdArchive, legalHold *legalHoldStore, retentionOverride *retentionOverrideStore) {
 	mux.HandleFunc("GET /admin/access-decisions/{decision_id}", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
 		detail, err := adminAccessDecisionDetail(adminHotStore, decisionStore, adminTenantIDFromRequest(r), r.PathValue("decision_id"))
@@ -28,7 +57,11 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, detail)
 	}))
 	mux.HandleFunc("GET /admin/logs/{stream}", adminEndpoint("admin.logs.read", func(w http.ResponseWriter, r *http.Request) {
-		result, err := adminLogQuery(adminHotStore, adminTenantIDFromRequest(r), r.PathValue("stream"), r.URL.Query())
+		tenant, allowed := adminLogReadScope(w, r)
+		if !allowed {
+			return
+		}
+		result, err := adminLogQuery(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
 			writeError(w, statusForAdminLogQueryError(err), err)
 			return
@@ -36,10 +69,21 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, result)
 	}))
 	mux.HandleFunc("GET /admin/logs/{stream}/export", adminEndpoint("admin.logs.export.preview", func(w http.ResponseWriter, r *http.Request) {
-		result, err := adminLogExport(adminHotStore, adminTenantIDFromRequest(r), r.PathValue("stream"), r.URL.Query())
+		tenant, allowed := adminLogReadScope(w, r)
+		if !allowed {
+			return
+		}
+		result, err := adminLogExport(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
 			writeError(w, statusForAdminLogQueryError(err), err)
 			return
+		}
+		if result.regionCoverage != nil {
+			w.Header().Set("X-DSSE-Region-Coverage", result.regionCoverage.Status)
+			w.Header().Set("X-DSSE-Region-Notice", "Records without a region are excluded")
+			if result.regionCoverage.UnknownRegionCount != nil {
+				w.Header().Set("X-DSSE-Unknown-Region-Count", fmt.Sprint(*result.regionCoverage.UnknownRegionCount))
+			}
 		}
 		writeAdminPreviewJSONL(w, http.StatusOK, result.rows, result.limit)
 	}))
@@ -64,9 +108,17 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		return mine
 	}
 	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := legalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		if err := legalHold.Health(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		var req struct {
 			Active bool   `json:"active"`
 			Reason string `json:"reason"`
@@ -76,7 +128,15 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
-		legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now())
+		if tenantID == "" {
+			writeError(w, http.StatusForbidden, fmt.Errorf("tenant scope is required"))
+			return
+		}
+		if err := legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
+			logErrorf("legal hold update failed: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(tenantID)})
 	}))
 	// Verify the tamper-evident hash chain of the tenant's archived audit segments (compliance integrity check).
@@ -94,12 +154,16 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	}))
 	// Admin-configurable per-stream retention (days), overriding the startup flags at runtime (no redeploy).
 	mux.HandleFunc("GET /admin/retention-config", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if retentionOverride == nil || retentionOverride.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Stream string `json:"stream"`
-			Days   int    `json:"days"`
+			Days   *int   `json:"days"`
 			Clear  bool   `json:"clear"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
@@ -123,10 +187,28 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 				"log retention is set for this deployment, not per organization, so it is the operator's to change"))
 			return
 		}
+		if retentionOverride == nil || retentionOverride.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
+			return
+		}
+		days := -1
+		if !req.Clear && req.Days == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are required"))
+			return
+		}
+		if req.Days != nil {
+			days = *req.Days
+		}
 		if req.Clear {
-			retentionOverride.Set(req.Stream, -1) // revert to the flag default
-		} else {
-			retentionOverride.Set(req.Stream, req.Days)
+			days = -1
+		} else if days < 0 || days > maxRetentionDays {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are out of range"))
+			return
+		}
+		if err := retentionOverride.Set(strings.TrimSpace(req.Stream), days); err != nil {
+			logErrorf("retention override update failed: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("retention settings could not be saved"))
+			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))

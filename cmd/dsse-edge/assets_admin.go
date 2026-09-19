@@ -1,9 +1,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	assetcatalog "github.com/lantern-networks/dsse-core/assetcatalog"
 )
@@ -28,7 +30,36 @@ import (
 // assets the CP never received deletes them on the first pull. That is not hypothetical: it removed 47 on this
 // lab's Edge (docs/2026-08-11_asset_reconciliation_deleted_47_operator_assets.md). Copy them up first —
 // ops/migrate_edge_assets_to_cp.sh.
-func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *assetcatalog.Store, syncEnrolled func(), configSourceURL string) {
+func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *assetcatalog.Store, syncEnrolled func(), configSourceURL string, onChanged func(), audit func(*http.Request, string, string, string, string, any)) {
+	var mutationMu sync.Mutex
+	record := func(r *http.Request, kind, id, operation string, value any, err error, found bool) {
+		result := "saved"
+		if !found {
+			result = "not_found"
+		}
+		if err != nil {
+			result = "rejected"
+			if errors.Is(err, assetcatalog.ErrPersistence) {
+				result = "persistence_unconfirmed"
+			}
+		}
+		if audit != nil {
+			audit(r, kind, id, operation, result, value)
+		}
+	}
+	writeFailure := func(w http.ResponseWriter, err error) {
+		if errors.Is(err, assetcatalog.ErrPersistence) {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("Saving the catalog was not confirmed. The previous live catalog remains active. Restore storage, reload and retry."))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+	}
+	changed := func() {
+		if onChanged != nil {
+			onChanged()
+		}
+	}
+
 	// syncNow refreshes the enrolled (steered) endpoints from the live inventory before a read, so the
 	// catalog reflects devices enrolled after startup without a restart. No-op when not wired (OSS/tests).
 	syncNow := func() {
@@ -58,11 +89,19 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		e.TenantID = tenantForWrite
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := store.UpsertEndpoint(e)
+		item := stored
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			item = e
+		}
+		record(r, "endpoint", item.ID, "upsert", item, err, true)
+		if err != nil {
+			writeFailure(w, err)
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("DELETE /admin/assets/endpoints/{id}", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -70,15 +109,19 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configWriteRejectedWhenSourced(w, configSourceURL, "endpoint assets") {
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
+		record(r, "endpoint", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err) // deleted in memory but not persisted — admin must know
+			writeFailure(w, err)
 			return
 		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("endpoint not found"))
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 
@@ -103,11 +146,19 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		g.TenantID = tenantForWrite
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := store.UpsertGroup(g)
+		item := stored
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			item = g
+		}
+		record(r, "group", item.ID, "upsert", item, err, true)
+		if err != nil {
+			writeFailure(w, err)
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("GET /admin/assets/groups/{group_id}/members", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
@@ -119,15 +170,19 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configWriteRejectedWhenSourced(w, configSourceURL, "endpoint group assets") {
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		ok, err := store.DeleteGroup(adminTenantIDFromRequest(r), r.PathValue("id"))
+		record(r, "group", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeFailure(w, err)
 			return
 		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("group not found"))
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 
@@ -152,11 +207,19 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		svc.TenantID = tenantForWrite
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := store.UpsertService(svc)
+		item := stored
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			item = svc
+		}
+		record(r, "service", item.ID, "upsert", item, err, true)
+		if err != nil {
+			writeFailure(w, err)
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("DELETE /admin/assets/services/{id}", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -164,15 +227,19 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configWriteRejectedWhenSourced(w, configSourceURL, "service assets") {
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		ok, err := store.DeleteService(adminTenantIDFromRequest(r), r.PathValue("id"))
+		record(r, "service", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeFailure(w, err)
 			return
 		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("service not found"))
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 }

@@ -43,3 +43,18 @@ func TestAdoptServiceIDForObservation(t *testing.T) {
 		t.Fatalf("nil store: got %q, want builtin-svc-ssh (family fallback)", got)
 	}
 }
+
+func TestAdoptServiceDoesNotChooseUDPForTCPObservation(t *testing.T) {
+	s := assetcatalog.NewStore()
+	for _, svc := range []assetcatalog.Service{
+		{ID: "udp", TenantID: "t", Alias: "A UDP", Ports: []assetcatalog.PortProto{{Protocol: "udp", Port: 22}}},
+		{ID: "tcp", TenantID: "t", Alias: "Z TCP", Ports: []assetcatalog.PortProto{{Protocol: "tcp", Port: 22}}},
+	} {
+		if _, err := s.UpsertService(svc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := adoptServiceIDForObservation(s, "t", 22, "ssh"); got != "tcp" {
+		t.Fatalf("chose %s", got)
+	}
+}

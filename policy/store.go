@@ -210,24 +210,13 @@ func (store *Store) Upsert(_ context.Context, policy model.Policy, tenantID stri
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
+	if err := store.saveAuthoredPolicyLocked(normalized); err != nil {
+		return model.Policy{}, err
+	}
 	store.putLocked(normalized)
-	store.recordAdminAuthoredLocked(normalized)
 	store.generation++
 	store.rebuildPolicyCacheLocked()
-	store.persistLocked() // durable: an admin-authored policy must survive a restart (was in-memory-only)
 	return copyAdminPolicy(normalized), nil
-}
-
-// recordAdminAuthoredLocked marks a policy as admin-authored (created via the Admin API) so persistLocked can
-// persist ONLY these — not the bundle-seeded set — and restore them as an overlay on boot. Caller holds store.mu.
-func (store *Store) recordAdminAuthoredLocked(policy model.Policy) {
-	if store.adminAuthoredPolicies == nil {
-		store.adminAuthoredPolicies = map[string]map[string]model.Policy{}
-	}
-	if store.adminAuthoredPolicies[policy.TenantID] == nil {
-		store.adminAuthoredPolicies[policy.TenantID] = map[string]model.Policy{}
-	}
-	store.adminAuthoredPolicies[policy.TenantID][policy.ID] = copyAdminPolicy(policy)
 }
 
 // Delete removes an ADMIN-AUTHORED policy, its authored record, and any status override for it. Only
@@ -1156,17 +1145,7 @@ func activeAdminPolicyIDs(policies []model.Policy) []string {
 // SetServerInitiatedEnabled toggles server-initiated enforcement for a tenant. Applied live by
 // RuntimeEvaluator.
 func (store *Store) SetServerInitiatedEnabled(tenantID string, enabled bool) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.serverInitiatedEnabled == nil {
-		store.serverInitiatedEnabled = map[string]bool{}
-	}
-	store.serverInitiatedEnabled[strings.TrimSpace(tenantID)] = enabled
-	store.generation++
-	store.persistLocked()
+	_ = store.SetServerInitiatedEnabledConfirmed(tenantID, enabled)
 }
 
 // ServerInitiatedEnabledFor reports whether server-initiated (server->client) default-deny enforcement is
@@ -1182,52 +1161,13 @@ func (store *Store) ServerInitiatedEnabledFor(tenantID string) bool {
 
 // UpsertLegacyException stores/updates a Legacy Exception for a tenant (validated by the caller).
 func (store *Store) UpsertLegacyException(tenantID string, ex model.LegacyException) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.legacyExceptions == nil {
-		store.legacyExceptions = map[string][]model.LegacyException{}
-	}
-	tenantID = strings.TrimSpace(tenantID)
-	list := store.legacyExceptions[tenantID]
-	replaced := false
-	for i := range list {
-		if list[i].ID == ex.ID {
-			list[i] = ex
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		list = append(list, ex)
-	}
-	store.legacyExceptions[tenantID] = list
-	store.generation++
-	store.persistLocked()
+	_ = store.UpsertLegacyExceptionConfirmed(tenantID, ex)
 }
 
-// RemoveLegacyException deletes a tenant's Legacy Exception by id, persisting the change so it does not
-// re-appear on restart. Returns false if no exception with that id exists for the tenant.
+// RemoveLegacyException retains the legacy absent-or-unsaved boolean contract.
 func (store *Store) RemoveLegacyException(tenantID, id string) bool {
-	if store == nil {
-		return false
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	tenantID = strings.TrimSpace(tenantID)
-	id = strings.TrimSpace(id)
-	list := store.legacyExceptions[tenantID]
-	for i := range list {
-		if list[i].ID == id {
-			store.legacyExceptions[tenantID] = append(list[:i:i], list[i+1:]...)
-			store.generation++
-			store.persistLocked()
-			return true
-		}
-	}
-	return false
+	removed, _ := store.RemoveLegacyExceptionConfirmed(tenantID, id)
+	return removed
 }
 
 // LegacyExceptionsFor returns a copy of a tenant's Legacy Exceptions.

@@ -13,7 +13,10 @@ import (
 	"github.com/lantern-networks/dsse-core/model"
 )
 
-func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledger *enrolledinventory.Ledger, writer *logs.Writer, evaluator decision.Evaluator, or503 func(http.ResponseWriter) bool, enabled bool) {
+func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledger *enrolledinventory.Ledger, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, or503 func(http.ResponseWriter) bool, enabled bool) {
+	if !pinnedTenantContextMatches(w, r) {
+		return
+	}
 	if !or503(w) {
 		return
 	}
@@ -42,8 +45,10 @@ func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledge
 	if enabled {
 		action = "enable"
 	}
-	_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, action, entry, evaluator, sourceIPFromRequest(r)))
-	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
+	record := enrolledInventoryAuditLog(tenantID, action, entry, evaluator, sourceIPFromRequest(r))
+	record.ActorUserID = auditActorPrincipal(r)
+	_ = appendAdminAudit(r.Context(), writer, outbox, record, time.Now().UTC())
+	writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry, "tenant_id": adminTenantIDFromRequest(r)})
 }
 
 // enrolledInventoryAuditLog records an admin enroll/enable/disable/remove of the Enrolled Inventory (
@@ -73,4 +78,33 @@ func enrolledInventoryAuditLog(tenantID, action string, entry enrolledinventory.
 			"enabled": entry.Enabled,
 		},
 	}
+}
+
+// A failed save can follow an applied local mutation, including an unconfirmed
+// backend write. Do not describe either local application or persistence as absent.
+var errEnrolledMutationPartial = errors.New("The change is active on this node, but saving could not be confirmed. Reload to review the current state and retry after storage is available.")
+
+func appendEnrolledMutationAudit(r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, action string, entry enrolledinventory.Entry, applied bool, saveErr error) {
+	record := enrolledInventoryAuditLog(adminTenantIDFromRequest(r), action, entry, evaluator, sourceIPFromRequest(r))
+	record.ActorUserID = auditActorPrincipal(r)
+	record.Metadata["applied_locally"] = applied
+	switch action {
+	case "enroll", "assign_group":
+		record.Metadata["group"] = entry.Group
+	case "set_kind":
+		kind := entry.Kind
+		if kind == "" {
+			kind = enrolledinventory.KindEndpoint
+		}
+		record.Metadata["kind"] = kind
+	}
+	if saveErr != nil {
+		result, reason := "failed", "Saving could not be confirmed; the previous local state is still in use."
+		if applied {
+			result, reason = "partial", errEnrolledMutationPartial.Error()
+		}
+		record.Result, record.Reason = &result, &reason
+		record.Metadata["persistence_error"] = true
+	}
+	_ = appendAdminAudit(r.Context(), writer, outbox, record, time.Now().UTC())
 }

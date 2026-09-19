@@ -337,6 +337,7 @@ let _pkiDeviceAuthority = null;
 let _pkiInterceptionAuthority = null;
 // What each movement is WAITING FOR, from the Edge that sees handshakes. The control plane holds the
 // authority; only an Edge can say who has adopted, so these are read from the enforcement plane.
+let _pkiTenantCAs = [];
 let _pkiNameRename = null;
 let _pkiInterceptionRotation = null;
 
@@ -347,11 +348,28 @@ async function loadCertMap(host) {
   _pkiMapAnchorInfo = {}; _pkiMapCustody = null; _pkiTenantInterception = null; _pkiRefusals = []; _pkiTransportAuthority = null;
   _pkiDeviceAuthority = null; _pkiInterceptionAuthority = null;
   _pkiNameRename = null; _pkiInterceptionRotation = null;
+  _pkiTenantCAs = []; _pkiOperation = null; _pkiExternal = []; _pkiPathFacts = {}; _pkiAnchorScope = null;
+  const failedReads = new Set();
+  const readExtra = async (path, unused, plane) => {
+    try {
+      const r = await apiFetch("GET", path, unused, plane);
+      // A CP deliberately refuses the Edge-only intermediate view; the authority is read below.
+      if (path === "/admin/interception-intermediate" && r.status === 409) return r;
+      if (!r.ok || !r.body || typeof r.body !== "object" || Array.isArray(r.body)) throw new Error();
+      if (/^\/admin\/tenant-(transport|device|interception)-authority/.test(path) && typeof r.body.has_authority !== "boolean") throw new Error();
+      return r;
+    } catch (e) { failedReads.add(path); throw e; }
+  };
   const extras = Promise.all([
-    apiFetch("GET", "/admin/pki/operations").then((r) => {
+    readExtra("/admin/tenant-cas").then((r) => {
+      const rows = r.body.tenant_cas || r.body.cas || r.body.items;
+      if (!Array.isArray(rows)) { failedReads.add("/admin/tenant-cas"); return; }
+      _pkiTenantCAs = rows;
+    }).catch(() => {}),
+    readExtra("/admin/pki/operations").then((r) => {
       _pkiOperation = (r.ok && r.body && r.body.in_flight) ? r.body : null;
     }).catch(() => {}),
-    apiFetch("GET", "/admin/pki/paths").then((r) => {
+    readExtra("/admin/pki/paths").then((r) => {
       const paths = (r.ok && r.body && r.body.paths) || [];
       _pkiExternal = paths.filter((p) => p.external);
       _pkiPathFacts = {};
@@ -363,16 +381,16 @@ async function loadCertMap(host) {
         _pkiPathFacts[p.server_cert_id] = f;
       });
     }).catch(() => {}),
-    apiFetch("GET", "/admin/pki/trust-refusals").then((r) => {
+    readExtra("/admin/pki/trust-refusals").then((r) => {
       if (r.ok && r.body && r.body.refusals) _pkiRefusals = r.body.refusals;
     }).catch(() => {}),
-    apiFetch("GET", "/admin/transport-trust-anchors").then((r) => {
+    readExtra("/admin/transport-trust-anchors").then((r) => {
       if (r.ok && r.body && r.body.anchors) r.body.anchors.forEach((a) => { _pkiMapAnchorInfo[a.sha256] = a; });
       // The reader has to be told when the decision counts machines this screen cannot name — otherwise an
       // empty list reads as an empty fleet, and a refusal naming machines they have never seen is unexplainable.
       if (r.ok && r.body) _pkiAnchorScope = r.body;
     }).catch(() => {}),
-    apiFetch("GET", "/admin/interception-intermediate").then((r) => {
+    readExtra("/admin/interception-intermediate").then((r) => {
       if (r.ok && r.body) _pkiMapCustody = r.body;
     }).catch(() => {}),
     // ★★★ AND THE ONE THE CONTROL PLANE ANSWERS (2026-09-03, the operator's report that this screen did not
@@ -383,27 +401,27 @@ async function loadCertMap(host) {
     // naming the remedy in the refusal: "that is an EDGE's answer … the authority itself is at
     // /admin/tenant-interception-authority". The screen treated the refusal as a failed fetch and fell
     // through to its unknown branch — so the instruction in the refusal was read by nobody.
-    apiFetch("GET", "/admin/tenant-interception-authority", undefined, "control").then((r) => {
+    readExtra("/admin/tenant-interception-authority", undefined, "control").then((r) => {
       if (r.ok && r.body) _pkiTenantInterception = r.body;
     }).catch(() => {}),
     // ★ ON THE CONTROL PLANE, because that is where the authority is. Asked of an Edge this answers "this
     // organization has none" — truthfully about that node, and wrongly about the organization, which would
     // hide the control on exactly the screen it belongs to.
-    apiFetch("GET", "/admin/tenant-transport-authority", undefined, "control").then((r) => {
+    readExtra("/admin/tenant-transport-authority", undefined, "control").then((r) => {
       if (r.ok && r.body) _pkiTransportAuthority = r.body;
     }).catch(() => {}),
-    apiFetch("GET", "/admin/tenant-device-authority?readiness=1", undefined, "control").then((r) => {
+    readExtra("/admin/tenant-device-authority?readiness=1", undefined, "control").then((r) => {
       if (r.ok && r.body) _pkiDeviceAuthority = r.body;
     }).catch(() => {}),
-    apiFetch("GET", "/admin/tenant-interception-authority", undefined, "control").then((r) => {
+    readExtra("/admin/tenant-interception-authority", undefined, "control").then((r) => {
       if (r.ok && r.body) _pkiInterceptionAuthority = r.body;
     }).catch(() => {}),
     // ★ FROM AN EDGE, because only an Edge sees a handshake. Asked of the control plane these answer nothing,
     // and a screen that showed that would offer the destructive half of every movement with no evidence.
-    apiFetch("GET", "/admin/transport-name-rename").then((r) => {
+    readExtra("/admin/transport-name-rename").then((r) => {
       if (r.ok && r.body) _pkiNameRename = r.body;
     }).catch(() => {}),
-    apiFetch("GET", "/admin/interception-authority-rotation").then((r) => {
+    readExtra("/admin/interception-authority-rotation").then((r) => {
       if (r.ok && r.body) _pkiInterceptionRotation = r.body;
     }).catch(() => {}),
   ]);
@@ -443,6 +461,11 @@ async function loadCertMap(host) {
   }
 
   if (!current()) return;
+  if (failedReads.size) {
+    uiState(host, "error", bl({ en: "Required PKI information could not be read. Retry before changing certificates.", ja: "必要なPKI情報を取得できません。証明書を変更する前に再試行してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadCertMap(host) });
+    return;
+  }
   host.innerHTML = "";
 
   results.filter((x) => x.error).forEach(({ node, error }) => {
@@ -1191,9 +1214,12 @@ async function showCertHistory(node, name, host) {
     body: [bodyHost],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })],
   });
+  const load = async () => {
+  uiState(bodyHost, "loading");
   try {
     const r = await apiFetch("GET", "/admin/certs/" + encodeURIComponent(name) + "/versions", undefined, node.plane);
-    const versions = (r.ok && r.body && (r.body.versions || r.body)) || [];
+    const versions = r.body && (r.body.versions || r.body);
+    if (!r.ok || !Array.isArray(versions)) throw new Error("Certificate history unavailable");
     bodyHost.innerHTML = "";
     if (!versions.length) {
       bodyHost.appendChild(el("p", { class: "ui-view-desc", text: bl({
@@ -1223,7 +1249,12 @@ async function showCertHistory(node, name, host) {
         } }),
       ]));
     });
-  } catch (e) { bodyHost.textContent = String(e); }
+  } catch (e) {
+    uiState(bodyHost, "error", bl({ en: "Certificate history could not be read.", ja: "証明書の履歴を取得できません。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: load });
+  }
+  };
+  await load();
 }
 
 
@@ -1618,7 +1649,7 @@ function tenantInterceptionCAControl(host) {
   const line = el("div", { class: "ui-view-desc", style: "margin-top:6px" });
   const add = el("button", { class: "ui-btn ui-btn-sm ui-btn-primary",
     text: bl({ en: "Load this tenant's interception CA", ja: "このテナントの傍受CAを入れる" }) });
-  add.addEventListener("click", () => openTenantInterceptionCAForm(host));
+  add.addEventListener("click", () => openTenantInterceptionCAForm(host, !!(_pkiTenantInterception && _pkiTenantInterception.has_authority)));
 
   // ★★★ THE ORDINARY CASE HAD NO BUTTON, ONLY A curl (2026-09-06, the operator: "PKI that is only completable
   // with curl should not exist — all of it belongs in the Admin Console").
@@ -1660,6 +1691,10 @@ function tenantInterceptionCAControl(host) {
   // unchanged, so a button shown beside one that exists is a control that cannot fail and teaches nothing.
   const answered = !!_pkiTenantInterception && typeof _pkiTenantInterception.has_authority === "boolean";
   const hasOwn = !!(_pkiTenantInterception && _pkiTenantInterception.has_authority);
+  // Importing another authority stages it; it does not replace the active signer.
+  // Keep that existing operation reachable once an authority has been installed.
+  if (hasOwn) add.textContent = bl({ en: "Stage a replacement CA", ja: "次のCAを登録" });
+  add.disabled = !answered || !!(_pkiTenantInterception && _pkiTenantInterception.staged);
   card.appendChild(el("div", { style: "display:flex; align-items:center; gap:10px; flex-wrap:wrap" }, [
     el("strong", { text: bl({ en: "This tenant's interception authority", ja: "このテナントの傍受の権威" }) }),
     el("span", { style: "flex:1 1 auto" }),
@@ -1675,8 +1710,8 @@ function tenantInterceptionCAControl(host) {
   const st = _pkiMapCustody || {};
   const mode = String(st.mode || "");
   const known = {
-    own_offline_root: { en: "Traffic is inspected under this tenant's own root. Replacing it takes effect immediately, so distribute the new root to its devices first.",
-                        ja: "このテナント自身のルートで傍受しています。差し替えは即時に効くので、先に新しいルートを端末へ配ってください。" },
+    own_offline_root: { en: "Traffic is inspected under this tenant's own root. A replacement is staged while devices adopt it; the current authority remains in use until promotion.",
+                        ja: "このテナント自身のルートで傍受しています。次のCAは端末の信頼設定が整うまで待機し、切り替えまで現在のCAを使います。" },
     node_intermediate: { en: "This tenant is inspected under the deployment's own intermediate — the anchor its devices already trust — rather than a root of its own.",
                          ja: "このテナントは、自前のルートではなく配備側の中間で傍受されています（端末が既に信頼しているアンカー）。" },
     none: { en: "This tenant has no interception authority of its own, so its traffic is not inspected at all — it is deliberately not signed under another tenant's CA. Two ways out, and a tenant is in one of them: let this deployment make a root for it, or load a root it already has.",
@@ -1731,8 +1766,6 @@ function tenantInterceptionCAControl(host) {
         "。実際に何で傍受されているかは Edge の答えで、この画面は制御プレーンに訊いています（制御プレーンは" +
         "権威を保持しますが通信は扱いません）。",
     });
-    // Nothing to load: offering it here is how an operator replaces an authority that already exists.
-    add.style.display = "none";
     return card;
   }
   // An unrecognised mode says what it is rather than picking the most alarming branch by default — the whole
@@ -1754,7 +1787,7 @@ function tenantInterceptionCAControl(host) {
   return card;
 }
 
-function openTenantInterceptionCAForm(host) {
+function openTenantInterceptionCAForm(host, replacing = false) {
   // uiField is the whole form vocabulary on this screen — get()/setError() and nothing invented. (An earlier
   // draft of this control called a uiTextarea that does not exist, which would have rendered an empty modal
   // and told nobody why. Same family as the response keys the Console once invented for itself.)
@@ -1770,9 +1803,11 @@ function openTenantInterceptionCAForm(host) {
   const key = field("intermediate_key_pem", { en: "Issuing private key — this is a key, not a certificate", ja: "発行用の秘密鍵 — これは証明書ではなく鍵です" },
     { en: "The key belonging to the issuing certificate. The Edge signs with it and never returns it.",
       ja: "発行証明書に対応する鍵です。Edge が署名に使い、返すことはありません。" });
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Load", ja: "入れる" }) });
+  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl(replacing
+    ? { en: "Stage replacement", ja: "次のCAを登録" } : { en: "Load", ja: "入れる" }) });
   const m = uiModal({
-    title: bl({ en: "Load this tenant's interception CA", ja: "このテナントの傍受CAを入れる" }),
+    title: bl(replacing ? { en: "Stage a replacement interception CA", ja: "次の傍受CAを登録" }
+      : { en: "Load this tenant's interception CA", ja: "このテナントの傍受CAを入れる" }),
     body: [
       el("p", { class: "ui-view-desc", text: bl({
         en: "This authority decrypts this tenant's traffic. It is issued from the tenant's own offline root, never from the provider's — the two are independent, and the provider does not hold this root. Its devices must trust the root before this takes effect.",
@@ -1808,8 +1843,11 @@ function openTenantInterceptionCAForm(host) {
     const r = await apiFetch("POST", "/admin/tenant-interception-authority", body);
     if (!r.ok) { submit.disabled = false; const msg = (r.body && r.body.error) || ("HTTP " + r.status); key.setError(msg); uiToast(msg, "err"); return; }
     m.close();
-    uiToast(bl({ en: "Loaded. This tenant's traffic is inspected under its own authority from now on.",
-                 ja: "入れました。以後、このテナントの通信は自前の権威で傍受します。" }), "ok");
+    uiToast(bl(r.body && r.body.staged === true
+      ? { en: "Replacement staged. The current authority remains in use. Wait for device adoption before switching.",
+          ja: "次のCAを登録しました。現在のCAは使用を続けます。端末の信頼設定が整ってから切り替えてください。" }
+      : { en: "Authority saved. Each Edge applies it on its next refresh; devices must trust its root before inspection.",
+          ja: "CAを保存しました。各Edgeは次回の取得で反映します。傍受には端末がルートを信頼している必要があります。" }), "ok");
     loadCertMap(host);
   });
 }
@@ -1873,8 +1911,8 @@ function tenantDeviceCAControl(host) {
            ja: "決着しています。この配備がこのテナントの端末の身元を発行しており、ワンタイムトークンで登録する端末に必要なのはこちらです。既に持っているCAの登録は、まだできます —— そのCAが発行した端末も受け入れるようになります。" })
     : bl({ en: "Two ways, and a tenant is in one of them. Register a CA they already have and this deployment admits what it issues — or let this deployment issue their device identities, which is what a device enrolling with a one-time token needs, because it has no certificate yet. Without either, its devices are refused at the handshake.",
            ja: "道は2つで、テナントはそのどちらかにいます。既に持っているCAを登録すれば、その発行した端末が受け入れられます。あるいは、この配備に端末の身元を発行させます —— ワンタイムトークンで登録する端末は、まだ証明書を持っていないので、こちらが要ります。どちらも無いと、その端末は接続時に拒否されます。" });
-  apiFetch("GET", "/admin/tenant-cas").then((r) => {
-    const rows = (r.ok && r.body && (r.body.tenant_cas || r.body.cas || r.body.items)) || [];
+  {
+    const rows = _pkiTenantCAs;
     // ★ THE SERVER ALREADY SCOPED THIS, AND THIS FILTER DID NOT (2026-08-18). The predicate keys on
     // operateTenant, which an operator has and a CUSTOMER never does — so for the reader this control is FOR,
     // `!operateTenant` was true and the filter passed everything through. It happened to be harmless because
@@ -1885,11 +1923,11 @@ function tenantDeviceCAControl(host) {
     const mine = operateTenant
       ? rows.filter((x) => !x.tenant_id || String(x.tenant_id).toLowerCase() === String(operateTenant).toLowerCase())
       : rows;
-    if (!mine.length) return;
+    if (!mine.length) return card;
     card.appendChild(el("div", { class: "ui-view-desc", style: "margin-top:6px" },
       uiBadge(bl({ en: "Registered", ja: "登録済み" }), "ok")));
     mine.forEach((x) => card.appendChild(el("div", { class: "ui-view-desc" }, el("code", { text: x.subject || x.sha256 || "" }))));
-  }).catch(() => {});
+  }
   return card;
 }
 

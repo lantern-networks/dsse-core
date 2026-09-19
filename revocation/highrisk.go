@@ -9,21 +9,31 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
-// HighRiskOverlay is the shared HIGH-RISK device overlay, distributed on the same fast
+// HighRiskOverlay holds separate device and tenant-scoped user risk sets on the same fast
 // feed as admission revocations (revocation-class: a device marked high-risk on the control plane must be
 // treated high-risk by EVERY node's decision path, so risk-based deny/re-auth is fleet-consistent and the
 // device can't reconnect elsewhere to dodge it). Unlike admission revocations there is no node-local/auto
-// layer — high-risk is admin-marked (CP-authoritative). One `devices` map serves both roles: authoritative on
-// the CP (Mark/Clear), synced on a puller (ReplaceSynced). Persisted so a CP restart can't silently clear it.
+// layer — high-risk is admin-marked (CP-authoritative). Both sets are authoritative on
+// the CP and synced on pullers. Persistence keeps marks across a CP restart.
 type HighRiskOverlay struct {
+	// writeMu serializes every writer, including persistence and pulled snapshots.
+	// Lock order is writeMu then mu. Readers take only mu; storage I/O and legacy
+	// attribution never hold mu. Published maps are replaced, not edited in place.
+	writeMu    sync.Mutex
 	mu         sync.RWMutex
 	devices    map[string]string // deviceID (normalized) -> severity (high|critical)
+	users      map[string]UserRisk
+	userIndex  map[string]string
+	loadErr    error
+	legacy     bool
 	persister  blobstore.Persister
 	generation atomic.Uint64
+	// writeMu protects this conservative retry flag for the shared snapshot.
+	riskSavePending bool
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
-	return &HighRiskOverlay{devices: map[string]string{}}
+	return &HighRiskOverlay{devices: map[string]string{}, users: map[string]UserRisk{}, userIndex: map[string]string{}}
 }
 
 // NormalizeDeviceID trims but PRESERVES case — device ids are opaque, case-sensitive identifiers and must
@@ -38,37 +48,16 @@ func (o *HighRiskOverlay) ConfigGeneration() uint64 {
 	return o.generation.Load()
 }
 
-// Mark records a device as high-risk (CP-authoritative). Only a state change bumps the generation + persists.
+// Mark is the legacy automatic-signal path. Escalations remain visible before
+// saving for compatibility. DLP uses RaiseDeviceRisk to receive outcomes. De-escalations require a successful
+// save. Administrative callers must use SetDeviceRisk to receive save outcomes.
 func (o *HighRiskOverlay) Mark(deviceID, severity string) {
-	id := NormalizeDeviceID(deviceID)
-	if o == nil || id == "" {
-		return
-	}
-	severity = strings.ToLower(strings.TrimSpace(severity))
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if prev, ok := o.devices[id]; ok && prev == severity {
-		return
-	}
-	o.devices[id] = severity
-	o.generation.Add(1)
-	o.persistLocked()
+	_, _ = o.setDeviceRisk(deviceID, severity, true)
 }
 
-// Clear removes a device from the high-risk set (de-escalation). Only a real removal bumps + persists.
+// Clear is the compatibility wrapper; an unconfirmed clear preserves the live mark.
 func (o *HighRiskOverlay) Clear(deviceID string) {
-	id := NormalizeDeviceID(deviceID)
-	if o == nil {
-		return
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if _, ok := o.devices[id]; !ok {
-		return
-	}
-	delete(o.devices, id)
-	o.generation.Add(1)
-	o.persistLocked()
+	_, _ = o.SetDeviceRisk(deviceID, "none")
 }
 
 // IsHighRisk reports whether a device is currently marked high-risk, with its severity.
@@ -108,6 +97,8 @@ func (o *HighRiskOverlay) ReplaceSynced(devices map[string]string) {
 			fresh[id] = strings.ToLower(strings.TrimSpace(v))
 		}
 	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.devices = fresh
@@ -146,28 +137,9 @@ func (o *HighRiskOverlay) CountDevices(deviceIDs []string) int {
 	return n
 }
 
-// RemoveDevices clears the marks on the named devices, returning how many were removed.
-//
-// ★ ORDER MATTERS AND IT IS THE CALLER'S TO GET RIGHT (2026-08-18). The ids come from the enrolled ledger, and
-// a tenant erasure removes that ledger's entries — so the ids must be captured BEFORE the ledger is cleared or
-// this receives an empty list and silently removes nothing, which is indistinguishable from "there were none".
+// RemoveDevices is the compatibility wrapper. A failed save removes nothing from
+// live state; callers that must distinguish failure from no matches use the checked form.
 func (o *HighRiskOverlay) RemoveDevices(deviceIDs []string) int {
-	if o == nil || len(deviceIDs) == 0 {
-		return 0
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	n := 0
-	for _, id := range deviceIDs {
-		key := NormalizeDeviceID(id)
-		if _, ok := o.devices[key]; ok {
-			delete(o.devices, key)
-			n++
-		}
-	}
-	if n > 0 {
-		o.generation.Add(1)
-		o.persistLocked()
-	}
+	n, _ := o.RemoveDevicesChecked(deviceIDs)
 	return n
 }

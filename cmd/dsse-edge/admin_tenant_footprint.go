@@ -143,7 +143,7 @@ func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *s
 	}
 
 	if ledger != nil {
-		footprint.add(adminTenantFootprintRow{Store: "enrolled_identities", Count: int64(ledger.CountAdmitted(footprint.TenantID))})
+		footprint.add(adminTenantFootprintRow{Store: "enrolled_identities", Count: int64(ledger.CountTenantRecords(footprint.TenantID))})
 	} else {
 		footprint.NotCounted = append(footprint.NotCounted, "enrolled_identities (no ledger on this node)")
 	}
@@ -386,7 +386,7 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 	add("human_approvals", e.HumanApprovals != nil, e.HumanApprovals.CountForTenant(f.TenantID), "no human-approval store on this node")
 	add("clientless_grants", e.ClientlessGrants != nil, e.ClientlessGrants.CountForTenant(f.TenantID), "no clientless grant store on this node")
 	add("end_user_idp_connections", e.IdPConnections != nil, e.IdPConnections.CountForTenant(f.TenantID), "no end-user IdP registry on this node")
-	add("high_risk_marks", e.HighRisk != nil, e.HighRisk.CountDevices(e.DeviceIDs), "no high-risk overlay on this node")
+	add("high_risk_marks", e.HighRisk != nil, e.HighRisk.CountDevices(e.DeviceIDs)+e.HighRisk.CountUsers(f.TenantID), "no high-risk overlay on this node")
 	add("admission_kill_switches", e.Admissions != nil, e.Admissions.CountDevices(e.DeviceIDs), "no admission revocation store on this node")
 	add("bypass_catalog_overrides", e.CatalogOverrides != nil, e.CatalogOverrides.CountForTenant(f.TenantID), "no bypass-catalog override store on this node")
 	add("connector_route_governance", e.ConnectorRoutes != nil, e.ConnectorRoutes.CountForTenant(f.TenantID), "no connector route governance on this node")
@@ -447,22 +447,42 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		add("end_user_idp_connections", e.IdPConnections.RemoveTenant(tenantID))
 	}
 	if e.HighRisk != nil {
-		add("high_risk_marks", e.HighRisk.RemoveDevices(e.DeviceIDs))
+		if n, err := e.HighRisk.RemoveTenantRisksChecked(tenantID, e.DeviceIDs); err != nil {
+			result.Failures = append(result.Failures, "risk erasure saving could not be confirmed")
+		} else {
+			add("high_risk_marks", n)
+		}
 	}
 	if e.Admissions != nil {
-		add("admission_kill_switches", e.Admissions.RemoveDevices(e.DeviceIDs))
+		if n, err := e.Admissions.RemoveDevicesChecked(e.DeviceIDs); err != nil {
+			result.Failures = append(result.Failures, "admission revocation erasure saving could not be confirmed")
+		} else {
+			add("admission_kill_switches", n)
+		}
 	}
 	if e.ConnectorRoutes != nil {
 		add("connector_route_governance", e.ConnectorRoutes.RemoveTenant(tenantID))
 	}
 	if e.CatalogOverrides != nil {
-		add("bypass_catalog_overrides", e.CatalogOverrides.RemoveTenant(tenantID))
+		if n, err := e.CatalogOverrides.RemoveTenant(tenantID); err != nil {
+			result.Failures = append(result.Failures, "bypass catalog override erasure could not be confirmed")
+		} else {
+			add("bypass_catalog_overrides", n)
+		}
 	}
 	if e.SeatAllocations != nil {
-		add("seat_allocation", e.SeatAllocations.RemoveTenant(tenantID))
+		if n, err := e.SeatAllocations.RemoveTenant(tenantID); err != nil {
+			result.Failures = append(result.Failures, "seat allocation erasure could not be confirmed")
+		} else {
+			add("seat_allocation", n)
+		}
 	}
 	if e.PolicyCandidates != nil {
-		add("policy_candidates", e.PolicyCandidates.RemoveTenant(tenantID))
+		if n, err := e.PolicyCandidates.RemoveTenant(tenantID); err != nil {
+			result.Failures = append(result.Failures, "policy candidate erasure could not be confirmed")
+		} else {
+			add("policy_candidates", n)
+		}
 	}
 	if e.TenantTransportAuthorities != nil {
 		add("tenant_transport_authorities", e.TenantTransportAuthorities.RemoveTenant(tenantID))
@@ -479,7 +499,12 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.EnrolmentTokens != nil {
-		add("enrolment_tokens_store", e.EnrolmentTokens.RemoveTenant(tenantID))
+		n := e.EnrolmentTokens.RemoveTenant(tenantID)
+		if err := e.EnrolmentTokens.Health(); err != nil {
+			result.Failures = append(result.Failures, "enrolment_tokens_store: "+err.Error())
+		} else {
+			add("enrolment_tokens_store", n)
+		}
 	}
 	if e.AgentRolloutPlans != nil {
 		add("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenant(tenantID))
@@ -490,15 +515,20 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 }
 
 // tenantExtraStoresFor fills in the device ids the two DEVICE-KEYED stores need, from the enrolled ledger.
-// Called on the READ path; the erasure path fills them from what RemoveTenant returns, because by then the
-// ledger has already been emptied and asking it would answer "no devices" for a tenant that had them.
+// Retained removal records are included so a deleted tenant can be erased or
+// retried after restart. The ledger is cleared only after its dependent cleanup.
 func tenantExtraStoresFor(base adminTenantExtraStores, ledger *enrolledinventory.Ledger, tenantID string) adminTenantExtraStores {
 	if ledger == nil {
 		return base
 	}
-	for _, entry := range ledger.List() {
-		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) {
+	seen := make(map[string]bool, len(base.DeviceIDs))
+	for _, id := range base.DeviceIDs {
+		seen[id] = true
+	}
+	for _, entry := range ledger.Authoritative() {
+		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) && !seen[entry.Identity] {
 			base.DeviceIDs = append(base.DeviceIDs, entry.Identity)
+			seen[entry.Identity] = true
 		}
 	}
 	return base

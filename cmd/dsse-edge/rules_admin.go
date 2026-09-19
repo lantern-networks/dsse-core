@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	assetcatalog "github.com/lantern-networks/dsse-core/assetcatalog"
 	policyrule "github.com/lantern-networks/dsse-core/policyrule"
@@ -50,7 +51,7 @@ func adoptServiceIDForObservation(assets *assetcatalog.Store, tenant string, por
 	if assets != nil && port > 0 {
 		for _, svc := range assets.ListServices(tenant) {
 			for _, p := range svc.Ports {
-				if p.Port == port {
+				if strings.EqualFold(strings.TrimSpace(p.Protocol), "tcp") && p.Port == port {
 					return svc.ID
 				}
 			}
@@ -67,7 +68,8 @@ func adoptServiceIDForObservation(assets *assetcatalog.Store, tenant string, por
 // logs reference the named authored rule); these reuse the admin.policy.* RBAC scope (rules are policy
 // authoring). East-west INBOUND rules are validated against their receivers' platforms (resolved from the
 // asset catalog) — inbound enforces on Windows WFP only.
-func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, rules *policyrule.Store, assets *assetcatalog.Store, onRulesChanged func(), onRuleDeleted func(tenantID, ruleID string), configSourceURL string) {
+func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, rules *policyrule.Store, assets *assetcatalog.Store, onRulesChanged func(), onRuleDeleted func(tenantID, ruleID string), configSourceURL string, auditMutation func(*http.Request, policyrule.Rule, string, string)) {
+	var mutationMu sync.Mutex
 	mux.HandleFunc("GET /admin/rules", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		tenant := adminTenantIDFromRequest(r)
 		listed := rules.List(tenant, r.URL.Query().Get("plane"))
@@ -82,8 +84,9 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		out := make([]ruleWithEnforcement, 0, len(listed))
 		for _, rule := range listed {
 			out = append(out, ruleWithEnforcement{
-				Rule:                  rule,
-				DestinationUnresolved: destinationResolvesToNothing(rule, assets, tenant),
+				Rule:                    rule,
+				DestinationUnresolved:   destinationResolvesToNothing(rule, assets, tenant),
+				InspectionSourceWarning: policyrule.InspectionSourceWarning(tenant, rule, assets),
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -110,9 +113,29 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			writeError(w, http.StatusBadRequest, verr)
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := rules.Upsert(rule)
+		if auditMutation != nil {
+			result := "saved"
+			if err != nil {
+				result = "rejected"
+				if errors.Is(err, policyrule.ErrPersistence) {
+					result = "persistence_unconfirmed"
+				}
+			}
+			item := stored
+			if err != nil {
+				item = rule
+			}
+			auditMutation(r, item, "upsert", result)
+		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, policyrule.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Saving the rule was not confirmed. The previous live rules remain active. Restore storage, reload and retry."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		// Say it at the moment it is written, too. An administrator who has just typed a hostname into a field
@@ -141,9 +164,22 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		}
 		tenant := adminTenantIDFromRequest(r)
 		id := r.PathValue("id")
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
+		previous, _ := rules.Get(tenant, id)
+		previous.TenantID, previous.ID = tenant, id
 		ok, err := rules.Delete(tenant, id)
+		if auditMutation != nil {
+			result := "saved"
+			if err != nil {
+				result = "persistence_unconfirmed"
+			} else if !ok {
+				result = "not_found"
+			}
+			auditMutation(r, previous, "delete", result)
+		}
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err) // deleted in memory but not persisted — would resurrect on restart
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("Saving the rule deletion was not confirmed. The previous live rules remain active. Restore storage, reload and retry."))
 			return
 		}
 		if !ok {
@@ -194,7 +230,8 @@ type ruleWithEnforcement struct {
 	policyrule.Rule
 	// DestinationUnresolved: the destination names nothing this organization's endpoint catalog knows, so the
 	// compiled policy is the match-nothing sentinel. The rule is present, active, and enforces nothing.
-	DestinationUnresolved bool `json:"destination_unresolved,omitempty"`
+	DestinationUnresolved   bool   `json:"destination_unresolved,omitempty"`
+	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
 }
 
 // destinationResolvesToNothing asks the compiler's own question with the compiler's own resolver: does this

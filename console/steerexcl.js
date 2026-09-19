@@ -72,18 +72,58 @@ function renderSteerExclAuthored(host) {
   renderSteerExclList(listHost);
 }
 
+function steerExclSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
+function steerExclInvalidList() { return bl({ en: "Could not verify the steering exclusions. Retry to confirm the current settings.", ja: "ステアリング除外を確認できません。再試行して現在の設定を確認してください。" }); }
+function steerExclObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+function steerExclListBody(response, tenant) {
+  const d = response?.body, ids = new Set();
+  const invalid = () => { throw new Error(steerExclInvalidList()); };
+  if (!response?.ok || response.status !== 200 || !steerExclObject(d) || d.schema_version !== "admin_steer_exclusions.v1" ||
+      d.tenant_id !== tenant || !Array.isArray(d.steer_exclusions)) invalid();
+  for (const p of d.steer_exclusions) {
+    if (!steerExclObject(p) || typeof p.id !== "string" || !p.id || p.id.trim() !== p.id || ids.has(p.id) || p.tenant_id !== tenant ||
+        !["tenant", "device_group", "device"].includes(p.scope_type) || typeof p.scope_id !== "string" || p.scope_id.trim() !== p.scope_id ||
+        (p.scope_type === "tenant" ? p.scope_id !== "" : !p.scope_id) || p.status !== "active" || typeof p.note !== "string" ||
+        !Array.isArray(p.excluded_app_signing_ids) || !p.excluded_app_signing_ids.length ||
+        p.excluded_app_signing_ids.some(x => typeof x !== "string" || !x || x.trim() !== x) ||
+        new Set(p.excluded_app_signing_ids).size !== p.excluded_app_signing_ids.length) invalid();
+    ids.add(p.id);
+  }
+  return d.steer_exclusions;
+}
+function steerExclObservedBody(response, tenant) {
+  const d = response?.body, devices = new Set();
+  const invalid = () => { throw new Error("Incomplete device observations"); };
+  const ids = v => v === null || (Array.isArray(v) && v.every(x => typeof x === "string" && x.trim()));
+  if (!response?.ok || response.status !== 200 || !steerExclObject(d) || d.tenant_id !== tenant || !Array.isArray(d.observed) ||
+      !Number.isSafeInteger(d.total_estimate) || d.total_estimate !== d.observed.length || d.next_cursor !== "") invalid();
+  for (const e of d.observed) {
+    if (!steerExclObject(e) || e.tenant_id !== tenant || typeof e.device_identity !== "string" || !e.device_identity.trim() || devices.has(e.device_identity) ||
+        typeof e.device_group !== "string" || typeof e.platform !== "string" || !ids(e.admin_app_signing_ids) || !ids(e.effective_app_signing_ids) ||
+        (e.ignored_app_signing_ids !== undefined && !ids(e.ignored_app_signing_ids))) invalid();
+    devices.add(e.device_identity);
+  }
+  return d.observed;
+}
+
 async function renderSteerExclList(listHost) {
+  if (listHost.isConnected === false) return;
+  const selection = steerExclSelection(), fresh = freshRender(listHost);
+  const current = () => fresh() && listHost.isConnected !== false && selection === steerExclSelection();
   uiState(listHost, "loading");
-  const current = freshRender(listHost);
-  let items;
+  let items, tenant;
   let devices = [];
   try {
     // Read from the AUTHORITY, not from an enforcing Edge's copy. Writes land on the control plane (the Edge
     // refuses them and the console routes them there), and the Edge refreshes its cache on a poll — so reading
     // the Edge showed a rule the operator had just created as missing for up to fifteen seconds.
-    const r = await apiFetch("GET", "/admin/steer-exclusions", undefined, "control");
-    if (!r.ok) { if (!current()) return; uiState(listHost, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSteerExclList(listHost) }); return; }
-    items = (r.body && r.body.steer_exclusions) || [];
+    const path = "/admin/steer-exclusions" + (selection ? "?expected_tenant_id=" + encodeURIComponent(selection) : "");
+    const [r, organization] = await Promise.all([apiFetch("GET", path, undefined, "control"), apiFetch("GET", "/admin/tenant", undefined, "control")]);
+    if (!current()) return;
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    tenant = organization?.body?.tenant_id;
+    if (!organization?.ok || organization.status !== 200 || typeof tenant !== "string" || !tenant.trim() || (selection && selection !== tenant)) throw new Error(steerExclInvalidList());
+    items = steerExclListBody(r, tenant);
   } catch (e) { if (!current()) return; uiState(listHost, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSteerExclList(listHost) }); return; }
   // Device reality, best-effort: an authored rule that no device applies is invisible otherwise, and silence is
   // exactly what this screen must not have. A failure here costs the column, not the list.
@@ -93,10 +133,10 @@ async function renderSteerExclList(listHost) {
   // must not have; an unread observation set said something worse than silence.
   let devicesUnread = false;
   try {
-    const o = await apiFetch("GET", "/admin/steer-exclusions/observed?limit=200");
-    devicesUnread = !o.ok;
-    devices = (o.ok && o.body && o.body.observed) || [];
+    const o = await apiFetch("GET", "/admin/steer-exclusions/observed?limit=200&expected_tenant_id=" + encodeURIComponent(tenant));
+    devices = steerExclObservedBody(o, tenant);
   } catch (e) { devices = []; devicesUnread = true; }
+  if (!current()) return;
   if (!items.length) {
     if (!current()) return;
     uiState(listHost, "empty", bl({ en: "No admin-authored steering exclusions yet. Add one to exclude an app from steering to the secure gateway for an tenant, group, or device.", ja: "管理者設定のステアリング除外はまだありません。テナント/グループ/デバイス単位でアプリをセキュアゲートウェイへのステアリングから外すには追加してください。" }));
@@ -139,13 +179,99 @@ async function renderSteerExclList(listHost) {
     // One sentence for the whole column, so "not known" in every row is explained once rather than read as a
     // per-rule fact.
     listHost.appendChild(el("p", { class: "ui-view-desc", text: bl({
-      en: "What devices are actually applying could not be read, so the Applied column says \"not known\" rather than showing nothing applied.",
-      ja: "端末が実際に適用しているかを取得できなかったため、「適用」列は「不明」と表示しています(「どこにも適用されていない」ではありません)。" }) }));
+      en: "Device observations are unavailable, incomplete, or could not be verified. The Applied column says \"not known\".",
+      ja: "端末の適用情報を取得・検証できないか、一覧が不完全なため、「適用」列は「不明」と表示しています。" }) }));
   }
+}
+
+// One editor owns one policy ID, including retries after an unconfirmed response.
+// This prevents duplicate creates; it does not make the upsert or its audit exactly-once.
+function steerExclNewID() {
+  return "sx_" + Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, "0")).join("");
+}
+function steerExclUnconfirmed() {
+  return bl({ en: "The result could not be confirmed. The change may already be saved. Retry here to use the same exclusion, or close and reload the list before making another change.",
+    ja: "結果を確認できません。変更は保存済みの可能性があります。この画面から再試行するか、閉じて一覧を再読込してから次の変更を行ってください。" });
+}
+function steerExclSaveConfirmed(r, expected) {
+  const p = r?.body;
+  if (!r?.ok || r.status !== 200 || !steerExclObject(p)) return false;
+  try { steerExclListBody({ ok: true, status: 200, body: { schema_version: "admin_steer_exclusions.v1", tenant_id: expected.tenant_id, steer_exclusions: [p] } }, expected.tenant_id); }
+  catch (_) { return false; }
+  return ["id", "tenant_id", "scope_type", "scope_id", "note"].every(k => p[k] === expected[k]) &&
+    p.excluded_app_signing_ids.length === expected.excluded_app_signing_ids.length &&
+    expected.excluded_app_signing_ids.every(id => p.excluded_app_signing_ids.includes(id));
+}
+function steerExclDeleteConfirmed(r, id, tenant) {
+  return r?.ok === true && r.status === 200 && steerExclObject(r.body) && r.body.deleted === true && r.body.id === id && r.body.tenant_id === tenant;
+}
+
+// Keep errors beside the unchanged input, and bind every mutation to the verified
+// organization. Leaving the view discards its late UI result, not the server write.
+function steerExclMutationDialog(opts) {
+  const selection = steerExclSelection();
+  let closed = false, pending = false, ready = false, tenant, observer;
+  const notice = el("div", { role: "status", text: bl({ en: "Checking organization…", ja: "テナントを確認中…" }) });
+  const retry = el("button", { class: "ui-btn", text: bl({ en: "Retry", ja: "再試行" }) });
+  retry.hidden = true;
+  const submit = el("button", { class: "ui-btn " + (opts.danger ? "ui-btn-danger" : "ui-btn-primary"), text: opts.submitLabel });
+  const close = () => { if (closed) return; closed = true; observer?.disconnect(); backdrop.remove(); document.removeEventListener("keydown", onKey); };
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => { if (!pending) close(); } });
+  const onKey = e => { if (e.key === "Escape" && !pending) close(); };
+  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: e => { if (e.target === backdrop && !pending) close(); } }, [
+    el("div", { class: "ui-modal", role: "dialog" }, [
+      el("div", { class: "ui-modal-head", text: opts.title }),
+      el("div", { class: "ui-modal-body" }, [...opts.body, notice, retry]),
+      el("div", { class: "ui-modal-foot" }, [cancel, submit]),
+    ]),
+  ]);
+  document.body.appendChild(backdrop);
+  document.addEventListener("keydown", onKey);
+  const active = () => {
+    if (closed) return false;
+    if (opts.host.isConnected === false || selection !== steerExclSelection()) { close(); return false; }
+    return true;
+  };
+  const lock = () => {
+    backdrop.querySelectorAll("input,select,textarea").forEach(n => { n.disabled = pending || !ready; });
+    submit.disabled = pending || !ready; cancel.disabled = pending; retry.disabled = pending;
+  };
+  const error = message => { notice.setAttribute("role", "alert"); notice.textContent = message; };
+  const load = async () => {
+    if (!active()) return;
+    ready = false; retry.hidden = true; lock();
+    try {
+      const r = await apiFetch("GET", "/admin/tenant", undefined, "control");
+      if (!active()) return;
+      tenant = r?.body?.tenant_id;
+      if (!r?.ok || r.status !== 200 || typeof tenant !== "string" || !tenant || tenant.trim() !== tenant ||
+          (selection && tenant !== selection) || (opts.tenantID && tenant !== opts.tenantID)) throw new Error();
+      ready = true; notice.textContent = ""; notice.setAttribute("role", "status");
+    } catch (_) {
+      if (!active()) return;
+      error(bl({ en: "Could not verify the organization. Retry before changing this exclusion.", ja: "テナントを確認できません。この除外を変更する前に再試行してください。" })); retry.hidden = false;
+    } finally { if (active()) lock(); }
+  };
+  retry.addEventListener("click", load);
+  submit.addEventListener("click", async () => {
+    if (!active() || pending || !ready) return;
+    pending = true; lock(); notice.textContent = "";
+    try {
+      if (await opts.onSubmit(tenant) === false) return;
+      if (!active()) return;
+      close(); opts.onSuccess();
+    } catch (e) {
+      if (active()) error(steerExclUnconfirmed() + (e?.message ? " (" + e.message + ")" : ""));
+    } finally { pending = false; if (active()) lock(); }
+  });
+  observer = new MutationObserver(() => { active(); });
+  observer.observe(document.body, { childList: true, subtree: true });
+  load();
 }
 
 function openSteerExclForm(host, existing) {
   existing = existing || null;
+  const id = existing ? existing.id : steerExclNewID();
   const scopeF = uiField({ name: "scope_type", label: bl({ en: "Scope", ja: "対象範囲" }), type: "select",
     value: existing ? (existing.scope_type || "device") : "device", options: [
       { value: "tenant", label: bl({ en: "Tenant (whole tenant)", ja: "テナント(テナント全体)" }) },
@@ -175,45 +301,43 @@ function openSteerExclForm(host, existing) {
   if (scopeSelect) scopeSelect.addEventListener("change", syncScopeID);
   syncScopeID();
 
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: existing ? bl({ en: "Save changes", ja: "変更を保存" }) : bl({ en: "Add exclusion", ja: "ステアリング除外を追加" }) });
-  const m = uiModal({
+  steerExclMutationDialog({
+    host, tenantID: existing?.tenant_id,
     title: existing ? bl({ en: "Edit steering exclusion", ja: "ステアリング除外を編集" }) : bl({ en: "Add a steering exclusion", ja: "ステアリング除外を追加" }),
     body: [scopeF.el, scopeIDF.el, idsF.el, noteF.el],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
-  submit.addEventListener("click", async () => {
-    const scopeType = scopeF.get();
-    const ids = (idsF.get() || "").split("\n").map((s) => s.trim()).filter(Boolean);
-    if (!ids.length) { idsF.setError(bl({ en: "List at least one app identifier.", ja: "アプリ識別子を1つ以上入力してください。" })); return; }
-    if (scopeType !== "tenant" && !scopeIDF.get()) { scopeIDF.setError(bl({ en: "Required for a group or device scope.", ja: "グループ/デバイス範囲では必須です。" })); return; }
-    submit.disabled = true;
-    const body = { scope_type: scopeType, excluded_app_signing_ids: ids, note: noteF.get() };
-    if (scopeType !== "tenant") body.scope_id = scopeIDF.get();
-    if (existing && existing.id) body.id = existing.id;
-    try {
-      const r = await apiFetch("POST", "/admin/steer-exclusions", body);
-      if (!r.ok) { submit.disabled = false; const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); uiToast(msg, "err"); return; }
-      m.close();
+    submitLabel: existing ? bl({ en: "Save changes", ja: "変更を保存" }) : bl({ en: "Add exclusion", ja: "ステアリング除外を追加" }),
+    onSubmit: async tenant => {
+      const scopeType = scopeF.get(), scopeID = scopeType === "tenant" ? "" : scopeIDF.get().trim();
+      const ids = [...new Set((idsF.get() || "").split("\n").map(s => s.trim()).filter(Boolean))];
+      idsF.setError(""); scopeIDF.setError("");
+      if (!ids.length) { idsF.setError(bl({ en: "List at least one app identifier.", ja: "アプリ識別子を1つ以上入力してください。" })); return false; }
+      if (scopeType !== "tenant" && !scopeID) { scopeIDF.setError(bl({ en: "Required for a group or device scope.", ja: "グループ/デバイス範囲では必須です。" })); return false; }
+      const body = { id, tenant_id: tenant, scope_type: scopeType, scope_id: scopeID, excluded_app_signing_ids: ids, note: noteF.get() };
+      const r = await apiFetch("POST", "/admin/steer-exclusions?expected_tenant_id=" + encodeURIComponent(tenant), body, "control");
+      if (!steerExclSaveConfirmed(r, body)) throw new Error(r?.ok ? "" : "HTTP " + r?.status);
+    },
+    onSuccess: () => {
       uiToast(existing ? bl({ en: "Exception saved.", ja: "除外を保存しました。" }) : bl({ en: "Exception added.", ja: "除外を追加しました。" }), "ok");
       renderSteerExclAuthored(host);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    },
   });
-  scopeF.focus();
 }
 
-async function deleteSteerExcl(x, listHost) {
-  const ok = await uiConfirm({
+function deleteSteerExcl(x, listHost) {
+  steerExclMutationDialog({
+    host: listHost, tenantID: x.tenant_id,
     title: bl({ en: "Delete this steering exclusion?", ja: "このステアリング除外を削除しますか?" }),
-    body: bl({ en: "The excluded apps will be steered through the secure gateway again on the affected devices (subject to the loop-prevention floor and any dev scaffold).", ja: "除外していたアプリは、対象デバイスで再びセキュアゲートウェイ経由になります(ループ防止フロアや開発用スキャフォールドは別途残ります)。" }),
-    confirmLabel: bl({ en: "Delete", ja: "削除" }), danger: true,
+    body: [el("div", { text: bl({ en: "The excluded apps will be steered through the secure gateway again on the affected devices (subject to the loop-prevention floor and any dev scaffold).", ja: "除外していたアプリは、対象デバイスで再びセキュアゲートウェイ経由になります(ループ防止フロアや開発用スキャフォールドは別途残ります)。" }) })],
+    submitLabel: bl({ en: "Delete", ja: "削除" }), danger: true,
+    onSubmit: async tenant => {
+      const r = await apiFetch("DELETE", "/admin/steer-exclusions/" + encodeURIComponent(x.id) + "?expected_tenant_id=" + encodeURIComponent(tenant), undefined, "control");
+      if (!steerExclDeleteConfirmed(r, x.id, tenant)) throw new Error(r?.ok ? "" : "HTTP " + r?.status);
+    },
+    onSuccess: () => {
+      uiToast(bl({ en: "Exception deleted.", ja: "除外を削除しました。" }), "ok");
+      renderSteerExclList(listHost);
+    },
   });
-  if (!ok) return;
-  try {
-    const r = await apiFetch("DELETE", "/admin/steer-exclusions/" + encodeURIComponent(x.id || ""));
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Exception deleted.", ja: "除外を削除しました。" }), "ok");
-    renderSteerExclList(listHost);
-  } catch (e) { uiToast(String(e), "err"); }
 }
 
 // ---------------------------------------------------------------------------

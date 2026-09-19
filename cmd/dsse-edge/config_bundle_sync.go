@@ -36,7 +36,8 @@ import (
 // CP→Edge config distribution (Phase 1 — docs/edge_config_distribution_phase1_design.md). The control plane
 // is the source of truth for runtime admin config; each Edge PULLS a versioned config bundle and applies it
 // to its in-memory stores so a fleet enforces identically. Generalizes steer_exclusion_sync. Fail-safe: a
-// fetch/decode error keeps the last good config. Atomic per generation: a bundle applies whole or not at all.
+// fetch/decode error keeps the last good config. Required section errors leave a generation unapplied
+// for retry; sections already changed are not rolled back.
 // Slice 1 carries access policies; further resources (east-west, dns, …) fold into the bundle.
 
 type configBundleSource struct {
@@ -418,9 +419,9 @@ type tenantDeletion struct {
 //     same lockout the control plane's own DELETE route refuses with 409;
 //   - a tenant the same payload also asks us to keep, which is a contradiction and not an instruction;
 //   - nothing else. A tenant we do not have is not an error: the delete is idempotent by design.
-func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdminStore, section *tenantModelBundle, existing []adminTenantModel) {
+func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdminStore, section *tenantModelBundle, existing []adminTenantModel) error {
 	if store == nil || section == nil || len(section.Deleted) == 0 {
-		return
+		return nil
 	}
 	kept := make(map[string]bool, len(section.Tenants))
 	for _, tenant := range section.Tenants {
@@ -430,6 +431,7 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 	for _, tenant := range existing {
 		present[strings.TrimSpace(tenant.TenantID)] = tenant
 	}
+	var failed error
 	for _, deletion := range section.Deleted {
 		tenantID := strings.TrimSpace(deletion.TenantID)
 		if tenantID == "" {
@@ -448,12 +450,14 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 			continue
 		}
 		if err := store.Delete(ctx, tenantID); err != nil {
+			failed = errors.Join(failed, fmt.Errorf("tenant deletion %q: %w", tenantID, err))
 			log.Printf("config-bundle sync: deleting tenant %q as instructed by the control plane failed: %v", tenantID, err)
 			continue
 		}
 		log.Printf("config-bundle sync: deleted tenant %q (control plane recorded the deletion at %s). Runtime state keyed to it is no longer served here.",
 			tenantID, strings.TrimSpace(deletion.DeletedAt))
 	}
+	return failed
 }
 
 // enrolledInventoryBundle wraps the enrolled set so the bundle can carry an explicitly-empty set (replace all)
@@ -534,11 +538,12 @@ type configApplyTargets struct {
 	// went on enforcing the ones it compiled at boot — the same divergence this section exists to end, moved one
 	// layer inward where no admin surface would show it at all.
 	onRulesApplied func()
-	// The four below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
+	// The fields below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
 	// own copy of a terminated tenant's data — the logs on its disk above all, which nothing else can reach.
 	logWriter           *logs.Writer
 	localCredentials    *localAdminCredentialStore
 	purgeDB             *sql.DB
+	legalHold           *legalHoldStore
 	enforcementTenantID string
 	// nodeName labels this node in the erasure log, so "which node erased what" is answerable afterwards.
 	nodeName string
@@ -789,33 +794,34 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			t.enrolled.ReplaceAllGroups(payload.Enrolled.Groups, now.Format(time.RFC3339))
 		}
 	}
+	var tenantApplyErr error
 	if payload.Tenants != nil && t.tenantModels != nil {
-		// The apply path has no request context; this is a background reconcile against a local store.
 		ctx := context.Background()
-		existing, _ := t.tenantModels.List(ctx)
-		if len(payload.Tenants.Tenants) == 0 && len(existing) > 0 {
-			log.Printf("config-bundle sync: control plane sent an EMPTY tenant set while this Edge holds %d tenant(s) — keeping local. An empty section means the CP is not the tenant authority, not that every tenant was deleted.", len(existing))
+		existing, err := t.tenantModels.List(ctx)
+		if err != nil {
+			tenantApplyErr = fmt.Errorf("tenant registry read: %w", err)
 		} else {
-			for _, tenant := range payload.Tenants.Tenants {
-				// UPSERT rather than replace-all. Deleting a tenant is a deliberate lifecycle act with its own
-				// route and its own lockout protection; inferring it from absence in a bundle would make a
-				// truncated or partially-built payload look like a deletion.
-				if _, err := t.tenantModels.Put(ctx, tenant, now); err != nil {
-					log.Printf("config-bundle sync: tenant %q from the control plane was refused: %v", tenant.TenantID, err)
-					criticalErr = errors.Join(criticalErr, fmt.Errorf("tenant %q: %w", tenant.TenantID, err))
+			if len(payload.Tenants.Tenants) == 0 && len(existing) > 0 {
+				log.Printf("config-bundle sync: empty tenant set is not a deletion; keeping %d local tenant(s)", len(existing))
+			} else {
+				for _, tenant := range payload.Tenants.Tenants {
+					if _, err := t.tenantModels.Put(ctx, tenant, now); err != nil {
+						tenantApplyErr = errors.Join(tenantApplyErr, fmt.Errorf("tenant %q: %w", tenant.TenantID, err))
+					}
 				}
 			}
+			tenantApplyErr = errors.Join(tenantApplyErr, applyCarriedTenantDeletions(ctx, t.tenantModels, payload.Tenants, existing))
 		}
-		// Carried deletions. These are applied even when the tenant list above was empty and left alone: an
-		// empty list means "I am not the authority for the set", while a deletion names one tenant and says it
-		// is gone. The two claims are independent, and only the second one is ever acted on destructively.
-		applyCarriedTenantDeletions(ctx, t.tenantModels, payload.Tenants, existing)
 	}
-	// Carried ERASURE orders. Deliberately outside the tenantModels guard above: a node still holding a
-	// terminated tenant's LOGS must erase them even if it has no tenant registry of its own to speak of.
-	applyCarriedTenantPurges(context.Background(), t, payload, t.nodeName, now)
-	if payload.Tenants != nil && t.erasureOrders != nil {
-		t.erasureOrders.remember(payload.Tenants.PurgeOrders)
+	if tenantApplyErr != nil {
+		criticalErr = errors.Join(criticalErr, tenantApplyErr)
+	} else {
+		// Never erase or remember an order after uncertain tenant reconciliation.
+		// Nodes without a registry can still receive independently signed erasure orders.
+		applyCarriedTenantPurges(context.Background(), t, payload, t.nodeName, now)
+		if payload.Tenants != nil && t.erasureOrders != nil {
+			t.erasureOrders.remember(payload.Tenants.PurgeOrders)
+		}
 	}
 	if payload.VLAN != nil && t.vlan != nil {
 		emptyPayload := len(payload.VLAN.Objects) == 0 && len(payload.VLAN.Policies) == 0
@@ -828,9 +834,13 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			// possible, and it is only possible here.
 			log.Printf("config-bundle sync: control plane reports its VLAN boundary set is COMPLETE and empty — clearing %d object(s) and %d policy/policies.",
 				len(t.vlan.ListObjects()), len(t.vlan.ListPolicies()))
-			t.vlan.ReplaceAll(nil, nil)
+			if err := t.vlan.ReplaceAll(nil, nil); err != nil {
+				criticalErr = errors.Join(criticalErr, err)
+			}
 		default:
-			t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies)
+			if err := t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies); err != nil {
+				criticalErr = errors.Join(criticalErr, err)
+			}
 		}
 	}
 	if payload.Connectors != nil && t.connectors != nil {
@@ -950,7 +960,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		} else {
 			for _, grant := range payload.DelegatedGrants.Grants {
 				if _, err := t.delegatedGrants.Upsert(grant); err != nil {
-					log.Printf("config-bundle sync: skipping invalid delegated grant %q from the control plane: %v", grant.ID, err)
+					// Continue so updates/revocations of retained IDs can still be applied at capacity.
+					// A rejected grant must leave the generation unapplied and eligible for retry.
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("delegated grant %q: %w", grant.ID, err))
 				}
 			}
 		}
@@ -968,15 +980,23 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// device-CA registry, because they are the same kind of fact from opposite directions: that one says which
 	// organization a client certificate belongs to, this one says which server certificates an organization's
 	// own flows may accept.
-	if payload.InternalCAs != nil && t.internalCAs != nil {
-		if count, applied := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf); applied {
+	if payload.InternalCAs != nil {
+		count, applied, err := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf)
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("internal authorities: %w", err))
+		}
+		if applied {
 			log.Printf("config_bundle_internal_cas applied=%d", count)
 		}
 	}
 	// What the fleet has already approved out of band, so a flow held on a node that did not run the
 	// ceremony is released by the grant that ceremony earned.
 	if payload.Grants != nil {
-		if added, updated := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC()); added > 0 || updated > 0 {
+		added, updated, err := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC())
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grants: %w", err))
+		}
+		if added > 0 || updated > 0 {
 			log.Printf("config_bundle_grants added=%d updated=%d", added, updated)
 		}
 	}
@@ -1010,8 +1030,10 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		applyLicenceBundleSection(payload.Licence, t.licenceStore, t.licensingGate, t.licenceAcceptedKeys,
 			t.licenceMSSPID, time.Now().UTC().Format(time.RFC3339), log.Printf)
 	}
-	if payload.InspectionPosture != nil && t.inspectionPosture != nil && t.setInspectionPosture != nil {
-		applyInspectionPostureBundleSection(payload.InspectionPosture, t.inspectionPosture, t.setInspectionPosture, log.Printf)
+	if payload.InspectionPosture != nil {
+		if _, err := applyInspectionPostureBundleSection(payload.InspectionPosture, t.inspectionPosture, t.setInspectionPosture, log.Printf); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("inspection posture: %w", err))
+		}
 	}
 	// THE SITE CATALOG. Applied before the rules block below purely so it sits beside the connector catalog it
 	// belongs with; nothing here depends on ordering. See config_bundle_sites.go for why it REPLACES within the
@@ -1035,6 +1057,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// assetcatalog/distribution.go and policyrule/distribution.go. Briefly: the catalog has three owners (CP,
 	// enrolled-device sync, built-ins) so replacing it would delete the other two every pull; the rule set has
 	// one owner, and an authored allow/bypass that survives its own deletion fails permissive.
+	if payload.Rules != nil && t.rules == nil {
+		criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rule target is unavailable"))
+	}
 	if payload.Rules != nil && t.rules != nil {
 		// ★ PRESENT-BUT-EMPTY CLEARS, and this is the one section where it must — reversing the rule every
 		// other section follows, after live testing showed the alternative is broken (2026-08-10).
@@ -1089,40 +1114,49 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		//
 		// Before the rule apply, because a rule may reference an endpoint this bundle introduces. Safe in the
 		// other order too: policyrule validation never consults the asset catalog.
+		assetsReady := true
+		if t.assets == nil && (len(payload.Rules.Endpoints)+len(payload.Rules.Groups)+len(payload.Rules.Services) > 0) {
+			assetsReady = false
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("authored asset target is unavailable"))
+		}
 		if t.assets != nil {
 			removed, aerr := t.assets.ReplaceAuthored(payload.Rules.Endpoints, payload.Rules.Groups, payload.Rules.Services)
 			if aerr != nil {
+				assetsReady = false
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored assets: %w", aerr))
 				log.Printf("config-bundle sync: the control plane's asset catalog was REFUSED, keeping the last good one: %v", aerr)
 			} else if len(removed) > 0 {
 				log.Printf("config-bundle sync: removed %d asset(s) the control plane does not author: %s",
 					len(removed), strings.Join(removed, ", "))
 			}
 		}
-		incoming := payload.Rules.Rules
-		if len(incoming) == 0 {
-			if local := t.rules.Snapshot(); len(local) > 0 {
-				log.Printf("config-bundle sync: the control plane authors NO rules; removing %d rule(s) this Edge still holds: %s", len(local), ruleIDsForLog(local))
-			}
-			if err := t.rules.ReplaceAll(nil); err != nil {
-				log.Printf("config-bundle sync: could not clear the authored rule set: %v", err)
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules (clear): %w", err))
-			} else if t.onRulesApplied != nil {
-				t.onRulesApplied()
-			}
-		} else {
-			// ★ NAME WHAT IS BEING REMOVED. The control plane is authoritative, so a rule this Edge holds and
-			// the CP does not is deleted — including one authored locally before the CP became the authority.
-			// That is correct and it is also how a cutover silently drops policy nobody migrated: on the first
-			// pull, every Edge-local rule that was never copied up simply disappears. It happened here, to the
-			// cert-pin bypass this fleet had adopted. Authority does not have to be quiet about what it erases.
-			logRemovedByDistribution(t.rules.Snapshot(), incoming)
-			// ALL-OR-NOTHING. ReplaceAll refuses the whole set if any rule is invalid, and the Edge then keeps
-			// the last good one: a half-applied policy is an access posture nobody authored.
-			if err := t.rules.ReplaceAll(payload.Rules.Rules); err != nil {
-				log.Printf("config-bundle sync: REFUSED the control plane's authored rule set, keeping the last good one: %v", err)
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules: %w", err))
-			} else if t.onRulesApplied != nil {
-				t.onRulesApplied()
+		if assetsReady {
+			incoming := payload.Rules.Rules
+			if len(incoming) == 0 {
+				if local := t.rules.Snapshot(); len(local) > 0 {
+					log.Printf("config-bundle sync: the control plane authors NO rules; removing %d rule(s) this Edge still holds: %s", len(local), ruleIDsForLog(local))
+				}
+				if err := t.rules.ReplaceAll(nil); err != nil {
+					log.Printf("config-bundle sync: could not clear the authored rule set: %v", err)
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules (clear): %w", err))
+				} else if t.onRulesApplied != nil {
+					t.onRulesApplied()
+				}
+			} else {
+				// ★ NAME WHAT IS BEING REMOVED. The control plane is authoritative, so a rule this Edge holds and
+				// the CP does not is deleted — including one authored locally before the CP became the authority.
+				// That is correct and it is also how a cutover silently drops policy nobody migrated: on the first
+				// pull, every Edge-local rule that was never copied up simply disappears. It happened here, to the
+				// cert-pin bypass this fleet had adopted. Authority does not have to be quiet about what it erases.
+				logRemovedByDistribution(t.rules.Snapshot(), incoming)
+				// ALL-OR-NOTHING. ReplaceAll refuses the whole set if any rule is invalid, and the Edge then keeps
+				// the last good one: a half-applied policy is an access posture nobody authored.
+				if err := t.rules.ReplaceAll(payload.Rules.Rules); err != nil {
+					log.Printf("config-bundle sync: REFUSED the control plane's authored rule set, keeping the last good one: %v", err)
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules: %w", err))
+				} else if t.onRulesApplied != nil {
+					t.onRulesApplied()
+				}
 			}
 		}
 	}
@@ -1361,7 +1395,7 @@ func applyCarriedTenantPurges(ctx context.Context, t configApplyTargets, payload
 			t.deviceCAs, t.deviceCARegistryPath, t.deviceTrust, t.vlan,
 			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants,
 				DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, t.enrolled, tenantID).DeviceIDs},
-			now)
+			t.legalHold, now)
 		if len(result.Erased) == 0 && result.Complete {
 			continue // nothing here: already erased, or this node never served the tenant. Silence is correct.
 		}

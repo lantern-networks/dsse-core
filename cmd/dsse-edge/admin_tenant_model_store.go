@@ -3,17 +3,18 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -52,13 +53,12 @@ type adminTenantModelAdminStore interface {
 type adminTenantModelFleetCarrier interface {
 	ConfigGeneration() uint64
 	DeletedTenants() []tenantDeletion
-	OrderPurge(string, time.Time)
+	OrderPurge(string, time.Time) error
 	PurgeOrders() []tenantPurgeOrder
 }
 
-// tenantPurgeOrderStands reports whether the standing erasure orders actually name this tenant. It is the
-// read-back after OrderPurge: that call returns nothing, so a store which failed to write the order is
-// indistinguishable from one that wrote it, and the erasure would proceed on this node alone.
+// tenantPurgeOrderStands verifies the recorded order after a confirmed save.
+// Read-back alone cannot establish durability for an in-memory file-store view.
 func tenantPurgeOrderStands(carrier adminTenantModelFleetCarrier, tenantID string) bool {
 	tenantID = strings.TrimSpace(tenantID)
 	for _, order := range carrier.PurgeOrders() {
@@ -184,7 +184,24 @@ type adminTenantModel struct {
 // stampOperatorFlag derives IsOperator from operatorTenantID (the single source of truth). Called on every read
 // path so the flag is correct regardless of any persisted value, and the persisted/stored bool is only a cache.
 func stampOperatorFlag(tenant adminTenantModel, operatorTenantID string) adminTenantModel {
+	tenant = cloneAdminTenantModel(tenant)
 	tenant.IsOperator = operatorTenantID != "" && tenant.TenantID == operatorTenantID
+	return tenant
+}
+
+// Returned models can be edited by callers without changing authorization state.
+func cloneAdminTenantModel(tenant adminTenantModel) adminTenantModel {
+	tenant.AllowedRegions = append([]string(nil), tenant.AllowedRegions...)
+	tenant.CreatedAt = copyStringPtr(tenant.CreatedAt)
+	tenant.UpdatedAt = copyStringPtr(tenant.UpdatedAt)
+	tenant.OperatorElevations = append([]operatorElevation(nil), tenant.OperatorElevations...)
+	for i := range tenant.OperatorElevations {
+		e := &tenant.OperatorElevations[i]
+		e.EndedAt = copyStringPtr(e.EndedAt)
+		e.EndedBy = copyStringPtr(e.EndedBy)
+		e.ApprovedAt = copyStringPtr(e.ApprovedAt)
+		e.ApprovedBy = copyStringPtr(e.ApprovedBy)
+	}
 	return tenant
 }
 
@@ -249,20 +266,14 @@ type adminTenantModelSnapshot struct {
 }
 
 func newAdminTenantModelStore(bundle model.PolicyBundle, now time.Time) *adminTenantModelStore {
-	return newDurableAdminTenantModelStore(bundle, now, "")
+	// Memory-only initialization has no storage operations that can fail.
+	store, _ := openAdminTenantModelStore(bundle, now, "", "")
+	return store
 }
 
-// newDurableAdminTenantModelStore builds the store, loading from the durable snapshot at path when it exists
-// (and is non-empty), otherwise seeding the bundle tenant. A non-empty path makes the store restart-resilient.
-func newDurableAdminTenantModelStore(bundle model.PolicyBundle, now time.Time, path string) *adminTenantModelStore {
-	return newOperatorAwareAdminTenantModelStore(bundle, now, path, "")
-}
-
-// newOperatorAwareAdminTenantModelStore is newDurableAdminTenantModelStore plus the operator-tenant feature
-// (-operator-tenant-id). operatorTenantID == "" reproduces the legacy behavior exactly (lab default): load or
-// seed the bundle tenant, no operator tenant, IsOperator always false. A non-empty operatorTenantID additionally
-// seeds the operator tenant (display name "Operator", status active) when absent and stamps IsOperator on reads.
-func newOperatorAwareAdminTenantModelStore(bundle model.PolicyBundle, now time.Time, path, operatorTenantID string) *adminTenantModelStore {
+// openAdminTenantModelStore distinguishes first boot from an unreadable existing
+// snapshot. No state is published and no listener should start on failure.
+func openAdminTenantModelStore(bundle model.PolicyBundle, now time.Time, path, operatorTenantID string) (*adminTenantModelStore, error) {
 	store := &adminTenantModelStore{
 		tenants:          map[string]adminTenantModel{},
 		deleted:          map[string]string{},
@@ -275,17 +286,22 @@ func newOperatorAwareAdminTenantModelStore(bundle model.PolicyBundle, now time.T
 	}
 	loaded := false
 	if store.path != "" {
-		if snapshot, tombstones, orders, ok := loadAdminTenantModelSnapshot(store.path); ok {
-			store.tenants = snapshot
-			if tombstones != nil {
-				store.deleted = tombstones
+		snapshot, found, err := readAdminTenantModelSnapshot(store.path)
+		if err != nil {
+			return nil, fmt.Errorf("load tenant registry: %w", err)
+		}
+		if found {
+			store.tenants = snapshot.Tenants
+			if snapshot.Deleted != nil {
+				store.deleted = snapshot.Deleted
 			}
-			if orders != nil {
-				store.purgeOrders = orders
+			if snapshot.PurgeOrders != nil {
+				store.purgeOrders = snapshot.PurgeOrders
 			}
 			loaded = true
 		}
 	}
+
 	dirty := false
 	if !loaded {
 		if tenantID := strings.TrimSpace(bundle.TenantID); tenantID != "" {
@@ -310,9 +326,11 @@ func newOperatorAwareAdminTenantModelStore(bundle model.PolicyBundle, now time.T
 		dirty = true
 	}
 	if dirty {
-		store.persistLocked()
+		if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: store.tenants, Deleted: store.deleted, PurgeOrders: store.purgeOrders}); err != nil {
+			return nil, err
+		}
 	}
-	return store
+	return store, nil
 }
 
 // seedOperatorTenantLocked inserts the operator tenant (display name "Operator", status active, IsOperator) when
@@ -339,37 +357,35 @@ func (store *adminTenantModelStore) seedOperatorTenantLocked(now time.Time) bool
 	return true
 }
 
-// loadAdminTenantModelSnapshot reads a durable snapshot; returns ok=false when the file is missing/empty/invalid
-// so the caller falls back to bundle seeding (never silently starts with a corrupt set).
-func loadAdminTenantModelSnapshot(path string) (map[string]adminTenantModel, map[string]string, map[string]string, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 {
-		return nil, nil, nil, false
-	}
+// readAdminTenantModelSnapshot reports absence only for a genuinely missing path.
+// Empty/invalid files, directories and dangling links are not a fresh installation.
+func readAdminTenantModelSnapshot(path string) (adminTenantModelSnapshot, bool, error) {
 	var snapshot adminTenantModelSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil || snapshot.Tenants == nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+				return snapshot, false, nil
+			}
+		}
+		return snapshot, false, err
+	}
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return snapshot, false, err
+	}
+	if snapshot.Tenants == nil {
+		return snapshot, false, errors.New("tenant registry snapshot has no tenants map")
+	}
+	return snapshot, true, nil
+}
+
+// The PostgreSQL import caller already refuses a named unreadable snapshot.
+func loadAdminTenantModelSnapshot(path string) (map[string]adminTenantModel, map[string]string, map[string]string, bool) {
+	snapshot, found, err := readAdminTenantModelSnapshot(path)
+	if err != nil || !found {
 		return nil, nil, nil, false
 	}
 	return snapshot.Tenants, snapshot.Deleted, snapshot.PurgeOrders, true
-}
-
-// persistLocked atomically rewrites the durable snapshot. The caller must hold store.mu. A no-op when path is "".
-func (store *adminTenantModelStore) persistLocked() {
-	if store.path == "" {
-		return
-	}
-	data, err := json.MarshalIndent(adminTenantModelSnapshot{Tenants: store.tenants, Deleted: store.deleted, PurgeOrders: store.purgeOrders}, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := store.path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(store.path), 0o750); err != nil {
-		return
-	}
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, store.path)
 }
 
 // ConfigGeneration returns the monotonic tenant-registry version. It feeds the config bundle's aggregate
@@ -379,22 +395,27 @@ func (store *adminTenantModelStore) ConfigGeneration() uint64 { return store.gen
 // OrderPurge records that an operator has ordered this tenant ERASED, so the order can be carried to every
 // node that ever held its data. Idempotent: ordering twice keeps the first instant, because the order is not a
 // new fact the second time and a moving timestamp would make the audit harder to read, not easier.
-func (store *adminTenantModelStore) OrderPurge(tenantID string, now time.Time) {
+func (store *adminTenantModelStore) OrderPurge(tenantID string, now time.Time) error {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return
+		return fmt.Errorf("tenant_id is required")
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.purgeOrders == nil {
-		store.purgeOrders = map[string]string{}
-	}
 	if _, already := store.purgeOrders[tenantID]; already {
-		return
+		return nil
 	}
-	store.purgeOrders[tenantID] = now.UTC().Format(time.RFC3339)
-	store.generation.Add(1) // the bundle carries this, so it is a new config version
-	store.persistLocked()
+	orders := make(map[string]string, len(store.purgeOrders)+1)
+	for id, at := range store.purgeOrders {
+		orders[id] = at
+	}
+	orders[tenantID] = now.UTC().Format(time.RFC3339)
+	if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: store.tenants, Deleted: store.deleted, PurgeOrders: orders}); err != nil {
+		return err
+	}
+	store.purgeOrders = orders
+	store.generation.Add(1)
+	return nil
 }
 
 // PurgeOrders returns the standing erasure orders. They are never cleared: an Edge that was offline when the
@@ -444,6 +465,56 @@ func (store *adminTenantModelStore) Get(_ context.Context, tenantID string) (adm
 	return stampOperatorFlag(tenant, store.operatorTenantID), nil
 }
 
+var errAdminTenantSaveUnconfirmed = errors.New("tenant save could not be confirmed")
+
+// Authoring must not publish a candidate or retire its tombstone until storage
+// confirms the save. Memory-only stores retain their existing behavior.
+func (store *adminTenantModelStore) commitAuthoredTenantLocked(tenant adminTenantModel) error {
+	tenant = cloneAdminTenantModel(tenant)
+	tenants := make(map[string]adminTenantModel, len(store.tenants)+1)
+	for id, row := range store.tenants {
+		tenants[id] = row
+	}
+	tenants[tenant.TenantID] = tenant
+	deleted := make(map[string]string, len(store.deleted))
+	for id, at := range store.deleted {
+		if id != tenant.TenantID {
+			deleted[id] = at
+		}
+	}
+	if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: tenants, Deleted: deleted, PurgeOrders: store.purgeOrders}); err != nil {
+		return err
+	}
+	store.tenants = tenants
+	store.deleted = deleted
+	store.generation.Add(1)
+	return nil
+}
+
+// saveCandidateLocked confirms storage before publishing a tenant-registry mutation.
+// An error can follow replacement; it does not imply the disk still holds the old snapshot.
+func (store *adminTenantModelStore) saveCandidateLocked(snapshot adminTenantModelSnapshot) error {
+	if store.path != "" {
+		raw, err := json.MarshalIndent(snapshot, "", "  ")
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+		}
+		err = (blobstore.FilePersister{Path: store.path}).Save(raw)
+		if err != nil && !(errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
+			return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+		}
+	}
+	return nil
+}
+
+func writeAdminTenantSaveError(w http.ResponseWriter, fallback int, err error) {
+	if errors.Is(err, errAdminTenantSaveUnconfirmed) {
+		writeError(w, http.StatusServiceUnavailable, errors.New("The tenant change could not be confirmed in storage. Reload before retrying."))
+		return
+	}
+	writeError(w, fallback, err)
+}
+
 func (store *adminTenantModelStore) Update(_ context.Context, tenant adminTenantModel, tenantID string, now time.Time) (adminTenantModel, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -457,15 +528,9 @@ func (store *adminTenantModelStore) Update(_ context.Context, tenant adminTenant
 	if err != nil {
 		return adminTenantModel{}, err
 	}
-	store.tenants[normalized.TenantID] = normalized
-	// Re-creating a tenant supersedes any tombstone for it: the deletion has been undone here, so it must
-	// stop being carried, or the bundle would ask every Edge to delete the tenant it just created.
-	delete(store.deleted, normalized.TenantID)
-	// The registry changed, so the bundle that carries it is a new version. Bumped HERE rather than
-	// inside persistLocked, which returns early for a memory-only store — the counter must not depend
-	// on whether a durable path happens to be configured.
-	store.generation.Add(1)
-	store.persistLocked()
+	if err := store.commitAuthoredTenantLocked(normalized); err != nil {
+		return adminTenantModel{}, err
+	}
 	return stampOperatorFlag(normalized, store.operatorTenantID), nil
 }
 
@@ -501,15 +566,9 @@ func (store *adminTenantModelStore) Put(_ context.Context, tenant adminTenantMod
 	if err != nil {
 		return adminTenantModel{}, err
 	}
-	store.tenants[normalized.TenantID] = normalized
-	// Re-creating a tenant supersedes any tombstone for it: the deletion has been undone here, so it must
-	// stop being carried, or the bundle would ask every Edge to delete the tenant it just created.
-	delete(store.deleted, normalized.TenantID)
-	// The registry changed, so the bundle that carries it is a new version. Bumped HERE rather than
-	// inside persistLocked, which returns early for a memory-only store — the counter must not depend
-	// on whether a durable path happens to be configured.
-	store.generation.Add(1)
-	store.persistLocked()
+	if err := store.commitAuthoredTenantLocked(normalized); err != nil {
+		return adminTenantModel{}, err
+	}
 	return stampOperatorFlag(normalized, store.operatorTenantID), nil
 }
 
@@ -523,21 +582,27 @@ func (store *adminTenantModelStore) Delete(_ context.Context, tenantID string) e
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	_, present := store.tenants[tenantID]
-	delete(store.tenants, tenantID)
-	// Record the tombstone whether or not the row was here. An operator deleting a tenant the control plane
-	// has already lost is the ghost case — the Edge still holds it, and this is the only way to say so.
-	if store.deleted == nil {
-		store.deleted = map[string]string{}
+	if _, tombstoned := store.deleted[tenantID]; !present && tombstoned {
+		return nil
 	}
-	if _, alreadyTombstoned := store.deleted[tenantID]; !present && alreadyTombstoned {
-		return nil // nothing changed: already gone and already carried. Do not churn the generation.
+	tenants := make(map[string]adminTenantModel, len(store.tenants))
+	for id, row := range store.tenants {
+		if id != tenantID {
+			tenants[id] = row
+		}
 	}
-	store.deleted[tenantID] = time.Now().UTC().Format(time.RFC3339)
-	// The registry changed, so the bundle that carries it is a new version. Bumped HERE rather than
-	// inside persistLocked, which returns early for a memory-only store — the counter must not depend
-	// on whether a durable path happens to be configured.
+	deleted := make(map[string]string, len(store.deleted)+1)
+	for id, at := range store.deleted {
+		deleted[id] = at
+	}
+	// Carry an explicit tombstone even when the local row was already absent.
+	deleted[tenantID] = time.Now().UTC().Format(time.RFC3339)
+	if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: tenants, Deleted: deleted, PurgeOrders: store.purgeOrders}); err != nil {
+		return err
+	}
+	store.tenants = tenants
+	store.deleted = deleted
 	store.generation.Add(1)
-	store.persistLocked()
 	return nil
 }
 
@@ -804,6 +869,14 @@ func adminTenantTimezone(ctx context.Context, store adminTenantModelRuntimeStore
 // and it did not.
 func adminTenantModelLifecycleAuditLogFor(r *http.Request, tenant adminTenantModel, action string, evaluator decision.Evaluator, now time.Time) model.AuditLog {
 	record := adminTenantModelLifecycleAuditLog(tenant, action, evaluator, now)
+	return stampAdminTenantModelAuditActor(record, r, tenant)
+}
+
+func adminTenantModelAuditLogFor(r *http.Request, tenant adminTenantModel, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+	return stampAdminTenantModelAuditActor(adminTenantModelAuditLog(tenant, evaluator, now), r, tenant)
+}
+
+func stampAdminTenantModelAuditActor(record model.AuditLog, r *http.Request, tenant adminTenantModel) model.AuditLog {
 	if identity, ok := adminIdentityFromRequest(r); ok {
 		// The actor goes in METADATA, not ActorUserID. The cross-tenant audit contract (CP0020) keeps raw
 		// class-2 identifiers — a person's user id, a raw subject, a session id — out of the control-plane

@@ -3,7 +3,9 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"github.com/lantern-networks/dsse-core/configversion"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 	steerexclusion "github.com/lantern-networks/dsse-core/steerexclusion"
 )
 
@@ -19,13 +22,25 @@ import (
 // reverse-telemetry view). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer) {
 	mux.HandleFunc("GET /admin/steer-exclusions", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.SteerExclusions == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steer exclusions are not enabled"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"steer_exclusions": config.SteerExclusions.List(adminTenantIDFromRequest(r))})
+		policies, err := config.SteerExclusions.ListChecked(adminTenantIDFromRequest(r))
+		if err != nil {
+			log.Printf("steer exclusion authority read failed: %v", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steering exclusion storage could not be verified; retry after restoring storage"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": steerexclusion.ListSchema, "tenant_id": adminTenantIDFromRequest(r), "steer_exclusions": policies})
 	}))
 	mux.HandleFunc("POST /admin/steer-exclusions", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// This Edge PULLS its exclusions from a control plane, so a write accepted here lives until the next
 		// poll and is then erased with no trace — the Console showed the rule created, and it was gone fifteen
 		// seconds later. Refusing with a 409 that names where to write instead is the difference between a
@@ -52,13 +67,17 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		p.TenantID = tenantForWrite
 		saved, err := config.SteerExclusions.Upsert(p, time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeSteerExclusionMutationError(w, r, config, evaluator, writer, "upsert", saved.ID, tenantForWrite, err)
 			return
 		}
-		recordConfigVersion(r, config.ConfigVersions, configversion.ResourceSteerExclusion, saved.ID, configversion.ActionUpsert, saved.Note, saved)
+		appendSteerExclusionMutationAudit(r, config, evaluator, writer, "upsert", saved.ID, tenantForWrite, nil)
+		recordConfigVersionForTenant(r, config.ConfigVersions, tenantForWrite, configversion.ResourceSteerExclusion, saved.ID, configversion.ActionUpsert, saved.Note, saved)
 		writeJSON(w, http.StatusOK, saved)
 	}))
 	mux.HandleFunc("DELETE /admin/steer-exclusions/{id}", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// This Edge PULLS its exclusions from a control plane, so a write accepted here lives until the next
 		// poll and is then erased with no trace — the Console showed the rule created, and it was gone fifteen
 		// seconds later. Refusing with a 409 that names where to write instead is the difference between a
@@ -73,14 +92,20 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		tenantID := adminTenantIDFromRequest(r)
 		id := r.PathValue("id")
 		before, hadBefore := config.SteerExclusions.Get(id, tenantID) // snapshot for the delete version (so a rollback can restore it)
-		if !config.SteerExclusions.Delete(id, tenantID, time.Now()) {
+		deleted, err := config.SteerExclusions.DeleteChecked(id, tenantID, time.Now())
+		if err != nil {
+			writeSteerExclusionMutationError(w, r, config, evaluator, writer, "delete", id, tenantID, err)
+			return
+		}
+		if !deleted {
 			writeError(w, http.StatusNotFound, fmt.Errorf("steer exclusion %s is absent", id))
 			return
 		}
+		appendSteerExclusionMutationAudit(r, config, evaluator, writer, "delete", id, tenantID, nil)
 		if hadBefore {
 			recordConfigVersion(r, config.ConfigVersions, configversion.ResourceSteerExclusion, id, configversion.ActionDelete, "deleted", before)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id})
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "id": id, "tenant_id": tenantID})
 	}))
 	// Config history + rollback (V-1): list every recorded version of a steer exclusion, and roll the
 	// resource back to a prior version (which re-applies that snapshot as a NEW version — auditable, reversible).
@@ -132,9 +157,10 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		snapshot.ID = id
 		saved, err := config.SteerExclusions.Upsert(snapshot, time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeSteerExclusionMutationError(w, r, config, evaluator, writer, "rollback", id, tenantID, err)
 			return
 		}
+		appendSteerExclusionMutationAudit(r, config, evaluator, writer, "rollback", id, tenantID, nil)
 		recordConfigVersion(r, config.ConfigVersions, configversion.ResourceSteerExclusion, id, configversion.ActionRollback,
 			fmt.Sprintf("rolled back to version %d", body.VersionNo), saved)
 		writeJSON(w, http.StatusOK, map[string]any{"rolled_back_to": body.VersionNo, "steer_exclusion": saved})
@@ -146,6 +172,9 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 	// is the forward preview: the admin-authored set the Edge WOULD serve a given device (layer 3 only), so an
 	// admin can check a policy's reach before the device next polls. Both are read-only and tenant-scoped.
 	mux.HandleFunc("GET /admin/steer-exclusions/observed", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if config.ObservedExclusions == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steer-exclusion telemetry is not enabled"))
 			return
@@ -182,6 +211,7 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			nextCursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(next)))
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
+			"tenant_id":      adminTenantIDFromRequest(r),
 			"observed":       res.Entries,
 			"total_estimate": res.Total,
 			"next_cursor":    nextCursor,
@@ -240,4 +270,35 @@ func registerSteerExclusionObservedRoutes(mux *http.ServeMux, adminEndpoint func
 	// Generic config-version API (S6): the control plane records + serves versions for ANY admin resource,
 	// so the zero-DB enforcing Edge can SHIP its admin changes (e.g. tenant-restriction) here for history +
 	// rollback. Available only where the durable store is wired (the control plane).
+}
+
+// Storage details stay server-side. An unconfirmed write may have reached durable
+// storage, so neither the UI nor the audit promises that a restart will undo it.
+var errSteerExclusionSave = errors.New("Saving could not be confirmed. This request kept the previous local state. Reload to review the current state and retry after storage is available.")
+
+func writeSteerExclusionMutationError(w http.ResponseWriter, r *http.Request, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, action, id, tenantID string, err error) {
+	switch {
+	case errors.Is(err, steerexclusion.ErrTenantConflict):
+		writeError(w, http.StatusForbidden, steerexclusion.ErrTenantConflict)
+	case errors.Is(err, steerexclusion.ErrPersistence):
+		log.Printf("steer exclusion %s %q: %v", action, id, err)
+		appendSteerExclusionMutationAudit(r, config, evaluator, writer, action, id, tenantID, err)
+		writeError(w, http.StatusInternalServerError, errSteerExclusionSave)
+	default:
+		writeError(w, http.StatusBadRequest, err)
+	}
+}
+
+func appendSteerExclusionMutationAudit(r *http.Request, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, operation, id, tenantID string, saveErr error) {
+	now := time.Now().UTC()
+	target, action, result := "steer_exclusion", "steer_exclusion_"+operation, "success"
+	reason := "Steering exclusion change accepted."
+	metadata := map[string]any{"applied_locally": true}
+	if saveErr != nil {
+		result, reason = "failed", errSteerExclusionSave.Error()
+		metadata["applied_locally"], metadata["persistence_error"] = false, true
+	}
+	sourceIP := sourceIPFromRequest(r)
+	record := model.AuditLog{ID: randomEdgeID("audit_", now), TenantID: tenantID, ActorUserID: auditActorPrincipal(r), EventType: "steer_exclusion_updated", TargetType: &target, TargetID: &id, Action: &action, Result: &result, Reason: &reason, EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID, SourceIP: &sourceIP, Timestamp: now.Format(time.RFC3339), Metadata: metadata}
+	_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, record, now)
 }

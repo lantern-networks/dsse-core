@@ -38,7 +38,7 @@ func TestFingerprintExactMatch(t *testing.T) {
 
 func TestFingerprintStoresHashesOnly(t *testing.T) {
 	fp := NewFingerprint("secret_ds", "salt", []string{"TOPSECRETVALUE123"})
-	// The raw value must not be recoverable — only salted hashes are held.
+	// The serialized representation contains hashes rather than raw values.
 	for _, h := range fp.Hashes() {
 		if h == "TOPSECRETVALUE123" || len(h) != 64 {
 			t.Fatalf("fingerprint leaked a raw value or wrong hash length: %q", h)
@@ -128,5 +128,32 @@ func TestFingerprintSetSubset(t *testing.T) {
 	}
 	if !set.Subset(nil).Empty() {
 		t.Fatal("Subset(nil) must be empty")
+	}
+}
+
+func TestFingerprintInputValidationMatchesScannerTokens(t *testing.T) {
+	for _, value := range []string{"CUST-100482", " cust100482 ", "user+tag@example.invalid", strings.Repeat("Z", 128)} {
+		if err := ValidateFingerprintValues([]string{value}); err != nil {
+			t.Fatal(err)
+		}
+		fp := NewFingerprint("record_id", "salt", []string{value})
+		found := false
+		for _, f := range DetectWithOptions([]byte(value), "text/plain", Options{Fingerprints: NewFingerprintSet([]*Fingerprint{fp})}) {
+			if f.Type == "record_id" && f.Count == 1 {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("accepted value cannot be scanned")
+		}
+	}
+	for _, value := range []string{"private two words", "private/slash", strings.Repeat("Z", 129), "private\tvalue", "café-value"} {
+		err := ValidateFingerprintValues([]string{"CUST-100482", value})
+		if err == nil || strings.Contains(err.Error(), value) || !strings.Contains(err.Error(), "value 2") {
+			t.Fatalf("invalid input leaked or accepted: %v", err)
+		}
+	}
+	if err := ValidateFingerprintValues([]string{"AB", "12-34"}); err != nil {
+		t.Fatal("legacy short-value ignore changed")
 	}
 }

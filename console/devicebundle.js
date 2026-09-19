@@ -71,10 +71,8 @@ function zipStored(entries) {
   return new Blob(chunks, { type: "application/zip" });
 }
 
-// dbFetchInstaller returns the published installer's bytes for one target, or null when this deployment has
-// published none for it. A deployment that has published nothing is a real state — it is what every
-// deployment looks like before its first release — and the bundle says so rather than shipping three files
-// under a name that promises four.
+// A 404 permits an installer-free bundle. Other failures must be resolved before minting a token.
+// The artifact endpoint can also return 404 for a missing published file, so do not assert "unpublished".
 async function dbFetchInstaller(platform, arch) {
   const base = baseForPlane(_PROFILE_PLANE);
   const token = localStorage.getItem("adminToken") || "";
@@ -85,14 +83,13 @@ async function dbFetchInstaller(platform, arch) {
   if (operateTenant) headers["x-operate-tenant"] = operateTenant;
   const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
     "&arch=" + encodeURIComponent(arch);
-  try {
-    const res = await fetch(base + path, { headers, credentials: "include" });
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
-    return new Uint8Array(buf);
-  } catch (e) {
-    return null;
-  }
+  const res = await fetch(base + path, { headers, credentials: "include", redirect: "error" });
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error(bl({ en: "Installer download failed (HTTP " + res.status + ").",
+    ja: "インストーラを取得できませんでした（HTTP " + res.status + "）。" }));
+  const buf = await res.arrayBuffer();
+  if (!buf.byteLength) throw new Error(bl({ en: "The installer download was empty.", ja: "取得したインストーラが空です。" }));
+  return new Uint8Array(buf);
 }
 
 // dbReadme is what the person opening the archive reads. It names the one act they perform and the one file
@@ -110,7 +107,7 @@ function dbReadme(hasInstaller, installerName) {
       // owner, not the operator; they cannot publish a release, and until somebody does there is nothing on
       // that screen for them to take. Being pointed at an empty page is worse than being told to ask, because
       // it looks like their mistake.
-      : "1. This deployment has not published an installer for this platform, so it is not in this folder",
+      : "1. This deployment could not provide an installer for this platform, so it is not in this folder",
     hasInstaller ? "" : "   and cannot be fetched from here. Ask whoever gave you this folder for the",
     hasInstaller ? "" : "   installer, put it in THIS folder, and open it.",
     "",
@@ -130,6 +127,7 @@ function dbReadme(hasInstaller, installerName) {
 
 // downloadDeviceBundle mints one approval and hands over the whole set as a single archive.
 async function downloadDeviceBundle(envelope, group, platform, arch, button) {
+  if (button.__bundlePending) return;
   const enc = new TextEncoder();
   const key = profileSigningKeyOf(envelope);
   if (!key) {
@@ -138,98 +136,71 @@ async function downloadDeviceBundle(envelope, group, platform, arch, button) {
                  ja: "この配備は署名鍵を公開していないため、この一式では端末が設定を検証できません。" }), "err");
     return;
   }
-  // ★ A BUTTON THAT FAILS MUST STOP SAYING IT IS WORKING (2026-09-06). Both early returns below reported the
-  // failure in a toast and left the label reading "Preparing…", which outlives the toast: the screen then said
-  // the download was still coming, forever, and the operator's next act was to wait. Only the catch restored
-  // the label, so the two failures the server can actually give were the two that lied.
-  const was = button.textContent;
+  const retryLabel = bl({ en: "Download everything for one device", ja: "端末1台ぶんを一式でダウンロード" });
+  let issuancePending = false;
+  button.__bundlePending = true;
   button.disabled = true;
   button.textContent = bl({ en: "Preparing…", ja: "準備中…" });
   try {
-    // ★ THE APPROVAL IS MINTED LAST-BUT-ONE AND ONLY ONCE. It is spent by the first machine that uses it, so
-    // a failure after this point costs the operator an approval — which is why the archive is assembled
-    // immediately after and nothing between them can fail on the network.
+    // Resolve the artifact before creating a credential. Only 404 permits a bundle without an installer.
+    const installer = await dbFetchInstaller(platform, arch);
+    issuancePending = true;
     const r = await apiFetch("POST", "/admin/enrolment-tokens", {
       label: group ? group : bl({ en: "Device configuration", ja: "端末の設定" }),
       group, expires_in_hours: 168, count: 1,
     }, _PROFILE_PLANE);
-    if (!r.ok) {
-      uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err");
-      button.textContent = was;
+    issuancePending = false;
+    if (r.status === 409 && r.body && r.body.partial === true &&
+        Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
+      showEnrolTokenOnce({ ...r.body, requested_count: 1 });
+    }
+    if (!r.ok || !enrolTokenCompleteBody(r.body, 1)) {
+      const uncertain = r.ok || r.status >= 500 || (r.body && r.body.partial === true);
+      uiToast(uncertain ? enrolTokenResponseWarning() :
+        (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err");
+      button.textContent = retryLabel;
       return;
     }
-    const secret = r.body && (r.body.secret || (r.body.tokens && r.body.tokens[0] && r.body.tokens[0].secret));
-    const tokenId = r.body && r.body.tokens && r.body.tokens[0] && r.body.tokens[0].token &&
-      r.body.tokens[0].token.id;
-    if (!secret) {
-      uiToast(bl({ en: "The approval came back without a token, so this bundle would enrol nothing.",
-                   ja: "承認がトークンを返さなかったため、この一式では登録できません。" }), "err");
-      button.textContent = was;
-      return;
-    }
-    const installer = await dbFetchInstaller(platform, arch);
+    const row = r.body.tokens[0];
+    const secret = row.secret;
+    // Keep the returned credential reachable even if ZIP construction or the browser download fails.
+    bundleApprovalFallback(button, secret, row.token.id);
     const installerName = "dsse-agent-" + platform + "-" + arch + (platform === "windows" ? ".msi" : ".pkg");
     const entries = [
       { name: "install_profile.json", bytes: enc.encode(JSON.stringify(envelope, null, 2) + "\n") },
       { name: "profile_signing_key.txt", bytes: enc.encode(key + "\n") },
-      { name: "enrolment_token.txt", bytes: enc.encode(String(secret) + "\n") },
+      { name: "enrolment_token.txt", bytes: enc.encode(secret + "\n") },
       { name: "README.txt", bytes: enc.encode(dbReadme(!!installer, installerName)) },
     ];
     if (installer) entries.unshift({ name: installerName, bytes: installer });
     const blob = zipStored(entries);
     const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "dsse-device-setup-" + platform + "-" + arch + ".zip";
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    try {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "dsse-device-setup-" + platform + "-" + arch + ".zip";
+      document.body.appendChild(a);
+      try { a.click(); } finally { a.remove(); }
+    } finally { setTimeout(() => URL.revokeObjectURL(url), 10000); }
     if (!installer) {
-      // Said out loud rather than left for the person to discover an archive with three files in it.
-      // ★ AND THE OPERATOR IS THE ONE WHO CAN FIX IT. This used to end "the README says where to get the
-      // installer" — while the README said "get it from the Console", which is this screen, which has
-      // nothing. Both ends of the chain pointed at each other. The recipient cannot publish a release; the
-      // person reading this toast can.
-      uiToast(bl({ en: "This deployment has published no installer for that platform, so the bundle carries "
+      uiToast(bl({ en: "This deployment could not provide an installer for that platform, so the bundle carries "
                        + "only the configuration, the key and the approval. Put the installer in the folder "
-                       + "before you hand it over — or publish one on Agent Releases, and every bundle after "
-                       + "that carries it.",
-                   ja: "この配備はそのプラットフォーム向けのインストーラを公開していないため、設定・鍵・承認だけが"
-                       + "入っています。渡す前にインストーラをフォルダに入れてください。あるいは Agent Releases で"
-                       + "公開すれば、以後の一式には自動で入ります。" }), "warn");
+                       + "before you hand it over, or check Agent Releases.",
+                   ja: "この配備からその機械用のインストーラを取得できないため、設定・鍵・承認だけが入っています。"
+                       + "渡す前にインストーラをフォルダに入れるか、Agent Releasesを確認してください。" }), "warn");
     }
-    // ★★★ "SPENT" WAS NOT TRUE, AND ANOTHER SCREEN SAID SO (2026-09-06). The approval is minted, unused and
-    // live for seven days; Enrolment Tokens — four items down the same nav — calls that same row "Waiting for
-    // device". One object, two screens, opposite words. "Spent" is defensible from this button's vantage (you
-    // cannot get this one again from here) and it is not how it is read: an operator reads "nothing is
-    // outstanding", closes the tab, and a live one-time credential stays on the organization's books with no
-    // screen prompting anyone to look. That is not hypothetical — it is why a row on that screen this morning
-    // could not be told from a stranded one without reconstructing which button had minted it.
     button.textContent = bl({ en: "Downloaded — one approval is now waiting for a device",
                               ja: "ダウンロード済み — 承認が1件、端末を待っています" });
-    // ★★★ AND THE APPROVAL IS SPENT WHETHER OR NOT THE FILE ARRIVED (2026-09-06, measured on two machines:
-    // a browser refused to save the archive — silently on one, from the first attempt on the other — and the
-    // screen said "Downloaded" both times).
-    //
-    // A page cannot learn whether a download was saved: the bytes leave through the browser and nothing comes
-    // back. The mint, however, has already happened — it must, because the approval is IN the archive — so a
-    // browser that drops the file leaves a valid one-time credential minted, outstanding, and held by nobody.
-    // That is worse than the waste: it is an approval on this organization's books that no machine will ever
-    // present, and no screen said it existed.
-    //
-    // So the two acts that answer it are offered here, on the spot, instead of being left for the operator to
-    // work out: take the approval by hand, or take it back. Neither is discoverable from a button that only
-    // says "Downloaded".
-    bundleApprovalFallback(button, secret, tokenId);
   } catch (e) {
-    uiToast(String(e), "err");
-    button.textContent = was;
+    uiToast(issuancePending ? enrolTokenResponseWarning() : String(e), "err");
+    button.textContent = retryLabel;
   } finally {
+    button.__bundlePending = false;
     button.disabled = false;
   }
 }
 
-// bundleApprovalFallback puts the spent approval within reach of the person who just spent it. Rendered once,
-// beneath the button, and replaced if the button is pressed again.
+// Keep the returned approval available independently of the archive download.
 function bundleApprovalFallback(button, secret, tokenId) {
   const host = button.parentNode;
   if (!host) return;
@@ -238,10 +209,10 @@ function bundleApprovalFallback(button, secret, tokenId) {
   const wrap = el("div", { style: "margin-top:8px" });
   wrap.setAttribute("data-bundle-approval", "1");
   wrap.appendChild(el("div", { class: "ui-view-desc", text: bl({
-    en: "If no file was saved, the browser refused it — the approval was still made, and it is waiting for a "
+    en: "Even if no file was saved, the approval was made, and it is waiting for a "
       + "device either way. Take it by hand, or take it back so nothing is left waiting for a machine that "
       + "will never come. It is listed on Enrolment Tokens until one of those happens.",
-    ja: "ファイルが保存されなかった場合は、ブラウザが拒否しています。それでも承認は作られており、どちらにせよ端末を"
+    ja: "ファイルが保存されなかった場合も承認は作られており、端末を"
       + "待ち続けます。手で受け取るか、来ない端末を待たせないよう取り消してください。どちらかを行うまで、"
       + "参加トークンの画面に残ります。" }) }));
   const show = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Show the approval", ja: "承認を表示" }) });
@@ -255,17 +226,38 @@ function bundleApprovalFallback(button, secret, tokenId) {
     show.disabled = true;
   });
   revoke.addEventListener("click", async () => {
+    if (revoke.disabled) return;
     if (!tokenId) { uiToast(bl({ en: "This approval came back without an id, so it cannot be taken back from "
                                     + "here — Enrolment Tokens lists it.",
                                  ja: "この承認にはIDが無いため、ここからは取り消せません。参加トークンの画面に" +
                                      "一覧があります。" }), "err"); return; }
     revoke.disabled = true;
-    const r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(tokenId) + "/revoke", {});
-    if (!r.ok) { revoke.disabled = false; uiToast((r.body && r.body.error) || ("HTTP " + r.status), "err"); return; }
-    wrap.textContent = "";
-    wrap.appendChild(el("div", { class: "ui-view-desc", text: bl({
-      en: "Taken back. Nothing can enrol with it, and nothing is left outstanding.",
-      ja: "取り消しました。これで登録できるものはなく、未使用のまま残ることもありません。" }) }));
+    try {
+      const r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(tokenId) + "/revoke", {}, _PROFILE_PLANE);
+      if (!r.ok) { uiToast((r.body && r.body.error) || ("HTTP " + r.status), "err"); return; }
+      const token = r.body && r.body.token;
+      if (!token || token.id !== tokenId || typeof token.revoked_at !== "string" || !token.revoked_at ||
+          (token.used_at && (typeof r.body.note !== "string" || !r.body.note))) {
+        uiToast(bl({ en: "Revocation could not be confirmed. Reload Enrolment Tokens to check its state.",
+          ja: "取消結果を確認できません。登録トークンの一覧を再読込して状態を確認してください。" }), "err");
+        return;
+      }
+      if (!button.__bundlePending && host.querySelector("[data-bundle-approval]") === wrap) {
+        button.textContent = bl({ en: "Download everything for one device", ja: "端末1台ぶんを一式でダウンロード" });
+      }
+      wrap.textContent = "";
+      if (r.body && r.body.note) {
+        wrap.appendChild(el("div", { class: "ui-callout ui-callout-warn", role: "alert", text: r.body.note }));
+        return;
+      }
+      wrap.appendChild(el("div", { class: "ui-view-desc", text: bl({
+        en: "Taken back. Nothing can enrol with it, and nothing is left outstanding.",
+        ja: "取り消しました。これで登録できるものはなく、未使用のまま残ることもありません。" }) }));
+    } catch (e) {
+      uiToast(String(e), "err");
+    } finally {
+      revoke.disabled = false;
+    }
   });
   wrap.appendChild(el("div", { style: "display:flex; gap:8px; margin-top:6px" }, [show, revoke]));
   wrap.appendChild(shown);

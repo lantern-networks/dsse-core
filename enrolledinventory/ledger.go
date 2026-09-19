@@ -1070,6 +1070,10 @@ func (l *Ledger) SetEnabled(id string, enabled bool, now string) (Entry, bool) {
 // setEnabled is the write, returning WHY it refused rather than leaving that on the receiver for somebody to
 // read later under a different lock.
 func (l *Ledger) setEnabled(id string, enabled bool, now string) (Entry, bool, error) {
+	return l.setEnabledForTenant(id, "", enabled, now)
+}
+
+func (l *Ledger) setEnabledForTenant(id, tenant string, enabled bool, now string) (Entry, bool, error) {
 	k := NormalizeIdentity(id)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1077,7 +1081,7 @@ func (l *Ledger) setEnabled(id string, enabled bool, now string) (Entry, bool, e
 	// ★ A TOMBSTONE IS NOT A DEVICE TO RE-ENABLE. Removal is deliberate, and the way back is enrolling again
 	// — which is its own decision, with its own credential and its own record. Letting "enable" resurrect a
 	// removal would make the tombstone a suggestion.
-	if !ok || e.isTombstone() {
+	if !ok || e.isTombstone() || (strings.TrimSpace(tenant) != "" && !strings.EqualFold(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenant))) {
 		return Entry{}, false, nil
 	}
 	before := e

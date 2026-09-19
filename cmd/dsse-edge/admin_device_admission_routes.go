@@ -349,14 +349,16 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		reason := valueOrDefault(strings.TrimSpace(req.Reason), "admin_kill_switch")
-		saveErr := config.AdmissionRevocations.RevokeChecked(req.Identity, reason)
+		applied, saveErr := config.AdmissionRevocations.RevokeCheckedContext(r.Context(), req.Identity, reason)
 		// The ONE place allowed to tear down established (T) sessions: an explicit administrator block. Every
 		// other revocation path (CP feed, mesh, node-reported automatic) only denies NEW handshakes. See the
 		// invariant on transportConns where the registry is created.
-		if config.TransportConnRegistry != nil {
+		if applied && config.TransportConnRegistry != nil {
 			config.TransportConnRegistry.logCloseIdentity(req.Identity, reason)
 		}
-		logInfof("transport_admission_revoked_by_admin identity=%q reason=%q", req.Identity, reason)
+		if applied {
+			logInfof("transport_admission_revoked_by_admin identity=%q reason=%q", req.Identity, reason)
+		}
 		tenantID := adminTenantIDFromRequest(r)
 		if config.EnrolledLedger != nil {
 			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
@@ -365,13 +367,20 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		record := transportAdmissionAuditLog(r, tenantID, "revoke", req.Identity, reason, evaluator, time.Now().UTC())
 		if saveErr != nil {
-			record.Result = stringPtr("partial")
-			record.Metadata["applied_locally"] = true
+			record.Result = stringPtr("error")
+			if applied {
+				record.Result = stringPtr("partial")
+			}
+			record.Metadata["applied_locally"] = applied
 			record.Metadata["persistence_confirmed"] = false
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		if saveErr != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device blocked locally, but saving was not confirmed; repair storage and retry the block before restarting"))
+			if applied {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device blocked locally, but saving was not confirmed; repair storage and retry the block before restarting"))
+			} else {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device block was not applied because shared storage or write authority was unavailable; reload before retrying"))
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "tenant_id": adminTenantIDFromRequest(r), "identity": strings.TrimSpace(req.Identity), "reason": reason})
@@ -408,7 +417,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				return
 			}
 		}
-		saveErr := config.AdmissionRevocations.RestoreChecked(req.Identity)
+		saveErr := config.AdmissionRevocations.RestoreCheckedContext(r.Context(), req.Identity)
 		// Restore removes only the locally authored block. A peer or pulled block can
 		// still deny admission. This is a current local observation, not a fleet ACK.
 		_, transportRevoked := config.AdmissionRevocations.IsRevoked(req.Identity)

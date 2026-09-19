@@ -66,7 +66,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 				tenantID = entry.TenantID
 			}
 		}
-		warning, err := config.HighRiskOverlay.SetDeviceRisk(entityID, sig.Severity)
+		warning, err := config.HighRiskOverlay.SetDeviceRiskContext(r.Context(), entityID, sig.Severity)
 		if err != nil {
 			now := time.Now().UTC()
 			failure := deviceRiskAuditLog(r, tenantID, adminRiskSignalResponse{EntityType: "device", EntityID: entityID, Severity: strings.ToLower(strings.TrimSpace(sig.Severity))}, evaluator, now)

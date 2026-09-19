@@ -31,7 +31,7 @@ func adminSetEnrolledDeviceEnabled(w http.ResponseWriter, r *http.Request, ledge
 	// review). This used to take a best-effort write: an operator disabling a compromised device got 200 and a
 	// success audit record whether or not the change was recorded, and the next restart readmitted the machine
 	// with an audit trail saying it had been revoked.
-	entry, serr := ledger.SetEnabledChecked(identity, enabled, time.Now().UTC().Format(time.RFC3339))
+	entry, serr := ledger.SetEnabledContext(r.Context(), identity, adminTenantIDFromRequest(r), enabled, time.Now().UTC().Format(time.RFC3339))
 	if errors.Is(serr, enrolledinventory.ErrIdentityNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 		return

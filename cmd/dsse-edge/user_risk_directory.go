@@ -110,7 +110,7 @@ func writeUserRisk(w http.ResponseWriter, r *http.Request, config serverConfig, 
 	resp.TenantID = person.TenantID
 	mark := directoryRiskMark(person)
 	mark.Severity = resp.Severity
-	warning, err := config.HighRiskOverlay.SetUserRisk(mark)
+	warning, err := config.HighRiskOverlay.SetUserRiskContext(r.Context(), mark)
 	if err != nil {
 		writeError(w, 503, fmt.Errorf("user risk save was not confirmed; the live risk state was not changed"))
 		return resp, "", false

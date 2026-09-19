@@ -91,3 +91,44 @@ func TestConcurrentHaltAndVersionSelection(t *testing.T) {
 		}
 	}
 }
+
+func TestReleaseChannelIntentContractAcrossRestart(t *testing.T) {
+	for _, tc := range []struct{ name, intent, channel, want string }{
+		{"version-unrestricted", "rollout", "", ""}, {"version-channel", "rollout", "beta", "beta"},
+		{"rollback-unrestricted", "rollback", "", ""}, {"follow", "follow", "", ""},
+		{"schedule", "schedule", "", "stable"}, {"freeze", "freeze", "", "stable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "plans.json")
+			s := NewAgentRolloutStore()
+			if err := s.LoadFrom(path); err != nil {
+				t.Fatal(err)
+			}
+			before := AgentRolloutPlan{DesiredVersion: "2.0.0", ReleaseChannel: "stable", Frozen: true, Reason: "incident hold"}
+			if err := s.Set("own", before); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Set("other", before); err != nil {
+				t.Fatal(err)
+			}
+			in := AgentRolloutPlan{Intent: tc.intent, DesiredVersion: "3.0.0", ReleaseChannel: tc.channel, Frozen: true, Reason: "incident hold"}
+			if tc.intent == "freeze" {
+				in.DesiredVersion = ""
+			}
+			got, err := s.Apply("own", in, time.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.ReleaseChannel != tc.want || !got.Frozen || got.Reason != before.Reason {
+				t.Fatal("intent violated channel or hold contract")
+			}
+			restored := NewAgentRolloutStore()
+			if err := restored.LoadFrom(path); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(restored.Get("own"), got) || !reflect.DeepEqual(restored.Get("other"), before) {
+				t.Fatal("restart or tenant isolation failed")
+			}
+		})
+	}
+}

@@ -425,6 +425,7 @@ async function renderSiteList(host) {
         el("td", {}, availabilityBadge(c)),
         el("td", { text: c.last_heartbeat_at || bl({ en: "never", ja: "なし" }) }),
         el("td", { class: "ui-row-actions" }, [
+          el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Details", ja: "詳細" }), onClick: () => showConnectorDetail(id, c) }),
           el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Rename", ja: "名前変更" }), onClick: () => renameConnector(id, c.name, host) }),
           el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "削除" }), onClick: () => removeConnector(id, c.name || id, host) }),
         ]),

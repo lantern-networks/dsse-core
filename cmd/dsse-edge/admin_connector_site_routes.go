@@ -176,6 +176,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		result, found, err := adminConnectorRotateRuntimeSecret(r.Context(), registry, adminTenantIDFromRequest(r), r.PathValue("connector_id"), request, now, connectorTunnelStatus)
 		if err != nil {
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector secret change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

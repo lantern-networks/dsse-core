@@ -263,17 +263,44 @@ function connFormatUptime(seconds) {
   return parts.join(" ");
 }
 
+const connectorRotationsPending = new Set();
+function connectorRotationUnconfirmed() {
+  return bl({ en: "The connector secret change could not be confirmed. Reload before retrying.",
+    ja: "コネクタのシークレット更新を確認できませんでした。再読込してから再操作してください。" });
+}
+
 async function rotateConnector(id, host) {
-  const ok = await uiConfirm({
-    title: bl({ en: "Rotate this connector's secret?", ja: "このコネクタのシークレットを更新しますか?" }),
-    body: bl({ en: "Issues a new secret for \"" + id + "\". The connector must pick up the new secret to keep connecting.", ja: "「" + id + "」に新しいシークレットを発行します。接続を維持するにはコネクタ側で新しいシークレットを取り込む必要があります。" }),
-    confirmLabel: bl({ en: "Rotate", ja: "更新" }), danger: true,
-  });
-  if (!ok) return;
+  if (connectorRotationsPending.has(id)) return;
+  connectorRotationsPending.add(id);
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const authority = () => baseForPlane("control");
+  const credential = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = [selection(), session(), authority(), credential()];
+  const current = () => [selection(), session(), authority(), credential()].every((value, i) => value === initial[i]);
   try {
+    const ok = await uiConfirm({
+      title: bl({ en: "Rotate this connector's secret?", ja: "このコネクタのシークレットを更新しますか?" }),
+      body: bl({ en: "Issues a new secret for \"" + id + "\". The connector must pick up the new secret to keep connecting.", ja: "「" + id + "」に新しいシークレットを発行します。接続を維持するにはコネクタ側で新しいシークレットを取り込む必要があります。" }),
+      confirmLabel: bl({ en: "Rotate", ja: "更新" }), danger: true,
+    });
+    if (!ok || !current()) return;
     const r = await apiFetch("POST", "/admin/connectors/" + encodeURIComponent(id) + "/runtime-secret/rotate", {});
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Secret rotated.", ja: "シークレットを更新しました。" }), "ok");
-    if (host && typeof renderConnList === "function") renderConnList(host); // no list to refresh when called from the detail modal
-  } catch (e) { uiToast(String(e), "err"); }
+    if (!current()) return;
+    const body = r && r.body;
+    if (!r || !r.ok || r.status !== 200 || !body || !body.connector || body.connector.id !== id ||
+        typeof body.runtime_secret !== "string" || !body.runtime_secret.trim()) {
+      uiToast(connectorRotationUnconfirmed(), "err"); return;
+    }
+    const modal = uiModal({
+      title: bl({ en: "Connector secret updated", ja: "コネクタのシークレットを更新しました" }),
+      body: [el("p", { text: id }), el("p", { class: "ui-view-desc", text: bl({
+        en: "Copy this secret now and configure it on the connector. It cannot be retrieved again.",
+        ja: "このシークレットを今コピーし、コネクタに設定してください。再取得はできません。" }) }),
+        el("div", { class: "ui-preview", text: body.runtime_secret })],
+      footer: [el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Done", ja: "完了" }), onClick: () => modal.close() })],
+    });
+    if (host && typeof renderConnList === "function") renderConnList(host);
+  } catch (e) { if (current()) uiToast(connectorRotationUnconfirmed(), "err"); }
+  finally { connectorRotationsPending.delete(id); }
 }

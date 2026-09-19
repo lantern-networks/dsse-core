@@ -8581,6 +8581,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		rotatedBy := adminPrincipalIDFromRequest(r)
 		conn, ok, err := registry.RotateRuntimeSecretHashForTenantWithMetadata(adminTenantIDFromRequest(r), connectorID, connectorRuntimeSecretHash(runtimeSecret), now, rotatedBy)
 		if err != nil {
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector secret change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

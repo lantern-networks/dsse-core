@@ -1271,6 +1271,25 @@ when it registers again. Stop or decommission it separately when permanent remov
 is intended.
 
 
+### Rotating a connector runtime secret
+
+In Sites, choose **Details** on a connector row, then **Rotate secret**. After a
+confirmed save, copy the new secret from the result dialog and configure it on
+that connector. The secret is shown once and cannot be retrieved later. Rotation
+changes the server's accepted credential; it does not automatically configure or
+restart the connector.
+
+With file-backed registry persistence, a failed rotation returns a
+service-unavailable response without a new secret or a success domain event.
+The running registry keeps its previous credential. Reload before retrying:
+a storage error may occur after bytes were written, so it does not prove that the
+on-disk credential is unchanged. A lost response may also follow a completed
+rotation. Keep the connector's configuration and the server's credential aligned
+before expecting it to reconnect. Successful audit records contain the actor,
+connector and rotation time, not the raw secret. This save check does not make
+registry persistence and audit delivery one transaction.
+
+
 ### Licence and seat-allocation saves
 
 When persistence is configured, applying a licence or changing an allocation waits

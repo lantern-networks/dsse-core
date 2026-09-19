@@ -270,8 +270,9 @@ and [macOS WKWebView window](../clients/macos-network-extension/Sources/DsseAgen
 The Incoming Connections service picker selects one **TCP port**, using the
 catalogue name as a label. For a service with several TCP ports, choose one port
 per exception. UDP services are not offered because the current Windows export
-cannot represent them. Existing API-authored non-TCP conditions are not covered
-by this Console workflow; do not use them as evidence of Windows enforcement.
+cannot represent them. Non-TCP conditions are rejected by the exception API. Existing incompatible
+records must be disabled, deleted, or changed to a supported condition before
+a managed incoming policy can be exported.
 
 Editing an existing exception keeps its current service condition unless you
 explicitly choose another one. Reselect a catalogue service to replace an older
@@ -283,3 +284,28 @@ midnight UTC for that date. Disabled and expired exceptions are excluded from ex
 Operator API users can target an authorized customer in a POST body. DELETE uses
 the current tenant context: enter that customer's context before deleting its
 exception. The domain audit belongs to the target customer and identifies the operator.
+
+The exception POST API preserves omitted fields on an existing ID, including
+source, device group, transport/port, disabled status, approval/session settings,
+and expiry. Explicit empty strings, zero, or false change those fields; `null`
+is rejected. New records require an ID, business owner and RFC3339 expiry.
+Validation and persistence complete before a change is reported as saved.
+
+The current `server_initiated_export.v1` consumer supports TCP family mappings
+and an explicit unconstrained service. It cannot enforce approval requirements
+or per-session lifetime limits. Active exceptions with those conditions, an
+unsupported transport/family, an invalid port, or a port without a transport are
+rejected on write. Disabled records can retain approval/session settings, but
+must be made representable before activation. This does not add UDP support.
+
+Both administrator and device export endpoints refuse the **entire managed
+policy** with HTTP 503 when an active stored record has an invalid expiry,
+unknown mode/status, or unsupported condition. They do not silently omit a deny
+while exporting a wider allow. Disabled and validly expired records are omitted.
+Correct the reported exception and verify a successful fetch. The Windows
+Defender Firewall poller keeps its last applied rules after a fetch error, so
+an export refusal is **not** proof of a new restriction or timely removal of an
+old allow. Check the endpoint's fetch logs and actual firewall state. Deliberately
+switching to **Allow by default** returns an empty withdrawal document even when
+incompatible records remain; it stops DSSE management rather than claiming those
+exceptions were applied.

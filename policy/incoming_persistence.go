@@ -1,6 +1,7 @@
 package policy
 
 import (
+	"fmt"
 	"github.com/lantern-networks/dsse-core/model"
 	"log"
 	"strings"
@@ -30,25 +31,47 @@ func (store *Store) SetServerInitiatedEnabledConfirmed(tenantID string, enabled 
 }
 
 func (store *Store) UpsertLegacyExceptionConfirmed(tenantID string, ex model.LegacyException) error {
+	_, err := store.MutateLegacyExceptionConfirmed(tenantID, ex.ID, func(model.LegacyException) (model.LegacyException, error) { return ex, nil })
+	return err
+}
+
+// MutateLegacyExceptionConfirmed merges against the current record under the same
+// lock used to persist it. Concurrent partial edits cannot erase each other's fields.
+// The callback must not call back into the store.
+func (store *Store) MutateLegacyExceptionConfirmed(tenantID, id string, mutate func(model.LegacyException) (model.LegacyException, error)) (model.LegacyException, error) {
 	if store == nil {
-		return ErrPolicyPersistence
+		return model.LegacyException{}, ErrPolicyPersistence
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	tenantID = strings.TrimSpace(tenantID)
 	list := append([]model.LegacyException(nil), store.legacyExceptions[tenantID]...)
-	replaced := false
+	index := -1
+	current := model.LegacyException{ID: id, TenantID: tenantID, Status: "active"}
 	for i := range list {
-		if list[i].ID == ex.ID {
-			list[i] = ex
-			replaced = true
+		if list[i].ID == id {
+			index = i
+			current = list[i]
 			break
 		}
 	}
-	if !replaced {
-		list = append(list, ex)
+	candidate, err := mutate(current)
+	if err != nil {
+		return model.LegacyException{}, err
 	}
-	return store.saveIncomingExceptionsLocked(tenantID, list)
+	if candidate.ID != id {
+		return model.LegacyException{}, fmt.Errorf("exception identity cannot change during update")
+	}
+	candidate.TenantID = tenantID
+	if index < 0 {
+		list = append(list, candidate)
+	} else {
+		list[index] = candidate
+	}
+	if err := store.saveIncomingExceptionsLocked(tenantID, list); err != nil {
+		return model.LegacyException{}, err
+	}
+	return candidate, nil
 }
 
 func (store *Store) RemoveLegacyExceptionConfirmed(tenantID, id string) (bool, error) {

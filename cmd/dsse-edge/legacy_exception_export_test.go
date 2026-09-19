@@ -17,7 +17,10 @@ func TestBuildServerInitiatedExport(t *testing.T) {
 		{ID: "c", BusinessOwner: "o", ExpiresAt: fut, SourceServer: "rmm", Mode: "warn", Status: "disabled"}, // disabled -> skip
 		{ID: "d", BusinessOwner: "o", ExpiresAt: fut, SourceServer: "mon", ServiceFamily: "ssh", Mode: "deny", Status: "active"},
 	}
-	exp := buildServerInitiatedExport(exs, now)
+	exp, err := buildServerInitiatedExport(exs, now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if exp.DefaultAction != "deny" {
 		t.Fatalf("default action should be deny")
 	}
@@ -33,7 +36,10 @@ func TestBuildServerInitiatedExport(t *testing.T) {
 }
 
 func TestTCPIncomingExportKeepsPortWithoutFamily(t *testing.T) {
-	exp := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp", Status: "active", Mode: "allow", Protocol: "tcp", Port: 22}}, time.Now())
+	exp, err := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339), Status: "active", Mode: "allow", Protocol: "tcp", Port: 22}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(exp.Rules) != 1 || exp.Rules[0].ServiceFamily != "tcp" || exp.Rules[0].Port != 22 {
 		t.Fatalf("TCP port broadened by export: %+v", exp)
 	}

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -214,38 +215,42 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy exceptions") {
 			return
 		}
-		// register/update a Legacy Exception (explicit governed allow for a server-initiated flow).
-		var ex model.LegacyException
-		if err := json.NewDecoder(r.Body).Decode(&ex); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		var patch map[string]json.RawMessage
+		if err := decodeLimitedJSONBody(w, r, &patch, maxEdgeRuntimeJSONBodyBytes); err != nil || patch == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid incoming exception object"))
 			return
 		}
-		// A legacy exception is an explicit governed ALLOW for a server-initiated flow. Whose it is comes from
-		// the caller, not from the body they wrote.
-		tenantForWrite, terr := adminTenantForWrite(r, ex.TenantID)
-		if terr != nil {
-			writeError(w, http.StatusForbidden, terr)
+		var key struct {
+			ID       string `json:"id"`
+			TenantID string `json:"tenant_id"`
+		}
+		raw, _ := json.Marshal(patch)
+		if err := json.Unmarshal(raw, &key); err != nil || strings.TrimSpace(key.ID) == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("id is required"))
 			return
 		}
-		ex.TenantID = tenantForWrite
-		if strings.TrimSpace(ex.Status) == "" {
-			ex.Status = "active"
-		}
-		if err := validateLegacyException(ex); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		tenantForWrite, err := adminTenantForWrite(r, key.TenantID)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err)
 			return
 		}
 		setter, ok := policyStore.(interface {
-			UpsertLegacyExceptionConfirmed(string, model.LegacyException) error
+			MutateLegacyExceptionConfirmed(string, string, func(model.LegacyException) (model.LegacyException, error)) (model.LegacyException, error)
 		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		err := setter.UpsertLegacyExceptionConfirmed(ex.TenantID, ex)
-		auditIncoming(r, ex.TenantID, ex.ID, "upsert_exception", err)
+		ex, err := setter.MutateLegacyExceptionConfirmed(tenantForWrite, key.ID, func(current model.LegacyException) (model.LegacyException, error) {
+			return mergeLegacyException(current, patch, tenantForWrite)
+		})
+		auditIncoming(r, tenantForWrite, key.ID, "upsert_exception", err)
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception save could not be confirmed. Reload before retrying."))
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception save could not be confirmed. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 
@@ -288,23 +293,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, buildLegacyExceptionList(exs, time.Now()))
 	}))
 	mux.HandleFunc("GET /admin/legacy-exceptions/export", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
-		// S2: export active Legacy Exceptions as Firewall / L3 rules (default-deny + explicit allow)
-		// for agentless / VLAN-boundary enforcement of server-initiated traffic.
-		var exs []model.LegacyException
-		if s, ok := policyStore.(interface {
-			LegacyExceptionsFor(string) []model.LegacyException
-		}); ok {
-			exs = s.LegacyExceptionsFor(adminTenantIDFromRequest(r))
-		}
-		exp := buildServerInitiatedExport(exs, time.Now())
-		// Reflect the tenant's Incoming-Connections default toggle (POST /admin/server-initiated) into the
-		// export: "allow by default" (enabled=false) => default_action=allow, telling the consuming enforcement
-		// point (e.g. the Windows firewall inbound backend) that DSSE is NOT managing inbound and its rules
-		// should be withdrawn. Enabled => the historical default-deny contract, unchanged.
-		if s, ok := policyStore.(interface {
-			ServerInitiatedEnabledFor(string) bool
-		}); ok && !s.ServerInitiatedEnabledFor(adminTenantIDFromRequest(r)) {
-			exp.DefaultAction = "allow"
+		exp, err := incomingExportForTenant(policyStore, adminTenantIDFromRequest(r), time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))
+			return
 		}
 		writeJSON(w, http.StatusOK, exp)
 	}))

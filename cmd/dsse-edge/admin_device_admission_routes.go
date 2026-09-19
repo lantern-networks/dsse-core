@@ -670,8 +670,11 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// An UNASSIGNED entry belongs to nobody, and adopting one is an operator action: a tenant-scoped admin
 		// cannot even see it, so `claimant` is the caller's tenant and an operator (unscoped, or holding
 		// admin.tenant.admin with X-Operate-Tenant) passes empty and may assign it.
-		entry, err := config.EnrolledLedger.EnrollGroupForTenant(req.Identity, tenantID, tenantID, req.Group,
+		entry, err := config.EnrolledLedger.EnrollGroupForTenantContext(r.Context(), req.Identity, tenantID, tenantID, req.Group,
 			req.Note, time.Now().UTC().Format(time.RFC3339), adminCallerIsOperator(r))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if errors.Is(err, enrolledinventory.ErrIdentityUnassigned) {
 			// ★ THIS BRANCH USED TO BE UNREACHABLE (2026-08-12, eighteenth review). The Console tells an
 			// operator that unassigned devices are theirs to assign, and no call could do it: a tenant-scoped
@@ -700,7 +703,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// identity exists and only when this deployment does not already know — never as a way to move a name
 		// to a different machine.
 		if ref := strings.TrimSpace(req.MachineRef); ref != "" {
-			if merr := config.EnrolledLedger.RecordReportedMachine(entry.Identity, ref,
+			if merr := config.EnrolledLedger.RecordReportedMachineContext(r.Context(), entry.Identity, tenantID, ref,
 				time.Now().UTC().Format(time.RFC3339)); merr != nil {
 				// Not fatal to the enrolment: the device is admitted either way, and losing this costs the
 				// deployment a distinction rather than a machine. Said out loud so it is not lost silently.
@@ -730,7 +733,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// The before-image comes back from the same lock as the write, so what the record says this grant
 		// replaced is what it replaced — a separate EntryFor could be overtaken by another enrolment or re-arm
 		// between the read and the write, in the one record whose purpose is naming what it superseded.
-		entry, before, err := config.EnrolledLedger.AllowReenrolment(identity, tenantID, time.Now().UTC().Format(time.RFC3339))
+		entry, before, err := config.EnrolledLedger.AllowReenrolmentContext(r.Context(), identity, tenantID, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if errors.Is(err, enrolledinventory.ErrIdentityNotFound) ||
 			errors.Is(err, enrolledinventory.ErrIdentityOwnedByAnotherTenant) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
@@ -808,7 +814,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		entry, ok, perr := config.EnrolledLedger.SetGroup(identity, req.Group, time.Now().UTC().Format(time.RFC3339))
+		entry, ok, perr := config.EnrolledLedger.SetGroupContext(r.Context(), identity, tenantID, req.Group, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, perr) {
+			return
+		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
@@ -845,7 +854,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		entry, ok, perr := config.EnrolledLedger.SetKind(identity, req.Kind, time.Now().UTC().Format(time.RFC3339))
+		entry, ok, perr := config.EnrolledLedger.SetKindContext(r.Context(), identity, tenantID, req.Kind, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, perr) {
+			return
+		}
 		if perr != nil && !ok {
 			// An unknown kind: refuse rather than store it. A typo must not quietly become "not an endpoint",
 			// because that is the reading under which silence stops being a finding.
@@ -878,7 +890,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		entry, err := config.EnrolledLedger.RemoveChecked(identity, time.Now().UTC().Format(time.RFC3339))
+		entry, err := config.EnrolledLedger.RemoveCheckedContext(r.Context(), identity, tenantID, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if errors.Is(err, enrolledinventory.ErrIdentityNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
@@ -946,7 +961,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
-		g, err := config.EnrolledLedger.CreateGroup(req.Name, tenantID, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		g, err := config.EnrolledLedger.CreateGroupContext(r.Context(), req.Name, tenantID, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusConflict, err)
 			return
@@ -975,25 +993,14 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("device group %q not found", id))
 			return
 		}
-		// Refuse to delete a group that still has devices assigned (would orphan the assignment), unless
-		// ?force=true: reassign first, or force. Match by normalized name (assignment is by name), scoped to the
-		// caller's tenant.
-		if r.URL.Query().Get("force") != "true" {
-			assigned := 0
-			for _, e := range config.EnrolledLedger.List() {
-				if !deviceGroupVisibleToTenant(e.TenantID, callerTenant) {
-					continue
-				}
-				if enrolledinventory.NormalizeGroupName(e.Group) == enrolledinventory.NormalizeGroupName(grp.Name) {
-					assigned++
-				}
-			}
-			if assigned > 0 {
-				writeError(w, http.StatusConflict, fmt.Errorf("device group %q still has %d assigned device(s); reassign them first or pass ?force=true", grp.Name, assigned))
-				return
-			}
+		removed, grp, derr := config.EnrolledLedger.DeleteGroupContext(r.Context(), id, callerTenant, r.URL.Query().Get("force") == "true")
+		if inventoryContextError(w, derr) {
+			return
 		}
-		removed, derr := config.EnrolledLedger.DeleteGroup(id)
+		if errors.Is(derr, enrolledinventory.ErrGroupAssigned) {
+			writeError(w, http.StatusConflict, derr)
+			return
+		}
 		if !removed {
 			writeError(w, http.StatusNotFound, fmt.Errorf("device group %q not found", id))
 			return
@@ -1039,7 +1046,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode update group: %w", err))
 			return
 		}
-		g, reassigned, err := config.EnrolledLedger.UpdateGroup(id, req.Name, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		g, reassigned, err := config.EnrolledLedger.UpdateGroupContext(r.Context(), id, callerTenant, req.Name, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if err != nil {
 			// Absent id → 404; empty name / name collision → 409 (mirrors CreateGroup's conflict handling).
 			if _, ok := config.EnrolledLedger.GroupByID(id); !ok {
@@ -1081,4 +1091,17 @@ func nodeIssuesDeviceIdentitiesFor(authority *tenantDeviceAuthority, tenant stri
 		}
 	}
 	return tenantDeviceIdentity.For(tenant) != nil
+}
+
+// Shared-store failure is neither an input conflict nor an applied local edit.
+func inventoryContextError(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, enrolledinventory.ErrInventorySave) {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return true
+	}
+	if errors.Is(err, enrolledinventory.ErrIdentityNotFound) {
+		writeError(w, http.StatusNotFound, errors.New("inventory object not found"))
+		return true
+	}
+	return false
 }

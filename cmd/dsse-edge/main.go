@@ -2771,6 +2771,19 @@ func main() {
 	// Licensing is enforced exactly when this deployment was given vendor keys. Without them there is nothing to
 	// verify against, and a single-tenant install or the reference lab must not be gated at all.
 	enrolmentLicensingGate := newEnrolmentLicensing(seatAllocations, enrolledLedger, len(licenseAcceptedKeys) > 0, *enforceSeatQuota)
+	if err := vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license")); err != nil {
+		log.Fatalf("setup vendor license store: %v", err)
+	}
+	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
+	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,
+	// which is the wrong answer to a restart.
+	if p, ok := vendorLicenceStore.Current(licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID)); ok {
+		enrolmentLicensingGate.Apply(p)
+		log.Printf("vendor licence: in force serial=%d seats=%d expires=%s evaluation=%t",
+			p.Serial, p.SeatsAt(time.Now().UTC()), p.ExpiresAt, p.IsEvaluation)
+	} else if len(licenseAcceptedKeys) > 0 {
+		log.Printf("vendor licence: NONE in force — enrolment is held until a licence is applied")
+	}
 	// ★ THE DEPLOYMENT'S ONE PLACE TO TAKE AN IDENTITY CLAIM, built on any node that holds a database rather
 	// than only on one that issues certificates. The control plane is the authority and does not issue, so
 	// building this inside the issuer branch left it with none and the fleet's claim routes answered 404.
@@ -3965,6 +3978,7 @@ func main() {
 	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
 	configureInventoryPromotion(cpLeaderElectorInstance, *enrolledInventoryStore, enrolledLedger)
 	configureSeatPromotion(cpLeaderElectorInstance, *seatAllocationStore, seatAllocations)
+	configureLicensePromotion(cpLeaderElectorInstance, *licenseStorePath, vendorLicenceStore, enrolmentLicensingGate, licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID))
 	cpLeaderElectorInstance.Start()
 	defer cpLeaderElectorInstance.Stop()
 	if sharedRevocationSource != nil {
@@ -4724,17 +4738,6 @@ func main() {
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
 	// Edge continues on -listen.
 
-	vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license"))
-	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
-	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,
-	// which is the wrong answer to a restart.
-	if p, ok := vendorLicenceStore.Current(licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID)); ok {
-		enrolmentLicensingGate.Apply(p)
-		log.Printf("vendor licence: in force serial=%d seats=%d expires=%s evaluation=%t",
-			p.Serial, p.SeatsAt(time.Now().UTC()), p.ExpiresAt, p.IsEvaluation)
-	} else if len(licenseAcceptedKeys) > 0 {
-		log.Printf("vendor licence: NONE in force — enrolment is held until a licence is applied")
-	}
 	// single-tenant Edge isolation: when a tenant CA registry is configured, bind this Edge to its
 	// own tenant (the policy bundle's tenant) so cross-tenant certs are denied at admission even if the
 	// registry trusts other tenants' CAs.

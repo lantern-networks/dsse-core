@@ -150,10 +150,17 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("licensing is not configured on this Edge"))
 			return false
 		}
+		if d.licence.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, errLicenseLoad)
+			return false
+		}
 		return true
 	}
 
 	mux.HandleFunc("GET /admin/license", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
+		if licenseReadRefusedOnAStandby(w) {
+			return
+		}
 		if !ready(w) {
 			return
 		}
@@ -322,9 +329,9 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			return
 		}
 
-		p, err := d.licence.Apply(env, d.acceptedKeys, d.msspID, adminOf(r), now.Format(time.RFC3339))
+		p, err := d.licence.ApplyContext(r.Context(), env, d.acceptedKeys, d.msspID, adminOf(r), now.Format(time.RFC3339))
 		if err != nil {
-			if errors.Is(err, errLicensePersistence) {
+			if errors.Is(err, errLicensePersistence) || errors.Is(err, errLicenseLoad) {
 				writeError(w, http.StatusServiceUnavailable, errors.New("Licence save could not be confirmed. Reload before retrying."))
 			} else {
 				writeError(w, http.StatusBadRequest, err)

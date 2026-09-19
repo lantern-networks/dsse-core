@@ -3,7 +3,9 @@ package seatallocation
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
@@ -20,36 +22,39 @@ type stateFile struct {
 // An allocation is operator configuration, and losing it on restart would not degrade gracefully: every tenant
 // would read as zero seats and no device anywhere could enrol until an operator re-entered the whole
 // distribution. That is why this store belongs with the config stores the durable-by-default guard covers.
-func (s *Store) SetPersister(p blobstore.Persister) {
+func (s *Store) SetPersister(p blobstore.Persister) error {
 	if s == nil || p == nil {
-		return
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	data, err := p.Load()
+	if err != nil {
+		return fmt.Errorf("load seat allocations: %w", err)
+	}
+	if data != nil {
+		var state stateFile
+		if err := json.Unmarshal(data, &state); err != nil {
+			return fmt.Errorf("decode seat allocations: %w", err)
+		}
+		if state.SchemaVersion != stateSchemaVersion || state.Allocations == nil {
+			return errors.New("invalid seat allocation snapshot")
+		}
+		for key, allocation := range state.Allocations {
+			if key == "" || strings.ToLower(strings.TrimSpace(allocation.TenantID)) != key || allocation.Seats < 0 {
+				return errors.New("invalid seat allocation entry")
+			}
+		}
+		s.allocations = state.Allocations
+	}
+	// A failed load must not replace either live state or its working persistence target.
 	s.persister = p
-	s.loadLocked()
+	return nil
 }
 
 // SetStateFile is the file-backed convenience used by the reference deployment.
-func (s *Store) SetStateFile(path string) {
-	s.SetPersister(blobstore.FilePersister{Path: path})
-}
-
-func (s *Store) loadLocked() {
-	data, err := s.persister.Load()
-	if err != nil || len(data) == 0 {
-		return
-	}
-	var state stateFile
-	if err := json.Unmarshal(data, &state); err != nil {
-		// Keep whatever is in memory rather than starting from empty: an empty allocation set stops enrolment
-		// everywhere, which is a worse answer to a corrupt file than carrying on and saying so loudly.
-		log.Printf("seat_allocations persist: load failed, keeping current state: %v", err)
-		return
-	}
-	if state.Allocations != nil {
-		s.allocations = state.Allocations
-	}
+func (s *Store) SetStateFile(path string) error {
+	return s.SetPersister(blobstore.FilePersister{Path: path})
 }
 
 // ErrPersistence means the management change was not confirmed by storage.

@@ -57,7 +57,9 @@ type FilePersister struct {
 func (f FilePersister) Load() ([]byte, error) {
 	data, err := os.ReadFile(f.Path)
 	if os.IsNotExist(err) {
-		return nil, nil
+		if _, statErr := os.Lstat(f.Path); os.IsNotExist(statErr) {
+			return nil, nil
+		}
 	}
 	if err != nil {
 		return nil, err

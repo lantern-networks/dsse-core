@@ -4719,7 +4719,9 @@ func main() {
 	// (T) secure transport: additive TLS listener for the encrypted endpoint↔Edge tunnel. Default
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
 	// Edge continues on -listen.
-	seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations"))
+	if err := seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations")); err != nil {
+		log.Fatalf("setup seat allocation store: %v", err)
+	}
 	vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license"))
 	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
 	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,

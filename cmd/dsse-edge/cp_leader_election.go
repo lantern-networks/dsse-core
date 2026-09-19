@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -171,14 +172,20 @@ func (e *cpLeaderElector) tick() {
 func (e *cpLeaderElector) release() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.isLeader.Store(false)
 	if e.conn != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, _ = e.conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", cpLeaderAdvisoryLockKey)
+		_, err := e.conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", cpLeaderAdvisoryLockKey)
 		cancel()
+		if err != nil {
+			// sql.Conn.Close returns a healthy session to its pool. After a failed
+			// unlock that session may still hold the lock; discard it so the peer
+			// can take over instead of leaving an unadvertised authority in the pool.
+			_ = e.conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
 		_ = e.conn.Close()
 		e.conn = nil
 	}
-	e.isLeader.Store(false)
 }
 
 // Stop ends the election loop and releases the lock. Safe on a nil elector.

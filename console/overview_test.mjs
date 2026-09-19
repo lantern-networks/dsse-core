@@ -50,3 +50,16 @@ test('operator capacity keeps a missing licensed pool unknown', async () => {
   assert.match(f.host.textContent, /Pool unknown/);
   assert.doesNotMatch(f.host.textContent, /Left:|No licence/);
 });
+
+test('Overview treats unavailable required reads as unknown, including transport failures',()=>{
+ const c=vm.createContext({});vm.runInContext(source('./overview.js'),c);
+ for(const status of [0,401,403,404,500,503])assert.equal(c.ovDenied({ok:false,status,body:{}}),true);
+ assert.equal(c.ovDenied({ok:true,status:200,body:null}),true);
+ assert.equal(c.ovDenied({ok:true,status:200,body:{devices:[]}}),false);
+ assert.equal(c.ovDenied({ok:true,status:200,body:{}},{ok:false,status:503}),true);
+});
+
+test('an unreadable tenant inventory never falls back to an operator own-tenant list',async()=>{
+ const el=(tag,props={})=>({...props,children:[],appendChild(n){this.children.push(n)}}),t=el('div'),r=el('div');let more;
+ const c=vm.createContext({el,bl:x=>x.en,answeringForTheDeployment:()=>true,apiFetch:async(m,p)=>p==='/admin/tenants'?{ok:false,status:503}:{ok:true,status:200,body:{tenant_id:'operator'}}});vm.runInContext(source('./overview.js'),c);await c.ovLoadTenantsRegions(t,v=>more=v,r);assert.equal(more,'');assert.equal(t.children[0].text,'not readable here');assert.equal(r.children[0].text,'not readable here');
+});

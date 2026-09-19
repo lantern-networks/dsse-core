@@ -217,7 +217,7 @@ async function ovLoadStrip(strip, fleetP) {
 // an em dash and a reason; only a read that ANSWERED gets a number.
 function ovDenied() {
   for (const r of arguments) {
-    if (r && (r.status === 403 || r.status === 401)) return true;
+    if (!r || !r.ok || !r.body) return true;
   }
   return false;
 }
@@ -483,6 +483,12 @@ async function ovLoadTenantsRegions(tHost, setMore, rHost) {
     ovGet("/admin/config-sync-status"),
     ovGet("/admin/tenant"),
   ]);
+  if (ovDenied(me) || (asksForTheList && ovDenied(tn))) {
+    setMore("");
+    tHost.appendChild(ovEmpty(bl(OV_UNREADABLE)));
+    rHost.appendChild(ovEmpty(bl(OV_UNREADABLE)));
+    return;
+  }
   let tenants = (tn.ok && tn.body && tn.body.tenants) || null;
   if (!tenants && me.ok && me.body) tenants = [me.body];
   if (!tenants || !tenants.length) {
@@ -522,7 +528,7 @@ async function ovLoadTenantsRegions(tHost, setMore, rHost) {
       el("span", { class: "ui-badge ui-badge-" + (rg.home > 0 ? "ok" : "off"), style: "margin-left:auto", text: rg.home > 0 ? bl({ en: "primary", ja: "主" }) : bl({ en: "allowed", ja: "許可" }) }),
     ]));
   });
-  const csTxt = (cs.ok && cs.body && cs.body.enabled) ? (cs.body.healthy === false ? bl({ en: "degraded", ja: "低下" }) : bl({ en: "healthy", ja: "正常" })) : bl({ en: "off", ja: "無効" });
+  const csTxt = ovDenied(cs) ? bl(OV_UNREADABLE) : (cs.ok && cs.body && cs.body.enabled) ? (cs.body.healthy === false ? bl({ en: "degraded", ja: "低下" }) : bl({ en: "healthy", ja: "正常" })) : bl({ en: "off", ja: "無効" });
   rHost.appendChild(el("div", { class: "ov-empty", style: "margin-top:10px" }, [document.createTextNode(bl({ en: "Live per-region reachability not yet reported. Config-sync: ", ja: "リージョンごとの到達性はまだ報告されていません。設定の同期: " })), el("b", { text: csTxt })]));
 }
 
@@ -540,7 +546,7 @@ async function ovLoadEdge(host, setMore) {
   const [st, conn, ai, at] = await Promise.all([ovGet("/admin/state"), ovGet("/admin/connectors"), ovGet("/admin/ai-usage-report?window=" + encodeURIComponent(_ovPeriod)), ovGet("/admin/ai-ops/access-trends?window=" + encodeURIComponent(_ovPeriod))]);
   // Refused reads are absent, not empty — see ovDenied. "No connectors registered" and "0 decisions" about an
   // organization this console may not read are the same claim the tiles used to make with a zero.
-  if (ovDenied(st, conn, ai)) {
+  if (ovDenied(st, conn, ai, at)) {
     host.innerHTML = ""; setMore("");
     host.appendChild(ovEmpty(bl({ en: "Connectors, decisions and AI traffic are not readable here — absent, not zero.",
                                   ja: "コネクタ・判定・AI 通信はここでは取得できません。「0」ではなく「不明」です。" })));

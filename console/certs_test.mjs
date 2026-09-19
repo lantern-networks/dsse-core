@@ -21,6 +21,7 @@ function fixture(authority, language = 'en') {
   });
   vm.runInContext(source, c);
   c.pkiDeploymentAct = () => false;
+  c.originalLoadCertMap = c.loadCertMap;
   c.loadCertMap = () => {};
   vm.runInContext('_pkiTenantInterception = ' + JSON.stringify(authority) + ';', c);
   const card = c.tenantInterceptionCAControl(el('div'));
@@ -59,4 +60,20 @@ test('failed replacement stays open for retry and does not announce a switch', a
   f.buttons[0].listeners.click(); const m = f.modals[0]; await m.footer.at(-1).listeners.click();
   assert.equal(m.closed, false); assert.equal(m.footer.at(-1).disabled, false);
   assert.deepEqual(f.notices, [{message: 'Save refused', kind: 'err'}]);
+});
+
+test('history failure stays unavailable and Retry can recover to a verified empty history',async()=>{
+ const f=fixture(null),states=[];let unavailable=true;
+ f.c.uiState=(host,kind,message,action)=>{host.children=[];states.push({kind,message,action})};
+ f.c.apiFetch=async()=>unavailable?{ok:false,status:503,body:{error:'private detail'}}:{ok:true,status:200,body:{versions:[]}};
+ await f.c.showCertHistory({label:{en:'Node'},plane:'control'},'node',{});
+ assert.equal(states.at(-1).kind,'error');assert.match(states.at(-1).message,/could not be read/);assert.doesNotMatch(states.at(-1).message,/private detail/);
+ unavailable=false;await states.at(-1).action.onClick();const host=f.modals[0].body[0];assert.ok(host.children.some(n=>String(n.text).includes('No previous versions')));
+});
+
+for(const path of ['/admin/tenant-cas','/admin/pki/operations','/admin/pki/paths','/admin/pki/trust-refusals','/admin/transport-trust-anchors','/admin/tenant-device-authority?readiness=1','/admin/tenant-transport-authority','/admin/tenant-interception-authority','/admin/transport-name-rename','/admin/interception-authority-rotation'])test('PKI map refuses missing dependency '+path,async()=>{
+ const f=fixture(null),states=[];f.c.freshRender=()=>()=>true;f.c.uiState=(h,kind,message,action)=>states.push({kind,message,action});
+ f.c.apiFetch=async(method,p)=>p===path?{ok:false,status:503,body:{error:'internal'}}:{ok:true,status:200,body:{has_authority:false,tenant_cas:[],paths:[],refusals:[],anchors:[],items:[]}};
+ // The form fixture substitutes this function; restore the production loader.
+ await f.c.originalLoadCertMap({});assert.equal(states.at(-1).kind,'error');assert.match(states.at(-1).message,/Required PKI information/);assert.equal(states.at(-1).action.label,'Retry');
 });

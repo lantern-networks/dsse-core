@@ -94,7 +94,7 @@ func (store *Store) saveSnapshotLocked(identities map[string]model.NonHumanIdent
 	}
 	if err != nil {
 		reportPersistError(fmt.Errorf("save NHI registry snapshot: %w", err))
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return nil
 		}
 		return ErrPersistence

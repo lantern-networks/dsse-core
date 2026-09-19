@@ -371,7 +371,7 @@ func (store *HumanIdentityDirectoryStore) saveSnapshotLocked(users map[string]mo
 	}
 	if err := store.persister.Save(data); err != nil {
 		reportPersistError(fmt.Errorf("save human identity directory snapshot: %w", err))
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return ErrDirectoryPersistence
 		}
 	}

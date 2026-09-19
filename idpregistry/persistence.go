@@ -90,7 +90,7 @@ func (s *Store) saveLocked(snapshot persistedRegistry) error {
 	}
 	if err != nil {
 		log.Printf("identity provider settings save: %v", err)
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return ErrPersistence
 		}
 	}

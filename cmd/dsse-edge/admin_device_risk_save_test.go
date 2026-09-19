@@ -221,3 +221,77 @@ func TestDeviceRiskWithoutRuntimeReportStillUsesCheckedOverlay(t *testing.T) {
 		t.Fatal("false save warning")
 	}
 }
+
+func TestDeviceRiskRuntimeUnconfirmedSaveProducesPartialAudit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		err     error
+		warning bool
+	}{
+		{"synced_nonatomic", blobstore.ErrSavedWithoutAtomicity, false},
+		{"unconfirmed", blobstore.ErrDurabilityUnconfirmed, true},
+		{"joined", errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, w, overlay, _, runtime, _ := deviceRiskAuditHandler(t)
+			p := &deviceOverlaySavePersister{base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "runtime.json")}, err: tc.err, retain: true}
+			if err := runtime.SetPersister(p); err != nil {
+				t.Fatal(err)
+			}
+			r := deviceRiskRequest(h, `{"entity_type":"device","entity_id":"owned-device","severity":"high"}`, transportAuditBearer)
+			if r.Code != 200 {
+				t.Fatal(r.Code, r.Body)
+			}
+			var out adminRiskSignalResponse
+			if err := json.Unmarshal(r.Body.Bytes(), &out); err != nil {
+				t.Fatal(err)
+			}
+			if !out.Applied || out.RuntimePersistenceWarning != tc.warning || out.OverlayPersistenceWarning || (out.NotStoredDurably != "") != tc.warning {
+				t.Fatalf("wrong partial outcome: %+v", out)
+			}
+			if overlay.Snapshot()["owned-device"] != "high" {
+				t.Fatal("durable overlay lost")
+			}
+			restored := device.NewStore()
+			if err := restored.SetPersister(p.base); err != nil {
+				t.Fatal(err)
+			}
+			d, _ := restored.Get("owned-device")
+			if d.Metadata["risk_state_severity"] != "high" {
+				t.Fatal("candidate not written before error")
+			}
+			rows := readTransportAudits(t, w)
+			if len(rows) != 2 {
+				t.Fatal("audit count", len(rows))
+			}
+			domain := false
+			for _, a := range rows {
+				if a.EventType == "device_risk_changed" {
+					domain = true
+					want := "success"
+					if tc.warning {
+						want = "partial"
+					}
+					if stringPtrValue(a.Result) != want || a.Metadata["runtime_persistence_warning"] != tc.warning {
+						t.Fatal("audit does not explain runtime persistence", a)
+					}
+				}
+			}
+			if !domain {
+				t.Fatal("domain audit absent")
+			}
+			p.err = nil
+			r = deviceRiskRequest(h, `{"entity_type":"device","entity_id":"owned-device","severity":"high"}`, transportAuditBearer)
+			if r.Code != 200 {
+				t.Fatal("retry", r.Code)
+			}
+			out = adminRiskSignalResponse{}
+			if err := json.Unmarshal(r.Body.Bytes(), &out); err != nil {
+				t.Fatal(err)
+			}
+			if out.RuntimePersistenceWarning {
+				t.Fatal("confirmed retry still warns")
+			}
+		})
+	}
+}

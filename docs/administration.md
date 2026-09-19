@@ -190,6 +190,21 @@ After withdrawal, test operator reads and writes with the previous session and c
 the customer can still administer its own organization. Review the audit record for
 delegation, elevation, the actual change, and withdrawal as distinct events.
 
+### Confirming tenant and delegation saves
+
+With the file-backed tenant registry configured, creating or editing a tenant,
+changing Tenant settings, and saving operator delegation or elevation changes wait
+for storage confirmation before publishing the new record and configuration
+generation. A rejected save returns HTTP 503 with a reload-before-retry message;
+it does not emit a success domain event. The previous in-process record remains in
+use, so a failed delegation withdrawal must not be treated as completed.
+
+Reload and verify the current state before retrying. A storage error or a lost
+response can occur after new bytes were written, so neither proves that the disk
+is unchanged. Without a persistence path, the registry remains memory-only.
+Storage and audit delivery are separate operations. These authoring guarantees do
+not extend to tenant deletion, purge propagation, or fleet application.
+
 ## Recovery is a separate authority
 
 Generated deployments initially arm an owner credential while the

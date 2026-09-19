@@ -171,6 +171,7 @@ func (o *HighRiskOverlay) changeRiskContext(ctx context.Context, edit func(*high
 			return nil, ErrRiskLoad
 		}
 		candidate.SchemaVersion = highRiskOverlayStateSchemaVersion
+		o.mergeAutomaticPending(&candidate)
 		edit(&candidate)
 		return json.Marshal(candidate)
 	})
@@ -183,6 +184,7 @@ func (o *HighRiskOverlay) changeRiskContext(ctx context.Context, edit func(*high
 	}
 	o.devices, o.users = candidate.Devices, candidate.Users
 	o.riskSavePending = false
+	o.automaticPending = nil
 	o.rebuildUserIndexLocked()
 	o.mu.Unlock()
 	return true, nil

@@ -1,6 +1,7 @@
 package revocation
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -35,9 +36,10 @@ type AdmissionRevocations struct {
 	// meshReceived is the federation layer: revocations PUSHED here by an external peer (e.g. a sibling control
 	// plane). They deny on this node's edges (folded into the edge feed) but are NEVER re-pushed — only an ORIGIN
 	// pushes, so a received item does not bounce back (the no-loop discipline).
-	meshReceived map[string]string
-	persister    blobstore.Persister // guarded by writeMu; snapshot of revoked + meshReceived; nil = volatile
-	generation   atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
+	meshInitialPending bool // writeMu: first shared save ran its edit but was unconfirmed
+	meshReceived       map[string]string
+	persister          blobstore.Persister // guarded by writeMu; snapshot of revoked + meshReceived; nil = volatile
+	generation         atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
 	// reporter, when set (puller mode), is called on a NEW node-local revocation so this node's own W-2
 	// auto-revocation propagates UP to the control plane, which redistributes it fleet-wide (slice 3b: a dark
 	// device caught on one node is then denied on every node, not just this one). Not called for ReplaceSynced.
@@ -103,7 +105,7 @@ func (a *AdmissionRevocations) RevokeFromMesh(identity, reason string) bool {
 // acknowledges delivery only after the configured store accepts the snapshot.
 // Unchanged retries do not bump generation, invoke callbacks or re-push the item.
 func (a *AdmissionRevocations) RevokeFromMeshChecked(identity, reason string) (bool, error) {
-	return a.revokeFromMesh(identity, reason, true)
+	return a.RevokeFromMeshCheckedContext(context.Background(), identity, reason)
 }
 
 func (a *AdmissionRevocations) revokeFromMesh(identity, reason string, retrySave bool) (bool, error) {

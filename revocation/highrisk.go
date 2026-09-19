@@ -29,7 +29,8 @@ type HighRiskOverlay struct {
 	persister  blobstore.Persister
 	generation atomic.Uint64
 	// writeMu protects this conservative retry flag for the shared snapshot.
-	riskSavePending bool
+	automaticPending map[string]string // writeMu: locally applied automatic marks awaiting shared commit
+	riskSavePending  bool
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {

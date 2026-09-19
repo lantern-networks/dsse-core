@@ -1,7 +1,11 @@
 package revocation
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"reflect"
 	"strings"
 )
 
@@ -18,7 +22,7 @@ type AutomaticRiskResult struct {
 // RaiseDeviceRisk never lowers an existing mark. It publishes escalation before
 // storage, preserving protection if storage fails, and reports that partial
 // outcome. The next matching detection retries an unconfirmed shared snapshot.
-// Once saved, identical detections avoid repeated disk writes. Administrative
+// With file storage, saved identical detections avoid repeated disk writes. Administrative
 // changes continue to use SetDeviceRisk's save-before-publish contract.
 func (o *HighRiskOverlay) RaiseDeviceRisk(deviceID, severity string) (AutomaticRiskResult, error) {
 	result := AutomaticRiskResult{Persistence: "not_attempted"}
@@ -34,6 +38,9 @@ func (o *HighRiskOverlay) RaiseDeviceRisk(deviceID, severity string) (AutomaticR
 	defer o.writeMu.Unlock()
 	if o.loadErr != nil || o.legacy {
 		return result, ErrRiskUnavailable
+	}
+	if p, ok := o.persister.(contextUpdater); ok {
+		return o.raiseSharedDeviceRiskLocked(p, id, severity)
 	}
 	previous := o.devices[id]
 	result.Severity, result.Applied = previous, true
@@ -65,4 +72,74 @@ func (o *HighRiskOverlay) RaiseDeviceRisk(deviceID, severity string) (AutomaticR
 		}
 	}
 	return result, nil
+}
+
+// Local detections remain conservative on a storage outage. Shared writers
+// must consult the locked row even for an unchanged detection: a local cache
+// cannot certify either the current severity or the other writers' entries.
+func (o *HighRiskOverlay) raiseSharedDeviceRiskLocked(p contextUpdater, id, severity string) (AutomaticRiskResult, error) {
+	previous := o.devices[id]
+	if riskRank(previous) > riskRank(severity) {
+		severity = previous
+	}
+	result := AutomaticRiskResult{Severity: severity, Applied: true, Changed: previous != severity, Persistence: "unconfirmed"}
+	if result.Changed {
+		o.mu.Lock()
+		o.devices = maps.Clone(o.devices)
+		o.devices[id] = severity
+		o.generation.Add(1)
+		o.mu.Unlock()
+	}
+	o.riskSavePending = true
+	var candidate highRiskOverlayStateFile
+	err := p.UpdateContext(context.Background(), func(raw []byte) ([]byte, error) {
+		candidate = highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: map[string]string{}, Users: map[string]UserRisk{}}
+		if raw != nil {
+			var err error
+			candidate, err = decodeRiskSnapshot(raw)
+			if err != nil {
+				return nil, err
+			}
+			if candidate.SchemaVersion != highRiskOverlayStateSchemaVersion && len(candidate.Devices) > 0 {
+				return nil, ErrRiskUnavailable
+			}
+		}
+		// First local escalation may be the first write to this row.
+		candidate.SchemaVersion = highRiskOverlayStateSchemaVersion
+		o.mergeAutomaticPending(&candidate)
+		if riskRank(severity) > riskRank(candidate.Devices[id]) {
+			candidate.Devices[id] = severity
+		}
+		return json.Marshal(candidate)
+	})
+	if err != nil {
+		if o.automaticPending == nil {
+			o.automaticPending = map[string]string{}
+		}
+		o.automaticPending[id] = severity
+		return result, ErrRiskSave
+	}
+	o.automaticPending = nil
+	o.mu.Lock()
+	if !maps.Equal(o.devices, candidate.Devices) || !reflect.DeepEqual(o.users, candidate.Users) {
+		o.generation.Add(1)
+	}
+	o.devices, o.users = candidate.Devices, candidate.Users
+	o.rebuildUserIndexLocked()
+	o.riskSavePending = false
+	result.Severity = candidate.Devices[id]
+	result.Changed = previous != result.Severity
+	result.Persistence = "saved"
+	o.mu.Unlock()
+	return result, nil
+}
+
+// Called under writeMu. Preserve unconfirmed local escalations when another
+// target is saved; an explicit administrative edit runs after this merge.
+func (o *HighRiskOverlay) mergeAutomaticPending(f *highRiskOverlayStateFile) {
+	for id, severity := range o.automaticPending {
+		if riskRank(severity) > riskRank(f.Devices[id]) {
+			f.Devices[id] = severity
+		}
+	}
 }

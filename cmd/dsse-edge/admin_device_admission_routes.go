@@ -129,6 +129,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// never re-pushed (no-loop — only an origin region pushes). Authenticated by the shared mesh secret; fail-SAFE
 	// (it can only DENY — restore stays admin-only at the origin region).
 	mux.HandleFunc("POST /revocation-mesh/admission", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		// Self-gate: only serve when this CP is configured to receive cross-region revocations (an allowed-peer
 		// set, or a revocation-mesh secret in lab). An unconfigured edge never exposes this DoS-sensitive surface
 		// (an accepted push can DENY any identity).
@@ -167,13 +168,18 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("revocation mesh item requires an identity"))
 			return
 		}
-		changed, saveErr := config.AdmissionRevocations.RevokeFromMeshChecked(item.Identity, item.Reason)
+		changed, saveErr := config.AdmissionRevocations.RevokeFromMeshCheckedContext(r.Context(), item.Identity, item.Reason)
 		identity := strings.ToLower(strings.TrimSpace(item.Identity))
 		// A failed save must not drain the sender's retry queue. A fresh delivery
 		// resaves even an unchanged item, without re-firing callbacks or mesh pushes.
 		// OriginRegion is a claim in the payload, not the authenticated peer identity.
 		if saveErr != nil {
-			log.Printf("revocation mesh: persistence unconfirmed; identity=%q peer=%q claimed_origin=%q changed=%t applied_locally=true", identity, peerIdentity, item.OriginRegion, changed)
+			_, applied := config.AdmissionRevocations.IsRevoked(identity)
+			log.Printf("revocation mesh: persistence unconfirmed; identity=%q peer=%q claimed_origin=%q changed=%t applied_locally=%t", identity, peerIdentity, item.OriginRegion, changed, applied)
+			if !applied {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("cross-region revocation saving was not confirmed; retry with a fresh authenticated request"))
+				return
+			}
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("cross-region revocation is applied locally, but saving was not confirmed; retry with a fresh authenticated request"))
 			return
 		}

@@ -109,6 +109,7 @@ func (o *HighRiskOverlay) restoreSnapshotLocked(p blobstore.Persister, refresh b
 	o.devices, o.users, o.legacy = f.Devices, f.Users, legacy
 	o.persister, o.loadErr = p, nil
 	o.riskSavePending = false
+	o.automaticPending = nil
 	o.rebuildUserIndexLocked()
 	o.mu.Unlock()
 	log.Printf("high_risk_overlay load: restored %d device and %d user risk marks", len(o.devices), len(o.users))

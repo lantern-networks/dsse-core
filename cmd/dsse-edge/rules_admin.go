@@ -51,7 +51,7 @@ func adoptServiceIDForObservation(assets *assetcatalog.Store, tenant string, por
 	if assets != nil && port > 0 {
 		for _, svc := range assets.ListServices(tenant) {
 			for _, p := range svc.Ports {
-				if p.Port == port {
+				if strings.EqualFold(strings.TrimSpace(p.Protocol), "tcp") && p.Port == port {
 					return svc.ID
 				}
 			}

@@ -264,3 +264,22 @@ Endpoint UI references: [Windows launcher](../clients/windows-wfp/steer/steer_st
 [Windows WebView2 host](../clients/windows-wfp/stepupwindow/main.go),
 [macOS notifications and menu](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpStatusController.swift),
 and [macOS WKWebView window](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpAuthWindow.swift).
+
+## Editing incoming exceptions
+
+The Incoming Connections service picker selects one **TCP port**, using the
+catalogue name as a label. For a service with several TCP ports, choose one port
+per exception. UDP services are not offered because the current Windows export
+cannot represent them. Existing API-authored non-TCP conditions are not covered
+by this Console workflow; do not use them as evidence of Windows enforcement.
+
+Editing an existing exception keeps its current service condition unless you
+explicitly choose another one. Reselect a catalogue service to replace an older
+condition that used a display name as its service family. **Any service** explicitly
+removes the service restriction. Owner-only edits retain disabled status, approval
+and session settings, and the exact expiry timestamp; changing the date sets
+midnight UTC for that date. Disabled and expired exceptions are excluded from export.
+
+Operator API users can target an authorized customer in a POST body. DELETE uses
+the current tenant context: enter that customer's context before deleting its
+exception. The domain audit belongs to the target customer and identifies the operator.

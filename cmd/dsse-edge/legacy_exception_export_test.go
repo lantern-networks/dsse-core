@@ -31,3 +31,10 @@ func TestBuildServerInitiatedExport(t *testing.T) {
 		t.Fatalf("rule d should map deny: %+v", exp.Rules[1])
 	}
 }
+
+func TestTCPIncomingExportKeepsPortWithoutFamily(t *testing.T) {
+	exp := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp", Status: "active", Mode: "allow", Protocol: "tcp", Port: 22}}, time.Now())
+	if len(exp.Rules) != 1 || exp.Rules[0].ServiceFamily != "tcp" || exp.Rules[0].Port != 22 {
+		t.Fatalf("TCP port broadened by export: %+v", exp)
+	}
+}

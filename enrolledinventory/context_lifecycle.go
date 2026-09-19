@@ -199,3 +199,17 @@ func (l *Ledger) DeleteGroupContext(ctx context.Context, id, tenant string, forc
 	}
 	return removed, group, err
 }
+
+// RecordEnrolmentReportContext records an already issued identity, without taking
+// another identity claim. The marker and machine binding commit together.
+func (l *Ledger) RecordEnrolmentReportContext(ctx context.Context, id, tenant, group, note, machineRef, now string) (entry Entry, err error) {
+	shared, err := l.mutateShared(ctx, func(c *Ledger) error {
+		var e error
+		entry, e = c.recordEnrolmentReport(id, tenant, group, note, machineRef, now)
+		return e
+	})
+	if shared && err != nil {
+		entry = Entry{}
+	}
+	return entry, err
+}

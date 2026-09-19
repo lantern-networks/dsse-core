@@ -650,6 +650,11 @@ func (l *Ledger) EnrollDeviceForTenantWithMachine(id, tenantID, group, note, now
 // this ledger's own facts and a report must not move a machine between fleets. Only the claim step is
 // skipped, because it was taken by the node that issued the certificate this report is about.
 func (l *Ledger) RecordEnrolmentDecidedElsewhere(id, tenantID, group, note, now string) (Entry, error) {
+	return l.recordEnrolmentReport(id, tenantID, group, note, "", now)
+}
+
+// Persist the issued marker and first machine binding as one inventory update.
+func (l *Ledger) recordEnrolmentReport(id, tenantID, group, note, machineRef, now string) (Entry, error) {
 	k := NormalizeIdentity(id)
 	if k == "" {
 		return Entry{}, fmt.Errorf("identity is required")
@@ -668,6 +673,9 @@ func (l *Ledger) RecordEnrolmentDecidedElsewhere(id, tenantID, group, note, now 
 	entry, err := l.enrollGroupMutateLocked(k, tenantID, group, note, now, false, false, func(e *Entry) {
 		e.DeviceEnrolledAt = now
 		e.DeviceEnrolledNonce = e.ReenrolmentNonce
+		if NormalizeMachineRef(e.MachineRef) == "" {
+			e.MachineRef = NormalizeMachineRef(machineRef)
+		}
 	})
 	if err != nil {
 		return Entry{}, err
@@ -680,7 +688,7 @@ func (l *Ledger) RecordEnrolmentDecidedElsewhere(id, tenantID, group, note, now 
 		} else {
 			delete(l.entries, k)
 		}
-		return Entry{}, fmt.Errorf("the enrolment could not be recorded durably: %w", perr)
+		return Entry{}, ErrInventorySave
 	}
 	return entry, nil
 }

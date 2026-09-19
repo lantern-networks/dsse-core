@@ -5474,7 +5474,19 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		config.LabMode != nil && *config.LabMode, config.TenantTrustDistributor)
 	// The machine door for "a device enrolled here", on the same identified channel as the material above.
 	registerEnrolmentReportRoute(mux, config.EnrolledLedger, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
-		config.LabMode != nil && *config.LabMode)
+		config.LabMode != nil && *config.LabMode,
+		func(r *http.Request, shipper auditIngestShipper, entry enrolledinventory.Entry, reportErr error) {
+			record := enrolledInventoryAuditLog(entry.TenantID, "enrolment_report", entry, evaluator, sourceIPFromRequest(r))
+			record.ActorNHIID = &shipper.Identity
+			reason := "Issued device enrolment report saved by the control plane."
+			if reportErr != nil {
+				result := "error"
+				record.Result = &result
+				reason = "Enrolment report was refused or saving could not be confirmed."
+			}
+			record.Reason = &reason
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
+		})
 	// The other half of the same sentence, for connectors — see connector_cp_report.go.
 	registerConnectorReportRoute(mux, registry, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)

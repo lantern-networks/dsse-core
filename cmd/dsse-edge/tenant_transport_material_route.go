@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -936,7 +937,8 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 }
 
 func registerEnrolmentReportRoute(mux *http.ServeMux, ledger *enrolledinventory.Ledger,
-	tenantCARegistry *tenantca.TenantCARegistry, configSourceURL string, devMode bool) {
+	tenantCARegistry *tenantca.TenantCARegistry, configSourceURL string, devMode bool,
+	audit func(*http.Request, auditIngestShipper, enrolledinventory.Entry, error)) {
 	if ledger == nil {
 		return
 	}
@@ -946,6 +948,7 @@ func registerEnrolmentReportRoute(mux *http.ServeMux, ledger *enrolledinventory.
 		return
 	}
 	mux.HandleFunc("POST /enrolment-report", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		shipper, verified := auditIngestShipperFrom(r, tenantCARegistry)
 		if !verified && !devMode {
 			writeError(w, http.StatusForbidden, fmt.Errorf("enrolment-report: this request presents no Edge "+
@@ -976,33 +979,47 @@ func registerEnrolmentReportRoute(mux *http.ServeMux, ledger *enrolledinventory.
 				"it enrolled into are both required — a device filed under nobody is a device nothing enforces for"))
 			return
 		}
+		identity = enrolledinventory.NormalizeIdentity(identity)
+		record := enrolledinventory.Entry{Identity: identity, TenantID: tenant}
+		reportResult := func(err error) {
+			if audit != nil {
+				audit(r, shipper, record, err)
+			}
+		}
+		if !devMode && !edgeMayShipForTenant(shipper, tenant) {
+			// Attribute a denied report to the verified caller, not a tenant
+			// chosen by an unauthorized request.
+			record.TenantID = shipper.CertTenant
+			err := fmt.Errorf("enrolment-report: this Edge is not authorized for the requested tenant")
+			reportResult(err)
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		if e := cpLeaderElectorInstance; e != nil && !e.IsLeader() {
+			reportResult(enrolledinventory.ErrInventorySave)
+			writeError(w, http.StatusServiceUnavailable, enrolledinventory.ErrInventorySave)
+			return
+		}
 		note := strings.TrimSpace(body.Note)
 		if note == "" {
 			note = "enrolled on " + strings.TrimSpace(shipper.Identity)
 		}
 		now := time.Now().UTC().Format(time.RFC3339)
-		// ★★★ RECORD, DO NOT RE-DECIDE (2026-08-24, measured — every report was answered 409). This used the
-		// same call as the Edge's own /enroll, which TAKES the identity claim. The claim was already taken, by
-		// the node that issued the certificate this report is about, and a claim at the same grant is refused
-		// on purpose — that refusal is what makes two issuers racing produce one winner. Asking "may I issue
-		// this?" about something already issued has exactly one correct answer.
-		//
-		// It still answers "is this identity disabled" and "does it already belong to another organization"
-		// inside one ledger lock, so a report cannot move a machine between fleets.
-		if _, err := ledger.RecordEnrolmentDecidedElsewhere(enrolledinventory.NormalizeIdentity(identity), tenant,
-			strings.TrimSpace(body.Group), note, now); err != nil {
-			writeError(w, http.StatusConflict, err)
+		entry, err := ledger.RecordEnrolmentReportContext(r.Context(), identity, tenant,
+			strings.TrimSpace(body.Group), note, body.MachineRef, now)
+		if err != nil {
+			reportResult(err)
+			status := http.StatusConflict
+			// A 409 is settled and discarded by the issuer's outbox. Storage
+			// and leadership failures must remain retryable.
+			if errors.Is(err, enrolledinventory.ErrInventorySave) {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, err)
 			return
 		}
-		// Reported, not authored, and only when this deployment does not already know: an issuing node saying
-		// which machine it issued to cannot use this to move a name to a different machine.
-		if ref := strings.TrimSpace(body.MachineRef); ref != "" {
-			if merr := ledger.RecordReportedMachine(enrolledinventory.NormalizeIdentity(identity), ref, now); merr != nil {
-				log.Printf("enrolment_report: the machine reported for %q was NOT recorded (%v) — this "+
-					"deployment cannot tell that machine from another of the same name, and a rename of it "+
-					"would become a second device", identity, merr)
-			}
-		}
+		record = entry
+		reportResult(nil)
 		log.Printf("enrolment_report accepted from %q: %q enrolled into %q machine=%q", shipper.Identity,
 			identity, tenant, enrolledinventory.NormalizeMachineRef(body.MachineRef))
 		w.WriteHeader(http.StatusNoContent)

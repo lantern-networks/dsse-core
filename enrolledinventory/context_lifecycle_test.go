@@ -24,7 +24,7 @@ func (p *unconfirmedInventoryContextStore) UpdateContext(ctx context.Context, ed
 	return errors.New("private backend write failure")
 }
 func TestSharedInventoryUnconfirmedLifecycleDoesNotPublish(t *testing.T) {
-	for _, operation := range []string{"enroll", "rearm", "assign", "kind", "remove", "machine", "create", "rename", "delete"} {
+	for _, operation := range []string{"enroll", "rearm", "assign", "kind", "remove", "machine", "report", "create", "rename", "delete"} {
 		t.Run(operation, func(t *testing.T) {
 			p := &unconfirmedInventoryContextStore{}
 			l := NewLedger()
@@ -55,6 +55,8 @@ func TestSharedInventoryUnconfirmedLifecycleDoesNotPublish(t *testing.T) {
 				_, err = l.RemoveCheckedContext(ctx, "device", "tenant", "now")
 			case "machine":
 				err = l.RecordReportedMachineContext(ctx, "device", "tenant", "machine", "now")
+			case "report":
+				_, err = l.RecordEnrolmentReportContext(ctx, "new", "tenant", "Pilot", "", "machine-new", "now")
 			case "create":
 				_, err = l.CreateGroupContext(ctx, "New", "tenant", "", "", "now")
 			case "rename":
@@ -69,5 +71,57 @@ func TestSharedInventoryUnconfirmedLifecycleDoesNotPublish(t *testing.T) {
 				t.Fatal("unconfirmed candidate published")
 			}
 		})
+	}
+}
+
+type reportFileStore struct {
+	data  []byte
+	fail  bool
+	saves int
+}
+
+func (p *reportFileStore) Load() ([]byte, error) { return bytes.Clone(p.data), nil }
+func (p *reportFileStore) Save(b []byte) error {
+	p.saves++
+	if p.fail {
+		return errors.New("disk failure")
+	}
+	p.data = bytes.Clone(b)
+	return nil
+}
+func TestEnrolmentReportCommitsMarkerAndMachineTogether(t *testing.T) {
+	p := &reportFileStore{}
+	l := NewLedger()
+	if err := l.SetPersisterChecked(p); err != nil {
+		t.Fatal(err)
+	}
+	p.fail = true
+	if _, err := l.RecordEnrolmentReportContext(context.Background(), "device", "tenant", "Pilot", "note", "machine-1", "now"); !errors.Is(err, ErrInventorySave) {
+		t.Fatalf("storage refusal %v", err)
+	}
+	if _, ok := l.EntryFor("device"); ok {
+		t.Fatal("failed file update published")
+	}
+	p.fail = false
+	before := p.saves
+	if _, err := l.RecordEnrolmentReportContext(context.Background(), "device", "tenant", "Pilot", "note", "machine-1", "now"); err != nil {
+		t.Fatal(err)
+	}
+	if p.saves != before+1 {
+		t.Fatal("report split into multiple saves")
+	}
+	restored := NewLedger()
+	if err := restored.SetPersisterChecked(p); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := restored.EntryFor("device")
+	if !ok || e.MachineRef != "machine-1" || e.DeviceEnrolledAt != "now" {
+		t.Fatalf("incomplete report %+v", e)
+	}
+	if _, err := restored.RecordEnrolmentReportContext(context.Background(), "device", "tenant", "Pilot", "note", "machine-2", "later"); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := restored.EntryFor("device"); e.MachineRef != "machine-1" {
+		t.Fatal("first machine binding replaced")
 	}
 }

@@ -305,9 +305,11 @@ and ship records to the control plane. Include all of these in storage and backu
 A backup is not proved until it can be restored with its matching authority material.
 
 Audit ingestion authenticates each Edge with its client identity and authorizes tenant
-records through `audit-ingest-authority.json`. Check the generated mappings when adding
+records and device enrolment reports through `audit-ingest-authority.json`. Check the generated mappings when adding
 a customer; an Edge may enforce its traffic while its audit records are refused by the
 control plane. Verify delivery and receipt for that customer, not only the operator tenant.
+Enrolment reports remain in the Edge outbox during storage failures or a leader change.
+Authorization failures also require correcting the identity mapping before delivery can resume.
 
 From the generated directory, stop a single-machine lab without removing its volumes:
 

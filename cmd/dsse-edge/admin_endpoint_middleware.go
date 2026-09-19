@@ -34,6 +34,9 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			// on a standby was still admitted two minutes later while the same block on the leader bit in
 			// fifteen seconds. Checked here because this is the one place every administrative route passes
 			// through, and a rule enforced anywhere else is a rule with holes in it.
+			if adminPermissionWrites(permission) {
+				r = r.WithContext(captureCPWriteLease(r.Context()))
+			}
 			if adminWriteRefusedOnAStandby(w, permission) {
 				recordRefusal()
 				return

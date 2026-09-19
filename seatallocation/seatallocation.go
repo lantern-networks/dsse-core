@@ -17,6 +17,7 @@
 package seatallocation
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -74,6 +75,12 @@ var (
 // anything it already runs stops. Refusing the reduction would leave the MSSP unable to reorganise its own pool
 // without first persuading a customer to decommission machines.
 func (s *Store) Allocate(policy Policy, tenantID string, seats int, by, note, now string) (Allocation, error) {
+	return s.AllocateContext(context.Background(), policy, tenantID, seats, by, note, now)
+}
+
+// AllocateContext applies pool checks to the latest shared snapshot and carries
+// the caller's write authority through storage. Live state follows commit only.
+func (s *Store) AllocateContext(ctx context.Context, policy Policy, tenantID string, seats int, by, note, now string) (Allocation, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Allocation{}, ErrNoTenant
@@ -83,35 +90,25 @@ func (s *Store) Allocate(policy Policy, tenantID string, seats int, by, note, no
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !policy.AllowOversubscription {
-		total := 0
-		for id, a := range s.allocations {
-			if !strings.EqualFold(id, tenantID) {
-				total += a.Seats
+	a := Allocation{TenantID: tenantID, Seats: seats, UpdatedAt: now, UpdatedBy: strings.TrimSpace(by), Note: strings.TrimSpace(note)}
+	err := s.mutateLocked(ctx, func(candidate map[string]Allocation) error {
+		if !policy.AllowOversubscription {
+			total := 0
+			for id, a := range candidate {
+				if !strings.EqualFold(id, tenantID) {
+					total += a.Seats
+				}
+			}
+			if total+seats > policy.PoolSeats {
+				return fmt.Errorf("%w: %d already allocated to other tenants, %d in the pool", ErrPoolExceeded, total, policy.PoolSeats)
 			}
 		}
-		if total+seats > policy.PoolSeats {
-			return Allocation{}, fmt.Errorf("%w: %d already allocated to other tenants, %d in the pool",
-				ErrPoolExceeded, total, policy.PoolSeats)
-		}
-	}
-	a := Allocation{
-		TenantID:  tenantID,
-		Seats:     seats,
-		UpdatedAt: now,
-		UpdatedBy: strings.TrimSpace(by),
-		Note:      strings.TrimSpace(note),
-	}
-	candidate := make(map[string]Allocation, len(s.allocations)+1)
-	for key, value := range s.allocations {
-		candidate[key] = value
-	}
-	candidate[strings.ToLower(tenantID)] = a
-	if err := s.saveCandidateLocked(candidate); err != nil {
+		candidate[strings.ToLower(tenantID)] = a
+		return nil
+	})
+	if err != nil {
 		return Allocation{}, err
 	}
-	s.allocations = candidate
-	s.generation.Add(1)
 	return a, nil
 }
 
@@ -181,24 +178,22 @@ func (s *Store) Remove(tenantID string) bool {
 
 // RemoveConfirmed distinguishes absent allocations from unconfirmed storage writes.
 func (s *Store) RemoveConfirmed(tenantID string) (bool, error) {
+	return s.RemoveConfirmedContext(context.Background(), tenantID)
+}
+func (s *Store) RemoveConfirmedContext(ctx context.Context, tenantID string) (bool, error) {
 	k := strings.ToLower(strings.TrimSpace(tenantID))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.allocations[k]; !ok {
-		return false, nil
-	}
-	candidate := make(map[string]Allocation, len(s.allocations))
-	for key, value := range s.allocations {
-		if key != k {
-			candidate[key] = value
-		}
-	}
-	if err := s.saveCandidateLocked(candidate); err != nil {
+	removed := false
+	err := s.mutateLocked(ctx, func(candidate map[string]Allocation) error {
+		_, removed = candidate[k]
+		delete(candidate, k)
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
-	s.allocations = candidate
-	s.generation.Add(1)
-	return true, nil
+	return removed, nil
 }
 
 // Verdict is the answer to "may this tenant enrol another device", with enough detail to say why.

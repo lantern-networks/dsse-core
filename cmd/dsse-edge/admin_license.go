@@ -407,7 +407,7 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			pool = p.SeatsAt(now)
 		}
 		policy := seatallocation.Policy{PoolSeats: pool, AllowOversubscription: d.oversubscribe}
-		a, err := d.allocations.Allocate(policy, req.TenantID, *req.Seats, adminOf(r), req.Note, now.Format(time.RFC3339))
+		a, err := d.allocations.AllocateContext(r.Context(), policy, req.TenantID, *req.Seats, adminOf(r), req.Note, now.Format(time.RFC3339))
 		if d.auditAllocation != nil {
 			result := "success"
 			if err != nil {
@@ -454,7 +454,7 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			writeError(w, http.StatusForbidden, errors.New("an authenticated tenant and allocation target are required"))
 			return
 		}
-		removed, err := d.allocations.RemoveConfirmed(tenant)
+		removed, err := d.allocations.RemoveConfirmedContext(r.Context(), tenant)
 		if d.auditAllocation != nil {
 			result := "success"
 			if err != nil || !removed {

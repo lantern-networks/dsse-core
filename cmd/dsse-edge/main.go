@@ -2738,6 +2738,9 @@ func main() {
 	// Seat allocation: how an MSSP divides its licensed pool among the tenants it operates. Durable for a sharp
 	// reason — losing it reads as zero seats for every tenant and stops enrolment across the whole fleet.
 	seatAllocations := seatallocation.NewStore()
+	if err := seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations")); err != nil {
+		log.Fatalf("setup seat allocation store: %v", err)
+	}
 	vendorLicenceStore := newLicenseStore()
 	// EVERY vendor key this deployment accepts. Loaded once at boot; an unreadable file is fatal rather than
 	// silently unlicensed, because "no keys" and "keys we could not read" would otherwise look identical and
@@ -3961,6 +3964,7 @@ func main() {
 	}
 	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
 	configureInventoryPromotion(cpLeaderElectorInstance, *enrolledInventoryStore, enrolledLedger)
+	configureSeatPromotion(cpLeaderElectorInstance, *seatAllocationStore, seatAllocations)
 	cpLeaderElectorInstance.Start()
 	defer cpLeaderElectorInstance.Stop()
 	if sharedRevocationSource != nil {
@@ -4719,9 +4723,7 @@ func main() {
 	// (T) secure transport: additive TLS listener for the encrypted endpoint↔Edge tunnel. Default
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
 	// Edge continues on -listen.
-	if err := seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations")); err != nil {
-		log.Fatalf("setup seat allocation store: %v", err)
-	}
+
 	vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license"))
 	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
 	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,

@@ -808,7 +808,7 @@ const OPERATOR_NAV_SECTIONS = [
     // Not "overview": the operator already lands on their own home, and two screens both called Overview is
     // the kind of duplication that makes a person doubt which one they are reading.
     ids: ["enrolled", "enrolment-tokens", "agent-profile", "egress-rules", "eastwest-rules",
-      "effective-policy", "apps", "sites", "assets", "identities", "idp", "grants", "steerexcl",
+      "effective-policy", "apps", "sites", "vlan", "assets", "identities", "idp", "grants", "steerexcl",
       "inspection-posture", "dns"] },
   { t: { en: "Commercial", ja: "契約・課金" }, ids: ["licensing"] },
   { t: { en: "Record", ja: "記録" }, ids: ["audit"] },

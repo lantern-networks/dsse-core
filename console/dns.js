@@ -38,6 +38,18 @@ function dnsUpstreamHost(upstream) {
 async function dnsFetchConnectorReach() {
   let conns = [];
   try { const r = await apiFetch("GET", "/admin/connectors"); if (r.ok && r.body) conns = r.body.connectors || []; } catch (e) { return []; }
+  // Site bindings are inherited by every connector in the group at runtime.
+  // The connector route editor intentionally returns only its own bindings.
+  const siteReads = new Map();
+  const siteRoutes = (id) => {
+    if (!siteReads.has(id)) siteReads.set(id, (async () => {
+      try {
+        const r = await apiFetch("GET", "/admin/sites/" + encodeURIComponent(id) + "/networks");
+        return (r.ok && r.body && r.body.networks) || [];
+      } catch (e) { return []; }
+    })());
+    return siteReads.get(id);
+  };
   return Promise.all(conns.map(async (c) => {
     const id = c.id || c.connector_id || "";
     const cidrs = [];
@@ -46,7 +58,11 @@ async function dnsFetchConnectorReach() {
       const routes = (rr.ok && rr.body && rr.body.routes) || [];
       routes.forEach((rt) => { if (!rt.routable) return; if (rt.cidr) cidrs.push(rt.cidr); (rt.network_cidrs || []).forEach((x) => cidrs.push(x)); });
     } catch (e) { /* leave empty */ }
-    return { id, name: c.name || id, cidrs };
+    if (c.connector_group_id && c.connector_group_id !== id) {
+      const inherited = await siteRoutes(c.connector_group_id);
+      inherited.forEach((rt) => { if (!rt.routable) return; if (rt.cidr) cidrs.push(rt.cidr); (rt.network_cidrs || []).forEach((x) => cidrs.push(x)); });
+    }
+    return { id, name: c.name || id, cidrs: [...new Set(cidrs)] };
   }));
 }
 // dnsReachFor: undefined = upstream isn't an IPv4 literal (can't check); a connector object = it reaches it;

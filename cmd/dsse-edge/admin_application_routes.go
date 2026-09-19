@@ -65,7 +65,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationCatalogAuditLog(created, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationCatalogAuditLog(created, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, created)
 	}))
 	// Connector UX Slice 2: publish a Private App. Publishing sets published=true plus the runtime route
@@ -162,7 +162,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 					return
 				}
 				// Authorized high-risk override: record the approval, then proceed with the publish.
-				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationCIDRCollisionOverrideAuditLog(entry, collisions, evaluator, now), now)
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationCIDRCollisionOverrideAuditLog(entry, collisions, evaluator, now)), now)
 			}
 		}
 		created, err := applicationCatalogStore.Upsert(r.Context(), entry, tenantID, now)
@@ -187,7 +187,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 				log.Printf("publish %s: surface asset endpoint: %v", created.ApplicationID, uerr)
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "application_publish.v1",
 			"application":    created,
@@ -222,7 +222,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 				logWarnf("unpublish app %s: %v", applicationID, err) // cleanup persist failure; the unpublish itself succeeded
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, false), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, false)), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "application_publish.v1",
 			"application":    created,
@@ -271,7 +271,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 				logWarnf("delete app %s: %v", applicationID, err) // cleanup persist failure; the app delete itself succeeded
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationDeleteAuditLog(tenantID, applicationID, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationDeleteAuditLog(tenantID, applicationID, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, map[string]any{"application_id": applicationID, "deleted": true})
 	}))
 	// Connector UX Slice 3: reachability diagnostics. Probe the application's destination through the connector

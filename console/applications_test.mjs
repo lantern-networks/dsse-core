@@ -38,3 +38,19 @@ test('a second save activation during the detail read cannot issue another write
 test('input changes during the detail read cannot copy one application into another ID',async()=>{
  let release;const values={id:'ssh',name:'Submitted'};const f=form({existing:null,values,get:()=>new Promise(resolve=>{release=resolve;})});const pending=f.submit();values.id='other';values.name='Later input';release({ok:true,body:fresh});await pending;assert.equal(f.calls[1].body.application_id,'ssh');assert.equal(f.calls[1].body.name,'Submitted');
 });
+
+function publicationFixture(responses) {
+ const calls=[],nodes=[],fields={};let modal,closed=0;
+ const el=(tag,attrs={},children=[])=>{
+  const n={tag,...attrs,style:{},children:Array.isArray(children)?children:[children],listeners:[],appendChild(x){this.children.push(x)},setAttribute(){},addEventListener(event,fn){if(event==='click')this.listeners.push(fn)},querySelector(){return this.input||(this.input=el('input'))},async click(){if(this.disabled)return;for(const fn of this.listeners)await fn();if(this.onclick)await this.onclick()}};nodes.push(n);return n;
+ };
+ const c=vm.createContext({bl:v=>v.en,el,uiToast(){},document:{getElementById:()=>({})},uiField:f=>{const n=el('div');fields[f.name]={value:f.value||f.placeholder||'',el:n,get(){return this.value},validate:()=>true,focus(){},setError(){}};return fields[f.name]},uiModal:spec=>{modal=spec;return{close(){closed++}}},apiFetch:async(method,path,body)=>{if(method==='GET')return{ok:true,body:{sites:[]}};calls.push({method,path,body});return responses.shift()}});
+ vm.runInContext(source,c);vm.runInContext('renderApplicationsView=()=>{}',c);c.openPublishWizard({});
+ return{calls,nodes,fields,get button(){return modal.footer[1]},get closed(){return closed}};
+}
+test('publication Done only closes and never submits a second publish',async()=>{
+ const f=publicationFixture([{ok:true,body:{review:{published_route:true}}}]);await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.button.textContent,'Done');await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.closed,1);
+});
+test('collision step requires explicit approval and sends exactly one override',async()=>{
+ const f=publicationFixture([{ok:false,status:409,body:{error:'cidr_route_collision',collisions:[]}},{ok:true,body:{review:{published_route:true}}}]);await f.button.click();assert.equal(f.calls.length,1);await f.button.click();assert.equal(f.calls.length,1);f.nodes.findLast(n=>n.type==='checkbox').checked=true;await f.button.click();await new Promise(resolve=>setImmediate(resolve));assert.equal(f.calls.length,2);assert.equal(f.calls[1].body.override_cidr_collision,true);await f.button.click();assert.equal(f.calls.length,2);assert.equal(f.closed,1);
+});

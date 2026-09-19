@@ -265,6 +265,7 @@ function openPublishWizard(content, existing) {
     };
   };
   async function doPublish(override) {
+    if (submit.disabled) return;
     if (!idF.validate() || !nameF.validate() || !destF.validate() || !portF.validate() || !nsF.validate()) return;
     submit.disabled = true;
     const body = { name: nameF.get(), destination: destF.get(), publish_protocol: typeF.get(), connector_group_id: siteF.get(), routing_namespace: nsF.get() };
@@ -289,7 +290,9 @@ function openPublishWizard(content, existing) {
       uiToast(bl({ en: "Private app published.", ja: "社内アプリを公開しました。" }), "ok");
     } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
   }
-  submit.addEventListener("click", () => doPublish(false));
+  // One handler owns the current step. Keeping the original listener alongside
+  // the override/Done handlers would publish again when the user only closes.
+  submit.onclick = () => doPublish(false);
   (existing ? destF : idF).focus();
 }
 

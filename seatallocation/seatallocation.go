@@ -236,7 +236,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	if s == nil {
 		return 0
 	}
-	tenantID = strings.TrimSpace(tenantID)
+	tenantID = strings.ToLower(strings.TrimSpace(tenantID))
 	if tenantID == "" {
 		return 0
 	}
@@ -248,21 +248,16 @@ func (s *Store) CountForTenant(tenantID string) int {
 	return 0
 }
 
-func (s *Store) RemoveTenant(tenantID string) int {
+func (s *Store) RemoveTenant(tenantID string) (int, error) {
 	if s == nil {
-		return 0
+		return 0, nil
 	}
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
+	removed, err := s.RemoveConfirmed(tenantID)
+	if err != nil {
+		return 0, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.allocations[tenantID]; !ok {
-		return 0
+	if removed {
+		return 1, nil
 	}
-	delete(s.allocations, tenantID)
-	s.generation.Add(1)
-	s.persistLocked()
-	return 1
+	return 0, nil
 }

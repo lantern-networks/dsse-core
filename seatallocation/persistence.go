@@ -52,27 +52,6 @@ func (s *Store) loadLocked() {
 	}
 }
 
-func (s *Store) persistLocked() {
-	if s == nil || s.persister == nil {
-		return
-	}
-	data, err := json.Marshal(stateFile{SchemaVersion: stateSchemaVersion, Allocations: s.allocations})
-	if err != nil {
-		log.Printf("seat_allocations persist: marshal failed: %v", err)
-		return
-	}
-	if err := s.persister.Save(data); err != nil {
-		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
-		// change was lost when it was written; saying nothing would hide that an interrupted write could
-		// truncate it. Both are worth exactly one accurate sentence.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
-			log.Printf("seat_allocations persist: saved, but NOT atomically — %v", err)
-		} else {
-			log.Printf("seat_allocations persist: save failed: %v", err)
-		}
-	}
-}
-
 // ErrPersistence means the management change was not confirmed by storage.
 var ErrPersistence = errors.New("seat allocation persistence failed")
 

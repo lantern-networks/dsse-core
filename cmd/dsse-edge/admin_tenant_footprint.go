@@ -471,7 +471,11 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.SeatAllocations != nil {
-		add("seat_allocation", e.SeatAllocations.RemoveTenant(tenantID))
+		if n, err := e.SeatAllocations.RemoveTenant(tenantID); err != nil {
+			result.Failures = append(result.Failures, "seat allocation erasure could not be confirmed")
+		} else {
+			add("seat_allocation", n)
+		}
 	}
 	if e.PolicyCandidates != nil {
 		if n, err := e.PolicyCandidates.RemoveTenant(tenantID); err != nil {

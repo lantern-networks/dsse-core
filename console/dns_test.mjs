@@ -34,3 +34,18 @@ test('DNS reach includes site bindings without losing connector-specific governa
   assert.equal(context.dnsReachFor('10.40.0.53:53', reach).name, 'First');
   assert.equal(context.dnsReachFor('10.70.0.53:53', reach), null);
 });
+
+for(const failed of ['/admin/connectors','/admin/connectors/c/routes','/admin/sites/s/networks'])test('DNS refuses incomplete reachability and recovers: '+failed,async()=>{
+ let fail=true,states=[];
+ const c=vm.createContext({bl:x=>x.en,freshRender:()=>()=>true,uiState:(host,kind,message,action)=>states.push({kind,message,action}),apiFetch:async(method,path)=>{
+  if(path===failed&&fail)return {ok:false,status:503,body:{}};
+  return {ok:true,status:200,body:path==='/admin/connectors'?{connectors:[{id:'c',name:'Connector',connector_group_id:'s'}]}:path==='/admin/connectors/c/routes'?{routes:[]} :path==='/admin/dns-policy'?{deny:[],sinkhole:{},forward_zones:[]}:{networks:[{routable:true,cidr:'10.40.0.0/24'}]}};
+ }});
+ vm.runInContext(readFileSync(new URL('./dns.js',import.meta.url),'utf8'),c);
+ await assert.rejects(c.dnsFetchConnectorReach(),/unavailable/);
+ await c.loadDns({},{});assert.equal(states.at(-1).kind,'error');assert.match(states.at(-1).message,/could not be verified/);assert.equal(states.at(-1).action.label,'Retry');
+ fail=false;const reach=await c.dnsFetchConnectorReach();assert.equal(c.dnsReachFor('10.40.0.53:53',reach).id,'c');
+});
+test('missing reachability collections are not an empty successful read',async()=>{
+ const c=vm.createContext({apiFetch:async()=>({ok:true,status:200,body:{}})});vm.runInContext(readFileSync(new URL('./dns.js',import.meta.url),'utf8'),c);await assert.rejects(c.dnsFetchConnectorReach(),/unavailable/);
+});

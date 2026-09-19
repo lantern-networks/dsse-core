@@ -36,32 +36,29 @@ function dnsUpstreamHost(upstream) {
 // dnsFetchConnectorReach returns [{id,name,cidrs:[]}] of ROUTABLE CIDRs per connector (raw CIDR bindings + the
 // CIDRs a Named-Network reference expands to), so we can tell which connector reaches a forward zone's upstream.
 async function dnsFetchConnectorReach() {
-  let conns = [];
-  try { const r = await apiFetch("GET", "/admin/connectors"); if (r.ok && r.body) conns = r.body.connectors || []; } catch (e) { return []; }
+  const rows = async (path, key) => {
+    const r = await apiFetch("GET", path);
+    if (!r.ok || !r.body || !Array.isArray(r.body[key])) throw new Error("DNS reachability unavailable");
+    return r.body[key];
+  };
+  const conns = await rows("/admin/connectors", "connectors");
   // Site bindings are inherited by every connector in the group at runtime.
-  // The connector route editor intentionally returns only its own bindings.
   const siteReads = new Map();
   const siteRoutes = (id) => {
-    if (!siteReads.has(id)) siteReads.set(id, (async () => {
-      try {
-        const r = await apiFetch("GET", "/admin/sites/" + encodeURIComponent(id) + "/networks");
-        return (r.ok && r.body && r.body.networks) || [];
-      } catch (e) { return []; }
-    })());
+    if (!siteReads.has(id)) siteReads.set(id, rows("/admin/sites/" + encodeURIComponent(id) + "/networks", "networks"));
     return siteReads.get(id);
   };
   return Promise.all(conns.map(async (c) => {
     const id = c.id || c.connector_id || "";
+    if (!id) throw new Error("DNS connector identity unavailable");
+    const routes = await rows("/admin/connectors/" + encodeURIComponent(id) + "/routes", "routes");
+    const inherited = c.connector_group_id && c.connector_group_id !== id ? await siteRoutes(c.connector_group_id) : [];
     const cidrs = [];
-    try {
-      const rr = await apiFetch("GET", "/admin/connectors/" + encodeURIComponent(id) + "/routes");
-      const routes = (rr.ok && rr.body && rr.body.routes) || [];
-      routes.forEach((rt) => { if (!rt.routable) return; if (rt.cidr) cidrs.push(rt.cidr); (rt.network_cidrs || []).forEach((x) => cidrs.push(x)); });
-    } catch (e) { /* leave empty */ }
-    if (c.connector_group_id && c.connector_group_id !== id) {
-      const inherited = await siteRoutes(c.connector_group_id);
-      inherited.forEach((rt) => { if (!rt.routable) return; if (rt.cidr) cidrs.push(rt.cidr); (rt.network_cidrs || []).forEach((x) => cidrs.push(x)); });
-    }
+    [...routes, ...inherited].forEach((rt) => {
+      if (!rt.routable) return;
+      if (rt.cidr) cidrs.push(rt.cidr);
+      (rt.network_cidrs || []).forEach((x) => cidrs.push(x));
+    });
     return { id, name: c.name || id, cidrs: [...new Set(cidrs)] };
   }));
 }
@@ -115,7 +112,14 @@ async function loadDns(host, content) {
   let ech = !!pol.ech_strip;
   const forwardZones = Array.isArray(pol.forward_zones) ? pol.forward_zones.map((z) => ({ zone: z.zone || "", upstream: z.upstream || "" })) : [];
   // Which connector reaches each internal DNS server (upstream)? Fetched once so the forward-zone rows can show it.
-  const connectorReach = await dnsFetchConnectorReach();
+  let connectorReach;
+  try { connectorReach = await dnsFetchConnectorReach(); }
+  catch (e) {
+    if (!current()) return;
+    uiState(host, "error", bl({ en: "Connector reachability could not be verified. Retry before editing DNS settings.", ja: "コネクタの到達情報を確認できません。DNS設定を編集する前に再試行してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadDns(host, content) });
+    return;
+  }
 
   if (!current()) return;
   host.innerHTML = "";

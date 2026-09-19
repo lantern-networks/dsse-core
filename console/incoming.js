@@ -6,6 +6,18 @@
 // POST /admin/legacy-exceptions {…}; GET /admin/legacy-exceptions/export.
 
 async function renderIncomingView(content) {
+  uiState(content, "loading");
+  const current = freshRender(content);
+  let blocked;
+  try {
+    blocked = incomingDefaultBody(await apiFetch("GET", "/admin/server-initiated"));
+  } catch (e) {
+    if (!current()) return;
+    uiState(content, "error", bl({ en: "The incoming default could not be verified. Retry before changing this policy.", ja: "受信接続の既定動作を確認できません。設定を変更する前に再試行してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderIncomingView(content) });
+    return;
+  }
+  if (!current()) return;
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
@@ -18,12 +30,10 @@ async function renderIncomingView(content) {
     el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add exception", ja: "+ 例外を追加" }), onClick: () => openExceptionForm(content) }),
   ]));
   // Show the LIVE default (readable via GET) so it is unambiguous which is in effect, then offer to switch.
-  let blocked = false;
-  try { const r = await apiFetch("GET", "/admin/server-initiated"); if (r.ok && r.body) blocked = !!r.body.server_initiated_enabled; } catch (e) { /* fall back to unknown=allow */ }
   content.appendChild(el("div", { class: "ui-toolbar" }, [
     el("span", { class: "ui-view-desc", text: bl({ en: "Default for incoming connections:", ja: "受信接続の既定:" }) }),
     uiBadge(blocked ? bl({ en: "Currently: Block by default", ja: "現在: 既定でブロック" }) : bl({ en: "Currently: Allow by default", ja: "現在: 既定で許可" }), blocked ? "ok" : "warn"),
-    el("button", { class: "ui-btn ui-btn-sm", text: blocked ? bl({ en: "Switch to allow by default", ja: "既定で許可に切替" }) : bl({ en: "Switch to block by default", ja: "既定でブロックに切替" }), onClick: () => setIncoming(!blocked, content) }),
+    el("button", { class: "ui-btn ui-btn-sm", text: blocked ? bl({ en: "Switch to allow by default", ja: "既定で許可に切替" }) : bl({ en: "Switch to block by default", ja: "既定でブロックに切替" }), onClick: () => { if (current()) setIncoming(!blocked, content); } }),
   ]));
   // Applied automatically — no manual export step. The Windows agent on each endpoint fetches this policy and
   // reconciles it into standard Windows Defender Firewall inbound rules (group "DSSE Server-Initiated",
@@ -35,6 +45,13 @@ async function renderIncomingView(content) {
   const host = el("div", {});
   content.appendChild(host);
   loadExceptions(host, content);
+}
+
+function incomingDefaultBody(response) {
+  if (!response?.ok || response.status !== 200 || typeof response.body?.server_initiated_enabled !== "boolean") {
+    throw new Error("Incoming default unavailable");
+  }
+  return response.body.server_initiated_enabled;
 }
 
 async function setIncoming(enabled, content) {
@@ -92,7 +109,10 @@ async function openExceptionForm(content, existing) {
   // are SELECTED, not hand-typed. Values map to the Legacy-Exception fields (source_server = endpoint address,
   // device_group = group alias, protocol + port = selected catalog TCP port).
   let idx;
-  try { idx = await catalogIndex(); } catch (e) { idx = { endpoints: [], groups: [], services: [] }; }
+  try { idx = await catalogIndex(); } catch (e) {
+    uiToast(bl({ en: "The asset catalog could not be read. Retry opening the editor after it recovers.", ja: "資産カタログを取得できません。復旧後に編集を開き直してください。" }), "err");
+    return;
+  }
   const curTag = bl({ en: " (current)", ja: "(現在値)" });
 
   const idF = uiField({ name: "id", label: bl({ en: "Exception ID", ja: "例外 ID" }), required: true, value: existing ? (existing.id || "") : "", placeholder: "ex-1" });

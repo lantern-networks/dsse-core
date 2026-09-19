@@ -25,7 +25,7 @@ func buildVLANBoundaryStore(config serverConfig) *vlan.Store {
 	vlanBoundary := vlan.NewStore() //: VLAN/Subnet objects + boundary policies + export
 	// Durability (optional, -vlan-object-store). Without it this is a plain in-memory map and EVERY restart
 	// erases every Network object the operator defined — the reason the Console's Networks page read permanently
-	// empty, since the lab rebuilds the Edge on every change. Every mutation re-saves (store-side persistLocked).
+	// empty, since the lab rebuilds the Edge on every change. Every mutation confirms its candidate snapshot before publication.
 	if storeShouldBeWired(config.VLANObjectStorePath) {
 		p, e := cpStateBlobPersister(config.VLANObjectStorePath, cpStateBlobDB, "vlan_objects")
 		if e != nil {
@@ -41,7 +41,7 @@ func buildVLANBoundaryStore(config serverConfig) *vlan.Store {
 			}
 		}
 		vlan.OnPersistError = func(err error) {
-			logErrorf("vlan_object_store_save_failed: %v — Network objects will NOT survive a restart", err)
+			logErrorf("vlan_object_store_save_failed: %v — network change was not confirmed; prior live state retained", err)
 		}
 	}
 	return vlanBoundary

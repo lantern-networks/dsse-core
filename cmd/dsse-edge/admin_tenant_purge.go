@@ -137,7 +137,11 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	// id. It was in neither the count nor the erasure — and a store nobody counts contributes nothing to "what
 	// is left", so the answer could not have been anything else.
 	if namedNetworks != nil {
-		objects, policies := namedNetworks.RemoveTenant(tenantID)
+		objects, policies, err := namedNetworks.RemoveTenant(tenantID)
+		if err != nil {
+			log.Printf("tenant network erasure: %v", err)
+			result.Failures = append(result.Failures, "network erasure saving could not be confirmed")
+		}
 		if objects > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "named_networks", Count: int64(objects)})
 		}

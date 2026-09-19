@@ -834,9 +834,13 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			// possible, and it is only possible here.
 			log.Printf("config-bundle sync: control plane reports its VLAN boundary set is COMPLETE and empty — clearing %d object(s) and %d policy/policies.",
 				len(t.vlan.ListObjects()), len(t.vlan.ListPolicies()))
-			t.vlan.ReplaceAll(nil, nil)
+			if err := t.vlan.ReplaceAll(nil, nil); err != nil {
+				criticalErr = errors.Join(criticalErr, err)
+			}
 		default:
-			t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies)
+			if err := t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies); err != nil {
+				criticalErr = errors.Join(criticalErr, err)
+			}
 		}
 	}
 	if payload.Connectors != nil && t.connectors != nil {

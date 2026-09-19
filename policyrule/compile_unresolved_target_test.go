@@ -8,7 +8,7 @@ import "testing"
 func TestCompileEastWestUnresolvedDestinationFailsClosed(t *testing.T) {
 	resolver := fakeEWResolver{
 		src:   map[string][]string{"grp-clients": {"dev-a"}},
-		proto: map[string][]string{"svc-ssh": {"ssh"}},
+		proto: map[string]map[string][]int{"svc-ssh": {"tcp": {22}}},
 		// dest map empty => the destination resolves to zero tokens.
 	}
 	rules := []Rule{{

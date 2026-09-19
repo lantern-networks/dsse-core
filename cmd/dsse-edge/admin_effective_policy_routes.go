@@ -46,7 +46,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			effective = rr.EffectiveEastWestRules(tenant)
 		}
 		covered := func(obs eastwestobserve.FlowObservation) bool {
-			req := model.DecisionRequest{Destination: obs.Destination, ServiceFamily: obs.ServiceFamily}
+			req := model.DecisionRequest{Destination: obs.Destination, ServiceFamily: obs.ServiceFamily, Protocol: "tcp", DestinationPort: obs.Port}
 			if obs.Source != eastwestobserve.SourceAny {
 				req.DeviceID = obs.Source
 			}

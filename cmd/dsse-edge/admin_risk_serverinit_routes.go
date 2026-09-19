@@ -157,13 +157,17 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			"withheld_unattributable": withheld,
 		})
 	}))
-	auditIncoming := func(r *http.Request, target, action string, err error) {
+	auditIncoming := func(r *http.Request, tenant, target, action string, err error) {
 		now := time.Now().UTC()
 		result := "success"
 		if err != nil {
 			result = "error"
 		}
-		row := model.AuditLog{ID: randomEdgeID("audit_incoming_", now), TenantID: adminTenantIDFromRequest(r), ActorUserID: auditActorPrincipal(r), EventType: "admin_incoming_changed", TargetType: stringPtr("incoming_policy"), TargetID: stringPtr(target), Action: stringPtr(action), Result: &result, Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID}
+		row := model.AuditLog{ID: randomEdgeID("audit_incoming_", now), TenantID: tenant, ActorUserID: auditActorPrincipal(r), EventType: "admin_incoming_changed", TargetType: stringPtr("incoming_policy"), TargetID: stringPtr(target), Action: stringPtr(action), Result: &result, Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID}
+		row.Metadata = map[string]any{"target_tenant_id": tenant}
+		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && !strings.EqualFold(identity.TenantID, tenant) {
+			stampOperatorActor(row.Metadata, identity)
+		}
 		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, row, now)
 	}
 	mux.HandleFunc("POST /admin/server-initiated", adminEndpoint("admin.serverinitiated.write", func(w http.ResponseWriter, r *http.Request) {
@@ -188,7 +192,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		if req.Enabled {
 			action = "block_default"
 		}
-		auditIncoming(r, adminTenantIDFromRequest(r), action, err)
+		auditIncoming(r, adminTenantIDFromRequest(r), adminTenantIDFromRequest(r), action, err)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy save could not be confirmed. Reload before retrying."))
 			return
@@ -239,7 +243,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			return
 		}
 		err := setter.UpsertLegacyExceptionConfirmed(ex.TenantID, ex)
-		auditIncoming(r, ex.ID, "upsert_exception", err)
+		auditIncoming(r, ex.TenantID, ex.ID, "upsert_exception", err)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception save could not be confirmed. Reload before retrying."))
 			return
@@ -260,12 +264,12 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		}
 		removed, err := setter.RemoveLegacyExceptionConfirmed(adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			auditIncoming(r, r.PathValue("id"), "remove_exception", err)
+			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", err)
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception removal could not be confirmed. Reload before retrying."))
 			return
 		}
 		if removed {
-			auditIncoming(r, r.PathValue("id"), "remove_exception", nil)
+			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", nil)
 		}
 
 		if !removed {

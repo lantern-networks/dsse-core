@@ -74,8 +74,21 @@ complete dependency analysis or an automatic release decision.
 
 A non-Any source or destination that resolves to nothing matches nothing. In
 PARTIAL ENFORCE such a failed match can fall through to the unmatched allow.
-Keep service references valid as well: an empty protocol selector on the compiled
-East-West rule is broad across recognized East-West families.
+A named service matches its configured transport/port pairs, not its display name.
+For example, a service named `Finance database` containing TCP/5432 does not also
+allow TCP/3306 or UDP/5432. Renaming the service does not change that condition.
+A deleted or unresolved named service matches nothing; only explicit **Any** removes
+the service restriction. This does not expand which service families enter the
+East-West layer. Legacy family-based API rules retain their family selectors.
+Upgrade all Edges before publishing transport/port-based compiled rules from an
+updated control plane. Older readers cannot apply these rules and see a nonmatching
+family guard instead of an unrestricted service. In partial mode, unmatched flows
+remain allowed; mixed-version enforcement is not an acceptance guarantee.
+
+Mode, legacy rules, and grant TTL changes submitted together are saved as one update.
+A refused or unconfirmed save returns an error and preserves the prior live policy.
+Reload the settings before retrying: an unconfirmed filesystem flush does not prove
+that disk contents stayed unchanged.
 
 The **Allow machines with no signed-in user** option is an explicit alternate
 path for Authenticate rules, disabled by default. Its attestation eligibility

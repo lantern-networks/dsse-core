@@ -419,9 +419,9 @@ type tenantDeletion struct {
 //     same lockout the control plane's own DELETE route refuses with 409;
 //   - a tenant the same payload also asks us to keep, which is a contradiction and not an instruction;
 //   - nothing else. A tenant we do not have is not an error: the delete is idempotent by design.
-func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdminStore, section *tenantModelBundle, existing []adminTenantModel) {
+func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdminStore, section *tenantModelBundle, existing []adminTenantModel) error {
 	if store == nil || section == nil || len(section.Deleted) == 0 {
-		return
+		return nil
 	}
 	kept := make(map[string]bool, len(section.Tenants))
 	for _, tenant := range section.Tenants {
@@ -431,6 +431,7 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 	for _, tenant := range existing {
 		present[strings.TrimSpace(tenant.TenantID)] = tenant
 	}
+	var failed error
 	for _, deletion := range section.Deleted {
 		tenantID := strings.TrimSpace(deletion.TenantID)
 		if tenantID == "" {
@@ -449,12 +450,14 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 			continue
 		}
 		if err := store.Delete(ctx, tenantID); err != nil {
+			failed = errors.Join(failed, fmt.Errorf("tenant deletion %q: %w", tenantID, err))
 			log.Printf("config-bundle sync: deleting tenant %q as instructed by the control plane failed: %v", tenantID, err)
 			continue
 		}
 		log.Printf("config-bundle sync: deleted tenant %q (control plane recorded the deletion at %s). Runtime state keyed to it is no longer served here.",
 			tenantID, strings.TrimSpace(deletion.DeletedAt))
 	}
+	return failed
 }
 
 // enrolledInventoryBundle wraps the enrolled set so the bundle can carry an explicitly-empty set (replace all)
@@ -791,33 +794,34 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			t.enrolled.ReplaceAllGroups(payload.Enrolled.Groups, now.Format(time.RFC3339))
 		}
 	}
+	var tenantApplyErr error
 	if payload.Tenants != nil && t.tenantModels != nil {
-		// The apply path has no request context; this is a background reconcile against a local store.
 		ctx := context.Background()
-		existing, _ := t.tenantModels.List(ctx)
-		if len(payload.Tenants.Tenants) == 0 && len(existing) > 0 {
-			log.Printf("config-bundle sync: control plane sent an EMPTY tenant set while this Edge holds %d tenant(s) — keeping local. An empty section means the CP is not the tenant authority, not that every tenant was deleted.", len(existing))
+		existing, err := t.tenantModels.List(ctx)
+		if err != nil {
+			tenantApplyErr = fmt.Errorf("tenant registry read: %w", err)
 		} else {
-			for _, tenant := range payload.Tenants.Tenants {
-				// UPSERT rather than replace-all. Deleting a tenant is a deliberate lifecycle act with its own
-				// route and its own lockout protection; inferring it from absence in a bundle would make a
-				// truncated or partially-built payload look like a deletion.
-				if _, err := t.tenantModels.Put(ctx, tenant, now); err != nil {
-					log.Printf("config-bundle sync: tenant %q from the control plane was refused: %v", tenant.TenantID, err)
-					criticalErr = errors.Join(criticalErr, fmt.Errorf("tenant %q: %w", tenant.TenantID, err))
+			if len(payload.Tenants.Tenants) == 0 && len(existing) > 0 {
+				log.Printf("config-bundle sync: empty tenant set is not a deletion; keeping %d local tenant(s)", len(existing))
+			} else {
+				for _, tenant := range payload.Tenants.Tenants {
+					if _, err := t.tenantModels.Put(ctx, tenant, now); err != nil {
+						tenantApplyErr = errors.Join(tenantApplyErr, fmt.Errorf("tenant %q: %w", tenant.TenantID, err))
+					}
 				}
 			}
+			tenantApplyErr = errors.Join(tenantApplyErr, applyCarriedTenantDeletions(ctx, t.tenantModels, payload.Tenants, existing))
 		}
-		// Carried deletions. These are applied even when the tenant list above was empty and left alone: an
-		// empty list means "I am not the authority for the set", while a deletion names one tenant and says it
-		// is gone. The two claims are independent, and only the second one is ever acted on destructively.
-		applyCarriedTenantDeletions(ctx, t.tenantModels, payload.Tenants, existing)
 	}
-	// Carried ERASURE orders. Deliberately outside the tenantModels guard above: a node still holding a
-	// terminated tenant's LOGS must erase them even if it has no tenant registry of its own to speak of.
-	applyCarriedTenantPurges(context.Background(), t, payload, t.nodeName, now)
-	if payload.Tenants != nil && t.erasureOrders != nil {
-		t.erasureOrders.remember(payload.Tenants.PurgeOrders)
+	if tenantApplyErr != nil {
+		criticalErr = errors.Join(criticalErr, tenantApplyErr)
+	} else {
+		// Never erase or remember an order after uncertain tenant reconciliation.
+		// Nodes without a registry can still receive independently signed erasure orders.
+		applyCarriedTenantPurges(context.Background(), t, payload, t.nodeName, now)
+		if payload.Tenants != nil && t.erasureOrders != nil {
+			t.erasureOrders.remember(payload.Tenants.PurgeOrders)
+		}
 	}
 	if payload.VLAN != nil && t.vlan != nil {
 		emptyPayload := len(payload.VLAN.Objects) == 0 && len(payload.VLAN.Policies) == 0

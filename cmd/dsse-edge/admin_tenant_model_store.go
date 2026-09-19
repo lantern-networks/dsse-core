@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -267,20 +266,14 @@ type adminTenantModelSnapshot struct {
 }
 
 func newAdminTenantModelStore(bundle model.PolicyBundle, now time.Time) *adminTenantModelStore {
-	return newDurableAdminTenantModelStore(bundle, now, "")
+	// Memory-only initialization has no storage operations that can fail.
+	store, _ := openAdminTenantModelStore(bundle, now, "", "")
+	return store
 }
 
-// newDurableAdminTenantModelStore builds the store, loading from the durable snapshot at path when it exists
-// (and is non-empty), otherwise seeding the bundle tenant. A non-empty path makes the store restart-resilient.
-func newDurableAdminTenantModelStore(bundle model.PolicyBundle, now time.Time, path string) *adminTenantModelStore {
-	return newOperatorAwareAdminTenantModelStore(bundle, now, path, "")
-}
-
-// newOperatorAwareAdminTenantModelStore is newDurableAdminTenantModelStore plus the operator-tenant feature
-// (-operator-tenant-id). operatorTenantID == "" reproduces the legacy behavior exactly (lab default): load or
-// seed the bundle tenant, no operator tenant, IsOperator always false. A non-empty operatorTenantID additionally
-// seeds the operator tenant (display name "Operator", status active) when absent and stamps IsOperator on reads.
-func newOperatorAwareAdminTenantModelStore(bundle model.PolicyBundle, now time.Time, path, operatorTenantID string) *adminTenantModelStore {
+// openAdminTenantModelStore distinguishes first boot from an unreadable existing
+// snapshot. No state is published and no listener should start on failure.
+func openAdminTenantModelStore(bundle model.PolicyBundle, now time.Time, path, operatorTenantID string) (*adminTenantModelStore, error) {
 	store := &adminTenantModelStore{
 		tenants:          map[string]adminTenantModel{},
 		deleted:          map[string]string{},
@@ -293,17 +286,22 @@ func newOperatorAwareAdminTenantModelStore(bundle model.PolicyBundle, now time.T
 	}
 	loaded := false
 	if store.path != "" {
-		if snapshot, tombstones, orders, ok := loadAdminTenantModelSnapshot(store.path); ok {
-			store.tenants = snapshot
-			if tombstones != nil {
-				store.deleted = tombstones
+		snapshot, found, err := readAdminTenantModelSnapshot(store.path)
+		if err != nil {
+			return nil, fmt.Errorf("load tenant registry: %w", err)
+		}
+		if found {
+			store.tenants = snapshot.Tenants
+			if snapshot.Deleted != nil {
+				store.deleted = snapshot.Deleted
 			}
-			if orders != nil {
-				store.purgeOrders = orders
+			if snapshot.PurgeOrders != nil {
+				store.purgeOrders = snapshot.PurgeOrders
 			}
 			loaded = true
 		}
 	}
+
 	dirty := false
 	if !loaded {
 		if tenantID := strings.TrimSpace(bundle.TenantID); tenantID != "" {
@@ -328,9 +326,11 @@ func newOperatorAwareAdminTenantModelStore(bundle model.PolicyBundle, now time.T
 		dirty = true
 	}
 	if dirty {
-		store.persistLocked()
+		if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: store.tenants, Deleted: store.deleted, PurgeOrders: store.purgeOrders}); err != nil {
+			return nil, err
+		}
 	}
-	return store
+	return store, nil
 }
 
 // seedOperatorTenantLocked inserts the operator tenant (display name "Operator", status active, IsOperator) when
@@ -357,37 +357,35 @@ func (store *adminTenantModelStore) seedOperatorTenantLocked(now time.Time) bool
 	return true
 }
 
-// loadAdminTenantModelSnapshot reads a durable snapshot; returns ok=false when the file is missing/empty/invalid
-// so the caller falls back to bundle seeding (never silently starts with a corrupt set).
-func loadAdminTenantModelSnapshot(path string) (map[string]adminTenantModel, map[string]string, map[string]string, bool) {
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) == 0 {
-		return nil, nil, nil, false
-	}
+// readAdminTenantModelSnapshot reports absence only for a genuinely missing path.
+// Empty/invalid files, directories and dangling links are not a fresh installation.
+func readAdminTenantModelSnapshot(path string) (adminTenantModelSnapshot, bool, error) {
 	var snapshot adminTenantModelSnapshot
-	if err := json.Unmarshal(data, &snapshot); err != nil || snapshot.Tenants == nil {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			if _, statErr := os.Lstat(path); errors.Is(statErr, os.ErrNotExist) {
+				return snapshot, false, nil
+			}
+		}
+		return snapshot, false, err
+	}
+	if err := json.Unmarshal(data, &snapshot); err != nil {
+		return snapshot, false, err
+	}
+	if snapshot.Tenants == nil {
+		return snapshot, false, errors.New("tenant registry snapshot has no tenants map")
+	}
+	return snapshot, true, nil
+}
+
+// The PostgreSQL import caller already refuses a named unreadable snapshot.
+func loadAdminTenantModelSnapshot(path string) (map[string]adminTenantModel, map[string]string, map[string]string, bool) {
+	snapshot, found, err := readAdminTenantModelSnapshot(path)
+	if err != nil || !found {
 		return nil, nil, nil, false
 	}
 	return snapshot.Tenants, snapshot.Deleted, snapshot.PurgeOrders, true
-}
-
-// persistLocked atomically rewrites the durable snapshot. The caller must hold store.mu. A no-op when path is "".
-func (store *adminTenantModelStore) persistLocked() {
-	if store.path == "" {
-		return
-	}
-	data, err := json.MarshalIndent(adminTenantModelSnapshot{Tenants: store.tenants, Deleted: store.deleted, PurgeOrders: store.purgeOrders}, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := store.path + ".tmp"
-	if err := os.MkdirAll(filepath.Dir(store.path), 0o750); err != nil {
-		return
-	}
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, store.path)
 }
 
 // ConfigGeneration returns the monotonic tenant-registry version. It feeds the config bundle's aggregate

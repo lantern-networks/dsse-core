@@ -3800,7 +3800,11 @@ func main() {
 		}
 		tenantModelStore = pgTenantModel
 	} else {
-		tenantModelStore = newOperatorAwareAdminTenantModelStore(pb, time.Now().UTC(), *tenantModelStorePath, *operatorTenantID)
+		fileTenantModel, terr := openAdminTenantModelStore(pb, time.Now().UTC(), *tenantModelStorePath, *operatorTenantID)
+		if terr != nil {
+			log.Fatalf("setup tenant model store: %v", terr)
+		}
+		tenantModelStore = fileTenantModel
 	}
 
 	// Persistent Site / Connector Group catalog (Connector UX Slice 1b). Empty/file path keeps the lab default

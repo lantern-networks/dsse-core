@@ -117,7 +117,7 @@ func (s *Store) saveLocked(events map[string]model.HumanApprovalEvent) error {
 	}
 	if err != nil {
 		log.Printf("human approvals save: %v", err)
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return ErrPersistence
 		}
 	}

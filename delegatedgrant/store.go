@@ -122,7 +122,7 @@ func (s *Store) saveLocked(grants map[string]model.DelegatedAccessGrant) error {
 	}
 	if err != nil {
 		log.Printf("delegated grants save: %v", err)
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return ErrPersistence
 		}
 	}

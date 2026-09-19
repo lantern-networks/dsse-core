@@ -68,9 +68,19 @@ func TestDelegationRuntimeLookupAndRevokeStayInTenant(t *testing.T) {
 }
 
 func TestDelegationSaveFailureAuditAndTenantBoundary(t *testing.T) {
+	for _, replaceBeforeError := range []bool{false, true} {
+		name := "refused"
+		if replaceBeforeError {
+			name = "replaced_unconfirmed"
+		}
+		t.Run(name, func(t *testing.T) { checkDelegationSaveFailureAuditAndTenantBoundary(t, replaceBeforeError) })
+	}
+}
+
+func checkDelegationSaveFailureAuditAndTenantBoundary(t *testing.T, replaceBeforeError bool) {
 	now := time.Now()
 	store := delegatedgrant.NewStore(0)
-	p := &riskAuditPersister{base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "grants.json")}}
+	p := &revocationAuditPersister{replaceBeforeError: replaceBeforeError, base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "grants.json")}}
 	if e := store.SetPersister(p); e != nil {
 		t.Fatal(e)
 	}
@@ -116,7 +126,7 @@ func TestDelegationSaveFailureAuditAndTenantBoundary(t *testing.T) {
 		}
 		if tc.fail {
 			after, _ := p.Load()
-			if store.ConfigGeneration() != gen || len(outbox.insertedAudits) != domain || string(before) != string(after) {
+			if store.ConfigGeneration() != gen || len(outbox.insertedAudits) != domain || (!replaceBeforeError && string(before) != string(after)) {
 				t.Fatal("rejected mutation changed state/generation/audit")
 			}
 		} else {

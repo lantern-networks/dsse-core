@@ -16,9 +16,21 @@ import (
 )
 
 func TestAdminHumanApprovalPersistencePartialRetryAndTenantIsolation(t *testing.T) {
+	for _, replaceBeforeError := range []bool{false, true} {
+		name := "refused"
+		if replaceBeforeError {
+			name = "replaced_unconfirmed"
+		}
+		t.Run(name, func(t *testing.T) {
+			checkAdminHumanApprovalPersistencePartialRetryAndTenantIsolation(t, replaceBeforeError)
+		})
+	}
+}
+
+func checkAdminHumanApprovalPersistencePartialRetryAndTenantIsolation(t *testing.T, replaceBeforeError bool) {
 	now := time.Now()
 	s := humanapproval.NewStore(0)
-	p := &riskAuditPersister{base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "approvals.json")}}
+	p := &revocationAuditPersister{replaceBeforeError: replaceBeforeError, base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "approvals.json")}}
 	if e := s.SetPersister(p); e != nil {
 		t.Fatal(e)
 	}
@@ -59,7 +71,7 @@ func TestAdminHumanApprovalPersistencePartialRetryAndTenantIsolation(t *testing.
 		}
 		if step.fail {
 			after, _ := p.Load()
-			if string(after) != string(before) {
+			if !replaceBeforeError && string(after) != string(before) {
 				t.Fatal("refused persister changed saved data")
 			}
 		}

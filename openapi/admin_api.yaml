@@ -5969,7 +5969,9 @@ paths:
         - AdminEastWest
       responses:
         '200':
-          description: Adoption result (created rule ids, skipped_covered, skipped_missing).
+          description: Adoption result (created rule ids, adopted observation/rule/destination mappings, skipped_covered, skipped_missing).
+        '500':
+          description: Adoption stopped before completion. The response retains confirmed created/adopted entries and skip lists, identifies failed_stage (asset_endpoint or rule), failed_observation_id, and unprocessed IDs. A rule failure also identifies its confirmed destination_endpoint_id. partial does not imply rollback or that an unconfirmed save had no effect; inspect current rules and destinations before retrying.
   /admin/east-west/grants:
     get:
       summary: List active ephemeral east-west grants for the tenant.

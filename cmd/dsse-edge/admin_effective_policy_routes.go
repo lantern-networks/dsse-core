@@ -58,6 +58,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return ok
 		}
 		created := []string{}
+		adopted := []map[string]string{}
 		skippedCovered := []string{}
 		skippedMissing := []string{}
 		changed := false
@@ -66,7 +67,39 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 				recompileAuthoredRules()
 			}
 		}()
-		for _, id := range reqBody.ObservationIDs {
+		// Each observation saves an endpoint and a rule separately. A failed batch
+		// must retain confirmed progress without claiming that the failed save rolled back.
+		finish := func(status int, index int, stage, endpointID string) {
+			result := "success"
+			body := map[string]any{
+				"schema_version": "admin_east_west_adopt.v1", "tenant_id": tenant,
+				"created": created, "adopted": adopted,
+				"skipped_covered": skippedCovered, "skipped_missing": skippedMissing,
+			}
+			if stage != "" {
+				result = "partial"
+				body["partial"] = true
+				body["error"] = "Adoption did not finish. Confirmed rules are listed in created; the failed save may have taken effect. Review current rules and destinations before retrying."
+				body["failed_stage"] = stage
+				body["failed_observation_id"] = reqBody.ObservationIDs[index]
+				body["unprocessed"] = append([]string{}, reqBody.ObservationIDs[index+1:]...)
+				if endpointID != "" {
+					body["destination_endpoint_id"] = endpointID
+				}
+			}
+			now := time.Now().UTC()
+			audit := model.AuditLog{
+				ID: randomEdgeID("audit_observation_adopt_", now), TenantID: tenant,
+				EventType: "east_west_observations_adopted", TargetType: stringPtr("east_west_observations"),
+				Action: stringPtr("adopt"), Result: stringPtr(result),
+				Timestamp: now.Format(time.RFC3339), SourceIP: stringPtr(r.RemoteAddr),
+				EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID,
+				Metadata: body,
+			}
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, applicationAuditWithActor(r, audit), now)
+			writeJSON(w, status, body)
+		}
+		for index, id := range reqBody.ObservationIDs {
 			obs, ok := config.EastWestObserveStore.Get(tenant, id)
 			if !ok {
 				skippedMissing = append(skippedMissing, id)
@@ -85,7 +118,8 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			// compiles to an empty→wildcard selector that would match any host). See adoptDestinationEndpointID.
 			destID, derr := adoptDestinationEndpointID(r.Context(), assetStore, tenant, obs.Destination)
 			if derr != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("adopt %s: materialize destination endpoint: %w", id, derr))
+				logErrorf("observation adoption endpoint persistence failed: %v", derr)
+				finish(http.StatusInternalServerError, index, "asset_endpoint", "")
 				return
 			}
 			rule := policyrule.Rule{
@@ -104,23 +138,19 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 			stored, err := ruleStore.UpsertContext(r.Context(), rule)
 			if err != nil {
+				logErrorf("observation adoption rule save failed: %v", err)
 				status := http.StatusBadRequest
 				if errors.Is(err, policyrule.ErrPersistence) {
 					status = http.StatusInternalServerError
 				}
-				writeError(w, status, fmt.Errorf("adopt %s: %w", id, err))
+				finish(status, index, "rule", destID)
 				return
 			}
 			created = append(created, stored.ID)
+			adopted = append(adopted, map[string]string{"observation_id": id, "rule_id": stored.ID, "destination_endpoint_id": destID})
 			changed = true
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"schema_version":  "admin_east_west_adopt.v1",
-			"tenant_id":       tenant,
-			"created":         created,
-			"skipped_covered": skippedCovered,
-			"skipped_missing": skippedMissing,
-		})
+		finish(http.StatusOK, 0, "", "")
 	}))
 
 	// Effective-Policy ("Why") view: the precedence-ordered, provenance-tagged decision basis for one

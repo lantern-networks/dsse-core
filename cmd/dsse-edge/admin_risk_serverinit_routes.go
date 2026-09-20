@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -183,12 +184,14 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 			return
 		}
-		setter, ok := policyStore.(interface{ SetServerInitiatedEnabledConfirmed(string, bool) error })
+		setter, ok := policyStore.(interface {
+			SetServerInitiatedEnabledContext(context.Context, string, bool) error
+		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		err := setter.SetServerInitiatedEnabledConfirmed(adminTenantIDFromRequest(r), req.Enabled)
+		err := setter.SetServerInitiatedEnabledContext(r.Context(), adminTenantIDFromRequest(r), req.Enabled)
 		action := "allow_default"
 		if req.Enabled {
 			action = "block_default"
@@ -202,6 +205,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, map[string]any{"server_initiated_enabled": req.Enabled})
 	}))
 	mux.HandleFunc("GET /admin/server-initiated", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		// The live default for incoming (server-initiated) connections, so the Console shows which is in effect.
 		enabled := false
 		if s, ok := policyStore.(interface {
@@ -235,13 +242,13 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			return
 		}
 		setter, ok := policyStore.(interface {
-			MutateLegacyExceptionConfirmed(string, string, func(model.LegacyException) (model.LegacyException, error)) (model.LegacyException, error)
+			MutateLegacyExceptionContext(context.Context, string, string, func(model.LegacyException) (model.LegacyException, error)) (model.LegacyException, error)
 		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		ex, err := setter.MutateLegacyExceptionConfirmed(tenantForWrite, key.ID, func(current model.LegacyException) (model.LegacyException, error) {
+		ex, err := setter.MutateLegacyExceptionContext(r.Context(), tenantForWrite, key.ID, func(current model.LegacyException) (model.LegacyException, error) {
 			return mergeLegacyException(current, patch, tenantForWrite)
 		})
 		auditIncoming(r, tenantForWrite, key.ID, "upsert_exception", err)
@@ -261,13 +268,13 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			return
 		}
 		setter, ok := policyStore.(interface {
-			RemoveLegacyExceptionConfirmed(string, string) (bool, error)
+			RemoveLegacyExceptionContext(context.Context, string, string) (bool, error)
 		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		removed, err := setter.RemoveLegacyExceptionConfirmed(adminTenantIDFromRequest(r), r.PathValue("id"))
+		removed, err := setter.RemoveLegacyExceptionContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
 			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", err)
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception removal could not be confirmed. Reload before retrying."))
@@ -284,6 +291,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, map[string]string{"id": r.PathValue("id"), "status": "deleted"})
 	}))
 	mux.HandleFunc("GET /admin/legacy-exceptions", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		var exs []model.LegacyException
 		if s, ok := policyStore.(interface {
 			LegacyExceptionsFor(string) []model.LegacyException
@@ -293,6 +304,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, buildLegacyExceptionList(exs, time.Now()))
 	}))
 	mux.HandleFunc("GET /admin/legacy-exceptions/export", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		exp, err := incomingExportForTenant(policyStore, adminTenantIDFromRequest(r), time.Now())
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))

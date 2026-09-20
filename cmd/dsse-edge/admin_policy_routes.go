@@ -47,6 +47,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		return true
 	}
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		options := policystore.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
 			Limit:  boundedIntQuery(r.URL.Query().Get("limit"), 100, 1, 1000),
@@ -404,6 +408,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		writeJSON(w, http.StatusOK, bundle)
 	}))
 	mux.HandleFunc("GET /admin/policies/{policy_id}", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		policy, found, err := policyStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -439,7 +447,12 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusConflict, fmt.Errorf("policy status toggle is not supported on this edge"))
 			return
 		}
-		if !concrete.SetPolicyStatus(adminTenantIDFromRequest(r), r.PathValue("policy_id"), status) {
+		found, err := concrete.SetPolicyStatusContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"), status)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+			return
+		}
+		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("policy %s not found", r.PathValue("policy_id")))
 			return
 		}
@@ -480,6 +493,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		removed, existed, err := policyStore.Delete(r.Context(), tenantID, r.PathValue("policy_id"))
 		if err != nil {
+			if errors.Is(err, policystore.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+				return
+			}
 			// A bundle-sourced policy: it exists, but this API is not where it lives.
 			writeError(w, http.StatusConflict, err)
 			return

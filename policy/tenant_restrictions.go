@@ -1,9 +1,8 @@
 package policy
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -35,6 +34,10 @@ type TenantRestrictionPatch struct {
 // SaveTenantRestriction commits a tenant-owned setting durably before publishing it.
 // Pointer fields distinguish omitted (keep) from explicit empty (clear).
 func (store *Store) SaveTenantRestriction(tenant, provider string, patch TenantRestrictionPatch) error {
+	return store.SaveTenantRestrictionContext(context.Background(), tenant, provider, patch)
+}
+
+func (store *Store) SaveTenantRestrictionContext(ctx context.Context, tenant, provider string, patch TenantRestrictionPatch) error {
 	tenant = strings.TrimSpace(tenant)
 	if tenant == "" {
 		return fmt.Errorf("select an organization before configuring SaaS restriction")
@@ -42,7 +45,7 @@ func (store *Store) SaveTenantRestriction(tenant, provider string, patch TenantR
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	return store.updateTenantRestrictionsLocked(tenant, func(next map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error) {
+	return store.updateTenantRestrictionsLocked(ctx, tenant, func(next map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error) {
 		s := next[provider]
 		if patch.AllowedValue != nil {
 			s.AllowedValue = *patch.AllowedValue
@@ -66,111 +69,25 @@ type atomicRuntimeStatePersister interface {
 	Update(func([]byte) ([]byte, error)) error
 }
 
-func (store *Store) updateTenantRestrictionsLocked(tenant string, edit func(map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error)) error {
+func (store *Store) updateTenantRestrictionsLocked(ctx context.Context, tenant string, edit func(map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error)) error {
 	if store.runtimeStatePersister == nil {
 		return fmt.Errorf("durable admin configuration storage is not configured")
 	}
-	if atomic, ok := store.runtimeStatePersister.(atomicRuntimeStatePersister); ok {
-		var committed map[string]map[string]tenantrestriction.Setting
-		err := atomic.Update(func(raw []byte) ([]byte, error) {
-			document := map[string]json.RawMessage{}
-			if len(raw) > 0 {
-				if err := json.Unmarshal(raw, &document); err != nil {
-					return nil, err
-				}
-			}
-			all := map[string]map[string]tenantrestriction.Setting{}
-			if section := document["saas_tenant_restrictions"]; len(section) > 0 {
-				if err := json.Unmarshal(section, &all); err != nil {
-					return nil, err
-				}
-			}
-			if all == nil {
-				all = map[string]map[string]tenantrestriction.Setting{}
-			}
-			for _, settings := range all {
-				if err := ValidateTenantRestrictions(settings); err != nil {
-					return nil, err
-				}
-			}
-			next, err := edit(tenantrestriction.Copy(all[tenant]))
-			if err != nil {
-				return nil, err
-			}
-			all[tenant] = next
-			document["saas_tenant_restrictions"], err = json.Marshal(all)
-			if err != nil {
-				return nil, err
-			}
-			committed = all
-			return json.Marshal(document)
-		})
+	return store.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+		next, err := edit(tenantrestriction.Copy(f.SaaSTenantRestrictions[tenant]))
 		if err != nil {
-			return fmt.Errorf("SaaS restriction was not saved: %w", err)
+			return err
 		}
-		store.tenantRestrictions = committed
-		store.generation++
+		f.SaaSTenantRestrictions[tenant] = next
 		return nil
-	}
-	previous := store.tenantRestrictions[tenant]
-	next, err := edit(tenantrestriction.Copy(previous))
-	if err != nil {
-		return err
-	}
-	store.tenantRestrictions[tenant] = next
-	if err := store.persistLockedChecked(); err != nil {
-		if previous == nil {
-			delete(store.tenantRestrictions, tenant)
-		} else {
-			store.tenantRestrictions[tenant] = previous
-		}
-		return err
-	}
-	store.generation++
-	return nil
+	})
 }
 
 // Read shared SaaS state at the point it is served, including the first bundle
 // after promotion. No periodic timer can guarantee that final read. Edges using
 // local stores do not perform I/O here; they retain their signed configuration.
-func (store *Store) RefreshTenantRestrictions() error {
-	if store == nil {
-		return nil
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if _, ok := store.runtimeStatePersister.(atomicRuntimeStatePersister); !ok {
-		return nil
-	}
-	raw, err := store.runtimeStatePersister.Load()
-	if err != nil {
-		return err
-	}
-	var document struct {
-		Settings map[string]map[string]tenantrestriction.Setting `json:"saas_tenant_restrictions"`
-	}
-	if len(raw) > 0 {
-		if err := json.Unmarshal(raw, &document); err != nil {
-			return err
-		}
-	}
-	if document.Settings == nil {
-		document.Settings = map[string]map[string]tenantrestriction.Setting{}
-	}
-	for _, settings := range document.Settings {
-		if err := ValidateTenantRestrictions(settings); err != nil {
-			return err
-		}
-	}
-	if !reflect.DeepEqual(document.Settings, store.tenantRestrictions) {
-		store.tenantRestrictions = document.Settings
-		store.generation++
-	}
-	return nil
-}
+func (store *Store) RefreshTenantRestrictions() error { return store.RefreshSharedRuntime() }
 
-// Compile rules and resolver values together. The evaluator owns this immutable
-// snapshot for the whole request, including the eventual HTTP header rewrite.
 func (store *Store) compileTenantRestrictionsLocked(base *decision.Evaluator) {
 	if len(store.tenantRestrictions) == 0 {
 		return
@@ -223,7 +140,7 @@ func (store *Store) RemoveTenantRestrictions(tenant string) (int, error) {
 		return 0, nil
 	}
 	count := 0
-	err := store.updateTenantRestrictionsLocked(tenant, func(previous map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error) {
+	err := store.updateTenantRestrictionsLocked(context.Background(), tenant, func(previous map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error) {
 		count = len(previous)
 		return map[string]tenantrestriction.Setting{}, nil
 	})

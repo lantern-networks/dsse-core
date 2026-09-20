@@ -65,3 +65,23 @@ func newAuthoredRuleCompiler(defaultTenant string, policies policy.RuntimeStore,
 		}
 	}
 }
+
+// Runtime controls must be fresh before the newly elected CP serves or compiles.
+func configureRuntimePromotion(e *cpLeaderElector, store policy.RuntimeStore) {
+	if e == nil {
+		return
+	}
+	shared, ok := store.(interface{ RefreshSharedRuntime() error })
+	if !ok {
+		return
+	}
+	previous := e.prepareLeadership
+	e.prepareLeadership = func() error {
+		if previous != nil {
+			if err := previous(); err != nil {
+				return err
+			}
+		}
+		return shared.RefreshSharedRuntime()
+	}
+}

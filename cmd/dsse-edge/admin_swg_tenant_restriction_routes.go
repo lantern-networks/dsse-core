@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -68,13 +70,17 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 				}
 			}
 			store, ok := policyStore.(interface {
-				SaveTenantRestriction(string, string, policy.TenantRestrictionPatch) error
+				SaveTenantRestrictionContext(context.Context, string, string, policy.TenantRestrictionPatch) error
 			})
 			if !ok {
 				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("managed SaaS configuration is unavailable"))
 				return
 			}
-			if err := store.SaveTenantRestriction(tenant, req.Provider, req.TenantRestrictionPatch); err != nil {
+			if err := store.SaveTenantRestrictionContext(r.Context(), tenant, req.Provider, req.TenantRestrictionPatch); err != nil {
+				if errors.Is(err, policy.ErrPolicyPersistence) {
+					writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
+					return
+				}
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
@@ -96,8 +102,12 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 			writeError(w, http.StatusNotFound, fmt.Errorf("no tenant-restriction rule %q in this organization", refused))
 			return
 		}
-		resp, err := swg.ApplyTenantRestrictionUpdate(swgRuntime, evaluator.PolicyBundle, policyStore, req.TenantRestrictionUpdateRequest)
+		resp, err := swg.ApplyTenantRestrictionUpdateContext(r.Context(), swgRuntime, evaluator.PolicyBundle, policyStore, req.TenantRestrictionUpdateRequest)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -155,8 +165,12 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 			writeError(w, http.StatusNotFound, fmt.Errorf("no tenant-restriction rule %q in this organization", refused))
 			return
 		}
-		resp, err := swg.ApplyTenantRestrictionUpdate(swgRuntime, evaluator.PolicyBundle, policyStore, req)
+		resp, err := swg.ApplyTenantRestrictionUpdateContext(r.Context(), swgRuntime, evaluator.PolicyBundle, policyStore, req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

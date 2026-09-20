@@ -1,59 +1,36 @@
 package policy
 
 import (
-	"log"
-	"maps"
-	"strings"
-
+	"context"
 	"github.com/lantern-networks/dsse-core/decision"
+	"strings"
 )
 
-// ApplyEastWestUpdateConfirmed saves the entire admin update once, under one lock.
-// A refused or unconfirmed save must not publish a new live enforcement mode.
-func (store *Store) ApplyEastWestUpdateConfirmed(tenant string, rules *[]decision.EastWestRule, ttl *int, enabled, unmatched *bool) error {
-	if store == nil {
+func (s *Store) ApplyEastWestUpdateConfirmed(tenant string, rules *[]decision.EastWestRule, ttl *int, enabled, unmatched *bool) error {
+	return s.ApplyEastWestUpdateContext(context.Background(), tenant, rules, ttl, enabled, unmatched)
+}
+
+// Save all explicitly supplied fields in one latest-row transaction.
+func (s *Store) ApplyEastWestUpdateContext(ctx context.Context, tenant string, rules *[]decision.EastWestRule, ttl *int, enabled, unmatched *bool) error {
+	if s == nil {
 		return ErrPolicyPersistence
 	}
-	if rules == nil && ttl == nil && enabled == nil && unmatched == nil {
-		return nil
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	tenant = strings.TrimSpace(tenant)
-	oldRules, oldTTL, oldEnabled, oldUnmatched := store.eastWestRules, store.eastWestMaxGrantTTL, store.eastWestEnabled, store.eastWestAllowUnmatched
-	store.eastWestRules = maps.Clone(oldRules)
-	if store.eastWestRules == nil {
-		store.eastWestRules = map[string][]decision.EastWestRule{}
-	}
-	store.eastWestMaxGrantTTL = maps.Clone(oldTTL)
-	if store.eastWestMaxGrantTTL == nil {
-		store.eastWestMaxGrantTTL = map[string]int{}
-	}
-	store.eastWestEnabled = maps.Clone(oldEnabled)
-	if store.eastWestEnabled == nil {
-		store.eastWestEnabled = map[string]bool{}
-	}
-	store.eastWestAllowUnmatched = maps.Clone(oldUnmatched)
-	if store.eastWestAllowUnmatched == nil {
-		store.eastWestAllowUnmatched = map[string]bool{}
-	}
-	if rules != nil {
-		store.eastWestRules[tenant] = append([]decision.EastWestRule(nil), (*rules)...)
-	}
-	if ttl != nil {
-		store.eastWestMaxGrantTTL[tenant] = max(0, *ttl)
-	}
-	if enabled != nil {
-		store.eastWestEnabled[tenant] = *enabled
-	}
-	if unmatched != nil {
-		store.eastWestAllowUnmatched[tenant] = *unmatched
-	}
-	if err := store.persistLockedChecked(); err != nil {
-		store.eastWestRules, store.eastWestMaxGrantTTL, store.eastWestEnabled, store.eastWestAllowUnmatched = oldRules, oldTTL, oldEnabled, oldUnmatched
-		log.Printf("east-west setting save: %v", err)
-		return ErrPolicyPersistence
-	}
-	store.generation++
-	return nil
+	return s.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+		if rules != nil {
+			f.EastWestRules[tenant] = append([]decision.EastWestRule(nil), (*rules)...)
+		}
+		if ttl != nil {
+			f.EastWestMaxGrantTTL[tenant] = max(0, *ttl)
+		}
+		if enabled != nil {
+			f.EastWestEnabled[tenant] = *enabled
+		}
+		if unmatched != nil {
+			f.EastWestAllowUnmatched[tenant] = *unmatched
+		}
+		return nil
+	})
 }

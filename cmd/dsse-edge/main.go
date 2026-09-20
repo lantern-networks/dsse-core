@@ -3985,6 +3985,7 @@ func main() {
 	configureSeatPromotion(cpLeaderElectorInstance, *seatAllocationStore, seatAllocations)
 	configureLicensePromotion(cpLeaderElectorInstance, *licenseStorePath, vendorLicenceStore, enrolmentLicensingGate, licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID))
 	recompileAuthoredRules := newAuthoredRuleCompiler(evaluator.PolicyBundle.TenantID, policyStore, ruleStore, assetStore, applyInspectionPosture)
+	configureRuntimePromotion(cpLeaderElectorInstance, policyStore)
 	configureAuthoredPromotion(cpLeaderElectorInstance, ruleStore, assetStore, recompileAuthoredRules)
 	cpLeaderElectorInstance.Start()
 	defer cpLeaderElectorInstance.Stop()

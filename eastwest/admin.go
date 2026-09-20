@@ -1,6 +1,7 @@
 package eastwest
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -138,8 +139,12 @@ func AdminStatus(store policy.RuntimeStore, tenantID string) adminStatusResponse
 // ApplyAdminUpdate toggles enforcement and/or replaces the rule set for a tenant, hot-applied to
 // the live decision path. Returns the resulting status.
 func ApplyAdminUpdate(store policy.RuntimeStore, tenantID string, req AdminUpdateRequest) (adminStatusResponse, error) {
+	return ApplyAdminUpdateContext(context.Background(), store, tenantID, req)
+}
+
+func ApplyAdminUpdateContext(ctx context.Context, store policy.RuntimeStore, tenantID string, req AdminUpdateRequest) (adminStatusResponse, error) {
 	s, ok := store.(interface {
-		ApplyEastWestUpdateConfirmed(string, *[]decision.EastWestRule, *int, *bool, *bool) error
+		ApplyEastWestUpdateContext(context.Context, string, *[]decision.EastWestRule, *int, *bool, *bool) error
 	})
 	if !ok {
 		return adminStatusResponse{}, policy.ErrPolicyPersistence
@@ -175,7 +180,7 @@ func ApplyAdminUpdate(store policy.RuntimeStore, tenantID string, req AdminUpdat
 		u := false
 		unmatched = &u
 	}
-	if err := s.ApplyEastWestUpdateConfirmed(tenantID, rules, req.MaxGrantTTLSeconds, enabled, unmatched); err != nil {
+	if err := s.ApplyEastWestUpdateContext(ctx, tenantID, rules, req.MaxGrantTTLSeconds, enabled, unmatched); err != nil {
 		return adminStatusResponse{}, err
 	}
 	return AdminStatus(store, tenantID), nil

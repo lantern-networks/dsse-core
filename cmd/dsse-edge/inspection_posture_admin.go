@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -212,15 +214,46 @@ func inspectionPostureForRequest(config serverConfig, r *http.Request) inspectio
 }
 
 // Keep saved-state adoption and its engine callback in order for concurrent updates.
-func newInspectionPostureSetter(store *inspectionposture.Store, apply func(string)) func(inspectionposture.Posture, string) (inspectionposture.Posture, error) {
-	var mu sync.Mutex
-	return func(p inspectionposture.Posture, tenant string) (inspectionposture.Posture, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		saved, err := store.Set(p)
-		if err == nil && apply != nil {
-			apply(tenant)
-		}
-		return saved, err
+type inspectionPostureAdmin struct {
+	mu    sync.Mutex
+	store *inspectionposture.Store
+	apply func(string)
+}
+
+func newInspectionPostureAdmin(store *inspectionposture.Store, apply func(string)) *inspectionPostureAdmin {
+	return &inspectionPostureAdmin{store: store, apply: apply}
+}
+func (a *inspectionPostureAdmin) update(ctx context.Context, edit func(inspectionposture.Posture) (inspectionposture.Posture, error), tenant string) (inspectionposture.Posture, inspectionposture.Posture, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	before, next, err := a.store.UpdateContext(ctx, edit)
+	if err == nil && a.apply != nil {
+		a.apply(tenant)
 	}
+	return before, next, err
+}
+func (a *inspectionPostureAdmin) set(p inspectionposture.Posture, tenant string) (inspectionposture.Posture, error) {
+	_, next, err := a.update(context.Background(), func(inspectionposture.Posture) (inspectionposture.Posture, error) { return p, nil }, tenant)
+	return next, err
+}
+func (a *inspectionPostureAdmin) refresh() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed, err := a.store.RefreshShared()
+	if err == nil && changed && a.apply != nil {
+		a.apply("")
+	}
+	return err
+}
+func newInspectionPostureSetter(store *inspectionposture.Store, apply func(string)) func(inspectionposture.Posture, string) (inspectionposture.Posture, error) {
+	return newInspectionPostureAdmin(store, apply).set
+}
+func refreshInspectionPosture(w http.ResponseWriter, config serverConfig) bool {
+	if config.RefreshInspectionPosture != nil {
+		if err := config.RefreshInspectionPosture(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("Inspection posture cannot be refreshed from storage."))
+			return false
+		}
+	}
+	return true
 }

@@ -223,6 +223,9 @@ func writeCatalogContextResponse(w http.ResponseWriter, r *http.Request, scope s
 // Refresh shared override authority before presenting either configured or live
 // selections. The existing callback rebuilds all tenant inspection patterns.
 func refreshCatalogOverrides(w http.ResponseWriter, config serverConfig) bool {
+	if !refreshInspectionPosture(w, config) {
+		return false
+	}
 	if config.CatalogOverrides == nil {
 		return true
 	}

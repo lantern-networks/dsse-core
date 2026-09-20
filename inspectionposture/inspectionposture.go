@@ -7,6 +7,7 @@ package inspectionposture
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -266,10 +267,11 @@ func dedupeLower(in []string) []string {
 // Store persists the posture across restarts (a posture change survives an Edge restart, unlike the previous
 // runtime-only known-bypass toggle).
 type Store struct {
-	writeMu   sync.Mutex
-	mu        sync.RWMutex
-	posture   Posture
-	statePath string
+	writeMu     sync.Mutex
+	initialized bool
+	mu          sync.RWMutex
+	posture     Posture
+	statePath   string
 	// persister is the fleet-shared backend, when the deployment has one.
 	//
 	// ★★ THIS POSTURE IS ENFORCEMENT, AND IT DIFFERED BETWEEN TWO EDGES OF ONE FLEET (2026-08-21, measured).
@@ -320,22 +322,7 @@ var ErrPersistence = errors.New("inspection posture persistence is unconfirmed")
 
 // Set validates and saves a candidate before exposing it to enforcement or bundle readers.
 func (s *Store) Set(p Posture) (Posture, error) {
-	next, err := Validate(p)
-	if err != nil {
-		return Posture{}, err
-	}
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-	if err := s.persist(next); err != nil {
-		return Posture{}, fmt.Errorf("%w: %v", ErrPersistence, err)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !reflect.DeepEqual(s.posture, next) {
-		s.posture = next
-		s.generation++
-	}
-	return clonePosture(s.posture), nil
+	return s.SetContext(context.Background(), p)
 }
 
 // Configure a writer only after its existing snapshot has been validated.
@@ -357,6 +344,7 @@ func (s *Store) SetPersister(p persister) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.persister = p
+	s.initialized = loaded
 	s.statePath = ""
 	if loaded && !reflect.DeepEqual(s.posture, next) {
 		s.posture = next
@@ -385,6 +373,7 @@ func (s *Store) SetStatePath(path string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.statePath = path
+	s.initialized = loaded
 	s.persister = nil
 	if loaded && !reflect.DeepEqual(s.posture, next) {
 		s.posture = next

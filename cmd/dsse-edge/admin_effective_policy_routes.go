@@ -291,41 +291,57 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		postureWriteMu.Lock()
 		defer postureWriteMu.Unlock()
-		before := config.InspectionPosture()
-		next := before
-		if body.Mode != nil {
-			next.Mode = strings.TrimSpace(*body.Mode)
+		var validationErr error
+		patch := func(before inspectionposture.Posture) (inspectionposture.Posture, error) {
+			next := before
+			if body.Mode != nil {
+				next.Mode = strings.TrimSpace(*body.Mode)
+			}
+			if body.DecryptAllowlistHosts != nil {
+				next.DecryptAllowlistHosts = *body.DecryptAllowlistHosts
+			}
+			if body.DecryptAllowlistGroups != nil {
+				next.DecryptAllowlistGroups = *body.DecryptAllowlistGroups
+			}
+			if body.BypassGroups != nil {
+				next.BypassGroups = *body.BypassGroups
+			}
+			if body.KnownBypassEnabled != nil {
+				next.KnownBypassEnabled = *body.KnownBypassEnabled
+			}
+			next, validationErr = inspectionposture.Validate(next)
+			if validationErr != nil {
+				return next, validationErr
+			}
+			for _, name := range next.BypassGroups {
+				if !stringInSetFold(name, before.BypassGroups) {
+					validationErr = errLegacyPostureSelection
+					return next, validationErr
+				}
+			}
+			return next, nil
 		}
-		if body.DecryptAllowlistHosts != nil {
-			next.DecryptAllowlistHosts = *body.DecryptAllowlistHosts
-		}
-		if body.DecryptAllowlistGroups != nil {
-			next.DecryptAllowlistGroups = *body.DecryptAllowlistGroups
-		}
-		if body.BypassGroups != nil {
-			next.BypassGroups = *body.BypassGroups
-		}
-		if body.KnownBypassEnabled != nil {
-			next.KnownBypassEnabled = *body.KnownBypassEnabled
-		}
-		if next.Mode != inspectionposture.ModeDecryptAll && next.Mode != inspectionposture.ModeBypassDefault {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("mode must be %q or %q", inspectionposture.ModeDecryptAll, inspectionposture.ModeBypassDefault))
-			return
-		}
-		next, err := inspectionposture.Validate(next)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		// Legacy selections are cleanup-only. Do not accept a dormant grant that a
-		// different or older node could turn into a bypass during startup.
-		for _, name := range next.BypassGroups {
-			if !stringInSetFold(name, before.BypassGroups) {
-				writeError(w, http.StatusConflict, fmt.Errorf("Legacy bypass selections can only be removed. Create a tenant Egress bypass rule through Inspection Settings or Internet Access."))
-				return
+		var before, next inspectionposture.Posture
+		var err error
+		if config.UpdateInspectionPosture != nil {
+			before, next, err = config.UpdateInspectionPosture(r.Context(), patch, adminTenantIDFromRequest(r))
+		} else {
+			// Compatibility for local, non-shared adapters.
+			before = config.InspectionPosture()
+			next, err = patch(before)
+			if err == nil {
+				_, err = config.SetInspectionPosture(next, adminTenantIDFromRequest(r))
 			}
 		}
-		_, err = config.SetInspectionPosture(next, adminTenantIDFromRequest(r))
+		if validationErr != nil {
+			status := http.StatusBadRequest
+			if errors.Is(validationErr, errLegacyPostureSelection) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, validationErr)
+			return
+		}
+
 		result := "saved"
 		if err != nil {
 			result = "persistence_unconfirmed"
@@ -347,3 +363,5 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// keep-steer by default). A tenant admin can override an individual entry (force_inspect / disabled), which
 	// is finer-grained than the all-or-nothing known-bypass toggle on the inspection posture.
 }
+
+var errLegacyPostureSelection = errors.New("Legacy bypass selections can only be removed. Create a tenant Egress bypass rule through Inspection Settings or Internet Access.")

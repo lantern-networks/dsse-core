@@ -186,6 +186,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configBundleRefusedOnAStandby(w) {
 			return
 		}
+		if !refreshInspectionPosture(w, config) {
+			return
+		}
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return
 		}

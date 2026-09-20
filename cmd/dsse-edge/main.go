@@ -251,9 +251,11 @@ type serverConfig struct {
 	// /admin/inspection-posture). SetInspectionPosture persists it and re-applies the engine's intercept + bypass
 	// sets. nil = no interception engine wired (read reports the default posture; write is rejected).
 	InspectionPosture func() inspectionposture.Posture
-	// SetInspectionPosture applies + persists the posture. A non-nil error means the posture IS live in the
-	// engine but was not persisted (it would revert on restart) — handlers surface it to the admin.
-	SetInspectionPosture func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error)
+	// SetInspectionPosture saves before applying; failures retain the previous live state.
+	SetInspectionPosture     func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error)
+	UpdateInspectionPosture  func(context.Context, func(inspectionposture.Posture) (inspectionposture.Posture, error), string) (inspectionposture.Posture, inspectionposture.Posture, error)
+	RefreshInspectionPosture func() error
+
 	// InspectionPostureGeneration is the posture store's contribution to the config bundle's aggregate
 	// generation. Without it a posture change alters the bundle's contents and not its version, so no Edge
 	// re-pulls — see config_bundle_inspection_posture.go.
@@ -2362,7 +2364,7 @@ func main() {
 	} else if !loaded {
 		seed := postureStore.Get()
 		seed.KnownBypassEnabled = *defaultBypassList
-		if _, err := postureStore.Set(seed); err != nil {
+		if _, err := postureStore.InitializeContext(context.Background(), seed); err != nil {
 			// Boot-time seed: a store that cannot persist its posture will silently revert on every
 			// restart — refuse to start half-durable rather than run with an invisible config drift.
 			log.Fatalf("seed inspection posture store: %v", err)
@@ -2455,6 +2457,7 @@ func main() {
 	}
 	// Deployment-wide legacy selections cannot author tenant rules on startup.
 	// Keep them available for operator review; current authored rules govern bypass.
+	postureAdmin := newInspectionPostureAdmin(postureStore, applyInspectionPosture)
 	if n := len(postureStore.Get().BypassGroups); n > 0 {
 		log.Printf("inspection: %d legacy SaaS bypass selection(s) retained but not applied. Review Inspection Settings; explicitly author any required tenant bypass and clear obsolete selections at the configuration authority.", n)
 	}
@@ -4556,7 +4559,9 @@ func main() {
 		// So a posture change moves the config bundle's VERSION and not only its contents — without this the
 		// section below would be published in every bundle and applied by nobody.
 		InspectionPostureGeneration:  postureStore.ConfigGeneration,
-		SetInspectionPosture:         newInspectionPostureSetter(postureStore, applyInspectionPosture),
+		SetInspectionPosture:         postureAdmin.set,
+		UpdateInspectionPosture:      postureAdmin.update,
+		RefreshInspectionPosture:     postureAdmin.refresh,
 		AssetStore:                   assetStore,
 		RuleStore:                    ruleStore,
 		TenantModelStore:             tenantModelStore,

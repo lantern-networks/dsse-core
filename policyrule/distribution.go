@@ -67,7 +67,7 @@ func (s *Store) Snapshot() []Rule {
 // The caller is responsible for the lockout guard (an empty incoming set means "the CP is not the authority
 // here", not "delete every rule"); that judgement belongs with the distributor, which can see whether the
 // section was absent or merely empty, and this function cannot.
-func (s *Store) ReplaceAll(rules []Rule) error {
+func (s *Store) replaceAll(rules []Rule) error {
 	next := map[string]map[string]Rule{}
 	for _, r := range rules {
 		r = cloneRule(r)

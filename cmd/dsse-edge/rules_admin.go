@@ -71,6 +71,9 @@ func adoptServiceIDForObservation(assets *assetcatalog.Store, tenant string, por
 func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, rules *policyrule.Store, assets *assetcatalog.Store, onRulesChanged func(), onRuleDeleted func(tenantID, ruleID string), configSourceURL string, auditMutation func(*http.Request, policyrule.Rule, string, string)) {
 	var mutationMu sync.Mutex
 	mux.HandleFunc("GET /admin/rules", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshAuthoredStores(w, rules, assets) {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		listed := rules.List(tenant, r.URL.Query().Get("plane"))
 		// ★★ A RULE CAN BE "ACTIVE" AND MATCH NOTHING, AND ONLY A LOG SAID SO (2026-08-17, measured as a
@@ -108,6 +111,9 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		}
 		tenant := adminTenantIDFromRequest(r)
 		rule.TenantID = tenant
+		if !refreshAuthoredStores(w, rules, assets) {
+			return
+		}
 		warning, verr := validateInboundReceivers(rule, assets, tenant)
 		if verr != nil {
 			writeError(w, http.StatusBadRequest, verr)
@@ -115,7 +121,7 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := rules.Upsert(rule)
+		stored, err := rules.UpsertContext(r.Context(), rule)
 		if auditMutation != nil {
 			result := "saved"
 			if err != nil {
@@ -166,9 +172,12 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		id := r.PathValue("id")
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
+		if !refreshAuthoredStores(w, rules, assets) {
+			return
+		}
 		previous, _ := rules.Get(tenant, id)
 		previous.TenantID, previous.ID = tenant, id
-		ok, err := rules.Delete(tenant, id)
+		ok, err := rules.DeleteContext(r.Context(), tenant, id)
 		if auditMutation != nil {
 			result := "saved"
 			if err != nil {

@@ -29,7 +29,7 @@ func NewStore() *Store {
 }
 
 // Upsert validates and persists a candidate before publishing it to readers.
-func (s *Store) Upsert(r Rule) (Rule, error) {
+func (s *Store) upsert(r Rule) (Rule, error) {
 	r = cloneRule(r)
 	if err := r.normalizeAndValidate(); err != nil {
 		return Rule{}, err
@@ -65,7 +65,7 @@ func (s *Store) Get(tenantID, id string) (Rule, bool) {
 }
 
 // Delete returns success only after the updated snapshot is saved.
-func (s *Store) Delete(tenantID, id string) (bool, error) {
+func (s *Store) delete(tenantID, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.rules[tenantID][id]; !ok {
@@ -94,7 +94,7 @@ func (s *Store) RemoveTenant(tenantID string) int {
 }
 
 // RemoveTenantChecked preserves the original rule set when deletion cannot be saved.
-func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
+func (s *Store) removeTenantChecked(tenantID string) (int, error) {
 	if s == nil || strings.TrimSpace(tenantID) == "" {
 		return 0, nil
 	}

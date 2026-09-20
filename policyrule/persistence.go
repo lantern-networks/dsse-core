@@ -32,6 +32,21 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, shared := p.(contextUpdater); shared {
+		raw, err := p.Load()
+		if err != nil {
+			return ErrPersistence
+		}
+		n, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return ErrPersistence
+		}
+		if !reflect.DeepEqual(s.rules, n.rules) {
+			s.generation++
+		}
+		s.rules, s.seq, s.persister = n.rules, n.seq, p
+		return nil
+	}
 	candidate := &Store{rules: cloneRules(s.rules), seq: s.seq, persister: p}
 	if err := candidate.loadLocked(); err != nil {
 		return err

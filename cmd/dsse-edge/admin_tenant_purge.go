@@ -110,7 +110,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	// deleted through the Console left its access rule on BOTH planes, still carrying its id — the one thing
 	// it had authored outliving the organization itself.
 	if rules != nil {
-		removed, err := rules.RemoveTenantChecked(tenantID)
+		removed, err := rules.RemoveTenantContext(ctx, tenantID)
 		if err != nil {
 			// Keep retired identities and fleet retry markers until erasure is confirmed.
 			// Persistence errors can contain private paths or database details.

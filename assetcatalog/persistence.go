@@ -36,6 +36,19 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, shared := p.(contextUpdater); shared {
+		raw, err := p.Load()
+		if err != nil {
+			return ErrPersistence
+		}
+		n, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return ErrPersistence
+		}
+		s.adoptLocked(n)
+		s.persister = p
+		return nil
+	}
 	next := s.candidateLocked()
 	next.persister = p
 	if err := next.loadLocked(); err != nil {
@@ -98,6 +111,18 @@ func (s *Store) persistLocked() error {
 	if s.persister == nil {
 		return nil
 	}
+	snap := s.authoredStateLocked()
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal asset-catalog snapshot: %w", err)
+	}
+	if err := s.persister.Save(data); err != nil {
+		return fmt.Errorf("persist asset catalog: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) authoredStateLocked() persistedCatalog {
 	snap := persistedCatalog{
 		Seq:       s.seq,
 		Endpoints: map[string]map[string]Endpoint{},
@@ -127,12 +152,5 @@ func (s *Store) persistLocked() error {
 			snap.Aliases[tenant][alias] = ownerID
 		}
 	}
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal asset-catalog snapshot: %w", err)
-	}
-	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist asset catalog: %w", err)
-	}
-	return nil
+	return snap
 }

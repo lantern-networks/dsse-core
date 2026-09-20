@@ -68,6 +68,9 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 	}
 	mux.HandleFunc("GET /admin/assets/endpoints", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshAuthoredStores(w, nil, store) {
+			return
+		}
 		syncNow()
 		writeJSON(w, http.StatusOK, store.ListEndpoints(adminTenantIDFromRequest(r)))
 	}))
@@ -91,7 +94,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		e.TenantID = tenantForWrite
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := store.UpsertEndpoint(e)
+		stored, err := store.UpsertEndpointContext(r.Context(), e)
 		item := stored
 		if err != nil {
 			item = e
@@ -111,7 +114,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteEndpointContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "endpoint", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeFailure(w, err)
@@ -126,6 +129,9 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 	}))
 
 	mux.HandleFunc("GET /admin/assets/groups", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshAuthoredStores(w, nil, store) {
+			return
+		}
 		writeJSON(w, http.StatusOK, store.ListGroups(adminTenantIDFromRequest(r)))
 	}))
 	mux.HandleFunc("POST /admin/assets/groups", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +154,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		g.TenantID = tenantForWrite
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := store.UpsertGroup(g)
+		stored, err := store.UpsertGroupContext(r.Context(), g)
 		item := stored
 		if err != nil {
 			item = g
@@ -162,6 +168,9 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("GET /admin/assets/groups/{group_id}/members", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshAuthoredStores(w, nil, store) {
+			return
+		}
 		syncNow()
 		writeJSON(w, http.StatusOK, store.ResolveGroupMembers(adminTenantIDFromRequest(r), r.PathValue("group_id")))
 	}))
@@ -172,7 +181,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		ok, err := store.DeleteGroup(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteGroupContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "group", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeFailure(w, err)
@@ -187,6 +196,9 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 	}))
 
 	mux.HandleFunc("GET /admin/assets/services", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshAuthoredStores(w, nil, store) {
+			return
+		}
 		writeJSON(w, http.StatusOK, store.ListServices(adminTenantIDFromRequest(r)))
 	}))
 	mux.HandleFunc("POST /admin/assets/services", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -209,7 +221,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		svc.TenantID = tenantForWrite
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := store.UpsertService(svc)
+		stored, err := store.UpsertServiceContext(r.Context(), svc)
 		item := stored
 		if err != nil {
 			item = svc
@@ -229,7 +241,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		ok, err := store.DeleteService(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteServiceContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "service", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeFailure(w, err)

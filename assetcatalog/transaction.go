@@ -1,6 +1,8 @@
 package assetcatalog
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -75,8 +77,37 @@ func (s *Store) adoptLocked(n *Store) {
 }
 
 func mutateCatalog[T any](s *Store, apply func(*Store) (T, error)) (T, error) {
+	return mutateCatalogContext(context.Background(), s, apply)
+}
+func mutateCatalogContext[T any](ctx context.Context, s *Store, apply func(*Store) (T, error)) (T, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if p, ok := s.persister.(contextUpdater); ok {
+		var n *Store
+		var result T
+		var validation error
+		err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
+			var err error
+			n, err = s.sharedCandidateLocked(raw)
+			if err != nil {
+				return nil, err
+			}
+			result, validation = apply(n)
+			if validation != nil {
+				return nil, validation
+			}
+			return json.Marshal(n.authoredStateLocked())
+		})
+		if validation != nil {
+			return result, validation
+		}
+		if err != nil {
+			var zero T
+			return zero, ErrPersistence
+		}
+		s.adoptLocked(n)
+		return result, nil
+	}
 	n := s.candidateLocked()
 	result, err := apply(n)
 	if err != nil {
@@ -96,33 +127,51 @@ func mutateCatalog[T any](s *Store, apply func(*Store) (T, error)) (T, error) {
 }
 
 func (s *Store) UpsertEndpoint(e Endpoint) (Endpoint, error) {
+	return s.UpsertEndpointContext(context.Background(), e)
+}
+func (s *Store) UpsertEndpointContext(ctx context.Context, e Endpoint) (Endpoint, error) {
 	e = copyEndpoint(e)
 	if e.Source == SourceEnrolled {
 		return s.upsertEndpoint(e)
 	}
-	return mutateCatalog(s, func(n *Store) (Endpoint, error) { return n.upsertEndpoint(e) })
+	return mutateCatalogContext(ctx, s, func(n *Store) (Endpoint, error) { return n.upsertEndpoint(e) })
 }
 
 func (s *Store) UpsertGroup(g Group) (Group, error) {
+	return s.UpsertGroupContext(context.Background(), g)
+}
+func (s *Store) UpsertGroupContext(ctx context.Context, g Group) (Group, error) {
 	g = copyGroup(g)
-	return mutateCatalog(s, func(n *Store) (Group, error) { return n.upsertGroup(g) })
+	return mutateCatalogContext(ctx, s, func(n *Store) (Group, error) { return n.upsertGroup(g) })
 }
 
 func (s *Store) UpsertService(svc Service) (Service, error) {
+	return s.UpsertServiceContext(context.Background(), svc)
+}
+func (s *Store) UpsertServiceContext(ctx context.Context, svc Service) (Service, error) {
 	svc = copyService(svc)
-	return mutateCatalog(s, func(n *Store) (Service, error) { return n.upsertService(svc) })
+	return mutateCatalogContext(ctx, s, func(n *Store) (Service, error) { return n.upsertService(svc) })
 }
 
 func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
-	return mutateCatalog(s, func(n *Store) (bool, error) { return n.deleteEndpoint(tenant, id) })
+	return s.DeleteEndpointContext(context.Background(), tenant, id)
+}
+func (s *Store) DeleteEndpointContext(ctx context.Context, tenant, id string) (bool, error) {
+	return mutateCatalogContext(ctx, s, func(n *Store) (bool, error) { return n.deleteEndpoint(tenant, id) })
 }
 
 func (s *Store) DeleteGroup(tenant, id string) (bool, error) {
-	return mutateCatalog(s, func(n *Store) (bool, error) { return n.deleteGroup(tenant, id) })
+	return s.DeleteGroupContext(context.Background(), tenant, id)
+}
+func (s *Store) DeleteGroupContext(ctx context.Context, tenant, id string) (bool, error) {
+	return mutateCatalogContext(ctx, s, func(n *Store) (bool, error) { return n.deleteGroup(tenant, id) })
 }
 
 func (s *Store) DeleteService(tenant, id string) (bool, error) {
-	return mutateCatalog(s, func(n *Store) (bool, error) { return n.deleteService(tenant, id) })
+	return s.DeleteServiceContext(context.Background(), tenant, id)
+}
+func (s *Store) DeleteServiceContext(ctx context.Context, tenant, id string) (bool, error) {
+	return mutateCatalogContext(ctx, s, func(n *Store) (bool, error) { return n.deleteService(tenant, id) })
 }
 
 func (s *Store) ReplaceAuthored(endpoints []Endpoint, groups []Group, services []Service) ([]string, error) {

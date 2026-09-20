@@ -34,6 +34,8 @@ type adminTenantPurgeResult struct {
 	PurgedAt string `json:"purged_at"`
 	// Erased is what went, per store, on this node.
 	Erased []adminTenantPurgeRow `json:"erased"`
+	// ArtifactCleanup records absence checks even when no manifest was removed on this call.
+	ArtifactCleanup map[string]string `json:"artifact_cleanup,omitempty"`
 	// Remaining is the footprint taken AFTER the erasure — the evidence, not a summary of intent.
 	Remaining adminTenantFootprint `json:"remaining"`
 	// Complete is true only when this node holds nothing at all afterwards. It says nothing about other nodes;

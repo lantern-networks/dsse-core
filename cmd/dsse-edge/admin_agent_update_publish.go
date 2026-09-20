@@ -679,15 +679,32 @@ func (s *publishedAgentUpdateStore) RemoveTenant(tenantID string) int {
 }
 
 func (s *publishedAgentUpdateStore) RemoveTenantChecked(tenantID string) (int, error) {
+	n, _, err := s.removeTenantWithCleanup(tenantID)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// Report byte cleanup independently of manifest counts, including empty-manifest retries.
+// States describe this call's confirmed absence, not the number of artifacts deleted.
+func (s *publishedAgentUpdateStore) removeTenantWithCleanup(tenantID string) (int, map[string]string, error) {
 	if s == nil {
-		return 0, nil
+		return 0, nil, nil
 	}
 	prefix := tenantShelfPrefix(tenantID)
 	if prefix == "" {
-		return 0, nil
+		return 0, nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	cleanup := map[string]string{"manifests": "not_attempted", "local": "not_configured", "shared": "not_configured"}
+	if tenantArtifactDir(s.artifactDir, tenantID) != "" {
+		cleanup["local"] = "not_attempted"
+	}
+	if s.shelf != nil && s.shelf.forget != nil {
+		cleanup["shared"] = "not_attempted"
+	}
 	envelopes := map[string]agentpolicy.Envelope{}
 	pending := map[string]agentpolicy.Envelope{}
 	removed := 0
@@ -708,10 +725,13 @@ func (s *publishedAgentUpdateStore) RemoveTenantChecked(tenantID string) (int, e
 	// An empty manifest shelf can still have artifact cleanup left to retry.
 	if removed > 0 {
 		if err := s.persistLocked(envelopes, pending); err != nil {
-			return 0, err
+			cleanup["manifests"] = "unconfirmed"
+			return 0, cleanup, err
 		}
 		s.envelopes, s.pending = envelopes, pending
 	}
+
+	cleanup["manifests"] = "absence_confirmed"
 
 	// ★ AND THE BYTES. A signed installer built for one customer is as much theirs as the manifest naming it,
 	// and it is the larger residue of the two. Its absence is not an error: an organization can have had a
@@ -720,18 +740,22 @@ func (s *publishedAgentUpdateStore) RemoveTenantChecked(tenantID string) (int, e
 		if rerr := os.RemoveAll(shelf); rerr != nil {
 			log.Printf("agent_update_artifacts_not_erased tenant=%s err=%v — the manifests are gone and the "+
 				"bytes are still on this node's disk", tenantID, rerr)
-			return 0, rerr
+			cleanup["local"] = "unconfirmed"
+			return removed, cleanup, rerr
 		}
+		cleanup["local"] = "absence_confirmed"
 	}
 	// And on the deployment's shelf, where every other control plane would still be able to hand them over.
 	if s.shelf != nil && s.shelf.forget != nil {
 		if ferr := s.shelf.forget(tenantID); ferr != nil {
 			log.Printf("agent_update_artifacts_not_erased_shared tenant=%s err=%v — the manifests are gone and "+
 				"the bytes are still on the deployment's shelf", tenantID, ferr)
-			return 0, ferr
+			cleanup["shared"] = "unconfirmed"
+			return removed, cleanup, ferr
 		}
+		cleanup["shared"] = "absence_confirmed"
 	}
-	return removed, nil
+	return removed, cleanup, nil
 }
 
 // tenantArtifactDir is where one organization's own release bytes live, or "" when there is no such directory

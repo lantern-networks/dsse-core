@@ -578,6 +578,9 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		auditRecord.Metadata["complete"] = result.Complete
 		auditRecord.Metadata["remaining_records"] = result.Remaining.Total
 		auditRecord.Metadata["failure_count"] = len(result.Failures)
+		if result.ArtifactCleanup != nil {
+			auditRecord.Metadata["artifact_cleanup"] = result.ArtifactCleanup
+		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		writeJSON(w, http.StatusOK, result)
 	}))

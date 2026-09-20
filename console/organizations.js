@@ -37,11 +37,18 @@ async function eraseOrgRecords(id, host, state) {
     const purge = await apiFetch("POST", "/admin/tenants/" + encodeURIComponent(id) + "/purge", {confirm_tenant_id: id}, "control");
     if (!orgErasureCurrent(host, state.owner)) return;
     if (!purge.ok || !orgErasureAcknowledged(purge.body, id)) throw new Error("unconfirmed erasure response");
-    if (!purge.body.complete || purge.body.remaining.total !== 0 || purge.body.failures.length) throw new Error("incomplete erasure");
+    if (!purge.body.complete || purge.body.remaining.total !== 0 || purge.body.failures.length) {
+      const cleanup = purge.body.artifact_cleanup;
+      if (cleanup && cleanup.manifests === "absence_confirmed" &&
+          (cleanup.local === "unconfirmed" || cleanup.shared === "unconfirmed")) {
+        state.message = {en: "Release manifests were removed, but installer file cleanup is not confirmed. Repair the artifact storage, then retry erasure. Other erasure failures may also remain.", ja: "リリースmanifestは消去済みですが、インストーラファイルの消去は未確認です。配布ファイルの保存先を復旧してから消去を再試行してください。他の消去障害も残っている場合があります。"};
+      }
+      throw new Error("incomplete erasure");
+    }
     _orgErasures.delete(id);
     uiToast(bl({en: "Local erasure confirmed: ", ja: "このノードでの消去を確認: "}) + id + bl({en: ". Other nodes and uncounted storage still require verification.", ja: "。他ノードと集計対象外の保存先は別途確認が必要です。"}), "ok");
   } catch (_) {
-    state.message = {en: "This tenant was deleted, but local erasure is not confirmed. Repair the reported storage failure, then retry erasure.", ja: "テナントは削除されましたが、このノードでの消去を確認できません。報告された保存障害を解消してから、消去を再試行してください。"};
+    state.message = state.message || {en: "This tenant was deleted, but local erasure is not confirmed. Repair the reported storage failure, then retry erasure.", ja: "テナントは削除されましたが、このノードでの消去を確認できません。報告された保存障害を解消してから、消去を再試行してください。"};
   } finally {
     state.busy = false;
     if (orgErasureCurrent(host, state.owner)) { renderOrgErasureNotices(host); renderOrgList(host); }

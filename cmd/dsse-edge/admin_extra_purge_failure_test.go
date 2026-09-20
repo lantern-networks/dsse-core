@@ -198,12 +198,36 @@ func TestPublishedArtifactErasureRetriesAfterManifestRemoval(t *testing.T) {
 	if e.PublishedAgentUpdates.CountForTenant("tenant_target") != 0 {
 		t.Fatal("manifest removal expected before shelf failure")
 	}
+	assertCleanup := func(result adminTenantPurgeResult, shared string) {
+		t.Helper()
+		b, _ := json.Marshal(result)
+		var body map[string]any
+		_ = json.Unmarshal(b, &body)
+		cleanup, ok := body["artifact_cleanup"].(map[string]any)
+		if !ok || cleanup["manifests"] != "absence_confirmed" || cleanup["shared"] != shared {
+			t.Fatalf("cleanup state absent or inaccurate: %s", b)
+		}
+	}
+	assertCleanup(result, "unconfirmed")
+	if !strings.Contains(strings.Join(result.Failures, " "), "artifact cleanup") || strings.Contains(strings.Join(result.Failures, " "), "private shelf") {
+		t.Fatalf("failure does not explain remaining bytes safely: %+v", result.Failures)
+	}
+	found := false
+	for _, row := range result.Erased {
+		if row.Store == "published_agent_releases" && row.Count == 2 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("confirmed manifest removal was not reported")
+	}
 	e = loadExtraPurgeFixture(t, "published", p)
 	e.PublishedAgentUpdates.WithArtifactShelf(shelf)
 	refuse = false
 	if result = run(); !result.Complete || calls != 2 {
 		t.Fatalf("empty shelf not retried: %+v calls=%d", result, calls)
 	}
+	assertCleanup(result, "absence_confirmed")
 	if e.PublishedAgentUpdates.CountForTenant("tenant_other") != 2 {
 		t.Fatal("foreign shelf changed")
 	}
@@ -244,5 +268,56 @@ func TestTenantPurgeCapturesInitializedConnectorRoutes(t *testing.T) {
 	fresh := newConnectorRouteGovernanceWithPersistence(connectorRouteGovPersistPath)
 	if fresh.CountForTenant("tenant_target") != 0 {
 		t.Fatal("route resurrected")
+	}
+}
+
+func TestPublishedArtifactCleanupStages(t *testing.T) {
+	for _, stage := range []string{"manifest", "local"} {
+		t.Run(stage, func(t *testing.T) {
+			root := t.TempDir()
+			p := &extraPurgePersister{base: blobstore.FilePersister{Path: filepath.Join(root, "published.json")}}
+			if err := p.Save([]byte(extraPurgeSeeds["published"])); err != nil {
+				t.Fatal(err)
+			}
+			e := loadExtraPurgeFixture(t, "published", p)
+			local := filepath.Join(root, "not-a-directory")
+			if err := os.WriteFile(local, []byte("blocked parent"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			e.PublishedAgentUpdates.artifactDir = local
+			sharedCalls := 0
+			e.PublishedAgentUpdates.WithArtifactShelf(&agentUpdateArtifactShelf{forget: func(string) error { sharedCalls++; return nil }})
+			p.uncertain = stage == "manifest"
+			result := adminTenantPurgeResult{TenantID: "tenant_target"}
+			e.erase(&result)
+			if len(result.Failures) != 1 || sharedCalls != 0 {
+				t.Fatalf("failed stage did not stop cleanup: %+v calls=%d", result, sharedCalls)
+			}
+			if stage == "manifest" {
+				if result.ArtifactCleanup["manifests"] != "unconfirmed" || result.ArtifactCleanup["local"] != "not_attempted" || len(result.Erased) != 0 {
+					t.Fatalf("unconfirmed manifest treated as removed: %+v", result)
+				}
+			} else if result.ArtifactCleanup["manifests"] != "absence_confirmed" || result.ArtifactCleanup["local"] != "unconfirmed" || result.ArtifactCleanup["shared"] != "not_attempted" {
+				t.Fatalf("local failure hidden: %+v", result)
+			}
+			p.uncertain = false
+			if err := os.Remove(local); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(local, "tenant_target"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(local, "tenant_target", "artifact"), []byte("bytes"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			result = adminTenantPurgeResult{TenantID: "tenant_target"}
+			e.erase(&result)
+			if len(result.Failures) != 0 || result.ArtifactCleanup["local"] != "absence_confirmed" || result.ArtifactCleanup["shared"] != "absence_confirmed" || sharedCalls != 1 {
+				t.Fatalf("repair failed: %+v", result)
+			}
+			if _, err := os.Stat(filepath.Join(local, "tenant_target")); !os.IsNotExist(err) {
+				t.Fatal("local bytes remain", err)
+			}
+		})
 	}
 }

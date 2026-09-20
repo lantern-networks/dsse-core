@@ -11999,6 +11999,12 @@ paths:
                           type: integer
                         error:
                           type: string
+                  artifact_cleanup:
+                    type: object
+                    description: Per-stage absence confirmation for manifests, local artifacts, and the shared artifact shelf, including retries that remove zero manifests. This is not a byte or file count and does not cover unconfigured storage.
+                    additionalProperties:
+                      type: string
+                      enum: [not_attempted, not_configured, unconfirmed, absence_confirmed]
                   failures:
                     type: array
                     items:

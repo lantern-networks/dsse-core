@@ -25,3 +25,9 @@ test('persistent failure notice is translated again when the display language ch
  f.context.el=(tag,attrs={},children=[])=>({tag,attrs,children,appendChild(n){this.children.push(n)}});
  f.context.bl=x=>x.ja;f.notices(f.host);const text=JSON.stringify(nodes);assert.match(text,/このノードでの消去を確認できません/);assert.equal(text.includes('This tenant was deleted'),false);
 });
+
+test('manifest removal and unconfirmed artifact cleanup are explained without exposing backend errors',async()=>{
+ const f=fixture();f.respond(method=>{const r=f.healthy(method);if(method==='POST'){r.body.complete=false;r.body.failures=['private shelf path'];r.body.artifact_cleanup={manifests:'absence_confirmed',local:'absence_confirmed',shared:'unconfirmed'};}return r});
+ await f.send();assert.match(f.state().message.en,/Release manifests were removed/);assert.match(f.state().message.en,/installer file cleanup is not confirmed/);assert.equal(f.state().message.en.includes('private shelf'),false);
+ f.respond(f.healthy);await f.context.eraseOrgRecords(id,f.host,f.state());assert.equal(f.state(),undefined);assert.deepEqual(f.calls.map(c=>c[0]),['DELETE','POST','POST']);
+});

@@ -27,7 +27,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -245,6 +244,8 @@ type serverConfig struct {
 	// egress rules — and the decrypt-bypass set (it folds in ApplyMaterializedCertPinBypass). The rule-change hook
 	// calls it so authoring an inspect/bypass rule re-applies the engine sets. nil = no interception engine wired.
 	ApplyInspectionPosture func(tenantID string)
+	// Shared with promotion so refresh and admin recompilation use one compiler lock.
+	RecompileAuthoredRules func()
 	// InspectionPosture / SetInspectionPosture read and change the persisted inspection posture (deployment mode
 	// decrypt_all|bypass_default + decrypt allowlist + known-bypass toggle) at runtime (GET/POST
 	// /admin/inspection-posture). SetInspectionPosture persists it and re-applies the engine's intercept + bypass
@@ -3980,6 +3981,8 @@ func main() {
 	configureInventoryPromotion(cpLeaderElectorInstance, *enrolledInventoryStore, enrolledLedger)
 	configureSeatPromotion(cpLeaderElectorInstance, *seatAllocationStore, seatAllocations)
 	configureLicensePromotion(cpLeaderElectorInstance, *licenseStorePath, vendorLicenceStore, enrolmentLicensingGate, licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID))
+	recompileAuthoredRules := newAuthoredRuleCompiler(evaluator.PolicyBundle.TenantID, policyStore, ruleStore, assetStore, applyInspectionPosture)
+	configureAuthoredPromotion(cpLeaderElectorInstance, ruleStore, assetStore, recompileAuthoredRules)
 	cpLeaderElectorInstance.Start()
 	defer cpLeaderElectorInstance.Stop()
 	if sharedRevocationSource != nil {
@@ -4548,6 +4551,7 @@ func main() {
 		CatalogOverrides:               catalogOverrides,
 		CatalogFeed:                    catalogFeed,
 		ApplyInspectionPosture:         applyInspectionPosture,
+		RecompileAuthoredRules:         recompileAuthoredRules,
 		InspectionPosture:              func() inspectionposture.Posture { return postureStore.Get() },
 		// So a posture change moves the config bundle's VERSION and not only its contents — without this the
 		// section below would be published in every bundle and applied by nobody.
@@ -6374,52 +6378,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	//
 	// Every organization holding authored rules is recompiled, and the node's own is always included so that
 	// deleting an organization's last rule still clears its compiled set.
-	recompileOneTenant := func(tenant string) {
-		// Re-apply BOTH inspection layers: an authored bypass rule feeds the decrypt-bypass set and an authored
-		// inspect rule feeds the intercept (decrypt) set under bypass-default. ApplyInspectionPosture folds in the
-		// bypass set too, so prefer it; fall back to the bypass-only hook if no interception engine is wired.
-		if config.ApplyInspectionPosture != nil {
-			config.ApplyInspectionPosture(tenant)
-		} else if config.ApplyMaterializedCertPinBypass != nil {
-			config.ApplyMaterializedCertPinBypass(tenant)
+	recompileAuthoredRules := config.RecompileAuthoredRules
+	if recompileAuthoredRules == nil {
+		applyInspection := config.ApplyInspectionPosture
+		if applyInspection == nil {
+			applyInspection = config.ApplyMaterializedCertPinBypass
 		}
-		if s, ok := policyStore.(interface {
-			SetCompiledEastWestRules(string, []decision.EastWestRule)
-		}); ok {
-			ewCompiled := policyrule.CompileEastWest(tenant, ruleStore.List(tenant, policyrule.PlaneEastWest), assetStore)
-			logDebugf("recompileAuthoredRules: tenant=%s east_west authored_rules=%d compiled=%d", tenant, len(ruleStore.List(tenant, policyrule.PlaneEastWest)), len(ewCompiled))
-			s.SetCompiledEastWestRules(tenant, ewCompiled)
-		} else {
-			logDebugf("recompileAuthoredRules: policyStore does NOT implement SetCompiledEastWestRules (compiled east-west NOT applied)")
-		}
-		if s, ok := policyStore.(interface {
-			SetCompiledPolicies(string, []model.Policy)
-		}); ok {
-			s.SetCompiledPolicies(tenant, policyrule.CompileEgressPolicies(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore))
-		}
-	}
-	var ruleCompilationMu sync.Mutex
-	recompileAuthoredRules := func() {
-		ruleCompilationMu.Lock()
-		defer ruleCompilationMu.Unlock()
-		// ★★ EVERY ORGANIZATION WITH SOMETHING TO CLEAR, NOT ONLY ONES WITH SOMETHING TO BUILD (2026-08-17,
-		// measured). This walked the organizations that HAVE authored rules. Deleting an organization's LAST
-		// rule removes it from that list, so its compiled set was never rebuilt to empty — and went on
-		// enforcing. Measured end to end: a customer deleted a deny rule, the rules screen showed none, the
-		// control plane had dropped the policy, and this Edge answered DENY for that destination across two
-		// further config pulls and would have forever.
-		compiledOwners := []string{}
-		if s, ok := policyStore.(interface{ CompiledRuleTenants() []string }); ok {
-			compiledOwners = s.CompiledRuleTenants()
-		}
-		seen := map[string]bool{}
-		for _, tenant := range append(append([]string{evaluator.PolicyBundle.TenantID}, ruleStore.Tenants()...), compiledOwners...) {
-			if seen[tenant] {
-				continue
-			}
-			seen[tenant] = true
-			recompileOneTenant(tenant)
-		}
+		recompileAuthoredRules = newAuthoredRuleCompiler(evaluator.PolicyBundle.TenantID, policyStore, ruleStore, assetStore, applyInspection)
 	}
 	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL, recompileAuthoredRules, func(r *http.Request, kind, id, operation, result string, value any) {
 		now := time.Now().UTC()

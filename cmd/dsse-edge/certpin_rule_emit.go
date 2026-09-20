@@ -48,9 +48,9 @@ func emitCertPinBypassRuleContext(ctx context.Context, assets *assetcatalog.Stor
 		return fmt.Errorf("cert-pin candidate %s has no tenant", c.CandidateID)
 	}
 	epID := "certpin-ep-" + c.CandidateID
-	if _, err := assets.UpsertEndpointContext(ctx, assetcatalog.Endpoint{
+	if _, err := assets.UpsertCertPinEndpointContext(ctx, c.CandidateID, assetcatalog.Endpoint{
 		ID: epID, TenantID: tenant, Alias: host, Kind: assetcatalog.KindNetwork,
-		Address: host, Source: assetcatalog.SourceManual, Tags: []string{"cert_pin"},
+		Address: host, Tags: []string{"cert_pin"},
 	}); err != nil {
 		return &certPinRuleWriteError{stage: "bypass_endpoint", err: err}
 	}

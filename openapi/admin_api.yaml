@@ -10864,7 +10864,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create or update an endpoint catalog entry.
-      description: Requires admin.endpoints.write. Upserts a named endpoint (alias + platform). Tenant is taken from the admin context.
+      description: Requires admin.endpoints.write. Upserts a named endpoint (alias + platform). Tenant is taken from the admin context. Cert-pin destinations (source cert_pin or reserved ID prefix certpin-ep-) cannot be created, modified, or deleted through the endpoint catalog; these writes return 403. Manage bypass rules through Internet Access. Legacy manual-source entries in that namespace are protected without changing their saved rules.
       tags:
         - AdminAssetCatalog
       requestBody:

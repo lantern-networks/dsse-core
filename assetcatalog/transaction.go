@@ -145,6 +145,9 @@ func (s *Store) UpsertEndpointContext(ctx context.Context, e Endpoint) (Endpoint
 	e = copyEndpoint(e)
 	return mutateCatalogContext(ctx, s, func(n *Store) (Endpoint, error) {
 		current, found := n.GetEndpoint(e.TenantID, e.ID)
+		if certPinEndpoint(e) || found && certPinEndpoint(current) {
+			return Endpoint{}, ErrCertPinEndpointOwnership
+		}
 		if e.Source == SourceApplication || found && current.Source == SourceApplication {
 			return Endpoint{}, ErrApplicationEndpointOwnership
 		}
@@ -194,6 +197,9 @@ func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
 }
 func (s *Store) DeleteEndpointContext(ctx context.Context, tenant, id string) (bool, error) {
 	return mutateCatalogContext(ctx, s, func(n *Store) (bool, error) {
+		if e, ok := n.GetEndpoint(tenant, id); strings.HasPrefix(id, certPinEndpointPrefix) || ok && certPinEndpoint(e) {
+			return false, ErrCertPinEndpointOwnership
+		}
 		if e, ok := n.GetEndpoint(tenant, id); ok && e.Source == SourceApplication {
 			return false, ErrApplicationEndpointOwnership
 		}

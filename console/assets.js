@@ -79,10 +79,13 @@ async function renderEndpointsSection(section) {
     if (!filtered.length) { uiState(tableHost, "empty", bl({ en: "No matches.", ja: "一致なし。" })); return; }
     const rows = filtered.map((ep) => {
       const actions = el("div", { class: "ui-row-actions" });
-      if (ep.source === "application") {
+      const certPin = ep.source === "cert_pin" || String(ep.id || "").startsWith("certpin-ep-");
+      if (certPin) {
+        actions.appendChild(el("span", { text: bl({ en: "Managed in Internet Access", ja: "インターネットアクセスで管理" }) }));
+      } else if (ep.source === "application") {
         actions.appendChild(el("span", { text: bl({ en: "Managed in Applications", ja: "アプリケーションで管理" }) }));
       } else actions.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: ep.kind === "network" ? bl({ en: "Edit", ja: "編集" }) : bl({ en: "Rename", ja: "名前変更" }), onClick: () => openEndpointForm(section, ep) }));
-      if (ep.source !== "enrolled" && ep.source !== "application") {
+      if (!certPin && ep.source !== "enrolled" && ep.source !== "application") {
         actions.appendChild(document.createTextNode(" "));
         actions.appendChild(el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "削除" }), onClick: () => removeEndpoint(ep, section) }));
       }

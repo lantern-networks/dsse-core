@@ -48,6 +48,10 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 	}
 	writeFailure := func(w http.ResponseWriter, err error) {
+		if errors.Is(err, assetcatalog.ErrCertPinEndpointOwnership) {
+			writeError(w, http.StatusForbidden, err)
+			return
+		}
 		if errors.Is(err, assetcatalog.ErrPersistence) {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("Saving the catalog was not confirmed. The previous live catalog remains active. Restore storage, reload and retry."))
 			return

@@ -144,6 +144,11 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
+		plans, err := agentRolloutPlans.SnapshotChecked()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		var fleet map[string]any
 		if agentTelemetry != nil {
 			if summary, err := adminAgentUpdateEventSummaryFrom(hot, writer, agentTelemetry, tenantID); err == nil {
@@ -153,7 +158,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version":        "admin_agent_rollout.v1",
 			"tenant_id":             tenantID,
-			"plan":                  agentRolloutPlans.Get(tenantID),
+			"plan":                  plans[tenantID],
 			"static_target":         agentTargetVersion,
 			"fleet_update_summary":  fleet,
 			"no_secret_attestation": true,
@@ -172,6 +177,11 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_agent_rollouts.v1", "tenants": map[string]any{}})
 			return
 		}
+		plans, err := agentRolloutPlans.SnapshotChecked()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		// ★ THE PREDICATE IS "DOES THIS CREDENTIAL BELONG TO THE DEPLOYMENT", NOT "IS SOMEBODY SIGNED IN OUTSIDE
 		// AN ORGANIZATION" (2026-08-28, measured: the Edge asked and was answered its own organization's plan
 		// and nobody else's, so every customer's fleet stayed held). adminAnsweringForTheDeployment describes an
@@ -187,14 +197,14 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			(operatorOrg != "" && strings.EqualFold(callerOrg, operatorOrg))
 		out := map[string]agentrollout.AgentRolloutPlan{}
 		if forTheDeployment {
-			for _, tenant := range agentRolloutPlans.Tenants() {
-				out[tenant] = agentRolloutPlans.Get(tenant)
+			for tenant, plan := range plans {
+				out[tenant] = plan
 			}
 		} else {
 			// A customer asking gets its own and nobody else's — the same rule every read on this surface has.
 			tenant := strings.TrimSpace(adminTenantIDFromRequest(r))
 			if tenant != "" {
-				out[tenant] = agentRolloutPlans.Get(tenant)
+				out[tenant] = plans[tenant]
 			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -283,7 +293,12 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		// The merge — carry the schedule through a halt, carry the halt through a schedule change — happens
 		// inside the store under ONE lock. Read-then-write here let two concurrent admins each read the same
 		// previous state, and the later writer silently undid the earlier one.
-		previous := agentRolloutPlans.Get(tenantID)
+		snapshot, readErr := agentRolloutPlans.SnapshotChecked()
+		if readErr != nil {
+			writeError(w, http.StatusServiceUnavailable, readErr)
+			return
+		}
+		previous := snapshot[tenantID]
 		// ★ PERSISTED BEFORE IT IS ACKNOWLEDGED. Edges pull this store as the authority; a halt that lives only
 		// in RAM is un-withdrawn by the next control-plane restart, and a 200 that outlives its own storage is
 		// the same lie this endpoint was refusing an hour ago.
@@ -325,7 +340,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				"not be recorded (%w): a halt nobody can account for afterwards is not one this system will make", err))
 			return
 		}
-		merged, serr := agentRolloutPlans.Apply(tenantID, plan, time.Now())
+		previous, merged, serr := agentRolloutPlans.ApplyContext(r.Context(), tenantID, plan, time.Now())
 		if serr != nil {
 			failed, why := "failed", "the plan could not be stored durably: "+serr.Error()
 			rec := agentRolloutAuditLog(tenantID, plan, evaluator, sourceIPFromRequest(r))

@@ -520,7 +520,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.AgentRolloutPlans != nil {
-		eraseChecked("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenantChecked)
+		eraseChecked("agent_rollout_plans", func(tenant string) (int, error) { return e.AgentRolloutPlans.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.PublishedAgentUpdates != nil {
 		eraseChecked("published_agent_releases", e.PublishedAgentUpdates.RemoveTenantChecked)

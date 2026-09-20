@@ -1,6 +1,7 @@
 package agentrollout
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -340,12 +341,11 @@ func (s *AgentRolloutStore) persistPlansLocked(plans map[string]AgentRolloutPlan
 }
 
 func (s *AgentRolloutStore) Get(tenantID string) AgentRolloutPlan {
-	if s == nil {
-		return AgentRolloutPlan{}
+	plans, err := s.SnapshotChecked()
+	if err != nil {
+		return AgentRolloutPlan{Frozen: true, Intent: AgentRolloutIntentFreeze, Reason: "rollout state is unavailable"}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.plans[strings.TrimSpace(tenantID)]
+	return plans[strings.TrimSpace(tenantID)]
 }
 
 // Apply merges a new plan into the tenant's current one and persists the result, ALL UNDER ONE LOCK.
@@ -363,83 +363,74 @@ func (s *AgentRolloutStore) Get(tenantID string) AgentRolloutPlan {
 //     an omitted channel clears the old channel. Follow clears both fields,
 //   - freeze keeps version/channel when omitted, and absent window/waves stay unchanged.
 func (s *AgentRolloutStore) Apply(tenantID string, in AgentRolloutPlan, now time.Time) (AgentRolloutPlan, error) {
+	_, after, err := s.ApplyContext(context.Background(), tenantID, in, now)
+	return after, err
+}
+
+// ApplyContext returns the actual transaction's before/after pair for audit.
+func (s *AgentRolloutStore) ApplyContext(ctx context.Context, tenantID string, in AgentRolloutPlan, now time.Time) (AgentRolloutPlan, AgentRolloutPlan, error) {
 	if s == nil {
-		return AgentRolloutPlan{}, nil
+		return AgentRolloutPlan{}, AgentRolloutPlan{}, nil
 	}
 	key := strings.TrimSpace(tenantID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	merged := s.plans[key]
-	if in.Waves != nil {
-		merged.Waves = in.Waves
-	}
-	if in.Window != nil {
-		merged.Window = in.Window
-	}
-	switch in.Intent {
-	case AgentRolloutIntentSchedule:
-		// The halt and its reason are left exactly as they were.
-	case AgentRolloutIntentFollow:
-		// ★ ONLY THE VERSION IS CLEARED. Following what the deployment offers is a statement about WHICH
-		// version, and it must not release a fleet somebody halted — the same rule the schedule intent has, in
-		// the other direction.
-		merged.DesiredVersion, merged.ReleaseChannel = "", ""
-	case AgentRolloutIntentFreeze:
-		// A halt/release changes movement, not the version already selected.
-		merged.Frozen, merged.Reason = in.Frozen, in.Reason
-		if in.DesiredVersion != "" {
-			merged.DesiredVersion = in.DesiredVersion
+	var before, merged AgentRolloutPlan
+	err := s.mutateLocked(ctx, func(candidate map[string]AgentRolloutPlan) {
+		before = clonePlan(candidate[key])
+		merged = clonePlan(before)
+		if in.Waves != nil {
+			merged.Waves = in.Waves
 		}
-		if in.ReleaseChannel != "" {
-			merged.ReleaseChannel = in.ReleaseChannel
+		if in.Window != nil {
+			merged.Window = in.Window
 		}
-	default:
-		// Selecting a version must not release an incident hold. Only an explicit
-		// freeze=false decision, with its required reason, may do that.
-		merged.DesiredVersion, merged.ReleaseChannel = in.DesiredVersion, in.ReleaseChannel
-	}
-	merged.Intent = in.Intent
-	merged.UpdatedAt = now.UTC().Format(time.RFC3339)
+		switch in.Intent {
+		case AgentRolloutIntentSchedule:
+			// The halt and its reason are left exactly as they were.
+		case AgentRolloutIntentFollow:
+			// ★ ONLY THE VERSION IS CLEARED. Following what the deployment offers is a statement about WHICH
+			// version, and it must not release a fleet somebody halted — the same rule the schedule intent has, in
+			// the other direction.
+			merged.DesiredVersion, merged.ReleaseChannel = "", ""
+		case AgentRolloutIntentFreeze:
+			// A halt/release changes movement, not the version already selected.
+			merged.Frozen, merged.Reason = in.Frozen, in.Reason
+			if in.DesiredVersion != "" {
+				merged.DesiredVersion = in.DesiredVersion
+			}
+			if in.ReleaseChannel != "" {
+				merged.ReleaseChannel = in.ReleaseChannel
+			}
+		default:
+			// Selecting a version must not release an incident hold. Only an explicit
+			// freeze=false decision, with its required reason, may do that.
+			merged.DesiredVersion, merged.ReleaseChannel = in.DesiredVersion, in.ReleaseChannel
+		}
+		merged.Intent = in.Intent
+		merged.UpdatedAt = now.UTC().Format(time.RFC3339)
 
-	candidate := make(map[string]AgentRolloutPlan, len(s.plans)+1)
-	for k, v := range s.plans {
-		candidate[k] = v
+		candidate[key] = clonePlan(merged)
+	})
+	if err != nil {
+		return AgentRolloutPlan{}, AgentRolloutPlan{}, err
 	}
-	candidate[key] = merged
-	if err := s.persistPlansLocked(candidate); err != nil {
-		return AgentRolloutPlan{}, err
-	}
-	s.plans = candidate
-	return merged, nil
+	return before, clonePlan(merged), nil
 }
 
 // Set records the plan and PERSISTS it before returning. The error is returned rather than logged: the caller
 // answers an operator who is halting a release, and "stored" must not be said about something that was not.
 func (s *AgentRolloutStore) Set(tenantID string, plan AgentRolloutPlan) error {
+	return s.SetContext(context.Background(), tenantID, plan)
+}
+
+func (s *AgentRolloutStore) SetContext(ctx context.Context, tenantID string, plan AgentRolloutPlan) error {
 	if s == nil {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	// ★ PERSIST THE CANDIDATE, THEN PUBLISH IT (2026-08-11, third review). Updating the map first meant a failed
-	// write left the new plan visible to Get — which is what the EDGES pull — while the API answered 500. An
-	// operator told their halt was not accepted would have had it applied anyway, and the reverse for an
-	// unfreeze: told it failed, while every device resumed.
-	//
-	// So the write is attempted against a COPY, and the live map only moves once the bytes are down.
-	key := strings.TrimSpace(tenantID)
-	candidate := make(map[string]AgentRolloutPlan, len(s.plans)+1)
-	for k, v := range s.plans {
-		candidate[k] = v
-	}
-	candidate[key] = plan
-	if err := s.persistPlansLocked(candidate); err != nil {
-		return err
-	}
-	s.plans = candidate
-	return nil
+	return s.mutateLocked(ctx, func(candidate map[string]AgentRolloutPlan) { candidate[strings.TrimSpace(tenantID)] = clonePlan(plan) })
 }
 
 // CountForTenant is how many plans this store holds for one organization: one, or none. It exists because a
@@ -468,29 +459,27 @@ func (s *AgentRolloutStore) RemoveTenant(tenantID string) int {
 }
 
 func (s *AgentRolloutStore) RemoveTenantChecked(tenantID string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenantID)
+}
+
+func (s *AgentRolloutStore) RemoveTenantContext(ctx context.Context, tenantID string) (int, error) {
 	if s == nil {
 		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := strings.TrimSpace(tenantID)
-	if _, ok := s.plans[key]; !ok {
-		return 0, nil
-	}
-	candidate := make(map[string]AgentRolloutPlan, len(s.plans))
-	for k, v := range s.plans {
-		if k == key {
-			continue
+	n := 0
+	err := s.mutateLocked(ctx, func(candidate map[string]AgentRolloutPlan) {
+		key := strings.TrimSpace(tenantID)
+		if _, ok := candidate[key]; ok {
+			delete(candidate, key)
+			n = 1
 		}
-		candidate[k] = v
-	}
-	if err := s.persistPlansLocked(candidate); err != nil {
-		// The caller counts what was erased; a removal that could not be stored has not happened, and saying
-		// it did is what makes an erasure report a number nobody can check.
+	})
+	if err != nil {
 		return 0, err
 	}
-	s.plans = candidate
-	return 1, nil
+	return n, nil
 }
 
 // Tenants lists every organization this store holds a plan for, sorted.

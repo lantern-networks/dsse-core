@@ -28,7 +28,7 @@ var extraPurgeSeeds = map[string]string{
 	"delegated":    `{"a":{"id":"a","tenant_id":"tenant_target"},"b":{"id":"b","tenant_id":"tenant_other"}}`,
 	"human":        `{"a":{"id":"a","tenant_id":"tenant_target"},"b":{"id":"b","tenant_id":"tenant_other"}}`,
 	"clientless":   `{"a":{"grant_id":"a","tenant_id":"tenant_target","user_id":"user","idp_id":"idp","issued_at":"2026-01-01T00:00:00Z","expires_at":"2027-01-01T00:00:00Z"},"b":{"grant_id":"b","tenant_id":"tenant_other","user_id":"user","idp_id":"idp","issued_at":"2026-01-01T00:00:00Z","expires_at":"2027-01-01T00:00:00Z"}}`,
-	"idp":          `{"connections":{"tenant_target":{"a":{"id":"a","tenant_id":"tenant_target"}},"tenant_other":{"b":{"id":"b","tenant_id":"tenant_other"}}},"defaults":{"tenant_target":"a","tenant_other":"b"}}`,
+	"idp":          `{"connections":{"tenant_target":{"a":{"idp_id":"a","tenant_id":"tenant_target"}},"tenant_other":{"b":{"idp_id":"b","tenant_id":"tenant_other"}}},"defaults":{"tenant_target":"a","tenant_other":"b"}}`,
 	"routes":       `{"seen":{"tenant_target":{"a":true},"tenant_other":{"b":true}},"held":{},"approved":{},"authored":{}}`,
 	"transport":    `[{"tenant_id":"tenant_target"},{"tenant_id":"tenant_other"}]`,
 	"interception": `[{"tenant_id":"tenant_target"},{"tenant_id":"tenant_other"}]`,

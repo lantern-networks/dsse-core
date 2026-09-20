@@ -47,6 +47,9 @@ func idpConnectionBundleSection(store *idpregistry.Store) *idpConnectionBundle {
 	if store == nil {
 		return nil
 	}
+	if err := store.RefreshShared(); err != nil {
+		return &idpConnectionBundle{Complete: false}
+	}
 	return &idpConnectionBundle{Connections: store.ListAll(), Defaults: store.DefaultsAll(), Complete: true}
 }
 

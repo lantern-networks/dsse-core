@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -16,10 +18,12 @@ import (
 // IdP verified_domains it supersedes (which were buried in Sign-in Providers, labelled for identity matching, and
 // required an IdP to exist). Durable, per-tenant.
 type organizationDomainsStore struct {
-	mu        sync.RWMutex
-	byTenant  map[string][]string
-	persister blobstore.Persister
-	dirty     bool
+	mu             sync.RWMutex
+	byTenant       map[string][]string
+	persister      blobstore.Persister
+	dirty          bool
+	authorityKnown bool
+	pending        map[string][]string
 }
 
 func newOrganizationDomainsStore() *organizationDomainsStore {
@@ -39,9 +43,16 @@ func (s *organizationDomainsStore) Domains(tenantID string) []string {
 	if s == nil {
 		return nil
 	}
+	domains, _ := s.DomainsChecked(tenantID)
+	return domains
+}
+func (s *organizationDomainsStore) DomainsChecked(tenant string) ([]string, error) {
+	if err := s.RefreshShared(); err != nil {
+		return nil, err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return append([]string(nil), s.byTenant[tenantID]...)
+	return append([]string(nil), s.byTenant[tenant]...), nil
 }
 
 // normalizedOrganizationDomains normalizes, sorts and de-duplicates nonempty inputs.
@@ -67,6 +78,10 @@ func (s *organizationDomainsStore) SetDomains(tenantID string, domains []string)
 	} else {
 		s.byTenant[tenantID] = out
 	}
+	if s.pending == nil {
+		s.pending = map[string][]string{}
+	}
+	s.pending[tenantID] = append([]string(nil), out...)
 	s.dirty = true
 	s.mu.Unlock()
 	return out
@@ -79,24 +94,30 @@ type organizationDomainsSnapshot struct {
 // SetPersister attaches durable storage and rehydrates on boot.
 func (s *organizationDomainsStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 	if p == nil {
+		s.persister = nil
+		s.authorityKnown = false
 		return nil
 	}
-	data, err := p.Load()
-	if err != nil || len(data) == 0 {
+	raw, err := p.Load()
+	if err != nil {
 		return err
 	}
-	var snap organizationDomainsSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	if raw == nil {
+		if s.authorityKnown {
+			return fmt.Errorf("organization domain authority disappeared")
+		}
+		s.persister = p
+		return nil
+	}
+	next, err := decodeOrganizationDomains(raw)
+	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if snap.ByTenant != nil {
-		s.byTenant = snap.ByTenant
-	}
+	s.byTenant, s.persister, s.authorityKnown = next.ByTenant, p, true
+	s.dirty = false
+	s.pending = nil
 	return nil
 }
 
@@ -121,34 +142,134 @@ func (s *organizationDomainsStore) saveSnapshotLocked(next organizationDomainsSn
 
 // SetDomainsDurable saves before publishing the account-classification change.
 func (s *organizationDomainsStore) SetDomainsDurable(tenant string, domains []string) ([]string, error) {
+	return s.SetDomainsContext(context.Background(), tenant, domains)
+}
+func (s *organizationDomainsStore) SetDomainsContext(ctx context.Context, tenant string, domains []string) ([]string, error) {
 	out := normalizedOrganizationDomains(domains)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.snapshotLocked()
-	if len(out) == 0 {
-		delete(next.ByTenant, tenant)
-	} else {
-		next.ByTenant[tenant] = out
-	}
-	if err := s.saveSnapshotLocked(next); err != nil {
+	if err := s.editDomainsLocked(ctx, map[string][]string{tenant: out}); err != nil {
 		return nil, err
 	}
-	s.byTenant = next.ByTenant
-	s.dirty = false
+	delete(s.pending, tenant)
+	s.dirty = len(s.pending) > 0
 	return append([]string{}, out...), nil
 }
 
-// Periodic snapshots and admin commits share the lock to preserve save order.
+// Periodic writers apply only explicitly changed tenants to the latest row.
 func (s *organizationDomainsStore) PersistIfDirty() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.dirty || s.persister == nil {
 		return nil
 	}
-	if err := s.saveSnapshotLocked(s.snapshotLocked()); err != nil {
+	if err := s.editDomainsLocked(context.Background(), s.pending); err != nil {
 		return err
 	}
+	s.pending = nil
 	s.dirty = false
+	return nil
+}
+
+type domainContextUpdater interface {
+	UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+}
+type domainUpdater interface {
+	Update(func([]byte) ([]byte, error)) error
+}
+
+func decodeOrganizationDomains(raw []byte) (organizationDomainsSnapshot, error) {
+	var next organizationDomainsSnapshot
+	if err := json.Unmarshal(raw, &next); err != nil {
+		return next, err
+	}
+	if next.ByTenant == nil {
+		return next, fmt.Errorf("incomplete organization domains snapshot")
+	}
+	return next, nil
+}
+func (s *organizationDomainsStore) editDomainsLocked(ctx context.Context, edits map[string][]string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	next := s.snapshotLocked()
+	build := func(raw []byte) ([]byte, error) {
+		if raw == nil {
+			if s.authorityKnown {
+				return nil, fmt.Errorf("organization domain authority disappeared")
+			}
+		} else {
+			var err error
+			next, err = decodeOrganizationDomains(raw)
+			if err != nil {
+				return nil, err
+			}
+			s.authorityKnown = true
+		}
+		for tenant, domains := range edits {
+			if len(domains) == 0 {
+				delete(next.ByTenant, tenant)
+			} else {
+				next.ByTenant[tenant] = append([]string(nil), domains...)
+			}
+		}
+		return json.Marshal(next)
+	}
+	var err error
+	switch p := s.persister.(type) {
+	case domainContextUpdater:
+		err = p.UpdateContext(ctx, build)
+	case domainUpdater:
+		err = p.Update(build)
+	default:
+		for tenant, domains := range edits {
+			if len(domains) == 0 {
+				delete(next.ByTenant, tenant)
+			} else {
+				next.ByTenant[tenant] = append([]string(nil), domains...)
+			}
+		}
+		err = s.saveSnapshotLocked(next)
+	}
+	if err != nil {
+		return err
+	}
+	s.byTenant = next.ByTenant
+	if s.persister != nil {
+		s.authorityKnown = true
+	}
+	return nil
+}
+func (s *organizationDomainsStore) RefreshShared() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch s.persister.(type) {
+	case domainContextUpdater, domainUpdater:
+	default:
+		return nil
+	}
+	raw, err := s.persister.Load()
+	if err != nil {
+		return err
+	}
+	if raw == nil {
+		if s.authorityKnown {
+			return fmt.Errorf("organization domain authority disappeared")
+		}
+		return nil
+	}
+	next, err := decodeOrganizationDomains(raw)
+	if err != nil {
+		return err
+	}
+	s.byTenant = next.ByTenant
+	s.authorityKnown = true
 	return nil
 }
 
@@ -160,6 +281,7 @@ func corporateDomainsResolver(org *organizationDomainsStore, idp *idpregistry.St
 		return nil
 	}
 	return func(tenantID string) []string {
+
 		seen := map[string]bool{}
 		var out []string
 		add := func(d string) {
@@ -170,12 +292,20 @@ func corporateDomainsResolver(org *organizationDomainsStore, idp *idpregistry.St
 			}
 		}
 		if org != nil {
-			for _, d := range org.Domains(tenantID) {
+			domains, err := org.DomainsChecked(tenantID)
+			if err != nil {
+				return nil
+			}
+			for _, d := range domains {
 				add(d)
 			}
 		}
 		if idp != nil {
-			for _, c := range idp.List(tenantID) {
+			connections, _, err := idp.TenantSnapshot(tenantID)
+			if err != nil {
+				return nil
+			}
+			for _, c := range connections {
 				for _, d := range c.VerifiedDomains {
 					add(d)
 				}

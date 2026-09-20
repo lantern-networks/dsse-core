@@ -112,10 +112,11 @@ func normalize(c Connection) (Connection, error) {
 // use; persists to a JSON state path when configured (see persistence.go) so registered IdPs survive a
 // restart.
 type Store struct {
-	mu          sync.RWMutex
-	connections map[string]map[string]Connection // tenant -> idp_id -> connection
-	defaults    map[string]string                // tenant -> default idp_id
-	persister   blobstore.Persister
+	mu             sync.RWMutex
+	connections    map[string]map[string]Connection // tenant -> idp_id -> connection
+	defaults       map[string]string                // tenant -> default idp_id
+	persister      blobstore.Persister
+	authorityKnown bool
 	// generation advances on every change. The config bundle SUMS it, and an Edge applies a bundle only when
 	// that sum is newer — see ConfigGeneration.
 	generation uint64
@@ -141,7 +142,7 @@ func NewStore() *Store {
 }
 
 // Upsert validates and stores a connection. The first connection registered for a tenant becomes its default.
-func (s *Store) Upsert(c Connection) (Connection, error) {
+func (s *Store) upsertLocal(c Connection) (Connection, error) {
 	normalized, err := normalize(c)
 	if err != nil {
 		return Connection{}, err
@@ -186,6 +187,9 @@ func (s *Store) Upsert(c Connection) (Connection, error) {
 
 // Get returns a connection by id for the tenant.
 func (s *Store) Get(tenantID, idpID string) (Connection, bool) {
+	if s.RefreshShared() != nil {
+		return Connection{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	c, ok := s.connections[strings.TrimSpace(tenantID)][strings.TrimSpace(idpID)]
@@ -194,6 +198,9 @@ func (s *Store) Get(tenantID, idpID string) (Connection, bool) {
 
 // List returns the tenant's connections, sorted by id (default first is the caller's concern via Default()).
 func (s *Store) List(tenantID string) []Connection {
+	if s.RefreshShared() != nil {
+		return nil
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]Connection, 0, len(s.connections[strings.TrimSpace(tenantID)]))
@@ -206,7 +213,7 @@ func (s *Store) List(tenantID string) []Connection {
 
 // Delete removes a connection. It refuses to delete the tenant's current default while other connections
 // remain (set a new default first) — but allows deleting the last one. Reports whether it existed.
-func (s *Store) Delete(tenantID, idpID string) (bool, error) {
+func (s *Store) deleteLocal(tenantID, idpID string) (bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	idpID = strings.TrimSpace(idpID)
 	s.mu.Lock()
@@ -231,7 +238,7 @@ func (s *Store) Delete(tenantID, idpID string) (bool, error) {
 }
 
 // SetDefault marks a registered connection as the tenant default. The id must already exist.
-func (s *Store) SetDefault(tenantID, idpID string) error {
+func (s *Store) setDefaultLocal(tenantID, idpID string) error {
 	tenantID = strings.TrimSpace(tenantID)
 	idpID = strings.TrimSpace(idpID)
 	s.mu.Lock()
@@ -251,6 +258,9 @@ func (s *Store) SetDefault(tenantID, idpID string) error {
 
 // Default returns the tenant's default connection.
 func (s *Store) Default(tenantID string) (Connection, bool) {
+	if s.RefreshShared() != nil {
+		return Connection{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	id := s.defaults[strings.TrimSpace(tenantID)]
@@ -325,7 +335,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 // an organization's registered sign-in providers outlived the organization.
 func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
 
-func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
+func (s *Store) removeTenantCheckedLocal(tenantID string) (int, error) {
 	if s == nil || strings.TrimSpace(tenantID) == "" {
 		return 0, nil
 	}
@@ -400,6 +410,9 @@ func (s *Store) DefaultsAll() map[string]string {
 func (s *Store) ReplaceAll(conns []Connection, defaults map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isShared(s.persister) {
+		return
+	} // Shared CP authority is authored through scoped mutations.
 	s.connections = map[string]map[string]Connection{}
 	for _, c := range conns {
 		tenant := strings.TrimSpace(c.TenantID)

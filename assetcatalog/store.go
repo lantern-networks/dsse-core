@@ -14,13 +14,14 @@ import (
 // per-tenant alias namespace (so an alias is unique across all three kinds). Methods are safe for
 // concurrent use. The admin API persists/serves it; the proprietary Console reads/writes through that API.
 type Store struct {
-	mu        sync.Mutex
-	seq       int
-	endpoints map[string]map[string]Endpoint // tenant -> id -> endpoint
-	groups    map[string]map[string]Group    // tenant -> id -> group
-	services  map[string]map[string]Service  // tenant -> id -> service
-	aliases   map[string]map[string]string   // tenant -> alias -> ownerID (the shared namespace)
-	persister blobstore.Persister            // when set, operator-authored entries are persisted here (survive restart)
+	mu              sync.Mutex
+	seq             int
+	endpoints       map[string]map[string]Endpoint // tenant -> id -> endpoint
+	groups          map[string]map[string]Group    // tenant -> id -> group
+	services        map[string]map[string]Service  // tenant -> id -> service
+	aliases         map[string]map[string]string   // tenant -> alias -> ownerID (the shared namespace)
+	enrolledAliases map[string]map[string]string   // tenant -> inventory ID -> operator alias; never identity
+	persister       blobstore.Persister            // when set, operator-authored entries are persisted here (survive restart)
 	// builtInEndpoints / builtInGroups are the shipped SaaS catalog presented as endpoint groups: tenant-
 	// agnostic, read-only, NOT persisted (re-seeded from code each boot), not deletable. They are unioned into
 	// List/Get/Resolve so a rule can reference a catalog group and the engine resolves it to the host patterns.
@@ -37,6 +38,7 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{
 		endpoints:        map[string]map[string]Endpoint{},
+		enrolledAliases:  map[string]map[string]string{},
 		groups:           map[string]map[string]Group{},
 		services:         map[string]map[string]Service{},
 		aliases:          map[string]map[string]string{},
@@ -115,6 +117,10 @@ func (s *Store) upsertEndpoint(e Endpoint) (Endpoint, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.upsertEndpointLocked(e)
+}
+
+func (s *Store) upsertEndpointLocked(e Endpoint) (Endpoint, error) {
 	if strings.TrimSpace(e.ID) == "" {
 		e.ID = s.nextIDLocked("ep")
 	}

@@ -17,7 +17,7 @@ func (s *Store) sharedCandidateLocked(raw []byte) (*Store, error) {
 	n.builtInEndpoints, n.builtInGroups, n.builtInServices = s.builtInEndpoints, s.builtInGroups, s.builtInServices
 	if raw == nil {
 		old := s.authoredStateLocked()
-		if len(old.Endpoints)+len(old.Groups)+len(old.Services) > 0 {
+		if len(old.Endpoints)+len(old.Groups)+len(old.Services)+len(old.EnrolledAliases) > 0 {
 			return nil, ErrPersistence
 		}
 	} else {
@@ -51,9 +51,20 @@ func (s *Store) sharedCandidateLocked(raw []byte) (*Store, error) {
 				rows[id] = norm
 			}
 		}
+		for tenant, rows := range snap.EnrolledAliases {
+			for id, alias := range rows {
+				if tenant == "" || !strings.HasPrefix(id, enrolledOwnerPrefix) || strings.TrimSpace(alias) == "" || snap.Aliases[tenant][alias] != id {
+					return nil, ErrPersistence
+				}
+			}
+		}
+		if snap.EnrolledAliases != nil {
+			n.enrolledAliases = snap.EnrolledAliases
+		}
 		n.seq, n.endpoints, n.groups, n.services, n.aliases = snap.Seq, snap.Endpoints, snap.Groups, snap.Services, snap.Aliases
 	}
-	// Enrolled endpoints and their aliases belong to local inventory, not this blob.
+	// Identity remains inventory-owned. Overlay confirmed operator aliases while
+	// rebuilding the local inventory view; default names do not reserve shared state.
 	for tenant, rows := range s.endpoints {
 		for id, e := range rows {
 			if e.Source == SourceEnrolled {
@@ -63,20 +74,11 @@ func (s *Store) sharedCandidateLocked(raw []byte) (*Store, error) {
 				if _, exists := n.endpoints[tenant][id]; exists {
 					return nil, ErrPersistence
 				}
+				if alias, ok := n.enrolledAliases[tenant][id]; ok {
+					e.Alias = alias
+				}
+				e.Alias = n.claimAliasLocked(tenant, e.Alias, id)
 				n.endpoints[tenant][id] = copyEndpoint(e)
-			}
-		}
-	}
-	for tenant, rows := range s.aliases {
-		for alias, id := range rows {
-			if strings.HasPrefix(id, enrolledOwnerPrefix) {
-				if n.aliases[tenant] == nil {
-					n.aliases[tenant] = map[string]string{}
-				}
-				if owner, exists := n.aliases[tenant][alias]; exists && owner != id {
-					return nil, ErrPersistence
-				}
-				n.aliases[tenant][alias] = id
 			}
 		}
 	}

@@ -10,14 +10,16 @@ import (
 
 // persistedCatalog is the on-disk snapshot of the OPERATOR-authored catalog. Enrolled-device endpoints are
 // deliberately excluded: they are re-derived from the (separately persisted) enrolled inventory on boot via
-// SyncEnrolledEndpoints, so persisting them would (a) leave stale endpoints for de-enrolled devices that
+// SyncEnrolledEndpoints. Only explicit operator aliases are persisted separately;
+// they never create an endpoint without inventory. Persisting full endpoints would (a) leave stale endpoints for de-enrolled devices that
 // have no delete path, and (b) rewrite the file on every auto-sync (which runs on each admin list).
 type persistedCatalog struct {
-	Seq       int                            `json:"seq"`
-	Endpoints map[string]map[string]Endpoint `json:"endpoints"`
-	Groups    map[string]map[string]Group    `json:"groups"`
-	Services  map[string]map[string]Service  `json:"services"`
-	Aliases   map[string]map[string]string   `json:"aliases"`
+	EnrolledAliases map[string]map[string]string   `json:"enrolled_aliases,omitempty"`
+	Seq             int                            `json:"seq"`
+	Endpoints       map[string]map[string]Endpoint `json:"endpoints"`
+	Groups          map[string]map[string]Group    `json:"groups"`
+	Services        map[string]map[string]Service  `json:"services"`
+	Aliases         map[string]map[string]string   `json:"aliases"`
 }
 
 // SetStatePath enables durable persistence: the store loads any previously-authored catalog from path and
@@ -83,6 +85,9 @@ func (s *Store) loadLocked() error {
 			snap.Services[tenant][id] = normalized
 		}
 	}
+	if snap.EnrolledAliases != nil {
+		s.enrolledAliases = snap.EnrolledAliases
+	}
 	if snap.Endpoints != nil {
 		s.endpoints = snap.Endpoints
 	}
@@ -124,11 +129,12 @@ func (s *Store) persistLocked() error {
 
 func (s *Store) authoredStateLocked() persistedCatalog {
 	snap := persistedCatalog{
-		Seq:       s.seq,
-		Endpoints: map[string]map[string]Endpoint{},
-		Groups:    s.groups,
-		Services:  s.services,
-		Aliases:   map[string]map[string]string{},
+		Seq:             s.seq,
+		EnrolledAliases: s.enrolledAliases,
+		Endpoints:       map[string]map[string]Endpoint{},
+		Groups:          s.groups,
+		Services:        s.services,
+		Aliases:         map[string]map[string]string{},
 	}
 	for tenant, byID := range s.endpoints {
 		for id, e := range byID {
@@ -143,7 +149,7 @@ func (s *Store) authoredStateLocked() persistedCatalog {
 	}
 	for tenant, byAlias := range s.aliases {
 		for alias, ownerID := range byAlias {
-			if strings.HasPrefix(ownerID, enrolledOwnerPrefix) {
+			if strings.HasPrefix(ownerID, enrolledOwnerPrefix) && s.enrolledAliases[tenant][ownerID] != alias {
 				continue
 			}
 			if snap.Aliases[tenant] == nil {

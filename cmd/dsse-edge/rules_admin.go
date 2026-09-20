@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -19,7 +20,7 @@ import (
 // yielding an EMPTY selector — which `eastWestSelectorMatches` treats as WILDCARD, silently making a per-host
 // adopted rule match ANY destination. Materializing the endpoint fixes both: the rule scopes to exactly the
 // observed host and the endpoint shows up under Networks/Assets. Dedups by address (reuse an existing endpoint).
-func adoptDestinationEndpointID(assets *assetcatalog.Store, tenant, address string) (string, error) {
+func adoptDestinationEndpointID(ctx context.Context, assets *assetcatalog.Store, tenant, address string) (string, error) {
 	address = strings.TrimSpace(address)
 	if assets == nil || address == "" {
 		return address, nil // best-effort fallback: keep the raw value (still a valid, if unnamed, selector)
@@ -29,7 +30,7 @@ func adoptDestinationEndpointID(assets *assetcatalog.Store, tenant, address stri
 			return ep.ID, nil // reuse the existing endpoint for this destination
 		}
 	}
-	ep, err := assets.UpsertEndpoint(assetcatalog.Endpoint{
+	ep, err := assets.UpsertEndpointContext(ctx, assetcatalog.Endpoint{
 		TenantID: tenant,
 		Kind:     assetcatalog.KindNetwork,
 		Address:  address,

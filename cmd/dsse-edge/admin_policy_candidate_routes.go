@@ -127,7 +127,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// candidate away from materialized (suppress/reject/dismiss a live bypass) must DELETE that rule — only
 		// then does the host get decrypted again. Then rebuild the bypass set (now without the rule).
 		if reviewed.Source == policycandidate.SourceCertPinningDetection && reviewed.Status != "materialized" && ruleStore != nil {
-			if _, err := ruleStore.Delete(adminTenantIDFromRequest(r), "certpin-rule-"+reviewed.CandidateID); err != nil {
+			if _, err := ruleStore.DeleteContext(r.Context(), adminTenantIDFromRequest(r), "certpin-rule-"+reviewed.CandidateID); err != nil {
 				partial(w, r, "admin_policy_candidate_reviewed", reviewed, now, "bypass_rule_removal", "delete")
 				return
 			}
@@ -198,7 +198,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// sees/toggles/deletes in the Egress view, not just an opaque candidate-store entry. Emitted BEFORE the
 		// re-apply below; candidate status alone does not bypass traffic.
 		if materialized.Source == policycandidate.SourceCertPinningDetection && assetStore != nil && ruleStore != nil {
-			if err := emitCertPinBypassRule(assetStore, ruleStore, materialized); err != nil {
+			if err := emitCertPinBypassRuleContext(r.Context(), assetStore, ruleStore, materialized); err != nil {
 				partial(w, r, "admin_policy_candidate_materialized", materialized, now, certPinWriteStage(err), "upsert")
 				return
 			}
@@ -302,7 +302,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if assetStore != nil && ruleStore != nil {
-			if err := emitCertPinBypassRule(assetStore, ruleStore, materialized); err != nil {
+			if err := emitCertPinBypassRuleContext(r.Context(), assetStore, ruleStore, materialized); err != nil {
 				partial(w, r, "admin_cert_pin_bypass_added", materialized, now, certPinWriteStage(err), "upsert")
 				return
 			}

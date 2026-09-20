@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -35,6 +36,9 @@ func certPinWriteStage(err error) string {
 // idempotent (Upsert replaces in place) rather than accumulating duplicates.
 // The runtime's source of bypass intent is the authored rule, not candidate status.
 func emitCertPinBypassRule(assets *assetcatalog.Store, rules *policyrule.Store, c policycandidate.Candidate) error {
+	return emitCertPinBypassRuleContext(context.Background(), assets, rules, c)
+}
+func emitCertPinBypassRuleContext(ctx context.Context, assets *assetcatalog.Store, rules *policyrule.Store, c policycandidate.Candidate) error {
 	host, _, err := policycandidate.CertPinBypassTarget(c)
 	if err != nil {
 		return err
@@ -44,13 +48,13 @@ func emitCertPinBypassRule(assets *assetcatalog.Store, rules *policyrule.Store, 
 		return fmt.Errorf("cert-pin candidate %s has no tenant", c.CandidateID)
 	}
 	epID := "certpin-ep-" + c.CandidateID
-	if _, err := assets.UpsertEndpoint(assetcatalog.Endpoint{
+	if _, err := assets.UpsertEndpointContext(ctx, assetcatalog.Endpoint{
 		ID: epID, TenantID: tenant, Alias: host, Kind: assetcatalog.KindNetwork,
 		Address: host, Source: assetcatalog.SourceManual, Tags: []string{"cert_pin"},
 	}); err != nil {
 		return &certPinRuleWriteError{stage: "bypass_endpoint", err: err}
 	}
-	if _, err := rules.Upsert(policyrule.Rule{
+	if _, err := rules.UpsertContext(ctx, policyrule.Rule{
 		ID: "certpin-rule-" + c.CandidateID, TenantID: tenant, Plane: policyrule.PlaneEgress,
 		Priority: systemBypassFloorPriority, Name: "Cert-pin bypass: " + host,
 		Source: []string{policyrule.SubjectAny}, Destination: []string{epID},

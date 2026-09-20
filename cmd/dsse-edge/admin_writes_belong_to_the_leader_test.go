@@ -9,7 +9,7 @@ func TestEveryChangingPermissionIsRecognisedAsAWrite(t *testing.T) {
 	writes := []string{
 		"admin.enrollment.write", "admin.policy.write", "admin.steering.write", "admin.connectors.write",
 		"admin.certs.write", "admin.tenant.write", "admin.tenant.admin", "admin.export.cancel",
-		"admin.export.create", "admin.dns.write", "admin.platform.write",
+		"admin.policy_candidates.review", "admin.export.create", "admin.dns.write", "admin.platform.write",
 	}
 	for _, p := range writes {
 		if !adminPermissionWrites(p) {

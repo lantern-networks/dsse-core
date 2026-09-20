@@ -305,7 +305,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// traffic at all is what creating one MEANS. A flag here would only be a way to create an organization
 		// that does not work.
 		if action == "create" && ruleStore != nil {
-			if _, rerr := ruleStore.Upsert(startingPostureRule(saved.TenantID)); rerr != nil {
+			if _, rerr := ruleStore.UpsertContext(r.Context(), startingPostureRule(saved.TenantID)); rerr != nil {
 				answer.StartingPostureNote = "this organization was created and carries no traffic yet: " + rerr.Error()
 				logWarnf("tenant_created_without_starting_posture tenant=%q: %v", saved.TenantID, rerr)
 			} else {

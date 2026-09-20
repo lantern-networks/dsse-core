@@ -37,6 +37,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation store unavailable"))
 			return
 		}
+		if !refreshAuthoredStores(w, ruleStore, assetStore) {
+			return
+		}
+		recompileAuthoredRules()
 		// Effective rules for dedup: an observation already matched by ANY effective east-west rule needs no
 		// adoption (covered flows are exactly what convergence already counts as handled).
 		var effective []decision.EastWestRule
@@ -57,6 +61,11 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		skippedCovered := []string{}
 		skippedMissing := []string{}
 		changed := false
+		defer func() {
+			if changed {
+				recompileAuthoredRules()
+			}
+		}()
 		for _, id := range reqBody.ObservationIDs {
 			obs, ok := config.EastWestObserveStore.Get(tenant, id)
 			if !ok {
@@ -74,7 +83,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			// Materialize the observed destination as a first-class, GUI-visible, editable network endpoint and
 			// reference it by id — NOT a raw IP (which is invisible in the Console, blocks re-editing, and
 			// compiles to an empty→wildcard selector that would match any host). See adoptDestinationEndpointID.
-			destID, derr := adoptDestinationEndpointID(assetStore, tenant, obs.Destination)
+			destID, derr := adoptDestinationEndpointID(r.Context(), assetStore, tenant, obs.Destination)
 			if derr != nil {
 				writeError(w, http.StatusInternalServerError, fmt.Errorf("adopt %s: materialize destination endpoint: %w", id, derr))
 				return
@@ -93,16 +102,17 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 				ServiceID: adoptServiceIDForObservation(assetStore, tenant, obs.Port, obs.ServiceFamily),
 				Action:    policyrule.Action{Access: policyrule.AccessAllow, Inspection: policyrule.InspectionInspect},
 			}
-			stored, err := ruleStore.Upsert(rule)
+			stored, err := ruleStore.UpsertContext(r.Context(), rule)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("adopt %s: %w", id, err))
+				status := http.StatusBadRequest
+				if errors.Is(err, policyrule.ErrPersistence) {
+					status = http.StatusInternalServerError
+				}
+				writeError(w, status, fmt.Errorf("adopt %s: %w", id, err))
 				return
 			}
 			created = append(created, stored.ID)
 			changed = true
-		}
-		if changed {
-			recompileAuthoredRules()
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version":  "admin_east_west_adopt.v1",

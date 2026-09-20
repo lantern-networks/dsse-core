@@ -189,6 +189,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return
 		}
+		if !refreshVLANStore(w, vlanBoundary) {
+			return
+		}
 		if !refreshDLPStores(w, config.DLPDistribution) {
 			return
 		}

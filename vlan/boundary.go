@@ -6,10 +6,10 @@
 package vlan
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -64,27 +64,22 @@ func (s *Store) Persisted() bool {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
-		return nil
+	if len(data) != 0 {
+		snap, err := decodeSnapshot(data)
+		if err != nil {
+			return err
+		}
+		s.adoptLocked(snap)
 	}
-	var snap vlanPersistSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
-	}
-	if snap.Objects != nil {
-		s.objects = snap.Objects
-	}
-	if snap.Policies != nil {
-		s.policies = snap.Policies
-	}
+	s.persister = p
 	return nil
 }
 
@@ -98,6 +93,9 @@ var ErrPersistence = errors.New("network storage unconfirmed")
 func (s *Store) saveCandidateLocked(objects map[string]model.VLANObject, policies map[string]model.VLANBoundaryPolicy) error {
 	if s.persister == nil {
 		return nil
+	}
+	if _, shared := s.persister.(sharedPersister); shared {
+		return fmt.Errorf("%w: whole snapshot replacement of shared authority is forbidden", ErrPersistence)
 	}
 	data, err := json.Marshal(vlanPersistSnapshot{Objects: objects, Policies: policies})
 	if err == nil {
@@ -157,6 +155,12 @@ func (s *Store) ReplaceAll(objects []model.VLANObject, policies []model.VLANBoun
 }
 
 func (s *Store) UpsertObject(o model.VLANObject) (model.VLANObject, error) {
+	return s.UpsertObjectContext(context.Background(), o, nil)
+}
+
+// UpsertObjectContext checks the existing owner against the latest authoritative row.
+// A nil authorize callback is reserved for trusted internal callers.
+func (s *Store) UpsertObjectContext(ctx context.Context, o model.VLANObject, authorize func(string) bool) (model.VLANObject, error) {
 	if strings.TrimSpace(o.ID) == "" {
 		return model.VLANObject{}, fmt.Errorf("vlan object id is required")
 	}
@@ -168,17 +172,24 @@ func (s *Store) UpsertObject(o model.VLANObject) (model.VLANObject, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	objects := maps.Clone(s.objects)
-	objects[o.ID] = o
-	if err := s.saveCandidateLocked(objects, s.policies); err != nil {
+	err := s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		if old, ok := snap.Objects[o.ID]; ok && authorize != nil && !authorize(old.TenantID) {
+			return ErrNotFound
+		}
+		snap.Objects[o.ID] = o
+		return nil
+	})
+	if err != nil {
 		return model.VLANObject{}, err
 	}
-	s.objects = objects
-	s.generation.Add(1)
 	return o, nil
 }
 
 func (s *Store) UpsertPolicy(p model.VLANBoundaryPolicy) (model.VLANBoundaryPolicy, error) {
+	return s.UpsertPolicyContext(context.Background(), p, nil)
+}
+
+func (s *Store) UpsertPolicyContext(ctx context.Context, p model.VLANBoundaryPolicy, authorize func(string) bool) (model.VLANBoundaryPolicy, error) {
 	if strings.TrimSpace(p.ID) == "" {
 		return model.VLANBoundaryPolicy{}, fmt.Errorf("vlan boundary policy id is required")
 	}
@@ -198,13 +209,16 @@ func (s *Store) UpsertPolicy(p model.VLANBoundaryPolicy) (model.VLANBoundaryPoli
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	policies := maps.Clone(s.policies)
-	policies[p.ID] = p
-	if err := s.saveCandidateLocked(s.objects, policies); err != nil {
+	err := s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		if old, ok := snap.Policies[p.ID]; ok && authorize != nil && !authorize(old.TenantID) {
+			return ErrNotFound
+		}
+		snap.Policies[p.ID] = p
+		return nil
+	})
+	if err != nil {
 		return model.VLANBoundaryPolicy{}, err
 	}
-	s.policies = policies
-	s.generation.Add(1)
 	return p, nil
 }
 
@@ -223,23 +237,33 @@ func (s *Store) ListObjects() []model.VLANObject {
 // generation (distributed via the config bundle). Nil-safe. (Boundary policies referencing a deleted object's
 // class are unaffected — they key on class, not object id.)
 func (s *Store) DeleteObject(id string) (bool, error) {
+	return s.DeleteObjectContext(context.Background(), id, nil)
+}
+
+func (s *Store) DeleteObjectContext(ctx context.Context, id string, authorize func(string) bool) (bool, error) {
 	if s == nil {
 		return false, nil
 	}
 	id = strings.TrimSpace(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.objects[id]; !ok {
-		return false, nil
-	}
-	objects := maps.Clone(s.objects)
-	delete(objects, id)
-	if err := s.saveCandidateLocked(objects, s.policies); err != nil {
+	deleted := false
+	err := s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		old, ok := snap.Objects[id]
+		if !ok {
+			return nil
+		}
+		if authorize != nil && !authorize(old.TenantID) {
+			return ErrNotFound
+		}
+		delete(snap.Objects, id)
+		deleted = true
+		return nil
+	})
+	if err != nil {
 		return false, err
 	}
-	s.objects = objects
-	s.generation.Add(1)
-	return true, nil
+	return deleted, nil
 }
 
 // GetObject returns the VLAN object (a Named Network — a named CIDR range) with the given id. Used by the
@@ -360,6 +384,10 @@ func (s *Store) CountForTenant(tenantID string) (objects int, policies int) {
 // a different question — "everything of theirs" — and answering it by listing and filtering at every call site
 // is how one call site ends up filtering differently.
 func (s *Store) RemoveTenant(tenantID string) (objects int, policies int, err error) {
+	return s.RemoveTenantContext(context.Background(), tenantID)
+}
+
+func (s *Store) RemoveTenantContext(ctx context.Context, tenantID string) (objects int, policies int, err error) {
 	if s == nil {
 		return 0, 0, nil
 	}
@@ -369,25 +397,23 @@ func (s *Store) RemoveTenant(tenantID string) (objects int, policies int, err er
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	objMap, polMap := maps.Clone(s.objects), maps.Clone(s.policies)
-	for id, o := range objMap {
-		if strings.EqualFold(strings.TrimSpace(o.TenantID), tenantID) {
-			delete(objMap, id)
-			objects++
+	err = s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		for id, o := range snap.Objects {
+			if strings.EqualFold(strings.TrimSpace(o.TenantID), tenantID) {
+				delete(snap.Objects, id)
+				objects++
+			}
 		}
-	}
-	for id, p := range polMap {
-		if strings.EqualFold(strings.TrimSpace(p.TenantID), tenantID) {
-			delete(polMap, id)
-			policies++
+		for id, p := range snap.Policies {
+			if strings.EqualFold(strings.TrimSpace(p.TenantID), tenantID) {
+				delete(snap.Policies, id)
+				policies++
+			}
 		}
-	}
-	if objects+policies > 0 {
-		if err := s.saveCandidateLocked(objMap, polMap); err != nil {
-			return 0, 0, err
-		}
-		s.objects, s.policies = objMap, polMap
-		s.generation.Add(1)
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
 	}
 	return objects, policies, nil
 }

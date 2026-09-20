@@ -6704,13 +6704,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		// The organization is the CALLER's, not this node's: taking it from the node let a customer of one
 		// organization file, approve and cash a break-glass request in another.
-		item, err := breakGlassRequests.Create(req, breakGlassCallerTenant(r, evaluator.PolicyBundle.TenantID), time.Now())
+		item, err := breakGlassRequests.CreateContext(r.Context(), req, breakGlassCallerTenant(r, evaluator.PolicyBundle.TenantID), time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeBreakGlassError(w, err)
 			return
 		}
 		appendBreakGlassDomainEvent(r.Context(), domainEventOutbox, item, "break_glass_requested", item.CreatedAt, time.Now())
-		if err := writer.Append("audit.log.jsonl", breakGlassLifecycleAuditLog("break_glass_requested", item, evaluator, sourceIPFromRequest(r), "", "")); err != nil {
+		if err := writer.Append("audit.log.jsonl", breakGlassLifecycleAuditForRequest(r, "break_glass_requested", item, evaluator, sourceIPFromRequest(r), "", "")); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
@@ -6722,26 +6722,26 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode break-glass approval: %w", err))
 			return
 		}
-		if existing, ok := breakGlassRequests.Get(r.PathValue("request_id")); ok &&
-			!breakGlassRequestVisibleTo(existing, r, evaluator.PolicyBundle.TenantID) {
-			// Absent rather than forbidden: a 403 would confirm the id exists in another organization.
-			writeError(w, http.StatusNotFound, fmt.Errorf("break-glass request %s is absent", r.PathValue("request_id")))
-			return
-		}
-		item, err := breakGlassRequests.Approve(r.PathValue("request_id"), req, time.Now())
+		item, err := breakGlassRequests.ApproveContext(r.Context(), r.PathValue("request_id"), req, time.Now(), func(item breakGlassAccessRequest) bool {
+			return breakGlassRequestVisibleTo(item, r, evaluator.PolicyBundle.TenantID)
+		})
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeBreakGlassError(w, err)
 			return
 		}
 		appendBreakGlassDomainEvent(r.Context(), domainEventOutbox, item, "break_glass_approved", item.ApprovedAt, time.Now())
-		if err := writer.Append("audit.log.jsonl", breakGlassLifecycleAuditLog("break_glass_approved", item, evaluator, sourceIPFromRequest(r), "", "")); err != nil {
+		if err := writer.Append("audit.log.jsonl", breakGlassLifecycleAuditForRequest(r, "break_glass_approved", item, evaluator, sourceIPFromRequest(r), "", "")); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, item)
 	}))
 	mux.HandleFunc("POST /break-glass/requests/{request_id}/issue-session", adminEndpoint("admin.break_glass.write", func(w http.ResponseWriter, r *http.Request) {
-		item, ok := breakGlassRequests.Get(r.PathValue("request_id"))
+		item, ok, err := breakGlassRequests.GetChecked(r.PathValue("request_id"))
+		if err != nil {
+			writeBreakGlassError(w, err)
+			return
+		}
 		if !ok || !breakGlassRequestVisibleTo(item, r, evaluator.PolicyBundle.TenantID) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("break-glass request %s is absent", r.PathValue("request_id")))
 			return
@@ -6753,18 +6753,22 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		callerTenant := breakGlassCallerTenant(r, evaluator.PolicyBundle.TenantID)
 		event, err := breakGlassAuthenticationEvent(item.SessionRequest(), callerTenant, r, time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeBreakGlassError(w, err)
 			return
 		}
 		event.Metadata["break_glass_request_id"] = item.ID
-		session, err := sessionStore.CreateFromAuthenticationEvent(event, evaluator.PolicyBundle.ID, callerTenant, time.Now())
+		// Consume the approval durably before creating any usable session. A crash
+		// after this reservation may lose an issuance, but cannot mint it twice.
+		issued, err := breakGlassRequests.MarkSessionIssuedContext(r.Context(), item.ID, event.SessionID, time.Now(), func(latest breakGlassAccessRequest) bool {
+			return breakGlassRequestVisibleTo(latest, r, evaluator.PolicyBundle.TenantID) && latest == item
+		})
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeBreakGlassError(w, err)
 			return
 		}
-		issued, err := breakGlassRequests.MarkSessionIssued(item.ID, session.ID, time.Now())
+		session, err := sessionStore.CreateFromAuthenticationEvent(event, evaluator.PolicyBundle.ID, callerTenant, time.Now())
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeBreakGlassError(w, err)
 			return
 		}
 		appendAuthenticationDomainEvent(r.Context(), domainEventOutbox, event, time.Now())
@@ -6773,7 +6777,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return
 		}
 		appendBreakGlassDomainEvent(r.Context(), domainEventOutbox, issued, "break_glass_session_issued", issued.IssuedAt, time.Now())
-		if err := writer.Append("audit.log.jsonl", breakGlassLifecycleAuditLog("break_glass_session_issued", issued, evaluator, sourceIPFromRequest(r), session.ID, event.ID)); err != nil {
+		if err := writer.Append("audit.log.jsonl", breakGlassLifecycleAuditForRequest(r, "break_glass_session_issued", issued, evaluator, sourceIPFromRequest(r), session.ID, event.ID)); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}

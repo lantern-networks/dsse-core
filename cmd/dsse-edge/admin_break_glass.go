@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -58,9 +59,10 @@ type breakGlassApprovalRequest struct {
 }
 
 type breakGlassRequestStore struct {
-	mu        sync.RWMutex
-	requests  map[string]breakGlassAccessRequest
-	persister blobstore.Persister
+	mu             sync.RWMutex
+	requests       map[string]breakGlassAccessRequest
+	persister      blobstore.Persister
+	authorityKnown bool
 }
 
 // SetStatePath enables durable file persistence (historical behaviour); a back-compat convenience over
@@ -78,37 +80,166 @@ func (s *breakGlassRequestStore) SetStatePath(path string) error {
 func (s *breakGlassRequestStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if data == nil {
+		if s.authorityKnown {
+			return fmt.Errorf("break-glass authority disappeared")
+		}
+		s.persister = p
 		return nil
 	}
-	var snap map[string]breakGlassAccessRequest
-	if err := json.Unmarshal(data, &snap); err != nil {
+	next, err := decodeBreakGlassRequests(data)
+	if err != nil {
 		return err
 	}
-	if snap != nil {
-		s.requests = snap
+	s.persister, s.requests, s.authorityKnown = p, next, true
+	return nil
+}
+
+var errBreakGlassPersistence = errors.New("break-glass persistence could not be confirmed")
+var errBreakGlassAbsent = errors.New("break-glass request is absent")
+
+type breakGlassContextUpdater interface {
+	UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+}
+type breakGlassUpdater interface {
+	Update(func([]byte) ([]byte, error)) error
+}
+
+func decodeBreakGlassRequests(raw []byte) (map[string]breakGlassAccessRequest, error) {
+	var rows map[string]breakGlassAccessRequest
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		return nil, fmt.Errorf("null break-glass authority")
+	}
+	for id, item := range rows {
+		if id == "" || item.ID != id || item.UserID == "" || item.TenantID == "" {
+			return nil, fmt.Errorf("invalid break-glass identity")
+		}
+		switch item.Status {
+		case "requested", "approved", "session_issued":
+		default:
+			return nil, fmt.Errorf("invalid break-glass status")
+		}
+		if item.Status != "requested" && item.ApproverUserID == "" {
+			return nil, fmt.Errorf("missing break-glass approver")
+		}
+		if item.Status == "session_issued" && item.SessionID == "" {
+			return nil, fmt.Errorf("missing break-glass session")
+		}
+	}
+	return rows, nil
+}
+
+// Edit the latest shared authority, not a stale process snapshot. Only a confirmed
+// save may publish authorization. The request's captured leadership term is kept.
+func (s *breakGlassRequestStore) editLocked(ctx context.Context, edit func(map[string]breakGlassAccessRequest) error) error {
+	var next map[string]breakGlassAccessRequest
+	var mutationErr error
+	build := func(raw []byte) ([]byte, error) {
+		var err error
+		if raw == nil {
+			if s.authorityKnown {
+				return nil, fmt.Errorf("break-glass authority disappeared")
+			}
+			raw, err = json.Marshal(s.requests)
+			if err != nil {
+				return nil, err
+			}
+		}
+		next, err = decodeBreakGlassRequests(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err = edit(next); err != nil {
+			mutationErr = err
+			return nil, err
+		}
+		return json.Marshal(next)
+	}
+	var err error
+	shared := false
+	switch p := s.persister.(type) {
+	case breakGlassContextUpdater:
+		shared = true
+		err = p.UpdateContext(ctx, build)
+	case breakGlassUpdater:
+		shared = true
+		err = p.Update(build)
+	default:
+		var raw []byte
+		raw, err = json.Marshal(s.requests)
+		if err == nil {
+			raw, err = build(raw)
+		}
+		if err == nil && p != nil {
+			err = p.Save(raw)
+		}
+	}
+	if err != nil {
+		if mutationErr != nil {
+			return mutationErr
+		}
+		if shared || !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			return fmt.Errorf("%w: %v", errBreakGlassPersistence, err)
+		}
+	}
+	s.requests = next
+	if s.persister != nil {
+		s.authorityKnown = true
 	}
 	return nil
 }
 
-// persistLocked atomically write-throughs the current request set. Caller holds s.mu. Best-effort.
-func (s *breakGlassRequestStore) persistLocked() {
-	if s.persister == nil {
-		return
+// The checked read is used before issuing a session; failure must not fall back
+// to a cached approved request. Mutations independently validate the latest row.
+func (s *breakGlassRequestStore) GetChecked(id string) (breakGlassAccessRequest, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, shared := s.persister.(breakGlassUpdater)
+	if _, ok := s.persister.(breakGlassContextUpdater); ok {
+		shared = true
 	}
-	data, err := json.MarshalIndent(s.requests, "", "  ")
-	if err != nil {
-		return
+	if shared {
+		raw, err := s.persister.Load()
+		if err != nil {
+			return breakGlassAccessRequest{}, false, errBreakGlassPersistence
+		}
+		if raw == nil {
+			if s.authorityKnown {
+				return breakGlassAccessRequest{}, false, errBreakGlassPersistence
+			}
+		} else {
+			next, err := decodeBreakGlassRequests(raw)
+			if err != nil {
+				return breakGlassAccessRequest{}, false, errBreakGlassPersistence
+			}
+			s.requests = next
+			s.authorityKnown = true
+		}
 	}
-	_ = s.persister.Save(data)
+	item, ok := s.requests[id]
+	return item, ok, nil
+}
+
+func writeBreakGlassError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errBreakGlassPersistence):
+		writeError(w, http.StatusServiceUnavailable, errBreakGlassPersistence)
+	case errors.Is(err, errBreakGlassAbsent):
+		writeError(w, http.StatusNotFound, errBreakGlassAbsent)
+	default:
+		writeError(w, http.StatusBadRequest, err)
+	}
 }
 
 func newBreakGlassRequestStore() *breakGlassRequestStore {
@@ -116,7 +247,13 @@ func newBreakGlassRequestStore() *breakGlassRequestStore {
 }
 
 func (s *breakGlassRequestStore) Create(req breakGlassSessionRequest, expectedTenantID string, now time.Time) (breakGlassAccessRequest, error) {
+	return s.CreateContext(context.Background(), req, expectedTenantID, now)
+}
+func (s *breakGlassRequestStore) CreateContext(ctx context.Context, req breakGlassSessionRequest, expectedTenantID string, now time.Time) (breakGlassAccessRequest, error) {
 	tenantID := valueOrDefault(req.TenantID, expectedTenantID)
+	if tenantID == "" {
+		return breakGlassAccessRequest{}, fmt.Errorf("break-glass tenant_id is required")
+	}
 	if expectedTenantID != "" && tenantID != expectedTenantID {
 		return breakGlassAccessRequest{}, fmt.Errorf("break-glass tenant_id %s does not match edge tenant_id %s", tenantID, expectedTenantID)
 	}
@@ -149,31 +286,43 @@ func (s *breakGlassRequestStore) Create(req breakGlassSessionRequest, expectedTe
 	}
 
 	s.mu.Lock()
-	s.requests[item.ID] = item
-	s.persistLocked()
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	err := s.editLocked(ctx, func(rows map[string]breakGlassAccessRequest) error { rows[item.ID] = item; return nil })
+	if err != nil {
+		return breakGlassAccessRequest{}, err
+	}
 	return item, nil
 }
 
 func (s *breakGlassRequestStore) Approve(id string, req breakGlassApprovalRequest, now time.Time) (breakGlassAccessRequest, error) {
+	return s.ApproveContext(context.Background(), id, req, now, nil)
+}
+func (s *breakGlassRequestStore) ApproveContext(ctx context.Context, id string, req breakGlassApprovalRequest, now time.Time, visible func(breakGlassAccessRequest) bool) (breakGlassAccessRequest, error) {
 	if req.ApproverUserID == "" {
 		return breakGlassAccessRequest{}, fmt.Errorf("break-glass approver_user_id is required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, ok := s.requests[id]
-	if !ok {
-		return breakGlassAccessRequest{}, fmt.Errorf("break-glass request %s is absent", id)
+	var item breakGlassAccessRequest
+	err := s.editLocked(ctx, func(rows map[string]breakGlassAccessRequest) error {
+		var ok bool
+		item, ok = rows[id]
+		if !ok || (visible != nil && !visible(item)) {
+			return errBreakGlassAbsent
+		}
+		if item.Status != "requested" {
+			return fmt.Errorf("break-glass request %s status is %s", id, item.Status)
+		}
+		item.Status = "approved"
+		item.ApproverUserID = req.ApproverUserID
+		item.ApprovalReason = req.Reason
+		item.ApprovedAt = now.UTC().Format(time.RFC3339)
+		rows[id] = item
+		return nil
+	})
+	if err != nil {
+		return breakGlassAccessRequest{}, err
 	}
-	if item.Status != "requested" {
-		return breakGlassAccessRequest{}, fmt.Errorf("break-glass request %s status is %s", id, item.Status)
-	}
-	item.Status = "approved"
-	item.ApproverUserID = req.ApproverUserID
-	item.ApprovalReason = req.Reason
-	item.ApprovedAt = now.UTC().Format(time.RFC3339)
-	s.requests[id] = item
-	s.persistLocked()
 	return item, nil
 }
 
@@ -185,20 +334,33 @@ func (s *breakGlassRequestStore) Get(id string) (breakGlassAccessRequest, bool) 
 }
 
 func (s *breakGlassRequestStore) MarkSessionIssued(id, sessionID string, now time.Time) (breakGlassAccessRequest, error) {
+	return s.MarkSessionIssuedContext(context.Background(), id, sessionID, now, nil)
+}
+func (s *breakGlassRequestStore) MarkSessionIssuedContext(ctx context.Context, id, sessionID string, now time.Time, visible func(breakGlassAccessRequest) bool) (breakGlassAccessRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	item, ok := s.requests[id]
-	if !ok {
-		return breakGlassAccessRequest{}, fmt.Errorf("break-glass request %s is absent", id)
+	if sessionID == "" {
+		return breakGlassAccessRequest{}, fmt.Errorf("session id is required")
 	}
-	if item.Status != "approved" {
-		return breakGlassAccessRequest{}, fmt.Errorf("break-glass request %s status is %s", id, item.Status)
+	var item breakGlassAccessRequest
+	err := s.editLocked(ctx, func(rows map[string]breakGlassAccessRequest) error {
+		var ok bool
+		item, ok = rows[id]
+		if !ok || (visible != nil && !visible(item)) {
+			return errBreakGlassAbsent
+		}
+		if item.Status != "approved" {
+			return fmt.Errorf("break-glass request %s status is %s", id, item.Status)
+		}
+		item.Status = "session_issued"
+		item.SessionID = sessionID
+		item.IssuedAt = now.UTC().Format(time.RFC3339)
+		rows[id] = item
+		return nil
+	})
+	if err != nil {
+		return breakGlassAccessRequest{}, err
 	}
-	item.Status = "session_issued"
-	item.SessionID = sessionID
-	item.IssuedAt = now.UTC().Format(time.RFC3339)
-	s.requests[id] = item
-	s.persistLocked()
 	return item, nil
 }
 
@@ -363,6 +525,14 @@ func isBreakGlassAccessRow(row map[string]any) bool {
 		return true
 	}
 	return strings.HasPrefix(stringValue(row["session_id"]), breakGlassSessionPrefix)
+}
+
+// Administrative execution and the target identity are different actors. Body
+// fields remain explicit metadata; they must not impersonate the authenticated caller.
+func breakGlassLifecycleAuditForRequest(r *http.Request, eventType string, item breakGlassAccessRequest, evaluator decision.Evaluator, sourceIP, sessionID, authenticationEventID string) model.AuditLog {
+	row := breakGlassLifecycleAuditLog(eventType, item, evaluator, sourceIP, sessionID, authenticationEventID)
+	row.ActorUserID = auditActorPrincipal(r)
+	return row
 }
 
 func breakGlassLifecycleAuditLog(eventType string, item breakGlassAccessRequest, evaluator decision.Evaluator, sourceIP, sessionID, authenticationEventID string) model.AuditLog {

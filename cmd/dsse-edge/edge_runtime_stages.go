@@ -133,7 +133,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve entitlement store %q: %v", config.EntitlementStorePath, e)
 		} else if p != nil {
 			if lerr := entitlementStore.SetPersister(p); lerr != nil {
-				log.Printf("entitlement store: load prior entitlements failed (starting fresh): %v", lerr)
+				log.Fatalf("load entitlement store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {

@@ -24,6 +24,10 @@ import (
 
 func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, adminHotStore hotstore.Store, dlpRuleStore *dlpRuleRuntimeStore, dlpAllowlistStore *dlpAllowlistRuntimeStore, dlpPolicyObjects *dlpPolicyObjectStore, dlpFingerprintStore *dlpFingerprintRuntimeStore, dlpClassifierStore *dlpClassifierRuntimeStore, entitlementStore *entitlementStore, inspectionEvents *inspection.Store, configSourceURL string) {
 	mux.HandleFunc("GET /admin/entitlements", adminEndpoint("admin.config.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := entitlementStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("entitlements are unavailable"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"features": entitlementStore.FeaturesForTenant(adminTenantIDFromRequest(r))})
 	}))
 	// ★ A TENANT COULD GRANT ITSELF PAID FEATURES (2026-08-15). Entitlements are the licensing boundary, and
@@ -52,14 +56,19 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 				return
 			}
 		}
-		for f, granted := range body.Features {
-			entitlementStore.SetFeature(tenant, f, granted)
+		if err := entitlementStore.SetFeaturesContext(r.Context(), tenant, body.Features); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("entitlement persistence could not be confirmed"))
+			return
 		}
 		logInfof("entitlements_applied_by_admin tenant=%s features=%v", tenant, body.Features)
 		writeJSON(w, http.StatusOK, map[string]any{"features": entitlementStore.FeaturesForTenant(tenant)})
 	}))
 	// dlpFeatureGate rejects a DLP config write when the tenant is not licensed for DLP (the paid-feature gate).
 	dlpFeatureGate := func(w http.ResponseWriter, r *http.Request) bool {
+		if err := entitlementStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("entitlements are unavailable"))
+			return false
+		}
 		if !entitlementStore.Entitled(adminTenantIDFromRequest(r), featureDLP) {
 			writeError(w, http.StatusForbidden, fmt.Errorf("DLP is not licensed for this tenant"))
 			return true

@@ -180,6 +180,9 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	defer s.fingerprints.mu.Unlock()
 	s.allowlist.mu.Lock()
 	defer s.allowlist.mu.Unlock()
+	if isDLPSharedPersister(s.policies.persister) || isDLPSharedPersister(s.classifiers.persister) || isDLPSharedPersister(s.fingerprints.persister) || isDLPSharedPersister(s.allowlist.persister) {
+		return fmt.Errorf("cannot apply an Edge DLP bundle to shared authority stores")
+	}
 	// Refuse the entire library before publication when its suppression rules
 	// cannot be saved. The polling caller retries the same generation.
 	if next.Allowlists != nil {
@@ -201,5 +204,17 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	s.policies.generation++
 	s.classifiers.generation++
 	s.fingerprints.generation++
+	return nil
+}
+
+func (s *dlpConfigStores) RefreshShared() error {
+	if !s.ready() {
+		return nil
+	}
+	for _, store := range []interface{ RefreshShared() error }{s.policies, s.classifiers, s.fingerprints, s.allowlist} {
+		if err := store.RefreshShared(); err != nil {
+			return err
+		}
+	}
 	return nil
 }

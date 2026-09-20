@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,6 +117,9 @@ var errInvalidFingerprintDataset = errors.New("invalid fingerprint dataset")
 // SetDatasetDurable refuses empty or unscannable replacements and confirms the
 // configured store before publishing the new compiled set. No raw values are saved.
 func (s *dlpFingerprintRuntimeStore) SetDatasetDurable(tenantID, name string, values []string) (int, error) {
+	return s.SetDatasetContext(context.Background(), tenantID, name, values)
+}
+func (s *dlpFingerprintRuntimeStore) SetDatasetContext(ctx context.Context, tenantID, name string, values []string) (int, error) {
 	if !dlp.ValidIdentifierName(name) || len(values) > maxFingerprintValues {
 		return 0, fmt.Errorf("%w: invalid name or too many values", errInvalidFingerprintDataset)
 	}
@@ -124,6 +128,18 @@ func (s *dlpFingerprintRuntimeStore) SetDatasetDurable(tenantID, name string, va
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isDLPSharedPersister(s.persister) {
+		var result int
+		err := s.mutateSharedLocked(ctx, func(next *dlpFingerprintRuntimeStore) error {
+			var err error
+			result, err = next.SetDatasetDurable(tenantID, name, values)
+			return err
+		})
+		if err != nil {
+			return 0, err
+		}
+		return result, err
+	}
 	hashes := dlp.NewFingerprint(name, s.tenantSalt(tenantID), values).Hashes()
 	if len(hashes) == 0 {
 		return 0, fmt.Errorf("%w: supply at least one supported value of five or more characters after normalization; use Delete to remove a dataset", errInvalidFingerprintDataset)
@@ -146,8 +162,23 @@ func (s *dlpFingerprintRuntimeStore) SetDatasetDurable(tenantID, name string, va
 // RemoveDatasetDurable saves before removing a live dataset. A missing name is a
 // no-op, but pending staged changes still have to reach the configured store.
 func (s *dlpFingerprintRuntimeStore) RemoveDatasetDurable(tenantID, name string) (bool, error) {
+	return s.RemoveDatasetContext(context.Background(), tenantID, name)
+}
+func (s *dlpFingerprintRuntimeStore) RemoveDatasetContext(ctx context.Context, tenantID, name string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isDLPSharedPersister(s.persister) {
+		var result bool
+		err := s.mutateSharedLocked(ctx, func(next *dlpFingerprintRuntimeStore) error {
+			var err error
+			result, err = next.RemoveDatasetDurable(tenantID, name)
+			return err
+		})
+		if err != nil {
+			return false, err
+		}
+		return result, err
+	}
 	_, exists := s.datasets[tenantID][name]
 	if !exists && !s.dirty {
 		return false, nil
@@ -180,6 +211,9 @@ func (s *dlpFingerprintRuntimeStore) snapshotLocked() fingerprintStoreSnapshot {
 	return next
 }
 func (s *dlpFingerprintRuntimeStore) saveSnapshotLocked(next fingerprintStoreSnapshot) error {
+	if isDLPSharedPersister(s.persister) {
+		return fmt.Errorf("shared DLP state requires a contextual mutation")
+	}
 	if s.persister == nil {
 		return nil
 	}
@@ -322,4 +356,73 @@ func (s *dlpFingerprintRuntimeStore) PersistIfDirty() error {
 // dlpFingerprintProvider supplies the compiled EDM set for a tenant to the egress DLP scan path.
 type dlpFingerprintProvider interface {
 	FingerprintSetForTenant(tenantID string) *dlp.FingerprintSet
+}
+
+// sharedCandidateLocked reuses the complete restore validator and compilation.
+// The detached candidate is never visible before the shared transaction commits.
+func (s *dlpFingerprintRuntimeStore) sharedCandidateLocked(raw []byte) (*dlpFingerprintRuntimeStore, error) {
+	next := newDLPFingerprintRuntimeStore(s.startupSalt)
+	if err := loadDLPSharedCandidate(raw, len(s.datasets) > 0, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+func (s *dlpFingerprintRuntimeStore) adoptSharedLocked(next *dlpFingerprintRuntimeStore) {
+	if !reflect.DeepEqual(s.snapshotLocked(), next.snapshotLocked()) {
+		s.generation++
+	}
+	s.datasets, s.sets, s.salt = next.datasets, next.sets, next.salt
+	s.dirty = false
+}
+func (s *dlpFingerprintRuntimeStore) mutateSharedLocked(ctx context.Context, edit func(*dlpFingerprintRuntimeStore) error) error {
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	var accepted *dlpFingerprintRuntimeStore
+	err := s.persister.(dlpSharedUpdater).UpdateContext(ctx, func(raw []byte) ([]byte, error) {
+		next, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := edit(next); err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(next.snapshotLocked())
+		if err != nil {
+			return nil, err
+		}
+		accepted = next
+		return data, nil
+	})
+	if err != nil {
+		return err
+	}
+	if accepted == nil {
+		return fmt.Errorf("shared DLP mutation was not applied")
+	}
+	s.adoptSharedLocked(accepted)
+	return nil
+}
+func (s *dlpFingerprintRuntimeStore) RefreshShared() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !isDLPSharedPersister(s.persister) {
+		return nil
+	}
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	raw, err := s.persister.Load()
+	if err != nil {
+		return err
+	}
+	next, err := s.sharedCandidateLocked(raw)
+	if err != nil {
+		return err
+	}
+	s.adoptSharedLocked(next)
+	return nil
 }

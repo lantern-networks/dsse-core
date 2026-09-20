@@ -189,6 +189,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return
 		}
+		if !refreshDLPStores(w, config.DLPDistribution) {
+			return
+		}
 		if err := refreshManagedTenantRestrictions(policyStore); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))
 			return

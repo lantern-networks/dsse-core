@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -84,6 +85,9 @@ func cloneClassifierSpecs(specs []dlp.ClassifierSpec) []dlp.ClassifierSpec {
 // either authored or compiled state. With no persister it remains in-memory only.
 // A Save error may mean an unconfirmed write: do not report success or adopt it live.
 func (s *dlpClassifierRuntimeStore) SetSpecsDurable(tenantID string, specs []dlp.ClassifierSpec) error {
+	return s.SetSpecsContext(context.Background(), tenantID, specs)
+}
+func (s *dlpClassifierRuntimeStore) SetSpecsContext(ctx context.Context, tenantID string, specs []dlp.ClassifierSpec) error {
 	specs = cloneClassifierSpecs(specs)
 	if len(specs) > dlp.MaxClassifiers {
 		return fmt.Errorf("too many classifiers (max %d)", dlp.MaxClassifiers)
@@ -94,6 +98,9 @@ func (s *dlpClassifierRuntimeStore) SetSpecsDurable(tenantID string, specs []dlp
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isDLPSharedPersister(s.persister) {
+		return s.mutateSharedLocked(ctx, func(next *dlpClassifierRuntimeStore) error { return next.SetSpecsDurable(tenantID, specs) })
+	}
 	next := s.snapshotLocked()
 	if len(specs) == 0 {
 		delete(next.Specs, tenantID)
@@ -123,6 +130,9 @@ func (s *dlpClassifierRuntimeStore) snapshotLocked() classifierStoreSnapshot {
 }
 
 func (s *dlpClassifierRuntimeStore) saveSnapshotLocked(snap classifierStoreSnapshot) error {
+	if isDLPSharedPersister(s.persister) {
+		return fmt.Errorf("shared DLP state requires a contextual mutation")
+	}
 	if s.persister == nil {
 		return nil
 	}
@@ -215,4 +225,73 @@ func (s *dlpClassifierRuntimeStore) PersistIfDirty() error {
 // dlpClassifierProvider supplies the compiled custom-classifier set for a tenant to the egress DLP scan path.
 type dlpClassifierProvider interface {
 	ClassifierSetForTenant(tenantID string) *dlp.ClassifierSet
+}
+
+// sharedCandidateLocked reuses the complete restore validator and compilation.
+// The detached candidate is never visible before the shared transaction commits.
+func (s *dlpClassifierRuntimeStore) sharedCandidateLocked(raw []byte) (*dlpClassifierRuntimeStore, error) {
+	next := newDLPClassifierRuntimeStore()
+	if err := loadDLPSharedCandidate(raw, len(s.specs) > 0, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+func (s *dlpClassifierRuntimeStore) adoptSharedLocked(next *dlpClassifierRuntimeStore) {
+	if !reflect.DeepEqual(s.snapshotLocked(), next.snapshotLocked()) {
+		s.generation++
+	}
+	s.specs, s.sets = next.specs, next.sets
+	s.dirty = false
+}
+func (s *dlpClassifierRuntimeStore) mutateSharedLocked(ctx context.Context, edit func(*dlpClassifierRuntimeStore) error) error {
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	var accepted *dlpClassifierRuntimeStore
+	err := s.persister.(dlpSharedUpdater).UpdateContext(ctx, func(raw []byte) ([]byte, error) {
+		next, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := edit(next); err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(next.snapshotLocked())
+		if err != nil {
+			return nil, err
+		}
+		accepted = next
+		return data, nil
+	})
+	if err != nil {
+		return err
+	}
+	if accepted == nil {
+		return fmt.Errorf("shared DLP mutation was not applied")
+	}
+	s.adoptSharedLocked(accepted)
+	return nil
+}
+func (s *dlpClassifierRuntimeStore) RefreshShared() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !isDLPSharedPersister(s.persister) {
+		return nil
+	}
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	raw, err := s.persister.Load()
+	if err != nil {
+		return err
+	}
+	next, err := s.sharedCandidateLocked(raw)
+	if err != nil {
+		return err
+	}
+	s.adoptSharedLocked(next)
+	return nil
 }

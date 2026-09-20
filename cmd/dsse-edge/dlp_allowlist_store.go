@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -93,12 +94,18 @@ func validatedAllowlistValues(values []string) ([]string, error) {
 // SetValuesDurable confirms configured storage before publishing suppression rules.
 // Without a persister this remains in-memory only; errors do not prove disk rollback.
 func (s *dlpAllowlistRuntimeStore) SetValuesDurable(tenantID string, values []string) error {
+	return s.SetValuesContext(context.Background(), tenantID, values)
+}
+func (s *dlpAllowlistRuntimeStore) SetValuesContext(ctx context.Context, tenantID string, values []string) error {
 	values, err := validatedAllowlistValues(values)
 	if err != nil {
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isDLPSharedPersister(s.persister) {
+		return s.mutateSharedLocked(ctx, func(next *dlpAllowlistRuntimeStore) error { return next.SetValuesDurable(tenantID, values) })
+	}
 	next := s.snapshotLocked()
 	if len(values) == 0 {
 		delete(next.Values, tenantID)
@@ -126,6 +133,9 @@ func (s *dlpAllowlistRuntimeStore) snapshotLocked() allowlistStoreSnapshot {
 	return next
 }
 func (s *dlpAllowlistRuntimeStore) saveSnapshotLocked(next allowlistStoreSnapshot) error {
+	if isDLPSharedPersister(s.persister) {
+		return fmt.Errorf("shared DLP state requires a contextual mutation")
+	}
 	if s.persister == nil {
 		return nil
 	}
@@ -217,4 +227,73 @@ func (s *dlpAllowlistRuntimeStore) PersistIfDirty() error {
 // dlpAllowlistProvider supplies the compiled allowlist for a tenant to the egress DLP scan path.
 type dlpAllowlistProvider interface {
 	AllowlistForTenant(tenantID string) *dlp.Allowlist
+}
+
+// sharedCandidateLocked reuses the complete restore validator and compilation.
+// The detached candidate is never visible before the shared transaction commits.
+func (s *dlpAllowlistRuntimeStore) sharedCandidateLocked(raw []byte) (*dlpAllowlistRuntimeStore, error) {
+	next := newDLPAllowlistRuntimeStore(s.salt)
+	if err := loadDLPSharedCandidate(raw, len(s.values) > 0, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+func (s *dlpAllowlistRuntimeStore) adoptSharedLocked(next *dlpAllowlistRuntimeStore) {
+	if !reflect.DeepEqual(s.snapshotLocked(), next.snapshotLocked()) {
+		s.generation++
+	}
+	s.values, s.sets = next.values, next.sets
+	s.dirty = false
+}
+func (s *dlpAllowlistRuntimeStore) mutateSharedLocked(ctx context.Context, edit func(*dlpAllowlistRuntimeStore) error) error {
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	var accepted *dlpAllowlistRuntimeStore
+	err := s.persister.(dlpSharedUpdater).UpdateContext(ctx, func(raw []byte) ([]byte, error) {
+		next, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := edit(next); err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(next.snapshotLocked())
+		if err != nil {
+			return nil, err
+		}
+		accepted = next
+		return data, nil
+	})
+	if err != nil {
+		return err
+	}
+	if accepted == nil {
+		return fmt.Errorf("shared DLP mutation was not applied")
+	}
+	s.adoptSharedLocked(accepted)
+	return nil
+}
+func (s *dlpAllowlistRuntimeStore) RefreshShared() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !isDLPSharedPersister(s.persister) {
+		return nil
+	}
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	raw, err := s.persister.Load()
+	if err != nil {
+		return err
+	}
+	next, err := s.sharedCandidateLocked(raw)
+	if err != nil {
+		return err
+	}
+	s.adoptSharedLocked(next)
+	return nil
 }

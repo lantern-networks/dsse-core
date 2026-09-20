@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -273,6 +274,9 @@ func (s *dlpPolicyObjectStore) snapshotLocked() dlpPolicyObjectSnapshot {
 }
 
 func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) error {
+	if isDLPSharedPersister(s.persister) {
+		return fmt.Errorf("shared DLP state requires a contextual mutation")
+	}
 	if s.persister == nil {
 		return nil
 	}
@@ -285,6 +289,9 @@ func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) 
 
 // UpsertDurable acknowledges an admin edit only after the configured store accepts it.
 func (s *dlpPolicyObjectStore) UpsertDurable(p model.DLPPolicyObject) error {
+	return s.UpsertContext(context.Background(), p)
+}
+func (s *dlpPolicyObjectStore) UpsertContext(ctx context.Context, p model.DLPPolicyObject) error {
 	var err error
 	p, err = prepareDLPPolicyObject(p)
 	if err != nil {
@@ -292,6 +299,9 @@ func (s *dlpPolicyObjectStore) UpsertDurable(p model.DLPPolicyObject) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isDLPSharedPersister(s.persister) {
+		return s.mutateSharedLocked(ctx, func(next *dlpPolicyObjectStore) error { return next.UpsertDurable(p) })
+	}
 	next := s.snapshotLocked()
 	if next.ByTenant[p.TenantID] == nil {
 		next.ByTenant[p.TenantID] = map[string]model.DLPPolicyObject{}
@@ -307,8 +317,23 @@ func (s *dlpPolicyObjectStore) UpsertDurable(p model.DLPPolicyObject) error {
 }
 
 func (s *dlpPolicyObjectStore) DeleteDurable(tenant, id string) (bool, error) {
+	return s.DeleteContext(context.Background(), tenant, id)
+}
+func (s *dlpPolicyObjectStore) DeleteContext(ctx context.Context, tenant, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isDLPSharedPersister(s.persister) {
+		var result bool
+		err := s.mutateSharedLocked(ctx, func(next *dlpPolicyObjectStore) error {
+			var err error
+			result, err = next.DeleteDurable(tenant, id)
+			return err
+		})
+		if err != nil {
+			return false, err
+		}
+		return result, err
+	}
 	_, existed := s.byTenant[tenant][id]
 	if !existed && !s.dirty {
 		return false, nil
@@ -344,4 +369,73 @@ func (s *dlpPolicyObjectStore) PersistIfDirty() error {
 // dlpPolicyObjectResolver resolves a named DLP policy for a tenant (consumed by the egress hook).
 type dlpPolicyObjectResolver interface {
 	Get(tenantID, id string) (model.DLPPolicyObject, bool)
+}
+
+// sharedCandidateLocked reuses the complete restore validator and compilation.
+// The detached candidate is never visible before the shared transaction commits.
+func (s *dlpPolicyObjectStore) sharedCandidateLocked(raw []byte) (*dlpPolicyObjectStore, error) {
+	next := newDLPPolicyObjectStore()
+	if err := loadDLPSharedCandidate(raw, len(s.byTenant) > 0, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+func (s *dlpPolicyObjectStore) adoptSharedLocked(next *dlpPolicyObjectStore) {
+	if !reflect.DeepEqual(s.snapshotLocked(), next.snapshotLocked()) {
+		s.generation++
+	}
+	s.byTenant = next.byTenant
+	s.dirty = false
+}
+func (s *dlpPolicyObjectStore) mutateSharedLocked(ctx context.Context, edit func(*dlpPolicyObjectStore) error) error {
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	var accepted *dlpPolicyObjectStore
+	err := s.persister.(dlpSharedUpdater).UpdateContext(ctx, func(raw []byte) ([]byte, error) {
+		next, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return nil, err
+		}
+		if err := edit(next); err != nil {
+			return nil, err
+		}
+		data, err := json.Marshal(next.snapshotLocked())
+		if err != nil {
+			return nil, err
+		}
+		accepted = next
+		return data, nil
+	})
+	if err != nil {
+		return err
+	}
+	if accepted == nil {
+		return fmt.Errorf("shared DLP mutation was not applied")
+	}
+	s.adoptSharedLocked(accepted)
+	return nil
+}
+func (s *dlpPolicyObjectStore) RefreshShared() error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !isDLPSharedPersister(s.persister) {
+		return nil
+	}
+	if s.dirty {
+		return fmt.Errorf("shared DLP state has uncommitted staged changes")
+	}
+	raw, err := s.persister.Load()
+	if err != nil {
+		return err
+	}
+	next, err := s.sharedCandidateLocked(raw)
+	if err != nil {
+		return err
+	}
+	s.adoptSharedLocked(next)
+	return nil
 }

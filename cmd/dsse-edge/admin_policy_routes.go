@@ -199,6 +199,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if !refreshVLANStore(w, vlanBoundary) {
 			return
 		}
+		if err := delegatedGrants.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if !refreshDLPStores(w, config.DLPDistribution) {
 			return
 		}

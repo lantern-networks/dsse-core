@@ -7267,6 +7267,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, trustedKeyring)
 	})
 	mux.HandleFunc("POST /human-approvals/events", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -7286,7 +7287,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return
 			}
 		}
-		stored, err := humanApprovals.Upsert(event)
+		stored, err := humanApprovals.UpsertContext(r.Context(), event)
 		if err != nil {
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
@@ -7319,6 +7320,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, event)
 	})
 	mux.HandleFunc("POST /delegated-grants", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -7336,7 +7338,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, nhi.StatusForReferenceError(err), err)
 			return
 		}
-		stored, err := delegatedGrants.Upsert(grant)
+		stored, err := delegatedGrants.UpsertContext(r.Context(), grant)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
@@ -7365,6 +7367,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, grant)
 	})
 	mux.HandleFunc("POST /delegated-grants/{grant_id}/revoke", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -7374,7 +7377,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode delegated access grant revoke request: %w", err))
 			return
 		}
-		grant, err := delegatedGrants.RevokeForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"), req.RevocationReason, now)
+		grant, err := delegatedGrants.RevokeForTenantContext(r.Context(), evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"), req.RevocationReason, now)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return

@@ -55,7 +55,7 @@ type adminHumanApprovalEventRevokeRequest struct {
 	ReasonCode string `json:"reason_code"`
 }
 
-func adminListHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenantID string, options adminHumanApprovalEventListOptions) (adminHumanApprovalEventListResponse, error) {
+func adminListHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, tenantID string, options adminHumanApprovalEventListOptions) (adminHumanApprovalEventListResponse, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return adminHumanApprovalEventListResponse{}, fmt.Errorf("tenant_id is required")
@@ -81,6 +81,9 @@ func adminListHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tena
 		limit = 100
 	}
 
+	if err := s.RefreshShared(); err != nil {
+		return adminHumanApprovalEventListResponse{}, err
+	}
 	rows := []adminHumanApprovalEvent{}
 	for _, approval := range s.Snapshot() {
 		if approval.TenantID != tenantID {
@@ -112,7 +115,7 @@ func adminListHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tena
 	}, nil
 }
 
-func adminGetHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenantID, approvalID string) (adminHumanApprovalEvent, bool, error) {
+func adminGetHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, tenantID, approvalID string) (adminHumanApprovalEvent, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	approvalID = strings.TrimSpace(approvalID)
 	if tenantID == "" {
@@ -125,26 +128,29 @@ func adminGetHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenan
 		return adminHumanApprovalEvent{}, false, fmt.Errorf("approval_id cannot contain slash")
 	}
 
-	approval, ok := s.GetForTenant(tenantID, approvalID)
+	approval, ok, err := s.GetForTenantContext(ctx, tenantID, approvalID)
+	if err != nil {
+		return adminHumanApprovalEvent{}, false, err
+	}
 	if !ok || approval.TenantID != tenantID {
 		return adminHumanApprovalEvent{}, false, nil
 	}
 	return adminHumanApprovalEventFromModel(approval), true, nil
 }
 
-func adminUpsertHumanApprovalEvent(s *humanapproval.Store, _ context.Context, approval adminHumanApprovalEvent, tenantID string, now time.Time) (adminHumanApprovalEvent, error) {
+func adminUpsertHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, approval adminHumanApprovalEvent, tenantID string, now time.Time) (adminHumanApprovalEvent, error) {
 	modelApproval, err := normalizeAdminHumanApprovalEvent(approval, tenantID, now)
 	if err != nil {
 		return adminHumanApprovalEvent{}, err
 	}
-	stored, err := s.Upsert(modelApproval)
+	stored, err := s.UpsertContext(ctx, modelApproval)
 	if err != nil {
 		return adminHumanApprovalEvent{}, err
 	}
 	return adminHumanApprovalEventFromModel(stored), nil
 }
 
-func adminRevokeHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenantID, approvalID string, request adminHumanApprovalEventRevokeRequest, now time.Time) (adminHumanApprovalEvent, bool, error) {
+func adminRevokeHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, tenantID, approvalID string, request adminHumanApprovalEventRevokeRequest, now time.Time) (adminHumanApprovalEvent, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	approvalID = strings.TrimSpace(approvalID)
 	if tenantID == "" {
@@ -161,7 +167,7 @@ func adminRevokeHumanApprovalEvent(s *humanapproval.Store, _ context.Context, te
 		return adminHumanApprovalEvent{}, false, fmt.Errorf("reason_code is invalid")
 	}
 
-	revoked, found, err := s.RevokeForTenant(tenantID, approvalID, reasonCode)
+	revoked, found, err := s.RevokeForTenantContext(ctx, tenantID, approvalID, reasonCode)
 	if !found {
 		return adminHumanApprovalEvent{}, false, err
 	}

@@ -448,10 +448,10 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.DelegatedGrants != nil {
-		eraseChecked("delegated_access_grants", e.DelegatedGrants.RemoveTenantChecked)
+		eraseChecked("delegated_access_grants", func(tenant string) (int, error) { return e.DelegatedGrants.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.HumanApprovals != nil {
-		eraseChecked("human_approvals", e.HumanApprovals.RemoveTenantChecked)
+		eraseChecked("human_approvals", func(tenant string) (int, error) { return e.HumanApprovals.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.ClientlessGrants != nil {
 		eraseChecked("clientless_grants", e.ClientlessGrants.RemoveTenantChecked)

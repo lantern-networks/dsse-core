@@ -115,7 +115,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		}
 		result, err := adminListDelegatedAccessGrant(delegatedGrants, r.Context(), adminTenantIDFromRequest(r), options)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -123,7 +123,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 	mux.HandleFunc("GET /admin/delegated-grants/{grant_id}", adminEndpoint("admin.delegated_grants.read", func(w http.ResponseWriter, r *http.Request) {
 		grant, found, err := adminGetDelegatedAccessGrant(delegatedGrants, r.Context(), adminTenantIDFromRequest(r), r.PathValue("grant_id"))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
 		if !found {
@@ -186,7 +186,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		}
 		result, err := adminListHumanApprovalEvent(humanApprovals, r.Context(), adminTenantIDFromRequest(r), options)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -194,7 +194,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 	mux.HandleFunc("GET /admin/human-approval-events/{approval_id}", adminEndpoint("admin.approval.read", func(w http.ResponseWriter, r *http.Request) {
 		approval, found, err := adminGetHumanApprovalEvent(humanApprovals, r.Context(), adminTenantIDFromRequest(r), r.PathValue("approval_id"))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
 		if !found {

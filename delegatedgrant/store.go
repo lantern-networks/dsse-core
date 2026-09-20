@@ -1,10 +1,9 @@
 package delegatedgrant
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -19,11 +18,12 @@ import (
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation write-throughs, so a
 // revoked grant stays revoked across a restart and in-flight grants are not lost.
 type Store struct {
-	mu         sync.RWMutex
-	grants     map[string]model.DelegatedAccessGrant
-	capacity   int
-	persister  blobstore.Persister
-	generation uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
+	mu             sync.RWMutex
+	grants         map[string]model.DelegatedAccessGrant
+	capacity       int
+	persister      blobstore.Persister
+	authorityKnown bool
+	generation     uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
 }
 
 // NewStore builds a delegated-grant store with the given admission capacity. The bound is injected by
@@ -50,6 +50,7 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	defer s.mu.Unlock()
 	if p == nil {
 		s.persister = nil
+		s.authorityKnown = false
 		return nil
 	}
 	data, err := p.Load()
@@ -57,36 +58,22 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data == nil && s.authorityKnown {
+			return fmt.Errorf("authorization authority disappeared")
+		}
 		if data != nil {
 			return fmt.Errorf("empty delegated grant snapshot")
 		}
 		s.persister = p
 		return nil
 	}
-	var snap map[string]model.DelegatedAccessGrant
-	if err := json.Unmarshal(data, &snap); err != nil {
+	fresh, err := decodeSnapshot(data)
+	if err != nil {
 		return err
-	}
-	if snap == nil {
-		return fmt.Errorf("invalid delegated grant snapshot")
-	}
-	fresh := make(map[string]model.DelegatedAccessGrant, len(snap))
-	for savedKey, grant := range snap {
-		if err := validKey(grant.TenantID, grant.ID); err != nil {
-			return err
-		}
-		key := grantKey(grant.TenantID, grant.ID)
-		if savedKey != grant.ID && savedKey != key {
-			return fmt.Errorf("invalid saved delegated grant key")
-		}
-		if _, found := fresh[key]; found {
-			return fmt.Errorf("duplicate saved delegated grant")
-		}
-		fresh[key] = grant
 	}
 	// Preserve all records even when the configured capacity has been lowered.
 	// Replace the accepted state and writer together only after a complete, valid load.
-	s.grants, s.persister = fresh, p
+	s.grants, s.persister, s.authorityKnown = fresh, p, true
 
 	return nil
 }
@@ -112,48 +99,33 @@ func cloneGrants(in map[string]model.DelegatedAccessGrant) map[string]model.Dele
 }
 
 // The caller holds the write lock. Failed candidates never reach live state.
-func (s *Store) saveLocked(grants map[string]model.DelegatedAccessGrant) error {
-	if s.persister == nil {
-		return nil
-	}
-	data, err := json.MarshalIndent(grants, "", "  ")
-	if err == nil {
-		err = s.persister.Save(data)
-	}
-	if err != nil {
-		log.Printf("delegated grants save: %v", err)
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
-			return ErrPersistence
-		}
-	}
-	return nil
-}
 
 func (s *Store) Upsert(grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
+	return s.UpsertContext(context.Background(), grant)
+}
+func (s *Store) UpsertContext(ctx context.Context, grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
 	if err := validKey(grant.TenantID, grant.ID); err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := grantKey(grant.TenantID, grant.ID)
-	existing, ok := s.grants[key]
-	if ok {
-		if err := validateTransition(existing, grant); err != nil {
-			return model.DelegatedAccessGrant{}, err
+	err := s.editLocked(ctx, func(next map[string]model.DelegatedAccessGrant) error {
+		key := grantKey(grant.TenantID, grant.ID)
+		old, ok := next[key]
+		if ok {
+			if err := validateTransition(old, grant); err != nil {
+				return err
+			}
 		}
-	}
-	// Forgetting a terminal record would allow a later upsert to reactivate the same ID.
-	// Reserve capacity only for new keys; updates and revocations must remain possible when full.
-	if !ok && s.capacity > 0 && len(s.grants) >= s.capacity {
-		return model.DelegatedAccessGrant{}, ErrCapacity
-	}
-	candidate := cloneGrants(s.grants)
-	candidate[key] = grant
-	if err := s.saveLocked(candidate); err != nil {
+		if !ok && s.capacity > 0 && len(next) >= s.capacity {
+			return ErrCapacity
+		}
+		next[key] = grant
+		return nil
+	})
+	if err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
-	s.grants = candidate
-	s.generation++
 	return grant, nil
 }
 
@@ -168,6 +140,9 @@ func (s *Store) ConfigGeneration() uint64 {
 // Get is retained for callers without tenant context and refuses ambiguous IDs.
 // Authenticated callers must use GetForTenant instead.
 func (s *Store) Get(id string) (model.DelegatedAccessGrant, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return model.DelegatedAccessGrant{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var result model.DelegatedAccessGrant
@@ -183,6 +158,9 @@ func (s *Store) Get(id string) (model.DelegatedAccessGrant, bool) {
 	return result, found
 }
 func (s *Store) GetForTenant(tenant, id string) (model.DelegatedAccessGrant, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return model.DelegatedAccessGrant{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if validKey(tenant, id) != nil {
@@ -221,47 +199,56 @@ func (s *Store) Snapshot() []model.DelegatedAccessGrant {
 	return out
 }
 
-// Revoke is a compatibility entry point; ambiguous IDs refuse mutation.
+// Revoke is a compatibility entry point and refuses ambiguous IDs in the latest authority.
 func (s *Store) Revoke(id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := ""
-	for k, grant := range s.grants {
-		if grant.ID == id {
-			if key != "" {
-				return model.DelegatedAccessGrant{}, fmt.Errorf("delegated grant ID is ambiguous")
-			}
-			key = k
-		}
-	}
-	return s.revokeLocked(key, id, reason, now)
+	return s.revokeContext(context.Background(), "", id, reason, now)
 }
 func (s *Store) RevokeForTenant(tenant, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
+	return s.RevokeForTenantContext(context.Background(), tenant, id, reason, now)
+}
+func (s *Store) RevokeForTenantContext(ctx context.Context, tenant, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
 	if err := validKey(tenant, id); err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
+	return s.revokeContext(ctx, tenant, id, reason, now)
+}
+func (s *Store) revokeContext(ctx context.Context, tenant, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.revokeLocked(grantKey(tenant, id), id, reason, now)
-}
-func (s *Store) revokeLocked(key, id, reason string, now time.Time) (model.DelegatedAccessGrant, error) {
-	grant, ok := s.grants[key]
-	if !ok {
-		return model.DelegatedAccessGrant{}, fmt.Errorf("delegated access grant %s is absent", id)
-	}
-	if grant.Status == "revoked" {
-		return grant, nil
-	}
-	revokedAt := now.UTC().Format(time.RFC3339)
-	grant.Status, grant.RevokedAt, grant.RevocationReason = "revoked", &revokedAt, stringPtr(reason)
-	candidate := cloneGrants(s.grants)
-	candidate[key] = grant
-	if err := s.saveLocked(candidate); err != nil {
+	var result model.DelegatedAccessGrant
+	found := false
+	err := s.editLocked(ctx, func(next map[string]model.DelegatedAccessGrant) error {
+		key := grantKey(tenant, id)
+		if tenant == "" {
+			key = ""
+			for k, v := range next {
+				if v.ID == id {
+					if key != "" {
+						return fmt.Errorf("authorization ID is ambiguous")
+					}
+					key = k
+				}
+			}
+		}
+		var ok bool
+		result, ok = next[key]
+		if !ok {
+			return ErrAbsent
+		}
+		found = true
+		if result.Status == "revoked" {
+			return errNoChange
+		}
+		revokedAt := now.UTC().Format(time.RFC3339)
+		result.Status, result.RevokedAt, result.RevocationReason = "revoked", &revokedAt, stringPtr(reason)
+		next[key] = result
+		return nil
+	})
+	if err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
-	s.grants = candidate
-	s.generation++
-	return grant, nil
+	_ = found
+	return result, err
 }
 
 func validateTransition(existing, next model.DelegatedAccessGrant) error {
@@ -330,29 +317,31 @@ func (s *Store) CountForTenant(tenantID string) int {
 func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
 
 // RemoveTenantChecked confirms persistence before discarding retry targets.
-func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
-	if s == nil || strings.TrimSpace(tenantID) == "" {
+func (s *Store) RemoveTenantChecked(tenant string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenant)
+}
+func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
+	if s == nil || strings.TrimSpace(tenant) == "" {
 		return 0, nil
 	}
-	tenantID = strings.TrimSpace(tenantID)
+	tenant = strings.TrimSpace(tenant)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := cloneGrants(s.grants)
 	n := 0
-	for id, v := range candidate {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
-			delete(candidate, id)
-			n++
+	err := s.editLocked(ctx, func(next map[string]model.DelegatedAccessGrant) error {
+		for key, v := range next {
+			if strings.EqualFold(strings.TrimSpace(v.TenantID), tenant) {
+				delete(next, key)
+				n++
+			}
 		}
-	}
-	if n == 0 {
-		return 0, nil
-	}
-	if err := s.saveLocked(candidate); err != nil {
+		if n == 0 {
+			return errNoChange
+		}
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
-	s.grants = candidate
-	s.generation++
-
 	return n, nil
 }

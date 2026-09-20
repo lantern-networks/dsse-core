@@ -104,7 +104,7 @@ func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator
 // somebody remembers to add it to a list here.
 func adminPermissionWrites(permission string) bool {
 	p := strings.ToLower(strings.TrimSpace(permission))
-	for _, suffix := range []string{".write", ".admin", ".cancel", ".create", ".review"} {
+	for _, suffix := range []string{".write", ".admin", ".cancel", ".create", ".review", ".revoke"} {
 		if strings.HasSuffix(p, suffix) {
 			return true
 		}

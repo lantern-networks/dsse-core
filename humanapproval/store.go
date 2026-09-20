@@ -1,10 +1,9 @@
 package humanapproval
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -19,10 +18,12 @@ import (
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation writes through,
 // so approval outcomes survive a restart.
 type Store struct {
-	mu        sync.RWMutex
-	events    map[string]model.HumanApprovalEvent
-	capacity  int
-	persister blobstore.Persister
+	mu                 sync.RWMutex
+	events             map[string]model.HumanApprovalEvent
+	capacity           int
+	persister          blobstore.Persister
+	authorityKnown     bool
+	pendingRevocations map[string]*string
 }
 
 // NewStore builds a human-approval-event store with the given admission capacity. The bound is injected by
@@ -49,6 +50,7 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	defer s.mu.Unlock()
 	if p == nil {
 		s.persister = nil
+		s.authorityKnown = false
 		return nil
 	}
 	data, err := p.Load()
@@ -56,35 +58,22 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data == nil && s.authorityKnown {
+			return fmt.Errorf("authorization authority disappeared")
+		}
 		if data != nil {
 			return fmt.Errorf("empty human approval snapshot")
 		}
 		s.persister = p
 		return nil
 	}
-	var snap map[string]model.HumanApprovalEvent
-	if err := json.Unmarshal(data, &snap); err != nil {
+	fresh, err := decodeSnapshot(data)
+	if err != nil {
 		return err
 	}
-	if snap == nil {
-		return fmt.Errorf("invalid human approval snapshot")
-	}
-	fresh := make(map[string]model.HumanApprovalEvent, len(snap))
-	for savedKey, event := range snap {
-		if err := validKey(event.TenantID, event.ID); err != nil {
-			return err
-		}
-		key := approvalKey(event.TenantID, event.ID)
-		if savedKey != event.ID && savedKey != key {
-			return fmt.Errorf("invalid saved human approval key")
-		}
-		if _, found := fresh[key]; found {
-			return fmt.Errorf("duplicate saved human approval")
-		}
-		fresh[key] = event
-	}
 	// Preserve all records even when the configured capacity has been lowered.
-	s.events, s.persister = fresh, p
+	s.applyPendingLocked(fresh)
+	s.events, s.persister, s.authorityKnown = fresh, p, true
 	return nil
 }
 
@@ -107,53 +96,42 @@ func cloneEvents(events map[string]model.HumanApprovalEvent) map[string]model.Hu
 	}
 	return result
 }
-func (s *Store) saveLocked(events map[string]model.HumanApprovalEvent) error {
-	if s.persister == nil {
-		return nil
-	}
-	data, err := json.MarshalIndent(events, "", "  ")
-	if err == nil {
-		err = s.persister.Save(data)
-	}
-	if err != nil {
-		log.Printf("human approvals save: %v", err)
-		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
-			return ErrPersistence
-		}
-	}
-	return nil
-}
 
 func (s *Store) Upsert(event model.HumanApprovalEvent) (model.HumanApprovalEvent, error) {
+	return s.UpsertContext(context.Background(), event)
+}
+func (s *Store) UpsertContext(ctx context.Context, event model.HumanApprovalEvent) (model.HumanApprovalEvent, error) {
 	if err := validKey(event.TenantID, event.ID); err != nil {
 		return model.HumanApprovalEvent{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := approvalKey(event.TenantID, event.ID)
-	existing, ok := s.events[key]
-	if ok {
-		if err := validateTransition(existing, event); err != nil {
-			return model.HumanApprovalEvent{}, err
+	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
+		key := approvalKey(event.TenantID, event.ID)
+		old, ok := next[key]
+		if ok {
+			if err := validateTransition(old, event); err != nil {
+				return err
+			}
 		}
-	}
-	// Forgetting a terminal record would allow a later upsert to reactivate the same ID.
-	// Reserve capacity only for new keys; updates and revocations must remain possible when full.
-	if !ok && s.capacity > 0 && len(s.events) >= s.capacity {
-		return model.HumanApprovalEvent{}, ErrCapacity
-	}
-	candidate := cloneEvents(s.events)
-	candidate[key] = event
-	if err := s.saveLocked(candidate); err != nil {
+		if !ok && s.capacity > 0 && len(next) >= s.capacity {
+			return ErrCapacity
+		}
+		next[key] = event
+		return nil
+	})
+	if err != nil {
 		return model.HumanApprovalEvent{}, err
 	}
-	s.events = candidate
 	return event, nil
 }
 
 // Get is a compatibility lookup and refuses IDs shared by multiple tenants.
 // Authenticated callers must use GetForTenant.
 func (s *Store) Get(id string) (model.HumanApprovalEvent, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return model.HumanApprovalEvent{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var result model.HumanApprovalEvent
@@ -169,6 +147,9 @@ func (s *Store) Get(id string) (model.HumanApprovalEvent, bool) {
 	return result, found
 }
 func (s *Store) GetForTenant(tenantID, id string) (model.HumanApprovalEvent, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return model.HumanApprovalEvent{}, false
+	}
 	if s == nil || validKey(tenantID, id) != nil {
 		return model.HumanApprovalEvent{}, false
 	}
@@ -207,47 +188,69 @@ func (s *Store) Snapshot() []model.HumanApprovalEvent {
 	return out
 }
 
-// Revoke is a compatibility entry point and refuses ambiguous IDs.
+// Revoke is a compatibility entry point and refuses ambiguous IDs in the latest authority.
 func (s *Store) Revoke(id, reason string) (model.HumanApprovalEvent, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := ""
-	for k, event := range s.events {
-		if event.ID == id {
-			if key != "" {
-				return model.HumanApprovalEvent{}, false, fmt.Errorf("human approval ID is ambiguous")
-			}
-			key = k
-		}
-	}
-	return s.revokeLocked(key, reason)
+	return s.revokeContext(context.Background(), "", id, reason)
 }
-
-// RevokeForTenant checks attribution and mutates under the same lock.
 func (s *Store) RevokeForTenant(tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
+	return s.RevokeForTenantContext(context.Background(), tenant, id, reason)
+}
+func (s *Store) RevokeForTenantContext(ctx context.Context, tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
 	if err := validKey(tenant, id); err != nil {
 		return model.HumanApprovalEvent{}, false, err
 	}
+	return s.revokeContext(ctx, tenant, id, reason)
+}
+func (s *Store) revokeContext(ctx context.Context, tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.revokeLocked(approvalKey(tenant, id), reason)
-}
-func (s *Store) revokeLocked(key, reason string) (model.HumanApprovalEvent, bool, error) {
-	event, ok := s.events[key]
-	if !ok {
-		return model.HumanApprovalEvent{}, false, nil
+	var result model.HumanApprovalEvent
+	found := false
+	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
+		key := approvalKey(tenant, id)
+		if tenant == "" {
+			key = ""
+			for k, v := range next {
+				if v.ID == id {
+					if key != "" {
+						return fmt.Errorf("authorization ID is ambiguous")
+					}
+					key = k
+				}
+			}
+		}
+		var ok bool
+		result, ok = next[key]
+		if !ok {
+			return errNoChange
+		}
+		found = true
+		if result.ApprovalResult != "revoked" {
+			result.ApprovalResult = "revoked"
+			result.Reason = stringPtr(reason)
+		}
+		next[key] = result
+		return nil
+	})
+	// A database refusal can happen before the edit callback (for example,
+	// acquiring the write transaction). Preserve the existing local denial
+	// contract for a known tenant-bound record, without claiming it was saved.
+	if errors.Is(err, ErrPersistence) && !found && tenant != "" {
+		result, found = s.events[approvalKey(tenant, id)]
+		if found {
+			result.ApprovalResult = "revoked"
+			result.Reason = stringPtr(reason)
+		}
 	}
-	// Keep an effective denial even when saving fails. Never restore an approval on a failed revoke.
-	if event.ApprovalResult != "revoked" {
-		event.ApprovalResult = "revoked"
-		event.Reason = stringPtr(reason)
-		s.events[key] = event
+	if err != nil && found {
+		if s.pendingRevocations == nil {
+			s.pendingRevocations = map[string]*string{}
+		}
+		key := approvalKey(result.TenantID, result.ID)
+		s.pendingRevocations[key] = result.Reason
+		s.events[key] = result
 	}
-	// Even an already-revoked event must retry the save: the previous attempt may be memory-only.
-	if err := s.saveLocked(s.events); err != nil {
-		return event, true, err
-	}
-	return event, true, nil
+	return result, found, err
 }
 
 func validateTransition(existing, next model.HumanApprovalEvent) error {
@@ -332,28 +335,31 @@ func (s *Store) CountForTenant(tenantID string) int {
 func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
 
 // RemoveTenantChecked confirms persistence before discarding retry targets.
-func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
-	if s == nil || strings.TrimSpace(tenantID) == "" {
+func (s *Store) RemoveTenantChecked(tenant string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenant)
+}
+func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
+	if s == nil || strings.TrimSpace(tenant) == "" {
 		return 0, nil
 	}
-	tenantID = strings.TrimSpace(tenantID)
+	tenant = strings.TrimSpace(tenant)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := cloneEvents(s.events)
 	n := 0
-	for id, v := range candidate {
-		if v.TenantID == tenantID {
-			delete(candidate, id)
-			n++
+	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
+		for key, v := range next {
+			if v.TenantID == tenant {
+				delete(next, key)
+				n++
+			}
 		}
-	}
-	if n == 0 {
-		return 0, nil
-	}
-	if err := s.saveLocked(candidate); err != nil {
+		if n == 0 {
+			return errNoChange
+		}
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
-	s.events = candidate
-
 	return n, nil
 }

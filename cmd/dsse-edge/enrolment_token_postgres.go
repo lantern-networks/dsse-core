@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -184,21 +185,47 @@ func enrolmentTokenUsability(tok enrolltoken.Token, tenantID string, now time.Ti
 	return nil
 }
 
+// Compatibility callers cannot report storage errors; management uses the checked,
+// tenant-scoped operation below.
 func (s *postgresEnrolmentTokenStore) Revoke(id, revokedBy string, now time.Time) (enrolltoken.Token, bool) {
-	res, err := s.db.Exec(`UPDATE enrolment_tokens SET revoked_at = $1, revoked_by = $2
-		 WHERE id = $3 AND revoked_at IS NULL`, now.UTC(), strings.TrimSpace(revokedBy), strings.TrimSpace(id))
+	tok, ok, _ := s.RevokeForTenantContext(context.Background(), "", id, revokedBy, now)
+	return tok, ok
+}
+
+func (s *postgresEnrolmentTokenStore) RevokeForTenantContext(parent context.Context, tenant, id, revokedBy string, now time.Time) (enrolltoken.Token, bool, error) {
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
+	defer cancel()
+	tx, finish, err := beginCPWriteTransaction(ctx, s.db)
 	if err != nil {
-		return enrolltoken.Token{}, false
+		return enrolltoken.Token{}, false, err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return enrolltoken.Token{}, false
+	defer finish()
+	defer tx.Rollback()
+	// RETURNING ties the reported identity to the mutation, without a second read
+	// which could fail after the revocation has already committed.
+	tok, err := scanEnrolmentToken(tx.QueryRowContext(ctx, `UPDATE enrolment_tokens SET revoked_at=$1, revoked_by=$2
+ WHERE id=$3 AND revoked_at IS NULL AND ($4='' OR lower(tenant_id)=lower($4)) RETURNING `+enrolmentTokenColumns,
+		now.UTC(), strings.TrimSpace(revokedBy), strings.TrimSpace(id), strings.TrimSpace(tenant)).Scan)
+	if err == sql.ErrNoRows {
+		return enrolltoken.Token{}, false, nil
 	}
-	row := s.db.QueryRow(`SELECT `+enrolmentTokenColumns+` FROM enrolment_tokens WHERE id = $1`, id)
-	tok, err := scanEnrolmentToken(row.Scan)
-	return tok, err == nil
+	if err != nil {
+		return enrolltoken.Token{}, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return enrolltoken.Token{}, false, err
+	}
+	return tok, true, nil
 }
 
 func (s *postgresEnrolmentTokenStore) List(tenantID string) []enrolltoken.Token {
+	tokens, _ := s.ListContext(context.Background(), tenantID)
+	return tokens
+}
+
+func (s *postgresEnrolmentTokenStore) ListContext(parent context.Context, tenantID string) ([]enrolltoken.Token, error) {
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
+	defer cancel()
 	query := `SELECT ` + enrolmentTokenColumns + ` FROM enrolment_tokens`
 	args := []any{}
 	if t := strings.TrimSpace(tenantID); t != "" {
@@ -206,20 +233,23 @@ func (s *postgresEnrolmentTokenStore) List(tenantID string) []enrolltoken.Token 
 		args = append(args, t)
 	}
 	query += ` ORDER BY issued_at DESC, id ASC`
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	defer rows.Close()
 	out := []enrolltoken.Token{}
 	for rows.Next() {
 		tok, err := scanEnrolmentToken(rows.Scan)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		out = append(out, tok)
 	}
-	return out
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *postgresEnrolmentTokenStore) Outstanding(tenantID string, now time.Time) int {

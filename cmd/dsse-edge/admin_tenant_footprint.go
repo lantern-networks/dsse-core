@@ -477,7 +477,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		eraseChecked("connector_route_governance", e.ConnectorRoutes.RemoveTenantChecked)
 	}
 	if e.CatalogOverrides != nil {
-		if n, err := e.CatalogOverrides.RemoveTenant(tenantID); err != nil {
+		if n, err := e.CatalogOverrides.RemoveTenantContext(ctx, tenantID); err != nil {
 			result.Failures = append(result.Failures, "bypass catalog override erasure could not be confirmed")
 		} else {
 			add("bypass_catalog_overrides", n)

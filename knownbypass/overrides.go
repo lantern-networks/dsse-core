@@ -1,6 +1,7 @@
 package knownbypass
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -50,12 +51,20 @@ func validOverrideMode(mode string) bool {
 // Set records (or replaces) a tenant's override for a catalog entry. The entry must exist in the catalog and
 // the mode must be valid; an unknown entry or mode is rejected so the override set cannot drift from the catalog.
 func (s *OverrideStore) Set(tenantID string, o Override, now time.Time) (Override, error) {
-	return s.SetFromCatalog(tenantID, o, Catalog().Entries, now)
+	return s.SetContext(context.Background(), tenantID, o, now)
+}
+
+func (s *OverrideStore) SetContext(ctx context.Context, tenantID string, o Override, now time.Time) (Override, error) {
+	return s.SetFromCatalogContext(ctx, tenantID, o, Catalog().Entries, now)
 }
 
 // SetFromCatalog records an override for an entry in the supplied effective catalog.
 // Callers must provide a trusted catalog and serialize catalog updates with this call.
 func (s *OverrideStore) SetFromCatalog(tenantID string, o Override, entries []Group, now time.Time) (Override, error) {
+	return s.SetFromCatalogContext(context.Background(), tenantID, o, entries, now)
+}
+
+func (s *OverrideStore) SetFromCatalogContext(ctx context.Context, tenantID string, o Override, entries []Group, now time.Time) (Override, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" || !utf8.ValidString(tenantID) {
 		return Override{}, fmt.Errorf("tenant_id is required")
@@ -85,12 +94,13 @@ func (s *OverrideStore) SetFromCatalog(tenantID string, o Override, entries []Gr
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	next := s.cloneLocked()
-	if next[tenantID] == nil {
-		next[tenantID] = map[string]Override{}
-	}
-	next[tenantID][o.EntryID] = o
-	if err := s.commitLocked(next); err != nil {
+	err := s.mutateLocked(ctx, func(next map[string]map[string]Override) {
+		if next[tenantID] == nil {
+			next[tenantID] = map[string]Override{}
+		}
+		next[tenantID][o.EntryID] = o
+	})
+	if err != nil {
 		return Override{}, err
 	}
 	return o, nil
@@ -99,20 +109,23 @@ func (s *OverrideStore) SetFromCatalog(tenantID string, o Override, entries []Gr
 // Clear removes a tenant's override, restoring the catalog default, only after saving.
 // The returned bool reports a confirmed removal, never an unconfirmed write.
 func (s *OverrideStore) Clear(tenantID, entryID string) (bool, error) {
+	return s.ClearContext(context.Background(), tenantID, entryID)
+}
+
+func (s *OverrideStore) ClearContext(ctx context.Context, tenantID, entryID string) (bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	entryID = strings.TrimSpace(entryID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, exists := s.overrides[tenantID][entryID]
-	if !exists && !s.dirty {
-		return false, nil
-	}
-	next := s.cloneLocked()
-	delete(next[tenantID], entryID)
-	if len(next[tenantID]) == 0 {
-		delete(next, tenantID)
-	}
-	if err := s.commitLocked(next); err != nil {
+	exists := false
+	err := s.mutateLocked(ctx, func(next map[string]map[string]Override) {
+		_, exists = next[tenantID][entryID]
+		delete(next[tenantID], entryID)
+		if len(next[tenantID]) == 0 {
+			delete(next, tenantID)
+		}
+	})
+	if err != nil {
 		return false, err
 	}
 	return exists, nil
@@ -242,6 +255,10 @@ func (s *OverrideStore) CountForTenant(tenantID string) int {
 
 // RemoveTenant reports erasure only after the resulting snapshot is saved.
 func (s *OverrideStore) RemoveTenant(tenantID string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenantID)
+}
+
+func (s *OverrideStore) RemoveTenantContext(ctx context.Context, tenantID string) (int, error) {
 	if s == nil {
 		return 0, nil
 	}
@@ -251,13 +268,12 @@ func (s *OverrideStore) RemoveTenant(tenantID string) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := len(s.overrides[tenantID])
-	if n == 0 && !s.dirty {
-		return 0, nil
-	}
-	next := s.cloneLocked()
-	delete(next, tenantID)
-	if err := s.commitLocked(next); err != nil {
+	n := 0
+	err := s.mutateLocked(ctx, func(next map[string]map[string]Override) {
+		n = len(next[tenantID])
+		delete(next, tenantID)
+	})
+	if err != nil {
 		return 0, err
 	}
 	return n, nil

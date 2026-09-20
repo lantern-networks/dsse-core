@@ -160,6 +160,9 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// is the visibility that was missing on 2026-06-23, when an authored Authenticate rule silently lost a
 	// priority tie to a built-in Google allow and we had to hand-curl /decisions/evaluate to find it. Read-only.
 	mux.HandleFunc("GET /admin/effective-policy", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		destination := strings.TrimSpace(r.URL.Query().Get("destination"))
 		if destination == "" {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("destination query parameter is required (e.g. ?destination=accounts.google.com)"))
@@ -203,6 +206,9 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// expects the Egress view to reflect all egress decisions in one place, not just authored rules; this gathers
 	// them (the edge owns every surface) so the Console renders a single list. Read-only aggregation.
 	mux.HandleFunc("GET /admin/egress-effective-rules", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		aliasByID := map[string]string{}
 		for _, e := range assetStore.ListEndpoints(tenant) {
@@ -247,6 +253,9 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// decrypt allowlist (explicit hosts + SaaS auth-group presets), and the curated known-bypass list. The
 	// "make the hidden default visible and editable" of docs/invisible_effective_configuration.md.
 	mux.HandleFunc("GET /admin/inspection-posture", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 	// Change the inspection posture (partial update — only provided fields change). bypass_default decrypts ONLY

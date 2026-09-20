@@ -15,6 +15,7 @@ package catalogfeed
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -225,9 +226,13 @@ func (s *Store) SetStatePath(path string) error {
 // feed updates. The override cannot be accepted against a superseded feed while
 // its save is in progress. Feed readers do not wait on that persistence operation.
 func (s *Store) SetOverride(overrides *knownbypass.OverrideStore, tenant string, override knownbypass.Override, now time.Time) (knownbypass.Override, error) {
+	return s.SetOverrideContext(context.Background(), overrides, tenant, override, now)
+}
+
+func (s *Store) SetOverrideContext(ctx context.Context, overrides *knownbypass.OverrideStore, tenant string, override knownbypass.Override, now time.Time) (knownbypass.Override, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	return overrides.SetFromCatalog(tenant, override, s.EffectiveCatalog().Entries, now)
+	return overrides.SetFromCatalogContext(ctx, tenant, override, s.EffectiveCatalog().Entries, now)
 }
 
 // commitLocked saves a candidate before publishing it. writeMu is held; mu is not

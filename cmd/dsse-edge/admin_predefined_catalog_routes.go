@@ -25,6 +25,9 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("predefined catalog overrides are not configured on this edge"))
 			return
 		}
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		// Effective catalog = the applied signed feed if one is in force, else the built-in default.
 		cat := knownbypass.Catalog()
@@ -166,9 +169,9 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		var o knownbypass.Override
 		var err error
 		if config.CatalogFeed != nil {
-			o, err = config.CatalogFeed.SetOverride(config.CatalogOverrides, tenant, req, time.Now().UTC())
+			o, err = config.CatalogFeed.SetOverrideContext(r.Context(), config.CatalogOverrides, tenant, req, time.Now().UTC())
 		} else {
-			o, err = config.CatalogOverrides.Set(tenant, req, time.Now().UTC())
+			o, err = config.CatalogOverrides.SetContext(r.Context(), tenant, req, time.Now().UTC())
 		}
 		if err != nil {
 			if errors.Is(err, knownbypass.ErrPersistence) {
@@ -193,7 +196,7 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		}
 		tenant := adminTenantIDFromRequest(r)
 		id := strings.TrimSpace(r.PathValue("id"))
-		cleared, err := config.CatalogOverrides.Clear(tenant, id)
+		cleared, err := config.CatalogOverrides.ClearContext(r.Context(), tenant, id)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog override removal could not be confirmed; reload and retry"))
 			return
@@ -215,4 +218,21 @@ func writeCatalogContextResponse(w http.ResponseWriter, r *http.Request, scope s
 		return
 	}
 	writeJSON(w, http.StatusOK, data)
+}
+
+// Refresh shared override authority before presenting either configured or live
+// selections. The existing callback rebuilds all tenant inspection patterns.
+func refreshCatalogOverrides(w http.ResponseWriter, config serverConfig) bool {
+	if config.CatalogOverrides == nil {
+		return true
+	}
+	changed, err := config.CatalogOverrides.RefreshShared()
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("Catalog overrides cannot be refreshed from storage."))
+		return false
+	}
+	if changed && config.ApplyMaterializedCertPinBypass != nil {
+		config.ApplyMaterializedCertPinBypass("")
+	}
+	return true
 }

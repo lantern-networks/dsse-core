@@ -73,6 +73,9 @@ func interceptionIsNotThisNodesAnswer(w http.ResponseWriter, config serverConfig
 
 func registerInterceptionPKIRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader) {
 	mux.HandleFunc("GET /admin/intercept/bypass-hosts", adminEndpoint("admin.swg.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		if !pinnedTenantContextMatches(w, r) {
 			return
 		}

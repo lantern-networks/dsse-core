@@ -862,12 +862,14 @@ func (store *Store) SetCompiledEastWestRules(tenantID string, rules []decision.E
 		store.compiledEastWestRules = map[string][]decision.EastWestRule{}
 	}
 	// Deliberately kept as an explicit empty set rather than a deleted key when there are no rules: this map is
-	// persisted and distributed, and an absent value reads as "keep what you have" downstream — which would
+	// distributed, and an absent value reads as "keep what you have" downstream — which would
 	// turn deleting the last east-west rule into a no-op. The egress compiled set is not distributed and does
 	// drop its key; see SetCompiledPolicies.
 	store.compiledEastWestRules[strings.TrimSpace(tenantID)] = append([]decision.EastWestRule(nil), rules...)
 	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	// Compiled rules are rebuilt from the durable authored-rule store. They are
+	// not part of the runtime overlay; saving it here can erase a peer CP's
+	// newer security controls with this process's stale snapshot.
 }
 
 // SetCompiledPolicies replaces the egress policies compiled from the authored-rule model for a tenant. Kept

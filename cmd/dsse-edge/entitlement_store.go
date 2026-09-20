@@ -86,6 +86,7 @@ func (s *entitlementStore) SetFeaturesContext(ctx context.Context, tenant string
 			return nil, fmt.Errorf("entitlement authority is missing")
 		}
 		if raw != nil {
+			next = entitlementSnapshot{}
 			if err := json.Unmarshal(raw, &next); err != nil {
 				return nil, err
 			}
@@ -145,6 +146,7 @@ func (s *entitlementStore) RefreshShared() error {
 	}
 	next := entitlementSnapshot{Features: map[string]map[string]bool{}}
 	if raw != nil {
+		next = entitlementSnapshot{}
 		if err := json.Unmarshal(raw, &next); err != nil {
 			return err
 		}

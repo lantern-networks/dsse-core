@@ -67,7 +67,7 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	dlpFeatureGate := func(w http.ResponseWriter, r *http.Request) bool {
 		if err := entitlementStore.RefreshShared(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("entitlements are unavailable"))
-			return false
+			return true
 		}
 		if !entitlementStore.Entitled(adminTenantIDFromRequest(r), featureDLP) {
 			writeError(w, http.StatusForbidden, fmt.Errorf("DLP is not licensed for this tenant"))

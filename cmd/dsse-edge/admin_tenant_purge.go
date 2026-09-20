@@ -110,7 +110,12 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	// deleted through the Console left its access rule on BOTH planes, still carrying its id — the one thing
 	// it had authored outliving the organization itself.
 	if rules != nil {
-		if removed := rules.RemoveTenant(tenantID); removed > 0 {
+		removed, err := rules.RemoveTenantChecked(tenantID)
+		if err != nil {
+			// Keep retired identities and fleet retry markers until erasure is confirmed.
+			// Persistence errors can contain private paths or database details.
+			result.Failures = append(result.Failures, "rule erasure saving could not be confirmed")
+		} else if removed > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "authored_rules", Count: int64(removed)})
 		}
 	}

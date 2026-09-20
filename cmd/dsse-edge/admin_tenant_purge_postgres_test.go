@@ -4,8 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/blobstore"
+	"github.com/lantern-networks/dsse-core/enrolledinventory"
+	"github.com/lantern-networks/dsse-core/policyrule"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -91,6 +95,91 @@ func TestPostgresTenantPurgeWithCredentialWriterProtocol(t *testing.T) {
 			}
 		}
 	}
+	t.Run("rule_save_failure_keeps_retired_inventory_and_fleet_marks", func(t *testing.T) {
+		tenant := "tenant_rules_failed"
+		dir := t.TempDir()
+		path := filepath.Join(dir, "rules.json")
+		inventory := blobstore.FilePersister{Path: filepath.Join(dir, "inventory.json")}
+		rules := policyrule.NewStore()
+		if err := rules.SetPersister(blobstore.FilePersister{Path: path}); err != nil {
+			t.Fatal(err)
+		}
+		ledger := enrolledinventory.NewLedger()
+		if err := ledger.SetPersisterChecked(inventory); err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range []string{tenant, "tenant_rules_other"} {
+			if _, err := rules.Upsert(policyrule.Rule{ID: "rule-" + id, TenantID: id, Plane: policyrule.PlaneEgress, Priority: 100, Source: []string{"*"}, Destination: []string{"*"}, ServiceID: "builtin-svc-https", Action: policyrule.Action{Access: "deny", Inspection: "inspect"}, Status: "active"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ledger.Enroll("device-"+id, id, "", now.Format(time.RFC3339)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		mark(tenant)
+		// A real filesystem refusal: replacement cannot rename over a directory.
+		if err := os.Rename(path, path+".saved"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		result := purgeAdminTenantData(ctx, "node", tenant, db, nil, nil, ledger, rules, nil, "", nil, nil, adminTenantExtraStores{}, nil, now)
+		if result.Complete || len(result.Failures) == 0 {
+			t.Errorf("rule persistence failure must be explicit: %+v", result)
+		}
+		if len(rules.List(tenant, "")) != 1 {
+			t.Error("failed erasure changed rules")
+		}
+		for _, table := range []string{"admin_tenant_model_deletions", "admin_tenant_model_purge_orders"} {
+			if count(table, tenant) != 1 {
+				t.Errorf("lost durable retry mark %s", table)
+			}
+		}
+		retired := false
+		for _, e := range ledger.Authoritative() {
+			if e.TenantID == tenant {
+				retired = !e.Enabled && e.RemovedAt != ""
+			}
+		}
+		if !retired {
+			t.Error("failed erasure lost retired inventory identity")
+		}
+		for _, row := range result.Erased {
+			if row.Store == "authored_rules" {
+				t.Error("unconfirmed rule erasure counted")
+			}
+		}
+		if strings.Contains(strings.Join(result.Failures, " "), dir) {
+			t.Error("filesystem path leaked")
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(path+".saved", path); err != nil {
+			t.Fatal(err)
+		}
+		rules = policyrule.NewStore()
+		if err := rules.SetPersister(blobstore.FilePersister{Path: path}); err != nil {
+			t.Fatal(err)
+		}
+		ledger = enrolledinventory.NewLedger()
+		if err := ledger.SetPersisterChecked(inventory); err != nil {
+			t.Fatal(err)
+		}
+		result = purgeAdminTenantData(ctx, "node", tenant, db, nil, nil, ledger, rules, nil, "", nil, nil, adminTenantExtraStores{}, nil, now)
+		if !result.Complete {
+			t.Fatalf("restart retry failed: %+v", result)
+		}
+		assertMarks(tenant, 0)
+		if len(rules.List(tenant, "")) != 0 || len(rules.List("tenant_rules_other", "")) != 1 {
+			t.Fatal("retry rule scope")
+		}
+		entries := ledger.Authoritative()
+		if len(entries) != 1 || entries[0].TenantID != "tenant_rules_other" || !entries[0].Enabled {
+			t.Fatal("retry inventory scope")
+		}
+	})
 	t.Run("residual_batches_and_empty", func(t *testing.T) {
 		// More than one batch, with no in-memory credential store on this node.
 		if _, err := credentialFixtureExec(ctx, p, `INSERT INTO admin_local_credentials(email,principal_id,tenant_id,status) SELECT 'batch-'||n||'@example.invalid','batch-'||n,'tenant_batch','pending_activation' FROM generate_series(1,5001) n`); err != nil {

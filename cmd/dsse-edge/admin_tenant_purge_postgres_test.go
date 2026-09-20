@@ -180,6 +180,31 @@ func TestPostgresTenantPurgeWithCredentialWriterProtocol(t *testing.T) {
 			t.Fatal("retry inventory scope")
 		}
 	})
+	t.Run("extra_store_failures_keep_fleet_marks", func(t *testing.T) {
+		for kind, seed := range extraPurgeSeeds {
+			t.Run(kind, func(t *testing.T) {
+				tenant := "tenant_target"
+				mark(tenant)
+				p := &extraPurgePersister{base: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "store.json")}}
+				if err := p.Save([]byte(seed)); err != nil {
+					t.Fatal(err)
+				}
+				e := loadExtraPurgeFixture(t, kind, p)
+				p.uncertain = true
+				result := purgeAdminTenantData(ctx, "node", tenant, db, nil, nil, nil, nil, nil, "", nil, nil, e, nil, now)
+				if result.Complete || len(result.Failures) == 0 {
+					t.Fatal("lost save failure")
+				}
+				assertMarks(tenant, 1)
+				p.uncertain = false
+				result = purgeAdminTenantData(ctx, "node", tenant, db, nil, nil, nil, nil, nil, "", nil, nil, e, nil, now)
+				if !result.Complete {
+					t.Fatalf("retry: %+v", result)
+				}
+				assertMarks(tenant, 0)
+			})
+		}
+	})
 	t.Run("residual_batches_and_empty", func(t *testing.T) {
 		// More than one batch, with no in-memory credential store on this node.
 		if _, err := credentialFixtureExec(ctx, p, `INSERT INTO admin_local_credentials(email,principal_id,tenant_id,status) SELECT 'batch-'||n||'@example.invalid','batch-'||n,'tenant_batch','pending_activation' FROM generate_series(1,5001) n`); err != nil {

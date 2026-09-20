@@ -305,29 +305,34 @@ func (s *Store) CountForTenant(tenantID string) int {
 // with a disposable organization: the erasure answered complete=true with remaining.total=0 while a record of
 // that organization's was still present. The store was in neither the count nor the erasure, and a store nobody
 // counts contributes nothing to "what is left".
-func (s *Store) RemoveTenant(tenantID string) int {
-	if s == nil {
-		return 0
+func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
+
+// RemoveTenantChecked confirms persistence before discarding retry targets.
+func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
+	if s == nil || strings.TrimSpace(tenantID) == "" {
+		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	candidate := cloneGrants(s.grants)
 	n := 0
-	for id, v := range s.grants {
+	for id, v := range candidate {
 		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
-			delete(s.grants, id)
+			delete(candidate, id)
 			n++
 		}
 	}
-	if n > 0 {
-		s.generation++
-		s.dirty = true
-		s.persistLocked()
+	if n == 0 {
+		return 0, nil
 	}
-	return n
+	if err := s.saveLocked(candidate); err != nil && !savedNonAtomically(err) {
+		return 0, err
+	}
+	s.grants = candidate
+	s.generation++
+	s.dirty = false
+	return n, nil
 }
 
 // ★★★ THE DEPLOYMENT'S GRANTS, NOT THIS NODE'S (2026-09-02).

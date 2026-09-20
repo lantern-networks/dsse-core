@@ -769,27 +769,29 @@ func (a *tenantTransportAuthority) CountForTenant(tenant string) int {
 }
 
 func (a *tenantTransportAuthority) RemoveTenant(tenant string) int {
-	// Nil-safe: the footprint helper evaluates every store's count in one call, so a node that holds no
-	// authorities must answer rather than crash.
+	n, _ := a.RemoveTenantChecked(tenant)
+	return n
+}
+
+func (a *tenantTransportAuthority) RemoveTenantChecked(tenant string) (int, error) {
 	if a == nil {
-		return 0
+		return 0, nil
 	}
 	key := strings.ToLower(strings.TrimSpace(tenant))
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
-		return 0
+		return 0, err
 	}
 	if _, ok := a.cas[key]; !ok {
-		return 0
+		return 0, nil
 	}
 	delete(a.cas, key)
+	// saveLocked restores the previous snapshot when the save is unconfirmed.
 	if err := a.saveLocked(); err != nil {
-		// Put it back rather than report a removal that did not survive: an erasure that says "done" over a
-		// row still on disk is the failure this whole family is about.
-		return 0
+		return 0, err
 	}
-	return 1
+	return 1, nil
 }
 
 // registerTenantTransportMaterialFlags declares the three flags this mechanism needs.

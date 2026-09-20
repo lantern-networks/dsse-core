@@ -323,29 +323,32 @@ func (s *Store) CountForTenant(tenantID string) int {
 // ★ IT EXISTS BECAUSE "COMPLETELY DELETED" LEFT THEM BEHIND (2026-08-18). This registry is keyed by tenant at
 // the top level, so the erasure is exact — and it was still in neither the tenant footprint nor the purge, so
 // an organization's registered sign-in providers outlived the organization.
-func (s *Store) RemoveTenant(tenantID string) int {
-	if s == nil {
-		return 0
+func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
+
+func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
+	if s == nil || strings.TrimSpace(tenantID) == "" {
+		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := len(s.connections[tenantID])
 	_, hadDefault := s.defaults[tenantID]
 	if n == 0 && !hadDefault {
-		return 0
+		return 0, nil
 	}
-	delete(s.connections, tenantID)
-	delete(s.defaults, tenantID)
 	if n == 0 {
-		n = 1 // the default alone was the residue
+		n = 1
 	}
+	candidate := s.snapshotLocked()
+	delete(candidate.Connections, tenantID)
+	delete(candidate.Defaults, tenantID)
+	if err := s.saveLocked(candidate); err != nil {
+		return 0, err
+	}
+	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
-	s.persistLocked()
-	return n
+	return n, nil
 }
 
 // ★★★ THE FLEET'S VIEW, BECAUSE AN EDGE CARRIES EVERY ORGANIZATION'S FLOWS (2026-09-02).

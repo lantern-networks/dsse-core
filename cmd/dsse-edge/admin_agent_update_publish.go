@@ -674,12 +674,17 @@ func (s *publishedAgentUpdateStore) CountForTenant(tenantID string) int {
 
 // RemoveTenant erases an organization's own shelf, documents and bytes, and persists before returning.
 func (s *publishedAgentUpdateStore) RemoveTenant(tenantID string) int {
+	n, _ := s.RemoveTenantChecked(tenantID)
+	return n
+}
+
+func (s *publishedAgentUpdateStore) RemoveTenantChecked(tenantID string) (int, error) {
 	if s == nil {
-		return 0
+		return 0, nil
 	}
 	prefix := tenantShelfPrefix(tenantID)
 	if prefix == "" {
-		return 0
+		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -700,15 +705,14 @@ func (s *publishedAgentUpdateStore) RemoveTenant(tenantID string) int {
 		}
 		pending[k] = v
 	}
-	if removed == 0 {
-		return 0
+	// An empty manifest shelf can still have artifact cleanup left to retry.
+	if removed > 0 {
+		if err := s.persistLocked(envelopes, pending); err != nil {
+			return 0, err
+		}
+		s.envelopes, s.pending = envelopes, pending
 	}
-	if err := s.persistLocked(envelopes, pending); err != nil {
-		// Not stored is not erased. Reporting a number here that a restart would undo is the shape of erasure
-		// report this product has already had to correct once.
-		return 0
-	}
-	s.envelopes, s.pending = envelopes, pending
+
 	// ★ AND THE BYTES. A signed installer built for one customer is as much theirs as the manifest naming it,
 	// and it is the larger residue of the two. Its absence is not an error: an organization can have had a
 	// manifest published and never the artifact.
@@ -716,6 +720,7 @@ func (s *publishedAgentUpdateStore) RemoveTenant(tenantID string) int {
 		if rerr := os.RemoveAll(shelf); rerr != nil {
 			log.Printf("agent_update_artifacts_not_erased tenant=%s err=%v — the manifests are gone and the "+
 				"bytes are still on this node's disk", tenantID, rerr)
+			return 0, rerr
 		}
 	}
 	// And on the deployment's shelf, where every other control plane would still be able to hand them over.
@@ -723,9 +728,10 @@ func (s *publishedAgentUpdateStore) RemoveTenant(tenantID string) int {
 		if ferr := s.shelf.forget(tenantID); ferr != nil {
 			log.Printf("agent_update_artifacts_not_erased_shared tenant=%s err=%v — the manifests are gone and "+
 				"the bytes are still on the deployment's shelf", tenantID, ferr)
+			return 0, ferr
 		}
 	}
-	return removed
+	return removed, nil
 }
 
 // tenantArtifactDir is where one organization's own release bytes live, or "" when there is no such directory

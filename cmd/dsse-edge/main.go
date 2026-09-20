@@ -6489,6 +6489,20 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// a_connector_is_given_every_door.go.
 	connectorEnrollmentRegions = tenantRegions
 	registerEndpointInventoryDetailRoutes(mux, adminEndpoint, config, evaluator, writer, adminAuditOutbox, deviceStore, endpointInventoryStore)
+	if connectorRouteGov == nil {
+		// ★★★ WHERE THESE DECISIONS LIVE (2026-08-25, measured: a route added to a Site survived being read
+		// back and did not survive a restart). cpStateBlobPersister already resolves an unset store to the
+		// deployment's shared database when there is one, which is exactly right here — a route is the
+		// authority's answer about what a connector fronts, and every control plane has to give the same one.
+		var routeGovPersister blobstore.Persister
+		if p, e := cpStateBlobPersister(connectorRouteGovPersistPath, cpStateBlobDB, "connector_route_governance"); e != nil {
+			log.Fatalf("connector route governance store: %v", e)
+		} else {
+			routeGovPersister = p
+		}
+		connectorRouteGov = newConnectorRouteGovernanceWithPersister(connectorRouteGovPersistPath,
+			connectorRouteCPConfigured, routeGovPersister)
+	}
 	registerTenantAdminRoutes(mux, adminEndpoint, config, evaluator, writer, tenantModelStore, operatorTenantID, adminAuditOutbox, adminAuth, ruleStore, vlanBoundary,
 		adminTenantExtraStores{
 			TenantRestrictions: managedTenantRestrictionStoreOrNil(policyStore),
@@ -6540,20 +6554,6 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return &connected
 		}
 		return nil
-	}
-	if connectorRouteGov == nil {
-		// ★★★ WHERE THESE DECISIONS LIVE (2026-08-25, measured: a route added to a Site survived being read
-		// back and did not survive a restart). cpStateBlobPersister already resolves an unset store to the
-		// deployment's shared database when there is one, which is exactly right here — a route is the
-		// authority's answer about what a connector fronts, and every control plane has to give the same one.
-		var routeGovPersister blobstore.Persister
-		if p, e := cpStateBlobPersister(connectorRouteGovPersistPath, cpStateBlobDB, "connector_route_governance"); e != nil {
-			log.Fatalf("connector route governance store: %v", e)
-		} else {
-			routeGovPersister = p
-		}
-		connectorRouteGov = newConnectorRouteGovernanceWithPersister(connectorRouteGovPersistPath,
-			connectorRouteCPConfigured, routeGovPersister)
 	}
 	// Resolve a connector binding that REFERENCES a Named Network (a VLANObject) to its CIDRs, so a subnet defined
 	// ONCE in the vlan-objects surface is reused for connector routing without re-typing (unified network object,

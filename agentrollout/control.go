@@ -463,14 +463,19 @@ func (s *AgentRolloutStore) CountForTenant(tenantID string) int {
 // desired version, a freeze and the reason a person typed for it — a record of that organization — and until
 // this existed a deletion left it behind while reporting nothing remaining.
 func (s *AgentRolloutStore) RemoveTenant(tenantID string) int {
+	n, _ := s.RemoveTenantChecked(tenantID)
+	return n
+}
+
+func (s *AgentRolloutStore) RemoveTenantChecked(tenantID string) (int, error) {
 	if s == nil {
-		return 0
+		return 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := strings.TrimSpace(tenantID)
 	if _, ok := s.plans[key]; !ok {
-		return 0
+		return 0, nil
 	}
 	candidate := make(map[string]AgentRolloutPlan, len(s.plans))
 	for k, v := range s.plans {
@@ -482,10 +487,10 @@ func (s *AgentRolloutStore) RemoveTenant(tenantID string) int {
 	if err := s.persistPlansLocked(candidate); err != nil {
 		// The caller counts what was erased; a removal that could not be stored has not happened, and saying
 		// it did is what makes an erasure report a number nobody can check.
-		return 0
+		return 0, err
 	}
 	s.plans = candidate
-	return 1
+	return 1, nil
 }
 
 // Tenants lists every organization this store holds a plan for, sorted.

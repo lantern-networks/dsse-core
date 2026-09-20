@@ -429,6 +429,15 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: store, Count: int64(n)})
 		}
 	}
+	eraseChecked := func(store string, remove func(string) (int, error)) {
+		n, err := remove(result.TenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, store+": erasure saving could not be confirmed")
+		} else {
+			add(store, n)
+		}
+	}
+
 	tenantID := result.TenantID
 	if e.TenantRestrictions != nil {
 		n, err := e.TenantRestrictions.RemoveTenantRestrictions(tenantID)
@@ -439,16 +448,16 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.DelegatedGrants != nil {
-		add("delegated_access_grants", e.DelegatedGrants.RemoveTenant(tenantID))
+		eraseChecked("delegated_access_grants", e.DelegatedGrants.RemoveTenantChecked)
 	}
 	if e.HumanApprovals != nil {
-		add("human_approvals", e.HumanApprovals.RemoveTenant(tenantID))
+		eraseChecked("human_approvals", e.HumanApprovals.RemoveTenantChecked)
 	}
 	if e.ClientlessGrants != nil {
-		add("clientless_grants", e.ClientlessGrants.RemoveTenant(tenantID))
+		eraseChecked("clientless_grants", e.ClientlessGrants.RemoveTenantChecked)
 	}
 	if e.IdPConnections != nil {
-		add("end_user_idp_connections", e.IdPConnections.RemoveTenant(tenantID))
+		eraseChecked("end_user_idp_connections", e.IdPConnections.RemoveTenantChecked)
 	}
 	if e.HighRisk != nil {
 		if n, err := e.HighRisk.RemoveTenantRisksContext(ctx, tenantID, e.DeviceIDs); err != nil {
@@ -465,7 +474,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.ConnectorRoutes != nil {
-		add("connector_route_governance", e.ConnectorRoutes.RemoveTenant(tenantID))
+		eraseChecked("connector_route_governance", e.ConnectorRoutes.RemoveTenantChecked)
 	}
 	if e.CatalogOverrides != nil {
 		if n, err := e.CatalogOverrides.RemoveTenant(tenantID); err != nil {
@@ -489,10 +498,10 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.TenantTransportAuthorities != nil {
-		add("tenant_transport_authorities", e.TenantTransportAuthorities.RemoveTenant(tenantID))
+		eraseChecked("tenant_transport_authorities", e.TenantTransportAuthorities.RemoveTenantChecked)
 	}
 	if e.TenantInterceptionAuthorities != nil {
-		add("tenant_interception_authorities", e.TenantInterceptionAuthorities.RemoveTenant(tenantID))
+		eraseChecked("tenant_interception_authorities", e.TenantInterceptionAuthorities.RemoveTenantChecked)
 	}
 	if e.TenantTrustDistributions != nil {
 		n, err := e.TenantTrustDistributions.RemoveTenant(tenantID)
@@ -511,10 +520,10 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.AgentRolloutPlans != nil {
-		add("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenant(tenantID))
+		eraseChecked("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenantChecked)
 	}
 	if e.PublishedAgentUpdates != nil {
-		add("published_agent_releases", e.PublishedAgentUpdates.RemoveTenant(tenantID))
+		eraseChecked("published_agent_releases", e.PublishedAgentUpdates.RemoveTenantChecked)
 	}
 }
 

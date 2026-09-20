@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -227,7 +228,19 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 		// an operator holding a partial set they have to reconcile against a kitting list, with live credentials
 		// already created — worse than a refusal that says how many would fit.
 		if policy.MaxOutstanding > 0 {
-			outstanding := tokens.Outstanding(tenantOf(r), now)
+			outstanding := 0
+			if checked, ok := tokens.(interface {
+				OutstandingContext(context.Context, string, time.Time) (int, error)
+			}); ok {
+				var err error
+				outstanding, err = checked.OutstandingContext(r.Context(), tenantOf(r), now)
+				if err != nil {
+					writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+					return
+				}
+			} else {
+				outstanding = tokens.Outstanding(tenantOf(r), now)
+			}
 			if room := policy.MaxOutstanding - outstanding; count > room {
 				writeError(w, http.StatusConflict, fmt.Errorf(
 					"%w: %d unused tokens are already outstanding and the limit is %d, so only %d more can be issued — revoke or let some expire first",
@@ -244,8 +257,11 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 				// an operator nothing about which machine is which.
 				label = fmt.Sprintf("%s (%d/%d)", label, i+1, count)
 			}
-			tok, secret, err := tokens.Issue(policy, tenantOf(r), req.Group, label, adminOf(r), adminLabelOf(r), expires, now)
+			tok, secret, err := issueEnrolmentToken(r.Context(), tokens, policy, tenantOf(r), req.Group, label, adminOf(r), adminLabelOf(r), expires, now)
 			if err != nil {
+				if errors.Is(err, enrolltoken.ErrStateUnavailable) {
+					err = enrolltoken.ErrStateUnavailable
+				}
 				// The batch was pre-checked, so reaching here means something else — report what was already
 				// minted rather than losing it silently. Those tokens exist and the operator has to know.
 				writeJSON(w, http.StatusConflict, map[string]any{

@@ -321,6 +321,10 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 				// administrator changing their own settings is not an operator act, and badging it would be the
 				// same lie pointing the other way.
 				configChange := adminConfigChangeAuditLog(identity, email, displayName, r.Method, r.URL.Path, rec.statusOrDefault(), evaluator, auditTenant, sourceIPFromRequest(r), r.UserAgent())
+				if rec.businessFailure {
+					result := "error"
+					configChange.Result = &result
+				}
 				if strings.TrimSpace(auditTenant) != "" &&
 					!strings.EqualFold(strings.TrimSpace(auditTenant), strings.TrimSpace(identity.TenantID)) {
 					stampOperatorActor(configChange.Metadata, identity)

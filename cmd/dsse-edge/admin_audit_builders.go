@@ -284,6 +284,8 @@ func adminOperateWithinTenantAuditLog(identity adminIdentity, targetTenant, meth
 type adminAuditStatusRecorder struct {
 	http.ResponseWriter
 	status int
+	// A typed business refusal can keep HTTP 200 while still being an audit failure.
+	businessFailure bool
 }
 
 func (rec *adminAuditStatusRecorder) WriteHeader(status int) {

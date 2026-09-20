@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -81,7 +82,10 @@ func (s *entitlementStore) SetFeaturesContext(ctx context.Context, tenant string
 	var next entitlementSnapshot
 	edit := func(raw []byte) ([]byte, error) {
 		next = entitlementSnapshot{Features: map[string]map[string]bool{}}
-		if len(raw) > 0 {
+		if raw == nil && len(s.features) > 0 {
+			return nil, fmt.Errorf("entitlement authority is missing")
+		}
+		if raw != nil {
 			if err := json.Unmarshal(raw, &next); err != nil {
 				return nil, err
 			}
@@ -113,7 +117,8 @@ func (s *entitlementStore) SetFeaturesContext(ctx context.Context, tenant string
 			return err
 		}
 		if s.persister != nil {
-			if err := s.persister.Save(raw); err != nil {
+			if err := s.persister.Save(raw); err != nil &&
+				(!errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
 				return err
 			}
 		}
@@ -135,8 +140,11 @@ func (s *entitlementStore) RefreshShared() error {
 	if err != nil {
 		return err
 	}
+	if raw == nil && len(s.features) > 0 {
+		return fmt.Errorf("entitlement authority is missing")
+	}
 	next := entitlementSnapshot{Features: map[string]map[string]bool{}}
-	if len(raw) > 0 {
+	if raw != nil {
 		if err := json.Unmarshal(raw, &next); err != nil {
 			return err
 		}

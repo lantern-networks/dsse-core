@@ -145,6 +145,9 @@ func (s *Store) UpsertEndpointContext(ctx context.Context, e Endpoint) (Endpoint
 	e = copyEndpoint(e)
 	return mutateCatalogContext(ctx, s, func(n *Store) (Endpoint, error) {
 		current, found := n.GetEndpoint(e.TenantID, e.ID)
+		if e.Source == SourceApplication || found && current.Source == SourceApplication {
+			return Endpoint{}, ErrApplicationEndpointOwnership
+		}
 		if e.Source == SourceEnrolled || strings.HasPrefix(e.ID, enrolledOwnerPrefix) || found && current.Source == SourceEnrolled {
 			if !found || current.Source != SourceEnrolled || current.ID != enrolledEndpointID(current.Identity) {
 				return Endpoint{}, fmt.Errorf("enrolled endpoint must come from inventory")
@@ -191,6 +194,9 @@ func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
 }
 func (s *Store) DeleteEndpointContext(ctx context.Context, tenant, id string) (bool, error) {
 	return mutateCatalogContext(ctx, s, func(n *Store) (bool, error) {
+		if e, ok := n.GetEndpoint(tenant, id); ok && e.Source == SourceApplication {
+			return false, ErrApplicationEndpointOwnership
+		}
 		if e, ok := n.GetEndpoint(tenant, id); ok && e.Source == SourceEnrolled {
 			return false, fmt.Errorf("enrolled endpoints are managed by inventory")
 		}

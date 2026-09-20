@@ -79,8 +79,10 @@ async function renderEndpointsSection(section) {
     if (!filtered.length) { uiState(tableHost, "empty", bl({ en: "No matches.", ja: "一致なし。" })); return; }
     const rows = filtered.map((ep) => {
       const actions = el("div", { class: "ui-row-actions" });
-      actions.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: ep.kind === "network" ? bl({ en: "Edit", ja: "編集" }) : bl({ en: "Rename", ja: "名前変更" }), onClick: () => openEndpointForm(section, ep) }));
-      if (ep.source !== "enrolled") {
+      if (ep.source === "application") {
+        actions.appendChild(el("span", { text: bl({ en: "Managed in Applications", ja: "アプリケーションで管理" }) }));
+      } else actions.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: ep.kind === "network" ? bl({ en: "Edit", ja: "編集" }) : bl({ en: "Rename", ja: "名前変更" }), onClick: () => openEndpointForm(section, ep) }));
+      if (ep.source !== "enrolled" && ep.source !== "application") {
         actions.appendChild(document.createTextNode(" "));
         actions.appendChild(el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "削除" }), onClick: () => removeEndpoint(ep, section) }));
       }
@@ -102,7 +104,7 @@ async function renderEndpointsSection(section) {
         el("td", {}, [el("strong", { text: ep.alias || "(unnamed)" })]),
         el("td", {}, uiBadge(ep.kind === "steered_device" ? bl({ en: "Device", ja: "デバイス" }) : bl({ en: "Server", ja: "サーバ" }), ep.kind === "steered_device" ? "ok" : "off")),
         el("td", { text: ep.kind === "steered_device" ? platLabel(ep.platform) : "—" }),
-        el("td", {}, uiBadge(ep.source === "enrolled" ? bl({ en: "Automatic", ja: "自動" }) : bl({ en: "Added by you", ja: "手動追加" }), "off")),
+        el("td", {}, uiBadge(ep.source === "application" ? bl({ en: "Application", ja: "アプリケーション" }) : ep.source === "enrolled" ? bl({ en: "Automatic", ja: "自動" }) : bl({ en: "Added by you", ja: "手動追加" }), "off")),
         el("td", {}, el("code", { text: ep.identity || ep.address || "—" })),
         insCell,
         el("td", { class: "ui-row-actions" }, actions),

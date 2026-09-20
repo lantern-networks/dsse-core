@@ -25,6 +25,25 @@ import (
 )
 
 func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, applicationCatalogStore appcatalog.RuntimeStore, registry connectorRegistryStore, tunnelManager *tunnel.Manager, routeProfiles map[string]edgeplane.ApplicationRouteProfile, tenantModelStore adminTenantModelRuntimeStore, domainEventOutbox domainEventOutboxWriter, configSourceURL string) {
+	manualEndpointAllowed := func(r *http.Request) bool {
+		identity, ok := adminIdentityFromRequest(r)
+		return ok && adminPermissionAllowed(identity.Roles, "admin.endpoints.write") && adminScopeAllowed(identity, "admin.endpoints.write")
+	}
+	endpointOwnershipConfirmed := func(w http.ResponseWriter, r *http.Request, tenant, applicationID string) bool {
+		if config.AssetStore == nil {
+			return true
+		}
+		if !refreshAuthoredStores(w, nil, config.AssetStore) {
+			return false
+		}
+		if ep, found := config.AssetStore.GetEndpoint(tenant, "app-"+applicationID); found &&
+			!assetcatalog.ApplicationEndpointWritable(ep, applicationID, manualEndpointAllowed(r)) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("admin.endpoints.write is required to change the existing manual destination"))
+			return false
+		}
+		return true
+	}
+
 	// The app row and its rule-destination endpoint are separate saves. Never
 	// report complete success when the second save (including its term fence) fails.
 	partialAsset := func(w http.ResponseWriter, r *http.Request, a model.AuditLog, now time.Time) {
@@ -92,6 +111,9 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		}
 		tenantID := adminTenantIDFromRequest(r)
 		applicationID := strings.TrimSpace(r.PathValue("application_id"))
+		if !endpointOwnershipConfirmed(w, r, tenantID, applicationID) {
+			return
+		}
 		var body struct {
 			Name                   string `json:"name"`
 			Destination            string `json:"destination"`
@@ -193,10 +215,10 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			if alias == "" {
 				alias = created.ApplicationID
 			}
-			if _, uerr := config.AssetStore.UpsertEndpointContext(r.Context(), assetcatalog.Endpoint{
+			if _, uerr := config.AssetStore.UpsertApplicationEndpointContext(r.Context(), created.ApplicationID, assetcatalog.Endpoint{
 				ID: "app-" + created.ApplicationID, TenantID: tenantID, Alias: alias,
-				Kind: assetcatalog.KindNetwork, Address: addr, Source: assetcatalog.SourceManual,
-			}); uerr != nil {
+				Kind: assetcatalog.KindNetwork, Address: addr,
+			}, manualEndpointAllowed(r)); uerr != nil {
 				partialAsset(w, r, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
 				return
 			}
@@ -214,6 +236,9 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		}
 		tenantID := adminTenantIDFromRequest(r)
 		applicationID := strings.TrimSpace(r.PathValue("application_id"))
+		if !endpointOwnershipConfirmed(w, r, tenantID, applicationID) {
+			return
+		}
 		now := time.Now()
 		entry, found, err := applicationCatalogStore.Get(r.Context(), tenantID, applicationID)
 		if err != nil {
@@ -232,7 +257,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		}
 		// Remove the rule-destination endpoint surfaced at publish (no longer reachable once unpublished).
 		if config.AssetStore != nil {
-			if _, err := config.AssetStore.DeleteEndpointContext(r.Context(), tenantID, "app-"+applicationID); err != nil {
+			if _, err := config.AssetStore.DeleteApplicationEndpointContext(r.Context(), tenantID, applicationID, manualEndpointAllowed(r)); err != nil {
 				partialAsset(w, r, adminApplicationPublishAuditLog(created, evaluator, now, false), now)
 				return
 			}
@@ -261,6 +286,9 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			return
 		}
 		applicationID := strings.TrimSpace(r.PathValue("application_id"))
+		if !endpointOwnershipConfirmed(w, r, tenantID, applicationID) {
+			return
+		}
 		if applicationID == "" {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("application_id is required"))
 			return
@@ -293,7 +321,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		}
 		// Drop the rule-destination endpoint surfaced at publish (the app no longer exists).
 		if config.AssetStore != nil {
-			if _, err := config.AssetStore.DeleteEndpointContext(r.Context(), tenantID, "app-"+applicationID); err != nil {
+			if _, err := config.AssetStore.DeleteApplicationEndpointContext(r.Context(), tenantID, applicationID, manualEndpointAllowed(r)); err != nil {
 				partialAsset(w, r, adminApplicationDeleteAuditLog(tenantID, applicationID, evaluator, now), now)
 				return
 			}

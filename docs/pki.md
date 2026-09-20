@@ -297,10 +297,20 @@ contains private keys and needs the same access and backup protections as other
 PKI stores. A failed replacement can still leave a retained copy of the unchanged
 previous pair in history.
 
-Both destination files must be writable. New material is staged before changing
-either file; a handled commit failure attempts to restore the previous files.
-Separate certificate and key paths do not provide atomic pair replacement across
-power loss or process termination. If interrupted during replacement, verify that
-the on-disk certificate and key match before restarting the service. A failed
-restoration retains its recovery copy and reports that failure; do not interpret
-this as a successful replacement.
+Both destination files must be writable regular files. New material is staged
+before changing either file. A private recovery journal beside the certificate
+(`CERT_PATH.dsse-pair-recovery.json`) durably retains the previous pair before
+replacement. If the process terminates before the update is confirmed, startup
+and reload restore that pair before loading it. Recovery is retryable if it is
+interrupted again. A malformed or inaccessible recovery journal prevents loading
+or updating that pair; an already-running listener keeps its last loaded pair.
+
+Keep the recovery journal with its backing files and protect it like a private
+key. After completion its contents become a durable marker without key material.
+Do not delete a pending journal or edit the backing files while recovering. If
+recovery fails, correct the storage problem and retry reload/startup. Separate
+processes must not share writable certificate files. This is recovery for the
+Console's file-pair update, not an atomic transaction with the version database
+or a guarantee about storage hardware surviving a power failure. A commit whose
+durability could not be confirmed is reported as a failure; reload and inspect
+the served fingerprint before retrying.

@@ -1431,6 +1431,7 @@ func main() {
 	// Log the build identity FIRST. Every other startup line is easier to interpret when the log says which
 	// binary produced it, and an incident starts with "what is running?".
 	log.Printf("starting %s", versionString())
+	recoverConfiguredCertificatePairs([2]string{*mainTLSCert, *mainTLSKey}, [2]string{*transportTLSCert, *transportTLSKey})
 	log.Print(applyCPUHeadroom(*cpuHeadroomCoresFlag))
 	log.Print(setConnectorMTLSPresentationRelaxed(*connectorMTLSNotRequiredFlag, *devMode))
 	applyAIUsageReportFlags()

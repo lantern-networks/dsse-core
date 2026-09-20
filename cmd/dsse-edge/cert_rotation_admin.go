@@ -152,14 +152,20 @@ func rotateNamedCertLocked(name, certPEM, keyPEM string, now time.Time) (certInv
 	return entry, nil
 }
 
-// Stage every file before changing either destination, then restore the previous
-// pair on a handled commit failure. Separate configured cert/key paths cannot be
-// atomically replaced as a pair; this does not promise power-loss atomicity.
+// Stage every file before changing either destination. The durable recovery
+// journal restores interrupted updates before the next load; handled failures
+// also restore the previous pair immediately.
 func saveNamedCertPair(certPath, keyPath string, cert, key []byte) error {
 	return saveNamedCertPairWithReplace(certPath, keyPath, cert, key, durablefile.Replace)
 }
 
 func saveNamedCertPairWithReplace(certPath, keyPath string, cert, key []byte, replace func(string, string) error) error {
+	return certreload.WithPairUpdate(certPath, keyPath, func() error {
+		return replaceNamedCertPair(certPath, keyPath, cert, key, replace)
+	})
+}
+
+func replaceNamedCertPair(certPath, keyPath string, cert, key []byte, replace func(string, string) error) error {
 	if filepath.Clean(certPath) == filepath.Clean(keyPath) {
 		return fmt.Errorf("certificate and key must use separate files")
 	}

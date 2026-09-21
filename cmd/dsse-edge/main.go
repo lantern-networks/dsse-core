@@ -696,7 +696,7 @@ func (config serverConfig) withDefaults() serverConfig {
 			store := config.InspectionEvents
 			go func() {
 				for range time.Tick(30 * time.Second) {
-					if err := store.PersistIfDirty(); err != nil {
+					if err := store.PersistIfDirtyContext(captureCPWriteLease(context.Background())); err != nil {
 						log.Printf("inspection events store: persist failed: %v", err)
 					}
 				}

@@ -187,6 +187,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			}
 		}
 		if !servedFromHotStore && inspectionEvents != nil {
+			if err := inspectionEvents.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP findings are temporarily unavailable; retry the request"))
+				return
+			}
 			events = inspectionEvents.ListByTenant(tenant)
 		}
 		findings := make([]map[string]any, 0, len(events))

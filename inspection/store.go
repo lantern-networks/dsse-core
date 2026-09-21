@@ -2,6 +2,7 @@ package inspection
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -16,13 +17,15 @@ import (
 // disables the bound). In-memory by default; attach a Persister (SetPersister) to make events — notably the
 // DLP findings — SURVIVE an Edge restart.
 type Store struct {
-	mu        sync.RWMutex
-	events    map[string]model.InspectionEvent
-	order     []string
-	capacity  int
-	persister blobstore.Persister
-	retention time.Duration // drop events whose Timestamp is older than this (0 = keep, subject only to the FIFO bound)
-	dirty     bool
+	mu            sync.RWMutex
+	events        map[string]model.InspectionEvent
+	order         []string
+	capacity      int
+	persister     blobstore.Persister
+	retention     time.Duration // drop events whose Timestamp is older than this (0 = keep, subject only to the FIFO bound)
+	dirty         bool
+	sharedKnown   bool
+	sharedPending map[string]bool
 
 	// Append-only WAL mode (when the persister supports blobstore.AppendPersister). Under decrypt-all + log-all
 	// the store fills fast; re-marshaling the WHOLE snapshot every flush is O(n) memory + I/O and was the cause of
@@ -30,7 +33,7 @@ type Store struct {
 	// is compacted (a single full rewrite of the bounded live set) only when it grows past maxWALBytes — so the
 	// O(n) marshal is amortized to rare rotations, not every 30s. Durability of the record itself is off-Edge
 	// (logs.Writer + domain-event outbox); this file is only a hot-cache WAL so the DLP findings view survives a
-	// restart. Persisters without append (Postgres blob) keep the full-snapshot path.
+	// restart. Shared persisters merge pending IDs into the latest row; other non-append stores use snapshots.
 	appendP     blobstore.AppendPersister
 	pending     []model.InspectionEvent // events appended since the last flush (append mode only)
 	walBytes    int64                   // approximate current WAL size, to trigger compaction
@@ -67,6 +70,29 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 		return nil
 	}
 	data, err := p.Load()
+	if _, shared := p.(sharedPersister); shared {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.sharedPending = map[string]bool{}
+		s.sharedKnown = data != nil || err != nil
+		if err != nil {
+			return err
+		}
+		snap, e := decodeSharedSnapshot(data, s.sharedKnown)
+		if e != nil {
+			return e
+		}
+		if data != nil {
+			s.events, s.order = snap.Events, snap.Order
+		} else {
+			for id := range s.events {
+				s.sharedPending[id] = true
+			}
+		}
+		s.pruneLocked(time.Now())
+		s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
+		return nil
+	}
 	if err != nil || len(data) == 0 {
 		return err
 	}
@@ -85,7 +111,7 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 		s.replayWALLocked(data)
 	}
 	s.pruneLocked(time.Now())
-	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k) })
+	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
 	if s.appendP != nil {
 		if migratedFromSnapshot {
 			// Convert a legacy snapshot file to WAL (NDJSON) format now, so subsequent appends do not corrupt a
@@ -116,6 +142,7 @@ func (s *Store) pruneLocked(now time.Time) {
 		}
 		if t, err := time.Parse(time.RFC3339, ev.Timestamp); err == nil && t.Before(cutoff) {
 			delete(s.events, id)
+			delete(s.sharedPending, id)
 			continue
 		}
 		kept = append(kept, id)
@@ -126,13 +153,19 @@ func (s *Store) pruneLocked(now time.Time) {
 // PersistIfDirty flushes unsaved changes. Cheap no-op when clean or when no persister is attached. Call
 // periodically — Upsert never does I/O. In APPEND mode (persister supports blobstore.AppendPersister) it appends
 // the buffered batch in O(batch), compacting to the bounded live set only when the WAL grows past maxWALBytes; all
-// file I/O happens OUTSIDE the lock so Upsert never blocks on disk. Otherwise (Postgres blob) it keeps the
-// historical full-snapshot Save.
-func (s *Store) PersistIfDirty() error {
+// file I/O happens OUTSIDE the lock. Shared transactions merge pending IDs under mu
+// (Upsert waits for that bounded transaction); other persisters retain snapshot Save.
+func (s *Store) PersistIfDirty() error { return s.PersistIfDirtyContext(context.Background()) }
+
+func (s *Store) PersistIfDirtyContext(ctx context.Context) error {
 	s.mu.Lock()
 	if s.persister == nil || (!s.dirty && len(s.pending) == 0) {
 		s.mu.Unlock()
 		return nil
+	}
+	if p, ok := s.persister.(sharedPersister); ok {
+		defer s.mu.Unlock()
+		return s.persistSharedLocked(ctx, p)
 	}
 	if s.appendP != nil {
 		// Build the append batch + decide compaction UNDER the lock; do the file write UNLOCKED.
@@ -150,7 +183,7 @@ func (s *Store) PersistIfDirty() error {
 			// Rotation: prune + FIFO-bound, then rewrite the file to just the live set (which already includes the
 			// pending events — they were added to the map on Upsert — so the batch is subsumed and not appended).
 			s.pruneLocked(time.Now())
-			s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k) })
+			s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
 			compact = s.encodeWALLocked()
 		}
 		ap := s.appendP
@@ -277,7 +310,13 @@ func (s *Store) Upsert(event model.InspectionEvent) model.InspectionEvent {
 		s.order = append(s.order, event.ID)
 	}
 	s.events[event.ID] = event
-	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k) })
+	if _, shared := s.persister.(sharedPersister); shared {
+		if s.sharedPending == nil {
+			s.sharedPending = map[string]bool{}
+		}
+		s.sharedPending[event.ID] = true
+	}
+	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
 	s.dirty = true
 	if s.appendP != nil {
 		// Buffer for the next append flush. Bounded: an event dropped from the buffer is still in the live map, so

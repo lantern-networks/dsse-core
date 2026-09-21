@@ -81,6 +81,12 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		// organization's registrations rather than the deployment's — the same rule the PKI, fleet and policy
 		// views use (adminAnswerScope). Entering an organization is a mode with a banner attached; a screen
 		// that answers for somebody else inside it is how the wrong customer's material gets acted on.
+		if _, shared := sharedTenantCAAuthor(); shared {
+			if err := sharedTenantCARead(registry); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("CA registry is unavailable"))
+				return
+			}
+		}
 		caller, operator := adminAnswerScope(r)
 		counts := registry.Registrations()
 		// ★ A COUNT IS NOT AN INVENTORY (2026-08-16). This answered `ca_count: 1` and nothing else — a tenant
@@ -220,6 +226,10 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			return
 		}
 
+		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_register", req.CAPEM, "") {
+			return
+		}
+
 		// TRUST first. If the handshake will not accept the certificate, the attribution entry describes a
 		// tenant whose devices cannot connect, and that is a worse thing to have written down than nothing.
 		// Read at REQUEST time, not captured at registration. ★ It was captured, and the routes are registered
@@ -331,6 +341,9 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		if err := adminTenantPKITargetAllowed(r, tenantID, "withdrawing a device CA of"); err != nil {
 			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", "", strings.ToLower(fingerprint)) {
 			return
 		}
 		// How many this organization would be left with, and whether anybody is still admitted under this one.
@@ -475,6 +488,9 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		// act — the loudest possible cross-tenant write on this surface.
 		if err := adminTenantPKITargetAllowed(r, tenantID, "withdrawing the device CA of"); err != nil {
 			writeError(w, http.StatusForbidden, err)
+			return
+		}
+		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", "", "") {
 			return
 		}
 		// Named BEFORE the withdrawal, because afterwards the registry no longer knows them — and the shared

@@ -39,7 +39,8 @@ type TenantCARegistryFile struct {
 }
 
 type TenantCARegistry struct {
-	pendingWithdrawals map[string]string // local removals awaiting completion of trust and persistence
+	authoritativeLoaded bool
+	pendingWithdrawals  map[string]string // local removals awaiting completion of trust and persistence
 
 	// Persisted with admission anchors; only a successful material install sets ownership.
 	materialManaged map[string]bool

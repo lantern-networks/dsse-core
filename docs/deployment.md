@@ -19,6 +19,14 @@ Three region IDs on one host do not provide regional fault tolerance. Certificat
 failover, and recovery must also be tested on the deployed build; the topology alone does
 not establish their reliability.
 
+The control plane owns the shared configuration database. An Edge that receives
+configuration through `-config-source-url` or `-config-source-endpoints` must use
+node-local configuration stores and must not also set `-postgres-dsn`. The process
+refuses this combination before connecting to the database, because applying an
+older received bundle could overwrite newer control-plane configuration. This
+also applies when the same process is marked `-control-plane` or has explicit
+store overrides. The generated installer configuration already separates these roles.
+
 Before starting, prepare:
 
 - Linux hosts with Docker Engine and the Compose v2 plugin, persistent storage, and

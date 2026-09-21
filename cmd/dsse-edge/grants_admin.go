@@ -28,7 +28,12 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			writeError(w, http.StatusForbidden, fmt.Errorf("admin tenant is required"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"grants": store.List(callerTenant)})
+		rows, err := store.ListChecked(callerTenant)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"grants": rows})
 	}))
 	mux.HandleFunc("POST /admin/grants/{id}/revoke", adminEndpoint("admin.grants.write", func(w http.ResponseWriter, r *http.Request) {
 		callerTenant := strings.TrimSpace(adminTenantIDFromRequest(r))
@@ -37,7 +42,11 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			return
 		}
 		id := r.PathValue("id")
-		grant, found, err := store.RevokeForTenant(callerTenant, id)
+		grant, found, err := store.RevokeForTenantContext(r.Context(), callerTenant, id)
+		if err != nil && !found {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("grant not found"))
 			return

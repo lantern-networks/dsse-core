@@ -207,6 +207,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
+		if err := theGrantStore.Load().RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if !refreshDLPStores(w, config.DLPDistribution) {
 			return
 		}

@@ -131,6 +131,7 @@ func (b *clientlessBroker) handleStart(w http.ResponseWriter, r *http.Request) {
 // handleCallback completes the flow: validate state, exchange the code, validate the ID token, mint a grant,
 // set the grant cookie. Any failure denies (fail closed).
 func (b *clientlessBroker) handleCallback(w http.ResponseWriter, r *http.Request) {
+	r = r.WithContext(captureCPWriteLease(r.Context()))
 	state := strings.TrimSpace(r.URL.Query().Get("state"))
 	code := strings.TrimSpace(r.URL.Query().Get("code"))
 	if state == "" || code == "" {
@@ -208,7 +209,7 @@ func (b *clientlessBroker) handleCallback(w http.ResponseWriter, r *http.Request
 	if boundDevice == "" {
 		boundDevice = edgeplane.TransportDeviceFromContext(r.Context())
 	}
-	grant, err := b.grants.Mint(grantstore.Grant{
+	grant, err := b.grants.MintContext(r.Context(), grantstore.Grant{
 		GrantID: grantID, TenantID: ceremonyTenant, UserID: userID, IdPID: conn.IdPID,
 		ACR: id.ACR, AMR: id.AMR, DeviceID: boundDevice,
 		// Self-describing identity + scope: WHO was approved (from the verified ID token, not a

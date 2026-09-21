@@ -27,6 +27,7 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 		return
 	}
 	mux.HandleFunc("POST /grant-report", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if _, verified := auditIngestShipperFrom(r, tenantCARegistry); !verified && !devMode {
 			writeError(w, http.StatusForbidden, fmt.Errorf("grant-report: this request presents no Edge "+
 				"certificate, so these grants could not be attributed to a node"))
@@ -44,7 +45,7 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid grant report"))
 			return
 		}
-		added, updated, err := grants.MergeChecked(body.Grants, time.Now().UTC())
+		added, updated, err := grants.MergeCheckedContext(r.Context(), body.Grants, time.Now().UTC())
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, grantstore.ErrConflict) {

@@ -454,7 +454,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		eraseChecked("human_approvals", func(tenant string) (int, error) { return e.HumanApprovals.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.ClientlessGrants != nil {
-		eraseChecked("clientless_grants", e.ClientlessGrants.RemoveTenantChecked)
+		eraseChecked("clientless_grants", func(tenant string) (int, error) { return e.ClientlessGrants.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.IdPConnections != nil {
 		eraseChecked("end_user_idp_connections", func(tenant string) (int, error) { return e.IdPConnections.RemoveTenantContext(ctx, tenant) })

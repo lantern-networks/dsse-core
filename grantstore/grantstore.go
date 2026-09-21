@@ -5,6 +5,7 @@
 package grantstore
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,10 +41,12 @@ type Grant struct {
 
 // Store holds tenant-attributed grants with globally unique bearer IDs, safe for concurrent use.
 type Store struct {
-	mu        sync.RWMutex
-	grants    map[string]Grant // grant_id -> grant
-	persister blobstore.Persister
-	dirty     bool // a locally applied denial still needs persistence
+	mu             sync.RWMutex
+	grants         map[string]Grant // grant_id -> grant
+	persister      blobstore.Persister
+	authorityKnown bool
+	pending        map[string]Grant
+	dirty          bool // a locally applied denial still needs persistence
 	// generation advances on every change. The config bundle SUMS it, and an Edge applies a bundle only when
 	// that sum is newer — see ConfigGeneration.
 	generation uint64
@@ -67,7 +70,7 @@ func NewStore() *Store { return &Store{grants: map[string]Grant{}} }
 
 // Mint stores a grant. grant_id and tenant_id are required (the caller supplies a high-entropy id). ttl sets
 // ExpiresAt = now + ttl.
-func (s *Store) Mint(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
+func (s *Store) mintLocal(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
 	g.GrantID = strings.TrimSpace(g.GrantID)
 	g.TenantID = strings.TrimSpace(g.TenantID)
 	if g.GrantID == "" {
@@ -103,6 +106,9 @@ func (s *Store) Mint(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
 
 // Get returns a grant by id.
 func (s *Store) Get(grantID string) (Grant, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return Grant{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	g, ok := s.grants[strings.TrimSpace(grantID)]
@@ -125,9 +131,11 @@ func (s *Store) Valid(grantID string, now time.Time) bool {
 // Revoke is the compatibility entry point: the boolean reports existence, not durability.
 // Tenant-authenticated callers must use RevokeForTenant and handle its persistence error.
 func (s *Store) Revoke(grantID string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	_, found, _ := s.revokeLocked(strings.TrimSpace(grantID))
+	g, ok := s.Get(grantID)
+	if !ok {
+		return false
+	}
+	_, found, _ := s.RevokeForTenant(g.TenantID, grantID)
 	return found
 }
 
@@ -135,7 +143,7 @@ func (s *Store) Revoke(grantID string) bool {
 // Denial is retained locally on save failure; repeating the call retries persistence.
 // ErrSavedWithoutAtomicity is a completed-save warning, while ErrPersistence
 // means confirmation is missing and the pending denial still needs a retry.
-func (s *Store) RevokeForTenant(tenantID, grantID string) (Grant, bool, error) {
+func (s *Store) revokeForTenantLocal(tenantID, grantID string) (Grant, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	grantID = strings.TrimSpace(grantID)
 	if tenantID == "" {
@@ -167,7 +175,7 @@ func (s *Store) revokeLocked(grantID string) (Grant, bool, error) {
 }
 
 // List returns the tenant's grants, newest first.
-func (s *Store) List(tenantID string) []Grant {
+func (s *Store) listLocal(tenantID string) []Grant {
 	tenantID = strings.TrimSpace(tenantID)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -191,7 +199,7 @@ func (s *Store) SetStatePath(path string) error {
 }
 
 // SetPersister adopts a validated snapshot and its writer together. A failed load preserves both.
-// Successful saves can be reloaded; coordination between independent writers is external to this store.
+// Shared writers coordinate edits through the persistence transaction.
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -236,6 +244,8 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		s.generation++
 	}
 	s.grants, s.persister, s.dirty = fresh, p, false
+	s.authorityKnown = true
+	s.pending = nil
 	return nil
 }
 
@@ -308,7 +318,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
 
 // RemoveTenantChecked confirms persistence before discarding retry targets.
-func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
+func (s *Store) removeTenantLocal(tenantID string) (int, error) {
 	if s == nil || strings.TrimSpace(tenantID) == "" {
 		return 0, nil
 	}
@@ -348,7 +358,7 @@ func (s *Store) RemoveTenantChecked(tenantID string) (int, error) {
 // revoking on one node left the grant live on every other.
 
 // ListAll is every organization's grants, ordered so two calls produce the same bytes.
-func (s *Store) ListAll() []Grant {
+func (s *Store) listAllLocal() []Grant {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]Grant, 0, len(s.grants))
@@ -368,3 +378,16 @@ func (s *Store) Merge(incoming []Grant, now time.Time) (added, updated int) {
 	}
 	return added, updated
 }
+
+func (s *Store) Mint(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
+	return s.MintContext(context.Background(), g, ttl, now)
+}
+func (s *Store) RevokeForTenant(tenant, id string) (Grant, bool, error) {
+	return s.RevokeForTenantContext(context.Background(), tenant, id)
+}
+func (s *Store) RemoveTenantChecked(tenant string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenant)
+}
+
+func (s *Store) List(tenant string) []Grant { rows, _ := s.ListChecked(tenant); return rows }
+func (s *Store) ListAll() []Grant           { rows, _ := s.ListAllChecked(); return rows }

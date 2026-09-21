@@ -1,6 +1,7 @@
 package grantstore
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"strings"
@@ -43,7 +44,7 @@ func sameAuthorization(a, b Grant) bool {
 // error. New active grants are adopted only after a successful save. An unchanged
 // replay retries unsaved denials; a clean replay neither writes nor advances generation.
 // Counts describe live additions/denials, which can be partial when saving fails.
-func (s *Store) MergeChecked(incoming []Grant, now time.Time) (added, updated int, err error) {
+func (s *Store) mergeLocal(incoming []Grant, now time.Time) (added, updated int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	proposals := make(map[string]Grant, len(incoming))
@@ -125,4 +126,8 @@ func (s *Store) MergeChecked(incoming []Grant, now time.Time) (added, updated in
 		}
 	}
 	return added, updated, nil
+}
+
+func (s *Store) MergeChecked(incoming []Grant, now time.Time) (int, int, error) {
+	return s.MergeCheckedContext(context.Background(), incoming, now)
 }

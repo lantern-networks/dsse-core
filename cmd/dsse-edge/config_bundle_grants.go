@@ -31,7 +31,8 @@ func grantBundleSection(store *grantstore.Store) *grantBundle {
 	if store == nil {
 		return nil
 	}
-	return &grantBundle{Grants: store.ListAll(), Complete: true}
+	rows, err := store.ListAllChecked()
+	return &grantBundle{Grants: rows, Complete: err == nil}
 }
 
 // applyGrantBundleSection validates and persists the authority's set. A failure

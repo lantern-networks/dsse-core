@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,10 +20,12 @@ import (
 // means "keep that stream forever" (never prune). A stream with no override falls back to the flag default.
 
 type retentionOverrideStore struct {
-	mu        sync.RWMutex
-	days      map[string]int // stream -> retention days (0 = keep forever)
-	loadErr   error
-	persister blobstore.Persister
+	writeMu     sync.Mutex
+	sharedKnown bool
+	mu          sync.RWMutex
+	days        map[string]int // stream -> retention days (0 = keep forever)
+	loadErr     error
+	persister   blobstore.Persister
 }
 
 func newRetentionOverrideStore(p blobstore.Persister) *retentionOverrideStore {
@@ -39,6 +42,7 @@ func newRetentionOverrideStore(p blobstore.Persister) *retentionOverrideStore {
 	if len(data) == 0 {
 		return s
 	}
+	s.sharedKnown = true
 	loaded, err := decodeRetentionOverrides(data)
 	if err != nil {
 		s.loadErr = fmt.Errorf("retention settings could not be loaded")
@@ -94,6 +98,9 @@ func (s *retentionOverrideStore) Health() error {
 	if s == nil {
 		return nil
 	}
+	if err := s.refreshShared(); err != nil {
+		return err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.loadErr
@@ -103,6 +110,9 @@ func (s *retentionOverrideStore) Health() error {
 func (s *retentionOverrideStore) Get(stream string) (int, bool) {
 	if s == nil {
 		return 0, false
+	}
+	if err := s.refreshShared(); err != nil {
+		return 0, true
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -114,7 +124,7 @@ func (s *retentionOverrideStore) Get(stream string) (int, bool) {
 }
 
 // Set records (or clears, when days < 0) a per-stream retention override and persists it.
-func (s *retentionOverrideStore) Set(stream string, days int) error {
+func (s *retentionOverrideStore) setLocal(stream string, days int) error {
 	if s == nil || stream == "" {
 		return fmt.Errorf("retention store or stream is unavailable")
 	}
@@ -167,4 +177,8 @@ func (s *retentionOverrideStore) persistLocked() error {
 		return err
 	}
 	return s.persister.Save(data)
+}
+
+func (s *retentionOverrideStore) Set(stream string, days int) error {
+	return s.SetContext(context.Background(), stream, days)
 }

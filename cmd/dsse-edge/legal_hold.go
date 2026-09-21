@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -26,10 +27,12 @@ type legalHoldRecord struct {
 }
 
 type legalHoldStore struct {
-	mu        sync.RWMutex
-	held      map[string]legalHoldRecord // tenant_id -> record
-	persister blobstore.Persister
-	loadErr   error
+	writeMu     sync.Mutex
+	sharedKnown bool
+	mu          sync.RWMutex
+	held        map[string]legalHoldRecord // tenant_id -> record
+	persister   blobstore.Persister
+	loadErr     error
 }
 
 func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
@@ -46,6 +49,7 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 	if len(data) == 0 {
 		return s
 	}
+	s.sharedKnown = true
 	var records []legalHoldRecord
 	if err := json.Unmarshal(data, &records); err != nil {
 		s.loadErr = err
@@ -80,6 +84,9 @@ func (s *legalHoldStore) IsHeld(tenantID string) bool {
 	if s == nil {
 		return false
 	}
+	if err := s.refreshShared(); err != nil {
+		return true
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.loadErr != nil {
@@ -90,7 +97,7 @@ func (s *legalHoldStore) IsHeld(tenantID string) bool {
 }
 
 // Set places or releases a legal hold on a tenant and persists the change.
-func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) error {
+func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, now time.Time) error {
 	if s == nil || tenantID == "" {
 		return fmt.Errorf("legal hold store or tenant is unavailable")
 	}
@@ -162,10 +169,17 @@ func (s *legalHoldStore) Health() error {
 	if s == nil {
 		return nil
 	}
+	if err := s.refreshShared(); err != nil {
+		return err
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.loadErr != nil {
 		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
 	}
 	return nil
+}
+
+func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) error {
+	return s.SetContext(context.Background(), tenantID, heldBy, reason, active, now)
 }

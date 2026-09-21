@@ -115,6 +115,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(retentionWriteContext(r.Context()))
 		if err := legalHold.Health(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
@@ -132,7 +133,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusForbidden, fmt.Errorf("tenant scope is required"))
 			return
 		}
-		if err := legalHold.Set(tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
+		if err := legalHold.SetContext(r.Context(), tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
 			logErrorf("legal hold update failed: %v", err)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
 			return
@@ -161,6 +162,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(retentionWriteContext(r.Context()))
 		var req struct {
 			Stream string `json:"stream"`
 			Days   *int   `json:"days"`
@@ -205,7 +207,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are out of range"))
 			return
 		}
-		if err := retentionOverride.Set(strings.TrimSpace(req.Stream), days); err != nil {
+		if err := retentionOverride.SetContext(r.Context(), strings.TrimSpace(req.Stream), days); err != nil {
 			logErrorf("retention override update failed: %v", err)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("retention settings could not be saved"))
 			return

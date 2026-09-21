@@ -37,6 +37,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation store unavailable"))
 			return
 		}
+		if err := config.EastWestObserveStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation inventory unavailable"))
+			return
+		}
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return
 		}

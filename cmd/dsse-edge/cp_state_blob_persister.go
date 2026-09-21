@@ -94,7 +94,13 @@ func (p postgresBlobPersister) Update(edit func([]byte) ([]byte, error)) error {
 func (p postgresBlobPersister) UpdateContext(ctx context.Context, edit func([]byte) ([]byte, error)) error {
 	return p.updateContext(ctx, edit, true)
 }
-func (p postgresBlobPersister) updateContext(parent context.Context, edit func([]byte) ([]byte, error), absentAsNil bool) error {
+func (p postgresBlobPersister) updateContext(parent context.Context, edit func([]byte) ([]byte, error), absentAsNil bool) (err error) {
+	commitAttempted := false
+	defer func() {
+		if err != nil && !commitAttempted {
+			err = fmt.Errorf("%w: %w", blobstore.ErrWriteNotCommitted, err)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
 	tx, finish, err := beginCPWriteTransaction(ctx, p.db)
@@ -123,6 +129,7 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	if _, err := tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
 		return err
 	}
+	commitAttempted = true
 	return tx.Commit()
 }
 

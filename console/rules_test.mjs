@@ -59,3 +59,23 @@ test('cert-pin summary only represents unmodified unrestricted allow/bypass rule
   {...r,id:'ordinary-rule'}, {...r,plane:'eastwest'},
  ]) assert.equal(context.isCertPinSummaryRule(changed),false,JSON.stringify(changed));
 });
+
+function observationAdoptionFixture(reply) {
+  const writes=[],editors=[],errors=[];
+  const ctx=vm.createContext({bl:b=>b.en,SUBJECT_ANY:'*',uiToast:(...a)=>errors.push(a),
+    apiFetch:async(method,path,body)=>{if(method==='GET')return reply;writes.push({path,body});return{ok:true,body:{id:'endpoint'}};},
+    loadList:async()=>[],uiPrompt:async()=> 'host',openRuleEditor:(...a)=>editors.push(a)});
+  vm.runInContext(readFileSync(new URL('./eastwestadvanced.js',import.meta.url),'utf8'),ctx);
+  return{ctx,writes,editors,errors};
+}
+test('observation adoption refuses unavailable or removed inventory before any write',async()=>{
+  for(const reply of [{ok:false,status:503},{ok:true,body:{observations:[]}}]){
+    const f=observationAdoptionFixture(reply);await f.ctx.adoptFlowIntoRule({observation_id:'flow',destination:'stale',port:22},{});
+    assert.equal(f.writes.length,0);assert.equal(f.editors.length,0);assert.equal(f.errors.length,1);
+  }
+});
+test('observation adoption uses the refreshed flow before endpoint creation',async()=>{
+  const f=observationAdoptionFixture({ok:true,body:{observations:[{observation_id:'flow',destination:'fresh',port:445,service_family:'smb'}]}});
+  await f.ctx.adoptFlowIntoRule({observation_id:'flow',destination:'stale',port:22},{});
+  assert.equal(f.writes[0].body.address,'fresh');assert.match(f.editors[0][3].name,/fresh:445/);
+});

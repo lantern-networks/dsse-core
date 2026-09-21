@@ -69,11 +69,14 @@ async function adoptFlowIntoRule(o, section) {
   try {
     // 0) Duplicate guard: re-check coverage NOW (the Adopt button may be stale if another flow to the same
     //    destination+service was just adopted). If a rule already covers this flow, don't create a second — refresh.
-    try {
-      const cur = await apiFetch("GET", "/admin/east-west/observations");
-      const fresh = cur && cur.ok && cur.body && (cur.body.observations || []).find((x) => x.observation_id === o.observation_id);
-      if (fresh && fresh.covered) { uiToast(bl({ en: "A rule already covers this flow.", ja: "このフローはすでにルールでカバーされています。" }), "info"); ewObservations(section); return; }
-    } catch (e) { /* non-fatal — proceed */ }
+    const cur = await apiFetch("GET", "/admin/east-west/observations");
+    if (!cur || !cur.ok || !cur.body || !Array.isArray(cur.body.observations)) {
+      throw new Error(bl({ en: "Observation inventory is unavailable. Reload before adopting.", ja: "観測一覧を確認できません。再読込してから採用してください。" }));
+    }
+    const fresh = cur.body.observations.find((x) => x.observation_id === o.observation_id);
+    if (!fresh) throw new Error(bl({ en: "This observation is no longer available. Reload the inventory.", ja: "この観測は現在の一覧にありません。一覧を再読込してください。" }));
+    if (fresh.covered) { uiToast(bl({ en: "A rule already covers this flow.", ja: "このフローはすでにルールでカバーされています。" }), "info"); ewObservations(section); return; }
+    o = fresh;
 
     // 1) Resolve the service by the observed port (unambiguous: 22→SSH, 445→SMB, 3389→RDP, 5985→WinRM-HTTP),
     //    falling back to the built-in-svc-<family> convention, else no service constraint.

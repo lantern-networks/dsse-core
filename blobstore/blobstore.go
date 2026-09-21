@@ -17,6 +17,11 @@ import (
 	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
+// ErrWriteNotCommitted marks a transactional failure before COMMIT was attempted.
+// Additive callers may retry these errors; an unclassified failure after preparing
+// an update must not be assumed rolled back (the COMMIT response may be lost).
+var ErrWriteNotCommitted = errors.New("transaction did not attempt commit")
+
 // Persister loads and saves one store's opaque snapshot blob. Load returns (nil, nil) when no snapshot exists yet
 // (first boot). Implementations must be safe for the store's single-writer-under-lock call pattern.
 type Persister interface {

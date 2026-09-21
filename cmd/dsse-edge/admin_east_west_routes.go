@@ -38,6 +38,10 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		tenant := adminTenantIDFromRequest(r)
 		var obs []eastwestobserve.FlowObservation
 		if eastWestObserveStore != nil {
+			if err := eastWestObserveStore.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation inventory unavailable"))
+				return
+			}
 			obs = eastWestObserveStore.List(tenant)
 		}
 		var rules []decision.EastWestRule

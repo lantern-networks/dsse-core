@@ -120,7 +120,11 @@ func (s *Store) editLocked(ctx context.Context, edit func(map[string]model.Human
 	if s.persister != nil {
 		s.authorityKnown = true
 	}
-	s.pendingRevocations = nil
+	for key := range s.pendingRevocations {
+		if event, ok := next[key]; ok && event.ApprovalResult == "revoked" {
+			delete(s.pendingRevocations, key)
+		}
+	}
 	return nil
 }
 

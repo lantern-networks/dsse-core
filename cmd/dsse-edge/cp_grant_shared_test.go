@@ -92,7 +92,10 @@ func TestPostgresGrantPeerTermReportReadAndAudit(t *testing.T) {
 		}
 	}
 	gate.before = rotate
-	call("POST", "/admin/grants/own/revoke", 503)
+	call("POST", "/admin/grants/own/revoke", 500)
+	if a.Valid("own", now) {
+		t.Fatal("pre-callback refusal lost local denial")
+	}
 	if !b.Valid("own", now) {
 		t.Fatal("old revoke applied")
 	}
@@ -143,8 +146,11 @@ func TestPostgresGrantPeerTermReportReadAndAudit(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	good, bad := 0, 0
+	good, bad, partial := 0, 0, 0
 	for _, r := range audits {
+		if r["event_type"] == "admin_access_grant_revoked" && r["result"] == "partial" {
+			partial++
+		}
 		if r["event_type"] == "admin_config_change" {
 			if r["result"] == "success" {
 				good++
@@ -153,7 +159,7 @@ func TestPostgresGrantPeerTermReportReadAndAudit(t *testing.T) {
 			}
 		}
 	}
-	if good != 1 || bad != 2 {
-		t.Fatalf("audit successes %d errors %d", good, bad)
+	if good != 1 || bad != 2 || partial != 1 {
+		t.Fatalf("audit successes %d errors %d partial %d", good, bad, partial)
 	}
 }

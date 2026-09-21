@@ -108,6 +108,9 @@ func (s *Store) UpsertContext(ctx context.Context, event model.HumanApprovalEven
 	defer s.mu.Unlock()
 	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
 		key := approvalKey(event.TenantID, event.ID)
+		if _, pending := s.pendingRevocations[key]; pending && event.ApprovalResult != "revoked" {
+			return fmt.Errorf("human approval revocation persistence is pending")
+		}
 		old, ok := next[key]
 		if ok {
 			if err := validateTransition(old, event); err != nil {
@@ -360,6 +363,11 @@ func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, er
 	})
 	if err != nil {
 		return 0, err
+	}
+	for key := range s.pendingRevocations {
+		if strings.HasPrefix(key, tenant+"\x00") {
+			delete(s.pendingRevocations, key)
+		}
 	}
 	return n, nil
 }

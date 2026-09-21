@@ -279,7 +279,16 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		writeError(w, http.StatusGone, fmt.Errorf("the Admin Console is a separate application; call the admin API (/admin/*) directly over TLS"))
 	})
 	mux.HandleFunc("GET /admin/export-downloads/{download_token}", func(w http.ResponseWriter, r *http.Request) {
-		token, ok := adminDownloadTokens.Consume(r.PathValue("download_token"), time.Now())
+		r = r.WithContext(retentionWriteContext(r.Context()))
+		token, ok, err := adminDownloadTokens.ConsumeContext(r.Context(), r.PathValue("download_token"), time.Now())
+		if err != nil {
+			if token.TenantID != "" {
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDownloadAuditLog("admin_export_download_failed", token, evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())
+			}
+			log.Printf("export download refused: token spend was not confirmed")
+			writeError(w, http.StatusServiceUnavailable, errDownloadStoreUnavailable)
+			return
+		}
 		if !ok {
 			// ★★ AND IN A FLEET THIS IS USUALLY NOT AN EXPIRY (2026-08-20, measured on four Edges). The token
 			// store is a map in one process and the generated file is on that node's own disk, so a link minted

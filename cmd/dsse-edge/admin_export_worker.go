@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -768,11 +767,12 @@ type adminDownloadTokenStore struct {
 	mu        sync.RWMutex
 	tokens    map[string]adminDownloadToken
 	persister blobstore.Persister
+	known     bool
+	loadErr   error
 }
 
-// SetPersister shares the outstanding download tokens (and the bytes they stand for) with the rest of the
-// fleet, and loads any that are still live. Without one the store behaves exactly as it did: one process,
-// its own disk.
+// SetPersister replaces the cache only after a checked load. Shared writes always
+// use the latest locked row, so a startup snapshot is never a write authority.
 func (s *adminDownloadTokenStore) SetPersister(p blobstore.Persister) error {
 	if s == nil || p == nil {
 		return nil
@@ -780,84 +780,18 @@ func (s *adminDownloadTokenStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.persister = p
-	data, err := p.Load()
-	if err != nil || len(data) == 0 {
-		return err
-	}
-	var loaded map[string]adminDownloadToken
-	if err := json.Unmarshal(data, &loaded); err != nil {
-		return err
-	}
-	for k, v := range loaded {
-		s.tokens[k] = v
-	}
-	return nil
-}
-
-// refreshFromFleetLocked merges what the fleet has minted, and what it has SPENT, since this node last looked.
-//
-// ★★★ ADDING ONLY WAS NOT ENOUGH, AND IT BROKE THE ONE-TIME PROPERTY (2026-08-21, caught by the second half
-// of the live test). A link minted on region-a and spent on region-b was still "active" in region-a's own
-// memory, so region-a served the same one-time download a second time — 200 twice, measured. The merge is
-// monotonic instead: a token the fleet records as spent or expired is adopted here, and a fleet snapshot
-// that still says "active" never undoes a spend this node has already made. Active → used, one direction
-// only, so two Edges converge and neither resurrects a link.
-func (s *adminDownloadTokenStore) refreshFromFleetLocked() {
-	if s.persister == nil {
-		return
-	}
-	data, err := s.persister.Load()
-	if err != nil || len(data) == 0 {
-		return
-	}
-	var fleet map[string]adminDownloadToken
-	if json.Unmarshal(data, &fleet) != nil {
-		return
-	}
-	for k, v := range fleet {
-		mine, known := s.tokens[k]
-		switch {
-		case !known:
-			s.tokens[k] = v
-		case mine.Status == "active" && v.Status != "active":
-			v.Payload = nil // it has been handed over once already
-			s.tokens[k] = v
-		}
-	}
-}
-
-// persistLocked writes the live tokens, dropping the spent and the expired. Called with the lock held.
-//
-// A failure is reported to the operator's log and NOT to the caller: a download link that was minted and
-// could not be shared still works on this node, and refusing to issue it would turn a fleet-wide
-// inconvenience into a local outage.
-func (s *adminDownloadTokenStore) persistLocked(now time.Time) {
-	if s.persister == nil {
-		return
-	}
-	// ★ A SPENT TOKEN IS KEPT UNTIL IT EXPIRES, BECAUSE IT IS THE EVIDENCE OF THE SPEND (2026-08-21). The
-	// first version dropped everything not active, so the moment one Edge consumed a link the record vanished
-	// from the shared store — and the Edge that minted it, still holding its own "active" copy, served the
-	// same one-time download again. The tombstone carries no payload and lasts exactly as long as the link
-	// would have.
-	live := map[string]adminDownloadToken{}
-	for k, v := range s.tokens {
-		if at, err := time.Parse(time.RFC3339, v.ExpiresAt); err == nil && !now.UTC().Before(at) {
-			continue // past its expiry: neither usable nor evidence of anything
-		}
-		if v.Status != "active" {
-			v.Payload = nil
-		}
-		live[k] = v
-	}
-	blob, err := json.Marshal(live)
+	raw, err := p.Load()
+	var next map[string]adminDownloadToken
 	if err == nil {
-		err = s.persister.Save(blob)
+		next, err = decodeDownloadTokens(raw, s.known)
 	}
 	if err != nil {
-		log.Printf("export download tokens: could not share them with the fleet (%v) — links minted here still "+
-			"work here, and will 404 on the other Edges", err)
+		s.loadErr = errDownloadStoreUnavailable
+		return s.loadErr
 	}
+	s.tokens, s.loadErr = next, nil
+	s.known = s.known || len(raw) > 0
+	return nil
 }
 
 type adminExportJobRequest struct {
@@ -1150,6 +1084,9 @@ func (s *adminExportJobStore) MarkCancelled(id, tenantID, cancelledBy, reason st
 }
 
 func (s *adminDownloadTokenStore) Create(job adminExportJob, localFilename, issuedBy string, payload []byte, now time.Time) (adminDownloadToken, error) {
+	return s.CreateContext(context.Background(), job, localFilename, issuedBy, payload, now)
+}
+func (s *adminDownloadTokenStore) CreateContext(ctx context.Context, job adminExportJob, localFilename, issuedBy string, payload []byte, now time.Time) (adminDownloadToken, error) {
 	if s == nil {
 		return adminDownloadToken{}, fmt.Errorf("download token store is not configured")
 	}
@@ -1176,43 +1113,57 @@ func (s *adminDownloadTokenStore) Create(job adminExportJob, localFilename, issu
 		Status:                   "active",
 		Payload:                  payload,
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tokens[token.Token] = token
-	s.persistLocked(now)
+	err = s.updateTokens(ctx, now, func(tokens map[string]adminDownloadToken) error {
+		tokens[token.Token] = token
+		return nil
+	})
+	if err != nil {
+		return adminDownloadToken{}, err
+	}
 	return token, nil
 }
 
 func (s *adminDownloadTokenStore) Consume(tokenValue string, now time.Time) (adminDownloadToken, bool) {
-	if s == nil {
-		return adminDownloadToken{}, false
+	token, ok, _ := s.ConsumeContext(context.Background(), tokenValue, now)
+	return token, ok
+}
+
+// On failure only non-secret audit metadata may be returned; bytes and the
+// bearer credential are released only after the shared spend has committed.
+func (s *adminDownloadTokenStore) ConsumeContext(ctx context.Context, tokenValue string, now time.Time) (adminDownloadToken, bool, error) {
+	var token adminDownloadToken
+	ok := false
+	err := s.updateTokens(ctx, now, func(tokens map[string]adminDownloadToken) error {
+		candidate, found := tokens[strings.TrimSpace(tokenValue)]
+		if !found || candidate.Status != "active" {
+			return errDownloadTokenAbsent
+		}
+		expiresAt, err := time.Parse(time.RFC3339, candidate.ExpiresAt)
+		if err != nil || !now.UTC().Before(expiresAt) {
+			return errDownloadTokenAbsent
+		}
+		token = candidate
+		candidate.Status, candidate.Payload = "used", nil
+		tokens[candidate.Token] = candidate
+		ok = true
+		return nil
+	})
+	if err != nil {
+		// A refusal before the transaction callback may still be attributable
+		// to a token this process previously issued/loaded. This cache is used
+		// only for audit metadata, never to authorize delivery.
+		if token.TenantID == "" && s != nil {
+			s.mu.RLock()
+			token = s.tokens[strings.TrimSpace(tokenValue)]
+			s.mu.RUnlock()
+		}
+		token.Token, token.Payload, token.LocalFilename = "", nil, ""
+		if errors.Is(err, errDownloadTokenAbsent) {
+			return adminDownloadToken{}, false, nil
+		}
+		return token, false, err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// ★★ READ WHAT THE FLEET HAS MINTED, BEFORE DECIDING (2026-08-21). Loading the shared store once at
-	// start-up is not enough: a link minted on another Edge a minute ago did not exist when this node booted,
-	// so region-b answered 404 to a token region-a had just issued — the shared store was there and this node
-	// had simply never looked again. Same shape as the transport trust store the same night. One blob read per
-	// download attempt, which happens when a person clicks a link.
-	s.refreshFromFleetLocked()
-	token, ok := s.tokens[strings.TrimSpace(tokenValue)]
-	if !ok || token.Status != "active" {
-		return adminDownloadToken{}, false
-	}
-	expiresAt, err := time.Parse(time.RFC3339, token.ExpiresAt)
-	if err != nil || !now.UTC().Before(expiresAt) {
-		token.Status = "expired"
-		s.tokens[token.Token] = token
-		return adminDownloadToken{}, false
-	}
-	spent := token
-	spent.Status = "used"
-	spent.Payload = nil // one use; the bytes have been handed over
-	s.tokens[token.Token] = spent
-	// ★ The spend is shared BEFORE the bytes are served, so a second Edge cannot honour the same one-time
-	// link. Same rule as the enrolment tokens: one use, decided once for the whole fleet.
-	s.persistLocked(now)
-	return token, true
+	return token, ok, nil
 }
 
 func createAndCompleteAdminExportJob(ctx context.Context, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, objectStore adminExportObjectStore, hotStore hotstore.Store, store adminExportJobProducerStore, evaluator decision.Evaluator, req adminExportJobRequest, tenantID, adminPrincipalID, sourceIP string, now time.Time) (adminExportJob, error) {
@@ -1507,7 +1458,7 @@ func createAdminExportDownloadURL(r *http.Request, store *adminDownloadTokenStor
 				"work on this node", localFilename, rerr)
 		}
 	}
-	token, err := store.Create(job, localFilename, issuedBy, payload, now)
+	token, err := store.CreateContext(r.Context(), job, localFilename, issuedBy, payload, now)
 	if err != nil {
 		return adminDownloadURLResponse{}, adminDownloadToken{}, err
 	}
@@ -1731,6 +1682,7 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		writeJSON(w, http.StatusOK, cancelled)
 	}))
 	mux.HandleFunc("POST /admin/export-jobs/{job_id}/download-url", adminEndpoint("admin.export.read", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(retentionWriteContext(r.Context()))
 		job, ok, err := adminExportJobGetForTenant(adminExportJobs, adminTenantIDFromRequest(r), r.PathValue("job_id"))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -1742,6 +1694,10 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		}
 		response, token, err := createAdminExportDownloadURL(r, adminDownloadTokens, exportObjectStore, job, adminPrincipalIDFromRequest(r), time.Now())
 		if err != nil {
+			if errors.Is(err, errDownloadStoreUnavailable) {
+				writeError(w, http.StatusServiceUnavailable, errDownloadStoreUnavailable)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

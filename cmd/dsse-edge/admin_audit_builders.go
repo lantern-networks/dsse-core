@@ -60,9 +60,13 @@ func adminDownloadAuditLog(eventType string, token adminDownloadToken, evaluator
 	reason := "Export download URL lifecycle event."
 	actorUserID := stringPtr(token.IssuedByAdminPrincipalID)
 	downloadActorKnown := true
-	if eventType == "admin_export_downloaded" {
+	if eventType == "admin_export_downloaded" || eventType == "admin_export_download_failed" {
 		actorUserID = stringPtr("anonymous_token_bearer")
 		downloadActorKnown = false
+	}
+	if eventType == "admin_export_download_failed" {
+		result = "failure"
+		reason = "Download token spend was not confirmed; no bytes released."
 	}
 	return model.AuditLog{
 		ID:            randomEdgeID("audit_"+eventType+"_", time.Now().UTC()),

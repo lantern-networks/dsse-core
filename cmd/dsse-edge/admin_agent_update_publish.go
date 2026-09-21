@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -85,7 +86,8 @@ type publishedAgentUpdateStore struct {
 	// Third instance of one shape in a day — the transport, device-identity and interception authorities each
 	// had it — and the same answer: the set an operator publishes is the deployment's, so it lives where the
 	// deployment's state lives.
-	blob blobstore.Persister
+	blob        blobstore.Persister
+	sharedKnown bool
 	// envelopes is the ACTIVE set: releases whose bytes this control plane can already hand over.
 	envelopes map[string]agentpolicy.Envelope
 	// pending holds a published manifest whose artifact has NOT arrived yet.
@@ -384,6 +386,7 @@ func (s *publishedAgentUpdateStore) LoadFromPersister(blob blobstore.Persister, 
 	}
 	s.mu.Lock()
 	s.blob = blob
+	s.sharedKnown = len(raw) > 0
 	s.mu.Unlock()
 	if len(raw) == 0 {
 		return nil
@@ -481,6 +484,13 @@ func (s *publishedAgentUpdateStore) adopt(raw []byte, where string, defaultTenan
 // and go active immediately. Returns whether it went active.
 func (s *publishedAgentUpdateStore) Publish(tenantID string, env agentpolicy.Envelope, trustedKeys []string,
 	now time.Time, bytesReady func(agentupdate.Manifest) bool) (agentupdate.Manifest, bool, string, error) {
+	return s.PublishContext(context.Background(), tenantID, env, trustedKeys, now, bytesReady)
+}
+
+func (s *publishedAgentUpdateStore) PublishContext(ctx context.Context, tenantID string, env agentpolicy.Envelope, trustedKeys []string,
+	now time.Time, bytesReady func(agentupdate.Manifest) bool) (agentupdate.Manifest, bool, string, error) {
+	ctx = publicationWriteContext(ctx)
+
 	// ★ THE VERIFIED KEY IS RETURNED, NOT STASHED (2026-08-12, seventh review). It used to be written into a
 	// per-target map and read back after the mutation, so two concurrent publishes to one target could have
 	// manifest A audited under manifest B's key — including when B then failed to persist. A request-local
@@ -494,18 +504,18 @@ func (s *publishedAgentUpdateStore) Publish(tenantID string, env agentpolicy.Env
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	envelopes := copyEnvelopes(s.envelopes)
-	pending := copyEnvelopes(s.pending)
-	if active {
-		envelopes[key] = env
-		delete(pending, key)
-	} else {
-		pending[key] = env
+	err = s.updatePublicationLocked(ctx, func(candidate *publishedAgentUpdateStore) error {
+		if active {
+			candidate.envelopes[key] = env
+			delete(candidate.pending, key)
+		} else {
+			candidate.pending[key] = env
+		}
+		return nil
+	})
+	if err != nil {
+		return m, false, verifiedKey, fmt.Errorf("%w: %v", errPublicationStore, err)
 	}
-	if perr := s.persistLocked(envelopes, pending); perr != nil {
-		return agentupdate.Manifest{}, false, "", perr
-	}
-	s.envelopes, s.pending = envelopes, pending
 	return m, active, verifiedKey, nil
 }
 
@@ -522,30 +532,35 @@ func (s *publishedAgentUpdateStore) Publish(tenantID string, env agentpolicy.Env
 // every device would be offered a release that 404s. Comparing the signed payload digest makes the promotion
 // refer to the same document the verification did.
 func (s *publishedAgentUpdateStore) Activate(tenantID, platform, arch, expectPayloadSHA256 string) (bool, error) {
+	return s.ActivateContext(context.Background(), tenantID, platform, arch, expectPayloadSHA256)
+}
+func (s *publishedAgentUpdateStore) ActivateContext(ctx context.Context, tenantID, platform, arch, expectPayloadSHA256 string) (bool, error) {
+	ctx = publicationWriteContext(ctx)
+
 	if s == nil {
 		return false, nil
 	}
 	key := tenantTargetKey(tenantID, platform, arch)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	env, ok := s.pending[key]
-	if !ok {
-		return false, nil
+	activated := false
+	err := s.updatePublicationLocked(ctx, func(candidate *publishedAgentUpdateStore) error {
+		env, ok := candidate.pending[key]
+		if !ok {
+			return nil
+		}
+		if want := strings.TrimSpace(expectPayloadSHA256); want != "" && !strings.EqualFold(env.PayloadSHA256, want) {
+			return fmt.Errorf("pending release changed while uploading: refusing activation")
+		}
+		candidate.envelopes[key] = env
+		delete(candidate.pending, key)
+		activated = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	if want := strings.TrimSpace(expectPayloadSHA256); want != "" && !strings.EqualFold(env.PayloadSHA256, want) {
-		return false, fmt.Errorf("the release waiting for bytes changed while these were being uploaded (pending "+
-			"manifest %s, these bytes were verified against %s): refusing to activate a release whose artifact "+
-			"is not the one just stored", env.PayloadSHA256, want)
-	}
-	envelopes := copyEnvelopes(s.envelopes)
-	pending := copyEnvelopes(s.pending)
-	envelopes[key] = env
-	delete(pending, key)
-	if perr := s.persistLocked(envelopes, pending); perr != nil {
-		return false, perr
-	}
-	s.envelopes, s.pending = envelopes, pending
-	return true, nil
+	return activated, nil
 }
 
 // PendingFor is the manifest a target is WAITING to activate, if any. The artifact upload checks its bytes
@@ -689,6 +704,11 @@ func (s *publishedAgentUpdateStore) RemoveTenantChecked(tenantID string) (int, e
 // Report byte cleanup independently of manifest counts, including empty-manifest retries.
 // States describe this call's confirmed absence, not the number of artifacts deleted.
 func (s *publishedAgentUpdateStore) removeTenantWithCleanup(tenantID string) (int, map[string]string, error) {
+	return s.removeTenantWithCleanupContext(context.Background(), tenantID)
+}
+func (s *publishedAgentUpdateStore) removeTenantWithCleanupContext(ctx context.Context, tenantID string) (int, map[string]string, error) {
+	ctx = publicationWriteContext(ctx)
+
 	if s == nil {
 		return 0, nil, nil
 	}
@@ -705,30 +725,20 @@ func (s *publishedAgentUpdateStore) removeTenantWithCleanup(tenantID string) (in
 	if s.shelf != nil && s.shelf.forget != nil {
 		cleanup["shared"] = "not_attempted"
 	}
-	envelopes := map[string]agentpolicy.Envelope{}
-	pending := map[string]agentpolicy.Envelope{}
 	removed := 0
-	for k, v := range s.envelopes {
-		if strings.HasPrefix(k, prefix) {
-			removed++
-			continue
+	if err := s.updatePublicationLocked(ctx, func(candidate *publishedAgentUpdateStore) error {
+		for _, values := range []map[string]agentpolicy.Envelope{candidate.envelopes, candidate.pending} {
+			for k := range values {
+				if strings.HasPrefix(k, prefix) {
+					delete(values, k)
+					removed++
+				}
+			}
 		}
-		envelopes[k] = v
-	}
-	for k, v := range s.pending {
-		if strings.HasPrefix(k, prefix) {
-			removed++
-			continue
-		}
-		pending[k] = v
-	}
-	// An empty manifest shelf can still have artifact cleanup left to retry.
-	if removed > 0 {
-		if err := s.persistLocked(envelopes, pending); err != nil {
-			cleanup["manifests"] = "unconfirmed"
-			return 0, cleanup, err
-		}
-		s.envelopes, s.pending = envelopes, pending
+		return nil
+	}); err != nil {
+		cleanup["manifests"] = "unconfirmed"
+		return 0, cleanup, err
 	}
 
 	cleanup["manifests"] = "absence_confirmed"
@@ -915,6 +925,7 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 	store *publishedAgentUpdateStore, trustedKeys []string, dir string, isEnforcingEdge bool, writer *logs.Writer,
 	evaluator decision.Evaluator, deviceFacing *publishedUpdates) {
 	mux.HandleFunc("PUT /admin/agent-update-artifact", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(publicationWriteContext(r.Context()))
 		tenantID := agentUpdatePublishScope(r)
 		if !agentUpdateReadContextMatches(w, r, tenantID) {
 			return
@@ -935,9 +946,14 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		// ★ PENDING FIRST. A release published a moment ago is waiting for exactly these bytes; the active
 		// entry is the PREVIOUS release, whose artifact is already here. Checking the bytes against the active
 		// manifest would reject the upload that is supposed to activate the new one.
-		env, ok := store.PendingFor(tenantID)[updateTargetKey(platform, arch)]
+		active, pending, err := store.PublicationFor(r.Context(), tenantID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		env, ok := pending[updateTargetKey(platform, arch)]
 		if !ok {
-			env, ok = store.ForTenant(tenantID)[updateTargetKey(platform, arch)]
+			env, ok = active[updateTargetKey(platform, arch)]
 		}
 		if !ok {
 			// ★ MANIFEST FIRST, DELIBERATELY. The manifest is what says which bytes are authorised; accepting
@@ -1013,7 +1029,12 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		// window that matters — an upload finishing against a manifest that is no longer the pending one — and
 		// the alternative, storing by digest, changes the device-facing path for a case that needs an operator
 		// racing themselves.
-		if current, still := store.PendingFor(tenantID)[updateTargetKey(platform, arch)]; still &&
+		_, pending, readErr := store.PublicationFor(r.Context(), tenantID)
+		if readErr != nil {
+			writeError(w, http.StatusServiceUnavailable, readErr)
+			return
+		}
+		if current, still := pending[updateTargetKey(platform, arch)]; still &&
 			!strings.EqualFold(current.PayloadSHA256, env.PayloadSHA256) {
 			writeError(w, http.StatusConflict, fmt.Errorf("the release waiting for bytes changed while these were "+
 				"being uploaded (pending manifest %s, these bytes were verified against %s): they were NOT stored, "+
@@ -1056,8 +1077,21 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		// ★ THE BYTES ARE WHAT ACTIVATE THE RELEASE. Until this line the manifest was published but held
 		// pending, and the fleet was still being offered whatever could actually be served. Persisted before it
 		// takes effect, like every other write here.
-		activated, aerr := store.Activate(tenantID, m.Platform, m.Arch, env.PayloadSHA256)
+		activated, aerr := store.ActivateContext(r.Context(), tenantID, m.Platform, m.Arch, env.PayloadSHA256)
 		if aerr != nil {
+			failed := agentUpdatePublishAuditLog(tenantID, m, env, evaluator, sourceIPFromRequest(r), actorOf(r), verifiedKey)
+			failed.EventType = "agent_update_activate_failed"
+			result := "error"
+			failed.Result = &result
+			action := "agent_update_activate"
+			failed.Action = &action
+			reason := aerr.Error()
+			failed.Reason = &reason
+			failed.Metadata["reason"] = aerr.Error()
+			if err := writer.Append("audit.log.jsonl", failed); err != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("activation refused and failure audit unavailable: %w", err))
+				return
+			}
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("the bytes are stored but the release could "+
 				"NOT be activated (%w): it stays pending rather than being offered from a state a restart would "+
 				"forget", aerr))
@@ -1123,7 +1157,12 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		}
 		platform := strings.TrimSpace(r.URL.Query().Get("platform"))
 		arch := strings.TrimSpace(r.URL.Query().Get("arch"))
-		env, ok := store.ForTenant(tenantID)[updateTargetKey(platform, arch)]
+		active, _, err := store.PublicationFor(r.Context(), tenantID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		env, ok := active[updateTargetKey(platform, arch)]
 		if !ok {
 			http.Error(w, "nothing is published for that target", http.StatusNotFound)
 			return
@@ -1174,11 +1213,16 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 		if !agentUpdateReadContextMatches(w, r, tenantID) {
 			return
 		}
+		active, pending, err := store.PublicationFor(r.Context(), tenantID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_agent_updates.v1",
 			"tenant_id":      tenantID,
-			"envelopes":      store.ForTenant(tenantID),
-			"pending":        store.PendingFor(tenantID),
+			"envelopes":      active,
+			"pending":        pending,
 		})
 	}))
 	// ★ ONE PUBLISH PATH, TWO DOORS INTO IT (2026-08-13). PUT takes an envelope signed somewhere else; POST
@@ -1207,7 +1251,7 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		// bytesReady: a DSSE release is only ACTIVE once its artifact is here. Republishing a manifest whose
 		// bytes are already stored (a re-sign, a re-push of the same version) activates immediately.
-		m, active, verifiedKey, err := store.Publish(tenantID, env, trustedKeys, time.Now(), func(man agentupdate.Manifest) bool {
+		m, active, verifiedKey, err := store.PublishContext(r.Context(), tenantID, env, trustedKeys, time.Now(), func(man agentupdate.Manifest) bool {
 			p := store.artifactPathFor(artifactDir, tenantID, man.Platform, man.Arch, man.Version)
 			if p == "" {
 				return false
@@ -1217,7 +1261,22 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 		if err != nil {
 			// ★ The refusal is the point of verifying here: a wrongly signed or expired manifest fails on the
 			// machine where the release was made, not on every endpoint that stages it and then refuses.
-			writeError(w, http.StatusBadRequest, fmt.Errorf("this manifest will not be published: %w", err))
+			refused := agentUpdatePublishAuditLog(tenantID, m, env, evaluator, sourceIPFromRequest(r), actor, verifiedKey)
+			refused.EventType = "agent_update_publish_failed"
+			result := "error"
+			refused.Result = &result
+			reason := err.Error()
+			refused.Reason = &reason
+			refused.Metadata["reason"] = err.Error()
+			if auditErr := writer.Append("audit.log.jsonl", refused); auditErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("publication refused and failure audit unavailable: %w", auditErr))
+				return
+			}
+			status := http.StatusBadRequest
+			if errors.Is(err, errPublicationStore) {
+				status = http.StatusServiceUnavailable
+			}
+			writeError(w, status, fmt.Errorf("this manifest will not be published: %w", err))
 			return
 		}
 		log.Printf("agent_update_published_by_admin tenant=%s target=%s/%s version=%s delivery=%s digest=%s",
@@ -1279,6 +1338,7 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 	}
 
 	mux.HandleFunc("PUT /admin/agent-updates", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(publicationWriteContext(r.Context()))
 		tenantID := agentUpdatePublishScope(r)
 		if !agentUpdateReadContextMatches(w, r, tenantID) {
 			return
@@ -1314,6 +1374,7 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 	// start if the two key ids or public keys coincide, because one key signing both the release and the rollout
 	// plan means a compromised release key can also lift the freeze that would stop it.
 	mux.HandleFunc("POST /admin/agent-updates", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(publicationWriteContext(r.Context()))
 		tenantID := agentUpdatePublishScope(r)
 		if !agentUpdateReadContextMatches(w, r, tenantID) {
 			return

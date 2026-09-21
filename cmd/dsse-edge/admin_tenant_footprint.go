@@ -523,7 +523,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		eraseChecked("agent_rollout_plans", func(tenant string) (int, error) { return e.AgentRolloutPlans.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.PublishedAgentUpdates != nil {
-		n, cleanup, err := e.PublishedAgentUpdates.removeTenantWithCleanup(tenantID)
+		n, cleanup, err := e.PublishedAgentUpdates.removeTenantWithCleanupContext(ctx, tenantID)
 		result.ArtifactCleanup = cleanup
 		add("published_agent_releases", n)
 		if err != nil {

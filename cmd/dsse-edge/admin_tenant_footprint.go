@@ -474,7 +474,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.ConnectorRoutes != nil {
-		eraseChecked("connector_route_governance", e.ConnectorRoutes.RemoveTenantChecked)
+		eraseChecked("connector_route_governance", func(id string) (int, error) { return e.ConnectorRoutes.RemoveTenantContext(ctx, id) })
 	}
 	if e.CatalogOverrides != nil {
 		if n, err := e.CatalogOverrides.RemoveTenantContext(ctx, tenantID); err != nil {

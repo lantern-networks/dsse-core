@@ -8263,6 +8263,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// is a property of this node's conversation with the authority and of nothing else.
 	connectorLiveness := newConnectorLivenessCarrier()
 	mux.HandleFunc("POST /connectors/register", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		var req model.ConnectorRegistration
 		if err := decodeLimitedJSONBody(w, r, &req, maxConnectorRegistrationBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode connector registration: %w", err))
@@ -8302,7 +8303,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// Route governance: record the advertised routes. First sight grandfathers the current set; a route
 		// advertised LATER (a re-register with a new CIDR) is pending until an operator approves it.
 		if connectorRouteGov != nil {
-			connectorRouteGov.SeeRoutes(conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
+			if err := connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now()); err != nil {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
+				return
+			}
 		}
 		// A connector's routes ARE this tenant's declaration of what is internal, so the east-west plane
 		// boundary moves with them. Refreshed here rather than read at decision time: the decision path must
@@ -8322,6 +8326,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusCreated, publicConnectorRegistration(conn))
 	})
 	mux.HandleFunc("POST /connectors/{connector_id}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		if !authorizeConnectorRuntimeRequest(w, r, connectorSecret, registry, r.PathValue("connector_id"), evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -8361,7 +8366,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// timing + apply the fail-safe to any NEWLY seen CIDR — without a reconnect. Discovery only (routing is
 		// CP-configured). See docs/connector_network_route_advertisement_design.md.
 		if connectorRouteGov != nil && req.ReachableRoutes != nil {
-			connectorRouteGov.SeeRoutes(conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
+			if err := connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now()); err != nil {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
+				return
+			}
 		}
 		if req.ReachableRoutes != nil {
 			refreshEastWestInternalNetworks(r.Context(), policyStore, registry, conn.TenantID)

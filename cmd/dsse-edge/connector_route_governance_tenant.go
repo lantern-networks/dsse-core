@@ -1,6 +1,9 @@
 package main
 
-import "maps"
+import (
+	"context"
+	"maps"
+)
 
 // connector_route_governance_tenant.go — an organization's routes are its own, and an erasure has to say so.
 //
@@ -34,7 +37,7 @@ func (g *connectorRouteGovernance) RemoveTenant(tenantID string) int {
 	return n
 }
 
-func (g *connectorRouteGovernance) RemoveTenantChecked(tenantID string) (int, error) {
+func (g *connectorRouteGovernance) removeTenantLocal(tenantID string) (int, error) {
 	if g == nil {
 		return 0, nil
 	}
@@ -63,5 +66,30 @@ func (g *connectorRouteGovernance) RemoveTenantChecked(tenantID string) (int, er
 	}
 	g.held, g.approved, g.seen, g.authored = candidate.Held, candidate.Approved, candidate.Seen, candidate.Authored
 	delete(g.lastAdvertised, tenantID)
+	return n, nil
+}
+
+func (g *connectorRouteGovernance) RemoveTenantChecked(tenantID string) (int, error) {
+	return g.RemoveTenantContext(context.Background(), tenantID)
+}
+func (g *connectorRouteGovernance) RemoveTenantContext(ctx context.Context, tenantID string) (int, error) {
+	if g == nil {
+		return 0, nil
+	}
+	n := 0
+	err := g.mutateRoutes(ctx, func(c *connectorRouteGovernance) error {
+		var err error
+		n, err = c.removeTenantLocal(tenantID)
+		if n > 0 {
+			c.gen++
+		}
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	g.mu.Lock()
+	delete(g.lastAdvertised, tenantID)
+	g.mu.Unlock()
 	return n, nil
 }

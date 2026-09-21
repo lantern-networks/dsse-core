@@ -267,8 +267,8 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		durable := true
 		if err := persistTenantCARegistry(registry, registryPath); err != nil {
 			durable = false
-			// Not a failure of the registration — it is live — but it will not survive a restart, and that is
-			// exactly the state the per-tenant interception root is in and why it counts as broken.
+			// Trust and attribution are already live. Preserve that partial state so the same PEM can be
+			// retried, but do not report a completed registration before its save is confirmed.
 			logInfof("tenant_ca_registered_but_not_durable tenant=%s err=%v", tenantID, err)
 		}
 		now := time.Now()
@@ -279,7 +279,22 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		}
 		audit.Metadata["ca_sha256"] = fingerprints
 		audit.Metadata["durable"] = durable
+		if !durable {
+			result := "error"
+			audit.Result = &result
+			audit.Metadata["applied"] = true
+			audit.Metadata["persistence"] = "unconfirmed"
+			audit.Metadata["reason_codes"] = []string{"tenant_ca_registration_save_failed"}
+		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		if !durable {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status": "partial", "applied": true, "tenant_id": tenantID,
+				"ca_added": len(added), "trusted": true, "durable": false, "persistence": "unconfirmed",
+				"error": "The CA registration is active on this server, but persistence is unconfirmed. Restore storage and retry with the same CA certificate before restarting. Fleet propagation is not confirmed.",
+			})
+			return
+		}
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"tenant_id":  tenantID,
 			"ca_added":   len(added),

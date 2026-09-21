@@ -101,7 +101,7 @@ var tenantCAHarnessTenantStore adminTenantModelAdminStore
 
 // tenantCARoutesForTest builds a server whose tenant CA registry and device trust store are both real, with
 // two organizations already in the tenant registry.
-func tenantCARoutesForTest(t *testing.T) (http.Handler, *tenantca.TenantCARegistry, *transportTrustStore, string) {
+func tenantCARoutesForTest(t *testing.T, outboxes ...adminAuditOutboxDeadReader) (http.Handler, *tenantca.TenantCARegistry, *transportTrustStore, string) {
 	t.Helper()
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {
@@ -156,7 +156,12 @@ func tenantCARoutesForTest(t *testing.T) (http.Handler, *tenantca.TenantCARegist
 		}
 	}
 
+	var outbox adminAuditOutboxDeadReader
+	if len(outboxes) > 0 {
+		outbox = outboxes[0]
+	}
 	handler := newServerWithConfig(serverConfig{
+		AdminAuditOutbox:     outbox,
 		Evaluator:            testEvaluator(),
 		Writer:               writer,
 		Registry:             connector.NewRegistry(),

@@ -33,6 +33,7 @@ type auditChainStore struct {
 	stateErr    error
 	per         map[string]auditChainState // tenant -> running chain state
 	persister   blobstore.Persister
+	sharedKnown bool
 }
 
 func newAuditChainStore(p blobstore.Persister) *auditChainStore {
@@ -49,6 +50,7 @@ func newAuditChainStore(p blobstore.Persister) *auditChainStore {
 	if len(data) == 0 {
 		return s
 	}
+	s.sharedKnown = true
 	loaded, err := decodeAuditChainState(data)
 	if err != nil {
 		s.stateErr = fmt.Errorf("audit chain state could not be loaded")
@@ -110,7 +112,10 @@ func (s *auditChainStore) Health() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.stateErr
+	if s.stateErr != nil {
+		return s.stateErr
+	}
+	return s.refreshSharedLocked()
 }
 
 // Next returns the seq + prev-hash to embed in the tenant's next audit segment.
@@ -123,12 +128,18 @@ func (s *auditChainStore) Next(tenant string) (int, string, error) {
 	if s.stateErr != nil {
 		return 0, "", s.stateErr
 	}
+	if err := s.refreshSharedLocked(); err != nil {
+		return 0, "", err
+	}
 	st := s.per[tenant]
 	return st.Seq, st.LastHash, nil
 }
 
 // Commit records that the segment with this seq + hash was successfully written, advancing the chain.
 func (s *auditChainStore) Commit(tenant string, seq int, hash string) error {
+	return s.CommitContext(context.Background(), tenant, seq, hash)
+}
+func (s *auditChainStore) CommitContext(ctx context.Context, tenant string, seq int, hash string) error {
 	if s == nil {
 		return fmt.Errorf("audit chain state is unavailable")
 	}
@@ -136,6 +147,9 @@ func (s *auditChainStore) Commit(tenant string, seq int, hash string) error {
 	defer s.mu.Unlock()
 	if s.stateErr != nil {
 		return s.stateErr
+	}
+	if _, ok := s.persister.(retentionSharedUpdater); ok {
+		return s.commitSharedLocked(retentionWriteContext(ctx), tenant, seq, hash)
 	}
 	if s.per[tenant].Seq != seq {
 		s.stateErr = fmt.Errorf("audit chain generation changed; reconciliation required")

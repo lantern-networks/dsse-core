@@ -92,6 +92,7 @@ func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) 
 }
 
 func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
+	ctx = retentionWriteContext(ctx)
 	if err := cfg.override.Health(); err != nil {
 		log.Printf("retention paused: %v", err)
 		return
@@ -167,10 +168,24 @@ func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, tenant, stream st
 }
 
 func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
+	ctx = retentionWriteContext(ctx)
 	chained := stream == "audit" && cfg.auditChain != nil
+	var shared *sharedAuditArchive
 	if chained {
 		cfg.auditChain.operationMu.Lock()
 		defer cfg.auditChain.operationMu.Unlock()
+		var err error
+		shared, err = cfg.auditChain.beginSharedArchive(ctx, db)
+		if err != nil {
+			log.Printf("cold-archive shared state: %v", err)
+			return
+		}
+		if shared != nil {
+			defer shared.close()
+			// This detached view is scoped to the locked database row. Its
+			// Commit stages the head; the real head and hot deletes commit together.
+			cfg.auditChain = &auditChainStore{per: shared.next}
+		}
 		if err := cfg.auditChain.Health(); err != nil {
 			log.Printf("cold-archive paused: %v", err)
 			return
@@ -190,7 +205,13 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 			return
 		}
 	}
-	tx, err := db.BeginTx(ctx, nil)
+	var tx *sql.Tx
+	var err error
+	if shared != nil {
+		tx = shared.tx
+	} else {
+		tx, err = db.BeginTx(ctx, nil)
+	}
 	if err != nil {
 		log.Printf("cold-archive begin: %v", err)
 		return
@@ -254,6 +275,9 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		log.Printf("cold-archive: put %s FAILED — leaving %d row(s) in place for retry: %v", key, n, err)
 		return
 	}
+	if shared != nil {
+		shared.objectWritten = true
+	}
 	// Advance the tamper-evident chain only AFTER the segment is durably written (its hash = the object bytes).
 	if chained {
 		if err := cfg.auditChain.Commit(tenant, chainSeq, hashObjectBytes(buf.Bytes())); err != nil {
@@ -261,15 +285,24 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 			return
 		}
 	}
+	if shared != nil {
+		if err := shared.stage(ctx, cfg.auditChain.per); err != nil {
+			log.Printf("cold-archive: head update failed; hot rows retained: %v", err)
+			return
+		}
+	}
 	// Archived successfully → now safe to delete exactly this stream's aged rows.
 	res, err := tx.ExecContext(ctx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND event_id = ANY($3)", tenant, stream, pq.Array(eventIDs))
 	if err != nil {
-		log.Printf("cold-archive: archived %s but delete failed (will re-archive next sweep): %v", key, err)
+		log.Printf("cold-archive: archived %s but delete failed; hot rows retained, reconcile before retry: %v", key, err)
 		return
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("cold-archive: archived %s but delete commit failed: %v", key, err)
 		return
+	}
+	if shared != nil {
+		shared.adopt()
 	}
 	deleted, _ := res.RowsAffected()
 	worm := ""

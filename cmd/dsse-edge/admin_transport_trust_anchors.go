@@ -189,7 +189,12 @@ func anchorCoverageAtSerial(config serverConfig, tenantID, fp string, known []st
 	// against a set it has since been sent a replacement for, so its fingerprints are about something that is
 	// no longer in use and must not count toward opening the gate.
 	readiness := config.ObservedExclusions.TransportCAReadinessAtSerial(tenantID, fp, known, serial)
-	if acks := transportAnchorAcks.For(fp); len(acks) > 0 {
+	acks, err := transportAnchorAcks.ForChecked(fp)
+	if err != nil {
+		readiness.SafeToCut = false
+		return readiness
+	}
+	if len(acks) > 0 {
 		acknowledged := map[string]bool{}
 		for _, ack := range acks {
 			acknowledged[strings.ToLower(strings.TrimSpace(ack.Identity))] = true
@@ -337,7 +342,11 @@ func deviceClientCARetireGate(config serverConfig, tenantID, targetSHA string) (
 	// work around the safeguard. So the operator may account for one BY NAME, on the same terms as the
 	// transport-trust gate: a claim about a deployment, recorded with who made it and why.
 	vouched := map[string]bool{}
-	for _, ack := range transportAnchorAcks.For(strings.ToLower(strings.TrimSpace(targetSHA))) {
+	acks, err := transportAnchorAcks.ForChecked(targetSHA)
+	if err != nil {
+		return false, gateRefuse("acknowledgements_unavailable", "operator assertions could not be read; retirement cannot be judged")
+	}
+	for _, ack := range acks {
 		vouched[strings.ToLower(strings.TrimSpace(ack.Identity))] = true
 	}
 	var chaining, unseen []string
@@ -453,6 +462,10 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 	adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
 	record func(r *http.Request, action, targetID, reason string, metadata map[string]any)) {
 	mux.HandleFunc("GET /admin/transport-trust-anchors", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := transportAnchorAcks.Refresh(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		// Read what the fleet has distributed before judging or listing: this node may be between
 		// recompute ticks and holding what it last wrote. See AdoptFleetDistribution.
 		if err := transportTrust.RefreshShared(); err != nil {
@@ -585,7 +598,11 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 				// a connector verifies the Edge against a CA file rather than running the steering agent — can
 				// otherwise never be ready, so the gate could never open and would stop being a safeguard.
 				// The acknowledgements name machines too, so they follow the same scope.
-				acks := transportAnchorAcks.For(fp)
+				acks, err := transportAnchorAcks.ForChecked(fp)
+				if err != nil {
+					writeError(w, http.StatusServiceUnavailable, err)
+					return
+				}
 				ackIDs := make([]string, 0, len(acks))
 				for _, ack := range acks {
 					ackIDs = append(ackIDs, ack.Identity)
@@ -820,8 +837,15 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 				by = identity.PrincipalID
 			}
 		}
-		if err := transportAnchorAcks.Acknowledge(r.PathValue("sha256"), req.Identity, req.Reason, by, time.Now()); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if err := transportAnchorAcks.AcknowledgeContext(r.Context(), r.PathValue("sha256"), req.Identity, req.Reason, by, time.Now()); err != nil {
+			status := http.StatusBadRequest
+			if errors.Is(err, errAnchorAcknowledgements) {
+				status = http.StatusServiceUnavailable
+				if record != nil {
+					record(r, "transport_trust_acknowledge_failed", r.PathValue("sha256"), "acknowledgement commit was not confirmed", map[string]any{"identity": req.Identity, "applied": false, "durable": false})
+				}
+			}
+			writeError(w, status, err)
 			return
 		}
 		logInfof("transport_anchor_acknowledged sha256=%q identity=%q by=%q reason=%q",
@@ -829,13 +853,15 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 		// An operator asserting that a device holds a certificate is what OPENS the withdrawal gate — the
 		// judgement that can strand a fleet. It was written to the process log and to no audit trail, so the
 		// decision existed but its author did not.
-		record(r, "transport_trust_acknowledged", r.PathValue("sha256"),
-			"An operator asserted that a device holds this certificate, which counts towards allowing a withdrawal.",
-			map[string]any{
-				"identity":        strings.TrimSpace(req.Identity),
-				"acknowledged_by": by,
-				"stated_reason":   strings.TrimSpace(req.Reason),
-			})
+		if record != nil {
+			record(r, "transport_trust_acknowledged", r.PathValue("sha256"),
+				"An operator asserted that a device holds this certificate, which counts towards allowing a withdrawal.",
+				map[string]any{
+					"identity":        strings.TrimSpace(req.Identity),
+					"acknowledged_by": by,
+					"stated_reason":   strings.TrimSpace(req.Reason),
+				})
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": transportAnchorAckSchemaVersion, "acknowledged": true,
 			"identity": strings.TrimSpace(req.Identity), "acknowledged_by": by,
@@ -848,9 +874,15 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 			"an acknowledgement that a device holds a certificate") {
 			return
 		}
-		if err := transportAnchorAcks.Withdraw(r.PathValue("sha256"), r.PathValue("identity")); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+		if err := transportAnchorAcks.WithdrawContext(r.Context(), r.PathValue("sha256"), r.PathValue("identity")); err != nil {
+			if record != nil {
+				record(r, "transport_trust_acknowledgement_withdraw_failed", r.PathValue("sha256"), "withdrawal commit was not confirmed; this process will not use the assertion until retry", map[string]any{"identity": r.PathValue("identity"), "applied": false, "durable": false, "locally_denied": true})
+			}
+			writeError(w, http.StatusServiceUnavailable, err)
 			return
+		}
+		if record != nil {
+			record(r, "transport_trust_acknowledgement_withdrawn", r.PathValue("sha256"), "an operator withdrew the assertion", map[string]any{"identity": r.PathValue("identity")})
 		}
 		logInfof("transport_anchor_acknowledgement_withdrawn sha256=%q identity=%q", r.PathValue("sha256"), r.PathValue("identity"))
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": transportAnchorAckSchemaVersion, "withdrawn": true})

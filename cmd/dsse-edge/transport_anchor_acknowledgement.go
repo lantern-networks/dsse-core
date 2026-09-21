@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // "I have confirmed this identity holds that anchor, by other means."
@@ -31,9 +34,10 @@ import (
 // cannot: the connector's CA file has been updated. An assertion that turns out to be wrong strands that
 // connector, which is exactly the accountability an assertion should carry.
 type transportAnchorAcknowledgements struct {
-	mu   sync.RWMutex
-	by   map[string]transportAnchorAcknowledgement // key: sha256 + "\x00" + identity
-	path string
+	mu      sync.RWMutex
+	writeMu sync.Mutex
+	by      map[string]transportAnchorAcknowledgement // key: sha256 + "\x00" + identity
+	path    string
 	// shared is the deployment's own database, used INSTEAD of path on a node that AUTHORS.
 	//
 	// ★★★ AN ASSERTION HAS TO OUTLIVE THE MACHINE THAT TOOK IT (2026-09-07). These are the judgements that
@@ -43,6 +47,9 @@ type transportAnchorAcknowledgements struct {
 	// assertion was ever made. No observation brings these back; they are the one kind of record on this
 	// deployment that cannot be recomputed.
 	shared blobstore.Persister
+	seen   bool
+	// Unconfirmed writes cannot authorize a withdrawal in this process. Retry the same operation to clear.
+	denied map[string]bool
 }
 
 type transportAnchorAcknowledgement struct {
@@ -90,127 +97,215 @@ func (a *transportAnchorAcknowledgements) where() string {
 	return a.path
 }
 
-func (a *transportAnchorAcknowledgements) load() {
-	if a == nil || (a.path == "" && a.shared == nil) {
-		return
+var errAnchorAcknowledgements = errors.New("anchor acknowledgement store unavailable")
+
+func decodeAnchorAcknowledgements(raw []byte, seen bool) (map[string]transportAnchorAcknowledgement, map[string]json.RawMessage, error) {
+	out := map[string]transportAnchorAcknowledgement{}
+	fields := map[string]json.RawMessage{}
+	if raw == nil && !seen {
+		return out, fields, nil
 	}
-	var raw []byte
-	var err error
-	if a.shared != nil {
-		raw, err = a.shared.Load()
-		if err == nil && len(raw) == 0 {
-			return
-		}
-	} else {
-		raw, err = os.ReadFile(a.path)
-	}
-	if err != nil {
-		// Not there yet is the ordinary first run and says nothing. Anything else is a store this node was
-		// given and could not read, and these are OPERATOR ASSERTIONS — judgements somebody made once, which
-		// no observation will bring back. A withdrawal that was already vouched for silently goes back to
-		// being refused.
-		if !os.IsNotExist(err) {
-			log.Printf("★ transport anchor acknowledgements: %s could not be read (%v) — an operator's "+
-				"assertions that a device holds an anchor by other means are NOT loaded, so a retirement they "+
-				"vouched for will be refused again", a.path, err)
-		}
-		return
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil, nil, err
 	}
 	var state transportAnchorAckState
 	if err := json.Unmarshal(raw, &state); err != nil {
-		log.Printf("★ transport anchor acknowledgements: %s did not parse (%v) — starting with none rather "+
-			"than half a set, and the assertions in it are not in effect", a.where(), err)
-		return
+		return nil, nil, err
 	}
-	a.mu.Lock()
+	if state.SchemaVersion != transportAnchorAckSchemaVersion || state.Acknowledgements == nil {
+		return nil, nil, fmt.Errorf("invalid acknowledgement state")
+	}
 	for _, ack := range state.Acknowledgements {
-		a.by[ackKey(ack.SHA256, ack.Identity)] = ack
+		if strings.TrimSpace(ack.SHA256) == "" || strings.TrimSpace(ack.Identity) == "" || strings.TrimSpace(ack.AcknowledgedBy) == "" {
+			return nil, nil, fmt.Errorf("incomplete assertion")
+		}
+		if _, err := time.Parse(time.RFC3339, ack.AcknowledgedAt); err != nil {
+			return nil, nil, err
+		}
+		key := ackKey(ack.SHA256, ack.Identity)
+		if _, exists := out[key]; exists {
+			return nil, nil, fmt.Errorf("duplicate assertion")
+		}
+		out[key] = ack
 	}
-	loaded := len(a.by)
-	a.mu.Unlock()
-	if loaded > 0 {
-		log.Printf("transport anchor acknowledgements: %d operator assertion(s) loaded from %s", loaded, a.where())
-	}
+	return out, fields, nil
 }
 
-func (a *transportAnchorAcknowledgements) persistLocked() error {
+func (a *transportAnchorAcknowledgements) readLocked() ([]byte, error) {
+	if a.shared != nil {
+		return a.shared.Load()
+	}
+	raw, err := os.ReadFile(a.path)
+	if os.IsNotExist(err) && !a.seen {
+		return nil, nil
+	}
+	return raw, err
+}
+
+func (a *transportAnchorAcknowledgements) refreshLocked() error {
 	if a.path == "" && a.shared == nil {
 		return nil
 	}
-	out := make([]transportAnchorAcknowledgement, 0, len(a.by))
-	for _, ack := range a.by {
-		out = append(out, ack)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].SHA256 != out[j].SHA256 {
-			return out[i].SHA256 < out[j].SHA256
+	raw, err := a.readLocked()
+	if err == nil {
+		var next map[string]transportAnchorAcknowledgement
+		next, _, err = decodeAnchorAcknowledgements(raw, a.seen)
+		if err == nil {
+			a.by = next
+			a.seen = a.seen || raw != nil
 		}
-		return out[i].Identity < out[j].Identity
-	})
-	raw, err := json.Marshal(transportAnchorAckState{SchemaVersion: transportAnchorAckSchemaVersion, Acknowledgements: out})
+	}
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errAnchorAcknowledgements, err)
 	}
-	if a.shared != nil {
-		return a.shared.Save(raw)
-	}
-	if dir := filepath.Dir(a.path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-	}
-	return os.WriteFile(a.path, raw, 0o600)
+	return nil
 }
 
-// Acknowledge records the operator's assertion. Durable: losing it on restart would re-close a gate an operator
-// had deliberately opened, and they would have no way to tell why.
+func (a *transportAnchorAcknowledgements) Refresh() error {
+	if a == nil {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.refreshLocked()
+}
+
+func (a *transportAnchorAcknowledgements) load() {
+	if err := a.Refresh(); err != nil {
+		log.Printf("transport anchor acknowledgements: %s: %v; assertions unavailable", a.where(), err)
+	}
+}
+
+// The callback edits the latest row; live authorizations change only after commit confirmation.
+func (a *transportAnchorAcknowledgements) mutate(ctx context.Context, key string, ack *transportAnchorAcknowledgement) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	seen := a.seen
+	var next map[string]transportAnchorAcknowledgement
+	edit := func(raw []byte) ([]byte, error) {
+		state, fields, err := decodeAnchorAcknowledgements(raw, seen)
+		if err != nil {
+			return nil, err
+		}
+		if a.shared == nil && a.path == "" {
+			for k, v := range a.by {
+				state[k] = v
+			}
+		}
+		if ack == nil {
+			delete(state, key)
+		} else {
+			state[key] = *ack
+		}
+		list := make([]transportAnchorAcknowledgement, 0, len(state))
+		for _, v := range state {
+			list = append(list, v)
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return ackKey(list[i].SHA256, list[i].Identity) < ackKey(list[j].SHA256, list[j].Identity)
+		})
+		fields["schema_version"], _ = json.Marshal(transportAnchorAckSchemaVersion)
+		fields["acknowledgements"], _ = json.Marshal(list)
+		next = state
+		return json.Marshal(fields)
+	}
+	var err error
+	if p, ok := a.shared.(interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}); ok {
+		// Trust withdrawal holds the CP lease while its gate reads ACKs. Do not hold
+		// the read mutex while waiting for that lease, or the two operations deadlock.
+		a.mu.Unlock()
+		err = p.UpdateContext(ctx, edit)
+		a.mu.Lock()
+	} else {
+		// File/legacy backends have no distributed transaction contract.
+		var raw []byte
+		if a.shared != nil || a.path != "" {
+			raw, err = a.readLocked()
+		}
+		if err == nil {
+			err = ctx.Err()
+		}
+		if err == nil {
+			var encoded []byte
+			encoded, err = edit(raw)
+			if err == nil {
+				if a.shared != nil {
+					err = a.shared.Save(encoded)
+				} else if a.path != "" {
+					err = os.MkdirAll(filepath.Dir(a.path), 0700)
+					if err == nil {
+						err = durablefile.Write(a.path, encoded, 0600)
+					}
+				}
+			}
+		}
+	}
+	if err != nil {
+		if a.denied == nil {
+			a.denied = map[string]bool{}
+		}
+		a.denied[key] = true
+		return fmt.Errorf("%w: commit not confirmed: %v; retry this operation before restart", errAnchorAcknowledgements, err)
+	}
+	a.by = next
+	if a.shared != nil || a.path != "" {
+		a.seen = true
+	}
+	delete(a.denied, key)
+	return nil
+}
+
 func (a *transportAnchorAcknowledgements) Acknowledge(sha256Hex, identity, reason, by string, now time.Time) error {
+	return a.AcknowledgeContext(captureCPWriteLease(context.Background()), sha256Hex, identity, reason, by, now)
+}
+func (a *transportAnchorAcknowledgements) AcknowledgeContext(ctx context.Context, sha256Hex, identity, reason, by string, now time.Time) error {
 	if a == nil {
 		return fmt.Errorf("acknowledgements are not configured")
 	}
-	if strings.TrimSpace(sha256Hex) == "" || strings.TrimSpace(identity) == "" {
-		return fmt.Errorf("both an anchor fingerprint and an identity are required")
+	if strings.TrimSpace(sha256Hex) == "" || strings.TrimSpace(identity) == "" || strings.TrimSpace(by) == "" {
+		return fmt.Errorf("anchor fingerprint, identity and administrator are required")
 	}
-	if strings.TrimSpace(by) == "" {
-		// An unattributed assertion is not an assertion. Somebody is claiming a fact about a deployment; the
-		// record has to say who, or it cannot be revisited when the claim turns out to be wrong.
-		return fmt.Errorf("the acknowledging administrator is required")
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.by[ackKey(sha256Hex, identity)] = transportAnchorAcknowledgement{
-		SHA256: strings.ToLower(strings.TrimSpace(sha256Hex)), Identity: strings.TrimSpace(identity),
-		Reason: strings.TrimSpace(reason), AcknowledgedBy: strings.TrimSpace(by),
-		AcknowledgedAt: now.UTC().Format(time.RFC3339),
-	}
-	return a.persistLocked()
+	ack := transportAnchorAcknowledgement{SHA256: strings.ToLower(strings.TrimSpace(sha256Hex)), Identity: strings.TrimSpace(identity), Reason: strings.TrimSpace(reason), AcknowledgedBy: strings.TrimSpace(by), AcknowledgedAt: now.UTC().Format(time.RFC3339)}
+	return a.mutate(ctx, ackKey(sha256Hex, identity), &ack)
 }
-
 func (a *transportAnchorAcknowledgements) Withdraw(sha256Hex, identity string) error {
+	return a.WithdrawContext(captureCPWriteLease(context.Background()), sha256Hex, identity)
+}
+func (a *transportAnchorAcknowledgements) WithdrawContext(ctx context.Context, sha256Hex, identity string) error {
 	if a == nil {
 		return nil
+	}
+	return a.mutate(ctx, ackKey(sha256Hex, identity), nil)
+}
+
+// Checked reads never fall back to stale assertions: unavailable evidence cannot open a gate.
+func (a *transportAnchorAcknowledgements) ForChecked(sha256Hex string) ([]transportAnchorAcknowledgement, error) {
+	if a == nil {
+		return nil, nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	delete(a.by, ackKey(sha256Hex, identity))
-	return a.persistLocked()
-}
-
-// For returns the acknowledged identities for one anchor.
-func (a *transportAnchorAcknowledgements) For(sha256Hex string) []transportAnchorAcknowledgement {
-	if a == nil {
-		return nil
+	if err := a.refreshLocked(); err != nil {
+		return nil, err
 	}
-	want := strings.ToLower(strings.TrimSpace(sha256Hex))
-	a.mu.RLock()
-	defer a.mu.RUnlock()
 	out := []transportAnchorAcknowledgement{}
-	for _, ack := range a.by {
-		if strings.ToLower(ack.SHA256) == want {
+	for key, ack := range a.by {
+		if !a.denied[key] && strings.EqualFold(ack.SHA256, strings.TrimSpace(sha256Hex)) {
 			out = append(out, ack)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Identity < out[j].Identity })
+	return out, nil
+}
+func (a *transportAnchorAcknowledgements) For(sha256Hex string) []transportAnchorAcknowledgement {
+	out, err := a.ForChecked(sha256Hex)
+	if err != nil {
+		log.Printf("transport anchor acknowledgements: withdrawal evidence unavailable: %v", err)
+	}
 	return out
 }
 

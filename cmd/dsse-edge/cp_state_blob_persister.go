@@ -129,6 +129,14 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	if _, err := tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
 		return err
 	}
+	// database/sql can reject Commit on an already canceled transaction without
+	// calling the driver. Classify cancellation observed here as a definite
+	// rollback, so non-idempotent stores do not latch an unknown commit outcome.
+	// Cancellation racing AFTER this check remains conservative: a driver may
+	// return the same context error after committing, so never reclassify it.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	commitAttempted = true
 	return tx.Commit()
 }

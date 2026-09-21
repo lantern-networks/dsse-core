@@ -95,6 +95,10 @@ func (s revocationMeshSource) deliverToPeer(peer revocationMeshPeer, item revoca
 	s.deliverToPeerContext(meshWriteContext(context.Background()), peer, item)
 }
 func (s revocationMeshSource) deliverToPeerContext(ctx context.Context, peer revocationMeshPeer, item revocationMeshItem) {
+	// The originating revoke has already applied. Persist its delivery even if
+	// the client disconnected; retain the admitted leadership term throughout
+	// enqueue and ACK. The shared persister still imposes its database timeout.
+	ctx = context.WithoutCancel(ctx)
 	if s.outbox == nil {
 		go s.pushToPeerWithRetry(peer, item)
 		return

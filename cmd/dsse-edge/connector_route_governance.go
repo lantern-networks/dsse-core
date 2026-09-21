@@ -111,6 +111,30 @@ type governancePersistState struct {
 	Authored map[string]map[string][]authoredRoute `json:"authored"`
 }
 
+// Validate the original wire shape before typed decoding loses omitted keys.
+// Complete snapshots may explicitly contain null/empty maps (last deletion),
+// but a missing decision map is not an authoritative empty set.
+func (s *governancePersistState) UnmarshalJSON(raw []byte) error {
+	type wireState governancePersistState
+	var next wireState
+	if err := json.Unmarshal(raw, &next); err != nil {
+		return err
+	}
+	if next.Complete {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return err
+		}
+		for _, key := range []string{"held", "approved", "seen", "authored"} {
+			if _, ok := fields[key]; !ok {
+				return fmt.Errorf("complete route governance snapshot missing %s", key)
+			}
+		}
+	}
+	*s = governancePersistState(next)
+	return nil
+}
+
 func newConnectorRouteGovernance() *connectorRouteGovernance {
 	return newConnectorRouteGovernanceWithPersistence("")
 }

@@ -14,6 +14,54 @@ import (
 	"github.com/lantern-networks/dsse-core/revocation"
 )
 
+func TestPostgresMeshCanceledOriginDelivery(t *testing.T) {
+	d, _, leader, peerLeader := trustDistributionPostgresFixture(t)
+	p := d.store.(postgresBlobPersister)
+	p.key = "revocation_mesh_outbox"
+	o, err := newRevocationMeshOutbox(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := make(chan bool, 2)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Check independent storage at receipt, before allowing the ACK cleanup.
+		fresh, err := newRevocationMeshOutbox(p)
+		requests <- err == nil && len(fresh.snapshot()) == 1
+	}))
+	defer peer.Close()
+	s := revocationMeshSource{outbox: o, client: peer.Client(), secret: "synthetic", originRegion: "origin"}
+	ctx, cancel := context.WithCancel(captureCPWriteLease(context.Background()))
+	cancel()
+	target := revocationMeshPeer{region: "peer", url: peer.URL}
+	item := revocationMeshItem{Identity: "target", Reason: "block", OriginRegion: "origin"}
+	s.deliverToPeerContext(ctx, target, item)
+	select {
+	case persisted := <-requests:
+		if !persisted {
+			t.Fatal("delivery preceded durable enqueue")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled origin lost delivery")
+	}
+	waitUntil(t, 2*time.Second, func() bool { return len(o.snapshot()) == 0 }, "shared ACK cleanup")
+	if len(meshOutboxLoaded(t, p)) != 0 {
+		t.Fatal("ACK cleanup not durable")
+	}
+	leader.release()
+	peerLeader.tick()
+	peerLeader.release()
+	leader.tick()
+	s.deliverToPeerContext(ctx, target, item)
+	select {
+	case <-requests:
+		t.Fatal("canceled old term delivered after reacquisition")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if len(o.snapshot()) != 0 || len(meshOutboxLoaded(t, p)) != 0 {
+		t.Fatal("old term retained delivery")
+	}
+}
+
 func TestPostgresMeshSharedLifecycleAndPromotion(t *testing.T) {
 	d, _, leader, peer := trustDistributionPostgresFixture(t)
 	p := d.store.(postgresBlobPersister)

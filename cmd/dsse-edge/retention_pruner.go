@@ -112,10 +112,10 @@ func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
 	}
 	for _, tbl := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		if cfg.outboxPublished > 0 {
-			pruneOlderThan(ctx, db, tbl, "updated_at", "status = 'published'", now.Add(-cfg.outboxPublished))
+			pruneOlderThan(ctx, db, cfg, tbl, "updated_at", "status = 'published'", now.Add(-cfg.outboxPublished))
 		}
 		if cfg.outboxDead > 0 {
-			pruneOlderThan(ctx, db, tbl, "updated_at", "status = 'dead'", now.Add(-cfg.outboxDead))
+			pruneOlderThan(ctx, db, cfg, tbl, "updated_at", "status = 'dead'", now.Add(-cfg.outboxDead))
 		}
 	}
 }
@@ -150,25 +150,32 @@ func pruneHotEventsPerStream(ctx context.Context, db *sql.DB, cfg retentionConfi
 		if cfg.archive != nil {
 			archiveThenPruneStream(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
 		} else {
-			deleteHotStreamOlderThan(ctx, db, p.tenant, p.stream, cutoff)
+			deleteHotStreamOlderThan(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
 		}
 	}
 }
 
 // deleteHotStreamOlderThan is the delete-only path (no cold archive configured) for one stream.
-func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, tenant, stream string, cutoff time.Time) {
-	res, err := db.ExecContext(ctx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3", tenant, stream, cutoff)
-	if err != nil {
-		log.Printf("retention prune hot_events %s/%s: %v", tenant, stream, err)
-		return
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("retention prune hot_events %s/%s: deleted %d row(s) older than %s", tenant, stream, n, cutoff.UTC().Format(time.RFC3339))
-	}
+func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
+	deleteRetentionRows(ctx, db, cfg, "hot_events", "received_at < $2 AND stream=$3", tenant, stream, cutoff, now)
+}
+func logPruneFailure(table string, err error) {
+	log.Printf("retention prune %s paused: %v", table, err)
+}
+func logPruneDeleted(table, tenant string, n int64, cutoff time.Time) {
+	log.Printf("retention prune %s tenant=%s: deleted %d row(s) older than %s", table, tenant, n, cutoff.UTC().Format(time.RFC3339))
 }
 
 func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
 	ctx = retentionWriteContext(ctx)
+	// Bound object-store waits. Keep the timeout off the SQL transaction context:
+	// cancelling that context discards the advisory-lock session during PUT.
+	// This still serializes the archive
+	// with CP writes, but an unavailable archive cannot hold that path forever.
+	archiveCtx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+	defer cancel()
+	unlockPolicy := lockPrunePolicy(cfg)
+	defer unlockPolicy()
 	chained := stream == "audit" && cfg.auditChain != nil
 	var shared *sharedAuditArchive
 	if chained {
@@ -195,7 +202,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 			log.Printf("cold-archive state: %v", err)
 			return
 		}
-		objects, err := cfg.archive.List(ctx, "hot_events/"+tenant+"/audit/", 0)
+		objects, err := cfg.archive.List(archiveCtx, "hot_events/"+tenant+"/audit/", 0)
 		if err != nil {
 			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
 			return
@@ -210,13 +217,25 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	if shared != nil {
 		tx = shared.tx
 	} else {
-		tx, err = db.BeginTx(ctx, nil)
+		var finish func()
+		tx, finish, err = beginCPWriteTransaction(ctx, db)
+		if err == nil {
+			defer finish()
+		}
 	}
 	if err != nil {
 		log.Printf("cold-archive begin: %v", err)
 		return
 	}
 	defer tx.Rollback()
+	cutoff, allowed, err := checkedPruneCutoff(ctx, tx, cfg, tenant, stream, cutoff, now)
+	if err != nil {
+		logPruneFailure("hot_events", err)
+		return
+	}
+	if !allowed {
+		return
+	}
 	rows, err := tx.QueryContext(ctx, "SELECT event_id, payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at, event_id FOR UPDATE", tenant, stream, cutoff)
 	if err != nil {
 		log.Printf("cold-archive: read %s/%s: %v", tenant, stream, err)
@@ -271,7 +290,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	if stream == "audit" && cfg.auditColdRetain > 0 {
 		opts.RetainUntil = now.Add(cfg.auditColdRetain) // WORM: audit segments are tamper-proof for the retention window
 	}
-	if _, err := cfg.archive.Put(ctx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), opts); err != nil {
+	if _, err := cfg.archive.Put(archiveCtx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), opts); err != nil {
 		log.Printf("cold-archive: put %s FAILED — leaving %d row(s) in place for retry: %v", key, n, err)
 		return
 	}
@@ -301,6 +320,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		log.Printf("cold-archive: archived %s but delete commit failed: %v", key, err)
 		return
 	}
+	adoptPrunePolicy(cfg)
 	if shared != nil {
 		shared.adopt()
 	}
@@ -314,19 +334,30 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 
 // pruneOlderThan deletes rows whose timeCol is < cutoff, optionally filtered by extraWhere. Best-effort:
 // errors are logged (a missing table on a non-CP node is fine — the pruner only runs with -postgres-dsn).
-func pruneOlderThan(ctx context.Context, db *sql.DB, table, timeCol, extraWhere string, cutoff time.Time) {
-	where := timeCol + " < $1"
-	if extraWhere != "" {
-		where = extraWhere + " AND " + where
-	}
-	res, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", table, where), cutoff)
+func pruneOlderThan(ctx context.Context, db *sql.DB, cfg retentionConfig, table, timeCol, extraWhere string, cutoff time.Time) {
+	rows, err := db.QueryContext(ctx, "SELECT DISTINCT tenant_id FROM "+table+" WHERE "+extraWhere+" AND "+timeCol+" < $1", cutoff)
 	if err != nil {
-		log.Printf("retention prune %s (%s): %v", table, extraWhere, err)
+		logPruneFailure(table, err)
 		return
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("retention prune %s%s: deleted %d row(s) older than %s",
-			table, ifNonEmpty(" "+extraWhere), n, cutoff.UTC().Format(time.RFC3339))
+	var tenants []string
+	for rows.Next() {
+		var tenant string
+		if err := rows.Scan(&tenant); err != nil {
+			rows.Close()
+			logPruneFailure(table, err)
+			return
+		}
+		tenants = append(tenants, tenant)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		logPruneFailure(table, err)
+		return
+	}
+	for _, tenant := range tenants {
+		deleteRetentionRows(ctx, db, retentionConfig{legalHold: cfg.legalHold}, table, extraWhere+" AND "+timeCol+" < $2", tenant, "", cutoff, time.Now())
 	}
 }
 

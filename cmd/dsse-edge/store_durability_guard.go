@@ -28,6 +28,7 @@ func storeUnderstandsSharedState(name string) bool {
 	// Edge polling the front door read them alternately.
 	case "admin_runtime_state", "admission_revocations", "high_risk_overlay", "agent_rollout", "agent_updates", "asset_catalog",
 		"audit_chain", "break_glass", "delegated_grants",
+		"dlp_allowlist", "dlp_classifiers", "dlp_fingerprints", "dlp_policy_objects",
 		"enrolled_inventory", "enrolment_tokens", "grants", "human_approvals", "idp_connections",
 		// inspection_posture UNDERSTANDS shared state but is never resolved to it automatically — see
 		// storeStaysNodeLocal below. The two lists answer different questions: this one is "would =postgres
@@ -246,4 +247,19 @@ func requireDurableStoresViolation(devMode, requireDurable bool, report volatile
 		return nil
 	}
 	return report.config
+}
+
+// A bundle receiver owns a node-local cache; the publishing CP owns authority.
+// A shared DSN used for other services must not make the receiver an author.
+func configBundleStorePath(stateDir, sourceURL, explicit, name string) string {
+	if strings.TrimSpace(sourceURL) == "" {
+		return durableStorePath(stateDir, explicit, name)
+	}
+	if v := strings.TrimSpace(explicit); v != "" && v != "memory" {
+		return explicit
+	}
+	if sd := strings.TrimSpace(stateDir); sd != "" {
+		return filepath.Join(sd, name+".json")
+	}
+	return ""
 }

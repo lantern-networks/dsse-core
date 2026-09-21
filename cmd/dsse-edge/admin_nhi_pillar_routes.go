@@ -164,6 +164,19 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		now := time.Now()
 		revoked, found, err := adminRevokeDelegatedAccessGrant(delegatedGrants, r.Context(), adminTenantIDFromRequest(r), r.PathValue("grant_id"), request, now)
 		if err != nil {
+			if found && errors.Is(err, delegatedgrant.ErrPersistence) {
+				audit := adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_revoked", revoked, evaluator, now)
+				audit.ActorUserID = auditActorPrincipal(r)
+				audit.Result = stringPtr("partial")
+				audit.Reason = stringPtr("Grant revoked on this server; persistence is unconfirmed. Retry revocation before restarting.")
+				audit.Metadata["applied"], audit.Metadata["persistence"] = true, "unconfirmed"
+				if identity, ok := adminIdentityFromRequest(r); ok && identity.TenantID != revoked.TenantID {
+					stampOperatorActor(audit.Metadata, identity)
+				}
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": revoked.TenantID, "grant_id": revoked.ID, "persistence": "unconfirmed", "error": "Grant revoked on this server, but persistence is unconfirmed. Retry revocation before restarting."})
+				return
+			}
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}

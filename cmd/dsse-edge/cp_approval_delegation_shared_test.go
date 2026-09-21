@@ -132,7 +132,17 @@ func TestPostgresApprovalDelegationPeerTermRevocation(t *testing.T) {
 				}
 				before, _ := p.Load()
 				gate.before = rotate
-				call("POST", path+suffix, payload, 500)
+				failed := call("POST", path+suffix, payload, 500)
+				if suffix != "" && key == "delegated_grants" {
+					var result map[string]any
+					if err := json.Unmarshal(failed.Body.Bytes(), &result); err != nil || result["status"] != "partial" || result["applied"] != true {
+						t.Fatalf("missing denial outcome: %s", failed.Body)
+					}
+					grant, ok := config.DelegatedGrants.GetForTenant(tenant, "own")
+					if !ok || delegatedgrant.IsActive(grant, time.Now()) {
+						t.Fatal("old-term save refusal revived local authorization")
+					}
+				}
 				gate.before = nil
 				after, _ := p.Load()
 				if !bytes.Equal(before, after) {
@@ -187,10 +197,7 @@ func TestPostgresApprovalDelegationPeerTermRevocation(t *testing.T) {
 					}
 				}
 			}
-			wantDomain := 2
-			if key == "human_approvals" {
-				wantDomain = 3
-			}
+			wantDomain := 3
 			if domain != wantDomain {
 				t.Fatalf("domain audits %d", domain)
 			}

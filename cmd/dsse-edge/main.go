@@ -1548,7 +1548,7 @@ func main() {
 	*humanApprovalStorePath = durableStorePath(*stateDir, *humanApprovalStorePath, "human_approvals")
 	*idpConnectionStorePath = durableStorePath(*stateDir, *idpConnectionStorePath, "idp_connections")
 	*tenantModelStorePath = durableStorePath(*stateDir, *tenantModelStorePath, "tenant_model")
-	*vlanObjectStorePath = durableStorePath(*stateDir, *vlanObjectStorePath, "vlan_objects")
+	*vlanObjectStorePath = configBundleStorePath(*stateDir, *configSourceURL, *vlanObjectStorePath, "vlan_objects")
 	*adminRuntimeStateStorePath = durableStorePath(*stateDir, *adminRuntimeStateStorePath, "admin_runtime_state")
 	// Which certificate each device was last handed is a MEASUREMENT, and a measurement that resets on restart
 	// reports a finished rotation as one still waiting for devices that already took it (review C6).
@@ -4588,10 +4588,10 @@ func main() {
 		HumanApprovalStorePath:             *humanApprovalStorePath,
 		EastWestObserveStorePath:           *eastWestObserveStorePath,
 		InspectionEventsStorePath:          *inspectionEventsStorePath,
-		DLPClassifierStorePath:             *dlpClassifierStorePath,
-		DLPAllowlistStorePath:              *dlpAllowlistStorePath,
-		DLPFingerprintStorePath:            *dlpFingerprintStorePath,
-		DLPPolicyObjectStorePath:           *dlpPolicyObjectStorePath,
+		DLPClassifierStorePath:             configBundleStorePath(*stateDir, *configSourceURL, *dlpClassifierStorePath, "dlp_classifiers"),
+		DLPAllowlistStorePath:              configBundleStorePath(*stateDir, *configSourceURL, *dlpAllowlistStorePath, "dlp_allowlist"),
+		DLPFingerprintStorePath:            configBundleStorePath(*stateDir, *configSourceURL, *dlpFingerprintStorePath, "dlp_fingerprints"),
+		DLPPolicyObjectStorePath:           configBundleStorePath(*stateDir, *configSourceURL, *dlpPolicyObjectStorePath, "dlp_policy_objects"),
 		OrganizationDomainsStorePath:       *organizationDomainsStorePath,
 		EntitlementStorePath:               *entitlementStorePath,
 		DLPRequiresLicense:                 *dlpRequiresLicense,

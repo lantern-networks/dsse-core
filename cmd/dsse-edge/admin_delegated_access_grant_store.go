@@ -168,6 +168,9 @@ func adminRevokeDelegatedAccessGrant(s *delegatedgrant.Store, ctx context.Contex
 		return adminDelegatedAccessGrant{}, false, nil
 	}
 	if err != nil {
+		if errors.Is(err, delegatedgrant.ErrPersistence) && grant.TenantID == tenantID && grant.ID == grantID && grant.Status == "revoked" {
+			return adminDelegatedAccessGrantFromModel(grant), true, err
+		}
 		return adminDelegatedAccessGrant{}, false, err
 	}
 

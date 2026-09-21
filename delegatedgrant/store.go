@@ -12,18 +12,23 @@ import (
 	"github.com/lantern-networks/dsse-core/model"
 )
 
+type pendingRevocation struct{ at, reason string }
+
 // Store is the in-memory delegated-access-grant store: OOB-authenticated, short-lived east-west grants
 // (upsert / lookup / active-check / revoke), admission-bounded by capacity (capacity<=0 disables the bound).
 // Existing records, including revoked grants, are never evicted for a new ID.
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation write-throughs, so a
 // revoked grant stays revoked across a restart and in-flight grants are not lost.
+// Failed revocations deny locally until a confirmed retry. This pending overlay
+// is process-local: a failed save is not a promise of durable or fleet-wide denial.
 type Store struct {
-	mu             sync.RWMutex
-	grants         map[string]model.DelegatedAccessGrant
-	capacity       int
-	persister      blobstore.Persister
-	authorityKnown bool
-	generation     uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
+	mu                 sync.RWMutex
+	grants             map[string]model.DelegatedAccessGrant
+	capacity           int
+	persister          blobstore.Persister
+	authorityKnown     bool
+	pendingRevocations map[string]pendingRevocation
+	generation         uint64 // monotonic config version (bumped on each Upsert and effective Revoke); folded into the config-bundle generation
 }
 
 // NewStore builds a delegated-grant store with the given admission capacity. The bound is injected by
@@ -73,7 +78,9 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	}
 	// Preserve all records even when the configured capacity has been lowered.
 	// Replace the accepted state and writer together only after a complete, valid load.
-	s.grants, s.persister, s.authorityKnown = fresh, p, true
+	s.applyPendingLocked(fresh)
+	s.publishLocked(fresh)
+	s.persister, s.authorityKnown = p, true
 
 	return nil
 }
@@ -98,7 +105,7 @@ func cloneGrants(in map[string]model.DelegatedAccessGrant) map[string]model.Dele
 	return out
 }
 
-// The caller holds the write lock. Failed candidates never reach live state.
+// Allowing mutations publish only after persistence; failed revocations retain a local denial.
 
 func (s *Store) Upsert(grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
 	return s.UpsertContext(context.Background(), grant)
@@ -112,6 +119,9 @@ func (s *Store) UpsertContext(ctx context.Context, grant model.DelegatedAccessGr
 	err := s.editLocked(ctx, func(next map[string]model.DelegatedAccessGrant) error {
 		key := grantKey(grant.TenantID, grant.ID)
 		old, ok := next[key]
+		if _, pending := s.pendingRevocations[key]; pending && grant.Status != "revoked" {
+			return fmt.Errorf("delegated access grant revocation is pending persistence")
+		}
 		if ok {
 			if err := validateTransition(old, grant); err != nil {
 				return err
@@ -237,6 +247,9 @@ func (s *Store) revokeContext(ctx context.Context, tenant, id, reason string, no
 		}
 		found = true
 		if result.Status == "revoked" {
+			if _, pending := s.pendingRevocations[key]; pending {
+				return nil
+			}
 			return errNoChange
 		}
 		revokedAt := now.UTC().Format(time.RFC3339)
@@ -244,11 +257,42 @@ func (s *Store) revokeContext(ctx context.Context, tenant, id, reason string, no
 		next[key] = result
 		return nil
 	})
+	if errors.Is(err, ErrPersistence) {
+		// A rejected lease/transaction may not have invoked the edit callback.
+		// Retain a tenant-scoped denial for a known local target in that case.
+		if !found {
+			if tenant != "" {
+				result, found = s.grants[grantKey(tenant, id)]
+			} else {
+				for _, g := range s.grants {
+					if g.ID == id {
+						if found {
+							return model.DelegatedAccessGrant{}, err
+						}
+						result, found = g, true
+					}
+				}
+			}
+		}
+		if found {
+			key := grantKey(result.TenantID, result.ID)
+			if s.pendingRevocations == nil {
+				s.pendingRevocations = map[string]pendingRevocation{}
+			}
+			if _, pending := s.pendingRevocations[key]; !pending {
+				s.pendingRevocations[key] = pendingRevocation{now.UTC().Format(time.RFC3339), reason}
+			}
+			next := cloneGrants(s.grants)
+			next[key] = result
+			s.applyPendingLocked(next)
+			s.publishLocked(next)
+			return s.grants[key], err
+		}
+	}
 	if err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
-	_ = found
-	return result, err
+	return result, nil
 }
 
 func validateTransition(existing, next model.DelegatedAccessGrant) error {
@@ -342,6 +386,12 @@ func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, er
 	})
 	if err != nil {
 		return 0, err
+	}
+	// Only this explicit, confirmed erasure releases absent denial identifiers.
+	for key := range s.pendingRevocations {
+		if strings.EqualFold(strings.SplitN(key, "\x00", 2)[0], tenant) {
+			delete(s.pendingRevocations, key)
+		}
 	}
 	return n, nil
 }

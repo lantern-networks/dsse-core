@@ -83,6 +83,7 @@ func (s *Store) editLocked(ctx context.Context, edit func(map[string]model.Deleg
 			}
 		}
 
+		s.applyPendingLocked(next)
 		if err = edit(next); err != nil {
 			mutationErr = err
 			return nil, err
@@ -118,6 +119,13 @@ func (s *Store) editLocked(ctx context.Context, edit func(map[string]model.Deleg
 		if shared || !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("authorization persistence: %v", err)
 			return ErrPersistence
+		}
+	}
+	// An unrelated save may confirm present denials, but cannot release an
+	// absent latch: a later recreation of the same identity must remain denied.
+	for key := range s.pendingRevocations {
+		if grant, ok := next[key]; ok && grant.Status == "revoked" {
+			delete(s.pendingRevocations, key)
 		}
 	}
 	s.publishLocked(next)
@@ -158,6 +166,7 @@ func (s *Store) RefreshShared() error {
 		return ErrPersistence
 	}
 
+	s.applyPendingLocked(next)
 	s.publishLocked(next)
 	s.authorityKnown = true
 	return nil
@@ -180,4 +189,15 @@ func (s *Store) GetForTenantContext(ctx context.Context, tenant, id string) (mod
 	defer s.mu.RUnlock()
 	v, ok := s.grants[grantKey(tenant, id)]
 	return v, ok, nil
+}
+
+// Overlay only existing records. Peer erasure must not resurrect a grant.
+func (s *Store) applyPendingLocked(next map[string]model.DelegatedAccessGrant) {
+	for key, pending := range s.pendingRevocations {
+		if grant, ok := next[key]; ok {
+			at := pending.at
+			grant.Status, grant.RevokedAt, grant.RevocationReason = "revoked", &at, stringPtr(pending.reason)
+			next[key] = grant
+		}
+	}
 }

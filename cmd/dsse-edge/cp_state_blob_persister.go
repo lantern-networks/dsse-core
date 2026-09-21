@@ -488,3 +488,17 @@ func sharedAgentUpdateArtifactShelf(db *sql.DB) *agentUpdateArtifactShelf {
 		},
 	}
 }
+
+// Do not let a receiving cache mutate its publisher's shared authority. An
+// explicit shared setting is contradictory and must fail before serving traffic.
+func configBundleStorePersister(value, sourceURL, key string) (blobstore.Persister, error) {
+	db := cpStateBlobDB
+	if strings.TrimSpace(sourceURL) != "" {
+		v := strings.TrimSpace(value)
+		if v == "postgres" || strings.HasPrefix(v, cpStateBlobPersisterImportPrefix) {
+			return nil, fmt.Errorf("%s is a config-bundle receiver cache: use a node-local file with -config-source-url, not shared Postgres", key)
+		}
+		db = nil
+	}
+	return cpStateBlobPersister(value, db, key)
+}

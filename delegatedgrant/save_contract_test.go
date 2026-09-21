@@ -56,8 +56,8 @@ func TestRejectedGrantMutationsDoNotPublishOrEvict(t *testing.T) {
 	}
 	after, _ := p.Load()
 	g, _ := s.GetForTenant("tenant", "first")
-	if string(before) != string(after) || s.ConfigGeneration() != gen || g.Status != "active" || len(g.ToolIDs) != 0 || s.Count() != 2 {
-		t.Fatal("failed write published or evicted prior state")
+	if string(before) != string(after) || s.ConfigGeneration() != gen+1 || g.Status != "revoked" || len(g.ToolIDs) != 0 || s.Count() != 2 {
+		t.Fatal("failed revoke did not retain local denial or changed saved state")
 	}
 	p.fail = false
 	if _, e := s.RevokeForTenant("tenant", "first", "review", time.Now()); e != nil {

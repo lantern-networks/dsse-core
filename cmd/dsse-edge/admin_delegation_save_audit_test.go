@@ -124,18 +124,56 @@ func checkDelegationSaveFailureAuditAndTenantBoundary(t *testing.T, replaceBefor
 		if r.Code != want || strings.Contains(r.Body.String(), "private-runtime-location") {
 			t.Fatalf("response %d: %s", r.Code, r.Body)
 		}
+		revoke := strings.HasSuffix(tc.path, "/revoke")
 		if tc.fail {
 			after, _ := p.Load()
-			if store.ConfigGeneration() != gen || len(outbox.insertedAudits) != domain || (!replaceBeforeError && string(before) != string(after)) {
-				t.Fatal("rejected mutation changed state/generation/audit")
+			if !replaceBeforeError && string(before) != string(after) {
+				t.Fatal("refused save changed persisted bytes")
 			}
-		} else {
-			if store.ConfigGeneration() != gen+1 || len(outbox.insertedAudits) != domain+1 {
-				t.Fatal("accepted mutation missing generation or audit")
+		}
+		if tc.fail && !revoke {
+			if store.ConfigGeneration() != gen || len(outbox.insertedAudits) != domain {
+				t.Fatal("rejected creation changed generation or domain audit")
 			}
-			a := outbox.insertedAudits[domain]
-			if stringPtrValue(a.ActorUserID) != "grant-admin" || a.TenantID != "tenant_lab_001" || stringPtrValue(a.TargetID) != "shared" {
-				t.Fatalf("audit attribution %+v", a)
+			if _, ok := store.GetForTenant("tenant_lab_001", "shared"); ok {
+				t.Fatal("rejected creation published a grant")
+			}
+			continue
+		}
+		wantGen := gen + 1
+		if revoke && !tc.fail {
+			// Confirming an already applied denial changes durability, not state.
+			wantGen = gen
+		}
+		if store.ConfigGeneration() != wantGen || len(outbox.insertedAudits) != domain+1 {
+			t.Fatal("applied mutation missing generation or domain audit")
+		}
+		a := outbox.insertedAudits[domain]
+		if stringPtrValue(a.ActorUserID) != "grant-admin" || a.TenantID != "tenant_lab_001" || stringPtrValue(a.TargetID) != "shared" {
+			t.Fatalf("audit attribution %+v", a)
+		}
+		if revoke {
+			grant, ok := store.GetForTenant("tenant_lab_001", "shared")
+			if !ok || grant.Status != "revoked" || delegatedgrant.IsActive(grant, now) {
+				t.Fatal("revocation did not deny locally")
+			}
+			if tc.fail {
+				var partial map[string]any
+				if err := json.Unmarshal(r.Body.Bytes(), &partial); err != nil || partial["status"] != "partial" || partial["applied"] != true || partial["persistence"] != "unconfirmed" {
+					t.Fatalf("missing partial response: %s", r.Body)
+				}
+				if stringPtrValue(a.Result) != "partial" || a.Metadata["applied"] != true || a.Metadata["persistence"] != "unconfirmed" {
+					t.Fatal("local denial missing partial audit")
+				}
+			} else {
+				reloaded := delegatedgrant.NewStore(0)
+				if err := reloaded.SetPersister(p); err != nil {
+					t.Fatal(err)
+				}
+				persisted, ok := reloaded.GetForTenant("tenant_lab_001", "shared")
+				if !ok || persisted.Status != "revoked" || stringPtrValue(a.Result) == "partial" {
+					t.Fatal("confirmed retry missing durable revocation or final audit")
+				}
 			}
 		}
 	}
@@ -155,7 +193,7 @@ func checkDelegationSaveFailureAuditAndTenantBoundary(t *testing.T, replaceBefor
 		t.Fatal("tool event accepted another tenant's grant")
 	}
 	rows := readTransportAudits(t, writer)
-	if len(rows) != 6 {
+	if len(rows) != 7 {
 		t.Fatalf("audit count %d", len(rows))
 	}
 	failures := 0

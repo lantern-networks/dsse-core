@@ -59,15 +59,15 @@ func TestUnconfirmedRevokeIsNotSuccessful(t *testing.T) {
 					}
 				}
 				g, _ := s.GetForTenant("tenant", "one")
-				want := "active"
+				want := "revoked"
 				if tc.confirmed {
 					want = "revoked"
 				}
 				if g.Status != want {
 					t.Fatal("wrong live state")
 				}
-				if !tc.confirmed && s.ConfigGeneration() != gen {
-					t.Fatal("unconfirmed generation advanced")
+				if !tc.confirmed && s.ConfigGeneration() != gen+1 {
+					t.Fatal("local denial did not advance generation")
 				}
 			}
 			// The candidate bytes were replaced before the error: neither error means disk stayed unchanged.

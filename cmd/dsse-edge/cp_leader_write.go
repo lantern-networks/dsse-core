@@ -32,9 +32,13 @@ func captureCPWriteLease(ctx context.Context) context.Context {
 // release waits for this transaction; session loss aborts the transaction before
 // a peer can acquire the lock. Call finish only after commit/rollback.
 func beginCPWriteTransaction(ctx context.Context, fallback *sql.DB) (*sql.Tx, func(), error) {
+	return beginCPWriteTransactionOptions(ctx, fallback, nil)
+}
+
+func beginCPWriteTransactionOptions(ctx context.Context, fallback *sql.DB, options *sql.TxOptions) (*sql.Tx, func(), error) {
 	lease, ok := ctx.Value(cpWriteLeaseKey{}).(cpWriteLease)
 	if !ok {
-		tx, err := fallback.BeginTx(ctx, nil)
+		tx, err := fallback.BeginTx(ctx, options)
 		return tx, func() {}, err
 	}
 	e := lease.elector
@@ -43,7 +47,7 @@ func beginCPWriteTransaction(ctx context.Context, fallback *sql.DB) (*sql.Tx, fu
 		e.mu.Unlock()
 		return nil, func() {}, errors.New("control-plane leadership changed before saving")
 	}
-	tx, err := e.conn.BeginTx(ctx, nil)
+	tx, err := e.conn.BeginTx(ctx, options)
 	if err != nil {
 		e.mu.Unlock()
 		return nil, func() {}, err

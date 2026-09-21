@@ -462,6 +462,7 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 	adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
 	record func(r *http.Request, action, targetID, reason string, metadata map[string]any)) {
 	mux.HandleFunc("GET /admin/transport-trust-anchors", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(trustDistributionWriteContext(r.Context()))
 		if err := transportAnchorAcks.Refresh(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
@@ -486,7 +487,12 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 		if target == "" {
 			target = tenantID // an unscoped deployment answers about the node's own organization, as before
 		}
-		pems, ownAnchors, sharedWithdrawn := perTenantTrustBundlesForAdmin.AnnouncedAnchorsFor(target)
+		pems, ownAnchors, sharedWithdrawn := perTenantTrustBundlesForAdmin.AnnouncedAnchorsForContext(r.Context(), target)
+		if strings.TrimSpace(pems) == "" && perTenantTrustBundlesForAdmin != nil &&
+			(perTenantTrustBundlesForAdmin.config.TenantTrustDistributor != nil || perTenantTrustBundlesForAdmin.config.DistributedTenantTrust != nil) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("canonical tenant trust distribution is unavailable"))
+			return
+		}
 		if strings.TrimSpace(pems) == "" {
 			pems, _ = currentTrustAnchors(config)
 		}

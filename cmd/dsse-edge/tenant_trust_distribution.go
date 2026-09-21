@@ -50,6 +50,11 @@ type tenantTrustDistributor struct {
 }
 
 func (d *tenantTrustDistributor) For(tenant string) (agentpolicy.Envelope, bool) {
+	return d.ForContext(context.Background(), tenant)
+}
+
+func (d *tenantTrustDistributor) ForContext(ctx context.Context, tenant string) (agentpolicy.Envelope, bool) {
+	ctx = trustDistributionWriteContext(ctx)
 	tr, err := d.config.TenantTransportAuthority.materialSnapshot()
 	if err != nil {
 		return agentpolicy.Envelope{}, false
@@ -58,7 +63,7 @@ func (d *tenantTrustDistributor) For(tenant string) (agentpolicy.Envelope, bool)
 	if err != nil {
 		return agentpolicy.Envelope{}, false
 	}
-	all, err := d.Publish(tr, in)
+	all, err := d.PublishContext(ctx, tr, in)
 	if err != nil {
 		logInfof("tenant_trust_distribution unavailable: %v", err)
 		return agentpolicy.Envelope{}, false
@@ -71,6 +76,26 @@ func (d *tenantTrustDistributor) For(tenant string) (agentpolicy.Envelope, bool)
 // private material response. PostgreSQL holds source rows against concurrent CAS
 // updates until the revision is durable. No network probes run in this transaction.
 func (d *tenantTrustDistributor) Publish(tr *tenantTransportAuthority, in *tenantInterceptionAuthority) (map[string]tenantTrustDistribution, error) {
+	return d.PublishContext(context.Background(), tr, in)
+}
+
+// Preserve a caller's captured term; callbacks without an HTTP request capture it
+// before reading authority or telemetry.
+func trustDistributionWriteContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Value(cpWriteLeaseKey{}).(cpWriteLease); !ok {
+		ctx = captureCPWriteLease(ctx)
+	}
+	return ctx
+}
+
+func (d *tenantTrustDistributor) PublishContext(ctx context.Context, tr *tenantTransportAuthority, in *tenantInterceptionAuthority) (map[string]tenantTrustDistribution, error) {
+	ctx = trustDistributionWriteContext(ctx)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.store == nil || d.config.AgentPolicySigner == nil || tr == nil {
@@ -96,12 +121,13 @@ func (d *tenantTrustDistributor) Publish(tr *tenantTransportAuthority, in *tenan
 	var save func([]byte) error
 	var finish func() error = func() error { return nil }
 	if pg, ok := d.store.(postgresBlobPersister); ok {
-		ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+		ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
 		defer cancel()
-		tx, err := pg.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+		tx, unlock, err := beginCPWriteTransactionOptions(ctx, pg.db, &sql.TxOptions{Isolation: sql.LevelSerializable})
 		if err != nil {
 			return nil, err
 		}
+		defer unlock()
 		defer tx.Rollback()
 		read := func(key string) ([]byte, error) {
 			var b []byte
@@ -223,7 +249,7 @@ func (d *tenantTrustDistributor) Publish(tr *tenantTransportAuthority, in *tenan
 			if admin == nil {
 				return nil, fmt.Errorf("tenant population cannot be read")
 			}
-			rows, err := admin.List(context.Background())
+			rows, err := admin.List(ctx)
 			if err != nil {
 				return nil, err
 			}
@@ -461,25 +487,52 @@ func (d *tenantTrustDistributor) CountForTenant(tenant string) (int, error) {
 	return 0, nil
 }
 func (d *tenantTrustDistributor) RemoveTenant(tenant string) (int, error) {
+	return d.RemoveTenantContext(context.Background(), tenant)
+}
+
+func (d *tenantTrustDistributor) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
 	if d == nil {
 		return 0, nil
 	}
+	ctx = trustDistributionWriteContext(ctx)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	removed := 0
+	edit := func(raw []byte) ([]byte, error) {
+		state, err := decodeTenantTrustDistributions(raw)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := state.Tenants[tenant]; !ok {
+			if raw == nil {
+				return json.Marshal(state)
+			}
+			return raw, nil
+		}
+		delete(state.Tenants, tenant)
+		next, err := json.Marshal(state)
+		if err == nil {
+			removed = 1
+		}
+		return next, err
+	}
+	if shared, ok := d.store.(interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}); ok {
+		if err := shared.UpdateContext(ctx, edit); err != nil {
+			return 0, err
+		}
+		return removed, nil
+	}
 	raw, err := d.store.Load()
 	if err != nil {
 		return 0, err
 	}
-	state, err := decodeTenantTrustDistributions(raw)
-	if err != nil {
-		return 0, err
-	}
-	if _, ok := state.Tenants[tenant]; !ok {
-		return 0, nil
-	}
-	delete(state.Tenants, tenant)
-	next, err := json.Marshal(state)
-	if err != nil {
+	next, err := edit(raw)
+	if err != nil || removed == 0 {
 		return 0, err
 	}
 	if cas, ok := d.store.(authorityCASBackend); ok {
@@ -490,5 +543,5 @@ func (d *tenantTrustDistributor) RemoveTenant(tenant string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return 1, nil
+	return removed, nil
 }

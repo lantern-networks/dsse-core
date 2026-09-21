@@ -504,7 +504,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		eraseChecked("tenant_interception_authorities", e.TenantInterceptionAuthorities.RemoveTenantChecked)
 	}
 	if e.TenantTrustDistributions != nil {
-		n, err := e.TenantTrustDistributions.RemoveTenant(tenantID)
+		n, err := e.TenantTrustDistributions.RemoveTenantContext(ctx, tenantID)
 		if err != nil {
 			result.Failures = append(result.Failures, "tenant_trust_distributions: "+err.Error())
 		} else {

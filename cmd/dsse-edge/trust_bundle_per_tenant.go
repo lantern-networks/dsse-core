@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"strings"
 	"sync"
@@ -88,6 +89,10 @@ func (b *perTenantTrustBundles) SetTransportMaterial(pems string, serial int64) 
 
 // For returns the signed bundle for one organization, building and caching it if needed.
 func (b *perTenantTrustBundles) For(tenantID string) (agentpolicy.Envelope, bool) {
+	return b.ForContext(context.Background(), tenantID)
+}
+
+func (b *perTenantTrustBundles) ForContext(ctx context.Context, tenantID string) (agentpolicy.Envelope, bool) {
 	if b == nil || b.config.AgentPolicySigner == nil {
 		return agentpolicy.Envelope{}, false
 	}
@@ -99,7 +104,7 @@ func (b *perTenantTrustBundles) For(tenantID string) (agentpolicy.Envelope, bool
 		return b.config.DistributedTenantTrust.For(tenant)
 	}
 	if b.config.TenantTrustDistributor != nil {
-		return b.config.TenantTrustDistributor.For(tenant)
+		return b.config.TenantTrustDistributor.ForContext(ctx, tenant)
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -287,12 +292,16 @@ func (b *perTenantTrustBundles) CatchUpWithTheFleet(tenant, announced string) {
 // drift this extraction removes: the page would show two of the organization's authorities while the next
 // bundle the same devices fetch carries one.
 func (b *perTenantTrustBundles) AnnouncedAnchorsFor(tenant string) (string, int, bool) {
+	return b.AnnouncedAnchorsForContext(context.Background(), tenant)
+}
+
+func (b *perTenantTrustBundles) AnnouncedAnchorsForContext(ctx context.Context, tenant string) (string, int, bool) {
 	if b == nil {
 		return "", 0, false
 	}
 
 	if b.config.DistributedTenantTrust != nil || b.config.TenantTrustDistributor != nil {
-		env, ok := b.For(tenant)
+		env, ok := b.ForContext(ctx, tenant)
 		if !ok {
 			return "", 0, false
 		}

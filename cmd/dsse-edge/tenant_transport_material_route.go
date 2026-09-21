@@ -70,6 +70,7 @@ func registerTenantTransportMaterialRoute(mux *http.ServeMux, authority *tenantT
 		ttl = 12 * time.Hour
 	}
 	mux.HandleFunc("POST /tenant-edge-material", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(trustDistributionWriteContext(r.Context()))
 		if !auditIngestBearerValid(r, token) {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("tenant-edge-material: unauthorized"))
 			return
@@ -150,7 +151,7 @@ func registerTenantTransportMaterialRoute(mux *http.ServeMux, authority *tenantT
 			Unchanged      bool                   `json:"unchanged,omitempty"`
 		}{TTL: ttl.String(), Generation: materialGeneration(authority, interception, deviceIdentity, registrations)}
 		if len(distributors) == 1 && distributors[0] != nil {
-			out.TrustBundles, err = distributors[0].Publish(authority, interception)
+			out.TrustBundles, err = distributors[0].PublishContext(r.Context(), authority, interception)
 			if err != nil {
 				writeError(w, http.StatusServiceUnavailable, err)
 				return

@@ -91,7 +91,7 @@ func TestPostgresConfiguredDLPReceiverAcceptsBundle(t *testing.T) {
 }
 
 func TestBundleReceiverRejectsExplicitSharedAuthority(t *testing.T) {
-	for _, key := range []string{"dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects"} {
+	for _, key := range []string{"dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects", "admin_runtime_state"} {
 		for _, value := range []string{"postgres", "postgres+import:local.json"} {
 			if _, err := configBundleStorePersister(value, "https://control.example.invalid", key); err == nil {
 				t.Fatalf("accepted receiver authority %s %s", key, value)
@@ -102,7 +102,7 @@ func TestBundleReceiverRejectsExplicitSharedAuthority(t *testing.T) {
 	sharedStateDSNConfigured = true
 	defer func() { sharedStateDSNConfigured = old }()
 	dir := t.TempDir()
-	for _, key := range []string{"dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects"} {
+	for _, key := range []string{"dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects", "admin_runtime_state"} {
 		if got := configBundleStorePath(dir, "https://control.example.invalid", "", key); got != filepath.Join(dir, key+".json") {
 			t.Fatal("receiver selected shared authority", got)
 		}

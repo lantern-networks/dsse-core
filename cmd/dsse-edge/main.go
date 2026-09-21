@@ -1549,7 +1549,7 @@ func main() {
 	*idpConnectionStorePath = durableStorePath(*stateDir, *idpConnectionStorePath, "idp_connections")
 	*tenantModelStorePath = durableStorePath(*stateDir, *tenantModelStorePath, "tenant_model")
 	*vlanObjectStorePath = configBundleStorePath(*stateDir, *configSourceURL, *vlanObjectStorePath, "vlan_objects")
-	*adminRuntimeStateStorePath = durableStorePath(*stateDir, *adminRuntimeStateStorePath, "admin_runtime_state")
+	*adminRuntimeStateStorePath = configBundleStorePath(*stateDir, *configSourceURL, *adminRuntimeStateStorePath, "admin_runtime_state")
 	// Which certificate each device was last handed is a MEASUREMENT, and a measurement that resets on restart
 	// reports a finished rotation as one still waiting for devices that already took it (review C6).
 	if p := durableStorePath(*stateDir, "", "server_cert_adoption"); p != "" {
@@ -2473,7 +2473,11 @@ func main() {
 	// though an administrator had chosen it, overwriting the evidence of what the posture was. Refusing to
 	// start is the loud, recoverable failure; the quiet one leaves a product that looks healthy and enforces
 	// less than it claims. An ABSENT store is still an ordinary first boot and is not an error.
-	if err := policyStore.SetRuntimeStatePersister(mustCPStateBlobPersister(*adminRuntimeStateStorePath, "admin_runtime_state")); err != nil {
+	runtimePersister, err := configBundleStorePersister(*adminRuntimeStateStorePath, *configSourceURL, "admin_runtime_state")
+	if err != nil {
+		log.Fatalf("admin runtime state: %v", err)
+	}
+	if err := policyStore.SetRuntimeStatePersister(runtimePersister); err != nil {
 		log.Fatalf("admin runtime state: %v", err)
 	}
 	if err := networkExtensionPublisher.PublishAdminPolicySnapshot(context.Background(), pb.TenantID, policyStore, pb, time.Now()); err != nil {

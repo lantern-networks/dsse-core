@@ -727,7 +727,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	}
 	var n int
 	if payload.TenantConfig != nil {
-		n = t.policyStore.ApplyBundle(s.tenantID, policies, *payload.TenantConfig, now)
+		var err error
+		n, err = t.policyStore.ApplyReceivedBundle(s.tenantID, policies, *payload.TenantConfig, now)
+		if err != nil {
+			return 0, fmt.Errorf("runtime configuration: %w", err)
+		}
 	} else {
 		n = t.policyStore.ReplaceTenant(s.tenantID, policies, now)
 	}
@@ -746,7 +750,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		}
 		applied := 0
 		if section.Config != nil {
-			applied = t.policyStore.ApplyBundle(tenantID, section.Policies, *section.Config, now)
+			var err error
+			applied, err = t.policyStore.ApplyReceivedBundle(tenantID, section.Policies, *section.Config, now)
+			if err != nil {
+				return 0, fmt.Errorf("runtime configuration for %s: %w", tenantID, err)
+			}
 		} else {
 			applied = t.policyStore.ReplaceTenant(tenantID, section.Policies, now)
 		}

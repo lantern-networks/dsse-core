@@ -1010,9 +1010,15 @@ func replayPostgresDomainEventOutboxDeadRow(ctx context.Context, db *sql.DB, ten
 	if err != nil {
 		return postgresDomainEventOutboxReplayResult{}, false, err
 	}
+	tx, finish, err := beginCPWriteTransaction(ctx, db)
+	if err != nil {
+		return postgresDomainEventOutboxReplayResult{}, false, err
+	}
+	defer finish()
+	defer tx.Rollback()
 	var result postgresDomainEventOutboxReplayResult
 	var previousDeadAt sql.NullTime
-	err = db.QueryRowContext(ctx, statement.SQL, statement.Args...).Scan(&result.TenantID, &result.OutboxID, &result.EventPlane, &result.Status, &result.PublishAttempt, &result.UpdatedAt, &result.PreviousPublishAttempt, &result.PreviousLastError, &previousDeadAt)
+	err = tx.QueryRowContext(ctx, statement.SQL, statement.Args...).Scan(&result.TenantID, &result.OutboxID, &result.EventPlane, &result.Status, &result.PublishAttempt, &result.UpdatedAt, &result.PreviousPublishAttempt, &result.PreviousLastError, &previousDeadAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return postgresDomainEventOutboxReplayResult{}, false, nil
 	}
@@ -1022,6 +1028,9 @@ func replayPostgresDomainEventOutboxDeadRow(ctx context.Context, db *sql.DB, ten
 	if previousDeadAt.Valid {
 		normalized := previousDeadAt.Time.UTC()
 		result.PreviousDeadAt = &normalized
+	}
+	if err := tx.Commit(); err != nil {
+		return postgresDomainEventOutboxReplayResult{}, false, err
 	}
 	return result, true, nil
 }

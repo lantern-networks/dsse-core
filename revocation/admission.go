@@ -47,7 +47,7 @@ type AdmissionRevocations struct {
 	// meshReporter, when set (a CP that federates with peers), is called on a NEW ORIGIN revocation so it
 	// propagates to the federation peers. NOT called for a federation-RECEIVED item (no-loop) nor for
 	// ReplaceSynced.
-	meshReporter func(identity, reason string)
+	meshReporter func(context.Context, string, string)
 	// onRevoked, when set, is called ONCE when an identity BECOMES revoked via ANY layer (node-local Revoke,
 	// federation RevokeFromMesh, or a NEWLY-added entry in ReplaceSynced) — i.e. it fires on the fast CP poll
 	// too, unlike reporter/meshReporter. It exists so the edge can ACTIVELY close that identity's live (T)
@@ -73,6 +73,20 @@ func (a *AdmissionRevocations) SetReporter(reporter func(identity, reason string
 // SetMeshReporter wires the federation propagation hook: a CP calls this so a NEW ORIGIN revocation is pushed to
 // its federation peers. Called once at boot.
 func (a *AdmissionRevocations) SetMeshReporter(reporter func(identity, reason string)) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if reporter == nil {
+		a.meshReporter = nil
+	} else {
+		a.meshReporter = func(_ context.Context, id, reason string) { reporter(id, reason) }
+	}
+}
+
+// SetMeshReporterContext preserves the revocation request authority for its outbox.
+func (a *AdmissionRevocations) SetMeshReporterContext(reporter func(context.Context, string, string)) {
 	if a == nil {
 		return
 	}
@@ -220,6 +234,9 @@ func (a *AdmissionRevocations) RevokeChecked(identity, reason string) error {
 }
 
 func (a *AdmissionRevocations) revoke(identity, reason string, retrySave bool) error {
+	return a.revokeContext(context.Background(), identity, reason, retrySave)
+}
+func (a *AdmissionRevocations) revokeContext(ctx context.Context, identity, reason string, retrySave bool) error {
 	id := normalizeIdentity(identity)
 	if id == "" {
 		return nil
@@ -250,7 +267,7 @@ func (a *AdmissionRevocations) revoke(identity, reason string, retrySave bool) e
 	// Federation push: an ORIGIN revocation propagates to the federation peers. Only fired for an origin Revoke —
 	// a federation-RECEIVED item (RevokeFromMesh) never re-pushes (no-loop).
 	if changed && meshReporter != nil {
-		meshReporter(id, reason)
+		meshReporter(ctx, id, reason)
 	}
 	// Active session revocation: close the identity's live connections (idempotent no-op if none).
 	if changed && onRevoked != nil {

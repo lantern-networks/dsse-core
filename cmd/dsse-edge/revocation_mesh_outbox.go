@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -21,6 +22,7 @@ type revocationMeshOutboxEntry struct {
 	Reason       string `json:"reason"`
 	OriginRegion string `json:"origin_region"`
 	EnqueuedAt   string `json:"enqueued_at"`
+	Revision     string `json:"revision,omitempty"`
 	// Process-local revision binds completion to this exact enqueue, even for ABA.
 	sequence uint64
 }
@@ -29,12 +31,15 @@ type revocationMeshOutboxEntry struct {
 // It saves the whole pending set on enqueue/ack via a blobstore.Persister. Failed
 // saves remain eligible for retry; a nil persister provides memory-only operation.
 type revocationMeshOutbox struct {
-	writeMu      sync.Mutex   // writers and storage; always before mu
-	mu           sync.RWMutex // published maps only, never held across storage
-	nextSequence uint64
-	retrySave    bool
-	persister    blobstore.Persister
-	pending      map[string]revocationMeshOutboxEntry
+	writeMu         sync.Mutex   // writers and storage; always before mu
+	mu              sync.RWMutex // published maps only, never held across storage
+	nextSequence    uint64
+	retrySave       bool
+	sharedKnown     bool
+	sharedUncertain bool
+	unsaved         map[string]meshPendingIntent
+	persister       blobstore.Persister
+	pending         map[string]revocationMeshOutboxEntry
 }
 
 func revocationMeshOutboxKey(region, identity string) string { return region + "\x00" + identity }
@@ -42,7 +47,7 @@ func revocationMeshOutboxKey(region, identity string) string { return region + "
 // newRevocationMeshOutbox loads any persisted pending pushes so a restart resumes them. A nil persister yields an
 // empty memory-only outbox.
 func newRevocationMeshOutbox(p blobstore.Persister) (*revocationMeshOutbox, error) {
-	o := &revocationMeshOutbox{persister: p, pending: map[string]revocationMeshOutboxEntry{}}
+	o := &revocationMeshOutbox{persister: p, unsaved: map[string]meshPendingIntent{}, pending: map[string]revocationMeshOutboxEntry{}}
 	if p == nil {
 		return o, nil
 	}
@@ -53,6 +58,7 @@ func newRevocationMeshOutbox(p blobstore.Persister) (*revocationMeshOutbox, erro
 	if data == nil {
 		return o, nil
 	}
+	o.sharedKnown = true
 	entries, err := decodeMeshOutboxSnapshot(data)
 	if err != nil {
 		return nil, err
@@ -68,8 +74,14 @@ func newRevocationMeshOutbox(p blobstore.Persister) (*revocationMeshOutbox, erro
 // enqueue retains the pending delivery in memory if saving fails. Delivery can
 // still protect the peer; retries report and retry the unconfirmed snapshot.
 func (o *revocationMeshOutbox) enqueue(e revocationMeshOutboxEntry) (revocationMeshOutboxEntry, string, error) {
+	return o.enqueueContext(captureCPWriteLease(context.Background()), e)
+}
+func (o *revocationMeshOutbox) enqueueContext(ctx context.Context, e revocationMeshOutboxEntry) (revocationMeshOutboxEntry, string, error) {
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
+	if o.shared() != nil {
+		return o.enqueueShared(ctx, e)
+	}
 	o.nextSequence++
 	e.sequence = o.nextSequence
 	candidate := maps.Clone(o.pending)
@@ -85,14 +97,23 @@ func (o *revocationMeshOutbox) isCurrent(e revocationMeshOutboxEntry) bool {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	current, ok := o.pending[revocationMeshOutboxKey(e.Region, e.Identity)]
+	if o.shared() != nil {
+		return ok && meshSame(current, e)
+	}
 	return ok && current == e
 }
 
 // ack compares the captured enqueue revision, and publishes removal only after a
 // confirmed save. An old completion cannot remove a replacement at the same key.
 func (o *revocationMeshOutbox) ack(e revocationMeshOutboxEntry) (bool, string, error) {
+	return o.ackContext(captureCPWriteLease(context.Background()), e)
+}
+func (o *revocationMeshOutbox) ackContext(ctx context.Context, e revocationMeshOutboxEntry) (bool, string, error) {
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
+	if o.shared() != nil {
+		return o.ackShared(ctx, e)
+	}
 	key := revocationMeshOutboxKey(e.Region, e.Identity)
 	if current, ok := o.pending[key]; !ok || current != e {
 		return false, "not_attempted", nil
@@ -112,8 +133,14 @@ func (o *revocationMeshOutbox) ack(e revocationMeshOutboxEntry) (bool, string, e
 // Retry persistence without changing the enqueue revision. All pending entries
 // share a snapshot, so any confirmed save also resolves earlier enqueue failures.
 func (o *revocationMeshOutbox) retryPending(e revocationMeshOutboxEntry) (bool, string, error) {
+	return o.retryPendingContext(captureCPWriteLease(context.Background()), e)
+}
+func (o *revocationMeshOutbox) retryPendingContext(ctx context.Context, e revocationMeshOutboxEntry) (bool, string, error) {
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
+	if o.shared() != nil {
+		return o.retryShared(ctx, e)
+	}
 	if current, ok := o.pending[revocationMeshOutboxKey(e.Region, e.Identity)]; !ok || current != e {
 		return false, "not_attempted", nil
 	}

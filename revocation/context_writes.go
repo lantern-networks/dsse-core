@@ -38,7 +38,7 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 	if !ok {
 		a.writeMu.Unlock()
 		if revoke {
-			return true, a.RevokeChecked(id, reason)
+			return true, a.revokeContext(ctx, id, reason, true)
 		}
 		err := a.RestoreChecked(id)
 		return err == nil, err
@@ -85,7 +85,7 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 			reporter(id, reason)
 		}
 		if meshReporter != nil {
-			meshReporter(id, reason)
+			meshReporter(ctx, id, reason)
 		}
 		if onRevoked != nil {
 			onRevoked(id, reason)

@@ -78,11 +78,13 @@ func parseRevocationMeshPeers(raw string) ([]revocationMeshPeer, error) {
 // monotonic, so an unchanged duplicate does not change enforcement. The receiver
 // still retries saving before acknowledging it.
 func (s revocationMeshSource) pushFunc() func(identity, reason string) {
-	return func(identity, reason string) {
-		item := revocationMeshItem{Identity: identity, Reason: reason, OriginRegion: s.originRegion}
-		for _, peer := range s.peers {
-			s.deliverToPeer(peer, item)
-		}
+	return func(identity, reason string) { s.pushContext(context.Background(), identity, reason) }
+}
+func (s revocationMeshSource) pushContext(ctx context.Context, identity, reason string) {
+	ctx = meshWriteContext(ctx)
+	item := revocationMeshItem{Identity: identity, Reason: reason, OriginRegion: s.originRegion}
+	for _, peer := range s.peers {
+		s.deliverToPeerContext(ctx, peer, item)
 	}
 }
 
@@ -90,32 +92,45 @@ func (s revocationMeshSource) pushFunc() func(identity, reason string) {
 // Restart recovery requires a confirmed save. Peer acceptance and saved cleanup are
 // checked separately. With no outbox, only the legacy in-process retry loop runs.
 func (s revocationMeshSource) deliverToPeer(peer revocationMeshPeer, item revocationMeshItem) {
+	s.deliverToPeerContext(meshWriteContext(context.Background()), peer, item)
+}
+func (s revocationMeshSource) deliverToPeerContext(ctx context.Context, peer revocationMeshPeer, item revocationMeshItem) {
 	if s.outbox == nil {
 		go s.pushToPeerWithRetry(peer, item)
 		return
 	}
-	entry, persistence, _ := s.outbox.enqueue(revocationMeshOutboxEntry{
+	entry, persistence, _ := s.outbox.enqueueContext(ctx, revocationMeshOutboxEntry{
 		Region: peer.region, URL: peer.url, Identity: item.Identity, Reason: item.Reason,
 		OriginRegion: item.OriginRegion, EnqueuedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 	log.Printf("revocation mesh outbox: enqueue identity=%q region=%q persistence=%s", entry.Identity, entry.Region, persistence)
-	go s.pushPendingToPeerWithRetry(peer, item, &entry)
+	go s.pushPendingContext(context.WithoutCancel(ctx), peer, item, &entry)
 }
 
 // resumePendingDeliveries re-drives every push that was enqueued but not acked before a restart: it
 // is called once at boot after the outbox is loaded. Returns the number of pending pushes resumed. A duplicate
 // delivery does not change enforcement on the peer, but retries saving there.
 func (s revocationMeshSource) resumePendingDeliveries() int {
-	if s.outbox == nil {
-		return 0
+	n, err := s.resumePendingContext(meshWriteContext(context.Background()))
+	if err != nil {
+		log.Printf("revocation mesh outbox: resume unavailable")
 	}
-	pending := s.outbox.snapshot()
+	return n
+}
+func (s revocationMeshSource) resumePendingContext(ctx context.Context) (int, error) {
+	if s.outbox == nil || !meshLeaseCurrent(ctx) {
+		return 0, nil
+	}
+	pending, err := s.outbox.pendingForResume()
+	if err != nil {
+		return 0, err
+	}
 	for _, e := range pending {
 		peer := revocationMeshPeer{region: e.Region, url: e.URL}
 		item := revocationMeshItem{Identity: e.Identity, Reason: e.Reason, OriginRegion: e.OriginRegion}
-		go s.pushPendingToPeerWithRetry(peer, item, &e)
+		go s.pushPendingContext(context.WithoutCancel(ctx), peer, item, &e)
 	}
-	return len(pending)
+	return len(pending), nil
 }
 
 // Legacy delivery without an outbox retains bounded in-process retries.
@@ -126,19 +141,25 @@ func (s revocationMeshSource) pushToPeerWithRetry(peer revocationMeshPeer, item 
 // A peer's ACK and confirmation that its pending entry was removed from storage
 // are separate outcomes. Once acknowledged, retry only cleanup, not the network.
 func (s revocationMeshSource) pushPendingToPeerWithRetry(peer revocationMeshPeer, item revocationMeshItem, entry *revocationMeshOutboxEntry) bool {
+	return s.pushPendingContext(meshWriteContext(context.Background()), peer, item, entry)
+}
+func (s revocationMeshSource) pushPendingContext(ctx context.Context, peer revocationMeshPeer, item revocationMeshItem, entry *revocationMeshOutboxEntry) bool {
 	const maxBackoff = 30 * time.Second
 	const maxWindow = 10 * time.Minute
 	backoff := time.Second
 	deadline := time.Now().UTC().Add(maxWindow)
 	peerAccepted := false
 	for {
+		if !meshLeaseCurrent(ctx) {
+			return false
+		}
 		if entry != nil && !s.outbox.isCurrent(*entry) {
 			log.Printf("revocation mesh outbox: superseded identity=%q region=%q", entry.Identity, entry.Region)
 			return false
 		}
 		if !peerAccepted {
 			if entry != nil {
-				current, persistence, _ := s.outbox.retryPending(*entry)
+				current, persistence, _ := s.outbox.retryPendingContext(ctx, *entry)
 				if !current {
 					return false
 				}
@@ -153,7 +174,7 @@ func (s revocationMeshSource) pushPendingToPeerWithRetry(peer revocationMeshPeer
 				log.Printf("revocation mesh: pushed %q (origin %s) to peer region %s", item.Identity, item.OriginRegion, peer.region)
 				return true
 			}
-			removed, persistence, err := s.outbox.ack(*entry)
+			removed, persistence, err := s.outbox.ackContext(ctx, *entry)
 			log.Printf("revocation mesh outbox: peer_accepted=true identity=%q region=%q removed=%t persistence=%s", entry.Identity, entry.Region, removed, persistence)
 			if err == nil {
 				return removed

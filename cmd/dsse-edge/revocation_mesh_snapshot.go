@@ -32,7 +32,7 @@ func decodeMeshOutboxSnapshot(data []byte) ([]revocationMeshOutboxEntry, error) 
 			return invalid()
 		}
 		var e revocationMeshOutboxEntry
-		fields := map[string]*string{"region": &e.Region, "url": &e.URL, "identity": &e.Identity, "reason": &e.Reason, "origin_region": &e.OriginRegion, "enqueued_at": &e.EnqueuedAt}
+		fields := map[string]*string{"region": &e.Region, "url": &e.URL, "identity": &e.Identity, "reason": &e.Reason, "origin_region": &e.OriginRegion, "enqueued_at": &e.EnqueuedAt, "revision": &e.Revision}
 		seen := map[string]bool{}
 		for d.More() {
 			v, err := d.Token()
@@ -56,6 +56,9 @@ func decodeMeshOutboxSnapshot(data []byte) ([]revocationMeshOutboxEntry, error) 
 			return invalid()
 		}
 		if !seen["region"] || !seen["url"] || !seen["identity"] || !canonicalMeshKey(e.Region) || !canonicalMeshIdentity(e.Identity) || !validMeshPeerURL(e.URL) {
+			return invalid()
+		}
+		if seen["revision"] && (len(e.Revision) != 32 || strings.IndexFunc(e.Revision, func(r rune) bool { return !(r >= '0' && r <= '9' || r >= 'a' && r <= 'f') }) >= 0) {
 			return invalid()
 		}
 		key := revocationMeshOutboxKey(e.Region, e.Identity)

@@ -282,7 +282,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	// to adopt.
 	if decision.IsDefaultDeny(dec) && config.PolicyCandidateStore != nil {
 		if cs, ok := config.PolicyCandidateStore.(*policycandidate.Store); ok {
-			_, _ = cs.ObserveUnmatchedFlow(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "", time.Now().UTC())
+			_, _ = cs.ObserveUnmatchedFlow(candidateWriteContext(r.Context()), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "", time.Now().UTC())
 		}
 	}
 	// Record the HTTP method (non-secret) so the AI-usage report can count "messages": a POST to an assistant is
@@ -506,7 +506,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 		// auto-bypasses (no inspection is silently dropped).
 		if swgEgressIsUnrecognizedName(err) {
 			if cs, ok := config.PolicyCandidateStore.(*policycandidate.Store); ok {
-				_, _ = cs.ObserveCertPinFailure(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "egress_tls_unrecognized_name", time.Now().UTC())
+				_, _ = cs.ObserveCertPinFailure(candidateWriteContext(r.Context()), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "egress_tls_unrecognized_name", time.Now().UTC())
 			}
 		}
 		setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeUpstreamRequestFailed)

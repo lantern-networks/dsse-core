@@ -2439,10 +2439,10 @@ func main() {
 			// investigate_only candidate. Recover the real FQDN from the DNS-over-tunnel conntrack first so the
 			// admin reviews a named entity, not a bare IP.
 			if fqdn, ip, ok := dns.RecoverCertPinName(edgeDNSConntrack, certPinTenant, host, "", now); ok {
-				_, _ = policyCandidateStore.ObserveCertPinFailureDNSCorrelated(context.Background(), certPinTenant, fqdn, ip, 443, "interception_handshake_rejected", now)
+				_, _ = policyCandidateStore.ObserveCertPinFailureDNSCorrelated(candidateWriteContext(context.Background()), certPinTenant, fqdn, ip, 443, "interception_handshake_rejected", now)
 				return
 			}
-			_, _ = policyCandidateStore.ObserveCertPinFailure(context.Background(), certPinTenant, host, "", 443, "interception_handshake_rejected", now)
+			_, _ = policyCandidateStore.ObserveCertPinFailure(candidateWriteContext(context.Background()), certPinTenant, host, "", 443, "interception_handshake_rejected", now)
 		})
 	}
 	// Both rule and catalog callbacks rebuild one tenant-separated snapshot.
@@ -7857,7 +7857,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// here as well would put the same flow in two adoption queues that adopt into different planes.
 			if decision.IsDefaultDeny(dec) && !decision.IsEastWestFlow(req, runtimeEvaluator.EastWestInternalNetworks) {
 				if cs, ok := policyCandidateStore.(*policycandidate.Store); ok {
-					if _, cerr := cs.ObserveUnmatchedFlow(r.Context(), req.TenantID, host, req.SNI, port, "", time.Now().UTC()); cerr != nil {
+					if _, cerr := cs.ObserveUnmatchedFlow(candidateWriteContext(r.Context()), req.TenantID, host, req.SNI, port, "", time.Now().UTC()); cerr != nil {
 						logDebugf("steer_mux_candidate_capture_failed dst=%q port=%d: %v", host, port, cerr)
 					}
 				}

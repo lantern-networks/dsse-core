@@ -10,7 +10,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -229,7 +228,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 					Action:     model.PolicyAction{Decision: "allow"},
 				}
 				if _, perr := policyStore.Upsert(r.Context(), adopted, tenantID, now); perr != nil {
-					log.Printf("adopt allow policy for %s: %v", host, perr)
+					recordCandidate(r, "admin_policy_candidate_materialized", materialized, now, policyCandidateAuditOutcome{result: "partial", failedStage: "allow_policy"})
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Candidate adoption was saved, but allow-policy saving could not be confirmed. Reload and retry.", "partial": true, "failed_stage": "allow_policy", "candidate_id": materialized.CandidateID})
+					return
 				}
 			}
 		}
@@ -362,6 +363,8 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		now := time.Now()
+		candidateWrites.Lock()
+		defer candidateWrites.Unlock()
 		cand, found, err := policyCandidateStore.Get(r.Context(), tenantID, candidateID)
 		if err != nil {
 			writePolicyCandidateError(w, err)
@@ -433,12 +436,19 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if reviewReason == "" {
 			reviewReason = "connector_candidate_published"
 		}
-		reviewed, _, rerr := policyCandidateStore.Review(r.Context(), tenantID, candidateID, policycandidate.ReviewRequest{Decision: "approved", ReviewReasonCode: reviewReason}, now)
-		if rerr != nil {
-			log.Printf("review connector-discovered candidate %s after publish: %v", candidateID, rerr)
+		reviewed, reviewFound, rerr := policyCandidateStore.Review(r.Context(), tenantID, candidateID, policycandidate.ReviewRequest{Decision: "approved", ReviewReasonCode: reviewReason}, now)
+		// Reachability was saved independently. Do not claim candidate approval
+		// or discard the confirmed application when the second store fails.
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
+		if rerr != nil || !reviewFound {
+			record := adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", cand, evaluator, now, policyCandidateAuditOutcome{actor: auditActorPrincipal(r), result: "partial", failedStage: "candidate_review"})
+			record.Metadata["candidate_saved"] = false
+			record.Metadata["application_saved"] = true
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, now)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Application publication was saved, but candidate review could not be confirmed. Reload and reconcile the application before retrying.", "partial": true, "failed_stage": "candidate_review", "candidate_id": candidateID, "application_id": created.ApplicationID})
+			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now), now)
+		recordCandidate(r, "admin_policy_candidate_reviewed", reviewed, now, policyCandidateAuditOutcome{result: "success"})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "connector_candidate_publish.v1",
 			"application":    created,
@@ -450,6 +460,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 
 // Storage details remain in the server, not in the response or common audit.
 func writePolicyCandidateError(w http.ResponseWriter, err error) {
+	if errors.Is(err, policycandidate.ErrUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate state is unavailable; reload and retry"))
+		return
+	}
 	if errors.Is(err, policycandidate.ErrPersistence) {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("candidate save could not be confirmed; reload and retry"))
 		return

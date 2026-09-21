@@ -396,7 +396,13 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 		add("saas_tenant_restrictions", false, 0, "no managed SaaS configuration on this node")
 	}
 	add("seat_allocation", e.SeatAllocations != nil, e.SeatAllocations.CountForTenant(f.TenantID), "no seat allocation store on this node")
-	add("policy_candidates", e.PolicyCandidates != nil, e.PolicyCandidates.CountForTenant(f.TenantID), "no policy candidate store on this node")
+	if e.PolicyCandidates == nil {
+		add("policy_candidates", false, 0, "no policy candidate store on this node")
+	} else if rows, err := e.PolicyCandidates.List(context.Background(), f.TenantID, policycandidate.ListOptions{Limit: 1}); err != nil {
+		f.add(adminTenantFootprintRow{Store: "policy_candidates", Count: -1, Error: "policy candidate state is unavailable"})
+	} else {
+		add("policy_candidates", true, rows.Count, "")
+	}
 	add("enrolment_tokens_store", e.EnrolmentTokens != nil, e.EnrolmentTokens.CountForTenant(f.TenantID), "no file/blob enrolment token store on this node")
 	add("tenant_transport_authorities", e.TenantTransportAuthorities != nil,
 		e.TenantTransportAuthorities.CountForTenant(f.TenantID), "this node issues no per-organization transport material")
@@ -491,7 +497,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.PolicyCandidates != nil {
-		if n, err := e.PolicyCandidates.RemoveTenant(tenantID); err != nil {
+		if n, err := e.PolicyCandidates.RemoveTenantContext(ctx, tenantID); err != nil {
 			result.Failures = append(result.Failures, "policy candidate erasure could not be confirmed")
 		} else {
 			add("policy_candidates", n)

@@ -31,7 +31,7 @@ func LearningCandidateID(host, sni string, port int) string {
 // observe mode; an admin reviews and materializes the candidate to bring the destination under explicit
 // policy (the generalization of cert-pinning's ObserveCertPinFailure to all observed traffic). An
 // already-decided candidate keeps its status while still counting observations.
-func (store *Store) ObserveUnmatchedFlow(_ context.Context, tenantID, host, sni string, port int, category string, now time.Time) (Candidate, error) {
+func (store *Store) ObserveUnmatchedFlow(ctx context.Context, tenantID, host, sni string, port int, category string, now time.Time) (Candidate, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
@@ -59,6 +59,11 @@ func (store *Store) ObserveUnmatchedFlow(_ context.Context, tenantID, host, sni 
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(store, ctx, func(next *Store) (Candidate, error) {
+			return next.ObserveUnmatchedFlow(ctx, tenantID, host, sni, port, category, now)
+		})
+	}
 
 	cand := Candidate{
 		CandidateID:    id,

@@ -28,11 +28,12 @@ func (store *Store) SetStatePath(path string) error {
 func (store *Store) SetPersister(p blobstore.Persister) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.dirty {
+	if store.dirty || store.sharedUncertain {
 		return fmt.Errorf("%w: retry saving before replacing storage", ErrPersistence)
 	}
 	if p == nil {
 		store.persister = nil
+		store.sharedKnown = false
 		return nil
 	}
 	data, err := p.Load()
@@ -41,12 +42,14 @@ func (store *Store) SetPersister(p blobstore.Persister) error {
 	}
 	if data == nil {
 		store.persister = p
+		store.sharedKnown = false
 		return nil
 	}
 	snapshot, err := decodeCandidateSnapshot(data)
 	if err != nil {
 		return err
 	}
+	store.sharedKnown = true
 	store.candidates = snapshot
 	store.persister = p
 	return nil

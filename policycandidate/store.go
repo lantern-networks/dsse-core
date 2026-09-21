@@ -83,17 +83,19 @@ type ReviewRequest struct {
 }
 
 type Store struct {
-	mu         sync.RWMutex
-	candidates map[string]map[string]Candidate
-	persister  blobstore.Persister // when set, candidates are persisted here so they survive a restart
-	dirty      bool                // a failed save may have replaced storage without confirming durability
+	mu              sync.RWMutex
+	candidates      map[string]map[string]Candidate
+	persister       blobstore.Persister // when set, candidates are persisted here so they survive a restart
+	sharedKnown     bool
+	sharedUncertain bool
+	dirty           bool // a failed save may have replaced storage without confirming durability
 }
 
 func NewStore() *Store {
 	return &Store{candidates: map[string]map[string]Candidate{}}
 }
 
-func (store *Store) List(_ context.Context, tenantID string, options ListOptions) (ListResponse, error) {
+func (store *Store) List(ctx context.Context, tenantID string, options ListOptions) (ListResponse, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return ListResponse{}, fmt.Errorf("tenant_id is required")
@@ -111,8 +113,11 @@ func (store *Store) List(_ context.Context, tenantID string, options ListOptions
 		limit = 100
 	}
 
-	store.mu.RLock()
-	defer store.mu.RUnlock()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.refreshSharedLocked(ctx); err != nil {
+		return ListResponse{}, err
+	}
 
 	rows := []Candidate{}
 	for _, candidate := range store.candidates[tenantID] {
@@ -136,7 +141,7 @@ func (store *Store) List(_ context.Context, tenantID string, options ListOptions
 	}, nil
 }
 
-func (store *Store) Get(_ context.Context, tenantID, candidateID string) (Candidate, bool, error) {
+func (store *Store) Get(ctx context.Context, tenantID, candidateID string) (Candidate, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	candidateID = strings.TrimSpace(candidateID)
 	if tenantID == "" {
@@ -146,8 +151,11 @@ func (store *Store) Get(_ context.Context, tenantID, candidateID string) (Candid
 		return Candidate{}, false, fmt.Errorf("candidate_id is required")
 	}
 
-	store.mu.RLock()
-	defer store.mu.RUnlock()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.refreshSharedLocked(ctx); err != nil {
+		return Candidate{}, false, err
+	}
 
 	candidate, ok := store.candidates[tenantID][candidateID]
 	if !ok {
@@ -156,7 +164,7 @@ func (store *Store) Get(_ context.Context, tenantID, candidateID string) (Candid
 	return copyCandidate(candidate), true, nil
 }
 
-func (store *Store) Upsert(_ context.Context, candidate Candidate, tenantID string, now time.Time) (Candidate, error) {
+func (store *Store) Upsert(ctx context.Context, candidate Candidate, tenantID string, now time.Time) (Candidate, error) {
 	normalized, err := normalize(candidate, tenantID, now)
 	if err != nil {
 		return Candidate{}, err
@@ -164,6 +172,9 @@ func (store *Store) Upsert(_ context.Context, candidate Candidate, tenantID stri
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(store, ctx, func(next *Store) (Candidate, error) { return next.Upsert(ctx, candidate, tenantID, now) })
+	}
 
 	if err := store.putLocked(normalized); err != nil {
 		return copyCandidate(normalized), err
@@ -171,7 +182,7 @@ func (store *Store) Upsert(_ context.Context, candidate Candidate, tenantID stri
 	return copyCandidate(normalized), nil
 }
 
-func (store *Store) Review(_ context.Context, tenantID, candidateID string, review ReviewRequest, now time.Time) (Candidate, bool, error) {
+func (store *Store) Review(ctx context.Context, tenantID, candidateID string, review ReviewRequest, now time.Time) (Candidate, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	candidateID = strings.TrimSpace(candidateID)
 	if tenantID == "" {
@@ -195,6 +206,13 @@ func (store *Store) Review(_ context.Context, tenantID, candidateID string, revi
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		result, err := sharedCandidateMutation(store, ctx, func(next *Store) (candidateLookup, error) {
+			c, found, err := next.Review(ctx, tenantID, candidateID, review, now)
+			return candidateLookup{c, found}, err
+		})
+		return result.candidate, result.found, err
+	}
 
 	candidate, ok := store.candidates[tenantID][candidateID]
 	if !ok {
@@ -498,6 +516,10 @@ func (s *Store) CountForTenant(tenantID string) int {
 }
 
 func (s *Store) RemoveTenant(tenantID string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenantID)
+}
+
+func (s *Store) RemoveTenantContext(ctx context.Context, tenantID string) (int, error) {
 	if s == nil {
 		return 0, nil
 	}
@@ -507,6 +529,9 @@ func (s *Store) RemoveTenant(tenantID string) (int, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, ok := s.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(s, ctx, func(next *Store) (int, error) { return next.RemoveTenantContext(ctx, tenantID) })
+	}
 	n := len(s.candidates[tenantID])
 	if n == 0 && !s.dirty {
 		return 0, nil

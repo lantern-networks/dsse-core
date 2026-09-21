@@ -50,8 +50,8 @@ func CertPinCandidateID(host, sni string, port int, reason string) string {
 // first time, and increments failure_count + refreshes last_observed on subsequent observations. It
 // NEVER bypasses — an admin must approve and materialize. An already-decided candidate
 // (approved/materialized/rejected/suppressed) keeps its status while still counting observations.
-func (store *Store) ObserveCertPinFailure(_ context.Context, tenantID, host, sni string, port int, reason string, now time.Time) (Candidate, error) {
-	return store.observeCertPin(tenantID, host, sni, "", "", port, reason, now)
+func (store *Store) ObserveCertPinFailure(ctx context.Context, tenantID, host, sni string, port int, reason string, now time.Time) (Candidate, error) {
+	return store.observeCertPin(ctx, tenantID, host, sni, "", "", port, reason, now)
 }
 
 // ObserveCertPinFailureDNSCorrelated records a cert-pin detection for a connect-by-IP flow (no SNI) whose real
@@ -59,11 +59,11 @@ func (store *Store) ObserveCertPinFailure(_ context.Context, tenantID, host, sni
 // FQDN, not the raw IP) so detections to the same name dedup, it carries "high" confidence (DNS correlation is
 // the strongest attribution evidence), and the originating IP is retained as evidence. This is how a raw-IPv6/
 // CDN candidate that would otherwise be investigate_only becomes a normal, named admin review item.
-func (store *Store) ObserveCertPinFailureDNSCorrelated(_ context.Context, tenantID, fqdn, observedIP string, port int, reason string, now time.Time) (Candidate, error) {
-	return store.observeCertPin(tenantID, fqdn, "", observedIP, attributionSourceDNSTunnel, port, reason, now)
+func (store *Store) ObserveCertPinFailureDNSCorrelated(ctx context.Context, tenantID, fqdn, observedIP string, port int, reason string, now time.Time) (Candidate, error) {
+	return store.observeCertPin(ctx, tenantID, fqdn, "", observedIP, attributionSourceDNSTunnel, port, reason, now)
 }
 
-func (store *Store) observeCertPin(tenantID, host, sni, observedIP, attributionSource string, port int, reason string, now time.Time) (Candidate, error) {
+func (store *Store) observeCertPin(ctx context.Context, tenantID, host, sni, observedIP, attributionSource string, port int, reason string, now time.Time) (Candidate, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
@@ -76,6 +76,11 @@ func (store *Store) observeCertPin(tenantID, host, sni, observedIP, attributionS
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(store, ctx, func(next *Store) (Candidate, error) {
+			return next.observeCertPin(ctx, tenantID, host, sni, observedIP, attributionSource, port, reason, now)
+		})
+	}
 
 	cand := Candidate{
 		CandidateID:       id,
@@ -131,7 +136,7 @@ func (store *Store) observeCertPin(tenantID, host, sni, observedIP, attributionS
 // tell what site a bare IP is (this is the same "approve an ENTITY, not an IP" rule the detector encodes as
 // investigate_only). If this host was already a candidate (e.g. previously auto-detected) its observation
 // history is kept and it is simply advanced to approved so it can be materialized.
-func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host string, now time.Time) (Candidate, error) {
+func (store *Store) AddManualCertPinBypass(ctx context.Context, tenantID, host string, now time.Time) (Candidate, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
@@ -150,6 +155,9 @@ func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host str
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(store, ctx, func(next *Store) (Candidate, error) { return next.AddManualCertPinBypass(ctx, tenantID, host, now) })
+	}
 
 	cand := Candidate{
 		CandidateID:    id,
@@ -182,7 +190,7 @@ func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host str
 // Materialize saves an approved candidate's adoption request. Rule creation is a
 // separate operation, so this status is not an enforcement receipt. A cert-pin
 // request can be retried after a later asset/rule save failed.
-func (store *Store) Materialize(_ context.Context, tenantID, candidateID string, allowHighRisk bool, now time.Time) (Candidate, bool, error) {
+func (store *Store) Materialize(ctx context.Context, tenantID, candidateID string, allowHighRisk bool, now time.Time) (Candidate, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	candidateID = strings.TrimSpace(candidateID)
 	if tenantID == "" || candidateID == "" {
@@ -195,12 +203,19 @@ func (store *Store) Materialize(_ context.Context, tenantID, candidateID string,
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		result, err := sharedCandidateMutation(store, ctx, func(next *Store) (candidateLookup, error) {
+			c, found, err := next.Materialize(ctx, tenantID, candidateID, allowHighRisk, now)
+			return candidateLookup{c, found}, err
+		})
+		return result.candidate, result.found, err
+	}
 
 	cand, ok := store.candidates[tenantID][candidateID]
 	if !ok {
 		return Candidate{}, false, nil
 	}
-	if cand.Status != "approved" && !(cand.Source == SourceCertPinningDetection && cand.Status == "materialized") {
+	if cand.Status != "approved" && !((cand.Source == SourceCertPinningDetection || cand.CandidateType == "allow_policy") && cand.Status == "materialized") {
 		return Candidate{}, false, fmt.Errorf("only an approved candidate can be materialized (status=%s)", cand.Status)
 	}
 	// Advisory labels are persisted/importable metadata, not an authorization

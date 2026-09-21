@@ -345,15 +345,21 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				remainingAfter++
 			}
 		}
+		pending := false
+		for _, key := range registry.PendingWithdrawals(tenantID) {
+			if strings.EqualFold(key, fingerprint) {
+				pending = true
+			}
+		}
 		// Established before anything is removed, because the two halves below must not come apart: taking a
 		// CA out of the trust set and then finding it was never attributed here would leave this node refusing
 		// certificates on behalf of an organization it has no record of.
-		if !targetExists {
+		if !targetExists && !pending {
 			writeError(w, http.StatusNotFound, fmt.Errorf(
 				"%q is not a CA registered to %q — nothing was withdrawn", fingerprint, tenantID))
 			return
 		}
-		if verdict := deviceCAWithdrawalGate(config, tenantID, fingerprint, remainingAfter); !verdict.Allowed {
+		if verdict := deviceCAWithdrawalGate(config, tenantID, fingerprint, remainingAfter); !pending && !verdict.Allowed {
 			writeError(w, http.StatusConflict, fmt.Errorf("withdrawal refused: %s", verdict.Text))
 			return
 		}
@@ -392,8 +398,9 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				"this control plane does not verify device certificates itself; the Edges take this CA out of "+
 					"both the registry and the trust set when they apply the next config bundle")
 		}
+		registry.BeginWithdrawal(tenantID, fingerprint)
 		removed, remaining := registry.WithdrawAnchor(tenantID, fingerprint)
-		if !removed {
+		if !removed && !pending {
 			// Unreachable via the existence check above, and reported rather than ignored: it would mean the
 			// registry changed underneath this request.
 			writeError(w, http.StatusConflict, fmt.Errorf(
@@ -406,18 +413,17 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		} else if _, _, err := trustStore.Withdraw(fingerprint); err != nil {
 			// Not in the trust set is SUCCESS: the CA was attributed here but distributed elsewhere, and the
 			// end state asked for — this node does not admit it — already holds. Anything else is a refusal,
-			// and the attribution stays so the operator can see what is still trusted.
+			// and a pending receipt keeps the target available for a retry.
 			if !strings.Contains(err.Error(), "no distributed certificate has that fingerprint") {
-				writeError(w, http.StatusConflict, fmt.Errorf(
-					"this CA could not be taken out of the device trust set, so it would keep admitting devices: %w", err))
+				logInfof("tenant_ca_trust_withdrawal_pending tenant=%s err=%v", tenantID, err)
+				tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", true)
 				return
 			}
 			// Not in the trust set is not the end of it: the pool a handshake reads folds in the registry, so
 			// the removal above is only served once something rebuilds it. Nothing else will.
 			if err := trustStore.Reapply(); err != nil {
-				writeError(w, http.StatusConflict, fmt.Errorf(
-					"this CA is no longer attributed to %q but the trust set a handshake reads could not be "+
-						"rebuilt, so it may still admit devices: %w", tenantID, err))
+				logInfof("tenant_ca_trust_withdrawal_pending tenant=%s err=%v", tenantID, err)
+				tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", true)
 				return
 			}
 		}
@@ -426,6 +432,11 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			durable = false
 			logInfof("tenant_ca_anchor_withdrawn_but_not_durable tenant=%s sha256=%s err=%v", tenantID, fingerprint, err)
 		}
+		if !durable {
+			tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", false)
+			return
+		}
+		registry.CompleteWithdrawal(tenantID, fingerprint)
 		now := time.Now()
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
 			adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_anchor_withdraw", evaluator, now), now)
@@ -474,12 +485,21 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				gone = append(gone, f.SHA256)
 			}
 		}
+		for _, key := range gone {
+			registry.BeginWithdrawal(tenantID, key)
+		}
+		gone = append(gone, registry.PendingWithdrawals(tenantID)...)
 		removed := registry.Withdraw(tenantID)
 		durable := true
 		if err := persistTenantCARegistry(registry, registryPath, gone...); err != nil {
 			durable = false
 			logInfof("tenant_ca_withdrawn_but_not_durable tenant=%s err=%v", tenantID, err)
 		}
+		if !durable {
+			tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", true)
+			return
+		}
+		registry.CompleteWithdrawal(tenantID, gone...)
 		now := time.Now()
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
 			adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_withdraw", evaluator, now), now)
@@ -526,4 +546,18 @@ func operatorOnlyValue(operator bool, value string) string {
 		return value
 	}
 	return ""
+}
+
+// A partial denial remains visible and retryable; never emit a successful lifecycle event here.
+func tenantCAWithdrawalPartial(w http.ResponseWriter, r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, tenantID, action string, stillTrusted bool) {
+	now := time.Now()
+	a := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, action, evaluator, now)
+	result := "error"
+	a.Result = &result
+	a.Metadata["applied"] = true
+	a.Metadata["durable"] = false
+	a.Metadata["still_trusted"] = stillTrusted
+	a.Metadata["reason_codes"] = []string{"tenant_ca_withdrawal_incomplete"}
+	_ = appendAdminAudit(r.Context(), writer, outbox, a, now)
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": tenantID, "durable": false, "still_trusted": stillTrusted, "error": "CA attribution was removed on this server, but withdrawal is incomplete. Restore storage and retry the same withdrawal before restarting. Fleet withdrawal is not confirmed."})
 }

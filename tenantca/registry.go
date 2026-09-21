@@ -39,6 +39,8 @@ type TenantCARegistryFile struct {
 }
 
 type TenantCARegistry struct {
+	pendingWithdrawals map[string]string // local removals awaiting completion of trust and persistence
+
 	// Persisted with admission anchors; only a successful material install sets ownership.
 	materialManaged map[string]bool
 	Pool            *x509.CertPool
@@ -238,6 +240,9 @@ func (r *TenantCARegistry) Register(tenantID string, pemBytes []byte) ([]*x509.C
 		r.byAnchorKey = map[string]string{}
 	}
 	for _, c := range certs {
+		if _, pending := r.pendingWithdrawals[CAAnchorKey(c)]; pending {
+			return nil, fmt.Errorf("CA withdrawal is pending; finish saving the withdrawal before registering it again")
+		}
 		if owner, ok := r.byAnchorKey[CAAnchorKey(c)]; ok && !strings.EqualFold(owner, tenantID) {
 			return nil, fmt.Errorf("that CA already identifies tenant %q; a CA cannot be moved to another "+
 				"organization, because every device already holding a certificate under it would move with it", owner)
@@ -478,9 +483,10 @@ func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, e
 			continue // this node has just withdrawn it; the shared view is behind, not right
 		}
 		r.mu.RLock()
+		_, pending := r.pendingWithdrawals[CAAnchorKey(certs[0])]
 		_, known := r.byAnchorKey[CAAnchorKey(certs[0])]
 		r.mu.RUnlock()
-		if known {
+		if known || pending {
 			continue
 		}
 		if _, rerr := r.Register(tenantID, []byte(e.CAPEM)); rerr == nil {
@@ -509,6 +515,7 @@ func (r *TenantCARegistry) SaveTo(p Persister, removedSHA256 ...string) error {
 	if p == nil {
 		return fmt.Errorf("no shared backend is configured for the tenant CA registry")
 	}
+	removedSHA256 = append(removedSHA256, r.PendingWithdrawals("")...)
 	existing, err := p.Load()
 	if err != nil {
 		return fmt.Errorf("read shared tenant CA registry before saving: %w", err)

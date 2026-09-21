@@ -6135,6 +6135,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			if filedUnder == "" {
 				filedUnder = evaluator.PolicyBundle.TenantID
 			}
+			if metadata["durable"] == false && config.Writer != nil {
+				entry := pkiMaterialAuditLog(filedUnder, action, "transport_trust_certificate", targetID, reason, metadata, principalIDForAudit(r), sourceIPFromRequest(r), evaluator)
+				result := "error"
+				entry.Result = &result
+				_ = config.Writer.Append("audit.log.jsonl", entry)
+				return
+			}
 			recordPKIMaterialChange(config.Writer, r, evaluator, filedUnder, action,
 				"transport_trust_certificate", targetID, reason, metadata)
 		})

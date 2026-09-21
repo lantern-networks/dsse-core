@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -454,7 +455,10 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 	mux.HandleFunc("GET /admin/transport-trust-anchors", adminEndpoint("admin.steering.read", func(w http.ResponseWriter, r *http.Request) {
 		// Read what the fleet has distributed before judging or listing: this node may be between
 		// recompute ticks and holding what it last wrote. See AdoptFleetDistribution.
-		transportTrust.AdoptFleetDistribution()
+		if err := transportTrust.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		_, serial := currentTrustAnchors(config)
 		// ★★★ THE SET THIS ORGANIZATION'S DEVICES ARE ACTUALLY TOLD TO TRUST (2026-08-20).
 		//
@@ -615,7 +619,10 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 	mux.HandleFunc("POST /admin/transport-trust-anchors", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
 		// Read what the fleet has distributed before judging or listing: this node may be between
 		// recompute ticks and holding what it last wrote. See AdoptFleetDistribution.
-		transportTrust.AdoptFleetDistribution()
+		if err := transportTrust.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if transportTrust == nil {
 			writeError(w, http.StatusConflict, fmt.Errorf("the trust set on this node is fixed at startup (-transport-trust-store is not configured)"))
 			return
@@ -641,9 +648,16 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode certificate: %w", err))
 			return
 		}
-		added, serial, err := transportTrust.Add(req.CertificatePEM)
+		added, serial, err := transportTrust.AddContext(r.Context(), req.CertificatePEM)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			status := http.StatusBadRequest
+			if errors.Is(err, errSharedTransportTrust) {
+				status = http.StatusServiceUnavailable
+				if record != nil {
+					record(r, "transport_trust_certificate_add_failed", "", "trust commit was not confirmed", map[string]any{"applied": false, "durable": false})
+				}
+			}
+			writeError(w, status, err)
 			return
 		}
 		sum := sha256.Sum256(added.Raw)
@@ -664,7 +678,10 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 	mux.HandleFunc("DELETE /admin/transport-trust-anchors/{sha256}", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
 		// Read what the fleet has distributed before judging or listing: this node may be between
 		// recompute ticks and holding what it last wrote. See AdoptFleetDistribution.
-		transportTrust.AdoptFleetDistribution()
+		if err := transportTrust.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if transportTrust == nil {
 			writeError(w, http.StatusConflict, fmt.Errorf("the trust set on this node is fixed at startup (-transport-trust-store is not configured)"))
 			return
@@ -685,12 +702,9 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 		}
 		target := strings.ToLower(strings.TrimSpace(r.PathValue("sha256")))
 		known := enabledEnrolledIdentities(config)
-		// The serial is captured HERE, outside the store lock, and carried into both judgements. The in-lock
-		// gate below must not read it from the store itself: WithdrawIf holds the store mutex while running
-		// the gate, and the gate reading the serial through currentTrustAnchors → Current re-locks the same
-		// mutex — the self-deadlock that froze this Edge's entire trust surface on 2026-08-02 the first time
-		// a withdrawal ever passed the pre-check. (A withdrawal bumps the serial only AFTER it commits, so
-		// the pre-lock serial is exact for the gate's purpose.)
+		// The preliminary gate uses the current snapshot. The final gate receives
+		// the latest row's serial and target certificate while the store is locked;
+		// it must not re-enter Current (that would deadlock the store).
 		_, distributionSerial := currentTrustAnchors(config)
 		// Judged first so a refusal is a 409 with the gate's reason, and re-judged INSIDE the store lock so
 		// a concurrent withdrawal cannot be admitted against a set that still contains the other's target.
@@ -698,22 +712,22 @@ func registerTransportTrustAnchorsEndpoint(mux *http.ServeMux, config serverConf
 			writeError(w, http.StatusConflict, fmt.Errorf("withdrawal refused: %s", verdict.Text))
 			return
 		}
-		var targetCert *x509.Certificate
-		for _, c := range transportTrust.Anchors() {
-			sum := sha256.Sum256(c.Raw)
-			if hex.EncodeToString(sum[:]) == target {
-				targetCert = c
-			}
-		}
-		removed, serial, err := transportTrust.WithdrawIf(target, func(remaining []*x509.Certificate) (bool, string) {
+		removed, serial, err := transportTrust.WithdrawIfContext(r.Context(), target, func(remaining []*x509.Certificate, targetCert *x509.Certificate, latestSerial int64) (bool, string) {
 			// anchorWithdrawGate takes the whole set and skips the target itself, so hand it the set as it
 			// stands at this instant: what would remain, plus the one being removed.
 			ok, verdict := anchorWithdrawGate(config, tenantID, target,
-				append(append([]*x509.Certificate{}, remaining...), targetCert), known, distributionSerial)
+				append(append([]*x509.Certificate{}, remaining...), targetCert), known, latestSerial)
 			return ok, verdict.Text
 		})
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			status := http.StatusBadRequest
+			if errors.Is(err, errSharedTransportTrust) {
+				status = http.StatusServiceUnavailable
+				if record != nil {
+					record(r, "transport_trust_certificate_withdraw_failed", target, "trust commit was not confirmed", map[string]any{"applied": false, "durable": false})
+				}
+			}
+			writeError(w, status, err)
 			return
 		}
 		logInfof("transport_trust_certificate_withdrawn subject=%q sha256=%s serial=%d", removed.Subject.CommonName, target, serial)

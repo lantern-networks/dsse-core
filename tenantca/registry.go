@@ -509,7 +509,11 @@ func (r *TenantCARegistry) SaveTo(p Persister, removedSHA256 ...string) error {
 	if p == nil {
 		return fmt.Errorf("no shared backend is configured for the tenant CA registry")
 	}
-	if existing, err := p.Load(); err == nil && len(existing) > 0 {
+	existing, err := p.Load()
+	if err != nil {
+		return fmt.Errorf("read shared tenant CA registry before saving: %w", err)
+	}
+	if len(existing) > 0 {
 		if _, aerr := r.adoptExcept(existing, removedSHA256); aerr != nil {
 			return aerr
 		}

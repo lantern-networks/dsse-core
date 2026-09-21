@@ -393,9 +393,16 @@ func (s *transportTrustStore) AdoptFleetDistribution() {
 // with a distribution nobody can serve.
 func (s *transportTrustStore) persistLocked() error {
 	if s.path != "" || s.shared != nil {
-		if raw, err := s.readState(); err == nil {
+		raw, err := s.readState()
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("read current trust distribution before saving: %w", err)
+		}
+		if err == nil {
 			var onDisk transportTrustStoreState
-			if json.Unmarshal(raw, &onDisk) == nil && onDisk.Serial > s.serial {
+			if err := json.Unmarshal(raw, &onDisk); err != nil {
+				return fmt.Errorf("decode current trust distribution before saving: %w", err)
+			}
+			if onDisk.Serial > s.serial {
 				return fmt.Errorf("the shared trust store is at serial %d and this node holds %d: another node "+
 					"has distributed something newer, and writing this view would take the fleet backwards to a "+
 					"set no device holds", onDisk.Serial, s.serial)

@@ -30,7 +30,8 @@ type legalHoldStore struct {
 	writeMu     sync.Mutex
 	sharedKnown bool
 	mu          sync.RWMutex
-	held        map[string]legalHoldRecord // tenant_id -> record
+	held        map[string]legalHoldRecord // confirmed tenant_id -> record
+	pending     map[string]bool            // failed hold additions; local only, never snapshot-saved
 	persister   blobstore.Persister
 	loadErr     error
 }
@@ -93,7 +94,7 @@ func (s *legalHoldStore) IsHeld(tenantID string) bool {
 		return true
 	}
 	_, ok := s.held[tenantID]
-	return ok
+	return ok || s.pending[tenantID]
 }
 
 // Set places or releases a legal hold on a tenant and persists the change.
@@ -120,8 +121,15 @@ func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, 
 		} else {
 			delete(s.held, tenantID)
 		}
+		if active {
+			if s.pending == nil {
+				s.pending = map[string]bool{}
+			}
+			s.pending[tenantID] = true
+		}
 		return err
 	}
+	delete(s.pending, tenantID)
 	if active {
 		log.Printf("legal_hold_set tenant=%s held=true by=%q", tenantID, heldBy)
 	} else {
@@ -182,4 +190,14 @@ func (s *legalHoldStore) Health() error {
 
 func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) error {
 	return s.SetContext(context.Background(), tenantID, heldBy, reason, active, now)
+}
+
+// Pending reports process-local protection whose durable save is unconfirmed.
+func (s *legalHoldStore) Pending(tenant string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.pending[tenant]
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,12 +21,13 @@ import (
 // means "keep that stream forever" (never prune). A stream with no override falls back to the flag default.
 
 type retentionOverrideStore struct {
-	writeMu     sync.Mutex
-	sharedKnown bool
-	mu          sync.RWMutex
-	days        map[string]int // stream -> retention days (0 = keep forever)
-	loadErr     error
-	persister   blobstore.Persister
+	writeMu        sync.Mutex
+	sharedKnown    bool
+	mu             sync.RWMutex
+	days           map[string]int  // confirmed stream -> retention days (0 = keep forever)
+	pendingForever map[string]bool // local only; do not include in persistence
+	loadErr        error
+	persister      blobstore.Persister
 }
 
 func newRetentionOverrideStore(p blobstore.Persister) *retentionOverrideStore {
@@ -116,7 +118,7 @@ func (s *retentionOverrideStore) Get(stream string) (int, bool) {
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.loadErr != nil {
+	if s.loadErr != nil || s.pendingForever[stream] {
 		return 0, true // Preserve every stream while configuration is unknown.
 	}
 	d, ok := s.days[stream]
@@ -148,8 +150,15 @@ func (s *retentionOverrideStore) setLocal(stream string, days int) error {
 		} else {
 			delete(s.days, stream)
 		}
+		if days == 0 {
+			if s.pendingForever == nil {
+				s.pendingForever = map[string]bool{}
+			}
+			s.pendingForever[stream] = true
+		}
 		return err
 	}
+	delete(s.pendingForever, stream)
 	log.Printf("retention_override_set stream=%s days=%d", stream, days)
 	return nil
 }
@@ -181,4 +190,18 @@ func (s *retentionOverrideStore) persistLocked() error {
 
 func (s *retentionOverrideStore) Set(stream string, days int) error {
 	return s.SetContext(context.Background(), stream, days)
+}
+
+func (s *retentionOverrideStore) PendingForever() []string {
+	out := []string{}
+	if s == nil {
+		return out
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for stream := range s.pendingForever {
+		out = append(out, stream)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -139,11 +139,20 @@ func (s *retentionOverrideStore) SetContext(ctx context.Context, stream string, 
 		return json.Marshal(candidate)
 	})
 	if err != nil {
+		if days == 0 {
+			s.mu.Lock()
+			if s.pendingForever == nil {
+				s.pendingForever = map[string]bool{}
+			}
+			s.pendingForever[stream] = true
+			s.mu.Unlock()
+		}
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.days, s.loadErr, s.sharedKnown = next, nil, true
+	delete(s.pendingForever, stream)
 	return nil
 }
 func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reason string, active bool, now time.Time) error {
@@ -175,10 +184,19 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 		return encodeSharedHolds(candidate)
 	})
 	if err != nil {
+		if active {
+			s.mu.Lock()
+			if s.pending == nil {
+				s.pending = map[string]bool{}
+			}
+			s.pending[tenantID] = true
+			s.mu.Unlock()
+		}
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.held, s.loadErr, s.sharedKnown = next, nil, true
+	delete(s.pending, tenantID)
 	return nil
 }

@@ -58,8 +58,11 @@ func TestLegalHoldHTTPOutcomeAndAudit(t *testing.T) {
 				if rec.Code != wantStatus {
 					t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 				}
-				if holds.IsHeld(tenant) != wantHeld {
+				if holds.IsHeld(tenant) != (wantHeld || failSave) {
 					t.Fatal("in-memory hold disagrees with outcome")
+				}
+				if holds.Pending(tenant) != (failSave && !initiallyHeld) {
+					t.Fatal("unconfirmed local status mismatch")
 				}
 				if newLegalHoldStore(p).IsHeld(tenant) != wantHeld {
 					t.Fatal("reloaded hold disagrees with outcome")

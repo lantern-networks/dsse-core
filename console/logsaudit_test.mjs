@@ -546,3 +546,17 @@ test('deployment search does not direct readers to tenant-scoped archive exports
  const text=f.nodes.map(n=>n.text||'').join(' ');
  assert.match(text,/end of matches in this server's hot audit log/);assert.doesNotMatch(text,/use Exports/);
 });
+
+
+test('unconfirmed local hold retries placement instead of releasing it', async()=>{
+ let click; const calls=[],texts=[];
+ const host={appendChild(){},innerHTML:''};
+ const c=vm.createContext({host,freshRender:()=>()=>true,bl:v=>v.en,
+  uiConfirm:async()=>true,uiBadge:(text)=>{texts.push(text);return {};},uiToast(){},uiState(){},
+  el:(tag,props)=>{texts.push(props?.text);return {addEventListener:(_,handler)=>{if(tag==='button')click=handler;}};},
+  apiFetch:async(method,path,body)=>{calls.push({method,body});return {ok:true,body:{tenant_held:true,pending_local_hold:method==='GET'}};}});
+ vm.runInContext(source,c);await vm.runInContext('laLegalHold(host)',c);await click();
+ assert.equal(calls.find(x=>x.method==='POST').body.active,true);
+ assert.ok(texts.includes('Save unconfirmed'));
+ assert.ok(texts.some(x=>typeof x==='string' && x.includes('only in this process')));
+});

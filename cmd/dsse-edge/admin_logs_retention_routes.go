@@ -112,7 +112,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r)), "pending_local_hold": legalHold.Pending(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(retentionWriteContext(r.Context()))
@@ -138,7 +138,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(tenantID)})
+		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(tenantID), "pending_local_hold": legalHold.Pending(tenantID)})
 	}))
 	// Verify the tamper-evident hash chain of the tenant's archived audit segments (compliance integrity check).
 	mux.HandleFunc("GET /admin/audit-chain/verify", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +159,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
+		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(retentionWriteContext(r.Context()))
@@ -212,6 +212,6 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("retention settings could not be saved"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All()})
+		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
 	}))
 }

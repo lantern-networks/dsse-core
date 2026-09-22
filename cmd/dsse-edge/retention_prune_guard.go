@@ -60,6 +60,11 @@ func prunePolicyRow(ctx context.Context, tx *sql.Tx, key, empty string, known bo
 // until this deletion ends. Never enlarge a cutoff selected by the caller.
 func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) (time.Time, bool, error) {
 	if s := cfg.legalHold; s != nil {
+		// The caller owns policy locks. A refresh or SQL read must not bypass
+		// a failed local request to preserve this tenant.
+		if s.pending[tenant] {
+			return cutoff, false, nil
+		}
 		held := s.held
 		if p, ok := s.persister.(postgresBlobPersister); ok {
 			raw, err := prunePolicyRow(ctx, tx, p.key, "[]", s.sharedKnown)
@@ -80,6 +85,9 @@ func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, te
 		}
 	}
 	if s := cfg.override; s != nil {
+		if s.pendingForever[stream] {
+			return cutoff, false, nil
+		}
 		days := s.days
 		if p, ok := s.persister.(postgresBlobPersister); ok {
 			raw, err := prunePolicyRow(ctx, tx, p.key, "{}", s.sharedKnown)

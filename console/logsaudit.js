@@ -554,10 +554,11 @@ async function laVolumeEstimate(section) {
 // Admin-configurable per-stream retention (days) — overrides the built-in defaults at runtime, no redeploy.
 async function laRetentionConfig(host) {
   const current = freshRender(host);
-  let ov;
+  let ov, pending = [];
   try {
     const r = await apiFetch("GET", "/admin/retention-config", undefined, _LA_PLANE);
     ov = r.body && r.body.overrides_days;
+    pending = (r.body && r.body.pending_local_forever) || [];
     if (!r.ok || !ov || typeof ov !== "object" || Array.isArray(ov) ||
         Object.values(ov).some(v => !Number.isSafeInteger(v) || v < 0 || v > 106751)) {
       throw new Error((r.body && r.body.error) || "Retention settings are unavailable");
@@ -570,6 +571,7 @@ async function laRetentionConfig(host) {
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Retention (per stream)", ja: "保持（ストリーム別）" }) }));
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Override how long each stream is kept in hot storage (days) — no redeploy. 0 = keep forever; unset = the built-in default (audit/approvals/grants 365d, others 30d).", ja: "各ストリームの短期保持日数を上書き（再デプロイ不要）。0=無期限、未設定=組込既定（audit/承認/grant は365日、他は30日）。" }) }));
+  if (pending.length) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Keep-forever save unconfirmed for: " + pending.join(", ") + ". Protection is local to this process; retry saving. Saved settings are shown below.", ja: "無期限保持の保存未確認: " + pending.join(", ") + "。保護はこのプロセス内のみです。保存を再試行してください。下記は保存済み設定です。" }) }));
   const keys = Object.keys(ov).sort();
   if (keys.length) host.appendChild(el("div", { style: "display:flex;gap:4px;flex-wrap:wrap;margin:4px 0" }, keys.map((s) => el("span", { class: "ui-badge ui-badge-off", style: "font-size:11px", text: s + " = " + (ov[s] === 0 ? bl({ en: "forever", ja: "無期限" }) : ov[s] + "d") }))));
   const streamF = uiField({ name: "s", label: bl({ en: "Stream", ja: "ストリーム" }), type: "select", value: "access", options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
@@ -635,11 +637,12 @@ function laAuditChain(host) {
 // Legal hold: freeze retention for THIS tenant (litigation / e-discovery). While held, no log is deleted/tiered.
 async function laLegalHold(host) {
   const current = freshRender(host);
-  let held;
+  let held, pending;
   try {
     const r = await apiFetch("GET", "/admin/legal-hold", undefined, _LA_PLANE);
     if (!r.ok || !r.body || typeof r.body.tenant_held !== "boolean") throw new Error((r.body && r.body.error) || "Legal hold status is unavailable");
-    held = r.body.tenant_held;
+    pending = r.body.pending_local_hold === true;
+    held = r.body.tenant_held && !pending;
   } catch (e) {
     if (!current()) return;
     uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLegalHold(host) });
@@ -648,10 +651,10 @@ async function laLegalHold(host) {
   if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Legal hold", ja: "リーガルホールド" }) }));
-  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));
+  host.appendChild(el("p", { class: "ui-view-desc", text: pending ? bl({ en: "Hold save unconfirmed. Logs are protected only in this process; restart or another node may lose this protection. Retry saving.", ja: "ホールドの保存は未確認です。このプロセス内のみログを保護します。再起動や別ノードでは保護されない場合があります。保存を再試行してください。" }) : bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));
   const btn = el("button", { class: "ui-btn ui-btn-sm " + (held ? "ui-btn-danger" : "") });
-  btn.textContent = held ? bl({ en: "Release hold", ja: "ホールド解除" }) : bl({ en: "Place legal hold", ja: "リーガルホールドを設定" });
-  host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
+  btn.textContent = pending ? bl({ en: "Retry hold save", ja: "ホールド保存を再試行" }) : held ? bl({ en: "Release hold", ja: "ホールド解除" }) : bl({ en: "Place legal hold", ja: "リーガルホールドを設定" });
+  host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(pending ? bl({ en: "Save unconfirmed", ja: "保存未確認" }) : held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
   btn.addEventListener("click", async () => {
     const ok = await uiConfirm({ title: held ? bl({ en: "Release the legal hold?", ja: "リーガルホールドを解除?" }) : bl({ en: "Place a legal hold?", ja: "リーガルホールドを設定?" }), body: held ? bl({ en: "Retention resumes — aged logs expire / tier to cold again per policy.", ja: "保持が再開し、古いログはポリシーに従い失効/cold 階層化されます。" }) : bl({ en: "ALL logs for this tenant will be preserved (no deletion, no tiering) until released.", ja: "このテナントの全ログが解除まで保持（削除も階層化もしない）されます。" }), confirmLabel: held ? bl({ en: "Release", ja: "解除" }) : bl({ en: "Place hold", ja: "設定" }), danger: !held });
     if (!ok || !current() || btn.disabled) return;

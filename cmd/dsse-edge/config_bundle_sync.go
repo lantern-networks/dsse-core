@@ -730,7 +730,10 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		var err error
 		n, err = t.policyStore.ApplyReceivedBundle(s.tenantID, policies, *payload.TenantConfig, now)
 		if err != nil {
-			return 0, fmt.Errorf("runtime configuration: %w", err)
+			if !errors.Is(err, policy.ErrReceivedRuntimeCache) {
+				return 0, fmt.Errorf("runtime configuration: %w", err)
+			}
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("runtime configuration: %w", err))
 		}
 	} else {
 		n = t.policyStore.ReplaceTenant(s.tenantID, policies, now)
@@ -753,7 +756,10 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			var err error
 			applied, err = t.policyStore.ApplyReceivedBundle(tenantID, section.Policies, *section.Config, now)
 			if err != nil {
-				return 0, fmt.Errorf("runtime configuration for %s: %w", tenantID, err)
+				if !errors.Is(err, policy.ErrReceivedRuntimeCache) {
+					return 0, fmt.Errorf("runtime configuration for %s: %w", tenantID, err)
+				}
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("runtime configuration for %s: %w", tenantID, err))
 			}
 		} else {
 			applied = t.policyStore.ReplaceTenant(tenantID, section.Policies, now)
@@ -793,7 +799,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 				// the GENERATION must not be recorded as applied, or the retry never happens and the Edge
 				// reports itself current while a disabled device stays admitted.
 				log.Printf("config-bundle sync: the enrolled inventory was NOT applied: %v", merr)
-				criticalErr = fmt.Errorf("enrolled inventory: %w", merr)
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("enrolled inventory: %w", merr))
 			}
 		}
 		// Device-group registry: nil = CP omitted (leave local); present (even empty) = authoritative. An empty
@@ -1239,7 +1245,7 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 			// ★ AND THE STATUS KEEPS THE REASON (2026-08-13, twenty-sixth review). recordPoll CLEARS lastError,
 			// so the log said "knowingly behind" while the health view went back to looking like a clean poll —
 			// the operator's window onto this lost the one fact that explains why the generation is not moving.
-			log.Printf("config-bundle sync: generation %d is NOT applied (%v) — it will be retried; this Edge "+
+			log.Printf("config-bundle sync: generation %d is not fully converged (%v) — it will be retried; this Edge "+
 				"is knowingly behind the control plane until it succeeds", payload.Generation, aerr)
 			s.status.recordError(aerr, time.Now().UTC())
 			return

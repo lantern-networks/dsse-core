@@ -10,8 +10,13 @@ import (
 	"time"
 )
 
-// ApplyReceivedBundle saves the received runtime controls to a node-local cache
-// before publishing them. A shared author store must never receive this snapshot.
+// ErrReceivedRuntimeCache means live controls were applied, but their node-local
+// restart cache is unconfirmed. Callers must retry without blocking later sections.
+var ErrReceivedRuntimeCache = errors.New("live controls applied; received runtime cache save unconfirmed")
+
+// ApplyReceivedBundle applies authoritative controls even when their node-local
+// restart cache cannot be saved. Until retry succeeds, restart may load stale
+// controls. A shared author store must never receive this snapshot.
 // Policies themselves still follow the existing bundle/authored-policy lifecycle.
 func (store *Store) ApplyReceivedBundle(tenant string, policies []model.Policy, cfg TenantConfigBundle, now time.Time) (int, error) {
 	tenant = strings.TrimSpace(tenant)
@@ -39,15 +44,16 @@ func (store *Store) ApplyReceivedBundle(tenant string, policies []model.Policy, 
 	if err != nil {
 		return 0, err
 	}
+	var cacheErr error
 	if p := store.runtimeStatePersister; p != nil {
 		err = p.Save(raw)
 		if err != nil && (!errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
-			return 0, fmt.Errorf("%w: received runtime cache: %v", ErrPolicyPersistence, err)
+			cacheErr = fmt.Errorf("%w: %w: %v", ErrPolicyPersistence, ErrReceivedRuntimeCache, err)
 		}
 	}
 	n := store.replacePoliciesLocked(tenant, policies, now)
 	store.applyTenantConfigLocked(tenant, cfg)
 	store.generation++
 	store.rebuildPolicyCacheLocked()
-	return n, nil
+	return n, cacheErr
 }

@@ -38,8 +38,8 @@ func lockPrunePolicy(cfg retentionConfig) func() {
 
 // Materialize an absent key under the same lock as its first administrative
 // writer. SELECT FOR UPDATE alone does not lock an absent PostgreSQL row.
-func prunePolicyRow(ctx context.Context, tx *sql.Tx, key, empty string, known bool) ([]byte, error) {
-	result, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs(store_key,payload,updated_at) VALUES($1,$2,now()) ON CONFLICT(store_key) DO NOTHING`, key, []byte(empty))
+func prunePolicyRow(budget *cpStatementBudget, tx *sql.Tx, key, empty string, known bool) ([]byte, error) {
+	result, err := budget.exec(tx, `INSERT INTO cp_state_blobs(store_key,payload,updated_at) VALUES($1,$2,now()) ON CONFLICT(store_key) DO NOTHING`, key, []byte(empty))
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +51,7 @@ func prunePolicyRow(ctx context.Context, tx *sql.Tx, key, empty string, known bo
 		return nil, fmt.Errorf("known pruning policy row is missing")
 	}
 	var raw []byte
-	err = tx.QueryRowContext(ctx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, key).Scan(&raw)
+	err = budget.queryRow(tx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, key).Scan(&raw)
 	return raw, err
 }
 
@@ -59,6 +59,12 @@ func prunePolicyRow(ctx context.Context, tx *sql.Tx, key, empty string, known bo
 // protection committed before these locks wins; a later policy writer waits
 // until this deletion ends. Never enlarge a cutoff selected by the caller.
 func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) (time.Time, bool, error) {
+	// Archive and cross-resource purge retain their original transaction context.
+	// Only callers which created a server-budgeted transaction opt in below.
+	return checkedPruneCutoffWithBudget(&cpStatementBudget{request: ctx, sqlCtx: ctx}, tx, cfg, tenant, stream, cutoff, now)
+}
+
+func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) (time.Time, bool, error) {
 	if s := cfg.legalHold; s != nil {
 		// The caller owns policy locks. A refresh or SQL read must not bypass
 		// a failed local request to preserve this tenant.
@@ -67,7 +73,7 @@ func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, te
 		}
 		held := s.held
 		if p, ok := s.persister.(postgresBlobPersister); ok {
-			raw, err := prunePolicyRow(ctx, tx, p.key, "[]", s.sharedKnown)
+			raw, err := prunePolicyRow(budget, tx, p.key, "[]", s.sharedKnown)
 			if err != nil {
 				return cutoff, false, err
 			}
@@ -90,7 +96,7 @@ func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, te
 		}
 		days := s.days
 		if p, ok := s.persister.(postgresBlobPersister); ok {
-			raw, err := prunePolicyRow(ctx, tx, p.key, "{}", s.sharedKnown)
+			raw, err := prunePolicyRow(budget, tx, p.key, "{}", s.sharedKnown)
 			if err != nil {
 				return cutoff, false, err
 			}
@@ -128,14 +134,16 @@ func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, t
 	defer cancel()
 	unlock := lockPrunePolicy(cfg)
 	defer unlock()
-	tx, finish, err := beginCPWriteTransaction(ctx, db)
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, db, nil)
 	if err != nil {
 		logPruneFailure(table, err)
 		return
 	}
 	defer finish()
 	defer tx.Rollback()
-	cutoff, allowed, err := checkedPruneCutoff(ctx, tx, cfg, tenant, stream, cutoff, now)
+	cutoff, allowed, err := checkedPruneCutoffWithBudget(budget, tx, cfg, tenant, stream, cutoff, now)
 	if err != nil {
 		logPruneFailure(table, err)
 		return
@@ -147,12 +155,12 @@ func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, t
 	if stream != "" {
 		args = append(args, stream)
 	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE tenant_id=$1 AND "+where, args...)
+	result, err := budget.exec(tx, "DELETE FROM "+table+" WHERE tenant_id=$1 AND "+where, args...)
 	if err != nil {
 		logPruneFailure(table, err)
 		return
 	}
-	if err = tx.Commit(); err != nil {
+	if err = budget.commit(tx); err != nil {
 		logPruneFailure(table, err)
 		return
 	}

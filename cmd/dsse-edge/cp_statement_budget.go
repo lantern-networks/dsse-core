@@ -7,7 +7,8 @@ import (
 	"time"
 )
 
-// Used by shared blob and enrolment-token writes on the advisory-lock session. lib/pq discards
+// Used by shared blob, enrolment-token and delete-only retention writes on the
+// advisory-lock session. lib/pq discards
 // that session on client context cancellation. Let PostgreSQL expire each
 // statement within the remaining request budget first, while keeping a later
 // client deadline as a fallback if the server does not finish normally.
@@ -94,7 +95,7 @@ func (b *cpStatementBudget) forwardCommitCancellation() func() bool {
 	return context.AfterFunc(b.request, b.cancel)
 }
 
-// Token mutations disclose their result only after commit. A request canceled
+// A request canceled
 // during a data statement must roll back even if that statement finishes first.
 func (b *cpStatementBudget) commit(tx *sql.Tx) error {
 	if err := b.request.Err(); err != nil {

@@ -12,6 +12,9 @@ import (
 // organization. Separate from a bare bool because the two refusals lead to DIFFERENT fixes — obtain the
 // delegation, or obtain an elevation — and a 403 that does not say which sends an operator to the wrong one.
 type operatorDelegatedVerdict struct {
+	// Unavailable distinguishes a failed authority read from a deployment without
+	// a tenant registry. A failed read cannot authorize customer-side operations.
+	Unavailable bool
 	// Delegated is true when this organization has asked the operator to run it.
 	Delegated bool
 	// NeedsElevation is true when the ROUTE is one of the irreversible or organization-wide acts.
@@ -59,7 +62,11 @@ func operatorDelegationForRequest(ctx context.Context, r *http.Request, identity
 	}
 	verdict.Why, verdict.NeedsElevation = operatorActNeedsElevation(r.Method, r.URL.Path)
 
-	tenant, resolved := operatorDelegationRecord(ctx, store, target)
+	tenant, resolved, err := operatorDelegationRecord(ctx, store, target)
+	if err != nil {
+		verdict.Unavailable = true
+		return verdict
+	}
 	if !resolved {
 		// Not resolvable here — see the note on Resolved. The caller keeps whatever permissions they hold in
 		// their own right and gains nothing from a delegation, because there is no record to have granted one.
@@ -94,21 +101,24 @@ func operatorDelegationForRequest(ctx context.Context, r *http.Request, identity
 // An empty registry is treated as "this node does not run the model" rather than "no organization has
 // delegated anything", for the same reason: the first is a deployment fact, the second is a claim about
 // organizations that do not exist here.
-func operatorDelegationRecord(ctx context.Context, store adminTenantModelRuntimeStore, target string) (adminTenantModel, bool) {
+func operatorDelegationRecord(ctx context.Context, store adminTenantModelRuntimeStore, target string) (adminTenantModel, bool, error) {
 	admin, ok := store.(adminTenantModelAdminStore)
 	if !ok {
-		return adminTenantModel{}, false
+		return adminTenantModel{}, false, nil
 	}
 	tenants, err := admin.List(ctx)
-	if err != nil || len(tenants) == 0 {
-		return adminTenantModel{}, false
+	if err != nil {
+		return adminTenantModel{}, false, err
+	}
+	if len(tenants) == 0 {
+		return adminTenantModel{}, false, nil
 	}
 	for _, tenant := range tenants {
 		if strings.EqualFold(strings.TrimSpace(tenant.TenantID), target) {
-			return tenant, true
+			return tenant, true, nil
 		}
 	}
-	return adminTenantModel{}, false
+	return adminTenantModel{}, false, nil
 }
 
 // operatorEnvelopeControlRoutes are the routes an operator must be able to reach REGARDLESS of the

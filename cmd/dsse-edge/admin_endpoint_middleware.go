@@ -165,6 +165,23 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			// questions below. An empty target means this is not an operator acting inside another
 			// organization, and everything that reads it after this is a no-op.
 			envelope := operatorDelegationForRequest(r.Context(), r, identity, tenantModelStore, time.Now())
+			if envelope.Unavailable && (operatorDelegationGrants(permission) || envelope.NeedsElevation) {
+				record := adminRBACDeniedAuditLog(identity, permission, evaluator, sourceIPFromRequest(r), r.UserAgent())
+				record.EventType = "admin_authorization_unavailable"
+				record.Result = stringPtr("error")
+				record.Reason = stringPtr("operator_delegation_unavailable")
+				record.Metadata["reason_codes"] = []string{"operator_delegation_unavailable"}
+				record.Metadata["method"] = r.Method
+				path, grantRef := accessGrantAuditPath(r.URL.Path)
+				record.Metadata["path"] = path
+				if grantRef != "" {
+					record.Metadata["grant_ref"] = grantRef
+				}
+				record.Metadata["status_code"] = http.StatusServiceUnavailable
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now())
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("organization access authorization is unavailable; retry after the service recovers"))
+				return
+			}
 
 			// ★ A TENANT-SIDE ACT INSIDE SOMEBODY ELSE'S ORGANIZATION NEEDS THAT ORGANIZATION'S DELEGATION,
 			// however the permission check was satisfied. Keying this off "the role check failed" was the

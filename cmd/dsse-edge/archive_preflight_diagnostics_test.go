@@ -22,14 +22,21 @@ func (a *archiveListFault) List(ctx context.Context, prefix string, limit int) (
 	return objects, a.listErr
 }
 
-func TestArchivePreflightDistinguishesListingFailureFromCountMismatch(t *testing.T) {
+func TestPostgresArchivePreflightDistinguishesListingFailureFromCountMismatch(t *testing.T) {
+	d, _, _, _ := trustDistributionPostgresFixture(t)
+	p := d.store.(postgresBlobPersister)
+	if _, err := p.db.Exec(`CREATE TABLE hot_events(tenant_id text,stream text,event_id text,received_at timestamptz,payload bytea); INSERT INTO hot_events VALUES('tenant_test','audit','old',now()-interval '10 days','{}')`); err != nil {
+		t.Fatal(err)
+	}
 	previous := log.Writer()
 	defer log.SetOutput(previous)
 	for _, kind := range []string{"listing_failure", "count_mismatch"} {
 		t.Run(kind, func(t *testing.T) {
 			var captured bytes.Buffer
 			log.SetOutput(&captured)
-			chain := newAuditChainStore(nil)
+			cp := p
+			cp.key = "chain_" + kind
+			chain := newAuditChainStore(cp)
 			if err := chain.Commit("tenant_test", 0, hashObjectBytes([]byte("saved"))); err != nil {
 				t.Fatal(err)
 			}
@@ -37,8 +44,9 @@ func TestArchivePreflightDistinguishesListingFailureFromCountMismatch(t *testing
 			if kind == "listing_failure" {
 				arc.listErr = errors.New("injected listing outage")
 			}
-			// A nil database makes any progression beyond preflight an observable failure.
-			archiveThenPruneStream(context.Background(), nil, retentionConfig{archive: arc, auditChain: chain}, "tenant_test", "audit", time.Now(), time.Now())
+			// Listing now follows policy/row eligibility; exercise the real
+			// transaction and verify neither failure advances it to deletion.
+			archiveThenPruneStream(context.Background(), p.db, retentionConfig{archive: arc, auditChain: chain}, "tenant_test", "audit", time.Now(), time.Now())
 			message := captured.String()
 			if strings.Contains(message, "<nil>") || !strings.Contains(message, `tenant="tenant_test"`) {
 				t.Fatalf("ambiguous diagnostic: %s", message)
@@ -50,9 +58,13 @@ func TestArchivePreflightDistinguishesListingFailureFromCountMismatch(t *testing
 			} else if !strings.Contains(message, "archive count mismatch expected=1 actual=0") || strings.Contains(message, "listing failed") {
 				t.Fatalf("mismatch misclassified: %s", message)
 			}
-			seq, _, err := chain.Next("tenant_test")
+			seq, _, err := newAuditChainStore(cp).Next("tenant_test")
 			if err != nil || seq != 1 {
 				t.Fatal("preflight changed saved chain position")
+			}
+			var rows int
+			if err := p.db.QueryRow(`SELECT count(*) FROM hot_events`).Scan(&rows); err != nil || rows != 1 || len(arc.objs) != 0 {
+				t.Fatalf("preflight failure changed hot rows/objects: rows=%d err=%v", rows, err)
 			}
 		})
 	}

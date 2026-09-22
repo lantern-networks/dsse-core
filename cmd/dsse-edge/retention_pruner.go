@@ -197,20 +197,6 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 			log.Printf("cold-archive paused: %v", err)
 			return
 		}
-		seq, _, err := cfg.auditChain.Next(tenant)
-		if err != nil {
-			log.Printf("cold-archive state: %v", err)
-			return
-		}
-		objects, err := cfg.archive.List(archiveCtx, "hot_events/"+tenant+"/audit/", 0)
-		if err != nil {
-			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
-			return
-		}
-		if len(objects) != seq {
-			log.Printf("cold-archive paused tenant=%q: archive count mismatch expected=%d actual=%d; reconcile archive objects and saved chain state", tenant, seq, len(objects))
-			return
-		}
 	}
 	var tx *sql.Tx
 	var err error
@@ -283,6 +269,22 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	if err := gz.Close(); err != nil {
 		log.Printf("cold-archive: gzip %s/%s: %v", tenant, stream, err)
 		return
+	}
+	// Consult the external archive only after the locked policy and hot-row
+	// selection establish that there is work to archive. Protected or empty
+	// streams must not occupy the CP writer waiting on an unavailable store.
+	// Keep this check inside the same head transaction as PUT: moving it
+	// outside would miss an orphan left by a competing failed archive.
+	if chained {
+		objects, err := cfg.archive.List(archiveCtx, "hot_events/"+tenant+"/audit/", 0)
+		if err != nil {
+			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
+			return
+		}
+		if len(objects) != chainSeq {
+			log.Printf("cold-archive paused tenant=%q: archive count mismatch expected=%d actual=%d; reconcile archive objects and saved chain state", tenant, chainSeq, len(objects))
+			return
+		}
 	}
 	// Sequence and content hash prevent a delete retry from overwriting an earlier segment.
 	key := fmt.Sprintf("hot_events/%s/%s/%s-%020d-%s.ndjson.gz", tenant, stream, now.UTC().Format("2006-01-02T150405"), chainSeq, hashObjectBytes(buf.Bytes()))

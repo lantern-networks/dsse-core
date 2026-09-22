@@ -15,6 +15,13 @@ import (
 // Otherwise retain it during the target transaction or filesystem step, subject
 // to context cancellation/session loss. Cross-resource atomicity is not provided.
 func beginTenantPurgeHoldGuard(ctx context.Context, holds *legalHoldStore, target *sql.DB, tenant string) (*sql.Tx, func(), error) {
+	return beginTenantPurgeHoldGuardWithBudget(&cpStatementBudget{request: ctx, sqlCtx: ctx}, holds, target, tenant)
+}
+
+// Only a same-pool SQL batch supplies a server budget. Filesystem and separate
+// database steps keep their original cancellation and protection boundaries.
+func beginTenantPurgeHoldGuardWithBudget(budget *cpStatementBudget, holds *legalHoldStore, target *sql.DB, tenant string) (*sql.Tx, func(), error) {
+	ctx := budget.request
 	if holds == nil {
 		return nil, func() {}, ctx.Err()
 	}
@@ -29,7 +36,7 @@ func beginTenantPurgeHoldGuard(ctx context.Context, holds *legalHoldStore, targe
 	if policyDB != nil {
 		var release func()
 		var err error
-		tx, release, err = beginCPWriteTransaction(ctx, policyDB)
+		tx, release, err = beginCPWriteTransactionContexts(ctx, budget.sqlCtx, policyDB, nil)
 		if err != nil {
 			return fail(fmt.Errorf("legal_hold: destructive write unavailable"))
 		}
@@ -37,7 +44,7 @@ func beginTenantPurgeHoldGuard(ctx context.Context, holds *legalHoldStore, targe
 	}
 	// Unlike retention, an explicit purge has no time cutoff; only the hold
 	// decision is reused, under the same local lock and authoritative row lock.
-	_, allowed, err := checkedPruneCutoff(ctx, tx, retentionConfig{legalHold: holds}, tenant, "", time.Time{}, time.Time{})
+	_, allowed, err := checkedPruneCutoffWithBudget(budget, tx, retentionConfig{legalHold: holds}, tenant, "", time.Time{}, time.Time{})
 	if err != nil {
 		return fail(fmt.Errorf("legal_hold: state unavailable"))
 	}

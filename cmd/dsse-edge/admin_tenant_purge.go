@@ -356,7 +356,16 @@ func executeTenantPurgeBatch(ctx context.Context, db *sql.DB, table, statement, 
 	ctx = retentionWriteContext(ctx)
 	ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, finish, err := beginTenantPurgeHoldGuard(ctx, holds, db, tenantID)
+	// Detach SQL cancellation only when policy and data share this transaction.
+	// A separate policy pool or filesystem step must retain its existing guard.
+	budget := &cpStatementBudget{request: ctx, sqlCtx: ctx, cancel: func() {}}
+	if holds != nil {
+		if p, ok := holds.persister.(postgresBlobPersister); ok && p.db == db {
+			budget = newCPStatementBudget(ctx)
+		}
+	}
+	defer budget.cancel()
+	tx, finish, err := beginTenantPurgeHoldGuardWithBudget(budget, holds, db, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -369,15 +378,15 @@ func executeTenantPurgeBatch(ctx context.Context, db *sql.DB, table, statement, 
 	}
 	defer tx.Rollback()
 	if table == "admin_local_credentials" {
-		if _, err := tx.ExecContext(ctx, `SET LOCAL dsse.credential_write_protocol = '1'`); err != nil {
+		if _, err := budget.exec(tx, `SET LOCAL dsse.credential_write_protocol = '1'`); err != nil {
 			return nil, err
 		}
 	}
-	result, err := tx.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
+	result, err := budget.exec(tx, statement, tenantID, adminTenantPurgeBatchSize)
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := budget.commit(tx); err != nil {
 		return nil, err
 	}
 	return result, nil

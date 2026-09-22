@@ -45,7 +45,7 @@ type cpLeaderElector struct {
 	// missing is that "this is the fleet" and "this is who has managed to reach me since I took over" are
 	// different sentences, and only one of them was being said. See fleetViewHasFormed.
 	leaderSince atomic.Int64
-	mu          sync.Mutex
+	mu          cpWriterMutex
 	conn        *sql.Conn // the dedicated connection holding the advisory lock while leader; nil when standby
 	stop        chan struct{}
 	stopped     chan struct{}

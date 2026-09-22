@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 )
 
 type cpWriteLeaseKey struct{}
@@ -15,16 +16,21 @@ type cpWriteLease struct {
 // Capture before authentication/body decoding. Reacquiring leadership cannot
 // authorize a request that was admitted in a previous term.
 func captureCPWriteLease(ctx context.Context) context.Context {
+	if _, captured := ctx.Value(cpWriteLeaseKey{}).(cpWriteLease); captured {
+		return ctx
+	}
 	e := cpLeaderElectorInstance
 	if e == nil {
 		return ctx
 	}
-	e.mu.Lock()
+	// Capture the published term without joining a busy SQL writer. The epoch
+	// changes across promotions; observing a transition fails closed. The
+	// transaction checks this exact term again under the session lock.
 	lease := cpWriteLease{elector: e}
-	if e.IsLeader() {
-		lease.epoch = e.leaderSince.Load()
+	epoch := e.leaderSince.Load()
+	if ctx.Err() == nil && e.IsLeader() && e.leaderSince.Load() == epoch {
+		lease.epoch = epoch
 	}
-	e.mu.Unlock()
 	return context.WithValue(ctx, cpWriteLeaseKey{}, lease)
 }
 
@@ -42,7 +48,12 @@ func beginCPWriteTransactionOptions(ctx context.Context, fallback *sql.DB, optio
 		return tx, func() {}, err
 	}
 	e := lease.elector
-	e.mu.Lock()
+	waitCtx, cancelWait := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+	err := e.mu.LockContext(waitCtx)
+	cancelWait()
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("control-plane writer wait: %w", err)
+	}
 	if lease.epoch == 0 || !e.IsLeader() || e.conn == nil || e.leaderSince.Load() != lease.epoch {
 		e.mu.Unlock()
 		return nil, func() {}, errors.New("control-plane leadership changed before saving")

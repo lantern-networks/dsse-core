@@ -68,7 +68,16 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 	if s := cfg.legalHold; s != nil {
 		// The caller owns policy locks. A refresh or SQL read must not bypass
 		// a failed local request to preserve this tenant.
-		if s.pending[tenant] {
+		var pending bool
+		if _, shared := s.persister.(retentionSharedUpdater); !shared {
+			pending = s.pending[tenant]
+		}
+		if _, shared := s.persister.(retentionSharedUpdater); shared {
+			s.mu.RLock()
+			pending = s.pending[tenant]
+			s.mu.RUnlock()
+		}
+		if pending {
 			return cutoff, false, nil
 		}
 		held := s.held
@@ -91,7 +100,15 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 		}
 	}
 	if s := cfg.override; s != nil {
-		if s.pendingForever[stream] {
+		var pending bool
+		if _, shared := s.persister.(retentionSharedUpdater); shared {
+			s.mu.RLock()
+			pending = s.pendingForever[stream]
+			s.mu.RUnlock()
+		} else {
+			pending = s.pendingForever[stream]
+		}
+		if pending {
 			return cutoff, false, nil
 		}
 		days := s.days

@@ -68,10 +68,16 @@ func encodeSharedHolds(held map[string]legalHoldRecord) ([]byte, error) {
 }
 
 func (s *retentionOverrideStore) refreshShared() error {
+	return s.refreshSharedContext(context.Background())
+}
+
+func (s *retentionOverrideStore) refreshSharedContext(ctx context.Context) error {
 	if _, ok := s.persister.(retentionSharedUpdater); !ok {
 		return nil
 	}
-	s.writeMu.Lock()
+	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+		return err
+	}
 	defer s.writeMu.Unlock()
 	raw, err := s.persister.Load()
 	var next map[string]int
@@ -91,10 +97,16 @@ func (s *retentionOverrideStore) refreshShared() error {
 	return nil
 }
 func (s *legalHoldStore) refreshShared() error {
+	return s.refreshSharedContext(context.Background())
+}
+
+func (s *legalHoldStore) refreshSharedContext(ctx context.Context) error {
 	if _, ok := s.persister.(retentionSharedUpdater); !ok {
 		return nil
 	}
-	s.writeMu.Lock()
+	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+		return err
+	}
 	defer s.writeMu.Unlock()
 	raw, err := s.persister.Load()
 	var next map[string]legalHoldRecord
@@ -122,8 +134,16 @@ func (s *retentionOverrideStore) SetContext(ctx context.Context, stream string, 
 		return s.setLocal(stream, days)
 	}
 	ctx = retentionWriteContext(ctx)
-	s.writeMu.Lock()
+	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+		if days == 0 {
+			s.rememberPendingForever(stream)
+		}
+		return err
+	}
 	defer s.writeMu.Unlock()
+	s.mu.RLock()
+	pendingVersion := s.pendingVersion[stream]
+	s.mu.RUnlock()
 	var next map[string]int
 	err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
 		candidate, err := decodeSharedRetention(raw, s.sharedKnown)
@@ -140,19 +160,17 @@ func (s *retentionOverrideStore) SetContext(ctx context.Context, stream string, 
 	})
 	if err != nil {
 		if days == 0 {
-			s.mu.Lock()
-			if s.pendingForever == nil {
-				s.pendingForever = map[string]bool{}
-			}
-			s.pendingForever[stream] = true
-			s.mu.Unlock()
+			s.rememberPendingForever(stream)
 		}
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.days, s.loadErr, s.sharedKnown = next, nil, true
-	delete(s.pendingForever, stream)
+	if s.pendingVersion[stream] == pendingVersion {
+		delete(s.pendingForever, stream)
+		delete(s.pendingVersion, stream)
+	}
 	return nil
 }
 func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reason string, active bool, now time.Time) error {
@@ -165,8 +183,16 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 		return s.setLocal(tenantID, heldBy, reason, active, now)
 	}
 	ctx = retentionWriteContext(ctx)
-	s.writeMu.Lock()
+	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+		if active {
+			s.rememberPendingHold(tenantID)
+		}
+		return err
+	}
 	defer s.writeMu.Unlock()
+	s.mu.RLock()
+	pendingVersion := s.pendingVersion[tenantID]
+	s.mu.RUnlock()
 	var next map[string]legalHoldRecord
 	err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
 		candidate, err := decodeSharedHolds(raw, s.sharedKnown)
@@ -185,18 +211,76 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 	})
 	if err != nil {
 		if active {
-			s.mu.Lock()
-			if s.pending == nil {
-				s.pending = map[string]bool{}
-			}
-			s.pending[tenantID] = true
-			s.mu.Unlock()
+			s.rememberPendingHold(tenantID)
 		}
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.held, s.loadErr, s.sharedKnown = next, nil, true
-	delete(s.pending, tenantID)
+	if s.pendingVersion[tenantID] == pendingVersion {
+		delete(s.pending, tenantID)
+		delete(s.pendingVersion, tenantID)
+	}
 	return nil
+}
+
+// Bound the queue independently of SQL execution. No goroutine remains queued
+// after return, and no canceled request can mutate storage later.
+func lockPolicyWriter(ctx context.Context, mu *cpWriterMutex) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	wait, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+	defer cancel()
+	return mu.LockContext(wait)
+}
+
+// A failed queued preservation request can arrive while an older writer owns
+// writeMu. Keep the intent under mu and give it a generation so that older
+// writer's later commit cannot clear it. This is process-local, not durable.
+func (s *legalHoldStore) rememberPendingHold(tenant string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pending == nil {
+		s.pending = map[string]bool{}
+	}
+	if s.pendingVersion == nil {
+		s.pendingVersion = map[string]uint64{}
+	}
+	s.nextPendingVersion++
+	s.pending[tenant] = true
+	s.pendingVersion[tenant] = s.nextPendingVersion
+}
+func (s *retentionOverrideStore) rememberPendingForever(stream string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pendingForever == nil {
+		s.pendingForever = map[string]bool{}
+	}
+	if s.pendingVersion == nil {
+		s.pendingVersion = map[string]uint64{}
+	}
+	s.nextPendingVersion++
+	s.pendingForever[stream] = true
+	s.pendingVersion[stream] = s.nextPendingVersion
+}
+
+// Shared writes check the authoritative row in their transaction. A preliminary
+// refresh would wait on the same gate before a failed preservation can be latched.
+func (s *legalHoldStore) healthBeforeWrite() error {
+	if s != nil {
+		if _, shared := s.persister.(retentionSharedUpdater); shared {
+			return nil
+		}
+	}
+	return s.Health()
+}
+func (s *retentionOverrideStore) healthBeforeWrite() error {
+	if s != nil {
+		if _, shared := s.persister.(retentionSharedUpdater); shared {
+			return nil
+		}
+	}
+	return s.Health()
 }

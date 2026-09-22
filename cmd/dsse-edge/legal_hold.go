@@ -27,13 +27,15 @@ type legalHoldRecord struct {
 }
 
 type legalHoldStore struct {
-	writeMu     sync.Mutex
-	sharedKnown bool
-	mu          sync.RWMutex
-	held        map[string]legalHoldRecord // confirmed tenant_id -> record
-	pending     map[string]bool            // failed hold additions; local only, never snapshot-saved
-	persister   blobstore.Persister
-	loadErr     error
+	writeMu            cpWriterMutex
+	pendingVersion     map[string]uint64
+	nextPendingVersion uint64
+	sharedKnown        bool
+	mu                 sync.RWMutex
+	held               map[string]legalHoldRecord // confirmed tenant_id -> record
+	pending            map[string]bool            // failed hold additions; local only, never snapshot-saved
+	persister          blobstore.Persister
+	loadErr            error
 }
 
 func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
@@ -82,10 +84,14 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 
 // IsHeld reports whether a tenant's logs are under legal hold (the retention pruner must skip it).
 func (s *legalHoldStore) IsHeld(tenantID string) bool {
+	return s.IsHeldContext(context.Background(), tenantID)
+}
+
+func (s *legalHoldStore) IsHeldContext(ctx context.Context, tenantID string) bool {
 	if s == nil {
 		return false
 	}
-	if err := s.refreshShared(); err != nil {
+	if err := s.refreshSharedContext(ctx); err != nil {
 		return true
 	}
 	s.mu.RLock()
@@ -174,10 +180,14 @@ func (s *legalHoldStore) persistLocked() error {
 
 // An unavailable snapshot cannot authorize deletion or be overwritten with partial state.
 func (s *legalHoldStore) Health() error {
+	return s.HealthContext(context.Background())
+}
+
+func (s *legalHoldStore) HealthContext(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	if err := s.refreshShared(); err != nil {
+	if err := s.refreshSharedContext(ctx); err != nil {
 		return err
 	}
 	s.mu.RLock()

@@ -21,13 +21,15 @@ import (
 // means "keep that stream forever" (never prune). A stream with no override falls back to the flag default.
 
 type retentionOverrideStore struct {
-	writeMu        sync.Mutex
-	sharedKnown    bool
-	mu             sync.RWMutex
-	days           map[string]int  // confirmed stream -> retention days (0 = keep forever)
-	pendingForever map[string]bool // local only; do not include in persistence
-	loadErr        error
-	persister      blobstore.Persister
+	writeMu            cpWriterMutex
+	pendingVersion     map[string]uint64
+	nextPendingVersion uint64
+	sharedKnown        bool
+	mu                 sync.RWMutex
+	days               map[string]int  // confirmed stream -> retention days (0 = keep forever)
+	pendingForever     map[string]bool // local only; do not include in persistence
+	loadErr            error
+	persister          blobstore.Persister
 }
 
 func newRetentionOverrideStore(p blobstore.Persister) *retentionOverrideStore {
@@ -97,10 +99,14 @@ func decodeRetentionOverrides(data []byte) (map[string]int, error) {
 
 // Health is nil for an optional, unconfigured store; failed loads require a clean reload.
 func (s *retentionOverrideStore) Health() error {
+	return s.HealthContext(context.Background())
+}
+
+func (s *retentionOverrideStore) HealthContext(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	if err := s.refreshShared(); err != nil {
+	if err := s.refreshSharedContext(ctx); err != nil {
 		return err
 	}
 	s.mu.RLock()

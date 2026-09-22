@@ -108,15 +108,15 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		return mine
 	}
 	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
-		if err := legalHold.Health(); err != nil {
+		if err := legalHold.HealthContext(r.Context()); err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(adminTenantIDFromRequest(r)), "pending_local_hold": legalHold.Pending(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeldContext(r.Context(), adminTenantIDFromRequest(r)), "pending_local_hold": legalHold.Pending(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(retentionWriteContext(r.Context()))
-		if err := legalHold.Health(); err != nil {
+		if err := legalHold.healthBeforeWrite(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
@@ -138,7 +138,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeld(tenantID), "pending_local_hold": legalHold.Pending(tenantID)})
+		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeldContext(r.Context(), tenantID), "pending_local_hold": legalHold.Pending(tenantID)})
 	}))
 	// Verify the tamper-evident hash chain of the tenant's archived audit segments (compliance integrity check).
 	mux.HandleFunc("GET /admin/audit-chain/verify", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
@@ -155,7 +155,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	}))
 	// Admin-configurable per-stream retention (days), overriding the startup flags at runtime (no redeploy).
 	mux.HandleFunc("GET /admin/retention-config", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
-		if retentionOverride == nil || retentionOverride.Health() != nil {
+		if retentionOverride == nil || retentionOverride.HealthContext(r.Context()) != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
 		}
@@ -189,7 +189,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 				"log retention is set for this deployment, not per organization, so it is the operator's to change"))
 			return
 		}
-		if retentionOverride == nil || retentionOverride.Health() != nil {
+		if retentionOverride == nil || retentionOverride.healthBeforeWrite() != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
 		}

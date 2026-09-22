@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -14,6 +15,44 @@ var errDownloadTokenAbsent = errors.New("download token is not active")
 
 type downloadSharedUpdater interface {
 	UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+}
+
+// Reject inactive bearers before acquiring a CP write lease or opening a write
+// transaction. Shared state is read through the pool, not the leader session.
+// This is only a preflight: the locked update must still validate and spend the
+// token. Returned data is audit metadata, never permission to deliver bytes.
+func (s *adminDownloadTokenStore) preflightDownload(ctx context.Context, value string, now time.Time) (adminDownloadToken, error) {
+	if s == nil {
+		return adminDownloadToken{}, errDownloadStoreUnavailable
+	}
+	value = strings.TrimSpace(value)
+	s.mu.RLock()
+	p, known, loadErr := s.persister, s.known, s.loadErr
+	token := s.tokens[value]
+	s.mu.RUnlock()
+	token.Token, token.Payload, token.LocalFilename = "", nil, ""
+	if ctx != nil && ctx.Err() != nil {
+		return token, errDownloadStoreUnavailable
+	}
+	if _, shared := p.(downloadSharedUpdater); shared {
+		raw, err := p.Load()
+		if err != nil {
+			return token, errDownloadStoreUnavailable
+		}
+		tokens, err := decodeDownloadTokens(raw, known)
+		if err != nil {
+			return token, errDownloadStoreUnavailable
+		}
+		token = tokens[value]
+		token.Token, token.Payload, token.LocalFilename = "", nil, ""
+	} else if loadErr != nil {
+		return token, errDownloadStoreUnavailable
+	}
+	expires, err := time.Parse(time.RFC3339, token.ExpiresAt)
+	if token.Status != "active" || err != nil || !now.UTC().Before(expires) {
+		return adminDownloadToken{}, errDownloadTokenAbsent
+	}
+	return token, nil
 }
 
 func decodeDownloadTokens(raw []byte, known bool) (map[string]adminDownloadToken, error) {

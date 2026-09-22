@@ -279,7 +279,8 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		writeError(w, http.StatusGone, fmt.Errorf("the Admin Console is a separate application; call the admin API (/admin/*) directly over TLS"))
 	})
 	mux.HandleFunc("GET /admin/export-downloads/{download_token}", func(w http.ResponseWriter, r *http.Request) {
-		r = r.WithContext(retentionWriteContext(r.Context()))
+		// ConsumeContext captures the write lease only after a read preflight.
+		// Invalid unauthenticated links must not join the CP writer queue.
 		token, ok, err := adminDownloadTokens.ConsumeContext(r.Context(), r.PathValue("download_token"), time.Now())
 		if err != nil {
 			if token.TenantID != "" {

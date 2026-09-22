@@ -1131,32 +1131,28 @@ func (s *adminDownloadTokenStore) Consume(tokenValue string, now time.Time) (adm
 // On failure only non-secret audit metadata may be returned; bytes and the
 // bearer credential are released only after the shared spend has committed.
 func (s *adminDownloadTokenStore) ConsumeContext(ctx context.Context, tokenValue string, now time.Time) (adminDownloadToken, bool, error) {
-	var token adminDownloadToken
+	token, err := s.preflightDownload(ctx, tokenValue, now)
 	ok := false
-	err := s.updateTokens(ctx, now, func(tokens map[string]adminDownloadToken) error {
-		candidate, found := tokens[strings.TrimSpace(tokenValue)]
-		if !found || candidate.Status != "active" {
-			return errDownloadTokenAbsent
-		}
-		expiresAt, err := time.Parse(time.RFC3339, candidate.ExpiresAt)
-		if err != nil || !now.UTC().Before(expiresAt) {
-			return errDownloadTokenAbsent
-		}
-		token = candidate
-		candidate.Status, candidate.Payload = "used", nil
-		tokens[candidate.Token] = candidate
-		ok = true
-		return nil
-	})
+	if err == nil {
+		err = s.updateTokens(ctx, now, func(tokens map[string]adminDownloadToken) error {
+			candidate, found := tokens[strings.TrimSpace(tokenValue)]
+			if !found || candidate.Status != "active" {
+				return errDownloadTokenAbsent
+			}
+			expiresAt, err := time.Parse(time.RFC3339, candidate.ExpiresAt)
+			if err != nil || !now.UTC().Before(expiresAt) {
+				return errDownloadTokenAbsent
+			}
+			token = candidate
+			candidate.Status, candidate.Payload = "used", nil
+			tokens[candidate.Token] = candidate
+			ok = true
+			return nil
+		})
+	}
 	if err != nil {
-		// A refusal before the transaction callback may still be attributable
-		// to a token this process previously issued/loaded. This cache is used
-		// only for audit metadata, never to authorize delivery.
-		if token.TenantID == "" && s != nil {
-			s.mu.RLock()
-			token = s.tokens[strings.TrimSpace(tokenValue)]
-			s.mu.RUnlock()
-		}
+		// Preflight metadata permits attribution even if the write is refused
+		// before its callback. It must not authorize delivery.
 		token.Token, token.Payload, token.LocalFilename = "", nil, ""
 		if errors.Is(err, errDownloadTokenAbsent) {
 			return adminDownloadToken{}, false, nil

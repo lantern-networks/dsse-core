@@ -83,7 +83,9 @@ func (s *postgresEnrolmentTokenStore) IssueContext(parent context.Context, polic
 	}
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, finish, err := beginCPWriteTransaction(ctx, s.db)
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, s.db, nil)
 	if err != nil {
 		return enrolltoken.Token{}, "", fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 	}
@@ -91,12 +93,12 @@ func (s *postgresEnrolmentTokenStore) IssueContext(parent context.Context, polic
 	defer tx.Rollback()
 	// All issuers, including unlimited-policy callers, serialize on the tenant.
 	// A transaction-scoped two-key lock is separate from the CP election lock.
-	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(1162760780, hashtext(lower($1)))`, tenantID); err != nil {
+	if _, err := budget.exec(tx, `SELECT pg_advisory_xact_lock(1162760780, hashtext(lower($1)))`, tenantID); err != nil {
 		return enrolltoken.Token{}, "", fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 	}
 	if policy.MaxOutstanding > 0 {
 		var outstanding int
-		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM enrolment_tokens WHERE lower(tenant_id)=lower($1) AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$2`, tenantID, now.UTC()).Scan(&outstanding); err != nil {
+		if err := budget.queryRow(tx, `SELECT count(*) FROM enrolment_tokens WHERE lower(tenant_id)=lower($1) AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$2`, tenantID, now.UTC()).Scan(&outstanding); err != nil {
 			return enrolltoken.Token{}, "", fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 		}
 		if outstanding >= policy.MaxOutstanding {
@@ -117,13 +119,13 @@ func (s *postgresEnrolmentTokenStore) IssueContext(parent context.Context, polic
 		IssuedByLabel: strings.TrimSpace(issuedByLabel),
 		IssuedAt:      now.UTC().Format(time.RFC3339), ExpiresAt: expiresAt.UTC().Format(time.RFC3339),
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO enrolment_tokens
+	if _, err := budget.exec(tx, `INSERT INTO enrolment_tokens
 		(id, token_hash, tenant_id, device_group, label, issued_by, issued_by_label, issued_at, expires_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		tok.ID, tok.Hash, tok.TenantID, tok.Group, tok.Label, tok.IssuedBy, tok.IssuedByLabel, now.UTC(), expiresAt.UTC()); err != nil {
 		return enrolltoken.Token{}, "", fmt.Errorf("%w: insert enrolment token: %v", enrolltoken.ErrStateUnavailable, err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := budget.commit(tx); err != nil {
 		return enrolltoken.Token{}, "", fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 	}
 	return tok, secret, nil
@@ -157,19 +159,21 @@ func (s *postgresEnrolmentTokenStore) Spend(id, tenantID, deviceID string, now t
 func (s *postgresEnrolmentTokenStore) SpendContext(parent context.Context, id, tenantID, deviceID string, now time.Time) (enrolltoken.Token, error) {
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, finish, err := beginCPWriteTransaction(ctx, s.db)
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, s.db, nil)
 	if err != nil {
 		return enrolltoken.Token{}, fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 	}
 	defer finish()
 	defer tx.Rollback()
 	id = strings.TrimSpace(id)
-	tok, err := scanEnrolmentToken(tx.QueryRowContext(ctx, `UPDATE enrolment_tokens SET used_at=$1, used_by=$2
+	tok, err := scanEnrolmentToken(budget.queryRow(tx, `UPDATE enrolment_tokens SET used_at=$1, used_by=$2
  WHERE id=$3 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$1
  AND ($4='' OR lower(tenant_id)=lower($4)) RETURNING `+enrolmentTokenColumns,
 		now.UTC(), strings.TrimSpace(deviceID), id, strings.TrimSpace(tenantID)).Scan)
 	if err == nil {
-		if err := tx.Commit(); err != nil {
+		if err := budget.commit(tx); err != nil {
 			return enrolltoken.Token{}, fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 		}
 		return tok, nil
@@ -177,7 +181,7 @@ func (s *postgresEnrolmentTokenStore) SpendContext(parent context.Context, id, t
 	if err != sql.ErrNoRows {
 		return enrolltoken.Token{}, fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 	}
-	tok, err = scanEnrolmentToken(tx.QueryRowContext(ctx, `SELECT `+enrolmentTokenColumns+` FROM enrolment_tokens WHERE id=$1`, id).Scan)
+	tok, err = scanEnrolmentToken(budget.queryRow(tx, `SELECT `+enrolmentTokenColumns+` FROM enrolment_tokens WHERE id=$1`, id).Scan)
 	if err == sql.ErrNoRows {
 		return enrolltoken.Token{}, enrolltoken.ErrUnknownToken
 	}
@@ -222,7 +226,9 @@ func (s *postgresEnrolmentTokenStore) Revoke(id, revokedBy string, now time.Time
 func (s *postgresEnrolmentTokenStore) RevokeForTenantContext(parent context.Context, tenant, id, revokedBy string, now time.Time) (enrolltoken.Token, bool, error) {
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, finish, err := beginCPWriteTransaction(ctx, s.db)
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, s.db, nil)
 	if err != nil {
 		return enrolltoken.Token{}, false, err
 	}
@@ -230,7 +236,7 @@ func (s *postgresEnrolmentTokenStore) RevokeForTenantContext(parent context.Cont
 	defer tx.Rollback()
 	// RETURNING ties the reported identity to the mutation, without a second read
 	// which could fail after the revocation has already committed.
-	tok, err := scanEnrolmentToken(tx.QueryRowContext(ctx, `UPDATE enrolment_tokens SET revoked_at=$1, revoked_by=$2
+	tok, err := scanEnrolmentToken(budget.queryRow(tx, `UPDATE enrolment_tokens SET revoked_at=$1, revoked_by=$2
  WHERE id=$3 AND revoked_at IS NULL AND ($4='' OR lower(tenant_id)=lower($4)) RETURNING `+enrolmentTokenColumns,
 		now.UTC(), strings.TrimSpace(revokedBy), strings.TrimSpace(id), strings.TrimSpace(tenant)).Scan)
 	if err == sql.ErrNoRows {
@@ -239,7 +245,7 @@ func (s *postgresEnrolmentTokenStore) RevokeForTenantContext(parent context.Cont
 	if err != nil {
 		return enrolltoken.Token{}, false, err
 	}
-	if err := tx.Commit(); err != nil {
+	if err := budget.commit(tx); err != nil {
 		return enrolltoken.Token{}, false, err
 	}
 	return tok, true, nil

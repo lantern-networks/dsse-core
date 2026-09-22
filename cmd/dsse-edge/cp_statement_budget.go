@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// Used by shared blob, enrolment-token and delete-only retention writes on the
+// Used by shared blob, enrolment-token and retention archive/delete writes on the
 // advisory-lock session. lib/pq discards
 // that session on client context cancellation. Let PostgreSQL expire each
 // statement within the remaining request budget first, while keeping a later
@@ -71,6 +71,13 @@ func (b *cpStatementBudget) exec(tx *sql.Tx, query string, args ...any) (sql.Res
 		return nil, err
 	}
 	return tx.ExecContext(b.sqlCtx, query, args...)
+}
+
+func (b *cpStatementBudget) query(tx *sql.Tx, query string, args ...any) (*sql.Rows, error) {
+	if err := b.prepare(tx); err != nil {
+		return nil, err
+	}
+	return tx.QueryContext(b.sqlCtx, query, args...)
 }
 
 type cpSQLRow interface{ Scan(...any) error }

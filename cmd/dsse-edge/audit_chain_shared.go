@@ -72,7 +72,7 @@ type sharedAuditArchive struct {
 	objectWritten, committed bool
 }
 
-func (s *auditChainStore) beginSharedArchive(ctx context.Context, db *sql.DB) (*sharedAuditArchive, error) {
+func (s *auditChainStore) beginSharedArchive(budget *cpStatementBudget, db *sql.DB) (*sharedAuditArchive, error) {
 	p, ok := s.persister.(postgresBlobPersister)
 	if !ok {
 		if _, shared := s.persister.(retentionSharedUpdater); shared {
@@ -86,16 +86,16 @@ func (s *auditChainStore) beginSharedArchive(ctx context.Context, db *sql.DB) (*
 		s.mu.Unlock()
 		return nil, err
 	}
-	tx, release, err := beginCPWriteTransaction(ctx, db)
+	tx, release, err := beginCPWriteTransactionContexts(budget.request, budget.sqlCtx, db, nil)
 	if err != nil {
 		s.mu.Unlock()
 		return nil, err
 	}
 	session := &sharedAuditArchive{tx: tx, release: release, source: s, key: p.key}
-	inserted, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs(store_key,payload,updated_at) VALUES($1,'{}',now()) ON CONFLICT(store_key) DO NOTHING`, p.key)
+	inserted, err := budget.exec(tx, `INSERT INTO cp_state_blobs(store_key,payload,updated_at) VALUES($1,'{}',now()) ON CONFLICT(store_key) DO NOTHING`, p.key)
 	var raw []byte
 	if err == nil {
-		err = tx.QueryRowContext(ctx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw)
+		err = budget.queryRow(tx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw)
 	}
 	if err == nil {
 		var n int64
@@ -113,10 +113,10 @@ func (s *auditChainStore) beginSharedArchive(ctx context.Context, db *sql.DB) (*
 	}
 	return session, nil
 }
-func (s *sharedAuditArchive) stage(ctx context.Context, next map[string]auditChainState) error {
+func (s *sharedAuditArchive) stage(budget *cpStatementBudget, next map[string]auditChainState) error {
 	raw, err := json.Marshal(next)
 	if err == nil {
-		_, err = s.tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, s.key, raw)
+		_, err = budget.exec(s.tx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, s.key, raw)
 	}
 	if err == nil {
 		s.next = next

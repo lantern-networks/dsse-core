@@ -59,7 +59,7 @@ func prunePolicyRow(budget *cpStatementBudget, tx *sql.Tx, key, empty string, kn
 // protection committed before these locks wins; a later policy writer waits
 // until this deletion ends. Never enlarge a cutoff selected by the caller.
 func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) (time.Time, bool, error) {
-	// Archive and cross-resource purge retain their original transaction context.
+	// Cross-resource purge callers retain their original transaction context.
 	// Only callers which created a server-budgeted transaction opt in below.
 	return checkedPruneCutoffWithBudget(&cpStatementBudget{request: ctx, sqlCtx: ctx}, tx, cfg, tenant, stream, cutoff, now)
 }

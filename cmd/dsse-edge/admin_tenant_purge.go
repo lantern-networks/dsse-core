@@ -165,7 +165,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		}
 	}
 	if writer != nil {
-		files, err := purgeTenantLogDirectory(writer, tenantID)
+		files, err := purgeTenantLogDirectoryWithHold(ctx, writer, tenantID, holds)
 		row := adminTenantPurgeRow{Store: "log_files", Count: files}
 		if err != nil {
 			row.Error = err.Error()
@@ -183,7 +183,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 			if table == "admin_local_credentials" && !credentialSweepAllowed {
 				continue // Do not bypass a rejected generation-aware account deletion.
 			}
-			row := purgeTenantRows(ctx, db, table, tenantID)
+			row := purgeTenantRows(ctx, db, table, tenantID, holds)
 			if row.Error != "" {
 				result.Failures = append(result.Failures, row.Store+": "+row.Error)
 			}
@@ -212,7 +212,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 					": kept, because something else failed and this is what keeps the deletion and the erasure travelling to nodes that have not applied them")
 				continue
 			}
-			row := purgeTenantRows(ctx, db, table, tenantID)
+			row := purgeTenantRows(ctx, db, table, tenantID, holds)
 			if row.Error != "" {
 				result.Failures = append(result.Failures, row.Store+": "+row.Error)
 			}
@@ -247,7 +247,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 // job with progress, which does not exist yet and is named as missing rather than pretended away.
 const adminTenantPurgeBatchSize = 5000
 
-func purgeTenantRows(ctx context.Context, db *sql.DB, table, tenantID string) adminTenantPurgeRow {
+func purgeTenantRows(ctx context.Context, db *sql.DB, table, tenantID string, holds *legalHoldStore) adminTenantPurgeRow {
 	row := adminTenantPurgeRow{Store: "postgres." + table}
 	// The table name comes from the package-level list, never from a request; the tenant id is bound.
 	//
@@ -255,7 +255,7 @@ func purgeTenantRows(ctx context.Context, db *sql.DB, table, tenantID string) ad
 	// and these tables do not agree on one.
 	statement := "DELETE FROM " + table + " WHERE ctid IN (SELECT ctid FROM " + table + " WHERE tenant_id = $1 LIMIT $2)"
 	for {
-		res, err := executeTenantPurgeBatch(ctx, db, table, statement, tenantID)
+		res, err := executeTenantPurgeBatch(ctx, db, table, statement, tenantID, holds)
 		if err != nil {
 			if isUndefinedTableError(err) {
 				return row // this deployment does not have the table: nothing to erase, and not a failure
@@ -352,15 +352,27 @@ func purgeTenantDeviceCAs(registry *tenantca.TenantCARegistry, registryPath stri
 
 // Credential cleanup uses the same transaction-local protocol as account mutations.
 // Commit each bounded batch before counting it, without authorizing other tables.
-func executeTenantPurgeBatch(ctx context.Context, db *sql.DB, table, statement, tenantID string) (sql.Result, error) {
-	if table != "admin_local_credentials" {
-		return db.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
-	}
-	tx, err := (postgresCredentialPersistence{db: db}).beginCredentialWrite(ctx)
+func executeTenantPurgeBatch(ctx context.Context, db *sql.DB, table, statement, tenantID string, holds *legalHoldStore) (sql.Result, error) {
+	ctx = retentionWriteContext(ctx)
+	ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+	defer cancel()
+	tx, finish, err := beginTenantPurgeHoldGuard(ctx, holds, db, tenantID)
 	if err != nil {
 		return nil, err
 	}
+	defer finish()
+	if tx == nil {
+		tx, err = db.BeginTx(ctx, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
 	defer tx.Rollback()
+	if table == "admin_local_credentials" {
+		if _, err := tx.ExecContext(ctx, `SET LOCAL dsse.credential_write_protocol = '1'`); err != nil {
+			return nil, err
+		}
+	}
 	result, err := tx.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
 	if err != nil {
 		return nil, err

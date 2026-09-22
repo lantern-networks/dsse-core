@@ -103,18 +103,20 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	}()
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, finish, err := beginCPWriteTransaction(ctx, p.db)
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, p.db, nil)
 	if err != nil {
 		return err
 	}
 	defer finish()
 	defer tx.Rollback()
-	inserted, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key)
+	inserted, err := budget.exec(tx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key)
 	if err != nil {
 		return err
 	}
 	var raw []byte
-	if err := tx.QueryRowContext(ctx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw); err != nil {
+	if err := budget.queryRow(tx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw); err != nil {
 		return err
 	}
 	if n, err := inserted.RowsAffected(); err != nil {
@@ -122,22 +124,26 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	} else if absentAsNil && n == 1 {
 		raw = nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	updated, err := edit(raw)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
+	if _, err := budget.exec(tx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
 		return err
 	}
-	// database/sql can reject Commit on an already canceled transaction without
-	// calling the driver. Classify cancellation observed here as a definite
-	// rollback, so non-idempotent stores do not latch an unknown commit outcome.
+	// The SQL context may outlive the request. Cancellation observed here is a
+	// definite rollback, so non-idempotent stores do not latch an unknown outcome.
 	// Cancellation racing AFTER this check remains conservative: a driver may
 	// return the same context error after committing, so never reclassify it.
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	commitAttempted = true
+	stopCommitCancellation := budget.forwardCommitCancellation()
+	defer stopCommitCancellation()
 	return tx.Commit()
 }
 

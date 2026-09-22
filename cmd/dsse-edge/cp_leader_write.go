@@ -42,9 +42,15 @@ func beginCPWriteTransaction(ctx context.Context, fallback *sql.DB) (*sql.Tx, fu
 }
 
 func beginCPWriteTransactionOptions(ctx context.Context, fallback *sql.DB, options *sql.TxOptions) (*sql.Tx, func(), error) {
+	return beginCPWriteTransactionContexts(ctx, ctx, fallback, options)
+}
+
+// Admission/writer waiting retains the request context even when a caller
+// supplies a separate, server-budgeted SQL context for the active transaction.
+func beginCPWriteTransactionContexts(ctx, sqlCtx context.Context, fallback *sql.DB, options *sql.TxOptions) (*sql.Tx, func(), error) {
 	lease, ok := ctx.Value(cpWriteLeaseKey{}).(cpWriteLease)
 	if !ok {
-		tx, err := fallback.BeginTx(ctx, options)
+		tx, err := fallback.BeginTx(sqlCtx, options)
 		return tx, func() {}, err
 	}
 	e := lease.elector
@@ -58,7 +64,7 @@ func beginCPWriteTransactionOptions(ctx context.Context, fallback *sql.DB, optio
 		e.mu.Unlock()
 		return nil, func() {}, errors.New("control-plane leadership changed before saving")
 	}
-	tx, err := e.conn.BeginTx(ctx, options)
+	tx, err := e.conn.BeginTx(sqlCtx, options)
 	if err != nil {
 		e.mu.Unlock()
 		return nil, func() {}, err

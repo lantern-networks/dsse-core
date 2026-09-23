@@ -22,7 +22,7 @@ import (
 func managedTRRoutes(t *testing.T, store *policy.Store, source string) *http.ServeMux {
 	t.Helper()
 	mux := http.NewServeMux()
-	registerSWGTenantRestrictionRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h }, decision.Evaluator{}, nil, store, swg.RuntimeConfig{}, nil, source)
+	registerSWGTenantRestrictionRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h }, decision.Evaluator{}, nil, store, swg.RuntimeConfig{}, nil, source, nil)
 	return mux
 }
 func managedTRRequest(h http.Handler, tenant, method, body string) *httptest.ResponseRecorder {

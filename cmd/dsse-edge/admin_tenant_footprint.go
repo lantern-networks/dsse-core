@@ -341,7 +341,7 @@ type adminTenantExtraStores struct {
 	AssetCatalog       *assetcatalog.Store
 	TenantRestrictions interface {
 		CountTenantRestrictions(string) int
-		RemoveTenantRestrictions(string) (int, error)
+		RemoveTenantRestrictionsContext(context.Context, string) (int, error)
 	}
 	TenantTrustDistributions *tenantTrustDistributor
 	DelegatedGrants          *delegatedgrant.Store
@@ -462,7 +462,7 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		eraseChecked("asset_catalog_records", func(id string) (int, error) { return e.AssetCatalog.RemoveTenantContext(ctx, id) })
 	}
 	if e.TenantRestrictions != nil {
-		n, err := e.TenantRestrictions.RemoveTenantRestrictions(tenantID)
+		n, err := e.TenantRestrictions.RemoveTenantRestrictionsContext(ctx, tenantID)
 		if err != nil {
 			result.Failures = append(result.Failures, "SaaS restriction erasure failed: "+err.Error())
 		} else {

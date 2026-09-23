@@ -5,9 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/policy"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/tenantrestriction"
@@ -166,130 +168,176 @@ func ApplyTenantRestrictionUpdate(swgRuntime RuntimeConfig, baseBundle model.Pol
 	return ApplyTenantRestrictionUpdateContext(context.Background(), swgRuntime, baseBundle, policyStore, req)
 }
 
-func ApplyTenantRestrictionUpdateContext(ctx context.Context, swgRuntime RuntimeConfig, baseBundle model.PolicyBundle, policyStore policy.RuntimeStore, req TenantRestrictionUpdateRequest) (TenantRestrictionUpdateResponse, error) {
-	if len(req.HeaderValueUpdates) == 0 && len(req.SaaSEnablement) == 0 {
-		return TenantRestrictionUpdateResponse{}, fmt.Errorf("no header_value_updates or saas_enablement provided")
-	}
-
-	// (a) header value updates -> resolver hot-swap.
-	appliedRefs := make([]adminSWGTenantRestrictionAppliedRef, 0)
-	if len(req.HeaderValueUpdates) > 0 {
-		if !swgRuntime.TenantRestrictionResolverConfigured {
-			return TenantRestrictionUpdateResponse{}, fmt.Errorf("tenant restriction is not configured; no active refs to update")
-		}
-		applied, err := swgRuntime.TenantRestrictionResolver.ReplaceHeaderValues(req.HeaderValueUpdates)
-		if err != nil {
-			return TenantRestrictionUpdateResponse{}, err
-		}
-		for _, ref := range applied {
-			value, ok := swgRuntime.TenantRestrictionResolver.ResolveHeaderValue(ref)
-			if !ok {
-				return TenantRestrictionUpdateResponse{}, fmt.Errorf("ref %s did not resolve after apply", ref)
-			}
-			appliedRefs = append(appliedRefs, adminSWGTenantRestrictionAppliedRef{Ref: ref, ValueFingerprint: nonSecretValueFingerprint(value)})
-		}
-	}
-
-	// (b) SaaS enable/disable -> runtime rule-status override on the policy store.
-	appliedSaaS := make([]adminSWGTenantRestrictionAppliedSaaS, 0)
-	if len(req.SaaSEnablement) > 0 {
-		toggleStore, ok := policyStore.(adminSWGTenantRestrictionToggleStore)
-		if !ok {
-			return TenantRestrictionUpdateResponse{}, fmt.Errorf("policy store does not support saas enable/disable")
-		}
-		statuses := map[string]string{}
-		for saas, enabled := range req.SaaSEnablement {
-			saas = strings.TrimSpace(saas)
-			matched := false
-			for _, rule := range baseBundle.SWGTenantRestrictionRules {
-				if rule.SaaSApplicationID != saas {
-					continue
-				}
-				matched = true
-				status := "inactive"
-				if enabled {
-					// Enabling requires the rule's header value to be resolvable (configured at startup).
-					if _, ok := swgRuntime.TenantRestrictionResolver.ResolveHeaderValue(rule.HeaderValueRef); !ok {
-						return TenantRestrictionUpdateResponse{}, fmt.Errorf("cannot enable %s: header value for %s is not configured (set it first via header_value_updates / start with it active)", saas, rule.HeaderValueRef)
-					}
-					status = "active"
-				}
-				statuses[rule.ID] = status
-				appliedSaaS = append(appliedSaaS, adminSWGTenantRestrictionAppliedSaaS{SaaSApplicationID: saas, RuleID: rule.ID, Status: status})
-			}
-			if !matched {
-				return TenantRestrictionUpdateResponse{}, fmt.Errorf("saas %s has no tenant restriction rule", saas)
-			}
-		}
-		if err := toggleStore.SetTenantRestrictionRuleStatusesContext(ctx, statuses); err != nil {
-			return TenantRestrictionUpdateResponse{}, err
-		}
-	}
-
-	// Persist header value updates to the active operator config + durable value store (cross-restart).
-	persistedActive := false
-	persistedStore := false
-	if len(req.HeaderValueUpdates) > 0 {
-		if path := strings.TrimSpace(swgRuntime.TenantRestrictionOperatorConfigPath); path != "" {
-			if perr := persistOperatorConfigHeaderValues(path, req.HeaderValueUpdates); perr == nil {
-				persistedActive = true
-			}
-		}
-		if path := strings.TrimSpace(swgRuntime.TenantRestrictionOperatorValueStorePath); path != "" {
-			if perr := persistOperatorConfigHeaderValues(path, req.HeaderValueUpdates); perr == nil {
-				persistedStore = true
-			}
-		}
-	}
-
-	// Status reflects the live runtime-effective rules (base bundle + current overrides).
-	effectiveBundle := baseBundle
-	if toggleStore, ok := policyStore.(adminSWGTenantRestrictionToggleStore); ok {
-		effectiveBundle.SWGTenantRestrictionRules = effectiveTenantRestrictionRules(baseBundle.SWGTenantRestrictionRules, toggleStore.TenantRestrictionRuleStatusOverrides())
-	}
-	return TenantRestrictionUpdateResponse{
-		SchemaVersion:             "admin_swg_tenant_restriction_update.v1",
-		AppliedRefs:               appliedRefs,
-		AppliedSaaS:               appliedSaaS,
-		HotApplied:                true,
-		PersistedToOperatorConfig: persistedActive,
-		PersistedToValueStore:     persistedStore,
-		NoSecretAttestation:       true,
-		Status:                    TenantRestrictionStatus(swgRuntime, effectiveBundle),
-	}, nil
+// Legacy updates span files, a resolver and runtime policy. Expose confirmed
+// stages when a later stage fails; never imply rollback of earlier saves.
+type TenantRestrictionUpdateError struct {
+	Stage   string
+	Outcome TenantRestrictionUpdateResponse
 }
 
-// persistOperatorConfigHeaderValues best-effort updates the operator config file's header_values[].value
-// for the given refs so the running edge's on-disk config stays consistent with the hot-applied state.
-// (Cross-dataplane-restart persistence additionally needs the dataplane value store; tracked as follow-up.)
-func persistOperatorConfigHeaderValues(path string, updates map[string]string) error {
+func (e *TenantRestrictionUpdateError) Error() string {
+	return "Tenant restriction saving could not be confirmed; some settings may have changed. Reload and retry."
+}
+
+var legacyRestrictionWriteMu sync.Mutex
+
+func ApplyTenantRestrictionUpdateContext(ctx context.Context, runtime RuntimeConfig, bundle model.PolicyBundle, store policy.RuntimeStore, req TenantRestrictionUpdateRequest) (TenantRestrictionUpdateResponse, error) {
+	legacyRestrictionWriteMu.Lock()
+	defer legacyRestrictionWriteMu.Unlock()
+	resp := TenantRestrictionUpdateResponse{SchemaVersion: "admin_swg_tenant_restriction_update.v1", NoSecretAttestation: true, AppliedRefs: []adminSWGTenantRestrictionAppliedRef{}, AppliedSaaS: []adminSWGTenantRestrictionAppliedSaaS{}}
+	fail := func(stage string) (TenantRestrictionUpdateResponse, error) {
+		return resp, &TenantRestrictionUpdateError{Stage: stage, Outcome: resp}
+	}
+	if ctx.Err() != nil {
+		return fail("request")
+	}
+	if len(req.HeaderValueUpdates) == 0 && len(req.SaaSEnablement) == 0 {
+		return resp, fmt.Errorf("no header_value_updates or saas_enablement provided")
+	}
+	// Validate the complete request before changing any resource.
+	updates := map[string]string{}
+	for ref, value := range req.HeaderValueUpdates {
+		ref, value = strings.TrimSpace(ref), strings.TrimSpace(value)
+		if !runtime.TenantRestrictionResolverConfigured {
+			return resp, fmt.Errorf("tenant restriction is not configured")
+		}
+		if _, ok := runtime.TenantRestrictionResolver.ResolveHeaderValue(ref); !ok || value == "" {
+			return resp, fmt.Errorf("invalid tenant restriction reference or empty value")
+		}
+		if _, duplicate := updates[ref]; duplicate {
+			return resp, fmt.Errorf("duplicate tenant restriction reference")
+		}
+		updates[ref] = value
+	}
+	toggle, ok := store.(adminSWGTenantRestrictionToggleStore)
+	statuses := map[string]string{}
+	applied := []adminSWGTenantRestrictionAppliedSaaS{}
+	if len(req.SaaSEnablement) > 0 && !ok {
+		return resp, fmt.Errorf("policy store does not support saas enable/disable")
+	}
+	for saas, enabled := range req.SaaSEnablement {
+		saas = strings.TrimSpace(saas)
+		matched := false
+		for _, rule := range bundle.SWGTenantRestrictionRules {
+			if rule.SaaSApplicationID != saas {
+				continue
+			}
+			matched = true
+			status := "inactive"
+			if enabled {
+				if _, found := runtime.TenantRestrictionResolver.ResolveHeaderValue(rule.HeaderValueRef); !found {
+					return resp, fmt.Errorf("configure the header value before enabling this application")
+				}
+				status = "active"
+			}
+			statuses[rule.ID] = status
+			applied = append(applied, adminSWGTenantRestrictionAppliedSaaS{SaaSApplicationID: saas, RuleID: rule.ID, Status: status})
+		}
+		if !matched {
+			return resp, fmt.Errorf("application has no tenant restriction rule")
+		}
+	}
+	type pendingFile struct {
+		path     string
+		raw      []byte
+		operator bool
+	}
+	files := []pendingFile{}
+	if len(updates) > 0 {
+		for i, path := range []string{runtime.TenantRestrictionOperatorConfigPath, runtime.TenantRestrictionOperatorValueStorePath} {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				continue
+			}
+			raw, err := prepareOperatorConfigHeaderValues(path, updates)
+			if err != nil {
+				return fail("header_file_prepare")
+			}
+			files = append(files, pendingFile{path: path, raw: raw, operator: i == 0})
+		}
+		if len(files) == 0 {
+			return fail("header_storage_unconfigured")
+		}
+		for _, file := range files {
+			if ctx.Err() != nil {
+				return fail("request")
+			}
+			if err := (blobstore.FilePersister{Path: file.path}).Save(file.raw); err != nil {
+				return fail("header_file_save")
+			}
+			if file.operator {
+				resp.PersistedToOperatorConfig = true
+			} else {
+				resp.PersistedToValueStore = true
+			}
+		}
+		if ctx.Err() != nil {
+			return fail("request")
+		}
+		refs, err := runtime.TenantRestrictionResolver.ReplaceHeaderValues(updates)
+		if err != nil {
+			return fail("header_live_apply")
+		}
+		for _, ref := range refs {
+			resp.AppliedRefs = append(resp.AppliedRefs, adminSWGTenantRestrictionAppliedRef{Ref: ref, ValueFingerprint: nonSecretValueFingerprint(updates[ref])})
+		}
+	}
+	if len(statuses) > 0 {
+		if ctx.Err() != nil {
+			return fail("request")
+		}
+		if err := toggle.SetTenantRestrictionRuleStatusesContext(ctx, statuses); err != nil {
+			return fail("runtime_status_save")
+		}
+		resp.AppliedSaaS = applied
+	}
+	resp.HotApplied = true
+	effective := bundle
+	if ok {
+		effective.SWGTenantRestrictionRules = effectiveTenantRestrictionRules(bundle.SWGTenantRestrictionRules, toggle.TenantRestrictionRuleStatusOverrides())
+	}
+	resp.Status = TenantRestrictionStatus(runtime, effective)
+	return resp, nil
+}
+
+// A missing/duplicate ref must not turn a no-op into confirmed persistence.
+func prepareOperatorConfigHeaderValues(path string, updates map[string]string) ([]byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return err
+	if err = json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
 	}
 	entries, ok := doc["header_values"].([]any)
 	if !ok {
-		return fmt.Errorf("operator config has no header_values array")
+		return nil, fmt.Errorf("operator config has no header_values array")
 	}
+	found := map[string]bool{}
 	for _, e := range entries {
 		entry, ok := e.(map[string]any)
 		if !ok {
 			continue
 		}
 		ref, _ := entry["ref"].(string)
-		if newValue, found := updates[strings.TrimSpace(ref)]; found {
-			entry["value"] = strings.TrimSpace(newValue)
+		ref = strings.TrimSpace(ref)
+		if value, exists := updates[ref]; exists {
+			if found[ref] {
+				return nil, fmt.Errorf("duplicate operator reference")
+			}
+			entry["value"] = value
+			found[ref] = true
 		}
+	}
+	if len(found) != len(updates) {
+		return nil, fmt.Errorf("operator config is missing requested references")
 	}
 	out, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(path, append(out, '\n'), 0o600)
+	return append(out, '\n'), nil
 }
 
 // ForTenant narrows a status to what one organization's administrator may be told.

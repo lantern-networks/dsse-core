@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/model"
 	"net/http"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/configversion"
 	"github.com/lantern-networks/dsse-core/decision"
@@ -24,7 +26,7 @@ func swgCallerTenant(r *http.Request) (tenant string, wholeDeployment bool) {
 // SWG tenant-restriction admin routes (status/write + S6 versions/rollback), moved
 // verbatim out of newServerWithConfig (Phase 2 route-registration split). Only mechanical
 // change: config.CPVersions became the cpVersions parameter.
-func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, swgRuntime swg.RuntimeConfig, cpVersions *cpConfigVersionClient, configSourceURL string) {
+func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, swgRuntime swg.RuntimeConfig, cpVersions *cpConfigVersionClient, configSourceURL string, outbox adminAuditOutboxDeadReader) {
 	mux.HandleFunc("GET /admin/swg/tenant-restriction", adminEndpoint("admin.swg.read", func(w http.ResponseWriter, r *http.Request) {
 		if err := refreshManagedTenantRestrictions(policyStore); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))
@@ -104,6 +106,9 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 		}
 		resp, err := swg.ApplyTenantRestrictionUpdateContext(r.Context(), swgRuntime, evaluator.PolicyBundle, policyStore, req.TenantRestrictionUpdateRequest)
 		if err != nil {
+			if recordLegacyRestrictionFailure(w, r, writer, outbox, evaluator, err) {
+				return
+			}
 			if errors.Is(err, policy.ErrPolicyPersistence) {
 				writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
 				return
@@ -167,6 +172,9 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 		}
 		resp, err := swg.ApplyTenantRestrictionUpdateContext(r.Context(), swgRuntime, evaluator.PolicyBundle, policyStore, req)
 		if err != nil {
+			if recordLegacyRestrictionFailure(w, r, writer, outbox, evaluator, err) {
+				return
+			}
 			if errors.Is(err, policy.ErrPolicyPersistence) {
 				writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
 				return
@@ -190,4 +198,16 @@ func refreshManagedTenantRestrictions(store policy.RuntimeStore) error {
 		return shared.RefreshTenantRestrictions()
 	}
 	return nil
+}
+
+func recordLegacyRestrictionFailure(w http.ResponseWriter, r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, err error) bool {
+	var partial *swg.TenantRestrictionUpdateError
+	if !errors.As(err, &partial) {
+		return false
+	}
+	now := time.Now().UTC()
+	audit := model.AuditLog{ID: randomEdgeID("audit_", now), TenantID: adminTenantIDFromRequest(r), ActorUserID: auditActorPrincipal(r), EventType: "admin_swg_tenant_restriction_unconfirmed", TargetType: stringPtr("tenant_restriction"), Action: stringPtr("update"), Result: stringPtr("partial"), Reason: stringPtr(partial.Error()), Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID, Metadata: map[string]any{"stage": partial.Stage, "persisted_to_operator_config": partial.Outcome.PersistedToOperatorConfig, "persisted_to_value_store": partial.Outcome.PersistedToValueStore, "applied_ref_count": len(partial.Outcome.AppliedRefs), "applied_status_count": len(partial.Outcome.AppliedSaaS), "value_material_recorded": false}}
+	_ = appendAdminAudit(r.Context(), writer, outbox, audit, now)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": partial.Error(), "stage": partial.Stage, "outcome": partial.Outcome})
+	return true
 }

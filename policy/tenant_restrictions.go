@@ -131,6 +131,10 @@ func (store *Store) CountTenantRestrictions(tenant string) int {
 }
 
 func (store *Store) RemoveTenantRestrictions(tenant string) (int, error) {
+	return store.RemoveTenantRestrictionsContext(context.Background(), tenant)
+}
+
+func (store *Store) RemoveTenantRestrictionsContext(ctx context.Context, tenant string) (int, error) {
 	if store == nil {
 		return 0, nil
 	}
@@ -140,7 +144,7 @@ func (store *Store) RemoveTenantRestrictions(tenant string) (int, error) {
 		return 0, nil
 	}
 	count := 0
-	err := store.updateTenantRestrictionsLocked(context.Background(), tenant, func(previous map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error) {
+	err := store.updateTenantRestrictionsLocked(ctx, tenant, func(previous map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error) {
 		count = len(previous)
 		return map[string]tenantrestriction.Setting{}, nil
 	})

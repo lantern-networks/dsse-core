@@ -329,12 +329,16 @@ with the saved position). A mismatch includes the tenant and expected/actual cou
 Neither message alone establishes malicious tampering.
 Repair requires inspecting the saved head and archived objects together. Do not reset the
 chain to zero or delete retained hot rows to clear the error.
+Use the [archive recovery procedure](archive-recovery.md) to classify the persistent
+outcome and adopt a verified orphan without deleting retained data.
 
 Segment names include creation time, sequence and content hash so a retry after a failed
 delete does not overwrite a preceding chained segment. Upload followed by delete failure
 can leave duplicate audit records in multiple valid segments. An ambiguous upload or
-state-save outcome may require operator reconciliation. Writes are serialized in one
-process; cross-process writers and leader changes still require separate coordination.
+state-save outcome may require operator reconciliation. File-backed writes are serialized within one process. With shared PostgreSQL,
+archive attempts lock the shared chain row and commit head advancement with hot-row
+deletion in the same transaction; external object uploads remain outside it.
+Independent deployments and leader changes still require operational verification.
 
 When a runtime override store is configured, the pruner can apply Console overrides even
 if startup hot-event TTLs are all zero. A zero polling interval still disables the pruner.

@@ -320,8 +320,11 @@ guarantee derived from the sender queue size.
 
 A report at or below the persisted retired prefix receives HTTP 422, whether it
 was previously applied or never arrived. It is neither acknowledged as applied nor
-counted again. The shipper retains refused bytes in its bounded `.refused` spool once other
+counted again. The observation shipper appends refused bytes to its `.refused` spool once other
 records demonstrate successful delivery, and reports the refusal in logs/health.
+That refused file is append-only and is not bounded by the CP receipt window;
+include it in disk and retention management. Spool writes are best effort, so keep
+the original local JSONL available when investigating delivery failures.
 Investigate the original local JSONL and CP counts before reconciling a very late
 report; changing its reporter or sequence can double counts. A channel-wide outage
 continues retrying until delivery can make progress. Queue overflow and hook drops

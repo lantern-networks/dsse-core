@@ -27,7 +27,7 @@ func (p *purgeHoldInterleave) Save(b []byte) error {
 	return nil
 }
 
-func TestPostgresTenantPurgeRechecksHoldAfterEarlierStore(t *testing.T) {
+func TestPostgresTenantPurgeRefusesHoldDuringEarlierStore(t *testing.T) {
 	d, _, _, _ := trustDistributionPostgresFixture(t)
 	hp := d.store.(postgresBlobPersister)
 	hp.key = "legal_hold"
@@ -61,40 +61,36 @@ func TestPostgresTenantPurgeRechecksHoldAfterEarlierStore(t *testing.T) {
 	if _, err := rules.Upsert(policyrule.Rule{ID: "rule", TenantID: "target", Plane: policyrule.PlaneEgress, Priority: 100, Source: []string{"*"}, Destination: []string{"*"}, ServiceID: "builtin-svc-https", Action: policyrule.Action{Access: "deny", Inspection: "inspect"}, Status: "active"}); err != nil {
 		t.Fatal(err)
 	}
-	// Commit a concurrent administrator's hold after the entry guard, during an
-	// earlier store's deletion. No wall-clock race or production hook is needed.
+	// A hold requested after erasure starts must be rejected. A success here
+	// would promise preservation after earlier stores were already erased.
 	p.afterSave = func() {
-		if err := peer.Set("target", "review", "", true, time.Now()); err != nil {
+		if err := peer.Set("target", "review", "", true, time.Now()); err == nil {
+			t.Error("hold accepted while multi-store erasure was in progress")
+		}
+		if err := peer.Set("other", "review", "", true, time.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}
 	result := purgeAdminTenantData(context.Background(), "test", "target", hp.db, writer, nil, nil, rules, nil, "", nil, nil, adminTenantExtraStores{}, holds, time.Now())
-	if result.Complete || len(result.Failures) == 0 {
-		t.Error("partial purge claimed success")
+	if len(result.Failures) != 0 {
+		t.Fatalf("purge failures: %v", result.Failures)
 	}
-	if _, err := os.Stat(logpath); err != nil {
-		t.Error("hold committed before file deletion but file was erased", err)
+	if _, err := os.Stat(logpath); !os.IsNotExist(err) {
+		t.Error("file was not erased", err)
 	}
 	for _, table := range []string{"hot_events", "admin_audit_outbox", "domain_event_outbox", "admin_tenant_model_deletions", "admin_tenant_model_purge_orders"} {
-		for _, tenant := range []string{"target", "peer"} {
+		for tenant, want := range map[string]int{"target": 0, "peer": 1} {
 			var n int
-			if err := hp.db.QueryRow("SELECT count(*) FROM "+table+" WHERE tenant_id=$1", tenant).Scan(&n); err != nil || n != 1 {
-				t.Errorf("%s/%s count=%d err=%v", table, tenant, n, err)
+			if err := hp.db.QueryRow("SELECT count(*) FROM "+table+" WHERE tenant_id=$1", tenant).Scan(&n); err != nil || n != want {
+				t.Errorf("%s/%s count=%d want=%d err=%v", table, tenant, n, want, err)
 			}
 		}
 	}
-	if err := peer.Set("target", "review", "", false, time.Now()); err != nil {
-		t.Fatal(err)
+	if !newLegalHoldStore(hp).IsHeld("other") {
+		t.Fatal("peer hold lost")
 	}
-	purgeAdminTenantData(context.Background(), "test", "target", hp.db, writer, nil, nil, rules, nil, "", nil, nil, adminTenantExtraStores{}, holds, time.Now())
-	if _, err := os.Stat(logpath); !os.IsNotExist(err) {
-		t.Error("released file not erased", err)
-	}
-	for _, table := range []string{"hot_events", "admin_audit_outbox", "domain_event_outbox"} {
-		var n int
-		if err := hp.db.QueryRow("SELECT count(*) FROM " + table + " WHERE tenant_id='target'").Scan(&n); err != nil || n != 0 {
-			t.Errorf("released %s count=%d err=%v", table, n, err)
-		}
+	if err := peer.Set("target", "review", "", true, time.Now()); err != nil {
+		t.Fatal("completed erasure still blocks hold", err)
 	}
 }
 

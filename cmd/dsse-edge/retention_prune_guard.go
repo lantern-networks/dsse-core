@@ -91,12 +91,15 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 			return cutoff, false, nil
 		}
 		held := s.held
+		fences := s.erasures
 		if p, ok := s.persister.(postgresBlobPersister); ok {
 			raw, err := prunePolicyRow(budget, tx, p.key, "[]", s.sharedKnown)
 			if err != nil {
 				return cutoff, false, err
 			}
-			held, err = decodeSharedHolds(raw, s.sharedKnown)
+			snapshot, decodeErr := decodeHoldSnapshot(raw, s.sharedKnown)
+			err = decodeErr
+			held, fences = snapshot.held(), snapshot.Erasures
 			if err != nil {
 				return cutoff, false, err
 			}
@@ -104,6 +107,9 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 			return cutoff, false, fmt.Errorf("shared pruning policy requires a PostgreSQL transaction")
 		} else if s.loadErr != nil {
 			return cutoff, false, s.loadErr
+		}
+		if f, busy := fences[tenant]; busy && !ownsTenantErasure(budget.request, tenant, f) {
+			return cutoff, false, nil
 		}
 		if _, ok := held[tenant]; ok {
 			return cutoff, false, nil

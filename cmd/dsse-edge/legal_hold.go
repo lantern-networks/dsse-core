@@ -2,11 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +25,8 @@ type legalHoldRecord struct {
 }
 
 type legalHoldStore struct {
+	erasures           map[string]tenantErasureFence
+	snapshotVersion    int
 	writeMu            cpWriterMutex
 	pendingVersion     map[string]uint64
 	nextPendingVersion uint64
@@ -53,36 +53,21 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 		return s
 	}
 	s.sharedKnown = true
-	var records []legalHoldRecord
-	if err := json.Unmarshal(data, &records); err != nil {
+	snapshot, err := decodeHoldSnapshot(data, false)
+	if err != nil {
 		s.loadErr = err
 		log.Printf("legal-hold store parse: %v", err)
 		return s
 	}
-	if records == nil {
-		s.loadErr = fmt.Errorf("legal hold snapshot must be an array")
-		return s
-	}
-	for _, r := range records {
-		tenant := strings.TrimSpace(r.TenantID)
-		if tenant == "" {
-			s.loadErr = fmt.Errorf("legal hold record has no tenant")
-			return s
-		}
-		if _, exists := s.held[tenant]; exists {
-			s.loadErr = fmt.Errorf("duplicate legal hold tenant")
-			return s
-		}
-		r.TenantID = tenant
-		s.held[tenant] = r
-	}
+	s.held, s.erasures, s.snapshotVersion = snapshot.held(), snapshot.Erasures, snapshot.Version
 	if len(s.held) > 0 {
 		log.Printf("legal-hold store loaded: %d tenant(s) under hold", len(s.held))
 	}
 	return s
 }
 
-// IsHeld reports whether a tenant's logs are under legal hold (the retention pruner must skip it).
+// IsHeld is a conservative deletion guard: accepted/pending holds, erasure fences
+// and unavailable state all stop retention. Admin status distinguishes these.
 func (s *legalHoldStore) IsHeld(tenantID string) bool {
 	return s.IsHeldContext(context.Background(), tenantID)
 }
@@ -100,7 +85,7 @@ func (s *legalHoldStore) IsHeldContext(ctx context.Context, tenantID string) boo
 		return true
 	}
 	_, ok := s.held[tenantID]
-	return ok || s.pending[tenantID]
+	return ok || s.pending[tenantID] || s.erasures[tenantID].ID != ""
 }
 
 // Set places or releases a legal hold on a tenant and persists the change.
@@ -112,6 +97,9 @@ func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, 
 	defer s.mu.Unlock()
 	if s.loadErr != nil {
 		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
+	}
+	if _, busy := s.erasures[tenantID]; busy {
+		return errTenantErasureInProgress
 	}
 	previous, existed := s.held[tenantID]
 	if active {
@@ -163,12 +151,7 @@ func (s *legalHoldStore) persistLocked() error {
 	if s.persister == nil {
 		return nil
 	}
-	records := make([]legalHoldRecord, 0, len(s.held))
-	for _, r := range s.held {
-		records = append(records, r)
-	}
-	sort.Slice(records, func(i, j int) bool { return records[i].TenantID < records[j].TenantID })
-	data, err := json.Marshal(records)
+	data, err := encodeHoldSnapshot(s.held, s.erasures, s.snapshotVersion)
 	if err != nil {
 		return fmt.Errorf("marshal legal hold: %w", err)
 	}

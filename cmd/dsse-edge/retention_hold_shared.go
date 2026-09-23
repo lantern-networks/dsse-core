@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 )
@@ -31,42 +31,6 @@ func decodeSharedRetention(raw []byte, known bool) (map[string]int, error) {
 	}
 	return decodeRetentionOverrides(raw)
 }
-func decodeSharedHolds(raw []byte, known bool) (map[string]legalHoldRecord, error) {
-	result := map[string]legalHoldRecord{}
-	if len(raw) == 0 {
-		if known {
-			return nil, fmt.Errorf("known legal hold row is missing")
-		}
-		return result, nil
-	}
-	var rows []legalHoldRecord
-	if err := json.Unmarshal(raw, &rows); err != nil {
-		return nil, err
-	}
-	if rows == nil {
-		return nil, fmt.Errorf("legal hold snapshot must be an array")
-	}
-	for _, r := range rows {
-		r.TenantID = strings.TrimSpace(r.TenantID)
-		if r.TenantID == "" {
-			return nil, fmt.Errorf("legal hold record has no tenant")
-		}
-		if _, ok := result[r.TenantID]; ok {
-			return nil, fmt.Errorf("duplicate legal hold tenant")
-		}
-		result[r.TenantID] = r
-	}
-	return result, nil
-}
-func encodeSharedHolds(held map[string]legalHoldRecord) ([]byte, error) {
-	rows := make([]legalHoldRecord, 0, len(held))
-	for _, r := range held {
-		rows = append(rows, r)
-	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].TenantID < rows[j].TenantID })
-	return json.Marshal(rows)
-}
-
 func (s *retentionOverrideStore) refreshShared() error {
 	return s.refreshSharedContext(context.Background())
 }
@@ -109,9 +73,9 @@ func (s *legalHoldStore) refreshSharedContext(ctx context.Context) error {
 	}
 	defer s.writeMu.Unlock()
 	raw, err := s.persister.Load()
-	var next map[string]legalHoldRecord
+	var next legalHoldSnapshot
 	if err == nil {
-		next, err = decodeSharedHolds(raw, s.sharedKnown)
+		next, err = decodeHoldSnapshot(raw, s.sharedKnown)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -119,7 +83,7 @@ func (s *legalHoldStore) refreshSharedContext(ctx context.Context) error {
 		s.loadErr = fmt.Errorf("legal hold state is unavailable")
 		return s.loadErr
 	}
-	s.held, s.loadErr = next, nil
+	s.held, s.erasures, s.snapshotVersion, s.loadErr = next.held(), next.Erasures, next.Version, nil
 	if len(raw) > 0 {
 		s.sharedKnown = true
 	}
@@ -180,6 +144,13 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 	}
 	p, ok := s.persister.(retentionSharedUpdater)
 	if !ok {
+		if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+			if active {
+				s.rememberPendingHold(tenantID)
+			}
+			return err
+		}
+		defer s.writeMu.Unlock()
 		return s.setLocal(tenantID, heldBy, reason, active, now)
 	}
 	ctx = retentionWriteContext(ctx)
@@ -193,12 +164,16 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 	s.mu.RLock()
 	pendingVersion := s.pendingVersion[tenantID]
 	s.mu.RUnlock()
-	var next map[string]legalHoldRecord
+	var next legalHoldSnapshot
 	err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
-		candidate, err := decodeSharedHolds(raw, s.sharedKnown)
+		snapshot, err := decodeHoldSnapshot(raw, s.sharedKnown)
 		if err != nil {
 			return nil, err
 		}
+		if _, busy := snapshot.Erasures[tenantID]; busy {
+			return nil, errTenantErasureInProgress
+		}
+		candidate := snapshot.held()
 		if active {
 			if _, exists := candidate[tenantID]; !exists {
 				candidate[tenantID] = legalHoldRecord{TenantID: tenantID, HeldSince: now.UTC().Format(time.RFC3339), HeldBy: heldBy, Reason: reason}
@@ -206,18 +181,21 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 		} else {
 			delete(candidate, tenantID)
 		}
-		next = candidate
-		return encodeSharedHolds(candidate)
+		raw, err = encodeHoldSnapshot(candidate, snapshot.Erasures, snapshot.Version)
+		if err == nil {
+			next, err = decodeHoldSnapshot(raw, false)
+		}
+		return raw, err
 	})
 	if err != nil {
-		if active {
+		if active && !errors.Is(err, errTenantErasureInProgress) {
 			s.rememberPendingHold(tenantID)
 		}
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.held, s.loadErr, s.sharedKnown = next, nil, true
+	s.held, s.erasures, s.snapshotVersion, s.loadErr, s.sharedKnown = next.held(), next.Erasures, next.Version, nil, true
 	if s.pendingVersion[tenantID] == pendingVersion {
 		delete(s.pending, tenantID)
 		delete(s.pendingVersion, tenantID)

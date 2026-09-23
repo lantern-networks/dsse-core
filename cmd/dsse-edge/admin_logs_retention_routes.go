@@ -93,8 +93,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	// "tenant_x, retained for the Fujiwara matter" is the most sensitive sentence this product stores about a
 	// customer, and it was readable by every other customer. Scoped like every other per-tenant read; the
 	// operator, answering for the deployment, still sees all of them because acting on one is their job.
-	holdsFor := func(r *http.Request) []legalHoldRecord {
-		all := legalHold.List()
+	holdsFor := func(r *http.Request, all []legalHoldRecord) []legalHoldRecord {
 		if _, wholeDeployment := adminAnswerScope(r); wholeDeployment {
 			return all
 		}
@@ -107,13 +106,15 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		}
 		return mine
 	}
-	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
-		if err := legalHold.HealthContext(r.Context()); err != nil {
+	writeHoldStatus := func(w http.ResponseWriter, r *http.Request) {
+		rows, held, pending, err := legalHold.adminStatus(r.Context(), adminTenantIDFromRequest(r))
+		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeldContext(r.Context(), adminTenantIDFromRequest(r)), "pending_local_hold": legalHold.Pending(adminTenantIDFromRequest(r))})
-	}))
+		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r, rows), "tenant_held": held, "pending_local_hold": pending})
+	}
+	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", writeHoldStatus))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(retentionWriteContext(r.Context()))
 		if err := legalHold.healthBeforeWrite(); err != nil {
@@ -138,7 +139,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r), "tenant_held": legalHold.IsHeldContext(r.Context(), tenantID), "pending_local_hold": legalHold.Pending(tenantID)})
+		writeHoldStatus(w, r)
 	}))
 	// Verify the tamper-evident hash chain of the tenant's archived audit segments (compliance integrity check).
 	mux.HandleFunc("GET /admin/audit-chain/verify", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {

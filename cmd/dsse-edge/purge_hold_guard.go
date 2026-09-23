@@ -13,7 +13,8 @@ import (
 // transaction across nested store mutations would deadlock their CP writers.
 // Return the policy transaction for reuse only when it uses the target pool.
 // Otherwise retain it during the target transaction or filesystem step, subject
-// to context cancellation/session loss. Cross-resource atomicity is not provided.
+// to context cancellation/session loss. The enclosing multi-store purge saves a
+// durable erasure fence before these steps; cross-resource atomicity is not provided.
 func beginTenantPurgeHoldGuard(ctx context.Context, holds *legalHoldStore, target *sql.DB, tenant string) (*sql.Tx, func(), error) {
 	return beginTenantPurgeHoldGuardWithBudget(&cpStatementBudget{request: ctx, sqlCtx: ctx}, holds, target, tenant)
 }

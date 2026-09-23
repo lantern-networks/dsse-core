@@ -76,13 +76,39 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 
 	// Recheck at the shared destructive boundary, including signed remote orders.
 	// A failed check must leave all stores and the standing order untouched.
-	if err := holds.Health(); err != nil {
-		result.Failures = append(result.Failures, "legal_hold: state unavailable; restore storage and restart")
+	_, held, _, protectionErr := holds.adminStatus(ctx, tenantID)
+	if protectionErr != nil {
+		result.Failures = append(result.Failures, "legal_hold: state unavailable or erasure recovery required")
 		return result
 	}
-	if holds.IsHeld(tenantID) {
+	if held {
 		result.Failures = append(result.Failures, "legal_hold: tenant is held")
 		return result
+	}
+	// A durable operation fence covers all stores and external filesystem work.
+	// It outlives the SQL session but holds no transaction across nested writers.
+	owned, finishErasure, fenceErr := holds.beginErasure(retentionWriteContext(ctx), tenantID, node)
+	if fenceErr != nil {
+		result.Failures = append(result.Failures, "tenant erasure could not be started; protection or recovery check required")
+		result.ElapsedMS = time.Since(started).Milliseconds()
+		return result
+	}
+	ctx = owned
+	released := false
+	closeErasure := func() {
+		if released {
+			return
+		}
+		released = true
+		// A failed external call may have an unknown outcome. Keep exclusion until
+		// offline reconciliation proves that no prior work can resume.
+		if holds != nil && len(result.Failures) != 0 {
+			result.Failures = append(result.Failures, "tenant erasure marker retained after partial failure; recovery required")
+			return
+		}
+		if err := finishErasure(); err != nil {
+			result.Failures = append(result.Failures, "tenant erasure completion could not be saved; recovery required")
+		}
 	}
 	// Deny admission and retain ownership when dependent cleanup reports a
 	// failure. A failed admission erase must keep its retry targets at restart.
@@ -90,6 +116,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		if _, err := ledger.RetireTenantContext(ctx, tenantID, now.UTC().Format(time.RFC3339)); err != nil {
 			result.Failures = append(result.Failures, "tenant identity retirement saving could not be confirmed")
 			result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now)
+			closeErasure()
 			result.ElapsedMS = time.Since(started).Milliseconds()
 			return result
 		}
@@ -202,6 +229,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		// and an erasure that always reads incomplete is one nobody can act on.
 		// Read once, before the loop: erasing the first of these can itself add a failure, and re-reading would
 		// then keep the second for a reason that did not exist when the decision was made.
+		closeErasure() // Keep delivery markers if completion cannot be confirmed.
 		everythingElseWorked := len(result.Failures) == 0
 		for _, table := range adminTenantFootprintPostgresTables {
 			if !tenantModelFleetCarryingTable(table) {
@@ -222,6 +250,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 		}
 	}
 
+	closeErasure()
 	result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now)
 	result.Complete = len(result.Failures) == 0 && result.Remaining.Clean()
 	result.ElapsedMS = time.Since(started).Milliseconds()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -345,11 +346,16 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// removes the row that says whose data this is; a preservation order that permits that is not a
 		// preservation order. Refusing is the fail-safe direction — a hold that is genuinely finished is lifted
 		// deliberately, and that lifting is itself on the record.
-		if err := config.LegalHold.Health(); err != nil {
-			writeError(w, http.StatusServiceUnavailable, err)
+		_, held, _, protectionErr := config.LegalHold.adminStatus(r.Context(), tenantID)
+		if protectionErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(protectionErr, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, protectionErr)
 			return
 		}
-		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
+		if held {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so it cannot be deleted; lift the hold first "+
 					"(DELETE /admin/legal-hold)", tenantID))
@@ -509,14 +515,19 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// a hold is for. Nothing about an operator being authorised to erase makes the hold irrelevant: the
 		// hold is what says this particular organization must not be erased YET, and it is released by lifting
 		// it, deliberately and on the record.
-		if err := config.LegalHold.Health(); err != nil {
-			writeError(w, http.StatusServiceUnavailable, err)
+		_, held, _, protectionErr := config.LegalHold.adminStatus(r.Context(), tenantID)
+		if protectionErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(protectionErr, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, protectionErr)
 			return
 		}
-		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
+		if held {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so its data must be preserved and cannot be erased; "+
-					"lift the hold first (DELETE /admin/legal-hold) — that is a decision with its own record", tenantID))
+					"resolve the hold through POST /admin/legal-hold first — that is a decision with its own record", tenantID))
 			return
 		}
 		var db *sql.DB

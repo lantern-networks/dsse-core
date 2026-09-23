@@ -6513,6 +6513,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	}
 	registerTenantAdminRoutes(mux, adminEndpoint, config, evaluator, writer, tenantModelStore, operatorTenantID, adminAuditOutbox, adminAuth, ruleStore, vlanBoundary,
 		adminTenantExtraStores{
+			AssetCatalog:       assetStore,
 			TenantRestrictions: managedTenantRestrictionStoreOrNil(policyStore),
 			DelegatedGrants:    config.DelegatedGrants,
 			HumanApprovals:     config.HumanApprovals,

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/agentrollout"
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/delegatedgrant"
 	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/enrolltoken"
@@ -337,6 +338,7 @@ func tenantModelFleetCarryingTable(table string) bool {
 // kill-switches know whose a device is — only the enrolled ledger does — so the caller resolves the ids and
 // passes them here. On the erasure path they MUST be captured before the ledger is cleared.
 type adminTenantExtraStores struct {
+	AssetCatalog       *assetcatalog.Store
 	TenantRestrictions interface {
 		CountTenantRestrictions(string) int
 		RemoveTenantRestrictions(string) (int, error)
@@ -385,6 +387,13 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 			return
 		}
 		f.add(adminTenantFootprintRow{Store: store, Count: int64(n)})
+	}
+	if e.AssetCatalog == nil {
+		add("asset_catalog_records", false, 0, "no asset catalog on this node")
+	} else if n, err := e.AssetCatalog.CountTenantRecords(f.TenantID); err != nil {
+		f.add(adminTenantFootprintRow{Store: "asset_catalog_records", Count: -1, Error: "asset catalog state is unavailable"})
+	} else {
+		f.add(adminTenantFootprintRow{Store: "asset_catalog_records", Count: int64(n), Note: "authored objects and alias metadata; excludes built-ins and inventory-derived endpoints"})
 	}
 	add("delegated_access_grants", e.DelegatedGrants != nil, e.DelegatedGrants.CountForTenant(f.TenantID), "no delegated-grant store on this node")
 	add("human_approvals", e.HumanApprovals != nil, e.HumanApprovals.CountForTenant(f.TenantID), "no human-approval store on this node")
@@ -449,6 +458,9 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 	}
 
 	tenantID := result.TenantID
+	if e.AssetCatalog != nil {
+		eraseChecked("asset_catalog_records", func(id string) (int, error) { return e.AssetCatalog.RemoveTenantContext(ctx, id) })
+	}
 	if e.TenantRestrictions != nil {
 		n, err := e.TenantRestrictions.RemoveTenantRestrictions(tenantID)
 		if err != nil {

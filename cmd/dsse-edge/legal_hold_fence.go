@@ -224,8 +224,6 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 	if err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -235,6 +233,8 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 			return err
 		}
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.held, s.erasures, s.snapshotVersion = next.held(), next.Erasures, 2
 	return nil
 }

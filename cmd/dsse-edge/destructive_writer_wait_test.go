@@ -13,7 +13,7 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 )
 
-func TestPrunePolicyCanceledSecondGateReleasesLocalReadLock(t *testing.T) {
+func TestPrunePolicyCanceledSecondGateReleasesFirstWriter(t *testing.T) {
 	h, r := newLegalHoldStore(nil), newRetentionOverrideStore(nil)
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
@@ -23,8 +23,8 @@ func TestPrunePolicyCanceledSecondGateReleasesLocalReadLock(t *testing.T) {
 	if unlock != nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("canceled second gate: unlock=%v err=%v", unlock != nil, err)
 	}
-	// Local Set requires the state mutex. The PostgreSQL cases separately
-	// check writeMu; this case catches a leaked RLock during partial cleanup.
+	// Local Set must acquire the first writer gate after the second gate
+	// times out; partial acquisition must not leak the earlier exclusion.
 	done := make(chan error, 1)
 	go func() { done <- h.Set("target", "review", "", true, time.Now()) }()
 	select {

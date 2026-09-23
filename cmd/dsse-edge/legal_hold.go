@@ -89,46 +89,51 @@ func (s *legalHoldStore) IsHeldContext(ctx context.Context, tenantID string) boo
 }
 
 // Set places or releases a legal hold on a tenant and persists the change.
+// Caller holds writeMu. Keep confirmed state readable while Save is blocked;
+// only publish a detached candidate after persistence succeeds.
 func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, now time.Time) error {
-	if s == nil || tenantID == "" {
-		return fmt.Errorf("legal hold store or tenant is unavailable")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	if s.loadErr != nil {
+		s.mu.RUnlock()
 		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
 	}
 	if _, busy := s.erasures[tenantID]; busy {
+		s.mu.RUnlock()
 		return errTenantErasureInProgress
 	}
-	previous, existed := s.held[tenantID]
+	candidate := make(map[string]legalHoldRecord, len(s.held)+1)
+	for k, v := range s.held {
+		candidate[k] = v
+	}
+	version := s.pendingVersion[tenantID]
+	fences, snapshotVersion := s.erasures, s.snapshotVersion
+	s.mu.RUnlock()
 	if active {
-		if _, exists := s.held[tenantID]; !exists {
-			s.held[tenantID] = legalHoldRecord{TenantID: tenantID, HeldSince: now.UTC().Format(time.RFC3339), HeldBy: heldBy, Reason: reason}
+		if _, exists := candidate[tenantID]; !exists {
+			candidate[tenantID] = legalHoldRecord{TenantID: tenantID, HeldSince: now.UTC().Format(time.RFC3339), HeldBy: heldBy, Reason: reason}
 		}
 	} else {
-		delete(s.held, tenantID)
+		delete(candidate, tenantID)
 	}
-	if err := s.persistLocked(); err != nil {
-		if existed {
-			s.held[tenantID] = previous
-		} else {
-			delete(s.held, tenantID)
-		}
+	// writeMu prevents concurrent confirmed policy/erasure mutations.
+	raw, err := encodeHoldSnapshot(candidate, fences, snapshotVersion)
+	if err == nil && s.persister != nil {
+		err = s.persister.Save(raw)
+	}
+	if err != nil {
 		if active {
-			if s.pending == nil {
-				s.pending = map[string]bool{}
-			}
-			s.pending[tenantID] = true
+			s.rememberPendingHold(tenantID)
 		}
-		return err
+		return fmt.Errorf("persist legal hold: %w", err)
 	}
-	delete(s.pending, tenantID)
-	if active {
-		log.Printf("legal_hold_set tenant=%s held=true by=%q", tenantID, heldBy)
-	} else {
-		log.Printf("legal_hold_set tenant=%s held=false", tenantID)
+	s.mu.Lock()
+	s.held = candidate
+	if s.pendingVersion[tenantID] == version {
+		delete(s.pending, tenantID)
+		delete(s.pendingVersion, tenantID)
 	}
+	s.mu.Unlock()
+	log.Printf("legal_hold_set tenant=%s held=%t by=%q", tenantID, active, heldBy)
 	return nil
 }
 
@@ -145,20 +150,6 @@ func (s *legalHoldStore) List() []legalHoldRecord {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
 	return out
-}
-
-func (s *legalHoldStore) persistLocked() error {
-	if s.persister == nil {
-		return nil
-	}
-	data, err := encodeHoldSnapshot(s.held, s.erasures, s.snapshotVersion)
-	if err != nil {
-		return fmt.Errorf("marshal legal hold: %w", err)
-	}
-	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist legal hold: %w", err)
-	}
-	return nil
 }
 
 // An unavailable snapshot cannot authorize deletion or be overwritten with partial state.

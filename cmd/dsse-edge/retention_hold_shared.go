@@ -95,6 +95,13 @@ func (s *retentionOverrideStore) SetContext(ctx context.Context, stream string, 
 	}
 	p, ok := s.persister.(retentionSharedUpdater)
 	if !ok {
+		if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+			if days == 0 {
+				s.rememberPendingForever(stream)
+			}
+			return err
+		}
+		defer s.writeMu.Unlock()
 		return s.setLocal(stream, days)
 	}
 	ctx = retentionWriteContext(ctx)

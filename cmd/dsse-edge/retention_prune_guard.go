@@ -10,7 +10,9 @@ import (
 // Acquire process-local policy locks BEFORE a CP transaction: SetContext takes
 // writeMu before the elector lock too. Holding these in the reverse order would
 // deadlock a Console change against a sweep. Shared policy is then read/locked
-// in the deletion transaction; local policy stays read-locked through commit.
+// in the deletion transaction; writeMu excludes local policy mutations through
+// commit. Never hold the state mutex across SQL/file/object I/O: a timed-out
+// preservation request must still be able to record its pending intent.
 func lockPrunePolicy(ctx context.Context, cfg retentionConfig) (func(), error) {
 	var unlock []func()
 	finish := func() {
@@ -23,10 +25,6 @@ func lockPrunePolicy(ctx context.Context, cfg retentionConfig) (func(), error) {
 			return nil, err
 		}
 		unlock = append(unlock, s.writeMu.Unlock)
-		if _, shared := s.persister.(retentionSharedUpdater); !shared {
-			s.mu.RLock()
-			unlock = append(unlock, s.mu.RUnlock)
-		}
 	}
 	if s := cfg.override; s != nil {
 		if err := s.writeMu.LockContext(ctx); err != nil {
@@ -34,10 +32,6 @@ func lockPrunePolicy(ctx context.Context, cfg retentionConfig) (func(), error) {
 			return nil, err
 		}
 		unlock = append(unlock, s.writeMu.Unlock)
-		if _, shared := s.persister.(retentionSharedUpdater); !shared {
-			s.mu.RLock()
-			unlock = append(unlock, s.mu.RUnlock)
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		finish()
@@ -78,20 +72,12 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 	if s := cfg.legalHold; s != nil {
 		// The caller owns policy locks. A refresh or SQL read must not bypass
 		// a failed local request to preserve this tenant.
-		var pending bool
-		if _, shared := s.persister.(retentionSharedUpdater); !shared {
-			pending = s.pending[tenant]
-		}
-		if _, shared := s.persister.(retentionSharedUpdater); shared {
-			s.mu.RLock()
-			pending = s.pending[tenant]
-			s.mu.RUnlock()
-		}
+		s.mu.RLock()
+		pending, held, fences, loadErr := s.pending[tenant], s.held, s.erasures, s.loadErr
+		s.mu.RUnlock()
 		if pending {
 			return cutoff, false, nil
 		}
-		held := s.held
-		fences := s.erasures
 		if p, ok := s.persister.(postgresBlobPersister); ok {
 			raw, err := prunePolicyRow(budget, tx, p.key, "[]", s.sharedKnown)
 			if err != nil {
@@ -105,8 +91,8 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 			}
 		} else if _, shared := s.persister.(retentionSharedUpdater); shared {
 			return cutoff, false, fmt.Errorf("shared pruning policy requires a PostgreSQL transaction")
-		} else if s.loadErr != nil {
-			return cutoff, false, s.loadErr
+		} else if loadErr != nil {
+			return cutoff, false, loadErr
 		}
 		if f, busy := fences[tenant]; busy && !ownsTenantErasure(budget.request, tenant, f) {
 			return cutoff, false, nil
@@ -116,18 +102,12 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 		}
 	}
 	if s := cfg.override; s != nil {
-		var pending bool
-		if _, shared := s.persister.(retentionSharedUpdater); shared {
-			s.mu.RLock()
-			pending = s.pendingForever[stream]
-			s.mu.RUnlock()
-		} else {
-			pending = s.pendingForever[stream]
-		}
+		s.mu.RLock()
+		pending, days, loadErr := s.pendingForever[stream], s.days, s.loadErr
+		s.mu.RUnlock()
 		if pending {
 			return cutoff, false, nil
 		}
-		days := s.days
 		if p, ok := s.persister.(postgresBlobPersister); ok {
 			raw, err := prunePolicyRow(budget, tx, p.key, "{}", s.sharedKnown)
 			if err != nil {
@@ -139,8 +119,8 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 			}
 		} else if _, shared := s.persister.(retentionSharedUpdater); shared {
 			return cutoff, false, fmt.Errorf("shared pruning policy requires a PostgreSQL transaction")
-		} else if s.loadErr != nil {
-			return cutoff, false, s.loadErr
+		} else if loadErr != nil {
+			return cutoff, false, loadErr
 		}
 		ret := cfg.hotEvents
 		if d, ok := cfg.perStream[stream]; ok {

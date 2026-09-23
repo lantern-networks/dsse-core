@@ -132,39 +132,43 @@ func (s *retentionOverrideStore) Get(stream string) (int, bool) {
 }
 
 // Set records (or clears, when days < 0) a per-stream retention override and persists it.
+// Caller holds writeMu, which also excludes destructive operations. mu is
+// only for brief state snapshots; file I/O must not delay status or pending intent.
 func (s *retentionOverrideStore) setLocal(stream string, days int) error {
-	if s == nil || stream == "" {
-		return fmt.Errorf("retention store or stream is unavailable")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 	if s.loadErr != nil {
-		return s.loadErr
+		err := s.loadErr
+		s.mu.RUnlock()
+		return err
 	}
-	if strings.TrimSpace(stream) != stream || days > maxRetentionDays {
-		return fmt.Errorf("invalid retention setting")
+	candidate := make(map[string]int, len(s.days)+1)
+	for k, v := range s.days {
+		candidate[k] = v
 	}
-	previous, existed := s.days[stream]
+	version := s.pendingVersion[stream]
+	s.mu.RUnlock()
 	if days < 0 {
-		delete(s.days, stream)
+		delete(candidate, stream)
 	} else {
-		s.days[stream] = days
+		candidate[stream] = days
 	}
-	if err := s.persistLocked(); err != nil {
-		if existed {
-			s.days[stream] = previous
-		} else {
-			delete(s.days, stream)
-		}
+	raw, err := json.Marshal(candidate)
+	if err == nil && s.persister != nil {
+		err = s.persister.Save(raw)
+	}
+	if err != nil {
 		if days == 0 {
-			if s.pendingForever == nil {
-				s.pendingForever = map[string]bool{}
-			}
-			s.pendingForever[stream] = true
+			s.rememberPendingForever(stream)
 		}
 		return err
 	}
-	delete(s.pendingForever, stream)
+	s.mu.Lock()
+	s.days = candidate
+	if s.pendingVersion[stream] == version {
+		delete(s.pendingForever, stream)
+		delete(s.pendingVersion, stream)
+	}
+	s.mu.Unlock()
 	log.Printf("retention_override_set stream=%s days=%d", stream, days)
 	return nil
 }
@@ -181,17 +185,6 @@ func (s *retentionOverrideStore) All() map[string]int {
 		out[k] = v
 	}
 	return out
-}
-
-func (s *retentionOverrideStore) persistLocked() error {
-	if s.persister == nil {
-		return nil
-	}
-	data, err := json.Marshal(s.days)
-	if err != nil {
-		return err
-	}
-	return s.persister.Save(data)
 }
 
 func (s *retentionOverrideStore) Set(stream string, days int) error {

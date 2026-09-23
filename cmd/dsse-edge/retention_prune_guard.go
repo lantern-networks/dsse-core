@@ -70,10 +70,13 @@ func checkedPruneCutoff(ctx context.Context, tx *sql.Tx, cfg retentionConfig, te
 
 func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) (time.Time, bool, error) {
 	if s := cfg.legalHold; s != nil {
+		if err := s.refreshLocalDeletionPermit(budget.request); err != nil {
+			return cutoff, false, err
+		}
 		// The caller owns policy locks. A refresh or SQL read must not bypass
 		// a failed local request to preserve this tenant.
 		s.mu.RLock()
-		pending, held, fences, loadErr := s.pending[tenant], s.held, s.erasures, s.loadErr
+		pending, held, fences, loadErr, permit := s.pending[tenant], s.held, s.erasures, s.loadErr, s.deletionPermit
 		s.mu.RUnlock()
 		if pending {
 			return cutoff, false, nil
@@ -85,7 +88,7 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 			}
 			snapshot, decodeErr := decodeHoldSnapshot(raw, s.sharedKnown)
 			err = decodeErr
-			held, fences = snapshot.held(), snapshot.Erasures
+			held, fences, permit = snapshot.held(), snapshot.Erasures, snapshot.DeletionPermit
 			if err != nil {
 				return cutoff, false, err
 			}
@@ -93,6 +96,9 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 			return cutoff, false, fmt.Errorf("shared pruning policy requires a PostgreSQL transaction")
 		} else if loadErr != nil {
 			return cutoff, false, loadErr
+		}
+		if err := s.checkDeletionSafety(budget.request, permit); err != nil {
+			return cutoff, false, err
 		}
 		if f, busy := fences[tenant]; busy && !ownsTenantErasure(budget.request, tenant, f) {
 			return cutoff, false, nil

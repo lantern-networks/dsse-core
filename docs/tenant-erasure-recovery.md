@@ -29,7 +29,7 @@ required before relying on a deployment-wide hold.
 
 ## Snapshot compatibility
 
-The first erasure writes version 2:
+An erasure without a deletion permit uses version 2:
 
 ```json
 {"version":2,"holds":[],"erasures":{"tenant-id":{"id":"0123456789abcdef0123456789abcdef","node":"node-name","started_at":"2026-09-23T00:00:00Z"}}}
@@ -40,6 +40,11 @@ version 2 after the last erasure marker is removed. Upgrade every reader/writer
 of that authority before performing erasure. Older array-only readers reject
 version 2; do not convert it back, remove unknown fields, or restore a stale
 snapshot to permit an old binary to run.
+
+Production deletion now also requires the version 3 process/term permit in
+[deletion-safety-recovery.md](deletion-safety-recovery.md). Version 3 remains
+version 3 when erasure markers change. Recovering a marker never renews that
+permit; a restarted process must be reconciled separately before deletion.
 
 ## Offline recovery
 
@@ -52,7 +57,7 @@ snapshot to permit an old binary to run.
    response, resource inventories and relevant logs in a restricted incident
    record. Inspect remaining stores and fleet delivery markers. A missing or
    malformed snapshot requires restoration from trusted evidence; do not replace
-   it with an empty state. The procedure below applies only to a known version 2
+   it with an empty state. The procedure below applies only to a known version 2/3
    snapshot and the exact interrupted operation.
 3. Remove only that operation's marker. Keep all hold records, other operation
    markers and the version. For PostgreSQL, bind `expected_hex` to the captured
@@ -74,13 +79,13 @@ SET payload = convert_to((inspected.doc #- ARRAY['erasures', :'tenant'])::text, 
 FROM inspected
 WHERE state.store_key = 'legal_hold'
   AND state.payload = inspected.raw
-  AND inspected.doc->>'version' = '2'
+  AND inspected.doc->>'version' IN ('2', '3')
   AND inspected.doc #>> ARRAY['erasures', :'tenant', 'id'] = :'operation_id';
 -- tenant-erasure-recovery-cas-end
 ```
 
    For a file store, while its sole owner is stopped, make the equivalent change
-   to the captured version 2 JSON using the exact tenant/operation ID. Verify
+   to the captured version 2/3 JSON using the exact tenant/operation ID. Verify
    the original bytes are still unchanged, then write through a temporary file,
    sync it, atomically replace the original and sync its directory. Keep the
    original permissions and the restricted backup. Do not edit the live file
@@ -90,7 +95,8 @@ WHERE state.store_key = 'legal_hold'
    hashes, operator, reason and resource reconciliation. This is an offline
    maintenance action, not an AdminConsole audit event.
 5. Restart current-version writers and inspect the footprint. If preservation is
-   now required, save and verify a hold before enabling deletion again. Otherwise
+   now required, save and verify a hold before enabling deletion again. Reconcile
+   the new process/term under the deletion-safety procedure before retrying. Otherwise
    retry the existing erasure operation, inspect its partial/full result and
    remaining footprint, and verify fleet delivery markers. Retrying does not
    restore data already erased. Unreachable nodes and external archives remain

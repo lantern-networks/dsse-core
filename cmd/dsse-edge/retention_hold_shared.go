@@ -84,6 +84,7 @@ func (s *legalHoldStore) refreshSharedContext(ctx context.Context) error {
 		return s.loadErr
 	}
 	s.held, s.erasures, s.snapshotVersion, s.loadErr = next.held(), next.Erasures, next.Version, nil
+	s.deletionPermit = next.DeletionPermit
 	if len(raw) > 0 {
 		s.sharedKnown = true
 	}
@@ -188,7 +189,7 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 		} else {
 			delete(candidate, tenantID)
 		}
-		raw, err = encodeHoldSnapshot(candidate, snapshot.Erasures, snapshot.Version)
+		raw, err = encodeHoldSnapshot(candidate, snapshot.Erasures, snapshot.Version, snapshot.DeletionPermit)
 		if err == nil {
 			next, err = decodeHoldSnapshot(raw, false)
 		}
@@ -203,6 +204,7 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.held, s.erasures, s.snapshotVersion, s.loadErr, s.sharedKnown = next.held(), next.Erasures, next.Version, nil, true
+	s.deletionPermit = next.DeletionPermit
 	if s.pendingVersion[tenantID] == pendingVersion {
 		delete(s.pending, tenantID)
 		delete(s.pendingVersion, tenantID)

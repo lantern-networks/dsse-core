@@ -27,6 +27,8 @@ type legalHoldRecord struct {
 type legalHoldStore struct {
 	erasures           map[string]tenantErasureFence
 	snapshotVersion    int
+	deletionPermit     *deletionSafetyPermit
+	deletionGuard      *deletionSafetyGuard
 	writeMu            cpWriterMutex
 	pendingVersion     map[string]uint64
 	nextPendingVersion uint64
@@ -60,6 +62,7 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 		return s
 	}
 	s.held, s.erasures, s.snapshotVersion = snapshot.held(), snapshot.Erasures, snapshot.Version
+	s.deletionPermit = snapshot.DeletionPermit
 	if len(s.held) > 0 {
 		log.Printf("legal-hold store loaded: %d tenant(s) under hold", len(s.held))
 	}
@@ -106,7 +109,7 @@ func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, 
 		candidate[k] = v
 	}
 	version := s.pendingVersion[tenantID]
-	fences, snapshotVersion := s.erasures, s.snapshotVersion
+	fences, snapshotVersion, permit := s.erasures, s.snapshotVersion, s.deletionPermit
 	s.mu.RUnlock()
 	if active {
 		if _, exists := candidate[tenantID]; !exists {
@@ -116,7 +119,7 @@ func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, 
 		delete(candidate, tenantID)
 	}
 	// writeMu prevents concurrent confirmed policy/erasure mutations.
-	raw, err := encodeHoldSnapshot(candidate, fences, snapshotVersion)
+	raw, err := encodeHoldSnapshot(candidate, fences, snapshotVersion, permit)
 	if err == nil && s.persister != nil {
 		err = s.persister.Save(raw)
 	}

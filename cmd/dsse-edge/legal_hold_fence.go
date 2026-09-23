@@ -22,9 +22,10 @@ type tenantErasureFence struct {
 	StartedAt string `json:"started_at"`
 }
 type legalHoldSnapshot struct {
-	Version  int                           `json:"version"`
-	Holds    []legalHoldRecord             `json:"holds"`
-	Erasures map[string]tenantErasureFence `json:"erasures"`
+	Version        int                           `json:"version"`
+	DeletionPermit *deletionSafetyPermit         `json:"deletion_permit,omitempty"`
+	Holds          []legalHoldRecord             `json:"holds"`
+	Erasures       map[string]tenantErasureFence `json:"erasures"`
 }
 type tenantErasureContext struct{ Tenant, ID string }
 
@@ -53,9 +54,12 @@ func decodeHoldSnapshot(raw []byte, known bool) (legalHoldSnapshot, error) {
 		if err := dec.Decode(new(any)); err != io.EOF {
 			return out, fmt.Errorf("trailing legal hold state")
 		}
-		if out.Version != 2 || out.Erasures == nil {
+		if (out.Version != 2 && out.Version != 3) || out.Erasures == nil {
 			return out, fmt.Errorf("unsupported legal hold state")
 		}
+	}
+	if out.DeletionPermit != nil && (out.Version != 3 || !out.DeletionPermit.valid()) {
+		return out, fmt.Errorf("invalid deletion safety permit")
 	}
 	if out.Holds == nil {
 		return out, fmt.Errorf("legal hold records must be an array")
@@ -85,7 +89,7 @@ func (v legalHoldSnapshot) held() map[string]legalHoldRecord {
 	}
 	return out
 }
-func encodeHoldSnapshot(held map[string]legalHoldRecord, fences map[string]tenantErasureFence, version int) ([]byte, error) {
+func encodeHoldSnapshot(held map[string]legalHoldRecord, fences map[string]tenantErasureFence, version int, permit ...*deletionSafetyPermit) ([]byte, error) {
 	rows := make([]legalHoldRecord, 0, len(held))
 	for _, r := range held {
 		rows = append(rows, r)
@@ -97,7 +101,14 @@ func encodeHoldSnapshot(held map[string]legalHoldRecord, fences map[string]tenan
 	if fences == nil {
 		fences = map[string]tenantErasureFence{}
 	}
-	return json.Marshal(legalHoldSnapshot{Version: 2, Holds: rows, Erasures: fences})
+	var approved *deletionSafetyPermit
+	if len(permit) > 0 {
+		approved = permit[0]
+	}
+	if version < 3 {
+		version = 2
+	}
+	return json.Marshal(legalHoldSnapshot{Version: version, Holds: rows, Erasures: fences, DeletionPermit: approved})
 }
 func ownsTenantErasure(ctx context.Context, tenant string, f tenantErasureFence) bool {
 	owner, ok := ctx.Value(tenantErasureContext{}).(tenantErasureContext)
@@ -164,6 +175,9 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 	var next legalHoldSnapshot
 	mutate := func(v legalHoldSnapshot) ([]byte, error) {
 		if begin {
+			if err := s.checkDeletionSafety(ctx, v.DeletionPermit); err != nil {
+				return nil, err
+			}
 			s.mu.RLock()
 			pending := s.pending[tenant]
 			s.mu.RUnlock()
@@ -184,9 +198,11 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 			}
 			delete(v.Erasures, tenant)
 		}
-		v.Version = 2
+		if v.Version < 2 {
+			v.Version = 2
+		}
 		next = v
-		return encodeHoldSnapshot(v.held(), v.Erasures, v.Version)
+		return encodeHoldSnapshot(v.held(), v.Erasures, v.Version, v.DeletionPermit)
 	}
 	if p, ok := s.persister.(retentionSharedUpdater); ok {
 		err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
@@ -201,8 +217,12 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 		}
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		s.held, s.erasures, s.snapshotVersion, s.sharedKnown, s.loadErr = next.held(), next.Erasures, 2, true, nil
+		s.held, s.erasures, s.snapshotVersion, s.sharedKnown, s.loadErr = next.held(), next.Erasures, next.Version, true, nil
+		s.deletionPermit = next.DeletionPermit
 		return nil
+	}
+	if err := s.refreshLocalDeletionPermit(ctx); err != nil {
+		return err
 	}
 	// The local path serializes writers throughout saving. Build a
 	// detached candidate so an unconfirmed write never publishes a clear fence.
@@ -211,7 +231,7 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 		s.mu.RUnlock()
 		return fmt.Errorf("legal hold state unavailable")
 	}
-	raw, err := encodeHoldSnapshot(s.held, s.erasures, s.snapshotVersion)
+	raw, err := encodeHoldSnapshot(s.held, s.erasures, s.snapshotVersion, s.deletionPermit)
 	s.mu.RUnlock()
 	if err != nil {
 		return err
@@ -235,6 +255,7 @@ func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.held, s.erasures, s.snapshotVersion = next.held(), next.Erasures, 2
+	s.held, s.erasures, s.snapshotVersion = next.held(), next.Erasures, next.Version
+	s.deletionPermit = next.DeletionPermit
 	return nil
 }

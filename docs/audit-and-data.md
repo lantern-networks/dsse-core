@@ -104,7 +104,13 @@ Generated configuration, runtime overrides, and storage settings can change them
 | `-audit-cold-retention` | 8,760 hours of requested object retention after archival, when configured |
 
 The pruner starts where PostgreSQL is configured and performs work on the control-plane
-leader. Setup failure is logged and startup can continue without pruning. Hot-event
+leader. Deletion starts paused after every process start or leadership change,
+including first installation. Reconcile unconfirmed protection requests and authorize
+the current process/term using [deletion safety recovery](deletion-safety-recovery.md)
+before pruning or tenant erasure can resume. This restriction prevents a successor
+from losing the previous process's failed hold/indefinite-retention requests; it does
+not pause reads or saving protective settings. Setup failure is logged and startup
+can continue without pruning. Hot-event
 retention precedence is **Console override, then per-stream startup override, then global
 default**. Zero keeps that stream indefinitely. Clearing a Console override restores the
 startup setting; it does not erase records immediately. Enter whole days (0–106751);
@@ -115,8 +121,9 @@ retention sweep, including its outbox cleanup. It does not substitute default TT
 accept changes over the unreadable snapshot. The Console reports an unavailable state
 and offers retry instead of showing empty overrides. Repair the backing data and reload
 the store (normally by restarting the affected process); retrying the page alone does not
-clear a startup load failure. A missing initial snapshot or an empty object is valid and
-uses startup defaults. This protection applies to this pruner, not external lifecycle jobs
+clear a startup load failure. A missing initial retention snapshot or an empty object
+uses startup defaults, but does not supply the separate deletion permit. This retention
+read-failure protection applies to this pruner, not external lifecycle jobs
 or explicit tenant erasure. Preserve storage capacity while pruning is paused.
 
 Console per-stream retention changes affect the **whole node**, not just the selected

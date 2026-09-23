@@ -254,7 +254,7 @@ func TestTenantErasureFenceHTTPRefusalAndAudit(t *testing.T) {
 }
 
 func TestTenantErasureFenceInvalidSnapshotFailsClosed(t *testing.T) {
-	for _, raw := range []string{`{"version":3,"holds":[],"erasures":{}}`, `{"version":2,"holds":[]}`, `{"version":2,"holds":[],"erasures":{"target":{"id":"bad","node":"n","started_at":"2026-09-23T00:00:00Z"}}}`} {
+	for _, raw := range []string{`{"version":4,"holds":[],"erasures":{}}`, `{"version":2,"holds":[]}`, `{"version":2,"holds":[],"erasures":{"target":{"id":"bad","node":"n","started_at":"2026-09-23T00:00:00Z"}}}`} {
 		p := blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "holds.json")}
 		if err := os.WriteFile(p.Path, []byte(raw), 0600); err != nil {
 			t.Fatal(err)

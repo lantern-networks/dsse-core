@@ -339,3 +339,18 @@ alone or assume a `404` proves that device trust was removed.
 This is manual recovery, not a durable withdrawal journal or an atomic update
 across both stores. It does not establish fleet propagation or recovery from an
 unknown database commit. Keep other CA writers stopped during reconciliation.
+
+## Ambiguous device-CA ownership at startup
+
+A CA certificate may belong to only one tenant. Startup rejects a registry that
+assigns the same certificate to different tenants, whether the earlier entry uses
+a PEM file or inline `ca_pem`. The file remains unchanged. A malformed existing
+registry is not treated as an absent cache on a config-pulling Edge, so the node
+stops rather than accepting an ambiguous tenant mapping.
+
+Keep that node out of service, preserve the rejected registry, and reconcile its
+entries with authoritative ownership records. Do not choose the last entry or
+reassign a CA just to make startup pass. Restore a consistent registry through
+the deployment's controlled maintenance procedure, then verify the owning tenant
+before serving devices. This check does not persist an interrupted withdrawal's
+pending receipt; the separate recovery procedure above still applies.

@@ -127,8 +127,12 @@ func LoadTenantCARegistry(path string) (*TenantCARegistry, error) {
 				return nil, fmt.Errorf("tenant CA registry: tenant %q inline ca_pem: %w", tid, perr)
 			}
 			for _, c := range certs {
+				key := CAAnchorKey(c)
+				if existing, ok := reg.byAnchorKey[key]; ok && existing != tid {
+					return nil, fmt.Errorf("tenant CA registry: CA shared by tenants %q and %q (isolation violation)", existing, tid)
+				}
 				reg.Pool.AddCert(c)
-				reg.byAnchorKey[CAAnchorKey(c)] = tid
+				reg.byAnchorKey[key] = tid
 				reg.anchors = append(reg.anchors, c)
 			}
 			continue

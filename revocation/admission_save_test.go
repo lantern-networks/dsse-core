@@ -138,8 +138,8 @@ func TestAdmissionCheckedSaveOutcomes(t *testing.T) {
 				if a.ConfigGeneration() != beforeRetry {
 					t.Fatal("retry generation churn")
 				}
-				if reported != wantCalls || meshed != wantCalls || closed != wantCalls {
-					t.Fatal("retry repeated callback")
+				if reported != wantCalls || meshed != 2*wantCalls || closed != wantCalls {
+					t.Fatal("retry must renew only mesh delivery")
 				}
 				reopened = NewAdmissionRevocations()
 				reopened.SetPersister(p)

@@ -227,8 +227,9 @@ func (a *AdmissionRevocations) Revoke(identity, reason string) {
 
 // RevokeChecked applies the restrictive local decision even if saving fails.
 // An error means persistence is unconfirmed, not that the block was rolled back.
-// Explicit retries save an unchanged block again without repeating callbacks or
-// bumping its generation. Automatic Revoke retains its no-churn behaviour.
+// Explicit retries save an unchanged block again and, on confirmed persistence,
+// re-request mesh delivery. They do not repeat the node reporter/session callback
+// or bump generation. Automatic Revoke retains its no-churn behaviour.
 func (a *AdmissionRevocations) RevokeChecked(identity, reason string) error {
 	return a.revoke(identity, reason, true)
 }
@@ -266,7 +267,9 @@ func (a *AdmissionRevocations) revokeContext(ctx context.Context, identity, reas
 	}
 	// Federation push: an ORIGIN revocation propagates to the federation peers. Only fired for an origin Revoke —
 	// a federation-RECEIVED item (RevokeFromMesh) never re-pushes (no-loop).
-	if changed && meshReporter != nil {
+	// Admission persistence and mesh enqueue are separate writes. An explicit,
+	// confirmed retry must recover an intent lost between them (including restart).
+	if (changed || (retrySave && err == nil)) && meshReporter != nil {
 		meshReporter(ctx, id, reason)
 	}
 	// Active session revocation: close the identity's live connections (idempotent no-op if none).

@@ -80,16 +80,16 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 	reporter, meshReporter, onRevoked := a.reporter, a.meshReporter, a.onRevoked
 	a.mu.Unlock()
 	a.writeMu.Unlock()
-	if notify {
-		if reporter != nil {
-			reporter(id, reason)
-		}
-		if meshReporter != nil {
-			meshReporter(ctx, id, reason)
-		}
-		if onRevoked != nil {
-			onRevoked(id, reason)
-		}
+	if notify && reporter != nil {
+		reporter(id, reason)
+	}
+	// A successful explicit retry also recovers a delivery intent missing after
+	// admission was committed. Refused/unknown unchanged writes cannot renew it.
+	if (notify || (revoke && err == nil)) && meshReporter != nil {
+		meshReporter(ctx, id, reason)
+	}
+	if notify && onRevoked != nil {
+		onRevoked(id, reason)
 	}
 	if err != nil {
 		return applied, ErrAdmissionSave

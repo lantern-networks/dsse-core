@@ -436,6 +436,29 @@ can remain until the process reloads the saved queue. Fix storage and inspect th
 queue outcome before restarting: a failed enqueue may have no recoverable copy.
 Do not delete the outbox to clear an error.
 
+Admission storage and enqueue are separate writes. A process exit or leadership
+change between them can leave a saved origin block with no saved delivery intent.
+Restart alone cannot reconstruct that missing intent. Reconcile the saved origin
+blocks, current peer configuration, queue, and peer state after such an interruption.
+Once storage and the current writer are healthy, explicitly repeat each still-intended
+local block with its original identity and reason. The checked administrative revoke
+path re-requests mesh delivery after confirming the admission save, even when the
+block was already present. Devices' failed-operation Retry repeats this request;
+if that notice is no longer available, use the authenticated
+`POST /admin/transport-admission/revoke` operation with the same identity and reason.
+Do not Allow then Block as a recovery workaround: that temporarily lifts local
+protection. Serialize recovery with other administrators so a retry does not
+reinstate a deliberately withdrawn block.
+
+An unchanged retry does not advance admission generation or repeat the node report
+or session-close callback. Automatic unchanged revokes and mesh-received blocks do
+not re-push. A refused or unconfirmed unchanged admission save does not renew mesh
+delivery. Inspect the enqueue, peer acknowledgement and saved cleanup separately;
+the successful revoke response still confirms local admission only. This is an
+explicit recovery procedure, not an atomic admission/outbox commit or an automatic
+reconciliation service. A process exit can also precede that request's audit write;
+the recovery request has its own audit and does not backfill the interrupted one.
+
 Console Block status and successful administrator audits describe the local
 admission and inventory changes. They do not acknowledge queue durability or
 acceptance by every peer. Use sender system logs to distinguish those outcomes;

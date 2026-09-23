@@ -96,14 +96,11 @@ func (s *retentionOverrideStore) SetContext(ctx context.Context, stream string, 
 	}
 	p, ok := s.persister.(retentionSharedUpdater)
 	if !ok {
-		if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+		return runLocalPolicyWrite(ctx, &s.writeMu, func() error { return s.setLocal(stream, days) }, func() {
 			if days == 0 {
 				s.rememberPendingForever(stream)
 			}
-			return err
-		}
-		defer s.writeMu.Unlock()
-		return s.setLocal(stream, days)
+		})
 	}
 	ctx = retentionWriteContext(ctx)
 	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
@@ -152,14 +149,11 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 	}
 	p, ok := s.persister.(retentionSharedUpdater)
 	if !ok {
-		if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
+		return runLocalPolicyWrite(ctx, &s.writeMu, func() error { return s.setLocal(tenantID, heldBy, reason, active, now) }, func() {
 			if active {
 				s.rememberPendingHold(tenantID)
 			}
-			return err
-		}
-		defer s.writeMu.Unlock()
-		return s.setLocal(tenantID, heldBy, reason, active, now)
+		})
 	}
 	ctx = retentionWriteContext(ctx)
 	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {

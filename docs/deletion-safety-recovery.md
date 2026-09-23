@@ -84,3 +84,25 @@ File calls already executing in the OS cannot be canceled merely by canceling
 an HTTP request. Do not release their exclusion or authorize a replacement until
 their termination is established. This permit is not a distributed file-I/O
 lock and does not establish independent Edge/region delivery of protection.
+
+## Slow local protection saves
+
+A local legal-hold or retention-setting request waits at most five seconds
+(or its shorter request deadline) for writer admission and saving. A timeout
+means **unconfirmed**, not rolled back. The file operation may still finish.
+The admitted worker retains the policy writer lock until the OS call and
+confirmed-state update finish. Queued requests cannot start another save, and
+pruning cannot bypass that lock. Hold additions and keep-forever requests stay
+pending in this process even if their timed-out save later succeeds; explicitly
+retry saving after storage recovers to confirm them.
+
+The deadline does not interrupt filesystem calls. If storage never returns,
+keep the affected writer isolated and stop the process before attempting offline
+reconciliation. Do not edit its files or start a replacement on the same paths
+while the old process may still write. Confirm that the old process has exited;
+if it cannot be stopped, repair or isolate the underlying storage/host and keep
+deletion paused. After restart, the process/term authorization procedure above
+still applies. Pending intent itself is not reconstructed from the timed-out
+request. File erasure-marker saves and filesystem deletion have separate
+ownership boundaries; this five-second protection-setting response contract
+does not promise bounded completion for those operations or for OS shutdown.

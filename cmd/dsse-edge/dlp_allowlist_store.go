@@ -143,7 +143,7 @@ func (s *dlpAllowlistRuntimeStore) saveSnapshotLocked(next allowlistStoreSnapsho
 	if err != nil {
 		return err
 	}
-	return s.persister.Save(data)
+	return blobstore.UnconfirmedSave(s.persister.Save(data))
 }
 
 // Tenants returns the tenant ids that have an allowlist, ordered (admin listing).

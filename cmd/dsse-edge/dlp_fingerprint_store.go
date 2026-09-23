@@ -221,7 +221,7 @@ func (s *dlpFingerprintRuntimeStore) saveSnapshotLocked(next fingerprintStoreSna
 	if err != nil {
 		return err
 	}
-	return s.persister.Save(data)
+	return blobstore.UnconfirmedSave(s.persister.Save(data))
 }
 
 // recompileLocked rebuilds the tenant's compiled FingerprintSet from the stored hashes. Caller holds the lock.

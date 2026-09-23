@@ -160,3 +160,44 @@ func TestSharedGrantFailedMergePublishesOnlyDenials(t *testing.T) {
 		t.Fatal("erase refresh", e)
 	}
 }
+
+// A pending denial for a grant a peer has since erased made every later report
+// batch from an Edge fail with ErrConflict while that Edge kept reporting the
+// grant, so no other grant in the batch was ever admitted. The latched grant is
+// left out (not recreated: that would revive an erased record); the rest merge.
+func TestSharedGrantMergeSkipsOnlyTheLatchedGrant(t *testing.T) {
+	p := &grantSharedFixture{}
+	a, b := NewStore(), NewStore()
+	a.SetPersister(p)
+	b.SetPersister(p)
+	now := time.Now().UTC()
+	gone, e := a.Mint(Grant{GrantID: "gone", TenantID: "t"}, time.Hour, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	p.fail = true
+	if _, _, e := a.RevokeForTenantContext(context.Background(), "t", "gone"); !errors.Is(e, ErrPersistence) {
+		t.Fatalf("expected a latched denial: %v", e)
+	}
+	p.fail = false
+	if _, e := b.RemoveTenantChecked("t"); e != nil {
+		t.Fatal(e)
+	}
+	fresh, e := NewStore().Mint(Grant{GrantID: "fresh", TenantID: "t2"}, time.Hour, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	reported := gone
+	reported.Revoked = false
+	if _, _, e := a.MergeCheckedContext(context.Background(), []Grant{reported, fresh}, now); e != nil {
+		t.Fatalf("one latched grant refused the whole report batch: %v", e)
+	}
+	if !b.Valid("fresh", now) {
+		t.Fatal("unrelated grant in the batch was not admitted")
+	}
+	for _, g := range b.ListAll() {
+		if g.GrantID == "gone" {
+			t.Fatalf("erased grant revived by a report: %+v", g)
+		}
+	}
+}

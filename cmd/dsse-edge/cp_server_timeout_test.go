@@ -184,33 +184,93 @@ func TestPostgresBlobRequestCancellationKeepsLeaderSession(t *testing.T) {
 	}
 }
 
-func TestPostgresBlobCommitCancellationRemainsConservative(t *testing.T) {
-	d, _, leader, peer := trustDistributionPostgresFixture(t)
+// A request that ends while COMMIT is in flight can no longer roll the change
+// back. Forwarding that cancellation made lib/pq close the advisory-lock session,
+// so a disconnecting client (including a device on the data path) handed
+// leadership to a peer. COMMIT is bounded by the SQL budget instead.
+func TestPostgresBlobCommitCancellationKeepsLeaderSession(t *testing.T) {
+	cases := []struct {
+		name  string
+		sleep string
+		limit time.Duration
+		// cancelAt < 0 means: let the request deadline expire instead.
+		cancelAt time.Duration
+	}{
+		{name: "client_cancel_during_commit", sleep: "0.5", limit: 5 * time.Second, cancelAt: 150 * time.Millisecond},
+		{name: "request_deadline_during_commit", sleep: "0.4", limit: 80 * time.Millisecond, cancelAt: -1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, _, leader, peer := trustDistributionPostgresFixture(t)
+			p := d.store.(postgresBlobPersister)
+			p.key = "commit_cancel_" + tc.name
+			if err := p.Save([]byte(`{"original":true}`)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.db.Exec(`CREATE OR REPLACE FUNCTION delay_blob_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(` + tc.sleep + `); RETURN NEW; END $$;
+				DROP TRIGGER IF EXISTS delay_blob_commit ON cp_state_blobs;
+				CREATE CONSTRAINT TRIGGER delay_blob_commit AFTER UPDATE ON cp_state_blobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION delay_blob_commit()`); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { p.db.Exec(`DROP TRIGGER IF EXISTS delay_blob_commit ON cp_state_blobs`) })
+			var before int
+			if err := leader.conn.QueryRowContext(context.Background(), "SELECT pg_backend_pid()").Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			term := leader.leaderSince.Load()
+			ctx, cancel := context.WithTimeout(captureCPWriteLease(context.Background()), tc.limit)
+			defer cancel()
+			if tc.cancelAt > 0 {
+				time.AfterFunc(tc.cancelAt, cancel)
+			}
+			err := p.UpdateContext(ctx, func([]byte) ([]byte, error) { return []byte(`{"changed":true}`), nil })
+			if ctx.Err() == nil {
+				t.Fatal("request context did not end during COMMIT; the case did not exercise the boundary")
+			}
+			if err != nil {
+				t.Fatalf("COMMIT that finished within the SQL budget reported failure: %v", err)
+			}
+			leader.tick()
+			peer.tick()
+			var after int
+			if err := leader.conn.QueryRowContext(context.Background(), "SELECT pg_backend_pid()").Scan(&after); err != nil {
+				t.Fatal(err)
+			}
+			if !leader.IsLeader() || peer.IsLeader() || before != after || term != leader.leaderSince.Load() {
+				t.Fatalf("request end during COMMIT cost leadership: before=%d after=%d", before, after)
+			}
+			if raw, err := p.Load(); err != nil || string(raw) != `{"changed":true}` {
+				t.Fatalf("committed change not durable: %s %v", raw, err)
+			}
+		})
+	}
+}
+
+// COMMIT is still bounded: past the budget plus grace, the transport backstop
+// fires. The outcome stays unknown (never reclassified as not-committed).
+func TestPostgresBlobHungCommitIsBoundedByBudget(t *testing.T) {
+	d, _, _, _ := trustDistributionPostgresFixture(t)
 	p := d.store.(postgresBlobPersister)
-	p.key = "commit_timeout"
+	p.key = "commit_hung"
 	if err := p.Save([]byte(`{"original":true}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.db.Exec(`CREATE FUNCTION delay_blob_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER delay_blob_commit AFTER UPDATE ON cp_state_blobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION delay_blob_commit()`); err != nil {
+	if _, err := p.db.Exec(`CREATE OR REPLACE FUNCTION delay_blob_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$;
+		DROP TRIGGER IF EXISTS delay_blob_commit ON cp_state_blobs;
+		CREATE CONSTRAINT TRIGGER delay_blob_commit AFTER UPDATE ON cp_state_blobs DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION delay_blob_commit()`); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { p.db.Exec(`DROP TRIGGER IF EXISTS delay_blob_commit ON cp_state_blobs`) })
 	ctx, cancel := context.WithTimeout(captureCPWriteLease(context.Background()), 80*time.Millisecond)
 	defer cancel()
+	started := time.Now()
 	err := p.UpdateContext(ctx, func([]byte) ([]byte, error) { return []byte(`{"changed":true}`), nil })
-	var pgerr *pq.Error
-	if !errors.As(err, &pgerr) || pgerr.Code != "57014" || errors.Is(err, blobstore.ErrWriteNotCommitted) {
-		t.Fatalf("COMMIT outcome was reclassified: %v", err)
+	elapsed := time.Since(started)
+	if err == nil || errors.Is(err, blobstore.ErrWriteNotCommitted) {
+		t.Fatalf("hung COMMIT outcome was not reported as unknown: %v", err)
 	}
-	// COMMIT must retain client cancellation: statement_timeout alone does
-	// not bound deferred finalization. Losing the session here is a known
-	// remaining availability issue, not permission to commit after timeout.
-	leader.tick()
-	peer.tick()
-	if leader.IsLeader() || !peer.IsLeader() {
-		t.Fatal("commit cancellation did not exercise the existing session-loss boundary")
-	}
-	if raw, err := p.Load(); err != nil || string(raw) != `{"original":true}` {
-		t.Fatalf("timed-out commit saved: %s %v", raw, err)
+	if elapsed > 80*time.Millisecond+cpStatementCancelGrace+time.Second {
+		t.Fatalf("COMMIT was not bounded by budget+grace: %v", elapsed)
 	}
 }
 
@@ -261,4 +321,47 @@ func TestPostgresBlobPreservesStricterServerTimeout(t *testing.T) {
 	if raw, err := p.Load(); err != nil || string(raw) != "{}" {
 		t.Fatalf("timed-out data changed: %s %v", raw, err)
 	}
+}
+
+// A fast shared write must not pay one extra round trip per statement on the
+// leader's advisory-lock session. A statement that starts well after the last
+// setting must still be bounded by the remaining total budget.
+func TestPostgresCPStatementBudgetSetsTimeoutOnlyWhenStale(t *testing.T) {
+	d, _, _, _ := trustDistributionPostgresFixture(t)
+	p := d.store.(postgresBlobPersister)
+	ctx, cancel := context.WithTimeout(captureCPWriteLease(context.Background()), 3*time.Second)
+	defer cancel()
+	tx, finish, err := beginCPWriteTransaction(ctx, p.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { tx.Rollback(); finish() }()
+	b := newCPStatementBudget(ctx)
+	defer b.cancel()
+	for i := 0; i < 3; i++ {
+		if _, err := b.exec(tx, `SELECT 1`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if b.timeoutSets != 1 {
+		t.Fatalf("fast statements set the timeout %d times, want 1", b.timeoutSets)
+	}
+	if _, err := b.exec(tx, `SELECT pg_sleep(0.6)`); err != nil {
+		t.Fatal(err)
+	}
+	var setting string
+	if err := b.queryRow(tx, `SELECT current_setting('statement_timeout')`).Scan(&setting); err != nil {
+		t.Fatal(err)
+	}
+	if b.timeoutSets != 2 {
+		t.Fatalf("stale setting was not renewed: sets=%d", b.timeoutSets)
+	}
+	got, err := time.ParseDuration(setting)
+	if err != nil {
+		t.Fatalf("unexpected setting %q: %v", setting, err)
+	}
+	if remaining := time.Until(b.deadline); got > remaining+cpStatementTimeoutReuse || got > 2500*time.Millisecond {
+		t.Fatalf("renewed timeout %v exceeds the remaining budget %v", got, remaining)
+	}
+	t.Logf("sets=%d renewed_timeout=%s", b.timeoutSets, setting)
 }

@@ -18,7 +18,7 @@ func TestAuditIngestReceiver(t *testing.T) {
 		t.Fatalf("NewWriter: %v", err)
 	}
 	mux := http.NewServeMux()
-	registerAuditIngestReceiver(mux, writer, "ship-secret", nil, nil, nil, true)
+	registerAuditIngestReceiver(mux, writer, "ship-secret", nil, nil, nil, true, observationReportSink{})
 
 	post := func(stream, bearer, body string) int {
 		req := httptest.NewRequest(http.MethodPost, "/audit-ingest", strings.NewReader(body))
@@ -60,7 +60,7 @@ func TestAuditIngestReceiver(t *testing.T) {
 
 	// No token -> no receiver registered (404).
 	bare := http.NewServeMux()
-	registerAuditIngestReceiver(bare, writer, "", nil, nil, nil, true)
+	registerAuditIngestReceiver(bare, writer, "", nil, nil, nil, true, observationReportSink{})
 	req := httptest.NewRequest(http.MethodPost, "/audit-ingest", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
 	bare.ServeHTTP(rec, req)

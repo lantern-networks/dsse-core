@@ -1,7 +1,6 @@
 package policycandidate
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -45,12 +44,13 @@ func (store *Store) SetPersister(p blobstore.Persister) error {
 		store.sharedKnown = false
 		return nil
 	}
-	snapshot, err := decodeCandidateSnapshot(data)
+	snapshot, receipts, err := decodeCandidateRow(data)
 	if err != nil {
 		return err
 	}
 	store.sharedKnown = true
 	store.candidates = snapshot
+	store.receipts = receipts
 	store.persister = p
 	return nil
 }
@@ -69,8 +69,12 @@ func (store *Store) cloneLocked() map[string]map[string]Candidate {
 // Caller holds mu across save and publication. An uncertain save leaves live state
 // unchanged and prevents changing the writer until a subsequent save is confirmed.
 func (store *Store) commitLocked(next map[string]map[string]Candidate) error {
+	return store.commitWithReceiptsLocked(next, store.receipts)
+}
+
+func (store *Store) commitWithReceiptsLocked(next map[string]map[string]Candidate, receipts map[string]ReportReceipt) error {
 	if store.persister != nil {
-		data, err := json.MarshalIndent(next, "", "  ")
+		data, err := encodeCandidateRow(next, receipts)
 		if err == nil {
 			err = store.persister.Save(data)
 		}
@@ -80,6 +84,7 @@ func (store *Store) commitLocked(next map[string]map[string]Candidate) error {
 		}
 	}
 	store.candidates = next
+	store.receipts = receipts
 	store.dirty = false
 	return nil
 }

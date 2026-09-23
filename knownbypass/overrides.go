@@ -224,7 +224,7 @@ func (s *OverrideStore) commitLocked(next map[string]map[string]Override) error 
 	if s.persister != nil {
 		data, err := json.MarshalIndent(next, "", "  ")
 		if err == nil {
-			err = s.persister.Save(data)
+			err = blobstore.UnconfirmedSave(s.persister.Save(data))
 		}
 		if err != nil {
 			s.dirty = true

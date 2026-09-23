@@ -11,6 +11,11 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
+// errEntitlementAuthorityMissing: this process holds grants but the shared row is
+// gone. A retry cannot fix it (this node must not rebuild authority from memory);
+// the row must be restored, or the process restarted so it starts from the row.
+var errEntitlementAuthorityMissing = errors.New("entitlement authority is missing")
+
 // Per-tenant feature entitlements — the license/contract gate for optional PAID features (starting with DLP). A
 // feature is entitled when explicitly granted for the tenant, or — when the tenant has no explicit entry — by the
 // configurable default, so an unlicensed deployment can default a paid feature OFF while the lab defaults it ON.
@@ -83,7 +88,7 @@ func (s *entitlementStore) SetFeaturesContext(ctx context.Context, tenant string
 	edit := func(raw []byte) ([]byte, error) {
 		next = entitlementSnapshot{Features: map[string]map[string]bool{}}
 		if raw == nil && len(s.features) > 0 {
-			return nil, fmt.Errorf("entitlement authority is missing")
+			return nil, errEntitlementAuthorityMissing
 		}
 		if raw != nil {
 			next = entitlementSnapshot{}
@@ -142,7 +147,7 @@ func (s *entitlementStore) RefreshShared() error {
 		return err
 	}
 	if raw == nil && len(s.features) > 0 {
-		return fmt.Errorf("entitlement authority is missing")
+		return errEntitlementAuthorityMissing
 	}
 	next := entitlementSnapshot{Features: map[string]map[string]bool{}}
 	if raw != nil {

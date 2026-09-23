@@ -35,6 +35,9 @@ func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			return
 		}
 		o.TenantID = tenantForWrite
+		if vlanLegacyWriteRefused(w, r, vlanBoundary, o.ID, false) {
+			return
+		}
 		saved, err := vlanBoundary.UpsertObjectContext(r.Context(), o, vlanOwnerForWrite(r, o.TenantID))
 		if err != nil {
 			writeVLANMutationError(w, err)
@@ -56,6 +59,9 @@ func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			return
 		}
 		id := r.PathValue("object_id")
+		if vlanLegacyWriteRefused(w, r, vlanBoundary, id, false) {
+			return
+		}
 		// Authorize against the latest row in the same transaction as deletion.
 		deleted, err := vlanBoundary.DeleteObjectContext(r.Context(), id, vlanOwnerForWrite(r, ""))
 		if err != nil {
@@ -83,6 +89,9 @@ func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			return
 		}
 		p.TenantID = tenantForWrite
+		if vlanLegacyWriteRefused(w, r, vlanBoundary, p.ID, true) {
+			return
+		}
 		saved, err := vlanBoundary.UpsertPolicyContext(r.Context(), p, vlanOwnerForWrite(r, p.TenantID))
 		if err != nil {
 			writeVLANMutationError(w, err)
@@ -124,6 +133,36 @@ func writeVLANMutationError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusBadRequest, err)
+}
+
+// vlanLegacyWriteRefused answers a customer's change to a definition that has no
+// organization with what is true: it exists (the same caller sees it listed),
+// and only the operator may change it. The store's authorization answered
+// ErrNotFound, so the Console said "absent" about a row it had just shown.
+// There is no oracle concern: unowned definitions are visible to every tenant.
+// The store still re-checks ownership inside the transaction.
+func vlanLegacyWriteRefused(w http.ResponseWriter, r *http.Request, store *vlan.Store, id string, policy bool) bool {
+	if _, operator := adminVLANCallerTenant(r); operator || strings.TrimSpace(id) == "" {
+		return false
+	}
+	if !refreshVLANStore(w, store) {
+		return true
+	}
+	unowned := false
+	if policy {
+		for _, p := range store.ListPolicies() {
+			if p.ID == id && strings.TrimSpace(p.TenantID) == "" {
+				unowned = true
+			}
+		}
+	} else if o, ok := store.GetObject(id); ok && strings.TrimSpace(o.TenantID) == "" {
+		unowned = true
+	}
+	if unowned {
+		writeError(w, http.StatusForbidden, errors.New("This definition has no organization: it predates per-organization Networks and only the deployment operator can change or remove it."))
+		return true
+	}
+	return false
 }
 
 // Reading legacy unowned definitions remains compatible, but modifying them

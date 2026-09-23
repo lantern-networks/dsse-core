@@ -74,7 +74,13 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		s.sharedPending = map[string]bool{}
-		s.sharedKnown = data != nil || err != nil
+		// Only a row actually read is "known". A boot read failure proves nothing
+		// about the row: if it exists, every flush merges into it inside the row
+		// lock; if it is absent, creating it from this process's unsaved
+		// observations loses nothing. Marking it known made an absent row an error
+		// forever, so a fleet that booted while the database was down never
+		// persisted an observation until restarted.
+		s.sharedKnown = data != nil
 		if err != nil {
 			return err
 		}

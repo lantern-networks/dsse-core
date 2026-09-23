@@ -6,11 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/blobstore"
+	"log"
 	"strings"
 	"time"
 )
 
 var errDownloadStoreUnavailable = errors.New("download token storage is unavailable; retry later")
+
+// errDownloadNotLeader: storage is fine, but this control plane does not hold the
+// write term. "Retry later" was wrong advice: retrying on this node never succeeds.
+var errDownloadNotLeader = errors.New("this control plane is not the active one; open the download through the management address")
 var errDownloadTokenAbsent = errors.New("download token is not active")
 
 type downloadSharedUpdater interface {
@@ -117,6 +123,7 @@ func (s *adminDownloadTokenStore) updateTokens(ctx context.Context, now time.Tim
 		})
 	} else {
 		if s.loadErr != nil {
+			log.Printf("export download token store: refusing writes after a failed load: %v", s.loadErr)
 			return errDownloadStoreUnavailable
 		}
 		if err = ctx.Err(); err == nil {
@@ -128,13 +135,21 @@ func (s *adminDownloadTokenStore) updateTokens(ctx context.Context, now time.Tim
 			var raw []byte
 			raw, err = encode(detached)
 			if err == nil && s.persister != nil {
-				err = s.persister.Save(raw)
+				err = blobstore.UnconfirmedSave(s.persister.Save(raw))
 			}
 		}
 	}
 	if err != nil {
 		if errors.Is(err, errDownloadTokenAbsent) {
 			return errDownloadTokenAbsent
+		}
+		// Callers answer a fixed "unavailable"; without this line "known row is
+		// missing", "invalid token state", a leadership change and a database
+		// outage were indistinguishable to an operator. No token value or payload
+		// is part of these errors.
+		log.Printf("export download token store: save not confirmed: %v", err)
+		if errors.Is(err, errCPLeadershipChanged) {
+			return errDownloadNotLeader
 		}
 		return errDownloadStoreUnavailable
 	}

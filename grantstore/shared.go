@@ -232,7 +232,7 @@ func (s *Store) MergeCheckedContext(ctx context.Context, incoming []Grant, now t
 	handled, err := s.mutateShared(ctx, func(c *Store) error {
 		before := cloneGrants(c.grants)
 		var e error
-		added, updated, e = c.MergeChecked(incoming, now)
+		added, updated, e = c.MergeChecked(s.withoutLatchedGrants(incoming, before), now)
 		if e == nil {
 			for id, g := range c.grants {
 				prev, exists := before[id]
@@ -285,4 +285,25 @@ func (s *Store) ListAllChecked() ([]Grant, error) {
 		return nil, err
 	}
 	return s.listAllLocal(), nil
+}
+
+// withoutLatchedGrants drops reported grants this process holds an unconfirmed
+// denial for, when the latest row no longer has them (a peer erased them). An
+// Edge keeps reporting such a grant until it expires; admitting it would revive
+// an erased record, and refusing it refused the whole batch, so no other grant
+// that Edge reported was ever admitted. Caller holds s.mu (mutateShared).
+func (s *Store) withoutLatchedGrants(incoming []Grant, current map[string]Grant) []Grant {
+	if len(s.pending) == 0 {
+		return incoming
+	}
+	out := make([]Grant, 0, len(incoming))
+	for _, g := range incoming {
+		if _, latched := s.pending[pendingGrantKey(g.TenantID, g.GrantID)]; latched && !g.Revoked {
+			if _, present := current[g.GrantID]; !present {
+				continue
+			}
+		}
+		out = append(out, g)
+	}
+	return out
 }

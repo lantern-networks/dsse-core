@@ -136,3 +136,11 @@ func TestCertPinOwnershipChecksLatestSharedRow(t *testing.T) {
 		t.Fatal("latest ownership overwritten")
 	}
 }
+
+func TestDeletingAnAbsentCertPinIDIsAbsentNotForbidden(t *testing.T) {
+	s := NewStore()
+	deleted, err := s.DeleteEndpointContext(context.Background(), "one", "certpin-ep-never-created")
+	if err != nil || deleted {
+		t.Fatalf("absent cert-pin ID answered as ownership refusal: deleted=%v err=%v", deleted, err)
+	}
+}

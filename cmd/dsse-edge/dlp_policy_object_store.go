@@ -284,7 +284,7 @@ func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) 
 	if err != nil {
 		return err
 	}
-	return s.persister.Save(raw)
+	return blobstore.UnconfirmedSave(s.persister.Save(raw))
 }
 
 // UpsertDurable acknowledges an admin edit only after the configured store accepts it.

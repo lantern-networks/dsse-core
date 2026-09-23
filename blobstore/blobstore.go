@@ -147,6 +147,18 @@ var ErrSavedWithoutAtomicity = errors.New("saved in place: the destination could
 // could not be confirmed. This differs from a completed, synced in-place save.
 var ErrDurabilityUnconfirmed = durablefile.ErrReplacedNotFlushed
 
+// UnconfirmedSave filters a Save error down to the part a caller must treat as
+// failure. A write that completed in place (ErrSavedWithoutAtomicity alone) is
+// on disk: reporting it as failed leaves live state behind the file, and the
+// "failed" change appears after the next restart. Only a write whose
+// durability is unconfirmed, or any other error, is returned.
+func UnconfirmedSave(err error) error {
+	if err != nil && errors.Is(err, ErrSavedWithoutAtomicity) && !errors.Is(err, ErrDurabilityUnconfirmed) {
+		return nil
+	}
+	return err
+}
+
 // Preserve the legacy weak-save classification for existing callers while
 // allowing authorization stores to distinguish the missing flush guarantee.
 type savedDurabilityWarning struct{}

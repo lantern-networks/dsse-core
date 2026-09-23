@@ -61,8 +61,8 @@ func applyIdPConnectionBundleSection(store *idpregistry.Store, section *idpConne
 	}
 	if !section.Complete {
 		if logf != nil {
-			logf("config_bundle_idp_connections: the control plane could not read its whole registry — " +
-				"keeping the %d connection(s) this Edge already holds. An incomplete read is not an absence")
+			logf("config_bundle_idp_connections: the control plane could not read its whole registry — "+
+				"keeping the %d connection(s) this Edge already holds. An incomplete read is not an absence", len(store.ListAll()))
 		}
 		return len(store.ListAll()), false
 	}

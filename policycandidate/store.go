@@ -89,6 +89,9 @@ type Store struct {
 	sharedKnown     bool
 	sharedUncertain bool
 	dirty           bool // a failed save may have replaced storage without confirming durability
+	// receipts records the reports applied (see ApplyReport). On a shared store the row is authoritative and this
+	// is only the copy a detached edit works on.
+	receipts map[string]ReportReceipt
 }
 
 func NewStore() *Store {

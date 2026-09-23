@@ -97,6 +97,11 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				}
 			}
 			if isNetwork && action == "add" {
+				// Decide existence and ownership from shared authority, not this process's
+				// cache: a Network another control plane just created must be bindable here.
+				if !refreshVLANStore(w, vlanBoundary) {
+					return
+				}
 				if o, ok := vlanBoundary.GetObject(req.NetworkID); !namedNetworkVisibleToTenant(o, ok, tenant) {
 					writeError(w, http.StatusBadRequest, fmt.Errorf("network_id %q is not a known Named Network", req.NetworkID))
 					return
@@ -470,6 +475,9 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			}
 		}
 		if req.NetworkID != "" && action == "add" {
+			if !refreshVLANStore(w, vlanBoundary) {
+				return
+			}
 			if o, ok := vlanBoundary.GetObject(req.NetworkID); !namedNetworkVisibleToTenant(o, ok, tenant) {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("network_id %q is not a known Network", req.NetworkID))
 				return

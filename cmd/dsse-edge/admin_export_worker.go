@@ -1690,6 +1690,10 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		}
 		response, token, err := createAdminExportDownloadURL(r, adminDownloadTokens, exportObjectStore, job, adminPrincipalIDFromRequest(r), time.Now())
 		if err != nil {
+			if errors.Is(err, errDownloadNotLeader) {
+				writeError(w, http.StatusConflict, errDownloadNotLeader)
+				return
+			}
 			if errors.Is(err, errDownloadStoreUnavailable) {
 				writeError(w, http.StatusServiceUnavailable, errDownloadStoreUnavailable)
 				return

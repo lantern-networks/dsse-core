@@ -74,6 +74,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, candidate)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates", adminEndpoint("admin.policy_candidates.write", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
+		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
+			return
+		}
 		var candidate policycandidate.Candidate
 		if err := decodeLimitedJSONBody(w, r, &candidate, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode policy candidate: %w", err))
@@ -91,6 +95,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, created)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/review", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
+		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
+			return
+		}
 		if !pinnedTenantContextMatches(w, r) {
 			return
 		}
@@ -102,17 +110,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		now := time.Now()
 		candidateWrites.Lock()
 		defer candidateWrites.Unlock()
-		// cp-authored-conditional: removing an existing cert-pin rule must be authored at the CP.
-		if ruleStore != nil {
-			if c, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); err != nil {
-				writePolicyCandidateError(w, err)
-				return
-			} else if found && c.Source == policycandidate.SourceCertPinningDetection {
-				if _, exists := ruleStore.Get(c.TenantID, "certpin-rule-"+c.CandidateID); exists && configWriteRejectedWhenSourced(w, configSourceURL, "removing a pinned-certificate bypass") {
-					return
-				}
-			}
-		}
 		reviewed, found, err := policyCandidateStore.Review(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"), review, now)
 		if err != nil {
 			writePolicyCandidateError(w, err)
@@ -138,6 +135,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, reviewed)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/materialize", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
+		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
+			return
+		}
 		if !pinnedTenantContextMatches(w, r) {
 			return
 		}
@@ -159,26 +160,8 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 				return
 			}
 		}
-		// ★ Same reasoning as POST /admin/cert-pin-bypass below, reached from the other direction: materializing a
-		// DETECTED cert-pin candidate emits the same Egress bypass rule, so on a config-pulling Edge it is the
-		// same adoption that expires at the next poll.
-		//
-		// Checked BEFORE the transition, which required looking the candidate up first. Guarding after
-		// Materialize would flip the candidate to materialized and THEN refuse — leaving the console showing an
-		// adoption with nothing behind it, which is worse than either outcome it is choosing between.
-		// cp-authored-conditional: this route is guarded only for cert-pin candidates. The same route also
-		// materializes allow-policy and private-app candidates, which stay Edge-local, so it must NOT go in the
-		// console's CP_AUTHORED_WRITES table — sending every materialize to the control plane would 404, because
-		// candidates are observations of traffic and only an Edge has them. The console adopts a cert-pin
-		// candidate by posting its host to /admin/cert-pin-bypass instead, which IS CP-authored and is
-		// self-contained. This guard is what stops an API caller from taking the old path.
 		candidateWrites.Lock()
 		defer candidateWrites.Unlock()
-		if existing, ok, gerr := concrete.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); gerr == nil && ok &&
-			existing.Source == policycandidate.SourceCertPinningDetection &&
-			configWriteRejectedWhenSourced(w, configSourceURL, "adopting a pinned-certificate bypass") {
-			return
-		}
 		if c, found, err := concrete.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); err == nil && found && c.Source == policycandidate.SourceCertPinningDetection && (assetStore == nil || ruleStore == nil) {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
 			return
@@ -320,6 +303,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// the only effect is proposing pending review items (fail-closed). Tenant-scoped + secret-safe (reachable
 	// route domains are already non-secret; private base URLs/secrets are never touched).
 	mux.HandleFunc("POST /admin/connector-discovery/refresh", adminEndpoint("admin.policy_candidates.write", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
+		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
+			return
+		}
 		concrete, ok := policyCandidateStore.(*policycandidate.Store)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, fmt.Errorf("policy candidate store does not support connector discovery"))
@@ -346,6 +333,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// here. Published != Allow: the response carries the same review block, so a freshly published app still
 	// authorizes nobody until a policy is bound (fail-closed).
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/approve-private-app", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
+		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
+			return
+		}
 		tenantID := adminTenantIDFromRequest(r)
 		candidateID := strings.TrimSpace(r.PathValue("candidate_id"))
 		var body struct {
@@ -460,6 +451,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 
 // Storage details remain in the server, not in the response or common audit.
 func writePolicyCandidateError(w http.ResponseWriter, err error) {
+	// Checked first: "reload and retry" is wrong advice here, retrying cannot succeed.
+	if errors.Is(err, policycandidate.ErrReconciliationRequired) {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate storage stopped after a save whose outcome is unknown; retrying will not help. Check the control plane log, then restart this control plane"))
+		return
+	}
 	if errors.Is(err, policycandidate.ErrUnavailable) {
 		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate state is unavailable; reload and retry"))
 		return

@@ -115,7 +115,9 @@ func mustAdminEndpointRBACMatrixRoutes(t *testing.T) []adminRBACMatrixRoute {
 	if err != nil {
 		t.Fatal(err)
 	}
-	routeExpr := regexp.MustCompile(`mux\.HandleFunc\(\s*"([A-Z]+) ([^"]+)"\s*,\s*adminEndpoint\(\s*"([^"]+)"`)
+	// Registrars that receive adminEndpoint as a parameter name it "wrap"
+	// (registerAdminPKIReadinessEndpoint). Those routes carry the same gate.
+	routeExpr := regexp.MustCompile(`mux\.HandleFunc\(\s*"([A-Z]+) ([^"]+)"\s*,\s*(?:adminEndpoint|wrap)\(\s*"([^"]+)"`)
 	var routes []adminRBACMatrixRoute
 	seen := map[string]struct{}{}
 	for _, file := range files {

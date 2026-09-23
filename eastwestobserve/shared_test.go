@@ -186,3 +186,33 @@ func TestSharedObservationDeltaMetadataAndNoResurrection(t *testing.T) {
 		t.Fatal("canceled accepted")
 	}
 }
+
+type bootReadFailure struct {
+	*sharedFixture
+	failLoads int
+}
+
+func (p *bootReadFailure) Load() ([]byte, error) {
+	if p.failLoads > 0 {
+		p.failLoads--
+		return nil, fmt.Errorf("database unavailable at boot")
+	}
+	return p.sharedFixture.Load()
+}
+
+// A boot read failure is not knowledge of the row. With no row, the first flush
+// creates it from this process's unsaved observations instead of failing forever.
+func TestSharedObservationsBootReadFailureStillPersists(t *testing.T) {
+	p := &bootReadFailure{sharedFixture: &sharedFixture{}, failLoads: 1}
+	s := NewStore()
+	if s.SetPersister(p, 0) == nil {
+		t.Fatal("boot read failure hidden")
+	}
+	s.Observe("tenant_a", "10.0.0.1", "", "10.0.0.2", "ssh", 22, time.Now())
+	if e := s.PersistIfDirty(); e != nil {
+		t.Fatalf("absent row after a boot read failure blocked every flush: %v", e)
+	}
+	if len(p.raw) == 0 {
+		t.Fatal("unsaved observation not persisted")
+	}
+}

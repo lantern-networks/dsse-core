@@ -8,6 +8,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"slices"
 	"sort"
@@ -57,6 +58,11 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			}
 		}
 		if err := entitlementStore.SetFeaturesContext(r.Context(), tenant, body.Features); err != nil {
+			log.Printf("entitlements update not saved: %v", err)
+			if errors.Is(err, errEntitlementAuthorityMissing) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("the shared entitlement record is missing; retrying will not help. Restore it, or restart this control plane so it starts from the stored record"))
+				return
+			}
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("entitlement persistence could not be confirmed"))
 			return
 		}

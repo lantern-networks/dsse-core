@@ -56,7 +56,11 @@ func TestPendingDenialDoesNotBlockOtherTenantOrUndoErasure(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if _, _, err = a.MergeChecked([]Grant{original}, now); err == nil {
+			// A report of the erased, latched grant is left out, not admitted.
+			if _, _, err = a.MergeChecked([]Grant{original}, now); err != nil {
+				t.Fatalf("report of a latched erased grant refused instead of skipped: %v", err)
+			}
+			if a.Valid(original.GrantID, now) {
 				t.Fatal("absent pending identity reauthorized by local ingestion")
 			}
 			if _, err = b.Mint(Grant{GrantID: "target", TenantID: "a"}, time.Hour, now); err != nil {
@@ -130,13 +134,18 @@ func TestPendingGrantConflictDoesNotReportUnappliedDenials(t *testing.T) {
 		t.Fatal(err)
 	}
 	other.Revoked = true
-	before, _ := p.Load()
+	// The latched, erased grant is skipped; the denial reported alongside it is a
+	// restriction and applies. Counts cover only what applied.
 	added, updated, err := a.MergeChecked([]Grant{original, other}, now)
-	if !errors.Is(err, ErrConflict) || added != 0 || updated != 0 {
-		t.Fatal("rejected batch claimed applied denials", added, updated, err)
+	if err != nil || added+updated != 1 {
+		t.Fatal("batch with a latched grant misreported", added, updated, err)
 	}
-	after, _ := p.Load()
-	if string(before) != string(after) || !a.Valid("other", now) {
-		t.Fatal("rejected batch applied")
+	if a.Valid("other", now) || a.Valid("pending", now) {
+		t.Fatal("reported denial not applied, or latched grant revived")
+	}
+	for _, g := range b.ListAll() {
+		if g.GrantID == "pending" {
+			t.Fatal("erased grant revived by a report")
+		}
 	}
 }

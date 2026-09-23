@@ -82,6 +82,20 @@ func (store *Store) observeCertPin(ctx context.Context, tenantID, host, sni, obs
 		})
 	}
 
+	existing, found := store.candidates[tenantID][id]
+	cand := certPinCandidate(existing, found, id, tenantID, host, sni, observedIP, attributionSource, port, reason, observed, 1)
+	normalized, err := normalize(cand, tenantID, now)
+	if err != nil {
+		return Candidate{}, err
+	}
+	if err := store.putLocked(normalized); err != nil {
+		return Candidate{}, err
+	}
+	return copyCandidate(normalized), nil
+}
+
+// certPinCandidate is the candidate after times more cert-pinning detections.
+func certPinCandidate(existing Candidate, found bool, id, tenantID, host, sni, observedIP, attributionSource string, port int, reason, observed string, times int) Candidate {
 	cand := Candidate{
 		CandidateID:       id,
 		TenantID:          tenantID,
@@ -93,14 +107,14 @@ func (store *Store) observeCertPin(ctx context.Context, tenantID, host, sni, obs
 		Port:              port,
 		ServiceFamily:     "https",
 		ReasonCodes:       []string{strings.TrimSpace(reason)},
-		FailureCount:      1,
+		FailureCount:      times,
 		LastObserved:      &observed,
 		ObservedIP:        strings.TrimSpace(observedIP),
 		AttributionSource: strings.TrimSpace(attributionSource),
 	}
-	if existing, ok := store.candidates[tenantID][id]; ok {
+	if found {
 		cand = existing
-		cand.FailureCount++
+		cand.FailureCount += times
 		cand.LastObserved = &observed
 		// A later DNS-correlated observation upgrades the evidence; a plain re-observation never downgrades it.
 		if ip := strings.TrimSpace(observedIP); ip != "" {
@@ -113,14 +127,7 @@ func (store *Store) observeCertPin(ctx context.Context, tenantID, host, sni, obs
 	// Classify attribution from the candidate's evidence: DNS-correlated -> high, a named host/SNI -> medium, a
 	// raw-IP-only candidate -> investigate_only. Recomputed each observation so it stays correct.
 	cand.Confidence, cand.SuggestedAction = certPinAttribution(cand.Host, cand.SNI, cand.AttributionSource)
-	normalized, err := normalize(cand, tenantID, now)
-	if err != nil {
-		return Candidate{}, err
-	}
-	if err := store.putLocked(normalized); err != nil {
-		return Candidate{}, err
-	}
-	return copyCandidate(normalized), nil
+	return cand
 }
 
 // AddManualCertPinBypass records an operator-authored cert-pin bypass for a named host and marks it APPROVED

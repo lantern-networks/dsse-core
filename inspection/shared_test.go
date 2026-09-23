@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/lantern-networks/dsse-core/model"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -178,12 +179,13 @@ func TestSharedInspectionInitialReadFailureAndBound(t *testing.T) {
 	}
 	p.failRead = false
 	s.Upsert(model.InspectionEvent{ID: "one", TenantID: "a"})
-	if s.PersistIfDirty() == nil {
-		t.Fatal("unknown initial failure treated as empty")
-	}
-	p.Save([]byte(`{"events":{},"order":[]}`))
+	// A boot read failure is not knowledge of the row. With no row, the first
+	// flush creates it from the unsaved observation instead of failing forever.
 	if e := s.PersistIfDirty(); e != nil {
-		t.Fatal(e)
+		t.Fatalf("absent row after a boot read failure blocked every flush: %v", e)
+	}
+	if !strings.Contains(string(p.raw), `"one"`) {
+		t.Fatalf("unsaved observation not persisted: %s", p.raw)
 	}
 	for _, id := range []string{"two", "three"} {
 		s.Upsert(model.InspectionEvent{ID: id, TenantID: "b"})

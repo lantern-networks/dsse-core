@@ -98,7 +98,7 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	commitAttempted := false
 	defer func() {
 		if err != nil && !commitAttempted {
-			err = fmt.Errorf("%w: %w", blobstore.ErrWriteNotCommitted, err)
+			err = writeNotCommittedError{err}
 		}
 	}()
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
@@ -142,8 +142,7 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 		return err
 	}
 	commitAttempted = true
-	stopCommitCancellation := budget.forwardCommitCancellation()
-	defer stopCommitCancellation()
+	// Bounded by budget.sqlCtx only; see cpStatementBudget.commit.
 	return tx.Commit()
 }
 
@@ -522,4 +521,15 @@ func configBundleStorePersister(value, sourceURL, key string) (blobstore.Persist
 		db = nil
 	}
 	return cpStateBlobPersister(value, db, key)
+}
+
+// writeNotCommittedError classifies a failure before COMMIT without changing its
+// text. Callers show store errors to administrators, write them into audit
+// reasons and a health surface; the classification is for errors.Is only and
+// must not appear there as "transaction did not attempt commit: ...".
+type writeNotCommittedError struct{ err error }
+
+func (e writeNotCommittedError) Error() string { return e.err.Error() }
+func (e writeNotCommittedError) Unwrap() []error {
+	return []error{blobstore.ErrWriteNotCommitted, e.err}
 }

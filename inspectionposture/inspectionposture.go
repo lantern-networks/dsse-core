@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
@@ -474,7 +475,7 @@ func (s *Store) persist(next Posture) error {
 		return err
 	}
 	if s.persister != nil {
-		return s.persister.Save(data)
+		return blobstore.UnconfirmedSave(s.persister.Save(data))
 	}
 	if s.statePath == "" {
 		return nil

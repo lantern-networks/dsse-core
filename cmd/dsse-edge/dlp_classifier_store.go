@@ -140,7 +140,7 @@ func (s *dlpClassifierRuntimeStore) saveSnapshotLocked(snap classifierStoreSnaps
 	if err != nil {
 		return err
 	}
-	return s.persister.Save(data)
+	return blobstore.UnconfirmedSave(s.persister.Save(data))
 }
 
 // Tenants returns the tenant ids that have classifiers, ordered (admin listing).

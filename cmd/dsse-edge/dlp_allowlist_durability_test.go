@@ -29,7 +29,7 @@ func TestDLPAllowlistDurableFailureRetryAndRestart(t *testing.T) {
 		}
 	}
 	before, gen := string(p.data), s.generation
-	for _, failure := range []error{errors.New("unavailable"), blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed} {
+	for _, failure := range []error{errors.New("unavailable"), blobstore.ErrDurabilityUnconfirmed} {
 		p.err = failure
 		for _, values := range [][]string{{"4242424242424242"}, nil} {
 			if !errors.Is(s.SetValuesDurable("own", values), failure) {

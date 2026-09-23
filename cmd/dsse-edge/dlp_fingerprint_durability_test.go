@@ -36,7 +36,7 @@ func TestDLPFingerprintDurableMutationFailureAndRestart(t *testing.T) {
 		}
 	}
 	before, gen := string(p.data), s.generation
-	for _, failure := range []error{errors.New("unavailable"), blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed} {
+	for _, failure := range []error{errors.New("unavailable"), blobstore.ErrDurabilityUnconfirmed} {
 		p.err = failure
 		if _, err := s.SetDatasetDurable("own", "customer_record", []string{"NEW-994400"}); !errors.Is(err, failure) {
 			t.Fatal("replacement reported success")

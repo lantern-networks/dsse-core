@@ -127,7 +127,7 @@ func TestOverrideMutationsKeepConfirmedStateOnFileFailure(t *testing.T) {
 }
 
 func TestOverrideUncertainSaveRequiresRetryEvenForMissingRemoval(t *testing.T) {
-	for _, failure := range []error{errors.New("reply lost after write"), blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed} {
+	for _, failure := range []error{errors.New("reply lost after write"), blobstore.ErrDurabilityUnconfirmed} {
 		for _, operation := range []string{"clear", "erase"} {
 			t.Run(failure.Error()+"/"+operation, func(t *testing.T) {
 				p := &overrideTestPersister{}
@@ -244,4 +244,30 @@ func sortedOverrideSnapshot(s *OverrideStore) map[string][]Override {
 		slices.SortFunc(entries, func(a, b Override) int { return strings.Compare(a.EntryID, b.EntryID) })
 	}
 	return result
+}
+
+// ErrSavedWithoutAtomicity alone means the write completed in place (every save
+// on a bind-mounted file returns it). It is a confirmed save: publish it and do
+// not demand a retry that would get the same answer forever.
+func TestOverrideInPlaceSaveIsPublished(t *testing.T) {
+	p := &overrideTestPersister{}
+	s := NewOverrideStore()
+	if e := s.SetPersister(p); e != nil {
+		t.Fatal(e)
+	}
+	p.fail = blobstore.ErrSavedWithoutAtomicity
+	p.writeBeforeError = true
+	if _, e := s.Set("own", Override{EntryID: "github_asset_cdn", Mode: OverrideDisabled}, time.Now()); e != nil {
+		t.Fatalf("in-place save reported as failure: %v", e)
+	}
+	if len(s.List("own")) != 1 || s.dirty {
+		t.Fatal("confirmed in-place save not published")
+	}
+	persisted := NewOverrideStore()
+	if e := persisted.SetPersister(&overrideTestPersister{data: p.data}); e != nil || len(persisted.List("own")) != 1 {
+		t.Fatal("live state and file disagree", e)
+	}
+	if e := s.SetPersister(&overrideTestPersister{}); e != nil {
+		t.Fatalf("writer replacement blocked after a confirmed save: %v", e)
+	}
 }

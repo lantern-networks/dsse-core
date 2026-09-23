@@ -287,6 +287,10 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDownloadAuditLog("admin_export_download_failed", token, evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())
 			}
 			log.Printf("export download refused: token spend was not confirmed")
+			if errors.Is(err, errDownloadNotLeader) {
+				writeError(w, http.StatusConflict, errDownloadNotLeader)
+				return
+			}
 			writeError(w, http.StatusServiceUnavailable, errDownloadStoreUnavailable)
 			return
 		}
@@ -315,7 +319,12 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			var err error
 			data, err = exportObjectStore.ReadGeneratedFile(token.LocalFilename)
 			if err != nil {
-				writeCredentialError(w, http.StatusNotFound, err)
+				// The spend is already committed, so this is something that took effect:
+				// record it. The read error names a server path; keep it in the log and
+				// give the anonymous bearer a fixed answer.
+				log.Printf("export download failed after the link was spent: generated file unreadable on this node: %v", err)
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDownloadAuditLog("admin_export_download_failed", token, evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())
+				writeError(w, http.StatusNotFound, fmt.Errorf("this download link has been used, but the export file is not available on this server. Generate a new export"))
 				return
 			}
 		}

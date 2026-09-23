@@ -409,6 +409,12 @@ const CP_AUTHORED_WRITES = [
   "POST /admin/dlp-rules",
   "POST /admin/east-west",
   "POST /admin/east-west/rollback",
+  "POST /admin/east-west/observations/adopt",
+  "POST /admin/connector-discovery/refresh",
+  "POST /admin/policy-candidates",
+  "POST /admin/policy-candidates/{candidate_id}/review",
+  "POST /admin/policy-candidates/{candidate_id}/materialize",
+  "POST /admin/policy-candidates/{candidate_id}/approve-private-app",
   "POST /admin/enrolled-devices",
   "POST /admin/enrolled-devices/{identity}/allow-reenrolment",
   "POST /admin/enrolled-devices/{identity}/disable",
@@ -572,6 +578,9 @@ const CP_AUTHORED_READS = [
   "GET /admin/connectors",
   "GET /admin/enrolled-devices",
   "GET /admin/device-runtime",
+  // An Edge is started and stopped at any time, so what the fleet observed is held by the control plane.
+  "GET /admin/policy-candidates",
+  "GET /admin/east-west/observations",
 ];
 
 function cpAuthoredRead(method, path) {

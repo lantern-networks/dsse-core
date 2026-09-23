@@ -7,6 +7,11 @@ import (
 	"fmt"
 )
 
+// errCPLeadershipChanged: the request was admitted in a term this process no
+// longer holds (or never held: a standby). Retrying here cannot succeed; the
+// request belongs on the current leader.
+var errCPLeadershipChanged = errors.New("control-plane leadership changed before saving")
+
 type cpWriteLeaseKey struct{}
 type cpWriteLease struct {
 	elector *cpLeaderElector
@@ -62,7 +67,7 @@ func beginCPWriteTransactionContexts(ctx, sqlCtx context.Context, fallback *sql.
 	}
 	if lease.epoch == 0 || !e.IsLeader() || e.conn == nil || e.leaderSince.Load() != lease.epoch {
 		e.mu.Unlock()
-		return nil, func() {}, errors.New("control-plane leadership changed before saving")
+		return nil, func() {}, errCPLeadershipChanged
 	}
 	tx, err := e.conn.BeginTx(sqlCtx, options)
 	if err != nil {

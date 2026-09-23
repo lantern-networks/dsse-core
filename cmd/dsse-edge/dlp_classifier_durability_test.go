@@ -26,13 +26,16 @@ type checkedClassifierPersister struct {
 func (p *checkedClassifierPersister) Load() ([]byte, error) {
 	return append([]byte(nil), p.data...), nil
 }
+
+// Mirrors blobstore.FilePersister: ErrSavedWithoutAtomicity (alone) is returned
+// only AFTER the bytes were written in place; every other error writes nothing.
 func (p *checkedClassifierPersister) Save(b []byte) error {
 	p.writes++
-	if p.err != nil {
+	if p.err != nil && !(errors.Is(p.err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(p.err, blobstore.ErrDurabilityUnconfirmed)) {
 		return p.err
 	}
 	p.data = append([]byte(nil), b...)
-	return nil
+	return p.err
 }
 func classifierFixtureSpecs(word string) []dlp.ClassifierSpec {
 	return []dlp.ClassifierSpec{{Name: "project_code", Kind: dlp.ClassifierKeyword, Keywords: []string{word}}}
@@ -51,7 +54,7 @@ func TestDLPClassifierDurableReplacementFailureAndRestart(t *testing.T) {
 	}
 	before := string(p.data)
 	gen := s.generation
-	for _, failure := range []error{errors.New("private storage failure"), blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed} {
+	for _, failure := range []error{errors.New("private storage failure"), blobstore.ErrDurabilityUnconfirmed} {
 		p.err = failure
 		for _, specs := range [][]dlp.ClassifierSpec{classifierFixtureSpecs("NEW"), nil} {
 			if !errors.Is(s.SetSpecsDurable("own", specs), failure) {

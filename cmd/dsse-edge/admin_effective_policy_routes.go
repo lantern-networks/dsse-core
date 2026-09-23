@@ -25,6 +25,10 @@ import (
 // inspection posture). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, recompileAuthoredRules func()) {
 	mux.HandleFunc("POST /admin/east-west/observations/adopt", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		// Observations are held by the control plane (observation_report.go), and adoption authors rules there.
+		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "adopting east-west observations") {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		var reqBody struct {
 			ObservationIDs []string `json:"observation_ids"`

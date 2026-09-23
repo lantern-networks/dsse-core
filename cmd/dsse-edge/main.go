@@ -691,7 +691,7 @@ func (config serverConfig) withDefaults() serverConfig {
 			log.Fatalf("resolve inspection events store %q: %v", config.InspectionEventsStorePath, e)
 		} else if p != nil {
 			if lerr := config.InspectionEvents.SetPersister(p, 90*24*time.Hour); lerr != nil {
-				log.Printf("inspection events store: load prior findings failed (starting fresh): %v", lerr)
+				log.Printf("inspection events store: load prior findings failed; serving without them, and each flush merges into the shared row once it can be read: %v", lerr)
 			}
 			store := config.InspectionEvents
 			go func() {
@@ -755,7 +755,7 @@ func (config serverConfig) withDefaults() serverConfig {
 				log.Fatalf("resolve east-west observe store %q: %v", config.EastWestObserveStorePath, e)
 			} else if p != nil {
 				if lerr := config.EastWestObserveStore.SetPersister(p, 90*24*time.Hour); lerr != nil {
-					log.Printf("east-west observe store: load prior inventory failed (starting fresh): %v", lerr)
+					log.Printf("east-west observe store: load prior inventory failed; serving without it, and each flush merges into the shared row once it can be read: %v", lerr)
 				}
 				store := config.EastWestObserveStore
 				go func() {
@@ -2440,9 +2440,11 @@ func main() {
 			// admin reviews a named entity, not a bare IP.
 			if fqdn, ip, ok := dns.RecoverCertPinName(edgeDNSConntrack, certPinTenant, host, "", now); ok {
 				_, _ = policyCandidateStore.ObserveCertPinFailureDNSCorrelated(candidateWriteContext(context.Background()), certPinTenant, fqdn, ip, 443, "interception_handshake_rejected", now)
+				reportCandidate(policycandidate.ReportCertPinFailureDNSMatch, certPinTenant, fqdn, "", ip, 443, "interception_handshake_rejected", now)
 				return
 			}
 			_, _ = policyCandidateStore.ObserveCertPinFailure(candidateWriteContext(context.Background()), certPinTenant, host, "", 443, "interception_handshake_rejected", now)
+			reportCandidate(policycandidate.ReportCertPinFailure, certPinTenant, host, "", "", 443, "interception_handshake_rejected", now)
 		})
 	}
 	// Both rule and catalog callbacks rebuild one tenant-separated snapshot.
@@ -2666,6 +2668,8 @@ func main() {
 	// auditShipper is hoisted so the multi-region CP selector (built later, in the config-source block) can be
 	// wired into it — audit replay then follows the current CP leader after an Edge→CP region failover.
 	var auditShipper *remoteAuditShipper
+	// Observation reports travel on their own shipper (observation_report.go), following the same selector.
+	var observationShipper *remoteAuditShipper
 	// Reported on /healthz. Nil until a shipper exists, which is what "this node was never told where to
 	// ship" has to look like from outside.
 	var auditShipHealthFn func(time.Time) map[string]any
@@ -2684,6 +2688,7 @@ func main() {
 		startDeviceCertificateReship()
 		auditShipper = shipper
 		auditShipHealthFn = shipper.health
+		observationShipper = armObservationReports(writer, *auditIngestURL, *auditIngestToken, *auditIngestCA, shipCert, shipKey, *logDir)
 		log.Printf("audit shipping enabled -> %s (streams: %s; durable retain-and-replay, local jsonl canonical)", *auditIngestURL, strings.Join(defaultAuditShipStreams, ", "))
 	}
 	livenessRevocations := revocation.NewAdmissionRevocations()
@@ -3242,6 +3247,9 @@ func main() {
 				// Phase 2 (cross_region_control_plane_failover_design.mdc/): extend the SAME CP selector to
 				// the audit-ship path so the durable spool replays buffered audit/access records to the current CP
 				// leader after an Edge→CP region failover — no lost logs within the spool window.
+				if observationShipper != nil {
+					observationShipper.setEndpoints(cpEndpointSel)
+				}
 				if auditShipper != nil {
 					auditShipper.setEndpoints(cpEndpointSel)
 					log.Printf("audit shipping now follows the multi-region CP selector (region failover-aware, durable retain-and-replay)")
@@ -3265,6 +3273,9 @@ func main() {
 					}
 					shipper.setEndpoints(cpEndpointSel)
 					writer.AddAppendHook(shipper.hook())
+					if obs := armObservationReports(writer, "", auditTok, auditCA, shipCert, shipKey, *logDir); obs != nil {
+						obs.setEndpoints(cpEndpointSel)
+					}
 					// Arms shipping of which certificate each device presents. Only meaningful where there is a control
 					// plane to ship to — see device_certificate_fact_ship.go for why the withdrawal gate needs it.
 					setDeviceCertificateShipWriter(writer)
@@ -4943,6 +4954,8 @@ func main() {
 	if err := serveMainEdgeListener(*listen, "agent-plane", mainHandler, *mainTLSCert, *mainTLSKey, *devMode, *allowInsecurePlaintext, drainState, *drainPeriod); err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+	// Drained: nothing new is observed now, so what is waiting goes to the spool for delivery.
+	stopObservationReports()
 }
 
 func newServer(evaluator decision.Evaluator, writer *logs.Writer, registry *connector.Registry) http.Handler {
@@ -5376,6 +5389,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if config.AuditShipHealth != nil {
 			body["audit_shipping"] = config.AuditShipHealth(time.Now())
 		}
+		// And whether what this Edge observed is reaching the control plane that holds it (observation_report.go).
+		if r := observationReports.Load(); r != nil {
+			body["observation_reporting"] = r.shipper.health(time.Now())
+		}
 		// ★ AND WHETHER THAT DATABASE IS ALONE. A control plane INCLUDES its database, so the authority is
 		// redundant only if the state is — counting control-plane processes answers a different question.
 		// Unknown is reported as unknown: "I could not ask" and "there are none" must not become the same
@@ -5487,8 +5504,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerEnrolledIdentityClaimFleetRoutes(mux, adminEndpoint, config.FleetIdentityClaimer, logInfof)
 	// Who has no way back, served where a person can read it before a destructive act.
 	registerRecoveryReadinessRoute(mux, adminEndpoint)
+	reportedCandidates, _ := policyCandidateStore.(*policycandidate.Store)
 	registerAuditIngestReceiver(mux, writer, config.AuditIngestReceiverToken, agentTelemetry, config.ObservedExclusions, tcaReg,
-		config.LabMode != nil && *config.LabMode)
+		config.LabMode != nil && *config.LabMode, observationReportSink{eastWest: config.EastWestObserveStore, candidates: reportedCandidates})
 	// ★ AND THE MATERIAL AN EDGE NEEDS TO SERVE AN ORGANIZATION IT WAS NEVER PREPARED FOR (2026-08-20). Same
 	// door as the audit channel, same proof of which Edge is calling — because this one hands out an
 	// organization's server identity, and a shared bearer alone must not be enough for that.
@@ -6118,7 +6136,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// Run the check, then re-assess so the caller gets the whole page rather than one field they have to
 		// merge themselves.
 		if config.KeyCustodyMonitor != nil {
-			config.KeyCustodyMonitor.Check()
+			config.KeyCustodyMonitor.CheckNow()
 		}
 		return assessPKIReadinessNow()
 	}, config.EnrolledLedger, adminEndpoint)
@@ -7839,7 +7857,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					if observeUser == "" {
 						observeUser = strings.TrimSpace(osUser)
 					}
-					config.EastWestObserveStore.Observe(req.TenantID, transportDeviceID, observeUser, host, req.ServiceFamily, port, time.Now())
+					at := time.Now()
+					config.EastWestObserveStore.Observe(req.TenantID, transportDeviceID, observeUser, host, req.ServiceFamily, port, at)
+					// The control plane holds the inventory; this Edge's copy ends with this process.
+					reportEastWestFlow(req.TenantID, transportDeviceID, observeUser, host, req.ServiceFamily, port, at)
 				}
 			}
 			dec := evaluateWithRuntimeEvidence(r.Context(), runtimeEvaluator, req, humanApprovals, delegatedGrants, nonHumanIdentities, time.Now())
@@ -7858,11 +7879,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// (EastWestObserveStore, recorded above and surfaced on the Connector Access page). Capturing them
 			// here as well would put the same flow in two adoption queues that adopt into different planes.
 			if decision.IsDefaultDeny(dec) && !decision.IsEastWestFlow(req, runtimeEvaluator.EastWestInternalNetworks) {
+				at := time.Now().UTC()
 				if cs, ok := policyCandidateStore.(*policycandidate.Store); ok {
-					if _, cerr := cs.ObserveUnmatchedFlow(candidateWriteContext(r.Context()), req.TenantID, host, req.SNI, port, "", time.Now().UTC()); cerr != nil {
+					if _, cerr := cs.ObserveUnmatchedFlow(candidateWriteContext(r.Context()), req.TenantID, host, req.SNI, port, "", at); cerr != nil {
 						logDebugf("steer_mux_candidate_capture_failed dst=%q port=%d: %v", host, port, cerr)
 					}
 				}
+				reportCandidate(policycandidate.ReportUnmatchedFlow, req.TenantID, host, req.SNI, "", port, "", at)
 			}
 			// The steer-mux OPEN decision is a Plane-B record ('s "one structured row per flow"). Until this
 			// existed, this path wrote NO structured record at all: an https flow got one later from the SWG path,
@@ -8304,11 +8327,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		// Route governance: record the advertised routes. First sight grandfathers the current set; a route
 		// advertised LATER (a re-register with a new CIDR) is pending until an operator approves it.
+		// The registration has taken effect whatever happens to discovery: record it,
+		// report it and refresh the boundary below, then say what did not save.
+		var discoveryErr error
 		if connectorRouteGov != nil {
-			if err := connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now()); err != nil {
-				writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
-				return
-			}
+			discoveryErr = connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
 		}
 		// A connector's routes ARE this tenant's declaration of what is internal, so the east-west plane
 		// boundary moves with them. Refreshed here rather than read at decision time: the decision path must
@@ -8323,6 +8346,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		if err := appendConnectorLog(r.Context(), writer, domainEventOutbox, connectorAudit("connector_registered", conn, nil), time.Now()); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if discoveryErr != nil {
+			log.Printf("connector %q registered; route discovery not saved: %v", conn.ID, discoveryErr)
+			writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
 			return
 		}
 		writeJSON(w, http.StatusCreated, publicConnectorRegistration(conn))
@@ -8367,11 +8395,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// Live discovery refresh: when the heartbeat re-reports the connector's routes, refresh the discovery
 		// timing + apply the fail-safe to any NEWLY seen CIDR — without a reconnect. Discovery only (routing is
 		// CP-configured). See docs/connector_network_route_advertisement_design.md.
+		// Liveness below has taken effect whatever happens to discovery; the status
+		// change and the report to the authority must not be skipped because of it.
+		var discoveryErr error
 		if connectorRouteGov != nil && req.ReachableRoutes != nil {
-			if err := connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now()); err != nil {
-				writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
-				return
-			}
+			discoveryErr = connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
 		}
 		if req.ReachableRoutes != nil {
 			refreshEastWestInternalNetworks(r.Context(), policyStore, registry, conn.TenantID)
@@ -8392,6 +8420,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if connectorCPReport != nil && connectorLiveness.shouldCarry(conn.ID, conn.Status, evaluator.EdgeRegionID, time.Now()) {
 			connectorCPReport.Report(connectorReport{Registration: conn, TenantID: conn.TenantID,
 				AttachedRegionID: evaluator.EdgeRegionID})
+		}
+		if discoveryErr != nil {
+			log.Printf("connector %q heartbeat recorded; route discovery not saved: %v", conn.ID, discoveryErr)
+			writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
+			return
 		}
 		writeJSON(w, http.StatusAccepted, conn)
 	})

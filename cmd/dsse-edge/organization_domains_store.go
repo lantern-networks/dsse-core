@@ -137,7 +137,7 @@ func (s *organizationDomainsStore) saveSnapshotLocked(next organizationDomainsSn
 	if err != nil {
 		return err
 	}
-	return s.persister.Save(raw)
+	return blobstore.UnconfirmedSave(s.persister.Save(raw))
 }
 
 // SetDomainsDurable saves before publishing the account-classification change.

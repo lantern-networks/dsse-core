@@ -15,11 +15,19 @@ import (
 // This does not guarantee a socket-level timeout for all driver operations.
 const cpStatementCancelGrace = time.Second
 
+// A statement_timeout set within this long before a statement is reused rather
+// than set again. Any statement then expires at most this long after the
+// budget deadline, which is inside cpStatementCancelGrace, so the server still
+// ends it before the client fallback closes the leader's session.
+const cpStatementTimeoutReuse = 250 * time.Millisecond
+
 type cpStatementBudget struct {
 	request, sqlCtx context.Context
 	cancel          context.CancelFunc
 	deadline        time.Time
 	server          bool
+	timeoutSetAt    time.Time
+	timeoutSets     int
 }
 
 func newCPStatementBudget(ctx context.Context) *cpStatementBudget {
@@ -39,7 +47,7 @@ func newCPStatementBudget(ctx context.Context) *cpStatementBudget {
 // Call before each data statement. COMMIT separately forwards cancellation:
 // statement_timeout does not bound all transaction-finalization work.
 // Reset the server timeout to the remaining TOTAL budget, not a new five
-// seconds per statement. Explicit cancellation is checked between statements;
+// seconds per statement, unless it was set within cpStatementTimeoutReuse. Explicit cancellation is checked between statements;
 // an in-flight statement may finish/expire first, then must roll back.
 func (b *cpStatementBudget) prepare(tx *sql.Tx) error {
 	if err := b.request.Err(); err != nil {
@@ -48,9 +56,13 @@ func (b *cpStatementBudget) prepare(tx *sql.Tx) error {
 	if !b.server {
 		return nil
 	}
-	remaining := time.Until(b.deadline)
+	now := time.Now()
+	remaining := b.deadline.Sub(now)
 	if remaining <= 0 {
 		return context.DeadlineExceeded
+	}
+	if !b.timeoutSetAt.IsZero() && now.Sub(b.timeoutSetAt) < cpStatementTimeoutReuse {
+		return nil // request.Err() was checked above.
 	}
 	ms := remaining.Milliseconds()
 	if ms < 1 {
@@ -63,6 +75,7 @@ func (b *cpStatementBudget) prepare(tx *sql.Tx) error {
 		THEN current_setting('statement_timeout') ELSE $1::text END, true)`, fmt.Sprintf("%dms", ms)); err != nil {
 		return err
 	}
+	b.timeoutSetAt, b.timeoutSets = now, b.timeoutSets+1
 	return b.request.Err()
 }
 
@@ -92,23 +105,16 @@ func (b *cpStatementBudget) queryRow(tx *sql.Tx, query string, args ...any) cpSQ
 	return tx.QueryRowContext(b.sqlCtx, query, args...)
 }
 
-// Preserve client cancellation during COMMIT, including deferred constraints
-// which can run beyond statement_timeout. The driver may discard leadership
-// here, and commit errors retain the existing unknown-outcome classification.
-func (b *cpStatementBudget) forwardCommitCancellation() func() bool {
-	if !b.server {
-		return func() bool { return true }
-	}
-	return context.AfterFunc(b.request, b.cancel)
-}
-
-// A request canceled
-// during a data statement must roll back even if that statement finishes first.
+// COMMIT does not forward request cancellation. Once COMMIT is sent, the
+// request can no longer roll the change back, and lib/pq answers cancellation
+// by closing the advisory-lock session, which hands leadership to a peer. A
+// client disconnect or an exhausted request budget must not cost leadership.
+// COMMIT (including deferred constraints) is still bounded by sqlCtx: the
+// budget deadline plus cpStatementCancelGrace, the same transport backstop
+// as data statements. A request canceled before COMMIT still rolls back.
 func (b *cpStatementBudget) commit(tx *sql.Tx) error {
 	if err := b.request.Err(); err != nil {
 		return err
 	}
-	stop := b.forwardCommitCancellation()
-	defer stop()
 	return tx.Commit()
 }

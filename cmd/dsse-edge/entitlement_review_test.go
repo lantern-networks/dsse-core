@@ -102,3 +102,20 @@ func TestEntitlementAbsentAndEmptyAuthorityRemainDistinct(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The missing-row refusal must be identifiable so the route can say a retry will
+// not help, instead of the generic "persistence could not be confirmed".
+func TestEntitlementMissingAuthorityIsIdentifiable(t *testing.T) {
+	p := &entitlementReviewShared{entitlementReviewFile{raw: []byte(`{"features":{"one":{"dlp":true}}}`)}}
+	s := newEntitlementStore(nil)
+	if err := s.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	p.raw = nil
+	if err := s.SetFeaturesContext(context.Background(), "two", map[string]bool{featureDLP: true}); !errors.Is(err, errEntitlementAuthorityMissing) {
+		t.Fatalf("write against a vanished row not identified: %v", err)
+	}
+	if err := s.RefreshShared(); !errors.Is(err, errEntitlementAuthorityMissing) {
+		t.Fatalf("read against a vanished row not identified: %v", err)
+	}
+}

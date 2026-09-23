@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"sync/atomic"
 	"testing"
+
+	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
 type faultPosturePersistence struct {
@@ -157,5 +159,35 @@ func TestPostureFileSaveFailureKeepsPreviousSnapshot(t *testing.T) {
 	restart := NewStore()
 	if loaded, err := restart.SetStatePath(path); err != nil || !loaded || !reflect.DeepEqual(restart.Get(), s.Get()) {
 		t.Fatal("file retry not restored", err)
+	}
+}
+
+type inPlacePosturePersistence struct{ data []byte }
+
+func (p *inPlacePosturePersistence) Load() ([]byte, error) { return p.data, nil }
+func (p *inPlacePosturePersistence) Save(b []byte) error {
+	p.data = append([]byte(nil), b...)
+	return blobstore.ErrSavedWithoutAtomicity // written in place, as FilePersister does on a bind mount
+}
+
+// A bind-mounted posture file returns ErrSavedWithoutAtomicity on every save,
+// after writing. Reporting that as failure left the engine on the old posture
+// while the file held the new one, which then took effect at the next restart.
+func TestPostureInPlaceSaveIsAdopted(t *testing.T) {
+	s := NewStore()
+	p := &inPlacePosturePersistence{}
+	if _, err := s.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	want := Posture{Mode: ModeBypassDefault, DecryptAllowlistHosts: []string{"intercept.example"}, KnownBypassEnabled: true}
+	if _, err := s.Set(want); err != nil {
+		t.Fatalf("in-place save reported as failure: %v", err)
+	}
+	restarted := NewStore()
+	if _, err := restarted.SetPersister(&inPlacePosturePersistence{data: p.data}); err != nil {
+		t.Fatal(err)
+	}
+	if s.Get().Mode != ModeBypassDefault || !reflect.DeepEqual(s.Get(), restarted.Get()) {
+		t.Fatalf("live posture and file disagree: live=%+v file=%+v", s.Get(), restarted.Get())
 	}
 }

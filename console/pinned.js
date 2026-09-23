@@ -9,7 +9,7 @@
 // recommendations and adopt them: approve, then materialize (which writes the host into the SWG TLS bypass
 // policy — the only state in which traffic is actually decrypt-bypassed).
 //
-// Backend (dsse-core / edge): GET /admin/policy-candidates, POST /admin/policy-candidates/{id}/review
+// Backend (dsse-core / control plane, which holds what every Edge observed): GET /admin/policy-candidates, POST /admin/policy-candidates/{id}/review
 // {decision, review_reason_code}, POST /admin/policy-candidates/{id}/materialize. Candidates whose
 // source == "cert_pinning_detection" are the pinned-site (bypass) recommendations.
 //

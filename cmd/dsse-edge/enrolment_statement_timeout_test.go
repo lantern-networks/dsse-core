@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"reflect"
@@ -140,29 +141,65 @@ func TestPostgresEnrolmentStatementCancellationKeepsLeader(t *testing.T) {
 	}
 }
 
-func TestPostgresEnrolmentCommitTimeoutDoesNotDiscloseToken(t *testing.T) {
+// COMMIT no longer forwards request cancellation (see cpStatementBudget.commit).
+// A token whose COMMIT finishes after the request deadline is durable, so it is
+// returned; withholding it would orphan a live credential. Leadership is kept.
+func TestPostgresEnrolmentCommitAfterDeadlineReturnsDurableToken(t *testing.T) {
 	_, _, leader, peer := trustDistributionPostgresFixture(t)
 	t.Setenv("ENROLMENT_TOKEN_E2E_DSN", os.Getenv("POSTGRES_QUEUE_E2E_DSN"))
 	db := openEnrolmentTokenDB(t)
 	s := newPostgresEnrolmentTokenStore(db)
-	if _, err := db.Exec(`CREATE FUNCTION slow_enrolment_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(0.3); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER slow_enrolment_commit AFTER INSERT ON enrolment_tokens DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_enrolment_commit()`); err != nil {
-		t.Fatal(err)
-	}
+	installSlowEnrolmentCommit(t, db, "0.3")
 	ctx, cancel := context.WithTimeout(captureCPWriteLease(context.Background()), 80*time.Millisecond)
 	defer cancel()
 	now := time.Now().UTC()
 	tok, secret, err := s.IssueContext(ctx, enrolltoken.DefaultPolicy(), "tenant_test_commit", "", "", "issuer", "", now.Add(time.Hour), now)
-	if !errors.Is(err, enrolltoken.ErrStateUnavailable) || tok.ID != "" || secret != "" {
-		t.Fatal("commit error disclosed token or reported success")
+	if ctx.Err() == nil {
+		t.Fatal("request deadline did not pass during COMMIT; the case did not exercise the boundary")
+	}
+	if err != nil || tok.ID == "" || secret == "" {
+		t.Fatalf("committed token was not returned: %v", err)
 	}
 	leader.tick()
 	peer.tick()
-	if leader.IsLeader() || !peer.IsLeader() {
-		t.Fatal("expected remaining client-canceled COMMIT session loss")
+	if !leader.IsLeader() || peer.IsLeader() {
+		t.Fatal("request deadline during COMMIT cost leadership")
 	}
 	rows, err := s.ListContext(context.Background(), "tenant_test_commit")
-	if err != nil || len(rows) != 0 {
-		t.Fatalf("deferred-trigger cancellation fixture persisted token: %v", err)
+	if err != nil || len(rows) != 1 || rows[0].ID != tok.ID {
+		t.Fatalf("returned token is not the durable one: %v %d", err, len(rows))
 	}
-	t.Log("COMMIT cancellation still loses leadership; no credential disclosed; this observed rollback does not prove all commit errors are rollbacks")
+}
+
+// A COMMIT that does not finish within budget+grace is cut off by the transport
+// backstop. Its outcome is unknown, so no credential may be disclosed.
+func TestPostgresEnrolmentHungCommitDoesNotDiscloseToken(t *testing.T) {
+	trustDistributionPostgresFixture(t)
+	t.Setenv("ENROLMENT_TOKEN_E2E_DSN", os.Getenv("POSTGRES_QUEUE_E2E_DSN"))
+	db := openEnrolmentTokenDB(t)
+	s := newPostgresEnrolmentTokenStore(db)
+	installSlowEnrolmentCommit(t, db, "3")
+	ctx, cancel := context.WithTimeout(captureCPWriteLease(context.Background()), 80*time.Millisecond)
+	defer cancel()
+	now := time.Now().UTC()
+	tok, secret, err := s.IssueContext(ctx, enrolltoken.DefaultPolicy(), "tenant_test_hung_commit", "", "", "issuer", "", now.Add(time.Hour), now)
+	if !errors.Is(err, enrolltoken.ErrStateUnavailable) || tok.ID != "" || secret != "" {
+		t.Fatal("hung commit disclosed a token or reported success")
+	}
+}
+
+// enrolment_tokens lives in the shared public schema, not a per-test schema:
+// replace any trigger a previous run left behind and remove it afterwards, so
+// the slow COMMIT cannot leak into later tests or a second run.
+func installSlowEnrolmentCommit(t *testing.T, db *sql.DB, seconds string) {
+	t.Helper()
+	drop := `DROP TRIGGER IF EXISTS slow_enrolment_commit ON enrolment_tokens; DROP FUNCTION IF EXISTS slow_enrolment_commit()`
+	if _, err := db.Exec(drop + `; CREATE FUNCTION slow_enrolment_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(` + seconds + `); RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER slow_enrolment_commit AFTER INSERT ON enrolment_tokens DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION slow_enrolment_commit()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := db.Exec(drop); err != nil {
+			t.Errorf("remove slow COMMIT trigger: %v", err)
+		}
+	})
 }

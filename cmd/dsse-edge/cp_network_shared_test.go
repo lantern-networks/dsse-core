@@ -65,9 +65,11 @@ func TestPostgresNetworkSharedPeerAndAcceptedTerm(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	oldDB, oldE := cpStateBlobDB, cpLeaderElectorInstance
-	cpStateBlobDB = db
-	defer func() { cpStateBlobDB, cpLeaderElectorInstance = oldDB, oldE }()
+	// connectorRouteGov is package-level and built only when nil, bound to this
+	// test's database; restore it so a second run does not inherit a closed DB.
+	oldDB, oldE, oldGov := cpStateBlobDB, cpLeaderElectorInstance, connectorRouteGov
+	cpStateBlobDB, connectorRouteGov = db, nil
+	defer func() { cpStateBlobDB, cpLeaderElectorInstance, connectorRouteGov = oldDB, oldE, oldGov }()
 	config := serverConfig{Evaluator: testEvaluator(), Writer: w, AdminAuth: auth, OperatorTenantID: tenant, VLANObjectStorePath: "postgres"}
 	h := newServerWithConfig(config)
 	cpLeaderElectorInstance = a

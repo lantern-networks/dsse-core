@@ -197,7 +197,9 @@ func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
 }
 func (s *Store) DeleteEndpointContext(ctx context.Context, tenant, id string) (bool, error) {
 	return mutateCatalogContext(ctx, s, func(n *Store) (bool, error) {
-		if e, ok := n.GetEndpoint(tenant, id); strings.HasPrefix(id, certPinEndpointPrefix) || ok && certPinEndpoint(e) {
+		// Only an existing destination is refused by ownership; an absent ID is
+		// absent (404), not "managed through bypass review" (403).
+		if e, ok := n.GetEndpoint(tenant, id); ok && (strings.HasPrefix(id, certPinEndpointPrefix) || certPinEndpoint(e)) {
 			return false, ErrCertPinEndpointOwnership
 		}
 		if e, ok := n.GetEndpoint(tenant, id); ok && e.Source == SourceApplication {

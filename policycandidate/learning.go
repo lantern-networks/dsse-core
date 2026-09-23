@@ -65,7 +65,26 @@ func (store *Store) ObserveUnmatchedFlow(ctx context.Context, tenantID, host, sn
 		})
 	}
 
-	cand := Candidate{
+	existing, found := store.candidates[tenantID][id]
+	cand := unmatchedFlowCandidate(existing, found, id, tenantID, applicationID, host, sni, port, reason, observed, 1)
+	normalized, err := normalize(cand, tenantID, now)
+	if err != nil {
+		return Candidate{}, err
+	}
+	if err := store.putLocked(normalized); err != nil {
+		return Candidate{}, err
+	}
+	return copyCandidate(normalized), nil
+}
+
+// unmatchedFlowCandidate is the candidate after times more sightings of an unmatched flow.
+func unmatchedFlowCandidate(existing Candidate, found bool, id, tenantID, applicationID, host, sni string, port int, reason, observed string, times int) Candidate {
+	if found {
+		existing.FailureCount += times
+		existing.LastObserved = &observed
+		return existing
+	}
+	return Candidate{
 		CandidateID:    id,
 		TenantID:       tenantID,
 		Source:         SourceUnmatchedFlow,
@@ -79,22 +98,9 @@ func (store *Store) ObserveUnmatchedFlow(ctx context.Context, tenantID, host, sn
 		SNI:           sni,
 		Port:          port,
 		ReasonCodes:   []string{reason},
-		FailureCount:  1,
+		FailureCount:  times,
 		LastObserved:  &observed,
 	}
-	if existing, ok := store.candidates[tenantID][id]; ok {
-		cand = existing
-		cand.FailureCount++
-		cand.LastObserved = &observed
-	}
-	normalized, err := normalize(cand, tenantID, now)
-	if err != nil {
-		return Candidate{}, err
-	}
-	if err := store.putLocked(normalized); err != nil {
-		return Candidate{}, err
-	}
-	return copyCandidate(normalized), nil
 }
 
 // learningServiceFamilyForPort maps a destination port to a non-secret service family label. Defaults to

@@ -3,6 +3,7 @@ package policycandidate
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"sync"
@@ -241,5 +242,34 @@ func TestSharedCandidateRejectsMissingInvalidAndCancelled(t *testing.T) {
 	}
 	if string(p.data) != "{}" {
 		t.Fatal("cancelled write changed row")
+	}
+}
+
+// An unknown COMMIT stops the store. The stop must be observable (accessor and a
+// dedicated error) so the Console does not advise a retry that cannot succeed.
+func TestSharedCandidateUnknownCommitIsReportedAsReconciliation(t *testing.T) {
+	ctx := context.Background()
+	p := &candidateSharedFixture{}
+	s := NewStore()
+	if e := s.SetPersister(p); e != nil {
+		t.Fatal(e)
+	}
+	if s.ReconciliationRequired() {
+		t.Fatal("fresh store reports reconciliation")
+	}
+	p.unknown = true
+	if _, err := s.ObserveUnmatchedFlow(ctx, "tenant_a", "unknown.example", "unknown.example", 443, "", time.Now()); err == nil {
+		t.Fatal("unknown commit reported success")
+	}
+	if !s.ReconciliationRequired() {
+		t.Fatal("unknown commit did not stop the store")
+	}
+	p.unknown = false
+	_, err := s.ObserveUnmatchedFlow(ctx, "tenant_a", "other.example", "other.example", 443, "", time.Now())
+	if !errors.Is(err, ErrReconciliationRequired) || !errors.Is(err, ErrPersistence) {
+		t.Fatalf("stopped write not identified: %v", err)
+	}
+	if _, err := s.List(ctx, "tenant_a", ListOptions{}); !errors.Is(err, ErrReconciliationRequired) || !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("stopped read not identified: %v", err)
 	}
 }

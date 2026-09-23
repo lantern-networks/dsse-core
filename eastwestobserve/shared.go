@@ -15,27 +15,34 @@ type sharedPersister interface {
 	UpdateContext(context.Context, func([]byte) ([]byte, error)) error
 }
 
-func decodeShared(raw []byte, known bool) (map[string]map[string]FlowObservation, error) {
+func decodeShared(raw []byte, known bool) (map[string]map[string]FlowObservation, map[string]ReportReceipt, error) {
 	if raw == nil && !known {
-		return map[string]map[string]FlowObservation{}, nil
+		return map[string]map[string]FlowObservation{}, nil, nil
+	}
+	if len(raw) == 0 {
+		return nil, nil, fmt.Errorf("observation shared inventory unavailable")
+	}
+	flowsRaw, receipts, err := splitRow(raw)
+	if err != nil {
+		return nil, nil, err
 	}
 	var flows map[string]map[string]FlowObservation
-	if len(raw) == 0 || json.Unmarshal(raw, &flows) != nil || flows == nil {
-		return nil, fmt.Errorf("observation shared inventory unavailable")
+	if json.Unmarshal(flowsRaw, &flows) != nil || flows == nil {
+		return nil, nil, fmt.Errorf("observation shared inventory unavailable")
 	}
 	for tenant, rows := range flows {
 		if tenant == "" || rows == nil {
-			return nil, fmt.Errorf("invalid observation tenant")
+			return nil, nil, fmt.Errorf("invalid observation tenant")
 		}
 		for id, o := range rows {
 			first, e1 := time.Parse(time.RFC3339, o.FirstSeen)
 			last, e2 := time.Parse(time.RFC3339, o.LastSeen)
 			if o.TenantID != tenant || o.ObservationID != id || o.Destination == "" || o.Source == "" || o.Count < 1 || id != ObservationKey(o.Source, o.Destination, o.ServiceFamily, o.Port) || e1 != nil || e2 != nil || first.After(last) {
-				return nil, fmt.Errorf("invalid shared observation")
+				return nil, nil, fmt.Errorf("invalid shared observation")
 			}
 		}
 	}
-	return flows, nil
+	return flows, receipts, nil
 }
 func cloneFlows(src map[string]map[string]FlowObservation) map[string]map[string]FlowObservation {
 	dst := map[string]map[string]FlowObservation{}
@@ -92,7 +99,8 @@ func (s *Store) persistSharedLocked(ctx context.Context, p sharedPersister) erro
 	prepared := false
 	err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
 		var e error
-		next, e = decodeShared(raw, s.sharedKnown)
+		var receipts map[string]ReportReceipt
+		next, receipts, e = decodeShared(raw, s.sharedKnown)
 		if e != nil {
 			return nil, e
 		}
@@ -101,7 +109,9 @@ func (s *Store) persistSharedLocked(ctx context.Context, p sharedPersister) erro
 		}
 		view := &Store{flows: next, retention: s.retention}
 		view.pruneLocked(time.Now())
-		out, e := json.Marshal(next)
+		// Reports applied by this row's other writers are part of the row.
+		pruneReceipts(receipts, time.Now())
+		out, e := encodeRow(next, receipts)
 		prepared = e == nil
 		return out, e
 	})
@@ -139,7 +149,7 @@ func (s *Store) RefreshShared() error {
 	if e != nil {
 		return e
 	}
-	next, e := decodeShared(raw, s.sharedKnown)
+	next, _, e := decodeShared(raw, s.sharedKnown)
 	if e != nil {
 		return e
 	}

@@ -1375,3 +1375,48 @@ step. If the candidate is already approved after a lost response, inspect the
 saved result instead of expecting a retry to publish again. Application storage
 and candidate approval are separate operations. This check does not make them a
 single transaction or protect against subsequent edits by another administrator.
+
+### Recovering an edited legacy cert-pin endpoint
+
+A generated `certpin-ep-<candidate_id>` endpoint is owned by the cert-pin workflow.
+Generic endpoint edits and deletion are refused, including for legacy rows whose
+source is still `manual` or empty. Re-registering a legacy row only adopts its
+original generated shape: matching tenant, network kind and reviewed host, the
+single `cert_pin` tag, no steering and no identity. A changed address or extra tag
+therefore needs reconciliation; bypassing the ownership check is not recovery.
+
+The ownership guard does **not** disable an existing bypass rule. An edited legacy
+endpoint can still be referenced by an active rule, and the rule's display name
+can show the old host. Inspect the stored endpoint and rule destinations together.
+
+1. Quiesce affected traffic and serialize administrative changes. In Internet
+   Access, open the cert-pin group's Details and **Disable** the affected rule.
+   Confirm its saved disabled state and the resulting bypass list. Other rules,
+   defaults and exclusions may still bypass inspection; disabling this rule alone
+   is not proof of TLS inspection on an Edge.
+2. Before repairing storage, stop every writer that can change the affected
+   catalog, candidate and rule. Preserve their current records and audit logs.
+   Identify the exact tenant, candidate ID, endpoint ID and referencing rules.
+   A generated-looking ID or matching candidate alone is not proof of ownership.
+3. Only if a trusted pre-edit backup establishes the original generated endpoint,
+   restore that **one endpoint record** through the deployment's controlled
+   offline storage-maintenance procedure. Verify that the current row has not
+   changed since it was read and preserve all other endpoints, tenants, groups,
+   services, aliases and metadata. Do not restore the entire old catalog or change
+   a database row while another process can write it. Record the maintenance
+   change separately: an offline repair does not create an Admin Console audit.
+4. Reload the stores by restarting the affected process while traffic remains
+   quiesced. Confirm the restored record and that the rule is still disabled.
+   To reinstate the reviewed exception, explicitly register the original host in
+   Sites to Bypass; this adopts the endpoint and **re-enables the bypass rule**.
+   Confirm the saved `cert_pin` ownership, exact host, rule and successful audit,
+   then verify distribution and actual behavior on each serving Edge before
+   restoring traffic. To remove the exception instead, use the existing rule's
+   Re-intercept action and confirm deletion; do not try to delete its protected
+   endpoint through the generic endpoint API.
+
+If the backup is absent, ownership is ambiguous, or the candidate/rule no longer
+agrees with the backup, keep the rule disabled and the affected traffic quiesced
+until an administrator resolves the records. Do not guess replacement fields or
+blindly re-register the host. These steps are a manual recovery procedure, not an
+automatic migration or a transaction spanning the three stores.

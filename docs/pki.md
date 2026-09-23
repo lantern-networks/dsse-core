@@ -341,14 +341,20 @@ to service. It does not replay the withdrawal automatically. Keep all writers an
 device serving stopped, preserve both stores and the failed operation's records,
 and reconcile the named tenant and certificate with authoritative ownership.
 For a single-anchor withdrawal, the completed state must exclude that certificate
-from both attribution and device trust. A tenant-wide attribution deletion does
+from both attribution and device trust. When the saved trust set changes, advance
+its distribution serial once above the saved value and preserve the other
+distribution metadata; devices must not receive a changed set under an unchanged
+serial. Keep the pending record through intermediate saves and verify the saved
+certificate fingerprints and serial before clearing it. A tenant-wide attribution deletion does
 not itself remove device trust. Preserve unrelated tenants and anchors. Remove
 the pending record only after both saved stores have been reconciled and their
 writes confirmed, then verify the loaded state before returning to service. If
 the operation or ownership is uncertain, retain the record and leave serving
 stopped. Do not simply delete the record or downgrade to a reader that ignores it.
 
-Weak shared backends still retain only a process-local withdrawal receipt. Their
+Shared paths outside the pure control-plane transactional author (including
+combined enforcement nodes using shared persistence) still retain only a
+process-local withdrawal receipt. Their
 last saved registry may restore the old attribution on restart. Keep such nodes
 out of device-serving traffic during reconciliation; do not treat a lost pending
 flag or a `404` as proof that device trust was removed. If the original CA remains

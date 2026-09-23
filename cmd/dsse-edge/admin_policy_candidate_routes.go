@@ -421,6 +421,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application storage cannot safely adopt this candidate"))
 			return
 		}
+		reviewer, ok := policyCandidateStore.(policycandidate.PublicationReviewer)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate storage cannot safely confirm this publication"))
+			return
+		}
 		created, err := publisher.CreateOrMatch(r.Context(), entry, tenantID, now)
 		if errors.Is(err, appcatalog.ErrCandidateApplicationConflict) {
 			writeError(w, http.StatusConflict, err)
@@ -436,7 +441,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if reviewReason == "" {
 			reviewReason = "connector_candidate_published"
 		}
-		reviewed, reviewFound, rerr := policyCandidateStore.Review(r.Context(), tenantID, candidateID, policycandidate.ReviewRequest{Decision: "approved", ReviewReasonCode: reviewReason}, now)
+		reviewed, reviewFound, rerr := reviewer.ApprovePublication(r.Context(), cand, reviewReason, now)
 		// Reachability was saved independently. Do not claim candidate approval
 		// or discard the confirmed application when the second store fails.
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)

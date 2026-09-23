@@ -1370,6 +1370,15 @@ rewriting it. Different settings or a config-seeded ID return 409 and leave the
 existing application unchanged. Reconcile those differences through the normal
 application workflow before proceeding.
 
+The final approval checks the latest candidate under its store write lock or
+shared-row transaction. A concurrent suppression, rejection, removal, or change
+to its publication target cannot be overwritten by that approval. The application
+already saved remains in place and the response reports a partial result; reload
+both records and reconcile the application through its normal management workflow.
+A new observation timestamp alone does not prevent approval or discard the latest
+observation. A storage adapter without conditional approval support is refused
+before application creation.
+
 Changing the application ID can create another application; it is not a recovery
 step. If the candidate is already approved after a lost response, inspect the
 saved result instead of expecting a retry to publish again. Application storage

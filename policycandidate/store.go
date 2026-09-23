@@ -205,7 +205,6 @@ func (store *Store) Review(ctx context.Context, tenantID, candidateID string, re
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	reviewedAt := now.UTC().Format(time.RFC3339)
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -221,6 +220,13 @@ func (store *Store) Review(ctx context.Context, tenantID, candidateID string, re
 	if !ok {
 		return Candidate{}, false, nil
 	}
+	return store.applyReviewLocked(candidate, review, now)
+}
+
+// applyReviewLocked preserves the same save/error contract for ordinary review
+// and conditional publication approval. The caller holds mu.
+func (store *Store) applyReviewLocked(candidate Candidate, review ReviewRequest, now time.Time) (Candidate, bool, error) {
+	reviewedAt := now.UTC().Format(time.RFC3339)
 	candidate.Status = review.Decision
 	candidate.ReviewReasonCode = review.ReviewReasonCode
 	candidate.ReviewedAt = &reviewedAt

@@ -314,3 +314,28 @@ Console's file-pair update, not an atomic transaction with the version database
 or a guarantee about storage hardware surviving a power failure. A commit whose
 durability could not be confirmed is reported as a failure; reload and inspect
 the served fingerprint before retrying.
+
+## Interrupted device-CA withdrawal on combined nodes
+
+On a node that both authors CA registrations and enforces device trust, withdrawing
+one CA changes two separate stores. A `500` partial response does not confirm that
+the CA has stopped admitting devices. Keep the original tenant and fingerprint,
+restore storage, and retry the same single-anchor DELETE before restarting.
+While that withdrawal is unfinished, other CA registration changes return `503`;
+a tenant-wide attribution deletion cannot finish a single-anchor trust removal.
+
+If the process already stopped, keep it out of device-serving traffic while
+reconciling the registry and device-trust files against the failed operation and
+its audit record. The process-local withdrawal receipt does not survive restart:
+the last saved registry may still contain the old CA, so startup can restore its
+attribution. Do not interpret the loss of the pending flag as completion. If the
+original CA is still attributed to the original tenant, restore the normal
+withdrawal prerequisites and retry the same DELETE. Confirm its absence from
+both saved stores and check the success audit before returning to service. If
+ownership is absent, inconsistent, or uncertain, leave serving stopped and
+reconcile the authoritative records; do not assign ownership from a fingerprint
+alone or assume a `404` proves that device trust was removed.
+
+This is manual recovery, not a durable withdrawal journal or an atomic update
+across both stores. It does not establish fleet propagation or recovery from an
+unknown database commit. Keep other CA writers stopped during reconciliation.

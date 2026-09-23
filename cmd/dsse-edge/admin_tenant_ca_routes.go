@@ -47,7 +47,7 @@ func persistTenantCARegistry(registry *tenantca.TenantCARegistry, registryPath s
 		// TenantCARegistry.SaveTo.
 		return registry.SaveTo(tenantCARegistryShared, removedSHA256...)
 	}
-	return registry.Save(registryPath)
+	return registry.SaveWithdrawals(registryPath, removedSHA256...)
 }
 
 func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
@@ -229,6 +229,12 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_register", req.CAPEM, "") {
 			return
 		}
+		tenantCAAuthorMu.Lock()
+		defer tenantCAAuthorMu.Unlock()
+		if len(registry.PendingWithdrawals("")) != 0 {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("An unfinished CA withdrawal must be retried before changing CA registrations."))
+			return
+		}
 
 		// TRUST first. If the handshake will not accept the certificate, the attribution entry describes a
 		// tenant whose devices cannot connect, and that is a worse thing to have written down than nothing.
@@ -346,6 +352,12 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", "", strings.ToLower(fingerprint)) {
 			return
 		}
+		tenantCAAuthorMu.Lock()
+		defer tenantCAAuthorMu.Unlock()
+		if !registry.WithdrawalRetryAllowed(tenantID, strings.ToLower(fingerprint), false) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("An unfinished CA withdrawal must be retried before changing CA registrations."))
+			return
+		}
 		// How many this organization would be left with, and whether anybody is still admitted under this one.
 		// Counted BEFORE the removal, so the gate judges the state the caller is asking to change.
 		remainingAfter, targetExists := 0, false
@@ -411,7 +423,7 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				"this control plane does not verify device certificates itself; the Edges take this CA out of "+
 					"both the registry and the trust set when they apply the next config bundle")
 		}
-		registry.BeginWithdrawal(tenantID, fingerprint)
+		registry.BeginTrustWithdrawal(tenantID, fingerprint)
 		removed, remaining := registry.WithdrawAnchor(tenantID, fingerprint)
 		if !removed && !pending {
 			// Unreachable via the existence check above, and reported rather than ignored: it would mean the
@@ -491,6 +503,12 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			return
 		}
 		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", "", "") {
+			return
+		}
+		tenantCAAuthorMu.Lock()
+		defer tenantCAAuthorMu.Unlock()
+		if !registry.WithdrawalRetryAllowed(tenantID, "", true) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("An unfinished CA withdrawal must be retried before changing CA registrations."))
 			return
 		}
 		// Named BEFORE the withdrawal, because afterwards the registry no longer knows them — and the shared

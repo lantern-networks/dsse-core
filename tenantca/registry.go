@@ -39,8 +39,9 @@ type TenantCARegistryFile struct {
 }
 
 type TenantCARegistry struct {
-	authoritativeLoaded bool
-	pendingWithdrawals  map[string]string // local removals awaiting completion of trust and persistence
+	authoritativeLoaded     bool
+	pendingTrustWithdrawals map[string]bool
+	pendingWithdrawals      map[string]string // local removals awaiting completion of trust and persistence
 
 	// Persisted with admission anchors; only a successful material install sets ownership.
 	materialManaged map[string]bool
@@ -361,6 +362,11 @@ func (r *TenantCARegistry) tenantCountLocked() int {
 // CA that identifies its devices; leaving that registration in memory would have moved the same failure one
 // restart away, which is how the per-tenant interception root behaves today and why it counts as broken.
 func (r *TenantCARegistry) Save(path string) error {
+	return r.SaveWithdrawals(path)
+}
+
+// SaveWithdrawals is called after the named removal has completed its trust stage.
+func (r *TenantCARegistry) SaveWithdrawals(path string, removedSHA256 ...string) error {
 	if r == nil {
 		return fmt.Errorf("tenant CA registry is not configured")
 	}
@@ -369,6 +375,10 @@ func (r *TenantCARegistry) Save(path string) error {
 		return fmt.Errorf("no tenant CA registry path is configured, so this registration would be lost on restart")
 	}
 	r.mu.RLock()
+	if err := r.checkWithdrawalSaveLocked(removedSHA256); err != nil {
+		r.mu.RUnlock()
+		return err
+	}
 	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
 	for _, c := range r.anchors {
 		tenantID := r.byAnchorKey[CAAnchorKey(c)]
@@ -422,14 +432,24 @@ type Persister interface {
 // The reference lab hides it, because all its Edges bind-mount the same registry file; a real deployment does
 // not share a filesystem.
 //
-// Snapshot/Adopt are the shared-store half. Save(path) stays exactly as it was for file deployments.
+// Snapshot/Adopt are the shared-store half. File deployments use Save(path).
 
 // Snapshot serialises the registry in the same form Save writes to a file.
 func (r *TenantCARegistry) Snapshot() ([]byte, error) {
+	return r.snapshot(nil, false)
+}
+
+func (r *TenantCARegistry) snapshot(removed []string, saving bool) ([]byte, error) {
 	if r == nil {
 		return nil, fmt.Errorf("tenant CA registry is not configured")
 	}
 	r.mu.RLock()
+	if saving {
+		if err := r.checkWithdrawalSaveLocked(removed); err != nil {
+			r.mu.RUnlock()
+			return nil, err
+		}
+	}
 	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
 	for _, c := range r.anchors {
 		tenantID := r.byAnchorKey[CAAnchorKey(c)]
@@ -516,7 +536,12 @@ func (r *TenantCARegistry) SaveTo(p Persister, removedSHA256 ...string) error {
 	if p == nil {
 		return fmt.Errorf("no shared backend is configured for the tenant CA registry")
 	}
-	removedSHA256 = append(removedSHA256, r.PendingWithdrawals("")...)
+	r.mu.RLock()
+	pendingErr := r.checkWithdrawalSaveLocked(removedSHA256)
+	r.mu.RUnlock()
+	if pendingErr != nil {
+		return pendingErr
+	}
 	existing, err := p.Load()
 	if err != nil {
 		return fmt.Errorf("read shared tenant CA registry before saving: %w", err)
@@ -526,7 +551,7 @@ func (r *TenantCARegistry) SaveTo(p Persister, removedSHA256 ...string) error {
 			return aerr
 		}
 	}
-	blob, err := r.Snapshot()
+	blob, err := r.snapshot(removedSHA256, true)
 	if err != nil {
 		return err
 	}

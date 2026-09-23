@@ -27,6 +27,7 @@ func TestIncomingOperatorBodyTargetOwnsItsAudit(t *testing.T) {
 	req := httptest.NewRequest("POST", "/admin/legacy-exceptions", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer review-operator")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Operate-Tenant", "customer")
 	res := httptest.NewRecorder()
 	h.ServeHTTP(res, req)
 	if res.Code != 200 {

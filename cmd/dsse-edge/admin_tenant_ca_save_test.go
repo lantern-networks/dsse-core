@@ -52,10 +52,13 @@ func TestTenantCARegistrationSaveFailureIsPartialAndRetryable(t *testing.T) {
 		if !trustStoreHolds(t, trust, cert) || registry.Registrations()["tenant_northwind"] != 1 {
 			t.Fatal("partial live state was misreported or duplicate CA added")
 		}
-		if len(outbox.insertedAudits) != before+1 {
+		if len(outbox.insertedAudits) != before+2 {
 			t.Fatal("missing lifecycle audit")
 		}
-		a := outbox.insertedAudits[before]
+		if outbox.insertedAudits[before].EventType != "admin_operate_within_tenant" {
+			t.Fatal("missing operator audit")
+		}
+		a := outbox.insertedAudits[before+1]
 		if stringPtrValue(a.Result) != wantResult || a.Metadata["durable"] != (attempt == 2) || a.Metadata["actor_admin_principal_id"] != "adm_operator" || a.TenantID != "tenant_northwind" {
 			t.Fatalf("wrong audit: %+v", a)
 		}

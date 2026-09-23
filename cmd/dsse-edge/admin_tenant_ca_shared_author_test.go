@@ -45,6 +45,7 @@ func (p *transactionalCAFixture) UpdateContext(ctx context.Context, edit func([]
 }
 func TestSharedCAAuthorDoesNotResurrectPeerWithdrawal(t *testing.T) {
 	a, _, _, _ := tenantCARoutesForTest(t)
+	storeA := tenantCAHarnessTenantStore
 	b, _, _, _ := tenantCARoutesForTest(t)
 	oldP, oldCP := tenantCARegistryShared, edgeIsControlPlane
 	defer func() { tenantCARegistryShared = oldP; edgeIsControlPlane = oldCP }()
@@ -57,7 +58,7 @@ func TestSharedCAAuthorDoesNotResurrectPeerWithdrawal(t *testing.T) {
 	_, peer := tenantCATestCA(t, "Peer")
 	_, newPEM := tenantCATestCA(t, "New")
 	for _, pem := range [][]byte{gonePEM, keep} {
-		r := doTenantCARequest(t, a, "POST", "/admin/tenant-cas", map[string]string{"tenant_id": "tenant_northwind", "ca_pem": string(pem)})
+		r := doTenantCARequest(t, a, "POST", "/admin/tenant-cas", map[string]string{"tenant_id": "tenant_northwind", "ca_pem": string(pem)}, storeA)
 		if r.Code != 201 {
 			t.Fatal(r.Code, r.Body)
 		}
@@ -72,7 +73,7 @@ func TestSharedCAAuthorDoesNotResurrectPeerWithdrawal(t *testing.T) {
 	extension["future_field"] = "keep"
 	rawExtension, _ = json.Marshal(extension)
 	p.Save(rawExtension)
-	r = doTenantCARequest(t, a, "DELETE", "/admin/tenant-cas/tenant_northwind/"+tenantca.CAAnchorKey(gone), nil)
+	r = doTenantCARequest(t, a, "DELETE", "/admin/tenant-cas/tenant_northwind/"+tenantca.CAAnchorKey(gone), nil, storeA)
 	if r.Code != 200 {
 		t.Fatal(r.Code, r.Body)
 	}

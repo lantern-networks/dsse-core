@@ -61,20 +61,22 @@ func TestEndingAnOrganizationBelongsToWhoeverOperatesTheDeployment(t *testing.T)
 
 // Counting is the other shape: your own organization is the point of the route; another's is not.
 func TestCountingAnotherOrganizationsDataNeedsCrossOrganizationRights(t *testing.T) {
+	readRequest := func(tenant string) *http.Request { r := lifecycleRequest(tenant); r.Method = http.MethodGet; return r }
+
 	declareOperatorTenant("tenant_operator_001", true)
 	t.Cleanup(func() { declareOperatorTenant("tenant_operator_001", true) })
 
 	if adminTenantPathReadAllowed(httptest.NewRecorder(),
-		lifecycleRequest("tenant_reference_lab"), "tenant_northwind", "counting the data of") {
+		readRequest("tenant_reference_lab"), "tenant_northwind", "counting the data of") {
 		t.Fatal("a customer counted another organization's data")
 	}
 	// ★ THE CONTROL: their own organization still answers, or the route is useless to the customer it is for.
 	if !adminTenantPathReadAllowed(httptest.NewRecorder(),
-		lifecycleRequest("tenant_reference_lab"), "tenant_reference_lab", "counting the data of") {
+		readRequest("tenant_reference_lab"), "tenant_reference_lab", "counting the data of") {
 		t.Fatal("an organization was refused a count of its OWN data")
 	}
 	if !adminTenantPathReadAllowed(httptest.NewRecorder(),
-		lifecycleRequest("tenant_operator_001"), "tenant_northwind", "counting the data of") {
+		readRequest("tenant_operator_001"), "tenant_northwind", "counting the data of") {
 		t.Fatal("the operator was refused")
 	}
 }

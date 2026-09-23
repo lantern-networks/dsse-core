@@ -50,11 +50,14 @@ func steerMutationFullFixture(t *testing.T) (http.Handler, *steerexclusion.Store
 	h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: w, AdminAuth: auth, SteerExclusions: s, AdminAuditOutbox: outbox, ConfigVersions: versions})
 	return h, s, w, path, outbox, versions
 }
-func steerMutationRequest(h http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+func steerMutationRequest(h http.Handler, method, path string, body any, operateTenant ...string) *httptest.ResponseRecorder {
 	raw, _ := json.Marshal(body)
 	r := httptest.NewRequest(method, path, bytes.NewReader(raw))
 	r.Header.Set("Authorization", "Bearer steering-review-token")
 	r.Header.Set("Content-Type", "application/json")
+	if len(operateTenant) > 0 {
+		r.Header.Set("X-Operate-Tenant", operateTenant[0])
+	}
 	res := httptest.NewRecorder()
 	h.ServeHTTP(res, r)
 	return res
@@ -303,7 +306,7 @@ func TestAdminSteerExclusionOperatorBodyAuditOwnership(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			r := steerMutationRequest(h, "POST", "/admin/steer-exclusions?expected_tenant_id=operator", map[string]any{"id": "operator-authored", "tenant_id": "tenant_other", "scope_type": "tenant", "excluded_app_signing_ids": []string{"com.example.owned"}})
+			r := steerMutationRequest(h, "POST", "/admin/steer-exclusions?expected_tenant_id=tenant_other", map[string]any{"id": "operator-authored", "tenant_id": "tenant_other", "scope_type": "tenant", "excluded_app_signing_ids": []string{"com.example.owned"}}, "tenant_other")
 			want := 200
 			if fail {
 				want = 500
@@ -349,7 +352,7 @@ func TestAdminSteerExclusionOperatorBodyAuditOwnership(t *testing.T) {
 			if domain["result"] != result {
 				t.Fatal("operator result", domain)
 			}
-			if len(outbox.insertedAudits) != 1 || outbox.insertedAudits[0].TenantID != "tenant_other" {
+			if len(outbox.insertedAudits) != 2 || outbox.insertedAudits[0].EventType != "admin_operate_within_tenant" || outbox.insertedAudits[0].TenantID != "tenant_other" || outbox.insertedAudits[1].TenantID != "tenant_other" {
 				t.Fatal("operator mirror tenant", outbox.insertedAudits)
 			}
 		})

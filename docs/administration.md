@@ -1335,3 +1335,20 @@ Incoming-policy audit events identify the tenant, acting principal, target
 exception (or tenant default), action and result. These records describe the
 management operation; they do not prove that a Windows endpoint has applied the
 firewall policy. Confirm endpoint enforcement separately.
+
+### Retrying candidate publication
+
+Adopting a connector-discovered candidate saves its Private App before saving
+the candidate approval. A partial response at `candidate_review` means that the
+application was saved but approval was not confirmed. Inspect the application
+and candidate before retrying, including after a process restart. Reuse the same
+application ID and publication settings: a matching application is reused without
+rewriting it. Different settings or a config-seeded ID return 409 and leave the
+existing application unchanged. Reconcile those differences through the normal
+application workflow before proceeding.
+
+Changing the application ID can create another application; it is not a recovery
+step. If the candidate is already approved after a lost response, inspect the
+saved result instead of expecting a retry to publish again. Application storage
+and candidate approval are separate operations. This check does not make them a
+single transaction or protect against subsequent edits by another administrator.

@@ -416,7 +416,16 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			Published:        true,
 			Status:           "active",
 		}
-		created, err := applicationCatalogStore.Upsert(r.Context(), entry, tenantID, now)
+		publisher, ok := applicationCatalogStore.(appcatalog.CandidatePublisher)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application storage cannot safely adopt this candidate"))
+			return
+		}
+		created, err := publisher.CreateOrMatch(r.Context(), entry, tenantID, now)
+		if errors.Is(err, appcatalog.ErrCandidateApplicationConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return

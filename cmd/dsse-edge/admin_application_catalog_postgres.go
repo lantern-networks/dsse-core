@@ -226,6 +226,16 @@ func (p *postgresApplicationCatalogStore) Get(ctx context.Context, tenantID, app
 // authored overlay. Tenant scoping is enforced by Normalize (entry tenant_id must match the authenticated tenant)
 // and by the (tenant_id, application_id) primary key.
 func (p *postgresApplicationCatalogStore) Upsert(ctx context.Context, application appcatalog.Entry, tenantID string, now time.Time) (appcatalog.Entry, error) {
+	return p.persistApplication(ctx, application, tenantID, now, false)
+}
+
+// CreateOrMatch never replaces an existing authored row. The unique key decides
+// concurrent creation; matching retries return the saved row without rewriting it.
+func (p *postgresApplicationCatalogStore) CreateOrMatch(ctx context.Context, application appcatalog.Entry, tenantID string, now time.Time) (appcatalog.Entry, error) {
+	return p.persistApplication(ctx, application, tenantID, now, true)
+}
+
+func (p *postgresApplicationCatalogStore) persistApplication(ctx context.Context, application appcatalog.Entry, tenantID string, now time.Time, createOnly bool) (appcatalog.Entry, error) {
 	normalized, err := appcatalog.Normalize(application, tenantID, now)
 	if err != nil {
 		return appcatalog.Entry{}, err
@@ -245,7 +255,7 @@ func (p *postgresApplicationCatalogStore) Upsert(ctx context.Context, applicatio
 	if normalized.LastProbeAt != nil && strings.TrimSpace(*normalized.LastProbeAt) != "" {
 		lastProbe = *normalized.LastProbeAt
 	}
-	_, err = p.db.ExecContext(ctx, strings.Join([]string{
+	query := strings.Join([]string{
 		"INSERT INTO application_catalog",
 		"(" + applicationCatalogColumns + ")",
 		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16, $17, $18, $19, $20, $21, $22, $23, $24::timestamptz)",
@@ -272,7 +282,14 @@ func (p *postgresApplicationCatalogStore) Upsert(ctx context.Context, applicatio
 		"last_probe_at = EXCLUDED.last_probe_at,",
 		"routing_namespace = EXCLUDED.routing_namespace,",
 		"updated_at = EXCLUDED.updated_at",
-	}, " "),
+	}, " ")
+	if createOnly {
+		if _, seeded := p.seed[normalized.TenantID][normalized.ApplicationID]; seeded {
+			return appcatalog.Entry{}, appcatalog.ErrCandidateApplicationConflict
+		}
+		query = strings.Split(query, " ON CONFLICT ")[0] + " ON CONFLICT (tenant_id, application_id) DO NOTHING"
+	}
+	result, err := p.db.ExecContext(ctx, query,
 		normalized.TenantID, normalized.ApplicationID, normalized.Name, normalized.ApplicationType, normalized.ServiceFamily,
 		normalized.Protocol, normalized.DestinationRole, normalized.ApplicationSensitivity, normalized.RouteRef,
 		normalized.SaaSProvider, normalized.SaaSCategory, normalized.SaaSRiskTier, normalized.DomainPatternCount,
@@ -281,6 +298,22 @@ func (p *postgresApplicationCatalogStore) Upsert(ctx context.Context, applicatio
 		updatedAt.UTC())
 	if err != nil {
 		return appcatalog.Entry{}, err
+	}
+	if createOnly {
+		n, err := result.RowsAffected()
+		if err != nil {
+			return appcatalog.Entry{}, err
+		}
+		if n == 0 {
+			current, found, err := p.Get(ctx, normalized.TenantID, normalized.ApplicationID)
+			if err != nil {
+				return appcatalog.Entry{}, err
+			}
+			if !found || !appcatalog.SameCandidatePublication(current, normalized) {
+				return appcatalog.Entry{}, appcatalog.ErrCandidateApplicationConflict
+			}
+			return appcatalog.CopyEntry(current), nil
+		}
 	}
 	return appcatalog.CopyEntry(normalized), nil
 }

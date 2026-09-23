@@ -9212,7 +9212,7 @@ func adminAgentAccessDecisionSummary(writer *logs.Writer, tenantID string) (map[
 	}, nil
 }
 
-func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query hotstore.SearchQuery, objectStore adminExportObjectStore, filename string, onRow func(rowsExported int) error) (string, hotstore.ExportResult, error) {
+func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query hotstore.SearchQuery, objectStore adminExportObjectStore, filename string, onRow func(rowsExported int, final bool) error) (string, hotstore.ExportResult, error) {
 	if store == nil {
 		return "", hotstore.ExportResult{}, fmt.Errorf("hot store is not configured")
 	}
@@ -9263,6 +9263,13 @@ func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query ho
 				if err := ctx.Err(); err != nil {
 					return nil, false, err
 				}
+				// Check terminal state before committing the generated file, even
+				// when fewer than 1,000 rows followed the last progress update.
+				if onRow != nil {
+					if err := onRow(rowsWritten, true); err != nil {
+						return nil, false, err
+					}
+				}
 				return nil, false, nil
 			}
 			if next.err != nil {
@@ -9272,7 +9279,7 @@ func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query ho
 			if onRow != nil {
 				// Alpha workers treat adminExportJobStoppedError from progress writes
 				// as an external stop signal, then re-read job state before cleanup.
-				if err := onRow(rowsWritten); err != nil {
+				if err := onRow(rowsWritten, false); err != nil {
 					return nil, false, err
 				}
 			}

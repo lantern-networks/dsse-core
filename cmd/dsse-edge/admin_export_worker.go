@@ -861,6 +861,15 @@ func newAdminDownloadTokenStore() *adminDownloadTokenStore {
 	return &adminDownloadTokenStore{tokens: map[string]adminDownloadToken{}}
 }
 
+// adminExportJobSnapshot detaches the maps that workers update in place. Call it
+// while holding the Store lock: HTTP encoding and audit construction happen
+// after that lock is released. Metadata values themselves are immutable.
+func adminExportJobSnapshot(job adminExportJob) adminExportJob {
+	job.Filters = copyStringMap(job.Filters)
+	job.Metadata = copyAnyMap(job.Metadata)
+	return job
+}
+
 func (s *adminExportJobStore) Create(req adminExportJobRequest, tenantID, adminPrincipalID string, now time.Time) adminExportJob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -868,7 +877,7 @@ func (s *adminExportJobStore) Create(req adminExportJobRequest, tenantID, adminP
 	s.order = append(s.order, job.ID)
 	s.jobs[job.ID] = job
 	s.order = evictFIFO(s.order, len(s.jobs), s.capacity, func(k string) { delete(s.jobs, k) })
-	return job
+	return adminExportJobSnapshot(job)
 }
 
 func newAdminExportJob(req adminExportJobRequest, tenantID, adminPrincipalID string, now time.Time) adminExportJob {
@@ -901,7 +910,7 @@ func (s *adminExportJobStore) Get(id string) (adminExportJob, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	job, ok := s.jobs[id]
-	return job, ok
+	return adminExportJobSnapshot(job), ok
 }
 
 func (s *adminExportJobStore) GetByTenant(ctx context.Context, tenantID, jobID string) (adminExportJob, bool, error) {
@@ -932,7 +941,7 @@ func (s *adminExportJobStore) List(tenantID string) []adminExportJob {
 	jobs := []adminExportJob{}
 	for _, job := range s.jobs {
 		if job.TenantID == tenantID {
-			jobs = append(jobs, job)
+			jobs = append(jobs, adminExportJobSnapshot(job))
 		}
 	}
 	sort.Slice(jobs, func(i, j int) bool {
@@ -961,7 +970,7 @@ func (s *adminExportJobStore) MarkRunning(id string, now time.Time) (adminExport
 	job.Metadata["rows_exported"] = 0
 	job.Metadata["last_progress_at"] = startedAt
 	s.jobs[id] = job
-	return job, nil
+	return adminExportJobSnapshot(job), nil
 }
 
 func (s *adminExportJobStore) MarkProgress(id string, rowsExported int, phase string, now time.Time) (adminExportJob, error) {
@@ -988,7 +997,7 @@ func (s *adminExportJobStore) MarkProgress(id string, rowsExported int, phase st
 	job.Metadata["rows_exported"] = rowsExported
 	job.Metadata["last_progress_at"] = now.UTC().Format(time.RFC3339)
 	s.jobs[id] = job
-	return job, nil
+	return adminExportJobSnapshot(job), nil
 }
 
 func (s *adminExportJobStore) MarkCompleted(id string, rowCount, totalMatches int, truncated bool, objectRef, checksum string, coverage *adminExportRegionCoverage, now time.Time) (adminExportJob, error) {
@@ -1019,7 +1028,7 @@ func (s *adminExportJobStore) MarkCompleted(id string, rowCount, totalMatches in
 	job.Metadata["rows_exported"] = rowCount
 	job.Metadata["last_progress_at"] = completedAt
 	s.jobs[id] = job
-	return job, nil
+	return adminExportJobSnapshot(job), nil
 }
 
 func (s *adminExportJobStore) MarkFailed(id, code string, now time.Time) (adminExportJob, error) {
@@ -1051,7 +1060,7 @@ func (s *adminExportJobStore) MarkFailedWithMetadata(id, code string, metadata m
 		}
 	}
 	s.jobs[id] = job
-	return job, nil
+	return adminExportJobSnapshot(job), nil
 }
 
 func (s *adminExportJobStore) MarkCancelled(id, tenantID, cancelledBy, reason string, now time.Time) (adminExportJob, error) {
@@ -1080,7 +1089,7 @@ func (s *adminExportJobStore) MarkCancelled(id, tenantID, cancelledBy, reason st
 		job.Metadata["cancellation_reason"] = trimmed
 	}
 	s.jobs[id] = job
-	return job, nil
+	return adminExportJobSnapshot(job), nil
 }
 
 func (s *adminDownloadTokenStore) Create(job adminExportJob, localFilename, issuedBy string, payload []byte, now time.Time) (adminDownloadToken, error) {
@@ -1262,8 +1271,8 @@ func runAdminExportJob(ctx context.Context, writer *logs.Writer, adminAuditOutbo
 	if coverage != nil {
 		objectStore = exportCommentObjectStore{adminExportObjectStore: objectStore, coverage: coverage}
 	}
-	checksum, exportResult, err := writeHotStoreExportRows(ctx, hotStore, searchQuery, objectStore, localFilename, func(rowsExported int) error {
-		if rowsExported == 1 || rowsExported%1000 == 0 {
+	checksum, exportResult, err := writeHotStoreExportRows(ctx, hotStore, searchQuery, objectStore, localFilename, func(rowsExported int, final bool) error {
+		if final || rowsExported == 1 || rowsExported%1000 == 0 {
 			_, err := store.MarkProgress(job.ID, rowsExported, "exporting", time.Now())
 			return err
 		}

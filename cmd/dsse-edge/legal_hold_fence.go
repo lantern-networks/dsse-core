@@ -168,10 +168,26 @@ func (s *legalHoldStore) beginErasure(ctx context.Context, tenant, node string) 
 }
 func (s *legalHoldStore) changeErasure(ctx context.Context, tenant string, fence tenantErasureFence, begin bool) error {
 	ctx = retentionWriteContext(ctx)
+	if _, shared := s.persister.(retentionSharedUpdater); !shared {
+		// A file Load/Save cannot be canceled. Return an unknown outcome to
+		// the caller while the worker retains the writer lock until actual I/O
+		// and state publication finish. A late begin leaves its durable fence;
+		// a late finish may clear it, so neither timeout implies rollback.
+		ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+		defer cancel()
+		return runLocalPolicyWrite(ctx, &s.writeMu, func() error {
+			return s.changeErasureLocked(ctx, tenant, fence, begin)
+		}, func() {})
+	}
 	if err := lockPolicyWriter(ctx, &s.writeMu); err != nil {
 		return err
 	}
 	defer s.writeMu.Unlock()
+	return s.changeErasureLocked(ctx, tenant, fence, begin)
+}
+
+// Caller owns writeMu until this function and any noncancelable I/O return.
+func (s *legalHoldStore) changeErasureLocked(ctx context.Context, tenant string, fence tenantErasureFence, begin bool) error {
 	var next legalHoldSnapshot
 	mutate := func(v legalHoldSnapshot) ([]byte, error) {
 		if begin {

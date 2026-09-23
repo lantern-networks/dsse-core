@@ -101,3 +101,21 @@ WHERE state.store_key = 'legal_hold'
    remaining footprint, and verify fleet delivery markers. Retrying does not
    restore data already erased. Unreachable nodes and external archives remain
    explicit deployment follow-up items.
+
+## Slow local marker I/O
+
+Local marker Load/Save requests use a five-second budget (or an earlier request
+cancellation). The response may return before the operating-system I/O ends.
+The actual worker retains the protection writer lock until I/O and confirmed
+state publication finish; another request cannot bypass it or start a second
+file write. A timed-out start never grants its caller permission to erase data.
+A late successful start leaves a marker requiring reconciliation. A late
+successful completion can remove the marker after the caller reported an
+unconfirmed result. Neither timeout means rollback; inspect the original state
+and partial response after the old worker has ended.
+
+Do not edit that file, clear a marker, or start a replacement owner while the old
+worker might resume. Follow the stop/termination and reconciliation procedure
+above. If actual I/O termination cannot be established, keep deletion paused.
+This budget covers marker I/O callers, not every resource operation in a purge;
+file-handle closing, directory removal and footprint reads are separate boundaries.

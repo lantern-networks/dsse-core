@@ -176,12 +176,19 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	defer cancel()
 	budget := newCPStatementBudget(archiveCtx)
 	defer budget.cancel()
-	unlockPolicy := lockPrunePolicy(cfg)
+	unlockPolicy, err := lockPrunePolicy(archiveCtx, cfg)
+	if err != nil {
+		log.Printf("cold-archive policy wait: %v", err)
+		return
+	}
 	defer unlockPolicy()
 	chained := stream == "audit" && cfg.auditChain != nil
 	var shared *sharedAuditArchive
 	if chained {
-		cfg.auditChain.operationMu.Lock()
+		if err := cfg.auditChain.operationMu.LockContext(archiveCtx); err != nil {
+			log.Printf("cold-archive chain wait: %v", err)
+			return
+		}
 		defer cfg.auditChain.operationMu.Unlock()
 		var err error
 		shared, err = cfg.auditChain.beginSharedArchive(budget, db)
@@ -201,7 +208,6 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		}
 	}
 	var tx *sql.Tx
-	var err error
 	if shared != nil {
 		tx = shared.tx
 	} else {

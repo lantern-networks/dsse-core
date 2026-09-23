@@ -11,10 +11,17 @@ import (
 // writeMu before the elector lock too. Holding these in the reverse order would
 // deadlock a Console change against a sweep. Shared policy is then read/locked
 // in the deletion transaction; local policy stays read-locked through commit.
-func lockPrunePolicy(cfg retentionConfig) func() {
+func lockPrunePolicy(ctx context.Context, cfg retentionConfig) (func(), error) {
 	var unlock []func()
+	finish := func() {
+		for i := len(unlock) - 1; i >= 0; i-- {
+			unlock[i]()
+		}
+	}
 	if s := cfg.legalHold; s != nil {
-		s.writeMu.Lock()
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			return nil, err
+		}
 		unlock = append(unlock, s.writeMu.Unlock)
 		if _, shared := s.persister.(retentionSharedUpdater); !shared {
 			s.mu.RLock()
@@ -22,18 +29,21 @@ func lockPrunePolicy(cfg retentionConfig) func() {
 		}
 	}
 	if s := cfg.override; s != nil {
-		s.writeMu.Lock()
+		if err := s.writeMu.LockContext(ctx); err != nil {
+			finish()
+			return nil, err
+		}
 		unlock = append(unlock, s.writeMu.Unlock)
 		if _, shared := s.persister.(retentionSharedUpdater); !shared {
 			s.mu.RLock()
 			unlock = append(unlock, s.mu.RUnlock)
 		}
 	}
-	return func() {
-		for i := len(unlock) - 1; i >= 0; i-- {
-			unlock[i]()
-		}
+	if err := ctx.Err(); err != nil {
+		finish()
+		return nil, err
 	}
+	return finish, nil
 }
 
 // Materialize an absent key under the same lock as its first administrative
@@ -149,7 +159,11 @@ func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, t
 	ctx = retentionWriteContext(ctx)
 	ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
 	defer cancel()
-	unlock := lockPrunePolicy(cfg)
+	unlock, err := lockPrunePolicy(ctx, cfg)
+	if err != nil {
+		logPruneFailure(table, err)
+		return
+	}
 	defer unlock()
 	budget := newCPStatementBudget(ctx)
 	defer budget.cancel()

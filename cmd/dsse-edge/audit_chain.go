@@ -28,7 +28,7 @@ type auditChainState struct {
 }
 
 type auditChainStore struct {
-	operationMu sync.Mutex // Serialize archive/advance within this process.
+	operationMu cpWriterMutex // Serialize archive/advance; queued operations may cancel.
 	mu          sync.Mutex
 	stateErr    error
 	per         map[string]auditChainState // tenant -> running chain state

@@ -25,7 +25,10 @@ func beginTenantPurgeHoldGuardWithBudget(budget *cpStatementBudget, holds *legal
 	if holds == nil {
 		return nil, func() {}, ctx.Err()
 	}
-	unlock := lockPrunePolicy(retentionConfig{legalHold: holds})
+	unlock, err := lockPrunePolicy(ctx, retentionConfig{legalHold: holds})
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("legal_hold: destructive policy wait: %w", err)
+	}
 	finish := unlock
 	fail := func(err error) (*sql.Tx, func(), error) { finish(); return nil, func() {}, err }
 	policyDB := target

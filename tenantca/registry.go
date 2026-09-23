@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // Tenant identification + isolation. Each tenant is trusted via ITS OWN CA; the tenant a
@@ -34,8 +36,9 @@ type TenantCAEntry struct {
 }
 
 type TenantCARegistryFile struct {
-	MaterialManagedTenants []string        `json:"material_managed_tenants,omitempty"`
-	Tenants                []TenantCAEntry `json:"tenants"`
+	PendingWithdrawals     []WithdrawalReceipt `json:"pending_withdrawals,omitempty"`
+	MaterialManagedTenants []string            `json:"material_managed_tenants,omitempty"`
+	Tenants                []TenantCAEntry     `json:"tenants"`
 }
 
 type TenantCARegistry struct {
@@ -114,6 +117,9 @@ func LoadTenantCARegistry(path string) (*TenantCARegistry, error) {
 	var doc TenantCARegistryFile
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("parse tenant CA registry %q: %w", path, err)
+	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return nil, ErrPendingWithdrawal
 	}
 	reg := &TenantCARegistry{Pool: x509.NewCertPool(), byAnchorKey: map[string]string{}}
 	for _, e := range doc.Tenants {
@@ -378,37 +384,11 @@ func (r *TenantCARegistry) SaveWithdrawals(path string, removedSHA256 ...string)
 	if path == "" {
 		return fmt.Errorf("no tenant CA registry path is configured, so this registration would be lost on restart")
 	}
-	r.mu.RLock()
-	if err := r.checkWithdrawalSaveLocked(removedSHA256); err != nil {
-		r.mu.RUnlock()
-		return err
-	}
-	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
-	for _, c := range r.anchors {
-		tenantID := r.byAnchorKey[CAAnchorKey(c)]
-		if tenantID == "" {
-			continue
-		}
-		doc.Tenants = append(doc.Tenants, TenantCAEntry{
-			TenantID: tenantID,
-			CAPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})),
-		})
-	}
-	r.mu.RUnlock()
-	sort.Slice(doc.Tenants, func(i, j int) bool { return doc.Tenants[i].TenantID < doc.Tenants[j].TenantID })
-
-	data, err := json.MarshalIndent(doc, "", "  ")
+	data, err := r.snapshot(removedSHA256, true)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeRegistryFile(path, data)
 }
 
 // NewTenantCARegistry returns an empty registry, for a deployment whose registrations live in a shared store
@@ -454,17 +434,7 @@ func (r *TenantCARegistry) snapshot(removed []string, saving bool) ([]byte, erro
 			return nil, err
 		}
 	}
-	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
-	for _, c := range r.anchors {
-		tenantID := r.byAnchorKey[CAAnchorKey(c)]
-		if tenantID == "" {
-			continue
-		}
-		doc.Tenants = append(doc.Tenants, TenantCAEntry{
-			TenantID: tenantID,
-			CAPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})),
-		})
-	}
+	doc := r.registryFileLocked()
 	r.mu.RUnlock()
 	sort.Slice(doc.Tenants, func(i, j int) bool { return doc.Tenants[i].TenantID < doc.Tenants[j].TenantID })
 	return json.MarshalIndent(doc, "", "  ")
@@ -487,6 +457,9 @@ func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, e
 	var doc TenantCARegistryFile
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return 0, err
+	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return 0, ErrPendingWithdrawal
 	}
 	skip := map[string]bool{}
 	for _, h := range skipSHA256 {
@@ -585,6 +558,9 @@ func (r *TenantCARegistry) Reconcile(data []byte) (added, removed int, err error
 	var doc TenantCARegistryFile
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return 0, 0, err
+	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return 0, 0, ErrPendingWithdrawal
 	}
 	fleet := map[string]bool{}
 	for _, e := range doc.Tenants {
@@ -762,4 +738,26 @@ func (r *TenantCARegistry) WithdrawAnchor(tenantID, sha256Hex string) (removed b
 		}
 	}
 	return removed, remaining
+}
+
+func (r *TenantCARegistry) registryFileLocked() TenantCARegistryFile {
+	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
+	for _, c := range r.anchors {
+		tenantID := r.byAnchorKey[CAAnchorKey(c)]
+		if tenantID == "" {
+			continue
+		}
+		doc.Tenants = append(doc.Tenants, TenantCAEntry{
+			TenantID: tenantID,
+			CAPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})),
+		})
+	}
+	return doc
+}
+
+func writeRegistryFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	return durablefile.Write(path, data, 0600)
 }

@@ -12,6 +12,9 @@ func RegistryFromSnapshot(raw []byte) (*TenantCARegistry, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, err
 	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return nil, ErrPendingWithdrawal
+	}
 	if doc.Tenants == nil {
 		return nil, fmt.Errorf("tenant CA snapshot is incomplete")
 	}

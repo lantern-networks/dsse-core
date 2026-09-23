@@ -424,6 +424,17 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 					"both the registry and the trust set when they apply the next config bundle")
 		}
 		registry.BeginTrustWithdrawal(tenantID, fingerprint)
+		if tenantCARegistryShared == nil {
+			if err := registry.SavePendingWithdrawals(registryPath); err != nil {
+				logInfof("tenant_ca_withdrawal_intent_unconfirmed tenant=%s err=%v", tenantID, err)
+				if pending && !targetExists {
+					tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", true)
+				} else {
+					tenantCAWithdrawalIntentFailure(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw")
+				}
+				return
+			}
+		}
 		removed, remaining := registry.WithdrawAnchor(tenantID, fingerprint)
 		if !removed && !pending {
 			// Unreachable via the existence check above, and reported rather than ignored: it would mean the
@@ -522,7 +533,19 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		for _, key := range gone {
 			registry.BeginWithdrawal(tenantID, key)
 		}
+		alreadyApplied := len(gone) == 0 && len(registry.PendingWithdrawals(tenantID)) != 0
 		gone = append(gone, registry.PendingWithdrawals(tenantID)...)
+		if tenantCARegistryShared == nil {
+			if err := registry.SavePendingWithdrawals(registryPath); err != nil {
+				logInfof("tenant_ca_withdrawal_intent_unconfirmed tenant=%s err=%v", tenantID, err)
+				if alreadyApplied {
+					tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", true)
+				} else {
+					tenantCAWithdrawalIntentFailure(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw")
+				}
+				return
+			}
+		}
 		removed := registry.Withdraw(tenantID)
 		durable := true
 		if err := persistTenantCARegistry(registry, registryPath, gone...); err != nil {
@@ -594,4 +617,16 @@ func tenantCAWithdrawalPartial(w http.ResponseWriter, r *http.Request, writer *l
 	a.Metadata["reason_codes"] = []string{"tenant_ca_withdrawal_incomplete"}
 	_ = appendAdminAudit(r.Context(), writer, outbox, a, now)
 	writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": tenantID, "durable": false, "still_trusted": stillTrusted, "error": "CA attribution was removed on this server, but withdrawal is incomplete. Restore storage and retry the same withdrawal before restarting. Fleet withdrawal is not confirmed."})
+}
+
+func tenantCAWithdrawalIntentFailure(w http.ResponseWriter, r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, tenantID, action string) {
+	now := time.Now()
+	a := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, action, evaluator, now)
+	result := "error"
+	a.Result = &result
+	a.Metadata["applied"] = false
+	a.Metadata["durable"] = false
+	a.Metadata["reason_codes"] = []string{"tenant_ca_withdrawal_intent_unconfirmed"}
+	_ = appendAdminAudit(r.Context(), writer, outbox, a, now)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "error", "applied": false, "tenant_id": tenantID, "durable": false, "error": "Withdrawal was not started because its recovery record could not be confirmed. Restore storage and retry the same operation. An on-disk recovery record may still block startup."})
 }

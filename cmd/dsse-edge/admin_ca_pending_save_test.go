@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/tenantca"
@@ -39,6 +42,20 @@ func TestTenantCAPartialWithdrawalBlocksUnrelatedSave(t *testing.T) {
 	if w := doTenantCARequest(t, h, "DELETE", endpoint, nil); w.Code != 500 {
 		t.Fatal(w.Code, w.Body)
 	}
+	prepared, err := os.ReadFile(registryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initialDoc, pendingDoc tenantca.TenantCARegistryFile
+	if err = json.Unmarshal(before, &initialDoc); err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(prepared, &pendingDoc); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(initialDoc.Tenants, pendingDoc.Tenants) || len(pendingDoc.PendingWithdrawals) != 1 {
+		t.Fatal("intent lost original anchors")
+	}
 	if err = os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -73,12 +90,12 @@ func TestTenantCAPartialWithdrawalBlocksUnrelatedSave(t *testing.T) {
 		t.Fatal("bare save forgot incomplete withdrawal")
 	}
 	after, err := os.ReadFile(registryPath)
-	if err != nil || !bytes.Equal(before, after) {
+	if err != nil || !bytes.Equal(prepared, after) {
 		t.Fatal("withdrawal recovery target lost", err)
 	}
 	fresh, err := tenantca.LoadTenantCARegistry(registryPath)
-	if err != nil || fresh.Registrations()["tenant_northwind"] != 2 {
-		t.Fatal("restart cannot identify outgoing CA", err)
+	if !errors.Is(err, tenantca.ErrPendingWithdrawal) || fresh != nil {
+		t.Fatal("restart did not refuse the unfinished withdrawal", err)
 	}
 	if w := doTenantCARequest(t, h, "DELETE", endpoint, nil); w.Code != 200 {
 		t.Fatal(w.Code, w.Body)

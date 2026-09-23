@@ -324,21 +324,41 @@ restore storage, and retry the same single-anchor DELETE before restarting.
 While that withdrawal is unfinished, other CA registration changes return `503`;
 a tenant-wide attribution deletion cannot finish a single-anchor trust removal.
 
-If the process already stopped, keep it out of device-serving traffic while
-reconciling the registry and device-trust files against the failed operation and
-its audit record. The process-local withdrawal receipt does not survive restart:
-the last saved registry may still contain the old CA, so startup can restore its
-attribution. Do not interpret the loss of the pending flag as completion. If the
-original CA is still attributed to the original tenant, restore the normal
-withdrawal prerequisites and retry the same DELETE. Confirm its absence from
-both saved stores and check the success audit before returning to service. If
-ownership is absent, inconsistent, or uncertain, leave serving stopped and
-reconcile the authoritative records; do not assign ownership from a fingerprint
-alone or assume a `404` proves that device trust was removed.
+For a file-backed author, the registry now saves a `pending_withdrawals` record
+before changing attribution or device trust. If this first save cannot be
+confirmed, a new withdrawal returns `503` with `applied: false`; neither live
+attribution nor trust is changed. A retry of an already-applied partial withdrawal
+continues to report that partial state. A recovery record can be present on disk
+even when its save returned an error. The same operation remains retryable in the
+running process. Only completion of the trust stage and the final registry save
+removes the record. Writes use flushed temporary files and durable replacement;
+filesystems that cannot confirm replacement are treated as failures.
 
-This is manual recovery, not a durable withdrawal journal or an atomic update
-across both stores. It does not establish fleet propagation or recovery from an
-unknown database commit. Keep other CA writers stopped during reconciliation.
+If the process stops with a pending record, startup refuses to load that registry,
+including when it is used as a config-pulling Edge's cache. Importing that snapshot
+also refuses it. This prevents an old saved attribution from silently returning
+to service. It does not replay the withdrawal automatically. Keep all writers and
+device serving stopped, preserve both stores and the failed operation's records,
+and reconcile the named tenant and certificate with authoritative ownership.
+For a single-anchor withdrawal, the completed state must exclude that certificate
+from both attribution and device trust. A tenant-wide attribution deletion does
+not itself remove device trust. Preserve unrelated tenants and anchors. Remove
+the pending record only after both saved stores have been reconciled and their
+writes confirmed, then verify the loaded state before returning to service. If
+the operation or ownership is uncertain, retain the record and leave serving
+stopped. Do not simply delete the record or downgrade to a reader that ignores it.
+
+Weak shared backends still retain only a process-local withdrawal receipt. Their
+last saved registry may restore the old attribution on restart. Keep such nodes
+out of device-serving traffic during reconciliation; do not treat a lost pending
+flag or a `404` as proof that device trust was removed. If the original CA remains
+attributed to its verified original tenant, restore the withdrawal prerequisites
+and retry the same DELETE, then inspect both saved stores and the success audit.
+
+The file record is a startup interlock, not an atomic update across both stores
+or a guarantee of fleet propagation. Automatic restart recovery, weak-backend
+receipt durability, and recovery from an unknown database commit remain separate
+boundaries. The transactional shared-authority path is unchanged.
 
 ## Ambiguous device-CA ownership at startup
 

@@ -191,8 +191,16 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: "enrolled_identities", Count: int64(len(removed))})
 		}
 	}
+	var logFootprint []adminTenantFootprintRow
 	if writer != nil {
 		files, err := purgeTenantLogDirectoryWithHold(ctx, writer, tenantID, holds)
+		remaining := adminTenantFootprintRow{Store: "log_files", Count: 0, Note: "absence verified by the file erasure owner"}
+		if err != nil {
+			remaining.Count = -1
+			remaining.Note = ""
+			remaining.Error = "file erasure or verification is unconfirmed; reconcile after the original owner ends"
+		}
+		logFootprint = append(logFootprint, remaining)
 		row := adminTenantPurgeRow{Store: "log_files", Count: files}
 		if err != nil {
 			row.Error = err.Error()
@@ -251,7 +259,7 @@ func purgeAdminTenantData(ctx context.Context, node, tenantID string, db *sql.DB
 	}
 
 	closeErasure()
-	result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now)
+	result.Remaining = countAdminTenantFootprint(ctx, node, tenantID, db, writer, credentials, ledger, rules, deviceCAs, namedNetworks, extra, now, logFootprint...)
 	result.Complete = len(result.Failures) == 0 && result.Remaining.Clean()
 	result.ElapsedMS = time.Since(started).Milliseconds()
 	log.Printf("tenant %q purged on this node: erased %d store(s), %d failure(s), complete=%v",
@@ -315,17 +323,53 @@ func purgeTenantRows(ctx context.Context, db *sql.DB, table, tenantID string, ho
 // file descriptor, unlinking the path leaves the bytes alive until the process lets go, and an erasure that
 // depends on a later restart is not an erasure.
 func purgeTenantLogDirectory(writer *logs.Writer, tenantID string) (int64, error) {
+	return purgeTenantLogDirectoryContext(context.Background(), writer, tenantID)
+}
+
+func purgeTenantLogDirectoryContext(ctx context.Context, writer *logs.Writer, tenantID string) (int64, error) {
 	if writer == nil {
 		return 0, nil
 	}
 	root := filepath.Join(writer.Dir(), "tenants", logs.SafeTenantSegment(tenantID))
-	files, _, err := countTenantLogFiles(writer.Dir(), tenantID)
+	return eraseTenantLogFiles(ctx,
+		func() (int64, error) { n, _, err := countTenantLogFiles(writer.Dir(), tenantID); return n, err },
+		func() error { return writer.CloseTenant(tenantID) },
+		func() error { return os.RemoveAll(root) })
+}
+
+// Each callback is a single filesystem phase. Check cancellation between phases
+// so a late Close cannot start deletion after its request has already returned.
+// Verify absence under the same owner rather than reopening the filesystem later
+// from the response's footprint collector.
+func eraseTenantLogFiles(ctx context.Context, count func() (int64, error), closeFiles, remove func() error) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	files, err := count()
 	if err != nil {
 		return 0, err
 	}
-	writer.CloseTenant(tenantID)
-	if err := os.RemoveAll(root); err != nil {
+	if err := ctx.Err(); err != nil {
 		return 0, err
+	}
+	if err := closeFiles(); err != nil {
+		return 0, fmt.Errorf("log handles could not be closed: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := remove(); err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	remaining, err := count()
+	if err != nil {
+		return 0, err
+	}
+	if remaining != 0 {
+		return 0, fmt.Errorf("log files remain after erasure")
 	}
 	return files, nil
 }

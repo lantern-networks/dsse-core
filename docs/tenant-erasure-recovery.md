@@ -117,5 +117,16 @@ and partial response after the old worker has ended.
 Do not edit that file, clear a marker, or start a replacement owner while the old
 worker might resume. Follow the stop/termination and reconciliation procedure
 above. If actual I/O termination cannot be established, keep deletion paused.
-This budget covers marker I/O callers, not every resource operation in a purge;
-file-handle closing, directory removal and footprint reads are separate boundaries.
+The file-erasure phase also uses a five-second budget (or earlier request
+cancellation), covering its initial inventory, handle closing, directory removal
+and absence verification. Its worker owns exclusion until the actual call returns.
+Cancellation between phases prevents a late close from starting removal; a close
+error also prevents removal. Cancellation during removal does not undo removed data.
+An unconfirmed result reports a remaining file count of -1, not zero. The purge
+response uses the file owner's verified or unknown result instead of repeating a
+potentially blocked filesystem inventory. Reconcile after the old owner ends and
+retry under the recovery procedure above.
+
+These are caller budgets, not operating-system cancellation guarantees or an
+end-to-end deadline for every store in a purge. The standalone footprint endpoint
+is not covered by the file-erasure worker.

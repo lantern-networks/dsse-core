@@ -123,7 +123,7 @@ var adminTenantFootprintPostgresTables = []string{
 // the counts from the others.
 func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *sql.DB, writer *logs.Writer,
 	credentials *localAdminCredentialStore, ledger *enrolledinventory.Ledger, rules *policyrule.Store,
-	deviceCAs *tenantca.TenantCARegistry, namedNetworks *vlan.Store, extra adminTenantExtraStores, now time.Time) adminTenantFootprint {
+	deviceCAs *tenantca.TenantCARegistry, namedNetworks *vlan.Store, extra adminTenantExtraStores, now time.Time, purgedLogs ...adminTenantFootprintRow) adminTenantFootprint {
 
 	footprint := adminTenantFootprint{
 		TenantID:   strings.TrimSpace(tenantID),
@@ -181,7 +181,11 @@ func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *s
 	// organization authored or something said ABOUT its devices, and each therefore belongs in "what is left".
 	extra.count(&footprint)
 
-	if writer != nil {
+	// A purge supplies its owner's verified absence or unknown result. Do not
+	// re-enter a filesystem that may still have an outstanding destructive call.
+	if len(purgedLogs) != 0 {
+		footprint.add(purgedLogs[0])
+	} else if writer != nil {
 		files, bytes, err := countTenantLogFiles(writer.Dir(), footprint.TenantID)
 		row := adminTenantFootprintRow{Store: "log_files", Count: files, Note: fmt.Sprintf("%d byte(s) on this node's disk", bytes)}
 		if err != nil {

@@ -25,7 +25,7 @@ import (
 // rowFormat marks a row that carries report receipts beside the flows. A row without receipts is still written
 // in the original shape (a tenant map), which is what earlier builds read. v3 makes older readers refuse
 // receipts with gaps rather than silently treating the high watermark as a contiguous prefix.
-const rowFormat = "eastwest_observations.v3"
+const rowFormat = "eastwest_observations.v4"
 
 // receiptRetention bounds the receipts kept. Every Edge process start is a new reporter, so without a bound the
 // receipts would grow with the fleet's history. A report replayed after its receipt is gone would be counted
@@ -50,7 +50,7 @@ func splitRow(raw []byte) ([]byte, map[string]ReportReceipt, error) {
 	if f, ok := probe["format"]; !ok || json.Unmarshal(f, &format) != nil {
 		return raw, nil, nil // a tenant map: every value is an object, never a string
 	}
-	if (format != rowFormat && format != "eastwest_observations.v2") || len(probe) != 3 || probe["flows"] == nil || probe["receipts"] == nil {
+	if (format != rowFormat && format != "eastwest_observations.v3" && format != "eastwest_observations.v2") || len(probe) != 3 || probe["flows"] == nil || probe["receipts"] == nil {
 		return nil, nil, fmt.Errorf("unknown observation row format")
 	}
 	var receipts map[string]ReportReceipt
@@ -145,6 +145,10 @@ func (s *Store) ApplyReport(ctx context.Context, tenantID, reporter string, seq 
 			if e != nil {
 				return nil, e
 			}
+			nextReceipt, err := receipts[reporter].Applied(seq, now)
+			if err != nil {
+				return nil, err
+			}
 			if receipts[reporter].Contains(seq) {
 				duplicate = true
 				return nil, errReportAlreadyApplied
@@ -156,7 +160,7 @@ func (s *Store) ApplyReport(ctx context.Context, tenantID, reporter string, seq 
 			if receipts == nil {
 				receipts = map[string]ReportReceipt{}
 			}
-			receipts[reporter] = receipts[reporter].Applied(seq, now)
+			receipts[reporter] = nextReceipt
 			pruneReceipts(receipts, now)
 			next = flows
 			return encodeRow(flows, receipts)
@@ -176,6 +180,10 @@ func (s *Store) ApplyReport(ctx context.Context, tenantID, reporter string, seq 
 		s.pruneLocked(now)
 		return true, nil
 	}
+	nextReceipt, err := s.receipts[reporter].Applied(seq, now)
+	if err != nil {
+		return false, err
+	}
 	if s.receipts[reporter].Contains(seq) {
 		return false, nil
 	}
@@ -185,7 +193,7 @@ func (s *Store) ApplyReport(ctx context.Context, tenantID, reporter string, seq 
 	if s.receipts == nil {
 		s.receipts = map[string]ReportReceipt{}
 	}
-	s.receipts[reporter] = s.receipts[reporter].Applied(seq, now)
+	s.receipts[reporter] = nextReceipt
 	pruneReceipts(s.receipts, now)
 	s.pruneLocked(now)
 	s.dirty = true

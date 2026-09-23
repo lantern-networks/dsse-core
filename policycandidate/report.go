@@ -46,7 +46,7 @@ type ReportReceipt = reportreceipt.Receipt
 
 // rowFormat marks a row carrying report receipts beside the candidates. A row without receipts keeps the original
 // shape (a tenant map), which earlier builds read. v3 prevents older readers from silently ignoring gaps.
-const rowFormat = "policy_candidates.v3"
+const rowFormat = "policy_candidates.v4"
 
 // receiptRetention bounds the receipts: every Edge process start is a new reporter. A report replayed after its
 // receipt is gone would be counted again; a sender does not hold an unacknowledged report for a month.
@@ -69,7 +69,7 @@ func decodeCandidateRow(data []byte) (map[string]map[string]Candidate, map[strin
 		snapshot, err := decodeCandidateSnapshot(data) // a tenant map: every value is an object, never a string
 		return snapshot, nil, err
 	}
-	if (format != rowFormat && format != "policy_candidates.v2") || len(probe) != 3 || probe["candidates"] == nil || probe["receipts"] == nil {
+	if (format != rowFormat && format != "policy_candidates.v3" && format != "policy_candidates.v2") || len(probe) != 3 || probe["candidates"] == nil || probe["receipts"] == nil {
 		return nil, nil, errInvalidSnapshot
 	}
 	var receipts map[string]ReportReceipt
@@ -195,6 +195,10 @@ func (store *Store) ApplyReport(ctx context.Context, tenantID, reporter string, 
 	now = now.UTC()
 
 	apply := func(candidates map[string]map[string]Candidate, receipts map[string]ReportReceipt) (map[string]ReportReceipt, error) {
+		nextReceipt, err := receipts[reporter].Applied(seq, now)
+		if err != nil {
+			return nil, err
+		}
 		if receipts[reporter].Contains(seq) {
 			return nil, errReportAlreadyApplied
 		}
@@ -207,7 +211,7 @@ func (store *Store) ApplyReport(ctx context.Context, tenantID, reporter string, 
 		if receipts == nil {
 			receipts = map[string]ReportReceipt{}
 		}
-		receipts[reporter] = receipts[reporter].Applied(seq, now)
+		receipts[reporter] = nextReceipt
 		pruneReceipts(receipts, now)
 		return receipts, nil
 	}

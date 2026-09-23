@@ -21,6 +21,7 @@ import (
 	"github.com/lantern-networks/dsse-core/eastwestobserve"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/policycandidate"
+	"github.com/lantern-networks/dsse-core/reportreceipt"
 )
 
 // observation_report.go — the traffic an Edge observes is held by the control plane.
@@ -391,7 +392,8 @@ func isObservationReportStream(stream string) bool {
 // applyObservationReport folds one shipped report into the store before the shipment is acknowledged, and
 // answers the status the shipper acts on: 400 sets a malformed record aside, 503 keeps it at the head of the
 // queue until the store takes it (a standby control plane, a database away), 202 includes a report that was
-// already applied.
+// already applied. A 422 refuses a report outside the retained replay window without
+// claiming that its observations were applied.
 //
 // The receipt is keyed by the shipping certificate's identity as well as the reporter, so an Edge cannot claim
 // another Edge's reporter and advance its receipts past reports that have not arrived.
@@ -431,6 +433,8 @@ func applyObservationReport(ctx context.Context, sink observationReportSink, str
 	switch {
 	case err == nil:
 		return http.StatusAccepted, nil
+	case errors.Is(err, reportreceipt.ErrExpired):
+		return http.StatusUnprocessableEntity, err
 	case errors.Is(err, eastwestobserve.ErrInvalidReport), errors.Is(err, policycandidate.ErrInvalidReport):
 		return http.StatusBadRequest, err
 	default:

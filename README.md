@@ -23,6 +23,13 @@ A successful installation check is not evidence of long-duration reliability or 
 security audit. It has not been independently run at length by anyone who did not write it.
 See the [threat model](docs/threat-model.md) and each platform's limitations.
 
+## Maintenance status
+
+Development of 0.3.1 is focused on everyday reliability. See
+[maintenance and 0.3.1 progress](docs/maintenance.md) for implemented fixes,
+remaining release checks and the target week. Development changes are not yet
+part of the published 0.3.0 experimental release.
+
 ## Why we built it
 
 Lantern DSSE grew out of work on ransomware defense: if a device is compromised,

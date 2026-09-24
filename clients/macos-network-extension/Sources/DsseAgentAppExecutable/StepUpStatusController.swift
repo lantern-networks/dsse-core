@@ -27,7 +27,7 @@ final class StepUpStatusController: NSObject, UNUserNotificationCenterDelegate, 
     private let armedSymbol = "lock.shield.fill"
 
     // install builds the menu-bar item and requests notification authorization. Must run on the main thread.
-    func install() {
+    @MainActor func install() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = item.button {
             button.image = NSImage(systemSymbolName: idleSymbol, accessibilityDescription: "Lantern DSSE")
@@ -110,7 +110,7 @@ final class StepUpStatusController: NSObject, UNUserNotificationCenterDelegate, 
         }
     }
 
-    @objc private func openPortal() {
+    @MainActor @objc private func openPortal() {
         guard let url = pendingURL else { return }
         DsseAgentLog("stepup: opening branded OOB auth window for host=\(Self.destination(from: url))")
         // Task #7 UX: open the Lantern DSSE-branded app-owned window (WKWebView hosting the real IdP) instead of
@@ -127,7 +127,7 @@ final class StepUpStatusController: NSObject, UNUserNotificationCenterDelegate, 
         }
     }
 
-    private func setSymbol(_ name: String) {
+    @MainActor private func setSymbol(_ name: String) {
         statusItem?.button?.image = NSImage(systemSymbolName: name, accessibilityDescription: "Lantern DSSE")
         statusItem?.button?.image?.isTemplate = true
     }

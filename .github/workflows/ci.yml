@@ -31,6 +31,8 @@ jobs:
           # pinned in two places drifts the moment one of them moves.
           go-version-file: go.mod
           check-latest: true
+      - name: Download Go modules
+        run: go mod download
       # ★ THE WINDOWS BINARIES ARE BUILT AS WINDOWS. Three packages under clients/windows-wfp keep main() in
       # *_windows.go, so `go build ./...` on a Linux runner reports "function main is undeclared" for them —
       # always, on a healthy tree. Left as one blanket build, CI would have been red from the first push, and

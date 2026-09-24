@@ -65,7 +65,7 @@ async function paLoadPeople() {
     paGet("/admin/human-identities/sources/health", _PA_DIR),
     paGet("/admin/human-identities/sources", _PA_DIR),
     paGet("/admin/human-identities/import-runs", _PA_DIR),
-    paGet("/admin/human-identities", _PA_DIR),
+    paLoadDirectoryPages(),
     paGet("/admin/risk-signals?entity_type=user", _PA_DIR),
   ]);
   const sources = paArray(sourceBody, "sources"), runs = paArray(runBody, "runs"), people = paArray(peopleBody, "identities");
@@ -80,6 +80,22 @@ async function paLoadPeople() {
       !people.every(person => person.tenant_id === risk.tenant_id) ||
       !Object.values(risk.high_risk).every(value => ["medium", "high", "critical"].includes(value))) throw new Error("Invalid directory response");
   return {health, sources, runs, people, riskMap: risk.high_risk};
+}
+// Search and row actions operate on the whole directory, not just the API's
+// first (default 200-entry) page. Do not display a partial list if a page fails.
+async function paLoadDirectoryPages() {
+  const identities = [], cursors = new Set();
+  let cursor = "";
+  do {
+    const body = await paGet("/admin/human-identities" + (cursor ? "?cursor=" + encodeURIComponent(cursor) : ""), _PA_DIR);
+    identities.push(...paArray(body, "identities"));
+    const next = body.next_cursor;
+    if (next != null && typeof next !== "string") throw new Error("Invalid directory response");
+    cursor = next || "";
+    if (cursor && cursors.has(cursor)) throw new Error("Invalid directory response");
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return {identities};
 }
 function paMutationError(r) {
   const detail = r && r.body && (r.body.error || r.body.message);

@@ -201,3 +201,22 @@ test('a partial outcome only confirms the matching tenant and policy with explic
  for(const changed of [{policy_id:'other'},{tenant_id:'other'},{applied:'true'},{applied:false},{status:'success'},{ne_snapshot_status:'published'}])assert.throws(()=>f.context.paConfirmBoundary({ok:false,status:500,body:{...body,...changed}},expected),/^Error: unconfirmed generic outcome$/);
  assert.throws(()=>f.context.paConfirmBoundary({ok:false,status:400,body},expected),/^Error: unconfirmed generic outcome$/);
 });
+
+test('directory follows every cursor so people beyond the first 200 can be searched and removed',async()=>{
+ const f=fixture();const people=Array.from({length:405},(_,i)=>({...person,id:`person-${String(i+1).padStart(3,'0')}`,subject:`person-${i+1}`,display_name:`Person ${i+1}`}));
+ const pages=new Map([[paths[3],{identities:people.slice(0,200),next_cursor:'page+2='}],[paths[3]+'?cursor=page%2B2%3D',{identities:people.slice(200,400),next_cursor:'page3'}],[paths[3]+'?cursor=page3',{identities:people.slice(400)}]]);
+ f.invokeWith(async(m,p,body)=>({ok:true,body:m==='POST'?body:pages.get(p)||bodyFor(p)}));await f.context.paPeople(f.host);
+ const reads=f.calls.filter(c=>pages.has(c.path));assert.equal(reads.length,3);assert.ok(reads.every(c=>c.plane==='control'));
+ const search=f.host.querySelectorAll('input')[0];search.value='Person 405';search.input();assert.match(f.host.textContent,/Person 405/);assert.equal(buttons(f.host).filter(b=>b.textContent==='Remove').length,1);
+ f.mockRefresh();await button(f.host,'Remove').click();assert.deepEqual(json(f.calls.find(c=>c.method==='POST').body),{...people[404],status:'deleted'});
+});
+test('a later directory page failure offers Retry without presenting a partial directory',async()=>{
+ const f=fixture();let failing=true;
+ f.invokeWith(async(m,p)=>p===paths[3]?{ok:true,body:{identities:[person],next_cursor:'next'}}:p===paths[3]+'?cursor=next'?failing?{ok:false,status:503}:{ok:true,body:{identities:[{...person,id:'bob',subject:'bob'}]}}:{ok:true,body:bodyFor(p)});
+ await f.context.paPeople(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(buttons(f.host).length,0);
+ failing=false;await f.states.at(-1).retry.onClick();assert.match(f.host.textContent,/bob/);
+});
+test('a repeated directory cursor stops instead of looping or presenting duplicates',async()=>{
+ const f=fixture();f.invokeWith(async(m,p)=>p.startsWith(paths[3])&&!p.includes('/sources')&&!p.includes('/import-runs')?{ok:true,body:{identities:[person],next_cursor:'same'}}:{ok:true,body:bodyFor(p)});
+ await f.context.paPeople(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(f.calls.filter(c=>c.path.includes('?cursor=')).length,1);
+});

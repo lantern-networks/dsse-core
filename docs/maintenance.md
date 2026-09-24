@@ -54,10 +54,12 @@ In Sites, connector routes now offer hostname and Named Network bindings in line
 with the existing administration API. A subnet entered directly is retained with
 guidance to define it on the Networks page; connector-reported routes are shown
 as information without Adopt or Hold controls that the API rejects. Existing
-configured bindings can still be removed. Local browser checks covered add,
-reload, removal, stored routes and audit records using a synthetic connector;
-real connector traffic and independent control-plane/Edge propagation remain
-release checks. This correction is not in the published 0.3.0 release.
+configured bindings can still be removed. Local browser checks with a synthetic
+connector covered add, reload, removal, stored routes and audit records against
+the development server. The public server's rejection contract was checked
+separately; its storage and audit behavior has not been browser-checked for this
+change. Real connector traffic and independent control-plane/Edge propagation
+remain release checks. This correction is not in the published 0.3.0 release.
 
 ## What still blocks 0.3.1
 

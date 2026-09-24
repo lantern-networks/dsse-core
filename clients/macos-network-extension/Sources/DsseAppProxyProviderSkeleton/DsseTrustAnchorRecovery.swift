@@ -186,7 +186,10 @@ public enum DsseTrustAnchorRecovery {
     }
 
     private final class ChainCaptureDelegate: NSObject, URLSessionDelegate {
-        var chain: [SecCertificate] = []
+        // The delegate callback can finish after the waiting caller times out.
+        // Reuse the synchronized capture used by the Network.framework probe.
+        private let captured = ChainBox()
+        var chain: [SecCertificate] { captured.value() }
         func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
                         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
             guard challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
@@ -195,7 +198,7 @@ public enum DsseTrustAnchorRecovery {
                 return
             }
             if let certs = SecTrustCopyCertificateChain(trust) as? [SecCertificate] {
-                chain = certs
+                captured.set(certs)
             }
             // Reading the chain is the whole purpose; the connection itself is then abandoned.
             completionHandler(.cancelAuthenticationChallenge, nil)

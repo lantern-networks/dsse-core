@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -12,17 +13,17 @@ import (
 // default. CRUD + set-default; the RP client secret is redacted on read. Model + storage live in dsse-core
 // (idpregistry); this is the product edge's admin surface over it. See
 // docs/idp_federated_authentication_design.md.
-func registerIdPConnectionsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *idpregistry.Store, configSourceURL string) {
+func registerIdPConnectionsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *idpregistry.Store, configSourceURL string, record func(*http.Request, string, string, string)) {
 	mux.HandleFunc("GET /admin/idp-connections", adminEndpoint("admin.idp.read", func(w http.ResponseWriter, r *http.Request) {
 		tenant := adminTenantIDFromRequest(r)
-		conns := store.List(tenant)
+		conns, defaultID, err := store.TenantSnapshot(tenant)
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
 		redacted := make([]idpregistry.Connection, 0, len(conns))
 		for _, c := range conns {
 			redacted = append(redacted, c.Redacted())
-		}
-		defaultID := ""
-		if d, ok := store.Default(tenant); ok {
-			defaultID = d.IdPID
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"connections":    redacted,
@@ -54,11 +55,12 @@ func registerIdPConnectionsAdmin(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		conn.TenantID = tenantForWrite
-		stored, err := store.Upsert(conn)
+		stored, err := store.UpsertContext(r.Context(), conn)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForIdPStoreError(err), err)
 			return
 		}
+		record(r, stored.TenantID, stored.IdPID, "upserted")
 		writeJSON(w, http.StatusOK, stored.Redacted())
 	}))
 
@@ -70,15 +72,16 @@ func registerIdPConnectionsAdmin(mux *http.ServeMux, adminEndpoint func(string, 
 		if configWriteRejectedWhenSourced(w, configSourceURL, "an identity-provider connection") {
 			return
 		}
-		ok, err := store.Delete(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForIdPStoreError(err), err)
 			return
 		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("idp connection not found"))
 			return
 		}
+		record(r, adminTenantIDFromRequest(r), r.PathValue("id"), "deleted")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 
@@ -90,10 +93,11 @@ func registerIdPConnectionsAdmin(mux *http.ServeMux, adminEndpoint func(string, 
 		if configWriteRejectedWhenSourced(w, configSourceURL, "an identity-provider connection") {
 			return
 		}
-		if err := store.SetDefault(adminTenantIDFromRequest(r), r.PathValue("id")); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		if err := store.SetDefaultContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id")); err != nil {
+			writeError(w, statusForIdPStoreError(err), err)
 			return
 		}
+		record(r, adminTenantIDFromRequest(r), r.PathValue("id"), "default_set")
 		writeJSON(w, http.StatusOK, map[string]string{"status": "default_set", "id": r.PathValue("id")})
 	}))
 
@@ -102,11 +106,31 @@ func registerIdPConnectionsAdmin(mux *http.ServeMux, adminEndpoint func(string, 
 	// full login. A safe, idempotent, side-effect-free READ — GET (so it uses the same auth path as the other
 	// reads, with no mutating-method CSRF requirement). admin.idp.read.
 	mux.HandleFunc("GET /admin/idp-connections/{id}/test", adminEndpoint("admin.idp.read", func(w http.ResponseWriter, r *http.Request) {
-		conn, ok := store.Get(adminTenantIDFromRequest(r), r.PathValue("id"))
+		rows, _, err := store.TenantSnapshot(adminTenantIDFromRequest(r))
+		if err != nil {
+			writeError(w, 500, err)
+			return
+		}
+		var conn idpregistry.Connection
+		ok := false
+		for _, c := range rows {
+			if c.IdPID == r.PathValue("id") {
+				conn = c
+				ok = true
+				break
+			}
+		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("idp connection not found"))
 			return
 		}
 		writeJSON(w, http.StatusOK, testIdPConnection(conn))
 	}))
+}
+
+func statusForIdPStoreError(err error) int {
+	if errors.Is(err, idpregistry.ErrPersistence) {
+		return http.StatusInternalServerError
+	}
+	return http.StatusBadRequest
 }

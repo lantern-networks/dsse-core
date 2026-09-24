@@ -1,9 +1,12 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/ecdsa"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -26,6 +29,7 @@ type licenseStore struct {
 	payload            *vendorlicense.Payload
 	lastAcceptedSerial int64
 	persister          blobstore.Persister
+	loadErr            error
 }
 
 type licenseState struct {
@@ -38,54 +42,163 @@ type licenseState struct {
 
 const licenseStateSchema = "dsse.vendor_license_state.v1"
 
+var errLicensePersistence = errors.New("license persistence failed")
+
 func newLicenseStore() *licenseStore { return &licenseStore{} }
 
-func (s *licenseStore) SetPersister(p blobstore.Persister) {
-	if s == nil || p == nil {
-		return
+var errLicenseLoad = errors.New("cannot read license snapshot")
+
+func decodeLicenseState(raw []byte) (licenseState, error) {
+	var st licenseState
+	if err := json.Unmarshal(raw, &st); err != nil || st.SchemaVersion != licenseStateSchema || st.LastAcceptedSerial <= 0 || st.Envelope == nil || st.Envelope.Signature == "" {
+		return st, errLicenseLoad
+	}
+	body, err := base64.StdEncoding.DecodeString(st.Envelope.PayloadB64)
+	if err != nil {
+		return st, errLicenseLoad
+	}
+	var payload vendorlicense.Payload
+	if json.Unmarshal(body, &payload) != nil || payload.Serial != st.LastAcceptedSerial {
+		return st, errLicenseLoad
+	}
+	return st, nil
+}
+func (s *licenseStore) SetPersister(p blobstore.Persister) error {
+	if s == nil {
+		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
-	data, err := p.Load()
-	if err != nil || len(data) == 0 {
-		return
+	return s.loadLocked(p)
+}
+func (s *licenseStore) ReloadFromStore() error {
+	if s == nil {
+		return nil
 	}
-	var st licenseState
-	if err := json.Unmarshal(data, &st); err != nil {
-		// Keep nothing rather than half a licence, but do NOT forget the serial silently — say so, because a
-		// forgotten high-water mark is what lets an older file back in.
-		log.Printf("vendor_license persist: load failed; the accepted-serial high-water mark may be lost: %v", err)
-		return
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadLocked(s.persister)
+}
+func (s *licenseStore) loadLocked(p blobstore.Persister) error {
+	if p == nil {
+		return s.loadErr
+	}
+	data, err := p.Load()
+	if err != nil {
+		s.loadErr = errLicenseLoad
+		return s.loadErr
+	}
+	if data == nil {
+		if s.lastAcceptedSerial != 0 || s.loadErr != nil {
+			s.loadErr = errLicenseLoad
+			return s.loadErr
+		}
+		s.persister = p
+		return nil
+	}
+	st, err := decodeLicenseState(data)
+	if err != nil || st.LastAcceptedSerial < s.lastAcceptedSerial {
+		s.loadErr = errLicenseLoad
+		return s.loadErr
 	}
 	s.envelope = st.Envelope
 	s.lastAcceptedSerial = st.LastAcceptedSerial
+	s.payload = nil
+	s.persister = p
+	s.loadErr = nil
+	return nil
+}
+func (s *licenseStore) Health() error {
+	if s == nil {
+		return errLicenseLoad
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.loadErr
 }
 
 // Apply verifies a licence and records it as the one in force. Verification is not optional and not skippable:
 // an unverified licence is a number an attacker chose.
 func (s *licenseStore) Apply(env vendorlicense.Envelope, accepted []*ecdsa.PublicKey, expectedMSSPID, by, now string) (vendorlicense.Payload, error) {
+	return s.ApplyContext(context.Background(), env, accepted, expectedMSSPID, by, now)
+}
+
+func (s *licenseStore) ApplyContext(ctx context.Context, env vendorlicense.Envelope, accepted []*ecdsa.PublicKey, expectedMSSPID, by, now string) (vendorlicense.Payload, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadErr != nil {
+		return vendorlicense.Payload{}, errLicenseLoad
+	}
+	if updater, ok := s.persister.(interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}); ok {
+		return s.applySharedLocked(ctx, updater, env, accepted, expectedMSSPID, by, now)
+	}
 	p, err := vendorlicense.Verify(env, accepted, expectedMSSPID, s.lastAcceptedSerial)
 	if err != nil {
 		return vendorlicense.Payload{}, err
 	}
-	s.envelope = &env
-	s.payload = &p
-	s.lastAcceptedSerial = p.Serial
 	if s.persister != nil {
 		data, mErr := json.Marshal(licenseState{
 			SchemaVersion: licenseStateSchema, Envelope: &env,
 			LastAcceptedSerial: p.Serial, AppliedAt: now, AppliedBy: by,
 		})
 		if mErr == nil {
-			if sErr := s.persister.Save(data); sErr != nil {
-				log.Printf("vendor_license persist: save failed: %v", sErr)
-			}
+			mErr = s.persister.Save(data)
+		}
+		if mErr != nil && (!errors.Is(mErr, blobstore.ErrSavedWithoutAtomicity) || errors.Is(mErr, blobstore.ErrDurabilityUnconfirmed)) {
+			log.Printf("vendor_license persist: save failed: %v", mErr)
+			return vendorlicense.Payload{}, errLicensePersistence
+		}
+		if mErr != nil {
+			log.Printf("vendor_license persist: saved without atomic replacement: %v", mErr)
 		}
 	}
+	// Do not consume the serial or change enrolment limits until storage confirms the save.
+	s.envelope = &env
+	s.payload = &p
+	s.lastAcceptedSerial = p.Serial
 	return p, nil
+}
+
+// Verification happens inside the shared-row transaction, using its serial
+// floor. The accepted request term owns this transaction through commit.
+func (s *licenseStore) applySharedLocked(ctx context.Context, updater interface {
+	UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+}, env vendorlicense.Envelope, accepted []*ecdsa.PublicKey, mssp, by, now string) (vendorlicense.Payload, error) {
+	var result vendorlicense.Payload
+	var ruleErr error
+	err := updater.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
+		floor := s.lastAcceptedSerial
+		if raw != nil {
+			st, err := decodeLicenseState(raw)
+			if err != nil {
+				return nil, err
+			}
+			if st.LastAcceptedSerial > floor {
+				floor = st.LastAcceptedSerial
+			}
+		} else if floor != 0 {
+			return nil, errLicenseLoad
+		}
+		var err error
+		result, err = vendorlicense.Verify(env, accepted, mssp, floor)
+		if err != nil {
+			ruleErr = err
+			return nil, err
+		}
+		return json.Marshal(licenseState{SchemaVersion: licenseStateSchema, Envelope: &env, LastAcceptedSerial: result.Serial, AppliedAt: now, AppliedBy: by})
+	})
+	if ruleErr != nil {
+		return vendorlicense.Payload{}, ruleErr
+	}
+	if err != nil {
+		return vendorlicense.Payload{}, errLicensePersistence
+	}
+	s.envelope = &env
+	s.payload = &result
+	s.lastAcceptedSerial = result.Serial
+	return result, nil
 }
 
 // ConfigGeneration is this store's term in the config bundle's version.
@@ -173,8 +286,11 @@ func (s *licenseStore) Current(accepted []*ecdsa.PublicKey, expectedMSSPID strin
 // issued enrolment token, POST /enroll answered 403 "enrolment is not available for this tenant".
 func (s *licenseStore) CurrentWithReason(accepted []*ecdsa.PublicKey, expectedMSSPID string) (vendorlicense.Payload, bool, error) {
 	s.mu.RLock()
-	env, serial := s.envelope, s.lastAcceptedSerial
+	env, serial, loadErr := s.envelope, s.lastAcceptedSerial, s.loadErr
 	s.mu.RUnlock()
+	if loadErr != nil {
+		return vendorlicense.Payload{}, false, loadErr
+	}
 	if env == nil {
 		return vendorlicense.Payload{}, false, nil
 	}

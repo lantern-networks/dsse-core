@@ -74,8 +74,21 @@ complete dependency analysis or an automatic release decision.
 
 A non-Any source or destination that resolves to nothing matches nothing. In
 PARTIAL ENFORCE such a failed match can fall through to the unmatched allow.
-Keep service references valid as well: an empty protocol selector on the compiled
-East-West rule is broad across recognized East-West families.
+A named service matches its configured transport/port pairs, not its display name.
+For example, a service named `Finance database` containing TCP/5432 does not also
+allow TCP/3306 or UDP/5432. Renaming the service does not change that condition.
+A deleted or unresolved named service matches nothing; only explicit **Any** removes
+the service restriction. This does not expand which service families enter the
+East-West layer. Legacy family-based API rules retain their family selectors.
+Upgrade all Edges before publishing transport/port-based compiled rules from an
+updated control plane. Older readers cannot apply these rules and see a nonmatching
+family guard instead of an unrestricted service. In partial mode, unmatched flows
+remain allowed; mixed-version enforcement is not an acceptance guarantee.
+
+Mode, legacy rules, and grant TTL changes submitted together are saved as one update.
+A refused or unconfirmed save returns an error and preserves the prior live policy.
+Reload the settings before retrying: an unconfirmed filesystem flush does not prove
+that disk contents stayed unchanged.
 
 The **Allow machines with no signed-in user** option is an explicit alternate
 path for Authenticate rules, disabled by default. Its attestation eligibility
@@ -251,3 +264,48 @@ Endpoint UI references: [Windows launcher](../clients/windows-wfp/steer/steer_st
 [Windows WebView2 host](../clients/windows-wfp/stepupwindow/main.go),
 [macOS notifications and menu](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpStatusController.swift),
 and [macOS WKWebView window](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpAuthWindow.swift).
+
+## Editing incoming exceptions
+
+The Incoming Connections service picker selects one **TCP port**, using the
+catalogue name as a label. For a service with several TCP ports, choose one port
+per exception. UDP services are not offered because the current Windows export
+cannot represent them. Non-TCP conditions are rejected by the exception API. Existing incompatible
+records must be disabled, deleted, or changed to a supported condition before
+a managed incoming policy can be exported.
+
+Editing an existing exception keeps its current service condition unless you
+explicitly choose another one. Reselect a catalogue service to replace an older
+condition that used a display name as its service family. **Any service** explicitly
+removes the service restriction. Owner-only edits retain disabled status, approval
+and session settings, and the exact expiry timestamp; changing the date sets
+midnight UTC for that date. Disabled and expired exceptions are excluded from export.
+
+Operator API users can target an authorized customer in a POST body. DELETE uses
+the current tenant context: enter that customer's context before deleting its
+exception. The domain audit belongs to the target customer and identifies the operator.
+
+The exception POST API preserves omitted fields on an existing ID, including
+source, device group, transport/port, disabled status, approval/session settings,
+and expiry. Explicit empty strings, zero, or false change those fields; `null`
+is rejected. New records require an ID, business owner and RFC3339 expiry.
+Validation and persistence complete before a change is reported as saved.
+
+The current `server_initiated_export.v1` consumer supports TCP family mappings
+and an explicit unconstrained service. It cannot enforce approval requirements
+or per-session lifetime limits. Active exceptions with those conditions, an
+unsupported transport/family, an invalid port, or a port without a transport are
+rejected on write. Disabled records can retain approval/session settings, but
+must be made representable before activation. This does not add UDP support.
+
+Both administrator and device export endpoints refuse the **entire managed
+policy** with HTTP 503 when an active stored record has an invalid expiry,
+unknown mode/status, or unsupported condition. They do not silently omit a deny
+while exporting a wider allow. Disabled and validly expired records are omitted.
+Correct the reported exception and verify a successful fetch. The Windows
+Defender Firewall poller keeps its last applied rules after a fetch error, so
+an export refusal is **not** proof of a new restriction or timely removal of an
+old allow. Check the endpoint's fetch logs and actual firewall state. Deliberately
+switching to **Allow by default** returns an empty withdrawal document even when
+incompatible records remain; it stops DSSE management rather than claiming those
+exceptions were applied.

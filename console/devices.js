@@ -45,8 +45,8 @@ function renderDevicesTab(content) {
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Devices", ja: "デバイス" }) }),
       el("p", { class: "ui-view-desc", text: bl({
-        en: "Devices admitted to connect through the secure gateway. \"Admission\" is whether the device is allowed to connect (enrolled + enabled) — distinct from \"Steer\", which is whether it is actively steering right now. Blocking a device stops it connecting right away.",
-        ja: "セキュアゲートウェイ経由の接続を許可されたデバイス。「接続許可」は接続が許可されているか（登録済み＋有効）を表し、いま実際にステアしているかを表す「ステア中」とは別です。ブロックすると、そのデバイスはすぐに接続できなくなります。",
+        en: "Devices registered with the secure gateway. Admission requires enabled enrollment and no connection block. Steering shows reported activity. Block status reflects the latest control-plane read; it does not confirm that every region has applied a change.",
+        ja: "セキュアゲートウェイに登録したデバイス。接続には登録が有効で、接続の遮断がないことが必要です。ステア中は報告された稼働状態を表します。遮断状態は管理サーバーの最新の取得結果であり、全リージョンへの反映完了を示すものではありません。",
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add device", ja: "+ デバイスを追加" }), onClick: () => openEnrollForm(content) }),
@@ -70,7 +70,10 @@ function renderDevicesTab(content) {
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderList(listHost) }),
   ]));
 
+  const messages = el("div", {});
+  content.appendChild(messages);
   const listHost = el("div", {});
+  listHost.__deviceAdmissionMessages = messages;
   content.appendChild(listHost);
   renderList(listHost);
 }
@@ -159,12 +162,42 @@ function applyUpdateState(st, u) {
   // acquire a chip, and must not be counted under "never reported", which is a claim about the DEVICE.
 }
 
+// Inventory and transport admission are independent gates. Keep the stored
+// inventory flag intact, and derive the display from both verified read results.
+function deviceIsBlocked(d) { return !d.enabled || d.transport_revoked === true; }
+function deviceTenantSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
+function deviceContextPath(path, tenant) {
+  return tenant ? path + "?expected_tenant_id=" + encodeURIComponent(tenant) : path;
+}
+function deviceAdmissionRows(inventory, transport, selection) {
+  const validID = value => typeof value === "string" && value.trim() !== "";
+  if (!inventory || inventory.schema_version !== "admin_enrolled_inventory.v1" ||
+      !validID(inventory.tenant_id) || (selection && inventory.tenant_id !== selection) ||
+      !Array.isArray(inventory.devices) ||
+      (inventory.unassigned !== undefined && (!Number.isInteger(inventory.unassigned) || inventory.unassigned < 0)) ||
+      inventory.devices.some(d => !d || !validID(d.identity) || typeof d.enabled !== "boolean") ||
+      new Set(inventory.devices.map(d => d.identity.trim().toLowerCase())).size !== inventory.devices.length) {
+    throw new Error(bl({en: "The device inventory response could not be verified.", ja: "デバイス一覧の応答を確認できません。"}));
+  }
+  if (!transport || transport.schema_version !== "admin_transport_admission.v1" ||
+      transport.tenant_id !== inventory.tenant_id || !Array.isArray(transport.revoked_identities) ||
+      !Number.isInteger(transport.withheld_unattributable) || transport.withheld_unattributable < 0 ||
+      transport.revoked_identities.some(id => !validID(id) || id !== id.trim().toLowerCase()) ||
+      new Set(transport.revoked_identities).size !== transport.revoked_identities.length) {
+    throw new Error(bl({en: "The connection block status could not be verified. Reload before changing devices.",
+      ja: "接続の遮断状態を確認できません。デバイスを変更する前に再読込してください。"}));
+  }
+  const revoked = new Set(transport.revoked_identities);
+  return inventory.devices.map(d => ({...d, transport_revoked: revoked.has(d.identity.trim().toLowerCase()),
+    admissionContext: {tenant: inventory.tenant_id, selection}}));
+}
+
 function deviceStateOf(d, obs, rt, effSev) {
   const st = { severity: "", signals: [], steering: false, failOpen: false, offline: false, excluded: 0, sub: "" };
   const p = (rt && rt.posture) || {};
-  if (!d.enabled) {
+  if (deviceIsBlocked(d)) {
     st.severity = "danger"; st.pill = { text: bl({ en: "Blocked", ja: "ブロック" }), tone: "danger" };
-    st.sub = bl({ en: "admission revoked", ja: "接続を遮断" });
+    st.sub = bl({ en: "connection blocked", ja: "接続を遮断" });
   } else if (!obs) {
     if (rt && rt.steer_active === true) {
       // steering per device-runtime, but no reverse-telemetry entry yet (e.g. an agent that reports runtime but
@@ -253,6 +286,10 @@ function deviceStateOf(d, obs, rt, effSev) {
 function overflowMenu(d, host, sev, grpSev) {
   const wrap = el("span", { class: "dev-ov" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: "⋯", title: bl({ en: "More", ja: "その他" }) });
+  btn.setAttribute("data-device-admission-control", "1");
+  btn.setAttribute("data-device-risk-control", "1");
+  btn.disabled = !!((host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity)) ||
+    (host.__deviceRiskPending && host.__deviceRiskPending.has(d.identity)));
   let menu = null;
   const onDoc = (e) => { if (!wrap.contains(e.target)) close(); };
   function close() { if (menu) { menu.remove(); menu = null; document.removeEventListener("click", onDoc, true); } }
@@ -293,25 +330,57 @@ function overflowMenu(d, host, sev, grpSev) {
   return wrap;
 }
 
+function deviceRiskSnapshot(body, tenant) {
+  const map = body && body.high_risk;
+  if (!body || body.entity_type !== "device" || body.tenant_id !== tenant || !tenant ||
+      !map || typeof map !== "object" || Array.isArray(map) ||
+      !Number.isSafeInteger(body.withheld_unattributable) || body.withheld_unattributable < 0 ||
+      Object.entries(map).some(([id, severity]) => !id || id !== id.trim() || !["medium", "high", "critical"].includes(severity))) {
+    throw new Error("Invalid device risk response");
+  }
+  return map;
+}
+
+// Fetch rejects with a TypeError on a lost connection. Keep other errors intact,
+// including validation failures and programming errors, so they remain diagnosable.
+function deviceReadFailure(e) {
+  if (e && e.name === "TypeError" && ["Failed to fetch", "Load failed", "NetworkError when attempting to fetch resource."].includes(e.message)) {
+    return bl({en: "Cannot reach the management server. Check your connection, then retry.",
+      ja: "管理サーバーに接続できません。接続を確認してから再試行してください。"});
+  }
+  return String(e);
+}
+
 async function renderList(host) {
   uiState(host, "loading");
-  const current = freshRender(host);
-  let devices;
+  const selection = deviceTenantSelection(), renderCurrent = freshRender(host);
+  const current = () => renderCurrent() && host.isConnected !== false && selection === deviceTenantSelection();
+  let devices, tenant;
   // ★ unassigned IS PART OF THE ANSWER (2026-08-12, seventeenth review). The endpoint withholds devices that
   // belong to no tenant — they are nobody's to see or act on — and reports how many. Reading only `devices`
   // threw that number away, so the guarantee that made withholding safe ("nothing vanishes, it becomes a
   // count") stopped at the API and never reached anyone. On a fleet where every device is unassigned the
   // screen said "No devices yet", which is the fleet vanishing, in the exact words that invite an operator to
   // enrol them a second time.
-  let unassigned = 0;
+  let unassigned = 0, withheldBlocks = 0;
   try {
-    const r = await apiFetch("GET", "/admin/enrolled-devices");
-    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) }); return; }
-    devices = (r.body && r.body.devices) || [];
-    unassigned = Number(r.body && r.body.unassigned) || 0;
+    const r = await apiFetch("GET", deviceContextPath("/admin/enrolled-devices", selection), undefined, "control");
+    if (!current()) return;
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    tenant = r.body && r.body.tenant_id;
+    if (typeof tenant !== "string" || !tenant.trim() || (selection && selection !== tenant)) {
+      throw new Error(bl({en: "The device organization could not be verified. Reload before continuing.",
+        ja: "デバイスの所属組織を確認できません。再読込してください。"}));
+    }
+    const transport = await apiFetch("GET", deviceContextPath("/admin/transport-admission", tenant), undefined, "control");
+    if (!current()) return;
+    if (!transport.ok) throw new Error(bl({en: "Connection block status unavailable", ja: "接続の遮断状態を取得できません"}) + " (HTTP " + transport.status + ")");
+    devices = deviceAdmissionRows(r.body, transport.body, selection);
+    unassigned = r.body.unassigned === undefined ? 0 : r.body.unassigned;
+    withheldBlocks = transport.body.withheld_unattributable;
   } catch (e) {
     if (!current()) return;
-    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
+    uiState(host, "error", deviceReadFailure(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
     return;
   }
   // Runtime facts the endpoint agent reports over the steer transport (OS, logged-in user, steer state, posture),
@@ -363,18 +432,26 @@ async function renderList(host) {
       if (ru.body.frozen) updateFrozen = ru.body.frozen_reason || bl({ en: "rollout halted", ja: "配布停止中" });
     }
   } catch (e) { /* best-effort */ }
-  // Current high-risk marks (the shared overlay, keyed by entity id), so a device's OWN row shows + sets its
-  // risk — no free-text id (this replaces the standalone Device Risk page). Best-effort.
-  let riskMap = {};
+  // Risk is required for both the badge and the current value in the action menu.
+  // A failed/foreign/malformed read must not turn into "Normal" or a clear selection.
+  let riskMap;
   try {
-    const rk = await apiFetch("GET", "/admin/risk-signals");
-    if (rk.ok && rk.body && rk.body.high_risk) riskMap = rk.body.high_risk;
-  } catch (e) { /* best-effort */ }
+    const rk = await apiFetch("GET", deviceContextPath("/admin/risk-signals", tenant), undefined, "control");
+    if (!current()) return;
+    if (!rk.ok) throw new Error("HTTP " + rk.status);
+    riskMap = deviceRiskSnapshot(rk.body, tenant);
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", bl({ en: "Risk status could not be read. Reload before changing device risk.",
+      ja: "リスク状態を取得できません。変更する前に再読込してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
+    return;
+  }
   // Device-group RISK FLOOR: a group can carry a risk floor, and a member device's EFFECTIVE risk is
   // max(its own overlay risk, its group's floor). Fetch the registry so this list REFLECTS the group floor.
   // NOTE: this is the display (R3). Enforcement — the decision engine acting on the floor — is the separate R1
   // step, see docs/device_group_risk_floor_union_resolution_design.ja.md.
-  let groupRisk = {};
+  let groupRisk = Object.create(null);
   try {
     const rg = await apiFetch("GET", "/admin/device-groups");
     if (rg.ok && rg.body && rg.body.groups) rg.body.groups.forEach((g) => { groupRisk[(g.name || "").trim().toLowerCase()] = g.risk || ""; });
@@ -418,7 +495,7 @@ async function renderList(host) {
     const rt = runtime[d.identity] || runtime[deviceKey(d.identity)] || {};
     // Every join on a device name goes through deviceKey — see ui.js for the two spellings that made this necessary.
     const obs = steerState[deviceKey(d.identity)];
-    const sev = riskMap[d.identity]; // the device's OWN overlay mark
+    const sev = Object.hasOwn(riskMap, d.identity) ? riskMap[d.identity] : undefined; // the device's OWN overlay mark
     const grpSev = groupRisk[(d.group || "").trim().toLowerCase()] || "";
     // Effective risk is resolved SERVER-SIDE (effective_risk) with the decision path's helper (folds in device-store
     // metadata the Console can't see; never reads LOWER than enforcement). Fall back to max(overlay, floor) if omitted.
@@ -435,7 +512,7 @@ async function renderList(host) {
     failopen: enrich.filter((x) => x.st.failOpen).length,
     excluded: enrich.filter((x) => x.st.excluded > 0).length,
     offline: enrich.filter((x) => x.st.offline).length,
-    blocked: enrich.filter((x) => !x.d.enabled).length,
+    blocked: enrich.filter((x) => deviceIsBlocked(x.d)).length,
     updPending: enrich.filter((x) => x.st.updateChip === "pending").length,
     updFailed: enrich.filter((x) => x.st.updateChip === "failed" || x.st.updateChip === "refused").length,
     updSilent: enrich.filter((x) => x.st.updateChip === "never_reported").length,
@@ -444,13 +521,13 @@ async function renderList(host) {
   const ff = _devicesState.fleet || "all";
   const q = _devicesState.search.trim().toLowerCase();
   const filtered = enrich.filter(({ d, st }) => {
-    if (_devicesState.filter === "enabled" && !d.enabled) return false;
-    if (_devicesState.filter === "disabled" && d.enabled) return false;
+    if (_devicesState.filter === "enabled" && deviceIsBlocked(d)) return false;
+    if (_devicesState.filter === "disabled" && !deviceIsBlocked(d)) return false;
     if (ff === "steering" && !st.steering) return false;
     if (ff === "failopen" && !st.failOpen) return false;
     if (ff === "excluded" && !(st.excluded > 0)) return false;
     if (ff === "offline" && !st.offline) return false;
-    if (ff === "blocked" && d.enabled) return false;
+    if (ff === "blocked" && !deviceIsBlocked(d)) return false;
     if (ff === "updPending" && st.updateChip !== "pending") return false;
     if (ff === "updFailed" && !(st.updateChip === "failed" || st.updateChip === "refused")) return false;
     if (ff === "updSilent" && st.updateChip !== "never_reported") return false;
@@ -486,6 +563,12 @@ async function renderList(host) {
     host.appendChild(el("div", { class: "ui-view-desc", style: "margin:4px 0 8px", text:
       bl({ en: "+ " + unassigned + " enrolled device(s) belong to no tenant and are not listed. An operator can assign one by adding it by identity while operating within this tenant.",
            ja: "ほかに " + unassigned + " 台がテナント未割当のため一覧に出ていません。このテナント内で操作中に端末IDを指定して追加すると、割り当てられます。" }) }));
+  }
+
+  if (withheldBlocks > 0) {
+    host.appendChild(el("div", {class: "ui-view-desc", text: bl({
+      en: withheldBlocks + " blocked identity/identities cannot be assigned to an organization and are not included in this list or its counts.",
+      ja: "所属組織を確認できない遮断対象が " + withheldBlocks + " 件あります。この一覧と集計には含まれません。"})}));
   }
 
   // ── The release band. Only when there IS one: a deployment that has published nothing should look like one.
@@ -576,13 +659,15 @@ async function renderList(host) {
       meta.appendChild(el("span", { style: "color:#6b7382", text: "·" }));
       meta.appendChild(el("span", { text: bl({ en: "from " + from, ja: from + " から" }) }));
     }
-    const primary = d.enabled
+    const primary = !deviceIsBlocked(d)
       ? el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Block", ja: "ブロック" }), onClick: () => disableDevice(d, host) })
       : el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Allow", ja: "許可" }), onClick: () => enableDevice(d, host) });
+    primary.setAttribute("data-device-admission-control", "1");
+    primary.disabled = !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity));
     const signals = st.signals.length
       ? st.signals.map((s) => el("span", { class: "dev-chip" + (s.tone ? " dev-chip-" + s.tone : ""), text: s.text, title: s.title || undefined }))
       : [el("span", { class: "dev-risk-ok", text: "—" })];
-    return el("tr", { class: st.severity ? "dev-sev-" + st.severity : "" }, [
+    return el("tr", { class: st.severity ? "dev-sev-" + st.severity : "", "data-device-identity": d.identity }, [
       el("td", { class: "dev-lead" }, [el("div", { class: "dev-id", text: d.identity || "" }), meta]),
       el("td", {}, [uiBadge(st.pill.text, st.pill.tone), el("div", { class: "dev-sub", text: st.sub })]),
       el("td", {}, deviceCertCell(certMap[deviceKey(d.identity)])),
@@ -736,68 +821,127 @@ function openEnrollForm(content) {
 // from the created groups (the registry) instead of free-typing a name. Tabs = Unassigned + each registry group
 // + "+ New" (create then reselect). Empty selection clears the assignment (device → tenant scope). The Edge
 // still reads the group from the enrolled ledger (NOT device-reported metadata) to resolve per-group policies.
-async function openAssignGroupForm(d, host, preselect) {
-  let groups = [];
-  try {
-    const r = await apiFetch("GET", "/admin/device-groups");
-    if (r.ok && r.body && r.body.groups) groups = r.body.groups;
-  } catch (e) { /* fall back to just the current assignment */ }
-  // preselect (a group NAME) is passed after the inline "+ New" flow so the just-created group is selected.
+function deviceAssignmentGroups(response, tenant) {
+  const body = response && response.body;
+  if (!response || !response.ok) throw new Error("HTTP " + (response && response.status || 0));
+  const text = value => typeof value === "string" && value.trim() !== "";
+  if (!body || body.schema_version !== "admin_device_group_registry.v1" || !text(body.tenant_id) ||
+      (tenant && body.tenant_id !== tenant) || !Array.isArray(body.groups) ||
+      body.groups.some(g => !g || !text(g.id) || !text(g.name) ||
+        (g.description != null && typeof g.description !== "string") ||
+        (g.tenant_id != null && g.tenant_id !== body.tenant_id)) ||
+      new Set(body.groups.map(g => g.id)).size !== body.groups.length ||
+      new Set(body.groups.map(g => g.name.trim().toLowerCase())).size !== body.groups.length) {
+    throw new Error(bl({ en: "The group list could not be verified. Retry before changing the assignment.",
+      ja: "グループ一覧を確認できません。割当を変更する前に再試行してください。" }));
+  }
+  return body.groups;
+}
+
+// Read the registry before offering edits. A failed read cannot stand in for an
+// empty registry, and a detached editor must not publish a late response.
+function openAssignGroupForm(d, host, preselect) {
+  const context = d.admissionContext;
+  const sameContext = () => host.isConnected !== false && (!context || context.selection === deviceTenantSelection());
+  if (!sameContext()) return;
+  const tenant = context ? context.tenant : d.tenant_id;
+  const path = value => deviceContextPath(value, tenant);
+  let groups = [], ready = false, saving = false, sequence = 0, closed = false;
   let selected = (typeof preselect === "string" ? preselect : (d.group || "")).trim();
   const tabsHost = el("div", { style: "display:flex;flex-wrap:wrap;gap:6px;margin:10px 0" });
   const info = el("p", { class: "ui-view-desc" });
-  const renderTabs = () => {
-    tabsHost.innerHTML = "";
-    const mk = (label, value) => el("button", {
-      class: "ui-btn ui-btn-sm" + (selected === value ? " ui-btn-primary" : ""),
-      text: label,
-      onClick: () => { selected = value; renderTabs(); },
-    });
-    tabsHost.appendChild(mk(bl({ en: "Unassigned", ja: "未割当" }), ""));
-    groups.forEach((g) => tabsHost.appendChild(mk(g.name, g.name)));
-    tabsHost.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "+ New", ja: "+ 新規作成" }), onClick: () => {
-      backdrop.remove();
-      // create, then reopen the assign modal with the new group already selected.
-      openCreateGroupForm((createdName) => openAssignGroupForm(d, host, createdName));
-    } }));
-    const cur = groups.find((g) => g.name === selected);
-    info.textContent = selected
-      ? (bl({ en: "Selected: ", ja: "選択中: " }) + selected + (cur && cur.description ? " — " + cur.description : ""))
-      : bl({ en: "No group (tenant scope).", ja: "グループなし(テナントスコープ)。" });
-  };
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Assign", ja: "割当" }) });
-  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: (e) => { if (e.target === backdrop) backdrop.remove(); } }, [
+  const loadState = el("div");
+  const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
+  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Assign", ja: "割当" }), disabled: true });
+  const close = () => { closed = true; sequence++; backdrop.remove(); };
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: close });
+  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: e => { if (e.target === backdrop && !saving) close(); } }, [
     el("div", { class: "ui-modal", role: "dialog" }, [
       el("div", { class: "ui-modal-head", text: bl({ en: "Device group", ja: "デバイスグループ" }) }),
       el("div", { class: "ui-modal-body" }, [
         el("p", { class: "ui-view-desc", text: bl({
           en: "Assign \"" + d.identity + "\" to a group. Pick a created group (or Unassigned to remove it). Group-scoped steer-exclusion / captive-tuning policies then apply to the device.",
           ja: "「" + d.identity + "」をグループに割当てます。作成済みグループを選択(未割当で解除)。このグループ対象の steer 除外・キャプティブ調整ポリシーがデバイスに適用されます。",
-        }) }),
-        tabsHost, info,
+        }) }), loadState, tabsHost, info, saveError,
       ]),
-      el("div", { class: "ui-modal-foot" }, [
-        el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => backdrop.remove() }),
-        submit,
-      ]),
+      el("div", { class: "ui-modal-foot" }, [cancel, submit]),
     ]),
   ]);
-  submit.addEventListener("click", async () => {
-    submit.disabled = true;
+  const active = () => {
+    if (!sameContext()) { close(); return false; }
+    return !closed && backdrop.isConnected;
+  };
+  const renderTabs = () => {
+    tabsHost.innerHTML = "";
+    const mk = (label, value) => el("button", {
+      class: "ui-btn ui-btn-sm" + (selected === value ? " ui-btn-primary" : ""),
+      text: label, disabled: saving || undefined,
+      onClick: () => { if (!active() || !ready || saving) return; selected = value; renderTabs(); },
+    });
+    tabsHost.appendChild(mk(bl({ en: "Unassigned", ja: "未割当" }), ""));
+    groups.forEach(g => tabsHost.appendChild(mk(g.name, g.name)));
+    // Existing assignments can predate the registry. Retain them explicitly;
+    // absence from a valid registry is not permission to clear an assignment.
+    const current = groups.find(g => g.name === selected);
+    if (selected && !current) tabsHost.appendChild(mk(selected, selected));
+    tabsHost.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "+ New", ja: "+ 新規作成" }), disabled: saving || undefined, onClick: () => {
+      if (!active() || !ready || saving) return;
+      close();
+      openCreateGroupForm(createdName => { if (sameContext()) return openAssignGroupForm(d, host, createdName); });
+    } }));
+    info.textContent = selected
+      ? bl({ en: "Selected: ", ja: "選択中: " }) + selected + (current && current.description ? " — " + current.description : "") +
+        (!current ? bl({ en: " (not in the group list; kept until you choose another assignment)", ja: "（一覧にありません。別の割当を選ぶまで保持します）" }) : "")
+      : bl({ en: "No group (tenant scope).", ja: "グループなし(テナントスコープ)。" });
+  };
+  const load = async () => {
+    if (!active() || saving) return;
+    const seq = ++sequence;
+    ready = false; submit.disabled = true; tabsHost.innerHTML = ""; info.textContent = "";
+    uiState(loadState, "loading");
     try {
-      const r = await apiFetch("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/group", { group: selected });
-      if (!r.ok) {
-        submit.disabled = false;
-        uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err");
-        return;
+      const response = await apiFetch("GET", path("/admin/device-groups"), undefined, "control");
+      if (!active() || seq !== sequence) return;
+      groups = deviceAssignmentGroups(response, tenant);
+      ready = true; loadState.innerHTML = ""; renderTabs(); submit.disabled = false;
+    } catch (e) {
+      if (!active() || seq !== sequence) return;
+      uiState(loadState, "error", bl({ en: "Could not load device groups. ", ja: "デバイスグループを取得できません。" }) + String(e.message || e),
+        { label: bl({ en: "Retry", ja: "再試行" }), onClick: load });
+    }
+  };
+  submit.addEventListener("click", async () => {
+    if (!active() || !ready || saving) return;
+    saving = true;
+    const assigned = selected;
+    const controls = Array.from(backdrop.querySelectorAll("button"));
+    controls.forEach(control => { control.disabled = true; });
+    saveError.textContent = ""; saveError.style.display = "none";
+    try {
+      const r = await apiFetch("POST", path("/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/group"), { group: assigned }, "control");
+      if (!active()) return;
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+      const device = r.body && r.body.device;
+      if (!r.body || r.body.schema_version !== "admin_enrolled_inventory.v1" || !device ||
+          typeof device.identity !== "string" || device.identity.trim().toLowerCase() !== d.identity.trim().toLowerCase() ||
+          (tenant && device.tenant_id !== tenant) || (device.group !== undefined && typeof device.group !== "string") ||
+          (device.group || "") !== assigned) {
+        throw new Error(bl({ en: "The response did not confirm this assignment. It may already be applied; reload to review the current state before retrying.",
+          ja: "応答から割当を確認できません。反映済みの可能性があります。再読込で現在の状態を確認してから再試行してください。" }));
       }
-      backdrop.remove();
-      uiToast(selected ? bl({ en: "Group set: " + selected + ".", ja: "グループを設定: " + selected + "。" }) : bl({ en: "Group cleared.", ja: "グループを解除しました。" }), "ok");
+      close();
+      uiToast(assigned ? bl({ en: "Group set: " + assigned + ".", ja: "グループを設定: " + assigned + "。" }) : bl({ en: "Group cleared.", ja: "グループを解除しました。" }), "ok");
       renderList(host);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) {
+      if (!active()) return;
+      saveError.textContent = String(e.message || e); saveError.style.display = "";
+    } finally {
+      saving = false;
+      if (active()) controls.forEach(control => { control.disabled = false; });
+    }
   });
   document.body.appendChild(backdrop);
-  renderTabs();
+  return load();
 }
 
 // ---- Device groups TAB (registry: list + create + delete) ----------------------------------------------
@@ -976,31 +1120,163 @@ async function deleteGroup(g, host) {
   } catch (e) { uiToast(String(e), "err"); }
 }
 
-async function disableDevice(d, host) {
-  const ok = await uiConfirm({
-    title: bl({ en: "Turn off this device?", ja: "このデバイスをオフにしますか?" }),
-    body: bl({ en: "\"" + d.identity + "\" will be blocked from connecting right away, and any active sessions end shortly after. You can turn it back on at any time.", ja: "「" + d.identity + "」はすぐに接続できなくなり、進行中のセッションも間もなく終了します。いつでも再びオンにできます。" }),
-    confirmLabel: bl({ en: "Turn off", ja: "オフにする" }), danger: true,
-  });
-  if (!ok) return;
-  // Emergency block folds in "Block a Device Now": cut it at the transport layer (immediate) AND disable
-  // enrolment, so an active session ends now and it can't reconnect. Transport call is best-effort.
-  try { await apiFetch("POST", "/admin/transport-admission/revoke", { identity: d.identity, reason: "blocked from Devices" }); } catch (e) { /* best-effort */ }
-  await act("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/disable", host, bl({ en: "Device blocked.", ja: "デバイスを遮断しました。" }));
+function deviceAdmissionBusy(host, identity, busy) {
+  for (const row of host.querySelectorAll("[data-device-identity]")) {
+    if (row.getAttribute("data-device-identity") !== identity) continue;
+    for (const button of row.querySelectorAll("[data-device-admission-control]")) {
+      button.disabled = busy || !!(button.getAttribute("data-device-risk-control") &&
+        host.__deviceRiskPending && host.__deviceRiskPending.has(identity));
+    }
+  }
 }
 
-async function enableDevice(d, host) {
-  try { await apiFetch("POST", "/admin/transport-admission/restore", { identity: d.identity }); } catch (e) { /* best-effort */ }
-  await act("POST", "/admin/enrolled-devices/" + encodeURIComponent(d.identity) + "/enable", host, bl({ en: "Device allowed.", ja: "デバイスを許可しました。" }));
+function deviceAdmissionNotice(host, d, enabled, message) {
+  const notices = host.__deviceAdmissionNotices || (host.__deviceAdmissionNotices = new Map());
+  const previous = notices.get(d.identity);
+  if (previous) { previous.remove(); notices.delete(d.identity); }
+  if (!message) return;
+  const box = el("div", { class: "ui-callout ui-callout-warn", role: "alert", style: "margin-bottom:12px" }, [
+    el("strong", { text: d.identity }),
+    el("div", { text: message, style: "white-space:pre-wrap" }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }),
+      onClick: () => changeDeviceAdmission(d, host, enabled) }),
+  ]);
+  (host.__deviceAdmissionMessages || host).appendChild(box);
+  notices.set(d.identity, box);
 }
+
+async function changeDeviceAdmission(d, host, enabled) {
+  const context = d.admissionContext;
+  const active = () => host.isConnected !== false && (!context || context.selection === deviceTenantSelection());
+  if (!active()) return;
+  const path = value => deviceContextPath(value, context && context.tenant);
+  const matchesTenant = body => !context || (body && body.tenant_id === context.tenant);
+  const pending = host.__deviceAdmissionPending || (host.__deviceAdmissionPending = new Set());
+  if (pending.has(d.identity)) return;
+  pending.add(d.identity);
+  deviceAdmissionBusy(host, d.identity, true);
+  let transportDone = false, failure = "", remainingBlock = false;
+  try {
+    if (!enabled) {
+      const ok = await uiConfirm({
+        title: bl({ en: "Turn off this device?", ja: "このデバイスをオフにしますか?" }),
+        body: bl({ en: "Blocks \"" + d.identity + "\" locally and requests closure of its active sessions. Other regions may keep a propagated block after you allow the device here.", ja: "「" + d.identity + "」をここで遮断し、既存の接続の終了を要求します。ここで許可に戻しても、他リージョンへ伝わった遮断は残ることがあります。" }),
+        confirmLabel: bl({ en: "Turn off", ja: "オフにする" }), danger: true,
+      });
+      if (!ok || !active()) return;
+    }
+    deviceAdmissionNotice(host, d, enabled, "");
+    const replyError = r => new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    const identityMatches = value => typeof value === "string" && value.trim().toLowerCase() === d.identity.trim().toLowerCase();
+    // Do not change admission after an unconfirmed transport operation. A retry is explicit and repeats
+    // the same intended state; it never reverses a possibly applied operation as an automatic rollback.
+    const transport = await apiFetch("POST", path("/admin/transport-admission/" + (enabled ? "restore" : "revoke")),
+      enabled ? { identity: d.identity } : { identity: d.identity, reason: "blocked from Devices" }, "control");
+    if (!active()) return;
+    if (!transport.ok) throw replyError(transport);
+    if (!transport.body || !matchesTenant(transport.body) || !identityMatches(transport.body.identity) ||
+        transport.body[enabled ? "restored" : "revoked"] !== true ||
+        (enabled && typeof transport.body.transport_revoked !== "boolean")) {
+      throw new Error(bl({ en: "The transport response did not confirm the requested device state.",
+        ja: "接続制御の応答から、指定した端末の変更を確認できません。" }));
+    }
+    transportDone = true;
+    if (enabled && transport.body.transport_revoked) {
+      remainingBlock = true;
+      throw new Error(bl({en: "A connection block still applies to this device. Its inventory admission was not changed. Resolve the remaining block, then reload or retry.",
+        ja: "このデバイスには接続の遮断が残っています。一覧の接続許可は変更していません。残る遮断を解消してから、再読込または再試行してください。"}));
+    }
+    const inventory = await apiFetch("POST", path("/admin/enrolled-devices/" + encodeURIComponent(d.identity) +
+      (enabled ? "/enable" : "/disable")), undefined, "control");
+    if (!active()) return;
+    if (!inventory.ok) throw replyError(inventory);
+    const device = inventory.body && inventory.body.device;
+    if (!device || !matchesTenant(inventory.body) || !identityMatches(device.identity) || device.enabled !== enabled) {
+      throw new Error(bl({ en: "The inventory response did not confirm the requested device state.",
+        ja: "デバイス一覧の応答から、指定した端末の変更を確認できません。" }));
+    }
+  } catch (e) {
+    failure = remainingBlock ? String(e.message || e) : (transportDone
+      ? bl({ en: "The transport change was acknowledged, but the device admission update could not be confirmed. The operation may be partly applied. Reload the state and retry when the error is resolved.",
+          ja: "接続制御の変更は受け付けられましたが、デバイスの接続許可の更新を確認できません。一部だけ反映された可能性があります。状態を再読込し、エラー解消後に再試行してください。" })
+      : bl({ en: "The transport change could not be confirmed, so the device admission update was not sent. The transport may already have changed. Reload the state and retry when the error is resolved.",
+          ja: "接続制御の変更を確認できないため、デバイスの接続許可の更新は送信していません。接続制御だけ変更済みの可能性があります。状態を再読込し、エラー解消後に再試行してください。" })) + "\n" + String(e);
+  } finally {
+    pending.delete(d.identity);
+    deviceAdmissionBusy(host, d.identity, false);
+  }
+  if (!active()) return;
+  if (failure) deviceAdmissionNotice(host, d, enabled, failure);
+  else uiToast((enabled ? bl({ en: "Local admission enabled: ", ja: "この管理サーバーで接続を許可しました: " })
+    : bl({ en: "Device blocked: ", ja: "デバイスを遮断しました: " })) + d.identity, "ok");
+  // A refresh failure must not turn an acknowledged write into a failed mutation or discard its warning.
+  try { await renderList(host); } catch (e) { uiToast(String(e), "err"); }
+}
+
+async function disableDevice(d, host) { return changeDeviceAdmission(d, host, false); }
+async function enableDevice(d, host) { return changeDeviceAdmission(d, host, true); }
 
 // setDeviceRisk marks / clears a device's risk from its own row (no free-text id) — replaces the Device Risk
 // page. "high" marks high-risk (a risk-gated policy then bites, e.g. re-auth); "none" clears it.
+function deviceRiskBusy(host, identity, busy) {
+  for (const row of host.querySelectorAll("[data-device-identity]")) {
+    if (row.getAttribute("data-device-identity") !== identity) continue;
+    for (const button of row.querySelectorAll("[data-device-risk-control]")) {
+      button.disabled = busy || !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(identity));
+    }
+  }
+}
+
+function deviceRiskNotice(host, d, severity, message) {
+  const notices = host.__deviceRiskNotices || (host.__deviceRiskNotices = new Map());
+  const previous = notices.get(d.identity);
+  if (previous) { previous.remove(); notices.delete(d.identity); }
+  if (!message) return;
+  const box = el("div", { class: "ui-callout ui-callout-warn", role: "alert", style: "margin-bottom:12px" }, [
+    el("strong", { text: d.identity }),
+    el("div", { text: message, style: "white-space:pre-wrap" }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }),
+      onClick: () => setDeviceRisk(d, severity, host) }),
+  ]);
+  (host.__deviceAdmissionMessages || host).appendChild(box);
+  notices.set(d.identity, box);
+}
+
 async function setDeviceRisk(d, severity, host) {
-  const r = await apiFetch("POST", "/admin/risk-signals", { entity_type: "device", entity_id: d.identity, severity: severity, evidence_ref: "console" });
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); renderList(host); return; }
-  uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" }) : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
-  renderList(host);
+  const pending = host.__deviceRiskPending || (host.__deviceRiskPending = new Set());
+  if (pending.has(d.identity)) return;
+  pending.add(d.identity);
+  deviceRiskBusy(host, d.identity, true);
+  deviceRiskNotice(host, d, severity, "");
+  let notice = "";
+  try {
+    const r = await apiFetch("POST", "/admin/risk-signals", {
+      entity_type: "device", entity_id: d.identity, severity, evidence_ref: "console",
+    }, "control");
+    if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    const b = r.body;
+    if (!b || b.entity_type !== "device" || typeof b.entity_id !== "string" ||
+        b.entity_id.trim().toLowerCase() !== d.identity.trim().toLowerCase() || b.severity !== severity ||
+        b.applied !== true || b.high_risk !== (severity === "high" || severity === "critical") ||
+        (b.not_stored_durably !== undefined && typeof b.not_stored_durably !== "string")) {
+      throw new Error(bl({ en: "The response did not confirm the requested device risk.",
+        ja: "応答から、指定した端末のリスク変更を確認できません。" }));
+    }
+    if (b.not_stored_durably && b.not_stored_durably.trim()) {
+      notice = bl({ en: "Risk applied, but saving was not confirmed. Retry once the store is healthy.",
+        ja: "リスクは反映されましたが、保存を確認できません。保存先の復旧後に再試行してください。" }) + "\n" + b.not_stored_durably;
+    }
+  } catch (e) {
+    notice = bl({ en: "The risk change could not be confirmed. It may already be applied. Reload the state and retry when the error is resolved.",
+      ja: "リスク変更を確認できません。反映済みの可能性があります。状態を再読込し、エラー解消後に再試行してください。" }) + "\n" + String(e);
+  } finally {
+    pending.delete(d.identity);
+    deviceRiskBusy(host, d.identity, false);
+  }
+  if (notice) deviceRiskNotice(host, d, severity, notice);
+  else uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" })
+    : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
+  try { await renderList(host); } catch (e) { uiToast(String(e), "err"); }
 }
 
 async function removeDevice(d, host) {

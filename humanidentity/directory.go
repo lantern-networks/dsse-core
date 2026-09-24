@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -44,12 +45,9 @@ type humanIdentityDirectorySnapshot struct {
 	SourcePolicies map[string]HumanIdentitySourcePolicy `json:"source_policies"`
 }
 
-// OnPersistError, when set, is called if a snapshot fails to save. A dropped save is invisible and expensive:
-// the mutation returns success, the Console shows the directory, and the next Edge restart forgets it — silently
-// recreating the exact loss this persistence prevents while looking healthy. Must not panic.
-//
-// It does NOT fail the mutation: the in-memory store is already serving the write, and rejecting an import
-// because the disk is unhappy is the worse failure.
+// OnPersistError reports storage failures or weakened save guarantees to the host.
+// Must not panic. Identity Upsert also returns ErrDirectoryPersistence on rejected
+// saves; source-policy and import-state writes still report errors best-effort.
 var OnPersistError func(error)
 
 func reportPersistError(err error) {
@@ -62,6 +60,12 @@ type HumanIdentityDirectoryRuntimeStore interface {
 	Upsert(context.Context, model.HumanIdentity, string, time.Time) (model.HumanIdentity, error)
 	List(context.Context, string, ...HumanIdentityDirectoryListOptions) ([]model.HumanIdentity, error)
 	Stats(context.Context, string, time.Time) (HumanIdentityDirectoryStats, error)
+}
+
+// HumanIdentityDirectoryCreator atomically refuses an existing tenant-scoped ID.
+// Manual additions use it; synchronization continues to use Upsert.
+type HumanIdentityDirectoryCreator interface {
+	Create(context.Context, model.HumanIdentity, string, time.Time) (model.HumanIdentity, error)
 }
 
 type HumanIdentityDirectoryBulkUpserter interface {
@@ -351,38 +355,72 @@ func (store *HumanIdentityDirectoryStore) SetPersister(p blobstore.Persister) er
 	return nil
 }
 
-// persistLocked writes the full directory snapshot. The CALLER must hold store.mu. No-op without a persister. A
-// failed save is routed to reportPersistError, never returned: it must not fail the mutation that triggered it.
-func (store *HumanIdentityDirectoryStore) persistLocked() {
+// ErrIdentityExists indicates a refused create, including a soft-deleted entry.
+var ErrIdentityExists = errors.New("human identity ID already exists; choose a different ID")
+
+// ErrDirectoryPersistence is safe to return to API callers. The underlying storage
+// error is reported through OnPersistError and may contain private deployment paths.
+var ErrDirectoryPersistence = errors.New("human identity directory could not be saved")
+
+// saveSnapshotLocked saves a candidate while the caller holds store.mu. A reported
+// in-place save is already committed; treating it as rejected would diverge memory
+// from disk. Stores without a persister remain intentionally in-memory.
+func (store *HumanIdentityDirectoryStore) saveSnapshotLocked(users map[string]model.HumanIdentity) error {
 	if store.persister == nil {
-		return
+		return nil
 	}
 	data, err := json.Marshal(humanIdentityDirectorySnapshot{
-		Users:          store.users,
+		Users:          users,
 		SourceStates:   store.sourceStates,
 		SourcePolicies: store.sourcePolicies,
 	})
 	if err != nil {
 		reportPersistError(fmt.Errorf("marshal human identity directory snapshot: %w", err))
-		return
+		return ErrDirectoryPersistence
 	}
 	if err := store.persister.Save(data); err != nil {
 		reportPersistError(fmt.Errorf("save human identity directory snapshot: %w", err))
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			return ErrDirectoryPersistence
+		}
 	}
+	return nil
+}
+
+// Source-policy and import-state writes retain their existing best-effort contract.
+// Identity Upsert below instead publishes only after its candidate is saved.
+func (store *HumanIdentityDirectoryStore) persistLocked() {
+	_ = store.saveSnapshotLocked(store.users)
 }
 
 func (store *HumanIdentityDirectoryStore) Upsert(_ context.Context, user model.HumanIdentity, tenantID string, now time.Time) (model.HumanIdentity, error) {
+	return store.saveIdentity(user, tenantID, now, false)
+}
+
+func (store *HumanIdentityDirectoryStore) Create(_ context.Context, user model.HumanIdentity, tenantID string, now time.Time) (model.HumanIdentity, error) {
+	return store.saveIdentity(user, tenantID, now, true)
+}
+
+func (store *HumanIdentityDirectoryStore) saveIdentity(user model.HumanIdentity, tenantID string, now time.Time, createOnly bool) (model.HumanIdentity, error) {
 	normalized, err := NormalizeHumanIdentity(user, tenantID, now)
 	if err != nil {
 		return model.HumanIdentity{}, err
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.users == nil {
-		store.users = map[string]model.HumanIdentity{}
+	key := HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)
+	if _, exists := store.users[key]; createOnly && exists {
+		return model.HumanIdentity{}, ErrIdentityExists
 	}
-	store.users[HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)] = normalized
-	store.persistLocked()
+	candidate := make(map[string]model.HumanIdentity, len(store.users)+1)
+	for key, existing := range store.users {
+		candidate[key] = existing
+	}
+	candidate[key] = normalized
+	if err := store.saveSnapshotLocked(candidate); err != nil {
+		return model.HumanIdentity{}, err
+	}
+	store.users = candidate
 	store.generation.Add(1)
 	return normalized, nil
 }
@@ -1779,4 +1817,34 @@ func newDirectoryID(prefix string, fallback time.Time) string {
 		return prefix + hex.EncodeToString(random[:])
 	}
 	return prefix + strconv.FormatInt(fallback.UnixNano(), 16)
+}
+
+// RiskIdentitySnapshot is an internal upgrade read, not a tenant-facing API. It
+// supplies complete attribution for legacy risk marks before the server starts.
+func (store *HumanIdentityDirectoryStore) RiskIdentitySnapshot(_ context.Context) ([]model.HumanIdentity, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	people := make([]model.HumanIdentity, 0, len(store.users))
+	for _, person := range store.users {
+		people = append(people, person)
+	}
+	return people, nil
+}
+
+// RiskIdentityResolver matches current directory aliases without modifying risk marks.
+// IDs and subjects remain tenant-scoped and case-sensitive.
+type RiskIdentityResolver interface {
+	RiskIdentityIDs(context.Context, string, string) ([]string, error)
+}
+
+func (store *HumanIdentityDirectoryStore) RiskIdentityIDs(_ context.Context, tenant, subject string) ([]string, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	ids := []string{}
+	for _, person := range store.users {
+		if person.TenantID == tenant && (person.ID == subject || person.Subject == subject || (person.Email != nil && *person.Email == subject)) {
+			ids = append(ids, person.ID)
+		}
+	}
+	return ids, nil
 }

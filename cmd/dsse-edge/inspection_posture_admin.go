@@ -1,7 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
+	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/knownbypass"
@@ -31,17 +35,21 @@ func catalogGroups() []catalogGroupView {
 
 // inspectionPostureSnapshot gathers the live posture view: the configured posture plus the engine's actual
 // intercept + bypass sets. Used by both the GET and POST handlers.
-func inspectionPostureSnapshot(config serverConfig) inspectionPostureResponse {
+func inspectionPostureSnapshot(config serverConfig, tenant string) inspectionPostureResponse {
 	posture := inspectionposture.DefaultPosture()
 	if config.InspectionPosture != nil {
 		posture = config.InspectionPosture()
 	}
 	var interceptHosts, effectiveBypass []string
+	deviceScoped := false
 	if config.NetworkExtensionLabTLS != nil {
-		interceptHosts = config.NetworkExtensionLabTLS.InterceptHosts()
-		effectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
+		patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
+		interceptHosts, effectiveBypass = patterns.Intercept, patterns.Bypass
+		deviceScoped = len(patterns.InterceptByDevice) > 0 || len(patterns.BypassByDevice) > 0
 	}
-	return buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
+	result := buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
+	result.DeviceScoped = deviceScoped
+	return result
 }
 
 // knownBypassGroupView is one curated known-bypass group made visible to the operator, with whether it is
@@ -69,6 +77,13 @@ type authDecryptGroupView struct {
 // bypass_default), the decrypt allowlist (explicit hosts + selected SaaS auth groups) and the curated
 // known-bypass list, plus the live intercept/bypass sets the engine actually applies.
 type inspectionPostureResponse struct {
+	TenantID         string `json:"tenant_id"`
+	Scope            string `json:"scope"`
+	Configurable     bool   `json:"configurable"`
+	RuntimeAvailable bool   `json:"runtime_available"`
+	CanManageRules   bool   `json:"can_manage_rules"`
+	DeviceScoped     bool   `json:"device_scoped"` // additional selectors use the authenticated device identity
+
 	DefaultMode            string                 `json:"default_mode"`     // decrypt_all | bypass_default
 	InterceptHosts         []string               `json:"intercept_hosts"`  // live engine intercept set ("*" = decrypt-all)
 	EffectiveBypass        []string               `json:"effective_bypass"` // live engine raw-forward set
@@ -177,6 +192,68 @@ func buildInspectionPosture(p inspectionposture.Posture, interceptHosts, effecti
 		AuthDecryptGroups:      authViews,
 		SaaSBypassGroups:       bypassGroupViews,
 		KnownBypassGroups:      knownViews,
-		Note:                   "decrypt_all decrypts every steered HTTPS flow EXCEPT the bypass set; bypass_default decrypts ONLY the allowlist (hosts + selected SaaS auth groups) and raw-forwards the rest. A bypassed flow is still steered and policy-gated. Keep a SaaS auth group selected under bypass_default to keep tenant restriction working.",
+		Note:                   "Default posture is deployment-wide; host lists are the requesting tenant's shared selection. Additional device-scoped selectors apply when device_scoped is true. decrypt_all decrypts every steered HTTPS flow EXCEPT the bypass set; bypass_default decrypts ONLY the allowlist (hosts + selected SaaS auth groups) and raw-forwards the rest. A bypassed flow is still steered and policy-gated. Keep a SaaS auth group selected under bypass_default to keep tenant restriction working.",
 	}
+}
+
+func inspectionPostureMayWrite(r *http.Request) bool {
+	return adminCallerIsOperator(r) && strings.TrimSpace(r.Header.Get("X-Operate-Tenant")) == ""
+}
+func inspectionPostureForRequest(config serverConfig, r *http.Request) inspectionPostureResponse {
+	result := inspectionPostureSnapshot(config, adminTenantIDFromRequest(r))
+	result.TenantID = adminTenantIDFromRequest(r)
+	result.Scope = "deployment"
+	writable := true
+	if identity, ok := adminIdentityFromRequest(r); ok {
+		writable = adminPermissionAllowed(identity.Roles, "admin.policy.write")
+	}
+	result.Configurable = writable && inspectionPostureMayWrite(r) && config.SetInspectionPosture != nil && config.InspectionPosture != nil && strings.TrimSpace(config.ConfigSourceURL) == ""
+	result.RuntimeAvailable = config.NetworkExtensionLabTLS != nil
+	result.CanManageRules = writable && strings.TrimSpace(config.ConfigSourceURL) == ""
+	return result
+}
+
+// Keep saved-state adoption and its engine callback in order for concurrent updates.
+type inspectionPostureAdmin struct {
+	mu    sync.Mutex
+	store *inspectionposture.Store
+	apply func(string)
+}
+
+func newInspectionPostureAdmin(store *inspectionposture.Store, apply func(string)) *inspectionPostureAdmin {
+	return &inspectionPostureAdmin{store: store, apply: apply}
+}
+func (a *inspectionPostureAdmin) update(ctx context.Context, edit func(inspectionposture.Posture) (inspectionposture.Posture, error), tenant string) (inspectionposture.Posture, inspectionposture.Posture, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	before, next, err := a.store.UpdateContext(ctx, edit)
+	if err == nil && a.apply != nil {
+		a.apply(tenant)
+	}
+	return before, next, err
+}
+func (a *inspectionPostureAdmin) set(p inspectionposture.Posture, tenant string) (inspectionposture.Posture, error) {
+	_, next, err := a.update(context.Background(), func(inspectionposture.Posture) (inspectionposture.Posture, error) { return p, nil }, tenant)
+	return next, err
+}
+func (a *inspectionPostureAdmin) refresh() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	changed, err := a.store.RefreshShared()
+	if err == nil && changed && a.apply != nil {
+		a.apply("")
+	}
+	return err
+}
+func newInspectionPostureSetter(store *inspectionposture.Store, apply func(string)) func(inspectionposture.Posture, string) (inspectionposture.Posture, error) {
+	return newInspectionPostureAdmin(store, apply).set
+}
+func refreshInspectionPosture(w http.ResponseWriter, config serverConfig) bool {
+	if config.RefreshInspectionPosture != nil {
+		if err := config.RefreshInspectionPosture(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("Inspection posture cannot be refreshed from storage."))
+			return false
+		}
+	}
+	return true
 }

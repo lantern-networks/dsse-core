@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/agentrollout"
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/delegatedgrant"
 	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/enrolltoken"
@@ -123,7 +124,7 @@ var adminTenantFootprintPostgresTables = []string{
 // the counts from the others.
 func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *sql.DB, writer *logs.Writer,
 	credentials *localAdminCredentialStore, ledger *enrolledinventory.Ledger, rules *policyrule.Store,
-	deviceCAs *tenantca.TenantCARegistry, namedNetworks *vlan.Store, extra adminTenantExtraStores, now time.Time) adminTenantFootprint {
+	deviceCAs *tenantca.TenantCARegistry, namedNetworks *vlan.Store, extra adminTenantExtraStores, now time.Time, purgedLogs ...adminTenantFootprintRow) adminTenantFootprint {
 
 	footprint := adminTenantFootprint{
 		TenantID:   strings.TrimSpace(tenantID),
@@ -143,7 +144,7 @@ func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *s
 	}
 
 	if ledger != nil {
-		footprint.add(adminTenantFootprintRow{Store: "enrolled_identities", Count: int64(ledger.CountAdmitted(footprint.TenantID))})
+		footprint.add(adminTenantFootprintRow{Store: "enrolled_identities", Count: int64(ledger.CountTenantRecords(footprint.TenantID))})
 	} else {
 		footprint.NotCounted = append(footprint.NotCounted, "enrolled_identities (no ledger on this node)")
 	}
@@ -181,7 +182,11 @@ func countAdminTenantFootprint(ctx context.Context, node, tenantID string, db *s
 	// organization authored or something said ABOUT its devices, and each therefore belongs in "what is left".
 	extra.count(&footprint)
 
-	if writer != nil {
+	// A purge supplies its owner's verified absence or unknown result. Do not
+	// re-enter a filesystem that may still have an outstanding destructive call.
+	if len(purgedLogs) != 0 {
+		footprint.add(purgedLogs[0])
+	} else if writer != nil {
 		files, bytes, err := countTenantLogFiles(writer.Dir(), footprint.TenantID)
 		row := adminTenantFootprintRow{Store: "log_files", Count: files, Note: fmt.Sprintf("%d byte(s) on this node's disk", bytes)}
 		if err != nil {
@@ -333,9 +338,10 @@ func tenantModelFleetCarryingTable(table string) bool {
 // kill-switches know whose a device is — only the enrolled ledger does — so the caller resolves the ids and
 // passes them here. On the erasure path they MUST be captured before the ledger is cleared.
 type adminTenantExtraStores struct {
+	AssetCatalog       *assetcatalog.Store
 	TenantRestrictions interface {
 		CountTenantRestrictions(string) int
-		RemoveTenantRestrictions(string) (int, error)
+		RemoveTenantRestrictionsContext(context.Context, string) (int, error)
 	}
 	TenantTrustDistributions *tenantTrustDistributor
 	DelegatedGrants          *delegatedgrant.Store
@@ -382,11 +388,18 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 		}
 		f.add(adminTenantFootprintRow{Store: store, Count: int64(n)})
 	}
+	if e.AssetCatalog == nil {
+		add("asset_catalog_records", false, 0, "no asset catalog on this node")
+	} else if n, err := e.AssetCatalog.CountTenantRecords(f.TenantID); err != nil {
+		f.add(adminTenantFootprintRow{Store: "asset_catalog_records", Count: -1, Error: "asset catalog state is unavailable"})
+	} else {
+		f.add(adminTenantFootprintRow{Store: "asset_catalog_records", Count: int64(n), Note: "authored objects and alias metadata; excludes built-ins and inventory-derived endpoints"})
+	}
 	add("delegated_access_grants", e.DelegatedGrants != nil, e.DelegatedGrants.CountForTenant(f.TenantID), "no delegated-grant store on this node")
 	add("human_approvals", e.HumanApprovals != nil, e.HumanApprovals.CountForTenant(f.TenantID), "no human-approval store on this node")
 	add("clientless_grants", e.ClientlessGrants != nil, e.ClientlessGrants.CountForTenant(f.TenantID), "no clientless grant store on this node")
 	add("end_user_idp_connections", e.IdPConnections != nil, e.IdPConnections.CountForTenant(f.TenantID), "no end-user IdP registry on this node")
-	add("high_risk_marks", e.HighRisk != nil, e.HighRisk.CountDevices(e.DeviceIDs), "no high-risk overlay on this node")
+	add("high_risk_marks", e.HighRisk != nil, e.HighRisk.CountDevices(e.DeviceIDs)+e.HighRisk.CountUsers(f.TenantID), "no high-risk overlay on this node")
 	add("admission_kill_switches", e.Admissions != nil, e.Admissions.CountDevices(e.DeviceIDs), "no admission revocation store on this node")
 	add("bypass_catalog_overrides", e.CatalogOverrides != nil, e.CatalogOverrides.CountForTenant(f.TenantID), "no bypass-catalog override store on this node")
 	add("connector_route_governance", e.ConnectorRoutes != nil, e.ConnectorRoutes.CountForTenant(f.TenantID), "no connector route governance on this node")
@@ -396,7 +409,13 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 		add("saas_tenant_restrictions", false, 0, "no managed SaaS configuration on this node")
 	}
 	add("seat_allocation", e.SeatAllocations != nil, e.SeatAllocations.CountForTenant(f.TenantID), "no seat allocation store on this node")
-	add("policy_candidates", e.PolicyCandidates != nil, e.PolicyCandidates.CountForTenant(f.TenantID), "no policy candidate store on this node")
+	if e.PolicyCandidates == nil {
+		add("policy_candidates", false, 0, "no policy candidate store on this node")
+	} else if rows, err := e.PolicyCandidates.List(context.Background(), f.TenantID, policycandidate.ListOptions{Limit: 1}); err != nil {
+		f.add(adminTenantFootprintRow{Store: "policy_candidates", Count: -1, Error: "policy candidate state is unavailable"})
+	} else {
+		add("policy_candidates", true, rows.Count, "")
+	}
 	add("enrolment_tokens_store", e.EnrolmentTokens != nil, e.EnrolmentTokens.CountForTenant(f.TenantID), "no file/blob enrolment token store on this node")
 	add("tenant_transport_authorities", e.TenantTransportAuthorities != nil,
 		e.TenantTransportAuthorities.CountForTenant(f.TenantID), "this node issues no per-organization transport material")
@@ -420,14 +439,30 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 
 // erase removes every record these stores hold for the tenant, appending a row per store that had any.
 func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
+	e.eraseContext(context.Background(), result)
+}
+
+func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminTenantPurgeResult) {
 	add := func(store string, n int) {
 		if n > 0 {
 			result.Erased = append(result.Erased, adminTenantPurgeRow{Store: store, Count: int64(n)})
 		}
 	}
+	eraseChecked := func(store string, remove func(string) (int, error)) {
+		n, err := remove(result.TenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, store+": erasure saving could not be confirmed")
+		} else {
+			add(store, n)
+		}
+	}
+
 	tenantID := result.TenantID
+	if e.AssetCatalog != nil {
+		eraseChecked("asset_catalog_records", func(id string) (int, error) { return e.AssetCatalog.RemoveTenantContext(ctx, id) })
+	}
 	if e.TenantRestrictions != nil {
-		n, err := e.TenantRestrictions.RemoveTenantRestrictions(tenantID)
+		n, err := e.TenantRestrictions.RemoveTenantRestrictionsContext(ctx, tenantID)
 		if err != nil {
 			result.Failures = append(result.Failures, "SaaS restriction erasure failed: "+err.Error())
 		} else {
@@ -435,43 +470,63 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.DelegatedGrants != nil {
-		add("delegated_access_grants", e.DelegatedGrants.RemoveTenant(tenantID))
+		eraseChecked("delegated_access_grants", func(tenant string) (int, error) { return e.DelegatedGrants.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.HumanApprovals != nil {
-		add("human_approvals", e.HumanApprovals.RemoveTenant(tenantID))
+		eraseChecked("human_approvals", func(tenant string) (int, error) { return e.HumanApprovals.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.ClientlessGrants != nil {
-		add("clientless_grants", e.ClientlessGrants.RemoveTenant(tenantID))
+		eraseChecked("clientless_grants", func(tenant string) (int, error) { return e.ClientlessGrants.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.IdPConnections != nil {
-		add("end_user_idp_connections", e.IdPConnections.RemoveTenant(tenantID))
+		eraseChecked("end_user_idp_connections", func(tenant string) (int, error) { return e.IdPConnections.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.HighRisk != nil {
-		add("high_risk_marks", e.HighRisk.RemoveDevices(e.DeviceIDs))
+		if n, err := e.HighRisk.RemoveTenantRisksContext(ctx, tenantID, e.DeviceIDs); err != nil {
+			result.Failures = append(result.Failures, "risk erasure saving could not be confirmed")
+		} else {
+			add("high_risk_marks", n)
+		}
 	}
 	if e.Admissions != nil {
-		add("admission_kill_switches", e.Admissions.RemoveDevices(e.DeviceIDs))
+		if n, err := e.Admissions.RemoveDevicesContext(ctx, e.DeviceIDs); err != nil {
+			result.Failures = append(result.Failures, "admission revocation erasure saving could not be confirmed")
+		} else {
+			add("admission_kill_switches", n)
+		}
 	}
 	if e.ConnectorRoutes != nil {
-		add("connector_route_governance", e.ConnectorRoutes.RemoveTenant(tenantID))
+		eraseChecked("connector_route_governance", func(id string) (int, error) { return e.ConnectorRoutes.RemoveTenantContext(ctx, id) })
 	}
 	if e.CatalogOverrides != nil {
-		add("bypass_catalog_overrides", e.CatalogOverrides.RemoveTenant(tenantID))
+		if n, err := e.CatalogOverrides.RemoveTenantContext(ctx, tenantID); err != nil {
+			result.Failures = append(result.Failures, "bypass catalog override erasure could not be confirmed")
+		} else {
+			add("bypass_catalog_overrides", n)
+		}
 	}
 	if e.SeatAllocations != nil {
-		add("seat_allocation", e.SeatAllocations.RemoveTenant(tenantID))
+		if n, err := e.SeatAllocations.RemoveTenantContext(ctx, tenantID); err != nil {
+			result.Failures = append(result.Failures, "seat allocation erasure could not be confirmed")
+		} else {
+			add("seat_allocation", n)
+		}
 	}
 	if e.PolicyCandidates != nil {
-		add("policy_candidates", e.PolicyCandidates.RemoveTenant(tenantID))
+		if n, err := e.PolicyCandidates.RemoveTenantContext(ctx, tenantID); err != nil {
+			result.Failures = append(result.Failures, "policy candidate erasure could not be confirmed")
+		} else {
+			add("policy_candidates", n)
+		}
 	}
 	if e.TenantTransportAuthorities != nil {
-		add("tenant_transport_authorities", e.TenantTransportAuthorities.RemoveTenant(tenantID))
+		eraseChecked("tenant_transport_authorities", e.TenantTransportAuthorities.RemoveTenantChecked)
 	}
 	if e.TenantInterceptionAuthorities != nil {
-		add("tenant_interception_authorities", e.TenantInterceptionAuthorities.RemoveTenant(tenantID))
+		eraseChecked("tenant_interception_authorities", e.TenantInterceptionAuthorities.RemoveTenantChecked)
 	}
 	if e.TenantTrustDistributions != nil {
-		n, err := e.TenantTrustDistributions.RemoveTenant(tenantID)
+		n, err := e.TenantTrustDistributions.RemoveTenantContext(ctx, tenantID)
 		if err != nil {
 			result.Failures = append(result.Failures, "tenant_trust_distributions: "+err.Error())
 		} else {
@@ -479,26 +534,49 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.EnrolmentTokens != nil {
-		add("enrolment_tokens_store", e.EnrolmentTokens.RemoveTenant(tenantID))
+		n := e.EnrolmentTokens.RemoveTenant(tenantID)
+		if err := e.EnrolmentTokens.Health(); err != nil {
+			result.Failures = append(result.Failures, "enrolment_tokens_store: "+err.Error())
+		} else {
+			add("enrolment_tokens_store", n)
+		}
 	}
 	if e.AgentRolloutPlans != nil {
-		add("agent_rollout_plans", e.AgentRolloutPlans.RemoveTenant(tenantID))
+		eraseChecked("agent_rollout_plans", func(tenant string) (int, error) { return e.AgentRolloutPlans.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.PublishedAgentUpdates != nil {
-		add("published_agent_releases", e.PublishedAgentUpdates.RemoveTenant(tenantID))
+		n, cleanup, err := e.PublishedAgentUpdates.removeTenantWithCleanupContext(ctx, tenantID)
+		result.ArtifactCleanup = cleanup
+		add("published_agent_releases", n)
+		if err != nil {
+			failure := "published_agent_releases: erasure saving could not be confirmed"
+			if cleanup["manifests"] == "absence_confirmed" {
+				location := "local"
+				if cleanup["shared"] == "unconfirmed" {
+					location = "shared"
+				}
+				failure = "published_agent_releases: manifests are absent; " + location + " artifact cleanup is unconfirmed; repair storage and retry erasure"
+			}
+			result.Failures = append(result.Failures, failure)
+		}
 	}
 }
 
 // tenantExtraStoresFor fills in the device ids the two DEVICE-KEYED stores need, from the enrolled ledger.
-// Called on the READ path; the erasure path fills them from what RemoveTenant returns, because by then the
-// ledger has already been emptied and asking it would answer "no devices" for a tenant that had them.
+// Retained removal records are included so a deleted tenant can be erased or
+// retried after restart. The ledger is cleared only after its dependent cleanup.
 func tenantExtraStoresFor(base adminTenantExtraStores, ledger *enrolledinventory.Ledger, tenantID string) adminTenantExtraStores {
 	if ledger == nil {
 		return base
 	}
-	for _, entry := range ledger.List() {
-		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) {
+	seen := make(map[string]bool, len(base.DeviceIDs))
+	for _, id := range base.DeviceIDs {
+		seen[id] = true
+	}
+	for _, entry := range ledger.Authoritative() {
+		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) && !seen[entry.Identity] {
 			base.DeviceIDs = append(base.DeviceIDs, entry.Identity)
+			seen[entry.Identity] = true
 		}
 	}
 	return base

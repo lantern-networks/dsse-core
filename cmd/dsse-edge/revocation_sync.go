@@ -48,10 +48,12 @@ func (s revocationSource) baseURL() string {
 // bundle: the puller re-applies on a newer generation OR a changed epoch (a CP restart resets the in-memory
 // generation; the persisted revoked set is still authoritative, so re-baselining is safe and fail-closed).
 type revocationFeed struct {
-	Generation uint64            `json:"generation"`
-	Epoch      string            `json:"epoch,omitempty"`
-	Revoked    map[string]string `json:"revoked"`             // identity -> non-secret reason code
-	HighRisk   map[string]string `json:"high_risk,omitempty"` // deviceID -> severity (decision-path)
+	Generation      uint64                `json:"generation"`
+	Epoch           string                `json:"epoch,omitempty"`
+	Revoked         map[string]string     `json:"revoked"` // identity -> non-secret reason code
+	UserRiskVersion int                   `json:"user_risk_version,omitempty"`
+	UserRisk        []revocation.UserRisk `json:"user_risk,omitempty"`
+	HighRisk        map[string]string     `json:"high_risk,omitempty"` // deviceID -> severity (decision-path)
 	// Authoritative marks this as a COMPLETE set from the config authority, which is what makes an EMPTY one
 	// meaningful. Zero revocations and "I could not tell you" are the same bytes otherwise, so a puller had to
 	// assume the worse of the two and keep whatever it held — correct, but it also meant releasing the LAST
@@ -234,6 +236,7 @@ func (s *revocationSyncStatus) snapshot() map[string]any {
 func (s revocationSource) run(ctx context.Context, overlay *revocation.AdmissionRevocations, highRisk *revocation.HighRiskOverlay) {
 	var lastApplied uint64
 	var lastEpoch string
+	var lastAuthoritative bool
 	haveApplied := false
 	pull := func(initial bool) {
 		feed, err := s.fetch(ctx)
@@ -246,7 +249,17 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 			}
 			return
 		}
-		apply := !haveApplied || feed.Epoch != lastEpoch || feed.Generation > lastApplied
+		// A failed local restoration must not be bypassed by an older feed that
+		// omits the typed user section, nor reported as a healthy unchanged poll.
+		if highRisk != nil && highRisk.Health() != nil {
+			err := fmt.Errorf("local risk state is not ready")
+			s.status.recordFailure(err, time.Now())
+			log.Printf("revocation sync: rejected feed: %v", err)
+			return
+		}
+		// A complete-set declaration can resolve an earlier ambiguous empty
+		// answer even if its generation has not advanced.
+		apply := !haveApplied || feed.Epoch != lastEpoch || feed.Generation > lastApplied || (feed.Authoritative && !lastAuthoritative && feed.Generation == lastApplied)
 		if !apply {
 			// Nothing newer, but the control plane ANSWERED — which is the difference between "up to date" and
 			// "has never heard from the authority", and the whole reason this status exists.
@@ -265,6 +278,13 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 		// answer, and the safe reading is to keep what we hold. That safe reading used to be the ONLY one, so
 		// releasing the last revocation propagated to nobody and the device stayed locked out until the Edge
 		// was restarted — a kill-switch that could be pressed but not released by the path that pressed it.
+		// Validate the typed user set before changing admission or device state.
+		// Older feeds preserve cached users; an empty set clears only when complete.
+		if err := applyUserRiskFeed(highRisk, feed); err != nil {
+			s.status.recordFailure(err, time.Now())
+			log.Printf("revocation sync: rejected user risk feed: %v", err)
+			return
+		}
 		keptLocal := false
 		if len(feed.Revoked) == 0 && overlay.SyncedCount() > 0 && !feed.Authoritative {
 			keptLocal = true
@@ -272,22 +292,27 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 		} else {
 			overlay.ReplaceSynced(feed.Revoked)
 		}
+		deviceRiskAction, deviceRiskCount := "disabled", 0
 		if highRisk != nil {
-			highRisk.ReplaceSynced(feed.HighRisk)
+			if len(feed.HighRisk) == 0 && !feed.Authoritative {
+				deviceRiskAction = "retained_unconfirmed_empty"
+			} else {
+				highRisk.ReplaceSynced(feed.HighRisk)
+				deviceRiskAction = "applied"
+			}
+			deviceRiskCount = len(highRisk.Snapshot())
 		}
 		lastApplied = feed.Generation
 		lastEpoch = feed.Epoch
+		lastAuthoritative = feed.Authoritative
 		haveApplied = true
-		// Report what actually happened. This line used to say "applied N revocations" even on the path that
-		// had just refused to apply them, so an operator reading the log during an incident was told the
-		// opposite of the truth at the one moment it mattered.
+		revocationAction := "applied"
 		if keptLocal {
-			s.status.recordApplied(feed.Generation, overlay.SyncedCount(), time.Now())
-			log.Printf("revocation sync: generation %d from the control plane — revocations NOT applied (kept %d local); %d high-risk device(s) applied", feed.Generation, overlay.SyncedCount(), len(feed.HighRisk))
-		} else {
-			s.status.recordApplied(feed.Generation, len(feed.Revoked), time.Now())
-			log.Printf("revocation sync: applied generation %d (%d revocation(s), %d high-risk device(s)) from the control plane", feed.Generation, len(feed.Revoked), len(feed.HighRisk))
+			revocationAction = "retained_unconfirmed_empty"
 		}
+		s.status.recordApplied(feed.Generation, overlay.SyncedCount(), time.Now())
+		log.Printf("revocation sync: generation=%d revocations=%s revocation_count=%d device_risk=%s high_risk_count=%d",
+			feed.Generation, revocationAction, overlay.SyncedCount(), deviceRiskAction, deviceRiskCount)
 	}
 	pull(true)
 	t := time.NewTicker(s.interval)
@@ -300,4 +325,26 @@ func (s revocationSource) run(ctx context.Context, overlay *revocation.Admission
 			pull(false)
 		}
 	}
+}
+
+func applyUserRiskFeed(overlay *revocation.HighRiskOverlay, feed revocationFeed) error {
+	if feed.UserRiskVersion != 0 && feed.UserRiskVersion != 1 {
+		return fmt.Errorf("unsupported user risk feed version")
+	}
+	if feed.UserRiskVersion == 0 {
+		if len(feed.UserRisk) > 0 {
+			return fmt.Errorf("user risk feed version is missing")
+		}
+		return nil
+	}
+	if overlay == nil {
+		return nil
+	}
+	if err := overlay.Health(); err != nil {
+		return fmt.Errorf("local risk state is not ready")
+	}
+	if len(feed.UserRisk) == 0 && !feed.Authoritative {
+		return nil
+	}
+	return overlay.ReplaceSyncedUsers(feed.UserRisk)
 }

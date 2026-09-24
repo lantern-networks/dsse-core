@@ -6,6 +6,7 @@ package main
 // constructor's locals so the handler bodies are untouched.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -114,7 +115,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		}
 		result, err := adminListDelegatedAccessGrant(delegatedGrants, r.Context(), adminTenantIDFromRequest(r), options)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -122,7 +123,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 	mux.HandleFunc("GET /admin/delegated-grants/{grant_id}", adminEndpoint("admin.delegated_grants.read", func(w http.ResponseWriter, r *http.Request) {
 		grant, found, err := adminGetDelegatedAccessGrant(delegatedGrants, r.Context(), adminTenantIDFromRequest(r), r.PathValue("grant_id"))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
 		if !found {
@@ -146,7 +147,9 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_upserted", upserted, evaluator, now), now)
+		audit := adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_upserted", upserted, evaluator, now)
+		audit.ActorUserID = auditActorPrincipal(r)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusOK, upserted)
 	}))
 	mux.HandleFunc("POST /admin/delegated-grants/{grant_id}/revoke", adminEndpoint("admin.delegated_grants.revoke", func(w http.ResponseWriter, r *http.Request) {
@@ -161,6 +164,19 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		now := time.Now()
 		revoked, found, err := adminRevokeDelegatedAccessGrant(delegatedGrants, r.Context(), adminTenantIDFromRequest(r), r.PathValue("grant_id"), request, now)
 		if err != nil {
+			if found && errors.Is(err, delegatedgrant.ErrPersistence) {
+				audit := adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_revoked", revoked, evaluator, now)
+				audit.ActorUserID = auditActorPrincipal(r)
+				audit.Result = stringPtr("partial")
+				audit.Reason = stringPtr("Grant revoked on this server; persistence is unconfirmed. Retry revocation before restarting.")
+				audit.Metadata["applied"], audit.Metadata["persistence"] = true, "unconfirmed"
+				if identity, ok := adminIdentityFromRequest(r); ok && identity.TenantID != revoked.TenantID {
+					stampOperatorActor(audit.Metadata, identity)
+				}
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": revoked.TenantID, "grant_id": revoked.ID, "persistence": "unconfirmed", "error": "Grant revoked on this server, but persistence is unconfirmed. Retry revocation before restarting."})
+				return
+			}
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
@@ -168,7 +184,9 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, http.StatusNotFound, fmt.Errorf("delegated access grant %s is absent", r.PathValue("grant_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_revoked", revoked, evaluator, now), now)
+		audit := adminDelegatedAccessGrantAuditLog("admin_delegated_access_grant_revoked", revoked, evaluator, now)
+		audit.ActorUserID = auditActorPrincipal(r)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
 		writeJSON(w, http.StatusOK, revoked)
 	}))
 	mux.HandleFunc("GET /admin/human-approval-events", adminEndpoint("admin.approval.read", func(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +199,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		}
 		result, err := adminListHumanApprovalEvent(humanApprovals, r.Context(), adminTenantIDFromRequest(r), options)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -189,7 +207,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 	mux.HandleFunc("GET /admin/human-approval-events/{approval_id}", adminEndpoint("admin.approval.read", func(w http.ResponseWriter, r *http.Request) {
 		approval, found, err := adminGetHumanApprovalEvent(humanApprovals, r.Context(), adminTenantIDFromRequest(r), r.PathValue("approval_id"))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
 		if !found {
@@ -210,7 +228,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalEventAuditLog("admin_human_approval_event_upserted", upserted, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalMutationAuditLog(r, "admin_human_approval_event_upserted", upserted, evaluator, now, false), now)
 		writeJSON(w, http.StatusOK, upserted)
 	}))
 	mux.HandleFunc("POST /admin/human-approval-events/{approval_id}/revoke", adminEndpoint("admin.approval.write", func(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +240,11 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		now := time.Now()
 		revoked, found, err := adminRevokeHumanApprovalEvent(humanApprovals, r.Context(), adminTenantIDFromRequest(r), r.PathValue("approval_id"), request, now)
 		if err != nil {
+			if found && errors.Is(err, humanapproval.ErrPersistence) {
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalMutationAuditLog(r, "admin_human_approval_event_revoked", revoked, evaluator, now, true), now)
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": revoked.TenantID, "approval_id": revoked.ID, "persistence": "unconfirmed", "error": "Approval revoked on this server, but persistence is unconfirmed. Retry revocation before restarting."})
+				return
+			}
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
@@ -229,7 +252,7 @@ func registerNHIPillarRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalEventAuditLog("admin_human_approval_event_revoked", revoked, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminHumanApprovalMutationAuditLog(r, "admin_human_approval_event_revoked", revoked, evaluator, now, false), now)
 		writeJSON(w, http.StatusOK, revoked)
 	}))
 }
@@ -268,6 +291,10 @@ func registerNHIRegistryRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		now := time.Now()
 		created, err := nonHumanIdentities.Upsert(r.Context(), identity, adminTenantIDFromRequest(r), now)
 		if err != nil {
+			if errors.Is(err, nhi.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, nhi.ErrPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

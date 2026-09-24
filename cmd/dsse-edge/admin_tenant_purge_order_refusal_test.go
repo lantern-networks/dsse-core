@@ -125,23 +125,19 @@ func TestAPurgeIsRefusedWhenTheErasureOrderCannotBeRecorded(t *testing.T) {
 }
 
 // tenantModelStoreThatSwallowsTheOrder carries the contract in full and still records nothing: OrderPurge
-// accepts and drops it. This is the Postgres store whose INSERT failed, or whose migration 041 never ran —
-// and it is invisible to the caller, because OrderPurge returns nothing to check.
+// claims success and drops it. Read-back remains a second guard after the checked save.
 type tenantModelStoreThatSwallowsTheOrder struct {
 	tenantModelStoreThatCannotCarry
 }
 
-func (s *tenantModelStoreThatSwallowsTheOrder) ConfigGeneration() uint64         { return 1 }
-func (s *tenantModelStoreThatSwallowsTheOrder) DeletedTenants() []tenantDeletion { return nil }
-func (s *tenantModelStoreThatSwallowsTheOrder) OrderPurge(string, time.Time)     {}
-func (s *tenantModelStoreThatSwallowsTheOrder) PurgeOrders() []tenantPurgeOrder  { return nil }
+func (s *tenantModelStoreThatSwallowsTheOrder) ConfigGeneration() uint64           { return 1 }
+func (s *tenantModelStoreThatSwallowsTheOrder) DeletedTenants() []tenantDeletion   { return nil }
+func (s *tenantModelStoreThatSwallowsTheOrder) OrderPurge(string, time.Time) error { return nil }
+func (s *tenantModelStoreThatSwallowsTheOrder) PurgeOrders() []tenantPurgeOrder    { return nil }
 
 // ★ AND THE SAME REFUSAL WHEN THE STORE ACCEPTS THE ORDER AND KEEPS NOTHING (2026-08-18).
 //
-// The first guard is a type assertion, which only catches a backend that never had the method. It cannot catch
-// the case the method exists for: a failed INSERT, or migration 041 never applied. OrderPurge has no error
-// return — the file store's signature has none and the two backends must be interchangeable — so the only way
-// to know the order was recorded is to look for it afterwards.
+// Even a backend returning nil must expose the order before erasure proceeds.
 func TestAPurgeIsRefusedWhenTheOrderIsAcceptedAndNotKept(t *testing.T) {
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {

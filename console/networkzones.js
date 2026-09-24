@@ -17,30 +17,48 @@ function renderNetworkZonesView(content) {
   renderZones(section);
 }
 
-// nzSiteMembership returns network_id -> [site display names] by asking each site which networks it binds.
+function nzCatalogRows(response, key) {
+  if (!response.ok) throw new Error("HTTP " + response.status);
+  if (!response.body || !Object.hasOwn(response.body, key)) throw new Error("Invalid network catalog response");
+  const rows = response.body[key];
+  if (rows === null) return [];
+  if (!Array.isArray(rows) || rows.some(row => !row || typeof row !== "object" || Array.isArray(row))) {
+    throw new Error("Invalid network catalog response");
+  }
+  return rows;
+}
+
+// All site bindings must be available before declaring a network unused.
 async function nzSiteMembership() {
-  const map = {};
-  try {
-    const rs = await apiFetch("GET", "/admin/sites");
-    const sites = (rs.ok && rs.body && rs.body.sites) || [];
-    await Promise.all(sites.map(async (s) => {
-      const sid = s.site_id || s.id;
-      try {
-        const rn = await apiFetch("GET", "/admin/sites/" + encodeURIComponent(sid) + "/networks");
-        ((rn.ok && rn.body && rn.body.networks) || []).forEach((n) => { if (n.network_id) { (map[n.network_id] = map[n.network_id] || []).push(s.name || sid); } });
-      } catch (e) { /* skip */ }
-    }));
-  } catch (e) { /* none */ }
+  const map = Object.create(null);
+  const sites = nzCatalogRows(await apiFetch("GET", "/admin/sites"), "sites");
+  await Promise.all(sites.map(async s => {
+    const sid = s.site_id || s.id;
+    if (typeof sid !== "string" || !sid || (s.name != null && typeof s.name !== "string")) throw new Error("Invalid site response");
+    const networks = nzCatalogRows(await apiFetch("GET", "/admin/sites/" + encodeURIComponent(sid) + "/networks"), "networks");
+    networks.forEach(n => {
+      if (!["network", "fqdn", "cidr"].includes(n.kind) ||
+          (n.kind === "fqdn" && (typeof n.fqdn !== "string" || !n.fqdn)) ||
+          (n.kind === "cidr" && (typeof n.cidr !== "string" || !n.cidr))) throw new Error("Invalid network binding response");
+      if (n.kind === "network" && (typeof n.network_id !== "string" || !n.network_id)) throw new Error("Invalid network binding response");
+      if (n.network_id != null && typeof n.network_id !== "string") throw new Error("Invalid network binding response");
+      if (n.network_id) (map[n.network_id] = map[n.network_id] || []).push(s.name || sid);
+    });
+  }));
   return map;
 }
 
 async function renderZones(section) {
   uiState(section, "loading");
   const current = freshRender(section);
-  let objs;
-  try { const r = await apiFetch("GET", "/admin/vlan-objects"); if (!r.ok) throw new Error("HTTP " + r.status); objs = (r.body && r.body.objects) || []; }
+  let objs, membership;
+  try {
+    objs = nzCatalogRows(await apiFetch("GET", "/admin/vlan-objects"), "objects");
+    if (objs.some(o => typeof o.id !== "string" || !o.id || (o.name != null && typeof o.name !== "string") ||
+        (o.cidrs != null && (!Array.isArray(o.cidrs) || o.cidrs.some(cidr => typeof cidr !== "string"))))) throw new Error("Invalid network response");
+    membership = await nzSiteMembership();
+  }
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderZones(section) }); return; }
-  const membership = await nzSiteMembership();
   if (!current()) return;
   section.innerHTML = "";
   section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add network", ja: "+ ネットワークを追加" }), onClick: () => openNetworkForm(section) })]));

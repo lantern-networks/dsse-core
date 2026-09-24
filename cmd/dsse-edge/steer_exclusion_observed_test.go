@@ -446,3 +446,26 @@ func TestEffectiveReportCarriesWhatTheDeviceIgnored(t *testing.T) {
 		t.Fatalf("an agent that said nothing must leave nil, got %#v — an empty list is a claim it never made", silent.IgnoredAppSigningIDs)
 	}
 }
+
+// Equal report timestamps must not reshuffle devices between cursor pages.
+func TestObservedPaginationEqualTimestamps(t *testing.T) {
+	s := newObservedExclusionStore(0)
+	now := time.Now()
+	for i := 0; i < 55; i++ {
+		s.Record(observedExclusionEntry{TenantID: "t1", DeviceIdentity: fmt.Sprintf("device-%03d", i), ReportedAt: now})
+	}
+	s.Record(observedExclusionEntry{TenantID: "t2", DeviceIdentity: "foreign", ReportedAt: now.Add(time.Hour)})
+	for pass := 0; pass < 5; pass++ {
+		first := s.Query("t1", observedQueryFilter{Limit: 50})
+		last := s.Query("t1", observedQueryFilter{Limit: 50, Offset: 50})
+		if first.Total != 55 || last.Total != 55 || len(first.Entries) != 50 || len(last.Entries) != 5 {
+			t.Fatalf("unexpected page sizes: %+v %+v", first, last)
+		}
+		all := append(first.Entries, last.Entries...)
+		for i, e := range all {
+			if want := fmt.Sprintf("device-%03d", i); e.DeviceIdentity != want {
+				t.Fatalf("page %d row %d = %s, want %s", pass, i, e.DeviceIdentity, want)
+			}
+		}
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/grantstore"
@@ -30,13 +31,18 @@ func grantBundleSection(store *grantstore.Store) *grantBundle {
 	if store == nil {
 		return nil
 	}
-	return &grantBundle{Grants: store.ListAll(), Complete: true}
+	rows, err := store.ListAllChecked()
+	return &grantBundle{Grants: rows, Complete: err == nil}
 }
 
-// applyGrantBundleSection folds the authority's set into this Edge's. Returns what changed.
-func applyGrantBundleSection(store *grantstore.Store, section *grantBundle, now time.Time) (added, updated int) {
-	if store == nil || section == nil || !section.Complete {
-		return 0, 0
+// applyGrantBundleSection validates and persists the authority's set. A failure
+// keeps the generation eligible for retry; locally applied denials remain in force.
+func applyGrantBundleSection(store *grantstore.Store, section *grantBundle, now time.Time) (added, updated int, err error) {
+	if section == nil {
+		return 0, 0, nil
 	}
-	return store.Merge(section.Grants, now)
+	if store == nil || !section.Complete {
+		return 0, 0, fmt.Errorf("access grant bundle is unavailable or incomplete")
+	}
+	return store.MergeChecked(section.Grants, now)
 }

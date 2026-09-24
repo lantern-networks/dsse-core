@@ -44,7 +44,7 @@ func TestTheAuthoritiesTravelInTheBundleTheFleetActuallyPulls(t *testing.T) {
 	}
 
 	edge, _ := internalca.NewStore(nil)
-	count, applied := applyInternalCABundleSection(edge, section, t.Logf)
+	count, applied, _ := applyInternalCABundleSection(edge, section, t.Logf)
 	if !applied || count != 1 {
 		t.Fatalf("the Edge must take it, got applied=%v count=%d", applied, count)
 	}
@@ -55,7 +55,7 @@ func TestTheAuthoritiesTravelInTheBundleTheFleetActuallyPulls(t *testing.T) {
 	// ★ A DELETION REACHES THE FLEET. Empty means none here — unlike the device-CA registry, where empty would
 	// refuse every device — because it is the only way an administrator's removal ever arrives.
 	controlPlane.Delete("a", "kaede", now)
-	if _, applied := applyInternalCABundleSection(edge, internalCABundleSection(controlPlane), t.Logf); !applied {
+	if _, applied, _ := applyInternalCABundleSection(edge, internalCABundleSection(controlPlane), t.Logf); !applied {
 		t.Fatal("an empty complete section must be applied")
 	}
 	if got := edge.AnchorsPEM("kaede", now); len(got) != 0 {
@@ -65,7 +65,7 @@ func TestTheAuthoritiesTravelInTheBundleTheFleetActuallyPulls(t *testing.T) {
 	// ★★ AND A CONTROL PLANE THAT COULD NOT LOOK CHANGES NOTHING.
 	controlPlane.Upsert(internalca.Authority{ID: "a", TenantID: "kaede", CertificatePEM: anInternalAuthorityPEM(t, "Kaede Internal CA")}, now)
 	applyInternalCABundleSection(edge, internalCABundleSection(controlPlane), t.Logf)
-	if _, applied := applyInternalCABundleSection(edge, &internalCABundle{Complete: false}, t.Logf); applied {
+	if _, applied, _ := applyInternalCABundleSection(edge, &internalCABundle{Complete: false}, t.Logf); applied {
 		t.Fatal("an incomplete section must never be read as \"there are none\"")
 	}
 	if got := edge.AnchorsPEM("kaede", now); len(got) != 1 {

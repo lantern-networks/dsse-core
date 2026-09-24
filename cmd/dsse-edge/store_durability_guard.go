@@ -20,14 +20,15 @@ var sharedStateDSNConfigured bool
 // posture check found both real devices gone from the inventory. A gate test regenerates this list from the
 // call sites so it cannot drift away from them.
 func storeUnderstandsSharedState(name string) bool {
-	switch strings.TrimSpace(name) {
+	switch sharedStoreKey(name) {
 	// audit_chain joined on 2026-08-24: it was already resolved by cpStateBlobPersister, and giving it a
 	// -state-dir default is what made it reachable through this path at all.
 	// agent_updates joined on 2026-08-28: the published set was a file on whichever control plane served the
 	// publish, so in an HA pair one node held the catalogue and the other answered "nothing published" — and an
 	// Edge polling the front door read them alternately.
-	case "admin_runtime_state", "admission_revocations", "agent_rollout", "agent_updates", "asset_catalog",
+	case "admin_runtime_state", "admission_revocations", "high_risk_overlay", "agent_rollout", "agent_updates", "asset_catalog",
 		"audit_chain", "break_glass", "delegated_grants",
+		"dlp_allowlist", "dlp_classifiers", "dlp_fingerprints", "dlp_policy_objects",
 		"enrolled_inventory", "enrolment_tokens", "grants", "human_approvals", "idp_connections",
 		// inspection_posture UNDERSTANDS shared state but is never resolved to it automatically — see
 		// storeStaysNodeLocal below. The two lists answer different questions: this one is "would =postgres
@@ -39,6 +40,25 @@ func storeUnderstandsSharedState(name string) bool {
 		return true
 	}
 	return false
+}
+
+// The risk store's historical filename and its Postgres row key differ. Keep
+// both stable while resolving the backend by the key its persister understands.
+func sharedStoreKey(name string) string {
+	if strings.TrimSpace(name) == "high_risk_devices" {
+		return "high_risk_overlay"
+	}
+	return strings.TrimSpace(name)
+}
+
+func durableStoreFlag(name string) string {
+	switch name {
+	case "high_risk_devices":
+		return "high-risk"
+	case "admission_revocations":
+		return "admission-revocation"
+	}
+	return strings.ReplaceAll(name, "_", "-")
 }
 
 // storeStaysNodeLocal names the stores an Edge must NOT be defaulted onto shared state for.
@@ -117,7 +137,10 @@ func durableStorePath(stateDir, explicit, name string) string {
 		own := ""
 		if sd := strings.TrimSpace(stateDir); sd != "" {
 			candidate := filepath.Join(sd, name+".json")
-			if st, err := os.Stat(candidate); err == nil && !st.IsDir() && st.Size() > 0 {
+			// An empty file, directory, dangling link or inaccessible path is
+			// not first boot. Keep it local for checked loading/recovery instead
+			// of hiding it by silently selecting a different, empty backend.
+			if _, err := os.Lstat(candidate); err == nil || !os.IsNotExist(err) {
 				own = candidate
 			}
 		}
@@ -126,7 +149,7 @@ func durableStorePath(stateDir, explicit, name string) string {
 		}
 		log.Printf("state store %q: this node has its own copy at %q and the deployment has a shared database, "+
 			"so it stays per node — two Edges can answer differently. Migrate with -%s-store=postgres+import:%s",
-			name, own, strings.ReplaceAll(name, "_", "-"), own)
+			name, own, durableStoreFlag(name), own)
 	}
 	if strings.TrimSpace(stateDir) == "" {
 		return explicit // no state dir configured: leave as-is (legacy; may be volatile)
@@ -224,4 +247,19 @@ func requireDurableStoresViolation(devMode, requireDurable bool, report volatile
 		return nil
 	}
 	return report.config
+}
+
+// A bundle receiver owns a node-local cache; the publishing CP owns authority.
+// A shared DSN used for other services must not make the receiver an author.
+func configBundleStorePath(stateDir, sourceURL, explicit, name string) string {
+	if strings.TrimSpace(sourceURL) == "" {
+		return durableStorePath(stateDir, explicit, name)
+	}
+	if v := strings.TrimSpace(explicit); v != "" && v != "memory" {
+		return explicit
+	}
+	if sd := strings.TrimSpace(stateDir); sd != "" {
+		return filepath.Join(sd, name+".json")
+	}
+	return ""
 }

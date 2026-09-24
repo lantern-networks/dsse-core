@@ -4,15 +4,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"strings"
+	"unicode"
 )
 
 // Allowlist suppresses findings for operator-declared KNOWN-SAFE values — a test card (4111 1111 1111 1111), a
 // sample My Number used in docs, a specific benign email — the #1 source of DLP false positives. It is the
 // false-positive-tuning primitive (slice F) and the hashing core a future EDM/exact-data-match (slice E) reuses.
 //
-// NON-SECRET discipline: the raw safe value is accepted only in transit (the admin enters it once) and NEVER
-// stored — the Allowlist holds only salted SHA-256 hashes. A value is normalized before hashing so a card matches
-// whether written grouped or contiguous, and an email regardless of case.
+// This compiled scanner holds only salted SHA-256 hashes. The administration store
+// and configuration bundle retain authored known-safe values for management.
+// Numeric grouping and email case normalize; other values match exactly.
 type Allowlist struct {
 	salt   string
 	hashes map[string]bool
@@ -27,11 +28,12 @@ func NewAllowlist(salt string, values []string) *Allowlist {
 		if v == "" {
 			continue
 		}
-		// Store under BOTH a type-agnostic normalization and the digits-only form, so a pasted "4111 1111 1111
-		// 1111" allowlists the card whether the finding carries it grouped or contiguous.
-		a.hashes[a.hash(normalizeAllowValue("", v))] = true
-		if d := digitsOnly(v); d != "" && d != v {
-			a.hashes[a.hash(d)] = true
+		// Keep literal, email and numeric matches separate. An identifier that
+		// contains digits must not authorize an unrelated card or phone number.
+		a.hashes[a.hash("literal\x00"+v)] = true
+		a.hashes[a.hash("email\x00"+strings.ToLower(v))] = true
+		if d, ok := formattedNumericAllowValue(v); ok {
+			a.hashes[a.hash("numeric\x00"+d)] = true
 		}
 	}
 	return a
@@ -46,7 +48,16 @@ func (a *Allowlist) Allowed(typ IdentifierType, raw []byte) bool {
 	if a.Empty() {
 		return false
 	}
-	return a.hashes[a.hash(normalizeAllowValue(typ, string(raw)))]
+	value := strings.TrimSpace(string(raw))
+	switch typ {
+	case MyNumber, CorporateNumber, CreditCard, Phone:
+		digits, ok := formattedNumericAllowValue(value)
+		return ok && a.hashes[a.hash("numeric\x00"+digits)]
+	case Email:
+		return a.hashes[a.hash("email\x00"+strings.ToLower(value))]
+	default:
+		return a.hashes[a.hash("literal\x00"+value)]
+	}
 }
 
 func (a *Allowlist) hash(normalized string) string {
@@ -54,37 +65,18 @@ func (a *Allowlist) hash(normalized string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// normalizeAllowValue canonicalizes a value so equivalent renderings hash alike: numeric identifiers to digits
-// only (grouping/separators dropped), email lowercased, everything else trimmed.
-func normalizeAllowValue(typ IdentifierType, v string) string {
-	v = strings.TrimSpace(v)
-	switch typ {
-	case MyNumber, CorporateNumber, CreditCard, Phone:
-		// Phone joins the digits-only branch (review #19): a phone finding carries its separators
-		// ("090-1234-5678"), so keeping them here meant the hash never matched the operator's allowlist
-		// entry and a separated phone could NEVER be allowlisted. Digits-only canonicalizes both sides.
-		return digitsOnly(v)
-	case Email:
-		return strings.ToLower(v)
-	case "":
-		// Unknown type (allowlist ingestion): if it is all-ish digits, prefer the digits-only form so a pasted
-		// card/number matches the numeric finding path; otherwise lowercase (covers emails).
-		if d := digitsOnly(v); d != "" && len(d) >= len(v)-len(v)/3 {
-			return d
-		}
-		return strings.ToLower(v)
-	default:
-		return v
-	}
-}
-
-// digitsOnly returns just the ASCII digits of s.
-func digitsOnly(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] >= '0' && s[i] <= '9' {
-			b.WriteByte(s[i])
+// formattedNumericAllowValue accepts digits with conventional numeric grouping,
+// never arbitrary text containing digits. Other values use exact literal matching.
+func formattedNumericAllowValue(value string) (string, bool) {
+	var digits strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case unicode.IsSpace(r) || r == '-' || r == '(' || r == ')' || r == '.':
+		default:
+			return "", false
 		}
 	}
-	return b.String()
+	return digits.String(), digits.Len() > 0
 }

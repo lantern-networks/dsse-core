@@ -28,6 +28,10 @@ func enrolledEndpointID(identity string) string {
 // auto-population never clobbers admin edits. Returns the synced endpoints.
 func (s *Store) SyncEnrolledEndpoints(tenantID string, devices []EnrolledDevice, now time.Time) []Endpoint {
 	out := make([]Endpoint, 0, len(devices))
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return out
+	}
 	for _, d := range devices {
 		identity := strings.TrimSpace(d.Identity)
 		if identity == "" {
@@ -38,11 +42,8 @@ func (s *Store) SyncEnrolledEndpoints(tenantID string, devices []EnrolledDevice,
 		if alias == "" {
 			alias = identity
 		}
-		// Keep the operator's alias if this device was already synced and renamed.
-		if existing, ok := s.GetEndpoint(tenantID, id); ok {
-			alias = existing.Alias
-		}
-		e, err := s.UpsertEndpoint(Endpoint{
+
+		e, err := s.syncEnrolledEndpoint(Endpoint{
 			ID:       id,
 			TenantID: tenantID,
 			Alias:    alias,
@@ -57,4 +58,18 @@ func (s *Store) SyncEnrolledEndpoints(tenantID string, devices []EnrolledDevice,
 		}
 	}
 	return out
+}
+
+// Inventory identity/platform and an operator alias are read and published under
+// one lock so a concurrent list sync cannot overwrite a confirmed rename.
+func (s *Store) syncEnrolledEndpoint(e Endpoint) (Endpoint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current, ok := s.endpoints[e.TenantID][e.ID]; ok {
+		e.Alias = current.Alias
+	}
+	if alias, ok := s.enrolledAliases[e.TenantID][e.ID]; ok {
+		e.Alias = alias
+	}
+	return s.upsertEndpointLocked(e)
 }

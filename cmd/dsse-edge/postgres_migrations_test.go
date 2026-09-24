@@ -12,13 +12,13 @@ func TestPostgresExportWorkerMigrationVersions(t *testing.T) {
 	if got, want := postgresExportWorkerMigrationVersions("jsonl"), []string{"001", "002", "004"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("jsonl worker versions = %#v, want %#v", got, want)
 	}
-	if got, want := postgresExportWorkerMigrationVersions(" postgres "), []string{"001", "002", "004", "003", "010"}; !reflect.DeepEqual(got, want) {
+	if got, want := postgresExportWorkerMigrationVersions(" postgres "), []string{"001", "002", "004", "003", "010", "050"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("postgres worker versions = %#v, want %#v", got, want)
 	}
 }
 
 func TestPostgresHotStoreMigrationVersions(t *testing.T) {
-	if got, want := postgresHotStoreMigrationVersions(), []string{"003", "010"}; !reflect.DeepEqual(got, want) {
+	if got, want := postgresHotStoreMigrationVersions(), []string{"003", "010", "050"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("hot store versions = %#v, want %#v", got, want)
 	}
 }

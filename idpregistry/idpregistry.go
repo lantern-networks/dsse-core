@@ -112,10 +112,11 @@ func normalize(c Connection) (Connection, error) {
 // use; persists to a JSON state path when configured (see persistence.go) so registered IdPs survive a
 // restart.
 type Store struct {
-	mu          sync.RWMutex
-	connections map[string]map[string]Connection // tenant -> idp_id -> connection
-	defaults    map[string]string                // tenant -> default idp_id
-	persister   blobstore.Persister
+	mu             sync.RWMutex
+	connections    map[string]map[string]Connection // tenant -> idp_id -> connection
+	defaults       map[string]string                // tenant -> default idp_id
+	persister      blobstore.Persister
+	authorityKnown bool
 	// generation advances on every change. The config bundle SUMS it, and an Edge applies a bundle only when
 	// that sum is newer — see ConfigGeneration.
 	generation uint64
@@ -141,15 +142,16 @@ func NewStore() *Store {
 }
 
 // Upsert validates and stores a connection. The first connection registered for a tenant becomes its default.
-func (s *Store) Upsert(c Connection) (Connection, error) {
+func (s *Store) upsertLocal(c Connection) (Connection, error) {
 	normalized, err := normalize(c)
 	if err != nil {
 		return Connection{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.connections[normalized.TenantID] == nil {
-		s.connections[normalized.TenantID] = map[string]Connection{}
+	candidate := s.snapshotLocked()
+	if candidate.Connections[normalized.TenantID] == nil {
+		candidate.Connections[normalized.TenantID] = map[string]Connection{}
 	}
 	// ★★★ THE SCREEN PROMISES THE SECRET SURVIVES A BLANK FIELD, AND THIS USED TO DELETE IT (2026-09-03,
 	// measured on a live deployment while a step-up ceremony failed at the last hop).
@@ -171,17 +173,23 @@ func (s *Store) Upsert(c Connection) (Connection, error) {
 			normalized.ClientSecret = existing.ClientSecret
 		}
 	}
-	s.connections[normalized.TenantID][normalized.IdPID] = normalized
-	if strings.TrimSpace(s.defaults[normalized.TenantID]) == "" {
-		s.defaults[normalized.TenantID] = normalized.IdPID
+	candidate.Connections[normalized.TenantID][normalized.IdPID] = normalized
+	if strings.TrimSpace(candidate.Defaults[normalized.TenantID]) == "" {
+		candidate.Defaults[normalized.TenantID] = normalized.IdPID
 	}
+	if err := s.saveLocked(candidate); err != nil {
+		return Connection{}, err
+	}
+	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
-	s.persistLocked()
 	return normalized, nil
 }
 
 // Get returns a connection by id for the tenant.
 func (s *Store) Get(tenantID, idpID string) (Connection, bool) {
+	if s.RefreshShared() != nil {
+		return Connection{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	c, ok := s.connections[strings.TrimSpace(tenantID)][strings.TrimSpace(idpID)]
@@ -190,6 +198,9 @@ func (s *Store) Get(tenantID, idpID string) (Connection, bool) {
 
 // List returns the tenant's connections, sorted by id (default first is the caller's concern via Default()).
 func (s *Store) List(tenantID string) []Connection {
+	if s.RefreshShared() != nil {
+		return nil
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]Connection, 0, len(s.connections[strings.TrimSpace(tenantID)]))
@@ -202,7 +213,7 @@ func (s *Store) List(tenantID string) []Connection {
 
 // Delete removes a connection. It refuses to delete the tenant's current default while other connections
 // remain (set a new default first) — but allows deleting the last one. Reports whether it existed.
-func (s *Store) Delete(tenantID, idpID string) (bool, error) {
+func (s *Store) deleteLocal(tenantID, idpID string) (bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	idpID = strings.TrimSpace(idpID)
 	s.mu.Lock()
@@ -213,17 +224,21 @@ func (s *Store) Delete(tenantID, idpID string) (bool, error) {
 	if s.defaults[tenantID] == idpID && len(s.connections[tenantID]) > 1 {
 		return false, fmt.Errorf("cannot delete the default IdP %q while others exist; set a new default first", idpID)
 	}
-	delete(s.connections[tenantID], idpID)
-	if s.defaults[tenantID] == idpID {
-		delete(s.defaults, tenantID)
+	candidate := s.snapshotLocked()
+	delete(candidate.Connections[tenantID], idpID)
+	if candidate.Defaults[tenantID] == idpID {
+		delete(candidate.Defaults, tenantID)
 	}
+	if err := s.saveLocked(candidate); err != nil {
+		return false, err
+	}
+	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
-	s.persistLocked()
 	return true, nil
 }
 
 // SetDefault marks a registered connection as the tenant default. The id must already exist.
-func (s *Store) SetDefault(tenantID, idpID string) error {
+func (s *Store) setDefaultLocal(tenantID, idpID string) error {
 	tenantID = strings.TrimSpace(tenantID)
 	idpID = strings.TrimSpace(idpID)
 	s.mu.Lock()
@@ -231,14 +246,21 @@ func (s *Store) SetDefault(tenantID, idpID string) error {
 	if _, ok := s.connections[tenantID][idpID]; !ok {
 		return fmt.Errorf("idp %q is not registered for the tenant", idpID)
 	}
-	s.defaults[tenantID] = idpID
+	candidate := s.snapshotLocked()
+	candidate.Defaults[tenantID] = idpID
+	if err := s.saveLocked(candidate); err != nil {
+		return err
+	}
+	s.defaults = candidate.Defaults
 	s.generation++
-	s.persistLocked()
 	return nil
 }
 
 // Default returns the tenant's default connection.
 func (s *Store) Default(tenantID string) (Connection, bool) {
+	if s.RefreshShared() != nil {
+		return Connection{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	id := s.defaults[strings.TrimSpace(tenantID)]
@@ -311,29 +333,32 @@ func (s *Store) CountForTenant(tenantID string) int {
 // ★ IT EXISTS BECAUSE "COMPLETELY DELETED" LEFT THEM BEHIND (2026-08-18). This registry is keyed by tenant at
 // the top level, so the erasure is exact — and it was still in neither the tenant footprint nor the purge, so
 // an organization's registered sign-in providers outlived the organization.
-func (s *Store) RemoveTenant(tenantID string) int {
-	if s == nil {
-		return 0
+func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
+
+func (s *Store) removeTenantCheckedLocal(tenantID string) (int, error) {
+	if s == nil || strings.TrimSpace(tenantID) == "" {
+		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := len(s.connections[tenantID])
 	_, hadDefault := s.defaults[tenantID]
 	if n == 0 && !hadDefault {
-		return 0
+		return 0, nil
 	}
-	delete(s.connections, tenantID)
-	delete(s.defaults, tenantID)
 	if n == 0 {
-		n = 1 // the default alone was the residue
+		n = 1
 	}
+	candidate := s.snapshotLocked()
+	delete(candidate.Connections, tenantID)
+	delete(candidate.Defaults, tenantID)
+	if err := s.saveLocked(candidate); err != nil {
+		return 0, err
+	}
+	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
-	s.persistLocked()
-	return n
+	return n, nil
 }
 
 // ★★★ THE FLEET'S VIEW, BECAUSE AN EDGE CARRIES EVERY ORGANIZATION'S FLOWS (2026-09-02).
@@ -385,6 +410,9 @@ func (s *Store) DefaultsAll() map[string]string {
 func (s *Store) ReplaceAll(conns []Connection, defaults map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if isShared(s.persister) {
+		return
+	} // Shared CP authority is authored through scoped mutations.
 	s.connections = map[string]map[string]Connection{}
 	for _, c := range conns {
 		tenant := strings.TrimSpace(c.TenantID)

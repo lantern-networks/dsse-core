@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"log"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -54,9 +56,11 @@ func (r authoredRoute) key() string {
 }
 
 type connectorRouteGovernance struct {
-	mu       sync.RWMutex
-	held     map[string]map[string]map[string]bool // tenant -> connectorID -> cidr -> held
-	authored map[string]map[string][]authoredRoute // tenant -> connectorID -> authored routes
+	writeMu     sync.Mutex
+	sharedKnown bool
+	mu          sync.RWMutex
+	held        map[string]map[string]map[string]bool // tenant -> connectorID -> cidr -> held
+	authored    map[string]map[string][]authoredRoute // tenant -> connectorID -> authored routes
 	// approved gates the fail-safe: once a connector has been SEEN (SeeRoutes ran once — the grandfather), only
 	// APPROVED self-declared CIDRs are routable. A route the connector advertises LATER is PENDING (not routable)
 	// until an operator approves it — so a mis-declared or rogue connector cannot silently grab 0.0.0.0/0.
@@ -99,10 +103,36 @@ type connectorRouteGovernance struct {
 
 // governancePersistState is the on-disk shape of the shared governance decisions.
 type governancePersistState struct {
+	// Complete distinguishes an authoritative empty set from a legacy omitted section.
+	Complete bool                                  `json:"complete,omitempty"`
 	Held     map[string]map[string]map[string]bool `json:"held"`
 	Approved map[string]map[string]map[string]bool `json:"approved"`
 	Seen     map[string]map[string]bool            `json:"seen"`
 	Authored map[string]map[string][]authoredRoute `json:"authored"`
+}
+
+// Validate the original wire shape before typed decoding loses omitted keys.
+// Complete snapshots may explicitly contain null/empty maps (last deletion),
+// but a missing decision map is not an authoritative empty set.
+func (s *governancePersistState) UnmarshalJSON(raw []byte) error {
+	type wireState governancePersistState
+	var next wireState
+	if err := json.Unmarshal(raw, &next); err != nil {
+		return err
+	}
+	if next.Complete {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			return err
+		}
+		for _, key := range []string{"held", "approved", "seen", "authored"} {
+			if _, ok := fields[key]; !ok {
+				return fmt.Errorf("complete route governance snapshot missing %s", key)
+			}
+		}
+	}
+	*s = governancePersistState(next)
+	return nil
 }
 
 func newConnectorRouteGovernance() *connectorRouteGovernance {
@@ -134,7 +164,13 @@ func newConnectorRouteGovernanceWithPersister(persistPath string, cpConfigured b
 		persistPath:    strings.TrimSpace(persistPath),
 		cpConfigured:   cpConfigured,
 	}
-	g.load()
+	if g.isShared() {
+		if err := g.RefreshShared(); err != nil {
+			log.Printf("connector route governance unavailable: %v", err)
+		}
+	} else {
+		g.load()
+	}
 	return g
 }
 
@@ -192,6 +228,7 @@ func (g *connectorRouteGovernance) load() {
 	if st.Authored != nil {
 		g.authored = st.Authored
 	}
+	g.sharedKnown = true
 	where := g.persistPath
 	if g.persister != nil {
 		where = "the deployment's shared state"
@@ -199,35 +236,43 @@ func (g *connectorRouteGovernance) load() {
 	log.Printf("connector_route_governance: loaded shared decisions from %s", where)
 }
 
-// saveLocked persists the decisions atomically. The CALLER must hold g.mu (read or write). No-op without a path.
+// saveLocked retains best-effort persistence for discovery and imported decisions.
+// Administrator binding mutations use persistStateLocked before publishing instead.
 func (g *connectorRouteGovernance) saveLocked() {
-	if g.persister == nil && g.persistPath == "" {
-		return
+	if err := g.persistStateLocked(governancePersistState{Held: g.held, Approved: g.approved, Seen: g.seen, Authored: g.authored}); err != nil {
+		log.Printf("connector_route_governance: persist failed: %v", err)
 	}
-	st := governancePersistState{Held: g.held, Approved: g.approved, Seen: g.seen, Authored: g.authored}
+}
+
+// persistStateLocked writes a candidate snapshot. The caller holds g.mu throughout
+// saving and publication so another writer cannot overwrite it with an older state.
+func (g *connectorRouteGovernance) persistStateLocked(st governancePersistState) error {
+	if g.persister == nil && g.persistPath == "" {
+		return nil
+	}
 	raw, err := json.Marshal(st)
 	if err != nil {
-		return
+		return fmt.Errorf("encode route decisions: %w", err)
 	}
 	if g.persister != nil {
 		if err := g.persister.Save(raw); err != nil {
-			// ★ SAID OUT LOUD. A route that was accepted and not recorded is the defect this fixes; failing
-			// to record it silently would reproduce it with an extra step.
-			log.Printf("connector_route_governance: the deployment's shared state did NOT record this change "+
-				"(%v) — a route accepted here will be gone when this control plane restarts", err)
+			return fmt.Errorf("save route decisions: %w", err)
 		}
-		return
+		return nil
 	}
 	tmp := g.persistPath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("connector_route_governance: persist write failed: %v", err)
-		return
+		return fmt.Errorf("write route decisions: %w", err)
 	}
-	_ = os.Rename(tmp, g.persistPath)
+	defer os.Remove(tmp)
+	if err := os.Rename(tmp, g.persistPath); err != nil {
+		return fmt.Errorf("replace route decisions: %w", err)
+	}
+	return nil
 }
 
 // SetHeld holds (block=true) or unholds a self-declared CIDR route for a connector.
-func (g *connectorRouteGovernance) SetHeld(tenant, connectorID, cidr string, held bool) {
+func (g *connectorRouteGovernance) setHeldLocal(tenant, connectorID, cidr string, held bool) {
 	tenant, connectorID, cidr = strings.TrimSpace(tenant), strings.TrimSpace(connectorID), strings.TrimSpace(cidr)
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -251,34 +296,28 @@ func (g *connectorRouteGovernance) SetHeld(tenant, connectorID, cidr string, hel
 }
 
 // AddAuthored adds an admin-authored binding (idempotent by CIDR or FQDN).
-func (g *connectorRouteGovernance) AddAuthored(tenant, connectorID string, r authoredRoute) {
+func (g *connectorRouteGovernance) addAuthoredLocal(tenant, connectorID string, r authoredRoute) error {
 	tenant, connectorID = strings.TrimSpace(tenant), strings.TrimSpace(connectorID)
 	r.CIDR = strings.TrimSpace(r.CIDR)
 	r.FQDN = strings.TrimSpace(r.FQDN)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	defer g.saveLocked()
-	g.gen++
-	if g.authored[tenant] == nil {
-		g.authored[tenant] = map[string][]authoredRoute{}
-	}
-	for i, existing := range g.authored[tenant][connectorID] {
+	list := append([]authoredRoute(nil), g.authored[tenant][connectorID]...)
+	for i, existing := range list {
 		if existing.key() == r.key() {
-			g.authored[tenant][connectorID][i] = r
-			return
+			list[i] = r
+			return g.commitAuthoredLocked(tenant, connectorID, list)
 		}
 	}
-	g.authored[tenant][connectorID] = append(g.authored[tenant][connectorID], r)
+	return g.commitAuthoredLocked(tenant, connectorID, append(list, r))
 }
 
 // RemoveAuthored deletes an admin-authored binding by its identity (a CIDR or an "fqdn:name" key equivalent).
 // key is matched against each binding's key: pass a bare CIDR, or an authoredRoute-derived key.
-func (g *connectorRouteGovernance) RemoveAuthored(tenant, connectorID, key string) {
+func (g *connectorRouteGovernance) removeAuthoredLocal(tenant, connectorID, key string) error {
 	tenant, connectorID, key = strings.TrimSpace(tenant), strings.TrimSpace(connectorID), strings.TrimSpace(key)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	defer g.saveLocked()
-	g.gen++
 	list := g.authored[tenant][connectorID]
 	out := list[:0:0]
 	for _, r := range list {
@@ -287,9 +326,28 @@ func (g *connectorRouteGovernance) RemoveAuthored(tenant, connectorID, key strin
 			out = append(out, r)
 		}
 	}
-	if g.authored[tenant] != nil {
-		g.authored[tenant][connectorID] = out
+	return g.commitAuthoredLocked(tenant, connectorID, out)
+}
+
+func (g *connectorRouteGovernance) commitAuthoredLocked(tenant, connectorID string, list []authoredRoute) error {
+	next := maps.Clone(g.authored)
+	if next == nil {
+		next = map[string]map[string][]authoredRoute{}
 	}
+	if next[tenant] != nil || len(list) > 0 {
+		bindings := maps.Clone(next[tenant])
+		if bindings == nil {
+			bindings = map[string][]authoredRoute{}
+		}
+		bindings[connectorID] = list
+		next[tenant] = bindings
+	}
+	if err := g.persistStateLocked(governancePersistState{Held: g.held, Approved: g.approved, Seen: g.seen, Authored: next}); err != nil {
+		return err
+	}
+	g.authored = next
+	g.gen++
+	return nil
 }
 
 func (g *connectorRouteGovernance) isHeld(tenant, connectorID, cidr string) bool {
@@ -307,7 +365,7 @@ func (g *connectorRouteGovernance) isHeld(tenant, connectorID, cidr string) bool
 // is NO grandfather: a discovered subnet is marked seen (so the operator sees it to adopt) but never
 // auto-approved — the connector never sources a routable route (fail-safe against a rogue connector grabbing
 // 0.0.0.0/0).
-func (g *connectorRouteGovernance) SeeRoutes(tenant, connectorID string, cidrs []string, now time.Time) {
+func (g *connectorRouteGovernance) seeRoutesLocal(tenant, connectorID string, cidrs []string, now time.Time) {
 	tenant, connectorID = strings.TrimSpace(tenant), strings.TrimSpace(connectorID)
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -332,7 +390,7 @@ func (g *connectorRouteGovernance) SeeRoutes(tenant, connectorID string, cidrs [
 }
 
 // SetApproved approves (or un-approves) a self-declared CIDR for routing (used on a pending route).
-func (g *connectorRouteGovernance) SetApproved(tenant, connectorID, cidr string, approved bool) {
+func (g *connectorRouteGovernance) setApprovedLocal(tenant, connectorID, cidr string, approved bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	defer g.saveLocked()
@@ -477,7 +535,7 @@ func (g *connectorRouteGovernance) Export() *governancePersistState {
 // for connector bindings). Present-with-content REPLACES the local decisions; nil / all-empty is a no-op so an
 // omitted or empty bundle section never wipes local decisions (lockout-safe, mirroring the connector catalog).
 // Nil-safe.
-func (g *connectorRouteGovernance) ImportShared(st *governancePersistState) {
+func (g *connectorRouteGovernance) importSharedLocal(st *governancePersistState) {
 	if g == nil || st == nil {
 		return
 	}

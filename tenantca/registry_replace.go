@@ -40,6 +40,9 @@ func (r *TenantCARegistry) replaceTenantPersisted(tenantID string, pemBytes []by
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if err := r.checkWithdrawalSaveLocked(nil); err != nil {
+		return err
+	}
 	for _, cert := range certs {
 		if owner, ok := r.byAnchorKey[CAAnchorKey(cert)]; ok && !strings.EqualFold(owner, tenantID) {
 			return fmt.Errorf("CA already identifies another organization")

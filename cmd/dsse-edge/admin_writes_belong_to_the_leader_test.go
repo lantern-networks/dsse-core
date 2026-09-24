@@ -8,15 +8,17 @@ import "testing"
 func TestEveryChangingPermissionIsRecognisedAsAWrite(t *testing.T) {
 	writes := []string{
 		"admin.enrollment.write", "admin.policy.write", "admin.steering.write", "admin.connectors.write",
-		"admin.certs.write", "admin.tenant.write", "admin.tenant.admin", "admin.export.cancel",
-		"admin.export.create", "admin.dns.write", "admin.platform.write",
+		"admin.delegated_grants.revoke", "admin.certs.write", "admin.tenant.write", "admin.tenant.admin", "admin.export.cancel",
+		"admin.audit.delivery.replay", "admin.domain_events.delivery.replay",
+		"admin.policy_candidates.review", "admin.export.create", "admin.dns.write", "admin.platform.write",
 	}
 	for _, p := range writes {
 		if !adminPermissionWrites(p) {
 			t.Fatalf("%q was not recognised as a change — a standby would accept it and discard it", p)
 		}
 	}
-	// The guard: reads must stay readable on a standby, which is what a standby is for.
+	// Read permissions are not writes. Individual routes can still refuse stale
+	// standby reads (for example risk/admission); this tests classification only.
 	reads := []string{
 		"admin.state.read", "admin.policy.read", "admin.enrollment.read", "admin.logs.read",
 		"admin.steering.read", "admin.connectors.read",

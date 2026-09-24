@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -54,7 +55,7 @@ type adminHumanApprovalEventRevokeRequest struct {
 	ReasonCode string `json:"reason_code"`
 }
 
-func adminListHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenantID string, options adminHumanApprovalEventListOptions) (adminHumanApprovalEventListResponse, error) {
+func adminListHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, tenantID string, options adminHumanApprovalEventListOptions) (adminHumanApprovalEventListResponse, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return adminHumanApprovalEventListResponse{}, fmt.Errorf("tenant_id is required")
@@ -80,6 +81,9 @@ func adminListHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tena
 		limit = 100
 	}
 
+	if err := s.RefreshShared(); err != nil {
+		return adminHumanApprovalEventListResponse{}, err
+	}
 	rows := []adminHumanApprovalEvent{}
 	for _, approval := range s.Snapshot() {
 		if approval.TenantID != tenantID {
@@ -111,7 +115,7 @@ func adminListHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tena
 	}, nil
 }
 
-func adminGetHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenantID, approvalID string) (adminHumanApprovalEvent, bool, error) {
+func adminGetHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, tenantID, approvalID string) (adminHumanApprovalEvent, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	approvalID = strings.TrimSpace(approvalID)
 	if tenantID == "" {
@@ -124,26 +128,29 @@ func adminGetHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenan
 		return adminHumanApprovalEvent{}, false, fmt.Errorf("approval_id cannot contain slash")
 	}
 
-	approval, ok := s.Get(approvalID)
+	approval, ok, err := s.GetForTenantContext(ctx, tenantID, approvalID)
+	if err != nil {
+		return adminHumanApprovalEvent{}, false, err
+	}
 	if !ok || approval.TenantID != tenantID {
 		return adminHumanApprovalEvent{}, false, nil
 	}
 	return adminHumanApprovalEventFromModel(approval), true, nil
 }
 
-func adminUpsertHumanApprovalEvent(s *humanapproval.Store, _ context.Context, approval adminHumanApprovalEvent, tenantID string, now time.Time) (adminHumanApprovalEvent, error) {
+func adminUpsertHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, approval adminHumanApprovalEvent, tenantID string, now time.Time) (adminHumanApprovalEvent, error) {
 	modelApproval, err := normalizeAdminHumanApprovalEvent(approval, tenantID, now)
 	if err != nil {
 		return adminHumanApprovalEvent{}, err
 	}
-	stored, err := s.Upsert(modelApproval)
+	stored, err := s.UpsertContext(ctx, modelApproval)
 	if err != nil {
 		return adminHumanApprovalEvent{}, err
 	}
 	return adminHumanApprovalEventFromModel(stored), nil
 }
 
-func adminRevokeHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenantID, approvalID string, request adminHumanApprovalEventRevokeRequest, now time.Time) (adminHumanApprovalEvent, bool, error) {
+func adminRevokeHumanApprovalEvent(s *humanapproval.Store, ctx context.Context, tenantID, approvalID string, request adminHumanApprovalEventRevokeRequest, now time.Time) (adminHumanApprovalEvent, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	approvalID = strings.TrimSpace(approvalID)
 	if tenantID == "" {
@@ -160,20 +167,11 @@ func adminRevokeHumanApprovalEvent(s *humanapproval.Store, _ context.Context, te
 		return adminHumanApprovalEvent{}, false, fmt.Errorf("reason_code is invalid")
 	}
 
-	approval, ok := s.Get(approvalID)
-	if !ok || approval.TenantID != tenantID {
-		return adminHumanApprovalEvent{}, false, nil
+	revoked, found, err := s.RevokeForTenantContext(ctx, tenantID, approvalID, reasonCode)
+	if !found {
+		return adminHumanApprovalEvent{}, false, err
 	}
-	if approval.ApprovalResult != "revoked" {
-		revoked, _, err := s.Revoke(approvalID, reasonCode)
-		if err != nil {
-			// Revoked in memory but not on disk: the approval would resurrect on restart. Surface it —
-			// the admin must know this revoke is not durable.
-			return adminHumanApprovalEventFromModel(revoked), true, err
-		}
-		approval = revoked
-	}
-	return adminHumanApprovalEventFromModel(approval), true, nil
+	return adminHumanApprovalEventFromModel(revoked), true, err
 }
 
 func normalizeAdminHumanApprovalEvent(approval adminHumanApprovalEvent, tenantID string, now time.Time) (model.HumanApprovalEvent, error) {
@@ -339,6 +337,22 @@ func sortAdminHumanApprovalEvents(approvals []adminHumanApprovalEvent) {
 		}
 		return approvals[i].ID < approvals[j].ID
 	})
+}
+
+// Attribution belongs to the request, not the approval's subject or approver.
+func adminHumanApprovalMutationAuditLog(r *http.Request, eventType string, approval adminHumanApprovalEvent, evaluator decision.Evaluator, now time.Time, partial bool) model.AuditLog {
+	audit := adminHumanApprovalEventAuditLog(eventType, approval, evaluator, now)
+	audit.ActorUserID = auditActorPrincipal(r)
+	audit.Metadata["applied"] = true
+	if partial {
+		audit.Result = stringPtr("partial")
+		audit.Reason = stringPtr("Approval revoked on this server; persistence is unconfirmed. Retry revocation before restarting.")
+		audit.Metadata["persistence"] = "unconfirmed"
+	}
+	if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && identity.TenantID != approval.TenantID {
+		stampOperatorActor(audit.Metadata, identity)
+	}
+	return audit
 }
 
 func adminHumanApprovalEventAuditLog(eventType string, approval adminHumanApprovalEvent, evaluator decision.Evaluator, now time.Time) model.AuditLog {

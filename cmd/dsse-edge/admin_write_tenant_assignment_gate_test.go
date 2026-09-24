@@ -38,7 +38,8 @@ func TestNoWriteAssignsTheCallersTenantOverANamedOne(t *testing.T) {
 	// Excused, by file:line subject, with the reason. Keep this list short — an entry is a promise that the
 	// record does NOT belong to the organization the body names.
 	excused := map[string]string{
-		"auditRecord": "a purge is recorded in the OPERATOR's audit, with the erased customer as the target: the evidence that an erasure was authorised must not live inside the thing that was erased",
+		"inspection_posture_admin.go:result": "a new read-only response snapshot identifies the requesting tenant; no request body or stored tenant is assigned",
+		"auditRecord":                        "a purge is recorded in the OPERATOR's audit, with the erased customer as the target: the evidence that an erasure was authorised must not live inside the thing that was erased",
 	}
 
 	var offenders []string
@@ -55,7 +56,7 @@ func TestNoWriteAssignsTheCallersTenantOverANamedOne(t *testing.T) {
 		scanned++
 		for i, line := range strings.Split(string(raw), "\n") {
 			m := assign.FindStringSubmatch(line)
-			if m == nil || excused[m[1]] != "" {
+			if m == nil || excused[m[1]] != "" || excused[name+":"+m[1]] != "" {
 				continue
 			}
 			offenders = append(offenders, name+":"+itoa(i+1)+": "+strings.TrimSpace(line))

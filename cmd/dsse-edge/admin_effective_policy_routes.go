@@ -1,10 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/decision"
@@ -14,15 +17,18 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
-	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
 	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
 // Observe-mode adoption plus the effective-policy read surface (per-device effective
 // policy, tenant effective policies, egress effective rules, catalog groups,
 // inspection posture). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
-func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, policyCandidateStore policycandidate.RuntimeStore, recompileAuthoredRules func()) {
+func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, recompileAuthoredRules func()) {
 	mux.HandleFunc("POST /admin/east-west/observations/adopt", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		// Observations are held by the control plane (observation_report.go), and adoption authors rules there.
+		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "adopting east-west observations") {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		var reqBody struct {
 			ObservationIDs []string `json:"observation_ids"`
@@ -35,6 +41,14 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation store unavailable"))
 			return
 		}
+		if err := config.EastWestObserveStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation inventory unavailable"))
+			return
+		}
+		if !refreshAuthoredStores(w, ruleStore, assetStore) {
+			return
+		}
+		recompileAuthoredRules()
 		// Effective rules for dedup: an observation already matched by ANY effective east-west rule needs no
 		// adoption (covered flows are exactly what convergence already counts as handled).
 		var effective []decision.EastWestRule
@@ -44,7 +58,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			effective = rr.EffectiveEastWestRules(tenant)
 		}
 		covered := func(obs eastwestobserve.FlowObservation) bool {
-			req := model.DecisionRequest{Destination: obs.Destination, ServiceFamily: obs.ServiceFamily}
+			req := model.DecisionRequest{Destination: obs.Destination, ServiceFamily: obs.ServiceFamily, Protocol: "tcp", DestinationPort: obs.Port}
 			if obs.Source != eastwestobserve.SourceAny {
 				req.DeviceID = obs.Source
 			}
@@ -52,10 +66,48 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return ok
 		}
 		created := []string{}
+		adopted := []map[string]string{}
 		skippedCovered := []string{}
 		skippedMissing := []string{}
 		changed := false
-		for _, id := range reqBody.ObservationIDs {
+		defer func() {
+			if changed {
+				recompileAuthoredRules()
+			}
+		}()
+		// Each observation saves an endpoint and a rule separately. A failed batch
+		// must retain confirmed progress without claiming that the failed save rolled back.
+		finish := func(status int, index int, stage, endpointID string) {
+			result := "success"
+			body := map[string]any{
+				"schema_version": "admin_east_west_adopt.v1", "tenant_id": tenant,
+				"created": created, "adopted": adopted,
+				"skipped_covered": skippedCovered, "skipped_missing": skippedMissing,
+			}
+			if stage != "" {
+				result = "partial"
+				body["partial"] = true
+				body["error"] = "Adoption did not finish. Confirmed rules are listed in created; the failed save may have taken effect. Review current rules and destinations before retrying."
+				body["failed_stage"] = stage
+				body["failed_observation_id"] = reqBody.ObservationIDs[index]
+				body["unprocessed"] = append([]string{}, reqBody.ObservationIDs[index+1:]...)
+				if endpointID != "" {
+					body["destination_endpoint_id"] = endpointID
+				}
+			}
+			now := time.Now().UTC()
+			audit := model.AuditLog{
+				ID: randomEdgeID("audit_observation_adopt_", now), TenantID: tenant,
+				EventType: "east_west_observations_adopted", TargetType: stringPtr("east_west_observations"),
+				Action: stringPtr("adopt"), Result: stringPtr(result),
+				Timestamp: now.Format(time.RFC3339), SourceIP: stringPtr(r.RemoteAddr),
+				EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID,
+				Metadata: body,
+			}
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, applicationAuditWithActor(r, audit), now)
+			writeJSON(w, status, body)
+		}
+		for index, id := range reqBody.ObservationIDs {
 			obs, ok := config.EastWestObserveStore.Get(tenant, id)
 			if !ok {
 				skippedMissing = append(skippedMissing, id)
@@ -72,9 +124,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			// Materialize the observed destination as a first-class, GUI-visible, editable network endpoint and
 			// reference it by id — NOT a raw IP (which is invisible in the Console, blocks re-editing, and
 			// compiles to an empty→wildcard selector that would match any host). See adoptDestinationEndpointID.
-			destID, derr := adoptDestinationEndpointID(assetStore, tenant, obs.Destination)
+			destID, derr := adoptDestinationEndpointID(r.Context(), assetStore, tenant, obs.Destination)
 			if derr != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("adopt %s: materialize destination endpoint: %w", id, derr))
+				logErrorf("observation adoption endpoint persistence failed: %v", derr)
+				finish(http.StatusInternalServerError, index, "asset_endpoint", "")
 				return
 			}
 			rule := policyrule.Rule{
@@ -91,33 +144,37 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 				ServiceID: adoptServiceIDForObservation(assetStore, tenant, obs.Port, obs.ServiceFamily),
 				Action:    policyrule.Action{Access: policyrule.AccessAllow, Inspection: policyrule.InspectionInspect},
 			}
-			stored, err := ruleStore.Upsert(rule)
+			stored, err := ruleStore.UpsertContext(r.Context(), rule)
 			if err != nil {
-				writeError(w, http.StatusBadRequest, fmt.Errorf("adopt %s: %w", id, err))
+				logErrorf("observation adoption rule save failed: %v", err)
+				status := http.StatusBadRequest
+				if errors.Is(err, policyrule.ErrPersistence) {
+					status = http.StatusInternalServerError
+				}
+				finish(status, index, "rule", destID)
 				return
 			}
 			created = append(created, stored.ID)
+			adopted = append(adopted, map[string]string{"observation_id": id, "rule_id": stored.ID, "destination_endpoint_id": destID})
 			changed = true
 		}
-		if changed {
-			recompileAuthoredRules()
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
-			"schema_version":  "admin_east_west_adopt.v1",
-			"tenant_id":       tenant,
-			"created":         created,
-			"skipped_covered": skippedCovered,
-			"skipped_missing": skippedMissing,
-		})
+		finish(http.StatusOK, 0, "", "")
 	}))
 
 	// Effective-Policy ("Why") view: the precedence-ordered, provenance-tagged decision basis for one
 	// destination — every policy that competes (authored rules AND built-in base policies loaded via -policy),
 	// in the exact order the engine evaluates them, with the winner and shadowed matches marked — PLUS the
-	// inspect/bypass basis (decrypt-all default vs known-bypass / authored bypass / materialized cert-pin). This
+	// inspect/bypass basis (decrypt-all default vs known-bypass / authored bypass). This
 	// is the visibility that was missing on 2026-06-23, when an authored Authenticate rule silently lost a
 	// priority tie to a built-in Google allow and we had to hand-curl /decisions/evaluate to find it. Read-only.
 	mux.HandleFunc("GET /admin/effective-policy", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		destination := strings.TrimSpace(r.URL.Query().Get("destination"))
 		if destination == "" {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("destination query parameter is required (e.g. ?destination=accounts.google.com)"))
@@ -136,25 +193,11 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// docs/invisible_effective_configuration.md).
 		bypassSources := inspectionSources{KnownGroups: knownbypass.Groups, InterceptHosts: []string{"*"}}
 		if config.NetworkExtensionLabTLS != nil {
-			bypassSources.EffectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
-			bypassSources.InterceptHosts = config.NetworkExtensionLabTLS.InterceptHosts()
-		}
-		// Attribute SaaS Optimize bypass: pass the groups enabled in the live posture.
-		if config.InspectionPosture != nil {
-			enabled := map[string]bool{}
-			for _, name := range config.InspectionPosture().BypassGroups {
-				enabled[name] = true
-			}
-			for _, g := range inspectionposture.SaaSBypassGroups {
-				if enabled[g.Name] {
-					bypassSources.OptimizeGroups = append(bypassSources.OptimizeGroups, g)
-				}
-			}
+			patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
+			bypassSources.EffectiveBypass, bypassSources.InterceptHosts = patterns.Bypass, patterns.Intercept
+			bypassSources.DeviceIntercept, bypassSources.DeviceBypass = patterns.InterceptByDevice, patterns.BypassByDevice
 		}
 		bypassSources.AuthoredBypass = policyrule.EgressBypassFQDNs(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore)
-		if cs, ok := policyCandidateStore.(*policycandidate.Store); ok {
-			bypassSources.CertPinBypass = materializedCertPinBypassHosts(cs, tenant)
-		}
 		// ★ The preview must be the answer THIS organization would get. Measured while operating inside a newly
 		// created organization: the trace listed another organization's policies and named one of them as the
 		// deciding policy. The enforcement path already refuses to match across organizations (evaluator.go,
@@ -167,14 +210,25 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// policies), in precedence order, source-tagged — so the full policy set is visible, not discoverable only
 	// per-destination. Read-only.
 	mux.HandleFunc("GET /admin/effective-policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		writeJSON(w, http.StatusOK, effectivePolicyList(evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r)))
 	}))
 	// The unified Egress view's data source: EVERY effective egress rule across all surfaces — authored rules,
-	// the built-in default, the known-bypass OS/cert floor, legacy SaaS Optimize posture bypass, and approved
+	// the built-in default, the known-bypass OS/cert floor, and authored SaaS Optimize or
 	// cert-pin bypass — normalized to one source → destination : service ⇒ access × inspection shape. An operator
 	// expects the Egress view to reflect all egress decisions in one place, not just authored rules; this gathers
 	// them (the edge owns every surface) so the Console renders a single list. Read-only aggregation.
 	mux.HandleFunc("GET /admin/egress-effective-rules", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		aliasByID := map[string]string{}
 		for _, e := range assetStore.ListEndpoints(tenant) {
@@ -184,33 +238,28 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			aliasByID[g.ID] = g.Alias
 		}
 		egressRules := ruleStore.List(tenant, policyrule.PlaneEgress)
+		sourceWarnings := map[string]string{}
+		serviceWarnings := map[string]bool{}
+		for _, rule := range egressRules {
+			sourceWarnings[rule.ID] = policyrule.InspectionSourceWarning(tenant, rule, assetStore)
+			serviceWarnings[rule.ID] = policyrule.EgressServiceUnresolved(tenant, rule.ServiceID, assetStore)
+		}
 		in := effectiveEgressInputs{
-			Eval:                evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
-			Tenant:              tenant,
-			AuthoredRules:       egressRules,
-			AliasByID:           aliasByID,
-			KnownGroups:         knownbypass.Groups,
-			AuthoredBypassHosts: policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
-			UnresolvedRuleIDs:   unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
+			Eval:                     evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
+			Tenant:                   tenant,
+			AuthoredRules:            egressRules,
+			AliasByID:                aliasByID,
+			KnownGroups:              knownbypass.Groups,
+			UnresolvedRuleIDs:        unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
+			InspectionSourceWarnings: sourceWarnings,
+			UnresolvedServiceRuleIDs: serviceWarnings,
 		}
 		if config.NetworkExtensionLabTLS != nil {
-			in.EffectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
+			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass
 		}
+
 		if config.InspectionPosture != nil {
-			p := config.InspectionPosture()
-			in.KnownEnabled = p.KnownBypassEnabled
-			enabled := map[string]bool{}
-			for _, name := range p.BypassGroups {
-				enabled[name] = true
-			}
-			for _, g := range inspectionposture.SaaSBypassGroups {
-				if enabled[g.Name] {
-					in.OptimizeLegacy = append(in.OptimizeLegacy, g)
-				}
-			}
-		}
-		if cs, ok := policyCandidateStore.(*policycandidate.Store); ok {
-			in.CertPinBypasses = materializedCertPinBypassRefs(cs, tenant)
+			in.KnownEnabled = config.InspectionPosture().KnownBypassEnabled
 		}
 		writeJSON(w, http.StatusOK, buildEffectiveEgressRules(in))
 	}))
@@ -224,11 +273,15 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// decrypt allowlist (explicit hosts + SaaS auth-group presets), and the curated known-bypass list. The
 	// "make the hidden default visible and editable" of docs/invisible_effective_configuration.md.
 	mux.HandleFunc("GET /admin/inspection-posture", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config))
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
+		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 	// Change the inspection posture (partial update — only provided fields change). bypass_default decrypts ONLY
 	// the allowlist and raw-forwards the rest (still steered + policy-gated); keep a SaaS auth group selected to
 	// keep tenant restriction working. Persisted; the engine's intercept + bypass sets are re-applied instantly.
+	var postureWriteMu sync.Mutex
 	mux.HandleFunc("POST /admin/inspection-posture", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
 		// ★★★ AND AN EDGE THAT PULLS ITS CONFIG IS NOT AN AUTHOR OF IT (2026-08-23). The posture now travels in
 		// the config bundle, so a change written here would be overwritten by the next poll — silently, and only
@@ -237,8 +290,12 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "inspection posture") {
 			return
 		}
+		if !inspectionPostureMayWrite(r) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("only the deployment operator, outside a customer context, may change deployment inspection defaults"))
+			return
+		}
 		if config.SetInspectionPosture == nil || config.InspectionPosture == nil {
-			writeError(w, http.StatusConflict, fmt.Errorf("inspection posture is not configurable on this edge (no interception engine wired)"))
+			writeError(w, http.StatusConflict, fmt.Errorf("inspection posture storage is not configured on this server"))
 			return
 		}
 		var body struct {
@@ -252,34 +309,79 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode posture request: %w", err))
 			return
 		}
-		next := config.InspectionPosture()
-		if body.Mode != nil {
-			next.Mode = strings.TrimSpace(*body.Mode)
+		postureWriteMu.Lock()
+		defer postureWriteMu.Unlock()
+		var validationErr error
+		patch := func(before inspectionposture.Posture) (inspectionposture.Posture, error) {
+			next := before
+			if body.Mode != nil {
+				next.Mode = strings.TrimSpace(*body.Mode)
+			}
+			if body.DecryptAllowlistHosts != nil {
+				next.DecryptAllowlistHosts = *body.DecryptAllowlistHosts
+			}
+			if body.DecryptAllowlistGroups != nil {
+				next.DecryptAllowlistGroups = *body.DecryptAllowlistGroups
+			}
+			if body.BypassGroups != nil {
+				next.BypassGroups = *body.BypassGroups
+			}
+			if body.KnownBypassEnabled != nil {
+				next.KnownBypassEnabled = *body.KnownBypassEnabled
+			}
+			next, validationErr = inspectionposture.Validate(next)
+			if validationErr != nil {
+				return next, validationErr
+			}
+			for _, name := range next.BypassGroups {
+				if !stringInSetFold(name, before.BypassGroups) {
+					validationErr = errLegacyPostureSelection
+					return next, validationErr
+				}
+			}
+			return next, nil
 		}
-		if body.DecryptAllowlistHosts != nil {
-			next.DecryptAllowlistHosts = *body.DecryptAllowlistHosts
+		var before, next inspectionposture.Posture
+		var err error
+		if config.UpdateInspectionPosture != nil {
+			before, next, err = config.UpdateInspectionPosture(r.Context(), patch, adminTenantIDFromRequest(r))
+		} else {
+			// Compatibility for local, non-shared adapters.
+			before = config.InspectionPosture()
+			next, err = patch(before)
+			if err == nil {
+				_, err = config.SetInspectionPosture(next, adminTenantIDFromRequest(r))
+			}
 		}
-		if body.DecryptAllowlistGroups != nil {
-			next.DecryptAllowlistGroups = *body.DecryptAllowlistGroups
-		}
-		if body.BypassGroups != nil {
-			next.BypassGroups = *body.BypassGroups
-		}
-		if body.KnownBypassEnabled != nil {
-			next.KnownBypassEnabled = *body.KnownBypassEnabled
-		}
-		if next.Mode != inspectionposture.ModeDecryptAll && next.Mode != inspectionposture.ModeBypassDefault {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("mode must be %q or %q", inspectionposture.ModeDecryptAll, inspectionposture.ModeBypassDefault))
+		if validationErr != nil {
+			status := http.StatusBadRequest
+			if errors.Is(validationErr, errLegacyPostureSelection) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, validationErr)
 			return
 		}
-		if _, err := config.SetInspectionPosture(next, adminTenantIDFromRequest(r)); err != nil {
-			writeError(w, http.StatusInternalServerError, err) // applied in memory but not persisted — would revert on restart
+
+		result := "saved"
+		if err != nil {
+			result = "persistence_unconfirmed"
+		}
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, inspectionPostureAuditLog(r, before, next, result, evaluator, now), now)
+		if err != nil {
+			if errors.Is(err, inspectionposture.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Storage did not confirm the inspection change. The previous live settings remain active. Restore storage and retry."))
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Inspection settings could not be updated. Reload and retry."))
+			}
 			return
 		}
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config))
+		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 
 	// Predefined pinned-bypass catalog: the curated set of well-known un-interceptable services (no-decrypt
 	// keep-steer by default). A tenant admin can override an individual entry (force_inspect / disabled), which
 	// is finer-grained than the all-or-nothing known-bypass toggle on the inspection posture.
 }
+
+var errLegacyPostureSelection = errors.New("Legacy bypass selections can only be removed. Create a tenant Egress bypass rule through Inspection Settings or Internet Access.")

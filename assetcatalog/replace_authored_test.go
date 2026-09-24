@@ -17,7 +17,7 @@ func ep(tenant, id, addr, source string) Endpoint {
 // apply only ever upserted. The CP answered 200 {"status":"deleted"} and the Edge kept it — verified live.
 func TestReplaceAuthoredRemovesWhatTheControlPlaneNoLongerSends(t *testing.T) {
 	s := NewStore()
-	if _, err := s.UpsertEndpoint(ep("t1", "certpin-ep-1", "pinned.example", SourceManual)); err != nil {
+	if _, err := s.ReplaceAuthored([]Endpoint{ep("t1", "certpin-ep-1", "pinned.example", SourceManual)}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.UpsertEndpoint(ep("t1", "keep-1", "kept.example", SourceManual)); err != nil {

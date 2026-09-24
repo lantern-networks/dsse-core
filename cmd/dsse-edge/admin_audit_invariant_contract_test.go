@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,12 +13,17 @@ import (
 
 	agenttool "github.com/lantern-networks/dsse-core/agenttool"
 	appcatalog "github.com/lantern-networks/dsse-core/appcatalog"
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	endpointinventory "github.com/lantern-networks/dsse-core/endpointinventory"
 	humanidentity "github.com/lantern-networks/dsse-core/humanidentity"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
 	toolcallaudit "github.com/lantern-networks/dsse-core/toolcallaudit"
 
+	"github.com/lantern-networks/dsse-core/grantstore"
+	"github.com/lantern-networks/dsse-core/inspectionposture"
+	"github.com/lantern-networks/dsse-core/internalca"
 	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
 func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
@@ -173,6 +179,37 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				ApprovalResult:         "approved",
 			}, evaluator, now),
 		},
+		{name: "internalAuthorityAuditLog", audit: internalAuthorityAuditLog(httptest.NewRequest("POST", "/admin/internal-cas", nil), internalca.Authority{ID: "authority", TenantID: "tenant_audit_cp0020", Name: rawSubject, CertificatePEM: rawPayloadRef}, "upsert", "rejected", evaluator, now)},
+		{name: "assetCatalogAuditLog/endpoint", audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/endpoints", nil), "endpoint", "asset-audit", "upsert", "saved", assetcatalog.Endpoint{ID: "asset-audit", TenantID: "tenant_audit_cp0020", Alias: rawSubject, Address: rawDestination, Identity: rawActorUserID, Tags: []string{rawTokenAudience}}, evaluator, now)},
+		{name: "assetCatalogAuditLog/group", audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/groups", nil), "group", "asset-audit", "upsert", "persistence_unconfirmed", assetcatalog.Group{ID: "asset-audit", TenantID: "tenant_audit_cp0020", Alias: rawSubject, StaticMembers: []string{rawTokenAudience}, Dynamic: &assetcatalog.MembershipRule{Tag: rawMetadataValue, Subnet: rawSourceIP}}, evaluator, now)},
+		{name: "assetCatalogAuditLog/service", audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/services", nil), "service", "asset-audit", "upsert", "saved", assetcatalog.Service{ID: "asset-audit", TenantID: "tenant_audit_cp0020", Alias: rawSubject, Ports: []assetcatalog.PortProto{{Protocol: rawMetadataValue, Port: 443}}}, evaluator, now)},
+		{name: "authoredRuleAuditLog", audit: authoredRuleAuditLog(httptest.NewRequest("POST", "/admin/rules", nil), policyrule.Rule{ID: "rule-audit", TenantID: "tenant_audit_cp0020", Name: rawSubject, Source: []string{rawTokenAudience}, Destination: []string{rawDestination}}, "upsert", "saved", evaluator, now)},
+		{name: "inspectionPostureAuditLog", audit: inspectionPostureAuditLog(httptest.NewRequest("POST", "/admin/inspection-posture", nil), inspectionposture.DefaultPosture(), inspectionposture.Posture{Mode: inspectionposture.ModeBypassDefault, DecryptAllowlistHosts: []string{rawDestination}}, "saved", evaluator, now)},
+		{
+			name:  "adminAccessGrantRevocationAuditLog",
+			audit: adminAccessGrantRevocationAuditLog(httptest.NewRequest("POST", "/admin/grants/target/revoke", nil), grantstore.Grant{GrantID: rawTokenAudience, TenantID: "tenant_audit_cp0020", UserID: rawSubject, UserEmail: rawMetadataValue, DeviceID: rawDestination, Scope: rawPayloadRef}, evaluator, now, true),
+		},
+		{
+			name: "adminHumanApprovalMutationAuditLog",
+			audit: adminHumanApprovalMutationAuditLog(httptest.NewRequest("POST", "/admin/human-approval-events/target/revoke", nil), "admin_human_approval_event_upserted", adminHumanApprovalEvent{
+				ID:                     auditID,
+				TenantID:               "tenant_audit_cp0020",
+				ApproverUserID:         &rawActorUserID,
+				SubjectUserID:          &rawSubject,
+				ActorNHIID:             &rawActorNHIID,
+				DelegatedAccessGrantID: &rawMetadataValue,
+				AgentTaskSessionID:     &rawSession,
+				ApplicationID:          &rawDestination,
+				Audience:               &rawTokenAudience,
+				Resource:               &rawPayloadRef,
+				ActionType:             &actionType,
+				TaskID:                 &rawMetadataValue,
+				RunID:                  &rawMetadataValue,
+				RequestedScopes:        []string{rawTokenAudience},
+				ReasonCode:             &rawMetadataValue,
+				ApprovalResult:         "approved",
+			}, evaluator, now, true),
+		},
 		{
 			name: "adminEndpointInventoryAuditLog",
 			audit: adminEndpointInventoryAuditLog(endpointinventory.Entry{
@@ -233,8 +270,9 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				Status:                  "healthy",
 				RuntimeSecretConfigured: true,
 				MetadataKeyCount:        1,
-			}, evaluator, now),
+			}, nil, evaluator, now),
 		},
+		{name: "connectorProgramPublishedAuditLog", audit: connectorProgramPublishedAuditLog(nil, "tenant_audit_cp0020", connectorProgramMeta{Platform: "linux", Arch: "amd64", SHA256: strings.Repeat("a", 64), Version: "test-build", FileName: "program.tar.gz", PublishedBy: rawActorUserID}, evaluator, now)},
 		{
 			name: "adminSiteAuditLog",
 			audit: adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{
@@ -247,7 +285,7 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				HAPolicy:               rawMetadataValue,
 				ExpectedConnectorCount: 1,
 				BootstrapSecretHash:    rawMetadataValue,
-			}, evaluator, now),
+			}, nil, evaluator, now),
 		},
 		{
 			name: "adminToolCallEventAuditLog",
@@ -562,28 +600,35 @@ func mustAuditEmitterFunctionNames(t *testing.T) []string {
 
 func coveredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
-		"adminAgentToolAuditLog":            true,
-		"adminApplicationCatalogAuditLog":   true,
-		"adminApplicationDeleteAuditLog":    true,
-		"adminApplicationPublishAuditLog":   true,
-		"adminConnectorManagementAuditLog":  true,
-		"adminDelegatedAccessGrantAuditLog": true,
-		"adminEndpointInventoryAuditLog":    true,
-		"adminHumanApprovalEventAuditLog":   true,
-		"adminPolicyAuditLog":               true,
-		"adminPolicyCandidateAuditLog":      true,
-		"adminSiteAuditLog":                 true,
-		"adminTenantModelAuditLog":          true,
-		"adminTenantModelLifecycleAuditLog": true,
-		"adminToolCallEventAuditLog":        true,
-		"delegatedAccessGrantAuditLog":      true,
-		"humanApprovalEventAuditLog":        true,
-		"humanIdentityAuditLog":             true,
-		"humanIdentityImportAuditLog":       true,
-		"humanIdentitySourcePolicyAuditLog": true,
-		"inspectionEventAuditLog":           true,
-		"nonHumanIdentityAuditLog":          true,
-		"toolCallEventAuditLog":             true,
+		"adminAgentToolAuditLog":             true,
+		"adminApplicationCatalogAuditLog":    true,
+		"adminApplicationDeleteAuditLog":     true,
+		"adminApplicationPublishAuditLog":    true,
+		"adminConnectorManagementAuditLog":   true,
+		"adminDelegatedAccessGrantAuditLog":  true,
+		"adminEndpointInventoryAuditLog":     true,
+		"adminHumanApprovalEventAuditLog":    true,
+		"adminHumanApprovalMutationAuditLog": true,
+		"adminAccessGrantRevocationAuditLog": true,
+		"authoredRuleAuditLog":               true,
+		"assetCatalogAuditLog":               true,
+		"inspectionPostureAuditLog":          true,
+		"internalAuthorityAuditLog":          true,
+		"adminPolicyAuditLog":                true,
+		"adminPolicyCandidateAuditLog":       true,
+		"adminSiteAuditLog":                  true,
+		"connectorProgramPublishedAuditLog":  true,
+		"adminTenantModelAuditLog":           true,
+		"adminTenantModelLifecycleAuditLog":  true,
+		"adminToolCallEventAuditLog":         true,
+		"delegatedAccessGrantAuditLog":       true,
+		"humanApprovalEventAuditLog":         true,
+		"humanIdentityAuditLog":              true,
+		"humanIdentityImportAuditLog":        true,
+		"humanIdentitySourcePolicyAuditLog":  true,
+		"inspectionEventAuditLog":            true,
+		"nonHumanIdentityAuditLog":           true,
+		"toolCallEventAuditLog":              true,
 	}
 }
 
@@ -631,8 +676,18 @@ func deferredAuditEmitterInvariantFunctions() map[string]bool {
 		// tenant deliberately, because the question after a bad release is WHO put it in front of the fleet —
 		// and it carries the artifact digest and signing key id, which are public identifiers of a signed
 		// artifact, not secrets.
-		"agentUpdatePublishAuditLog":         true,
-		"enrolledInventoryAuditLog":          true,
+		"agentUpdatePublishAuditLog": true,
+		"enrolledInventoryAuditLog":  true,
+		// Transport admission names the affected device and acting administrator deliberately.
+		// Its HTTP audit contract checks that credentials and unrelated request fields stay out.
+		// IdP changes deliberately identify the administrator. The dedicated attribution/privacy
+		// test checks that identity, then applies the shared non-secret invariant to the rest.
+		"adminIdPChangeAuditLog": true,
+		// Attributed CRUD/partial outcomes; dedicated publication tests apply the shared privacy invariant.
+		"adminPolicyMutationAuditLog":        true,
+		"transportAdmissionAuditLog":         true,
+		"deviceRiskAuditLog":                 true,
+		"userRiskAuditLog":                   true,
 		"agentStatusAuditLog":                true,
 		"agentUpdateAuditLog":                true,
 		"authenticationEventAuditLog":        true,

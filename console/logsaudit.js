@@ -18,6 +18,7 @@ const _LA_SHIPPED_STREAMS = new Set(["audit", "access", "device_state", "inspect
 function laPlaneFor(stream) { return _LA_SHIPPED_STREAMS.has(stream) ? _LA_PLANE : "edge"; }
 let _laTab = "logs";
 let _laStream = "access";
+let _laAuditScope = "tenant";
 let _laFilters = {}; // active facet filters (field -> value) + q/from/to
 
 // Stream ids MUST match the backend aliases (adminLogStreamFilenameMap): the old ids
@@ -59,8 +60,11 @@ function laDecisionBadge(dec) {
   return uiBadge(label, kind);
 }
 function laResultBadge(res) {
-  const r = String(res || "").toLowerCase();
-  const kind = /ok|success|allow|approved|done|complete/.test(r) ? "ok" : /fail|deny|error|reject/.test(r) ? "danger" : "off";
+  const r = String(res || "").trim().toLowerCase();
+  // Match whole outcomes: "revoked" contains "ok", and "incomplete" contains "complete".
+  // Unknown outcomes retain their text and remain neutral rather than implying success.
+  const kind = /^(ok|success|allow|allowed|approved|done|complete|completed)$/.test(r) ? "ok"
+    : /^(fail|failed|failure|deny|denied|error|reject|rejected|revoked|expired|cancelled|canceled|withdrawn|timeout|timed_out)$/.test(r) ? "danger" : r === "partial" ? "warn" : "off";
   return uiBadge(laDash(res), kind);
 }
 
@@ -178,6 +182,7 @@ const _LA_EVENT = {
   private_app_web_session_started: { en: "Web session started", ja: "Webセッション開始" },
   // inspection findings
   saas_tenant_restriction_rewrite: { en: "Tenant-restriction rewrite", ja: "テナント制限リライト" },
+  dlp_device_risk: { en: "Automatic DLP risk outcome", ja: "DLP自動リスクの適用結果" },
   dlp_match: { en: "DLP match", ja: "DLP一致" },
 };
 function laPretty(code) {
@@ -430,7 +435,8 @@ const _LA_COLS = {
     { h: { en: "Approver", ja: "承認者" }, c: (r) => laDash(laVal(r, "approver_user_id", "approver_id")) },
     { h: { en: "Object", ja: "対象" }, c: (r) => laDash(laVal(r, "target_id", "application_id")) },
     { h: { en: "Event", ja: "イベント" }, c: (r) => laEventLabel(r, "event_type", "action") },
-    { h: { en: "Outcome", ja: "結果" }, c: (r) => laResultBadge(laVal(r, "outcome", "result", "trust_state")) },
+    { h: { en: "Outcome", ja: "結果" }, c: (r) => laResultBadge(laVal(r, "outcome", "result")) },
+    { h: { en: "Trust state", ja: "信頼状態" }, c: (r) => laDash(laVal(r, "trust_state")) },
   ],
   delegated_access_grants: [
     { h: { en: "Time", ja: "時刻" }, c: laWhen },
@@ -465,6 +471,9 @@ function renderLogsAuditView(content) {
       el("p", { class: "ui-view-desc", text: bl({ en: "Access decisions and activity, and scheduled exports.", ja: "アクセス判断・アクティビティと、エクスポート。" }) }),
     ]),
   ]));
+  const writerHealthHost = el("div", {});
+  content.appendChild(writerHealthHost);
+  laAuditWriterHealth(writerHealthHost);
   content.appendChild(uiTabs([
     { id: "logs", label: bl({ en: "Logs", ja: "ログ" }) },
     { id: "volume", label: bl({ en: "Volume", ja: "ログ量" }) },
@@ -486,21 +495,38 @@ function laHumanBytes(b) {
   return (b >= 100 || i === 0 ? Math.round(b) : b.toFixed(1)) + " " + u[i];
 }
 async function laVolume(section) {
+  section.innerHTML = "";
+  const estimateHost = el("div");
+  section.appendChild(estimateHost);
+  const lhHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(lhHost);
+  laLegalHold(lhHost);
+  const acHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(acHost);
+  laAuditChain(acHost);
+  const rcHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(rcHost);
+  laRetentionConfig(rcHost);
+  await laVolumeEstimate(estimateHost);
+}
+
+// A failed volume estimate must not hide independent retention and audit controls.
+async function laVolumeEstimate(section) {
   uiState(section, "loading");
   const current = freshRender(section);
   const from = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
   let flows24 = null, users = null, errMsg = null;
   try {
     const r = await apiFetch("GET", "/admin/logs/access?from=" + encodeURIComponent(from) + "&limit=1", undefined, _LA_PLANE);
-    if (r.ok && r.body && r.body.total_matches != null) flows24 = Number(r.body.total_matches);
-    else errMsg = "HTTP " + (r && r.status);
+    if (r.ok && r.body && Number.isSafeInteger(r.body.total_matches) && r.body.total_matches >= 0) flows24 = r.body.total_matches;
+    else errMsg = r.ok ? "Invalid access record count" : "HTTP " + r.status;
   } catch (e) { errMsg = String(e); }
   try {
     const dr = await apiFetch("GET", "/admin/human-identities", null, "control");
     const items = (dr && dr.ok && dr.body) ? (dr.body.identities || dr.body.items || []) : [];
     if (items.length) users = items.length;
   } catch (e) { /* optional */ }
-  if (flows24 == null) { if (!current()) return; uiState(section, "error", errMsg || bl({ en: "no data", ja: "データなし" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laVolume(section) }); return; }
+  if (flows24 == null) { if (!current()) return; uiState(section, "error", errMsg || bl({ en: "no data", ja: "データなし" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laVolumeEstimate(section) }); return; }
 
   const RAW = 1024, COMP = 4; // planning constants: ~1 KB/access record raw, ~4x compression (design doc)
   const storedDay = (flows24 * RAW) / COMP;
@@ -523,24 +549,29 @@ async function laVolume(section) {
     const perUser = Math.round(flows24 / users);
     section.appendChild(el("p", { class: "ui-view-desc", style: "margin-top:6px", text: bl({ en: "Design-model assumption was 3,000 flows/user/day — your measured " + perUser.toLocaleString() + " calibrates it (per user ≈ " + laHumanBytes((perUser * RAW) / COMP) + "/day stored).", ja: "設計モデルの仮定は 3,000 flows/user/日 ── 実測 " + perUser.toLocaleString() + " で較正できます（1ユーザー ≈ 保存 " + laHumanBytes((perUser * RAW) / COMP) + "/日）。" }) }));
   }
-  const lhHost = el("div", { style: "margin-top:18px" });
-  section.appendChild(lhHost);
-  laLegalHold(lhHost);
-  const acHost = el("div", { style: "margin-top:18px" });
-  section.appendChild(acHost);
-  laAuditChain(acHost);
-  const rcHost = el("div", { style: "margin-top:18px" });
-  section.appendChild(rcHost);
-  laRetentionConfig(rcHost);
 }
 
 // Admin-configurable per-stream retention (days) — overrides the built-in defaults at runtime, no redeploy.
 async function laRetentionConfig(host) {
-  let ov = {};
-  try { const r = await apiFetch("GET", "/admin/retention-config", undefined, _LA_PLANE); if (r.ok && r.body) ov = r.body.overrides_days || {}; } catch (e) { /* optional */ }
+  const current = freshRender(host);
+  let ov, pending = [];
+  try {
+    const r = await apiFetch("GET", "/admin/retention-config", undefined, _LA_PLANE);
+    ov = r.body && r.body.overrides_days;
+    pending = (r.body && r.body.pending_local_forever) || [];
+    if (!r.ok || !ov || typeof ov !== "object" || Array.isArray(ov) ||
+        Object.values(ov).some(v => !Number.isSafeInteger(v) || v < 0 || v > 106751)) {
+      throw new Error((r.body && r.body.error) || "Retention settings are unavailable");
+    }
+  } catch (e) {
+    if (current()) uiState(host, "error", String(e), {label:bl({en:"Retry",ja:"再試行"}),onClick:()=>laRetentionConfig(host)});
+    return;
+  }
+  if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Retention (per stream)", ja: "保持（ストリーム別）" }) }));
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Override how long each stream is kept in hot storage (days) — no redeploy. 0 = keep forever; unset = the built-in default (audit/approvals/grants 365d, others 30d).", ja: "各ストリームの短期保持日数を上書き（再デプロイ不要）。0=無期限、未設定=組込既定（audit/承認/grant は365日、他は30日）。" }) }));
+  if (pending.length) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Keep-forever save unconfirmed for: " + pending.join(", ") + ". Protection is local to this process; retry saving. Saved settings are shown below.", ja: "無期限保持の保存未確認: " + pending.join(", ") + "。保護はこのプロセス内のみです。保存を再試行してください。下記は保存済み設定です。" }) }));
   const keys = Object.keys(ov).sort();
   if (keys.length) host.appendChild(el("div", { style: "display:flex;gap:4px;flex-wrap:wrap;margin:4px 0" }, keys.map((s) => el("span", { class: "ui-badge ui-badge-off", style: "font-size:11px", text: s + " = " + (ov[s] === 0 ? bl({ en: "forever", ja: "無期限" }) : ov[s] + "d") }))));
   const streamF = uiField({ name: "s", label: bl({ en: "Stream", ja: "ストリーム" }), type: "select", value: "access", options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
@@ -549,17 +580,29 @@ async function laRetentionConfig(host) {
   const save = el("button", { class: "ui-btn ui-btn-primary ui-btn-sm", text: bl({ en: "Save", ja: "保存" }) });
   const clr = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reset to default", ja: "既定に戻す" }) });
   host.appendChild(el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:4px" }, [streamF.el, daysF.el, save, clr]));
+  const mutate = async (payload, message) => {
+    if (!current() || save.disabled || clr.disabled) return;
+    save.disabled = clr.disabled = true;
+    try {
+      const r = await apiFetch("POST", "/admin/retention-config", payload, _LA_PLANE);
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+      if (current()) uiToast(message, "ok");
+    } catch (e) {
+      if (current()) uiToast(String(e), "err");
+    } finally {
+      if (current()) await laRetentionConfig(host);
+    }
+  };
   save.addEventListener("click", async () => {
-    const days = parseInt(daysF.get(), 10);
-    if (isNaN(days) || days < 0) { uiToast(bl({ en: "Enter a day count (0 = forever).", ja: "日数を入力（0=無期限）。" }), "err"); return; }
-    const r = await apiFetch("POST", "/admin/retention-config", { stream: streamF.get(), days: days }, _LA_PLANE);
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Retention saved.", ja: "保持を保存しました。" }), "ok"); laRetentionConfig(host);
+    const raw = String(daysF.get()).trim();
+    const days = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(days) || days > 106751) {
+      uiToast(bl({ en: "Enter whole days from 0 to 106751 (0 = forever).", ja: "0〜106751の整数で日数を入力（0=無期限）。" }), "err"); return;
+    }
+    await mutate({stream:streamF.get(),days}, bl({en:"Retention saved.",ja:"保持を保存しました。"}));
   });
   clr.addEventListener("click", async () => {
-    const r = await apiFetch("POST", "/admin/retention-config", { stream: streamF.get(), clear: true }, _LA_PLANE);
-    if (!r.ok) { uiToast("HTTP " + r.status, "err"); return; }
-    uiToast(bl({ en: "Reset to default.", ja: "既定に戻しました。" }), "ok"); laRetentionConfig(host);
+    await mutate({stream:streamF.get(),clear:true}, bl({en:"Reset to default.",ja:"既定に戻しました。"}));
   });
 }
 
@@ -567,7 +610,7 @@ async function laRetentionConfig(host) {
 function laAuditChain(host) {
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Audit integrity", ja: "監査の完全性" }) }));
-  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Verify the tamper-evident hash chain of the archived audit segments — detects any deleted, altered, or reordered segment.", ja: "アーカイブ済み監査セグメントの改ざん検知ハッシュチェーンを検証 ── 削除・改ざん・並べ替えを検出。" }) }));
+  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Verify links, sequence and gzip integrity for listed audit segments. This does not prove completeness or detect removal of the final segments.", ja: "取得できた監査セグメントの連結・連番・gzip整合性を検証します。全記録の存在や末尾の削除までは証明しません。" }) }));
   const out = el("span", { class: "ui-view-desc" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Verify chain", ja: "チェーン検証" }) });
   host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [btn, el("span", { class: "ui-spacer" }), out]));
@@ -576,39 +619,82 @@ function laAuditChain(host) {
     let r; try { r = await apiFetch("GET", "/admin/audit-chain/verify", undefined, _LA_PLANE); } catch (e) { btn.disabled = false; out.textContent = ""; uiToast(String(e), "err"); return; }
     btn.disabled = false;
     if (!r.ok) { out.textContent = ""; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    const b = r.body || {}; out.innerHTML = "";
-    out.appendChild(uiBadge(b.ok ? bl({ en: "Intact", ja: "整合" }) : bl({ en: "BROKEN", ja: "破損" }), b.ok ? "ok" : "danger"));
-    out.appendChild(el("span", { style: "margin-left:8px", text: (b.segments || 0) + bl({ en: " segment(s)", ja: " セグメント" }) + (b.ok ? "" : " — " + (b.detail || b.broken_at || "")) }));
+    const b = r.body;
+    if (!b || !Number.isSafeInteger(b.segments) || b.segments < 0 || typeof b.ok !== "boolean" ||
+        b.scope !== "listed_segments_only" || !["empty", "broken", "links_verified"].includes(b.status) ||
+        (b.ok !== (b.status === "links_verified")) || (b.status === "empty" ? b.segments !== 0 : b.segments === 0)) {
+      out.textContent = ""; uiToast(bl({en:"Verification result is unavailable.",ja:"検証結果を確認できません。"}), "err"); return;
+    }
+    out.innerHTML = "";
+    const label = b.status === "empty" ? bl({en:"No segments to verify",ja:"検証対象なし"}) :
+      b.ok ? bl({en:"Listed links verified",ja:"取得した連結を確認"}) : bl({en:"Verification failed",ja:"検証失敗"});
+    out.appendChild(uiBadge(label, b.status === "empty" ? "off" : b.ok ? "ok" : "danger"));
+    out.appendChild(el("span", {style:"margin-left:8px",text:b.segments + bl({en:" segment(s)",ja:" セグメント"}) +
+      (b.status === "broken" ? " — " + (b.detail || b.broken_at || "") : "")}));
   });
 }
 
 // Legal hold: freeze retention for THIS tenant (litigation / e-discovery). While held, no log is deleted/tiered.
 async function laLegalHold(host) {
-  let held = false;
-  try { const r = await apiFetch("GET", "/admin/legal-hold", undefined, _LA_PLANE); if (r.ok && r.body) held = !!r.body.tenant_held; } catch (e) { /* optional */ }
+  const current = freshRender(host);
+  let held, pending;
+  try {
+    const r = await apiFetch("GET", "/admin/legal-hold", undefined, _LA_PLANE);
+    if (!r.ok || !r.body || typeof r.body.tenant_held !== "boolean") throw new Error((r.body && r.body.error) || "Legal hold status is unavailable");
+    pending = r.body.pending_local_hold === true;
+    held = r.body.tenant_held && !pending;
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLegalHold(host) });
+    return;
+  }
+  if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Legal hold", ja: "リーガルホールド" }) }));
-  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));
+  host.appendChild(el("p", { class: "ui-view-desc", text: pending ? bl({ en: "Hold save unconfirmed. Logs are protected only in this process; restart or another node may lose this protection. Retry saving.", ja: "ホールドの保存は未確認です。このプロセス内のみログを保護します。再起動や別ノードでは保護されない場合があります。保存を再試行してください。" }) : bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));
   const btn = el("button", { class: "ui-btn ui-btn-sm " + (held ? "ui-btn-danger" : "") });
-  btn.textContent = held ? bl({ en: "Release hold", ja: "ホールド解除" }) : bl({ en: "Place legal hold", ja: "リーガルホールドを設定" });
-  host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
+  btn.textContent = pending ? bl({ en: "Retry hold save", ja: "ホールド保存を再試行" }) : held ? bl({ en: "Release hold", ja: "ホールド解除" }) : bl({ en: "Place legal hold", ja: "リーガルホールドを設定" });
+  host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(pending ? bl({ en: "Save unconfirmed", ja: "保存未確認" }) : held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
   btn.addEventListener("click", async () => {
     const ok = await uiConfirm({ title: held ? bl({ en: "Release the legal hold?", ja: "リーガルホールドを解除?" }) : bl({ en: "Place a legal hold?", ja: "リーガルホールドを設定?" }), body: held ? bl({ en: "Retention resumes — aged logs expire / tier to cold again per policy.", ja: "保持が再開し、古いログはポリシーに従い失効/cold 階層化されます。" }) : bl({ en: "ALL logs for this tenant will be preserved (no deletion, no tiering) until released.", ja: "このテナントの全ログが解除まで保持（削除も階層化もしない）されます。" }), confirmLabel: held ? bl({ en: "Release", ja: "解除" }) : bl({ en: "Place hold", ja: "設定" }), danger: !held });
-    if (!ok) return;
-    const r = await apiFetch("POST", "/admin/legal-hold", { active: !held }, _LA_PLANE);
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(held ? bl({ en: "Legal hold released.", ja: "リーガルホールドを解除しました。" }) : bl({ en: "Legal hold placed.", ja: "リーガルホールドを設定しました。" }), "ok");
-    laLegalHold(host);
+    if (!ok || !current() || btn.disabled) return;
+    btn.disabled = true;
+    try {
+      const r = await apiFetch("POST", "/admin/legal-hold", { active: !held }, _LA_PLANE);
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+      if (current()) uiToast(held ? bl({ en: "Legal hold released.", ja: "リーガルホールドを解除しました。" }) : bl({ en: "Legal hold placed.", ja: "リーガルホールドを設定しました。" }), "ok");
+    } catch (e) {
+      if (current()) uiToast(String(e), "err");
+    } finally {
+      if (current()) await laLegalHold(host);
+    }
   });
+}
+
+function laCanReadDeploymentAudit() {
+  return _laStream === "audit" && typeof answeringForTheDeployment === "function" && answeringForTheDeployment();
 }
 
 function laLogs(section) {
   section.innerHTML = "";
-  const sel = uiField({ name: "stream", type: "select", value: _laStream, options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
+  if (!laCanReadDeploymentAudit()) _laAuditScope = "tenant";
+  const sel = uiField({ name: "stream", label: bl({ en: "Stream", ja: "ストリーム" }), type: "select", value: _laStream, options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
   sel.el.style.marginBottom = "0";
-  sel.el.querySelector("select").addEventListener("change", () => { _laStream = sel.get(); _laFilters = {}; laLoadStream(host, filterHost, summaryHost); });
+  sel.el.querySelector("select").addEventListener("change", () => { _laStream = sel.get(); _laFilters = {}; _laAuditScope = "tenant"; laLogs(section); });
+  const scopes = [];
+  if (laCanReadDeploymentAudit()) {
+    const scope = uiField({ name: "audit_scope", label: bl({ en: "Audit scope", ja: "監査の範囲" }), type: "select", value: _laAuditScope,
+      options: [{ value: "tenant", label: bl({ en: "Current organization", ja: "現在の組織" }) },
+                { value: "deployment", label: bl({ en: "Deployment operations", ja: "配備全体の操作" }) }] });
+    scope.el.style.marginBottom = "0";
+    scope.el.querySelector("select").addEventListener("change", () => {
+      _laAuditScope = scope.get(); _laFilters = {};
+      laFilterBar(filterHost, host, summaryHost); laLoadStream(host, filterHost, summaryHost);
+    });
+    scopes.push(scope.el);
+  }
   section.appendChild(el("div", { class: "ui-toolbar" }, [
-    el("span", { class: "ui-view-desc", text: bl({ en: "Stream:", ja: "ストリーム:" }) }), sel.el,
+    sel.el, ...scopes,
     el("span", { class: "ui-spacer" }),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }),
   ]));
@@ -637,6 +723,7 @@ function laFilterBar(filterHost, host, summaryHost) {
   // "app_swg_egress" placeholder, so an app-name filter never matched. The host is what operators filter by.
   if (isDecisionStream) { const dst = uiField({ name: "destination", label: bl({ en: "Destination", ja: "宛先" }), type: "text", value: _laFilters.destination || "" }); fields.push(["destination", dst]); }
   const dev = uiField({ name: "device_id", label: bl({ en: "Device", ja: "デバイス" }), type: "text", value: _laFilters.device_id || "" }); fields.push(["device_id", dev]);
+  const region = uiField({ name: "edge_region_id", label: bl({ en: "Region", ja: "リージョン" }), type: "text", value: _laFilters.edge_region_id || "" }); fields.push(["edge_region_id", region]);
   const from = uiField({ name: "from", label: bl({ en: "From", ja: "開始" }), type: "date", value: _laFilters._from || "" }); fields.push(["from", from]);
   const to = uiField({ name: "to", label: bl({ en: "To", ja: "終了" }), type: "date", value: _laFilters._to || "" }); fields.push(["to", to]);
 
@@ -663,6 +750,9 @@ let _laTotal = 0;     // total_matches for the active query (across the whole ho
 function laQueryString(cursor) {
   const p = new URLSearchParams();
   Object.keys(_laFilters).forEach((k) => { if (k.charAt(0) === "_") return; const v = _laFilters[k]; if (v) p.set(k, v); });
+  // Never reuse a deployment scope after leaving the operator's audit view.
+  p.delete("audit_scope");
+  if (laCanReadDeploymentAudit() && _laAuditScope === "deployment") p.set("audit_scope", "deployment");
   p.set("limit", String(_LA_PAGE));
   if (cursor) p.set("cursor", cursor); // page forward to OLDER rows (server orders newest-first)
   return p.toString();
@@ -671,7 +761,7 @@ function laQueryString(cursor) {
 // Client-side summary over the loaded window (no extra endpoint): decision mix + allow rate.
 function laSummary(summaryHost, rows, stream) {
   summaryHost.innerHTML = "";
-  if (!stream === "access" || !rows.length) return;
+  if (stream !== "access" || !rows.length) return;
   const counts = {}; let allow = 0, total = 0;
   rows.forEach((r) => { const d = String(r.decision || "").toLowerCase(); if (!d) return; counts[d] = (counts[d] || 0) + 1; total++; if (d === "allow") allow++; });
   if (!total) return;
@@ -691,28 +781,51 @@ function laSummary(summaryHost, rows, stream) {
 async function laLoadStream(host, filterHost, summaryHost, append) {
   // The guard is taken for EVERY call, not only the fresh ones: "Load older" appends to the same host, and an
   // append that lands after a newer query started would concatenate two different result sets.
-  const current = freshRender(host);
-  if (!append) { _laRows = []; _laCursor = ""; _laTotal = 0; uiState(host, "loading"); }
+  const fresh = freshRender(host), stream = _laStream, scope = _laAuditScope;
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const selected = selection(), operatorAudit = laCanReadDeploymentAudit();
+  const current = () => fresh() && host.isConnected !== false && stream === _laStream && scope === _laAuditScope &&
+    selected === selection() && operatorAudit === laCanReadDeploymentAudit();
+  const deploymentAudit = operatorAudit && scope === "deployment";
+  if (!append) { _laRows = []; _laCursor = ""; _laTotal = 0; if (summaryHost) summaryHost.innerHTML = ""; uiState(host, "loading"); }
+  let coverage;
   try {
     const qs = laQueryString(append ? _laCursor : "");
     const r = await apiFetch("GET", "/admin/logs/" + encodeURIComponent(_laStream) + (qs ? "?" + qs : ""), undefined, laPlaneFor(_laStream));
-    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }); return; }
-    const body = r.body || {};
-    const rows = Array.isArray(body) ? body : (body.rows || body.entries || body.events || []);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!current()) return;
+    const body = r.body;
+    if (!body || !Array.isArray(body.rows) || body.rows.some(row => !row || typeof row !== "object" || Array.isArray(row)) ||
+        !Number.isSafeInteger(body.total_matches) || body.total_matches < 0 ||
+        (body.next_cursor != null && typeof body.next_cursor !== "string")) {
+      throw new Error("Invalid log search response");
+    }
+    if (deploymentAudit && (r.status !== 200 || body.filters?.tenant_id !== "deployment" ||
+        body.rows.some(row => row.tenant_id !== "deployment"))) {
+      throw new Error(bl({ en: "Could not verify deployment audit records. Retry the search.", ja: "配備全体の監査情報を確認できません。検索を再試行してください。" }));
+    }
+    coverage = body.region_coverage;
+    const rows = body.rows;
     _laRows = append ? _laRows.concat(rows) : rows;
-    _laCursor = (body && body.next_cursor) || "";
-    if (body && body.total_matches != null) _laTotal = Number(body.total_matches);
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost) }); return; }
+    _laCursor = body.next_cursor || "";
+    _laTotal = body.total_matches;
+  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLoadStream(host, filterHost, summaryHost, append) }); return; }
   // For the audit stream, resolve admin principal ids → email/name once so the Admin column shows WHO acted.
   if (_laStream === "audit" && !append) {
-    _laAdminDir = {};
+    const directory = {};
     try {
       const ar = await apiFetch("GET", "/admin/admins", undefined, _LA_PLANE);
       const admins = (ar && ar.ok && ar.body && (ar.body.admins || ar.body.principals || ar.body.items)) || [];
-      admins.forEach((a) => { const id = a && (a.id || a.principal_id); if (id) _laAdminDir[id] = { email: (a.email || "").trim(), name: ((a.display_name || a.name) || "").trim() }; });
+      admins.forEach((a) => { const id = a && (a.id || a.principal_id); if (id) directory[id] = { email: (a.email || "").trim(), name: ((a.display_name || a.name) || "").trim() }; });
     } catch (e) { /* directory optional — metadata email still shows */ }
+    if (!current()) return;
+    _laAdminDir = directory;
   }
-  if (summaryHost) laSummary(summaryHost, _laRows, _laStream);
+  if (!current()) return;
+  if (summaryHost) {
+    laSummary(summaryHost, _laRows, _laStream);
+    if (_laFilters.edge_region_id) summaryHost.appendChild(el("p", { class: "ui-view-desc", text: laRegionCoverageText(coverage) }));
+  }
   if (!_laRows.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No matching entries.", ja: "該当エントリはありません。" })); return; }
   const cols = laColsFor(_laStream);
   const trs = _laRows.map((row) => {
@@ -733,7 +846,9 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
     : bl({ en: "Showing ", ja: "表示 " }) + _laRows.length;
   const footer = el("div", { style: "display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:8px 0 2px" }, [el("span", { class: "ui-view-desc", text: countTxt })]);
   if (_laCursor) footer.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Load older", ja: "さらに古いものを読み込む" }), onClick: () => laLoadStream(host, filterHost, summaryHost, true) }));
-  else footer.appendChild(el("span", { class: "ui-view-desc", text: bl({ en: "— end of matches (older data past retention is in cold archive; use Exports)", ja: "— 一致の末尾（保持期間を過ぎた古いデータはコールドアーカイブ。エクスポートを利用）" }) }));
+  else footer.appendChild(el("span", { class: "ui-view-desc", text: deploymentAudit
+    ? bl({ en: "— end of matches in this server's hot audit log", ja: "— このサーバーで検索できる監査記録の末尾" })
+    : bl({ en: "— end of matches (older data past retention is in cold archive; use Exports)", ja: "— 一致の末尾（保持期間を過ぎた古いデータはコールドアーカイブ。エクスポートを利用）" }) }));
   host.appendChild(footer);
 }
 
@@ -761,23 +876,33 @@ function laFieldRow(k, v) {
 // One-line summary of a related record (grant / approval / inspection / decision-trace) linked to a decision.
 function laRelatedSummary(s, r) {
   if (s === "delegated_access_grants") return [laVal(r, "grantee_id", "actor_nhi_id", "user_id"), laVal(r, "scope", "application_id", "tool_id"), laVal(r, "event_type", "action", "status")].filter(Boolean).join(" · ") || "—";
-  if (s === "human_approval_events") return [laVal(r, "requester_user_id", "user_id", "subject_user_id"), "→", laVal(r, "approver_user_id", "approver_id"), laVal(r, "outcome", "result", "trust_state")].filter(Boolean).join(" ") || "—";
+  if (s === "human_approval_events") return [laVal(r, "requester_user_id", "user_id", "subject_user_id"), "→", laVal(r, "approver_user_id", "approver_id"), laVal(r, "outcome", "result")].filter(Boolean).join(" ") || "—";
   if (s === "inspection_events") return [laPretty(laVal(r, "finding_type", "event_type")), laVal(r, "inspection_mode"), laVal(r, "severity")].filter(Boolean).join(" · ") || "—";
   return Object.keys(r).slice(0, 3).map((k) => k + "=" + laVal(r, k)).join(" ") || "—";
 }
 // Fetch the records LINKED to an access decision (its grant, approval, inspection, decision trace) and show
 // them — so a grant/approval is visible right from the access-log entry it authorized.
 async function laRelatedRecords(host, decisionId) {
+  const current = freshRender(host);
+  uiState(host, "loading");
+  let rel;
+  try {
+    const r = await apiFetch("GET", "/admin/access-decisions/" + encodeURIComponent(decisionId), undefined, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const body = r.body;
+    rel = body && body.related_logs;
+    if (!body || body.access_decision_id !== decisionId || !rel || typeof rel !== "object" || Array.isArray(rel) ||
+        Object.values(rel).some(rows => !Array.isArray(rows) || rows.some(row => !row || typeof row !== "object" || Array.isArray(row)))) {
+      throw new Error("Invalid related records response");
+    }
+  } catch (e) {
+    if (current()) uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laRelatedRecords(host, decisionId) });
+    return;
+  }
+  if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("div", { class: "ui-field-label", text: bl({ en: "Related records", ja: "関連レコード" }) }));
-  const status = el("div", { class: "ui-view-desc", text: bl({ en: "Loading…", ja: "読込中…" }) });
-  host.appendChild(status);
-  let body;
-  try { const r = await apiFetch("GET", "/admin/access-decisions/" + encodeURIComponent(decisionId), undefined, _LA_PLANE); if (!r.ok) { status.textContent = "HTTP " + r.status; return; } body = r.body; }
-  catch (e) { status.textContent = String(e); return; }
-  const rel = (body && body.related_logs) || {};
-  const streams = Object.keys(rel).filter((s) => (rel[s] || []).length);
-  status.remove();
+  const streams = Object.keys(rel).filter(s => rel[s].length);
   if (!streams.length) { host.appendChild(el("div", { class: "ui-view-desc", text: bl({ en: "No linked grant / approval / inspection for this decision.", ja: "この判断に紐づく grant/承認/検査はありません。" }) })); return; }
   streams.forEach((s) => {
     const label = (_LA_STREAMS.find((x) => x.id === s) || { label: { en: s, ja: s } }).label;
@@ -806,38 +931,168 @@ function laDetail(row) {
   const m = uiModal({ title: bl({ en: "Log entry", ja: "ログエントリ" }), body: body, footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })] });
 }
 
-// ---- Exports (unchanged behaviour) --------------------------------------
+// ---- Exports ----------------------------------------------------------
 async function laExports(section) {
   uiState(section, "loading");
   const current = freshRender(section);
   let jobs;
-  try { const r = await apiFetch("GET", "/admin/export-jobs", undefined, _LA_PLANE); if (!r.ok) throw new Error("HTTP " + r.status); jobs = (r.body && r.body.jobs) || []; }
+  try { const r = await apiFetch("GET", "/admin/export-jobs", undefined, _LA_PLANE); if (!r.ok) throw new Error("HTTP " + r.status); jobs = r.body && r.body.jobs;
+    if (!Array.isArray(jobs) || jobs.some(job => !job || typeof job !== "object" || Array.isArray(job))) throw new Error("Invalid export jobs response"); }
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laExports(section) }); return; }
   if (!current()) return;
   section.innerHTML = "";
-  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
+  section.appendChild(el("div", { class: "ui-toolbar" }, [el("button", { class: "ui-btn", text: bl({ en: "Refresh", ja: "更新" }), onClick: () => laExports(section) }), el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
   if (!jobs.length) { section.appendChild(emptyBox(bl({ en: "No exports yet.", ja: "エクスポートがありません。" }))); return; }
-  section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" })], jobs.map((j) => [
-    el("span", { text: j.stream || "—" }), el("span", { text: j.format || "—" }), uiBadge(j.status || "—", /done|complete|ready/i.test(j.status || "") ? "ok" : "off"), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+  section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" }), bl({ en: "Actions", ja: "操作" })], jobs.map((j) => [
+    el("div", {}, [el("span", { text: j.stream || "—" }), ...(j.filters && j.filters.edge_region_id ? [el("p", { class: "ui-view-desc", text: laRegionCoverageText(j.metadata && j.metadata.region_coverage) })] : [])]), el("span", { text: j.format || "—" }), laResultBadge(j.status), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+    typeof j.id === "string" && j.id ? el("div", {class:"ui-toolbar"}, [
+      el("button", {class:"ui-btn",text:bl({en:"Details",ja:"詳細"}),onClick:event=>laExportDetails(j,event.currentTarget)}),
+      ...(j.status === "completed" ? [el("button", { class: "ui-btn", text: bl({en:"Download",ja:"ダウンロード"}), onClick: event => laDownloadExport(j, event.currentTarget) })] : []),
+      ...(["queued","running"].includes(j.status) ? [el("button", {class:"ui-btn",text:bl({en:"Cancel",ja:"取消"}),onClick:event=>laCancelExport(j,event.currentTarget,section)})] : []),
+    ]) : el("span", {text:"—"}),
   ])));
+}
+
+async function laCancelExport(job, button, section) {
+  if (button.disabled) return;
+  button.disabled = true;
+  let attempted = false;
+  try {
+    if (!await uiConfirm({title:bl({en:"Cancel this export?",ja:"このエクスポートを取り消しますか？"}),body:bl({en:"The queued or running export will be stopped. A job that has already finished cannot be cancelled.",ja:"待機中または実行中の処理を停止します。すでに完了した処理は取り消せません。"}),confirmLabel:bl({en:"Cancel export",ja:"エクスポートを取消"}),danger:true})) return;
+    attempted = true;
+    const r = await apiFetch("POST", "/admin/export-jobs/" + encodeURIComponent(job.id) + "/cancel", {}, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.body || r.body.id !== job.id || r.body.status !== "cancelled") throw new Error("Invalid cancellation response");
+    uiToast(bl({en:"Export cancelled.",ja:"エクスポートを取り消しました。"}),"ok");
+  } catch (e) { uiToast(bl({en:"Cancellation could not be confirmed. Check the refreshed status before trying again.",ja:"取消を確認できませんでした。更新後の状態を確認してから再操作してください。"}),"err"); }
+  finally { button.disabled = false; if (attempted) await laExports(section); }
+}
+
+async function laExportDetails(job, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const r = await apiFetch("GET", "/admin/export-jobs/" + encodeURIComponent(job.id), undefined, _LA_PLANE);
+    const j = r.body;
+    if (!r.ok || !j || j.id !== job.id || typeof j.status !== "string") throw new Error("Invalid export detail response");
+    const fields = [
+      [bl({en:"Job",ja:"ジョブ"}),j.id], [bl({en:"Status",ja:"状態"}),j.status],
+      [bl({en:"From",ja:"開始"}),j.from], [bl({en:"To",ja:"終了"}),j.to],
+      [bl({en:"Progress",ja:"進行状況"}),j.metadata && j.metadata.progress_phase],
+      [bl({en:"Rows exported",ja:"出力済み行数"}),j.metadata && j.metadata.rows_exported],
+      [bl({en:"Last progress",ja:"最終進行時刻"}),j.metadata && j.metadata.last_progress_at],
+      [bl({en:"Error code",ja:"エラーコード"}),j.error_code],
+    ];
+    const m = uiModal({title:bl({en:"Export details",ja:"エクスポート詳細"}),body:fields.map(([label,value])=>el("p",{text:label+": "+(value == null ? "—" : String(value))})),footer:[el("button",{class:"ui-btn",text:bl({en:"Close",ja:"閉じる"}),onClick:()=>m.close()})]});
+  } catch (e) { uiToast(bl({en:"Could not load export details. Try again.",ja:"エクスポート詳細を取得できませんでした。再試行してください。"}),"err"); }
+  finally { button.disabled = false; }
+}
+
+// Resolve only the token path against the Console control-plane proxy. The server's
+// absolute URL can name an internal service behind the front door.
+async function laDownloadExport(job, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const r = await apiFetch("POST", "/admin/export-jobs/" + encodeURIComponent(job.id) + "/download-url", {}, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const raw = r.body && r.body.download_url;
+    if (typeof raw !== "string") throw new Error("Invalid download response");
+    const url = new URL(raw, window.location.origin);
+    if (!/^https?:$/.test(url.protocol) || !/^\/admin\/export-downloads\/[A-Za-z0-9_-]+$/.test(url.pathname) || url.search || url.hash) throw new Error("Invalid download response");
+    const response = await fetch(baseForPlane(_LA_PLANE) + url.pathname, {credentials:"same-origin", cache:"no-store", redirect:"error", referrerPolicy:"no-referrer"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const blob = await response.blob();
+    const objectURL = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectURL; a.download = "dsse-export-" + job.id.replace(/[^A-Za-z0-9_-]/g, "_") + ".ndjson.gz";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectURL), 10000);
+  } catch (e) {
+    uiToast(bl({en:"Could not download the export. Retry to request a new download link.",ja:"エクスポートを取得できませんでした。再度ダウンロードを押すと、新しい取得リンクを発行します。"}), "err");
+  } finally { button.disabled = false; }
+}
+
+// Date selections use the operator's local calendar, matching log search.
+function laExportDateRange(from, to) {
+  const parseDay = value => {
+    const text = String(value || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error(bl({en:"Select valid start and end dates.",ja:"開始日と終了日を正しく選択してください。"}));
+    const date = new Date(text + "T00:00:00");
+    if (!Number.isFinite(date.getTime()) || date.getFullYear() !== Number(text.slice(0,4)) ||
+        date.getMonth()+1 !== Number(text.slice(5,7)) || date.getDate() !== Number(text.slice(8,10))) {
+      throw new Error(bl({en:"Select valid start and end dates.",ja:"開始日と終了日を正しく選択してください。"}));
+    }
+    return date;
+  };
+  const start = parseDay(from), end = parseDay(to);
+  if (start > end) throw new Error(bl({en:"End date must not precede start date.",ja:"終了日は開始日以降を選択してください。"}));
+  end.setHours(23,59,59,999);
+  return {from:start.toISOString(),to:end.toISOString().replace(".999Z", ".999999999Z")};
 }
 
 function openExportForm(section) {
   const streamF = uiField({ name: "stream", label: bl({ en: "Log", ja: "ログ" }), type: "select", value: "access", options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
-  const fmtF = uiField({ name: "fmt", label: bl({ en: "Format", ja: "形式" }), type: "select", value: "ndjson", options: [{ value: "ndjson", label: "NDJSON" }, { value: "csv", label: "CSV" }] });
+  const fmtF = uiField({ name: "fmt", label: bl({ en: "Format", ja: "形式" }), type: "select", value: "ndjson", options: [{ value: "ndjson", label: "NDJSON" }] });
   const fromF = uiField({ name: "from", label: bl({ en: "From", ja: "開始" }), type: "date" });
   const toF = uiField({ name: "to", label: bl({ en: "To", ja: "終了" }), type: "date" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Create export", ja: "エクスポート作成" }) });
   const m = uiModal({ title: bl({ en: "New export", ja: "エクスポート作成" }), body: [streamF.el, fmtF.el, fromF.el, toF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
+    if (submit.disabled) return;
     submit.disabled = true;
-    const payload = { stream: streamF.get(), format: fmtF.get() };
-    if (fromF.get()) payload.from = new Date(fromF.get()).toISOString();
-    if (toF.get()) payload.to = new Date(toF.get()).toISOString();
     try {
+      const payload = {stream:streamF.get(),format:fmtF.get(),...laExportDateRange(fromF.get(),toF.get())};
       const r = await apiFetch("POST", "/admin/export-jobs", payload, _LA_PLANE);
-      if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
       m.close(); uiToast(bl({ en: "Export started.", ja: "エクスポートを開始しました。" }), "ok"); laExports(section);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) { uiToast(String(e), "err"); }
+    finally { submit.disabled = false; }
   });
+}
+
+function laRegionCoverageText(coverage) {
+  const count = coverage && coverage.unknown_region_count;
+  if (coverage && coverage.status === "available" && Number.isSafeInteger(count) && count >= 0) {
+    return bl({ en: "Records with an unknown region excluded from these filters: ", ja: "同じ検索条件で地域不明のため除外された記録: " }) + count;
+  }
+  return bl({ en: "Records without a region are excluded. Their count could not be determined; this result does not establish that no such records exist.", ja: "地域不明の記録は除外されています。件数を確認できないため、この結果だけで記録が存在しないとは判断できません。" });
+}
+
+
+function laAuditWriterHealthText(h) {
+  if (!h || !["healthy", "degraded", "unknown", "unavailable"].includes(h.status) ||
+      !Number.isSafeInteger(h.primary_failures) || h.primary_failures < 0 ||
+      !Number.isSafeInteger(h.hook_failures) || h.hook_failures < 0) {
+    throw new Error("Invalid audit writer health response");
+  }
+  const title = bl({en:"Audit file writes",ja:"監査原本の保存"});
+  if (h.status === "unavailable") return title + ": " + bl({en:"Unavailable",ja:"取得不能"});
+  if (h.status === "unknown") return title + ": " + bl({en:"No completed writes observed yet",ja:"保存完了の観測はまだありません"});
+  return title + ": " + bl({en:"Write failures",ja:"保存失敗"}) + " " + h.primary_failures +
+    " / " + bl({en:"Post-write hook failures",ja:"保存後の転送処理失敗"}) + " " + h.hook_failures +
+    ". " + bl({en:"This process only; restart resets observations. Outbox delivery is separate. Failure counts are not missing-record counts.",ja:"このプロセスの観測です。再起動でリセットされます。配送待ちの状態とは別です。失敗件数は欠落レコード数ではありません。"});
+}
+
+async function laAuditWriterHealth(host) {
+  const current = freshRender(host);
+  try {
+    const r = await apiFetch("GET", "/admin/audit-writer/health", undefined, _LA_PLANE);
+    if (!current()) return;
+    if (r.status === 403) {
+      host.innerHTML = "";
+      host.appendChild(el("p", {class:"ui-view-desc",text:bl({en:"Audit writer health is available to deployment administrators.",ja:"監査原本の保存状態は配備管理者が確認できます。"})}));
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const text = laAuditWriterHealthText(r.body);
+    host.innerHTML = "";
+    if (r.body.primary_failures > 0 || r.body.hook_failures > 0) host.appendChild(uiBadge(bl({en:"Attention needed",ja:"要確認"}), "danger"));
+    host.appendChild(el("p", {class:"ui-view-desc",text}));
+    host.appendChild(el("p", {class:"ui-view-desc",text:bl({en:"Retrieved at",ja:"取得時刻"}) + " " + new Date().toISOString() +
+      ". " + bl({en:"Snapshot; does not refresh automatically.",ja:"自動更新されない取得時点の表示です。"})}));
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", String(e), {label:bl({en:"Retry",ja:"再試行"}),onClick:()=>laAuditWriterHealth(host)});
+  }
 }

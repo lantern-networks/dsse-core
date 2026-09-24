@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
 	"time"
 
 	appcatalog "github.com/lantern-networks/dsse-core/appcatalog"
+	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
@@ -21,6 +24,10 @@ import (
 // enrollment command). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, registry connectorRegistryStore, tunnelManager *tunnel.Manager, siteStore adminSiteStore, vlanBoundary *vlan.Store, domainEventOutbox domainEventOutboxWriter, adminAuditOutbox adminAuditOutboxDeadReader, applicationCatalogStore appcatalog.RuntimeStore, tenantModelStore adminTenantModelRuntimeStore, configSourceURL string, connectorTunnelStatus func(string) *bool, connectorDeclaredRoutes func(ctx context.Context, tenant, connectorID string) (cidrs, fqdns []string, found bool)) {
 	mux.HandleFunc("GET /admin/connectors/{connector_id}/routes", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := connectorRouteGov.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("Could not read network bindings."))
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		cid := r.PathValue("connector_id")
 		declared, declaredFQDNs, found := connectorDeclaredRoutes(r.Context(), tenant, cid)
@@ -31,6 +38,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "routes": connectorRouteGov.Routes(tenant, cid, declared, declaredFQDNs)})
 	}))
 	mux.HandleFunc("POST /admin/connectors/{connector_id}/routes", adminEndpoint("admin.connectors.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		if configWriteRejectedWhenSourced(w, configSourceURL, "connector routes") {
 			return
 		}
@@ -89,6 +97,11 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				}
 			}
 			if isNetwork && action == "add" {
+				// Decide existence and ownership from shared authority, not this process's
+				// cache: a Network another control plane just created must be bindable here.
+				if !refreshVLANStore(w, vlanBoundary) {
+					return
+				}
 				if o, ok := vlanBoundary.GetObject(req.NetworkID); !namedNetworkVisibleToTenant(o, ok, tenant) {
 					writeError(w, http.StatusBadRequest, fmt.Errorf("network_id %q is not a known Named Network", req.NetworkID))
 					return
@@ -98,6 +111,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be hold | unhold | approve | unapprove | add | remove"))
 			return
 		}
+		var bindingErr error
 		switch action {
 		case "hold":
 			connectorRouteGov.SetHeld(tenant, cid, req.CIDR, true)
@@ -108,16 +122,31 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		case "unapprove":
 			connectorRouteGov.SetApproved(tenant, cid, req.CIDR, false)
 		case "add":
-			connectorRouteGov.AddAuthored(tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthoredContext(r.Context(), tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case isNetwork:
-				connectorRouteGov.RemoveAuthored(tenant, cid, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, "net:"+req.NetworkID)
 			case isFQDN:
-				connectorRouteGov.RemoveAuthored(tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				connectorRouteGov.RemoveAuthored(tenant, cid, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, req.CIDR)
 			}
+		}
+		now := time.Now().UTC()
+		result := "success"
+		if bindingErr != nil {
+			result = "error"
+		}
+		audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: cid, TenantID: tenant}, r, evaluator, now)
+		kind := "route_binding"
+		audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
+		audit.Metadata = map[string]any{"network_id": req.NetworkID, "fqdn": req.FQDN, "cidr": req.CIDR, "operation": action}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		if bindingErr != nil {
+			log.Printf("admin network binding: %v", bindingErr)
+			writeError(w, http.StatusInternalServerError, errors.New("Could not save network binding."))
+			return
 		}
 		declared, declaredFQDNs, _ := connectorDeclaredRoutes(r.Context(), tenant, cid)
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "routes": connectorRouteGov.Routes(tenant, cid, declared, declaredFQDNs)})
@@ -167,6 +196,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		result, found, err := adminConnectorRotateRuntimeSecret(r.Context(), registry, adminTenantIDFromRequest(r), r.PathValue("connector_id"), request, now, connectorTunnelStatus)
 		if err != nil {
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector secret change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -174,7 +207,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusNotFound, fmt.Errorf("connector %s is absent", r.PathValue("connector_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_runtime_secret_rotated", result.Connector, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_runtime_secret_rotated", result.Connector, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, result)
 	}))
 	// Operator display name for a connector (rename). Stored as server-managed metadata (survives re-registration
@@ -199,7 +232,11 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		cid := r.PathValue("connector_id")
 		conn, found, err := reg.SetDisplayNameForTenant(tenant, cid, req.Name)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector change could not be confirmed in storage. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		if !found {
@@ -209,7 +246,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		dto := adminConnectorFromModel(conn)
 		applyConnectorTunnelStatus(&dto, connectorTunnelStatus)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_renamed", dto, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_renamed", dto, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, dto)
 	}))
 	// Decommission a connector: remove it from the registry (Console "Remove"). A live connector that keeps
@@ -227,14 +264,18 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		cid := r.PathValue("connector_id")
 		removed, err := reg.RemoveForTenant(tenant, cid)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector change could not be confirmed in storage. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		if !removed {
 			writeError(w, http.StatusNotFound, fmt.Errorf("connector %s is absent", cid))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_removed", adminConnector{ID: cid, TenantID: tenant}, evaluator, time.Now()), time.Now())
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminConnectorManagementAuditLog("admin_connector_removed", adminConnector{ID: cid, TenantID: tenant}, r, evaluator, time.Now()), time.Now())
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "removed": true})
 	}))
 	// Connector UX Slice 1 (/) + Slice 1b: a Site /
@@ -316,10 +357,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		saved, err := siteStore.Upsert(r.Context(), site, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_upserted", saved, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_upserted", saved, r, evaluator, now), now)
 		detail, _, derr := adminSiteGetMerged(r.Context(), registry, siteStore, tenantID, saved.SiteID, connectorTunnelStatus, now)
 		if derr != nil {
 			writeError(w, http.StatusBadRequest, derr)
@@ -357,16 +398,20 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		now := time.Now()
 		if err := siteStore.Delete(r.Context(), tenantID, siteID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_deleted", adminSiteModel{SiteID: siteID, TenantID: tenantID}, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_deleted", adminSiteModel{SiteID: siteID, TenantID: tenantID}, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "deleted": true})
 	}))
 	// Site Networks (docs/site_private_access_design.md): the networks a SITE serves, bound ONCE to the site and
 	// served by ALL its connectors (active + standby are interchangeable). GET lists them; POST binds/unbinds a
 	// CIDR, a hostname (FQDN), or a Named-Network reference. Keyed by the site (connector group), never per-connector.
 	mux.HandleFunc("GET /admin/sites/{site_id}/networks", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := connectorRouteGov.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("Could not read network bindings."))
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		siteID := strings.TrimSpace(r.PathValue("site_id"))
 		if siteID == "" {
@@ -380,6 +425,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "networks": rows})
 	}))
 	mux.HandleFunc("POST /admin/sites/{site_id}/networks", adminEndpoint("admin.connectors.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		if configWriteRejectedWhenSourced(w, configSourceURL, "site networks") {
 			return
 		}
@@ -429,25 +475,44 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			}
 		}
 		if req.NetworkID != "" && action == "add" {
+			if !refreshVLANStore(w, vlanBoundary) {
+				return
+			}
 			if o, ok := vlanBoundary.GetObject(req.NetworkID); !namedNetworkVisibleToTenant(o, ok, tenant) {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("network_id %q is not a known Network", req.NetworkID))
 				return
 			}
 		}
+		var bindingErr error
 		switch action {
 		case "add":
-			connectorRouteGov.AddAuthored(tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthoredContext(r.Context(), tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case req.NetworkID != "":
-				connectorRouteGov.RemoveAuthored(tenant, siteID, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, siteID, "net:"+req.NetworkID)
 			case req.FQDN != "":
-				connectorRouteGov.RemoveAuthored(tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				connectorRouteGov.RemoveAuthored(tenant, siteID, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, siteID, req.CIDR)
 			}
 		default:
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be add | remove"))
+			return
+		}
+		now := time.Now().UTC()
+		result := "success"
+		if bindingErr != nil {
+			result = "error"
+		}
+		audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: siteID, TenantID: tenant}, r, evaluator, now)
+		kind := "route_binding"
+		audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
+		audit.Metadata = map[string]any{"network_id": req.NetworkID, "fqdn": req.FQDN, "cidr": req.CIDR, "operation": action}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		if bindingErr != nil {
+			log.Printf("admin network binding: %v", bindingErr)
+			writeError(w, http.StatusInternalServerError, errors.New("Could not save network binding."))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "networks": connectorRouteGov.Routes(tenant, siteID, nil, nil)})
@@ -551,14 +616,14 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		result, found, err := adminSiteEnrollmentCommandIssue(r.Context(), siteStore, tenantID, r.PathValue("site_id"), params, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("site %s is absent", r.PathValue("site_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{SiteID: result.SiteID, TenantID: tenantID, BootstrapSecretHash: connectorRuntimeSecretHash(result.BootstrapSecret)}, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{SiteID: result.SiteID, TenantID: tenantID, BootstrapSecretHash: connectorRuntimeSecretHash(result.BootstrapSecret)}, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, result)
 	}))
 }
@@ -587,4 +652,14 @@ func namedNetworkVisibleToTenant(o model.VLANObject, ok bool, tenant string) boo
 	}
 	owner := strings.TrimSpace(o.TenantID)
 	return owner == "" || strings.TrimSpace(tenant) == "" || strings.EqualFold(owner, strings.TrimSpace(tenant))
+}
+
+// Keep storage paths and internal error details out of the administrative response.
+func writeAdminSiteStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAdminSitePersistence) {
+		log.Printf("site storage error: %v", err)
+		writeError(w, http.StatusInternalServerError, errAdminSitePersistence)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }

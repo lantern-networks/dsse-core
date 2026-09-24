@@ -20,9 +20,9 @@ import (
 // A hand-maintained list drifts the first time somebody wires a new store, and the drift is invisible until a
 // node comes up empty. So this regenerates it from the call sites and compares.
 func TestTheSharedStateListMatchesTheCallSites(t *testing.T) {
-	callSite := regexp.MustCompile(`(?s)(?:must)?[Cc][Pp]StateBlobPersister\((.*?)\)`)
+	callSite := regexp.MustCompile(`(?s)(?:(?:must)?[Cc][Pp]StateBlobPersister|configBundleStorePersister)\((.*?)\)`)
 	keyLiteral := regexp.MustCompile(`"([a-z_]+)"`)
-	durable := regexp.MustCompile(`durableStorePath\([^)]*"([a-z_]+)"\)`)
+	durable := regexp.MustCompile(`(?:durableStorePath|configBundleStorePath)\([^)]*"([a-z_]+)"\)`)
 
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -55,7 +55,7 @@ func TestTheSharedStateListMatchesTheCallSites(t *testing.T) {
 
 	want := []string{}
 	for key := range defaultedByStatePath {
-		if resolvedByPersister[key] {
+		if resolvedByPersister[sharedStoreKey(key)] {
 			want = append(want, key)
 		}
 	}

@@ -5,13 +5,16 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	certreload "github.com/lantern-networks/dsse-core/certreload"
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // Management-plane certificate rotation — admin surface (slice 2 of docs/admin_certificate_rotation_design.md).
@@ -92,10 +95,18 @@ func certInventory() []certInventoryEntry {
 	return out
 }
 
+var certRotationMu sync.Mutex
+
 // rotateNamedCert validates the uploaded PEM cert+key, writes them to the named cert's backing files, and
 // hot-reloads every listener using that cert. Returns the new inventory entry. Fail-safe: validation happens
 // before any write; a reload failure after write keeps the previous in-memory cert (it does not crash).
 func rotateNamedCert(name, certPEM, keyPEM string, now time.Time) (certInventoryEntry, error) {
+	certRotationMu.Lock()
+	defer certRotationMu.Unlock()
+	return rotateNamedCertLocked(name, certPEM, keyPEM, now)
+}
+
+func rotateNamedCertLocked(name, certPEM, keyPEM string, now time.Time) (certInventoryEntry, error) {
 	name = strings.TrimSpace(name)
 	// validate key<->cert match + parse
 	pair, err := tls.X509KeyPair([]byte(certPEM), []byte(keyPEM))
@@ -121,18 +132,16 @@ func rotateNamedCert(name, certPEM, keyPEM string, now time.Time) (certInventory
 		return certInventoryEntry{}, fmt.Errorf("no rotatable certificate named %q", name)
 	}
 
-	written := map[string]bool{}
-	for _, r := range matched {
-		if written[r.CertFile()] {
-			continue
+	// One name must resolve to one physical pair. Otherwise a late failure could
+	// rotate only part of an unrelated set of listeners with the same basename.
+	first := matched[0]
+	for _, r := range matched[1:] {
+		if filepath.Clean(r.CertFile()) != filepath.Clean(first.CertFile()) || filepath.Clean(r.KeyFile()) != filepath.Clean(first.KeyFile()) {
+			return certInventoryEntry{}, fmt.Errorf("certificate name is ambiguous across backing files")
 		}
-		written[r.CertFile()] = true
-		if err := os.WriteFile(r.CertFile(), []byte(certPEM), 0o644); err != nil {
-			return certInventoryEntry{}, fmt.Errorf("write cert %s: %w", r.CertFile(), err)
-		}
-		if err := os.WriteFile(r.KeyFile(), []byte(keyPEM), 0o600); err != nil {
-			return certInventoryEntry{}, fmt.Errorf("write key %s: %w", r.KeyFile(), err)
-		}
+	}
+	if err := saveNamedCertPair(first.CertFile(), first.KeyFile(), []byte(certPEM), []byte(keyPEM)); err != nil {
+		return certInventoryEntry{}, err
 	}
 	for _, r := range matched {
 		if err := r.Reload(); err != nil {
@@ -141,4 +150,116 @@ func rotateNamedCert(name, certPEM, keyPEM string, now time.Time) (certInventory
 	}
 	entry, _ := certEntryFor(matched[0])
 	return entry, nil
+}
+
+// Stage every file before changing either destination. The durable recovery
+// journal restores interrupted updates before the next load; handled failures
+// also restore the previous pair immediately.
+func saveNamedCertPair(certPath, keyPath string, cert, key []byte) error {
+	return saveNamedCertPairWithReplace(certPath, keyPath, cert, key, durablefile.Replace)
+}
+
+func saveNamedCertPairWithReplace(certPath, keyPath string, cert, key []byte, replace func(string, string) error) error {
+	return certreload.WithPairUpdate(certPath, keyPath, func() error {
+		return replaceNamedCertPair(certPath, keyPath, cert, key, replace)
+	})
+}
+
+func replaceNamedCertPair(certPath, keyPath string, cert, key []byte, replace func(string, string) error) error {
+	if filepath.Clean(certPath) == filepath.Clean(keyPath) {
+		return fmt.Errorf("certificate and key must use separate files")
+	}
+	paths := []string{certPath, keyPath}
+	old := make([][]byte, 2)
+	for i, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("certificate backing path is not a regular file")
+		}
+		old[i], err = os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		// Retain the existing permission boundary even where rename would bypass a
+		// read-only destination file. Opening must not truncate the old material.
+		f, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			return fmt.Errorf("certificate backing file is not writable: %w", err)
+		}
+		if err := f.Close(); err != nil {
+			return err
+		}
+	}
+	staged, backups := make([]string, 2), make([]string, 2)
+	defer func() {
+		for _, p := range append(staged, backups...) {
+			if p != "" {
+				_ = os.Remove(p)
+			}
+		}
+	}()
+	for i, value := range [][]byte{cert, key} {
+		var err error
+		staged[i], err = stageNamedCertFile(paths[i], value)
+		if err != nil {
+			return err
+		}
+		backups[i], err = stageNamedCertFile(paths[i], old[i])
+		if err != nil {
+			return err
+		}
+	}
+	restore := func(cause error, count int) error {
+		errs := []error{cause}
+		for i := 0; i < count; i++ {
+			if err := replace(backups[i], paths[i]); err != nil {
+				if errors.Is(err, durablefile.ErrReplacedNotFlushed) {
+					errs = append(errs, fmt.Errorf("previous certificate material restored but durability is unconfirmed: %w", err))
+				} else {
+					errs = append(errs, fmt.Errorf("restore previous certificate material failed; recovery copy retained at %s: %w", backups[i], err))
+					backups[i] = "" // Do not erase the recovery copy when restoration failed.
+				}
+			}
+		}
+		return errors.Join(errs...)
+	}
+	for i, path := range paths {
+		if err := replace(staged[i], path); err != nil {
+			changed := i
+			if errors.Is(err, durablefile.ErrReplacedNotFlushed) {
+				changed++ // This destination already changed before its flush failed.
+			}
+			return restore(err, changed)
+		}
+	}
+	return nil
+}
+
+func stageNamedCertFile(path string, data []byte) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), ".dsse-cert-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	keep := false
+	defer func() {
+		_ = f.Close()
+		if !keep {
+			_ = os.Remove(name)
+		}
+	}()
+	if _, err = f.Write(data); err != nil {
+		return "", err
+	}
+	if err = f.Sync(); err != nil {
+		return "", err
+	}
+	if err = f.Close(); err != nil {
+		return "", err
+	}
+	keep = true
+	return name, nil
 }

@@ -128,6 +128,7 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 	}
 	devMode := false
 	attestationSecret := "runtime-attestation-secret"
+	tenantCAs, connectorTLS := postgresTestConnectorIdentity(t, "tenant_lab_001", "conn_attestation")
 	handler := newServerWithConfig(serverConfig{
 		Evaluator: testEvaluatorWithPolicies([]model.Policy{{
 			ID:       "pol_lab_nhi_tool_attested_allow_001",
@@ -144,6 +145,7 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 			RequiredWorkloadAttestation: true,
 			Status:                      "active",
 		}}),
+		TenantCARegistry:          tenantCAs,
 		Writer:                    writer,
 		ConnectorSecret:           defaultConnectorSecret,
 		WorkloadAttestationSecret: attestationSecret,
@@ -172,6 +174,7 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 		DelegatedAccessGrantID: "dag_lab_001",
 		AgentTaskSessionID:     "ats_lab_001",
 		ToolID:                 "tool_ticket_create_001",
+		ToolActionType:         "ticket:create",
 		ApplicationID:          "app_dummy_https",
 	}
 	timestamp := now.Format(time.RFC3339)
@@ -179,6 +182,8 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 	signature := runtimeWorkloadAttestationSignature(attestationSecret, signedReq, "verified", timestamp, nonce)
 
 	req := httptest.NewRequest(http.MethodPost, "/decisions/evaluate", bytes.NewReader(body))
+	req.TLS = connectorTLS
+	req.Header.Set(connectorIDHeader, "conn_attestation")
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(connectorSecretHeader, defaultConnectorSecret)
 	req.Header.Set(workloadAttestationStateHeader, "verified")
@@ -199,6 +204,8 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/decisions/evaluate", bytes.NewReader(body))
+	req.TLS = connectorTLS
+	req.Header.Set(connectorIDHeader, "conn_attestation")
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(connectorSecretHeader, defaultConnectorSecret)
 	req.Header.Set(workloadAttestationStateHeader, "verified")

@@ -37,6 +37,7 @@ import (
 // collapses them into ONE message for the caller, because distinguishing them to an unauthenticated client turns
 // a public endpoint into an oracle for which tokens exist and which have been spent.
 var (
+	ErrStateUnavailable  = errors.New("enrolment token state is unavailable")
 	ErrUnknownToken      = errors.New("enrolment token is not recognised")
 	ErrTokenUsed         = errors.New("enrolment token has already been used")
 	ErrTokenRevoked      = errors.New("enrolment token was revoked")
@@ -98,6 +99,7 @@ type Store struct {
 	tokens     map[string]Token // by ID
 	byHash     map[string]string
 	persister  blobstore.Persister
+	stateErr   error
 	generation atomic.Int64
 }
 
@@ -150,6 +152,9 @@ func (s *Store) Issue(policy Policy, tenantID, group, label, issuedBy, issuedByL
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stateErr != nil {
+		return Token{}, "", s.stateErr
+	}
 	if policy.MaxOutstanding > 0 && s.outstandingLocked(tenantID, now) >= policy.MaxOutstanding {
 		return Token{}, "", ErrOutstandingCap
 	}
@@ -168,10 +173,11 @@ func (s *Store) Issue(policy Policy, tenantID, group, label, issuedBy, issuedByL
 		IssuedAt:      now.UTC().Format(time.RFC3339),
 		ExpiresAt:     expiresAt.UTC().Format(time.RFC3339),
 	}
-	s.tokens[id] = tok
-	s.byHash[sum] = id
-	s.generation.Add(1)
-	s.persistLocked()
+	next := s.copyTokensLocked()
+	next[id] = tok
+	if err := s.commitTokensLocked(next); err != nil {
+		return Token{}, "", err
+	}
 	return tok, secret, nil
 }
 
@@ -212,6 +218,9 @@ func (s *Store) Spend(id, tenantID, deviceID string, now time.Time) (Token, erro
 }
 
 func (s *Store) verifyLocked(secret, tenantID string, now time.Time) (Token, error) {
+	if s.stateErr != nil {
+		return Token{}, s.stateErr
+	}
 	id, ok := s.byHash[hashSecret(secret)]
 	if !ok {
 		return Token{}, ErrUnknownToken
@@ -220,6 +229,9 @@ func (s *Store) verifyLocked(secret, tenantID string, now time.Time) (Token, err
 }
 
 func (s *Store) checkLocked(id, tenantID string, now time.Time) (Token, error) {
+	if s.stateErr != nil {
+		return Token{}, s.stateErr
+	}
 	tok, ok := s.tokens[id]
 	if !ok {
 		return Token{}, ErrUnknownToken
@@ -248,9 +260,11 @@ func (s *Store) spendLocked(id, deviceID, tenantID string, now time.Time) (Token
 	}
 	tok.UsedAt = now.UTC().Format(time.RFC3339)
 	tok.UsedBy = strings.TrimSpace(deviceID)
-	s.tokens[tok.ID] = tok
-	s.generation.Add(1)
-	s.persistLocked()
+	next := s.copyTokensLocked()
+	next[tok.ID] = tok
+	if err := s.commitTokensLocked(next); err != nil {
+		return Token{}, err
+	}
 	return tok, nil
 }
 
@@ -266,9 +280,11 @@ func (s *Store) Revoke(id, revokedBy string, now time.Time) (Token, bool) {
 	}
 	tok.RevokedAt = now.UTC().Format(time.RFC3339)
 	tok.RevokedBy = strings.TrimSpace(revokedBy)
-	s.tokens[tok.ID] = tok
-	s.generation.Add(1)
-	s.persistLocked()
+	next := s.copyTokensLocked()
+	next[tok.ID] = tok
+	if err := s.commitTokensLocked(next); err != nil {
+		return Token{}, false
+	}
 	return tok, true
 }
 
@@ -412,24 +428,20 @@ func (s *Store) RemoveTenant(tenantID string) int {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	next := s.copyTokensLocked()
 	n := 0
 	for id, t := range s.tokens {
 		if strings.EqualFold(strings.TrimSpace(t.TenantID), tenantID) {
-			delete(s.tokens, id)
+			delete(next, id)
 			n++
 		}
 	}
 	if n == 0 {
 		return 0
 	}
-	rebuilt := make(map[string]string, len(s.tokens))
-	for hash, id := range s.byHash {
-		if _, ok := s.tokens[id]; ok {
-			rebuilt[hash] = id
-		}
+	if err := s.commitTokensLocked(next); err != nil {
+		return 0
 	}
-	s.byHash = rebuilt
-	s.persistLocked()
 	return n
 }
 

@@ -659,9 +659,15 @@ func replayPostgresAdminAuditOutboxDeadRow(ctx context.Context, db *sql.DB, tena
 	if err != nil {
 		return postgresAdminAuditOutboxReplayResult{}, false, err
 	}
+	tx, finish, err := beginCPWriteTransaction(ctx, db)
+	if err != nil {
+		return postgresAdminAuditOutboxReplayResult{}, false, err
+	}
+	defer finish()
+	defer tx.Rollback()
 	var result postgresAdminAuditOutboxReplayResult
 	var previousDeadAt sql.NullTime
-	err = db.QueryRowContext(ctx, statement.SQL, statement.Args...).Scan(&result.TenantID, &result.OutboxID, &result.Status, &result.PublishAttempt, &result.UpdatedAt, &result.PreviousPublishAttempt, &result.PreviousLastError, &previousDeadAt)
+	err = tx.QueryRowContext(ctx, statement.SQL, statement.Args...).Scan(&result.TenantID, &result.OutboxID, &result.Status, &result.PublishAttempt, &result.UpdatedAt, &result.PreviousPublishAttempt, &result.PreviousLastError, &previousDeadAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return postgresAdminAuditOutboxReplayResult{}, false, nil
 	}
@@ -671,6 +677,9 @@ func replayPostgresAdminAuditOutboxDeadRow(ctx context.Context, db *sql.DB, tena
 	if previousDeadAt.Valid {
 		normalized := previousDeadAt.Time.UTC()
 		result.PreviousDeadAt = &normalized
+	}
+	if err := tx.Commit(); err != nil {
+		return postgresAdminAuditOutboxReplayResult{}, false, err
 	}
 	return result, true, nil
 }

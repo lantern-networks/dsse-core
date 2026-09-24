@@ -47,6 +47,68 @@ function renderPeopleView(content) {
 async function paGet(path, plane) { const r = await apiFetch("GET", path, undefined, plane); if (!r.ok) throw new Error("HTTP " + r.status); return r.body || {}; }
 async function paList(path, key, plane) { const b = await paGet(path, plane); return (b && b[key]) || []; }
 
+// People dependencies are required: unavailable health/risk is not an empty or
+// normal directory. Validate before exposing mutation controls.
+function paObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function paArray(body, key) {
+  if (!paObject(body) || !Object.hasOwn(body, key) || (body[key] !== null && !Array.isArray(body[key]))) throw new Error("Invalid directory response");
+  return body[key] || [];
+}
+function paText(value) { return typeof value === "string" && value.trim() !== ""; }
+function paPerson(value) {
+  return paObject(value) && ["id", "tenant_id", "subject", "source"].every(key => paText(value[key])) &&
+    ["active", "suspended", "deleted"].includes(value.status) &&
+    ["email", "display_name", "department", "last_seen_at", "expires_at"].every(key => value[key] == null || typeof value[key] === "string");
+}
+async function paLoadPeople() {
+  const [health, sourceBody, runBody, peopleBody, risk] = await Promise.all([
+    paGet("/admin/human-identities/sources/health", _PA_DIR),
+    paGet("/admin/human-identities/sources", _PA_DIR),
+    paGet("/admin/human-identities/import-runs", _PA_DIR),
+    paLoadDirectoryPages(),
+    paGet("/admin/risk-signals?entity_type=user", _PA_DIR),
+  ]);
+  const sources = paArray(sourceBody, "sources"), runs = paArray(runBody, "runs"), people = paArray(peopleBody, "identities");
+  const healthSources = paArray(health, "sources");
+  const count = value => Number.isSafeInteger(value) && value >= 0;
+  if (!paText(health.status) || !count(health.source_count) || health.source_count !== healthSources.length ||
+      !Number.isFinite(health.stale_after_seconds) || health.stale_after_seconds <= 0 ||
+      !healthSources.every(row => paObject(row) && paText(row.source) && paText(row.status)) ||
+      !sources.every(row => paObject(row) && paText(row.source) && ["total", "active", "expired"].every(key => count(row[key])) && (row.observed_at == null || typeof row.observed_at === "string")) ||
+      !runs.every(row => paObject(row) && paText(row.import_run_id) && (row.source == null || typeof row.source === "string") && count(row.upserted) && count(row.deactivated)) ||
+      !people.every(paPerson) || !paObject(risk) || risk.entity_type !== "user" || !paText(risk.tenant_id) || !paObject(risk.high_risk) ||
+      !people.every(person => person.tenant_id === risk.tenant_id) ||
+      !Object.values(risk.high_risk).every(value => ["medium", "high", "critical"].includes(value))) throw new Error("Invalid directory response");
+  return {health, sources, runs, people, riskMap: risk.high_risk};
+}
+// Search and row actions operate on the whole directory, not just the API's
+// first (default 200-entry) page. Do not display a partial list if a page fails.
+async function paLoadDirectoryPages() {
+  const identities = [], cursors = new Set();
+  let cursor = "";
+  do {
+    const body = await paGet("/admin/human-identities" + (cursor ? "?cursor=" + encodeURIComponent(cursor) : ""), _PA_DIR);
+    identities.push(...paArray(body, "identities"));
+    const next = body.next_cursor;
+    if (next != null && typeof next !== "string") throw new Error("Invalid directory response");
+    cursor = next || "";
+    if (cursor && cursors.has(cursor)) throw new Error("Invalid directory response");
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return {identities};
+}
+function paMutationError(r) {
+  const detail = r && r.body && (r.body.error || r.body.message);
+  return typeof detail === "string" ? detail : "HTTP " + (r && r.status || "unknown");
+}
+function paUnconfirmedChange() {
+  return bl({ en: "The directory change could not be confirmed. Reload the list before trying again; the change may already have been applied.", ja: "変更結果を確認できません。一覧を再読込してから再試行してください。変更は反映済みの可能性があります。" });
+}
+function paConfirmPerson(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  if (!paPerson(r.body) || r.body.id !== expected.id || r.body.subject !== expected.subject || r.body.source !== expected.source || r.body.status !== expected.status || (expected.tenant_id && r.body.tenant_id !== expected.tenant_id) || (r.body.email || "") !== (expected.email || "")) throw new Error(paUnconfirmedChange());
+}
+
 // paWriteEnforcement writes an enforcement-config resource (delegated grant, service account / NHI, agent policy).
 // It goes to the ENFORCEMENT Edge by default — where this single-edge lab decides, so a grant lands exactly where
 // the decision engine reads it. If the Edge is a config-PULLER (a fleet: -config-source-url set) it rejects the
@@ -63,35 +125,61 @@ async function paWriteEnforcement(method, path, body) {
 
 // setUserRisk marks / clears a person's risk from their own row (no free-text id) — replaces the Device Risk
 // page's user option. "high" makes a risk-gated policy bite (e.g. force re-authentication) for that user on ANY
-// device; "none" clears it. Keyed by the person's id (the IdP subject the decision request carries).
+// device within the same tenant; "none" clears it. The server resolves the directory ID and subject.
+function paRiskNotice(section, u, severity, message) {
+  const notices = section.__paRiskNotices || (section.__paRiskNotices = new Map());
+  if (message) notices.set(u.id, {u, severity, message}); else notices.delete(u.id);
+}
+function paDrawRiskNotices(section) {
+  for (const notice of (section.__paRiskNotices || new Map()).values()) {
+    section.appendChild(el("div", { class: "ui-callout ui-callout-warn", role: "alert" }, [
+      el("strong", {text: notice.u.display_name || notice.u.subject || notice.u.id}),
+      el("div", {text: notice.message, style: "white-space:pre-wrap"}),
+      el("button", {class: "ui-btn ui-btn-sm", text: bl({en: "Retry risk change", ja: "リスク変更を再試行"}),
+        disabled: section.__paRiskPending?.has(notice.u.id) ? "" : null, onClick: () => setUserRisk(notice.u, notice.severity, section)}),
+    ]));
+  }
+}
 async function setUserRisk(u, severity, section) {
-  const r = await apiFetch("POST", "/admin/risk-signals", { entity_type: "user", entity_id: u.id, severity: severity, evidence_ref: "console" }, _PA_ENF);
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); paPeople(section); return; }
-  uiToast(severity === "none" ? bl({ en: "Risk cleared.", ja: "リスクを解除しました。" }) : bl({ en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。" }), "ok");
-  paPeople(section);
+  const pending = section.__paRiskPending || (section.__paRiskPending = new Set());
+  if (pending.has(u.id)) return;
+  pending.add(u.id); paRiskNotice(section, u, severity, "");
+  for (const control of section.querySelectorAll("[data-person-risk-id]")) if (control.getAttribute("data-person-risk-id") === u.id) control.disabled = true;
+  let notice = "";
+  try {
+    const r = await apiFetch("POST", "/admin/risk-signals", {entity_type: "user", entity_id: u.id, severity}, _PA_DIR);
+    if (!r || !r.ok) throw new Error(paMutationError(r));
+    const b = r.body;
+    if (!paObject(b) || b.entity_type !== "user" || b.entity_id !== u.id || b.tenant_id !== u.tenant_id || b.severity !== severity || b.applied !== true ||
+        b.high_risk !== (severity === "high" || severity === "critical") ||
+        (b.not_stored_durably !== undefined && typeof b.not_stored_durably !== "string")) throw new Error("Invalid user risk response");
+    if (b.not_stored_durably) notice = bl({en: "Risk applied, but durable saving is not confirmed. Retry after storage recovers.", ja: "リスクは反映されましたが、永続保存を確認できません。保存先の復旧後に再試行してください。"});
+  } catch (e) {
+    notice = bl({en: "The risk change could not be confirmed. Reload the state before retrying; the change may already be applied.", ja: "リスク変更を確認できません。反映済みの可能性があるため、状態を再読込してから再試行してください。"}) + "\n" + (e.message || String(e));
+  } finally {
+    pending.delete(u.id);
+    for (const control of section.querySelectorAll("[data-person-risk-id]")) if (control.getAttribute("data-person-risk-id") === u.id) control.disabled = false;
+  }
+  paRiskNotice(section, u, severity, notice);
+  if (!notice) uiToast(severity === "none" ? bl({en: "Risk cleared.", ja: "リスクを解除しました。"}) : bl({en: "Risk set: " + severity + ".", ja: "リスクを設定: " + severity + "。"}), "ok");
+  await paPeople(section);
 }
 
 // ---- People: a synced directory (health + sources + import runs + identities), manual add demoted ----
 async function paPeople(section) {
   uiState(section, "loading");
   const current = freshRender(section);
-  let health, sources, runs, people;
+  let health, sources, runs, people, riskMap;
   try {
-    [health, sources, runs, people] = await Promise.all([
-      paGet("/admin/human-identities/sources/health", _PA_DIR).catch(() => ({})),
-      paList("/admin/human-identities/sources", "sources", _PA_DIR).catch(() => []),
-      paList("/admin/human-identities/import-runs", "runs", _PA_DIR).catch(() => []),
-      paList("/admin/human-identities", "identities", _PA_DIR),
-    ]);
-  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); return; }
-  // Removed identities (the sync's soft-delete terminal state) are not part of the live directory — hide them.
-  people = (people || []).filter((u) => (u.status || "").toLowerCase() !== "deleted");
-  // Current high-risk marks (the shared overlay lives on the enforcement Edge), so each person's own row shows +
-  // sets their risk — no free-text id. Best-effort. Keyed by the person's id (the IdP subject the decision uses).
-  let riskMap = {};
-  try { const rk = await apiFetch("GET", "/admin/risk-signals", null, _PA_ENF); if (rk && rk.ok && rk.body && rk.body.high_risk) riskMap = rk.body.high_risk; } catch (e) { /* best-effort */ }
+    ({health, sources, runs, people, riskMap} = await paLoadPeople());
+  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); paDrawRiskNotices(section); return; }
+  // Removed entries still own their ID. Manual addition must not silently
+  // replace a synced identity or reactivate one hidden from the live list.
+  const existingIDs = new Set(people.map((u) => u.id));
+  people = people.filter((u) => u.status !== "deleted");
   if (!current()) return;
   section.innerHTML = "";
+  paDrawRiskNotices(section);
 
   // Directory-sync health banner: this is a SYNCED directory; the operator should see freshness, not a raw list.
   const synced = (health.source_count || 0) > 0;
@@ -99,10 +187,10 @@ async function paPeople(section) {
   const hb = el("div", { class: "pa-health " + (health.status === "ok" ? "pa-health-ok" : health.status ? "pa-health-warn" : "") });
   hb.appendChild(el("strong", { text: synced
     ? bl({ en: (health.source_count) + " identity source(s) · ", ja: "identity ソース " + (health.source_count) + " 件 · " }) + (health.status === "ok" ? bl({ en: "healthy", ja: "健全" }) : (health.status || "—"))
-    : bl({ en: "No identity source connected", ja: "identity ソース未接続" }) }));
+    : bl({ en: "No identity sources recorded", ja: "identity ソースの記録がありません" }) }));
   hb.appendChild(el("div", { class: "ui-view-desc", text: synced
-    ? bl({ en: "People are synced from your IdP/HR directory" + (staleDays ? "; a source is stale after " + staleDays + " day(s)." : "."), ja: "ユーザーは IdP/HR ディレクトリから同期されます" + (staleDays ? "; " + staleDays + " 日で stale 扱い。" : "。") })
-    : bl({ en: "People are normally synced from an IdP/HR directory. None is connected yet — the list below is manual entries only.", ja: "ユーザーは通常 IdP/HR ディレクトリから同期します。未接続のため、下の一覧は手動エントリのみです。" }) }));
+    ? bl({ en: "Source health includes manual entries and imported identities" + (staleDays ? "; a source is stale after " + staleDays + " day(s)." : "."), ja: "手動エントリと取り込んだユーザーのソース状態です" + (staleDays ? "; " + staleDays + " 日で stale 扱い。" : "。") })
+    : bl({ en: "No directory entries or source configuration have been recorded yet.", ja: "ユーザーやソース設定はまだ記録されていません。" }) }));
   section.appendChild(hb);
 
   // Sources (per-source counts + freshness) — the value that was previously hidden.
@@ -127,7 +215,7 @@ async function paPeople(section) {
       [bl({ en: "Person", ja: "ユーザー" }), bl({ en: "Email", ja: "メール" }), bl({ en: "Dept", ja: "部門" }), bl({ en: "Source", ja: "出所" }), bl({ en: "Last seen", ja: "最終確認" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Risk", ja: "リスク" }), bl({ en: "", ja: "" })],
       rows.map((u) => {
         const sev = riskMap[u.id];
-        const riskSel = el("select", { class: "ui-input", style: "width:auto;padding:2px 4px" }, [
+        const riskSel = el("select", { "data-person-risk-id": u.id, disabled: section.__paRiskPending?.has(u.id) ? "" : null, class: "ui-input", style: "width:auto;padding:2px 4px" }, [
           el("option", { value: "none", text: bl({ en: "Normal", ja: "通常" }) }),
           el("option", { value: "medium", text: bl({ en: "Medium", ja: "中" }) }),
           el("option", { value: "high", text: bl({ en: "High", ja: "高" }) }),
@@ -146,8 +234,8 @@ async function paPeople(section) {
             paRemoveBtn(
               bl({ en: "Remove this identity from the directory?", ja: "この identity をディレクトリから除去?" }),
               bl({ en: "It leaves the live directory (soft-remove). Access is decided by sign-in + rules, so this does not change access.", ja: "ライブディレクトリから外れます(ソフト除去)。アクセスはサインイン+ルールで決まるため変わりません。" }),
-              () => apiFetch("POST", "/admin/human-identities", { id: u.id, subject: u.subject, email: u.email, source: u.source || "manual", status: "deleted" }, _PA_DIR),
-              () => paPeople(section)),
+              () => apiFetch("POST", "/admin/human-identities", { ...u, status: "deleted" }, _PA_DIR),
+              () => paPeople(section), r => paConfirmPerson(r, { ...u, status: "deleted" })),
           ]),
         ];
       })
@@ -159,21 +247,42 @@ async function paPeople(section) {
   section.appendChild(el("div", { class: "pa-fallback" }, [
     el("span", { class: "ui-view-desc", text: bl({ en: "Not in a synced source? Add manually — this records an identity but does NOT grant access.", ja: "同期ソースに無い? 手動追加 ── identity を記録するだけで、アクセスは付与しません。" }) }),
     el("span", { class: "ui-spacer" }),
-    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add manually", ja: "手動追加" }), onClick: () => openPersonForm(section) }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add manually", ja: "手動追加" }), onClick: () => openPersonForm(section, existingIDs) }),
   ]));
 }
-function openPersonForm(section) {
+function openPersonForm(section, existingIDs = new Set()) {
   const idF = uiField({ name: "id", label: bl({ en: "ID", ja: "ID" }), required: true, placeholder: "u1" });
   const subjF = uiField({ name: "subj", label: bl({ en: "Username / subject", ja: "ユーザー名 / subject" }), required: true, placeholder: "alice" });
   const emailF = uiField({ name: "email", label: bl({ en: "Email", ja: "メール" }), placeholder: "alice@example.com" });
-  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "disabled", label: bl({ en: "Disabled", ja: "無効" }) }] });
+  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "suspended", label: bl({ en: "Suspended", ja: "停止" }) }] });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add person", ja: "ユーザー追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a person (manual fallback)", ja: "ユーザーを追加(手動フォールバック)" }), body: [el("p", { class: "ui-field-hint", text: bl({ en: "Recording an identity here does not grant any access — access is decided by sign-in + rules.", ja: "ここで identity を記録してもアクセスは付与されません ── アクセスはサインイン + ルールで決まります。" }) }), idF.el, subjF.el, emailF.el, statusF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
+  let pending = false, closed = false;
+  const error = el("div", { class: "ui-field-error-msg", style: "display:block", role: "alert" });
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() });
+  const m = uiModal({ title: bl({ en: "Add a person (manual fallback)", ja: "ユーザーを追加(手動フォールバック)" }),
+    body: [el("p", { class: "ui-field-hint", text: bl({ en: "Recording an identity here does not grant any access — access is decided by sign-in + rules.", ja: "ここで identity を記録してもアクセスは付与されません ── アクセスはサインイン + ルールで決まります。" }) }), idF.el, subjF.el, emailF.el, statusF.el, error],
+    footer: [cancel, submit], onClose: () => { closed = true; if (pending) uiToast(paUnconfirmedChange(), "err"); } });
   submit.addEventListener("click", async () => {
-    if (!idF.validate() || !subjF.validate()) return; submit.disabled = true;
-    const r = await apiFetch("POST", "/admin/human-identities", { id: idF.get(), subject: subjF.get(), email: emailF.get(), source: "manual", status: statusF.get() }, _PA_DIR);
-    if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    m.close(); uiToast(bl({ en: "Person added.", ja: "ユーザーを追加しました。" }), "ok"); paPeople(section);
+    if (pending || closed || !idF.validate() || !subjF.validate()) return;
+    const body = { id: idF.get(), subject: subjF.get(), email: emailF.get(), source: "manual", status: statusF.get() };
+    if (existingIDs.has(body.id)) {
+      error.textContent = bl({ en: "This ID already exists in the directory, including removed entries. Choose a different ID.", ja: "このIDは削除済みを含む登録に存在します。別のIDを指定してください。" });
+      idF.focus();
+      return;
+    }
+    pending = true; error.textContent = "";
+    const controls = [...m.el.querySelectorAll("input,select,button")];
+    const disabled = controls.map(control => control.disabled);
+    controls.forEach(control => { control.disabled = true; });
+    try {
+      let r;
+      try { r = await apiFetch("POST", "/admin/human-identities?mode=create", body, _PA_DIR); }
+      catch (_) { throw new Error(paUnconfirmedChange()); }
+      paConfirmPerson(r, body);
+      if (closed) return;
+      pending = false; m.close(); uiToast(bl({ en: "Person added.", ja: "ユーザーを追加しました。" }), "ok"); await paPeople(section);
+    } catch (e) { if (!closed) error.textContent = e.message || String(e); }
+    finally { pending = false; controls.forEach((control, index) => { control.disabled = disabled[index]; }); }
   });
   idF.focus();
 }
@@ -184,18 +293,17 @@ async function paAccounts(section) {
   const current = freshRender(section);
   let accts, risk, policies;
   try {
-    [accts, risk, policies] = await Promise.all([
-      paList("/admin/non-human-identities", "identities", _PA_ENF),
-      paGet("/admin/non-human-identities/risk", _PA_ENF).catch(() => ({ identities: [] })),
-      paList("/admin/policies", "policies", _PA_ENF).catch(() => []),
-    ]);
-  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paAccounts(section) }); return; }
-  const sevById = {}; (risk.identities || []).forEach((r) => (sevById[r.id] = r.severity));
-  // Tool-boundary (ceiling) per agent — the policy pol-agent-<id> authored alongside the NHI (S3). Enforcement
-  // reads this policy's AllowedToolIDs; showing it here makes the boundary visible where the agent lives.
-  const boundaryById = {}; (policies || []).forEach((p) => { const t = agentBoundaryTools(p); if (t) boundaryById[t.nhi] = t.tools; });
+    const data = await paLoadAccounts();
+    ({accts, risk, policies} = data);
+    if (!current()) return;
+    section.__paAccountTenant = data.tenant;
+  } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paAccounts(section) }); paDrawAccountNotices(section); return; }
+  const sevById = new Map(risk.map(row => [row.id, row.severity]));
+  const boundaryById = new Map();
+  policies.forEach(p => { const boundary = agentBoundaryTools(p); if (boundary) boundaryById.set(boundary.nhi, boundary.tools); });
   if (!current()) return;
   section.innerHTML = "";
+  paDrawAccountNotices(section);
   section.appendChild(el("div", { class: "ui-toolbar" }, [
     el("span", { class: "ui-view-desc", text: bl({ en: "The automated actors in agentic decisions — risk gates access, and out-of-boundary tool calls are denied.", ja: "エージェントとして判断する主体 ── リスクがアクセスを絞り、境界外のツール呼び出しは拒否されます。" }) }),
     el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add account", ja: "+ アカウント追加" }), onClick: () => openAccountForm(section) }),
@@ -208,8 +316,8 @@ async function paAccounts(section) {
       [bl({ en: "Account", ja: "アカウント" }), bl({ en: "Type", ja: "種別" }), bl({ en: "Owner", ja: "所有者" }), bl({ en: "Allowed tools", ja: "許可ツール" }), bl({ en: "Risk", ja: "リスク" }), bl({ en: "Status", ja: "状態" })],
       rows.map((a) => [
         el("strong", { text: a.name || a.id }), el("span", { text: a.nhi_type || "—" }), el("span", { text: a.owner_user_id || "—" }),
-        boundaryById[a.id] ? el("code", { text: boundaryById[a.id].join(", ") }) : el("span", { class: "ui-view-desc", text: bl({ en: "any (no boundary)", ja: "制限なし" }) }),
-        severityBadge(sevById[a.id]),
+        boundaryById.has(a.id) ? el("code", { text: boundaryById.get(a.id).join(", ") }) : el("span", { class: "ui-view-desc", text: bl({ en: "No account boundary", ja: "アカウント境界なし" }) }),
+        severityBadge(sevById.get(a.id)),
         uiBadge(a.status === "active" ? bl({ en: "Active", ja: "有効" }) : (a.status || "—"), a.status === "active" ? "ok" : "off"),
       ])
     ),
@@ -219,11 +327,56 @@ async function paAccounts(section) {
 // The agent tool-boundary is authored as a policy pol-agent-<nhi> keyed on actor_nhi_id, carrying AllowedToolIDs.
 const AGENT_POLICY_PREFIX = "pol-agent-";
 function agentBoundaryTools(p) {
-  if (!p || !p.id || p.id.indexOf(AGENT_POLICY_PREFIX) !== 0) return null;
-  const nhi = (p.conditions && p.conditions.actor_nhi_id) || p.id.slice(AGENT_POLICY_PREFIX.length);
-  const tools = p.allowed_tool_ids || [];
-  return { nhi, tools };
+  if (!p.id.startsWith(AGENT_POLICY_PREFIX) || p.status !== "active") return null;
+  return {nhi: p.conditions.actor_nhi_id, tools: p.allowed_tool_ids};
 }
+function paAccount(value) {
+  return paObject(value) && ["id", "tenant_id", "name", "nhi_type", "owner_user_id"].every(key => paText(value[key])) &&
+    ["active", "suspended", "expired", "revoked"].includes(value.status);
+}
+async function paLoadAccounts() {
+  const [body, report, policyBody] = await Promise.all([
+    paGet("/admin/non-human-identities", _PA_ENF), paGet("/admin/non-human-identities/risk", _PA_ENF), paGet("/admin/policies?limit=1000", _PA_ENF),
+  ]);
+  const accts = paArray(body, "identities"), risk = paArray(report, "identities"), policies = paArray(policyBody, "policies");
+  const strings = list => Array.isArray(list) && list.every(paText);
+  if (!paText(body.tenant_id) || report.tenant_id !== body.tenant_id || body.count !== accts.length || report.total !== risk.length || policyBody.count !== policies.length ||
+      !accts.every(a => paAccount(a) && a.tenant_id === body.tenant_id) || new Set(accts.map(a => a.id)).size !== accts.length ||
+      !risk.every(r => paObject(r) && paText(r.id) && ["none", "low", "medium", "high", "critical"].includes(r.severity)) ||
+      new Set(risk.map(r => r.id)).size !== risk.length || !accts.every(a => risk.some(r => r.id === a.id)) ||
+      !policies.every(p => paObject(p) && paText(p.id) && p.tenant_id === body.tenant_id && paText(p.status))) throw new Error("Invalid account state response");
+  for (const p of policies.filter(p => p.id.startsWith(AGENT_POLICY_PREFIX) && p.status === "active")) {
+    if (!paObject(p.conditions) || !paText(p.conditions.actor_nhi_id) || p.id !== AGENT_POLICY_PREFIX + p.conditions.actor_nhi_id ||
+        !strings(p.allowed_tool_ids) || p.allowed_tool_ids.length === 0 || !paObject(p.action) || p.action.decision !== "allow") throw new Error("Invalid account boundary response");
+  }
+  return {accts, risk, policies, tenant: body.tenant_id};
+}
+function paAccountNotice(section, id, message) {
+  const notices = section.__paAccountNotices || (section.__paAccountNotices = new Map());
+  if (message) notices.set(id, message); else notices.delete(id);
+}
+function paDrawAccountNotices(section) {
+  for (const [id, message] of section.__paAccountNotices || []) section.appendChild(el("div", {class: "ui-callout ui-callout-warn", role: "alert"}, [el("strong", {text: id}), el("div", {text: message})]));
+}
+function paConfirmAccount(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  if (!paAccount(r.body) || ["id", "name", "nhi_type", "owner_user_id", "status"].some(k => r.body[k] !== expected[k]) ||
+      (expected.tenant_id && r.body.tenant_id !== expected.tenant_id)) throw new Error("Account result is unconfirmed; it may already be saved. Reload before retrying.");
+  return r.body;
+}
+function paConfirmBoundary(r, expected) {
+  const outcome = r && r.body;
+  if (r && !r.ok && r.status === 500 && paObject(outcome) && outcome.status === "partial" && outcome.applied === true &&
+      outcome.policy_id === expected.id && outcome.tenant_id === expected.tenant_id && outcome.ne_snapshot_status === "unconfirmed") {
+    throw new Error(bl({en: "The tool boundary is applied on the administration server, but its endpoint configuration publication is unconfirmed. Retry the boundary and verify distribution before using the account.", ja: "ツール境界は管理側に反映済みですが、端末向け設定の発行を確認できません。境界設定を再試行し、配布状態を確認してから利用してください。"}));
+  }
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  const b = r.body;
+  if (!paObject(b) || b.id !== expected.id || b.tenant_id !== expected.tenant_id || b.status !== "active" ||
+      !paObject(b.conditions) || b.conditions.actor_nhi_id !== expected.conditions.actor_nhi_id || !paObject(b.action) || b.action.decision !== "allow" ||
+      !Array.isArray(b.allowed_tool_ids) || JSON.stringify([...b.allowed_tool_ids].sort()) !== JSON.stringify([...expected.allowed_tool_ids].sort())) throw new Error("Boundary result is unconfirmed; it may already be saved. Reload before retrying.");
+}
+
 function severityBadge(sev) {
   sev = (sev || "none").toLowerCase();
   const kind = (sev === "high" || sev === "critical") ? "danger" : sev === "medium" ? "warn" : "off";
@@ -236,114 +389,194 @@ function openAccountForm(section) {
   const typeF = uiField({ name: "type", label: bl({ en: "Type", ja: "種別" }), type: "select", value: "service_account", options: [{ value: "service_account", label: bl({ en: "Service account", ja: "サービスアカウント" }) }, { value: "ai_agent", label: bl({ en: "AI agent", ja: "AI エージェント" }) }, { value: "workload", label: bl({ en: "Workload", ja: "ワークロード" }) }] });
   const ownerF = uiField({ name: "owner", label: bl({ en: "Owner (person ID)", ja: "所有者(ユーザー ID)" }), required: true, placeholder: "u1", hint: bl({ en: "Every automated account is owned by a person — accountability for its actions.", ja: "自動アカウントは必ず人が所有 ── 行動の説明責任。" }) });
   const toolsF = uiField({ name: "tools", label: bl({ en: "Allowed tools (boundary)", ja: "許可ツール(境界)" }), placeholder: "read_repo, open_pr", hint: bl({ en: "The tools this agent may ever call. Any tool outside this list is denied before it runs (leave empty for no boundary).", ja: "このエージェントが呼べるツールの上限。ここに無いツールは実行前に拒否(空なら境界なし)。" }) });
-  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "disabled", label: bl({ en: "Disabled", ja: "無効" }) }] });
+  const statusF = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: "active", options: [{ value: "active", label: bl({ en: "Active", ja: "有効" }) }, { value: "suspended", label: bl({ en: "Suspended", ja: "停止" }) }] });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add account", ja: "アカウント追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a service account", ja: "サービスアカウントを追加" }), body: [idF.el, nameF.el, typeF.el, ownerF.el, toolsF.el, statusF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
+  const error = el("div", {class: "ui-field-error-msg", style: "display:block;white-space:pre-wrap", role: "alert"});
+  let pending = false, closed = false, saved = false, completed = false, draft;
+  const partial = () => bl({en: "Account saved; its tool boundary is not confirmed. Review the account before using it.", ja: "アカウントは保存されましたが、ツール境界を確認できません。利用前に設定を確認してください。"});
+  const uncertain = () => bl({en: "The account operation is unconfirmed and may already be applied. Reload its state before retrying.", ja: "処理結果を確認できません。反映済みの可能性があるため、状態を再読込してから再試行してください。"});
+  const cancel = el("button", {class: "ui-btn", text: bl({en: "Cancel", ja: "キャンセル"}), onClick: () => m.close()});
+  const m = uiModal({ title: bl({ en: "Add a service account", ja: "サービスアカウントを追加" }), body: [idF.el, nameF.el, typeF.el, ownerF.el, toolsF.el, statusF.el, error], footer: [cancel, submit], onClose: () => {
+    closed = true;
+    if (!completed && (pending || saved)) { paAccountNotice(section, draft.account.id, saved ? partial() : uncertain()); paAccounts(section); }
+  }});
+  const fields = [idF, nameF, typeF, ownerF, toolsF, statusF];
+  const controls = m.el.querySelectorAll("input,select,button");
   submit.addEventListener("click", async () => {
-    if (!idF.validate() || !nameF.validate() || !ownerF.validate()) return; submit.disabled = true;
-    const r = await paWriteEnforcement("POST", "/admin/non-human-identities", { id: idF.get(), name: nameF.get(), nhi_type: typeF.get(), owner_user_id: ownerF.get(), status: statusF.get() });
-    if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    // Author the agent's tool boundary as a policy (S3): pol-agent-<id> keyed on actor_nhi_id, allow with an
-    // AllowedToolIDs allowlist. The evaluator denies any tool outside it before execution.
-    const tools = toolsF.get().split(",").map((s) => s.trim()).filter(Boolean);
-    if (tools.length) {
-      const pr = await paWriteEnforcement("POST", "/admin/policies", { id: AGENT_POLICY_PREFIX + idF.get(), name: "Agent tool boundary: " + nameF.get(), priority: 50, conditions: { actor_nhi_id: idF.get() }, action: { decision: "allow" }, allowed_tool_ids: tools, status: "active" });
-      if (!pr.ok) { submit.disabled = false; uiToast(bl({ en: "Account saved but boundary failed: ", ja: "アカウントは保存、境界は失敗: " }) + ((pr.body && (pr.body.error || pr.body.message)) || ("HTTP " + pr.status)), "err"); return; }
+    if (pending || closed) return;
+    if (!saved) {
+      if (!idF.validate() || !nameF.validate() || !ownerF.validate()) return;
+      draft = {account: {id: idF.get(), name: nameF.get(), nhi_type: typeF.get(), owner_user_id: ownerF.get(), status: statusF.get()}, tools: [...new Set(toolsF.get().split(",").map(s => s.trim()).filter(Boolean))]};
+      if (section.__paAccountTenant) draft.account.tenant_id = section.__paAccountTenant;
+      if (draft.tools.length && draft.account.id.includes("/")) { idF.setError(bl({en: "An account with a tool boundary cannot use / in its ID.", ja: "ツール境界を設定するアカウントのIDに / は使用できません。"})); return; }
     }
-    m.close(); uiToast(bl({ en: "Account added.", ja: "アカウントを追加しました。" }), "ok"); paAccounts(section);
+    pending = true; error.textContent = ""; controls.forEach(c => { c.disabled = true; });
+    try {
+      if (!saved) {
+        let r; try { r = await paWriteEnforcement("POST", "/admin/non-human-identities", draft.account); } catch (_) { throw new Error(uncertain()); }
+        const account = paConfirmAccount(r, draft.account); draft.account.tenant_id = account.tenant_id; saved = true;
+      }
+      if (closed) { paAccountNotice(section, draft.account.id, draft.tools.length ? partial() : ""); await paAccounts(section); return; }
+      if (draft.tools.length) {
+        const expected = {id: AGENT_POLICY_PREFIX + draft.account.id, tenant_id: draft.account.tenant_id, name: "Agent tool boundary: " + draft.account.name, priority: 50, conditions: {actor_nhi_id: draft.account.id}, action: {decision: "allow"}, allowed_tool_ids: draft.tools, status: "active"};
+        let r; try { r = await paWriteEnforcement("POST", "/admin/policies", expected); } catch (_) { throw new Error(uncertain()); }
+        paConfirmBoundary(r, expected);
+      }
+      completed = true; paAccountNotice(section, draft.account.id, "");
+      if (!closed) { m.close(); uiToast(bl({en: "Account added.", ja: "アカウントを追加しました。"}), "ok"); }
+      await paAccounts(section);
+    } catch (e) {
+      const message = (saved ? partial() + "\n" : "") + (e.message || String(e));
+      paAccountNotice(section, draft.account.id, message);
+      if (!closed) error.textContent = message; else await paAccounts(section);
+    } finally {
+      pending = false; controls.forEach(c => { c.disabled = false; });
+      if (saved && !completed) { fields.forEach(f => { f.el.querySelectorAll("input,select").forEach(input => { input.disabled = true; }); }); submit.textContent = bl({en: "Retry boundary", ja: "境界設定を再試行"}); }
+    }
   });
   idF.focus();
 }
 
-// ---- Delegations: NHI acts on behalf of a person; the decision checks validity/scope/expiry. ----
+// ---- Delegations: NHI acts on behalf of a person. ----
+function paSafeGrantRef(value) { return paText(value) && /^[A-Za-z0-9_.:@-]+$/.test(value); }
+function paGrant(g) {
+  return paObject(g) && ["id", "tenant_id", "actor_nhi_id", "subject_user_id"].every(k => paText(g[k])) &&
+    ["active", "revoked", "expired"].includes(g.status) && typeof g.expires_at === "string" &&
+    (!g.expires_at || Number.isFinite(Date.parse(g.expires_at))) &&
+    ["tool_ids", "scopes"].every(k => g[k] == null || (Array.isArray(g[k]) && g[k].every(paText))) &&
+    ["application_id", "revoked_at"].every(k => g[k] == null || typeof g[k] === "string");
+}
+function paGrantStatus(g) { return g.status === "active" && g.expires_at && Date.parse(g.expires_at) <= Date.now() ? "expired" : g.status; }
+function paCountedRows(body, key, valid, tenant) {
+  const rows = paArray(body, key);
+  if (!Number.isSafeInteger(body.count) || body.count < rows.length || body.count < 0 || (body.count > 0 && rows.length === 0) ||
+      !rows.every(row => valid(row) && row.tenant_id === tenant) || new Set(rows.map(r => r.id)).size !== rows.length) throw new Error("Invalid " + key + " response");
+  return rows;
+}
+function paGrantNotice(section, id, message) {
+  const notices = section.__paGrantNotices || (section.__paGrantNotices = new Map());
+  if (message) notices.set(id, message); else notices.delete(id);
+}
+function paDrawGrantNotices(section) {
+  for (const [id, message] of section.__paGrantNotices || []) section.appendChild(el("div", {class: "ui-callout ui-callout-warn", role: "alert"}, [el("strong", {text:id}), el("div", {text:message})]));
+}
+function paCoverage(section, shown, count) {
+  if (shown < count) section.appendChild(el("p", {class:"ui-view-desc", role:"status", text:bl({en:`Showing ${shown} of ${count} records.`, ja:`${count}件中${shown}件を表示しています。`})}));
+}
 async function paDelegations(section) {
-  uiState(section, "loading");
-  const current = freshRender(section);
-  let grants;
-  try { grants = await paList("/admin/delegated-grants", "grants", _PA_ENF); }
-  catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paDelegations(section) }); return; }
-  if (!current()) return;
-  section.innerHTML = "";
-  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-view-desc", text: bl({ en: "Lets a service account act on behalf of a person; the decision checks the grant is valid, in scope, and unexpired.", ja: "サービスアカウントが人の代理で動作することを許可。判定では、その許可が有効で・範囲内で・失効していないかを確認します。" }) }), el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add delegation", ja: "+ 委譲を追加" }), onClick: () => openDelegationForm(section) })]));
-  const scopeText = (g) => {
-    const parts = [];
-    if (g.tool_ids && g.tool_ids.length) parts.push((g.tool_ids.length) + bl({ en: " tool(s)", ja: " ツール" }));
-    if (g.scopes && g.scopes.length) parts.push((g.scopes.length) + bl({ en: " scope(s)", ja: " スコープ" }));
-    if (g.application_id) parts.push("app:" + g.application_id);
-    return parts.length ? parts.join(", ") : bl({ en: "any", ja: "制限なし" });
-  };
-  const delRow = (g) => el("tr", {}, [
-    el("td", { text: g.actor_nhi_id || "—" }),
-    el("td", { text: g.subject_user_id || "—" }),
-    el("td", {}, el("span", { class: "ui-view-desc", text: scopeText(g) })),
-    el("td", {}, el("span", { class: "ui-view-desc", text: g.expires_at ? window.dsseFormatTime(g.expires_at) : "—" })),
-    el("td", {}, uiBadge(g.status === "active" ? bl({ en: "Active", ja: "有効" }) : (g.status || "—"), g.status === "active" ? "ok" : "off")),
-    el("td", { class: "ui-row-actions" }, g.status === "active" ? el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Revoke", ja: "失効" }), onClick: async () => {
-      const ok = await uiConfirm({ title: bl({ en: "Revoke this delegation?", ja: "この委譲を失効?" }), confirmLabel: bl({ en: "Revoke", ja: "失効" }), danger: true });
-      if (!ok) return; const r = await paWriteEnforcement("POST", "/admin/delegated-grants/" + encodeURIComponent(g.id) + "/revoke", {});
-      if (!r.ok) { uiToast("HTTP " + r.status, "err"); return; } uiToast(bl({ en: "Revoked.", ja: "失効しました。" }), "ok"); paDelegations(section);
-    } }) : el("span", { class: "ui-view-desc", text: "—" })),
-  ]);
-  section.appendChild(paSearchTable(
-    bl({ en: "Search delegations by account or person…", ja: "アカウント・代理対象で検索…" }),
-    grants,
-    (g) => [g.actor_nhi_id, g.subject_user_id, g.application_id].filter(Boolean).join(" "),
-    (gs) => el("table", { class: "ui-table" }, [el("thead", {}, el("tr", {}, [bl({ en: "Account", ja: "アカウント" }), bl({ en: "Acts as", ja: "代理対象" }), bl({ en: "Scope", ja: "スコープ" }), bl({ en: "Expires", ja: "失効" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Actions", ja: "操作" })].map((x) => el("th", { text: x })))), el("tbody", {}, gs.map(delRow))]),
-    bl({ en: "No delegations yet.", ja: "委譲がありません。" })
-  ));
+  uiState(section, "loading"); const current = freshRender(section);
+  let grants, body;
+  try {
+    const [g, tenant] = await Promise.all([paGet("/admin/delegated-grants?limit=1000", _PA_ENF), paGet("/admin/tenant", _PA_ENF)]);
+    if (!paObject(tenant) || !paText(tenant.tenant_id)) throw new Error("Invalid tenant response");
+    grants = paCountedRows(g,"grants",paGrant,tenant.tenant_id); body = g;
+    if (!current()) return; section.__paGrantTenant = tenant.tenant_id;
+  } catch (e) { if (!current()) return; uiState(section,"error",String(e),{label:bl({en:"Retry",ja:"再試行"}),onClick:()=>paDelegations(section)}); paDrawGrantNotices(section); return; }
+  if (!current()) return; section.innerHTML = ""; paDrawGrantNotices(section);
+  section.appendChild(el("div", {class:"ui-toolbar"}, [el("span", {class:"ui-view-desc",text:bl({en:"Delegations let an account act for a person, subject to policy, scope and expiry checks.",ja:"委譲はアカウントが人の代理で動作するための設定です。ポリシー・範囲・有効期限の確認が適用されます。"})}),el("span",{class:"ui-spacer"}),el("button",{class:"ui-btn ui-btn-primary",text:bl({en:"+ Add delegation",ja:"+ 委譲を追加"}),onClick:()=>openDelegationForm(section)})]));
+  paCoverage(section,grants.length,body.count);
+  const scopeText = g => [g.tool_ids?.length ? g.tool_ids.length + bl({en:" tool(s)",ja:" ツール"}) : "",g.scopes?.length ? g.scopes.length + bl({en:" scope(s)",ja:" スコープ"}) : "",g.application_id ? `app:${g.application_id}` : ""].filter(Boolean).join(", ") || bl({en:"No additional scope",ja:"追加の範囲制限なし"});
+  section.appendChild(paSearchTable(bl({en:"Search delegations by account or person…",ja:"アカウント・代理対象で検索…"}),grants,g=>[g.id,g.actor_nhi_id,g.subject_user_id,g.application_id].filter(Boolean).join(" "),gs=>simpleTable([bl({en:"Account",ja:"アカウント"}),bl({en:"Acts as",ja:"代理対象"}),bl({en:"Scope",ja:"スコープ"}),bl({en:"Expires",ja:"失効"}),bl({en:"Status",ja:"状態"}),bl({en:"Actions",ja:"操作"})],gs.map(g=>[
+    el("span",{text:g.actor_nhi_id}),el("span",{text:g.subject_user_id}),el("span",{text:scopeText(g)}),el("span",{text:g.expires_at?window.dsseFormatTime(g.expires_at):"—"}),uiBadge(paGrantStatus(g),paGrantStatus(g)==="active"?"ok":"off"),g.status==="active"?paRevokeGrant(section,g):el("span",{text:"—"}),
+  ])),bl({en:"No delegations yet.",ja:"委譲がありません。"})));
+}
+function paConfirmGrant(r, expected) {
+  if (!r || !r.ok) throw new Error(paMutationError(r));
+  const g=r.body;
+  if (!paGrant(g) || ["id","tenant_id","actor_nhi_id","subject_user_id","status"].some(k=>expected[k] && g[k]!==expected[k]) ||
+      (expected.tool_ids && JSON.stringify([...(g.tool_ids||[])].sort())!==JSON.stringify([...expected.tool_ids].sort())) ||
+      (expected.expires_at && Date.parse(g.expires_at)!==Date.parse(expected.expires_at)) ||
+      (expected.status==="revoked" && (!paText(g.revoked_at)||!Number.isFinite(Date.parse(g.revoked_at))))) throw new Error(paUnconfirmedChange());
+  return g;
+}
+function paRevokeGrant(section,g) {
+  let pending=false;
+  const error=el("span",{class:"ui-field-error-msg",style:"display:block",role:"alert"});
+  const button=el("button",{class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Revoke",ja:"失効"}),onClick:async()=>{
+    if(pending)return;pending=true;button.disabled=true;error.textContent="";
+    try {
+      if(!await uiConfirm({title:bl({en:"Revoke this delegation?",ja:"この委譲を失効?"}),confirmLabel:bl({en:"Revoke",ja:"失効"}),danger:true}))return;
+      let r;try{r=await paWriteEnforcement("POST","/admin/delegated-grants/"+encodeURIComponent(g.id)+"/revoke",{});}catch(_){throw new Error(paUnconfirmedChange());}
+      paConfirmGrant(r,{...g,status:"revoked"});paGrantNotice(section,g.id,"");
+      uiToast(bl({en:"Revoked.",ja:"失効しました。"}),"ok");await paDelegations(section);
+    }catch(e){const message=e.message||String(e);error.textContent=message;paGrantNotice(section,g.id,message);}
+    finally{pending=false;button.disabled=false;}
+  }});
+  return el("span",{},[button,error]);
 }
 function openDelegationForm(section) {
-  const idF = uiField({ name: "id", label: bl({ en: "ID", ja: "ID" }), required: true, placeholder: "grant-1" });
-  const nhiF = uiField({ name: "nhi", label: bl({ en: "Service account", ja: "サービスアカウント" }), required: true, placeholder: "nhi-1" });
-  const subjF = uiField({ name: "subj", label: bl({ en: "Acts as (person ID)", ja: "代理対象(ユーザー ID)" }), required: true, placeholder: "u1" });
-  const toolsF = uiField({ name: "tools", label: bl({ en: "Tool scope", ja: "ツールスコープ" }), placeholder: "read_repo, open_pr", hint: bl({ en: "The tools this delegation permits (within the agent's boundary). Leave empty for the agent's full boundary.", ja: "この委譲が許すツール(エージェント境界内)。空ならエージェント境界の全て。" }) });
-  const expF = uiField({ name: "exp", label: bl({ en: "Expires (optional)", ja: "失効(任意)" }), type: "datetime-local", hint: bl({ en: "After this the delegation is denied. Leave empty for no expiry.", ja: "これ以降この委譲は拒否。空なら無期限。" }) });
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add delegation", ja: "委譲を追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a delegation", ja: "委譲を追加" }), body: [idF.el, nhiF.el, subjF.el, toolsF.el, expF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
-  submit.addEventListener("click", async () => {
-    if (!idF.validate() || !nhiF.validate() || !subjF.validate()) return; submit.disabled = true;
-    const tools = toolsF.get().split(",").map((s) => s.trim()).filter(Boolean);
-    const body = { id: idF.get(), actor_nhi_id: nhiF.get(), subject_user_id: subjF.get(), tool_ids: tools, status: "active" };
-    if (expF.get()) body.expires_at = new Date(expF.get()).toISOString();
-    const r = await paWriteEnforcement("POST", "/admin/delegated-grants", body);
-    if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    m.close(); uiToast(bl({ en: "Delegation added.", ja: "委譲を追加しました。" }), "ok"); paDelegations(section);
-  });
-  idF.focus();
+  const idF=uiField({name:"id",label:"ID",required:true,placeholder:"grant-1"});
+  const nhiF=uiField({name:"nhi",label:bl({en:"Service account",ja:"サービスアカウント"}),required:true,placeholder:"nhi-1"});
+  const subjF=uiField({name:"subj",label:bl({en:"Acts as (person ID)",ja:"代理対象(ユーザー ID)"}),required:true,placeholder:"u1"});
+  const toolsF=uiField({name:"tools",label:bl({en:"Tool scope",ja:"ツールスコープ"}),placeholder:"read_repo, open_pr",hint:bl({en:"Permitted tools within the selected policy's boundary. Empty adds no tool restriction.",ja:"選択されるポリシーの境界内で許可するツール。空欄ならツール制限を追加しません。"})});
+  const expF=uiField({name:"exp",label:bl({en:"Expires (optional)",ja:"失効(任意)"}),type:"datetime-local",hint:bl({en:"Leave empty to use the server's default lifetime. Check the returned expiry after saving.",ja:"空欄ではサーバーの既定の有効期間を使用します。保存後に有効期限を確認してください。"})});
+  const error=el("div",{class:"ui-field-error-msg",style:"display:block;white-space:pre-wrap",role:"alert"});
+  const submit=el("button",{class:"ui-btn ui-btn-primary",text:bl({en:"Add delegation",ja:"委譲を追加"})});
+  let pending=false,closed=false,completed=false,draft;
+  const m=uiModal({title:bl({en:"Add a delegation",ja:"委譲を追加"}),body:[idF.el,nhiF.el,subjF.el,toolsF.el,expF.el,error],footer:[el("button",{class:"ui-btn",text:bl({en:"Cancel",ja:"キャンセル"}),onClick:()=>m.close()}),submit],onClose:()=>{closed=true;if(pending&&!completed){paGrantNotice(section,draft.id,paUnconfirmedChange());paDelegations(section);}}});
+  const controls=m.el.querySelectorAll("input,select,button");
+  submit.addEventListener("click",async()=>{
+    if(pending||closed)return;
+    if(!idF.validate()||!nhiF.validate()||!subjF.validate())return;
+    error.textContent="";
+    const tools=[...new Set(toolsF.get().split(",").map(s=>s.trim()).filter(Boolean))];
+    if(/[\/\x00]/.test(idF.get())||![nhiF.get(),subjF.get(),...tools].every(paSafeGrantRef)){error.textContent=bl({en:"Check the ID, account, person and tool identifiers.",ja:"ID・アカウント・代理対象・ツールの識別子を確認してください。"});return;}
+    const expiry=expF.get();if(expiry&&!Number.isFinite(Date.parse(expiry))){expF.setError(bl({en:"Enter a valid date and time.",ja:"有効な日時を入力してください。"}));return;}
+    draft={id:idF.get(),actor_nhi_id:nhiF.get(),subject_user_id:subjF.get(),tool_ids:tools,status:"active",tenant_id:section.__paGrantTenant};
+    if(expiry)draft.expires_at=new Date(expiry).toISOString();
+    pending=true;controls.forEach(c=>{c.disabled=true;});
+    try{
+      let r;try{r=await paWriteEnforcement("POST","/admin/delegated-grants",draft);}catch(_){throw new Error(paUnconfirmedChange());}
+      paConfirmGrant(r,draft);completed=true;paGrantNotice(section,draft.id,"");
+      if(!closed){m.close();uiToast(bl({en:"Delegation added.",ja:"委譲を追加しました。"}),"ok");}await paDelegations(section);
+    }catch(e){const message=e.message||String(e);paGrantNotice(section,draft.id,message);if(!closed)error.textContent=message;else await paDelegations(section);}
+    finally{pending=false;controls.forEach(c=>{c.disabled=false;});}
+  });idF.focus();
 }
 
-// ---- Activity: tool calls the agentic boundary evaluated + step-up approvals. ----
+// ---- Activity: recorded calls and approvals; unavailable sources remain unknown. ----
+function paActivityBadge(result, approval=false) {
+  const value=typeof result==="string"?result:"—";
+  return uiBadge(value,(approval?["approved"]:["allow","ok","success"]).includes(value.toLowerCase())?"ok":"off");
+}
 async function paActivity(section) {
-  uiState(section, "loading");
-  const current = freshRender(section);
-  let events, approvals;
-  try { [events, approvals] = await Promise.all([paList("/admin/tool-call-events", "events", _PA_ENF).catch(() => []), paList("/admin/human-approval-events", "approvals", _PA_ENF).catch(() => [])]); }
-  catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paActivity(section) }); return; }
-  if (!current()) return;
-  section.innerHTML = "";
-  section.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Tool calls the agentic boundary evaluated, and step-up approvals — the audit trail behind the decisions above.", ja: "AIエージェントの境界が評価したツール呼び出しと、ステップアップ承認 ── 上の判定の監査証跡。" }) }));
-  section.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Recent tool calls", ja: "最近のツール呼び出し" }) }));
-  if (!events.length) section.appendChild(emptyBox(bl({ en: "No tool activity.", ja: "ツール活動なし。" })));
-  else section.appendChild(simpleTable([bl({ en: "When", ja: "日時" }), bl({ en: "Account", ja: "アカウント" }), bl({ en: "Tool", ja: "ツール" }), bl({ en: "Result", ja: "結果" })], events.slice(0, 100).map((e2) => [
-    el("span", { class: "ui-view-desc", text: (e2.created_at || e2.timestamp) ? window.dsseFormatTime(e2.created_at || e2.timestamp) : "—" }), el("span", { text: e2.actor_nhi_id || e2.actor || "—" }), el("code", { text: e2.tool_id || e2.tool || "—" }), uiBadge(e2.decision || e2.result || "—", /allow|ok|success/i.test(e2.decision || e2.result || "") ? "ok" : "off"),
-  ])));
-  section.appendChild(el("h3", { class: "ui-field-label", style: "margin-top:20px", text: bl({ en: "Recent approvals", ja: "最近の承認" }) }));
-  if (!approvals.length) section.appendChild(emptyBox(bl({ en: "No approvals.", ja: "承認なし。" })));
-  else section.appendChild(simpleTable([bl({ en: "When", ja: "日時" }), bl({ en: "Who", ja: "対象" }), bl({ en: "Decision", ja: "判定" })], approvals.slice(0, 100).map((a) => [
-    el("span", { class: "ui-view-desc", text: a.created_at ? window.dsseFormatTime(a.created_at) : "—" }), el("span", { text: a.subject_user_id || a.subject || "—" }), uiBadge(a.decision || "—", /approve|allow/i.test(a.decision || "") ? "ok" : "off"),
-  ])));
+  uiState(section,"loading");const current=freshRender(section);let events,approvals,eventBody,approvalBody;
+  try{
+    const [e,a,tenant]=await Promise.all([paGet("/admin/tool-call-events",_PA_ENF),paGet("/admin/human-approval-events",_PA_ENF),paGet("/admin/tenant",_PA_ENF)]);
+    if(!paObject(tenant)||!paText(tenant.tenant_id))throw new Error("Invalid tenant response");
+    const time=v=>typeof v==="string"&&Number.isFinite(Date.parse(v));
+    events=paCountedRows(e,"events",r=>paObject(r)&&["id","tenant_id","actor_nhi_id","tool_id"].every(k=>paText(r[k]))&&time(r.timestamp)&&(r.decision==null||typeof r.decision==="string"),tenant.tenant_id);
+    approvals=paCountedRows(a,"approvals",r=>paObject(r)&&["id","tenant_id","approval_result"].every(k=>paText(r[k]))&&time(r.created_at)&&(r.subject_user_id==null||typeof r.subject_user_id==="string"),tenant.tenant_id);
+    eventBody=e;approvalBody=a;
+  }catch(e){if(!current())return;uiState(section,"error",String(e),{label:bl({en:"Retry",ja:"再試行"}),onClick:()=>paActivity(section)});return;}
+  if(!current())return;section.innerHTML="";
+  section.appendChild(el("p",{class:"ui-view-desc",text:bl({en:"Recorded tool calls and approval decisions.",ja:"記録されたツール呼び出しと承認結果。"})}));
+  section.appendChild(el("h3",{class:"ui-field-label",text:bl({en:"Recent tool calls",ja:"最近のツール呼び出し"})}));paCoverage(section,events.length,eventBody.count);
+  section.appendChild(events.length?simpleTable([bl({en:"When",ja:"日時"}),bl({en:"Account",ja:"アカウント"}),bl({en:"Tool",ja:"ツール"}),bl({en:"Result",ja:"結果"})],events.map(e=>[el("span",{text:window.dsseFormatTime(e.timestamp)}),el("span",{text:e.actor_nhi_id}),el("code",{text:e.tool_id}),paActivityBadge(e.decision)])):emptyBox(bl({en:"No tool activity.",ja:"ツール活動なし。"})));
+  section.appendChild(el("h3",{class:"ui-field-label",style:"margin-top:20px",text:bl({en:"Recent approvals",ja:"最近の承認"})}));paCoverage(section,approvals.length,approvalBody.count);
+  section.appendChild(approvals.length?simpleTable([bl({en:"When",ja:"日時"}),bl({en:"Who",ja:"対象"}),bl({en:"Decision",ja:"判定"})],approvals.map(a=>[el("span",{text:window.dsseFormatTime(a.created_at)}),el("span",{text:a.subject_user_id||"—"}),paActivityBadge(a.approval_result,true)])):emptyBox(bl({en:"No approvals.",ja:"承認なし。"})));
 }
 
 // paRemoveBtn — a "Remove" action that soft-removes a record (the model has no hard delete; removal is a status
 // change) after a confirm. doAction returns the apiFetch promise; onDone re-renders.
-function paRemoveBtn(confirmTitle, bodyMsg, doAction, onDone) {
-  return el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "除去" }), onClick: async () => {
-    const ok = await uiConfirm({ title: confirmTitle, body: bodyMsg, confirmLabel: bl({ en: "Remove", ja: "除去" }), danger: true });
-    if (!ok) return;
-    const r = await doAction();
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Removed.", ja: "除去しました。" }), "ok"); onDone();
+function paRemoveBtn(confirmTitle, bodyMsg, doAction, onDone, validateResult) {
+  let pending = false;
+  const error = el("span", { class: "ui-field-error-msg", style: "display:block", role: "alert" });
+  const button = el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "除去" }), onClick: async () => {
+    if (pending) return;
+    pending = true; button.disabled = true; error.textContent = "";
+    try {
+      const ok = await uiConfirm({ title: confirmTitle, body: bodyMsg, confirmLabel: bl({ en: "Remove", ja: "除去" }), danger: true });
+      if (!ok) return;
+      let r;
+      try { r = await doAction(); } catch (_) { throw new Error(paUnconfirmedChange()); }
+      if (!r || !r.ok) throw new Error(paMutationError(r));
+      validateResult(r);
+      uiToast(bl({ en: "Removed.", ja: "除去しました。" }), "ok"); await onDone();
+    } catch (e) { error.textContent = e.message || String(e); }
+    finally { pending = false; button.disabled = false; }
   } });
+  return el("span", {}, [button, error]);
 }
 
 // searchTable — a search box over a list that filters client-side on a per-item haystack, then re-renders via

@@ -15,6 +15,7 @@ import (
 	"github.com/lantern-networks/dsse-core/edgeplane"
 	enrolledinventory "github.com/lantern-networks/dsse-core/enrolledinventory"
 	humanapproval "github.com/lantern-networks/dsse-core/humanapproval"
+	"github.com/lantern-networks/dsse-core/humanidentity"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
 	"github.com/lantern-networks/dsse-core/revocation"
 	usagemeter "github.com/lantern-networks/dsse-core/usagemeter"
@@ -59,6 +60,7 @@ type connectorApplicationDeps struct {
 	devMode                   bool
 	workloadAttestations      runtimeWorkloadAttestationNonceStore
 	highRisk                  *revocation.HighRiskOverlay
+	humanIdentities           humanidentity.HumanIdentityDirectoryRuntimeStore
 	enrolledLedger            *enrolledinventory.Ledger
 }
 
@@ -113,6 +115,11 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 		baseReq = decisionRequestForApplicationConnect(r, conn, applicationID, routeProfiles)
 	}
 	req := enrichDecisionRequestWithSession(baseReq, sessionStore)
+	req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, deps.humanIdentities, highRisk)
+	if riskErr != nil {
+		writeError(w, http.StatusServiceUnavailable, riskErr)
+		return
+	}
 	req = enrichDecisionRequestWithRisk(req, deviceStore, highRisk, enrolledLedger)
 	req = deriveDecisionRequestActor(req, delegatedGrants)
 	var attestation runtimeWorkloadAttestationEvidence

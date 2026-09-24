@@ -1,6 +1,7 @@
 package delegatedgrant
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -31,8 +32,13 @@ func TestActiveExpiredRevokedAndCapacity(t *testing.T) {
 	if _, ok := store.GetActive("g1", now); ok {
 		t.Fatal("a revoked grant must not be active")
 	}
-	// FIFO capacity bound
-	_, _ = store.Upsert(mk("g3", now.Add(time.Hour).Format(time.RFC3339)))
+	// Capacity must not forget the revocation or the expired record.
+	if _, err := store.Upsert(mk("g3", now.Add(time.Hour).Format(time.RFC3339))); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("admission: %v", err)
+	}
+	if g, ok := store.Get("g1"); !ok || g.Status != "revoked" {
+		t.Fatal("revocation lost")
+	}
 	if store.Count() > store.Capacity() {
 		t.Fatalf("count %d exceeds capacity %d", store.Count(), store.Capacity())
 	}

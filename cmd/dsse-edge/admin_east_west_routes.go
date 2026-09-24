@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -22,14 +23,25 @@ import (
 
 func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, policyStore policy.RuntimeStore, eastWestAuthChallenges *eastwest.AuthChallengeStore, cpVersions *cpConfigVersionClient, eastWestObserveStore *eastwestobserve.Store, configSourceURL string) {
 	mux.HandleFunc("GET /admin/east-west", adminEndpoint("admin.eastwest.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
 		writeJSON(w, http.StatusOK, eastwest.AdminStatus(policyStore, adminTenantIDFromRequest(r)))
 	}))
 	// S1 (Observe): the lateral-flow inventory + convergence readiness. Read-only; recording happens on the
 	// steer-mux decision path. Coverage is computed against the CURRENT east-west rules (so it never goes stale).
 	mux.HandleFunc("GET /admin/east-west/observations", adminEndpoint("admin.eastwest.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		tenant := adminTenantIDFromRequest(r)
 		var obs []eastwestobserve.FlowObservation
 		if eastWestObserveStore != nil {
+			if err := eastWestObserveStore.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation inventory unavailable"))
+				return
+			}
 			obs = eastWestObserveStore.List(tenant)
 		}
 		var rules []decision.EastWestRule
@@ -39,7 +51,7 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			rules = rr.EffectiveEastWestRules(tenant)
 		}
 		for i := range obs {
-			req := model.DecisionRequest{Destination: obs[i].Destination, ServiceFamily: obs[i].ServiceFamily}
+			req := model.DecisionRequest{Destination: obs[i].Destination, ServiceFamily: obs[i].ServiceFamily, Protocol: "tcp", DestinationPort: obs[i].Port}
 			if obs[i].Source != eastwestobserve.SourceAny {
 				req.DeviceID = obs[i].Source
 			}
@@ -101,8 +113,12 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 			return
 		}
-		resp, err := eastwest.ApplyAdminUpdate(policyStore, adminTenantIDFromRequest(r), req)
+		resp, err := eastwest.ApplyAdminUpdateContext(r.Context(), policyStore, adminTenantIDFromRequest(r), req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Connector access policy save could not be confirmed. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -152,8 +168,12 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("decode version payload: %w", err))
 			return
 		}
-		resp, err := eastwest.ApplyAdminUpdate(policyStore, adminTenantIDFromRequest(r), req)
+		resp, err := eastwest.ApplyAdminUpdateContext(r.Context(), policyStore, adminTenantIDFromRequest(r), req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Connector access policy save could not be confirmed. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

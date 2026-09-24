@@ -1,11 +1,12 @@
 package eastwest
 
 import (
+	"context"
 	"fmt"
-	"github.com/lantern-networks/dsse-core/policy"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/policy"
 )
 
 // admin_east_west: control-plane for east-west (internal/lateral) per-hop authorization (E1.5). Admins
@@ -138,45 +139,49 @@ func AdminStatus(store policy.RuntimeStore, tenantID string) adminStatusResponse
 // ApplyAdminUpdate toggles enforcement and/or replaces the rule set for a tenant, hot-applied to
 // the live decision path. Returns the resulting status.
 func ApplyAdminUpdate(store policy.RuntimeStore, tenantID string, req AdminUpdateRequest) (adminStatusResponse, error) {
-	s, ok := store.(adminStore)
+	return ApplyAdminUpdateContext(context.Background(), store, tenantID, req)
+}
+
+func ApplyAdminUpdateContext(ctx context.Context, store policy.RuntimeStore, tenantID string, req AdminUpdateRequest) (adminStatusResponse, error) {
+	s, ok := store.(interface {
+		ApplyEastWestUpdateContext(context.Context, string, *[]decision.EastWestRule, *int, *bool, *bool) error
+	})
 	if !ok {
-		return adminStatusResponse{}, fmt.Errorf("policy store does not support east-west authorization")
+		return adminStatusResponse{}, policy.ErrPolicyPersistence
 	}
+	var rules *[]decision.EastWestRule
 	if req.Rules != nil {
-		rules := make([]decision.EastWestRule, 0, len(*req.Rules))
+		parsed := make([]decision.EastWestRule, 0, len(*req.Rules))
 		for i, raw := range *req.Rules {
 			rule, err := adminRuleToModel(raw)
 			if err != nil {
 				return adminStatusResponse{}, fmt.Errorf("rule[%d]: %w", i, err)
 			}
-			rules = append(rules, rule)
+			parsed = append(parsed, rule)
 		}
-		s.SetEastWestRules(tenantID, rules)
+		rules = &parsed
 	}
-	if req.MaxGrantTTLSeconds != nil {
-		s.SetEastWestMaxGrantTTL(tenantID, *req.MaxGrantTTLSeconds)
-	}
-	// Mode is the preferred posture control and sets both flags atomically. It takes precedence over the legacy
-	// Enabled toggle so a Console that sends mode never fights a stale enabled bool.
+	enabled, unmatched := req.Enabled, (*bool)(nil)
 	if req.Mode != nil {
+		e, u := false, false
 		switch strings.ToLower(strings.TrimSpace(*req.Mode)) {
 		case ModeObserve:
-			s.SetEastWestEnabled(tenantID, false)
+			enabled = &e
 		case ModePartial:
-			s.SetEastWestEnabled(tenantID, true)
-			s.SetEastWestAllowUnmatched(tenantID, true)
+			e, u = true, true
+			enabled, unmatched = &e, &u
 		case ModeFull:
-			s.SetEastWestEnabled(tenantID, true)
-			s.SetEastWestAllowUnmatched(tenantID, false)
+			e = true
+			enabled, unmatched = &e, &u
 		default:
 			return adminStatusResponse{}, fmt.Errorf("invalid mode %q (want observe|partial|full)", *req.Mode)
 		}
-	} else if req.Enabled != nil {
-		// Legacy binary toggle: observe (false) <-> full (true). Full keeps default-deny (allowUnmatched=false).
-		s.SetEastWestEnabled(tenantID, *req.Enabled)
-		if *req.Enabled {
-			s.SetEastWestAllowUnmatched(tenantID, false)
-		}
+	} else if enabled != nil && *enabled {
+		u := false
+		unmatched = &u
+	}
+	if err := s.ApplyEastWestUpdateContext(ctx, tenantID, rules, req.MaxGrantTTLSeconds, enabled, unmatched); err != nil {
+		return adminStatusResponse{}, err
 	}
 	return AdminStatus(store, tenantID), nil
 }

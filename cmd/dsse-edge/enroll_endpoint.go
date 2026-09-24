@@ -277,7 +277,7 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 		CertTTL:          certTTL,
 		Logf:             logf,
 		NowPolicyVersion: 1,
-		Assign: func(req enroll.Request) (t, g, reason string, ok bool) {
+		AssignContext: func(ctx context.Context, req enroll.Request) (t, g, reason string, ok bool) {
 			var spendTokenID string
 			t, g, reason, ok = assignEligibility(req, &spendTokenID)
 			if !ok {
@@ -322,7 +322,7 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 				// This is before the CSR is parsed, so a device with a valid token that sends a malformed CSR
 				// burns it and the admin re-issues. The alternative — spending after signing — would let two
 				// racing copies both receive a certificate, which is the thing one-time exists to prevent.
-				if _, err := tokens.Spend(spendTokenID, t, req.DeviceID, time.Now().UTC()); err != nil {
+				if _, err := spendEnrolmentToken(ctx, tokens, spendTokenID, t, req.DeviceID, time.Now().UTC()); err != nil {
 					if logf != nil {
 						logf("enroll_refused mode=token device=%q reason=%q", req.DeviceID, err.Error())
 					}
@@ -398,6 +398,7 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 	enrolLimiter := newTokenBucketLimiter(enrolRateLimitPerSecond, enrolRateLimitBurst)
 	enrolHandler := iss.Handler()
 	mux.HandleFunc("POST /enroll", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		// ★ A SUSPENDED ORGANIZATION TAKES NO NEW DEVICES (2026-08-18). Suspension freezes the administrative
 		// plane and stops NEW admission; the devices already enrolled keep being enforced, because a billing
 		// dispute must not take protection off a customer's laptops. Checked before the rate limiter so a frozen

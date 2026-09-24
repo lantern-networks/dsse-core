@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -98,6 +101,10 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("enrolment tokens are not configured on this Edge"))
 			return false
 		}
+		if health, ok := tokens.(interface{ Health() error }); ok && health.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+			return false
+		}
 		// ★★★ AN EDGE THAT ASKS THE AUTHORITY CANNOT ANSWER FOR IT (2026-08-25, measured on the two-region lab
 		// while walking the new Device configuration screen). This node holds no enrolment tokens by design —
 		// it forwards the one act that matters, spending one, to the control plane. The ADMIN surface was never
@@ -116,6 +123,17 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 			return false
 		}
 		return or503 == nil || or503(w)
+	}
+
+	// Read one checked snapshot so rows and counts agree, and a storage failure
+	// cannot be presented as an authoritative empty inventory.
+	list := func(r *http.Request) ([]enrolltoken.Token, error) {
+		if checked, ok := tokens.(interface {
+			ListContext(context.Context, string) ([]enrolltoken.Token, error)
+		}); ok {
+			return checked.ListContext(r.Context(), tenantOf(r))
+		}
+		return tokens.List(tenantOf(r)), nil
 	}
 
 	mux.HandleFunc("POST /admin/enrolment-tokens", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -210,7 +228,19 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 		// an operator holding a partial set they have to reconcile against a kitting list, with live credentials
 		// already created — worse than a refusal that says how many would fit.
 		if policy.MaxOutstanding > 0 {
-			outstanding := tokens.Outstanding(tenantOf(r), now)
+			outstanding := 0
+			if checked, ok := tokens.(interface {
+				OutstandingContext(context.Context, string, time.Time) (int, error)
+			}); ok {
+				var err error
+				outstanding, err = checked.OutstandingContext(r.Context(), tenantOf(r), now)
+				if err != nil {
+					writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+					return
+				}
+			} else {
+				outstanding = tokens.Outstanding(tenantOf(r), now)
+			}
 			if room := policy.MaxOutstanding - outstanding; count > room {
 				writeError(w, http.StatusConflict, fmt.Errorf(
 					"%w: %d unused tokens are already outstanding and the limit is %d, so only %d more can be issued — revoke or let some expire first",
@@ -227,8 +257,11 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 				// an operator nothing about which machine is which.
 				label = fmt.Sprintf("%s (%d/%d)", label, i+1, count)
 			}
-			tok, secret, err := tokens.Issue(policy, tenantOf(r), req.Group, label, adminOf(r), adminLabelOf(r), expires, now)
+			tok, secret, err := issueEnrolmentToken(r.Context(), tokens, policy, tenantOf(r), req.Group, label, adminOf(r), adminLabelOf(r), expires, now)
 			if err != nil {
+				if errors.Is(err, enrolltoken.ErrStateUnavailable) {
+					err = enrolltoken.ErrStateUnavailable
+				}
 				// The batch was pre-checked, so reaching here means something else — report what was already
 				// minted rather than losing it silently. Those tokens exist and the operator has to know.
 				writeJSON(w, http.StatusConflict, map[string]any{
@@ -267,9 +300,27 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 		}
 		now := time.Now().UTC()
 		tenant := tenantOf(r)
+		snapshot, err := list(r)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+			return
+		}
+		outstanding := 0
+		expiring := []enrolltoken.Token{}
+		for _, tok := range snapshot {
+			if !tok.Outstanding(now) {
+				continue
+			}
+			outstanding++
+			expires, _ := time.Parse(time.RFC3339, tok.ExpiresAt)
+			if expires.Before(now.Add(48 * time.Hour)) {
+				expiring = append(expiring, tok)
+			}
+		}
+		sort.SliceStable(expiring, func(i, j int) bool { return expiring[i].ExpiresAt < expiring[j].ExpiresAt })
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_enrolment_tokens.v1",
-			"tokens":         tokens.List(tenant),
+			"tokens":         snapshot,
 			// A backlog of unused long-lived tokens is what a caller-chosen lifetime creates, and it is invisible
 			// unless it is counted. Surface it next to the cap so an operator sees it building rather than
 			// discovering it when issuance starts failing.
@@ -289,11 +340,11 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 			"enrols_for_tenant": enrolmentTokenEnrolsForDisclosure(r, enrolsForTenant),
 			"tenant_warning": enrolmentTokenTenantWarning(tenant, enrolsForTenant, adminAnsweringForTheDeployment(r),
 				nodeIssuesFor(tenant)),
-			"outstanding":        tokens.Outstanding(tenant, now),
+			"outstanding":        outstanding,
 			"outstanding_cap":    policy.MaxOutstanding,
 			"max_lifetime_hours": int(policy.MaxLifetime / time.Hour),
 			// So a kitting run is warned before it stalls on a dead installer rather than after.
-			"expiring_within_48h": tokens.ExpiringWithin(tenant, 48*time.Hour, now),
+			"expiring_within_48h": expiring,
 		})
 	}))
 
@@ -302,7 +353,11 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 			return
 		}
 		id := r.PathValue("id")
-		existing := tokens.List(tenantOf(r))
+		existing, err := list(r)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+			return
+		}
 		owned := false
 		for _, t := range existing {
 			if t.ID == id {
@@ -316,8 +371,23 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 			writeError(w, http.StatusNotFound, fmt.Errorf("no such enrolment token"))
 			return
 		}
-		tok, ok := tokens.Revoke(id, adminOf(r), time.Now().UTC())
+		var tok enrolltoken.Token
+		var ok bool
+		if checked, supports := tokens.(interface {
+			RevokeForTenantContext(context.Context, string, string, string, time.Time) (enrolltoken.Token, bool, error)
+		}); supports {
+			tok, ok, err = checked.RevokeForTenantContext(r.Context(), tenantOf(r), id, adminOf(r), time.Now().UTC())
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, enrolltoken.ErrStateUnavailable)
+				return
+			}
+		} else {
+			tok, ok = tokens.Revoke(id, adminOf(r), time.Now().UTC())
+		}
 		if !ok {
+			if !ready(w) {
+				return
+			}
 			writeError(w, http.StatusConflict, fmt.Errorf("enrolment token is already revoked"))
 			return
 		}

@@ -86,27 +86,63 @@ func (p postgresBlobPersister) Save(data []byte) error {
 // Update serializes a read-modify-write across all CP processes. The callback's
 // state becomes visible only after commit; unknown JSON fields can be preserved.
 func (p postgresBlobPersister) Update(edit func([]byte) ([]byte, error)) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+	return p.updateContext(context.Background(), edit, false)
+}
+
+// UpdateContext carries administrative leadership through to the database
+// commit. An absent row is passed as nil, distinct from a corrupt empty object.
+func (p postgresBlobPersister) UpdateContext(ctx context.Context, edit func([]byte) ([]byte, error)) error {
+	return p.updateContext(ctx, edit, true)
+}
+func (p postgresBlobPersister) updateContext(parent context.Context, edit func([]byte) ([]byte, error), absentAsNil bool) (err error) {
+	commitAttempted := false
+	defer func() {
+		if err != nil && !commitAttempted {
+			err = writeNotCommittedError{err}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
-	tx, err := p.db.BeginTx(ctx, nil)
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, p.db, nil)
 	if err != nil {
 		return err
 	}
+	defer finish()
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key); err != nil {
+	inserted, err := budget.exec(tx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key)
+	if err != nil {
 		return err
 	}
 	var raw []byte
-	if err := tx.QueryRowContext(ctx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw); err != nil {
+	if err := budget.queryRow(tx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw); err != nil {
+		return err
+	}
+	if n, err := inserted.RowsAffected(); err != nil {
+		return err
+	} else if absentAsNil && n == 1 {
+		raw = nil
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	updated, err := edit(raw)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
+	if _, err := budget.exec(tx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
 		return err
 	}
+	// The SQL context may outlive the request. Cancellation observed here is a
+	// definite rollback, so non-idempotent stores do not latch an unknown outcome.
+	// Cancellation racing AFTER this check remains conservative: a driver may
+	// return the same context error after committing, so never reclassify it.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	commitAttempted = true
+	// Bounded by budget.sqlCtx only; see cpStatementBudget.commit.
 	return tx.Commit()
 }
 
@@ -471,4 +507,29 @@ func sharedAgentUpdateArtifactShelf(db *sql.DB) *agentUpdateArtifactShelf {
 			return err
 		},
 	}
+}
+
+// Do not let a receiving cache mutate its publisher's shared authority. An
+// explicit shared setting is contradictory and must fail before serving traffic.
+func configBundleStorePersister(value, sourceURL, key string) (blobstore.Persister, error) {
+	db := cpStateBlobDB
+	if strings.TrimSpace(sourceURL) != "" {
+		v := strings.TrimSpace(value)
+		if v == "postgres" || strings.HasPrefix(v, cpStateBlobPersisterImportPrefix) {
+			return nil, fmt.Errorf("%s is a config-bundle receiver cache: use a node-local file with -config-source-url, not shared Postgres", key)
+		}
+		db = nil
+	}
+	return cpStateBlobPersister(value, db, key)
+}
+
+// writeNotCommittedError classifies a failure before COMMIT without changing its
+// text. Callers show store errors to administrators, write them into audit
+// reasons and a health surface; the classification is for errors.Is only and
+// must not appear there as "transaction did not attempt commit: ...".
+type writeNotCommittedError struct{ err error }
+
+func (e writeNotCommittedError) Error() string { return e.err.Error() }
+func (e writeNotCommittedError) Unwrap() []error {
+	return []error{blobstore.ErrWriteNotCommitted, e.err}
 }

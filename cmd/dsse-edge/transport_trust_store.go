@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -307,6 +308,9 @@ func (s *transportTrustStore) AdoptDistribution(published transportTrustStoreSta
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.shared != nil {
+		return false
+	} // Only file receivers adopt CP distributions.
 	// ★★★ WHAT THE AUTHORITY WROTE AND WHAT THIS NODE SERVES ARE TWO NUMBERS (2026-09-07, measured on a
 	// three-region deployment: the leading control plane answered 200 "added, serial 4" and ninety seconds
 	// later no Edge in any region had the certificate).
@@ -393,9 +397,16 @@ func (s *transportTrustStore) AdoptFleetDistribution() {
 // with a distribution nobody can serve.
 func (s *transportTrustStore) persistLocked() error {
 	if s.path != "" || s.shared != nil {
-		if raw, err := s.readState(); err == nil {
+		raw, err := s.readState()
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("read current trust distribution before saving: %w", err)
+		}
+		if err == nil {
 			var onDisk transportTrustStoreState
-			if json.Unmarshal(raw, &onDisk) == nil && onDisk.Serial > s.serial {
+			if err := json.Unmarshal(raw, &onDisk); err != nil {
+				return fmt.Errorf("decode current trust distribution before saving: %w", err)
+			}
+			if onDisk.Serial > s.serial {
 				return fmt.Errorf("the shared trust store is at serial %d and this node holds %d: another node "+
 					"has distributed something newer, and writing this view would take the fleet backwards to a "+
 					"set no device holds", onDisk.Serial, s.serial)
@@ -479,8 +490,19 @@ func deviceTrustPoolFrom(registryPool *x509.CertPool, pems string) (*x509.CertPo
 // Reports whether it moved, so the caller can say why in one line rather than logging on every boot: the
 // announcement is remembered across restarts, and an unchanged announcement is not a change.
 func (s *transportTrustStore) AdvanceForAnnouncement(announced []string, reason string) (int64, bool, error) {
+	return s.AdvanceForAnnouncementContext(captureCPWriteLease(context.Background()), announced, reason)
+}
+func (s *transportTrustStore) AdvanceForAnnouncementContext(ctx context.Context, announced []string, reason string) (int64, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var moved bool
+	if handled, err := s.mutateSharedLocked(ctx, func(c *transportTrustStore) error {
+		_, changed, err := c.AdvanceForAnnouncementContext(ctx, announced, reason)
+		moved = changed
+		return err
+	}); handled {
+		return s.serial, err == nil && moved, err
+	}
 	s.adoptNewerFromDiskLocked()
 	// ★ THE ORDER IS NOT PART OF THE ANNOUNCEMENT (2026-08-20, caught the same hour it was introduced). This
 	// compares joined strings, so two nodes in one fleet that compute the SAME set in different order each read
@@ -510,8 +532,10 @@ func (s *transportTrustStore) AdvanceForAnnouncement(announced []string, reason 
 		s.announced = previous
 		return s.serial, false, err
 	}
-	log.Printf("trust_bundle serial advanced to %d because %s changed: %q -> %q (devices adopt by serial, so a "+
-		"changed announcement that leaves the serial behind never reaches them)", s.serial, reason, previous, next)
+	if _, staged := s.shared.(*transportTrustCandidate); !staged {
+		log.Printf("trust_bundle serial advanced to %d because %s changed: %q -> %q (devices adopt by serial, so a "+
+			"changed announcement that leaves the serial behind never reaches them)", s.serial, reason, previous, next)
+	}
 	return s.serial, true, nil
 }
 
@@ -540,6 +564,9 @@ func (s *transportTrustStore) Reapply() error {
 
 // Add appends one certificate to the set. Exactly one per call — each addition is one auditable act.
 func (s *transportTrustStore) Add(certPEM string) (*x509.Certificate, int64, error) {
+	return s.AddContext(captureCPWriteLease(context.Background()), certPEM)
+}
+func (s *transportTrustStore) AddContext(ctx context.Context, certPEM string) (*x509.Certificate, int64, error) {
 	certs := parseAllCerts([]byte(certPEM))
 	if len(certs) != 1 {
 		return nil, 0, fmt.Errorf("exactly one certificate is added at a time (got %d)", len(certs))
@@ -560,6 +587,15 @@ func (s *transportTrustStore) Add(certPEM string) (*x509.Certificate, int64, err
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if handled, err := s.mutateSharedLocked(ctx, func(candidate *transportTrustStore) error {
+		_, _, err := candidate.AddContext(ctx, certPEM)
+		return err
+	}); handled {
+		if err != nil {
+			return nil, 0, err
+		}
+		return c, s.serial, nil
+	}
 	s.adoptNewerFromDiskLocked()
 	for _, existing := range s.anchorsLocked() {
 		es := sha256.Sum256(existing.Raw)
@@ -587,9 +623,27 @@ func (s *transportTrustStore) Withdraw(sha string) (*x509.Certificate, int64, er
 // gate(B) passes on A, both proceed, and the surviving set verifies nothing (review R9). Sequentially the
 // second is refused; concurrently it was not.
 func (s *transportTrustStore) WithdrawIf(sha string, gate func(remaining []*x509.Certificate) (bool, string)) (*x509.Certificate, int64, error) {
+	var checked func([]*x509.Certificate, *x509.Certificate, int64) (bool, string)
+	if gate != nil {
+		checked = func(c []*x509.Certificate, _ *x509.Certificate, _ int64) (bool, string) { return gate(c) }
+	}
+	return s.WithdrawIfContext(captureCPWriteLease(context.Background()), sha, checked)
+}
+func (s *transportTrustStore) WithdrawIfContext(ctx context.Context, sha string, gate func(remaining []*x509.Certificate, removed *x509.Certificate, serial int64) (bool, string)) (*x509.Certificate, int64, error) {
 	sha = strings.ToLower(strings.TrimSpace(sha))
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var removedShared *x509.Certificate
+	if handled, err := s.mutateSharedLocked(ctx, func(candidate *transportTrustStore) error {
+		var err error
+		removedShared, _, err = candidate.WithdrawIfContext(ctx, sha, gate)
+		return err
+	}); handled {
+		if err != nil {
+			return nil, 0, err
+		}
+		return removedShared, s.serial, nil
+	}
 	s.adoptNewerFromDiskLocked()
 	anchors := s.anchorsLocked()
 	if len(anchors) < 2 {
@@ -616,7 +670,7 @@ func (s *transportTrustStore) WithdrawIf(sha string, gate func(remaining []*x509
 				remaining = append(remaining, c)
 			}
 		}
-		if ok, reason := gate(remaining); !ok {
+		if ok, reason := gate(remaining, removed, s.serial); !ok {
 			return nil, 0, fmt.Errorf("%s", reason)
 		}
 	}
@@ -705,6 +759,9 @@ func openSharedTransportTrustStore(shared blobstore.Persister, carriedFrom, seed
 	resign func(string, int64) (func(), error)) (*transportTrustStore, error) {
 	if shared == nil {
 		return nil, fmt.Errorf("a shared transport trust store needs the deployment's database")
+	}
+	if p, ok := shared.(transportTrustUpdater); ok {
+		return openTransactionalTransportTrustStore(shared, p, carriedFrom, seedPEM, seedSerial, resign)
 	}
 	// ★★★ THE MOVE MUST NOT TAKE THE AUTHORITY BACKWARDS (2026-09-07, measured the first time this ran on a
 	// deployment that already had a distribution).

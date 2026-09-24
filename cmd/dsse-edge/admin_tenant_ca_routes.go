@@ -47,7 +47,7 @@ func persistTenantCARegistry(registry *tenantca.TenantCARegistry, registryPath s
 		// TenantCARegistry.SaveTo.
 		return registry.SaveTo(tenantCARegistryShared, removedSHA256...)
 	}
-	return registry.Save(registryPath)
+	return registry.SaveWithdrawals(registryPath, removedSHA256...)
 }
 
 func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
@@ -81,6 +81,12 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		// organization's registrations rather than the deployment's — the same rule the PKI, fleet and policy
 		// views use (adminAnswerScope). Entering an organization is a mode with a banner attached; a screen
 		// that answers for somebody else inside it is how the wrong customer's material gets acted on.
+		if _, shared := sharedTenantCAAuthor(); shared {
+			if err := sharedTenantCARead(registry); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("CA registry is unavailable"))
+				return
+			}
+		}
 		caller, operator := adminAnswerScope(r)
 		counts := registry.Registrations()
 		// ★ A COUNT IS NOT AN INVENTORY (2026-08-16). This answered `ca_count: 1` and nothing else — a tenant
@@ -220,6 +226,16 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			return
 		}
 
+		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_register", req.CAPEM, "") {
+			return
+		}
+		tenantCAAuthorMu.Lock()
+		defer tenantCAAuthorMu.Unlock()
+		if len(registry.PendingWithdrawals("")) != 0 {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("An unfinished CA withdrawal must be retried before changing CA registrations."))
+			return
+		}
+
 		// TRUST first. If the handshake will not accept the certificate, the attribution entry describes a
 		// tenant whose devices cannot connect, and that is a worse thing to have written down than nothing.
 		// Read at REQUEST time, not captured at registration. ★ It was captured, and the routes are registered
@@ -267,13 +283,34 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		durable := true
 		if err := persistTenantCARegistry(registry, registryPath); err != nil {
 			durable = false
-			// Not a failure of the registration — it is live — but it will not survive a restart, and that is
-			// exactly the state the per-tenant interception root is in and why it counts as broken.
+			// Trust and attribution are already live. Preserve that partial state so the same PEM can be
+			// retried, but do not report a completed registration before its save is confirmed.
 			logInfof("tenant_ca_registered_but_not_durable tenant=%s err=%v", tenantID, err)
 		}
 		now := time.Now()
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
-			adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_register", evaluator, now), now)
+		audit := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_register", evaluator, now)
+		fingerprints := []string{}
+		for _, cert := range parseAllCerts([]byte(req.CAPEM)) {
+			fingerprints = append(fingerprints, tenantca.CAAnchorKey(cert))
+		}
+		audit.Metadata["ca_sha256"] = fingerprints
+		audit.Metadata["durable"] = durable
+		if !durable {
+			result := "error"
+			audit.Result = &result
+			audit.Metadata["applied"] = true
+			audit.Metadata["persistence"] = "unconfirmed"
+			audit.Metadata["reason_codes"] = []string{"tenant_ca_registration_save_failed"}
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		if !durable {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"status": "partial", "applied": true, "tenant_id": tenantID,
+				"ca_added": len(added), "trusted": true, "durable": false, "persistence": "unconfirmed",
+				"error": "The CA registration is active on this server, but persistence is unconfirmed. Restore storage and retry with the same CA certificate before restarting. Fleet propagation is not confirmed.",
+			})
+			return
+		}
 		writeJSON(w, http.StatusCreated, map[string]any{
 			"tenant_id":  tenantID,
 			"ca_added":   len(added),
@@ -312,6 +349,15 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			writeError(w, http.StatusForbidden, err)
 			return
 		}
+		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", "", strings.ToLower(fingerprint)) {
+			return
+		}
+		tenantCAAuthorMu.Lock()
+		defer tenantCAAuthorMu.Unlock()
+		if !registry.WithdrawalRetryAllowed(tenantID, strings.ToLower(fingerprint), false) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("An unfinished CA withdrawal must be retried before changing CA registrations."))
+			return
+		}
 		// How many this organization would be left with, and whether anybody is still admitted under this one.
 		// Counted BEFORE the removal, so the gate judges the state the caller is asking to change.
 		remainingAfter, targetExists := 0, false
@@ -324,15 +370,21 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				remainingAfter++
 			}
 		}
+		pending := false
+		for _, key := range registry.PendingWithdrawals(tenantID) {
+			if strings.EqualFold(key, fingerprint) {
+				pending = true
+			}
+		}
 		// Established before anything is removed, because the two halves below must not come apart: taking a
 		// CA out of the trust set and then finding it was never attributed here would leave this node refusing
 		// certificates on behalf of an organization it has no record of.
-		if !targetExists {
+		if !targetExists && !pending {
 			writeError(w, http.StatusNotFound, fmt.Errorf(
 				"%q is not a CA registered to %q — nothing was withdrawn", fingerprint, tenantID))
 			return
 		}
-		if verdict := deviceCAWithdrawalGate(config, tenantID, fingerprint, remainingAfter); !verdict.Allowed {
+		if verdict := deviceCAWithdrawalGate(config, tenantID, fingerprint, remainingAfter); !pending && !verdict.Allowed {
 			writeError(w, http.StatusConflict, fmt.Errorf("withdrawal refused: %s", verdict.Text))
 			return
 		}
@@ -371,8 +423,20 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				"this control plane does not verify device certificates itself; the Edges take this CA out of "+
 					"both the registry and the trust set when they apply the next config bundle")
 		}
+		registry.BeginTrustWithdrawal(tenantID, fingerprint)
+		if tenantCARegistryShared == nil {
+			if err := registry.SavePendingWithdrawals(registryPath); err != nil {
+				logInfof("tenant_ca_withdrawal_intent_unconfirmed tenant=%s err=%v", tenantID, err)
+				if pending && !targetExists {
+					tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", true)
+				} else {
+					tenantCAWithdrawalIntentFailure(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw")
+				}
+				return
+			}
+		}
 		removed, remaining := registry.WithdrawAnchor(tenantID, fingerprint)
-		if !removed {
+		if !removed && !pending {
 			// Unreachable via the existence check above, and reported rather than ignored: it would mean the
 			// registry changed underneath this request.
 			writeError(w, http.StatusConflict, fmt.Errorf(
@@ -385,18 +449,17 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		} else if _, _, err := trustStore.Withdraw(fingerprint); err != nil {
 			// Not in the trust set is SUCCESS: the CA was attributed here but distributed elsewhere, and the
 			// end state asked for — this node does not admit it — already holds. Anything else is a refusal,
-			// and the attribution stays so the operator can see what is still trusted.
+			// and a pending receipt keeps the target available for a retry.
 			if !strings.Contains(err.Error(), "no distributed certificate has that fingerprint") {
-				writeError(w, http.StatusConflict, fmt.Errorf(
-					"this CA could not be taken out of the device trust set, so it would keep admitting devices: %w", err))
+				logInfof("tenant_ca_trust_withdrawal_pending tenant=%s err=%v", tenantID, err)
+				tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", true)
 				return
 			}
 			// Not in the trust set is not the end of it: the pool a handshake reads folds in the registry, so
 			// the removal above is only served once something rebuilds it. Nothing else will.
 			if err := trustStore.Reapply(); err != nil {
-				writeError(w, http.StatusConflict, fmt.Errorf(
-					"this CA is no longer attributed to %q but the trust set a handshake reads could not be "+
-						"rebuilt, so it may still admit devices: %w", tenantID, err))
+				logInfof("tenant_ca_trust_withdrawal_pending tenant=%s err=%v", tenantID, err)
+				tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", true)
 				return
 			}
 		}
@@ -405,6 +468,11 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			durable = false
 			logInfof("tenant_ca_anchor_withdrawn_but_not_durable tenant=%s sha256=%s err=%v", tenantID, fingerprint, err)
 		}
+		if !durable {
+			tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_anchor_withdraw", false)
+			return
+		}
+		registry.CompleteWithdrawal(tenantID, fingerprint)
 		now := time.Now()
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
 			adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_anchor_withdraw", evaluator, now), now)
@@ -445,6 +513,15 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			writeError(w, http.StatusForbidden, err)
 			return
 		}
+		if sharedTenantCAWrite(w, r, registry, config, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", "", "") {
+			return
+		}
+		tenantCAAuthorMu.Lock()
+		defer tenantCAAuthorMu.Unlock()
+		if !registry.WithdrawalRetryAllowed(tenantID, "", true) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("An unfinished CA withdrawal must be retried before changing CA registrations."))
+			return
+		}
 		// Named BEFORE the withdrawal, because afterwards the registry no longer knows them — and the shared
 		// view still does, so the merge would put them straight back. See TenantCARegistry.SaveTo.
 		gone := []string{}
@@ -453,12 +530,33 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 				gone = append(gone, f.SHA256)
 			}
 		}
+		for _, key := range gone {
+			registry.BeginWithdrawal(tenantID, key)
+		}
+		alreadyApplied := len(gone) == 0 && len(registry.PendingWithdrawals(tenantID)) != 0
+		gone = append(gone, registry.PendingWithdrawals(tenantID)...)
+		if tenantCARegistryShared == nil {
+			if err := registry.SavePendingWithdrawals(registryPath); err != nil {
+				logInfof("tenant_ca_withdrawal_intent_unconfirmed tenant=%s err=%v", tenantID, err)
+				if alreadyApplied {
+					tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", true)
+				} else {
+					tenantCAWithdrawalIntentFailure(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw")
+				}
+				return
+			}
+		}
 		removed := registry.Withdraw(tenantID)
 		durable := true
 		if err := persistTenantCARegistry(registry, registryPath, gone...); err != nil {
 			durable = false
 			logInfof("tenant_ca_withdrawn_but_not_durable tenant=%s err=%v", tenantID, err)
 		}
+		if !durable {
+			tenantCAWithdrawalPartial(w, r, writer, adminAuditOutbox, evaluator, tenantID, "tenant_ca_withdraw", true)
+			return
+		}
+		registry.CompleteWithdrawal(tenantID, gone...)
 		now := time.Now()
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
 			adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "tenant_ca_withdraw", evaluator, now), now)
@@ -505,4 +603,30 @@ func operatorOnlyValue(operator bool, value string) string {
 		return value
 	}
 	return ""
+}
+
+// A partial denial remains visible and retryable; never emit a successful lifecycle event here.
+func tenantCAWithdrawalPartial(w http.ResponseWriter, r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, tenantID, action string, stillTrusted bool) {
+	now := time.Now()
+	a := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, action, evaluator, now)
+	result := "error"
+	a.Result = &result
+	a.Metadata["applied"] = true
+	a.Metadata["durable"] = false
+	a.Metadata["still_trusted"] = stillTrusted
+	a.Metadata["reason_codes"] = []string{"tenant_ca_withdrawal_incomplete"}
+	_ = appendAdminAudit(r.Context(), writer, outbox, a, now)
+	writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "partial", "applied": true, "tenant_id": tenantID, "durable": false, "still_trusted": stillTrusted, "error": "CA attribution was removed on this server, but withdrawal is incomplete. Restore storage and retry the same withdrawal before restarting. Fleet withdrawal is not confirmed."})
+}
+
+func tenantCAWithdrawalIntentFailure(w http.ResponseWriter, r *http.Request, writer *logs.Writer, outbox adminAuditOutboxDeadReader, evaluator decision.Evaluator, tenantID, action string) {
+	now := time.Now()
+	a := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, action, evaluator, now)
+	result := "error"
+	a.Result = &result
+	a.Metadata["applied"] = false
+	a.Metadata["durable"] = false
+	a.Metadata["reason_codes"] = []string{"tenant_ca_withdrawal_intent_unconfirmed"}
+	_ = appendAdminAudit(r.Context(), writer, outbox, a, now)
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "error", "applied": false, "tenant_id": tenantID, "durable": false, "error": "Withdrawal was not started because its recovery record could not be confirmed. Restore storage and retry the same operation. An on-disk recovery record may still block startup."})
 }

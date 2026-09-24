@@ -65,8 +65,8 @@ function renderEgressView(content) {
         // ★ WRITTEN FOR THE PERSON WHO HAS TO USE IT (2026-08-17, read as a customer administrator). It said
         // "north-south access", "there is no observe mode here" and "source → destination : service" — three
         // pieces of our own vocabulary in two sentences, on the screen a customer reaches for first.
-        en: "Everything your people reach on the internet is allowed and inspected. Add a rule to block a destination, or to let one through uninspected.",
-        ja: "社内の人がインターネットで開くものは、すべて許可され、内容を検査します。特定の宛先を遮断する、または検査せずに通す場合はルールを追加します。",
+        en: "Manage access and inspection rules for internet destinations. Actual inspection also depends on Inspection Settings, device configuration and other exclusions.",
+        ja: "インターネットの宛先へのアクセスと検査ルールを管理します。実際の検査範囲は傍受設定・端末設定・他の除外にも従います。",
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add rule", ja: "+ ルールを追加" }),
@@ -82,7 +82,8 @@ function renderEgressView(content) {
 async function loadList(path) {
   const r = await apiFetch("GET", path);
   if (!r.ok) throw new Error("HTTP " + r.status + (typeof r.body === "string" && r.body ? " " + r.body : ""));
-  return Array.isArray(r.body) ? r.body : [];
+  if (!Array.isArray(r.body)) throw new Error("Invalid catalog response");
+  return r.body;
 }
 
 // catalogIndex loads the asset catalog once and returns lookups for display + editor pickers.
@@ -132,8 +133,8 @@ async function renderRuleList(section, plane, direction) {
     const certPins = [];
     entries.forEach((entry) => {
       if (entry.kind === "authored" && entry.rule) {
-        if (entry.rule.id && entry.rule.id.startsWith("certpin-rule-")) { certPins.push(entry.rule); return; }
-        rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved }), idx, section, plane, direction));
+        if (isCertPinSummaryRule(entry.rule) && !entry.destination_unresolved && !entry.service_unresolved && !entry.inspection_source_warning) { certPins.push(entry.rule); return; }
+        rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved, service_unresolved: entry.service_unresolved, inspection_source_warning: entry.inspection_source_warning }), idx, section, plane, direction));
         return;
       }
       if (entry.kind === "builtin_default") { rows.push(builtinRow({ policy_id: entry.policy_id, name: entry.name, priority: entry.priority, decision: entry.access, status: entry.status, service_text: entry.service_text, inspection: entry.inspection }, section, plane, direction, builtinDefaults)); return; }
@@ -213,6 +214,10 @@ function statusCellFor(rule, active) {
       en: "This destination is not in the endpoint catalog, so the rule enforces nothing.",
       ja: "この宛先はエンドポイントに登録されていないため、このルールは何も強制していません。" }) }));
   }
+  if (rule && rule.service_unresolved) {
+    cell.appendChild(uiBadge(bl({en:"service unavailable",ja:"サービス未解決"}), "danger"));
+    cell.appendChild(el("div", {class:"ui-view-desc", text:bl({en:"This service is unavailable or invalid. The rule matches no traffic, including deny and authentication rules.",ja:"サービスが存在しないか定義が不正です。このルールは通信に一致せず、拒否・認証要求も適用されません。"})}));
+  }
   return cell;
 }
 
@@ -273,25 +278,33 @@ function authoredRow(r, idx, section, plane, direction) {
   const edit = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }),
     onClick: () => openRuleEditor(plane, direction, () => renderRuleList(section, plane, direction), r) });
 
-  const toggle = el("button", { class: "ui-btn ui-btn-sm", text: active ? bl({ en: "Disable", ja: "無効化" }) : bl({ en: "Enable", ja: "有効化" }),
-    title: active ? bl({ en: "Currently active — turn off (the rule is kept, just inert)", ja: "現在有効 — 無効化(ルールは残り、効かなくなるだけ)" }) : bl({ en: "Currently disabled — turn on", ja: "現在無効 — 有効化" }),
-    onClick: async () => {
-      toggle.disabled = true;
-      const resp = await apiFetch("POST", "/admin/rules", Object.assign({}, r, { status: active ? "disabled" : "active" }));
-      if (!resp.ok) { toggle.disabled = false; uiToast(httpErr(resp), "err"); return; }
-      uiToast(active ? bl({ en: "Rule disabled.", ja: "ルールを無効化しました。" }) : bl({ en: "Rule enabled.", ja: "ルールを有効化しました。" }), "ok");
-      renderRuleList(section, plane, direction);
-    } });
-
-  const del = el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }),
-    onClick: async () => {
-      const ok = await uiConfirm({ title: bl({ en: "Delete this rule?", ja: "このルールを削除しますか?" }), body: r.name || r.id, confirmLabel: bl({ en: "Delete", ja: "削除" }), danger: true });
-      if (!ok) return;
-      const resp = await apiFetch("DELETE", "/admin/rules/" + encodeURIComponent(r.id));
-      if (!resp.ok) { uiToast(httpErr(resp), "err"); return; }
-      uiToast(bl({ en: "Rule deleted.", ja: "ルールを削除しました。" }), "ok");
-      renderRuleList(section, plane, direction);
-    } });
+  let pending = false;
+  const run = async operation => {
+    if (pending || section.isConnected === false) return;
+    pending = true;
+    const controls = [edit,toggle,del]; controls.forEach(e => e.disabled = true);
+    try {
+      if (await ruleEditorTenant() !== r.tenant_id) throw new Error(ruleUnknownOutcome());
+      if (section.isConnected === false) return;
+      if (await operation() === true) await renderRuleList(section,plane,direction);
+    } catch(e) { uiToast((e.message || String(e))+" "+ruleUnknownOutcome(),"err"); }
+    finally { pending = false; controls.forEach(e => e.disabled = false); }
+  };
+  const toggle = el("button", { class:"ui-btn ui-btn-sm", text:active ? bl({en:"Disable",ja:"無効化"}) : bl({en:"Enable",ja:"有効化"}), onClick:()=>run(async()=>{
+    const body = Object.assign({},r,{status:active ? "disabled" : "active"});
+    const resp = await apiFetch("POST","/admin/rules",body);
+    validateRuleSave(resp,body,r.tenant_id);
+    uiToast(bl({en:"Rule status saved.",ja:"ルールの状態を保存しました。"}),"ok");
+    return true;
+  })});
+  const del = el("button", {class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Delete",ja:"削除"}),onClick:()=>run(async()=>{
+    if (!await uiConfirm({title:bl({en:"Delete this rule?",ja:"このルールを削除しますか?"}),body:r.name || r.id,confirmLabel:bl({en:"Delete",ja:"削除"}),danger:true})) return false;
+    if (section.isConnected === false || await ruleEditorTenant() !== r.tenant_id) throw new Error(ruleUnknownOutcome());
+    const resp = await apiFetch("DELETE","/admin/rules/"+encodeURIComponent(r.id));
+    if (!resp?.ok) throw new Error(httpErr(resp));
+    if (resp.status!==200 || resp.body?.status!=="deleted" || resp.body?.id!==r.id) throw new Error(ruleUnknownOutcome());
+    uiToast(bl({en:"Rule deleted.",ja:"ルールを削除しました。"}),"ok");return true;
+  })});
 
   return el("tr", {}, [
     el("td", {}, [
@@ -302,10 +315,16 @@ function authoredRow(r, idx, section, plane, direction) {
       ? [el("span", { class: "rule-expr", text: ruleExpr(r, idx) }), document.createTextNode(" "), browserChip()]
       : [el("span", { class: "rule-expr", text: ruleExpr(r, idx) })]),
     accessCell,
-    el("td", {}, inspectionBadge(r.action.inspection)),
+    el("td", {}, [inspectionBadge(r.action.inspection), r.inspection_source_warning ? el("div", {class:"ui-view-desc", text:inspectionSourceWarningText(r.inspection_source_warning)}) : null]),
     statusCellFor(r, active),
     el("td", { class: "ui-row-actions" }, [edit, document.createTextNode(" "), toggle, document.createTextNode(" "), del]),
   ]);
+}
+
+function inspectionSourceWarningText(reason) {
+  if (reason === "identity_context_unavailable") return bl({en:"Only device sources can select TLS inspection. Person, identity-group and agent sources cannot decide it here; access rules still apply.",ja:"TLS検査の範囲は端末の送信元で指定します。人・IDグループ・エージェントの指定はここでは検査範囲に反映されません。アクセス条件は引き続き適用されます。"});
+  if (reason === "no_resolved_device") return bl({en:"No source device resolves for inspection. Check the selected device or group.",ja:"検査対象の送信元端末が見つかりません。選択した端末・グループを確認してください。"});
+  return bl({en:"Check the inspection source before relying on this rule.",ja:"このルールの検査範囲を確認してください。"});
 }
 
 // hasImplJargon flags a backend-supplied name that leaks internal codenames / implementation language (a programme codename,
@@ -470,6 +489,17 @@ function derivedRow(entry, section, plane, direction) {
   ]);
 }
 
+// Only the original unrestricted allow/bypass shape fits the compact presentation.
+// Edited rules must retain their ordinary row and editor instead of hiding intent.
+function isCertPinSummaryRule(rule) {
+  return !!rule && typeof rule.id === "string" && rule.id.startsWith("certpin-rule-") &&
+    rule.plane === "egress" && rule.action?.access === "allow" && rule.action?.inspection === "bypass" &&
+    Object.keys(rule.action).every(key => key === "access" || key === "inspection") &&
+    Array.isArray(rule.source) && rule.source.length === 1 && rule.source[0] === "*" &&
+    Array.isArray(rule.destination) && rule.destination.length === 1 &&
+    !rule.service_id && !rule.risk_at_least && !rule.allowed_tool_ids?.length;
+}
+
 // certPinSummaryRow collapses the per-host cert-pin bypass rules (authored egress rules whose id starts with
 // "certpin-rule-") into a single row. The per-host list + controls live in the Details modal so the Internet
 // Access view isn't flooded with one row per site. Access/Inspection are fixed (Allow + Bypass).
@@ -487,7 +517,7 @@ function certPinSummaryRow(rules, idx, section, plane, direction) {
       el("strong", { text: bl({ en: "Cert-pin bypass", ja: "ピンニングによる検査除外" }) }),
       el("div", { class: "ui-view-desc" }, uiBadge(bl({ en: n + " sites", ja: n + " 件のサイト" }), "off")),
     ]),
-    el("td", {}, el("span", { class: "rule-expr", text: bl({ en: n + " sites where TLS inspection is skipped", ja: "TLS 傍受を省略する " + n + " 件のサイト" }) })),
+    el("td", {}, el("span", { class: "rule-expr", text: bl({ en: n + " saved bypass rules", ja: "保存済みの検査除外ルール " + n + " 件" }) })),
     el("td", {}, accessBadge("allow")),
     el("td", {}, inspectionBadge("bypass")),
     el("td", {}, statusCell),
@@ -555,6 +585,31 @@ function openCertPinDetails(rules, idx, section, plane, direction) {
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })] });
 }
 
+// Keep the authored reference present even before the asynchronous list arrives.
+// A missing/deleted policy or a failed list fetch must not silently mean "None".
+async function loadRuleDLPPolicies(field, selectedID) {
+  const sel = field.el.querySelector("select");
+  const none = () => el("option", { value: "", text: bl({ en: "None", ja: "なし" }) });
+  const retained = () => el("option", { value: selectedID, text: selectedID });
+  sel.replaceChildren(none(), ...(selectedID ? [retained()] : []));
+  sel.value = selectedID;
+  sel.disabled = true;
+  try {
+    const pr = await apiFetch("GET", "/admin/dlp-policies");
+    if (!pr || !pr.ok || !pr.body || !Object.hasOwn(pr.body, "policies") ||
+        (pr.body.policies !== null && !Array.isArray(pr.body.policies))) throw new Error("unavailable policies");
+    const policies = pr.body.policies || [];
+    if (!policies.every(p => p && typeof p.id === "string" && p.id && typeof p.name === "string" && p.name)) throw new Error("invalid policies");
+    const missing = selectedID && !policies.some(p => p.id === selectedID);
+    sel.replaceChildren(none(), ...policies.map(p => el("option", { value: p.id, text: p.name })), ...(missing ? [retained()] : []));
+    sel.value = selectedID;
+    sel.disabled = false;
+    if (missing) field.setError(bl({ en: "This policy is not available. Its reference is kept; choose None to remove it.", ja: "このポリシーは利用できません。参照は保持されます。解除する場合は「なし」を選んでください。" }));
+  } catch (e) {
+    field.setError(bl({ en: "Cannot load DLP policies. The current selection is unchanged; reopen the editor to retry.", ja: "DLPポリシーを取得できません。現在の選択は保持されます。再試行するには編集画面を開き直してください。" }));
+  }
+}
+
 // ---- editor ----------------------------------------------------------------
 
 // openRuleEditor builds the two-axis rule editor in a modal. plane/direction fix the rule's plane + direction.
@@ -563,15 +618,17 @@ function openCertPinDetails(rules, idx, section, plane, direction) {
 // (upsert) — i.e. Edit; otherwise it creates a new rule.
 async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) {
   existing = existing || null;
+  let savePending = false, writeAttempted = false;
   let savedOk = false; // set true on a successful save so onCancelled (below) does NOT fire on close
-  let idx;
-  try { idx = await catalogIndex(); }
+  let idx, editorTenant;
+  try { [idx, editorTenant] = await Promise.all([catalogIndex(), ruleEditorTenant()]); }
   catch (e) { uiToast(bl({ en: "Could not load the catalog: ", ja: "カタログを読み込めません: " }) + (e.message || e), "err"); return; }
 
   const eAction = (existing && existing.action) || {};
   // existing WITH an id = Edit; existing WITHOUT an id = a PRE-FILLED new rule (e.g. adopting an observed flow) —
   // review + Save creates it. No existing = a blank new rule.
   const isEdit = !!(existing && existing.id);
+  const draftRuleID = isEdit ? existing.id : "rule-" + crypto.randomUUID();
   const title = isEdit
     ? bl({ en: "Edit rule", ja: "ルールを編集" })
     : existing
@@ -801,16 +858,8 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   // inline per-rule DLP config, so DLP settings live in exactly one place (the DLP Policies page) and a rule only
   // SELECTS one here. Options are loaded async from /admin/dlp-policies.
   const dlpPolicyF = uiField({ name: "dlppolicy", label: bl({ en: "DLP policy", ja: "DLP ポリシー" }), type: "select", value: (dlpExisting && dlpExisting.policy_id) || "", hint: bl({ en: "Apply a reusable DLP policy to this traffic. Create and edit policies (what to detect + action + account + device risk) on the DLP Policies page.", ja: "この通信に適用する DLP ポリシーを選択。ポリシー(検出対象+アクション+アカウント+デバイスリスク)は「DLP ポリシー」ページで作成・編集します。" }), options: [{ value: "", label: bl({ en: "None", ja: "なし" }) }] });
-  // Load the tenant's named DLP policies into the selector.
-  (async () => {
-    try {
-      const pr = await apiFetch("GET", "/admin/dlp-policies");
-      const policies = (pr && pr.ok && pr.body && pr.body.policies) || [];
-      const sel = dlpPolicyF.el.querySelector("select");
-      policies.forEach((p) => sel.appendChild(el("option", { value: p.id, text: p.name })));
-      if (dlpExisting && dlpExisting.policy_id) sel.value = dlpExisting.policy_id;
-    } catch (e) { /* policies optional */ }
-  })();
+  // Populate only the egress control; initialize its saved reference synchronously.
+  if (plane === "egress") loadRuleDLPPolicies(dlpPolicyF, (dlpExisting && dlpExisting.policy_id) || "");
   // Paid-feature gate: only show the DLP option on a rule when the tenant is licensed for DLP.
   const dlpLicensed = !(window.dsseEntitlements && window.dsseEntitlements.dlp === false);
   const dlpWrap = dlpLicensed ? el("div", { class: "asset-dyn" }, [dlpPolicyF.el]) : el("div", {});
@@ -836,12 +885,14 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   ] });
   const m = uiModal({ title, body: [prioF.el, nameF.el, src.el, agentWrap, dst.el, svcF.el, accessF.el, assuranceWrap, inspF.el, riskF.el].concat(plane === "east_west" ? [stageF.el] : []).concat(plane === "egress" ? [dlpWrap] : []),
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-    // If the editor is dismissed WITHOUT a successful save (Cancel / Esc / backdrop), let the caller undo any
-    // object it pre-created for this editor (e.g. an adopted-flow destination endpoint) — nothing applied.
-    onClose: () => { if (!savedOk && typeof onCancelled === "function") onCancelled(); } });
+    // Clean up a pre-created dependency only if no write was attempted. An unconfirmed response
+    // may follow a committed rule that still references that dependency.
+    onClose: () => { if (!savedOk && !writeAttempted && typeof onCancelled === "function") onCancelled(); } });
 
   submit.addEventListener("click", async () => {
-    if (!prioF.validate()) return;
+    if (savePending || !m.el.isConnected || !prioF.validate()) return;
+    const priority = Number(prioF.get());
+    if (!/^-?\d+$/.test(prioF.get().trim()) || !Number.isSafeInteger(priority)) { uiToast(bl({en:"Priority must be a whole number.",ja:"優先度は整数で入力してください。"}),"err"); return; }
     const source = src.selected();
     let destination = dst.selected();
     const agentRule = source.some((s) => typeof s === "string" && s.indexOf(AGENT_PREFIX) === 0);
@@ -849,7 +900,8 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
     if (agentRule && !destination.length) destination = [SUBJECT_ANY];
     if (!source.length || !destination.length) { uiToast(bl({ en: "Pick a source and a destination.", ja: "送信元と宛先を選択してください。" }), "err"); return; }
 
-    const action = { access: accessF.get(), inspection: inspF.get() };
+    const action = Object.assign({}, eAction, { access: accessF.get(), inspection: inspF.get() });
+    for (const key of ["required_idp_id","min_acr","required_amr","max_age_seconds","device_attested_auto","dlp"]) delete action[key];
     if (plane === "egress" && dlpPolicyF.get()) {
       // DLP is applied by referencing a named DLP policy (the only model) — it supplies detectors + action + scope.
       action.dlp = { policy_id: dlpPolicyF.get() };
@@ -864,25 +916,43 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
       if (deviceAttestedF.get()) action.device_attested_auto = true; // machine/non-interactive: device attestation in lieu of a human ceremony
     }
 
-    const body = { plane, priority: parseInt(prioF.get(), 10) || 0, name: nameF.get(), source, destination, service_id: svcF.get() || undefined, action };
+    const body = { plane, priority, name: nameF.get(), source, destination, service_id: svcF.get() || undefined, action };
     if (riskF.get()) body.risk_at_least = riskF.get(); // risk gate → compiles to a risk_state_severity condition
     // Agent rule: carry the tool boundary → compiles to the policy's allowed_tool_ids.
     if (agentRule) { const tools = toolsF.get().split(",").map((s) => s.trim()).filter(Boolean); if (tools.length) body.allowed_tool_ids = tools; }
     if (plane === "east_west") body.direction = (existing && existing.direction) || direction;
     if (plane === "east_west") body.stage = stageF.get(); // learning-lifecycle stage (enforce|warn)
-    // Edit (existing WITH an id): keep the same rule id (upsert) + preserve status. A PRE-FILLED new rule
-    // (existing without an id, e.g. adopting an observed flow) sets no id ⇒ the backend creates a fresh rule.
-    if (existing && existing.id) { body.id = existing.id; body.status = existing.status; }
+    // Preserve the rule ID on edits and retries, including a new draft with an unconfirmed response.
+    body.id = draftRuleID;
+    if (existing && existing.id) body.status = existing.status;
 
-    submit.disabled = true;
-    const resp = await apiFetch("POST", "/admin/rules", body);
-    if (!resp.ok) { submit.disabled = false; uiToast(httpErr(resp), "err"); return; }
-    savedOk = true; // a real save — onClose must NOT undo the pre-created endpoint
-    m.close();
-    const warning = resp.body && resp.body.warning;
-    if (warning) uiToast(bl({ en: "Saved with a warning: ", ja: "警告付きで保存: " }) + warning, "info");
-    else uiToast(bl({ en: "Rule saved.", ja: "ルールを保存しました。" }), "ok");
-    onSaved();
+    savePending = true;
+    const controls = [...m.el.querySelectorAll("button,input,select,textarea")].map(e => [e,e.disabled]);
+    controls.forEach(([e]) => e.disabled = true);
+    m.el.querySelectorAll(".rule-save-error").forEach(e => e.remove());
+    try {
+      if (await ruleEditorTenant() !== editorTenant) throw new Error(ruleUnknownOutcome());
+      if (!m.el.isConnected) return;
+      writeAttempted = true;
+      const resp = await apiFetch("POST", "/admin/rules", body);
+      validateRuleSave(resp, body, editorTenant);
+      savedOk = true;
+      m.close();
+      const warning = resp.body && resp.body.warning;
+      if (warning) uiToast(bl({ en: "Saved with a warning: ", ja: "警告付きで保存: " }) + warning, "info");
+      else uiToast(bl({ en: "Rule saved.", ja: "ルールを保存しました。" }), "ok");
+      onSaved();
+    } catch(e) {
+      if (m.el.isConnected) {
+        const message = e.message || String(e), guidance = ruleUnknownOutcome();
+        const notice = el("p",{class:"rule-save-error ui-callout ui-callout-warn",role:"alert",text:message.includes(guidance) ? message : message+" "+guidance});
+        m.el.querySelector(".ui-modal-body").prepend(notice);
+        notice.scrollIntoView({block:"nearest"});
+      }
+    } finally {
+      savePending = false;
+      controls.forEach(([e,disabled]) => e.disabled = disabled);
+    }
   });
 
   syncAgent(); // reflect an agent source (show the tool-boundary field) on open, incl. Edit of an existing agent rule
@@ -1144,4 +1214,41 @@ function ruleFlowText(entry) {
     ? bl({ en: parts.length + " destination groups", ja: "宛先 " + parts.length + " グループ" })
     : dest;
   return entry.source_text + " → " + shown + " : " + entry.service_text;
+}
+
+function ruleUnknownOutcome() {
+  return bl({en:"The outcome is unconfirmed. Reload the rule list and check it before creating or retrying a rule.",ja:"結果を確認できません。作成や再試行の前にルール一覧を再読込して確認してください。"});
+}
+async function ruleEditorTenant() {
+  const r = await apiFetch("GET","/admin/tenant");
+  if (!r?.ok || typeof r.body?.tenant_id !== "string" || !r.body.tenant_id) throw new Error(ruleUnknownOutcome());
+  return r.body.tenant_id;
+}
+function validateRuleSave(response, expected, tenant) {
+  if (!response?.ok) throw new Error(httpErr(response));
+  const saved = response.body;
+  if (response.status!==200 || !saved || typeof saved.id!=="string" || !saved.id || saved.tenant_id!==tenant || (expected.id && saved.id!==expected.id)) throw new Error(ruleUnknownOutcome());
+  for (const key of ["plane","direction","priority","name","service_id","status","stage","risk_at_least"]) {
+    let value = expected[key];
+    if (key==="status" && !value) value="active";
+    if (key==="stage" && !value) value="enforce";
+    if (key==="direction" && expected.plane==="east_west" && !value) value="outbound";
+    if ((saved[key] ?? "") !== (value ?? "")) throw new Error(ruleUnknownOutcome());
+  }
+  for (const key of ["source","destination","allowed_tool_ids"]) {
+    const want = expected[key] || [];
+    if (JSON.stringify(saved[key] || []) !== JSON.stringify(want)) throw new Error(ruleUnknownOutcome());
+  }
+  const action = Object.assign({},expected.action,{inspection:expected.action?.inspection || "inspect"});
+  for (const [key,value] of Object.entries(action)) {
+    if (value===false || value===0 || value==="" || value==null) { if (saved.action?.[key] && saved.action[key]!==value) throw new Error(ruleUnknownOutcome()); }
+    else if (!ruleExpectedValue(saved.action?.[key],value)) throw new Error(ruleUnknownOutcome());
+  }
+  return saved;
+}
+
+function ruleExpectedValue(actual, expected) {
+  if (Array.isArray(expected)) return JSON.stringify(actual) === JSON.stringify(expected);
+  if (expected && typeof expected === "object") return actual && Object.entries(expected).every(([key,value]) => ruleExpectedValue(actual[key],value));
+  return actual === expected;
 }

@@ -18,6 +18,23 @@ var edgeControlPlaneSyncFiles = []string{
 	"enrolment_cp_report.go",
 }
 
+// Query parameters constrain a request; they do not change its permission path.
+var edgeControlPlaneAdminPath = regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)(?:\?[^"\r\n]*)?"`)
+
+func TestControlPlaneCredentialRouteDiscoveryIncludesQueryParameters(t *testing.T) {
+	const source = `"/admin/config-bundle" + "/admin/steer-exclusions?expected_tenant_id=" + tenant + "/admin/new-route?cursor=next"`
+	matches := edgeControlPlaneAdminPath.FindAllStringSubmatch(source, -1)
+	want := []string{"/admin/config-bundle", "/admin/steer-exclusions", "/admin/new-route"}
+	if len(matches) != len(want) {
+		t.Fatalf("found %d routes, want %d", len(matches), len(want))
+	}
+	for i, path := range want {
+		if matches[i][1] != path {
+			t.Fatalf("route %d = %q, want %q", i, matches[i][1], path)
+		}
+	}
+}
+
 // ★ THE SCOPE LIST HAS TO FOLLOW THE CALLS, OR IT IS A DOCUMENT (the machine-credential separation, 2026-08-16). The credential an Edge
 // presents to its control plane was the shared owner secret, so nobody had ever had to know what the machine
 // path actually needs. Once it is a narrow token, adding a fourth call without adding its scope produces a
@@ -32,14 +49,13 @@ func TestTheControlPlaneCredentialCoversExactlyTheCallsItMakes(t *testing.T) {
 		t.Skip("the admin handler is not a mux in this build")
 	}
 
-	adminPath := regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)"`)
 	called := map[string]bool{}
 	for _, name := range edgeControlPlaneSyncFiles {
 		raw, err := os.ReadFile(filepath.Join(".", name))
 		if err != nil {
 			t.Fatalf("read %s: %v — the machine path moved and this gate did not", name, err)
 		}
-		for _, match := range adminPath.FindAllStringSubmatch(string(raw), -1) {
+		for _, match := range edgeControlPlaneAdminPath.FindAllStringSubmatch(string(raw), -1) {
 			called[match[1]] = true
 		}
 	}

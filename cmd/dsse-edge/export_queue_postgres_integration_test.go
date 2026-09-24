@@ -206,6 +206,22 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 		_ = db.Close()
 	})
 
+	// Upgrade an existing pre-region table through production component setup.
+	migrations, err := migrationstore.LoadDir(filepath.Join("..", "..", "migrations"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := selectPostgresComponentMigrations(migrations, "legacy hot store", postgresMigrationHotEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := migrationstore.Apply(ctx, db, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO hot_events(tenant_id,stream,event_id,occurred_at,payload) VALUES('tenant_legacy','access','old-event',now(),'{}')`); err != nil {
+		t.Fatal(err)
+	}
+
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewWriter returned error: %v", err)
@@ -226,8 +242,14 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 		}
 	})
 
+	var legacyRegion string
+	if err := db.QueryRowContext(ctx, `SELECT edge_region_id FROM hot_events WHERE tenant_id='tenant_legacy' AND event_id='old-event'`).Scan(&legacyRegion); err != nil || legacyRegion != "" {
+		t.Fatalf("legacy row upgrade: region=%q err=%v", legacyRegion, err)
+	}
+
 	if err := writer.Append("access.log.jsonl", map[string]any{
 		"id":                 "alog_edge_ingest_001",
+		"edge_region_id":     "region-test",
 		"tenant_id":          "tenant_lab_001",
 		"timestamp":          "2026-05-23T04:00:00Z",
 		"decision":           "allow",
@@ -248,7 +270,7 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 	result, err := store.Search(ctx, hotstore.SearchQuery{
 		TenantID: "tenant_lab_001",
 		Stream:   "access",
-		Filters:  map[string]string{"decision": "allow"},
+		Filters:  map[string]string{"decision": "allow", "edge_region_id": "region-test"},
 		Limit:    10,
 	})
 	if err != nil {
@@ -267,6 +289,38 @@ func TestEdgePostgresHotStoreIngestFromWriterE2E(t *testing.T) {
 	if related.TotalRows != 1 || len(related.RowsByStream["access"]) != 1 {
 		t.Fatalf("related = %#v", related)
 	}
+	// Region coverage ignores only region/pagination, retaining all other scope.
+	from, to := time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
+	for _, row := range []struct {
+		id, tenant, stream, region, decision, text string
+		at                                         time.Time
+	}{
+		{"match", "tenant_coverage", "access", "", "deny", "needle", time.Now()},
+		{"foreign", "foreign", "access", "", "deny", "needle", time.Now()},
+		{"stream", "tenant_coverage", "audit", "", "deny", "needle", time.Now()},
+		{"known", "tenant_coverage", "access", "region-test", "deny", "needle", time.Now()},
+		{"allow", "tenant_coverage", "access", "", "allow", "needle", time.Now()},
+		{"text", "tenant_coverage", "access", "", "deny", "other", time.Now()},
+		{"old", "tenant_coverage", "access", "", "deny", "needle", from.Add(-time.Hour)},
+	} {
+		payload, _ := json.Marshal(map[string]string{"decision": row.decision, "message": row.text})
+		if _, err := db.ExecContext(ctx, `INSERT INTO hot_events(tenant_id,stream,event_id,edge_region_id,occurred_at,payload) VALUES($1,$2,$3,$4,$5,$6)`, row.tenant, row.stream, row.id, row.region, row.at, payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	counter, ok := store.(hotstore.UnknownRegionCounter)
+	if !ok {
+		t.Fatal("PostgreSQL region counter absent")
+	}
+	query := hotstore.SearchQuery{TenantID: "tenant_coverage", Stream: "access", Filters: map[string]string{"edge_region_id": "region-test", "decision": "deny", "tenant_id": "foreign"}, Text: "needle", From: &from, To: &to, Limit: 1, Cursor: "ignored-by-count"}
+	if n, err := counter.CountUnknownRegion(ctx, query); err != nil || n != 1 {
+		t.Fatalf("unknown count=%d err=%v", n, err)
+	}
+	query.TenantID = "empty-tenant"
+	if n, err := counter.CountUnknownRegion(ctx, query); err != nil || n != 0 {
+		t.Fatalf("empty count=%d err=%v", n, err)
+	}
+
 }
 
 func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
@@ -324,7 +378,8 @@ func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
 	if _, err := store.MarkProgress(job.ID, 7, "exporting", now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("MarkProgress returned error: %v", err)
 	}
-	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", now.Add(3*time.Minute))
+	coverage := &adminExportRegionCoverage{Schema: "dsse.export-region-coverage.v1", RegionFilterApplied: true, Status: "unavailable", Notice: "Records without a region are excluded."}
+	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", coverage, now.Add(3*time.Minute))
 	if err != nil {
 		t.Fatalf("MarkCompleted returned error: %v", err)
 	}
@@ -332,6 +387,14 @@ func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
 		t.Fatalf("completed = %#v", completed)
 	}
 	runtimeJob, ok := store.Get(job.ID)
+	coverageJSON, err := json.Marshal(runtimeJob.Metadata["region_coverage"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restoredCoverage adminExportRegionCoverage
+	if err := json.Unmarshal(coverageJSON, &restoredCoverage); err != nil || restoredCoverage.Schema != coverage.Schema || !restoredCoverage.RegionFilterApplied || restoredCoverage.UnknownRegionCount != nil {
+		t.Fatalf("coverage not durably restored: %s %v", coverageJSON, err)
+	}
 	if !ok || runtimeJob.Status != "completed" || runtimeJob.RowCount != 7 {
 		t.Fatalf("runtime job = %#v, ok=%v", runtimeJob, ok)
 	}
@@ -568,8 +631,13 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 	if err != nil {
 		t.Fatalf("ReadJSONL returned error: %v", err)
 	}
-	if len(auditRows) != 0 {
-		t.Fatalf("audit rows = %#v, want no direct JSONL audit writes", auditRows)
+	// The worker suppresses its domain JSONL events; the shared HTTP audit remains mandatory.
+	if len(auditRows) != 1 || auditRows[0]["event_type"] != "admin_config_change" || auditRows[0]["result"] != "success" {
+		t.Fatalf("expected one shared HTTP audit, got %#v", auditRows)
+	}
+	metadata, ok := auditRows[0]["metadata"].(map[string]any)
+	if !ok || metadata["path"] != "/admin/export-jobs" || metadata["status_code"] != float64(202) {
+		t.Fatalf("HTTP audit metadata=%#v", metadata)
 	}
 }
 
@@ -1338,6 +1406,10 @@ func resetPostgresExportTaskQueueTables(t *testing.T, ctx context.Context, db *s
 		"DROP TABLE IF EXISTS export_worker_task_dead_letters",
 		"DROP TABLE IF EXISTS export_worker_tasks",
 		"DROP TABLE IF EXISTS admin_export_jobs",
+		// Migrations 047/051 attach triggers to these tables.
+		// Remove their tables together with the migration ledger.
+		"DROP TABLE IF EXISTS cp_state_blobs CASCADE",
+		"DROP TABLE IF EXISTS admin_local_credentials CASCADE",
 		"DROP TABLE IF EXISTS schema_migrations",
 	} {
 		if _, err := db.ExecContext(ctx, statement); err != nil {

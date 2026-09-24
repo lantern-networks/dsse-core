@@ -1,9 +1,11 @@
 package tenantca
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
 	"testing"
 	"time"
 )
@@ -161,5 +163,55 @@ func TestAnEmptySharedViewDoesNotDisarmTheRegistry(t *testing.T) {
 	}
 	if resolves(reg, ca) != "tenant_acme" {
 		t.Fatal("the registry disarmed itself on a view it could not use")
+	}
+}
+
+// A readable stale cache must never replace an authoritative row that cannot be read.
+type readFailurePersister struct {
+	memPersister
+	fail   bool
+	writes int
+}
+
+func (p *readFailurePersister) Load() ([]byte, error) {
+	if p.fail {
+		return nil, errors.New("read unavailable")
+	}
+	return p.memPersister.Load()
+}
+func (p *readFailurePersister) Save(b []byte) error { p.writes++; return p.memPersister.Save(b) }
+func TestRegistrySaveDoesNotOverwriteUnreadableSharedState(t *testing.T) {
+	p := &readFailurePersister{}
+	peer, local := NewTenantCARegistry(), NewTenantCARegistry()
+	other, otherPEM := selfSignedCAForTest(t, "Peer CA")
+	own, ownPEM := selfSignedCAForTest(t, "Own CA")
+	if _, err := peer.Register("peer", otherPEM); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SaveTo(p); err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte(nil), p.data...)
+	writes := p.writes
+	if _, err := local.Register("own", ownPEM); err != nil {
+		t.Fatal(err)
+	}
+	p.fail = true
+	if err := local.SaveTo(p); err == nil {
+		t.Fatal("unreadable shared row overwritten from local cache")
+	}
+	if p.writes != writes || !bytes.Equal(before, p.data) {
+		t.Fatal("read failure changed shared state")
+	}
+	p.fail = false
+	if err := local.SaveTo(p); err != nil {
+		t.Fatal(err)
+	}
+	restarted := NewTenantCARegistry()
+	if _, err := restarted.LoadFrom(p); err != nil {
+		t.Fatal(err)
+	}
+	if resolves(restarted, other) != "peer" || resolves(restarted, own) != "own" {
+		t.Fatal("retry lost peer or own CA")
 	}
 }

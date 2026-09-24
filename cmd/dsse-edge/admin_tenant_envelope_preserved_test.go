@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -34,12 +35,10 @@ func TestAnUpsertThatOmitsTheEnvelopeDoesNotRevokeIt(t *testing.T) {
 	}
 
 	// The body that caused it: three fields, and nothing about the envelope.
-	partial := adminTenantModel{TenantID: "tenant_customer", DisplayName: "Customer", Status: "suspended"}
-	named := bodyNamesOperatorEnvelope([]byte(`{"tenant_id":"tenant_customer","display_name":"Customer","status":"suspended"}`))
-	if len(named) != 0 {
-		t.Fatalf("the body named no envelope field, but the probe found %v", named)
+	preserved, err := mergeTenantSettingsEdit(ctx, store, "tenant_customer", []byte(`{"tenant_id":"tenant_customer","display_name":"Customer","status":"suspended"}`))
+	if err != nil {
+		t.Fatal(err)
 	}
-	preserved := preserveOperatorEnvelopeOnUpsert(ctx, store, partial, named)
 	if _, err := store.Put(ctx, preserved, now); err != nil {
 		t.Fatalf("upsert: %v", err)
 	}
@@ -62,15 +61,9 @@ func TestAnUpsertThatOmitsTheEnvelopeDoesNotRevokeIt(t *testing.T) {
 		t.Fatalf("the status the caller actually sent did not take: %q", after.Status)
 	}
 
-	// ★ AND A BODY THAT DOES NAME THE ENVELOPE IS HONOURED — omission stops meaning erasure, but an explicit
-	// value is still an instruction. Without this the fix would make the envelope unwritable through a restore.
-	explicit := adminTenantModel{TenantID: "tenant_customer", DisplayName: "Customer", Status: "active"}
-	namedExplicit := bodyNamesOperatorEnvelope([]byte(`{"tenant_id":"tenant_customer","operator_managed":false,"operator_elevations":[],"operator_elevation_requires_approval":false,"operator_delegation_changed_at":null,"operator_delegation_changed_by":""}`))
-	if len(namedExplicit) != 5 {
-		t.Fatalf("the probe missed an explicitly named envelope field: %v", namedExplicit)
-	}
-	revoked := preserveOperatorEnvelopeOnUpsert(ctx, store, explicit, namedExplicit)
-	if revoked.OperatorManaged {
-		t.Fatal("an explicit operator_managed:false was overridden by the preservation — the customer can no longer withdraw the delegation")
+	// Explicit authorization changes must use the consent-aware delegation routes.
+	_, err = mergeTenantSettingsEdit(ctx, store, "tenant_customer", []byte(`{"operator_managed":false,"operator_elevations":[],"operator_elevation_requires_approval":false,"operator_delegation_changed_at":null,"operator_delegation_changed_by":""}`))
+	if !errors.Is(err, errTenantEnvelopeEdit) {
+		t.Fatalf("explicit authorization edit: %v", err)
 	}
 }

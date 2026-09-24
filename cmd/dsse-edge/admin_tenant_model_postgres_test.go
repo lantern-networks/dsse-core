@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,7 +86,7 @@ func TestPostgresAdminTenantModelStoreE2E(t *testing.T) {
 			// describes: the tables go, the ledger says they are applied, and the next run dies. Found by
 			// adding 041 and reading the cleanup rather than by the second run.
 			"DROP TABLE IF EXISTS admin_tenant_model_purge_orders",
-			"DELETE FROM schema_migrations WHERE version IN ('023', '024', '038', '039', '040', '041')",
+			"DELETE FROM schema_migrations WHERE version IN ('023', '024', '038', '039', '040', '041', '044')",
 		} {
 			_, _ = db.ExecContext(context.Background(), stmt)
 		}
@@ -267,5 +268,51 @@ func TestPostgresAdminTenantModelStoreE2E(t *testing.T) {
 	}
 	if missing.TenantID != "tenant_ghost_001" || missing.Status != "active" {
 		t.Fatalf("missing default = %#v, want ghost/active", missing)
+	}
+}
+
+func TestPostgresPurgeOrderAcknowledgementE2E(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	// Connection-local table leaves existing tenant registry data untouched.
+	if _, err = db.Exec(`CREATE TEMP TABLE admin_tenant_model_purge_orders (tenant_id text PRIMARY KEY, ordered_at timestamptz NOT NULL, CHECK (tenant_id <> 'refused'))`); err != nil {
+		t.Fatal(err)
+	}
+	s := &postgresAdminTenantModelStore{db: db}
+	now := time.Now().UTC().Truncate(time.Second)
+	if err := s.OrderPurge("refused", now); !errors.Is(err, errAdminTenantSaveUnconfirmed) {
+		t.Fatalf("missing save error: %v", err)
+	}
+	if s.ConfigGeneration() != 0 || len(s.PurgeOrders()) != 0 {
+		t.Fatal("refused order published")
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.OrderPurge("target", now.Add(time.Duration(i)*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if s.ConfigGeneration() != 1 {
+		t.Fatal("no-op advanced generation")
+	}
+	rows := s.PurgeOrders()
+	if len(rows) != 1 || rows[0].OrderedAt != now.Format(time.RFC3339) {
+		t.Fatal("first order not preserved", rows)
+	}
+	if _, err := db.Exec(`ALTER TABLE pg_temp.admin_tenant_model_purge_orders DROP CONSTRAINT admin_tenant_model_purge_orders_tenant_id_check`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OrderPurge("refused", now); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.PurgeOrders()) != 2 || s.ConfigGeneration() != 2 {
+		t.Fatal("retry did not record order")
 	}
 }

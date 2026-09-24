@@ -13,7 +13,7 @@ func TestCompileEastWestCarriesRiskAtLeast(t *testing.T) {
 	resolver := fakeEWResolver{
 		src:   map[string][]string{"grp-clients": {"dev-alice"}},
 		dest:  map[string][]string{"grp-servers": {"db.internal"}},
-		proto: map[string][]string{"svc-ssh": {"ssh"}},
+		proto: map[string]map[string][]int{"svc-ssh": {"tcp": {22}}},
 	}
 	rules := []Rule{
 		{ID: "gated", TenantID: "acme", Plane: PlaneEastWest, Direction: DirectionOutbound, Status: StatusActive, Priority: 100,
@@ -45,7 +45,7 @@ func TestCompileEastWestCarriesRiskAtLeast(t *testing.T) {
 func TestCompileEastWestRiskAtLeastNoneIsNoGate(t *testing.T) {
 	resolver := fakeEWResolver{
 		dest:  map[string][]string{"grp-servers": {"db.internal"}},
-		proto: map[string][]string{"svc-ssh": {"ssh"}},
+		proto: map[string]map[string][]int{"svc-ssh": {"tcp": {22}}},
 	}
 	for _, threshold := range []string{"", "none", "NONE", "  "} {
 		rules := []Rule{

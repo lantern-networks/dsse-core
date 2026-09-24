@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	dnsresolver "github.com/lantern-networks/dsse-core/dnsresolver"
 )
@@ -109,6 +110,8 @@ func restoreDNSPolicy(store *dnsPolicyStore, resolver *dnsresolver.Resolver) str
 // DNS-policy admin routes (read + durable write-through to the resolver), moved verbatim
 // out of newServerWithConfig (Phase 2 route-registration split).
 func registerDNSPolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, edgeDNSResolver *dnsresolver.Resolver, edgeDNSPolicyStore *dnsPolicyStore, configSourceURL string) {
+	// Serialize durable replacement and live publication for concurrent admin writes.
+	var writeMu sync.Mutex
 	mux.HandleFunc("GET /admin/dns-policy", adminEndpoint("admin.dns.read", func(w http.ResponseWriter, r *http.Request) {
 		if edgeDNSResolver == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("dns resolver not configured"))
@@ -134,12 +137,16 @@ func registerDNSPolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		edgeDNSResolver.SetPolicy(policy)
-		// Persisted before the response returns, so an operator who is told the policy was applied cannot then
-		// lose it to a restart they had no reason to connect with the change.
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		// Publish only after the durable replacement succeeds. A failed save must
+		// leave the running resolver on the last acknowledged policy.
 		if err := edgeDNSPolicyStore.save(dnsresolver.PolicyToDTO(policy)); err != nil {
-			log.Printf("dns policy: applied but NOT persisted (%v) — it will revert on restart", err)
+			log.Printf("dns policy: could not persist proposed policy: %v", err)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("could not save DNS policy; active policy was not changed"))
+			return
 		}
+		edgeDNSResolver.SetPolicy(policy)
 		appliedDTO := dnsresolver.PolicyToDTO(policy)
 		logInfof("dns_policy_applied_by_admin deny=%d sinkhole=%d stub=%d ech_strip=%t", len(appliedDTO.Deny), len(appliedDTO.Sinkhole), len(appliedDTO.StubIPv4), policy.ECHStripValue())
 		writeJSON(w, http.StatusOK, dnsresolver.PolicyToDTO(edgeDNSResolver.CurrentPolicy()))

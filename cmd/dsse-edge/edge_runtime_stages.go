@@ -25,9 +25,9 @@ func buildVLANBoundaryStore(config serverConfig) *vlan.Store {
 	vlanBoundary := vlan.NewStore() //: VLAN/Subnet objects + boundary policies + export
 	// Durability (optional, -vlan-object-store). Without it this is a plain in-memory map and EVERY restart
 	// erases every Network object the operator defined — the reason the Console's Networks page read permanently
-	// empty, since the lab rebuilds the Edge on every change. Every mutation re-saves (store-side persistLocked).
+	// empty, since the lab rebuilds the Edge on every change. Every mutation confirms its candidate snapshot before publication.
 	if storeShouldBeWired(config.VLANObjectStorePath) {
-		p, e := cpStateBlobPersister(config.VLANObjectStorePath, cpStateBlobDB, "vlan_objects")
+		p, e := configBundleStorePersister(config.VLANObjectStorePath, config.ConfigSourceURL, "vlan_objects")
 		if e != nil {
 			log.Fatalf("resolve vlan object store %q: %v", config.VLANObjectStorePath, e)
 		}
@@ -41,7 +41,7 @@ func buildVLANBoundaryStore(config serverConfig) *vlan.Store {
 			}
 		}
 		vlan.OnPersistError = func(err error) {
-			logErrorf("vlan_object_store_save_failed: %v — Network objects will NOT survive a restart", err)
+			logErrorf("vlan_object_store_save_failed: %v — network change was not confirmed; prior live state retained", err)
 		}
 	}
 	return vlanBoundary
@@ -102,11 +102,11 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 	// Durable allowlist (optional): rehydrate + recompile on boot + flush periodically so operator-declared
 	// known-safe values (false-positive tuning) survive an Edge restart.
 	if storeShouldBeWired(config.DLPAllowlistStorePath) {
-		if p, e := cpStateBlobPersister(config.DLPAllowlistStorePath, cpStateBlobDB, "dlp_allowlist"); e != nil {
+		if p, e := configBundleStorePersister(config.DLPAllowlistStorePath, config.ConfigSourceURL, "dlp_allowlist"); e != nil {
 			log.Fatalf("resolve dlp allowlist store %q: %v", config.DLPAllowlistStorePath, e)
 		} else if p != nil {
 			if lerr := dlpAllowlistStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp allowlist store: load prior values failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp allowlist store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
@@ -133,7 +133,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve entitlement store %q: %v", config.EntitlementStorePath, e)
 		} else if p != nil {
 			if lerr := entitlementStore.SetPersister(p); lerr != nil {
-				log.Printf("entitlement store: load prior entitlements failed (starting fresh): %v", lerr)
+				log.Fatalf("load entitlement store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
@@ -147,11 +147,11 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 	// Reusable named DLP Policy objects (S5): egress rules reference one by id. Durable.
 	dlpPolicyObjects := newDLPPolicyObjectStore()
 	if storeShouldBeWired(config.DLPPolicyObjectStorePath) {
-		if p, e := cpStateBlobPersister(config.DLPPolicyObjectStorePath, cpStateBlobDB, "dlp_policy_objects"); e != nil {
+		if p, e := configBundleStorePersister(config.DLPPolicyObjectStorePath, config.ConfigSourceURL, "dlp_policy_objects"); e != nil {
 			log.Fatalf("resolve dlp policy object store %q: %v", config.DLPPolicyObjectStorePath, e)
 		} else if p != nil {
 			if lerr := dlpPolicyObjects.SetPersister(p); lerr != nil {
-				log.Printf("dlp policy object store: load prior policies failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp policy object store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
@@ -166,11 +166,11 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 	// Durable EDM datasets (optional): rehydrate + recompile on boot + flush periodically so operator fingerprints
 	// (hashes only) survive an Edge restart.
 	if storeShouldBeWired(config.DLPFingerprintStorePath) {
-		if p, e := cpStateBlobPersister(config.DLPFingerprintStorePath, cpStateBlobDB, "dlp_fingerprints"); e != nil {
+		if p, e := configBundleStorePersister(config.DLPFingerprintStorePath, config.ConfigSourceURL, "dlp_fingerprints"); e != nil {
 			log.Fatalf("resolve dlp fingerprint store %q: %v", config.DLPFingerprintStorePath, e)
 		} else if p != nil {
 			if lerr := dlpFingerprintStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp fingerprint store: load prior datasets failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp fingerprint store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
@@ -183,13 +183,13 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 	}
 	dlpClassifierStore := newDLPClassifierRuntimeStore()
 	// Durable custom classifiers (optional): rehydrate + recompile on boot + flush periodically so operator-defined
-	// identifiers survive an Edge restart. SetSpecs only marks dirty, so a background ticker does the I/O.
+	// identifiers survive an Edge restart. Admin writes save synchronously; the ticker flushes staged updates.
 	if storeShouldBeWired(config.DLPClassifierStorePath) {
-		if p, e := cpStateBlobPersister(config.DLPClassifierStorePath, cpStateBlobDB, "dlp_classifiers"); e != nil {
+		if p, e := configBundleStorePersister(config.DLPClassifierStorePath, config.ConfigSourceURL, "dlp_classifiers"); e != nil {
 			log.Fatalf("resolve dlp classifier store %q: %v", config.DLPClassifierStorePath, e)
 		} else if p != nil {
 			if lerr := dlpClassifierStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp classifier store: load prior classifiers failed (starting fresh): %v", lerr)
+				log.Fatalf("load dlp classifier store: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {

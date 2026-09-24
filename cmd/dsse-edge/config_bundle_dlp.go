@@ -24,11 +24,13 @@ func configBundleFleetReader(r *http.Request, operator string) bool {
 
 // Named policies are resolved at request time, so distributing only rule IDs
 // silently drops their inspection. The signed config carries the definitions and
-// detector library together. EDM carries salted hashes, never source values.
+// detector library together. EDM carries salted hashes, never source values;
+// allowlists carry the operator-declared known-safe values for local compilation.
 type dlpConfigBundle struct {
 	Policies    map[string]map[string]model.DLPPolicyObject `json:"policies"`
 	Classifiers map[string][]dlp.ClassifierSpec             `json:"classifiers"`
 	Datasets    map[string]map[string][]string              `json:"datasets"`
+	Allowlists  map[string][]string                         `json:"allowlists"`
 	Salt        string                                      `json:"salt"`
 }
 
@@ -36,10 +38,11 @@ type dlpConfigStores struct {
 	policies     *dlpPolicyObjectStore
 	classifiers  *dlpClassifierRuntimeStore
 	fingerprints *dlpFingerprintRuntimeStore
+	allowlist    *dlpAllowlistRuntimeStore
 }
 
 func (s *dlpConfigStores) ready() bool {
-	return s != nil && s.policies != nil && s.classifiers != nil && s.fingerprints != nil
+	return s != nil && s.policies != nil && s.classifiers != nil && s.fingerprints != nil && s.allowlist != nil
 }
 func (s *dlpConfigStores) Generation() uint64 {
 	if !s.ready() {
@@ -51,7 +54,9 @@ func (s *dlpConfigStores) Generation() uint64 {
 	defer s.classifiers.mu.RUnlock()
 	s.fingerprints.mu.RLock()
 	defer s.fingerprints.mu.RUnlock()
-	return s.policies.generation + s.classifiers.generation + s.fingerprints.generation
+	s.allowlist.mu.RLock()
+	defer s.allowlist.mu.RUnlock()
+	return s.policies.generation + s.classifiers.generation + s.fingerprints.generation + s.allowlist.generation
 }
 func (s *dlpConfigStores) Snapshot() *dlpConfigBundle {
 	if !s.ready() {
@@ -63,7 +68,9 @@ func (s *dlpConfigStores) Snapshot() *dlpConfigBundle {
 	defer s.classifiers.mu.RUnlock()
 	s.fingerprints.mu.RLock()
 	defer s.fingerprints.mu.RUnlock()
-	raw, err := json.Marshal(dlpConfigBundle{Policies: s.policies.byTenant, Classifiers: s.classifiers.specs, Datasets: s.fingerprints.datasets, Salt: s.fingerprints.salt})
+	s.allowlist.mu.RLock()
+	defer s.allowlist.mu.RUnlock()
+	raw, err := json.Marshal(dlpConfigBundle{Policies: s.policies.byTenant, Classifiers: s.classifiers.specs, Datasets: s.fingerprints.datasets, Salt: s.fingerprints.salt, Allowlists: s.allowlist.values})
 	if err != nil {
 		panic(err)
 	} // Only concrete JSON data types, no custom marshalers.
@@ -79,6 +86,13 @@ func (b *dlpConfigBundle) ForTenant(tenant string) *dlpConfigBundle {
 		return nil
 	}
 	out := &dlpConfigBundle{Policies: map[string]map[string]model.DLPPolicyObject{}, Classifiers: map[string][]dlp.ClassifierSpec{}, Datasets: map[string]map[string][]string{}, Salt: b.Salt}
+	// A nil section came from an older publisher; an explicit empty map clears.
+	if b.Allowlists != nil {
+		out.Allowlists = map[string][]string{}
+		if values, ok := b.Allowlists[tenant]; ok {
+			out.Allowlists[tenant] = append([]string(nil), values...)
+		}
+	}
 	if rows, ok := b.Policies[tenant]; ok {
 		out.Policies[tenant] = rows
 	}
@@ -144,6 +158,19 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 			}
 		}
 	}
+	allowlists := map[string][]string{}
+	for tenant, values := range next.Allowlists {
+		if strings.TrimSpace(tenant) == "" {
+			return fmt.Errorf("allowlist has no tenant")
+		}
+		values, err := validatedAllowlistValues(values)
+		if err != nil {
+			return fmt.Errorf("invalid allowlist: %w", err)
+		}
+		if len(values) > 0 {
+			allowlists[tenant] = values
+		}
+	}
 	// Validate all sections before changing any store, and publish dependencies first.
 	s.policies.mu.Lock()
 	defer s.policies.mu.Unlock()
@@ -151,6 +178,25 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	defer s.classifiers.mu.Unlock()
 	s.fingerprints.mu.Lock()
 	defer s.fingerprints.mu.Unlock()
+	s.allowlist.mu.Lock()
+	defer s.allowlist.mu.Unlock()
+	if isDLPSharedPersister(s.policies.persister) || isDLPSharedPersister(s.classifiers.persister) || isDLPSharedPersister(s.fingerprints.persister) || isDLPSharedPersister(s.allowlist.persister) {
+		return fmt.Errorf("cannot apply an Edge DLP bundle to shared authority stores")
+	}
+	// Refuse the entire library before publication when its suppression rules
+	// cannot be saved. The polling caller retries the same generation.
+	if next.Allowlists != nil {
+		if err := s.allowlist.saveSnapshotLocked(allowlistStoreSnapshot{Values: allowlists}); err != nil {
+			return fmt.Errorf("save DLP allowlist: %w", err)
+		}
+		compiled := map[string]*dlp.Allowlist{}
+		for tenant, values := range allowlists {
+			compiled[tenant] = dlp.NewAllowlist(s.allowlist.salt+"\x00"+tenant, values)
+		}
+		s.allowlist.values, s.allowlist.sets = allowlists, compiled
+		s.allowlist.dirty = false
+		s.allowlist.generation++
+	}
 	s.classifiers.specs, s.classifiers.sets = next.Classifiers, classifiers
 	s.fingerprints.datasets, s.fingerprints.sets, s.fingerprints.salt = next.Datasets, fingerprints, next.Salt
 	s.policies.byTenant = next.Policies
@@ -158,5 +204,17 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	s.policies.generation++
 	s.classifiers.generation++
 	s.fingerprints.generation++
+	return nil
+}
+
+func (s *dlpConfigStores) RefreshShared() error {
+	if !s.ready() {
+		return nil
+	}
+	for _, store := range []interface{ RefreshShared() error }{s.policies, s.classifiers, s.fingerprints, s.allowlist} {
+		if err := store.RefreshShared(); err != nil {
+			return err
+		}
+	}
 	return nil
 }

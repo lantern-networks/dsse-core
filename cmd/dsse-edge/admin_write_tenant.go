@@ -23,7 +23,8 @@ import (
 )
 
 // adminTenantForWrite is the organization a write belongs to. bodyTenant is whatever the request body asked
-// for — honoured only for an operator, who may author on another organization's behalf.
+// for — an operator must first select the same organization so the middleware
+// checks its delegation and elevation. Tenantless/lab compatibility is explicit.
 //
 // ★★ AND A NAME YOU MAY NOT USE IS REFUSED, NOT QUIETLY SWAPPED (2026-08-17, measured as the first
 // administrator of a self-run organization). Returning the caller's own organization is right when the body
@@ -41,7 +42,11 @@ import (
 func adminTenantForWrite(r *http.Request, bodyTenant string) (string, error) {
 	resolved := adminTenantIDFromRequest(r)
 	if adminCallerIsOperator(r) {
-		return valueOrDefault(bodyTenant, resolved), nil
+		target := valueOrDefault(bodyTenant, resolved)
+		if err := adminOperatorWriteTargetAllowed(r, target, "writing into"); err != nil {
+			return "", err
+		}
+		return target, nil
 	}
 	if named := strings.TrimSpace(bodyTenant); named != "" && !strings.EqualFold(named, strings.TrimSpace(resolved)) {
 		return "", fmt.Errorf(

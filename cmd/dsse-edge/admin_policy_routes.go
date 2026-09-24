@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -19,14 +20,38 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
-	"github.com/lantern-networks/dsse-core/policy"
+	policystore "github.com/lantern-networks/dsse-core/policy"
 	policyrule "github.com/lantern-networks/dsse-core/policyrule"
 	"github.com/lantern-networks/dsse-core/vlan"
 )
 
-func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string)) {
+func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policystore.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string)) {
+	publishAndAudit := func(w http.ResponseWriter, r *http.Request, item model.Policy, operation string, now time.Time) bool {
+		snapshotStatus := "not_requested"
+		if networkExtensionPublisher != nil {
+			snapshotStatus = "published"
+			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
+			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), item.TenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
+				snapshotStatus = "unconfirmed"
+				logInfof("admin policy snapshot publication: %v", err)
+			}
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyMutationAuditLog(r, item, evaluator, now, operation, snapshotStatus), now)
+		if snapshotStatus == "unconfirmed" {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":  "Policy change applied on this server; Network Extension snapshot publication is unconfirmed. Reload the policy state and check distribution before retrying.",
+				"status": "partial", "applied": true, "policy_id": item.ID, "tenant_id": item.TenantID, "ne_snapshot_status": snapshotStatus,
+			})
+			return false
+		}
+		return true
+	}
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		options := policy.ListOptions{
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
+		options := policystore.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
 			Limit:  boundedIntQuery(r.URL.Query().Get("limit"), 100, 1, 1000),
 		}
@@ -165,8 +190,40 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configBundleRefusedOnAStandby(w) {
 			return
 		}
+		if !refreshInspectionPosture(w, config) {
+			return
+		}
+		if !refreshAuthoredStores(w, ruleStore, assetStore) {
+			return
+		}
+		if !refreshVLANStore(w, vlanBoundary) {
+			return
+		}
+		if err := theIdPRegistry.Load().RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if err := delegatedGrants.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if err := transportTrust.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if err := theGrantStore.Load().RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		if !refreshDLPStores(w, config.DLPDistribution) {
+			return
+		}
 		if err := refreshManagedTenantRestrictions(policyStore); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))
+			return
+		}
+		if err := connectorRouteGov.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
@@ -197,7 +254,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// EVERY tenant's enforcement config, not just the puller's. The two fields above stay for an Edge that
 		// predates this section; a current Edge reads this one and applies each tenant it names, leaving any
 		// tenant it does NOT name alone — absence is not a instruction here either.
-		if concrete, ok := policyStore.(*policy.Store); ok && concrete != nil {
+		if concrete, ok := policyStore.(*policystore.Store); ok && concrete != nil {
 			for _, id := range concrete.Tenants() {
 				cfg := concrete.SnapshotTenantConfig(id)
 				bundle.TenantPolicies = append(bundle.TenantPolicies, tenantPolicySection{
@@ -263,9 +320,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			bundle.Connectors = &connectorCatalogBundle{Connectors: publicConnectorRegistrations(registry.List())}
 		}
 		// Fold the connector route-governance decisions into the bundle so a pull-model Edge converges on the
-		// CP-configured bindings + hold/adopt state without a shared governance store (non-secret; nil when there
-		// are no decisions, keeping the section lockout-safe). See docs/connector_network_route_advertisement_design.md.
-		bundle.RouteGovernance = connectorRouteGov.Export()
+		// CP-configured bindings without a shared governance store. A committed empty set is
+		// complete, so deletion of the last binding reaches receivers; an unknown set is omitted.
+		bundle.RouteGovernance = connectorRouteGov.ExportForBundle()
 		// /agent governance: distribute the Non-Human Identity registry + delegated-access grants so
 		// agent governance authored on the control plane reaches enforcing Edges. Present-but-empty stays lockout-
 		// safe on the Edge (apply keeps a non-empty local set). Guarded for nil stores.
@@ -371,6 +428,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		writeJSON(w, http.StatusOK, bundle)
 	}))
 	mux.HandleFunc("GET /admin/policies/{policy_id}", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		policy, found, err := policyStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -401,12 +462,17 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, fmt.Errorf("status must be active or disabled"))
 			return
 		}
-		concrete, ok := policyStore.(*policy.Store)
+		concrete, ok := policyStore.(*policystore.Store)
 		if !ok {
 			writeError(w, http.StatusConflict, fmt.Errorf("policy status toggle is not supported on this edge"))
 			return
 		}
-		if !concrete.SetPolicyStatus(adminTenantIDFromRequest(r), r.PathValue("policy_id"), status) {
+		found, err := concrete.SetPolicyStatusContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"), status)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+			return
+		}
+		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("policy %s not found", r.PathValue("policy_id")))
 			return
 		}
@@ -425,17 +491,16 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		created, err := policyStore.Upsert(r.Context(), policy, tenantID, now)
 		if err != nil {
+			if errors.Is(err, policystore.ErrPolicyPersistence) {
+				writeError(w, http.StatusInternalServerError, policystore.ErrPolicyPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if networkExtensionPublisher != nil {
-			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), tenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("publish network extension policy snapshot: %w", err))
-				return
-			}
+		if !publishAndAudit(w, r, created, "upsert", now) {
+			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyAuditLog(created, evaluator, now), now)
 		writeJSON(w, http.StatusOK, created)
 	}))
 	// The missing half of POST: an authored policy could be created and disabled but never removed, so a
@@ -448,6 +513,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		removed, existed, err := policyStore.Delete(r.Context(), tenantID, r.PathValue("policy_id"))
 		if err != nil {
+			if errors.Is(err, policystore.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+				return
+			}
 			// A bundle-sourced policy: it exists, but this API is not where it lives.
 			writeError(w, http.StatusConflict, err)
 			return
@@ -456,15 +525,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusNotFound, fmt.Errorf("no admin-authored policy %s", r.PathValue("policy_id")))
 			return
 		}
-		if networkExtensionPublisher != nil {
-			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), tenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("publish network extension policy snapshot: %w", err))
-				return
-			}
+		if !publishAndAudit(w, r, removed, "delete", now) {
+			return
 		}
 		logInfof("admin_policy_deleted id=%q name=%q tenant=%q", removed.ID, removed.Name, tenantID)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyAuditLog(removed, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_policies.v1",
 			"deleted":        removed.ID,

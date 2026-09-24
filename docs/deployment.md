@@ -19,6 +19,14 @@ Three region IDs on one host do not provide regional fault tolerance. Certificat
 failover, and recovery must also be tested on the deployed build; the topology alone does
 not establish their reliability.
 
+The control plane owns the shared configuration database. An Edge that receives
+configuration through `-config-source-url` or `-config-source-endpoints` must use
+node-local configuration stores and must not also set `-postgres-dsn`. The process
+refuses this combination before connecting to the database, because applying an
+older received bundle could overwrite newer control-plane configuration. This
+also applies when the same process is marked `-control-plane` or has explicit
+store overrides. The generated installer configuration already separates these roles.
+
 Before starting, prepare:
 
 - Linux hosts with Docker Engine and the Compose v2 plugin, persistent storage, and
@@ -302,12 +310,43 @@ published for peer communication and verification; an unadvertised port still ne
 
 The control plane owns Postgres, ClickHouse, and MinIO. Edges retain local audit spools
 and ship records to the control plane. Include all of these in storage and backup planning.
+
+In a shared PostgreSQL deployment, east-west and policy-candidate observation
+reports are committed with their receipt in the control-plane store. Receipts retain the most recent 4,096 sequence positions
+per shipping identity, reporter process and stream, across all of that reporter's
+tenants. Reports may arrive out of order within that window; duplicates there do
+not add counts again. This is a sequence budget, not a duration or a delivery
+guarantee derived from the sender queue size.
+
+A report at or below the persisted retired prefix receives HTTP 422, whether it
+was previously applied or never arrived. It is neither acknowledged as applied nor
+counted again. The observation shipper appends refused bytes to its `.refused` spool once other
+records demonstrate successful delivery, and reports the refusal in logs/health.
+That refused file is append-only and is not bounded by the CP receipt window;
+include it in disk and retention management. Spool writes are best effort, so keep
+the original local JSONL available when investigating delivery failures.
+Investigate the original local JSONL and CP counts before reconciling a very late
+report; changing its reporter or sequence can double counts. A channel-wide outage
+continues retrying until delivery can make progress. Queue overflow and hook drops
+still require attention to the local JSONL and delivery health.
+
+Rows carrying observation receipts now use `eastwest_observations.v4` and
+`policy_candidates.v4`. New readers accept the original tenant-map shape and v2/v3
+receipts; the next accepted report bounds that reporter's retained gaps. Older
+readers reject v4: upgrade all CP readers/writers together before allowing writes,
+and restore a compatible backup if rolling back. Do not rename the row version to
+force an older reader to accept it. Inactive reporters still expire after 30 days
+when another report triggers pruning; this is not indefinite deduplication or a
+bound on the total number of reporter identities.
+
 A backup is not proved until it can be restored with its matching authority material.
 
 Audit ingestion authenticates each Edge with its client identity and authorizes tenant
-records through `audit-ingest-authority.json`. Check the generated mappings when adding
+records and device enrolment reports through `audit-ingest-authority.json`. Check the generated mappings when adding
 a customer; an Edge may enforce its traffic while its audit records are refused by the
 control plane. Verify delivery and receipt for that customer, not only the operator tenant.
+Enrolment reports remain in the Edge outbox during storage failures or a leader change.
+Authorization failures also require correcting the identity mapping before delivery can resume.
 
 From the generated directory, stop a single-machine lab without removing its volumes:
 

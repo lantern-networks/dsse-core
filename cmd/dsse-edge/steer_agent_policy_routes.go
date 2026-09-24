@@ -15,7 +15,6 @@ import (
 	"github.com/lantern-networks/dsse-core/agenttuning"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
-	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
 )
 
@@ -194,17 +193,10 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 					"register its organization's Tenant CA on this node", identity))
 			return
 		}
-		var exs []model.LegacyException
-		if s, ok := policyStore.(interface {
-			LegacyExceptionsFor(string) []model.LegacyException
-		}); ok {
-			exs = s.LegacyExceptionsFor(tenantID)
-		}
-		exp := buildServerInitiatedExport(exs, time.Now())
-		if s, ok := policyStore.(interface {
-			ServerInitiatedEnabledFor(string) bool
-		}); ok && !s.ServerInitiatedEnabledFor(tenantID) {
-			exp.DefaultAction = "allow" // toggle off = DSSE not managing inbound (agent withdraws its rules)
+		exp, err := incomingExportForTenant(policyStore, tenantID, time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))
+			return
 		}
 		writeJSON(w, http.StatusOK, exp)
 	})
@@ -686,6 +678,7 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 		// and a fleet can never be looking at two different bundles for one organization.
 		installTrustBundleFor = func(tenant string) (any, bool) { return perTenant.For(tenant) }
 		mux.HandleFunc("GET /bootstrap/trust-bundle", func(w http.ResponseWriter, r *http.Request) {
+			r = r.WithContext(trustDistributionWriteContext(r.Context()))
 			// Whose bundle. A device that can still prove who it is gets its OWN organization's, resolved from
 			// the certificate exactly as the steer routes do. One that cannot — the case this endpoint exists
 			// for, a device whose certificate has expired — may name its organization explicitly; the contents
@@ -744,13 +737,13 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 			// unknown one. Enumeration is a property of per-organization SNI, not of this route. Making it
 			// impossible means unguessable organization names, which is a naming decision, not a bug fix.)
 			if asked := strings.TrimSpace(r.URL.Query().Get("tenant")) + strings.TrimSpace(r.URL.Query().Get("server_name")); asked != "" {
-				if _, serves := perTenant.For(tenant); !serves || strings.TrimSpace(tenant) == "" {
+				if _, serves := perTenant.ForContext(r.Context(), tenant); !serves || strings.TrimSpace(tenant) == "" {
 					writeError(w, http.StatusNotFound, fmt.Errorf("this node does not serve %q — ask another Edge "+
 						"rather than take a bundle belonging to a different organization", asked))
 					return
 				}
 			}
-			if env, ok := perTenant.For(tenant); ok {
+			if env, ok := perTenant.ForContext(r.Context(), tenant); ok {
 				// ★★ AN ANONYMOUS CALLER NAMING SOMEBODY ELSE'S ORGANIZATION IS RECORDED (2026-08-20).
 				//
 				// The reasoning above — the contents are public certificates and a caller must already know the

@@ -6,7 +6,9 @@
 package vlan
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -62,53 +64,48 @@ func (s *Store) Persisted() bool {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
-		return nil
+	if len(data) != 0 {
+		snap, err := decodeSnapshot(data)
+		if err != nil {
+			return err
+		}
+		s.adoptLocked(snap)
 	}
-	var snap vlanPersistSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return err
-	}
-	if snap.Objects != nil {
-		s.objects = snap.Objects
-	}
-	if snap.Policies != nil {
-		s.policies = snap.Policies
-	}
+	s.persister = p
 	return nil
 }
 
-// OnPersistError, when set, is called if a snapshot fails to save. It exists because a DROPPED save here is
-// invisible in the worst possible way: the API returns 200, the Console shows the network, the operator believes
-// it is configured — and it is gone at the next restart, which is the exact symptom (an empty Networks page that
-// "regressed again") this persistence was added to end. A silent save failure recreates the bug while looking
-// fixed. The host should log this loudly; it must not panic.
-//
-// It does NOT fail the mutation: the in-memory set is already updated and serving, and refusing the operator's
-// change because the disk is unhappy is a different (and worse) failure. Report, do not swallow.
+// OnPersistError reports storage failures to the host in addition to returning them.
 var OnPersistError func(error)
 
-// persistLocked writes the full snapshot. The CALLER must hold s.mu. No-op without a persister.
-func (s *Store) persistLocked() {
+// ErrPersistence means the mutation could not be confirmed in storage. The prior
+// live state is retained; an unconfirmed write may already have replaced the file.
+var ErrPersistence = errors.New("network storage unconfirmed")
+
+func (s *Store) saveCandidateLocked(objects map[string]model.VLANObject, policies map[string]model.VLANBoundaryPolicy) error {
 	if s.persister == nil {
-		return
+		return nil
 	}
-	data, err := json.Marshal(vlanPersistSnapshot{Objects: s.objects, Policies: s.policies})
-	if err != nil {
-		s.reportPersistError(fmt.Errorf("marshal vlan snapshot: %w", err))
-		return
+	if _, shared := s.persister.(sharedPersister); shared {
+		return fmt.Errorf("%w: whole snapshot replacement of shared authority is forbidden", ErrPersistence)
 	}
-	if err := s.persister.Save(data); err != nil {
-		s.reportPersistError(fmt.Errorf("save vlan snapshot: %w", err))
+	data, err := json.Marshal(vlanPersistSnapshot{Objects: objects, Policies: policies})
+	if err == nil {
+		err = s.persister.Save(data)
 	}
+	if err != nil && !(errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
+		s.reportPersistError(err)
+		return fmt.Errorf("%w: %v", ErrPersistence, err)
+	}
+	return nil
 }
 
 func (s *Store) reportPersistError(err error) {
@@ -127,10 +124,10 @@ func (s *Store) ConfigGeneration() uint64 {
 
 // ReplaceAll atomically replaces the WHOLE VLAN object + boundary-policy set under one lock (config
 // distribution: a config-pulling Edge swaps in the control plane's authoritative set). Entries without an id
-// are skipped. Bumps the generation.
-func (s *Store) ReplaceAll(objects []model.VLANObject, policies []model.VLANBoundaryPolicy) {
+// are skipped. Saves before publishing and advancing the generation.
+func (s *Store) ReplaceAll(objects []model.VLANObject, policies []model.VLANBoundaryPolicy) error {
 	if s == nil {
-		return
+		return nil
 	}
 	objMap := make(map[string]model.VLANObject, len(objects))
 	for _, o := range objects {
@@ -148,13 +145,22 @@ func (s *Store) ReplaceAll(objects []model.VLANObject, policies []model.VLANBoun
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.saveCandidateLocked(objMap, polMap); err != nil {
+		return err
+	}
 	s.objects = objMap
 	s.policies = polMap
 	s.generation.Add(1)
-	s.persistLocked()
+	return nil
 }
 
 func (s *Store) UpsertObject(o model.VLANObject) (model.VLANObject, error) {
+	return s.UpsertObjectContext(context.Background(), o, nil)
+}
+
+// UpsertObjectContext checks the existing owner against the latest authoritative row.
+// A nil authorize callback is reserved for trusted internal callers.
+func (s *Store) UpsertObjectContext(ctx context.Context, o model.VLANObject, authorize func(string) bool) (model.VLANObject, error) {
 	if strings.TrimSpace(o.ID) == "" {
 		return model.VLANObject{}, fmt.Errorf("vlan object id is required")
 	}
@@ -166,13 +172,24 @@ func (s *Store) UpsertObject(o model.VLANObject) (model.VLANObject, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.objects[o.ID] = o
-	s.generation.Add(1) // distributed via the config bundle: advance so Edges re-pull
-	s.persistLocked()
+	err := s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		if old, ok := snap.Objects[o.ID]; ok && authorize != nil && !authorize(old.TenantID) {
+			return ErrNotFound
+		}
+		snap.Objects[o.ID] = o
+		return nil
+	})
+	if err != nil {
+		return model.VLANObject{}, err
+	}
 	return o, nil
 }
 
 func (s *Store) UpsertPolicy(p model.VLANBoundaryPolicy) (model.VLANBoundaryPolicy, error) {
+	return s.UpsertPolicyContext(context.Background(), p, nil)
+}
+
+func (s *Store) UpsertPolicyContext(ctx context.Context, p model.VLANBoundaryPolicy, authorize func(string) bool) (model.VLANBoundaryPolicy, error) {
 	if strings.TrimSpace(p.ID) == "" {
 		return model.VLANBoundaryPolicy{}, fmt.Errorf("vlan boundary policy id is required")
 	}
@@ -192,9 +209,16 @@ func (s *Store) UpsertPolicy(p model.VLANBoundaryPolicy) (model.VLANBoundaryPoli
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.policies[p.ID] = p
-	s.generation.Add(1) // distributed via the config bundle: advance so Edges re-pull
-	s.persistLocked()
+	err := s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		if old, ok := snap.Policies[p.ID]; ok && authorize != nil && !authorize(old.TenantID) {
+			return ErrNotFound
+		}
+		snap.Policies[p.ID] = p
+		return nil
+	})
+	if err != nil {
+		return model.VLANBoundaryPolicy{}, err
+	}
 	return p, nil
 }
 
@@ -209,23 +233,37 @@ func (s *Store) ListObjects() []model.VLANObject {
 	return out
 }
 
-// DeleteObject removes the VLAN object (Named Network) with the given id. Reports whether it existed. Bumps the
+// DeleteObject removes the VLAN object (Named Network) with the given id after saving. Reports absence or storage failure. Bumps the
 // generation (distributed via the config bundle). Nil-safe. (Boundary policies referencing a deleted object's
 // class are unaffected — they key on class, not object id.)
-func (s *Store) DeleteObject(id string) bool {
+func (s *Store) DeleteObject(id string) (bool, error) {
+	return s.DeleteObjectContext(context.Background(), id, nil)
+}
+
+func (s *Store) DeleteObjectContext(ctx context.Context, id string, authorize func(string) bool) (bool, error) {
 	if s == nil {
-		return false
+		return false, nil
 	}
 	id = strings.TrimSpace(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.objects[id]; !ok {
-		return false
+	deleted := false
+	err := s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		old, ok := snap.Objects[id]
+		if !ok {
+			return nil
+		}
+		if authorize != nil && !authorize(old.TenantID) {
+			return ErrNotFound
+		}
+		delete(snap.Objects, id)
+		deleted = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	delete(s.objects, id)
-	s.generation.Add(1)
-	s.persistLocked()
-	return true
+	return deleted, nil
 }
 
 // GetObject returns the VLAN object (a Named Network — a named CIDR range) with the given id. Used by the
@@ -334,7 +372,7 @@ func (s *Store) CountForTenant(tenantID string) (objects int, policies int) {
 	return objects, policies
 }
 
-// RemoveTenant erases every Named Network and boundary policy belonging to a tenant, returning the counts.
+// RemoveTenant confirms erasure of every Named Network and boundary policy belonging to a tenant before returning counts.
 //
 // ★ IT EXISTS BECAUSE "COMPLETELY DELETED" LEFT THEM BEHIND (2026-08-18, measured on the reference deployment).
 // A disposable organization was created, given one Named Network, deleted, and then erased. The erasure
@@ -345,31 +383,37 @@ func (s *Store) CountForTenant(tenantID string) (objects int, policies int) {
 // The API is per-tenant rather than per-id on purpose. DeleteObject(id) is what a handler uses; an erasure asks
 // a different question — "everything of theirs" — and answering it by listing and filtering at every call site
 // is how one call site ends up filtering differently.
-func (s *Store) RemoveTenant(tenantID string) (objects int, policies int) {
+func (s *Store) RemoveTenant(tenantID string) (objects int, policies int, err error) {
+	return s.RemoveTenantContext(context.Background(), tenantID)
+}
+
+func (s *Store) RemoveTenantContext(ctx context.Context, tenantID string) (objects int, policies int, err error) {
 	if s == nil {
-		return 0, 0
+		return 0, 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return 0, 0
+		return 0, 0, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for id, o := range s.objects {
-		if strings.EqualFold(strings.TrimSpace(o.TenantID), tenantID) {
-			delete(s.objects, id)
-			objects++
+	err = s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
+		for id, o := range snap.Objects {
+			if strings.EqualFold(strings.TrimSpace(o.TenantID), tenantID) {
+				delete(snap.Objects, id)
+				objects++
+			}
 		}
-	}
-	for id, p := range s.policies {
-		if strings.EqualFold(strings.TrimSpace(p.TenantID), tenantID) {
-			delete(s.policies, id)
-			policies++
+		for id, p := range snap.Policies {
+			if strings.EqualFold(strings.TrimSpace(p.TenantID), tenantID) {
+				delete(snap.Policies, id)
+				policies++
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
 	}
-	if objects+policies > 0 {
-		s.generation.Add(1)
-		s.persistLocked()
-	}
-	return objects, policies
+	return objects, policies, nil
 }

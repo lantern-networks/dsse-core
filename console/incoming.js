@@ -6,6 +6,18 @@
 // POST /admin/legacy-exceptions {…}; GET /admin/legacy-exceptions/export.
 
 async function renderIncomingView(content) {
+  uiState(content, "loading");
+  const current = freshRender(content);
+  let blocked;
+  try {
+    blocked = incomingDefaultBody(await apiFetch("GET", "/admin/server-initiated"));
+  } catch (e) {
+    if (!current()) return;
+    uiState(content, "error", bl({ en: "The incoming default could not be verified. Retry before changing this policy.", ja: "受信接続の既定動作を確認できません。設定を変更する前に再試行してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderIncomingView(content) });
+    return;
+  }
+  if (!current()) return;
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
@@ -18,12 +30,10 @@ async function renderIncomingView(content) {
     el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add exception", ja: "+ 例外を追加" }), onClick: () => openExceptionForm(content) }),
   ]));
   // Show the LIVE default (readable via GET) so it is unambiguous which is in effect, then offer to switch.
-  let blocked = false;
-  try { const r = await apiFetch("GET", "/admin/server-initiated"); if (r.ok && r.body) blocked = !!r.body.server_initiated_enabled; } catch (e) { /* fall back to unknown=allow */ }
   content.appendChild(el("div", { class: "ui-toolbar" }, [
     el("span", { class: "ui-view-desc", text: bl({ en: "Default for incoming connections:", ja: "受信接続の既定:" }) }),
     uiBadge(blocked ? bl({ en: "Currently: Block by default", ja: "現在: 既定でブロック" }) : bl({ en: "Currently: Allow by default", ja: "現在: 既定で許可" }), blocked ? "ok" : "warn"),
-    el("button", { class: "ui-btn ui-btn-sm", text: blocked ? bl({ en: "Switch to allow by default", ja: "既定で許可に切替" }) : bl({ en: "Switch to block by default", ja: "既定でブロックに切替" }), onClick: () => setIncoming(!blocked, content) }),
+    el("button", { class: "ui-btn ui-btn-sm", text: blocked ? bl({ en: "Switch to allow by default", ja: "既定で許可に切替" }) : bl({ en: "Switch to block by default", ja: "既定でブロックに切替" }), onClick: () => { if (current()) setIncoming(!blocked, content); } }),
   ]));
   // Applied automatically — no manual export step. The Windows agent on each endpoint fetches this policy and
   // reconciles it into standard Windows Defender Firewall inbound rules (group "DSSE Server-Initiated",
@@ -35,6 +45,13 @@ async function renderIncomingView(content) {
   const host = el("div", {});
   content.appendChild(host);
   loadExceptions(host, content);
+}
+
+function incomingDefaultBody(response) {
+  if (!response?.ok || response.status !== 200 || typeof response.body?.server_initiated_enabled !== "boolean") {
+    throw new Error("Incoming default unavailable");
+  }
+  return response.body.server_initiated_enabled;
 }
 
 async function setIncoming(enabled, content) {
@@ -60,10 +77,10 @@ async function loadExceptions(host, content) {
   const rows = exc.map((x) => el("tr", {}, [
     el("td", {}, el("code", { text: x.source_server || x.id || "" })),
     el("td", { text: x.device_group || "—" }),
-    el("td", {}, uiBadge(x.service_family || "—", "off")),
+    el("td", {}, uiBadge([x.service_family, x.protocol, x.port || ""].filter(Boolean).join(" / ") || bl({ en: "Any service", ja: "全サービス" }), "off")),
     el("td", { text: x.business_owner || "—" }),
     el("td", { class: "ui-view-desc", text: x.expires_at ? window.dsseFormatTime(x.expires_at, { hour: undefined, minute: undefined, second: undefined, timeZoneName: undefined }) : "—" }),
-    el("td", {}, uiBadge(x.mode === "deny" ? bl({ en: "Block", ja: "ブロック" }) : bl({ en: "Allow", ja: "許可" }), x.mode === "deny" ? "danger" : "ok")),
+    el("td", {}, [uiBadge(x.mode === "deny" ? bl({ en: "Block", ja: "ブロック" }) : (x.mode === "warn" || x.mode === "observe" ? x.mode : bl({ en: "Allow", ja: "許可" })), x.mode === "deny" ? "danger" : "ok"), x.status === "disabled" ? uiBadge(bl({ en: "Disabled", ja: "無効" }), "off") : null]),
     el("td", { class: "ui-row-actions" }, [
       el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }), onClick: () => openExceptionForm(content, x) }),
       el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), onClick: () => deleteException(x.id, content) }),
@@ -90,9 +107,12 @@ async function openExceptionForm(content, existing) {
   existing = existing || null;
   // Reuse the SAME asset catalog as the Egress / Connector Access rule editors so Source / Destination / Service
   // are SELECTED, not hand-typed. Values map to the Legacy-Exception fields (source_server = endpoint address,
-  // device_group = group alias, service_family + port = catalog service) — backend unchanged.
+  // device_group = group alias, protocol + port = selected catalog TCP port).
   let idx;
-  try { idx = await catalogIndex(); } catch (e) { idx = { endpoints: [], groups: [], services: [] }; }
+  try { idx = await catalogIndex(); } catch (e) {
+    uiToast(bl({ en: "The asset catalog could not be read. Retry opening the editor after it recovers.", ja: "資産カタログを取得できません。復旧後に編集を開き直してください。" }), "err");
+    return;
+  }
   const curTag = bl({ en: " (current)", ja: "(現在値)" });
 
   const idF = uiField({ name: "id", label: bl({ en: "Exception ID", ja: "例外 ID" }), required: true, value: existing ? (existing.id || "") : "", placeholder: "ex-1" });
@@ -114,35 +134,29 @@ async function openExceptionForm(content, existing) {
   }
   const grpF = uiField({ name: "grp", label: bl({ en: "Destination (device group)", ja: "宛先(デバイスグループ)" }), type: "select", value: existing ? (existing.device_group || "") : "", options: grpOpts });
 
-  // Service: catalog services. Value = service id (resolved to service_family + port on save).
-  let svcInitial = "";
-  const svcMatch = existing && existing.service_family ? (idx.services || []).find((s) => (s.alias || "").toLowerCase() === String(existing.service_family).toLowerCase()) : null;
-  if (svcMatch) svcInitial = svcMatch.id;
-  const svcOpts = [{ value: "", label: bl({ en: "Any / select a service…", ja: "指定なし / サービスを選択…" }) }]
-    .concat((idx.services || []).map((s) => ({ value: s.id, label: s.alias + " (" + (s.ports || []).map((p) => p.protocol + "/" + p.port).join(",") + ")" })));
-  if (existing && existing.service_family && !svcMatch) {
-    svcOpts.push({ value: "__raw__", label: existing.service_family + curTag });
-    svcInitial = "__raw__";
-  }
-  const svcF = uiField({ name: "svc", label: bl({ en: "Service", ja: "Service" }), type: "select", value: svcInitial, options: svcOpts });
+  // The current Windows export supports TCP. One exception represents one port;
+  // never silently take ports[0] or turn a display name into a protocol family.
+  const serviceChoices = incomingServiceChoices(idx.services || []);
+  const svcOpts = [{ value: "", label: bl({ en: "Any service", ja: "全サービス" }) }]
+    .concat(serviceChoices.map((x) => ({ value: x.value, label: x.label })));
+  const hasCurrent = existing && (existing.service_family || existing.protocol || existing.port);
+  if (hasCurrent) svcOpts.push({ value: "__raw__", label: bl({ en: "Keep current condition: ", ja: "現在の条件を保持: " }) + [existing.service_family, existing.protocol, existing.port || ""].filter(Boolean).join(" / ") });
+  const svcF = uiField({ name: "svc", label: bl({ en: "Service", ja: "Service" }), type: "select", value: hasCurrent ? "__raw__" : "", options: svcOpts,
+    hint: bl({ en: "Each selection is one TCP port. UDP services are not supported by the current Windows export. Choose Any only to remove the service restriction.", ja: "1つの選択はTCPの1ポートです。現行のWindows配布はUDPサービスに対応していません。サービス制限を外す場合だけ「全サービス」を選んでください。" }) });
 
   const ownerF = uiField({ name: "owner", label: bl({ en: "Business owner", ja: "業務責任者" }), value: existing ? (existing.business_owner || "") : "", placeholder: "secops" });
   const expF = uiField({ name: "exp", label: bl({ en: "Expires", ja: "期限" }), type: "date", value: existing && existing.expires_at ? String(existing.expires_at).slice(0, 10) : "" });
-  const modeF = uiField({ name: "mode", label: bl({ en: "Action", ja: "動作" }), type: "select", value: existing ? (existing.mode || "allow") : "allow", options: [{ value: "allow", label: bl({ en: "Allow", ja: "許可" }) }, { value: "deny", label: bl({ en: "Block", ja: "ブロック" }) }] });
+  const modeF = uiField({ name: "mode", label: bl({ en: "Action", ja: "動作" }), type: "select", value: existing ? (existing.mode || "allow") : "allow", options: [{ value: "allow", label: bl({ en: "Allow", ja: "許可" }) }, { value: "deny", label: bl({ en: "Block", ja: "ブロック" }) }].concat(existing && ["warn", "observe"].includes(existing.mode) ? [{ value: existing.mode, label: existing.mode + curTag }] : []) });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: existing ? bl({ en: "Save", ja: "保存" }) : bl({ en: "Add exception", ja: "例外を追加" }) });
   const m = uiModal({ title: existing ? bl({ en: "Edit an incoming-connection exception", ja: "受信接続の例外を編集" }) : bl({ en: "Add an incoming-connection exception", ja: "受信接続の例外を追加" }), body: [idF.el, srcF.el, grpF.el, svcF.el, ownerF.el, expF.el, modeF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
     if (!idF.validate()) return;
     if (!srcF.get()) { uiToast(bl({ en: "Pick a source server.", ja: "送信元のサーバを選択してください。" }), "err"); return; }
-    const payload = { id: idF.get(), source_server: srcF.get(), device_group: grpF.get(), business_owner: ownerF.get(), mode: modeF.get() };
-    const sid = svcF.get();
-    if (sid === "__raw__" && existing) {
-      payload.service_family = existing.service_family;
-    } else if (sid) {
-      const svc = (idx.services || []).find((s) => s.id === sid);
-      if (svc) { payload.service_family = svc.alias; if (svc.ports && svc.ports[0]) payload.port = svc.ports[0].port; }
-    }
-    if (expF.get()) payload.expires_at = new Date(expF.get()).toISOString();
+    let payload;
+    try {
+      payload = incomingExceptionPayload(existing, { id: idF.get(), source_server: srcF.get(), device_group: grpF.get(), business_owner: ownerF.get(), mode: modeF.get() }, svcF.get(), serviceChoices, expF.get());
+    } catch (e) { uiToast(String(e), "err"); return; }
+
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/legacy-exceptions", payload);
@@ -151,4 +165,31 @@ async function openExceptionForm(content, existing) {
     } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
   });
   idF.focus();
+}
+
+// Keep non-editor fields and exact expiry instants when an unrelated field changes.
+function incomingServiceChoices(services) {
+  return services.flatMap((s) => (s.ports || []).filter((p) => String(p.protocol).toLowerCase() === "tcp" && Number.isInteger(p.port) && p.port > 0 && p.port <= 65535)
+    .map((p, i, pairs) => ({ value: pairs.length === 1 ? s.id : JSON.stringify([s.id, "tcp", p.port]), label: s.alias + " (tcp/" + p.port + ")", protocol: "tcp", port: p.port })));
+}
+function incomingExceptionPayload(existing, fields, service, choices, expiryDate) {
+  const payload = { ...fields };
+  for (const key of ["status", "max_session_seconds", "approval_required"]) {
+    if (existing && Object.hasOwn(existing, key)) payload[key] = existing[key];
+  }
+  if (service === "__raw__" && existing) {
+    payload.service_family = existing.service_family || "";
+    payload.protocol = existing.protocol || "";
+    payload.port = existing.port || 0;
+  } else if (service) {
+    const choice = choices.find((x) => x.value === service);
+    if (!choice) throw new Error(bl({ en: "Service is unavailable. Reload before saving.", ja: "サービスを取得できません。再読込してから保存してください。" }));
+    payload.service_family = "";
+    payload.protocol = choice.protocol;
+    payload.port = choice.port;
+  } else {
+    payload.service_family = ""; payload.protocol = ""; payload.port = 0;
+  }
+  if (expiryDate) payload.expires_at = existing && expiryDate === String(existing.expires_at || "").slice(0, 10) ? existing.expires_at : new Date(expiryDate).toISOString();
+  return payload;
 }

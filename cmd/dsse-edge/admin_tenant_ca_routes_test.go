@@ -101,7 +101,7 @@ var tenantCAHarnessTenantStore adminTenantModelAdminStore
 
 // tenantCARoutesForTest builds a server whose tenant CA registry and device trust store are both real, with
 // two organizations already in the tenant registry.
-func tenantCARoutesForTest(t *testing.T) (http.Handler, *tenantca.TenantCARegistry, *transportTrustStore, string) {
+func tenantCARoutesForTest(t *testing.T, outboxes ...adminAuditOutboxDeadReader) (http.Handler, *tenantca.TenantCARegistry, *transportTrustStore, string) {
 	t.Helper()
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {
@@ -156,7 +156,12 @@ func tenantCARoutesForTest(t *testing.T) (http.Handler, *tenantca.TenantCARegist
 		}
 	}
 
+	var outbox adminAuditOutboxDeadReader
+	if len(outboxes) > 0 {
+		outbox = outboxes[0]
+	}
 	handler := newServerWithConfig(serverConfig{
+		AdminAuditOutbox:     outbox,
 		Evaluator:            testEvaluator(),
 		Writer:               writer,
 		Registry:             connector.NewRegistry(),
@@ -175,7 +180,7 @@ func tenantCARoutesForTest(t *testing.T) (http.Handler, *tenantca.TenantCARegist
 	return handler, registry, trust, path
 }
 
-func doTenantCARequest(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {
+func doTenantCARequest(t *testing.T, handler http.Handler, method, path string, body any, stores ...adminTenantModelAdminStore) *httptest.ResponseRecorder {
 	t.Helper()
 	var reader *strings.Reader
 	if body != nil {
@@ -190,6 +195,39 @@ func doTenantCARequest(t *testing.T, handler http.Handler, method, path string, 
 	req := httptest.NewRequest(method, path, reader)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("authorization", "Bearer "+testTenantCABearer)
+	// Persistence fixtures use an explicitly delegated/elevated operator. Authorization
+	// tests use operatorEnvelopeCall directly, without this fixture setup.
+	if adminMutatingMethod(method) {
+		target := ""
+		if parts := strings.Split(strings.Trim(path, "/"), "/"); len(parts) >= 3 && parts[1] == "tenant-cas" {
+			target = parts[2]
+		}
+		if body != nil {
+			raw, _ := json.Marshal(body)
+			var named struct {
+				TenantID string `json:"tenant_id"`
+			}
+			_ = json.Unmarshal(raw, &named)
+			if named.TenantID != "" {
+				target = named.TenantID
+			}
+		}
+		if target != "" {
+			req.Header.Set("X-Operate-Tenant", target)
+			store := adminTenantModelAdminStore(tenantCAHarnessTenantStore)
+			if len(stores) > 0 {
+				store = stores[0]
+			}
+			tenant, err := store.Get(context.Background(), target)
+			if err == nil && (target == "tenant_acme" || target == "tenant_northwind") {
+				tenant.OperatorManaged = true
+				tenant.OperatorElevations = []operatorElevation{{ID: "fixture-authorized", GrantedTo: "adm_operator", StartedAt: time.Now().Add(-time.Minute).Format(time.RFC3339), ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)}}
+				if _, err := store.Put(context.Background(), tenant, time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	return rec

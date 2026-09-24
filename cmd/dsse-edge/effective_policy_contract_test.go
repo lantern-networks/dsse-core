@@ -183,6 +183,11 @@ func TestInspectionPostureEndpointNoEngine(t *testing.T) {
 
 func TestInspectionPostureToggleFullPosture(t *testing.T) {
 	store := inspectionposture.NewStore()
+	legacy := store.Get()
+	legacy.BypassGroups = []string{"m365_optimize"}
+	if _, err := store.Set(legacy); err != nil {
+		t.Fatal(err)
+	}
 	eval := decision.Evaluator{PolicyBundle: model.PolicyBundle{TenantID: "tenant_lab_001"}}
 	handler := newServerWithConfig(serverConfig{
 		Evaluator: eval, Registry: connector.NewRegistry(), AdminAuth: newAdminAuthStore(),
@@ -197,7 +202,7 @@ func TestInspectionPostureToggleFullPosture(t *testing.T) {
 		return rec.Code, resp
 	}
 
-	// Switch to bypass-default with the m365 auth preset + an Optimize bypass group + known-bypass off.
+	// Switch modes while retaining a legacy selection; it is not a new bypass grant.
 	code, resp := post(`{"mode":"bypass_default","decrypt_allowlist_groups":["m365_auth"],"bypass_groups":["m365_optimize"],"known_bypass_enabled":false}`)
 	if code != http.StatusOK {
 		t.Fatalf("switch to bypass_default status=%d, want 200", code)

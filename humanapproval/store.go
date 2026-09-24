@@ -1,7 +1,8 @@
 package humanapproval
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -12,18 +13,20 @@ import (
 )
 
 // Store is the in-memory human-approval-event store: out-of-band approval ceremony outcomes
-// (upsert / lookup / active-check / revoke) backing east-west step-up authorization, FIFO-bounded by
-// capacity (capacity<=0 disables the bound). Optionally durable: SetStatePath rehydrates from a JSON
-// snapshot and each mutation write-throughs, so approval outcomes survive a restart.
+// (upsert / lookup / active-check / revoke) backing east-west step-up authorization, admission-bounded by
+// capacity (capacity<=0 disables the bound). Existing records are never evicted for a new ID.
+// Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation writes through,
+// so approval outcomes survive a restart.
 type Store struct {
-	mu        sync.RWMutex
-	events    map[string]model.HumanApprovalEvent
-	order     []string
-	capacity  int
-	persister blobstore.Persister
+	mu                 sync.RWMutex
+	events             map[string]model.HumanApprovalEvent
+	capacity           int
+	persister          blobstore.Persister
+	authorityKnown     bool
+	pendingRevocations map[string]*string
 }
 
-// NewStore builds a human-approval-event store with the given FIFO capacity. The bound is injected by
+// NewStore builds a human-approval-event store with the given admission capacity. The bound is injected by
 // cmd/edge (which reads it from the environment) so this package stays env-name-free.
 func NewStore(capacity int) *Store {
 	return &Store{events: map[string]model.HumanApprovalEvent{}, capacity: capacity}
@@ -45,8 +48,9 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
+		s.authorityKnown = false
 		return nil
 	}
 	data, err := p.Load()
@@ -54,63 +58,107 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		if data == nil && s.authorityKnown {
+			return fmt.Errorf("authorization authority disappeared")
+		}
+		if data != nil {
+			return fmt.Errorf("empty human approval snapshot")
+		}
+		s.persister = p
 		return nil
 	}
-	var snap map[string]model.HumanApprovalEvent
-	if err := json.Unmarshal(data, &snap); err != nil {
+	fresh, err := decodeSnapshot(data)
+	if err != nil {
 		return err
 	}
-	if snap != nil {
-		s.events = snap
-		s.order = s.order[:0]
-		for id := range snap {
-			s.order = append(s.order, id)
-		}
-	}
+	// Preserve all records even when the configured capacity has been lowered.
+	s.applyPendingLocked(fresh)
+	s.events, s.persister, s.authorityKnown = fresh, p, true
 	return nil
 }
 
-// persistLocked write-throughs the current event set. The error MUST reach the mutating caller: a swallowed
-// Save meant an approval outcome — or worse, a REVOKE — was acknowledged while nothing hit disk, so a
-// revoked approval silently resurrected on restart. Caller holds s.mu.
-func (s *Store) persistLocked() error {
-	if s.persister == nil {
-		return nil
-	}
-	data, err := json.MarshalIndent(s.events, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal human-approval snapshot: %w", err)
-	}
-	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist human approvals: %w", err)
+// ErrCapacity rejects a new identity without discarding authorization or revocation state.
+var ErrCapacity = errors.New("human approval store capacity reached; existing records retained")
+
+var ErrPersistence = errors.New("human approvals could not be saved")
+
+func approvalKey(tenant, id string) string { return tenant + "\x00" + id }
+func validKey(tenant, id string) error {
+	if tenant == "" || id == "" || strings.TrimSpace(tenant) != tenant || strings.TrimSpace(id) != id || strings.ContainsRune(tenant, '\x00') || strings.ContainsRune(id, '\x00') {
+		return fmt.Errorf("invalid human approval tenant or ID")
 	}
 	return nil
+}
+func cloneEvents(events map[string]model.HumanApprovalEvent) map[string]model.HumanApprovalEvent {
+	result := make(map[string]model.HumanApprovalEvent, len(events)+1)
+	for key, event := range events {
+		result[key] = event
+	}
+	return result
 }
 
 func (s *Store) Upsert(event model.HumanApprovalEvent) (model.HumanApprovalEvent, error) {
+	return s.UpsertContext(context.Background(), event)
+}
+func (s *Store) UpsertContext(ctx context.Context, event model.HumanApprovalEvent) (model.HumanApprovalEvent, error) {
+	if err := validKey(event.TenantID, event.ID); err != nil {
+		return model.HumanApprovalEvent{}, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	existing, ok := s.events[event.ID]
-	if ok {
-		if err := validateTransition(existing, event); err != nil {
-			return model.HumanApprovalEvent{}, err
+	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
+		key := approvalKey(event.TenantID, event.ID)
+		if _, pending := s.pendingRevocations[key]; pending && event.ApprovalResult != "revoked" {
+			return fmt.Errorf("human approval revocation persistence is pending")
 		}
-	}
-	if !ok {
-		s.order = append(s.order, event.ID)
-	}
-	s.events[event.ID] = event
-	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k) })
-	if err := s.persistLocked(); err != nil {
-		return event, fmt.Errorf("approval event %s stored in memory but not persisted (will not survive a restart): %w", event.ID, err)
+		old, ok := next[key]
+		if ok {
+			if err := validateTransition(old, event); err != nil {
+				return err
+			}
+		}
+		if !ok && s.capacity > 0 && len(next) >= s.capacity {
+			return ErrCapacity
+		}
+		next[key] = event
+		return nil
+	})
+	if err != nil {
+		return model.HumanApprovalEvent{}, err
 	}
 	return event, nil
 }
 
+// Get is a compatibility lookup and refuses IDs shared by multiple tenants.
+// Authenticated callers must use GetForTenant.
 func (s *Store) Get(id string) (model.HumanApprovalEvent, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return model.HumanApprovalEvent{}, false
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	event, ok := s.events[id]
+	var result model.HumanApprovalEvent
+	found := false
+	for _, event := range s.events {
+		if event.ID == id {
+			if found {
+				return model.HumanApprovalEvent{}, false
+			}
+			result, found = event, true
+		}
+	}
+	return result, found
+}
+func (s *Store) GetForTenant(tenantID, id string) (model.HumanApprovalEvent, bool) {
+	if err := s.RefreshShared(); err != nil {
+		return model.HumanApprovalEvent{}, false
+	}
+	if s == nil || validKey(tenantID, id) != nil {
+		return model.HumanApprovalEvent{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	event, ok := s.events[approvalKey(tenantID, id)]
 	return event, ok
 }
 
@@ -128,7 +176,7 @@ func (s *Store) Count() int {
 	return len(s.events)
 }
 
-// Capacity returns the configured FIFO capacity bound (<=0 means unbounded).
+// Capacity returns the configured admission capacity bound (<=0 means unbounded).
 func (s *Store) Capacity() int { return s.capacity }
 
 // Snapshot returns a copy of every event. Admin list views (in cmd/edge) filter/sort/convert over this
@@ -143,25 +191,69 @@ func (s *Store) Snapshot() []model.HumanApprovalEvent {
 	return out
 }
 
-// Revoke marks an event as revoked (idempotent) and returns it; ok is false if the id is absent. A non-nil
-// error means the revoke IS live in memory but durability failed — the approval would RESURRECT on restart,
-// which is the most security-relevant persist failure this store has, so callers must surface it.
+// Revoke is a compatibility entry point and refuses ambiguous IDs in the latest authority.
 func (s *Store) Revoke(id, reason string) (model.HumanApprovalEvent, bool, error) {
+	return s.revokeContext(context.Background(), "", id, reason)
+}
+func (s *Store) RevokeForTenant(tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
+	return s.RevokeForTenantContext(context.Background(), tenant, id, reason)
+}
+func (s *Store) RevokeForTenantContext(ctx context.Context, tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
+	if err := validKey(tenant, id); err != nil {
+		return model.HumanApprovalEvent{}, false, err
+	}
+	return s.revokeContext(ctx, tenant, id, reason)
+}
+func (s *Store) revokeContext(ctx context.Context, tenant, id, reason string) (model.HumanApprovalEvent, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	event, ok := s.events[id]
-	if !ok {
-		return model.HumanApprovalEvent{}, false, nil
-	}
-	if event.ApprovalResult != "revoked" {
-		event.ApprovalResult = "revoked"
-		event.Reason = stringPtr(reason)
-		s.events[id] = event
-		if err := s.persistLocked(); err != nil {
-			return event, true, fmt.Errorf("approval %s revoked in memory but not persisted (would resurrect on restart): %w", id, err)
+	var result model.HumanApprovalEvent
+	found := false
+	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
+		key := approvalKey(tenant, id)
+		if tenant == "" {
+			key = ""
+			for k, v := range next {
+				if v.ID == id {
+					if key != "" {
+						return fmt.Errorf("authorization ID is ambiguous")
+					}
+					key = k
+				}
+			}
+		}
+		var ok bool
+		result, ok = next[key]
+		if !ok {
+			return errNoChange
+		}
+		found = true
+		if result.ApprovalResult != "revoked" {
+			result.ApprovalResult = "revoked"
+			result.Reason = stringPtr(reason)
+		}
+		next[key] = result
+		return nil
+	})
+	// A database refusal can happen before the edit callback (for example,
+	// acquiring the write transaction). Preserve the existing local denial
+	// contract for a known tenant-bound record, without claiming it was saved.
+	if errors.Is(err, ErrPersistence) && !found && tenant != "" {
+		result, found = s.events[approvalKey(tenant, id)]
+		if found {
+			result.ApprovalResult = "revoked"
+			result.Reason = stringPtr(reason)
 		}
 	}
-	return event, true, nil
+	if err != nil && found {
+		if s.pendingRevocations == nil {
+			s.pendingRevocations = map[string]*string{}
+		}
+		key := approvalKey(result.TenantID, result.ID)
+		s.pendingRevocations[key] = result.Reason
+		s.events[key] = result
+	}
+	return result, found, err
 }
 
 func validateTransition(existing, next model.HumanApprovalEvent) error {
@@ -208,23 +300,6 @@ func IsActive(event model.HumanApprovalEvent, now time.Time) bool {
 	return true
 }
 
-// evictFIFO drops oldest keys until liveLen <= capacity (replicated package-local FIFO bound).
-func evictFIFO(order []string, liveLen, capacity int, del func(key string)) []string {
-	if capacity <= 0 {
-		return order
-	}
-	for liveLen > capacity && len(order) > 0 {
-		oldest := order[0]
-		order = order[1:]
-		del(oldest)
-		liveLen--
-	}
-	if len(order) > 2*capacity {
-		order = append([]string(nil), order...)
-	}
-	return order
-}
-
 func stringPtr(value string) *string {
 	if value == "" {
 		return nil
@@ -247,7 +322,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	defer s.mu.RUnlock()
 	n := 0
 	for _, v := range s.events {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
+		if v.TenantID == tenantID {
 			n++
 		}
 	}
@@ -260,25 +335,39 @@ func (s *Store) CountForTenant(tenantID string) int {
 // with a disposable organization: the erasure answered complete=true with remaining.total=0 while a record of
 // that organization's was still present. The store was in neither the count nor the erasure, and a store nobody
 // counts contributes nothing to "what is left".
-func (s *Store) RemoveTenant(tenantID string) int {
-	if s == nil {
-		return 0
+func (s *Store) RemoveTenant(tenantID string) int { n, _ := s.RemoveTenantChecked(tenantID); return n }
+
+// RemoveTenantChecked confirms persistence before discarding retry targets.
+func (s *Store) RemoveTenantChecked(tenant string) (int, error) {
+	return s.RemoveTenantContext(context.Background(), tenant)
+}
+func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
+	if s == nil || strings.TrimSpace(tenant) == "" {
+		return 0, nil
 	}
-	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
-	}
+	tenant = strings.TrimSpace(tenant)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
-	for id, v := range s.events {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
-			delete(s.events, id)
-			n++
+	err := s.editLocked(ctx, func(next map[string]model.HumanApprovalEvent) error {
+		for key, v := range next {
+			if v.TenantID == tenant {
+				delete(next, key)
+				n++
+			}
+		}
+		if n == 0 {
+			return errNoChange
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	for key := range s.pendingRevocations {
+		if strings.HasPrefix(key, tenant+"\x00") {
+			delete(s.pendingRevocations, key)
 		}
 	}
-	if n > 0 {
-		s.persistLocked()
-	}
-	return n
+	return n, nil
 }

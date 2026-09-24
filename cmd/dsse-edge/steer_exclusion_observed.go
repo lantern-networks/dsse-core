@@ -319,7 +319,14 @@ func (s *observedExclusionStore) List(tenantID string) []observedExclusionEntry 
 		}
 		out = append(out, v)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ReportedAt.After(out[j].ReportedAt) })
+	// Offset pagination needs a stable order when devices report at the same
+	// instant. Match the PostgreSQL store's timestamp/identity ordering.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ReportedAt.Equal(out[j].ReportedAt) {
+			return out[i].DeviceIdentity < out[j].DeviceIdentity
+		}
+		return out[i].ReportedAt.After(out[j].ReportedAt)
+	})
 	return out
 }
 

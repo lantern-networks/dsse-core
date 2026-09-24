@@ -164,6 +164,10 @@ components:
           items:
             type: object
             additionalProperties: true
+    ExportFormat:
+      type: string
+      enum: [ndjson]
+      default: ndjson
     ExportJob:
       type: object
       required:
@@ -198,10 +202,7 @@ components:
             - tool_call_events
             - inspection_events
         format:
-          type: string
-          enum:
-            - ndjson
-            - csv
+          $ref: "#/components/schemas/ExportFormat"
         filters:
           type: object
           additionalProperties:
@@ -2509,6 +2510,25 @@ components:
             - require_reauthentication
             - require_workload_attestation
       additionalProperties: false
+    PolicyMutationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          enum: [partial]
+        applied:
+          type: boolean
+          description: The policy store accepted the operation; this is not a guarantee of durable storage or fleet delivery.
+        policy_id:
+          type: string
+        tenant_id:
+          type: string
+        ne_snapshot_status:
+          type: string
+          enum: [unconfirmed]
     Policy:
       type: object
       required:
@@ -2653,6 +2673,8 @@ components:
         source:
           type: string
           enum:
+            - policy_learning
+            - unmatched_flow
             - operator
             - import
             - cert_pinning_detection
@@ -2669,6 +2691,10 @@ components:
         host:
           type: string
           description: Connector UX Slice 4 / cert-pinning. Non-secret destination (FQDN, CIDR, or host) the candidate proposes. For connector_discovered candidates this is the declared reachable-route destination to publish as a Private App.
+        registration_host:
+          type: string
+          readOnly: true
+          description: Derived only in list responses for cert-pin candidates with an exact DNS target. Uses a named Host or an exact SNI when Host is an IP or absent. Omitted for IP-only or malformed targets. Not stored in candidate snapshots; not an enforcement receipt.
         publish_protocol:
           type: string
           enum:
@@ -2709,6 +2735,8 @@ components:
           enum:
             - pending
             - approved
+            - materialized
+            - suppressed
             - rejected
             - dismissed
         review_reason_code:
@@ -2727,10 +2755,14 @@ components:
     PolicyCandidateList:
       type: object
       required:
+        - tenant_id
         - candidates
         - count
         - limit
       properties:
+        tenant_id:
+          type: string
+          description: Authenticated effective organization for this list, including an empty result.
         candidates:
           type: array
           items:
@@ -3291,6 +3323,25 @@ components:
         limit:
           type: integer
           minimum: 1
+    HumanApprovalMutationError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        status:
+          type: string
+          enum: [partial]
+        applied:
+          type: boolean
+          description: Revocation is effective on this server; persistence is unconfirmed.
+        approval_id:
+          type: string
+        tenant_id:
+          type: string
+        persistence:
+          type: string
+          enum: [unconfirmed]
     HumanApprovalEventRevokeRequest:
       type: object
       properties:
@@ -5245,17 +5296,34 @@ paths:
           description: Invalid rules (unknown on_match, identifier, or instance_scope, or no identifiers).
   /admin/dlp-findings:
     get:
-      summary: List what DLP has detected (the findings/visibility view).
-      description: Requires admin.dlp.read. Returns the tenant's DLP detections (dlp_match inspection events) — NON-SECRET (identifier types + counts, action, destination host, instance class, severity, user/device, access-decision id for drill-down, timestamp; never the raw matched value), newest first, with an aggregated summary (by_identifier, by_action, by_destination, blocked, scan_skipped). By default the binary/non-text dlp_scan_skipped events are EXCLUDED (operational noise); pass ?include_skipped=true to include them. Optional filters ?identifier= ?action= ?severity= ?since=<RFC3339> ?limit= (default 200). Drives the Console DLP findings view. See docs/dlp_vision_and_roadmap.md.
+      summary: List tenant-scoped DLP detection events.
+      description: >-
+        Requires admin.dlp.read. Returns schema_version admin_dlp_findings.v1, tenant_id,
+        no_secret_attestation, findings and summary. Only dlp_match inspection events are
+        included; include_skipped is accepted for compatibility but has no effect.
+        Rows contain identifier types and counts, action, destination, instance class,
+        user/device context, access-decision ID and timestamp, without matched values.
+        summary.total counts events before the response limit; returned counts rows in
+        this response. Each by_identifier count is events containing that type, so adding
+        these counts can count a multi-type event more than once. blocked counts block events.
+        Optional filters are identifier, action, severity, since (RFC3339) and limit
+        (default 200, accepted range 1-2000). The configured aggregate store is searched
+        over the last 30 days, up to its latest 20000 inspection rows before these filters;
+        these are bounded results, not complete retained-history totals. A configured-store
+        failure returns 503 rather than silently using a local cache. With no aggregate
+        store configured, the local inspection store is used. Findings are not a scan or
+        delivery ledger. See docs/dlp.md.
       tags:
         - AdminDLPPolicy
       responses:
         "200":
-          description: DLP findings (non-secret) + aggregated summary.
+          description: DLP findings and event-level summary for the authenticated tenant.
+        "503":
+          description: Configured findings store could not be read. Retry; no empty or partial local success is returned.
   /admin/dlp-classifiers:
     get:
       summary: Read the tenant's operator-defined custom DLP classifiers (slice C).
-      description: Requires admin.dlp.read. Returns the tenant's custom identifiers — each a name plus either a regex pattern or a keyword dictionary — that the DLP scan detects alongside the built-in identifiers. NON-SECRET (a classifier only ever reports its name + a count, never matched bytes). See docs/dlp_vision_and_roadmap.md slice C.
+      description: Returns tenant_id alongside the list. Requires admin.dlp.read. Returns the tenant's custom identifiers — each a name plus either a regex pattern or a keyword dictionary — that the DLP scan detects alongside the built-in identifiers. NON-SECRET (a classifier only ever reports its name + a count, never matched bytes). See docs/dlp_vision_and_roadmap.md slice C.
       tags:
         - AdminDLPPolicy
       responses:
@@ -5263,7 +5331,7 @@ paths:
           description: Current custom classifiers for the tenant.
     post:
       summary: Hot-apply the tenant's operator-defined custom DLP classifiers (slice C).
-      description: Requires admin.dlp.write. Atomically replaces the tenant's whole custom-classifier set (empty = clear), recompiling it into the live scan set (no restart). Rejects a reserved/malformed name, an over-cap or un-compilable regex (RE2, no backreferences), a regex that matches the empty string, and an empty/over-cap keyword dictionary. Caps — 64 classifiers, 512-char pattern, 256 keywords. The tenant is taken from the admin identity, not the body.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Replaces the tenant's whole custom-classifier set ([] = clear) after validation and acceptance by configured storage, then recompiles it into the live scan set (no restart). Missing or null classifiers is rejected. Without configured storage, changes remain in memory only. Concurrent writes have no revision conflict detection. A save error may follow an on-disk write and does not prove disk rollback. Rejects a reserved/malformed name, an over-cap or un-compilable regex (RE2, no backreferences), a regex that matches the empty string, and an empty/over-cap keyword dictionary. Caps — 64 classifiers, 512-char pattern, 256 keywords. The tenant is taken from the admin identity, not the body.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5272,7 +5340,11 @@ paths:
           application/json:
             schema:
               type: object
+              required: [classifiers]
               properties:
+                expected_tenant_id:
+                  type: string
+                  description: Optional precondition. If nonempty, it must equal the authenticated tenant; it never selects a different tenant.
                 classifiers:
                   type: array
                   items:
@@ -5298,14 +5370,18 @@ paths:
                         type: boolean
                         description: Regex kind only — match case-insensitively.
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No mutation applied here.
         "200":
-          description: Classifiers applied; returns the new live set.
+          description: Classifiers saved to configured storage and applied locally (in-memory only when no store is configured); returns the current live set.
         "400":
           description: Invalid classifiers (bad name, un-compilable/too-broad regex, empty/over-cap dictionary, or over the 64-classifier cap).
+        "500":
+          description: Saving could not be confirmed. Live definitions are unchanged; the on-disk result may be uncertain. Check storage before retrying.
   /admin/dlp-allowlist:
     get:
       summary: Read the tenant's DLP allowlist (known-safe values, slice F).
-      description: Requires admin.dlp.read. Returns the operator-declared known-safe values whose DLP matches are suppressed (test cards, sample My Numbers, benign emails). These are values the operator asserts are non-sensitive; the data plane keeps only salted hashes.
+      description: Returns tenant_id alongside the list. Requires admin.dlp.read. Returns the operator-declared known-safe values whose DLP matches are suppressed (test cards, sample My Numbers, benign emails). These are values the operator asserts are non-sensitive. The compiled scanner holds hashes; administration stores and signed configuration bundles retain authored values.
       tags:
         - AdminDLPPolicy
       responses:
@@ -5313,7 +5389,7 @@ paths:
           description: Current allowlist values for the tenant.
     post:
       summary: Hot-apply the tenant's DLP allowlist (false-positive tuning, slice F).
-      description: Requires admin.dlp.write. Atomically replaces the tenant's whole allowlist (empty = clear), recompiling it into the live salted-hash suppression set (no restart). A matched value equal (after normalization — digits-only for cards/numbers, lowercased email) to an allowlisted value raises no finding and never trips a block. Do NOT enter real secrets. Max 1000 values. The tenant is taken from the admin identity.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Replaces the tenant's whole list after configured storage confirms the save; without a store it is memory-only. An explicit empty array clears the list. Numeric identifiers normalize digits with spaces, hyphens, parentheses or periods; email ignores case; other detector types use exact trimmed literals. Digits embedded in arbitrary text do not authorize a numeric match. Exact duplicates are removed. There is no revision-based conflict detection. Known-safe authored values are distributed in signed configuration bundles; update publisher and receivers together. Do NOT enter real secrets. Max 1000 values. The tenant is taken from the admin identity.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5322,21 +5398,30 @@ paths:
           application/json:
             schema:
               type: object
+              required: [values]
               properties:
+                expected_tenant_id:
+                  type: string
+                  description: Optional precondition. If nonempty, it must equal the authenticated tenant; it never selects a different tenant.
                 values:
                   type: array
+                  maxItems: 1000
                   items:
                     type: string
                   description: Known-safe values to suppress (e.g. a test card, a sample My Number).
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No mutation applied here.
         "200":
           description: Allowlist applied; returns the new live values.
         "400":
-          description: Invalid request (over the 1000-value cap).
+          description: Invalid request (missing/null values, blank entry or over the 1000-value cap).
+        "500":
+          description: Saving could not be confirmed. Live exceptions are unchanged; disk may already have changed. Check storage before retrying.
   /admin/dlp-fingerprints:
     get:
       summary: List the tenant's Exact-Data-Match datasets (slice E).
-      description: Requires admin.dlp.read. Returns each fingerprinted dataset as name + value count — NON-SECRET (the values themselves are never persisted or returned; only salted hashes are stored).
+      description: Returns tenant_id alongside the list. Requires admin.dlp.read. Returns each fingerprinted dataset as name + value count — NON-SECRET (the values themselves are never persisted or returned; only salted hashes are stored).
       tags:
         - AdminDLPPolicy
       responses:
@@ -5344,7 +5429,7 @@ paths:
           description: Datasets (name + count) for the tenant.
     post:
       summary: Fingerprint a sensitive dataset for Exact-Data-Match (slice E).
-      description: Requires admin.dlp.write. Creates or replaces a named dataset by fingerprinting the supplied exact values into salted hashes; the scan then raises a finding under that name whenever one of the values appears in egress. The raw values are transit-only — only hashes are stored, so the dataset cannot be recovered from config. Name must be lowercase snake_case (2–40 chars), not a reserved identifier. Max 100000 values. Tenant from the admin identity.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Creates or replaces a named dataset by fingerprinting the supplied exact values into salted hashes; the scan then raises a finding under that name whenever one of the values appears in egress. Only hashes are stored; protect hashes and salts against guessing of source values. Values must be single ASCII tokens (letters, digits, - _ . @ +) up to 128 bytes. Matching lowercases letters and removes - and _. Normalized duplicates count once and values shorter than five normalized characters are ignored. Unsupported or zero-usable-value replacements are rejected without deleting the old dataset. Configured storage must accept the update before the local scanner changes; without storage this is in-memory only. A storage error may follow a disk write and does not prove rollback. Name must be lowercase snake_case (2–40 chars), not a reserved identifier. Max 100000 values. Tenant from the admin identity.
       tags:
         - AdminDLPPolicy
       requestBody:
@@ -5353,7 +5438,11 @@ paths:
           application/json:
             schema:
               type: object
+              required: [name, values]
               properties:
+                expected_tenant_id:
+                  type: string
+                  description: Optional precondition. If nonempty, it must equal the authenticated tenant; it never selects a different tenant.
                 name:
                   type: string
                   description: The identifier name the dataset detections are reported under.
@@ -5361,22 +5450,43 @@ paths:
                   type: array
                   items:
                     type: string
-                  description: The exact sensitive values to fingerprint (hashed, never stored raw).
+                  minItems: 1
+                  maxItems: 100000
+                  description: Single-token values to fingerprint; at least one must remain after normalization and short-value filtering. Hashed, never stored raw.
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No mutation applied here.
         "200":
-          description: Dataset fingerprinted; returns the dataset (name + count) and the tenant's datasets.
+          description: Dataset accepted by configured storage and applied locally; returns the dataset (name + count) and the tenant's datasets.
         "400":
-          description: Invalid request (bad name or over the value cap).
+          description: Invalid name, missing/empty values, unsupported tokens, no usable values, or over the value cap. No replacement is applied.
+        "500":
+          description: Saving could not be confirmed. Previous live dataset retained; the disk result may be uncertain.
     delete:
       summary: Remove an Exact-Data-Match dataset (slice E).
-      description: Requires admin.dlp.write. Deletes the named dataset (?name=). Tenant from the admin identity.
+      description: Successful responses include tenant_id. Requires admin.dlp.write. Deletes the named dataset (?name=) after acceptance by configured storage. An absent dataset is a no-op, with any pending staged changes saved first. Without storage this is in-memory only. Tenant from the admin identity.
       tags:
         - AdminDLPPolicy
+      parameters:
+        - name: name
+          in: query
+          required: true
+          schema: { type: string }
+          description: Dataset identifier to remove.
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Optional nonempty tenant precondition, compared with the authenticated context before deletion.
       responses:
+        "409":
+          description: Expected tenant differs from the authenticated context, or this node requires the control plane. No deletion applied here.
         "200":
           description: Removed (or not present); returns the tenant's remaining datasets.
         "400":
           description: Missing name.
+        "500":
+          description: Deletion save could not be confirmed. Previous live dataset retained; the disk result may be uncertain.
   /admin/dlp-policies:
     get:
       summary: List the reusable named DLP Policy objects (S5).
@@ -5859,7 +5969,9 @@ paths:
         - AdminEastWest
       responses:
         '200':
-          description: Adoption result (created rule ids, skipped_covered, skipped_missing).
+          description: Adoption result (created rule ids, adopted observation/rule/destination mappings, skipped_covered, skipped_missing).
+        '500':
+          description: Adoption stopped before completion. The response retains confirmed created/adopted entries and skip lists, identifies failed_stage (asset_endpoint or rule), failed_observation_id, and unprocessed IDs. A rule failure also identifies its confirmed destination_endpoint_id. partial does not imply rollback or that an unconfirmed save had no effect; inspect current rules and destinations before retrying.
   /admin/east-west/grants:
     get:
       summary: List active ephemeral east-west grants for the tenant.
@@ -6124,7 +6236,10 @@ paths:
         and a connector has no identity until the program it does not have has enrolled it — so it is carried
         by the same person, in the same visit to the same screen. The organization's own published program is
         served if it has one, otherwise the program this deployment itself runs. The response carries
-        X-Artifact-Sha256 so whoever carries the bytes can check what arrived.
+        X-Artifact-Sha256 so whoever carries the bytes can check what arrived. X-Dsse-Connector-Program-Tenant
+        identifies the authenticated request tenant; X-Dsse-Connector-Program-Source identifies the resolved
+        publication source (tenant or deployment). The Console checks both against its verified catalogue,
+        even when two publications contain identical bytes. Responses use Cache-Control: no-store.
       tags:
         - AdminConnectors
       parameters:
@@ -6139,6 +6254,18 @@ paths:
       responses:
         "200":
           description: The program bytes.
+          headers:
+            X-Dsse-Connector-Program-Tenant:
+              description: The authenticated request tenant, including when serving a shared program.
+              schema: { type: string }
+            X-Dsse-Connector-Program-Source:
+              description: Resolved publication source; not taken from uploaded metadata.
+              schema: { type: string, enum: [tenant, deployment] }
+            X-Artifact-Sha256:
+              description: SHA-256 declared by the resolved publication metadata.
+              schema: { type: string }
+        "403":
+          description: This request names no organization.
         "404":
           description: This deployment holds no connector program for that platform and architecture.
     put:
@@ -6182,19 +6309,29 @@ paths:
       description: >-
         Requires admin.connectors.read. Returns the deployment's own program together with anything published
         for this organization, and a note saying what an empty list means for somebody about to walk to a
-        machine — a screen showing "0" cannot be acted on by the person reading it.
+        machine. The response tenant_id identifies the request tenant; each program's source is tenant for
+        an organization override or deployment for a shared program. Source is derived from the store
+        location, not uploaded metadata. A verified empty catalogue is programs: [] and count: 0. Unconfigured or unreadable
+        storage, invalid target metadata and missing or size-inconsistent program bytes return 503,
+        without a partial list or a fallback hiding a broken organization override. Missing scope
+        directories remain valid on first use. This read does not hash every artifact or provide
+        a transactional snapshot across concurrent publication.
       tags:
         - AdminConnectors
       responses:
         "200":
-          description: The programs, with their digests and sizes.
+          description: The complete effective catalogue, with digests, sizes, count and Cache-Control no-store.
+        "503":
+          description: The catalogue could not be verified. No storage paths are exposed; retry after investigation.
   /admin/agent-update-artifact:
     get:
-      summary: The bytes of the currently published release, for an Edge that does not hold them.
+      summary: Download the active release package in the verified tenant or publication view.
       description: >-
-        Requires admin.agents.read. Admin-only, unlike the device-facing artifact route: this is how an
-        enforcing Edge asks the control plane for a release it publishes but has not got, and there is no reason
-        to widen it. The response carries X-Dsse-Agent-Update-Version.
+        Requires admin.agents.read. The default tenant-effective lookup is unchanged for
+        bundles and Edge replication. The Console explicitly requests the publication
+        view and pins its displayed active manifest; pending manifests are not served.
+        Authentication and permissions run before these optional consistency checks.
+        Normal reads do not create operation audit records. Range requests remain supported.
       tags:
         - AdminAgentRollout
       parameters:
@@ -6206,21 +6343,81 @@ paths:
           name: arch
           required: true
           schema: { type: string }
+        - in: query
+          name: artifact_scope
+          required: false
+          schema: { type: string, enum: [tenant, publication], default: tenant }
+          description: >-
+            Omitted or tenant uses the authenticated/selected tenant's effective package.
+            Publication uses deployment scope for an operator outside an organization,
+            otherwise the verified selected/authenticated tenant. This parameter does
+            not select an arbitrary tenant or grant access. Empty, unknown or repeated
+            values are refused with 400.
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the resolved view scope. A mismatched or repeated value returns 409.
+            An explicitly empty value matches only the empty legacy scope.
+        - in: query
+          name: expected_manifest_sha256
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the active envelope's payload hash, compared case-insensitively.
+            Empty, mismatched or repeated values return 409 before opening the artifact.
       responses:
         "200":
           description: The artifact bytes.
+          headers:
+            X-Dsse-Agent-Update-Version:
+              schema: { type: string }
+              description: The active manifest version.
+            X-Dsse-Agent-Update-Scope:
+              schema: { type: string }
+              description: The resolved view scope, including when using a fallback artifact.
+            X-Dsse-Agent-Update-Manifest-SHA256:
+              schema: { type: string }
+              description: The active envelope payload hash.
+            Cache-Control:
+              schema: { type: string, enum: [no-store] }
+        "206":
+          description: Requested byte range; the same release metadata headers are included.
+        "400":
+          description: Invalid or repeated artifact_scope.
         "404":
           description: Nothing published for that target, or the control plane does not hold its artifact.
+        "409":
+          description: The scope or active manifest no longer matches the supplied pin.
     put:
       summary: Upload the bytes a published manifest authorises.
       description: >-
-        Requires admin.agents.write. The manifest must be published FIRST — bytes with nothing to check them
+        Requires admin.platform.write. The manifest must be published FIRST — bytes with nothing to check them
         against would make this a place to stage anything — and the body is verified against that manifest's
         size and digest before it is stored. Refused on an enforcing edge, which pulls artifacts rather than
         holding authority for them.
       tags:
         - AdminAgentRollout
       parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the verified publication scope (deployment for an operator outside
+            an organization, otherwise the selected/authenticated tenant). A
+            present mismatched, empty-for-nonempty, or repeated value is refused
+            with 409 before signing, publication or artifact writes. This does
+            not select a tenant or grant permission. Older clients may omit it.
+        - in: query
+          name: expected_manifest_sha256
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the acknowledged manifest payload hash. A present mismatched,
+            empty or repeated value is refused with 409 before reading/storing
+            package bytes. Existing requests may omit this parameter.
         - in: query
           name: platform
           required: true
@@ -6236,11 +6433,17 @@ paths:
             schema: { type: string, format: binary }
       responses:
         "200":
-          description: Stored; edges fetch it when they find they do not hold it.
+          description: >-
+            Stored acknowledgement includes schema_version=admin_agent_updates.v1,
+            tenant_id, manifest_sha256 and stored platform/arch/version/bytes/artifact_sha256.
+            activated states whether this call promoted the manifest; active states
+            whether that same manifest is currently offered by the catalogue. They
+            are distinct: retrying an already-active upload may have activated=false
+            and active=true. This is not confirmation of endpoint installation.
         "400":
           description: These bytes are not the ones the published manifest authorises.
         "409":
-          description: This process is an enforcing edge; upload on the control plane.
+          description: Enforcing edge, changed publication scope, or a stale/ambiguous manifest pin.
         "412":
           description: Nothing published for that target yet, or no artifact directory here.
   /admin/agent/device-updates:
@@ -6260,28 +6463,49 @@ paths:
     get:
       summary: The signed release manifests this control plane publishes to the fleet.
       description: >-
-        Requires admin.agents.read. Returns the CALLER'S TENANT's signed manifest envelopes, keyed platform/arch,
-        alongside the tenant_id they are for. `envelopes` holds only releases whose ARTIFACT is present — it is
-        what an edge adopts. `pending` holds releases that are published and verified but still waiting for their
-        bytes; nothing offers them to a device until the artifact upload activates them. Enforcing edges PULL this and verify each envelope against their own
-        pinned update key — and check the tenant — before relaying it: an edge that trusted the channel would let a
-        compromised control plane choose what its fleet runs, and one that ignored the tenant could hand another
-        tenant's build to its own devices.
+        Requires admin.agents.read. Returns schema_version=admin_agent_updates.v1, tenant_id and the
+        envelopes and pending maps, keyed platform/arch. Both maps are present, including when empty.
+        An operator outside a selected tenant reads the deployment scope; a selected tenant or a customer
+        identity reads its authenticated operating tenant. envelopes contains releases whose artifact is
+        present; pending contains verified manifests waiting for bytes, which are not yet offered to devices.
+        Enforcing edges verify each envelope and its scope against their pinned update key before relaying it.
+        The optional expected_tenant_id checks the verified publication scope before reading either map;
+        it does not select a tenant or grant access. Legacy clients may omit it.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Reject a present value that differs from the verified publication scope. An empty value pins legacy empty scope.
       responses:
         "200":
-          description: The published set.
+          description: The active and pending published sets for the verified scope.
+        "409":
+          description: The publication scope changed. Reload before continuing.
     put:
       summary: Publish a signed release manifest to the fleet.
       description: >-
-        Requires admin.agents.write. The body is a manifest envelope signed ELSEWHERE — this control plane never
+        Requires admin.platform.write. The body is a manifest envelope signed ELSEWHERE — this control plane never
         signs, it verifies against -agent-update-pin and stores. Refused on an enforcing edge, which pulls its
         published set and would overwrite a local write on the next poll. Persisted before it is acknowledged;
         a wrongly-signed or expired manifest fails here, on the machine where the release was made, rather than
         on every endpoint that stages it and then refuses. Publishing needs no edge restart.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the verified publication scope (deployment for an operator outside
+            an organization, otherwise the selected/authenticated tenant). A
+            present mismatched, empty-for-nonempty, or repeated value is refused
+            with 409 before signing, publication or artifact writes. This does
+            not select a tenant or grant permission. Older clients may omit it.
       requestBody:
         required: true
         content:
@@ -6291,17 +6515,21 @@ paths:
               description: A dsse_agent_update_manifest.v1 signed envelope.
       responses:
         "200":
-          description: Published; edges adopt it on their next poll.
+          description: >-
+            Acknowledgement includes schema_version=admin_agent_updates.v1, tenant_id,
+            manifest_sha256, published platform/arch/version/artifact_sha256/artifact_size
+            and state (pending or active). A pending manifest is not yet offered to
+            devices. Upload its package using the same scope and manifest hash.
         "400":
           description: The manifest will not verify, or is expired.
         "409":
-          description: This process is an enforcing edge; publish on the control plane.
+          description: An enforcing edge, or changed/ambiguous publication scope.
         "412":
           description: No update-signing key is pinned here, so nothing can be checked.
     post:
       summary: Sign and publish a release — the key stays in the token.
       description: >-
-        Requires admin.agents.write. The body is the manifest FIELDS, not an envelope: this control plane signs
+        Requires admin.platform.write. The body is the manifest FIELDS, not an envelope: this control plane signs
         them with the update-signing key held in a PKCS#11 token (-agent-update-hsm-agent-socket) and then takes
         the identical path as PUT — verify against the pinned key, record the audit attempt before the store is
         touched, activate or hold for the artifact. It exists so that publishing does not require the most
@@ -6315,6 +6543,17 @@ paths:
         the SAME version is allowed, because manifests expire and rolling a device back needs no manifest at all.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema: { type: string }
+          description: >-
+            Pin the verified publication scope (deployment for an operator outside
+            an organization, otherwise the selected/authenticated tenant). A
+            present mismatched, empty-for-nonempty, or repeated value is refused
+            with 409 before signing, publication or artifact writes. This does
+            not select a tenant or grant permission. Older clients may omit it.
       requestBody:
         required: true
         content:
@@ -6324,41 +6563,91 @@ paths:
               description: The agentupdate.Manifest fields (version, platform, arch, delivery, artifact digest/size, validity).
       responses:
         "200":
-          description: Signed and published; edges adopt it on their next poll.
+          description: >-
+            Acknowledgement includes schema_version=admin_agent_updates.v1, tenant_id,
+            manifest_sha256, published platform/arch/version/artifact_sha256/artifact_size
+            and state (pending or active). A pending manifest is not yet offered to
+            devices. Upload its package using the same scope and manifest hash.
         "400":
           description: The fields are not a valid manifest, or carry an unknown field.
         "409":
-          description: An enforcing edge, or a version older than the signing floor for that target.
+          description: An enforcing edge, changed/ambiguous publication scope, or a version older than the signing floor.
         "412":
           description: This control plane holds no update-signing key, or pins none.
   /admin/agent-update-sign-floor:
     get:
-      summary: The versions this control plane will not sign below, per target.
+      summary: The minimum versions this control plane can sign, per target.
       description: >-
-        Requires admin.agents.read. Returns the highest version signed for each tenant/platform/arch and the
-        public key this control plane signs with, so a refusal is something an operator can anticipate rather
-        than work around by inventing a version number. The floor is raised by every successful publication
-        through either door and is never lowered — withdrawing a release is exactly what an attacker who wanted
-        to re-sign an old version would do first.
+        Requires admin.agents.read. Returns schema_version=admin_agent_update_sign_floor.v1, tenant_id,
+        floors keyed platform/arch and signing_public_key. Uses the same verified publication scope as
+        GET /admin/agent-updates: deployment for an operator outside a selected tenant, otherwise the
+        authenticated operating tenant. An empty floors object is valid. signing_public_key is the signer's
+        public key in hexadecimal or the explicit string "no" when no signer is available.
+        The floor is raised by successful publication and never lowered. It restricts signing, not rollback
+        using an already available release. A missing or failed response is unknown, not proof of no signer.
+        The optional expected_tenant_id checks the scope before reading floors; it does not select a tenant
+        or grant access. Legacy clients may omit it.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Reject a present value that differs from the verified publication scope. An empty value pins legacy empty scope.
       responses:
         "200":
-          description: The per-target signing floor.
+          description: The per-target signing floors and signer availability for the verified scope.
+        "409":
+          description: The publication scope changed. Reload before continuing.
   /admin/agent-rollout:
     get:
       summary: Read the tenant's agent rollout/rollback plan + fleet adoption ().
-      description: Requires admin.agents.read. Returns the admin-managed rollout plan (desired version, release channel, intent, freeze) the runtime per-device rollout endpoint consults, plus the fleet update-adoption summary (which versions devices have moved to).
+      description: >-
+        Requires admin.agents.read. Returns schema_version=admin_agent_rollout.v1, the authenticated tenant_id,
+        and the admin-managed plan plus fleet adoption summary. An unset plan still includes explicit scalar
+        defaults, including frozen=false. Missing or malformed data must not be treated as unset settings.
+        The optional expected_tenant_id checks the authenticated operating context before reading the plan;
+        it does not select a tenant or grant access. Legacy clients may omit it.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Reject a present value that differs from the authenticated tenant. An empty value pins the legacy empty scope.
       responses:
         "200":
           description: Current rollout plan + fleet adoption summary.
+        "409":
+          description: The operating tenant changed. Reload before continuing.
     put:
       summary: Drive an agent rollout, rollback, or incident freeze ().
-      description: Requires admin.agents.write. Hot-applies a desired rollout state (no restart). intent=rollout|rollback requires desired_version (the version the fleet should converge to — a rollback simply targets a known-good version); intent=freeze halts all movement so a bad rollout can be stopped instantly. Audited.
+      description: >-
+        Requires admin.agents.write. Changes the selected version, incident hold or schedule without a restart.
+        rollout and rollback require desired_version and preserve the current hold and its reason. follow clears
+        the selected version/channel and preserves the hold. Only freeze with frozen=false and a reason releases
+        a hold. A freeze request without a version/channel keeps the prior selection. schedule changes only the
+        supplied window/waves. Edges and devices adopt the result on later polls. A named version must still be
+        available in the deployment; this endpoint does not restore an old installer or prove endpoint installation.
+        Attempt and outcome audits identify the actor and tenant and mirror to the configured audit outbox after
+        primary recording. Plan persistence and audit recording are separate writes. The response contains
+        schema_version=admin_agent_rollout.v1, tenant_id and the complete merged plan. A lost response does not
+        prove that saving failed; retries can create additional audit records. The optional expected_tenant_id
+        must match the authenticated tenant, including a present empty value for legacy deployment scope.
+        A mismatch is refused before validation, domain audit or mutation; omission retains legacy behavior.
       tags:
         - AdminAgentRollout
+      parameters:
+        - in: query
+          name: expected_tenant_id
+          required: false
+          schema:
+            type: string
+          description: Bind the write to the tenant verified when the settings were loaded. Does not grant access.
       requestBody:
         required: true
         content:
@@ -6370,18 +6659,32 @@ paths:
               properties:
                 intent:
                   type: string
-                  enum: [rollout, rollback, freeze]
+                  enum: [rollout, rollback, freeze, schedule, follow]
                 desired_version:
                   type: string
                 release_channel:
                   type: string
                 reason:
                   type: string
+                  description: Required for either direction of a freeze decision.
+                frozen:
+                  type: boolean
+                  description: Used with intent=freeze. Defaults to true; false releases the hold.
+                window:
+                  type: object
+                  description: Maintenance window; omitted leaves the previous value unchanged.
+                  additionalProperties: true
+                waves:
+                  type: object
+                  description: Complete wave schedule when supplied, including any priorities and default_delay_days. Omitted preserves the previous schedule.
+                  additionalProperties: true
       responses:
         "200":
-          description: Rollout plan applied.
+          description: Complete merged rollout plan applied and returned with its schema and tenant.
         "400":
           description: Invalid plan (bad intent, or missing desired_version for rollout/rollback).
+        "409":
+          description: The operating tenant changed, or this Edge is not the rollout authority.
   /admin/agent-rollouts:
     get:
       summary: Read every organization's agent rollout plan.
@@ -6466,10 +6769,18 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
     post:
-      summary: Upsert a tenant-scoped Human Identity.
-      description: Requires admin.identity.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Upserted active identities are used by Usage Meter as the observe-only human_seat governance source. Admin audit metadata for this write records presence/counts only with human_identity_metadata_recorded_scope=none.
+      summary: Create or upsert a tenant-scoped Human Identity.
+      description: "With mode=create (used by Console manual Add), an existing ID in the authenticated tenant is rejected with 409, including deleted entries. The conflict check and save share the file-store instance lock or one PostgreSQL insert. Omit mode to retain synchronization/upsert behavior, which replaces the entry. Requires admin.identity.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Upserted active identities are used by Usage Meter as the observe-only human_seat governance source. Admin audit metadata for this write records presence/counts only with human_identity_metadata_recorded_scope=none."
       tags:
         - AdminIdentity
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [create]
+          description: Reject existing IDs instead of replacing them. Omit for upsert.
       requestBody:
         required: true
         content:
@@ -6489,6 +6800,21 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The ID already exists in this tenant; no identity or generation was changed. Applies to mode=create.
+        "503":
+          description: The configured backend cannot safely perform create-only writes. Nothing was saved.
+        "500":
+          description: Directory persistence failed or was not confirmed. The process does not publish the candidate or advance its configuration generation on this error. A database connection error may leave the database outcome unknown; read back before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /admin/human-identities/import-runs:
     get:
       summary: List Human Identity import run summaries.
@@ -6691,6 +7017,17 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: An identity save failed. Imports may have committed earlier items; inspect the directory before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /identity-sources/due:
     get:
       summary: List Human Identity sources due for connector import.
@@ -6747,6 +7084,17 @@ paths:
           description: Invalid import request.
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: An identity save failed. Imports may have committed earlier items; inspect the directory before retrying. Storage details are omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+
   /admin/non-human-identities:
     get:
       summary: List tenant-scoped Non-Human Identities.
@@ -6788,6 +7136,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: A rejected store save leaves live configuration and generation unchanged. If the store accepted the change but Network Extension snapshot publication failed, the response has status partial and applied true. Publication may have written some files; fleet delivery is not established.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
   /admin/non-human-identities/risk:
     get:
       summary: Report Non-Human Identity risk signals (/).
@@ -6807,10 +7165,11 @@ paths:
           $ref: "#/components/responses/Forbidden"
   /admin/ai-usage-report:
     get:
-      summary: Report known generative-AI service usage ().
+      summary: Report known generative-AI service usage.
       description: >-
         Requires admin.ai.read. Identifies known generative-AI service usage from access logs and classifies each
-        (approved|tolerated|prohibited) via the SaaS catalog / built-in defaults. Non-secret enums and counts only.
+        (approved|tolerated|prohibited) via the SaaS catalog / built-in defaults. Returns counts, byte volumes, and
+        recorded user/device/app/account attribution; it does not return credentials or request bodies.
         The response carries "window" (the range asked for) and "coverage" (the range actually covered): the read is
         row-capped and newest-first, so a tenant busy enough to hit the cap is reported over a shorter span than
         requested, with coverage.truncated true and coverage.from the real start of the data. coverage.retained_from
@@ -6819,10 +7178,18 @@ paths:
         as loss: a quiet period and rotated-away records are indistinguishable from the report's position.
         coverage.source names the path that answered: "rows" loaded the window and grouped in Go; "aggregate" had
         the hot store GROUP BY (Postgres only). Both run the same aggregation and produce identical reports; on the
-        aggregate path coverage.row_cap is the group cap, since nothing is row-loaded.
+        aggregate path coverage.row_cap is zero, since nothing is row-loaded; coverage.truncated reports the group limit.
+        The response tenant_id is the authenticated tenant. Optional expected_tenant_id rejects a changed context with 409.
+        Session totals union 30-minute wall-clock buckets per service, so they are not unique-user counts or sums of activity-row sessions.
       tags:
         - AdminAIVisibility
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          description: Optional precondition; must match the authenticated tenant. It grants no authority.
+          schema:
+            type: string
         - name: window
           in: query
           required: false
@@ -6852,6 +7219,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "409":
+          description: The expected tenant does not match the authenticated context.
         "400":
           description: Unknown window preset, unparseable from/to, from at or after to, window and from/to both given, or a span beyond the 30d maximum.
         "401":
@@ -7102,6 +7471,49 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+    delete:
+      summary: Retire a PROVISIONED per-tenant interception root that is not signing anything.
+      description: >-
+        Requires admin.policy.write for your OWN organization, or admin.tenant.admin for another's.
+
+
+        POST on this path creates a per-tenant root so it can be DISTRIBUTED before per-tenant signing is
+        enabled. Nothing removed them, so a deployment that later went a different way keeps certificates that
+        sign nothing — and two of them on the reference lab carried the same common name, which is exactly what
+        an operator cannot resolve from a trust store. Leaving them is not neutral: they may have been handed
+        to a customer.
+
+
+        Refused with 409 while per-tenant roots are IN FORCE: that root either signs the organization's leaves
+        now or would be regenerated for the next flow, so removing it would change what its devices must trust
+        without telling them — replace it through the announced overlap instead. Also refused for the node's
+        primary tenant, whose root is the deployment anchor rather than a provisioned per-tenant one. 404 when
+        the organization has no provisioned root here.
+
+
+        No traffic changes: it was signing nothing. A device that was given the certificate keeps trusting an
+        authority no leaf chains to.
+      tags:
+        - AdminInterceptionRoots
+      parameters:
+        - name: tenant
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Retired from this node, in memory and on disk.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No provisioned interception root for this organization.
+        "409":
+          description: That root is, or would become, the signer for this organization.
+        "503":
+          description: Interception is not enabled on this edge.
   /admin/interception-intermediate:
     get:
       summary: Interception intermediate status.
@@ -7285,50 +7697,6 @@ paths:
           description: Not announced as a retiring root for this organization.
         "409":
           description: That root is the one currently signing for this organization.
-        "503":
-          description: Interception is not enabled on this edge.
-  /admin/interception-roots/{tenant}:
-    delete:
-      summary: Retire a PROVISIONED per-tenant interception root that is not signing anything.
-      description: >-
-        Requires admin.policy.write for your OWN organization, or admin.tenant.admin for another's.
-
-
-        POST on this path creates a per-tenant root so it can be DISTRIBUTED before per-tenant signing is
-        enabled. Nothing removed them, so a deployment that later went a different way keeps certificates that
-        sign nothing — and two of them on the reference lab carried the same common name, which is exactly what
-        an operator cannot resolve from a trust store. Leaving them is not neutral: they may have been handed
-        to a customer.
-
-
-        Refused with 409 while per-tenant roots are IN FORCE: that root either signs the organization's leaves
-        now or would be regenerated for the next flow, so removing it would change what its devices must trust
-        without telling them — replace it through the announced overlap instead. Also refused for the node's
-        primary tenant, whose root is the deployment anchor rather than a provisioned per-tenant one. 404 when
-        the organization has no provisioned root here.
-
-
-        No traffic changes: it was signing nothing. A device that was given the certificate keeps trusting an
-        authority no leaf chains to.
-      tags:
-        - AdminInterceptionRoots
-      parameters:
-        - name: tenant
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          description: Retired from this node, in memory and on disk.
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "403":
-          $ref: "#/components/responses/Forbidden"
-        "404":
-          description: No provisioned interception root for this organization.
-        "409":
-          description: That root is, or would become, the signer for this organization.
         "503":
           description: Interception is not enabled on this edge.
   /admin/interception-intermediate/{tenant}:
@@ -7536,12 +7904,23 @@ paths:
         "503":
           description: This deployment holds no agent-policy signing key, so it cannot issue a profile a device would accept.
   /admin/predefined-catalog:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     get:
       summary: View the predefined pinned-bypass catalog and this tenant's overrides.
       description: Requires admin.policy.read. Returns the versioned curated catalog of well-known un-interceptable services (vendor/category/risk per entry), the tenant's per-entry overrides (force_inspect/disabled), and the resulting effective bypass host set.
       tags:
         - AdminPredefinedCatalog
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The versioned catalog, the tenant's overrides, and the effective bypass hosts.
           content:
@@ -7554,12 +7933,23 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
   /admin/predefined-catalog/feed:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     get:
       summary: View the signed predefined-catalog feed status.
       description: Requires admin.policy.read. Returns the applied feed source (feed/builtin), catalog version, staleness, the current applied feed, and the version history available for rollback.
       tags:
         - AdminPredefinedCatalog
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: Feed status + version history.
           content:
@@ -7573,7 +7963,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Apply a vendor-signed predefined-catalog feed.
-      description: Requires admin.policy.write. Validates a signed catalog feed envelope (ed25519 signature + checksum + expiry + trusted keyring) and, if it is newer than the applied version, makes it the effective catalog. An invalid/expired/older feed is rejected and the current catalog is kept (last-known-good).
+      description: Requires admin.policy.write and deployment-operator scope (not an entered customer organization). Validates a signed catalog feed envelope (ed25519 signature + checksum + expiry + trusted keyring) and, if it is newer than the applied version, makes it the effective catalog. Only supported canonical field names are accepted; duplicate JSON keys, nonpositive catalog versions, duplicate/blank entry IDs and invalid timestamps are rejected. Envelope metadata keys remain extensible. An invalid/expired/older feed is rejected and the current catalog is kept (last-known-good). With storage configured, saves the candidate before publishing its catalog and history; a save error retains the current live selection and permits retry.
       tags:
         - AdminPredefinedCatalog
       requestBody:
@@ -7582,8 +7972,53 @@ paths:
           application/json:
             schema:
               type: object
-              additionalProperties: true
+              additionalProperties: false
+              required: [type, version, payload, checksum, signature, signing_key_id, status]
+              properties:
+                type: {type: string, enum: [predefined_catalog_feed]}
+                version: {type: string, minLength: 1}
+                checksum: {type: string}
+                signature: {type: string}
+                signing_key_id: {type: string}
+                status: {type: string, enum: [active]}
+                created_at:
+                  type: string
+                  description: Optional RFC3339 timestamp; an empty value is permitted.
+                expires_at:
+                  type: string
+                  description: Optional RFC3339 timestamp; a new expired feed is rejected.
+                metadata:
+                  type: object
+                  nullable: true
+                  additionalProperties: true
+                payload:
+                  type: object
+                  additionalProperties: false
+                  required: [version, entries]
+                  properties:
+                    version: {type: integer, minimum: 1}
+                    entries:
+                      type: array
+                      minItems: 1
+                      description: Entry IDs must be unique and contain no leading or trailing whitespace.
+                      items:
+                        type: object
+                        additionalProperties: false
+                        required: [id]
+                        properties:
+                          id: {type: string, minLength: 1}
+                          name: {type: string, nullable: true}
+                          vendor: {type: string, nullable: true}
+                          category: {type: string, nullable: true}
+                          risk: {type: string, nullable: true}
+                          description: {type: string, nullable: true}
+                          patterns:
+                            type: array
+                            nullable: true
+                            items: {type: string, nullable: true}
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The applied feed.
           content:
@@ -7597,10 +8032,23 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the feed snapshot could not be confirmed. Current live catalog and history are retained; repair storage, reload and retry before restarting.
+        "503":
+          description: The catalog feed store is not configured.
   /admin/predefined-catalog/feed/rollback:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     post:
       summary: Roll back the predefined-catalog feed to a prior version.
-      description: Requires admin.policy.write. Restores a previously-applied catalog version from the feed history (the only way to move to an older version).
+      description: Requires admin.policy.write and deployment-operator scope (not an entered customer organization). Restores a previously-applied catalog version from the feed history (the only way to move to an older version). With storage configured, saves the candidate before publishing its catalog and history; a save error retains the current live selection and permits retry.
       tags:
         - AdminPredefinedCatalog
       requestBody:
@@ -7611,6 +8059,8 @@ paths:
               type: object
               additionalProperties: true
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The restored feed.
           content:
@@ -7624,10 +8074,23 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the feed snapshot could not be confirmed. Current live catalog and history are retained; repair storage, reload and retry before restarting.
+        "503":
+          description: The catalog feed store is not configured.
   /admin/predefined-catalog/overrides:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     post:
       summary: Override a predefined catalog entry for this tenant.
-      description: Requires admin.policy.write. Sets a per-tenant override on a catalog entry — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). The live bypass set is rebuilt immediately.
+      description: Requires admin.policy.write. Sets a per-tenant override on an entry in the effective catalog (the applied feed, or the built-in catalog when no feed is applied) — force_inspect (decrypt despite the pin; may break the app) or disabled (stop applying this curated bypass). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
       tags:
         - AdminPredefinedCatalog
       requestBody:
@@ -7638,6 +8101,8 @@ paths:
               type: object
               additionalProperties: true
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: The stored override.
           content:
@@ -7651,10 +8116,23 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the requested override state could not be confirmed. The current live selection is retained; reload and retry.
+        "503":
+          description: The catalog override store is not configured.
   /admin/predefined-catalog/overrides/{id}/clear:
+    parameters:
+      - name: expected_tenant_id
+        in: query
+        description: Optional authenticated-organization precondition. A nonempty mismatch returns 409 before reading or changing catalog state. This does not grant operator authority or make the feed tenant-local.
+        schema: {type: string}
+      - name: scoped
+        in: query
+        description: With 1, a successful response wraps the legacy payload in data and includes tenant_id plus scope (tenant for catalog/overrides, deployment for feed status/apply/rollback). Without 1 the legacy response is unchanged.
+        schema: {type: string, enum: ["1"]}
     post:
       summary: Clear a tenant's override on a predefined catalog entry.
-      description: Requires admin.policy.write. Removes the override and restores the catalog default (the entry is bypassed again). The live bypass set is rebuilt immediately.
+      description: Requires admin.policy.write. Removes the override and restores the catalog default (the entry is bypassed again). When persistence is configured, the resulting snapshot is saved before rebuilding the live bypass set. A save error returns 500 and keeps the current live selection; storage may have an uncertain commit, so reload and retry before restarting. Without persistence, the change is in memory only.
       tags:
         - AdminPredefinedCatalog
       parameters:
@@ -7664,6 +8142,8 @@ paths:
           schema:
             type: string
       responses:
+        "409":
+          description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
         "200":
           description: Whether an override was cleared.
           content:
@@ -7675,6 +8155,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Saving the requested override state could not be confirmed. The current live selection is retained; reload and retry.
+        "503":
+          description: The catalog override store is not configured.
   /admin/internal-cas:
     get:
       summary: List the certificate authorities this organization vouches for over its own private assets.
@@ -7689,13 +8173,15 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Add or replace one internal certificate authority.
-      description: Requires admin.policy.write. The material must be a CA certificate that has not expired; a server's own certificate is refused with the reason. An operator may name another organization in tenant_id; a customer naming one is refused rather than redirected.
+      description: Requires admin.policy.write. Supply exactly one public CA certificate that has not expired. Private keys, additional certificates, other PEM material and trailing JSON are refused. Requests are limited to 1 MiB. Live trust changes only after persistence reports success. A stable id permits retry of the same submission; omitting id generates a new one. An operator may name another organization in tenant_id; a customer naming one is refused rather than redirected.
       tags:
         - AdminInternalCAs
       requestBody:
@@ -7715,6 +8201,12 @@ paths:
                 additionalProperties: true
         "400":
           description: The material is not an authority this deployment can use, with the reason.
+        "409":
+          description: This node receives configuration from a source and refuses local writes.
+        "500":
+          description: Persistence is unconfirmed. This request did not adopt a live change; restore storage, reload and retry.
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7722,7 +8214,7 @@ paths:
   /admin/internal-cas/all:
     get:
       summary: Every organization's internal certificate authorities.
-      description: Requires admin.policy.read AND the operator organization. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy.
+      description: "Requires admin.policy.read AND a configured operator organization matching the caller. An unconfigured operator is denied. This is the list an Edge pulls: an Edge carries flows for many organizations, so pulling only its own node's organization would refuse every other organization's private assets while reporting itself healthy."
       tags:
         - AdminInternalCAs
       responses:
@@ -7733,6 +8225,8 @@ paths:
               schema:
                 type: object
                 additionalProperties: true
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7740,7 +8234,7 @@ paths:
   /admin/internal-cas/{id}:
     delete:
       summary: Remove one internal certificate authority.
-      description: Requires admin.policy.write. Scoped to the authenticated organization. Private assets whose certificates it issued stop being reachable on the next request, not the next restart.
+      description: Requires admin.policy.write. Scoped to the authenticated organization. The durable delete must report success before live trust changes. Other servers must receive the configuration update. This operation does not forcibly close established connections.
       tags:
         - AdminInternalCAs
       parameters:
@@ -7751,19 +8245,32 @@ paths:
             type: string
       responses:
         "200":
-          description: Removed.
+          description: Removed; the response includes deleted=true, id, and tenant_id.
+        "503":
+          description: Internal authority storage is unavailable; an unavailable list is not an empty list.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           description: No such authority in this organization.
+        "409":
+          description: This node receives configuration from a source and refuses local writes.
+        "500":
+          description: Persistence is unconfirmed. This request did not remove live trust; restore storage, reload and retry.
   /admin/steer-exclusions:
     get:
       summary: List admin-managed steer exclusions.
       description: Requires admin.steering.read. Returns the tenant's steer-exclusion policies (which app code-signing identifiers are excluded from steering, per tenant/device-group/device).
       tags:
         - AdminSteerExclusions
+      parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional expected tenant context; a mismatch returns 409 before reading the policy store.
       responses:
         "200":
           description: Steer-exclusion policies for the authenticated tenant.
@@ -7771,16 +8278,38 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                required: [schema_version, tenant_id, steer_exclusions]
+                properties:
+                  schema_version:
+                    type: string
+                    enum: [admin_steer_exclusions.v1]
+                  tenant_id:
+                    type: string
+                  steer_exclusions:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The expected tenant differs from the authenticated operation context.
+        "503":
+          description: Exclusion storage could not be read or validated; retained local policies are not returned as a current authoritative set.
     post:
       summary: Upsert a steer-exclusion policy.
-      description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.
+      description: Requires admin.steering.write. Assigns excluded app code-signing identifiers to a scope (tenant, device_group, or device). An ID owned by another tenant is rejected with 403. With persistence configured, success requires a confirmed save. The resolved set is later signed and delivered to the agent; the endpoint user cannot change it.
       tags:
         - AdminSteerExclusions
+      parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional authenticated operation context; mismatch returns 409 before mutation. This does not change an authorized operator's ability to name a different target tenant in the body.
       requestBody:
         required: true
         content:
@@ -7790,7 +8319,7 @@ paths:
               additionalProperties: true
       responses:
         "200":
-          description: The stored steer-exclusion policy.
+          description: The stored policy, including id, tenant_id, normalized scope and app identifiers, note and active status. Supplying the same id on a retry updates that policy; audits and history may record both requests.
           content:
             application/json:
               schema:
@@ -7802,6 +8331,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The expected tenant differs from the authenticated operation context, or this node pulls its configuration from another authority.
+        "500":
+          description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/pki/certificates:
     get:
       summary: The certificate map — every certificate this node is configured with, as objects with relations.
@@ -7982,10 +8515,16 @@ paths:
   /admin/steer-exclusions/observed:
     get:
       summary: Query devices' self-reported effective steer-exclusion sets (reverse telemetry; filtered + paginated).
-      description: Requires admin.steering.read. Returns a FILTERED, PAGINATED page (never the whole fleet — see docs/steer_exclusions_observed_telemetry_scale_design.md) of per-device reports of the merged exclusion set each endpoint actually applies, with each entry classified admin / floor / unmanaged. Each report carries admin_app_signing_ids and unmanaged_app_signing_ids (the flagged, non-admin non-floor entries). Response includes total_estimate and next_cursor. Observability only — never feeds enforcement. Tenant-scoped.
+      description: Requires admin.steering.read. Returns a FILTERED, PAGINATED page (never the whole fleet — see docs/steer_exclusions_observed_telemetry_scale_design.md) of per-device reports of the merged exclusion set each endpoint actually applies, with each entry classified admin / floor / unmanaged. Each report carries admin_app_signing_ids and unmanaged_app_signing_ids (the flagged, non-admin non-floor entries). Response includes the authenticated tenant_id, total_estimate and next_cursor. Observability only — never feeds enforcement. Tenant-scoped.
       tags:
         - AdminSteerExclusions
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional expected tenant context; a mismatch returns 409 before querying observations.
         - name: device
           in: query
           schema:
@@ -8028,6 +8567,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The expected tenant differs from the authenticated operation context.
   /admin/steer-exclusions/observed/by-app:
     get:
       summary: Aggregate observed exclusions by AppID across the fleet (drift view).
@@ -8091,6 +8632,12 @@ paths:
           required: true
           schema:
             type: string
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional authenticated operation context; mismatch returns 409 before mutation.
       responses:
         "200":
           description: Deleted.
@@ -8098,13 +8645,25 @@ paths:
             application/json:
               schema:
                 type: object
-                additionalProperties: true
+                required: [deleted, id, tenant_id]
+                properties:
+                  deleted:
+                    type: boolean
+                    enum: [true]
+                  id:
+                    type: string
+                  tenant_id:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: The expected tenant differs from the authenticated operation context, or this node pulls its configuration from another authority.
+        "500":
+          description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/steer-exclusions/{id}/versions:
     get:
       summary: List the version history of a steer-exclusion policy.
@@ -8134,7 +8693,7 @@ paths:
   /admin/steer-exclusions/{id}/rollback:
     post:
       summary: Roll a steer-exclusion policy back to a prior version.
-      description: Requires admin.steering.write. Re-applies the snapshot of the given version_no as a new version.
+      description: Requires admin.steering.write. Re-applies the snapshot of the given version_no as a new version. The same tenant-ownership and save-confirmation checks as an upsert apply.
       tags:
         - AdminSteerExclusions
       parameters:
@@ -8170,6 +8729,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Saving could not be confirmed. This request retains the previous local policy; the backend may already contain the attempted change. Reload before retrying.
   /admin/config-versions:
     post:
       summary: Record a config version (generic; control plane).
@@ -8562,9 +9123,28 @@ paths:
   /admin/risk-signals:
     get:
       summary: Return the current high-risk device/identity snapshot ().
-      description: Requires admin.risk.read. Returns the set of devices/identities currently marked high-risk (severity per entity) that the decision engine reads on the live path.
+      description: >-
+        Requires admin.risk.read. Returns tenant-scoped device risk or, with entity_type=user, the user namespace.
+        Both responses include tenant_id, entity_type and high_risk. A control-plane standby refuses with 409
+        because its held snapshot is refreshed at promotion, not continuously. Readable local data alone does
+        not make the standby authoritative. A leader or local authority with unavailable risk storage returns 503.
+        Refusals do not clear saved or held risk. No election configured and enforcing-Edge reads retain their
+        existing behavior. Reads create no administrator-change audit events.
+        User risk remains keyed by the canonical directory ID. Runtime decision enrichment also matches
+        current tenant-scoped directory subjects and email addresses, so an alias update does not remove
+        the risk condition. Saved prior aliases remain protected for previously issued sessions until the
+        mark is explicitly cleared; alias reuse is not automatic proof that the old mark may be removed.
+        A directory read failure refuses the runtime decision rather than treating a marked tenant as clean.
       tags:
         - AdminRiskState
+      parameters:
+        - in: query
+          name: entity_type
+          required: false
+          schema:
+            type: string
+            enum: [device, user]
+          description: Omission selects device risk. User risk is scoped to the authenticated tenant.
       responses:
         "200":
           description: Current high-risk snapshot.
@@ -8577,6 +9157,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: This control plane is on standby. Retry through the active management server.
+        "503":
+          description: The local risk snapshot cannot be verified. Restore storage before retrying.
     post:
       summary: Ingest a device/identity risk signal ().
       description: Requires admin.risk.write. Ingests a risk signal (including Manual High Risk Marking). A high-risk signal folds into the device's risk state and revokes the device's standing east-west grants.
@@ -8656,10 +9240,12 @@ paths:
   /admin/retention-config:
     get:
       summary: Read the admin-configured per-stream retention overrides.
-      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default.
+      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default. A failed persisted-settings load returns 503 and pauses retention until a clean reload.
       tags:
         - AdminRetention
       responses:
+        "503":
+          description: Retention settings could not be loaded or are unavailable.
         "200":
           description: Current per-stream retention overrides (days).
           content:
@@ -8673,7 +9259,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Set (or clear) a per-stream retention override.
-      description: Requires admin.retention.write. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
+      description: Requires admin.retention.write and deployment-wide administration. An unavailable store returns 503 without overwriting persisted settings. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
       tags:
         - AdminRetention
       requestBody:
@@ -8688,11 +9274,15 @@ paths:
                   description: The log stream (e.g. access, audit).
                 days:
                   type: integer
-                  description: Retention in days; 0 keeps the stream forever.
+                  minimum: 0
+                  maximum: 106751
+                  description: Whole days, required unless clear=true; explicit 0 keeps the stream forever.
                 clear:
                   type: boolean
                   description: If true, remove the override and revert to the flag default.
       responses:
+        "503":
+          description: Retention settings could not be loaded or are unavailable.
         "200":
           description: Resulting overrides.
           content:
@@ -8709,7 +9299,7 @@ paths:
   /admin/audit-chain/verify:
     get:
       summary: Verify the audit cold-archive tamper-evident hash chain.
-      description: Requires admin.retention.read. Walks the tenant's archived audit segments and checks the hash chain — each segment embeds the SHA-256 of the previous one, so a deleted / altered / reordered segment breaks the chain and is reported. Returns ok=true when the chain is intact.
+      description: Requires admin.retention.read. Checks the listed tenant audit segments for valid headers, contiguous sequence numbers, previous-object hashes and complete gzip integrity. Status is empty (ok=false), broken (ok=false), or links_verified (ok=true). Scope is listed_segments_only. Success does not establish completeness against a trusted checkpoint, detect a removed suffix or detect a consistently rewritten chain.
       tags:
         - AdminRetention
       responses:
@@ -9208,19 +9798,48 @@ paths:
           $ref: "#/components/responses/Forbidden"
   /admin/intercept/bypass-hosts:
     get:
-      summary: List the live decrypt-bypass (never-decrypted) host patterns.
-      description: Requires admin.swg.read. Returns the host patterns the interception engine raw-forwards (never decrypts) — the shipped known-bypass compatibility list (Apple/iCloud/GitHub/OS-update/OCSP) plus any materialized cert-pinning recommendations. Observability for the Pinned Sites view ("what is NOT being decrypted").
+      summary: List configured decrypt-bypass host patterns for the requesting tenant.
+      description: Requires admin.swg.read. Returns the local engine's tenant-specific host selection, including deployment defaults, that tenant's curated-catalog overrides and authored bypass rules applying to any source. Device-specific exceptions are applied separately using the authenticated source device and are not flattened into this list. It excludes other tenants' rules. This configuration listing does not include dynamic pin-learning state or prove independent Edge delivery or actual traffic inspection.
       tags:
         - AdminPolicyCandidateReview
+      parameters:
+        - name: scoped
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: ["1"]
+          description: Return an object containing tenant_id and hosts. Without this option the legacy bare array is returned. Scoped reads refuse nodes without an inspection engine instead of reporting empty state.
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
       responses:
+        "503":
+          description: A scoped query cannot be answered because interception is unavailable on this node.
+        "409":
+          description: The authenticated organization differs from expected_tenant_id, or a scoped query was made to a control plane that serves no traffic.
         "200":
-          description: Host patterns currently bypassed (raw-forwarded, never decrypted).
+          description: Configured bypass patterns. Only the legacy bare-array mode reports an empty array when this node has no interception engine.
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  type: string
+                oneOf:
+                  - type: array
+                    items:
+                      type: string
+                  - type: object
+                    required: [tenant_id, hosts]
+                    properties:
+                      tenant_id:
+                        type: string
+                      hosts:
+                        type: array
+                        nullable: true
+                        items:
+                          type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -9595,10 +10214,16 @@ paths:
   /admin/policy-candidates:
     get:
       summary: List tenant-scoped allow/bypass policy candidates.
-      description: Requires admin.policy_candidates.read. Returns metadata-only policy candidates for operator review. Raw logs, endpoints, IPs, hosts, users, payloads, credentials, tokens, TLS/cert, Apple, and device material are intentionally excluded.
+      description: Requires admin.policy_candidates.read. Returns metadata-only policy candidates for operator review. Candidates can include destination host/SNI, port, observation counts and attribution evidence. Request payloads, credentials and certificate material are not returned.
       tags:
         - AdminPolicyCandidateReview
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
         - name: status
           in: query
           required: false
@@ -9629,6 +10254,8 @@ paths:
             default: 100
           description: Maximum rows returned. Values outside 1..1000 are clamped by the server.
       responses:
+        "409":
+          description: The authenticated organization differs from expected_tenant_id, or a scoped query was made to a control plane that serves no traffic.
         "200":
           description: Tenant policy candidate list.
           content:
@@ -9643,7 +10270,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped allow/bypass policy candidate.
-      description: Requires admin.policy_candidates.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This process-local metadata-only candidate store does not materialize policy, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.policy_candidates.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This endpoint changes candidate metadata without creating a policy. With configured persistence, a candidate snapshot is saved before it becomes visible; unconfirmed saves return 500 and keep the previous live candidate state.
       tags:
         - AdminPolicyCandidateReview
       requestBody:
@@ -9659,6 +10286,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "500":
+          description: Candidate save could not be confirmed. Previous live candidate state is retained; reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9673,8 +10302,12 @@ paths:
         certificate, without waiting for the detector to surface it. Creates an approved cert-pinning bypass
         candidate and materializes it in one call — the same path a detected-then-adopted candidate takes — so
         it becomes a first-class Egress bypass rule visible and revocable alongside detected ones. The host must
-        be a named host, not a raw IP literal (a bypass no-decrypts its destination; you cannot attribute a bare
-        IP). This is an explicit admin action, so it does not violate the never-auto-bypass invariant.
+        be one exact DNS hostname. Wildcards, CIDRs, IP literals, abbreviated numeric addresses, URLs and
+        port suffixes are rejected before any save. IDNA names are normalized to lowercase ASCII. This is an explicit admin action, so it does not violate the never-auto-bypass invariant.
+        Candidate save failure returns 500 before proceeding to rule creation. The approval, materialization,
+        asset and rule saves are separate operations: a confirmed earlier step may remain after a later failure.
+        Reload candidate and Egress rule state before retrying; this endpoint does not provide an atomic
+        transaction across these stores or a fleet propagation receipt.
       tags:
         - AdminPolicyCandidateReview
       requestBody:
@@ -9688,14 +10321,40 @@ paths:
               properties:
                 host:
                   type: string
-                  description: The named host to decrypt-bypass (e.g. gateway.example.com). Raw IP literals are rejected.
+                  description: One exact hostname to decrypt-bypass (e.g. gateway.example.com). Patterns, prefixes, IP literals, URLs and port suffixes are rejected; allow_high_risk does not expand this endpoint.
+      parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
       responses:
         "200":
-          description: The materialized cert-pin bypass candidate.
+          description: The candidate and bypass rule were saved locally. Serving-Edge adoption and fleet propagation must be checked separately.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "409":
+          description: The organization differs from expected_tenant_id, or this rule change must be authored on the control plane rather than a configuration-pulling Edge.
+        "500":
+          description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  partial:
+                    type: boolean
+                  failed_stage:
+                    type: string
+                  candidate_id:
+                    type: string
+                  candidate_status:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9733,10 +10392,16 @@ paths:
   /admin/policy-candidates/{candidate_id}/review:
     post:
       summary: Review a tenant-scoped allow/bypass policy candidate.
-      description: Requires admin.policy_candidates.review. The review action updates candidate status only; policy materialization, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.policy_candidates.review. Approval alone does not enable a bypass. Candidate persistence is confirmed before publishing the review and performing dependent rule cleanup. Candidate storage and authored-rule storage are separate operations. Rule removal failure returns 500/partial with failed_stage=bypass_rule_removal and may leave the bypass active. A configuration-pulling Edge refuses a review that would remove an existing cert-pin rule with 409. This response is not a fleet propagation receipt.
       tags:
         - AdminPolicyCandidateReview
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
         - name: candidate_id
           in: path
           required: true
@@ -9755,6 +10420,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "409":
+          description: The organization differs from expected_tenant_id, or this rule change must be authored on the control plane rather than a configuration-pulling Edge.
+        "500":
+          description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  partial:
+                    type: boolean
+                  failed_stage:
+                    type: string
+                  candidate_id:
+                    type: string
+                  candidate_status:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9766,15 +10450,32 @@ paths:
   /admin/policy-candidates/{candidate_id}/materialize:
     post:
       summary: Materialize an approved bypass policy candidate.
-      description: Requires admin.policy_candidates.review. Applies an already-approved candidate (e.g. a cert-pinning bypass proposal) by adding its host to the interception bypass set and marking it materialized. Detection never auto-bypasses; only this explicit admin step makes a bypass live. Approving without materializing leaves the host intercepted.
+      description: Requires admin.policy_candidates.review. Records adoption of an approved candidate and, for cert-pinning candidates, saves its authored bypass rule before requesting local apply. Already-materialized cert-pin candidates can retry an incomplete rule write; high-risk confirmation remains required. Candidate status alone is not an enforcement receipt. A failure after candidate save returns 500 with partial=true and failed_stage; previously saved steps remain. Pending, rejected and suppressed candidates cannot be adopted by this endpoint. For cert-pin candidates, the target is derived from actual Host/SNI, not stored confidence or suggested_action. A named Host takes precedence; an IP/empty Host can use a named SNI. Exact IPv4-only targets require allow_high_risk=true. IPv6-only targets are refused because the current inspection selector cannot apply literal IPv6 patterns; an IPv6 Host with a named SNI can use that name. Wildcards, CIDRs and malformed targets are refused even with that override. The serving Edge and fleet must be checked separately.
       tags:
         - AdminPolicyCandidateReview
       parameters:
+        - name: expected_tenant_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Optional loaded-organization precondition. A mismatch with the authenticated request tenant returns 409 before reading or mutating state; it grants no cross-tenant access.
         - name: candidate_id
           in: path
           required: true
           schema:
             type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                allow_high_risk:
+                  type: boolean
+                  default: false
+                  description: Explicit confirmation for a single IPv4-only cert-pin candidate. IPv6-only literal targets are unsupported. Does not permit patterns or prefixes and does not bypass configuration-authority checks.
       responses:
         "200":
           description: Materialized policy candidate.
@@ -9782,6 +10483,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PolicyCandidate"
+        "409":
+          description: The organization differs from expected_tenant_id, or this rule change must be authored on the control plane rather than a configuration-pulling Edge.
+        "500":
+          description: Candidate or dependent save could not be confirmed. Earlier saved steps remain. When partial is true, failed_stage identifies the unconfirmed step; an existing bypass may remain active. Reload and retry after restoring storage. An uncertain commit may have changed persistent storage.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                  partial:
+                    type: boolean
+                  failed_stage:
+                    type: string
+                  candidate_id:
+                    type: string
+                  candidate_status:
+                    type: string
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -9904,7 +10624,7 @@ paths:
   /admin/idp-connections:
     get:
       summary: List the tenant's end-user IdP connections + the default.
-      description: Requires admin.idp.read. Returns the per-tenant federated-auth IdP connections (RP client_secret redacted) and the default_idp_id. See docs/idp_federated_authentication_design.md.
+      description: Requires admin.idp.read. Returns the per-tenant federated-auth IdP connections (RP client_secret redacted) and the default_idp_id. See docs/idp.md.
       tags:
         - AdminIdPConnections
       responses:
@@ -9945,6 +10665,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}:
     delete:
       summary: Remove an end-user IdP connection.
@@ -9968,6 +10697,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}/default:
     post:
       summary: Set a registered connection as the tenant default IdP.
@@ -9989,6 +10727,15 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Identity provider persistence failed; the candidate was not published.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/idp-connections/{id}/test:
     get:
       summary: Test a registered IdP connection (non-interactive).
@@ -10024,7 +10771,7 @@ paths:
   /admin/grants:
     get:
       summary: List the federated-auth grants minted by the clientless broker.
-      description: Requires admin.grants.read. Returns the tenant's grants (user, idp_id, acr/amr, issued/expires, revoked). See docs/idp_federated_authentication_design.md.
+      description: Requires admin.grants.read. Returns the tenant's grants (user, idp_id, acr/amr, issued/expires, revoked). See docs/idp.md.
       tags:
         - AdminGrants
       responses:
@@ -10046,7 +10793,17 @@ paths:
   /admin/grants/{id}/revoke:
     post:
       summary: Revoke a federated-auth grant (continuous revocation).
-      description: Requires admin.grants.write. A revoked grant denies the next flow and stays revoked across a restart.
+      description: >-
+        Requires admin.grants.write. Checks the exact caller tenant and grant under
+        one lock. Revokes locally and attempts persistence; a save failure retains
+        local denial and returns partial, requiring a retry before restart. A repeat
+        retries saving even if already revoked. Success confirms local acceptance,
+        not fleet delivery or durable storage when no persister is configured.
+        A completed synced in-place write returns 200 with saved_non_atomic and
+        a Console storage warning. A completed replacement with unconfirmed flush
+        returns partial 500 and remains pending for retry.
+        The grant ID is a bearer credential; audit records use a SHA-256 reference.
+        See docs/idp.md for distribution and persistence limits.
       tags:
         - AdminGrants
       parameters:
@@ -10057,7 +10814,52 @@ paths:
             type: string
       responses:
         "200":
-          description: Revoked.
+          description: Revocation accepted locally.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, grant_id, tenant_id, audit_ref]
+                properties:
+                  persistence:
+                    type: string
+                    enum: [saved_non_atomic]
+                    description: Present only for a completed save without atomic replacement.
+                  status:
+                    type: string
+                    enum: [revoked]
+                  grant_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  audit_ref:
+                    type: string
+                    description: SHA-256 reference, not the bearer grant ID.
+        "500":
+          description: Local denial applied but persistence is unconfirmed; restore storage and retry before restarting.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, applied, grant_id, tenant_id, audit_ref, persistence, error]
+                properties:
+                  status:
+                    type: string
+                    enum: [partial]
+                  applied:
+                    type: boolean
+                    enum: [true]
+                  grant_id:
+                    type: string
+                  tenant_id:
+                    type: string
+                  audit_ref:
+                    type: string
+                  persistence:
+                    type: string
+                    enum: [unconfirmed]
+                  error:
+                    type: string
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10079,7 +10881,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create or update an endpoint catalog entry.
-      description: Requires admin.endpoints.write. Upserts a named endpoint (alias + platform). Tenant is taken from the admin context.
+      description: Requires admin.endpoints.write. Upserts a named endpoint (alias + platform). Tenant is taken from the admin context. Cert-pin destinations (source cert_pin or reserved ID prefix certpin-ep-) cannot be created, modified, or deleted through the endpoint catalog; these writes return 403. Manage bypass rules through Internet Access. Legacy manual-source entries in that namespace are protected without changing their saved rules.
       tags:
         - AdminAssetCatalog
       requestBody:
@@ -10090,7 +10892,9 @@ paths:
               type: object
       responses:
         "200":
-          description: Stored endpoint.
+          description: Stored endpoint. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -10123,7 +10927,9 @@ paths:
               type: object
       responses:
         "200":
-          description: Stored group.
+          description: Stored group. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -10164,7 +10970,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create or update a named service.
-      description: Requires admin.endpoints.write. Upserts a named service. Tenant is taken from the admin context.
+      description: Requires admin.endpoints.write. Upserts a named service. Tenant is taken from the admin context. Protocols are trimmed and lowercased and must be tcp or udp; ports must be integers from 1 through 65535. Invalid definitions are rejected before saving or changing runtime rules.
       tags:
         - AdminAssetCatalog
       requestBody:
@@ -10173,9 +10979,26 @@ paths:
           application/json:
             schema:
               type: object
+              required: [ports]
+              properties:
+                id: { type: string }
+                alias: { type: string }
+                ports:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [protocol, port]
+                    properties:
+                      protocol:
+                        type: string
+                        description: Must be tcp or udp after trimming and lowercasing.
+                      port: { type: integer, minimum: 1, maximum: 65535 }
       responses:
         "200":
-          description: Stored service.
+          description: Stored service. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "400":
           $ref: "#/components/responses/BadRequest"
         "401":
@@ -10196,7 +11019,9 @@ paths:
             type: string
       responses:
         "200":
-          description: Deleted.
+          description: Deleted. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10217,7 +11042,9 @@ paths:
             type: string
       responses:
         "200":
-          description: Deleted.
+          description: Deleted. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10238,7 +11065,9 @@ paths:
             type: string
       responses:
         "200":
-          description: Deleted.
+          description: Deleted. Successful catalog mutations rebuild local authored-rule projections.
+        "500":
+          description: Persistence was not confirmed; previous live authored catalog retained. Reload and retry after restoring storage.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -10248,7 +11077,7 @@ paths:
   /admin/rules:
     get:
       summary: List the tenant's authored unified rules.
-      description: Requires admin.policy.read. Returns the authored `source → destination` rules (with their service selector and action) across the east-west and egress planes. Optional ?plane filters to one plane. See docs/policy_and_endpoint_model_design.md.
+      description: Requires admin.policy.read. Returns the authored `source → destination` rules (with their service selector and action) across the east-west and egress planes. Optional ?plane filters to one plane. inspection_source_warning identifies identity_context_unavailable or no_resolved_device for pre-TLS inspection source selection; access-policy compilation is separate. See docs/policy_and_endpoint_model_design.md.
       tags:
         - AdminRules
       parameters:
@@ -10266,7 +11095,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create or update a unified rule.
-      description: Requires admin.policy.write. Upserts a rule and recompiles enforcement (egress bypass set + compiled east-west rule set). `service_id` is optional; omitted or empty means Any — no service scope (east-west matches every service family, egress matches every destination port). Inbound rules are validated against their receivers' platforms (inbound enforces on Windows WFP only); a non-fatal warning may be returned.
+      description: Requires admin.policy.write. With persistence configured, saves a candidate before publishing it and recompiling enforcement. A save error keeps the previous live rules. After an unconfirmed response, reload and reconcile the rule before retrying with the same ID. Config-sourced nodes reject direct writes. `service_id` is optional; omitted or empty means Any — no service scope (east-west matches every service family, egress matches every destination port). Inbound rules are validated against their receivers' platforms (inbound enforces on Windows WFP only); a non-fatal warning may be returned.
       tags:
         - AdminRules
       requestBody:
@@ -10284,10 +11113,14 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Authored rules are managed by the configuration source.
+        "500":
+          description: Rule persistence was not confirmed; previous live rules remain active. Reconcile storage before retrying or restarting.
   /admin/rules/{id}:
     delete:
       summary: Delete an authored rule.
-      description: Requires admin.policy.write. Removes the rule and recompiles enforcement.
+      description: Requires admin.policy.write. With persistence configured, saves the deletion before removing the live rule and recompiling enforcement. Config-sourced nodes reject direct writes.
       tags:
         - AdminRules
       parameters:
@@ -10305,6 +11138,10 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: Authored rules are managed by the configuration source.
+        "500":
+          description: Deletion persistence was not confirmed; the previous live rule remains active. Reconcile storage before retrying or restarting.
   /admin/agent-tools:
     get:
       summary: List tenant-scoped Agent Tool Registry entries.
@@ -10561,7 +11398,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Delegated Access Grant.
-      description: Requires admin.delegated_grants.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata-only Admin API does not issue tokens, broker delegated sessions, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.delegated_grants.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata API does not issue tokens or broker delegated sessions. A confirmed change updates the store generation; delivery through the configured bundle synchronization is asynchronous. Empty expiry uses the server default lifetime (30 minutes).
       tags:
         - AdminDelegatedAccessGrant
       requestBody:
@@ -10585,6 +11422,24 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          description: Delegated grant persistence failed; the candidate was not published to live state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+        "503":
+          description: New organization-and-ID record refused because the store is at capacity. Existing authorization and revocation records are retained; existing-ID mutations remain subject to validation and persistence checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/delegated-grants/{grant_id}:
     get:
       summary: Get a tenant-scoped Delegated Access Grant.
@@ -10616,7 +11471,7 @@ paths:
   /admin/delegated-grants/{grant_id}/revoke:
     post:
       summary: Revoke a tenant-scoped Delegated Access Grant.
-      description: Requires admin.delegated_grants.revoke. The revoke action updates grant status only; token revocation, session brokering, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.delegated_grants.revoke. The revoke action updates grant status and the store generation. It does not revoke a separately issued token or terminate a session. Verify asynchronous bundle delivery and enforcement on each Edge separately.
       tags:
         - AdminDelegatedAccessGrant
       parameters:
@@ -10647,6 +11502,15 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Delegated grant persistence failed; the candidate was not published to live state.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/human-approval-events:
     get:
       summary: List tenant-scoped Human Approval Events.
@@ -10707,7 +11571,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Human Approval Event.
-      description: Requires admin.approval.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This metadata-only Admin API does not send notifications, perform approval UI workflows, compile bundles, or hot reload runtime enforcement.
+      description: Requires admin.approval.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. A rejected save returns 500 before the candidate becomes available to local lookups. This metadata API does not send notifications, perform approval UI workflows, compile bundles, or distribute outcomes to other servers.
       tags:
         - AdminHumanApprovalEvent
       requestBody:
@@ -10731,6 +11595,21 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "409":
           $ref: "#/components/responses/Conflict"
+        "500":
+          description: Approval candidate could not be saved; it was not published in this process.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanApprovalMutationError"
+        "503":
+          description: New organization-and-ID record refused because the store is at capacity. Existing authorization and revocation records are retained; existing-ID mutations remain subject to validation and persistence checks.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
   /admin/human-approval-events/{approval_id}:
     get:
       summary: Get a tenant-scoped Human Approval Event.
@@ -10762,7 +11641,7 @@ paths:
   /admin/human-approval-events/{approval_id}/revoke:
     post:
       summary: Revoke a tenant-scoped Human Approval Event.
-      description: Requires admin.approval.write. The revoke action updates approval_result only; notification workflows, runtime domain event emission, bundle signing, and runtime hot reload are deferred.
+      description: Requires admin.approval.write. Revocation is applied to this server before saving. If saving fails, 500 reports partial, applied=true and persistence=unconfirmed; retry the same revoke before restarting. An already-revoked record still retries saving and retains the original reason. This metadata API does not perform notification workflows or distribute revocation to other servers.
       tags:
         - AdminHumanApprovalEvent
       parameters:
@@ -10793,6 +11672,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: Revocation is active on this server but persistence is unconfirmed. Retry before restarting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HumanApprovalMutationError"
   /admin/endpoints:
     get:
       summary: List tenant-scoped Endpoint Inventory entries.
@@ -11131,6 +12016,12 @@ paths:
                           type: integer
                         error:
                           type: string
+                  artifact_cleanup:
+                    type: object
+                    description: Per-stage absence confirmation for manifests, local artifacts, and the shared artifact shelf, including retries that remove zero manifests. This is not a byte or file count and does not cover unconfigured storage.
+                    additionalProperties:
+                      type: string
+                      enum: [not_attempted, not_configured, unconfirmed, absence_confirmed]
                   failures:
                     type: array
                     items:
@@ -11262,6 +12153,23 @@ paths:
         "400": { description: The chain does not link, the key does not match, or it is not a CA. }
         "403": { description: Naming another organization without the rights the envelope requires. }
 
+    get:
+      summary: Whose root this organization's traffic is inspected under, and whether a replacement is staged.
+      description: >
+        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority.
+
+
+        A staged authority is NOT signing, and the answer says so: promoting before every device holds the
+        incoming root took every HTTPS site away from a fleet for eighteen minutes on 2026-08-19. Read
+        GET /admin/interception-authority-rotation on an Edge before promoting; withdrawing takes nothing away.
+
+
+        Never returns key material, and the root key is not here at all — it is the organization's.
+      responses:
+        "200":
+          description: The authority, or has_authority false when the deployment's own root is used.
+        "409":
+          description: This node holds no per-organization interception authorities.
   /admin/tenant-transport-authority:
     get:
       summary: Where this organization's transport authority stands.
@@ -11285,6 +12193,54 @@ paths:
                   rotating: { type: boolean }
                   incoming_since: { type: string }
         "403": { description: Not permitted for this organization. }
+    post:
+      summary: Create this organization's transport authority, if it has none.
+      description: >
+        Requires admin.enrollment.write or admin.tenant.admin; naming another organization additionally goes through the operator
+        envelope, like every other cross-organization PKI act.
+
+
+        The authority is the CA that signs the certificate this organization's devices meet when they connect,
+        and it is held on the CONTROL PLANE rather than on the Edges. That is what lets an Edge added under
+        load serve the organization at all: it is handed short-lived server material on request instead of
+        having a five-year key placed on it as a file, which is what every per-organization certificate was
+        until 2026-08-20 — measured, on this repository's own scale-out definition, as carrying none of them.
+
+
+        The NAME is given here, at the moment the authority is created, because the name devices are told to
+        send and the certificate they meet have to stay together. Asking again returns the authority that
+        already exists: replacing one is a rotation (publish the new anchor, measure adoption, withdraw the
+        old), never a side effect of a second call.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [server_name]
+              properties:
+                tenant_id:
+                  type: string
+                  description: Operators only; a tenant admin's own organization is taken from the session.
+                server_name:
+                  type: string
+                  description: The name this organization's agents will send, e.g. northwind.dsse.invalid.
+      responses:
+        "200":
+          description: The authority, existing or newly created.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant_id: { type: string }
+                  server_name: { type: string }
+                  anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
+                  created_at: { type: string }
+                  applies_to: { type: string }
+        "400": { description: No name was given, or it could not be created. }
+        "403": { description: Naming another organization without the rights the envelope requires. }
+
   /admin/tenant-transport-authority/rotate:
     post:
       summary: Give this organization a SECOND transport authority, beside the one in force.
@@ -11431,6 +12387,37 @@ paths:
           description: The caller may not act on that organization's PKI, or holds no active elevation over it.
         "501":
           description: This control plane holds no device-identity authorities.
+    get:
+      summary: What this organization's devices are enrolled under, and whether it is moving.
+      description: >
+        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority — a
+        control plane. An Edge says so rather than reporting every organization as having none.
+
+
+        Three tiers of per-organization authority had grown a full set of acts and a readiness answer each,
+        and only the transport tier could be READ. A screen could say nothing about the tier that decides
+        whether an organization's devices are admitted at all.
+
+
+        During a rotation the signer is NOT the authority in force — the incoming one signs, because that is
+        how devices migrate. After an abandonment it is the authority in force again while both stay admitted.
+        Those are opposite states, so the answer names which, rather than only "rotating".
+
+        With readiness=1 during a rotation, retirement_readiness contains allowed, reason and checked_at.
+        This read-only preview uses the same shared inventory, observation freshness and regional TLS evidence
+        as the retirement POST. It does not reserve permission; the POST always checks again.
+      parameters:
+        - in: query
+          name: readiness
+          schema: { type: string, enum: ["1"] }
+          description: Include the control plane's read-only retirement verification during a rotation.
+      responses:
+        "200":
+          description: The authority, or has_authority false when this organization uses the deployment's own.
+        "409":
+          description: This node holds no per-organization device-identity authorities.
+        "503":
+          description: The durable authority snapshot could not be read; stale metadata is not returned.
   /admin/tenant-device-authority/rotate:
     post:
       summary: Begin moving this organization's devices onto a new device-identity authority.
@@ -11483,56 +12470,6 @@ paths:
           description: This organization has no device-identity authority, or is already mid-rotation.
         "501":
           description: This control plane holds no device-identity authorities.
-  /admin/tenant-device-authority:
-    get:
-      summary: What this organization's devices are enrolled under, and whether it is moving.
-      description: >
-        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority — a
-        control plane. An Edge says so rather than reporting every organization as having none.
-
-
-        Three tiers of per-organization authority had grown a full set of acts and a readiness answer each,
-        and only the transport tier could be READ. A screen could say nothing about the tier that decides
-        whether an organization's devices are admitted at all.
-
-
-        During a rotation the signer is NOT the authority in force — the incoming one signs, because that is
-        how devices migrate. After an abandonment it is the authority in force again while both stay admitted.
-        Those are opposite states, so the answer names which, rather than only "rotating".
-
-        With readiness=1 during a rotation, retirement_readiness contains allowed, reason and checked_at.
-        This read-only preview uses the same shared inventory, observation freshness and regional TLS evidence
-        as the retirement POST. It does not reserve permission; the POST always checks again.
-      parameters:
-        - in: query
-          name: readiness
-          schema: { type: string, enum: ["1"] }
-          description: Include the control plane's read-only retirement verification during a rotation.
-      responses:
-        "200":
-          description: The authority, or has_authority false when this organization uses the deployment's own.
-        "409":
-          description: This node holds no per-organization device-identity authorities.
-        "503":
-          description: The durable authority snapshot could not be read; stale metadata is not returned.
-  /admin/tenant-interception-authority:
-    get:
-      summary: Whose root this organization's traffic is inspected under, and whether a replacement is staged.
-      description: >
-        Requires admin.certs.read or admin.tenant.admin. Answered by the node that HOLDS the authority.
-
-
-        A staged authority is NOT signing, and the answer says so: promoting before every device holds the
-        incoming root took every HTTPS site away from a fleet for eighteen minutes on 2026-08-19. Read
-        GET /admin/interception-authority-rotation on an Edge before promoting; withdrawing takes nothing away.
-
-
-        Never returns key material, and the root key is not here at all — it is the organization's.
-      responses:
-        "200":
-          description: The authority, or has_authority false when the deployment's own root is used.
-        "409":
-          description: This node holds no per-organization interception authorities.
   /admin/tenant-device-authority/abandon-rotation:
     post:
       summary: Give up on a device-identity rotation without refusing the devices that already moved.
@@ -11870,55 +12807,6 @@ paths:
                   never_reported: { type: array, items: { type: string } }
                   may_retire_previous: { type: boolean }
                   note: { type: string }
-  /admin/tenant-transport-authority:
-    post:
-      summary: Create this organization's transport authority, if it has none.
-      description: >
-        Requires admin.enrollment.write or admin.tenant.admin; naming another organization additionally goes through the operator
-        envelope, like every other cross-organization PKI act.
-
-
-        The authority is the CA that signs the certificate this organization's devices meet when they connect,
-        and it is held on the CONTROL PLANE rather than on the Edges. That is what lets an Edge added under
-        load serve the organization at all: it is handed short-lived server material on request instead of
-        having a five-year key placed on it as a file, which is what every per-organization certificate was
-        until 2026-08-20 — measured, on this repository's own scale-out definition, as carrying none of them.
-
-
-        The NAME is given here, at the moment the authority is created, because the name devices are told to
-        send and the certificate they meet have to stay together. Asking again returns the authority that
-        already exists: replacing one is a rotation (publish the new anchor, measure adoption, withdraw the
-        old), never a side effect of a second call.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [server_name]
-              properties:
-                tenant_id:
-                  type: string
-                  description: Operators only; a tenant admin's own organization is taken from the session.
-                server_name:
-                  type: string
-                  description: The name this organization's agents will send, e.g. northwind.dsse.invalid.
-      responses:
-        "200":
-          description: The authority, existing or newly created.
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  tenant_id: { type: string }
-                  server_name: { type: string }
-                  anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
-                  created_at: { type: string }
-                  applies_to: { type: string }
-        "400": { description: No name was given, or it could not be created. }
-        "403": { description: Naming another organization without the rights the envelope requires. }
-
   /admin/tenant-cas:
     get:
       summary: List the CAs that identify each tenant's devices.
@@ -12564,7 +13452,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Upsert a tenant-scoped Policy Engine policy.
-      description: Requires admin.policy.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. This endpoint manages process-local control-plane policy definitions in this increment; bundle compilation/signing and live runtime hot reload are deferred.
+      description: Requires admin.policy.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. With a configured persistent store, the authored policy is saved before publication to the live policy store. Successful local publication does not establish delivery to every Edge.
       tags:
         - AdminPolicy
       requestBody:
@@ -12586,6 +13474,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "500":
+          description: A rejected store save leaves live configuration and generation unchanged. If the store accepted the change but Network Extension snapshot publication failed, the response has status partial and applied true. Publication may have written some files; fleet delivery is not established.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyMutationError"
   /admin/effective-policy:
     get:
       summary: Explain the precedence-ordered policy basis for a destination ("Why").
@@ -12596,8 +13490,9 @@ paths:
         each row tagged by source (authored / built_in). This surfaces the hidden competition behind a
         surprising decision (e.g. an authored Authenticate rule losing a priority tie to a built-in allow). Also
         returns the inspect/bypass basis (whether the Edge decrypts or raw-forwards the flow, and which source
-        decided it: decrypt-all default / known-bypass / authored bypass / materialized cert-pin). Response is
-        metadata-only.
+        decided it: decrypt-all default / known-bypass / authored bypass / materialized cert-pin).
+        inspection.decision may be depends_on_device when a source-device selector changes the result;
+        this destination-only request has no authenticated source device. Response is metadata-only.
       tags:
         - AdminPolicy
       parameters:
@@ -12656,7 +13551,7 @@ paths:
                     description: Whether the Edge decrypts (inspect) or raw-forwards (bypass) the flow, and which source decided it. Orthogonal to the policy decision — a bypassed flow is still steered and policy-gated.
                     properties:
                       decision: { type: string, enum: [inspect, bypass] }
-                      source: { type: string, enum: [default_decrypt_all, known_bypass, authored_bypass, cert_pin_materialized, static_bypass] }
+                      source: { type: string, enum: [default_decrypt_all, known_bypass, authored_bypass, static_bypass] }
                       detail: { type: string }
                   trace:
                     type: array
@@ -12757,10 +13652,12 @@ paths:
       description: >
         Requires admin.policy.read. Aggregates every egress rule the edge owns into one precedence-ordered list,
         not just authored ones: authored rules (editable), the built-in catch-all default (toggleable), the
-        known-bypass OS/cert floor (master-toggleable), legacy SaaS Optimize posture selections, and approved
-        cert-pin bypasses — each normalized to one source -> destination : service => access x inspection shape
+        known-bypass OS/cert floor (master-toggleable). Legacy SaaS posture selections do not create active rows.
+        Cert-pin bypasses are ordinary authored rules; candidate history does not synthesize active rules
+        or restore deleted/disabled rules on restart. Each entry is normalized to one source -> destination : service => access x inspection shape
         with a kind tag and capability flags (editable / deletable / toggle_kind). Phase B-3 of the unified policy
-        model. Read-only. Metadata-only.
+        model. Read-only. Metadata-only. An authored entry with service_unresolved=true matches no traffic,
+        including deny/authenticate rules. Repair its service reference; other rules and defaults still apply.
       tags:
         - AdminPolicy
       responses:
@@ -12777,7 +13674,7 @@ paths:
                     items:
                       type: object
                       properties:
-                        kind: { type: string, enum: [authored, builtin_default, known_bypass, optimize_bypass, cert_pin_bypass] }
+                        kind: { type: string, enum: [authored, builtin_default, known_bypass] }
                         id: { type: string }
                         name: { type: string }
                         priority: { type: integer }
@@ -12786,6 +13683,7 @@ paths:
                         service_text: { type: string }
                         access: { type: string, enum: [allow, deny, authenticate] }
                         inspection: { type: string, enum: [inspect, bypass] }
+                        service_unresolved: { type: boolean, description: The named service is missing or invalid; the authored rule matches no traffic. }
                         status: { type: string, enum: [active, disabled, off] }
                         editable: { type: boolean }
                         deletable: { type: boolean }
@@ -12837,7 +13735,12 @@ paths:
         mode (decrypt_all = decrypt every steered HTTPS flow except the bypass set; bypass_default = decrypt ONLY
         the allowlist and raw-forward the rest), the decrypt allowlist (explicit hosts + selected SaaS auth-group
         presets), the curated hardcoded known-bypass groups (each marked active when in the live bypass set), and
-        the engine's actual intercept/bypass sets. Read-only. Metadata-only.
+        the local engine's intercept/bypass sets selected for the requesting tenant. scope=deployment describes
+        the shared posture settings; the host lists include only this tenant's contributions shared by all
+        source devices. device_scoped indicates additional selectors using the authenticated device identity.
+        configurable indicates whether this caller can edit the defaults; runtime_available is false on a
+        server without an interception engine. can_manage_rules is separate and covers tenant-authored SaaS
+        bypass rules. A control-plane response does not confirm that every Edge has applied the settings.
       tags:
         - AdminPolicy
       responses:
@@ -12848,13 +13751,19 @@ paths:
               schema:
                 type: object
                 properties:
+                  tenant_id: { type: string }
+                  scope: { type: string, enum: [deployment] }
+                  configurable: { type: boolean }
+                  runtime_available: { type: boolean }
+                  can_manage_rules: { type: boolean }
+                  device_scoped: { type: boolean, description: Additional device-specific inspection selectors exist. }
                   default_mode: { type: string, enum: [decrypt_all, bypass_default] }
                   intercept_hosts: { type: array, items: { type: string } }
                   effective_bypass: { type: array, items: { type: string } }
                   known_bypass_enabled: { type: boolean }
                   decrypt_allowlist_hosts: { type: array, items: { type: string } }
                   decrypt_allowlist_groups: { type: array, items: { type: string } }
-                  bypass_groups: { type: array, items: { type: string } }
+                  bypass_groups: { type: array, items: { type: string }, description: Legacy selections retained for review only. Existing entries may be removed but new selections return 409. Current tenant bypasses are authored Egress rules. }
                   warnings: { type: array, items: { type: string } }
                   note: { type: string }
                   auth_decrypt_groups:
@@ -12876,7 +13785,7 @@ paths:
                         description: { type: string }
                         patterns: { type: array, items: { type: string } }
                         category: { type: string }
-                        selected: { type: boolean }
+                        selected: { type: boolean, description: Present in the legacy deployment selection. This does not indicate an active tenant bypass. }
                   known_bypass_groups:
                     type: array
                     items:
@@ -12893,11 +13802,18 @@ paths:
     post:
       summary: Change the inspection posture (deployment mode + decrypt allowlist + known-bypass).
       description: >
-        Requires admin.policy.write. Partial update — only the provided fields change. Set mode=bypass_default to
+        Requires admin.policy.write and the deployment operator outside an X-Operate-Tenant customer context.
+        Customer administrators cannot edit deployment defaults. Config-sourced nodes reject local writes. Partial update — only the provided fields change. Set mode=bypass_default to
         decrypt ONLY the allowlist (decrypt_allowlist_hosts + decrypt_allowlist_groups, e.g. m365_auth/google_auth)
         and raw-forward everything else; a bypassed flow is still steered and policy-gated, so keep a SaaS auth
         group selected to keep tenant restriction working. known_bypass_enabled toggles the curated raw-forward
-        list. Persisted; the engine's intercept + bypass sets are re-applied instantly. Returns the updated posture.
+        list. Known presets and DNS host patterns (or IPv4 literals) are validated. URLs, ports, unknown presets
+        and unsupported IPv6 literals are rejected. The candidate is saved before the local live settings and
+        engine callback are updated. A storage failure returns 500 and retains the previous live settings.
+        Re-read after uncertain responses and retry once storage is restored. Edges receive the change through
+        configuration synchronization; failed persistence keeps the bundle generation pending for retry.
+        Returns the updated posture. A dedicated audit event records the scope, mode, counts, digest and outcome
+        without recording destination lists, in addition to the common HTTP mutation audit.
       tags:
         - AdminPolicy
       requestBody:
@@ -12910,7 +13826,7 @@ paths:
                 mode: { type: string, enum: [decrypt_all, bypass_default] }
                 decrypt_allowlist_hosts: { type: array, items: { type: string } }
                 decrypt_allowlist_groups: { type: array, items: { type: string } }
-                bypass_groups: { type: array, items: { type: string } }
+                bypass_groups: { type: array, items: { type: string }, description: Legacy selections retained for review only. Existing entries may be removed but new selections return 409. Current tenant bypasses are authored Egress rules. }
                 known_bypass_enabled: { type: boolean }
       responses:
         "200":
@@ -12926,7 +13842,9 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
         "409":
-          description: Inspection posture is not configurable on this edge (no interception engine wired).
+          description: Posture storage is not configured, this node pulls its configuration from an authority, or the request adds a legacy bypass selection.
+        "500":
+          description: Saving the candidate was not confirmed; the previous live settings remain active. Reload and retry after storage recovers.
   /admin/policies/{policy_id}:
     get:
       summary: Get a tenant-scoped Policy Engine policy.
@@ -12978,6 +13896,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: The policy exists but is bundle-sourced; it cannot be deleted through the Admin API.
+        "500":
+          description: Deletion is applied on this server, but Network Extension snapshot publication is unconfirmed. Reload before retrying; the removed policy now returns 404. This does not establish durable deletion or delivery to every endpoint.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicyMutationError"
   /admin/rbac/catalog:
     get:
       summary: Return Admin RBAC role and API token scope catalog.
@@ -13187,7 +14111,7 @@ paths:
           $ref: "#/components/responses/NotFound"
   /admin/logs/{stream}:
     get:
-      summary: Search tenant-scoped log stream.
+      summary: Search an authorized log stream.
       tags:
         - AdminLog
       parameters:
@@ -13205,6 +14129,21 @@ paths:
               - delegated_access_grants
               - tool_call_events
               - inspection_events
+        - name: audit_scope
+          in: query
+          schema:
+            type: string
+            enum: [tenant, deployment]
+            default: tenant
+          description: >-
+            Omitted or tenant uses the authenticated organization, including an
+            authorized X-Operate-Tenant selection. Deployment is valid only for
+            stream=audit and an authenticated deployment operator with
+            cross-organization authority, outside any selected organization.
+            It reads only the reserved deployment namespace, not customer logs.
+            Unknown, empty or repeated values are rejected with 400; an
+            unauthorized deployment scope is rejected with 403. The existing
+            route-specific read or preview-export permission is still required.
         - name: q
           in: query
           schema:
@@ -13213,7 +14152,7 @@ paths:
           in: query
           schema:
             type: string
-          description: Direct field filter. tenant_id is always forced by auth context.
+          description: Direct field filter. tenant_id is forced by the authorized audit scope or authenticated organization.
         - name: application_id
           in: query
           schema:
@@ -13322,6 +14261,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/LogSearchResponse"
+        "400":
+          description: Invalid query, audit scope, or deployment scope on a non-audit stream.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -13330,7 +14271,7 @@ paths:
           $ref: "#/components/responses/NotFound"
   /admin/logs/{stream}/export:
     get:
-      summary: Preview export for tenant-scoped log stream.
+      summary: Preview an authorized log stream as bounded NDJSON.
       tags:
         - AdminLog
       parameters:
@@ -13355,6 +14296,21 @@ paths:
             minimum: 1
             maximum: 200
             default: 25
+        - name: audit_scope
+          in: query
+          schema:
+            type: string
+            enum: [tenant, deployment]
+            default: tenant
+          description: >-
+            Omitted or tenant uses the authenticated organization, including an
+            authorized X-Operate-Tenant selection. Deployment is valid only for
+            stream=audit and an authenticated deployment operator with
+            cross-organization authority, outside any selected organization.
+            It reads only the reserved deployment namespace, not customer logs.
+            Unknown, empty or repeated values are rejected with 400; an
+            unauthorized deployment scope is rejected with 403. The existing
+            route-specific read or preview-export permission is still required.
         - name: q
           in: query
           schema:
@@ -13363,7 +14319,7 @@ paths:
           in: query
           schema:
             type: string
-          description: Direct field filter. tenant_id is always forced by auth context.
+          description: Direct field filter. tenant_id is forced by the authorized audit scope or authenticated organization.
         - name: application_id
           in: query
           schema:
@@ -13470,12 +14426,70 @@ paths:
             application/x-ndjson:
               schema:
                 type: string
+        "400":
+          description: Invalid query, audit scope, or deployment scope on a non-audit stream.
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /admin/audit-writer/health:
+    get:
+      summary: Report observed primary audit-file write failures.
+      description: >-
+        Requires admin.logs.read and deployment-wide administration. Tenant-scoped
+        sessions and requests operating on a tenant receive 403. Counters describe
+        completed audit appends in this node's current Writer instance, reset on
+        recreation, and do not prove durable storage or fleet-wide completeness.
+        Primary failures remain degraded after successful writes. Hook failures
+        are counted separately and do not change primary status. Reading does not
+        append an audit event or clear failures.
+      tags:
+        - AdminLog
+      responses:
+        "200":
+          description: In-memory writer observations, including unknown or unavailable states.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, scope, attempts, primary_successes, primary_failures, hook_failures]
+                properties:
+                  status:
+                    type: string
+                    enum: [unknown, unavailable, healthy, degraded]
+                  scope:
+                    type: string
+                    enum: [writer_process_lifetime]
+                  attempts:
+                    type: integer
+                    minimum: 0
+                  primary_successes:
+                    type: integer
+                    minimum: 0
+                  primary_failures:
+                    type: integer
+                    minimum: 0
+                  hook_failures:
+                    type: integer
+                    minimum: 0
+                  last_success_at:
+                    type: string
+                    format: date-time
+                  last_primary_failure_at:
+                    type: string
+                    format: date-time
+                  last_hook_failure_at:
+                    type: string
+                    format: date-time
+                  last_primary_failure_phase:
+                    type: string
+                    enum: [encode, open, write, rotation]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /admin/hot-store/health:
     get:
       summary: Return Edge Hot Store mirror health.
@@ -13957,7 +14971,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Create asynchronous log export job.
-      description: Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF.
+      description: Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Both bounds are required; to must not precede from. Only ndjson is supported. Validation occurs before worker submission.
       tags:
         - AdminExport
       requestBody:
@@ -13993,17 +15007,15 @@ paths:
                   additionalProperties:
                     type: string
                 format:
-                  type: string
-                  enum:
-                    - ndjson
-                    - csv
-                  default: ndjson
+                  $ref: "#/components/schemas/ExportFormat"
                 limit:
                   type: integer
                   minimum: 0
                   maximum: 1000000
-                  description: Omit or set 0 to use the server-side Phase 1 default of 1000000 rows. Alpha should make the default explicit per plan.
+                  description: Omit or set 0 to use the default of 1000000 rows.
       responses:
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "202":
           description: Export job accepted.
           content:

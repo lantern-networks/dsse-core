@@ -25,6 +25,12 @@ import (
 // surface reads ~20 enrollment/licensing/mesh config fields.
 func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, deviceStore deviceRuntimeStore, registry connectorRegistryStore, tcaReg *tenantca.TenantCARegistry, tenantModelStore adminTenantModelRuntimeStore, configSourceURL string, configBundleEpoch string) {
 	mux.HandleFunc("GET /admin/transport-admission", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
+		if admissionReadRefusedOnAStandby(w) {
+			return
+		}
 		// Scoped like every other per-device read (same sweep). A kill-switch list names devices and says they
 		// were cut off, which is a statement about another customer's incident when it is not the caller's.
 		//
@@ -32,6 +38,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// FEED a pulling Edge applies, its caller is the deployment rather than a customer, and filtering it by
 		// a human's tenant would silently stop propagating other tenants' kill-switches — a fix that turns a
 		// disclosure into an enforcement failure. The two look alike and are not the same act.
+		if config.AdmissionRevocations == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("transport admission overlay not configured"))
+			return
+		}
 		callerTenant := adminTenantIDFromRequest(r)
 		revoked := []string{}
 		unattributable := 0
@@ -51,6 +61,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version":          "admin_transport_admission.v1",
+			"tenant_id":               callerTenant,
 			"revoked_identities":      revoked,
 			"withheld_unattributable": unattributable,
 			"no_secret_attestation":   true,
@@ -87,6 +98,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				return
 			}
 		}
+		if admissionReadRefusedOnAStandby(w) {
+			return
+		}
 		// Only the control plane may say "this is the complete set". That claim is what lets a pulling Edge
 		// treat an EMPTY set as a real release rather than as a blank answer, so a node that is merely echoing
 		// what it pulled must not make it.
@@ -99,7 +113,14 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		if config.HighRiskOverlay != nil {
 			feed.Generation += config.HighRiskOverlay.ConfigGeneration() // aggregate: a high-risk change advances the feed too
-			feed.HighRisk = config.HighRiskOverlay.Snapshot()
+			devices, users, err := config.HighRiskOverlay.CheckedSnapshot()
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is not available"))
+				return
+			}
+			feed.HighRisk = devices
+			feed.UserRiskVersion = 1
+			feed.UserRisk = users
 		}
 		writeJSON(w, http.StatusOK, feed)
 	}))
@@ -108,6 +129,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// never re-pushed (no-loop — only an origin region pushes). Authenticated by the shared mesh secret; fail-SAFE
 	// (it can only DENY — restore stays admin-only at the origin region).
 	mux.HandleFunc("POST /revocation-mesh/admission", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		// Self-gate: only serve when this CP is configured to receive cross-region revocations (an allowed-peer
 		// set, or a revocation-mesh secret in lab). An unconfigured edge never exposes this DoS-sensitive surface
 		// (an accepted push can DENY any identity).
@@ -117,7 +139,8 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		// Authenticate the peer CP. With an allowlist configured this requires a VERIFIED mTLS identity that is an
 		// AUTHORIZED sibling (secret fallback disabled) — an empty/any-cert push could revoke ANY identity.
-		if _, ok := meshIngressAuth(r, config.MeshIngressAllowedPeers, config.RevocationMeshSecret, "x-revocation-mesh-secret"); !ok {
+		peerIdentity, authenticated := meshIngressAuth(r, config.MeshIngressAllowedPeers, config.RevocationMeshSecret, "x-revocation-mesh-secret")
+		if !authenticated {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("revocation mesh push requires an authorized peer mTLS identity (allowlisted) or, in lab, a valid x-revocation-mesh-secret"))
 			return
 		}
@@ -145,10 +168,22 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("revocation mesh item requires an identity"))
 			return
 		}
-		changed := config.AdmissionRevocations.RevokeFromMesh(item.Identity, item.Reason)
-		if changed {
-			log.Printf("revocation mesh: applied cross-region revocation %q (origin region %q)", item.Identity, item.OriginRegion)
+		changed, saveErr := config.AdmissionRevocations.RevokeFromMeshCheckedContext(r.Context(), item.Identity, item.Reason)
+		identity := strings.ToLower(strings.TrimSpace(item.Identity))
+		// A failed save must not drain the sender's retry queue. A fresh delivery
+		// resaves even an unchanged item, without re-firing callbacks or mesh pushes.
+		// OriginRegion is a claim in the payload, not the authenticated peer identity.
+		if saveErr != nil {
+			_, applied := config.AdmissionRevocations.IsRevoked(identity)
+			log.Printf("revocation mesh: persistence unconfirmed; identity=%q peer=%q claimed_origin=%q changed=%t applied_locally=%t", identity, peerIdentity, item.OriginRegion, changed, applied)
+			if !applied {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("cross-region revocation saving was not confirmed; retry with a fresh authenticated request"))
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("cross-region revocation is applied locally, but saving was not confirmed; retry with a fresh authenticated request"))
+			return
 		}
+		log.Printf("revocation mesh: accepted; identity=%q peer=%q claimed_origin=%q changed=%t", identity, peerIdentity, item.OriginRegion, changed)
 		writeJSON(w, http.StatusOK, map[string]any{"applied": changed})
 	})
 	// Node→CP reporting. A node that observes something alarming about a device says so HERE, and that is all
@@ -277,6 +312,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		})
 	}))
 	mux.HandleFunc("POST /admin/transport-admission/revoke", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// Phase 3: the revocation overlay is CP-authoritative + fleet-distributed, so author kill-switches on
 		// the control plane (a puller's local revoke would not propagate). The node-local W-2 auto-revocation
 		// path is separate and not gated.
@@ -317,17 +355,46 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		reason := valueOrDefault(strings.TrimSpace(req.Reason), "admin_kill_switch")
-		config.AdmissionRevocations.Revoke(req.Identity, reason)
+		applied, saveErr := config.AdmissionRevocations.RevokeCheckedContext(r.Context(), req.Identity, reason)
 		// The ONE place allowed to tear down established (T) sessions: an explicit administrator block. Every
 		// other revocation path (CP feed, mesh, node-reported automatic) only denies NEW handshakes. See the
 		// invariant on transportConns where the registry is created.
-		if config.TransportConnRegistry != nil {
+		if applied && config.TransportConnRegistry != nil {
 			config.TransportConnRegistry.logCloseIdentity(req.Identity, reason)
 		}
-		logInfof("transport_admission_revoked_by_admin identity=%q reason=%q", req.Identity, reason)
-		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "identity": strings.TrimSpace(req.Identity), "reason": reason})
+		if applied {
+			logInfof("transport_admission_revoked_by_admin identity=%q reason=%q", req.Identity, reason)
+		}
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		record := transportAdmissionAuditLog(r, tenantID, "revoke", req.Identity, reason, evaluator, time.Now().UTC())
+		if saveErr != nil {
+			record.Result = stringPtr("error")
+			if applied {
+				record.Result = stringPtr("partial")
+			}
+			record.Metadata["applied_locally"] = applied
+			record.Metadata["persistence_confirmed"] = false
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
+		if saveErr != nil {
+			if applied {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device blocked locally, but saving was not confirmed; repair storage and retry the block before restarting"))
+			} else {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device block was not applied because shared storage or write authority was unavailable; reload before retrying"))
+			}
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "revoked": true, "tenant_id": adminTenantIDFromRequest(r), "identity": strings.TrimSpace(req.Identity), "reason": reason})
 	}))
 	mux.HandleFunc("POST /admin/transport-admission/restore", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if configWriteRejectedWhenSourced(w, configSourceURL, "admission revocations (restore)") {
 			return
 		}
@@ -356,15 +423,42 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				return
 			}
 		}
-		config.AdmissionRevocations.Restore(req.Identity)
+		saveErr := config.AdmissionRevocations.RestoreCheckedContext(r.Context(), req.Identity)
+		// Restore removes only the locally authored block. A peer or pulled block can
+		// still deny admission. This is a current local observation, not a fleet ACK.
+		_, transportRevoked := config.AdmissionRevocations.IsRevoked(req.Identity)
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(req.Identity); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		record := transportAdmissionAuditLog(r, tenantID, "restore", req.Identity, "", evaluator, time.Now().UTC())
+		record.Metadata["transport_revoked"] = transportRevoked
+		if saveErr == nil && transportRevoked {
+			record.Result = stringPtr("partial")
+		}
+		if saveErr != nil {
+			record.Result = stringPtr("error")
+			record.Metadata["applied_locally"] = false
+			record.Metadata["persistence_confirmed"] = false
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
+		if saveErr != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device restore was not applied locally because saving was not confirmed; reconcile storage and retry the intended state before restarting"))
+			return
+		}
 		logInfof("transport_admission_restored_by_admin identity=%q", strings.TrimSpace(req.Identity))
-		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "restored": true, "identity": strings.TrimSpace(req.Identity)})
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_transport_admission.v1", "restored": true, "tenant_id": adminTenantIDFromRequest(r), "identity": strings.TrimSpace(req.Identity), "transport_revoked": transportRevoked})
 	}))
 	// management ledger: the Admin Console device list for the Enrolled Inventory. Enroll a device,
 	// disable it (the manual revocation path), re-enable, or remove it — consulted live at the (T) handshake,
 	// no restart. Replaces the static signed-file inventory with a managed ledger (cert-profile enforcement
 	// is intentionally NOT included — out of scope).
 	enrolledLedgerOr503 := func(w http.ResponseWriter) bool {
+		if admissionReadRefusedOnAStandby(w) {
+			return false
+		}
 		if config.EnrolledLedger == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("enrolled inventory ledger not configured"))
 			return false
@@ -410,6 +504,16 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return nodeIssuesDeviceIdentitiesFor(config.TenantDeviceAuthority, tenant)
 		}, config.ConfigSourceURL, config.OperatorTenantID)
 	registerAdminLicenseEndpoints(mux, adminLicenseDeps{
+		auditAllocation: func(r *http.Request, target, action, result string, seats *int) {
+			now := time.Now().UTC()
+			identity, _ := adminIdentityFromRequest(r)
+			meta := map[string]any{"target_tenant_id": target, "auth_method": identity.AuthMethod}
+			if seats != nil {
+				meta["requested_seats"] = *seats
+			}
+			row := model.AuditLog{ID: randomEdgeID("audit_seat_allocation_", now), TenantID: adminTenantIDFromRequest(r), ActorUserID: auditActorPrincipal(r), EventType: "admin_seat_allocation_changed", TargetType: stringPtr("tenant_seat_allocation"), TargetID: stringPtr(target), Action: stringPtr(action), Result: stringPtr(result), Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID, Metadata: meta}
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, row, now)
+		},
 		licence:     config.VendorLicense,
 		allocations: config.SeatAllocations,
 		licensing:   config.EnrolmentLicensing,
@@ -430,6 +534,9 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		oversubscribe: config.LicenseAllowOversubscription,
 	}, adminEndpoint)
 	mux.HandleFunc("GET /admin/enrolled-devices", adminEndpoint("admin.enrollment.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if !enrolledLedgerOr503(w) {
 			return
 		}
@@ -569,8 +676,11 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// An UNASSIGNED entry belongs to nobody, and adopting one is an operator action: a tenant-scoped admin
 		// cannot even see it, so `claimant` is the caller's tenant and an operator (unscoped, or holding
 		// admin.tenant.admin with X-Operate-Tenant) passes empty and may assign it.
-		entry, err := config.EnrolledLedger.EnrollGroupForTenant(req.Identity, tenantID, tenantID, req.Group,
+		entry, err := config.EnrolledLedger.EnrollGroupForTenantContext(r.Context(), req.Identity, tenantID, tenantID, req.Group,
 			req.Note, time.Now().UTC().Format(time.RFC3339), adminCallerIsOperator(r))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if errors.Is(err, enrolledinventory.ErrIdentityUnassigned) {
 			// ★ THIS BRANCH USED TO BE UNREACHABLE (2026-08-12, eighteenth review). The Console tells an
 			// operator that unassigned devices are theirs to assign, and no call could do it: a tenant-scoped
@@ -587,14 +697,19 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if entry.Identity != "" {
+				appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "enroll", entry, true, err)
+				writeError(w, http.StatusInternalServerError, errEnrolledMutationPartial)
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		// Reported, not authored: an issuing node saying which machine it issued to. Recorded after the
 		// identity exists and only when this deployment does not already know — never as a way to move a name
 		// to a different machine.
 		if ref := strings.TrimSpace(req.MachineRef); ref != "" {
-			if merr := config.EnrolledLedger.RecordReportedMachine(entry.Identity, ref,
+			if merr := config.EnrolledLedger.RecordReportedMachineContext(r.Context(), entry.Identity, tenantID, ref,
 				time.Now().UTC().Format(time.RFC3339)); merr != nil {
 				// Not fatal to the enrolment: the device is admitted either way, and losing this costs the
 				// deployment a distinction rather than a machine. Said out loud so it is not lost silently.
@@ -604,7 +719,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				entry = e
 			}
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "enroll", entry, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "enroll", entry, true, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 	}))
 	// ★ RE-ENROLMENT IS ITS OWN OPERATION (2026-08-12, twenty-first review). It used to be a side effect of
@@ -624,7 +739,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// The before-image comes back from the same lock as the write, so what the record says this grant
 		// replaced is what it replaced — a separate EntryFor could be overtaken by another enrolment or re-arm
 		// between the read and the write, in the one record whose purpose is naming what it superseded.
-		entry, before, err := config.EnrolledLedger.AllowReenrolment(identity, tenantID, time.Now().UTC().Format(time.RFC3339))
+		entry, before, err := config.EnrolledLedger.AllowReenrolmentContext(r.Context(), identity, tenantID, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if errors.Is(err, enrolledinventory.ErrIdentityNotFound) ||
 			errors.Is(err, enrolledinventory.ErrIdentityOwnedByAnotherTenant) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
@@ -667,18 +785,21 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if configWriteRejectedWhenSourced(w, configSourceURL, "enrolled inventory") {
 			return
 		}
-		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, evaluator, enrolledLedgerOr503, true)
+		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, adminAuditOutbox, evaluator, enrolledLedgerOr503, true)
 	}))
 	mux.HandleFunc("POST /admin/enrolled-devices/{identity}/disable", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "enrolled inventory") {
 			return
 		}
-		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, evaluator, enrolledLedgerOr503, false)
+		adminSetEnrolledDeviceEnabled(w, r, config.EnrolledLedger, writer, adminAuditOutbox, evaluator, enrolledLedgerOr503, false)
 	}))
 	// M7: assign/change a device's CP-authoritative group (Device Groups and their ASSIGNMENT — the union-model scope selector
 	// the agent-policy/agent-tuning resolution reads via cpAuthoritativeGroup). An empty group clears the
 	// assignment (tenant-scope only). Same admin-scope + config-sourced guard as the other ledger mutations.
 	mux.HandleFunc("POST /admin/enrolled-devices/{identity}/group", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if configWriteRejectedWhenSourced(w, configSourceURL, "enrolled inventory") {
 			return
 		}
@@ -699,23 +820,20 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		entry, ok, perr := config.EnrolledLedger.SetGroup(identity, req.Group, time.Now().UTC().Format(time.RFC3339))
+		entry, ok, perr := config.EnrolledLedger.SetGroupContext(r.Context(), identity, tenantID, req.Group, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, perr) {
+			return
+		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
 		if perr != nil {
-			// ★ THE WAVE GROUP DECIDES WHICH RING THIS DEVICE UPDATES IN (2026-08-13, thirty-first review #8).
-			// Answering 200 to a move that did not reach the disk means the next control-plane restart puts the
-			// device back in its old ring — pilot, taking a release on wave 0, which is the ring that exists to
-			// catch a bad build before the fleet does. The change IS in force until then, and the caller is told
-			// what it has to do about it.
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("%s is in group %q on this node and the "+
-				"change was NOT stored durably (%w) — it will revert on the next restart, so apply it again once "+
-				"the store is healthy", identity, req.Group, perr))
+			appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "assign_group", entry, true, perr)
+			writeError(w, http.StatusInternalServerError, errEnrolledMutationPartial)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "assign_group", entry, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "assign_group", entry, true, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 	}))
 	// Declare what an identity IS. A connector holds a transport certificate and is admitted from this same
@@ -742,7 +860,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		entry, ok, perr := config.EnrolledLedger.SetKind(identity, req.Kind, time.Now().UTC().Format(time.RFC3339))
+		entry, ok, perr := config.EnrolledLedger.SetKindContext(r.Context(), identity, tenantID, req.Kind, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, perr) {
+			return
+		}
 		if perr != nil && !ok {
 			// An unknown kind: refuse rather than store it. A typo must not quietly become "not an endpoint",
 			// because that is the reading under which silence stops being a finding.
@@ -754,12 +875,11 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if perr != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("%s is kind %q on this node and the change "+
-				"was NOT stored durably (%w) — it reverts on the next restart, and until it does the posture gate "+
-				"reads this identity under the old kind", identity, req.Kind, perr))
+			appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "set_kind", entry, true, perr)
+			writeError(w, http.StatusInternalServerError, errEnrolledMutationPartial)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "set_kind", entry, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "set_kind", entry, true, nil)
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "device": entry})
 	}))
 	mux.HandleFunc("DELETE /admin/enrolled-devices/{identity}", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -776,17 +896,28 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		if !config.EnrolledLedger.Remove(identity, time.Now().UTC().Format(time.RFC3339)) {
+		entry, err := config.EnrolledLedger.RemoveCheckedContext(r.Context(), identity, tenantID, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
+		if errors.Is(err, enrolledinventory.ErrIdentityNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Errorf("identity %q is not in the enrolled inventory", identity))
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "remove", enrolledinventory.Entry{Identity: enrolledinventory.NormalizeIdentity(identity)}, evaluator, sourceIPFromRequest(r)))
+		appendEnrolledMutationAudit(r, writer, adminAuditOutbox, evaluator, "remove", entry, err == nil, err)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, errors.New("Device removal could not be confirmed. The previous local state is still in use. Reload and retry after storage is available."))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_enrolled_inventory.v1", "removed": true, "identity": enrolledinventory.NormalizeIdentity(identity)})
 	}))
 	// Device-group REGISTRY (first-class groups). Distinct from the per-device assignment (Entry.Group): this is
 	// the authoritative catalog of groups that EXIST, so the Console offers created groups for tab-select
 	// assignment instead of free-form typing. Reuses the enrolled ledger's durable store (no new plumbing).
 	mux.HandleFunc("GET /admin/device-groups", adminEndpoint("admin.enrollment.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if !enrolledLedgerOr503(w) {
 			return
 		}
@@ -836,12 +967,20 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
-		g, err := config.EnrolledLedger.CreateGroup(req.Name, tenantID, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		g, err := config.EnrolledLedger.CreateGroupContext(r.Context(), req.Name, tenantID, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(tenantID, "create_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r)))
+		record := enrolledInventoryAuditLog(tenantID, "create_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r))
+		record.ActorUserID = auditActorPrincipal(r)
+		targetType := "device_group"
+		record.TargetType = &targetType
+		delete(record.Metadata, "enabled")
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_device_group_registry.v1", "group": g})
 	}))
 	mux.HandleFunc("DELETE /admin/device-groups/{id}", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -860,25 +999,14 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusNotFound, fmt.Errorf("device group %q not found", id))
 			return
 		}
-		// Refuse to delete a group that still has devices assigned (would orphan the assignment), unless
-		// ?force=true: reassign first, or force. Match by normalized name (assignment is by name), scoped to the
-		// caller's tenant.
-		if r.URL.Query().Get("force") != "true" {
-			assigned := 0
-			for _, e := range config.EnrolledLedger.List() {
-				if !deviceGroupVisibleToTenant(e.TenantID, callerTenant) {
-					continue
-				}
-				if enrolledinventory.NormalizeGroupName(e.Group) == enrolledinventory.NormalizeGroupName(grp.Name) {
-					assigned++
-				}
-			}
-			if assigned > 0 {
-				writeError(w, http.StatusConflict, fmt.Errorf("device group %q still has %d assigned device(s); reassign them first or pass ?force=true", grp.Name, assigned))
-				return
-			}
+		removed, grp, derr := config.EnrolledLedger.DeleteGroupContext(r.Context(), id, callerTenant, r.URL.Query().Get("force") == "true")
+		if inventoryContextError(w, derr) {
+			return
 		}
-		removed, derr := config.EnrolledLedger.DeleteGroup(id)
+		if errors.Is(derr, enrolledinventory.ErrGroupAssigned) {
+			writeError(w, http.StatusConflict, derr)
+			return
+		}
 		if !removed {
 			writeError(w, http.StatusNotFound, fmt.Errorf("device group %q not found", id))
 			return
@@ -889,7 +1017,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 				"on the next restart", id, derr))
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(callerTenant, "delete_group", enrolledinventory.Entry{Identity: id, Group: grp.Name}, evaluator, sourceIPFromRequest(r)))
+		record := enrolledInventoryAuditLog(callerTenant, "delete_group", enrolledinventory.Entry{Identity: id, Group: grp.Name}, evaluator, sourceIPFromRequest(r))
+		record.ActorUserID = auditActorPrincipal(r)
+		targetType := "device_group"
+		record.TargetType = &targetType
+		delete(record.Metadata, "enabled")
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_device_group_registry.v1", "removed": true, "id": id})
 	}))
 	mux.HandleFunc("PATCH /admin/device-groups/{id}", adminEndpoint("admin.enrollment.write", func(w http.ResponseWriter, r *http.Request) {
@@ -919,7 +1052,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode update group: %w", err))
 			return
 		}
-		g, reassigned, err := config.EnrolledLedger.UpdateGroup(id, req.Name, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		g, reassigned, err := config.EnrolledLedger.UpdateGroupContext(r.Context(), id, callerTenant, req.Name, req.Description, req.Risk, time.Now().UTC().Format(time.RFC3339))
+		if inventoryContextError(w, err) {
+			return
+		}
 		if err != nil {
 			// Absent id → 404; empty name / name collision → 409 (mirrors CreateGroup's conflict handling).
 			if _, ok := config.EnrolledLedger.GroupByID(id); !ok {
@@ -929,7 +1065,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusConflict, err)
 			return
 		}
-		_ = writer.Append("audit.log.jsonl", enrolledInventoryAuditLog(callerTenant, "update_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r)))
+		record := enrolledInventoryAuditLog(callerTenant, "update_group", enrolledinventory.Entry{Identity: g.ID, Group: g.Name}, evaluator, sourceIPFromRequest(r))
+		record.ActorUserID = auditActorPrincipal(r)
+		targetType := "device_group"
+		record.TargetType = &targetType
+		delete(record.Metadata, "enabled")
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
 		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "admin_device_group_registry.v1", "group": g, "reassigned_devices": reassigned})
 	}))
 	// admin DNS-policy API: read + hot-apply the Edge DNS ruleset (deny/sinkhole/stub/ECH-strip) at
@@ -956,4 +1097,17 @@ func nodeIssuesDeviceIdentitiesFor(authority *tenantDeviceAuthority, tenant stri
 		}
 	}
 	return tenantDeviceIdentity.For(tenant) != nil
+}
+
+// Shared-store failure is neither an input conflict nor an applied local edit.
+func inventoryContextError(w http.ResponseWriter, err error) bool {
+	if errors.Is(err, enrolledinventory.ErrInventorySave) {
+		writeError(w, http.StatusServiceUnavailable, err)
+		return true
+	}
+	if errors.Is(err, enrolledinventory.ErrIdentityNotFound) {
+		writeError(w, http.StatusNotFound, errors.New("inventory object not found"))
+		return true
+	}
+	return false
 }

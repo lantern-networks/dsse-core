@@ -1,6 +1,7 @@
 package revocation
 
 import (
+	"context"
 	"sort"
 	"strings"
 	"sync"
@@ -12,7 +13,8 @@ import (
 // AdmissionRevocations is the dynamic overlay on top of the static Enrolled Inventory: a thread-safe set of
 // transport identities the Edge has AUTO-revoked (e.g. an agent-dark device). The (T) mTLS admission check
 // consults it so a revoked identity is rejected at the handshake even though it is still present in the
-// (static) enrolled file. Restore — re-enroll / re-attest — clears it (the re-admission gate).
+// (static) enrolled file. Restore clears a locally authored block. It does not
+// withdraw a received-region or pulled block; enrollment alone is not a mesh restore.
 //
 // Keyed on the TRANSPORT IDENTITY (the cert CN/SAN that admission matches), not the device store id; the
 // wiring layer maps a dark device to its transport identity before calling Revoke.
@@ -24,15 +26,20 @@ import (
 // still bites locally. The CP serves its `revoked` set as the feed; persistence keeps it across a CP restart
 // (a restart must NOT silently un-revoke). generation is bumped on every node-local change for the feed.
 type AdmissionRevocations struct {
+	// Persisted-layer writers and persister replacement serialize here. Readers
+	// and the independently pulled synced layer never wait for storage I/O.
+	// Lock order: writeMu, then mu. No callback runs under either lock.
+	writeMu sync.Mutex
 	mu      sync.RWMutex
 	revoked map[string]string // node-local / ORIGIN: this region's admin kill-switches + its own W-2 auto-revocations
 	synced  map[string]string // control-plane distributed (Phase 3, intra-region): identity -> reason
 	// meshReceived is the federation layer: revocations PUSHED here by an external peer (e.g. a sibling control
 	// plane). They deny on this node's edges (folded into the edge feed) but are NEVER re-pushed — only an ORIGIN
 	// pushes, so a received item does not bounce back (the no-loop discipline).
-	meshReceived map[string]string
-	persister    blobstore.Persister // durable snapshot of `revoked` + `meshReceived`; nil = in-memory only
-	generation   atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
+	meshInitialPending bool // writeMu: first shared save ran its edit but was unconfirmed
+	meshReceived       map[string]string
+	persister          blobstore.Persister // guarded by writeMu; snapshot of revoked + meshReceived; nil = volatile
+	generation         atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
 	// reporter, when set (puller mode), is called on a NEW node-local revocation so this node's own W-2
 	// auto-revocation propagates UP to the control plane, which redistributes it fleet-wide (slice 3b: a dark
 	// device caught on one node is then denied on every node, not just this one). Not called for ReplaceSynced.
@@ -40,7 +47,7 @@ type AdmissionRevocations struct {
 	// meshReporter, when set (a CP that federates with peers), is called on a NEW ORIGIN revocation so it
 	// propagates to the federation peers. NOT called for a federation-RECEIVED item (no-loop) nor for
 	// ReplaceSynced.
-	meshReporter func(identity, reason string)
+	meshReporter func(context.Context, string, string)
 	// onRevoked, when set, is called ONCE when an identity BECOMES revoked via ANY layer (node-local Revoke,
 	// federation RevokeFromMesh, or a NEWLY-added entry in ReplaceSynced) — i.e. it fires on the fast CP poll
 	// too, unlike reporter/meshReporter. It exists so the edge can ACTIVELY close that identity's live (T)
@@ -71,6 +78,20 @@ func (a *AdmissionRevocations) SetMeshReporter(reporter func(identity, reason st
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if reporter == nil {
+		a.meshReporter = nil
+	} else {
+		a.meshReporter = func(_ context.Context, id, reason string) { reporter(id, reason) }
+	}
+}
+
+// SetMeshReporterContext preserves the revocation request authority for its outbox.
+func (a *AdmissionRevocations) SetMeshReporterContext(reporter func(context.Context, string, string)) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.meshReporter = reporter
 }
 
@@ -89,26 +110,45 @@ func (a *AdmissionRevocations) SetOnRevoked(fn func(identity, reason string)) {
 // region's edges (via the feed) but is never re-pushed cross-region (no-loop). Monotonic: only a state change
 // bumps the generation + persists, so re-delivering the same item is a no-op. Returns whether it changed state.
 func (a *AdmissionRevocations) RevokeFromMesh(identity, reason string) bool {
+	changed, _ := a.revokeFromMesh(identity, reason, false)
+	return changed
+}
+
+// RevokeFromMeshChecked retains the received block even when saving fails. Each
+// explicit delivery retries saving, including an unchanged item, so the receiver
+// acknowledges delivery only after the configured store accepts the snapshot.
+// Unchanged retries do not bump generation, invoke callbacks or re-push the item.
+func (a *AdmissionRevocations) RevokeFromMeshChecked(identity, reason string) (bool, error) {
+	return a.RevokeFromMeshCheckedContext(context.Background(), identity, reason)
+}
+
+func (a *AdmissionRevocations) revokeFromMesh(identity, reason string, retrySave bool) (bool, error) {
 	id := normalizeIdentity(identity)
 	if id == "" {
-		return false
+		return false, nil
 	}
 	reason = strings.TrimSpace(reason)
+	a.writeMu.Lock()
 	a.mu.Lock()
-	if prev, existed := a.meshReceived[id]; existed && prev == reason {
-		a.mu.Unlock()
-		return false
+	prev, existed := a.meshReceived[id]
+	changed := !existed || prev != reason
+	if changed {
+		a.meshReceived[id] = reason
+		a.generation.Add(1)
 	}
-	a.meshReceived[id] = reason
-	a.generation.Add(1)
-	a.persistLocked()
-	onRevoked := a.onRevoked
 	a.mu.Unlock()
-	// Active session revocation: close the identity's live connections (fired outside the lock; idempotent).
-	if onRevoked != nil {
+	var err error
+	if changed || retrySave {
+		err = a.persistLocked()
+	}
+	a.mu.RLock()
+	onRevoked := a.onRevoked
+	a.mu.RUnlock()
+	a.writeMu.Unlock()
+	if changed && onRevoked != nil {
 		onRevoked(id, reason)
 	}
-	return true
+	return changed, err
 }
 
 // ConfigGeneration returns the monotonic revocation version (bumped on each node-local change). The control
@@ -182,50 +222,108 @@ func normalizeIdentity(identity string) string {
 // churn the feed or spam the control plane). On a new revocation the reporter (puller mode) ships it UP to the
 // control plane for fleet-wide redistribution.
 func (a *AdmissionRevocations) Revoke(identity, reason string) {
+	_ = a.revoke(identity, reason, false)
+}
+
+// RevokeChecked applies the restrictive local decision even if saving fails.
+// An error means persistence is unconfirmed, not that the block was rolled back.
+// Explicit retries save an unchanged block again and, on confirmed persistence,
+// re-request mesh delivery. They do not repeat the node reporter/session callback
+// or bump generation. Automatic Revoke retains its no-churn behaviour.
+func (a *AdmissionRevocations) RevokeChecked(identity, reason string) error {
+	return a.revoke(identity, reason, true)
+}
+
+func (a *AdmissionRevocations) revoke(identity, reason string, retrySave bool) error {
+	return a.revokeContext(context.Background(), identity, reason, retrySave)
+}
+func (a *AdmissionRevocations) revokeContext(ctx context.Context, identity, reason string, retrySave bool) error {
 	id := normalizeIdentity(identity)
 	if id == "" {
-		return
+		return nil
 	}
 	reason = strings.TrimSpace(reason)
+	a.writeMu.Lock()
 	a.mu.Lock()
 	prev, existed := a.revoked[id]
 	changed := !existed || prev != reason
 	if changed {
 		a.revoked[id] = reason
 		a.generation.Add(1)
-		a.persistLocked()
 	}
+	a.mu.Unlock()
+	var err error
+	if changed || retrySave {
+		err = a.persistLocked()
+	}
+	a.mu.RLock()
 	reporter := a.reporter
 	meshReporter := a.meshReporter
 	onRevoked := a.onRevoked
-	a.mu.Unlock()
+	a.mu.RUnlock()
+	a.writeMu.Unlock()
 	if changed && reporter != nil {
 		reporter(id, reason)
 	}
 	// Federation push: an ORIGIN revocation propagates to the federation peers. Only fired for an origin Revoke —
 	// a federation-RECEIVED item (RevokeFromMesh) never re-pushes (no-loop).
-	if changed && meshReporter != nil {
-		meshReporter(id, reason)
+	// Admission persistence and mesh enqueue are separate writes. An explicit,
+	// confirmed retry must recover an intent lost between them (including restart).
+	if (changed || (retrySave && err == nil)) && meshReporter != nil {
+		meshReporter(ctx, id, reason)
 	}
 	// Active session revocation: close the identity's live connections (idempotent no-op if none).
 	if changed && onRevoked != nil {
 		onRevoked(id, reason)
 	}
+	return err
 }
 
 // Restore clears a node-local revocation (re-admission after re-enroll/re-attest). Idempotent — only a real
 // removal bumps the generation + persists. A CP-distributed (synced) revocation can only be cleared at the
 // control plane.
 func (a *AdmissionRevocations) Restore(identity string) {
+	_ = a.restore(identity, false)
+}
+
+// RestoreChecked saves before lifting a local block. Failed or unconfirmed
+// persistence leaves the live block and generation unchanged. Storage might have
+// accepted bytes before returning an error: reconcile and explicitly retry before
+// restarting. Neither restore method clears synced or mesh revocations.
+func (a *AdmissionRevocations) RestoreChecked(identity string) error {
+	return a.restore(identity, true)
+}
+
+func (a *AdmissionRevocations) restore(identity string, retrySave bool) error {
 	id := normalizeIdentity(identity)
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if _, existed := a.revoked[id]; !existed {
-		return
+	if id == "" {
+		return nil
 	}
-	delete(a.revoked, id)
-	a.generation.Add(1)
-	a.persistLocked()
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.mu.RLock()
+	_, existed := a.revoked[id]
+	if !existed && !retrySave {
+		a.mu.RUnlock()
+		return nil
+	}
+	candidate := make(map[string]string, len(a.revoked))
+	for key, reason := range a.revoked {
+		if key != id {
+			candidate[key] = reason
+		}
+	}
+	a.mu.RUnlock()
+	if err := a.saveStateLocked(candidate); err != nil {
+		return err
+	}
+	if existed {
+		a.mu.Lock()
+		a.revoked = candidate
+		a.generation.Add(1)
+		a.mu.Unlock()
+	}
+	return nil
 }
 
 // IsRevoked reports whether an identity is currently revoked (node-local OR control-plane distributed), with
@@ -311,7 +409,8 @@ func (a *AdmissionRevocations) List() []string {
 // one transport identity. revoked is a snapshot set; requireEnrolled mirrors cfg.RequireEnrolledIdentity.
 // Returns (admit, non-secret reason code). Auto-revocation WINS over enrolment: a revoked identity is denied
 // even if it is still in the enrolled file (that is the whole point — disabling the file edit is not how you
-// un-revoke; re-enrolment is). Reason codes mirror the live handshake log vocabulary.
+// un-revoke; local restore handles the locally authored layer). Reason codes mirror
+// the live handshake log vocabulary.
 func admitDecision(enrolled map[string]struct{}, revoked map[string]struct{}, requireEnrolled bool, identity string) (bool, string) {
 	id := normalizeIdentity(identity)
 	if _, gone := revoked[id]; gone && id != "" {
@@ -354,21 +453,41 @@ func (a *AdmissionRevocations) CountDevices(deviceIDs []string) int {
 // ★ The ids must be captured BEFORE the enrolled ledger is cleared, or this receives an empty list and removes
 // nothing, which reads identically to "there were none".
 func (a *AdmissionRevocations) RemoveDevices(deviceIDs []string) int {
+	n, _ := a.RemoveDevicesChecked(deviceIDs)
+	return n
+}
+
+// RemoveDevicesChecked publishes origin erasure only after saving. Explicit
+// retries also resave an unchanged candidate after an ambiguous storage outcome.
+// Received and pulled revocations are not owned by this operation.
+func (a *AdmissionRevocations) RemoveDevicesChecked(deviceIDs []string) (int, error) {
 	if a == nil || len(deviceIDs) == 0 {
-		return 0
+		return 0, nil
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	a.mu.RLock()
+	candidate := make(map[string]string, len(a.revoked))
+	for id, reason := range a.revoked {
+		candidate[id] = reason
+	}
+	a.mu.RUnlock()
 	n := 0
 	for _, id := range deviceIDs {
 		key := NormalizeDeviceID(id)
-		if _, ok := a.revoked[key]; ok {
-			delete(a.revoked, key)
+		if _, ok := candidate[key]; ok {
+			delete(candidate, key)
 			n++
 		}
 	}
-	if n > 0 {
-		a.persistLocked()
+	if err := a.saveStateLocked(candidate); err != nil {
+		return 0, err
 	}
-	return n
+	if n > 0 {
+		a.mu.Lock()
+		a.revoked = candidate
+		a.generation.Add(1)
+		a.mu.Unlock()
+	}
+	return n, nil
 }

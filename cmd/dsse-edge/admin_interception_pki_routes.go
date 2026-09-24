@@ -73,11 +73,27 @@ func interceptionIsNotThisNodesAnswer(w http.ResponseWriter, config serverConfig
 
 func registerInterceptionPKIRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader) {
 	mux.HandleFunc("GET /admin/intercept/bypass-hosts", adminEndpoint("admin.swg.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
+		// The Console requests an attributable answer. Preserve the legacy bare
+		// array for existing clients, but never claim an unavailable engine is empty.
+		if r.URL.Query().Get("scoped") == "1" {
+			if interceptionIsNotThisNodesAnswer(w, config, "which destinations bypass inspection") {
+				return
+			}
+			tenant := adminTenantIDFromRequest(r)
+			writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "hosts": config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass})
+			return
+		}
 		if config.NetworkExtensionLabTLS == nil {
 			writeJSON(w, http.StatusOK, []string{})
 			return
 		}
-		writeJSON(w, http.StatusOK, config.NetworkExtensionLabTLS.BypassHosts())
+		writeJSON(w, http.StatusOK, config.NetworkExtensionLabTLS.InspectionPatternsForTenant(adminTenantIDFromRequest(r)).Bypass)
 	}))
 	// Interception-root PKI: the default (anchor) root + any per-tenant roots known this run, so an operator can
 	// distribute each tenant's interception root to that tenant's devices. POST provisions a tenant's root (and

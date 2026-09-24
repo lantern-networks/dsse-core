@@ -290,3 +290,36 @@ func TestNodeReturnsWhenSigningSpeedRecovers(t *testing.T) {
 		t.Fatalf("the node stayed drained after signing recovered (%s) — a drain that never lifts is its own outage", reason)
 	}
 }
+
+// "Check signing now" is exposed to read-only administrators. Clicking it three times while one slow patch
+// lasts must not do what three consecutive scheduled checks (a minute and a half of sustained slowness) do:
+// pull the node out of rotation. A request still refreshes what the page shows, and an outright failure it
+// finds still drains, exactly as a scheduled one would.
+func TestRequestedChecksDoNotCountTowardsDraining(t *testing.T) {
+	slow := &slowProvider{inner: newTestProvider(t), delay: keyCustodySlowSignThreshold + 250*time.Millisecond}
+	monitor := NewKeyCustodyMonitor(func() InterceptionRootProvider { return slow }, time.Hour, func(string, ...any) {})
+	monitor.Check() // one scheduled slow sample
+	for i := 0; i < keyCustodySlowChecksBeforeUnready; i++ {
+		monitor.CheckNow()
+	}
+	if ready, reason := monitor.Ready(); !ready {
+		t.Fatalf("requested checks drained the node: %s", reason)
+	}
+	if h := monitor.Health(); !h.Healthy || h.CheckedAt.IsZero() {
+		t.Fatalf("a requested check did not refresh the reported health: %+v", h)
+	}
+	for i := 1; i < keyCustodySlowChecksBeforeUnready; i++ {
+		monitor.Check()
+	}
+	if ready, _ := monitor.Ready(); ready {
+		t.Fatal("requested checks in between reset the scheduled count")
+	}
+
+	p := newTestProvider(t)
+	broken := NewKeyCustodyMonitor(func() InterceptionRootProvider { return p }, time.Hour, func(string, ...any) {})
+	p.signer = &failingSigner{pub: p.cert.PublicKey}
+	broken.CheckNow()
+	if ready, _ := broken.Ready(); ready {
+		t.Fatal("a requested check that finds a key unable to sign must drain, as a scheduled one does")
+	}
+}

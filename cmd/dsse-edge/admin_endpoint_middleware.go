@@ -21,18 +21,30 @@ import (
 )
 
 func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, adminAuth adminAuthRuntimeStore, adminToken string, devMode bool, tenantModelStore adminTenantModelRuntimeStore,
-	hasAdministrators func(context.Context, string) (bool, bool)) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+	hasAdministrators func(context.Context, string) (bool, bool), credentials *localAdminCredentialStore, refusalAudit ...*adminStandbyAudit) func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+	refusals := newAdminStandbyAudit(writer, evaluator)
+	if len(refusalAudit) > 0 && refusalAudit[0] != nil {
+		refusals = refusalAudit[0]
+	}
 	return func(permission string, handler http.HandlerFunc) http.HandlerFunc {
+		recordRefusal := refusals.forPermission(permission)
 		return func(w http.ResponseWriter, r *http.Request) {
 			// ★★★ BEFORE ANYTHING ELSE: a change written to a node that does not lead is accepted and then
 			// discarded. See admin_writes_belong_to_the_leader.go — measured with its control, a device blocked
 			// on a standby was still admitted two minutes later while the same block on the leader bit in
 			// fifteen seconds. Checked here because this is the one place every administrative route passes
 			// through, and a rule enforced anywhere else is a rule with holes in it.
+			if adminPermissionWrites(permission) {
+				r = r.WithContext(captureCPWriteLease(r.Context()))
+			}
 			if adminWriteRefusedOnAStandby(w, permission) {
+				recordRefusal()
 				return
 			}
 			identity, ok, err := adminRequestIdentity(r, evaluator.PolicyBundle.TenantID, adminToken, adminAuth, devMode, time.Now())
+			if ok && err == nil {
+				identity, ok, err = refreshManagedAdminIdentity(r.Context(), adminAuth, credentials, identity)
+			}
 			if err != nil {
 				log.Printf("admin auth store error: %v", err)
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAuthFailureAuditLog("admin_auth_failed", evaluator, sourceIPFromRequest(r), r.UserAgent(), "authentication_store_error"), time.Now())
@@ -153,6 +165,23 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			// questions below. An empty target means this is not an operator acting inside another
 			// organization, and everything that reads it after this is a no-op.
 			envelope := operatorDelegationForRequest(r.Context(), r, identity, tenantModelStore, time.Now())
+			if envelope.Unavailable && (operatorDelegationGrants(permission) || envelope.NeedsElevation) {
+				record := adminRBACDeniedAuditLog(identity, permission, evaluator, sourceIPFromRequest(r), r.UserAgent())
+				record.EventType = "admin_authorization_unavailable"
+				record.Result = stringPtr("error")
+				record.Reason = stringPtr("operator_delegation_unavailable")
+				record.Metadata["reason_codes"] = []string{"operator_delegation_unavailable"}
+				record.Metadata["method"] = r.Method
+				path, grantRef := accessGrantAuditPath(r.URL.Path)
+				record.Metadata["path"] = path
+				if grantRef != "" {
+					record.Metadata["grant_ref"] = grantRef
+				}
+				record.Metadata["status_code"] = http.StatusServiceUnavailable
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now())
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("organization access authorization is unavailable; retry after the service recovers"))
+				return
+			}
 
 			// ★ A TENANT-SIDE ACT INSIDE SOMEBODY ELSE'S ORGANIZATION NEEDS THAT ORGANIZATION'S DELEGATION,
 			// however the permission check was satisfied. Keying this off "the role check failed" was the
@@ -309,6 +338,10 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 				// administrator changing their own settings is not an operator act, and badging it would be the
 				// same lie pointing the other way.
 				configChange := adminConfigChangeAuditLog(identity, email, displayName, r.Method, r.URL.Path, rec.statusOrDefault(), evaluator, auditTenant, sourceIPFromRequest(r), r.UserAgent())
+				if rec.businessFailure {
+					result := "error"
+					configChange.Result = &result
+				}
 				if strings.TrimSpace(auditTenant) != "" &&
 					!strings.EqualFold(strings.TrimSpace(auditTenant), strings.TrimSpace(identity.TenantID)) {
 					stampOperatorActor(configChange.Metadata, identity)
@@ -336,4 +369,33 @@ func adminPermissionAllowedAny(roles []string, permission string) bool {
 		}
 	}
 	return false
+}
+
+// Existing sessions must observe account suspension, removal and current roles.
+// First-party provenance comes from the authenticated principal, never a request field.
+// External IdPs and a relying Edge with no local credential authority remain unchanged.
+func refreshManagedAdminIdentity(ctx context.Context, auth adminAuthRuntimeStore, credentials *localAdminCredentialStore, identity adminIdentity) (adminIdentity, bool, error) {
+	if auth == nil || credentials == nil || (identity.AuthMethod != "admin_session" && identity.AuthMethod != "admin_api_token") {
+		return identity, true, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, credentialPersistenceTimeout)
+	defer cancel()
+	principal, found, err := auth.FindPrincipal(ctx, identity.PrincipalID, identity.TenantID)
+	if err != nil {
+		return adminIdentity{}, false, err
+	}
+	if !found {
+		return adminIdentity{}, false, nil
+	}
+	if principal.IDPID != "first_party" {
+		return identity, true, nil
+	}
+	credential, exists := credentials.authorityFor(identity.TenantID, identity.PrincipalID)
+	if !exists || credential.Status != credentialStatusActive {
+		return adminIdentity{}, false, nil
+	}
+	if identity.AuthMethod == "admin_session" {
+		identity.Roles = credential.Roles
+	}
+	return identity, true, nil
 }

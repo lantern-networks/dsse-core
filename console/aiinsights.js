@@ -15,6 +15,46 @@ const _AI_PLANE = "control";
 // printed, which meant a report cut short by the row cap looked exactly like a quiet week.
 let _aiUsagePeriod = "7d";
 
+function aiUsageSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
+function aiUsageInvalid() { return bl({ en: "Could not verify the AI usage report. Retry to confirm usage.", ja: "AI 利用レポートを確認できません。再試行して利用状況を確認してください。" }); }
+function aiUsageBody(response, tenant, period) {
+  const d = response?.body, object = v => v !== null && typeof v === "object" && !Array.isArray(v);
+  const count = v => Number.isSafeInteger(v) && v >= 0;
+  const date = v => typeof v === "string" && Number.isFinite(Date.parse(v));
+  const invalid = () => { throw new Error(aiUsageInvalid()); };
+  if (!response?.ok || response.status !== 200 || !object(d) || d.schema_version !== "admin_ai_usage_report.v2" ||
+      d.tenant_id !== tenant || d.no_secret_attestation !== true || !date(d.generated_at) ||
+      !Array.isArray(d.services) || !Array.isArray(d.by_activity)) invalid();
+  for (const key of ["total_ai_sessions", "total_ai_accesses", "total_ai_messages", "total_bytes_sent", "total_bytes_received"]) {
+    if (!count(d[key])) invalid();
+  }
+  const w = d.window, c = d.coverage;
+  if (!object(w) || w.requested !== period || !date(w.from) || !date(w.to) || Date.parse(w.from) >= Date.parse(w.to) ||
+      !object(c) || !["rows", "aggregate"].includes(c.source) || !date(c.from) || !date(c.to) ||
+      Date.parse(c.from) < Date.parse(w.from) || Date.parse(c.from) > Date.parse(c.to) || c.to !== w.to ||
+      !count(c.rows) || !count(c.row_cap) || typeof c.truncated !== "boolean" ||
+      (c.retained_from !== undefined && (!date(c.retained_from) || Date.parse(c.retained_from) > Date.parse(c.to)))) invalid();
+  const ids = new Set();
+  for (const s of d.services) {
+    if (!object(s) || typeof s.saas_application_id !== "string" || !s.saas_application_id || ids.has(s.saas_application_id) ||
+        typeof s.name !== "string" || ["sessions", "access_count", "messages", "bytes_sent", "bytes_received"].some(k => !count(s[k]))) invalid();
+    ids.add(s.saas_application_id);
+  }
+  for (const a of d.by_activity) {
+    if (!object(a) || ["sessions", "accesses", "messages", "bytes_sent", "bytes_received"].some(k => !count(a[k]))) invalid();
+    for (const k of ["identity", "identity_type", "corporate_user", "device", "app", "ai_account", "ai_email", "ai_name", "service"]) {
+      if (typeof a[k] !== "string") invalid();
+    }
+  }
+  // Service sessions union wall-clock buckets, so activity sessions need not sum
+  // to the service total. Additive counters must still agree, even for zero rows.
+  for (const [total, service, activity] of [["total_ai_accesses", "access_count", "accesses"], ["total_ai_messages", "messages", "messages"], ["total_bytes_sent", "bytes_sent", "bytes_sent"], ["total_bytes_received", "bytes_received", "bytes_received"]]) {
+    if (d.services.reduce((n, s) => n + s[service], 0) !== d[total] || d.by_activity.reduce((n, a) => n + a[activity], 0) !== d[total]) invalid();
+  }
+  if (d.services.reduce((n, s) => n + s.sessions, 0) !== d.total_ai_sessions) invalid();
+  return d;
+}
+
 function renderAiServiceUsageView(content) {
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, [
@@ -29,27 +69,39 @@ function renderAiServiceUsageView(content) {
   ]));
   const host = el("div", {});
   content.appendChild(host);
-  loadAiUsage(host);
+  return loadAiUsage(host, _aiUsagePeriod);
 }
 
-async function loadAiUsage(host) {
+async function loadAiUsage(host, period = _aiUsagePeriod) {
+  if (host.isConnected === false) return;
+  const selection = aiUsageSelection(), fresh = freshRender(host);
+  const current = () => fresh() && host.isConnected !== false && selection === aiUsageSelection();
   uiState(host, "loading");
-  const current = freshRender(host);
   let d;
   // apiFetch routes this report to the control plane so usage in other regions
   // remains visible when an agent fails over or this Console is opened elsewhere.
-  try { const r = await apiFetch("GET", "/admin/ai-usage-report?window=" + encodeURIComponent(_aiUsagePeriod)); if (!r.ok) throw new Error("HTTP " + r.status); d = r.body || {}; }
-  catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadAiUsage(host) }); return; }
+  try {
+    const path = "/admin/ai-usage-report?window=" + encodeURIComponent(period) + (selection ? "&expected_tenant_id=" + encodeURIComponent(selection) : "");
+    const [r, organization] = await Promise.all([apiFetch("GET", path, undefined, _AI_PLANE), apiFetch("GET", "/admin/tenant", undefined, _AI_PLANE)]);
+    if (!current()) return;
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const tenant = organization?.body?.tenant_id;
+    if (!organization?.ok || organization.status !== 200 || typeof tenant !== "string" || !tenant.trim() || (selection && selection !== tenant)) throw new Error(aiUsageInvalid());
+    d = aiUsageBody(r, tenant, period);
+  }
+  catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadAiUsage(host, period) }); return; }
   // Attribution enrichment (P2): join the corporate_user against the People directory so the report shows a
   // display name + department, not a raw id/subject. The directory lives on the control plane (durable, synced);
   // best-effort — a miss falls back to the raw id, so the report never breaks if the directory is empty.
-  const dir = {};
+  const dir = new Map();
   try {
-    const hr = await apiFetch("GET", "/admin/human-identities", undefined, "control");
-    if (hr.ok && hr.body && Array.isArray(hr.body.identities)) {
+    const hr = await apiFetch("GET", "/admin/human-identities", undefined, _AI_PLANE);
+    if (hr.ok && hr.body?.tenant_id === d.tenant_id && Array.isArray(hr.body.identities)) {
       hr.body.identities.forEach((u) => {
+        if (!u || u.tenant_id !== d.tenant_id || ["id", "subject", "email", "display_name", "department"].some(k => u[k] != null && typeof u[k] !== "string")) return;
         const info = { name: u.display_name || u.subject || u.id, dept: u.department || "" };
-        [u.id, u.subject, u.email].forEach((k) => { if (k) dir[String(k).toLowerCase()] = info; });
+        if (!info.name) return;
+        [u.id, u.subject, u.email].forEach((k) => { if (k) dir.set(k.toLowerCase(), info); });
       });
     }
   } catch (e) { /* directory optional */ }
@@ -84,7 +136,7 @@ async function loadAiUsage(host) {
         const who = a.corporate_user || a.identity || "—";
         const showWho = who !== prevWho; prevWho = who;
         // P2: show the directory display name (+ department) for the corporate_user; keep the raw id as a tooltip.
-        const hit = dir[String(who).toLowerCase()];
+        const hit = dir.get(String(who).toLowerCase());
         const whoCell = !showWho ? el("span", {})
           : hit ? el("span", { title: who }, [el("strong", { text: hit.name })].concat(hit.dept ? [el("span", { class: "ui-view-desc", style: "margin-left:6px", text: hit.dept })] : []))
           : el("strong", { text: who });

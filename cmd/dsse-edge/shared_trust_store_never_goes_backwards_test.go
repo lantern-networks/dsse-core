@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,5 +62,52 @@ func TestTheSharedTrustStoreRefusesToGoBackwards(t *testing.T) {
 	forward := &transportTrustStore{path: path, serial: 128, pems: "newest", announced: "tenant=next"}
 	if err := forward.persistLocked(); err != nil {
 		t.Fatalf("a node advancing the distribution could not persist it: %v", err)
+	}
+}
+
+type trustReadFailurePersister struct {
+	raw     []byte
+	readErr error
+	writes  int
+}
+
+func (p *trustReadFailurePersister) Load() ([]byte, error) { return p.raw, p.readErr }
+func (p *trustReadFailurePersister) Save(b []byte) error {
+	p.raw = append([]byte(nil), b...)
+	p.writes++
+	return nil
+}
+func TestTrustSaveRefusesUnreadableAuthority(t *testing.T) {
+	for _, bad := range []string{"read-error", "malformed-json"} {
+		t.Run(bad, func(t *testing.T) {
+			raw, _ := json.Marshal(transportTrustStoreState{SchemaVersion: "transport_trust_store.v1", Serial: 127, AnchorsPEM: "peer"})
+			p := &trustReadFailurePersister{raw: raw}
+			if bad == "read-error" {
+				p.readErr = errors.New("read unavailable")
+			} else {
+				p.raw = []byte("{")
+			}
+			before := append([]byte(nil), p.raw...)
+			s := &transportTrustStore{shared: p, serial: 126, pems: "stale"}
+			if err := s.persistLocked(); err == nil {
+				t.Fatal("unreadable authority overwritten")
+			}
+			if p.writes != 0 || !bytes.Equal(before, p.raw) {
+				t.Fatal("failed read changed authority")
+			}
+			p.raw = raw
+			p.readErr = nil
+			if err := s.persistLocked(); err == nil {
+				t.Fatal("recovered read did not enforce peer serial")
+			}
+			s.serial = 128
+			s.pems = "forward"
+			if err := s.persistLocked(); err != nil {
+				t.Fatal(err)
+			}
+			if p.writes != 1 {
+				t.Fatal("retry write count", p.writes)
+			}
+		})
 	}
 }

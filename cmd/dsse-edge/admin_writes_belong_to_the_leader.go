@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 // admin_writes_belong_to_the_leader.go — an administrative write is authored where leadership is.
@@ -29,8 +35,9 @@ import (
 
 // adminWriteRefusedOnAStandby reports the refusal and returns true when the caller must stop.
 //
-// Reads only apply to WRITE permissions: a standby answering questions is exactly what a standby is for, and
-// its answers are the authority's own state, one re-read behind at worst.
+// This guard applies only to write permissions. Individual read routes must also
+// check authority when their state is not refreshed on a standby, as admission
+// and risk do; a healthy local snapshot alone does not establish currentness.
 func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool {
 	if !adminPermissionWrites(permission) {
 		return false
@@ -48,13 +55,56 @@ func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool 
 	return true
 }
 
+// recordAdminStandbyRefusal records a routing decision, not a judged credential or
+// attempted configuration change. The guard runs before identity/tenant resolution:
+// only the node's configured audit scope and the server-registered permission are
+// known. Deliberately accept no request, so bodies, paths, credentials, user-agent,
+// forwarded addresses and claimed tenant/actor cannot enter this record.
+func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator, permission string, now, first, last time.Time, count uint64) {
+	if writer == nil {
+		logErrorf("admin_audit_write_failed event=%q: audit writer is not configured", "admin_write_refused_on_standby")
+		logErrorf("standby audit summary unconfirmed permission=%q request_count=%d", permission, count)
+		return
+	}
+	audit := model.AuditLog{
+		ID:            randomEdgeID("audit_admin_write_refused_on_standby_", now),
+		TenantID:      evaluator.PolicyBundle.TenantID,
+		EventType:     "admin_write_refused_on_standby",
+		TargetType:    stringPtr("admin_endpoint"),
+		Action:        stringPtr("admin_route"),
+		Result:        stringPtr("refused"),
+		Reason:        stringPtr("not_leader"),
+		EdgeRegionID:  &evaluator.EdgeRegionID,
+		EdgeClusterID: &evaluator.EdgeClusterID,
+		Timestamp:     now.UTC().Format(time.RFC3339Nano),
+		Metadata: map[string]any{
+			"audit_scope":         "node",
+			"authentication":      "not_evaluated",
+			"request_tenant":      "not_evaluated",
+			"required_permission": permission,
+			"http_status":         http.StatusConflict,
+			"aggregation":         "permission_window",
+			"request_count":       count,
+			"first_seen":          first.UTC().Format(time.RFC3339Nano),
+			"last_seen":           last.UTC().Format(time.RFC3339Nano),
+			"interval_seconds":    int(adminStandbyAuditInterval / time.Second),
+		},
+	}
+	// No synchronous authority/outbox call on this pre-authentication path. The
+	// node-local JSONL and its configured append hooks remain in use. Local failure
+	// is reported by the shared writer health/error path and cannot undo the 409.
+	if err := appendAdminAudit(context.Background(), writer, nil, audit, now); err != nil {
+		logErrorf("standby audit summary unconfirmed permission=%q request_count=%d first_seen=%s last_seen=%s", permission, count, first.UTC().Format(time.RFC3339Nano), last.UTC().Format(time.RFC3339Nano))
+	}
+}
+
 // adminPermissionWrites reports whether a permission names a change rather than a question.
 //
 // By the scope's own suffix, so a permission added tomorrow is covered the day it exists rather than the day
 // somebody remembers to add it to a list here.
 func adminPermissionWrites(permission string) bool {
 	p := strings.ToLower(strings.TrimSpace(permission))
-	for _, suffix := range []string{".write", ".admin", ".cancel", ".create"} {
+	for _, suffix := range []string{".write", ".admin", ".cancel", ".create", ".review", ".revoke", ".replay"} {
 		if strings.HasSuffix(p, suffix) {
 			return true
 		}

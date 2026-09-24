@@ -127,8 +127,8 @@ func TestAdminPolicyAPIUpsertThenDetailRead(t *testing.T) {
 	if len(outbox.insertedAudits) != 1 || outbox.insertedAudits[0].EventType != "admin_policy_upserted" {
 		t.Fatalf("outbox inserted audits = %#v, want admin_policy_upserted", outbox.insertedAudits)
 	}
-	if outbox.insertedAudits[0].SourceIP != nil || outbox.insertedAudits[0].ActorUserID != nil {
-		t.Fatalf("policy audit included raw source/user fields: %#v", outbox.insertedAudits[0])
+	if outbox.insertedAudits[0].SourceIP != nil || outbox.insertedAudits[0].ActorUserID == nil || *outbox.insertedAudits[0].ActorUserID == "" {
+		t.Fatalf("policy audit must identify the acting administrator without copying raw source fields: %#v", outbox.insertedAudits[0])
 	}
 }
 

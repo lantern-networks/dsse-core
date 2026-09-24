@@ -156,7 +156,10 @@ func (s *ClickHouseStore) Search(ctx context.Context, query SearchQuery) (Search
 	if err != nil {
 		return SearchResult{}, err
 	}
-	totalMatches, _ := strconv.Atoi(strings.TrimSpace(string(countBody)))
+	totalMatches, err := strconv.Atoi(strings.TrimSpace(string(countBody)))
+	if err != nil || totalMatches < 0 {
+		return SearchResult{}, fmt.Errorf("invalid ClickHouse search count")
+	}
 	limit := query.Limit
 	if limit < 0 {
 		limit = 0

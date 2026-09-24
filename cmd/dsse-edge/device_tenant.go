@@ -164,7 +164,7 @@ func (u *unattributedTenantReports) Snapshot() (devices, total int, first, last 
 }
 
 // adminTenantPKITargetAllowed decides whether this caller may act on the PKI of the named tenant: yes for its
-// own, yes for an operator holding admin.tenant.admin, no otherwise. It returns the refusal message so every
+// own, or for an operator acting within the same selected tenant, no otherwise. It returns the refusal message so every
 // PKI route says the same thing the same way.
 //
 // ★ THIS IS THE SHAPE THAT LET A CUSTOMER MINT ANOTHER CUSTOMER'S INTERCEPTION ROOT (2026-08-15). That route
@@ -210,10 +210,30 @@ func adminTenantPKITargetAllowed(r *http.Request, targetTenant, act string) erro
 		return nil
 	}
 	if adminCallerIsOperator(r) {
-		return nil
+		return adminOperatorWriteTargetAllowed(r, target, act)
 	}
 	return fmt.Errorf("%s another organization (%q) requires cross-tenant operator rights; you are operating in %q",
 		act, target, caller)
+}
+
+// A path/body target must agree with the tenant whose delegation and elevation
+// the middleware checked. Operator authority alone is not customer consent.
+// Reads, envelope controls, and explicitly tenantless/lab deployments retain
+// their existing behavior; named production operators must select the target.
+func adminOperatorWriteTargetAllowed(r *http.Request, target, act string) error {
+	if r == nil || !adminMutatingMethod(r.Method) || operatorRouteIsEnvelopeControl(r.URL.Path) {
+		return nil
+	}
+	identity, ok := adminIdentityFromRequest(r)
+	if !ok || strings.EqualFold(identity.AuthMethod, adminLabBypassAuthMethod) ||
+		(strings.TrimSpace(identity.TenantID) == "" && operatorTenantlessMode.Load()) {
+		return nil
+	}
+	selected, _ := adminOperateTenant(r, identity)
+	if target == "" || strings.EqualFold(strings.TrimSpace(target), strings.TrimSpace(selected)) {
+		return nil
+	}
+	return fmt.Errorf("%s organization %q requires selecting that organization first; the request is operating in %q", act, target, selected)
 }
 
 // adminCallerIsOperator reports whether this request is being made by somebody who operates ACROSS tenants —

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/archive"
+	"github.com/lib/pq"
 )
 
 // Retention pruning (W4, docs/feature_inventory_and_production_readiness.md A-1). The postgres log/outbox
@@ -46,7 +47,7 @@ type retentionConfig struct {
 }
 
 func (c retentionConfig) enabled() bool {
-	return c.interval > 0 && (c.hotEvents > 0 || len(c.perStream) > 0 || c.outboxPublished > 0 || c.outboxDead > 0)
+	return c.interval > 0 && (c.hotEvents > 0 || len(c.perStream) > 0 || c.override != nil || c.outboxPublished > 0 || c.outboxDead > 0)
 }
 
 // retentionForStream is the hot-events retention for a stream. Precedence: admin Console override (runtime) >
@@ -91,21 +92,30 @@ func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) 
 }
 
 func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
+	ctx = retentionWriteContext(ctx)
+	if err := cfg.override.Health(); err != nil {
+		log.Printf("retention paused: %v", err)
+		return
+	}
+	if err := cfg.legalHold.Health(); err != nil {
+		log.Printf("retention paused: %v", err)
+		return
+	}
 	// CP HA: only the leader prunes/tiers, so two active CPs don't double-delete rows or double-archive segments
 	// to the cold store. A standby simply skips; when it becomes leader it takes over the sweep.
 	if !cpLeaderElectorInstance.IsLeader() {
 		return
 	}
 	now := time.Now()
-	if cfg.hotEvents > 0 || len(cfg.perStream) > 0 {
+	if cfg.hotEvents > 0 || len(cfg.perStream) > 0 || cfg.override != nil {
 		pruneHotEventsPerStream(ctx, db, cfg, now)
 	}
 	for _, tbl := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		if cfg.outboxPublished > 0 {
-			pruneOlderThan(ctx, db, tbl, "updated_at", "status = 'published'", now.Add(-cfg.outboxPublished))
+			pruneOlderThan(ctx, db, cfg, tbl, "updated_at", "status = 'published'", now.Add(-cfg.outboxPublished))
 		}
 		if cfg.outboxDead > 0 {
-			pruneOlderThan(ctx, db, tbl, "updated_at", "status = 'dead'", now.Add(-cfg.outboxDead))
+			pruneOlderThan(ctx, db, cfg, tbl, "updated_at", "status = 'dead'", now.Add(-cfg.outboxDead))
 		}
 	}
 }
@@ -140,25 +150,87 @@ func pruneHotEventsPerStream(ctx context.Context, db *sql.DB, cfg retentionConfi
 		if cfg.archive != nil {
 			archiveThenPruneStream(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
 		} else {
-			deleteHotStreamOlderThan(ctx, db, p.tenant, p.stream, cutoff)
+			deleteHotStreamOlderThan(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
 		}
 	}
 }
 
 // deleteHotStreamOlderThan is the delete-only path (no cold archive configured) for one stream.
-func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, tenant, stream string, cutoff time.Time) {
-	res, err := db.ExecContext(ctx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3", tenant, stream, cutoff)
-	if err != nil {
-		log.Printf("retention prune hot_events %s/%s: %v", tenant, stream, err)
-		return
-	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("retention prune hot_events %s/%s: deleted %d row(s) older than %s", tenant, stream, n, cutoff.UTC().Format(time.RFC3339))
-	}
+func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
+	deleteRetentionRows(ctx, db, cfg, "hot_events", "received_at < $2 AND stream=$3", tenant, stream, cutoff, now)
+}
+func logPruneFailure(table string, err error) {
+	log.Printf("retention prune %s paused: %v", table, err)
+}
+func logPruneDeleted(table, tenant string, n int64, cutoff time.Time) {
+	log.Printf("retention prune %s tenant=%s: deleted %d row(s) older than %s", table, tenant, n, cutoff.UTC().Format(time.RFC3339))
 }
 
 func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
-	rows, err := db.QueryContext(ctx, "SELECT payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at", tenant, stream, cutoff)
+	ctx = retentionWriteContext(ctx)
+	// Share one request budget across SQL and object-store work. PostgreSQL
+	// expires data statements before the later client fallback can discard the
+	// advisory-lock session. Keep the original cancellation for external calls
+	// and check it again before advancing the chain or committing deletion.
+	archiveCtx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+	defer cancel()
+	budget := newCPStatementBudget(archiveCtx)
+	defer budget.cancel()
+	unlockPolicy, err := lockPrunePolicy(archiveCtx, cfg)
+	if err != nil {
+		log.Printf("cold-archive policy wait: %v", err)
+		return
+	}
+	defer unlockPolicy()
+	chained := stream == "audit" && cfg.auditChain != nil
+	var shared *sharedAuditArchive
+	if chained {
+		if err := cfg.auditChain.operationMu.LockContext(archiveCtx); err != nil {
+			log.Printf("cold-archive chain wait: %v", err)
+			return
+		}
+		defer cfg.auditChain.operationMu.Unlock()
+		var err error
+		shared, err = cfg.auditChain.beginSharedArchive(budget, db)
+		if err != nil {
+			log.Printf("cold-archive shared state: %v", err)
+			return
+		}
+		if shared != nil {
+			defer shared.close()
+			// This detached view is scoped to the locked database row. Its
+			// Commit stages the head; the real head and hot deletes commit together.
+			cfg.auditChain = &auditChainStore{per: shared.next}
+		}
+		if err := cfg.auditChain.Health(); err != nil {
+			log.Printf("cold-archive paused: %v", err)
+			return
+		}
+	}
+	var tx *sql.Tx
+	if shared != nil {
+		tx = shared.tx
+	} else {
+		var finish func()
+		tx, finish, err = beginCPWriteTransactionContexts(budget.request, budget.sqlCtx, db, nil)
+		if err == nil {
+			defer finish()
+		}
+	}
+	if err != nil {
+		log.Printf("cold-archive begin: %v", err)
+		return
+	}
+	defer tx.Rollback()
+	cutoff, allowed, err := checkedPruneCutoffWithBudget(budget, tx, cfg, tenant, stream, cutoff, now)
+	if err != nil {
+		logPruneFailure("hot_events", err)
+		return
+	}
+	if !allowed {
+		return
+	}
+	rows, err := budget.query(tx, "SELECT event_id, payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at, event_id FOR UPDATE", tenant, stream, cutoff)
 	if err != nil {
 		log.Printf("cold-archive: read %s/%s: %v", tenant, stream, err)
 		return
@@ -168,23 +240,37 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	// Tamper-evident chain: the audit stream's segments begin with a chain header binding this segment to the
 	// previous one. Written BEFORE the records so it is covered by the segment hash.
 	chainSeq := 0
-	chained := stream == "audit" && cfg.auditChain != nil
 	if chained {
 		var prev string
-		chainSeq, prev = cfg.auditChain.Next(tenant)
+		chainSeq, prev, err = cfg.auditChain.Next(tenant)
+		if err != nil {
+			rows.Close()
+			log.Printf("cold-archive chain: %v", err)
+			return
+		}
 		gz.Write(auditChainHeaderLine(chainSeq, prev))
 	}
 	n := 0
+	var eventIDs []string
 	for rows.Next() {
 		var payload []byte // jsonb comes back as raw JSON bytes
-		if err := rows.Scan(&payload); err != nil {
-			continue
+		var eventID string
+		if err := rows.Scan(&eventID, &payload); err != nil {
+			rows.Close()
+			log.Printf("cold-archive scan: %v", err)
+			return
 		}
+		eventIDs = append(eventIDs, eventID)
 		gz.Write(bytes.TrimRight(payload, "\n"))
 		gz.Write([]byte("\n"))
 		n++
 	}
-	rows.Close()
+	rowErr := rows.Err()
+	closeErr := rows.Close()
+	if rowErr != nil || closeErr != nil {
+		log.Printf("cold-archive read incomplete: %v / %v", rowErr, closeErr)
+		return
+	}
 	if n == 0 {
 		return
 	}
@@ -192,25 +278,65 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		log.Printf("cold-archive: gzip %s/%s: %v", tenant, stream, err)
 		return
 	}
-	// Key: hot_events/<tenant>/<stream>/<cutoff-date>-<count>.ndjson.gz — sortable, per-stream, idempotent-ish.
-	key := fmt.Sprintf("hot_events/%s/%s/%s-%d.ndjson.gz", tenant, stream, cutoff.UTC().Format("2006-01-02T150405"), n)
+	// Consult the external archive only after the locked policy and hot-row
+	// selection establish that there is work to archive. Protected or empty
+	// streams must not occupy the CP writer waiting on an unavailable store.
+	// Keep this check inside the same head transaction as PUT: moving it
+	// outside would miss an orphan left by a competing failed archive.
+	if chained {
+		objects, err := cfg.archive.List(archiveCtx, "hot_events/"+tenant+"/audit/", 0)
+		if err != nil {
+			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
+			return
+		}
+		if len(objects) != chainSeq {
+			log.Printf("cold-archive paused tenant=%q: archive count mismatch expected=%d actual=%d; reconcile archive objects and saved chain state", tenant, chainSeq, len(objects))
+			return
+		}
+	}
+	// Sequence and content hash prevent a delete retry from overwriting an earlier segment.
+	key := fmt.Sprintf("hot_events/%s/%s/%s-%020d-%s.ndjson.gz", tenant, stream, now.UTC().Format("2006-01-02T150405"), chainSeq, hashObjectBytes(buf.Bytes()))
 	opts := archive.PutOptions{ContentType: "application/gzip"}
 	if stream == "audit" && cfg.auditColdRetain > 0 {
 		opts.RetainUntil = now.Add(cfg.auditColdRetain) // WORM: audit segments are tamper-proof for the retention window
 	}
-	if _, err := cfg.archive.Put(ctx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), opts); err != nil {
+	if _, err := cfg.archive.Put(archiveCtx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), opts); err != nil {
 		log.Printf("cold-archive: put %s FAILED — leaving %d row(s) in place for retry: %v", key, n, err)
+		return
+	}
+	if shared != nil {
+		shared.objectWritten = true
+	}
+	if err := archiveCtx.Err(); err != nil {
+		log.Printf("cold-archive: object written but request canceled; hot rows retained: %v", err)
 		return
 	}
 	// Advance the tamper-evident chain only AFTER the segment is durably written (its hash = the object bytes).
 	if chained {
-		cfg.auditChain.Commit(tenant, chainSeq, hashObjectBytes(buf.Bytes()))
+		if err := cfg.auditChain.Commit(tenant, chainSeq, hashObjectBytes(buf.Bytes())); err != nil {
+			log.Printf("cold-archive: %s retained in hot after state failure: %v", key, err)
+			return
+		}
+	}
+	if shared != nil {
+		if err := shared.stage(budget, cfg.auditChain.per); err != nil {
+			log.Printf("cold-archive: head update failed; hot rows retained: %v", err)
+			return
+		}
 	}
 	// Archived successfully → now safe to delete exactly this stream's aged rows.
-	res, err := db.ExecContext(ctx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3", tenant, stream, cutoff)
+	res, err := budget.exec(tx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND event_id = ANY($3)", tenant, stream, pq.Array(eventIDs))
 	if err != nil {
-		log.Printf("cold-archive: archived %s but delete failed (will re-archive next sweep): %v", key, err)
+		log.Printf("cold-archive: archived %s but delete failed; hot rows retained, reconcile before retry: %v", key, err)
 		return
+	}
+	if err := budget.commit(tx); err != nil {
+		log.Printf("cold-archive: archived %s but delete commit failed: %v", key, err)
+		return
+	}
+	adoptPrunePolicy(cfg)
+	if shared != nil {
+		shared.adopt()
 	}
 	deleted, _ := res.RowsAffected()
 	worm := ""
@@ -222,19 +348,30 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 
 // pruneOlderThan deletes rows whose timeCol is < cutoff, optionally filtered by extraWhere. Best-effort:
 // errors are logged (a missing table on a non-CP node is fine — the pruner only runs with -postgres-dsn).
-func pruneOlderThan(ctx context.Context, db *sql.DB, table, timeCol, extraWhere string, cutoff time.Time) {
-	where := timeCol + " < $1"
-	if extraWhere != "" {
-		where = extraWhere + " AND " + where
-	}
-	res, err := db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s WHERE %s", table, where), cutoff)
+func pruneOlderThan(ctx context.Context, db *sql.DB, cfg retentionConfig, table, timeCol, extraWhere string, cutoff time.Time) {
+	rows, err := db.QueryContext(ctx, "SELECT DISTINCT tenant_id FROM "+table+" WHERE "+extraWhere+" AND "+timeCol+" < $1", cutoff)
 	if err != nil {
-		log.Printf("retention prune %s (%s): %v", table, extraWhere, err)
+		logPruneFailure(table, err)
 		return
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("retention prune %s%s: deleted %d row(s) older than %s",
-			table, ifNonEmpty(" "+extraWhere), n, cutoff.UTC().Format(time.RFC3339))
+	var tenants []string
+	for rows.Next() {
+		var tenant string
+		if err := rows.Scan(&tenant); err != nil {
+			rows.Close()
+			logPruneFailure(table, err)
+			return
+		}
+		tenants = append(tenants, tenant)
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		logPruneFailure(table, err)
+		return
+	}
+	for _, tenant := range tenants {
+		deleteRetentionRows(ctx, db, retentionConfig{legalHold: cfg.legalHold}, table, extraWhere+" AND "+timeCol+" < $2", tenant, "", cutoff, time.Now())
 	}
 }
 

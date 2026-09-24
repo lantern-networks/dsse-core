@@ -130,8 +130,8 @@ func TestAdminDelegatedAccessGrantAPIUpsertListDetailAndRevoke(t *testing.T) {
 		t.Fatalf("outbox inserted audits = %#v, want delegated grant upsert/revoke", outbox.insertedAudits)
 	}
 	for _, audit := range outbox.insertedAudits {
-		if audit.SourceIP != nil || audit.ActorUserID != nil {
-			t.Fatalf("delegated grant audit included raw source/user fields: %#v", audit)
+		if audit.SourceIP != nil || audit.ActorUserID == nil || *audit.ActorUserID == "" {
+			t.Fatalf("delegated grant audit must identify the acting administrator and omit raw source fields: %#v", audit)
 		}
 		if audit.Metadata["delegated_grant_metadata_recorded_scope"] != "none" || audit.Metadata["delegated_token_issued"] != false || audit.Metadata["runtime_hot_reload"] != false {
 			t.Fatalf("delegated grant audit metadata = %#v, want non-secret admin boundary", audit.Metadata)

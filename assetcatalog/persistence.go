@@ -10,14 +10,16 @@ import (
 
 // persistedCatalog is the on-disk snapshot of the OPERATOR-authored catalog. Enrolled-device endpoints are
 // deliberately excluded: they are re-derived from the (separately persisted) enrolled inventory on boot via
-// SyncEnrolledEndpoints, so persisting them would (a) leave stale endpoints for de-enrolled devices that
+// SyncEnrolledEndpoints. Only explicit operator aliases are persisted separately;
+// they never create an endpoint without inventory. Persisting full endpoints would (a) leave stale endpoints for de-enrolled devices that
 // have no delete path, and (b) rewrite the file on every auto-sync (which runs on each admin list).
 type persistedCatalog struct {
-	Seq       int                            `json:"seq"`
-	Endpoints map[string]map[string]Endpoint `json:"endpoints"`
-	Groups    map[string]map[string]Group    `json:"groups"`
-	Services  map[string]map[string]Service  `json:"services"`
-	Aliases   map[string]map[string]string   `json:"aliases"`
+	EnrolledAliases map[string]map[string]string   `json:"enrolled_aliases,omitempty"`
+	Seq             int                            `json:"seq"`
+	Endpoints       map[string]map[string]Endpoint `json:"endpoints"`
+	Groups          map[string]map[string]Group    `json:"groups"`
+	Services        map[string]map[string]Service  `json:"services"`
+	Aliases         map[string]map[string]string   `json:"aliases"`
 }
 
 // SetStatePath enables durable persistence: the store loads any previously-authored catalog from path and
@@ -36,11 +38,27 @@ func (s *Store) SetStatePath(path string) error {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
-	if p == nil {
+	if _, shared := p.(contextUpdater); shared {
+		raw, err := p.Load()
+		if err != nil {
+			return ErrPersistence
+		}
+		n, err := s.sharedCandidateLocked(raw)
+		if err != nil {
+			return ErrPersistence
+		}
+		s.adoptLocked(n)
+		s.persister = p
 		return nil
 	}
-	return s.loadLocked()
+	next := s.candidateLocked()
+	next.persister = p
+	if err := next.loadLocked(); err != nil {
+		return err
+	}
+	s.adoptLocked(next)
+	s.persister = p
+	return nil
 }
 
 func (s *Store) loadLocked() error {
@@ -57,6 +75,18 @@ func (s *Store) loadLocked() error {
 	var snap persistedCatalog
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
+	}
+	for tenant, services := range snap.Services {
+		for id, service := range services {
+			normalized, err := normalizeServiceTransports(service)
+			if err != nil {
+				return fmt.Errorf("invalid service transport in catalog snapshot: %w", err)
+			}
+			snap.Services[tenant][id] = normalized
+		}
+	}
+	if snap.EnrolledAliases != nil {
+		s.enrolledAliases = snap.EnrolledAliases
 	}
 	if snap.Endpoints != nil {
 		s.endpoints = snap.Endpoints
@@ -86,12 +116,25 @@ func (s *Store) persistLocked() error {
 	if s.persister == nil {
 		return nil
 	}
+	snap := s.authoredStateLocked()
+	data, err := json.MarshalIndent(snap, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal asset-catalog snapshot: %w", err)
+	}
+	if err := s.persister.Save(data); err != nil {
+		return fmt.Errorf("persist asset catalog: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) authoredStateLocked() persistedCatalog {
 	snap := persistedCatalog{
-		Seq:       s.seq,
-		Endpoints: map[string]map[string]Endpoint{},
-		Groups:    s.groups,
-		Services:  s.services,
-		Aliases:   map[string]map[string]string{},
+		Seq:             s.seq,
+		EnrolledAliases: s.enrolledAliases,
+		Endpoints:       map[string]map[string]Endpoint{},
+		Groups:          s.groups,
+		Services:        s.services,
+		Aliases:         map[string]map[string]string{},
 	}
 	for tenant, byID := range s.endpoints {
 		for id, e := range byID {
@@ -106,7 +149,7 @@ func (s *Store) persistLocked() error {
 	}
 	for tenant, byAlias := range s.aliases {
 		for alias, ownerID := range byAlias {
-			if strings.HasPrefix(ownerID, enrolledOwnerPrefix) {
+			if strings.HasPrefix(ownerID, enrolledOwnerPrefix) && s.enrolledAliases[tenant][ownerID] != alias {
 				continue
 			}
 			if snap.Aliases[tenant] == nil {
@@ -115,12 +158,5 @@ func (s *Store) persistLocked() error {
 			snap.Aliases[tenant][alias] = ownerID
 		}
 	}
-	data, err := json.MarshalIndent(snap, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal asset-catalog snapshot: %w", err)
-	}
-	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist asset catalog: %w", err)
-	}
-	return nil
+	return snap
 }

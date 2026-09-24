@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -114,18 +116,21 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		now := time.Now()
-		// ★ THE SAME PRESERVATION ON THE ORGANIZATION'S OWN UPDATE. A customer editing its display name must
-		// not be able to drop its own delegation record by omission either — and it cannot SET the envelope
-		// here, so omission is the only way it could ever change.
-		if adminStore, ok := tenantModelStore.(adminTenantModelAdminStore); ok {
-			tenant = preserveOperatorEnvelopeOnUpsert(r.Context(), adminStore, tenant, bodyNamesOperatorEnvelope(raw))
+		if supplied := strings.TrimSpace(tenant.TenantID); supplied != "" && supplied != strings.TrimSpace(adminTenantIDFromRequest(r)) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("tenant_id does not match authenticated tenant"))
+			return
+		}
+		tenant, err := mergeTenantSettingsEdit(r.Context(), tenantModelStore, adminTenantIDFromRequest(r), raw)
+		if err != nil {
+			writeTenantSettingsEditError(w, err)
+			return
 		}
 		updated, err := tenantModelStore.Update(r.Context(), tenant, adminTenantIDFromRequest(r), now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLog(updated, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLogFor(r, updated, evaluator, now), now)
 		writeJSON(w, http.StatusOK, updated)
 	}))
 	// Cross-tenant (super-admin) tenant administration: list every tenant, create/upsert an arbitrary tenant,
@@ -196,7 +201,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// caller's to name at all — see organization_id_is_not_a_name.go.
 		action := "create"
 		if strings.TrimSpace(tenant.TenantID) != "" {
-			if existing, lerr := adminStore.List(r.Context()); lerr == nil {
+			if existing, lerr := adminStore.List(r.Context()); lerr != nil {
+				writeTenantSettingsEditError(w, lerr)
+				return
+			} else {
 				action = "create"
 				for _, candidate := range existing {
 					if candidate.TenantID == strings.TrimSpace(tenant.TenantID) {
@@ -228,20 +236,17 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			}
 			tenant.TenantID = minted
 		}
-		// ★★ THE OPERATOR ENVELOPE IS NOT THIS FORM'S TO REWRITE (2026-08-18, done by accident and measured).
-		// This is a whole-record upsert, so a body that omits a field ERASES it. Sending
-		// {tenant_id, display_name, status} to flip an organization back to active wiped its timezone, plan,
-		// home region and allowed regions — and, far worse, its operator_managed flag and all sixteen of its
-		// recorded elevations. That is the standing delegation and the customer's own record of when the
-		// operator used it (the envelope design), silently revoked as collateral damage of an unrelated edit.
-		//
-		// Those fields have their OWN routes (PUT /admin/operator-delegation, the elevation routes) and are
-		// carried here only so a read/modify/write round-trip does not lose them. So they are preserved unless
-		// the body actually carries them — the same treatment CreatedAt already gets, and for the same reason.
-		tenant = preserveOperatorEnvelopeOnUpsert(r.Context(), adminStore, tenant, bodyNamesOperatorEnvelope(raw))
+		if action == "update" {
+			merged, err := mergeTenantSettingsEdit(r.Context(), tenantModelStore, tenant.TenantID, raw)
+			if err != nil {
+				writeTenantSettingsEditError(w, err)
+				return
+			}
+			tenant = merged
+		}
 		saved, err := adminStore.Put(r.Context(), tenant, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, saved, action, evaluator, now), now)
@@ -305,7 +310,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// traffic at all is what creating one MEANS. A flag here would only be a way to create an organization
 		// that does not work.
 		if action == "create" && ruleStore != nil {
-			if _, rerr := ruleStore.Upsert(startingPostureRule(saved.TenantID)); rerr != nil {
+			if _, rerr := ruleStore.UpsertContext(r.Context(), startingPostureRule(saved.TenantID)); rerr != nil {
 				answer.StartingPostureNote = "this organization was created and carries no traffic yet: " + rerr.Error()
 				logWarnf("tenant_created_without_starting_posture tenant=%q: %v", saved.TenantID, rerr)
 			} else {
@@ -345,7 +350,16 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// removes the row that says whose data this is; a preservation order that permits that is not a
 		// preservation order. Refusing is the fail-safe direction — a hold that is genuinely finished is lifted
 		// deliberately, and that lifting is itself on the record.
-		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
+		_, held, _, protectionErr := config.LegalHold.adminStatus(r.Context(), tenantID)
+		if protectionErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(protectionErr, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, protectionErr)
+			return
+		}
+		if held {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so it cannot be deleted; lift the hold first "+
 					"(DELETE /admin/legal-hold)", tenantID))
@@ -353,10 +367,9 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		now := time.Now()
 		if err := adminStore.Delete(r.Context(), tenantID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now), now)
 		cascade := cascadeTenantDeletion(r.Context(), config.LocalCredentials, adminAuth, config.EnrolledLedger, tenantID, now)
 
 		// ★★★ RECORDS MAY WAIT FOR THE PURGE; A LIVE CERTIFICATE AUTHORITY MAY NOT (2026-08-21, measured).
@@ -397,6 +410,26 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		remaining := countAdminTenantFootprint(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore, config.TenantCARegistry, namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now)
+		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		cascadeComplete := true
+		for key, value := range cascade {
+			if strings.HasSuffix(key, "_error") {
+				cascadeComplete = false
+			}
+			if key == "sessions_revoked" {
+				if _, ok := value.(int); !ok {
+					cascadeComplete = false
+				}
+			}
+		}
+		outcome := "success"
+		if !cascadeComplete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["cascade_complete"] = cascadeComplete
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		body := map[string]any{
 			"tenant_id": tenantID,
 			"deleted":   true,
@@ -486,10 +519,19 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// a hold is for. Nothing about an operator being authorised to erase makes the hold irrelevant: the
 		// hold is what says this particular organization must not be erased YET, and it is released by lifting
 		// it, deliberately and on the record.
-		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
+		_, held, _, protectionErr := config.LegalHold.adminStatus(r.Context(), tenantID)
+		if protectionErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(protectionErr, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, protectionErr)
+			return
+		}
+		if held {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so its data must be preserved and cannot be erased; "+
-					"lift the hold first (DELETE /admin/legal-hold) — that is a decision with its own record", tenantID))
+					"resolve the hold through POST /admin/legal-hold first — that is a decision with its own record", tenantID))
 			return
 		}
 		var db *sql.DB
@@ -515,10 +557,11 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 					"its data with nothing to tell them — refusing rather than erasing part of it", tenantID))
 			return
 		}
-		orderer.OrderPurge(tenantID, now)
-		// Read the order back. OrderPurge cannot return an error (the file store's signature has none, and the
-		// two backends must be interchangeable), so the only way to know the order was actually recorded — a
-		// failed INSERT, a table that migration 041 never created — is to look for it.
+		if err := orderer.OrderPurge(tenantID, now); err != nil {
+			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
+			return
+		}
+		// Confirmed storage is required before local erasure; then verify visibility.
 		if !tenantPurgeOrderStands(orderer, tenantID) {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf(
 				"the erasure order for %q was not recorded, so no other node would ever be told to erase it — "+
@@ -528,7 +571,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		result := purgeAdminTenantData(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore,
 			config.TenantCARegistry, strings.TrimSpace(config.TenantCARegistryPath),
-			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), config.LegalHold, now)
 		// Recorded in the OPERATOR's audit, not the customer's.
 		//
 		// ★ AND THAT DISTINCTION IS LOAD-BEARING, WHICH THIS CODE LEARNED THE HARD WAY (2026-08-15). The audit
@@ -542,6 +585,17 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// was authorised and carried out must not live inside the thing that was erased.
 		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "purge", evaluator, now)
 		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		outcome := "success"
+		if !result.Complete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["complete"] = result.Complete
+		auditRecord.Metadata["remaining_records"] = result.Remaining.Total
+		auditRecord.Metadata["failure_count"] = len(result.Failures)
+		if result.ArtifactCleanup != nil {
+			auditRecord.Metadata["artifact_cleanup"] = result.ArtifactCleanup
+		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		writeJSON(w, http.StatusOK, result)
 	}))
@@ -571,15 +625,22 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentialStore, adminAuth adminAuthRuntimeStore, ledger *enrolledinventory.Ledger, tenantID string, now time.Time) map[string]any {
 	result := map[string]any{}
 	if credentials != nil {
-		if removed := credentials.DeleteAllForTenant(tenantID); len(removed) > 0 {
+		removed, err := credentials.DeleteAllForTenant(tenantID)
+		if err != nil {
+			result["administrators_error"] = "credential deletion incomplete: storage unavailable"
+		}
+		if len(removed) > 0 {
 			result["administrators"] = removed
 			log.Printf("tenant %q deleted: removed %d administrator account(s): %s", tenantID, len(removed), strings.Join(removed, ", "))
 		}
 	}
 	if ledger != nil {
-		if removed := ledger.RemoveTenant(tenantID); len(removed) > 0 {
-			result["enrolled_identities"] = len(removed)
-			log.Printf("tenant %q deleted: removed %d enrolled identity/identities from the ledger", tenantID, len(removed))
+		if n, err := ledger.RetireTenantContext(ctx, tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+			result["enrolled_identities_error"] = "identity retirement saving could not be confirmed"
+		} else if n > 0 {
+			result["enrolled_identities"] = n
+			result["identity_records_retained_for_purge"] = n
+			log.Printf("tenant %q deleted: retired %d identities; ownership retained for erasure", tenantID, n)
 		}
 	}
 	revoker, ok := adminAuth.(interface {
@@ -604,57 +665,56 @@ func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentia
 	return result
 }
 
-// bodyNamesOperatorEnvelope reports which envelope fields the request body actually CARRIED. The struct decode
-// cannot answer this — an absent operator_managed and a present false are the same bool — so the raw body is
-// read a second time as a map. Cheap, and the alternative (pointer fields on the model) would put "was it
-// sent?" into every other place the model is used.
-func bodyNamesOperatorEnvelope(raw []byte) map[string]bool {
-	named := map[string]bool{}
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return named
+var errTenantEnvelopeEdit = errors.New("operator delegation and elevation fields must be changed through the operator-access routes")
+
+// Settings forms send only the fields they edit. Preserve omitted values, including
+// customer withdrawal history. Authorization state is read-only on these routes;
+// its dedicated routes enforce customer consent and record the responsible actor.
+func mergeTenantSettingsEdit(ctx context.Context, store adminTenantModelRuntimeStore, tenantID string, raw []byte) (adminTenantModel, error) {
+	existing, err := store.Get(ctx, strings.TrimSpace(tenantID))
+	if err != nil {
+		return adminTenantModel{}, err
 	}
-	for _, key := range []string{"operator_managed", "operator_elevations", "operator_elevation_requires_approval",
-		"operator_delegation_changed_at", "operator_delegation_changed_by"} {
-		if _, present := probe[key]; present {
-			named[key] = true
-		}
+	stored, err := json.Marshal(existing)
+	if err != nil {
+		return adminTenantModel{}, err
 	}
-	return named
+	var fields, patch map[string]json.RawMessage
+	if err = json.Unmarshal(stored, &fields); err != nil {
+		return adminTenantModel{}, err
+	}
+	if err = json.Unmarshal(raw, &patch); err != nil {
+		return adminTenantModel{}, err
+	}
+	for key, value := range patch {
+		fields[key] = value
+	}
+	mergedRaw, err := json.Marshal(fields)
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	var merged adminTenantModel
+	if err = json.Unmarshal(mergedRaw, &merged); err != nil {
+		return adminTenantModel{}, err
+	}
+	merged.TenantID = strings.TrimSpace(tenantID)
+	if merged.OperatorManaged != existing.OperatorManaged ||
+		merged.OperatorDelegationWithdrawnByCustomer != existing.OperatorDelegationWithdrawnByCustomer ||
+		merged.OperatorElevationRequiresApproval != existing.OperatorElevationRequiresApproval ||
+		!reflect.DeepEqual(merged.OperatorElevations, existing.OperatorElevations) ||
+		!reflect.DeepEqual(merged.OperatorDelegationChangedAt, existing.OperatorDelegationChangedAt) ||
+		!reflect.DeepEqual(merged.OperatorDelegationChangedBy, existing.OperatorDelegationChangedBy) {
+		return adminTenantModel{}, errTenantEnvelopeEdit
+	}
+	return merged, nil
 }
 
-// preserveOperatorEnvelopeOnUpsert copies the stored envelope back onto an incoming record for every envelope
-// field the body did not name. A body that DOES name one is honoured — an operator restoring a full record
-// from a backup must be able to, and the whole point is that omission stops meaning erasure.
-func preserveOperatorEnvelopeOnUpsert(ctx context.Context, store adminTenantModelAdminStore, incoming adminTenantModel, named map[string]bool) adminTenantModel {
-	if store == nil {
-		return incoming
+func writeTenantSettingsEditError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errTenantEnvelopeEdit) {
+		writeError(w, http.StatusForbidden, err)
+		return
 	}
-	if len(named) == 5 {
-		return incoming // the body carried the whole envelope
-	}
-	existing, err := store.Get(ctx, strings.TrimSpace(incoming.TenantID))
-	if err != nil {
-		// Unreadable registry: do not invent an envelope, and do not erase one either — the incoming record is
-		// what the caller asked for, and a failure here must not be the thing that revokes a delegation.
-		return incoming
-	}
-	if !named["operator_managed"] {
-		incoming.OperatorManaged = existing.OperatorManaged
-	}
-	if !named["operator_elevations"] {
-		incoming.OperatorElevations = existing.OperatorElevations
-	}
-	if !named["operator_elevation_requires_approval"] {
-		incoming.OperatorElevationRequiresApproval = existing.OperatorElevationRequiresApproval
-	}
-	if !named["operator_delegation_changed_at"] {
-		incoming.OperatorDelegationChangedAt = existing.OperatorDelegationChangedAt
-	}
-	if !named["operator_delegation_changed_by"] {
-		incoming.OperatorDelegationChangedBy = existing.OperatorDelegationChangedBy
-	}
-	return incoming
+	writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant settings could not be read; no changes were saved"))
 }
 
 // adminTenantCreateAnswer is the created organization plus what else the creation did. Embedded so every field

@@ -39,7 +39,9 @@ function renderAssetsView(content) {
 async function loadAssetsArr(path) {
   const r = await apiFetch("GET", path);
   if (!r.ok) throw new Error("HTTP " + r.status);
-  return Array.isArray(r.body) ? r.body : [];
+  if (r.body === null) return [];
+  if (!Array.isArray(r.body)) throw new Error("Invalid catalog response");
+  return r.body;
 }
 function platLabel(p) { return p === "macos" ? "macOS" : p === "windows" ? "Windows" : "—"; }
 
@@ -77,8 +79,13 @@ async function renderEndpointsSection(section) {
     if (!filtered.length) { uiState(tableHost, "empty", bl({ en: "No matches.", ja: "一致なし。" })); return; }
     const rows = filtered.map((ep) => {
       const actions = el("div", { class: "ui-row-actions" });
-      actions.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: ep.kind === "network" ? bl({ en: "Edit", ja: "編集" }) : bl({ en: "Rename", ja: "名前変更" }), onClick: () => openEndpointForm(section, ep) }));
-      if (ep.source !== "enrolled") {
+      const certPin = ep.source === "cert_pin" || String(ep.id || "").startsWith("certpin-ep-");
+      if (certPin) {
+        actions.appendChild(el("span", { text: bl({ en: "Managed in Internet Access", ja: "インターネットアクセスで管理" }) }));
+      } else if (ep.source === "application") {
+        actions.appendChild(el("span", { text: bl({ en: "Managed in Applications", ja: "アプリケーションで管理" }) }));
+      } else actions.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: ep.kind === "network" ? bl({ en: "Edit", ja: "編集" }) : bl({ en: "Rename", ja: "名前変更" }), onClick: () => openEndpointForm(section, ep) }));
+      if (!certPin && ep.source !== "enrolled" && ep.source !== "application") {
         actions.appendChild(document.createTextNode(" "));
         actions.appendChild(el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "削除" }), onClick: () => removeEndpoint(ep, section) }));
       }
@@ -100,7 +107,7 @@ async function renderEndpointsSection(section) {
         el("td", {}, [el("strong", { text: ep.alias || "(unnamed)" })]),
         el("td", {}, uiBadge(ep.kind === "steered_device" ? bl({ en: "Device", ja: "デバイス" }) : bl({ en: "Server", ja: "サーバ" }), ep.kind === "steered_device" ? "ok" : "off")),
         el("td", { text: ep.kind === "steered_device" ? platLabel(ep.platform) : "—" }),
-        el("td", {}, uiBadge(ep.source === "enrolled" ? bl({ en: "Automatic", ja: "自動" }) : bl({ en: "Added by you", ja: "手動追加" }), "off")),
+        el("td", {}, uiBadge(ep.source === "application" ? bl({ en: "Application", ja: "アプリケーション" }) : ep.source === "enrolled" ? bl({ en: "Automatic", ja: "自動" }) : bl({ en: "Added by you", ja: "手動追加" }), "off")),
         el("td", {}, el("code", { text: ep.identity || ep.address || "—" })),
         insCell,
         el("td", { class: "ui-row-actions" }, actions),
@@ -213,14 +220,25 @@ async function renderGroupsSection(section) {
   renderCatalogGroups(section);
 }
 
+function assetGroupMemberRows(ids, endpoints) {
+  if (!Array.isArray(ids) || !ids.every((id) => typeof id === "string" && id)) throw new Error("Invalid group member list");
+  if (!Array.isArray(endpoints) || !endpoints.every((ep) => ep && typeof ep.id === "string" && ep.id)) throw new Error("Invalid endpoint list");
+  const byID = new Map(endpoints.map((ep) => [ep.id, ep]));
+  return ids.map((id) => byID.get(id) || { id, alias: id });
+}
+
 async function showGroupMembers(g) {
   const bodyHost = el("div", {}, el("span", { class: "ui-spinner" }));
   const m = uiModal({ title: bl({ en: "Members of ", ja: "メンバー: " }) + g.alias, body: [bodyHost], footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })] });
   try {
-    const list = await loadAssetsArr("/admin/assets/groups/" + encodeURIComponent(g.id) + "/members");
+    const [ids, endpoints] = await Promise.all([
+      loadAssetsArr("/admin/assets/groups/" + encodeURIComponent(g.id) + "/members"),
+      loadAssetsArr("/admin/assets/endpoints"),
+    ]);
+    const list = assetGroupMemberRows(ids, endpoints);
     bodyHost.innerHTML = "";
     if (!list.length) { bodyHost.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "No members match right now.", ja: "現在一致するメンバーはありません。" }) })); return; }
-    list.forEach((mem) => bodyHost.appendChild(el("div", { class: "ui-checkrow" }, [uiBadge(platLabel(mem.platform), "off"), el("span", { text: mem.alias })])));
+    list.forEach((mem) => bodyHost.appendChild(el("div", { class: "ui-checkrow" }, [uiBadge(platLabel(mem.platform), "off"), el("span", { text: mem.alias || mem.id })])));
   } catch (e) { bodyHost.textContent = String(e); }
 }
 
@@ -336,6 +354,19 @@ async function renderServicesSection(section) {
   draw();
 }
 
+function servicePortsFromRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  const ports = [];
+  for (const row of rows) {
+    const text = String(row.port).trim();
+    if (!/^\d+$/.test(text) || !["tcp", "udp"].includes(row.protocol)) return null;
+    const port = Number(text);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+    ports.push({ protocol: row.protocol, port });
+  }
+  return ports;
+}
+
 function openServiceForm(section) {
   const aliasF = uiField({ name: "alias", label: bl({ en: "Service name", ja: "サービス名" }), required: true, placeholder: bl({ en: "e.g. PostgreSQL", ja: "例: PostgreSQL" }) });
   const portRows = [];
@@ -361,9 +392,9 @@ function openServiceForm(section) {
     el("div", { style: "margin-top:6px" }, el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "+ Add port", ja: "+ ポート追加" }), onClick: () => { portRows.push({ protocol: "tcp", port: "" }); renderPorts(); } })),
   ], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
-    if (!aliasF.validate()) return;
-    const ports = portRows.map((r) => ({ protocol: r.protocol, port: parseInt(r.port, 10) })).filter((p) => Number.isInteger(p.port) && p.port > 0);
-    if (!ports.length) { uiToast(bl({ en: "Add at least one valid port.", ja: "有効なポートを1つ以上追加してください。" }), "err"); return; }
+    if (submit.disabled || !aliasF.validate()) return;
+    const ports = servicePortsFromRows(portRows);
+    if (!ports) { uiToast(bl({ en: "Enter a whole port number from 1 to 65535 in every row.", ja: "各行のポートに1から65535の整数を入力してください。" }), "err"); return; }
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/assets/services", { alias: aliasF.get(), ports });

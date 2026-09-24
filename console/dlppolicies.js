@@ -152,6 +152,12 @@ async function renderDLPPoliciesView(content) {
     group(bl({ en: "Custom identifiers", ja: "カスタム識別子" }), _library.custom.map((c) => ({ id: c.name, label: c.name })));
     group(bl({ en: "Exact-Data-Match datasets", ja: "完全一致データ" }), _library.edm.map((d) => ({ id: d.name, label: d.name + " (" + d.count + ")" })));
 
+    // A successfully loaded library can still lack a previously selected detector.
+    // Keep that reference visible until the operator explicitly removes it.
+    const availableIDs = new Set(idFields.map((x) => x.id));
+    const missingIDs = have.filter((id) => !availableIDs.has(id));
+    group(bl({ en: "Unavailable identifiers — restore in Sensitive Data or deselect", ja: "利用できない識別子 — 機密データで復元するか選択を解除" }), missingIDs.map((id) => ({ id, label: id })));
+
     // Device-risk condition (S4,): a COMPOSITE condition (not a raw count) that raises the device's risk so
     // risk-based rules act. Defaults chosen to catch real exfil while excluding FP noise (≥2 distinct types, same
     // destination, short burst).
@@ -214,6 +220,13 @@ async function renderDLPPoliciesView(content) {
       saveError.style.display = "none";
       if (!nameF.validate()) { nameF.focus(); return; }
       const ids = idFields.filter((x) => x.f.get()).map((x) => x.id);
+      const unresolved = ids.filter((id) => missingIDs.includes(id));
+      if (unresolved.length) {
+        saveError.textContent = bl({ en: "Restore or deselect unavailable identifiers before saving: ", ja: "保存前に利用できない識別子を復元するか選択を解除してください: " }) + unresolved.join(", ");
+        saveError.style.display = "";
+        saveError.scrollIntoView({ block: "nearest" });
+        return;
+      }
       if (!ids.length) { uiToast(bl({ en: "Pick at least one identifier to detect.", ja: "検出する識別子を 1 つ以上選んでください。" }), "err"); return; }
       let minCount = 0, minTypes = 0;
       if (drEnableF.get()) {
@@ -227,7 +240,8 @@ async function renderDLPPoliciesView(content) {
           drCountF.setError(bl({ en: "At least one detection threshold must be greater than 0.", ja: "少なくとも一方の検出しきい値を1以上にしてください。" })); drCountF.focus(); return;
         }
       }
-      const obj = { name: nameF.get(), identifiers: ids, on_match: actionF.get(), instance_scope: scopeF.get() === "any" ? "" : scopeF.get() };
+      // Preserve settings this editor does not expose (status, threshold, metadata).
+      const obj = { ...existing, name: nameF.get(), identifiers: ids, on_match: actionF.get(), instance_scope: scopeF.get() === "any" ? "" : scopeF.get() };
       if (existing) obj.id = existing.id;
       obj.device_risk = drEnableF.get() ? [{
         min_count: minCount,

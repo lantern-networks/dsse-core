@@ -91,11 +91,36 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode application catalog entry: %w", err))
 			return
 		}
+		tenantID := adminTenantIDFromRequest(r)
+		applicationID := strings.TrimSpace(application.ApplicationID)
+		renameEndpoint := false
+		if application.Published && config.AssetStore != nil {
+			if !refreshAuthoredStores(w, nil, config.AssetStore) {
+				return
+			}
+			name := strings.TrimSpace(application.Name)
+			if name == "" {
+				name = applicationID
+			}
+			if endpoint, found := config.AssetStore.GetEndpoint(tenantID, "app-"+applicationID); found && endpoint.Alias != name {
+				if !assetcatalog.ApplicationEndpointWritable(endpoint, applicationID, manualEndpointAllowed(r)) {
+					writeError(w, http.StatusForbidden, fmt.Errorf("admin.endpoints.write is required to change the existing manual destination"))
+					return
+				}
+				renameEndpoint = true
+			}
+		}
 		now := time.Now()
-		created, err := applicationCatalogStore.Upsert(r.Context(), application, adminTenantIDFromRequest(r), now)
+		created, err := applicationCatalogStore.Upsert(r.Context(), application, tenantID, now)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
+		}
+		if renameEndpoint {
+			if err := config.AssetStore.RenameApplicationEndpointContext(r.Context(), tenantID, created.ApplicationID, created.Name, manualEndpointAllowed(r)); err != nil {
+				partialAsset(w, r, adminApplicationCatalogAuditLog(created, evaluator, now), now)
+				return
+			}
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationCatalogAuditLog(created, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, created)

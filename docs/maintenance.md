@@ -24,6 +24,7 @@ They are **not included in the published 0.3.0 release**:
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
 | Directory updates | Preserve user-risk association after subject or email changes | Local browser risk changes, import and decision API checks, saved-state and audit comparisons; separate PostgreSQL regression |
 | DLP and access rules | Preserve existing settings and references during ordinary edits; restore permitted read-only DLP listing | Local browser checks, saved-state and audit comparisons, automated regressions |
+| Applications | Keep an existing published application destination’s display name in sync after ordinary edits; preserve destination identity and group references | Local browser edits, saved-state and audit comparisons; permission and partial-save regressions |
 | Organizations | Preserve delegation choices and other stored fields during ordinary name edits | Local browser permission checks, saved-state and audit comparisons, automated regressions |
 | Administrator onboarding and traffic overview | Check activation/login and period-based display of nonzero traffic data | Local browser and stored-data comparisons |
 
@@ -34,9 +35,10 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with
-  material effects on access, saved data or audit records. The next focused check
-  is whether ordinary edits to a published application update its rule-destination
-  catalog entry correctly.
+  material effects on access, saved data or audit records. The published-application
+  name synchronization defect has been corrected on the development branch.
+  The next evidence review covers administrator invitation, activation and login;
+  already verified shared flows will not be repeated.
 - Resolve or explicitly assess remaining persistence and restart limitations;
   postponing an investigation does not turn it into a passed check.
 - Install from the public instructions and verify real allowed and denied traffic,

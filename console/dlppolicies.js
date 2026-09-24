@@ -24,6 +24,20 @@ function dlpEditorList(response, key, validItem) {
   return list;
 }
 
+// Editing needs a complete detector library and account-domain configuration;
+// reading a policy does not. Keep those stricter dependencies at the edit boundary.
+async function dlpEditorDependencies() {
+  const [cr, fr, od] = await Promise.all([
+    apiFetch("GET", "/admin/dlp-classifiers"), apiFetch("GET", "/admin/dlp-fingerprints"), apiFetch("GET", "/admin/organization-domains"),
+  ]);
+  const named = (x) => x && typeof x.name === "string" && x.name.trim() !== "";
+  return {
+    custom: dlpEditorList(cr, "classifiers", named),
+    edm: dlpEditorList(fr, "datasets", named),
+    domains: dlpEditorList(od, "domains", (x) => typeof x === "string" && x.trim() !== ""),
+  };
+}
+
 function dlpWholeCount(raw) {
   const text = String(raw).trim();
   if (!/^\d+$/.test(text)) return null;
@@ -50,16 +64,11 @@ async function renderDLPPoliciesView(content) {
     const current = freshRender(section);
     uiState(section, "loading");
     try {
-      const [pr, cr, fr, od] = await Promise.all([apiFetch("GET", "/admin/dlp-policies"), apiFetch("GET", "/admin/dlp-classifiers"), apiFetch("GET", "/admin/dlp-fingerprints"), apiFetch("GET", "/admin/organization-domains")]);
+      const pr = await apiFetch("GET", "/admin/dlp-policies");
       const named = (x) => x && typeof x.name === "string" && x.name.trim() !== "";
       const policies = dlpEditorList(pr, "policies", (x) => named(x) && typeof x.id === "string" && x.id && Array.isArray(x.identifiers) && x.identifiers.every((id) => typeof id === "string" && id));
-      const custom = dlpEditorList(cr, "classifiers", named);
-      const edm = dlpEditorList(fr, "datasets", named);
-      const domains = dlpEditorList(od, "domains", (x) => typeof x === "string" && x.trim() !== "");
       if (!current()) return;
       _policies = policies;
-      _library = { custom, edm };
-      _orgDomains = domains;
     } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
     render();
   }
@@ -67,7 +76,7 @@ async function renderDLPPoliciesView(content) {
   function render() {
     section.innerHTML = "";
     section.appendChild(el("div", { class: "ui-toolbar" }, [
-      el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add policy", ja: "+ ポリシーを追加" }), onClick: () => openEditor(null) }),
+      el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add policy", ja: "+ ポリシーを追加" }), onClick: () => prepareEditor(null) }),
       el("span", { class: "ui-view-desc", text: _policies.length + " " + bl({ en: "policies", ja: "ポリシー" }) }),
     ]));
     if (!_policies.length) {
@@ -83,11 +92,29 @@ async function renderDLPPoliciesView(content) {
         el("span", { class: "ui-view-desc", text: dlpInstanceScopeLabel(p.instance_scope) }),
         el("span", { class: "ui-view-desc", text: (p.device_risk && p.device_risk.length) ? (p.device_risk.length + " " + bl({ en: "condition(s)", ja: "条件" })) : "—" }),
         el("div", { class: "ui-row-actions" }, [
-          el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }), onClick: () => openEditor(p) }),
+          el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }), onClick: () => prepareEditor(p) }),
           el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), onClick: () => remove(p) }),
         ]),
       ])
     ));
+  }
+
+  let editorLoading = false;
+  async function prepareEditor(existing) {
+    if (editorLoading) return;
+    editorLoading = true;
+    const current = freshRender(section);
+    try {
+      const deps = await dlpEditorDependencies();
+      if (!current() || section.isConnected === false) return;
+      _library = { custom: deps.custom, edm: deps.edm };
+      _orgDomains = deps.domains;
+      openEditor(existing);
+    } catch (e) {
+      if (current() && section.isConnected !== false) {
+        uiToast(bl({ en: "Cannot open the editor: ", ja: "編集画面を開けません: " }) + String(e.message || e), "danger");
+      }
+    } finally { editorLoading = false; }
   }
 
   function openEditor(existing) {

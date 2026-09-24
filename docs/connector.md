@@ -169,9 +169,9 @@ What comes back names both, and says whether it actually carries traffic:
  "kind":"network","source":"admin","held":false,"pending":false,"routable":true}
 ```
 
-A connector may also *report* subnets it can see. Those are discovery, not routing: they stay unroutable
-until an administrator adopts them, so a machine plugged into a network it should not publish does not
-publish it by arriving.
+A connector may also *report* subnets it can see. These reports are informational; the administration API
+does not accept adopting or holding self-reported routes. To configure a reported subnet, define it on the
+Networks page and bind that Named Network to the connector.
 
 ## Region failover
 

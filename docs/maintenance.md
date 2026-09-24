@@ -50,6 +50,15 @@ Four regressions check asynchronous success and rejection for both buttons, and
 browser-enforced clipboard denial was checked with a synthetic invitation.
 This fix is also not included in the published 0.3.0 release.
 
+In Sites, connector routes now offer hostname and Named Network bindings in line
+with the existing administration API. A subnet entered directly is retained with
+guidance to define it on the Networks page; connector-reported routes are shown
+as information without Adopt or Hold controls that the API rejects. Existing
+configured bindings can still be removed. Local browser checks covered add,
+reload, removal, stored routes and audit records using a synthetic connector;
+real connector traffic and independent control-plane/Edge propagation remain
+release checks. This correction is not in the published 0.3.0 release.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

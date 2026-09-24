@@ -173,6 +173,9 @@ async function paPeople(section) {
   try {
     ({health, sources, runs, people, riskMap} = await paLoadPeople());
   } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); paDrawRiskNotices(section); return; }
+  // Removed entries still own their ID. Manual addition must not silently
+  // replace a synced identity or reactivate one hidden from the live list.
+  const existingIDs = new Set(people.map((u) => u.id));
   people = people.filter((u) => u.status !== "deleted");
   if (!current()) return;
   section.innerHTML = "";
@@ -244,10 +247,10 @@ async function paPeople(section) {
   section.appendChild(el("div", { class: "pa-fallback" }, [
     el("span", { class: "ui-view-desc", text: bl({ en: "Not in a synced source? Add manually — this records an identity but does NOT grant access.", ja: "同期ソースに無い? 手動追加 ── identity を記録するだけで、アクセスは付与しません。" }) }),
     el("span", { class: "ui-spacer" }),
-    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add manually", ja: "手動追加" }), onClick: () => openPersonForm(section) }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add manually", ja: "手動追加" }), onClick: () => openPersonForm(section, existingIDs) }),
   ]));
 }
-function openPersonForm(section) {
+function openPersonForm(section, existingIDs = new Set()) {
   const idF = uiField({ name: "id", label: bl({ en: "ID", ja: "ID" }), required: true, placeholder: "u1" });
   const subjF = uiField({ name: "subj", label: bl({ en: "Username / subject", ja: "ユーザー名 / subject" }), required: true, placeholder: "alice" });
   const emailF = uiField({ name: "email", label: bl({ en: "Email", ja: "メール" }), placeholder: "alice@example.com" });
@@ -262,6 +265,11 @@ function openPersonForm(section) {
   submit.addEventListener("click", async () => {
     if (pending || closed || !idF.validate() || !subjF.validate()) return;
     const body = { id: idF.get(), subject: subjF.get(), email: emailF.get(), source: "manual", status: statusF.get() };
+    if (existingIDs.has(body.id)) {
+      error.textContent = bl({ en: "This ID already exists in the directory, including removed entries. Choose a different ID.", ja: "このIDは削除済みを含む登録に存在します。別のIDを指定してください。" });
+      idF.focus();
+      return;
+    }
     pending = true; error.textContent = "";
     const controls = [...m.el.querySelectorAll("input,select,button")];
     const disabled = controls.map(control => control.disabled);

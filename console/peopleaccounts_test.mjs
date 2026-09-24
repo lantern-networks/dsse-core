@@ -220,3 +220,18 @@ test('a repeated directory cursor stops instead of looping or presenting duplica
  const f=fixture();f.invokeWith(async(m,p)=>p.startsWith(paths[3])&&!p.includes('/sources')&&!p.includes('/import-runs')?{ok:true,body:{identities:[person],next_cursor:'same'}}:{ok:true,body:bodyFor(p)});
  await f.context.paPeople(f.host);assert.equal(f.states.at(-1).state,'error');assert.equal(f.calls.filter(c=>c.path.includes('?cursor=')).length,1);
 });
+
+test('manual addition cannot overwrite a listed synced, suspended, or removed identity',async()=>{
+ for(const status of ['active','suspended','deleted']){
+  const f=fixture();const saved={...person,status,source:'idp-source',display_name:'Synced Alice'};
+  f.invokeWith(async(m,p,body)=>({ok:true,body:m==='POST'?{...body,tenant_id:'tenant'}:p===paths[3]?{identities:[saved]}:bodyFor(p)}));
+  await f.context.paPeople(f.host);await button(f.host,'Add manually').click();const modal=f.modals.at(-1);
+  f.fields.id.input.value='alice';f.fields.subj.input.value='replacement';f.fields.email.input.value='replacement@example.test';
+  await button(modal.el,'Add person').click();assert.equal(f.calls.filter(c=>c.method==='POST').length,0);assert.equal(modal.closed,false);assert.match(error(modal.el).textContent,/already exists/);
+  f.mockRefresh();f.fields.id.input.value='new-person';await button(modal.el,'Add person').click();assert.equal(f.calls.filter(c=>c.method==='POST').length,1);assert.equal(modal.closed,true);
+ }
+});
+test('manual duplicate protection also covers an identity from a later directory page',async()=>{
+ const f=fixture();f.invokeWith(async(m,p,body)=>({ok:true,body:m==='POST'?{...body,tenant_id:'tenant'}:p===paths[3]?{identities:[],next_cursor:'next'}:p===paths[3]+'?cursor=next'?{identities:[person]}:bodyFor(p)}));
+ await f.context.paPeople(f.host);await button(f.host,'Add manually').click();f.fields.id.input.value='alice';f.fields.subj.input.value='alice';await button(f.modals.at(-1).el,'Add person').click();assert.equal(f.calls.filter(c=>c.method==='POST').length,0);
+});

@@ -33,6 +33,20 @@ This is a guide to intent, not a substitute for the current permission catalog.
 acts. In particular, analyst is not "read everything", and read-oriented roles can
 still export data. Grant the smallest role set that covers the intended work.
 
+## Editing organization settings
+
+Updating an existing organization with `POST /admin/tenants`, or its own settings
+with `POST /admin/tenant`, preserves fields omitted from the request. Explicit
+empty values still clear editable settings. A display-name or status change does
+not reset the timezone, stored policy metadata, or customer delegation history.
+
+Delegation and elevation fields are read-only through these settings routes.
+Unchanged values may be sent back; changing them returns 403 without saving.
+Use the dedicated operator-access routes, which enforce customer consent and
+record the actor. Backup clients that previously changed those fields through a
+general tenant update must use those routes instead. In particular, only the
+customer can restore delegation after withdrawing it.
+
 ## Create and maintain named accounts
 
 1. Follow [Deployment](deployment.md) for initial bootstrap, then sign in with the named

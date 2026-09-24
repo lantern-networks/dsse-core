@@ -129,15 +129,12 @@ async function showConnectorDetail(id, fallback) {
   foot.appendChild(el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => modal.close() }));
 }
 
-// renderConnectorRouteGovernance is the CP-configured "Networks" surface (the design doc): the operator BINDS a
-// network (CIDR or FQDN) to the connector — the control plane, not the connector, is the source of routes. A
-// connector's self-reported subnets are non-authoritative DISCOVERY the operator ADOPTS to make routable. A
-// saved binding propagates at once (route layer instantly; the connector within one effective-routes poll).
-// Backend: GET/POST /admin/connectors/{id}/routes ({action, cidr|fqdn, description}).
+// Connector bindings reference a Named Network or a hostname. Self-reported routes
+// are informational: the server does not accept adopting or holding them.
 async function renderConnectorRouteGovernance(host, id) {
   host.innerHTML = "";
-  host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Connector routes (declared / adopted)", ja: "コネクタ経路（宣言 / 採用）" }) }));
-  host.appendChild(el("p", { class: "ui-field-hint", text: bl({ en: "Bind the networks (subnets or hostnames) this connector serves. Configured bindings are the source of routing; a subnet the connector reports is DISCOVERED — adopt it to make it routable. Changes take effect immediately.", ja: "このコネクタが担うネットワーク(サブネット/ホスト名)を紐付けます。設定した紐付けがルーティングの源です。コネクタが報告するサブネットは「発見」状態で、採用するとルーティング可能になります。変更は即時に反映されます。" }) }));
+  host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Connector routes (configured / reported)", ja: "コネクタ経路（設定 / 報告）" }) }));
+  host.appendChild(el("p", { class: "ui-field-hint", text: bl({ en: "Bind a Named Network or hostname that this connector serves. Define subnets on the Networks page, then select them here. Routes reported by the connector are informational and cannot be adopted directly.", ja: "このコネクタが担う定義済みネットワークまたはホスト名を紐付けます。サブネットはネットワーク画面で定義し、ここで選択してください。コネクタから報告された経路は参考情報で、直接採用できません。" }) }));
   let routes = [];
   try { const r = await apiFetch("GET", "/admin/connectors/" + encodeURIComponent(id) + "/routes"); if (r.ok && r.body) routes = r.body.routes || []; } catch (e) { /* leave empty */ }
   // Named Networks (VLAN objects) are ranges defined ONCE and referenced here, so a subnet is not re-typed.
@@ -157,17 +154,6 @@ async function renderConnectorRouteGovernance(host, id) {
       : rt.pending
         ? uiBadge(bl({ en: "Discovered", ja: "発見" }), "warn")
         : uiBadge(bl({ en: "Routable", ja: "ルーティング可" }), "ok");
-    const connActions = (rt) => {
-      // hold/adopt govern self-reported SUBNETS only (the backend rejects an fqdn hold); a discovered name
-      // route is informational today — no dead button that can only 400.
-      if (rt.kind !== "cidr" && !rt.cidr) return null;
-      if (rt.held) return [el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Unhold", ja: "保留解除" }), onClick: () => connRouteAction(id, Object.assign({ action: "unhold" }, payloadFor(rt)), host) })];
-      if (rt.pending) return [
-        el("button", { class: "ui-btn ui-btn-sm ui-btn-primary", text: bl({ en: "Adopt", ja: "採用" }), onClick: () => connRouteAction(id, Object.assign({ action: "approve" }, payloadFor(rt)), host) }),
-        el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Hold", ja: "保留" }), onClick: () => connRouteAction(id, Object.assign({ action: "hold" }, payloadFor(rt)), host) }),
-      ];
-      return [el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Hold", ja: "保留" }), onClick: () => connRouteAction(id, Object.assign({ action: "hold" }, payloadFor(rt)), host) })];
-    };
     const kindBadge = (rt) => uiBadge(
       rt.kind === "network" ? bl({ en: "Named network", ja: "定義済みNW" })
         : (rt.kind === "fqdn" || (!rt.cidr && rt.fqdn)) ? bl({ en: "Name", ja: "名前" })
@@ -176,26 +162,29 @@ async function renderConnectorRouteGovernance(host, id) {
       el("td", {}, el("code", { text: dest(rt) })),
       el("td", {}, kindBadge(rt)),
       el("td", {}, uiBadge(rt.source === "admin" ? bl({ en: "Configured", ja: "設定済み" }) : bl({ en: "Discovered", ja: "発見" }), rt.source === "admin" ? "ok" : "off")),
-      el("td", {}, stateBadge(rt)),
+      el("td", {}, rt.source === "admin" ? stateBadge(rt) : uiBadge(bl({ en: "Reported", ja: "報告のみ" }), "off")),
       el("td", { class: "ui-row-actions" }, rt.source === "admin"
         ? [el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Remove", ja: "削除" }), onClick: () => connRouteAction(id, Object.assign({ action: "remove" }, payloadFor(rt)), host) })]
-        : connActions(rt)),
+        : []),
     ]));
     host.appendChild(el("table", { class: "ui-table" }, [
       el("thead", {}, el("tr", {}, [bl({ en: "Network", ja: "ネットワーク" }), bl({ en: "Type", ja: "種別" }), bl({ en: "Source", ja: "由来" }), bl({ en: "State", ja: "状態" }), bl({ en: "Manage", ja: "操作" })].map((x) => el("th", { text: x })))),
       el("tbody", {}, rows),
     ]));
   }
-  // Bind a network: a CIDR (e.g. 10.20.0.0/16) or an FQDN/hostname (e.g. wiki.corp) + optional description.
-  // Type is auto-detected — a value with "/" is a subnet, otherwise a name binding.
-  const inp = el("input", { class: "ui-input", placeholder: bl({ en: "10.20.0.0/16 or wiki.corp", ja: "10.20.0.0/16 または wiki.corp" }) });
+  // Bind a hostname directly; subnets use the Named Network selector below.
+  const inp = el("input", { class: "ui-input", placeholder: bl({ en: "wiki.corp", ja: "wiki.corp" }) });
   inp.style.maxWidth = "220px";
   const desc = el("input", { class: "ui-input", placeholder: bl({ en: "description (optional)", ja: "説明(任意)" }) });
   desc.style.maxWidth = "200px";
   const submit = () => {
     const v = inp.value.trim();
     if (!v) return;
-    const payload = v.indexOf("/") >= 0 ? { cidr: v } : { fqdn: v };
+    if (v.includes("/")) {
+      uiToast(bl({ en: "Define this subnet on the Networks page, then select it as a Named Network here.", ja: "このサブネットをネットワーク画面で定義し、ここで定義済みネットワークとして選択してください。" }), "err");
+      return;
+    }
+    const payload = { fqdn: v };
     payload.action = "add";
     if (desc.value.trim()) payload.description = desc.value.trim();
     connRouteAction(id, payload, host);

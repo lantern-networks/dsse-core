@@ -106,8 +106,8 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
 
   // (connector_network_route_advertisement_design.md): the route-governance surface lives HERE — the
   // site-first IA has no separate Connectors page, so each of the site's connectors gets its governance panel
-  // (declared/discovered subnets with Routable / Discovered / Held state and Adopt / Hold / Unhold) in this
-  // modal. Without it the operator cannot see or manage what actually routes (the 2026-07-16 orphaned-UI gap).
+  // (configured bindings and informational connector-reported routes) in this
+  // modal. Configured bindings can be removed; reported subnets are informational.
   let conns = [];
   try {
     const r = await apiFetch("GET", "/admin/connectors");

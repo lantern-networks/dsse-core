@@ -182,6 +182,16 @@ async function loadDns(host, content) {
   // the one button that would write it is the operator's.
   if (answeringForTheDeployment()) host.appendChild(el("div", { style: "margin-top:14px" }, save));
   save.addEventListener("click", async () => {
+    // An incomplete edit must not silently delete an existing rule. Deletion
+    // is the explicit Remove action, including for newly added blank rows.
+    if (redirects.some(r => !r.name.trim() || !r.addr.trim())) {
+      uiToast(bl({ en: "Complete each redirect domain and address, or remove the row explicitly.", ja: "各リダイレクトのドメインとアドレスを入力してください。削除する場合は行の削除ボタンを使ってください。" }), "err");
+      return;
+    }
+    if (forwardZones.some(z => !z.zone.trim() || !z.upstream.trim())) {
+      uiToast(bl({ en: "Complete each forward zone and DNS server, or remove the row explicitly.", ja: "各転送ゾーンとDNSサーバを入力してください。削除する場合は行の削除ボタンを使ってください。" }), "err");
+      return;
+    }
     const deny = blocked.map((s) => s.trim()).filter(Boolean);
     const sinkhole = {};
     for (const r of redirects) { if (r.name && r.addr) sinkhole[r.name] = r.addr; }

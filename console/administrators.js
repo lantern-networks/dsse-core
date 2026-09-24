@@ -155,13 +155,13 @@ function openInvitationHandover(invitation, opts) {
   const onReissue = opts && opts.onReissue;
   const text = [inv.subject ? bl({ en: "Subject: ", ja: "件名: " }) + inv.subject : "", inv.body || ""]
     .filter(Boolean).join("\n\n");
-  const copyAll = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Copy message", ja: "本文をコピー" }), onClick: () => {
-    try { navigator.clipboard.writeText(text); uiToast(bl({ en: "Copied.", ja: "コピーしました。" }), "ok"); }
-    catch (e) { uiToast(String(e), "err"); }
+  const copyAll = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Copy message", ja: "本文をコピー" }), onClick: async () => {
+    try { await navigator.clipboard.writeText(text); uiToast(bl({ en: "Copied.", ja: "コピーしました。" }), "ok"); }
+    catch (e) { uiToast(bl({ en: "Could not copy. Select and copy the message above.", ja: "コピーできませんでした。上の本文を選択してコピーしてください。" }), "err"); }
   } });
-  const copyLink = el("button", { class: "ui-btn", text: bl({ en: "Copy link only", ja: "リンクのみコピー" }), onClick: () => {
-    try { navigator.clipboard.writeText(inv.link || ""); uiToast(bl({ en: "Copied.", ja: "コピーしました。" }), "ok"); }
-    catch (e) { uiToast(String(e), "err"); }
+  const copyLink = el("button", { class: "ui-btn", text: bl({ en: "Copy link only", ja: "リンクのみコピー" }), onClick: async () => {
+    try { await navigator.clipboard.writeText(inv.link || ""); uiToast(bl({ en: "Copied.", ja: "コピーしました。" }), "ok"); }
+    catch (e) { uiToast(bl({ en: "Could not copy. Select and copy the message above.", ja: "コピーできませんでした。上の本文を選択してコピーしてください。" }), "err"); }
   } });
   // onClosed lets a caller continue AFTER the operator has taken the link. The creation wizard needs it:
   // opening its checklist alongside put a modal on top of the one thing in the flow that cannot be recovered

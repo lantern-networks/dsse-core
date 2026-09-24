@@ -42,6 +42,14 @@ regressions cover the form behavior, and Console tests now run in CI.
 This fix is not included in the published 0.3.0 release; independent
 control-plane/Edge traffic and the release checks below remain outstanding.
 
+Invitation message and link copying now waits for the clipboard operation before
+showing success. If the browser refuses the copy, the handover dialog explains
+how to select and copy the message manually. This affects both administrator and
+operator invitations; it does not issue a new invitation or change its validity.
+Four regressions check asynchronous success and rejection for both buttons, and
+browser-enforced clipboard denial was checked with a synthetic invitation.
+This fix is also not included in the published 0.3.0 release.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

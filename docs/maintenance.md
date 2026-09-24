@@ -1,6 +1,6 @@
 # Maintenance and 0.3.1 progress
 
-Updated: 2026-09-24. Lantern DSSE is actively maintained by Lantern Networks, Inc.
+Updated: 2026-09-25. Lantern DSSE is actively maintained by Lantern Networks, Inc.
 The latest published version is [0.3.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.0-experimental), released on September 11.
 **0.3.1 is in development and has not been released.**
 
@@ -31,12 +31,22 @@ Local browser checks and separate database tests do not establish independent
 control-plane/Edge operation, external identity-provider interoperability, or
 long-duration reliability. Test counts are not a release-readiness percentage.
 
+## Focused fixes in this tree
+
+DNS Filtering now rejects incomplete redirect and conditional-forwarding rows
+before saving. Previously, clearing either required field and applying the form
+silently removed that rule. Complete the row or use its Remove button to delete it.
+Corrected saves, reloads, explicit removal, preserved settings and audit records
+were checked in a local browser against the server and file store. Six focused
+regressions cover the form behavior, and Console tests now run in CI.
+This fix is not included in the published 0.3.0 release; independent
+control-plane/Edge traffic and the release checks below remain outstanding.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with
-  material effects on access, saved data or audit records. The next focused check
-  is whether ordinary edits to a published application update its rule-destination
-  catalog entry correctly.
+  material effects on access, saved data or audit records. Reuse existing evidence
+  while reconciling remaining checks and reviewing independent fixes for integration.
 - Resolve or explicitly assess remaining persistence and restart limitations;
   postponing an investigation does not turn it into a passed check.
 - Install from the public instructions and verify real allowed and denied traffic,

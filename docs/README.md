@@ -9,6 +9,7 @@ with values from your deployment. Use the documentation from the revision you bu
 
 | Your task | Reading order |
 |---|---|
+| Follow ongoing maintenance and the next release | [Maintenance and 0.3.1 progress](maintenance.md) |
 | Review release scope, defaults, and unresolved evidence | [Release overview and known limitations](release-overview.md) |
 | Understand the system and its trust boundaries | [Architecture](architecture.md), [Threat model](threat-model.md), [Security policy](../SECURITY.md) |
 | Understand certificates, keys, and their renewal | [PKI structure and lifecycle](pki.md) |

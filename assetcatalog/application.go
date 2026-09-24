@@ -49,3 +49,17 @@ func (s *Store) DeleteApplicationEndpointContext(ctx context.Context, tenant, ap
 		return n.deleteEndpoint(tenant, id)
 	})
 }
+
+// RenameApplicationEndpointContext updates the existing rule destination's display
+// name without replacing its address, tags, identity or group references.
+func (s *Store) RenameApplicationEndpointContext(ctx context.Context, tenant, applicationID, alias string, allowManual bool) error {
+	_, err := mutateCatalogContext(ctx, s, func(n *Store) (Endpoint, error) {
+		current, found := n.GetEndpoint(tenant, "app-"+applicationID)
+		if !found || !ApplicationEndpointWritable(current, applicationID, allowManual) {
+			return Endpoint{}, ErrApplicationEndpointOwnership
+		}
+		current.Alias = alias
+		return n.upsertEndpoint(current)
+	})
+	return err
+}

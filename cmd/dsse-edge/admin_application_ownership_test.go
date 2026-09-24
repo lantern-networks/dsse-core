@@ -15,7 +15,7 @@ import (
 )
 
 func TestApplicationScopedWriterCannotMutateManualEndpoint(t *testing.T) {
-	for _, action := range []string{"publish", "unpublish", "delete", "retry-delete"} {
+	for _, action := range []string{"publish", "unpublish", "delete", "retry-delete", "edit"} {
 		t.Run(action, func(t *testing.T) {
 			tenant := "tenant_lab_001"
 			now := time.Now()
@@ -44,7 +44,12 @@ func TestApplicationScopedWriterCannotMutateManualEndpoint(t *testing.T) {
 			if action == "delete" || action == "retry-delete" {
 				method, path = "DELETE", "/admin/applications/app"
 			}
-			r := httptest.NewRequest(method, path, strings.NewReader(`{"destination":"app.example.invalid","destination_port":443,"publish_protocol":"web"}`))
+			body := `{"destination":"app.example.invalid","destination_port":443,"publish_protocol":"web"}`
+			if action == "edit" {
+				path = "/admin/applications"
+				body = `{"application_id":"app","name":"Renamed app","application_type":"private_app","published":true,"destination":"app.example.invalid","destination_port":443,"publish_protocol":"web"}`
+			}
+			r := httptest.NewRequest(method, path, strings.NewReader(body))
 			r.Header.Set("Authorization", "Bearer application-review-token")
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, r)

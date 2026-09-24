@@ -1881,7 +1881,8 @@ final class HandleNewFlowTakeoverTests: XCTestCase {
     func testLiveRuntimeCopyDriverTimesOutWhenEdgeRoundTripDoesNotComplete() throws {
         let upstreamPayload = Data("synthetic-client-bytes".utf8)
         let flow = MockProviderTCPFlowCopyIO(upstreamPayload: upstreamPayload)
-        let transport = SleepingRuntimeCopyTransport(delay: 0.25, downstreamPayload: Data("late-response".utf8))
+        let transport = BlockedRuntimeCopyTransport(downstreamPayload: Data("late-response".utf8))
+        defer { transport.release.signal() }
         let liveGuard = DsseLiveRuntimeCopyGuard()
         let metadata = DsseLocalRuntimeCopyMetadata(
             tenantID: "tenant_lab_001",
@@ -4842,13 +4843,19 @@ private final class RecordingSessionRuntimeCopyTransport: DsseSessionLocalRuntim
     }
 }
 
-private final class SleepingRuntimeCopyTransport: DsseLocalRuntimeCopyTransport, @unchecked Sendable {
-    let delay: TimeInterval
+private final class BlockedRuntimeCopyTransport: DsseLocalRuntimeCopyTransport, @unchecked Sendable {
+    // Keep the exchange incomplete until the timeout assertions finish, even if
+    // a loaded test runner takes longer than an arbitrary sleep to resume them.
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
     let downstreamPayload: Data
-    var seenPayloads: [Data] = []
+    private var payloads: [Data] = []
+    var seenPayloads: [Data] {
+        lock.lock(); defer { lock.unlock() }
+        return payloads
+    }
 
-    init(delay: TimeInterval, downstreamPayload: Data) {
-        self.delay = delay
+    init(downstreamPayload: Data) {
         self.downstreamPayload = downstreamPayload
     }
 
@@ -4856,8 +4863,8 @@ private final class SleepingRuntimeCopyTransport: DsseLocalRuntimeCopyTransport,
         _ payload: Data,
         metadata: DsseLocalRuntimeCopyMetadata
     ) throws -> Data {
-        seenPayloads.append(payload)
-        Thread.sleep(forTimeInterval: delay)
+        lock.lock(); payloads.append(payload); lock.unlock()
+        release.wait()
         return downstreamPayload
     }
 }

@@ -92,10 +92,12 @@ final class DsseCertificateRenewalLiveTests: XCTestCase {
             SecCertificateCopyData(renewed.certificate) as Data)
         let keyTag = renewed.privateKeyTag
         Self.installedCertificates.append(renewed.certificate)
-        let renewedCertificate = renewed.certificate
+        // Capture Sendable DER bytes; construct the certificate on the teardown actor.
+        let certificateData = SecCertificateCopyData(renewed.certificate) as Data
         addTeardownBlock {
-            DsseRenewedIdentityStore.remove(certificate: renewedCertificate)
-            DsseCertificateRenewal.deleteKey(tag: keyTag)
+            defer { DsseCertificateRenewal.deleteKey(tag: keyTag) }
+            let certificate = try XCTUnwrap(SecCertificateCreateWithData(nil, certificateData as CFData))
+            DsseRenewedIdentityStore.remove(certificate: certificate)
         }
 
         // The Edge takes the identity from the verified certificate, so this must come back as the device that
@@ -149,10 +151,12 @@ final class DsseCertificateRenewalLiveTests: XCTestCase {
             SecCertificateCopyData(renewed.certificate) as Data)
         let keyTag = renewed.privateKeyTag
         Self.installedCertificates.append(renewed.certificate)
-        let renewedCertificate = renewed.certificate
+        // Capture Sendable DER bytes; construct the certificate on the teardown actor.
+        let certificateData = SecCertificateCopyData(renewed.certificate) as Data
         addTeardownBlock {
-            DsseRenewedIdentityStore.remove(certificate: renewedCertificate)
-            DsseCertificateRenewal.deleteKey(tag: keyTag)
+            defer { DsseCertificateRenewal.deleteKey(tag: keyTag) }
+            let certificate = try XCTUnwrap(SecCertificateCreateWithData(nil, certificateData as CFData))
+            DsseRenewedIdentityStore.remove(certificate: certificate)
         }
 
         XCTAssertThrowsError(

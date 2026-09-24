@@ -162,13 +162,18 @@ async function renderDLPPoliciesView(content) {
     // risk-based rules act. Defaults chosen to catch real exfil while excluding FP noise (≥2 distinct types, same
     // destination, short burst).
     const dr = (existing && existing.device_risk && existing.device_risk[0]) || null;
-    const drEnableF = uiField({ name: "dr_on", label: bl({ en: "Raise device risk on an abnormal burst", ja: "異常なバースト時にデバイスリスクを上げる" }), type: "checkbox", value: !!dr });
-    const drCountF = uiField({ name: "dr_count", label: bl({ en: "Detections (min)", ja: "検出数(最小)" }), type: "text", value: String((dr && dr.min_count) || 10) });
-    const drTypesF = uiField({ name: "dr_types", label: bl({ en: "Distinct confidential types (min)", ja: "異なる機密データ種類(最小)" }), type: "text", value: String((dr && dr.min_distinct_types) || 2), hint: bl({ en: "≥2 excludes single-type false positives (e.g. telemetry ids).", ja: "≥2 で単一型の誤検知(テレメトリ ID 等)を除外。" }) });
+    const drEnableF = uiField({ name: "dr_on", label: bl({ en: "Raise device risk on an abnormal burst", ja: "異常なバースト時にデバイスリスクを上げる" }), type: "checkbox", value: !!dr, hint: existing?.device_risk?.length > 1 ? bl({ en: "These fields edit the first condition; additional conditions are retained. Turning this off removes all device-risk conditions.", ja: "以下は先頭の条件を編集します。他の条件は保持します。オフにするとデバイスリスク条件をすべて解除します。" }) : "" });
+    const drCountF = uiField({ name: "dr_count", label: bl({ en: "Detections (min)", ja: "検出数(最小)" }), type: "text", value: String(dr ? dr.min_count : 10) });
+    const drTypesF = uiField({ name: "dr_types", label: bl({ en: "Distinct confidential types (min)", ja: "異なる機密データ種類(最小)" }), type: "text", value: String(dr ? dr.min_distinct_types : 2), hint: bl({ en: "≥2 excludes single-type false positives (e.g. telemetry ids).", ja: "≥2 で単一型の誤検知(テレメトリ ID 等)を除外。" }) });
     const drSameF = uiField({ name: "dr_same", label: bl({ en: "All to the same destination", ja: "すべて同一宛先へ" }), type: "checkbox", value: dr ? !!dr.same_destination : true });
-    const drWinF = uiField({ name: "dr_win", label: bl({ en: "Within", ja: "計測期間" }), type: "select", value: String((dr && dr.window_seconds) || 300), options: [
+    const riskWindow = dr ? dr.window_seconds : 300;
+    const riskWindowOptions = [
       { value: "300", label: bl({ en: "5 minutes", ja: "5 分" }) }, { value: "900", label: bl({ en: "15 minutes", ja: "15 分" }) }, { value: "3600", label: bl({ en: "1 hour", ja: "1 時間" }) },
-    ] });
+    ];
+    if (!riskWindowOptions.some((x) => x.value === String(riskWindow))) {
+      riskWindowOptions.push({ value: String(riskWindow), label: String(riskWindow) + " s" });
+    }
+    const drWinF = uiField({ name: "dr_win", label: bl({ en: "Within", ja: "計測期間" }), type: "select", value: String(riskWindow), options: riskWindowOptions });
     const drClassF = uiField({ name: "dr_class", label: bl({ en: "Only to", ja: "対象宛先" }), type: "select", value: (dr && dr.destination_class) || "any", options: [
       { value: "any", label: bl({ en: "Any destination", ja: "すべての宛先" }) }, { value: "personal", label: bl({ en: "Personal / outside-org only", ja: "個人/社外のみ" }) },
     ] });
@@ -244,13 +249,13 @@ async function renderDLPPoliciesView(content) {
       const obj = { ...existing, name: nameF.get(), identifiers: ids, on_match: actionF.get(), instance_scope: scopeF.get() === "any" ? "" : scopeF.get() };
       if (existing) obj.id = existing.id;
       obj.device_risk = drEnableF.get() ? [{
+        ...(existing?.device_risk?.[0] || { severity: "high" }),
         min_count: minCount,
         min_distinct_types: minTypes,
         same_destination: drSameF.get(),
-        window_seconds: parseInt(drWinF.get(), 10) || 300,
+        window_seconds: Number(drWinF.get()),
         destination_class: drClassF.get() === "any" ? "" : drClassF.get(),
-        severity: "high",
-      }] : [];
+      }, ...(existing?.device_risk?.slice(1) || [])] : [];
       submit.disabled = true;
       try {
         const r = await apiFetch("POST", "/admin/dlp-policies", obj);

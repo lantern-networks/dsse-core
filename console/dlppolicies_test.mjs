@@ -53,3 +53,24 @@ test('ordinary edits retain disabled status, threshold and metadata not exposed 
  await f.context.onSave();assert.equal(f.writes.length,1);const saved=f.writes[0][2];
  assert.equal(saved.status,'disabled');assert.equal(saved.min_count,5);assert.equal(saved.metadata.review,'retain');assert.equal(saved.id,'retained');
 });
+
+function riskEditorFixture(risks){
+ const f=saveFixture();f.context.existing={id:'risk-policy',device_risk:risks};const fields={};
+ f.context.el=()=>({style:{}});
+ f.context.uiField=options=>{let value=options.value;if(options.type==='select'&&!options.options.some(x=>x.value===value))value=options.options[0].value;const field={get:()=>value,set:v=>value=v,setError(){},focus(){},el:{querySelector:()=>({addEventListener(){}})}};fields[options.name]=field;return field};
+ const start=source.indexOf('    const dr =');const end=source.indexOf('    const submit =',start);
+ vm.runInContext('(()=>{'+source.slice(start,end)+';Object.assign(globalThis,{drEnableF,drCountF,drTypesF,drSameF,drWinF,drClassF});})()',f.context);
+ return {...f,riskFields:fields};
+}
+const riskConditions=[{min_count:0,min_distinct_types:3,same_destination:false,window_seconds:600,destination_class:'',severity:'medium'},{min_count:12,min_distinct_types:0,same_destination:true,window_seconds:900,destination_class:'personal',severity:'high'}];
+test('name-only edits preserve zero thresholds, custom windows, severity and additional risk conditions',async()=>{
+ for(const window_seconds of [0,600]){const conditions=structuredClone(riskConditions);conditions[0].window_seconds=window_seconds;const f=riskEditorFixture(conditions);await f.context.onSave();assert.equal(f.writes.length,1);assert.deepEqual(JSON.parse(JSON.stringify(f.writes[0][2].device_risk)),conditions);assert.deepEqual(f.context.existing.device_risk,conditions);}
+ const conditions=structuredClone(riskConditions);conditions[0].min_count=12;conditions[0].min_distinct_types=0;const f=riskEditorFixture(conditions);await f.context.onSave();assert.equal(f.writes[0][2].device_risk[0].min_distinct_types,0);
+});
+test('editing the first risk condition preserves its severity and all other conditions',async()=>{
+ const before=structuredClone(riskConditions),f=riskEditorFixture(before);f.riskFields.dr_count.set('5');await f.context.onSave();const saved=JSON.parse(JSON.stringify(f.writes[0][2].device_risk));assert.deepEqual(saved,[{...before[0],min_count:5},before[1]]);assert.deepEqual(before,riskConditions);
+});
+test('explicitly disabling risk conditions removes them and re-enabling retains the configured conditions',async()=>{
+ const f=riskEditorFixture(structuredClone(riskConditions));f.riskFields.dr_on.set(false);await f.context.onSave();assert.deepEqual(Array.from(f.writes[0][2].device_risk),[]);
+ const restored=riskEditorFixture(structuredClone(riskConditions));restored.riskFields.dr_on.set(false);restored.riskFields.dr_on.set(true);await restored.context.onSave();assert.deepEqual(JSON.parse(JSON.stringify(restored.writes[0][2].device_risk)),riskConditions);
+});

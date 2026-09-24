@@ -6769,10 +6769,18 @@ paths:
         "403":
           $ref: "#/components/responses/Forbidden"
     post:
-      summary: Upsert a tenant-scoped Human Identity.
-      description: Requires admin.identity.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Upserted active identities are used by Usage Meter as the observe-only human_seat governance source. Admin audit metadata for this write records presence/counts only with human_identity_metadata_recorded_scope=none.
+      summary: Create or upsert a tenant-scoped Human Identity.
+      description: "With mode=create (used by Console manual Add), an existing ID in the authenticated tenant is rejected with 409, including deleted entries. The conflict check and save share the file-store instance lock or one PostgreSQL insert. Omit mode to retain synchronization/upsert behavior, which replaces the entry. Requires admin.identity.write. Mutating Admin UI requests authenticated by AdminSession cookie require x-csrf-token matching the server-side session secret. Bearer automation requests do not use CSRF. Upserted active identities are used by Usage Meter as the observe-only human_seat governance source. Admin audit metadata for this write records presence/counts only with human_identity_metadata_recorded_scope=none."
       tags:
         - AdminIdentity
+      parameters:
+        - name: mode
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [create]
+          description: Reject existing IDs instead of replacing them. Omit for upsert.
       requestBody:
         required: true
         content:
@@ -6792,8 +6800,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: The ID already exists in this tenant; no identity or generation was changed. Applies to mode=create.
+        "503":
+          description: The configured backend cannot safely perform create-only writes. Nothing was saved.
         "500":
-          description: The configured directory persister rejected the save. The candidate identity and configuration generation were not published. Storage details are omitted.
+          description: Directory persistence failed or was not confirmed. The process does not publish the candidate or advance its configuration generation on this error. A database connection error may leave the database outcome unknown; read back before retrying. Storage details are omitted.
           content:
             application/json:
               schema:

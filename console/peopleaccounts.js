@@ -276,7 +276,7 @@ function openPersonForm(section, existingIDs = new Set()) {
     controls.forEach(control => { control.disabled = true; });
     try {
       let r;
-      try { r = await apiFetch("POST", "/admin/human-identities", body, _PA_DIR); }
+      try { r = await apiFetch("POST", "/admin/human-identities?mode=create", body, _PA_DIR); }
       catch (_) { throw new Error(paUnconfirmedChange()); }
       paConfirmPerson(r, body);
       if (closed) return;

@@ -139,7 +139,22 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		now := time.Now()
-		created, err := humanIdentities.Upsert(r.Context(), identity, adminTenantIDFromRequest(r), now)
+		var created model.HumanIdentity
+		var err error
+		switch r.URL.Query().Get("mode") {
+		case "":
+			created, err = humanIdentities.Upsert(r.Context(), identity, adminTenantIDFromRequest(r), now)
+		case "create":
+			creator, ok := humanIdentities.(humanidentity.HumanIdentityDirectoryCreator)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("safe identity creation is unavailable"))
+				return
+			}
+			created, err = creator.Create(r.Context(), identity, adminTenantIDFromRequest(r), now)
+		default:
+			writeError(w, http.StatusBadRequest, fmt.Errorf("unsupported human identity mode"))
+			return
+		}
 		if err != nil {
 			writeHumanIdentityMutationError(w, err)
 			return
@@ -250,6 +265,10 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 // Storage errors are server failures, including when wrapped by an import. Keep
 // internal paths and storage details out of the client response.
 func writeHumanIdentityMutationError(w http.ResponseWriter, err error) {
+	if errors.Is(err, humanidentity.ErrIdentityExists) {
+		writeError(w, http.StatusConflict, humanidentity.ErrIdentityExists)
+		return
+	}
 	if errors.Is(err, humanidentity.ErrDirectoryPersistence) {
 		writeError(w, http.StatusInternalServerError, humanidentity.ErrDirectoryPersistence)
 		return

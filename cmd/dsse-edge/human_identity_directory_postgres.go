@@ -25,6 +25,7 @@ type postgresHumanIdentityDirectoryStore struct {
 }
 
 var _ humanidentity.HumanIdentityDirectoryRuntimeStore = postgresHumanIdentityDirectoryStore{}
+var _ humanidentity.HumanIdentityDirectoryCreator = postgresHumanIdentityDirectoryStore{}
 var _ humanidentity.HumanIdentityDirectoryBulkUpserter = postgresHumanIdentityDirectoryStore{}
 var _ humanidentity.HumanIdentityImportRunLister = postgresHumanIdentityDirectoryStore{}
 var _ humanidentity.HumanIdentityImportRunGetter = postgresHumanIdentityDirectoryStore{}
@@ -48,6 +49,34 @@ func (store postgresHumanIdentityDirectoryStore) Upsert(ctx context.Context, use
 	}
 	if _, err := store.DB.ExecContext(ctx, statement.SQL, statement.Args...); err != nil {
 		return model.HumanIdentity{}, fmt.Errorf("upsert human identity: %w", err)
+	}
+	store.bumpGeneration()
+	return normalized, nil
+}
+
+// Create keeps the conflict check and insertion in one database statement.
+func (store postgresHumanIdentityDirectoryStore) Create(ctx context.Context, user model.HumanIdentity, tenantID string, now time.Time) (model.HumanIdentity, error) {
+	if store.DB == nil {
+		return model.HumanIdentity{}, humanidentity.ErrDirectoryPersistence
+	}
+	normalized, err := humanidentity.NormalizeHumanIdentity(user, tenantID, now)
+	if err != nil {
+		return model.HumanIdentity{}, err
+	}
+	statement, err := buildPostgresHumanIdentityDirectoryWriteStatement(normalized, now, true)
+	if err != nil {
+		return model.HumanIdentity{}, err
+	}
+	result, err := store.DB.ExecContext(ctx, statement.SQL, statement.Args...)
+	if err != nil {
+		return model.HumanIdentity{}, humanidentity.ErrDirectoryPersistence
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return model.HumanIdentity{}, humanidentity.ErrDirectoryPersistence
+	}
+	if affected == 0 {
+		return model.HumanIdentity{}, humanidentity.ErrIdentityExists
 	}
 	store.bumpGeneration()
 	return normalized, nil
@@ -446,6 +475,10 @@ func postgresHumanIdentitySourcePolicySQL() []string {
 }
 
 func buildPostgresHumanIdentityDirectoryUpsertStatement(user model.HumanIdentity, now time.Time) (postgresExportTaskQueueStatement, error) {
+	return buildPostgresHumanIdentityDirectoryWriteStatement(user, now, false)
+}
+
+func buildPostgresHumanIdentityDirectoryWriteStatement(user model.HumanIdentity, now time.Time, createOnly bool) (postgresExportTaskQueueStatement, error) {
 	normalized, err := humanidentity.NormalizeHumanIdentity(user, user.TenantID, now)
 	if err != nil {
 		return postgresExportTaskQueueStatement{}, err
@@ -461,11 +494,15 @@ func buildPostgresHumanIdentityDirectoryUpsertStatement(user model.HumanIdentity
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	conflictClause := "ON CONFLICT (tenant_id, human_identity_id) DO UPDATE SET subject = EXCLUDED.subject, email = EXCLUDED.email, display_name = EXCLUDED.display_name, source = EXCLUDED.source, department = EXCLUDED.department, last_seen_at = EXCLUDED.last_seen_at, expires_at = EXCLUDED.expires_at, status = EXCLUDED.status, metadata = EXCLUDED.metadata, payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at"
+	if createOnly {
+		conflictClause = "ON CONFLICT (tenant_id, human_identity_id) DO NOTHING"
+	}
 	return postgresExportTaskQueueStatement{
 		SQL: strings.Join([]string{
 			"INSERT INTO human_identities (tenant_id, human_identity_id, subject, email, display_name, source, department, last_seen_at, expires_at, status, metadata, payload, created_at, updated_at)",
 			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9::timestamptz, $10, $11::jsonb, $12::jsonb, $13, $13)",
-			"ON CONFLICT (tenant_id, human_identity_id) DO UPDATE SET subject = EXCLUDED.subject, email = EXCLUDED.email, display_name = EXCLUDED.display_name, source = EXCLUDED.source, department = EXCLUDED.department, last_seen_at = EXCLUDED.last_seen_at, expires_at = EXCLUDED.expires_at, status = EXCLUDED.status, metadata = EXCLUDED.metadata, payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at",
+			conflictClause,
 		}, " "),
 		Args: []any{
 			normalized.TenantID,

@@ -235,3 +235,12 @@ test('manual duplicate protection also covers an identity from a later directory
  const f=fixture();f.invokeWith(async(m,p,body)=>({ok:true,body:m==='POST'?{...body,tenant_id:'tenant'}:p===paths[3]?{identities:[],next_cursor:'next'}:p===paths[3]+'?cursor=next'?{identities:[person]}:bodyFor(p)}));
  await f.context.paPeople(f.host);await button(f.host,'Add manually').click();f.fields.id.input.value='alice';f.fields.subj.input.value='alice';await button(f.modals.at(-1).el,'Add person').click();assert.equal(f.calls.filter(c=>c.method==='POST').length,0);
 });
+
+test('manual Add uses create mode and preserves inputs on a server-side duplicate',async()=>{
+ const f=fixture();const modal=f.form();
+ f.invokeWith(async()=>({ok:false,status:409,body:{error:'human identity ID already exists; choose a different ID'}}));
+ await button(modal.el,'Add person').click();
+ assert.equal(f.calls[0].path,'/admin/human-identities?mode=create');assert.equal(modal.closed,false);assert.equal(f.fields.id.input.value,'alice');assert.match(error(modal.el).textContent,/already exists/);
+ f.fields.id.input.value='bob';f.fields.subj.input.value='bob';f.mockRefresh();f.invokeWith(async(m,p,body)=>({ok:true,body:{...body,tenant_id:'tenant'}}));
+ await button(modal.el,'Add person').click();assert.equal(modal.closed,true);assert.equal(f.calls.length,2);assert.equal(f.calls[1].path,'/admin/human-identities?mode=create');
+});

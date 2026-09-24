@@ -62,6 +62,12 @@ type HumanIdentityDirectoryRuntimeStore interface {
 	Stats(context.Context, string, time.Time) (HumanIdentityDirectoryStats, error)
 }
 
+// HumanIdentityDirectoryCreator atomically refuses an existing tenant-scoped ID.
+// Manual additions use it; synchronization continues to use Upsert.
+type HumanIdentityDirectoryCreator interface {
+	Create(context.Context, model.HumanIdentity, string, time.Time) (model.HumanIdentity, error)
+}
+
 type HumanIdentityDirectoryBulkUpserter interface {
 	UpsertMany(context.Context, []model.HumanIdentity, string, time.Time) ([]model.HumanIdentity, error)
 }
@@ -349,6 +355,9 @@ func (store *HumanIdentityDirectoryStore) SetPersister(p blobstore.Persister) er
 	return nil
 }
 
+// ErrIdentityExists indicates a refused create, including a soft-deleted entry.
+var ErrIdentityExists = errors.New("human identity ID already exists; choose a different ID")
+
 // ErrDirectoryPersistence is safe to return to API callers. The underlying storage
 // error is reported through OnPersistError and may contain private deployment paths.
 var ErrDirectoryPersistence = errors.New("human identity directory could not be saved")
@@ -385,17 +394,29 @@ func (store *HumanIdentityDirectoryStore) persistLocked() {
 }
 
 func (store *HumanIdentityDirectoryStore) Upsert(_ context.Context, user model.HumanIdentity, tenantID string, now time.Time) (model.HumanIdentity, error) {
+	return store.saveIdentity(user, tenantID, now, false)
+}
+
+func (store *HumanIdentityDirectoryStore) Create(_ context.Context, user model.HumanIdentity, tenantID string, now time.Time) (model.HumanIdentity, error) {
+	return store.saveIdentity(user, tenantID, now, true)
+}
+
+func (store *HumanIdentityDirectoryStore) saveIdentity(user model.HumanIdentity, tenantID string, now time.Time, createOnly bool) (model.HumanIdentity, error) {
 	normalized, err := NormalizeHumanIdentity(user, tenantID, now)
 	if err != nil {
 		return model.HumanIdentity{}, err
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	key := HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)
+	if _, exists := store.users[key]; createOnly && exists {
+		return model.HumanIdentity{}, ErrIdentityExists
+	}
 	candidate := make(map[string]model.HumanIdentity, len(store.users)+1)
 	for key, existing := range store.users {
 		candidate[key] = existing
 	}
-	candidate[HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)] = normalized
+	candidate[key] = normalized
 	if err := store.saveSnapshotLocked(candidate); err != nil {
 		return model.HumanIdentity{}, err
 	}

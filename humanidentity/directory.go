@@ -1830,3 +1830,21 @@ func (store *HumanIdentityDirectoryStore) RiskIdentitySnapshot(_ context.Context
 	}
 	return people, nil
 }
+
+// RiskIdentityResolver matches current directory aliases without modifying risk marks.
+// IDs and subjects remain tenant-scoped and case-sensitive.
+type RiskIdentityResolver interface {
+	RiskIdentityIDs(context.Context, string, string) ([]string, error)
+}
+
+func (store *HumanIdentityDirectoryStore) RiskIdentityIDs(_ context.Context, tenant, subject string) ([]string, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	ids := []string{}
+	for _, person := range store.users {
+		if person.TenantID == tenant && (person.ID == subject || person.Subject == subject || (person.Email != nil && *person.Email == subject)) {
+			ids = append(ids, person.ID)
+		}
+	}
+	return ids, nil
+}

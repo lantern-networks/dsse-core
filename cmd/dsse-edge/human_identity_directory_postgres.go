@@ -807,3 +807,23 @@ func (store postgresHumanIdentityDirectoryStore) RiskIdentitySnapshot(ctx contex
 	}
 	return people, rows.Err()
 }
+
+func (store postgresHumanIdentityDirectoryStore) RiskIdentityIDs(ctx context.Context, tenant, subject string) ([]string, error) {
+	if store.DB == nil {
+		return nil, fmt.Errorf("identity directory is unavailable")
+	}
+	rows, err := store.DB.QueryContext(ctx, "SELECT human_identity_id FROM human_identities WHERE tenant_id = $1 AND (human_identity_id = $2 OR subject = $2 OR email = $2)", tenant, subject)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}

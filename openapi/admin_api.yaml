@@ -9130,6 +9130,11 @@ paths:
         not make the standby authoritative. A leader or local authority with unavailable risk storage returns 503.
         Refusals do not clear saved or held risk. No election configured and enforcing-Edge reads retain their
         existing behavior. Reads create no administrator-change audit events.
+        User risk remains keyed by the canonical directory ID. Runtime decision enrichment also matches
+        current tenant-scoped directory subjects and email addresses, so an alias update does not remove
+        the risk condition. Saved prior aliases remain protected for previously issued sessions until the
+        mark is explicitly cleared; alias reuse is not automatic proof that the old mark may be removed.
+        A directory read failure refuses the runtime decision rather than treating a marked tenant as clean.
       tags:
         - AdminRiskState
       parameters:

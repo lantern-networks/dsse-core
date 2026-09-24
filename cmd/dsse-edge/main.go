@@ -5252,6 +5252,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		devMode:                   devMode,
 		workloadAttestations:      workloadAttestations,
 		highRisk:                  config.HighRiskOverlay,
+		humanIdentities:           humanIdentities,
 		enrolledLedger:            config.EnrolledLedger,
 	}
 	adminToken := strings.TrimSpace(config.AdminToken)
@@ -7524,6 +7525,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return
 		}
 		req = enrichDecisionRequestWithSession(req, sessionStore)
+		req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
+		if riskErr != nil {
+			writeError(w, http.StatusServiceUnavailable, riskErr)
+			return
+		}
 		req = enrichDecisionRequestWithRisk(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
 		req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now()) // D1: recover FQDN for connect-by-IP / non-TLS flows
 		req = deriveDecisionRequestActor(req, delegatedGrants)
@@ -7829,6 +7835,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				req.DeviceID = transportDeviceID
 			}
 			req.DeviceTrustLevel = valueOrDefault(req.DeviceTrustLevel, connectDeviceTrustLevel)
+			req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
+			if riskErr != nil {
+				logErrorf("steer_mux_user_risk_directory_unavailable")
+				return
+			}
 			req = enrichDecisionRequestWithRisk(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
 			req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now())
 			req = deriveDecisionRequestActor(req, delegatedGrants)

@@ -277,3 +277,20 @@ func (o *HighRiskOverlay) CountUsers(tenant string) int {
 func (o *HighRiskOverlay) RemoveUsers(tenant string) (int, error) {
 	return o.RemoveTenantRisksChecked(tenant, nil)
 }
+
+// UserSeverities returns canonical user IDs and severities for one tenant.
+// Decision enrichment does not need the sorted, alias-bearing admin snapshot.
+func (o *HighRiskOverlay) UserSeverities(tenant string) map[string]string {
+	result := map[string]string{}
+	if o == nil {
+		return result
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	for _, mark := range o.users {
+		if mark.TenantID == tenant {
+			result[mark.ID] = mark.Severity
+		}
+	}
+	return result
+}

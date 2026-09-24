@@ -120,3 +120,45 @@ func writeUserRisk(w http.ResponseWriter, r *http.Request, config serverConfig, 
 	}
 	return resp, person.TenantID, true
 }
+
+// Follow the current directory's aliases by canonical ID. Saved aliases remain in
+// the overlay for sessions issued before a rename; this read does not clear them
+// or introduce a second durable write into directory synchronization.
+func enrichDecisionRequestWithDirectoryRisk(ctx context.Context, req model.DecisionRequest, directory humanidentity.HumanIdentityDirectoryRuntimeStore, overlay *revocation.HighRiskOverlay) (model.DecisionRequest, error) {
+	if overlay == nil || req.UserID == "" || req.TenantID == "" {
+		return req, nil
+	}
+	marks := overlay.UserSeverities(req.TenantID)
+	if len(marks) == 0 {
+		return req, nil
+	}
+	if directory == nil {
+		return req, fmt.Errorf("user risk directory is unavailable")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	var ids []string
+	var err error
+	if resolver, ok := directory.(humanidentity.RiskIdentityResolver); ok {
+		ids, err = resolver.RiskIdentityIDs(ctx, req.TenantID, req.UserID)
+	} else {
+		var people []model.HumanIdentity
+		people, err = directory.List(ctx, req.TenantID)
+		for _, person := range people {
+			if person.TenantID == req.TenantID && (person.ID == req.UserID || person.Subject == req.UserID || (person.Email != nil && *person.Email == req.UserID)) {
+				ids = append(ids, person.ID)
+			}
+		}
+	}
+	if err != nil {
+		return req, fmt.Errorf("user risk directory could not be read")
+	}
+	for _, id := range ids {
+		severity := marks[id]
+		req.RiskStateSeverity = maxRiskSeverity(req.RiskStateSeverity, severity)
+		if severity == "high" || severity == "critical" {
+			req.AdminHighRisk = true
+		}
+	}
+	return req, nil
+}

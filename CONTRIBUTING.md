@@ -48,6 +48,38 @@ Use fictional names and addresses; never include credentials or private deployme
 Keep release claims consistent with the experimental status and distinguish implemented
 behavior from the results of a specific test. See [Verification](docs/verification.md).
 
+## Integration and release checks
+
+Keep pull requests independently reviewable, with one logical fix or a small set
+of inseparable changes. Explain the user-visible problem, expected behavior,
+dependencies, verification results and remaining limitations. Keep public claims
+separate from unpublished deployment details.
+
+A change may be integrated when:
+
+- Its scope and dependencies have been reviewed, and required checks pass for the
+  proposed revision. Document unavailable or skipped checks and their effect on
+  acceptance; a skip is not a pass. Identify which checks ran locally or on hosted CI.
+- A behavior change has appropriate regression coverage. For an affected user
+  workflow, check the real interface and relevant saved state, permissions and
+  audit records; do not substitute a rendering or HTTP-only test for browser evidence.
+- No unresolved material defect in the changed behavior is being hidden by the
+  summary, and the change does not depend on unmerged code without stating it.
+- Documentation-only changes have valid links and accurate claims; they do not
+  require repeating unrelated runtime acceptance checks. DCO requirements still apply.
+
+Integration into `main` is separate from publishing a release. Release checks cover
+the complete candidate, including installation and upgrade instructions, applicable
+platforms and signed packages, independent control-plane/Edge traffic and change
+propagation, failure and PKI checks, and sustained operation. A merged fix does not
+waive these checks or change the project's experimental status. Unverified release
+conditions remain open until there is evidence or an explicit documented scope decision.
+
+Update [maintenance progress](docs/maintenance.md) for meaningful integrated fixes,
+changed blockers or schedule changes. At release time, provide user-facing changes,
+known limitations and upgrade guidance. Avoid accumulating unrelated completed fixes
+in a single long-lived pull request.
+
 ## Guidelines
 
 - Keep changes focused; one logical change per pull request.

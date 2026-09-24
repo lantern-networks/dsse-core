@@ -23,6 +23,13 @@ Signed endpoint packages, checksums and known release limitations are listed in
 Start with the [documentation index](docs/README.md) for a reading path by role and
 the [verification guide](docs/verification.md) for what each check establishes.
 
+## Maintenance status
+
+Development of 0.3.1 is focused on everyday reliability. See
+[maintenance and 0.3.1 progress](docs/maintenance.md) for implemented fixes,
+remaining release checks and the target week. Development changes are not yet
+part of the published 0.3.0 experimental release.
+
 ## Install and start a deployment
 
 Follow these pages in order. All commands use this repository's root, where `go.mod`,

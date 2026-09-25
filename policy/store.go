@@ -105,6 +105,7 @@ type Store struct {
 	// TOP OF the committed bundle seed — the bundle stays the policy source-of-truth. Ephemeral state
 	// (east-west grants) is NOT persisted. nil = no persistence. A shared (Postgres) persister survives a CP failover.
 	runtimeStatePersister blobstore.Persister
+	runtimeAuthorityKnown bool
 	// generation is a monotonic counter bumped on every policy mutation (Upsert / ReplaceTenant). Phase 1
 	// config distribution uses it as the policy "config
 	// version": the control plane serves {generation, policies} via GET /admin/config-bundle and each Edge

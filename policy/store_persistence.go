@@ -82,6 +82,7 @@ func (store *Store) SetRuntimeStatePersister(p blobstore.Persister) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.runtimeStatePersister = p
+	store.runtimeAuthorityKnown = false
 	if p == nil {
 		return nil
 	}
@@ -171,6 +172,7 @@ func (store *Store) loadRuntimeStateLocked() error {
 	for tenant, enabled := range store.serverInitiatedEnabled {
 		log.Printf("admin_policy_runtime_state load: server-initiated tenant=%s enabled=%t", tenant, enabled)
 	}
+	store.runtimeAuthorityKnown = true
 	return nil
 }
 
@@ -213,6 +215,7 @@ func (store *Store) persistLockedChecked() error {
 			return fmt.Errorf("save failed: %w", err)
 		}
 	}
+	store.runtimeAuthorityKnown = true
 	return nil
 }
 

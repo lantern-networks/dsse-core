@@ -34,6 +34,15 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Connector Access rule and posture edits now validate the whole request and save
+the four related settings together before publishing them. An invalid mode no
+longer leaves a rule or TTL change behind; a rejected save returns a retryable
+error and keeps the prior live configuration. Local product-HTTP checks cover
+failure, explicit retry, administrative readback, file-store reload and
+success/error audit records. A synthetic shared-store regression checks that
+the edit retains unrelated settings already present in the persisted row. Existing browser
+evidence is reused; this change adds no new GUI or deployed-fleet acceptance.
+
 Connector Access configuration bundles now reject a snapshot if its policy
 generation changes while the control plane assembles it. During an ordinary
 partial/full posture edit, this could previously deliver an intermediate mode

@@ -8,6 +8,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -101,8 +102,12 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
 			return
 		}
-		resp, err := eastwest.ApplyAdminUpdate(policyStore, adminTenantIDFromRequest(r), req)
+		resp, err := eastwest.ApplyAdminUpdateContext(r.Context(), policyStore, adminTenantIDFromRequest(r), req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Connector access policy save could not be confirmed. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -152,8 +157,12 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("decode version payload: %w", err))
 			return
 		}
-		resp, err := eastwest.ApplyAdminUpdate(policyStore, adminTenantIDFromRequest(r), req)
+		resp, err := eastwest.ApplyAdminUpdateContext(r.Context(), policyStore, adminTenantIDFromRequest(r), req)
 		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Connector access policy save could not be confirmed. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

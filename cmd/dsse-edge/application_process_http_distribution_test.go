@@ -33,7 +33,7 @@ func processDistributionAuth() *adminAuthStore {
 	auth := newAdminAuthStore()
 	auth.UpsertPrincipal(adminPrincipal{ID: "operator", TenantID: processDistributionTenant, Roles: []string{"admin"}, Status: "active"})
 	auth.UpsertAPIToken(adminAPIToken{ID: "operator", TenantID: processDistributionTenant, TokenHash: adminTokenHash(processDistributionToken),
-		Roles: []string{"admin"}, Scopes: []string{"admin.policy.read", "admin.policy.write", "admin.applications.read", "admin.applications.write", "admin.endpoints.read", "admin.endpoints.write"},
+		Roles: []string{"admin"}, Scopes: []string{"admin.policy.read", "admin.policy.write", "admin.applications.read", "admin.applications.write", "admin.endpoints.read", "admin.endpoints.write", "admin.eastwest.read", "admin.eastwest.write"},
 		CreatedByAdminPrincipalID: "operator", Status: "active", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
 	return auth
 }
@@ -93,11 +93,16 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	cpPolicy := policy.NewStore(nil)
+	if err := cpPolicy.SetRuntimeStatePath(filepath.Join(dir, "cp-policy.json")); err != nil {
+		t.Fatal(err)
+	}
 	cp := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(),
 		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(),
 		ApplicationCatalogStore: processDistributionApps(t, filepath.Join(dir, "cp-apps.json")),
 		AssetStore:              cpAssets,
 		RuleStore:               cpRules,
+		PolicyStore:             cpPolicy,
 		AgentPolicySigner:       signer, Writer: writer, AdminAuditOutbox: outbox}))
 	defer cp.Close()
 	raw, err := json.Marshal(processDistributionReady{URL: cp.URL, PublicKey: signer.PublicKeyHex()})
@@ -128,13 +133,30 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 			"admin_asset_catalog_changed", "admin_asset_catalog_changed", // endpoint edit/delete
 		}
 	}
-	if len(outbox.insertedAudits) != len(want) {
-		t.Fatalf("CP audit count=%d, want %d", len(outbox.insertedAudits), len(want))
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "eastwest" {
+		want = []string{"admin_config_change", "admin_config_change", "admin_config_change", "admin_config_change", "admin_config_change", "admin_config_change"}
+	}
+	audits := outbox.insertedAudits
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "eastwest" {
+		audits = outbox.wrapperAudits
+	}
+	if len(audits) != len(want) {
+		t.Fatalf("CP audit count=%d, want %d", len(audits), len(want))
 	}
 	for i, event := range want {
-		if audit := outbox.insertedAudits[i]; audit.EventType != event || audit.TargetID == nil ||
-			(os.Getenv("DSSE_DISTRIBUTION_CP_MODE") != "assets" && *audit.TargetID != "wiki") {
+		if audit := audits[i]; audit.EventType != event || audit.TargetID == nil ||
+			(os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "" && *audit.TargetID != "wiki") {
 			t.Fatalf("CP audit %d = %+v, want %s", i, audit, event)
+		}
+	}
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "eastwest" {
+		for i, audit := range audits {
+			if audit.TenantID != processDistributionTenant || audit.ActorUserID == nil || *audit.ActorUserID != "operator" ||
+				audit.TargetType == nil || *audit.TargetType != "admin_api" || *audit.TargetID != "/admin/east-west" ||
+				audit.Action == nil || *audit.Action != "POST" || audit.Result == nil || *audit.Result != "success" ||
+				audit.Metadata["status_code"] != 200 {
+				t.Fatalf("CP east-west audit %d = %+v", i, audit)
+			}
 		}
 	}
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {

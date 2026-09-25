@@ -184,6 +184,12 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
+		// The runtime policy store can change while a bundle is assembled. If its
+		// generation changes between reading the posture and assigning the bundle
+		// generation, an Edge can accept an intermediate east-west mode under the
+		// final generation and never poll the final mode. Refuse this snapshot so
+		// the poller retries with a coherent one.
+		policyGenerationBefore := policyStore.ConfigGeneration()
 		tenantConfig := policyStore.SnapshotTenantConfig(tenantID)
 		applications, catalogGeneration, err := applicationState.read(r.Context(), config.ApplicationCatalogStore)
 		if err != nil {
@@ -220,6 +226,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 					Config:   &cfg,
 				})
 			}
+		}
+		if policyStore.ConfigGeneration() != policyGenerationBefore {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("policy configuration changed while preparing the bundle; retry"))
+			return
 		}
 		if edgeDNSResolver != nil {
 			dnsDTO := dnsresolver.PolicyToDTO(edgeDNSResolver.CurrentPolicy())

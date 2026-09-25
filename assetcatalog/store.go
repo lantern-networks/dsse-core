@@ -105,6 +105,21 @@ func (s *Store) claimAliasLocked(tenant, desired, ownerID string) string {
 // UpsertEndpoint stores an endpoint, assigning an id if absent and a tenant-unique alias (auto-suffixed on
 // collision). Returns the stored endpoint with its resolved id and alias.
 func (s *Store) UpsertEndpoint(e Endpoint) (Endpoint, error) {
+	return s.upsertEndpoint(e, false, false)
+}
+
+// UpsertApplicationEndpoint owns the stable destination used by a published app.
+// An existing manual endpoint may only be adopted by an endpoint administrator.
+func (s *Store) UpsertApplicationEndpoint(applicationID string, e Endpoint, allowManual bool) (Endpoint, error) {
+	applicationID = strings.TrimSpace(applicationID)
+	if applicationID == "" {
+		return Endpoint{}, fmt.Errorf("application_id is required")
+	}
+	e.ID, e.Source = "app-"+applicationID, SourceApplication
+	return s.upsertEndpoint(e, true, allowManual)
+}
+
+func (s *Store) upsertEndpoint(e Endpoint, application, allowManual bool) (Endpoint, error) {
 	e.TenantID = strings.TrimSpace(e.TenantID)
 	if e.TenantID == "" {
 		return Endpoint{}, fmt.Errorf("tenant_id is required")
@@ -114,8 +129,25 @@ func (s *Store) UpsertEndpoint(e Endpoint) (Endpoint, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousSeq := s.seq
+	if e.Source == SourceApplication && !application {
+		return Endpoint{}, fmt.Errorf("application endpoints are managed by application publish")
+	}
 	if strings.TrimSpace(e.ID) == "" {
 		e.ID = s.nextIDLocked("ep")
+	}
+	if current, found := s.endpoints[e.TenantID][e.ID]; found {
+		if application && current.Source != SourceApplication && !(allowManual && (current.Source == SourceManual || current.Source == "")) {
+			return Endpoint{}, fmt.Errorf("admin.endpoints.write is required to replace the existing destination")
+		}
+		if !application && current.Source == SourceApplication {
+			return Endpoint{}, fmt.Errorf("application endpoints are managed by application publish")
+		}
+	}
+	previous, hadPrevious := s.endpoints[e.TenantID][e.ID]
+	previousAliases := make(map[string]string, len(s.aliases[e.TenantID]))
+	for alias, owner := range s.aliases[e.TenantID] {
+		previousAliases[alias] = owner
 	}
 	e.Alias = s.claimAliasLocked(e.TenantID, e.Alias, e.ID)
 	if s.endpoints[e.TenantID] == nil {
@@ -127,7 +159,15 @@ func (s *Store) UpsertEndpoint(e Endpoint) (Endpoint, error) {
 	if e.Source != SourceEnrolled {
 		s.generation++
 		if err := s.persistLocked(); err != nil {
-			return e, fmt.Errorf("endpoint %s stored in memory but not persisted (will not survive a restart): %w", e.ID, err)
+			if hadPrevious {
+				s.endpoints[e.TenantID][e.ID] = previous
+			} else {
+				delete(s.endpoints[e.TenantID], e.ID)
+			}
+			s.aliases[e.TenantID] = previousAliases
+			s.seq = previousSeq
+			s.generation--
+			return Endpoint{}, fmt.Errorf("endpoint %s update was not confirmed persisted: %w", e.ID, err)
 		}
 	}
 	return e, nil
@@ -184,22 +224,49 @@ func (s *Store) UpsertService(svc Service) (Service, error) {
 
 // DeleteEndpoint removes an endpoint and frees its alias. Returns false if it was not present. A group that
 // still lists the deleted endpoint as a static member resolves gracefully (missing members are skipped).
-// A non-nil error means the delete IS live in memory but the snapshot failed to persist (the endpoint would
-// resurrect on restart) — callers must surface it.
+// A failed snapshot restores the previous in-memory endpoint so a retry can persist the delete.
 func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
+	return s.deleteEndpoint(tenant, id, false, false)
+}
+
+// DeleteApplicationEndpoint removes only a destination owned by the application,
+// or a legacy manual destination when the caller has endpoint-write permission.
+func (s *Store) DeleteApplicationEndpoint(tenant, applicationID string, allowManual bool) (bool, error) {
+	applicationID = strings.TrimSpace(applicationID)
+	if applicationID == "" {
+		return false, fmt.Errorf("application_id is required")
+	}
+	return s.deleteEndpoint(tenant, "app-"+applicationID, true, allowManual)
+}
+
+func (s *Store) deleteEndpoint(tenant, id string, application, allowManual bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.builtInEndpoints[id]; ok {
 		return false, nil // built-in catalog endpoints are read-only
 	}
-	if _, ok := s.endpoints[tenant][id]; !ok {
+	previous, ok := s.endpoints[tenant][id]
+	if !ok {
 		return false, nil
+	}
+	if application && previous.Source != SourceApplication && !(allowManual && (previous.Source == SourceManual || previous.Source == "")) {
+		return false, fmt.Errorf("admin.endpoints.write is required to remove the existing destination")
+	}
+	if !application && previous.Source == SourceApplication {
+		return false, fmt.Errorf("application endpoints are managed by application publish")
+	}
+	previousAliases := make(map[string]string, len(s.aliases[tenant]))
+	for alias, owner := range s.aliases[tenant] {
+		previousAliases[alias] = owner
 	}
 	delete(s.endpoints[tenant], id)
 	s.releaseAliasLocked(tenant, id)
 	s.generation++
 	if err := s.persistLocked(); err != nil {
-		return true, fmt.Errorf("endpoint %s deleted in memory but not persisted (would resurrect on restart): %w", id, err)
+		s.endpoints[tenant][id] = previous
+		s.aliases[tenant] = previousAliases
+		s.generation--
+		return false, fmt.Errorf("endpoint %s deletion was not confirmed persisted: %w", id, err)
 	}
 	return true, nil
 }

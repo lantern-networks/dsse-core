@@ -18,8 +18,9 @@ const (
 
 // Endpoint sources.
 const (
-	SourceEnrolled = "enrolled" // auto-populated from the enrolled inventory; identity is read-only
-	SourceManual   = "manual"   // added by an admin
+	SourceEnrolled    = "enrolled"    // auto-populated from the enrolled inventory; identity is read-only
+	SourceManual      = "manual"      // added by an admin
+	SourceApplication = "application" // managed by application publish
 )
 
 // PortProto is one protocol+port a Service exposes (e.g. tcp/5432).
@@ -39,7 +40,7 @@ type Endpoint struct {
 	Identity string   `json:"identity,omitempty"` // verified device identity (read-only; enrolled inventory)
 	Address  string   `json:"address,omitempty"`  // IP / CIDR / FQDN (network endpoints)
 	Tags     []string `json:"tags,omitempty"`
-	Source   string   `json:"source"`             // SourceEnrolled | SourceManual
+	Source   string   `json:"source"`             // SourceEnrolled | SourceManual | SourceApplication
 	BuiltIn  bool     `json:"built_in,omitempty"` // shipped (SaaS catalog) — read-only, not persisted, not deletable
 	Category string   `json:"category,omitempty"` // built-in only: sign_in | ai | collaboration | optimize
 }

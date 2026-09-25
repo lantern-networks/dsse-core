@@ -7,6 +7,7 @@ package vlan
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -86,15 +87,30 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-// OnPersistError, when set, is called if a snapshot fails to save. It exists because a DROPPED save here is
-// invisible in the worst possible way: the API returns 200, the Console shows the network, the operator believes
-// it is configured — and it is gone at the next restart, which is the exact symptom (an empty Networks page that
-// "regressed again") this persistence was added to end. A silent save failure recreates the bug while looking
-// fixed. The host should log this loudly; it must not panic.
-//
-// It does NOT fail the mutation: the in-memory set is already updated and serving, and refusing the operator's
-// change because the disk is unhappy is a different (and worse) failure. Report, do not swallow.
+// OnPersistError, when set, logs a failed save in addition to the object's returned error.
+// Other legacy mutations still use persistLocked and only report through this callback.
 var OnPersistError func(error)
+
+// ErrPersistence means a Network object change was not confirmed in storage.
+// A failed save may still have reached the destination; callers must not report success.
+var ErrPersistence = errors.New("network storage unconfirmed")
+
+// saveObjectCandidateLocked saves the proposed object catalogue before publishing it to live readers.
+// A non-atomic replacement warning means the bytes were saved; other errors leave live state unchanged.
+func (s *Store) saveObjectCandidateLocked(objects map[string]model.VLANObject) error {
+	if s.persister == nil {
+		return nil
+	}
+	data, err := json.Marshal(vlanPersistSnapshot{Objects: objects, Policies: s.policies})
+	if err == nil {
+		err = s.persister.Save(data)
+	}
+	if err != nil && !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		s.reportPersistError(err)
+		return fmt.Errorf("%w: %v", ErrPersistence, err)
+	}
+	return nil
+}
 
 // persistLocked writes the full snapshot. The CALLER must hold s.mu. No-op without a persister.
 func (s *Store) persistLocked() {
@@ -166,9 +182,16 @@ func (s *Store) UpsertObject(o model.VLANObject) (model.VLANObject, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.objects[o.ID] = o
+	objects := make(map[string]model.VLANObject, len(s.objects)+1)
+	for id, existing := range s.objects {
+		objects[id] = existing
+	}
+	objects[o.ID] = o
+	if err := s.saveObjectCandidateLocked(objects); err != nil {
+		return model.VLANObject{}, err
+	}
+	s.objects = objects
 	s.generation.Add(1) // distributed via the config bundle: advance so Edges re-pull
-	s.persistLocked()
 	return o, nil
 }
 
@@ -212,20 +235,28 @@ func (s *Store) ListObjects() []model.VLANObject {
 // DeleteObject removes the VLAN object (Named Network) with the given id. Reports whether it existed. Bumps the
 // generation (distributed via the config bundle). Nil-safe. (Boundary policies referencing a deleted object's
 // class are unaffected — they key on class, not object id.)
-func (s *Store) DeleteObject(id string) bool {
+func (s *Store) DeleteObject(id string) (bool, error) {
 	if s == nil {
-		return false
+		return false, nil
 	}
 	id = strings.TrimSpace(id)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.objects[id]; !ok {
-		return false
+		return false, nil
 	}
-	delete(s.objects, id)
+	objects := make(map[string]model.VLANObject, len(s.objects)-1)
+	for key, existing := range s.objects {
+		if key != id {
+			objects[key] = existing
+		}
+	}
+	if err := s.saveObjectCandidateLocked(objects); err != nil {
+		return false, err
+	}
+	s.objects = objects
 	s.generation.Add(1)
-	s.persistLocked()
-	return true
+	return true, nil
 }
 
 // GetObject returns the VLAN object (a Named Network — a named CIDR range) with the given id. Used by the

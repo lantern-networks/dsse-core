@@ -40,7 +40,7 @@ func TestStorePersistenceSurvivesRestart(t *testing.T) {
 	}
 
 	// A delete also persists.
-	if !s2.DeleteObject("net-tokyo") {
+	if deleted, err := s2.DeleteObject("net-tokyo"); err != nil || !deleted {
 		t.Fatalf("DeleteObject returned false")
 	}
 	s3 := NewStore()
@@ -64,7 +64,7 @@ func TestStorePersistenceDeleteSurvivesRestart(t *testing.T) {
 	}
 	first.UpsertObject(model.VLANObject{ID: "vlan_a", TenantID: "t1", Name: "A", Class: "server", CIDRs: []string{"10.1.0.0/16"}})
 	first.UpsertObject(model.VLANObject{ID: "vlan_b", TenantID: "t1", Name: "B", Class: "server", CIDRs: []string{"10.2.0.0/16"}})
-	if !first.DeleteObject("vlan_a") {
+	if deleted, err := first.DeleteObject("vlan_a"); err != nil || !deleted {
 		t.Fatal("delete reported missing")
 	}
 
@@ -78,9 +78,7 @@ func TestStorePersistenceDeleteSurvivesRestart(t *testing.T) {
 	}
 }
 
-// A save failure must be REPORTED, never swallowed. If it is dropped, the API still returns 200 and the Console
-// still shows the network, so the operator believes it is configured — and it is gone at the next restart. That
-// is precisely the "Networks page is empty again" bug, recreated while looking fixed.
+// A save failure must reach the caller without publishing an object or generation.
 type failingPersister struct{ err error }
 
 func (f failingPersister) Load() ([]byte, error) { return nil, nil }
@@ -88,7 +86,36 @@ func (f failingPersister) Save([]byte) error     { return f.err }
 func (f failingPersister) Append([]byte) error   { return f.err }
 func (f failingPersister) Size() (int64, error)  { return 0, nil }
 
-func TestStorePersistErrorIsReportedNotSwallowed(t *testing.T) {
+type savedWithWarningPersister struct{ data []byte }
+
+func (p *savedWithWarningPersister) Load() ([]byte, error) { return p.data, nil }
+func (p *savedWithWarningPersister) Save(data []byte) error {
+	p.data = append([]byte(nil), data...)
+	return blobstore.ErrSavedWithoutAtomicity
+}
+
+func TestStoreObjectSavedWithoutAtomicityIsPublished(t *testing.T) {
+	p := &savedWithWarningPersister{}
+	s := NewStore()
+	if err := s.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.UpsertObject(model.VLANObject{ID: "net-one", Name: "One", Class: "server", CIDRs: []string{"10.1.0.0/16"}}); err != nil {
+		t.Fatalf("saved bytes were rejected: %v", err)
+	}
+	if _, ok := s.GetObject("net-one"); !ok || s.ConfigGeneration() != 1 {
+		t.Fatal("saved object was not published")
+	}
+	reloaded := NewStore()
+	if err := reloaded.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.GetObject("net-one"); !ok {
+		t.Fatal("saved object missing after reload")
+	}
+}
+
+func TestStoreObjectSaveFailureDoesNotBecomeLive(t *testing.T) {
 	prev := OnPersistError
 	t.Cleanup(func() { OnPersistError = prev })
 	var got error
@@ -98,16 +125,14 @@ func TestStorePersistErrorIsReportedNotSwallowed(t *testing.T) {
 	if err := s.SetPersister(failingPersister{err: errTestDiskFull}); err != nil {
 		t.Fatalf("SetPersister: %v", err)
 	}
-	if _, err := s.UpsertObject(model.VLANObject{ID: "vlan_x", TenantID: "t1", Name: "X", Class: "server", CIDRs: []string{"10.9.0.0/16"}}); err != nil {
-		t.Fatalf("upsert: %v", err)
+	if _, err := s.UpsertObject(model.VLANObject{ID: "vlan_x", TenantID: "t1", Name: "X", Class: "server", CIDRs: []string{"10.9.0.0/16"}}); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("upsert error = %v, want ErrPersistence", err)
 	}
 	if got == nil {
 		t.Fatal("a failed save was swallowed; the operator would believe the network is durable when it is not")
 	}
-	// The mutation itself still applies: the in-memory set is serving, and refusing the operator's change
-	// because the disk is unhappy is a different and worse failure.
-	if len(s.ListObjects()) != 1 {
-		t.Fatalf("objects = %#v, want the mutation to still apply", s.ListObjects())
+	if len(s.ListObjects()) != 0 || s.ConfigGeneration() != 0 {
+		t.Fatalf("failed save published objects or generation: objects=%#v generation=%d", s.ListObjects(), s.ConfigGeneration())
 	}
 }
 

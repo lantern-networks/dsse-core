@@ -132,6 +132,50 @@ func (s *Store) UpsertApplicationEndpoint(applicationID string, e Endpoint, allo
 	return s.upsertEndpoint(e, true, allowManual)
 }
 
+// RenameApplicationEndpoint changes only the existing rule destination's
+// display alias. An ordinary application edit must preserve its address,
+// ownership, tags, and the stable ID used by group and policy references.
+func (s *Store) RenameApplicationEndpoint(tenant, applicationID, alias string, allowManual bool) error {
+	applicationID = strings.TrimSpace(applicationID)
+	if applicationID == "" {
+		return fmt.Errorf("application_id is required")
+	}
+	if shared, ok := s.getSharedUpdater(); ok {
+		_, err := sharedCatalogMutation(s, shared, func(latest *Store) (Endpoint, error) {
+			return latest.renameApplicationEndpoint(tenant, applicationID, alias, allowManual)
+		})
+		return err
+	}
+	_, err := s.renameApplicationEndpoint(tenant, applicationID, alias, allowManual)
+	return err
+}
+
+func (s *Store) renameApplicationEndpoint(tenant, applicationID, alias string, allowManual bool) (Endpoint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := "app-" + applicationID
+	previous, found := s.endpoints[tenant][id]
+	if !found || previous.BuiltIn || previous.Source != SourceApplication &&
+		!(allowManual && (previous.Source == SourceManual || previous.Source == "")) {
+		return Endpoint{}, fmt.Errorf("admin.endpoints.write is required to rename the existing destination")
+	}
+	previousAliases := make(map[string]string, len(s.aliases[tenant]))
+	for name, owner := range s.aliases[tenant] {
+		previousAliases[name] = owner
+	}
+	updated := previous
+	updated.Alias = s.claimAliasLocked(tenant, alias, id)
+	s.endpoints[tenant][id] = updated
+	s.generation++
+	if err := s.persistLocked(); err != nil {
+		s.endpoints[tenant][id] = previous
+		s.aliases[tenant] = previousAliases
+		s.generation--
+		return Endpoint{}, fmt.Errorf("endpoint alias update was not confirmed persisted: %w", err)
+	}
+	return updated, nil
+}
+
 func (s *Store) upsertEndpoint(e Endpoint, application, allowManual bool) (Endpoint, error) {
 	e.TenantID = strings.TrimSpace(e.TenantID)
 	if e.TenantID == "" {

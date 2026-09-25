@@ -121,7 +121,12 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	defer outbox.mu.Unlock()
 	want := []string{"admin_application_published", "admin_application_unpublished"}
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {
-		want = []string{"admin_asset_catalog_changed", "admin_asset_catalog_changed", "admin_asset_catalog_changed"}
+		want = []string{
+			"admin_asset_catalog_changed",                                                               // endpoint create
+			"admin_asset_catalog_changed", "admin_asset_catalog_changed", "admin_asset_catalog_changed", // group create/edit/delete
+			"admin_asset_catalog_changed", "admin_asset_catalog_changed", "admin_asset_catalog_changed", // service create/edit/delete
+			"admin_asset_catalog_changed", "admin_asset_catalog_changed", // endpoint edit/delete
+		}
 	}
 	if len(outbox.insertedAudits) != len(want) {
 		t.Fatalf("CP audit count=%d, want %d", len(outbox.insertedAudits), len(want))
@@ -130,6 +135,18 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 		if audit := outbox.insertedAudits[i]; audit.EventType != event || audit.TargetID == nil ||
 			(os.Getenv("DSSE_DISTRIBUTION_CP_MODE") != "assets" && *audit.TargetID != "wiki") {
 			t.Fatalf("CP audit %d = %+v, want %s", i, audit, event)
+		}
+	}
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {
+		kinds := []string{"endpoint", "group", "group", "group", "service", "service", "service", "endpoint", "endpoint"}
+		actions := []string{"upsert", "upsert", "upsert", "delete", "upsert", "upsert", "delete", "upsert", "delete"}
+		for i, audit := range outbox.insertedAudits {
+			id := map[string]string{"endpoint": "ep-a", "group": "group-a", "service": "service-a"}[kinds[i]]
+			if audit.TenantID != processDistributionTenant || audit.ActorUserID == nil || *audit.ActorUserID != "operator" ||
+				audit.TargetType == nil || *audit.TargetType != "asset_"+kinds[i] || *audit.TargetID != id ||
+				audit.Action == nil || *audit.Action != actions[i] || audit.Result == nil || *audit.Result != "saved" {
+				t.Fatalf("CP asset audit %d = %+v, want %s/%s/%s saved by operator", i, audit, kinds[i], id, actions[i])
+			}
 		}
 	}
 }

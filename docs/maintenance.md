@@ -154,6 +154,10 @@ feed carries each generation to the Edge; its admin read, durable asset file and
 compiled egress deny destination follow the change. The control plane's three
 asset-change audit records are checked. This is synthetic process/HTTP evidence,
 not a new GUI acceptance or independently deployed CP/Edge traffic check.
+The same fixture now checks Group membership and Service port create, edit and
+final delete through the signed feed and Edge HTTP/durable-file readback. The
+CP audit check covers all nine asset changes with tenant, actor, kind, ID,
+operation and saved result. Deployed fleet communication remains unverified.
 
 | Change | Checked behavior | Still to verify |
 |---|---|---|

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,7 @@ type adminConnector struct {
 	TenantID                 string   `json:"tenant_id"`
 	ConnectorGroupID         string   `json:"connector_group_id,omitempty"`
 	Name                     string   `json:"name,omitempty"`
+	DisplayName              string   `json:"display_name"`
 	EdgeRegionID             string   `json:"edge_region_id,omitempty"`
 	EdgeClusterID            string   `json:"edge_cluster_id,omitempty"`
 	ApplicationIDs           []string `json:"application_ids"`
@@ -185,6 +187,7 @@ func adminConnectorFromModel(conn model.ConnectorRegistration) adminConnector {
 		TenantID:                 conn.TenantID,
 		ConnectorGroupID:         conn.ConnectorGroupID,
 		Name:                     name,
+		DisplayName:              connector.DisplayName(conn),
 		EdgeRegionID:             conn.EdgeRegionID,
 		AttachedRegionID:         conn.AttachedRegionID,
 		EdgeClusterID:            conn.EdgeClusterID,
@@ -293,17 +296,15 @@ func adminConnectorMetadataKeyCount(metadata map[string]any) int {
 	return count
 }
 
-func adminConnectorManagementAuditLog(eventType string, conn adminConnector, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+func adminConnectorManagementAuditLog(eventType string, conn adminConnector, r *http.Request, evaluator decision.Evaluator, now time.Time) model.AuditLog {
 	action := strings.TrimPrefix(eventType, "admin_connector_")
-	result := conn.Status
-	if result == "" {
-		result = "updated"
-	}
+	result := "success"
 	reason := "Connector management admin metadata updated."
 	targetType := "admin_connector"
 	return model.AuditLog{
 		ID:             randomEdgeID("audit_", now),
 		TenantID:       conn.TenantID,
+		ActorUserID:    auditActorPrincipal(r),
 		EventType:      eventType,
 		TargetType:     &targetType,
 		TargetID:       &conn.ID,

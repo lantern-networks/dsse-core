@@ -274,18 +274,64 @@ async function siteNetworkAction(siteID, payload, bodyHost, listHost) {
   }
 }
 
+function connectorManagementError() {
+  return bl({ en: "The connector change could not be confirmed. Reload to check its state before retrying.",
+    ja: "コネクタの変更を確認できませんでした。再読込して状態を確認してから再試行してください。" });
+}
+
+function connectorManagementContext(host) {
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: baseForPlane("control"), token: token(), seq: host.__renderSeq };
+  const tenant = initial.selection || (initial.session && initial.session.auth_method === "admin_session" ? initial.session.tenant_id : null);
+  const validTenant = tenant == null && !(initial.session && initial.session.auth_method === "admin_session") ||
+    typeof tenant === "string" && !!tenant && tenant.trim() === tenant;
+  const current = () => validTenant && host.isConnected !== false && host.__renderSeq === initial.seq &&
+    selection() === initial.selection && session() === initial.session &&
+    baseForPlane("control") === initial.authority && token() === initial.token;
+  return { tenant, current };
+}
+
+function connectorManagementReadback(response, id, tenant) {
+  const emptySites = { ok: true, status: 200, body: { sites: [], count: 0 } };
+  const { conns } = siteListData(emptySites, response, tenant);
+  return conns.find(conn => conn.id === id);
+}
+
 // renameConnector opens a small modal to set an operator display name for a connector (survives reconnection).
 async function renameConnector(id, current, host) {
+  if (!host || host.isConnected === false) return;
+  const pending = host.__connectorManagementOps || (host.__connectorManagementOps = new Set());
+  const key = "rename:" + id;
+  if (pending.has(key)) return;
+  const context = connectorManagementContext(host);
+  if (!context.current()) return;
+  pending.add(key);
+  let closed = false, busy = false, attempted = false, confirmed = false;
   const f = uiField({ name: "name", label: bl({ en: "Connector name", ja: "コネクタ名" }), value: current || "", placeholder: bl({ en: "Tokyo DC connector", ja: "東京DC コネクタ" }), hint: bl({ en: "A friendly name shown in the console. Leave empty to clear.", ja: "コンソール表示用の分かりやすい名前。空で解除。" }) });
   const save = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({ title: bl({ en: "Rename connector", ja: "コネクタの名前変更" }), body: [f.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), save] });
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  const m = uiModal({ title: bl({ en: "Rename connector", ja: "コネクタの名前変更" }), body: [f.el, notice], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), save], onClose: () => { closed = true; if (!busy && (!attempted || confirmed || !context.current())) pending.delete(key); } });
   save.onclick = async () => {
-    save.disabled = true;
+    if (busy || attempted || closed || !context.current()) return;
+    busy = true; attempted = true; save.disabled = true;
+    const name = f.get().trim();
     try {
-      const r = await apiFetch("POST", "/admin/connectors/" + encodeURIComponent(id) + "/name", { name: f.get() });
-      if (!r.ok) { save.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      const r = await apiFetch("POST", "/admin/connectors/" + encodeURIComponent(id) + "/name", { name }, "control");
+      if (closed || !context.current()) return;
+      if (!r || !r.ok || r.status !== 200 || !r.body || r.body.id !== id || r.body.display_name !== name ||
+          (context.tenant && r.body.tenant_id !== context.tenant)) throw new Error("Unconfirmed connector rename");
+      const read = await apiFetch("GET", "/admin/connectors", undefined, "control");
+      if (closed || !context.current()) return;
+      const row = connectorManagementReadback(read, id, context.tenant);
+      if (!row || row.display_name !== name || row.name !== r.body.name) throw new Error("Unconfirmed connector readback");
+      confirmed = true;
       m.close(); uiToast(bl({ en: "Renamed.", ja: "名前を変更しました。" }), "ok"); renderSiteList(host);
-    } catch (e) { save.disabled = false; uiToast(String(e), "err"); }
+    } catch (_) {
+      if (closed || !context.current()) return;
+      notice.textContent = connectorManagementError(); notice.style.display = "";
+    } finally { busy = false; if (closed && (!attempted || confirmed || !context.current())) pending.delete(key); }
   };
   f.focus();
 }
@@ -293,11 +339,28 @@ async function renameConnector(id, current, host) {
 // removeConnector decommissions a connector (deletes it from the registry). A live connector re-registers, so
 // this is for offline / retired ones.
 async function removeConnector(id, name, host) {
-  const ok = await uiConfirm({ title: bl({ en: "Remove this connector?", ja: "このコネクタを削除?" }), body: bl({ en: "\"" + name + "\" is removed from this site. A connector that is still running will re-appear when it next checks in.", ja: "「" + name + "」をこの拠点から削除します。稼働中のコネクタは次回チェックインで再登場します。" }), confirmLabel: bl({ en: "Remove", ja: "削除" }), danger: true });
-  if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/connectors/" + encodeURIComponent(id));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
+  if (!host || host.isConnected === false) return;
+  const pending = host.__connectorManagementOps || (host.__connectorManagementOps = new Set());
+  const key = "remove:" + id;
+  if (pending.has(key)) return;
+  const context = connectorManagementContext(host);
+  if (!context.current()) return;
+  pending.add(key);
+  let attempted = false, confirmed = false;
+  try {
+    const ok = await uiConfirm({ title: bl({ en: "Remove this connector?", ja: "このコネクタを削除?" }), body: bl({ en: "\"" + name + "\" is removed from this site. A connector that is still running will re-appear when it next checks in.", ja: "「" + name + "」をこの拠点から削除します。稼働中のコネクタは次回チェックインで再登場します。" }), confirmLabel: bl({ en: "Remove", ja: "削除" }), danger: true });
+    if (!ok || !context.current()) return;
+    attempted = true;
+    const r = await apiFetch("DELETE", "/admin/connectors/" + encodeURIComponent(id), undefined, "control");
+    if (!context.current()) return;
+    if (!r || !r.ok || r.status !== 200 || !r.body || r.body.connector_id !== id || r.body.removed !== true) throw new Error("Unconfirmed connector removal");
+    const read = await apiFetch("GET", "/admin/connectors", undefined, "control");
+    if (!context.current()) return;
+    if (connectorManagementReadback(read, id, context.tenant)) throw new Error("Connector still listed");
+    confirmed = true;
+    uiToast(bl({ en: "Connector removed.", ja: "コネクタを削除しました。" }), "ok"); renderSiteList(host);
+  } catch (_) { if (context.current()) uiToast(connectorManagementError(), "err"); }
+  finally { if (!attempted || confirmed || !context.current()) pending.delete(key); }
 }
 
 // siteHealthBadge maps a Site health label to a coloured badge. healthy -> ok, degraded -> warn,
@@ -389,6 +452,9 @@ async function renderSiteList(host) {
     uiState(host, "error", bl({ en: "Sites and connectors could not be verified. Retry before making changes.", ja: "サイトとコネクタを確認できませんでした。変更前に再試行してください。" }), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteList(host) });
     return;
   }
+
+  // A successful explicit reload is the only safe point to allow another uncertain management attempt.
+  host.__connectorManagementOps = new Set();
 
   const bySite = new Map();
   conns.forEach(conn => { const group = conn.connector_group_id || ""; if (!bySite.has(group)) bySite.set(group, []); bySite.get(group).push(conn); });

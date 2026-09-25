@@ -78,6 +78,17 @@ confirmed the Sites failure, retry, reload and matching raw audit records using
 the public server. Independent control-plane/Edge propagation and production
 storage remain release checks. This fix is not in the published 0.3.0 release.
 
+Ordinary DLP Policy edits now keep existing settings that the editor does not
+show, including disabled status, thresholds, metadata and additional device-risk
+conditions. An identifier removed from the Sensitive Data library stays visible
+as selected; the editor asks for an explicit deselection or restoration before
+saving. Read-only users can still list policies when editor-only configuration
+is unavailable. Twenty-eight focused Console regressions pass. The same Console
+revision was checked in a local browser against the development server for
+editing, reload, saved state and audit; the public server has not had a separate
+browser acceptance run for this change. Public-server persistence and real
+control-plane/Edge traffic remain release checks. This fix is not in 0.3.0.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

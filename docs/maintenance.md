@@ -114,6 +114,14 @@ confirm the administrator's display of user risk marks. The current public risk
 read is scoped through enrolled devices and needs a separate tenant-safe user
 risk path before that display can be accepted.
 
+Devices readers whose risk overlay request is denied can still see the permitted
+device list. The page shows a server-provided effective risk when present, says
+Unknown when it is absent, and omits risk-edit actions. Other failed or malformed
+risk reads require a retry instead of implying Normal. A local public-server
+synthetic browser fixture checked the old and corrected English/Japanese views;
+focused regressions cover the read boundary. This does not grant device write
+permissions or establish independent CP/Edge propagation.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

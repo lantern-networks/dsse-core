@@ -148,6 +148,13 @@ permissions or establish independent CP/Edge propagation.
 
 Recent focused fixes integrated into public main:
 
+An isolated local two-process fixture now checks ordinary endpoint create, address
+edit and final delete on a product control-plane HTTP handler. A signed automatic
+feed carries each generation to the Edge; its admin read, durable asset file and
+compiled egress deny destination follow the change. The control plane's three
+asset-change audit records are checked. This is synthetic process/HTTP evidence,
+not a new GUI acceptance or independently deployed CP/Edge traffic check.
+
 | Change | Checked behavior | Still to verify |
 |---|---|---|
 | [Tenant settings save retry](https://github.com/lantern-networks/dsse-core/pull/22) | After a lost save response, the editor retains the input, describes the result as unconfirmed, and permits a retry. A synthetic-browser check covered failure and retry. | Product-server persistence for that lost-response case and independent CP behavior. |

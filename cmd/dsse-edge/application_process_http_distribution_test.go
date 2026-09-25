@@ -33,7 +33,7 @@ func processDistributionAuth() *adminAuthStore {
 	auth := newAdminAuthStore()
 	auth.UpsertPrincipal(adminPrincipal{ID: "operator", TenantID: processDistributionTenant, Roles: []string{"admin"}, Status: "active"})
 	auth.UpsertAPIToken(adminAPIToken{ID: "operator", TenantID: processDistributionTenant, TokenHash: adminTokenHash(processDistributionToken),
-		Roles: []string{"admin"}, Scopes: []string{"admin.policy.read", "admin.applications.read", "admin.applications.write", "admin.endpoints.read"},
+		Roles: []string{"admin"}, Scopes: []string{"admin.policy.read", "admin.policy.write", "admin.applications.read", "admin.applications.write", "admin.endpoints.read", "admin.endpoints.write"},
 		CreatedByAdminPrincipalID: "operator", Status: "active", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
 	return auth
 }
@@ -78,6 +78,10 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	}
 	outbox := &recordingAdminAuditOutboxDeadReader{}
 	cpAssets := processDistributionAssets(t, filepath.Join(dir, "cp-assets.json"))
+	cpRules := policyrule.NewStore()
+	if err := cpRules.SetStatePath(filepath.Join(dir, "cp-rules.json")); err != nil {
+		t.Fatal(err)
+	}
 	if key := os.Getenv("DSSE_DISTRIBUTION_CP_POSTGRES_KEY"); key != "" {
 		db, err := sql.Open("postgres", os.Getenv("DSSE_TEST_POSTGRES_DSN"))
 		if err != nil {
@@ -93,6 +97,7 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(),
 		ApplicationCatalogStore: processDistributionApps(t, filepath.Join(dir, "cp-apps.json")),
 		AssetStore:              cpAssets,
+		RuleStore:               cpRules,
 		AgentPolicySigner:       signer, Writer: writer, AdminAuditOutbox: outbox}))
 	defer cp.Close()
 	raw, err := json.Marshal(processDistributionReady{URL: cp.URL, PublicKey: signer.PublicKeyHex()})
@@ -115,12 +120,16 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
 	want := []string{"admin_application_published", "admin_application_unpublished"}
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {
+		want = []string{"admin_asset_catalog_changed", "admin_asset_catalog_changed", "admin_asset_catalog_changed"}
+	}
 	if len(outbox.insertedAudits) != len(want) {
 		t.Fatalf("CP audit count=%d, want %d", len(outbox.insertedAudits), len(want))
 	}
 	for i, event := range want {
-		if audit := outbox.insertedAudits[i]; audit.EventType != event || audit.TargetID == nil || *audit.TargetID != "wiki" {
-			t.Fatalf("CP audit %d = %+v, want %s/wiki", i, audit, event)
+		if audit := outbox.insertedAudits[i]; audit.EventType != event || audit.TargetID == nil ||
+			(os.Getenv("DSSE_DISTRIBUTION_CP_MODE") != "assets" && *audit.TargetID != "wiki") {
+			t.Fatalf("CP audit %d = %+v, want %s", i, audit, event)
 		}
 	}
 }

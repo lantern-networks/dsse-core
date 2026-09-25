@@ -15,9 +15,10 @@ removing and enabling records; preserving saved settings; enforcing permissions;
 propagating changes; and recording audit events. New features are outside the
 0.3.1 stabilization scope.
 
-These changes have been implemented and checked on the
+The areas below have been checked in the
 [development PR](https://github.com/lantern-networks/dsse-core/pull/1).
-They are **not included in the published 0.3.0 release**:
+Some focused fixes have also reached public main, as noted below. None of these
+changes is included in the published 0.3.0 release:
 
 | Area | Change | Evidence available so far |
 |---|---|---|
@@ -123,6 +124,14 @@ risk reads require a retry instead of implying Normal. A local public-server
 synthetic browser fixture checked the old and corrected English/Japanese views;
 focused regressions cover the read boundary. This does not grant device write
 permissions or establish independent CP/Edge propagation.
+
+Recent focused fixes integrated into public main:
+
+| Change | Checked behavior | Still to verify |
+|---|---|---|
+| [Tenant settings save retry](https://github.com/lantern-networks/dsse-core/pull/22) | After a lost save response, the editor retains the input, describes the result as unconfirmed, and permits a retry. A synthetic-browser check covered failure and retry. | Product-server persistence for that lost-response case and independent CP behavior. |
+| [Application editing and publication](https://github.com/lantern-networks/dsse-core/pull/23) | A name-only edit retains existing routing and classification fields; closing a completed publication no longer submits it again. Regressions and a synthetic-browser check covered these paths. | Product-server saved-state and audit checks for this public change, plus independent CP/Edge traffic. |
+| [Application rule-destination save result](https://github.com/lantern-networks/dsse-core/pull/24) | When a separate rule-destination save fails after an application change, publish, unpublish and delete now return a partial error with a partial audit instead of success. HTTP regressions checked all three, and a synthetic browser showed the publication warning and explicit retry. | The two stores are not atomic. In particular, recovery after a failed unpublish or delete still needs a durable reconciliation path and restart checks. |
 
 ## What still blocks 0.3.1
 

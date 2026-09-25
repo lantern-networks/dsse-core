@@ -45,6 +45,10 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		return true
 	}
 	writeAssetError := func(w http.ResponseWriter, err error, status int) {
+		if errors.Is(err, assetcatalog.ErrPersistence) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("saving the asset catalog was not confirmed; reload and retry after storage recovers"))
+			return
+		}
 		if errors.Is(err, assetcatalog.ErrSharedUpdateUnconfirmed) {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return

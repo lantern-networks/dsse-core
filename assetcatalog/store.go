@@ -1,6 +1,7 @@
 package assetcatalog
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -9,6 +10,10 @@ import (
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
+
+// ErrPersistence means an authored catalog change was not confirmed saved.
+// Callers must not report success or disclose the storage error to an administrator.
+var ErrPersistence = errors.New("asset catalog persistence was not confirmed")
 
 // Store is an in-memory catalog of endpoints, groups, and services for one or more tenants, with a shared
 // per-tenant alias namespace (so an alias is unique across all three kinds). Methods are safe for
@@ -243,8 +248,14 @@ func (s *Store) UpsertGroup(g Group) (Group, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousSeq := s.seq
 	if strings.TrimSpace(g.ID) == "" {
 		g.ID = s.nextIDLocked("grp")
+	}
+	previous, hadPrevious := s.groups[g.TenantID][g.ID]
+	previousAliases := make(map[string]string, len(s.aliases[g.TenantID]))
+	for alias, owner := range s.aliases[g.TenantID] {
+		previousAliases[alias] = owner
 	}
 	g.Alias = s.claimAliasLocked(g.TenantID, g.Alias, g.ID)
 	if s.groups[g.TenantID] == nil {
@@ -253,7 +264,15 @@ func (s *Store) UpsertGroup(g Group) (Group, error) {
 	s.groups[g.TenantID][g.ID] = g
 	s.generation++
 	if err := s.persistLocked(); err != nil {
-		return g, fmt.Errorf("group %s stored in memory but not persisted (will not survive a restart): %w", g.ID, err)
+		if hadPrevious {
+			s.groups[g.TenantID][g.ID] = previous
+		} else {
+			delete(s.groups[g.TenantID], g.ID)
+		}
+		s.aliases[g.TenantID] = previousAliases
+		s.seq = previousSeq
+		s.generation--
+		return Group{}, fmt.Errorf("%w: group %s update: %v", ErrPersistence, g.ID, err)
 	}
 	return g, nil
 }
@@ -274,8 +293,14 @@ func (s *Store) UpsertService(svc Service) (Service, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	previousSeq := s.seq
 	if strings.TrimSpace(svc.ID) == "" {
 		svc.ID = s.nextIDLocked("svc")
+	}
+	previous, hadPrevious := s.services[svc.TenantID][svc.ID]
+	previousAliases := make(map[string]string, len(s.aliases[svc.TenantID]))
+	for alias, owner := range s.aliases[svc.TenantID] {
+		previousAliases[alias] = owner
 	}
 	svc.Alias = s.claimAliasLocked(svc.TenantID, svc.Alias, svc.ID)
 	if s.services[svc.TenantID] == nil {
@@ -284,7 +309,15 @@ func (s *Store) UpsertService(svc Service) (Service, error) {
 	s.services[svc.TenantID][svc.ID] = svc
 	s.generation++
 	if err := s.persistLocked(); err != nil {
-		return svc, fmt.Errorf("service %s stored in memory but not persisted (will not survive a restart): %w", svc.ID, err)
+		if hadPrevious {
+			s.services[svc.TenantID][svc.ID] = previous
+		} else {
+			delete(s.services[svc.TenantID], svc.ID)
+		}
+		s.aliases[svc.TenantID] = previousAliases
+		s.seq = previousSeq
+		s.generation--
+		return Service{}, fmt.Errorf("%w: service %s update: %v", ErrPersistence, svc.ID, err)
 	}
 	return svc, nil
 }
@@ -362,14 +395,22 @@ func (s *Store) DeleteGroup(tenant, id string) (bool, error) {
 	if _, ok := s.builtInGroups[id]; ok {
 		return false, nil // built-in catalog groups are read-only
 	}
-	if _, ok := s.groups[tenant][id]; !ok {
+	previous, ok := s.groups[tenant][id]
+	if !ok {
 		return false, nil
+	}
+	previousAliases := make(map[string]string, len(s.aliases[tenant]))
+	for alias, owner := range s.aliases[tenant] {
+		previousAliases[alias] = owner
 	}
 	delete(s.groups[tenant], id)
 	s.releaseAliasLocked(tenant, id)
 	s.generation++
 	if err := s.persistLocked(); err != nil {
-		return true, fmt.Errorf("group %s deleted in memory but not persisted (would resurrect on restart): %w", id, err)
+		s.groups[tenant][id] = previous
+		s.aliases[tenant] = previousAliases
+		s.generation--
+		return false, fmt.Errorf("%w: group %s deletion: %v", ErrPersistence, id, err)
 	}
 	return true, nil
 }
@@ -384,14 +425,22 @@ func (s *Store) DeleteService(tenant, id string) (bool, error) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.services[tenant][id]; !ok {
+	previous, ok := s.services[tenant][id]
+	if !ok {
 		return false, nil
+	}
+	previousAliases := make(map[string]string, len(s.aliases[tenant]))
+	for alias, owner := range s.aliases[tenant] {
+		previousAliases[alias] = owner
 	}
 	delete(s.services[tenant], id)
 	s.releaseAliasLocked(tenant, id)
 	s.generation++
 	if err := s.persistLocked(); err != nil {
-		return true, fmt.Errorf("service %s deleted in memory but not persisted (would resurrect on restart): %w", id, err)
+		s.services[tenant][id] = previous
+		s.aliases[tenant] = previousAliases
+		s.generation--
+		return false, fmt.Errorf("%w: service %s deletion: %v", ErrPersistence, id, err)
 	}
 	return true, nil
 }

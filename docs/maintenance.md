@@ -34,6 +34,14 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Groups & Services now keeps the previous live catalog and generation when a
+group or service create, update, or delete cannot be saved. The Console receives
+a retryable storage error without an internal path; a successful retry can be
+read from a fresh store. Six focused persistence cases and product HTTP/audit
+checks cover this boundary. This change has no new browser
+acceptance for these six operations, and independent deployment propagation
+remains a release check.
+
 DNS Filtering now rejects incomplete redirect and conditional-forwarding rows
 before saving. Previously, clearing either required field and applying the form
 silently removed that rule. Complete the row or use its Remove button to delete it.

@@ -44,7 +44,7 @@ func TestStoreGetAndDeleteObject(t *testing.T) {
 		t.Fatal("GetObject must be false for a missing id")
 	}
 	g := s.ConfigGeneration()
-	if !s.DeleteObject("net-1") {
+	if deleted, err := s.DeleteObject("net-1"); err != nil || !deleted {
 		t.Fatal("DeleteObject must report true for an existing id")
 	}
 	if _, ok := s.GetObject("net-1"); ok {
@@ -53,7 +53,7 @@ func TestStoreGetAndDeleteObject(t *testing.T) {
 	if s.ConfigGeneration() <= g {
 		t.Fatal("delete must bump the generation")
 	}
-	if s.DeleteObject("net-1") {
+	if deleted, err := s.DeleteObject("net-1"); err != nil || deleted {
 		t.Fatal("DeleteObject must report false for an absent id")
 	}
 }

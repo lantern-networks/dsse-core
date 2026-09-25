@@ -6,6 +6,7 @@ package main
 // constructor's locals so the handler bodies are untouched.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -35,6 +36,10 @@ func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		o.TenantID = tenantForWrite
 		saved, err := vlanBoundary.UpsertObject(o)
 		if err != nil {
+			if errors.Is(err, vlan.ErrPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("The network change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -58,7 +63,12 @@ func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			writeError(w, http.StatusNotFound, fmt.Errorf("vlan object %q is absent", id))
 			return
 		}
-		if !vlanBoundary.DeleteObject(id) {
+		deleted, err := vlanBoundary.DeleteObject(id)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("The network change could not be confirmed in storage. Reload before retrying."))
+			return
+		}
+		if !deleted {
 			writeError(w, http.StatusNotFound, fmt.Errorf("vlan object %q is absent", id))
 			return
 		}

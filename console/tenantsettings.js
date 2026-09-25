@@ -122,8 +122,19 @@ async function loadTenantSettings(host, content) {
     // Send the tenant back whole: the self-scoped update takes the model, and posting only the changed fields
     // would clear the rest.
     const body = Object.assign({}, tenant, { display_name: nameF.get(), timezone: tzF.get() });
-    const r = await apiFetch("POST", "/admin/tenant", body, _TENANT_PLANE);
-    save.disabled = false;
+    let r;
+    try {
+      r = await apiFetch("POST", "/admin/tenant", body, _TENANT_PLANE);
+    } catch (e) {
+      // The request may have reached the authority even when its reply was lost.
+      // Keep the edit and let the operator verify the saved value before retrying.
+      uiToast(bl({
+        en: "Could not confirm the save. Reload to verify the setting before retrying.",
+        ja: "保存結果を確認できませんでした。再試行前に再読込して設定を確認してください。" }), "err");
+      return;
+    } finally {
+      save.disabled = false;
+    }
     if (!r.ok) {
       const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
       tzF.setError(msg);

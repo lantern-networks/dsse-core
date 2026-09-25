@@ -9,21 +9,27 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
-// HighRiskOverlay is the shared HIGH-RISK device overlay, distributed on the same fast
+// HighRiskOverlay holds separate device and tenant-scoped user risk marks, distributed on the same fast
 // feed as admission revocations (revocation-class: a device marked high-risk on the control plane must be
 // treated high-risk by EVERY node's decision path, so risk-based deny/re-auth is fleet-consistent and the
 // device can't reconnect elsewhere to dodge it). Unlike admission revocations there is no node-local/auto
-// layer — high-risk is admin-marked (CP-authoritative). One `devices` map serves both roles: authoritative on
-// the CP (Mark/Clear), synced on a puller (ReplaceSynced). Persisted so a CP restart can't silently clear it.
+// layer — high-risk is admin-marked (CP-authoritative). Device and user namespaces are persisted together;
+// each is authoritative on the CP and replaced from an explicitly typed feed on a puller.
 type HighRiskOverlay struct {
-	mu         sync.RWMutex
-	devices    map[string]string // deviceID (normalized) -> severity (high|critical)
-	persister  blobstore.Persister
-	generation atomic.Uint64
+	writeMu           sync.Mutex
+	mu                sync.RWMutex
+	devices           map[string]string // deviceID (normalized) -> severity (high|critical)
+	users             map[string]UserRisk
+	userIndex         map[string]string
+	loadErr           error
+	legacy            bool
+	deviceSavePending bool // writeMu: a live device change has not reached durable storage
+	persister         blobstore.Persister
+	generation        atomic.Uint64
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
-	return &HighRiskOverlay{devices: map[string]string{}}
+	return &HighRiskOverlay{devices: map[string]string{}, users: map[string]UserRisk{}, userIndex: map[string]string{}}
 }
 
 // NormalizeDeviceID trims but PRESERVES case — device ids are opaque, case-sensitive identifiers and must
@@ -45,13 +51,20 @@ func (o *HighRiskOverlay) Mark(deviceID, severity string) {
 		return
 	}
 	severity = strings.ToLower(strings.TrimSpace(severity))
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if prev, ok := o.devices[id]; ok && prev == severity {
+	if o.loadErr != nil || o.legacy {
 		return
 	}
-	o.devices[id] = severity
-	o.generation.Add(1)
+	if prev, ok := o.devices[id]; ok && prev == severity && !o.deviceSavePending {
+		return
+	}
+	if o.devices[id] != severity {
+		o.devices[id] = severity
+		o.generation.Add(1)
+	}
 	o.persistLocked()
 }
 
@@ -61,13 +74,20 @@ func (o *HighRiskOverlay) Clear(deviceID string) {
 	if o == nil {
 		return
 	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if _, ok := o.devices[id]; !ok {
+	if o.loadErr != nil || o.legacy {
 		return
 	}
-	delete(o.devices, id)
-	o.generation.Add(1)
+	if _, ok := o.devices[id]; !ok && !o.deviceSavePending {
+		return
+	}
+	if _, ok := o.devices[id]; ok {
+		delete(o.devices, id)
+		o.generation.Add(1)
+	}
 	o.persistLocked()
 }
 
@@ -108,6 +128,8 @@ func (o *HighRiskOverlay) ReplaceSynced(devices map[string]string) {
 			fresh[id] = strings.ToLower(strings.TrimSpace(v))
 		}
 	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.devices = fresh
@@ -155,6 +177,8 @@ func (o *HighRiskOverlay) RemoveDevices(deviceIDs []string) int {
 	if o == nil || len(deviceIDs) == 0 {
 		return 0
 	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	n := 0

@@ -31,6 +31,7 @@ type adminRiskSignalResponse struct {
 	SchemaVersion     string `json:"schema_version"`
 	EntityType        string `json:"entity_type"`
 	EntityID          string `json:"entity_id"`
+	TenantID          string `json:"tenant_id,omitempty"`
 	Severity          string `json:"severity"`
 	HighRisk          bool   `json:"high_risk"`
 	StandingGrantsCut int    `json:"standing_grants_revoked"`
@@ -112,7 +113,7 @@ func applyAdminRiskSignal(deviceStore deviceRuntimeStore, tenantID string, sig m
 			NotStoredDurably: notStored,
 		}, nil
 	case "user", "human":
-		// User-scoped marking: no device-store row, but the shared overlay (keyed by the user id) makes every
+		// User-scoped marking: no device-store row; the tenant-scoped user overlay makes every
 		// node's decision path treat the user as high-risk, so a policy gating on risk_state_severity refuses
 		// them. Marking only — see the note above on why this no longer drops standing grants.
 		sev := strings.ToLower(strings.TrimSpace(sig.Severity))

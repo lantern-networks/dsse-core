@@ -589,6 +589,9 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 
 func deferredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
+		// Dedicated user-risk HTTP tests verify attribution and reject evidence,
+		// subject aliases, and bearer credentials in the audit record.
+		"userRiskAuditLog":              true,
 		"adminAccountLifecycleAuditLog": true,
 		// ★ THE BREAK-GLASS USE RECORD deliberately names the actor and the route (the machine-credential separation). The whole point is
 		// that this act cannot say WHO — the shared token names a synthetic principal — so the record carries

@@ -791,6 +791,9 @@ func (config serverConfig) withDefaults() serverConfig {
 	if config.HumanIdentities == nil {
 		config.HumanIdentities = humanidentity.NewHumanIdentityDirectoryStore()
 	}
+	if err := prepareUserRiskState(context.Background(), config.HighRiskOverlay, config.EnrolledLedger, config.HumanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
+	}
 	if config.HotStore == nil && config.Writer != nil {
 		config.HotStore = hotstore.NewJSONLStore(config.Writer, adminLogStreamFilenameMap())
 	}
@@ -2785,7 +2788,9 @@ func main() {
 	if p, e := cpStateBlobPersister(*highRiskStore, cpStateBlobDB, "high_risk_overlay"); e != nil {
 		log.Fatalf("resolve high-risk store: %v", e)
 	} else {
-		highRiskOverlay.SetPersister(p) // Phase 3: persist high-risk markings across a restart
+		if err := highRiskOverlay.SetPersister(p); err != nil {
+			log.Fatalf("load high-risk store: %v", err)
+		}
 	}
 	// management ledger: created here (empty) so BOTH the admin endpoints (via serverConfig) and the
 	// (T) listener (via secureTransportConfig below) share one instance; seeded from the static inventory
@@ -3996,6 +4001,9 @@ func main() {
 	}
 
 	if lerr := enrolledLedger.SetPersisterChecked(mustCPStateBlobPersister(*enrolledInventoryStore, "enrolled_inventory")); lerr != nil {
+		if highRiskOverlay.NeedsMigration() {
+			log.Fatalf("legacy risk migration requires readable enrolled inventory: %v", lerr)
+		}
 		if enrollSigner != nil {
 			log.Fatalf("REFUSING TO START: this Edge issues device certificates and its enrolled inventory could "+
 				"not be read (%v). Continuing would treat every identity in the fleet as never enrolled, claim "+
@@ -4003,6 +4011,9 @@ func main() {
 		}
 		log.Printf("enrolled_inventory: the durable store could not be read (%v) — this Edge does not issue "+
 			"certificates, so it continues on the static seed and the control plane's next bundle", lerr)
+	}
+	if err := prepareUserRiskState(context.Background(), highRiskOverlay, enrolledLedger, humanIdentities); err != nil {
+		log.Fatalf("prepare risk state: %v", err)
 	}
 	// ★★★ AND READ AGAIN, BECAUSE A STANDBY THAT ONLY LEARNS BY RESTARTING IS NOT WARM (2026-08-25). Two
 	// control planes share one database precisely so the standby holds what the leader authored. This store
@@ -7606,6 +7617,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return
 		}
 		req = enrichDecisionRequestWithSession(req, sessionStore)
+		req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
+		if riskErr != nil {
+			writeError(w, http.StatusServiceUnavailable, riskErr)
+			return
+		}
 		req = enrichDecisionRequestWithRisk(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
 		req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now()) // D1: recover FQDN for connect-by-IP / non-TLS flows
 		req = deriveDecisionRequestActor(req, delegatedGrants)
@@ -7911,6 +7927,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				req.DeviceID = transportDeviceID
 			}
 			req.DeviceTrustLevel = valueOrDefault(req.DeviceTrustLevel, connectDeviceTrustLevel)
+			req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
+			if riskErr != nil {
+				logErrorf("steer_mux_user_risk_directory_unavailable")
+				return
+			}
 			req = enrichDecisionRequestWithRisk(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
 			req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now())
 			req = deriveDecisionRequestActor(req, delegatedGrants)

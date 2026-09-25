@@ -40,14 +40,19 @@ test('input changes during the detail read cannot copy one application into anot
 });
 
 function publicationFixture(responses) {
- const calls=[],nodes=[],fields={};let modal,closed=0;
+ const calls=[],nodes=[],fields={},toasts=[];let modal,closed=0;
  const el=(tag,attrs={},children=[])=>{
   const n={tag,...attrs,style:{},children:Array.isArray(children)?children:[children],listeners:[],appendChild(x){this.children.push(x)},setAttribute(){},addEventListener(event,fn){if(event==='click')this.listeners.push(fn)},querySelector(){return this.input||(this.input=el('input'))},async click(){if(this.disabled)return;for(const fn of this.listeners)await fn();if(this.onclick)await this.onclick()}};nodes.push(n);return n;
  };
- const c=vm.createContext({bl:v=>v.en,el,uiToast(){},document:{getElementById:()=>({})},uiField:f=>{const n=el('div');fields[f.name]={value:f.value||f.placeholder||'',el:n,get(){return this.value},validate:()=>true,focus(){},setError(){}};return fields[f.name]},uiModal:spec=>{modal=spec;return{close(){closed++}}},apiFetch:async(method,path,body)=>{if(method==='GET')return{ok:true,body:{sites:[]}};calls.push({method,path,body});return responses.shift()}});
+ const c=vm.createContext({bl:v=>v.en,el,uiToast:(message,kind)=>toasts.push({message,kind}),document:{getElementById:()=>({})},uiField:f=>{const n=el('div');fields[f.name]={value:f.value||f.placeholder||'',el:n,get(){return this.value},validate:()=>true,focus(){},setError(){}};return fields[f.name]},uiModal:spec=>{modal=spec;return{close(){closed++}}},apiFetch:async(method,path,body)=>{if(method==='GET')return{ok:true,body:{sites:[]}};calls.push({method,path,body});return responses.shift()}});
  vm.runInContext(source,c);vm.runInContext('renderApplicationsView=()=>{}',c);c.openPublishWizard({});
- return{calls,nodes,fields,get button(){return modal.footer[1]},get closed(){return closed}};
+ return{calls,nodes,fields,toasts,get button(){return modal.footer[1]},get preview(){return modal.body.at(-1)},get closed(){return closed}};
 }
+test('asset save partial result never presents a completed publication and can be retried deliberately',async()=>{
+ const f=publicationFixture([{ok:false,status:500,body:{error:'application_asset_update_unconfirmed',partial:true}},{ok:true,body:{review:{published_route:true}}}]);
+ await f.button.click();assert.equal(f.calls.length,1);assert.notEqual(f.button.textContent,'Done');assert.match(f.preview.textContent,/not confirmed/);assert.equal(f.toasts.at(-1).kind,'err');assert.doesNotMatch(f.toasts.at(-1).message,/^application_asset_update_unconfirmed$/);
+ await f.button.click();assert.equal(f.calls.length,2);assert.equal(f.button.textContent,'Done');
+});
 test('publication Done only closes and never submits a second publish',async()=>{
  const f=publicationFixture([{ok:true,body:{review:{published_route:true}}}]);await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.button.textContent,'Done');await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.closed,1);
 });

@@ -46,11 +46,16 @@ function renderPeopleView(content) {
 
 async function paGet(path, plane) { const r = await apiFetch("GET", path, undefined, plane); if (!r.ok) throw new Error("HTTP " + r.status); return r.body || {}; }
 async function paList(path, key, plane) { const b = await paGet(path, plane); return (b && b[key]) || []; }
-async function paLoadRiskMarks() {
+async function paLoadRiskMarks(tenant) {
+  if (typeof tenant !== "string" || !tenant) return null;
   try {
-    const r = await apiFetch("GET", "/admin/risk-signals", null, _PA_ENF);
-    const marks = r && r.ok && r.body && r.body.high_risk;
-    if (marks && typeof marks === "object" && !Array.isArray(marks) &&
+    // The unqualified route is a device overlay. It omits user marks when it
+    // scopes entries through enrolled devices, so an empty map is not Normal.
+    const r = await apiFetch("GET", "/admin/risk-signals?entity_type=user", undefined, _PA_DIR);
+    const body = r && r.ok && r.body;
+    const marks = body && body.high_risk;
+    if (body && body.entity_type === "user" && body.tenant_id === tenant &&
+        marks && typeof marks === "object" && !Array.isArray(marks) &&
         Object.values(marks).every((severity) => ["medium", "high", "critical"].includes(severity))) return marks;
   } catch (e) { /* Directory readers may not have risk.read. */ }
   return null;
@@ -84,20 +89,27 @@ async function setUserRisk(u, severity, section) {
 async function paPeople(section) {
   uiState(section, "loading");
   const current = freshRender(section);
-  let health, sources, runs, people;
+  let health, sources, runs, people, peopleBody;
   try {
-    [health, sources, runs, people] = await Promise.all([
+    [health, sources, runs, peopleBody] = await Promise.all([
       paGet("/admin/human-identities/sources/health", _PA_DIR).catch(() => ({})),
       paList("/admin/human-identities/sources", "sources", _PA_DIR).catch(() => []),
       paList("/admin/human-identities/import-runs", "runs", _PA_DIR).catch(() => []),
-      paList("/admin/human-identities", "identities", _PA_DIR),
+      paGet("/admin/human-identities", _PA_DIR),
     ]);
   } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); return; }
+  people = peopleBody && peopleBody.identities;
+  const tenant = peopleBody && peopleBody.tenant_id;
+  if (typeof tenant !== "string" || !tenant || !Array.isArray(people) ||
+      !people.every((u) => u && u.tenant_id === tenant)) {
+    if (current()) uiState(section, "error", "Invalid directory response", { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) });
+    return;
+  }
   // Removed identities (the sync's soft-delete terminal state) are not part of the live directory — hide them.
   people = (people || []).filter((u) => (u.status || "").toLowerCase() !== "deleted");
-  // Current high-risk marks (the shared overlay lives on the enforcement Edge), keyed by person id.
+  // Only the control plane's tenant-scoped user-risk response can verify these rows.
   // A denied or unavailable read must not render an unverified Normal value or an edit control.
-  const riskMap = await paLoadRiskMarks();
+  const riskMap = await paLoadRiskMarks(tenant);
   if (!current()) return;
   section.innerHTML = "";
   if (riskMap === null) section.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({

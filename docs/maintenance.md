@@ -113,6 +113,10 @@ regressions cover denied, failed, malformed and successful reads. This does not
 confirm the administrator's display of user risk marks. The current public risk
 read is scoped through enrolled devices and needs a separate tenant-safe user
 risk path before that display can be accepted.
+The People page now requests a tenant-bound user-risk response and refuses the
+device-only response, so a saved user mark is no longer mislabeled Normal by an
+empty device map. Risk remains Unknown and editing unavailable on the current
+public server until that user-risk response is implemented.
 
 Devices readers whose risk overlay request is denied can still see the permitted
 device list. The page shows a server-provided effective risk when present, says

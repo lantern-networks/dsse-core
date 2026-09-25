@@ -16,15 +16,16 @@ import (
 // layer — high-risk is admin-marked (CP-authoritative). Device and user namespaces are persisted together;
 // each is authoritative on the CP and replaced from an explicitly typed feed on a puller.
 type HighRiskOverlay struct {
-	writeMu    sync.Mutex
-	mu         sync.RWMutex
-	devices    map[string]string // deviceID (normalized) -> severity (high|critical)
-	users      map[string]UserRisk
-	userIndex  map[string]string
-	loadErr    error
-	legacy     bool
-	persister  blobstore.Persister
-	generation atomic.Uint64
+	writeMu           sync.Mutex
+	mu                sync.RWMutex
+	devices           map[string]string // deviceID (normalized) -> severity (high|critical)
+	users             map[string]UserRisk
+	userIndex         map[string]string
+	loadErr           error
+	legacy            bool
+	deviceSavePending bool // writeMu: a live device change has not reached durable storage
+	persister         blobstore.Persister
+	generation        atomic.Uint64
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
@@ -54,11 +55,16 @@ func (o *HighRiskOverlay) Mark(deviceID, severity string) {
 	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if prev, ok := o.devices[id]; ok && prev == severity {
+	if o.loadErr != nil || o.legacy {
 		return
 	}
-	o.devices[id] = severity
-	o.generation.Add(1)
+	if prev, ok := o.devices[id]; ok && prev == severity && !o.deviceSavePending {
+		return
+	}
+	if o.devices[id] != severity {
+		o.devices[id] = severity
+		o.generation.Add(1)
+	}
 	o.persistLocked()
 }
 
@@ -72,11 +78,16 @@ func (o *HighRiskOverlay) Clear(deviceID string) {
 	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if _, ok := o.devices[id]; !ok {
+	if o.loadErr != nil || o.legacy {
 		return
 	}
-	delete(o.devices, id)
-	o.generation.Add(1)
+	if _, ok := o.devices[id]; !ok && !o.deviceSavePending {
+		return
+	}
+	if _, ok := o.devices[id]; ok {
+		delete(o.devices, id)
+		o.generation.Add(1)
+	}
 	o.persistLocked()
 }
 

@@ -87,7 +87,7 @@ func (o *HighRiskOverlay) SetUserRisk(mark UserRisk) (warning bool, err error) {
 	}
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
-	if o.loadErr != nil || o.legacy {
+	if o.loadErr != nil || o.legacy || o.deviceSavePending {
 		return false, ErrRiskUnavailable
 	}
 	candidate := cloneUserRisks(o.users)
@@ -280,7 +280,7 @@ func (o *HighRiskOverlay) RemoveUsers(tenant string) (int, error) {
 	}
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
-	if o.loadErr != nil || o.legacy {
+	if o.loadErr != nil || o.legacy || o.deviceSavePending {
 		return 0, ErrRiskUnavailable
 	}
 	candidate := cloneUserRisks(o.users)
@@ -312,7 +312,7 @@ func (o *HighRiskOverlay) RemoveTenantRisksChecked(tenant string, deviceIDs []st
 	}
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
-	if o.loadErr != nil || o.legacy {
+	if o.loadErr != nil || o.legacy || o.deviceSavePending {
 		return 0, ErrRiskUnavailable
 	}
 	devices := make(map[string]string, len(o.devices))

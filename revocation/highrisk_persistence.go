@@ -58,6 +58,7 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	o.mu.Lock()
 	o.devices, o.users = state.Devices, state.Users
 	o.persister, o.loadErr = p, nil
+	o.deviceSavePending = false
 	o.legacy = state.SchemaVersion == "high_risk_overlay_state.v1" && len(state.Devices) != 0
 	o.rebuildUserIndexLocked()
 	o.generation.Add(1)
@@ -88,10 +89,13 @@ func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[s
 // Legacy device paths retain their existing API, but persist both namespaces
 // together so a later device update cannot erase previously saved user marks.
 func (o *HighRiskOverlay) persistLocked() {
-	if o == nil || o.persister == nil || o.loadErr != nil || o.legacy {
+	if o == nil || o.loadErr != nil || o.legacy {
 		return
 	}
 	if _, err := o.saveStateLocked(o.devices, o.users); err != nil {
+		o.deviceSavePending = true
 		log.Printf("high_risk_overlay persist: %v", err)
+	} else {
+		o.deviceSavePending = false
 	}
 }

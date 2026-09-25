@@ -66,6 +66,41 @@ func TestUserRiskSeparatesTenantsDevicesAndSubjects(t *testing.T) {
 		t.Fatal("clear changed device")
 	}
 }
+
+func TestFailedDeviceSaveCannotBePersistedByUserWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "risk.json")
+	p := &userRiskPersister{base: blobstore.FilePersister{Path: path}}
+	o := NewHighRiskOverlay()
+	if err := o.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	p.fail = true
+	o.Mark("device", "high") // conservative live escalation, but the save failed
+	if sev, _ := o.IsHighRisk("device"); sev != "high" {
+		t.Fatal("failed device save removed the live escalation")
+	}
+	p.fail = false
+	if _, err := o.SetUserRisk(UserRisk{TenantID: "one", ID: "alice", Severity: "high"}); !errors.Is(err, ErrRiskUnavailable) {
+		t.Fatalf("unconfirmed device mark leaked into user save: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("rejected user save wrote a snapshot: %v", err)
+	}
+	o.Mark("device", "high") // same-value retry must confirm the pending save
+	if _, err := o.SetUserRisk(UserRisk{TenantID: "one", ID: "alice", Severity: "high"}); err != nil {
+		t.Fatal(err)
+	}
+	again := NewHighRiskOverlay()
+	if err := again.SetStatePath(path); err != nil {
+		t.Fatal(err)
+	}
+	if sev, _ := again.IsHighRisk("device"); sev != "high" {
+		t.Fatal("device retry did not persist")
+	}
+	if sev, _ := again.UserSeverity("one", "alice"); sev != "high" {
+		t.Fatal("user write did not persist")
+	}
+}
 func TestUserRiskRejectsSaveBeforePublishingAndSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "risk.json")
 	p := &userRiskPersister{base: blobstore.FilePersister{Path: path}}

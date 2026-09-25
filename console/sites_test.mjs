@@ -325,3 +325,24 @@ for(const [name,change] of Object.entries(listContextChanges))for(const stage of
  }
 });
 test('site list Japanese error distinguishes unavailable data from no connectors',async()=>{const f=siteListFixture({connectors:{ok:false,status:503}});f.context.bl=x=>x.ja;await f.render();assert.match(f.states.at(-1).message,/確認できませんでした/);assert.equal(f.states.at(-1).retry.label,'再試行');});
+
+for (const group of ['s', '', '__proto__']) for (const reverse of [false,true]) {
+ test(`site availability follows the server answer for group ${JSON.stringify(group)} with reversed order ${reverse}`,async()=>{
+  const conns=[
+   {...listConnector(),id:'z',name:'Zulu',connector_group_id:group,online:true,tunnel_connected:null,status:'offline'},
+   {...listConnector(),id:'a',name:'Alpha',connector_group_id:group,online:true,tunnel_connected:false},
+   {...listConnector(),id:'offline',name:'Not online',connector_group_id:group,online:false,tunnel_connected:true,status:'healthy'},
+  ];if(reverse)conns.reverse();
+  const f=siteListFixture({sites:catalogueResponse('sites',group?[{...listSite(),site_id:group,connector_count:3,online_count:2}]:[]),connectors:catalogueResponse('connectors',conns)});
+  f.context.uiBadge=(text,kind)=>f.context.el('span',{text,badgeKind:kind});await f.render();
+  const text=node=>[node.textContent||'',...(node.children||[]).map(text)].join(' ');
+  const rendered=f.host.querySelectorAll('tr').filter(n=>n.children[0]?.tag==='td');assert.equal(rendered.length,3);
+  for(const row of rendered){
+   const name=text(row.children[0]);const badge=row.children[1].children[0];assert.equal(badge.textContent,name.includes('Not online')?'Offline':'Online');assert.equal(badge.badgeKind,name.includes('Not online')?'danger':'ok');
+  }
+  const content=text(f.host);assert.match(content,/Availability/);assert.ok(!/\bActive\b|\bStandby\b|\bConnected\b/.test(content));assert.match(content,/recent heartbeats/);
+ });
+}
+test('site availability labels and explanation are Japanese',async()=>{
+ const f=siteListFixture({connectors:catalogueResponse('connectors',[listConnector(),{...listConnector(),id:'offline',online:false}])});f.context.bl=x=>x.ja;f.context.uiBadge=(text,kind)=>f.context.el('span',{text,badgeKind:kind});await f.render();const text=n=>[n.textContent||'',...(n.children||[]).map(text)].join(' ');assert.match(text(f.host),/稼働状態/);assert.match(text(f.host),/オンライン/);assert.match(text(f.host),/オフライン/);assert.ok(!/アクティブ|スタンバイ/.test(text(f.host)));
+});

@@ -105,6 +105,13 @@ func (s *Store) claimAliasLocked(tenant, desired, ownerID string) string {
 // UpsertEndpoint stores an endpoint, assigning an id if absent and a tenant-unique alias (auto-suffixed on
 // collision). Returns the stored endpoint with its resolved id and alias.
 func (s *Store) UpsertEndpoint(e Endpoint) (Endpoint, error) {
+	if e.Source != SourceEnrolled {
+		if shared, ok := s.getSharedUpdater(); ok {
+			return sharedCatalogMutation(s, shared, func(latest *Store) (Endpoint, error) {
+				return latest.upsertEndpoint(e, false, false)
+			})
+		}
+	}
 	return s.upsertEndpoint(e, false, false)
 }
 
@@ -116,6 +123,12 @@ func (s *Store) UpsertApplicationEndpoint(applicationID string, e Endpoint, allo
 		return Endpoint{}, fmt.Errorf("application_id is required")
 	}
 	e.ID, e.Source = "app-"+applicationID, SourceApplication
+	shared, ok := s.getSharedUpdater()
+	if ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (Endpoint, error) {
+			return latest.upsertEndpoint(e, true, allowManual)
+		})
+	}
 	return s.upsertEndpoint(e, true, allowManual)
 }
 
@@ -175,6 +188,11 @@ func (s *Store) upsertEndpoint(e Endpoint, application, allowManual bool) (Endpo
 
 // UpsertGroup stores a group (static and/or dynamic membership) with a tenant-unique alias.
 func (s *Store) UpsertGroup(g Group) (Group, error) {
+	if shared, ok := s.getSharedUpdater(); ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (Group, error) {
+			return latest.UpsertGroup(g)
+		})
+	}
 	g.TenantID = strings.TrimSpace(g.TenantID)
 	if g.TenantID == "" {
 		return Group{}, fmt.Errorf("tenant_id is required")
@@ -198,6 +216,11 @@ func (s *Store) UpsertGroup(g Group) (Group, error) {
 
 // UpsertService stores a named port/protocol service with a tenant-unique alias.
 func (s *Store) UpsertService(svc Service) (Service, error) {
+	if shared, ok := s.getSharedUpdater(); ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (Service, error) {
+			return latest.UpsertService(svc)
+		})
+	}
 	svc.TenantID = strings.TrimSpace(svc.TenantID)
 	if svc.TenantID == "" {
 		return Service{}, fmt.Errorf("tenant_id is required")
@@ -226,6 +249,11 @@ func (s *Store) UpsertService(svc Service) (Service, error) {
 // still lists the deleted endpoint as a static member resolves gracefully (missing members are skipped).
 // A failed snapshot restores the previous in-memory endpoint so a retry can persist the delete.
 func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
+	if shared, ok := s.getSharedUpdater(); ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
+			return latest.deleteEndpoint(tenant, id, false, false)
+		})
+	}
 	return s.deleteEndpoint(tenant, id, false, false)
 }
 
@@ -235,6 +263,12 @@ func (s *Store) DeleteApplicationEndpoint(tenant, applicationID string, allowMan
 	applicationID = strings.TrimSpace(applicationID)
 	if applicationID == "" {
 		return false, fmt.Errorf("application_id is required")
+	}
+	shared, ok := s.getSharedUpdater()
+	if ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
+			return latest.deleteEndpoint(tenant, "app-"+applicationID, true, allowManual)
+		})
 	}
 	return s.deleteEndpoint(tenant, "app-"+applicationID, true, allowManual)
 }
@@ -274,6 +308,11 @@ func (s *Store) deleteEndpoint(tenant, id string, application, allowManual bool)
 // DeleteGroup removes a group and frees its alias. Returns false if it was not present. Error semantics as
 // DeleteEndpoint.
 func (s *Store) DeleteGroup(tenant, id string) (bool, error) {
+	if shared, ok := s.getSharedUpdater(); ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
+			return latest.DeleteGroup(tenant, id)
+		})
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.builtInGroups[id]; ok {
@@ -294,6 +333,11 @@ func (s *Store) DeleteGroup(tenant, id string) (bool, error) {
 // DeleteService removes a service and frees its alias. Returns false if it was not present. Error semantics
 // as DeleteEndpoint.
 func (s *Store) DeleteService(tenant, id string) (bool, error) {
+	if shared, ok := s.getSharedUpdater(); ok {
+		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
+			return latest.DeleteService(tenant, id)
+		})
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.services[tenant][id]; !ok {

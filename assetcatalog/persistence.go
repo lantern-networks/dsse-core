@@ -13,11 +13,12 @@ import (
 // SyncEnrolledEndpoints, so persisting them would (a) leave stale endpoints for de-enrolled devices that
 // have no delete path, and (b) rewrite the file on every auto-sync (which runs on each admin list).
 type persistedCatalog struct {
-	Seq       int                            `json:"seq"`
-	Endpoints map[string]map[string]Endpoint `json:"endpoints"`
-	Groups    map[string]map[string]Group    `json:"groups"`
-	Services  map[string]map[string]Service  `json:"services"`
-	Aliases   map[string]map[string]string   `json:"aliases"`
+	Seq        int                            `json:"seq"`
+	Generation uint64                         `json:"generation,omitempty"`
+	Endpoints  map[string]map[string]Endpoint `json:"endpoints"`
+	Groups     map[string]map[string]Group    `json:"groups"`
+	Services   map[string]map[string]Service  `json:"services"`
+	Aliases    map[string]map[string]string   `json:"aliases"`
 }
 
 // SetStatePath enables durable persistence: the store loads any previously-authored catalog from path and
@@ -73,6 +74,9 @@ func (s *Store) loadLocked() error {
 	if snap.Seq > s.seq {
 		s.seq = snap.Seq
 	}
+	if snap.Generation > s.generation {
+		s.generation = snap.Generation
+	}
 	return nil
 }
 
@@ -86,12 +90,26 @@ func (s *Store) persistLocked() error {
 	if s.persister == nil {
 		return nil
 	}
+	data, err := s.marshalLocked()
+	if err != nil {
+		return err
+	}
+	if err := s.persister.Save(data); err != nil {
+		return fmt.Errorf("persist asset catalog: %w", err)
+	}
+	return nil
+}
+
+// marshalLocked provides the same snapshot bytes for a normal Save and for a
+// shared persister's serialized read-modify-write transaction.
+func (s *Store) marshalLocked() ([]byte, error) {
 	snap := persistedCatalog{
-		Seq:       s.seq,
-		Endpoints: map[string]map[string]Endpoint{},
-		Groups:    s.groups,
-		Services:  s.services,
-		Aliases:   map[string]map[string]string{},
+		Seq:        s.seq,
+		Generation: s.generation,
+		Endpoints:  map[string]map[string]Endpoint{},
+		Groups:     s.groups,
+		Services:   s.services,
+		Aliases:    map[string]map[string]string{},
 	}
 	for tenant, byID := range s.endpoints {
 		for id, e := range byID {
@@ -117,10 +135,7 @@ func (s *Store) persistLocked() error {
 	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
-		return fmt.Errorf("marshal asset-catalog snapshot: %w", err)
+		return nil, fmt.Errorf("marshal asset-catalog snapshot: %w", err)
 	}
-	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist asset catalog: %w", err)
-	}
-	return nil
+	return data, nil
 }

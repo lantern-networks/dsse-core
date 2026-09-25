@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -36,7 +37,24 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			syncEnrolled()
 		}
 	}
+	refreshShared := func(w http.ResponseWriter) bool {
+		if err := store.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("asset catalog cannot be refreshed"))
+			return false
+		}
+		return true
+	}
+	writeAssetError := func(w http.ResponseWriter, err error, status int) {
+		if errors.Is(err, assetcatalog.ErrSharedUpdateUnconfirmed) {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		writeError(w, status, err)
+	}
 	mux.HandleFunc("GET /admin/assets/endpoints", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshShared(w) {
+			return
+		}
 		syncNow()
 		writeJSON(w, http.StatusOK, store.ListEndpoints(adminTenantIDFromRequest(r)))
 	}))
@@ -60,7 +78,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		e.TenantID = tenantForWrite
 		stored, err := store.UpsertEndpoint(e)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAssetError(w, err, http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, http.StatusOK, stored)
@@ -72,7 +90,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err) // durability unconfirmed — admin must know
+			writeAssetError(w, err, http.StatusInternalServerError) // durability unconfirmed — admin must know
 			return
 		}
 		if !ok {
@@ -83,6 +101,9 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 	}))
 
 	mux.HandleFunc("GET /admin/assets/groups", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshShared(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, store.ListGroups(adminTenantIDFromRequest(r)))
 	}))
 	mux.HandleFunc("POST /admin/assets/groups", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -105,12 +126,15 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		g.TenantID = tenantForWrite
 		stored, err := store.UpsertGroup(g)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAssetError(w, err, http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("GET /admin/assets/groups/{group_id}/members", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshShared(w) {
+			return
+		}
 		syncNow()
 		writeJSON(w, http.StatusOK, store.ResolveGroupMembers(adminTenantIDFromRequest(r), r.PathValue("group_id")))
 	}))
@@ -121,7 +145,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		ok, err := store.DeleteGroup(adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAssetError(w, err, http.StatusInternalServerError)
 			return
 		}
 		if !ok {
@@ -132,6 +156,9 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 	}))
 
 	mux.HandleFunc("GET /admin/assets/services", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshShared(w) {
+			return
+		}
 		writeJSON(w, http.StatusOK, store.ListServices(adminTenantIDFromRequest(r)))
 	}))
 	mux.HandleFunc("POST /admin/assets/services", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -154,7 +181,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		svc.TenantID = tenantForWrite
 		stored, err := store.UpsertService(svc)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAssetError(w, err, http.StatusBadRequest)
 			return
 		}
 		writeJSON(w, http.StatusOK, stored)
@@ -166,7 +193,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		ok, err := store.DeleteService(adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAssetError(w, err, http.StatusInternalServerError)
 			return
 		}
 		if !ok {

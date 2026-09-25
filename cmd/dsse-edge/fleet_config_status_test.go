@@ -3,12 +3,26 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestFleetStatusRefusesUnconfirmedControlPlaneGeneration(t *testing.T) {
+	mux := http.NewServeMux()
+	registerFleetConfigStatusRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h },
+		newFleetConfigStatusStore(time.Minute), func() (uint64, string, error) {
+			return 0, "", errors.New("private database connection detail")
+		})
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/fleet/config-status", nil))
+	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "private database connection detail") {
+		t.Fatalf("unconfirmed generation status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
 
 // The question the Console could not ask on 2026-08-10: "which Edges actually have this?"
 //
@@ -179,7 +193,7 @@ func TestTheFleetAnswerIsScopedToWhoIsAsking(t *testing.T) {
 
 	mux := http.NewServeMux()
 	registerFleetConfigStatusRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h },
-		store, func() (uint64, string) { return 7, "e1" })
+		store, func() (uint64, string, error) { return 7, "e1", nil })
 
 	call := func(identity adminIdentity) map[string]any {
 		t.Helper()

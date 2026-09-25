@@ -33,6 +33,10 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		if config.AssetStore == nil {
 			return true
 		}
+		if err := config.AssetStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("asset catalog cannot be refreshed"))
+			return false
+		}
 		if current, found := config.AssetStore.GetEndpoint(tenant, "app-"+applicationID); found &&
 			current.Source != assetcatalog.SourceApplication &&
 			!(manualEndpointAllowed(r) && (current.Source == assetcatalog.SourceManual || current.Source == "")) {

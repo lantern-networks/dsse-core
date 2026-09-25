@@ -274,8 +274,8 @@ function overflowMenu(d, host, sev, grpSev, riskReadable = true) {
     const floorRank = riskRank(grpSev);
     const items = [
       el("button", { class: "dev-ov-item", text: bl({ en: "Assign group…", ja: "グループを割当…" }), onClick: () => { close(); openAssignGroupForm(d, host); } }),
-      el("div", { class: "dev-ov-sep" }),
     ];
+    if (riskReadable) items.push(el("div", { class: "dev-ov-sep" }));
     (riskReadable ? [["none", "Normal", "通常"], ["medium", "Medium", "中"], ["high", "High", "高"], ["critical", "Critical", "重大"]] : []).forEach(([val, en, ja]) => {
       const below = riskRank(val) < floorRank;
       const cur = (sev || "none") === val;

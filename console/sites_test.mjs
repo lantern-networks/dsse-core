@@ -346,3 +346,131 @@ for (const group of ['s', '', '__proto__']) for (const reverse of [false,true]) 
 test('site availability labels and explanation are Japanese',async()=>{
  const f=siteListFixture({connectors:catalogueResponse('connectors',[listConnector(),{...listConnector(),id:'offline',online:false}])});f.context.bl=x=>x.ja;f.context.uiBadge=(text,kind)=>f.context.el('span',{text,badgeKind:kind});await f.render();const text=n=>[n.textContent||'',...(n.children||[]).map(text)].join(' ');assert.match(text(f.host),/稼働状態/);assert.match(text(f.host),/オンライン/);assert.match(text(f.host),/オフライン/);assert.ok(!/アクティブ|スタンバイ/.test(text(f.host)));
 });
+
+function siteDeleteFixture(language = 'en') {
+  const f = fixture(), notices = [], modals = [], calls = [];
+  const state = {authority: 'https://control.test', token: '', reloads: 0, detailClosed: 0};
+  f.host.isConnected = true; f.host.__renderSeq = 1;
+  f.context.operateTenant = ''; f.context.idpSession = {auth_method: 'admin_session', tenant_id: 'tenant-a'};
+  f.context.baseForPlane = () => state.authority;
+  f.context.localStorage = {getItem: () => state.token}; f.context.bl = x => x[language];
+  f.context.uiToast = (...args) => notices.push(args);
+  f.context.renderSiteList = () => state.reloads++;
+  f.context.uiModal = opts => {
+    const modal = {opts, el: {isConnected: true}, close() { if (this.el.isConnected) { this.el.isConnected = false; opts.onClose?.(); } }};
+    modals.push(modal); return modal;
+  };
+  f.context.apiFetch = async (...args) => {
+    calls.push(args);
+    return args[0] === 'DELETE' ? {ok: true, status: 200, body: {site_id: 'site/id', deleted: true}}
+      : {ok: true, status: 200, body: {sites: [], count: 0}};
+  };
+  const detail = {el: {isConnected: true}, close() {state.detailClosed++; this.el.isConnected = false;}};
+  const open = () => f.context.deleteSite('site/id', 'Review site', detail, f.host);
+  open();
+  const modal = modals[0], confirm = modal.opts.footer[1], notice = modal.opts.body[1];
+  return {...f, state, notices, modals, calls, detail, open, modal, confirm, notice};
+}
+const deletedCatalogue = (rows = []) => ({ok: true, status: 200, body: {sites: rows, count: rows.length}});
+const derivedSite = (overrides = {}) => ({site_id: 'site/id', tenant_id: 'tenant-a', health: 'healthy', connector_count: 1, online_count: 1, ...overrides});
+
+test('site deletion verifies the identity acknowledgement and persistent record disappearance', async () => {
+  const f = siteDeleteFixture(); await f.confirm.onclick();
+  assert.deepEqual(f.calls.map(c => [c[0], c[1], c[3]]), [['DELETE', '/admin/sites/site%2Fid', 'control'], ['GET', '/admin/sites', 'control']]);
+  assert.equal(f.modal.el.isConnected, false); assert.equal(f.state.detailClosed, 1);
+  assert.equal(f.state.reloads, 1); assert.equal(f.notices[0][1], 'ok');
+  assert.equal(f.host.__siteDeletions.size, 0);
+});
+
+for (const [name, response] of [
+  ['empty', {}], ['null', null], ['array', []], ['wrong identity', {site_id: 'other', deleted: true}],
+  ['false', {site_id: 'site/id', deleted: false}], ['string', {site_id: 'site/id', deleted: 'true'}],
+  ['missing deleted', {site_id: 'site/id'}], ['missing identity', {deleted: true}],
+]) test(`site deletion rejects ${name} acknowledgement without a second destructive attempt`, async () => {
+  const f = siteDeleteFixture(); f.context.apiFetch = async (...args) => {f.calls.push(args); return {ok: true, status: 200, body: response};};
+  await f.confirm.onclick(); await f.confirm.onclick();
+  assert.equal(f.calls.length, 1); assert.equal(f.confirm.disabled, true); assert.equal(f.modal.el.isConnected, true);
+  assert.match(f.notice.textContent, /may already have been applied/); assert.equal(f.notices.length, 0); assert.equal(f.state.reloads, 0);
+});
+
+for (const [name, response] of [
+  ['HTTP failure', {ok: false, status: 503, body: {error: 'private diagnostic'}}],
+  ['wrong status', {ok: true, status: 202, body: {site_id: 'site/id', deleted: true}}],
+  ['transport exception', new Error('private diagnostic')],
+]) test(`site deletion contains ${name} without exposing raw diagnostics`, async () => {
+  const f = siteDeleteFixture('ja'); f.context.apiFetch = async () => {if (response instanceof Error) throw response; return response;};
+  await f.confirm.onclick(); assert.match(f.notice.textContent, /削除を確認できません/);
+  assert.doesNotMatch(f.notice.textContent, /private diagnostic/); assert.equal(f.notices.length, 0);
+});
+
+for (const [name, readback] of [
+  ['still managed', deletedCatalogue([derivedSite({managed: true})])],
+  ['null managed', deletedCatalogue([derivedSite({managed: null})])],
+  ['duplicate rows', deletedCatalogue([derivedSite(), derivedSite()])],
+  ['foreign tenant', deletedCatalogue([derivedSite({tenant_id: 'tenant-b'})])],
+  ['missing rows', {ok: true, status: 200, body: {count: 0}}],
+  ['wrong count', {ok: true, status: 200, body: {sites: [], count: 1}}],
+  ['read HTTP failure', {ok: false, status: 503, body: {error: 'private diagnostic'}}],
+  ['read exception', new Error('private diagnostic')],
+]) test(`site deletion does not confirm ${name} readback`, async () => {
+  const f = siteDeleteFixture(), reply = f.context.apiFetch;
+  f.context.apiFetch = async (...args) => {if (args[0] === 'DELETE') return reply(...args); if (readback instanceof Error) throw readback; return readback;};
+  await f.confirm.onclick(); assert.match(f.notice.textContent, /could not be confirmed/);
+  assert.equal(f.notices.length, 0); assert.equal(f.state.detailClosed, 0);
+});
+
+test('site deletion accepts derived connector groups with omitted or false managed and Go nil lists', async () => {
+  for (const readback of [deletedCatalogue([derivedSite()]), deletedCatalogue([derivedSite({managed: false})]), {ok: true, status: 200, body: {sites: null, count: 0}}]) {
+    const f = siteDeleteFixture(), reply = f.context.apiFetch;
+    f.context.apiFetch = (...args) => args[0] === 'DELETE' ? reply(...args) : Promise.resolve(readback);
+    await f.confirm.onclick(); assert.equal(f.state.reloads, 1); assert.equal(f.notices.length, 1);
+  }
+});
+
+const changeDeleteContext = {
+  selection: f => {f.context.operateTenant = 'tenant-b';}, session: f => {f.context.idpSession = {...f.context.idpSession};},
+  authority: f => {f.state.authority = 'https://elsewhere.test';}, token: f => {f.state.token = 'new-token';},
+  generation: f => {f.host.__renderSeq++;}, detached: f => {f.host.isConnected = false;},
+  detail: f => {f.detail.el.isConnected = false;}, closed: f => {f.modal.close();},
+};
+for (const [name, change] of Object.entries(changeDeleteContext)) {
+  test(`site deletion rejects ${name} context changes during confirmation`, async () => {
+    const f = siteDeleteFixture(); change(f); await f.confirm.onclick();
+    assert.equal(f.calls.length, 0); assert.equal(f.notices.length, 0); assert.equal(f.state.reloads, 0);
+  });
+  test(`site deletion discards late DELETE and readback after ${name} context changes`, async () => {
+    for (const step of ['DELETE', 'GET']) for (const fail of [false, true]) {
+      const f = siteDeleteFixture(), reply = f.context.apiFetch, gate = deferredSiteReply();
+      f.context.apiFetch = async (...args) => {if (args[0] === step) {f.calls.push(args); return gate.promise;} return reply(...args);};
+      const done = f.confirm.onclick();
+      if (step === 'GET') await new Promise(resolve => setImmediate(resolve));
+      change(f);
+      if (fail) gate.reject(new Error('old private error'));
+      else gate.resolve(step === 'DELETE' ? {ok: true, status: 200, body: {site_id: 'site/id', deleted: true}} : deletedCatalogue());
+      await done; assert.equal(f.calls.length, step === 'DELETE' ? 1 : 2);
+      assert.equal(f.notices.length, 0); assert.equal(f.state.reloads, 0); assert.equal(f.notice.textContent, '');
+    }
+  });
+}
+
+test('site deletion suppresses duplicate dialogs and clicks until a dismissed request finishes', async () => {
+  const f = siteDeleteFixture(), gate = deferredSiteReply(); f.context.apiFetch = async (...args) => {f.calls.push(args); return gate.promise;};
+  f.open(); assert.equal(f.modals.length, 1);
+  const done = f.confirm.onclick(); await f.confirm.onclick(); f.modal.close(); f.open();
+  assert.equal(f.modals.length, 1); assert.equal(f.calls.length, 1); assert.equal(f.confirm.disabled, true);
+  gate.resolve({ok: true, status: 200, body: {site_id: 'site/id', deleted: true}}); await done;
+  assert.equal(f.host.__siteDeletions.size, 0); f.open(); assert.equal(f.modals.length, 2);
+});
+
+test('cancelled site deletion permits a fresh confirmation without writing', () => {
+  const f = siteDeleteFixture(); f.modal.close(); f.open(); assert.equal(f.modals.length, 2); assert.equal(f.calls.length, 0);
+});
+
+test('invalid cookie tenant refuses a site deletion dialog; scoped API token needs no tenant read', async () => {
+  for (const tenant of [undefined, null, '', ' ']) {
+    const f = siteDeleteFixture(); f.modal.close(); f.context.idpSession = {auth_method: 'admin_session', tenant_id: tenant}; f.open(); assert.equal(f.modals.length, 1);
+  }
+  const f = siteDeleteFixture(); f.modal.close(); f.context.idpSession = null; f.open();
+  await f.modals.at(-1).opts.footer[1].onclick(); assert.equal(f.state.reloads, 1);
+  assert.equal(f.calls.some(c => c[1] === '/admin/tenant'), false);
+});

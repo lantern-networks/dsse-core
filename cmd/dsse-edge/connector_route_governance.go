@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"log"
+	"maps"
 	"os"
 	"sort"
 	"strings"
@@ -199,31 +200,32 @@ func (g *connectorRouteGovernance) load() {
 	log.Printf("connector_route_governance: loaded shared decisions from %s", where)
 }
 
-// saveLocked persists the decisions atomically. The CALLER must hold g.mu (read or write). No-op without a path.
+// saveLocked retains best-effort persistence for discovery. Admin bindings use
+// persistStateLocked before publishing their new state.
 func (g *connectorRouteGovernance) saveLocked() {
-	if g.persister == nil && g.persistPath == "" {
-		return
+	if err := g.persistStateLocked(governancePersistState{Held: g.held, Approved: g.approved, Seen: g.seen, Authored: g.authored}); err != nil {
+		log.Printf("connector_route_governance: persist failed")
 	}
-	st := governancePersistState{Held: g.held, Approved: g.approved, Seen: g.seen, Authored: g.authored}
+}
+
+// persistStateLocked saves a candidate while the caller holds g.mu.
+func (g *connectorRouteGovernance) persistStateLocked(st governancePersistState) error {
+	if g.persister == nil && g.persistPath == "" {
+		return nil
+	}
 	raw, err := json.Marshal(st)
 	if err != nil {
-		return
+		return err
 	}
 	if g.persister != nil {
-		if err := g.persister.Save(raw); err != nil {
-			// ★ SAID OUT LOUD. A route that was accepted and not recorded is the defect this fixes; failing
-			// to record it silently would reproduce it with an extra step.
-			log.Printf("connector_route_governance: the deployment's shared state did NOT record this change "+
-				"(%v) — a route accepted here will be gone when this control plane restarts", err)
-		}
-		return
+		return g.persister.Save(raw)
 	}
 	tmp := g.persistPath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("connector_route_governance: persist write failed: %v", err)
-		return
+		return err
 	}
-	_ = os.Rename(tmp, g.persistPath)
+	defer os.Remove(tmp)
+	return os.Rename(tmp, g.persistPath)
 }
 
 // SetHeld holds (block=true) or unholds a self-declared CIDR route for a connector.
@@ -251,34 +253,28 @@ func (g *connectorRouteGovernance) SetHeld(tenant, connectorID, cidr string, hel
 }
 
 // AddAuthored adds an admin-authored binding (idempotent by CIDR or FQDN).
-func (g *connectorRouteGovernance) AddAuthored(tenant, connectorID string, r authoredRoute) {
+func (g *connectorRouteGovernance) AddAuthored(tenant, connectorID string, r authoredRoute) error {
 	tenant, connectorID = strings.TrimSpace(tenant), strings.TrimSpace(connectorID)
 	r.CIDR = strings.TrimSpace(r.CIDR)
 	r.FQDN = strings.TrimSpace(r.FQDN)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	defer g.saveLocked()
-	g.gen++
-	if g.authored[tenant] == nil {
-		g.authored[tenant] = map[string][]authoredRoute{}
-	}
-	for i, existing := range g.authored[tenant][connectorID] {
+	list := append([]authoredRoute(nil), g.authored[tenant][connectorID]...)
+	for i, existing := range list {
 		if existing.key() == r.key() {
-			g.authored[tenant][connectorID][i] = r
-			return
+			list[i] = r
+			return g.commitAuthoredLocked(tenant, connectorID, list)
 		}
 	}
-	g.authored[tenant][connectorID] = append(g.authored[tenant][connectorID], r)
+	return g.commitAuthoredLocked(tenant, connectorID, append(list, r))
 }
 
 // RemoveAuthored deletes an admin-authored binding by its identity (a CIDR or an "fqdn:name" key equivalent).
 // key is matched against each binding's key: pass a bare CIDR, or an authoredRoute-derived key.
-func (g *connectorRouteGovernance) RemoveAuthored(tenant, connectorID, key string) {
+func (g *connectorRouteGovernance) RemoveAuthored(tenant, connectorID, key string) error {
 	tenant, connectorID, key = strings.TrimSpace(tenant), strings.TrimSpace(connectorID), strings.TrimSpace(key)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	defer g.saveLocked()
-	g.gen++
 	list := g.authored[tenant][connectorID]
 	out := list[:0:0]
 	for _, r := range list {
@@ -287,9 +283,28 @@ func (g *connectorRouteGovernance) RemoveAuthored(tenant, connectorID, key strin
 			out = append(out, r)
 		}
 	}
-	if g.authored[tenant] != nil {
-		g.authored[tenant][connectorID] = out
+	return g.commitAuthoredLocked(tenant, connectorID, out)
+}
+
+func (g *connectorRouteGovernance) commitAuthoredLocked(tenant, connectorID string, list []authoredRoute) error {
+	next := maps.Clone(g.authored)
+	if next == nil {
+		next = map[string]map[string][]authoredRoute{}
 	}
+	if next[tenant] != nil || len(list) > 0 {
+		bindings := maps.Clone(next[tenant])
+		if bindings == nil {
+			bindings = map[string][]authoredRoute{}
+		}
+		bindings[connectorID] = list
+		next[tenant] = bindings
+	}
+	if err := g.persistStateLocked(governancePersistState{Held: g.held, Approved: g.approved, Seen: g.seen, Authored: next}); err != nil {
+		return err
+	}
+	g.authored = next
+	g.gen++
+	return nil
 }
 
 func (g *connectorRouteGovernance) isHeld(tenant, connectorID, cidr string) bool {

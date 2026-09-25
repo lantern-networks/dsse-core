@@ -24,3 +24,25 @@ test('failed membership reads show Retry before creating catalog mutation contro
 test('an obsolete failed read cannot replace the current screen',async()=>{
  const states=[];const c=context(async()=>{throw Error('old failure');});c.uiState=(host,state)=>states.push(state);c.freshRender=()=>()=>false;await c.renderZones({});assert.deepEqual(states,['loading']);
 });
+test('network create requires a matching acknowledgement and catalog readback',()=>{
+ const c=context(async()=>({ok:true}));
+ const request={id:'net-new',name:'New network',class:'server',cidrs:['192.0.2.0/24']};
+ const saved={...request,tenant_id:'tenant_lab'};
+ for(const response of [null,{ok:true,status:200,body:null},{ok:true,status:200,body:{}},
+  {ok:true,status:200,body:{...saved,name:'Other'}},{ok:true,status:202,body:saved}]) {
+  assert.equal(c.nzSavedObject(response,request),false);
+ }
+ assert.equal(c.nzSavedObject({ok:true,status:200,body:saved},request),true);
+ for(const response of [{ok:false,status:503},{ok:true,body:{}}]) assert.throws(()=>c.nzObjectReadback(response,request));
+ for(const response of [{ok:true,body:{objects:[{}]}},{ok:true,body:{objects:[{...saved,name:'Other'}]}},
+  {ok:true,body:{objects:[saved,saved]}}]) assert.equal(c.nzObjectReadback(response,request),false);
+ assert.equal(c.nzObjectReadback({ok:true,body:{objects:[saved]}},request),true);
+});
+test('network delete requires the targeted acknowledgement and absence in a valid catalog',()=>{
+ const c=context(async()=>({ok:true}));
+ const id='net-old';
+ for(const response of [{ok:false,status:503},{ok:true,body:{}}]) assert.throws(()=>c.nzDeletionReadback(response,id));
+ assert.equal(c.nzDeletionReadback({ok:true,body:{objects:[{}]}},id),false);
+ assert.equal(c.nzDeletionReadback({ok:true,body:{objects:[{id}]}},id),false);
+ assert.equal(c.nzDeletionReadback({ok:true,body:{objects:[{id:'net-other'}]}},id),true);
+});

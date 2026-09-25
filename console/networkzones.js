@@ -53,6 +53,28 @@ function networkZonesCanWrite() {
   return Array.isArray(permissions) && (permissions.includes("admin.vlan.write") || permissions.includes("*"));
 }
 
+function nzObjectMatches(row, expected) {
+  return !!row && typeof row === "object" && !Array.isArray(row) && row.id === expected.id &&
+    row.name === expected.name && row.class === expected.class && Array.isArray(row.cidrs) &&
+    row.cidrs.length === expected.cidrs.length && row.cidrs.every((cidr, i) => cidr === expected.cidrs[i]);
+}
+
+function nzSavedObject(response, expected) {
+  return !!response && response.ok && response.status === 200 && nzObjectMatches(response.body, expected);
+}
+
+function nzObjectReadback(response, expected) {
+  const rows = nzCatalogRows(response, "objects");
+  if (rows.some(row => typeof row.id !== "string" || !row.id)) return false;
+  const matches = rows.filter(row => row.id === expected.id);
+  return matches.length === 1 && nzObjectMatches(matches[0], expected);
+}
+
+function nzDeletionReadback(response, id) {
+  const rows = nzCatalogRows(response, "objects");
+  return rows.every(row => typeof row.id === "string" && row.id && row.id !== id);
+}
+
 async function renderZones(section) {
   uiState(section, "loading");
   const current = freshRender(section);
@@ -90,28 +112,83 @@ function openNetworkForm(section) {
   const nameF = uiField({ name: "name", label: bl({ en: "Name", ja: "名前" }), required: true, placeholder: bl({ en: "Tokyo servers", ja: "東京サーバ" }) });
   const cidrsF = uiField({ name: "cidrs", label: bl({ en: "Subnets", ja: "サブネット" }), required: true, placeholder: "10.20.0.0/16, 10.30.0.0/16", hint: bl({ en: "Comma-separated.", ja: "カンマ区切り。" }) });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add network", ja: "ネットワーク追加" }) });
-  const m = uiModal({ title: bl({ en: "Add a network", ja: "ネットワークを追加" }), body: [nameF.el, cidrsF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  let closed = false, busy = false, attempted = false;
+  const initial = { session: typeof idpSession === "undefined" ? null : idpSession,
+    tenant: typeof operateTenant === "string" ? operateTenant : "", seq: section.__renderSeq,
+    authority: baseForPlane("control"), token: typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "" };
+  const current = () => !closed && section.isConnected !== false && section.__renderSeq === initial.seq &&
+    (typeof idpSession === "undefined" ? null : idpSession) === initial.session &&
+    (typeof operateTenant === "string" ? operateTenant : "") === initial.tenant &&
+    baseForPlane("control") === initial.authority &&
+    (typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "") === initial.token;
+  const m = uiModal({ title: bl({ en: "Add a network", ja: "ネットワークを追加" }), body: [nameF.el, cidrsF.el, notice], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit], onClose: () => { closed = true; } });
   submit.addEventListener("click", async () => {
+    if (busy || attempted || !current()) return;
     if (!nameF.validate() || !cidrsF.validate()) return;
     const cidrs = cidrsF.get().split(",").map((s) => s.trim()).filter(Boolean);
     // A UNIQUE id — never derived from the name, so a new network can't collide with (and silently overwrite) an
     // existing one that a site already references, which would make it show as "used" the moment it's created.
     const id = "net-" + ((self.crypto && crypto.randomUUID) ? crypto.randomUUID().slice(0, 8) : String(Date.now()));
-    submit.disabled = true;
+    const request = { id, name: nameF.get(), class: "server", cidrs };
+    attempted = true; busy = true; submit.disabled = true;
     try {
-      const r = await apiFetch("POST", "/admin/vlan-objects", { id: id, name: nameF.get(), class: "server", cidrs: cidrs });
-      if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      const r = await apiFetch("POST", "/admin/vlan-objects", request);
+      if (!current()) return;
+      if (r && !r.ok && r.status === 400) {
+        attempted = false; submit.disabled = false;
+        notice.textContent = (r.body && (r.body.error || r.body.message)) || bl({ en: "Check the network name and subnets.", ja: "ネットワーク名とサブネットを確認してください。" });
+        notice.style.display = "";
+        return;
+      }
+      if (!nzSavedObject(r, request)) throw new Error("Unconfirmed network save");
+      const read = await apiFetch("GET", "/admin/vlan-objects");
+      if (!current()) return;
+      if (!nzObjectReadback(read, request)) throw new Error("Unconfirmed network readback");
       m.close(); uiToast(bl({ en: "Network added.", ja: "ネットワークを追加しました。" }), "ok"); renderZones(section);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (_) {
+      if (!current()) return;
+      notice.textContent = bl({ en: "The network save could not be confirmed. It may already have been applied. Cancel and reload to check the catalog before trying again.", ja: "ネットワークの保存を確認できませんでした。すでに反映されている可能性があります。キャンセルして再読込し、一覧を確認してから再試行してください。" });
+      notice.style.display = "";
+    } finally { busy = false; }
   });
   nameF.focus();
 }
 
 async function nzDeleteNetwork(o, section) {
-  const ok = await uiConfirm({ title: bl({ en: "Delete this network?", ja: "このネットワークを削除?" }), body: bl({ en: "\"" + (o.name || o.id) + "\" is removed from the catalog. Sites that referenced it lose the binding.", ja: "「" + (o.name || o.id) + "」をカタログから削除します。参照していたサイトの紐付けは外れます。" }), confirmLabel: bl({ en: "Delete", ja: "削除" }), danger: true });
-  if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/vlan-objects/" + encodeURIComponent(o.id));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Network deleted.", ja: "ネットワークを削除しました。" }), "ok"); renderZones(section);
+  const pending = section.__networkDeletions || (section.__networkDeletions = new Set());
+  if (pending.has(o.id)) return;
+  pending.add(o.id);
+  let closed = false, busy = false, attempted = false;
+  const initial = { session: typeof idpSession === "undefined" ? null : idpSession,
+    tenant: typeof operateTenant === "string" ? operateTenant : "", seq: section.__renderSeq,
+    authority: baseForPlane("control"), token: typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "" };
+  const current = () => !closed && section.isConnected !== false && section.__renderSeq === initial.seq &&
+    (typeof idpSession === "undefined" ? null : idpSession) === initial.session &&
+    (typeof operateTenant === "string" ? operateTenant : "") === initial.tenant &&
+    baseForPlane("control") === initial.authority &&
+    (typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "") === initial.token;
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  const confirm = el("button", { class: "ui-btn ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }) });
+  const modal = uiModal({ title: bl({ en: "Delete this network?", ja: "このネットワークを削除?" }),
+    body: [el("p", { text: bl({ en: "\"" + (o.name || o.id) + "\" is removed from the catalog. Sites that referenced it lose the binding.", ja: "「" + (o.name || o.id) + "」をカタログから削除します。参照していたサイトの紐付けは外れます。" }) }), notice],
+    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }), confirm],
+    onClose: () => { closed = true; if (!busy) pending.delete(o.id); } });
+  confirm.onclick = async () => {
+    if (busy || attempted || !current()) return;
+    attempted = true; busy = true; confirm.disabled = true;
+    try {
+      const r = await apiFetch("DELETE", "/admin/vlan-objects/" + encodeURIComponent(o.id));
+      if (!current()) return;
+      if (!r || !r.ok || r.status !== 200 || !r.body || Array.isArray(r.body) || r.body.deleted !== o.id) throw new Error("Unconfirmed network deletion");
+      const read = await apiFetch("GET", "/admin/vlan-objects");
+      if (!current()) return;
+      if (!nzDeletionReadback(read, o.id)) throw new Error("Network still listed");
+      modal.close(); uiToast(bl({ en: "Network deleted.", ja: "ネットワークを削除しました。" }), "ok"); renderZones(section);
+    } catch (_) {
+      if (!current()) return;
+      notice.textContent = bl({ en: "The deletion could not be confirmed. It may already have been applied. Cancel and reload to check the catalog before trying again.", ja: "削除を確認できませんでした。すでに反映されている可能性があります。キャンセルして再読込し、一覧を確認してから再試行してください。" });
+      notice.style.display = "";
+    } finally { busy = false; if (closed) pending.delete(o.id); }
+  };
 }
-

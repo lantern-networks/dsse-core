@@ -83,18 +83,27 @@ show, including disabled status, thresholds, metadata and additional device-risk
 conditions. An identifier removed from the Sensitive Data library stays visible
 as selected; the editor asks for an explicit deselection or restoration before
 saving. Read-only users can still list policies when editor-only configuration
-is unavailable. Twenty-eight focused Console regressions pass. The same Console
-revision was checked in a local browser against the development server for
-editing, reload, saved state and audit; the public server has not had a separate
-browser acceptance run for this change. Public-server persistence and real
+is unavailable. Twenty-eight focused Console regressions pass. A separate headed
+browser check against a local public-server synthetic fixture edited a policy,
+reloaded it, compared saved fields and the raw audit record, and confirmed that
+an auditor can list but cannot edit it. Production persistence and real
 control-plane/Edge traffic remain release checks. This fix is not in 0.3.0.
 
 Internet Access rule edits now retain a saved DLP policy reference while the
 policy list loads or is unavailable, including a reference to a deleted policy.
 Selecting None explicitly removes it. Existing local browser evidence covers
 editing, disable/enable, reload, saved state and audit against the development
-server; public-server acceptance and independent CP/Edge traffic remain release
-checks. This fix is not in 0.3.0.
+server. A separate headed browser check against a local public-server synthetic
+fixture confirmed that a deleted policy reference survives a name-only edit and
+reload, that selecting None removes it, and that both saves match raw audit
+records. Independent CP/Edge traffic remains a release check. This fix is not
+in 0.3.0.
+
+The admin audit now names mutations of `/admin/rules` as access-rule changes.
+That endpoint serves both connector and Internet Access rules, so the former
+connector-only label misclassified Internet Access edits. Focused English and
+Japanese label regressions and a synthetic browser rendering check pass. This
+display correction does not alter the saved rule or raw audit record.
 
 ## What still blocks 0.3.1
 

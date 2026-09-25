@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -344,7 +345,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		saved, err := siteStore.Upsert(r.Context(), site, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_upserted", saved, r, evaluator, now), now)
@@ -385,7 +386,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		now := time.Now()
 		if err := siteStore.Delete(r.Context(), tenantID, siteID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_deleted", adminSiteModel{SiteID: siteID, TenantID: tenantID}, r, evaluator, now), now)
@@ -595,7 +596,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		}
 		result, found, err := adminSiteEnrollmentCommandIssue(r.Context(), siteStore, tenantID, r.PathValue("site_id"), params, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminSiteStoreError(w, err)
 			return
 		}
 		if !found {
@@ -605,6 +606,16 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{SiteID: result.SiteID, TenantID: tenantID, BootstrapSecretHash: connectorRuntimeSecretHash(result.BootstrapSecret)}, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, result)
 	}))
+}
+
+// Keep storage paths and internal error details out of the administrative response.
+func writeAdminSiteStoreError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAdminSitePersistence) {
+		log.Printf("site storage error: %v", err)
+		writeError(w, http.StatusInternalServerError, errAdminSitePersistence)
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }
 
 // namedNetworkVisibleToTenant answers whether this caller may REFERENCE that Named Network.

@@ -79,6 +79,19 @@ confirmed the Sites failure, retry, reload and matching raw audit records using
 the public server. Independent control-plane/Edge propagation and production
 storage remain release checks. This fix is not in the published 0.3.0 release.
 
+The file-backed Site catalogue now reports a storage failure for creation,
+editing, deletion and enrollment-command rotation, without changing the live
+record or its distribution generation. Previously these operations could report
+success and appear in memory while the saved file remained unchanged. Eight
+synthetic failure cases cover temporary writes and atomic replacement, including
+saved-state reload and success/failure audit attribution. A separate local
+control-plane and Edge process check covers ordinary Site creation, editing and
+last-record deletion through signed bundle polling, administrative readback,
+file reload and three control-plane mutation audits. Earlier browser evidence
+for Site operations is reused; this check adds no new GUI acceptance. Deployed
+fleet propagation, shared PostgreSQL and real connector traffic remain release
+checks. This fix is not in the published 0.3.0 release.
+
 Ordinary DLP Policy edits now keep existing settings that the editor does not
 show, including disabled status, thresholds, metadata and additional device-risk
 conditions. An identifier removed from the Sensitive Data library stays visible

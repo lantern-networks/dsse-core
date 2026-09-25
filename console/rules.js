@@ -555,6 +555,31 @@ function openCertPinDetails(rules, idx, section, plane, direction) {
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Close", ja: "閉じる" }), onClick: () => m.close() })] });
 }
 
+// Keep the authored reference present even before the asynchronous list arrives.
+// A missing/deleted policy or a failed list fetch must not silently mean "None".
+async function loadRuleDLPPolicies(field, selectedID) {
+  const sel = field.el.querySelector("select");
+  const none = () => el("option", { value: "", text: bl({ en: "None", ja: "なし" }) });
+  const retained = () => el("option", { value: selectedID, text: selectedID });
+  sel.replaceChildren(none(), ...(selectedID ? [retained()] : []));
+  sel.value = selectedID;
+  sel.disabled = true;
+  try {
+    const pr = await apiFetch("GET", "/admin/dlp-policies");
+    if (!pr || !pr.ok || !pr.body || !Object.hasOwn(pr.body, "policies") ||
+        (pr.body.policies !== null && !Array.isArray(pr.body.policies))) throw new Error("unavailable policies");
+    const policies = pr.body.policies || [];
+    if (!policies.every(p => p && typeof p.id === "string" && p.id && typeof p.name === "string" && p.name)) throw new Error("invalid policies");
+    const missing = selectedID && !policies.some(p => p.id === selectedID);
+    sel.replaceChildren(none(), ...policies.map(p => el("option", { value: p.id, text: p.name })), ...(missing ? [retained()] : []));
+    sel.value = selectedID;
+    sel.disabled = false;
+    if (missing) field.setError(bl({ en: "This policy is not available. Its reference is kept; choose None to remove it.", ja: "このポリシーは利用できません。参照は保持されます。解除する場合は「なし」を選んでください。" }));
+  } catch (e) {
+    field.setError(bl({ en: "Cannot load DLP policies. The current selection is unchanged; reopen the editor to retry.", ja: "DLPポリシーを取得できません。現在の選択は保持されます。再試行するには編集画面を開き直してください。" }));
+  }
+}
+
 // ---- editor ----------------------------------------------------------------
 
 // openRuleEditor builds the two-axis rule editor in a modal. plane/direction fix the rule's plane + direction.
@@ -801,16 +826,8 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   // inline per-rule DLP config, so DLP settings live in exactly one place (the DLP Policies page) and a rule only
   // SELECTS one here. Options are loaded async from /admin/dlp-policies.
   const dlpPolicyF = uiField({ name: "dlppolicy", label: bl({ en: "DLP policy", ja: "DLP ポリシー" }), type: "select", value: (dlpExisting && dlpExisting.policy_id) || "", hint: bl({ en: "Apply a reusable DLP policy to this traffic. Create and edit policies (what to detect + action + account + device risk) on the DLP Policies page.", ja: "この通信に適用する DLP ポリシーを選択。ポリシー(検出対象+アクション+アカウント+デバイスリスク)は「DLP ポリシー」ページで作成・編集します。" }), options: [{ value: "", label: bl({ en: "None", ja: "なし" }) }] });
-  // Load the tenant's named DLP policies into the selector.
-  (async () => {
-    try {
-      const pr = await apiFetch("GET", "/admin/dlp-policies");
-      const policies = (pr && pr.ok && pr.body && pr.body.policies) || [];
-      const sel = dlpPolicyF.el.querySelector("select");
-      policies.forEach((p) => sel.appendChild(el("option", { value: p.id, text: p.name })));
-      if (dlpExisting && dlpExisting.policy_id) sel.value = dlpExisting.policy_id;
-    } catch (e) { /* policies optional */ }
-  })();
+  // Populate only the egress control; initialize its saved reference synchronously.
+  if (plane === "egress") loadRuleDLPPolicies(dlpPolicyF, (dlpExisting && dlpExisting.policy_id) || "");
   // Paid-feature gate: only show the DLP option on a rule when the tenant is licensed for DLP.
   const dlpLicensed = !(window.dsseEntitlements && window.dsseEntitlements.dlp === false);
   const dlpWrap = dlpLicensed ? el("div", { class: "asset-dyn" }, [dlpPolicyF.el]) : el("div", {});

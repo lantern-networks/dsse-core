@@ -89,6 +89,13 @@ editing, reload, saved state and audit; the public server has not had a separate
 browser acceptance run for this change. Public-server persistence and real
 control-plane/Edge traffic remain release checks. This fix is not in 0.3.0.
 
+Internet Access rule edits now retain a saved DLP policy reference while the
+policy list loads or is unavailable, including a reference to a deleted policy.
+Selecting None explicitly removes it. Existing local browser evidence covers
+editing, disable/enable, reload, saved state and audit against the development
+server; public-server acceptance and independent CP/Edge traffic remain release
+checks. This fix is not in 0.3.0.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

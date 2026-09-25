@@ -87,21 +87,21 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	return nil
 }
 
-// OnPersistError, when set, logs a failed save in addition to the object's returned error.
+// OnPersistError, when set, logs a failed save in addition to an object or policy returned error.
 // Other legacy mutations still use persistLocked and only report through this callback.
 var OnPersistError func(error)
 
-// ErrPersistence means a Network object change was not confirmed in storage.
+// ErrPersistence means a Network object or boundary-policy change was not confirmed in storage.
 // A failed save may still have reached the destination; callers must not report success.
 var ErrPersistence = errors.New("network storage unconfirmed")
 
-// saveObjectCandidateLocked saves the proposed object catalogue before publishing it to live readers.
+// saveCandidateLocked saves the proposed catalogue before publishing it to live readers.
 // A non-atomic replacement warning means the bytes were saved; other errors leave live state unchanged.
-func (s *Store) saveObjectCandidateLocked(objects map[string]model.VLANObject) error {
+func (s *Store) saveCandidateLocked(objects map[string]model.VLANObject, policies map[string]model.VLANBoundaryPolicy) error {
 	if s.persister == nil {
 		return nil
 	}
-	data, err := json.Marshal(vlanPersistSnapshot{Objects: objects, Policies: s.policies})
+	data, err := json.Marshal(vlanPersistSnapshot{Objects: objects, Policies: policies})
 	if err == nil {
 		err = s.persister.Save(data)
 	}
@@ -187,7 +187,7 @@ func (s *Store) UpsertObject(o model.VLANObject) (model.VLANObject, error) {
 		objects[id] = existing
 	}
 	objects[o.ID] = o
-	if err := s.saveObjectCandidateLocked(objects); err != nil {
+	if err := s.saveCandidateLocked(objects, s.policies); err != nil {
 		return model.VLANObject{}, err
 	}
 	s.objects = objects
@@ -215,9 +215,16 @@ func (s *Store) UpsertPolicy(p model.VLANBoundaryPolicy) (model.VLANBoundaryPoli
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.policies[p.ID] = p
+	policies := make(map[string]model.VLANBoundaryPolicy, len(s.policies)+1)
+	for id, existing := range s.policies {
+		policies[id] = existing
+	}
+	policies[p.ID] = p
+	if err := s.saveCandidateLocked(s.objects, policies); err != nil {
+		return model.VLANBoundaryPolicy{}, err
+	}
+	s.policies = policies
 	s.generation.Add(1) // distributed via the config bundle: advance so Edges re-pull
-	s.persistLocked()
 	return p, nil
 }
 
@@ -251,7 +258,7 @@ func (s *Store) DeleteObject(id string) (bool, error) {
 			objects[key] = existing
 		}
 	}
-	if err := s.saveObjectCandidateLocked(objects); err != nil {
+	if err := s.saveCandidateLocked(objects, s.policies); err != nil {
 		return false, err
 	}
 	s.objects = objects

@@ -63,20 +63,56 @@ function openSiteForm(host, existing) {
 // showSiteNetworks opens the site's Networks — bound once to the site and served by all its connectors. Subnets
 // are SELECTED from the catalog (defined on the Networks page); a single hostname is bound directly here.
 async function showSiteNetworks(siteID, host) {
-  const modal = uiModal({ title: bl({ en: "Networks — " + siteID, ja: siteID + " のネットワーク" }), body: [el("div", {}, uiBadge(bl({ en: "Loading…", ja: "読込中…" }), "off"))], footer: [] });
+  let bodyHost;
+  const modal = uiModal({ title: bl({ en: "Networks — " + siteID, ja: siteID + " のネットワーク" }), body: [], footer: [], onClose: () => { if (bodyHost) freshRender(bodyHost); } });
   const box = modal.el.querySelector(".ui-modal"); if (box) box.style.width = "min(720px, 94vw)";
-  const bodyHost = modal.el.querySelector(".ui-modal-body");
-  await renderSiteNetworks(bodyHost, siteID, host);
+  bodyHost = modal.el.querySelector(".ui-modal-body");
   const foot = modal.el.querySelector(".ui-modal-foot"); foot.innerHTML = "";
   foot.appendChild(el("button", { class: "ui-btn", text: bl({ en: "Done", ja: "完了" }), onClick: () => { modal.close(); renderSiteList(host); } }));
+  await renderSiteNetworks(bodyHost, siteID, host);
+}
+
+function siteNetworkRows(response, key) {
+  if (!response || !response.ok) throw new Error("HTTP " + (response && response.status));
+  if (!response.body || !Object.hasOwn(response.body, key)) throw new Error("Invalid site network response");
+  const rows = response.body[key];
+  if (rows === null) return [];
+  if (!Array.isArray(rows) || rows.some(row => !row || typeof row !== "object" || Array.isArray(row))) throw new Error("Invalid site network response");
+  return rows;
+}
+
+async function loadSiteNetworkData(siteID) {
+  const [bindings, networks, connectors] = await Promise.all([
+    apiFetch("GET", "/admin/sites/" + encodeURIComponent(siteID) + "/networks"),
+    apiFetch("GET", "/admin/vlan-objects"),
+    apiFetch("GET", "/admin/connectors"),
+  ]);
+  const rows = siteNetworkRows(bindings, "networks");
+  const catalog = siteNetworkRows(networks, "objects");
+  const conns = siteNetworkRows(connectors, "connectors");
+  const text = value => typeof value === "string" && value.length > 0;
+  const optionalText = value => value == null || typeof value === "string";
+  const optionalTexts = value => value == null || (Array.isArray(value) && value.every(v => typeof v === "string"));
+  if (rows.some(r => !["network", "fqdn", "cidr"].includes(r.kind) ||
+      (r.kind === "network" && !text(r.network_id)) || (r.kind === "fqdn" && !text(r.fqdn)) || (r.kind === "cidr" && !text(r.cidr)) ||
+      ![r.network_id, r.fqdn, r.cidr].every(optionalText) || [r.network_id, r.fqdn, r.cidr].filter(Boolean).length !== 1 ||
+      !optionalText(r.network_name) || !optionalTexts(r.network_cidrs))) throw new Error("Invalid site network binding");
+  if (catalog.some(n => !text(n.id) || !optionalText(n.name) || !optionalTexts(n.cidrs))) throw new Error("Invalid network catalog");
+  if (conns.some(c => !text(c.id) || ![c.name, c.connector_group_id, c.edge_region_id, c.attached_region_id].every(optionalText))) throw new Error("Invalid connector catalog");
+  return { rows, catalog, conns: conns.filter(c => (c.connector_group_id || "") === siteID) };
 }
 
 async function renderSiteNetworks(bodyHost, siteID, listHost) {
+  const current = freshRender(bodyHost);
+  bodyHost.__siteNetworkEditor = null;
+  uiState(bodyHost, "loading");
+  let data;
+  try { data = await loadSiteNetworkData(siteID); }
+  catch (e) { if (current()) uiState(bodyHost, "error", String(e.message || e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderSiteNetworks(bodyHost, siteID, listHost) }); return; }
+  if (!current()) return;
+  const { rows, catalog, conns } = data;
   bodyHost.innerHTML = "";
   bodyHost.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "The networks this site serves — all its connectors serve them.", ja: "この拠点が担うネットワーク。配下の全コネクタが担います。" }) }));
-  let rows = [], catalog = [];
-  try { const r = await apiFetch("GET", "/admin/sites/" + encodeURIComponent(siteID) + "/networks"); if (r.ok && r.body) rows = r.body.networks || []; } catch (e) { /* leave empty */ }
-  try { const r = await apiFetch("GET", "/admin/vlan-objects"); if (r.ok && r.body) catalog = r.body.objects || []; } catch (e) { /* leave empty */ }
   const dest = (rt) => rt.kind === "network" ? ((rt.network_name || rt.network_id) + ((rt.network_cidrs && rt.network_cidrs.length) ? " (" + rt.network_cidrs.join(", ") + ")" : "")) : (rt.cidr || rt.fqdn || "");
   const payloadFor = (rt) => rt.kind === "network" ? { network_id: rt.network_id } : (rt.fqdn ? { fqdn: rt.fqdn } : { cidr: rt.cidr });
   const kindLabel = (rt) => rt.kind === "network" ? bl({ en: "Named network", ja: "定義済みNW" }) : (rt.fqdn ? bl({ en: "Name", ja: "名前" }) : bl({ en: "Subnet", ja: "サブネット" }));
@@ -103,16 +139,14 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
   // Subnets come from the catalog (select above — defined on the Networks page). A single hostname is bound here.
   const inp = el("input", { class: "ui-input", placeholder: bl({ en: "or a hostname — wiki.corp", ja: "またはホスト名 — wiki.corp" }) }); inp.style.maxWidth = "240px";
   bodyHost.appendChild(el("div", { class: "ui-toolbar", style: "margin-top:6px" }, [inp, el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Add", ja: "追加" }), onClick: () => { const v = inp.value.trim(); if (!v) return; siteNetworkAction(siteID, { action: "add", fqdn: v }, bodyHost, listHost); } })]));
+  const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
+  bodyHost.appendChild(saveError);
+  bodyHost.__siteNetworkEditor = { current, busy: false, error: saveError, controls: Array.from(bodyHost.querySelectorAll("button,input,select")) };
 
   // (connector_network_route_advertisement_design.md): the route-governance surface lives HERE — the
   // site-first IA has no separate Connectors page, so each of the site's connectors gets its governance panel
   // (configured bindings and informational connector-reported routes) in this
   // modal. Configured bindings can be removed; reported subnets are informational.
-  let conns = [];
-  try {
-    const r = await apiFetch("GET", "/admin/connectors");
-    if (r.ok && r.body) conns = (r.body.connectors || []).filter((c) => (c.connector_group_id || "") === siteID);
-  } catch (e) { /* leave empty */ }
   for (const c of conns) {
     const panel = el("div", { style: "margin-top:16px;border-top:1px solid rgba(128,128,128,.25);padding-top:10px" });
     bodyHost.appendChild(panel);
@@ -149,10 +183,27 @@ async function renderSiteNetworks(bodyHost, siteID, listHost) {
 }
 
 async function siteNetworkAction(siteID, payload, bodyHost, listHost) {
-  const r = await apiFetch("POST", "/admin/sites/" + encodeURIComponent(siteID) + "/networks", payload);
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Network updated.", ja: "ネットワークを更新しました。" }), "ok");
-  renderSiteNetworks(bodyHost, siteID, listHost);
+  const editor = bodyHost.__siteNetworkEditor;
+  if (!editor || !editor.current() || editor.busy) return;
+  editor.busy = true;
+  editor.error.style.display = "none";
+  const controls = editor.controls.map(control => ({ control, disabled: control.disabled }));
+  controls.forEach(({ control }) => { control.disabled = true; });
+  try {
+    const r = await apiFetch("POST", "/admin/sites/" + encodeURIComponent(siteID) + "/networks", payload);
+    if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+    if (!editor.current()) return;
+    uiToast(bl({ en: "Network updated.", ja: "ネットワークを更新しました。" }), "ok");
+    await renderSiteNetworks(bodyHost, siteID, listHost);
+  } catch (e) {
+    if (!editor.current()) return;
+    editor.error.textContent = String(e.message || e);
+    editor.error.style.display = "";
+    editor.error.scrollIntoView({ block: "nearest" });
+  } finally {
+    editor.busy = false;
+    if (editor.current()) controls.forEach(({ control, disabled }) => { control.disabled = disabled; });
+  }
 }
 
 // renameConnector opens a small modal to set an operator display name for a connector (survives reconnection).

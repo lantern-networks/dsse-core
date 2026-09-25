@@ -46,6 +46,15 @@ function renderPeopleView(content) {
 
 async function paGet(path, plane) { const r = await apiFetch("GET", path, undefined, plane); if (!r.ok) throw new Error("HTTP " + r.status); return r.body || {}; }
 async function paList(path, key, plane) { const b = await paGet(path, plane); return (b && b[key]) || []; }
+async function paLoadRiskMarks() {
+  try {
+    const r = await apiFetch("GET", "/admin/risk-signals", null, _PA_ENF);
+    const marks = r && r.ok && r.body && r.body.high_risk;
+    if (marks && typeof marks === "object" && !Array.isArray(marks) &&
+        Object.values(marks).every((severity) => ["medium", "high", "critical"].includes(severity))) return marks;
+  } catch (e) { /* Directory readers may not have risk.read. */ }
+  return null;
+}
 
 // paWriteEnforcement writes an enforcement-config resource (delegated grant, service account / NHI, agent policy).
 // It goes to the ENFORCEMENT Edge by default — where this single-edge lab decides, so a grant lands exactly where
@@ -86,12 +95,15 @@ async function paPeople(section) {
   } catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => paPeople(section) }); return; }
   // Removed identities (the sync's soft-delete terminal state) are not part of the live directory — hide them.
   people = (people || []).filter((u) => (u.status || "").toLowerCase() !== "deleted");
-  // Current high-risk marks (the shared overlay lives on the enforcement Edge), so each person's own row shows +
-  // sets their risk — no free-text id. Best-effort. Keyed by the person's id (the IdP subject the decision uses).
-  let riskMap = {};
-  try { const rk = await apiFetch("GET", "/admin/risk-signals", null, _PA_ENF); if (rk && rk.ok && rk.body && rk.body.high_risk) riskMap = rk.body.high_risk; } catch (e) { /* best-effort */ }
+  // Current high-risk marks (the shared overlay lives on the enforcement Edge), keyed by person id.
+  // A denied or unavailable read must not render an unverified Normal value or an edit control.
+  const riskMap = await paLoadRiskMarks();
   if (!current()) return;
   section.innerHTML = "";
+  if (riskMap === null) section.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
+    en: "Risk settings are unavailable. People remain visible, but risk is Unknown and cannot be edited.",
+    ja: "リスク設定を取得できません。ユーザー一覧は表示できますが、リスクは不明となり編集できません。",
+  }) }));
 
   // Directory-sync health banner: this is a SYNCED directory; the operator should see freshness, not a raw list.
   const synced = (health.source_count || 0) > 0;
@@ -126,23 +138,24 @@ async function paPeople(section) {
     (rows) => simpleTable(
       [bl({ en: "Person", ja: "ユーザー" }), bl({ en: "Email", ja: "メール" }), bl({ en: "Dept", ja: "部門" }), bl({ en: "Source", ja: "出所" }), bl({ en: "Last seen", ja: "最終確認" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Risk", ja: "リスク" }), bl({ en: "", ja: "" })],
       rows.map((u) => {
-        const sev = riskMap[u.id];
-        const riskSel = el("select", { class: "ui-input", style: "width:auto;padding:2px 4px" }, [
+        const sev = riskMap && riskMap[u.id];
+        const riskSel = riskMap === null ? null : el("select", { class: "ui-input", style: "width:auto;padding:2px 4px" }, [
           el("option", { value: "none", text: bl({ en: "Normal", ja: "通常" }) }),
           el("option", { value: "medium", text: bl({ en: "Medium", ja: "中" }) }),
           el("option", { value: "high", text: bl({ en: "High", ja: "高" }) }),
           el("option", { value: "critical", text: bl({ en: "Critical", ja: "重大" }) }),
         ]);
-        riskSel.value = sev || "none";
-        riskSel.addEventListener("change", () => setUserRisk(u, riskSel.value, section));
+        if (riskSel) {
+          riskSel.value = sev || "none";
+          riskSel.addEventListener("change", () => setUserRisk(u, riskSel.value, section));
+        }
         return [
           el("strong", { text: u.display_name || u.subject || u.id }), el("span", { text: u.email || "—" }), el("span", { text: u.department || "—" }),
           el("span", { text: u.source || "—" }), el("span", { class: "ui-view-desc", text: u.last_seen_at ? window.dsseFormatTime(u.last_seen_at) : "—" }),
           uiBadge(u.status === "active" ? bl({ en: "Active", ja: "有効" }) : (u.status || "—"), u.status === "active" ? "ok" : "off"),
-          uiBadge(sev === "critical" ? bl({ en: "Critical", ja: "重大" }) : sev === "high" ? bl({ en: "High", ja: "高" }) : sev === "medium" ? bl({ en: "Medium", ja: "中" }) : bl({ en: "Normal", ja: "通常" }), (sev === "high" || sev === "critical") ? "danger" : (sev === "medium" ? "warn" : "off")),
+          uiBadge(riskMap === null ? bl({ en: "Unknown", ja: "不明" }) : sev === "critical" ? bl({ en: "Critical", ja: "重大" }) : sev === "high" ? bl({ en: "High", ja: "高" }) : sev === "medium" ? bl({ en: "Medium", ja: "中" }) : bl({ en: "Normal", ja: "通常" }), (sev === "high" || sev === "critical") ? "danger" : (sev === "medium" ? "warn" : "off")),
           el("span", { class: "ui-row-actions" }, [
-            riskSel,
-            document.createTextNode(" "),
+            ...(riskSel ? [riskSel, document.createTextNode(" ")] : []),
             paRemoveBtn(
               bl({ en: "Remove this identity from the directory?", ja: "この identity をディレクトリから除去?" }),
               bl({ en: "It leaves the live directory (soft-remove). Access is decided by sign-in + rules, so this does not change access.", ja: "ライブディレクトリから外れます(ソフト除去)。アクセスはサインイン+ルールで決まるため変わりません。" }),

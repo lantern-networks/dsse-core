@@ -105,6 +105,15 @@ connector-only label misclassified Internet Access edits. Focused English and
 Japanese label regressions and a synthetic browser rendering check pass. This
 display correction does not alter the saved rule or raw audit record.
 
+People directory readers now see Unknown instead of Normal when their risk
+overlay read is denied or unavailable, and no risk edit selector is shown in
+that state. A headed browser check against a local public-server synthetic
+fixture confirmed the auditor view in English and Japanese; focused Console
+regressions cover denied, failed, malformed and successful reads. This does not
+confirm the administrator's display of user risk marks. The current public risk
+read is scoped through enrolled devices and needs a separate tenant-safe user
+risk path before that display can be accepted.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

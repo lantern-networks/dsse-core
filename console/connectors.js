@@ -135,8 +135,18 @@ async function renderConnectorRouteGovernance(host, id) {
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Connector routes (configured / reported)", ja: "コネクタ経路（設定 / 報告）" }) }));
   host.appendChild(el("p", { class: "ui-field-hint", text: bl({ en: "Bind a Named Network or hostname that this connector serves. Define subnets on the Networks page, then select them here. Routes reported by the connector are informational and cannot be adopted directly.", ja: "このコネクタが担う定義済みネットワークまたはホスト名を紐付けます。サブネットはネットワーク画面で定義し、ここで選択してください。コネクタから報告された経路は参考情報で、直接採用できません。" }) }));
-  let routes = [];
-  try { const r = await apiFetch("GET", "/admin/connectors/" + encodeURIComponent(id) + "/routes"); if (r.ok && r.body) routes = r.body.routes || []; } catch (e) { /* leave empty */ }
+  let routes;
+  try {
+    const r = await apiFetch("GET", "/admin/connectors/" + encodeURIComponent(id) + "/routes");
+    if (!r.ok || !r.body || !Array.isArray(r.body.routes)) throw new Error("connector routes unavailable");
+    routes = r.body.routes;
+  } catch (e) {
+    uiState(host, "error", bl({ en: "Connector routes could not be verified. Retry before making changes.", ja: "コネクタ経路を確認できませんでした。変更前に再試行してください。" }), {
+      label: bl({ en: "Retry", ja: "再試行" }),
+      onClick: () => renderConnectorRouteGovernance(host, id),
+    });
+    return;
+  }
   // Named Networks (VLAN objects) are ranges defined ONCE and referenced here, so a subnet is not re-typed.
   let networks = [];
   try { const r = await apiFetch("GET", "/admin/vlan-objects"); if (r.ok && r.body) networks = r.body.objects || []; } catch (e) { /* leave empty */ }

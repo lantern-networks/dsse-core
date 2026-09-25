@@ -111,6 +111,18 @@ function fmtAgo(ts) {
 function shortApp(a) { a = String(a || ""); const parts = a.split(/[.\/\\:]/); return parts[parts.length - 1] || a; }
 function riskLabel(sev) { return sev === "critical" ? bl({ en: "Critical", ja: "重大" }) : sev === "high" ? bl({ en: "High", ja: "高" }) : sev === "medium" ? bl({ en: "Medium", ja: "中" }) : bl({ en: "Normal", ja: "通常" }); }
 function riskTone(sev) { return (sev === "high" || sev === "critical") ? "danger" : (sev === "medium" ? "warn" : "off"); }
+async function deviceRiskMarks() {
+  const r = await apiFetch("GET", "/admin/risk-signals");
+  if (r && !r.ok && r.status === 403) return null;
+  if (!r || !r.ok) throw new Error("HTTP " + (r && r.status || "unknown"));
+  const marks = r.body && r.body.high_risk;
+  if (!marks || typeof marks !== "object" || Array.isArray(marks) ||
+      !Object.values(marks).every((severity) => ["medium", "high", "critical"].includes(severity))) throw new Error("Invalid risk response");
+  return marks;
+}
+function deviceEffectiveRiskWithoutOverlay(value) {
+  return ["none", "medium", "high", "critical"].includes(value) ? value : "unknown";
+}
 
 // applyUpdateState folds what a device did with the release it was offered into the row it already has.
 //
@@ -250,7 +262,7 @@ function deviceStateOf(d, obs, rt, effSev) {
 
 // overflowMenu — the row's "⋯": Block/Allow stays a first-class button; Group / Risk / Remove fold in here so the
 // row isn't a wall of buttons. Risk levels below the device's group floor are disabled (they wouldn't take effect).
-function overflowMenu(d, host, sev, grpSev) {
+function overflowMenu(d, host, sev, grpSev, riskReadable = true) {
   const wrap = el("span", { class: "dev-ov" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: "⋯", title: bl({ en: "More", ja: "その他" }) });
   let menu = null;
@@ -264,7 +276,7 @@ function overflowMenu(d, host, sev, grpSev) {
       el("button", { class: "dev-ov-item", text: bl({ en: "Assign group…", ja: "グループを割当…" }), onClick: () => { close(); openAssignGroupForm(d, host); } }),
       el("div", { class: "dev-ov-sep" }),
     ];
-    [["none", "Normal", "通常"], ["medium", "Medium", "中"], ["high", "High", "高"], ["critical", "Critical", "重大"]].forEach(([val, en, ja]) => {
+    (riskReadable ? [["none", "Normal", "通常"], ["medium", "Medium", "中"], ["high", "High", "高"], ["critical", "Critical", "重大"]] : []).forEach(([val, en, ja]) => {
       const below = riskRank(val) < floorRank;
       const cur = (sev || "none") === val;
       items.push(el("button", {
@@ -363,13 +375,21 @@ async function renderList(host) {
       if (ru.body.frozen) updateFrozen = ru.body.frozen_reason || bl({ en: "rollout halted", ja: "配布停止中" });
     }
   } catch (e) { /* best-effort */ }
-  // Current high-risk marks (the shared overlay, keyed by entity id), so a device's OWN row shows + sets its
-  // risk — no free-text id (this replaces the standalone Device Risk page). Best-effort.
-  let riskMap = {};
+  // A denied overlay read must not turn an unknown device risk into Normal or expose risk editing.
+  let riskMap, riskReadable = true;
   try {
-    const rk = await apiFetch("GET", "/admin/risk-signals");
-    if (rk.ok && rk.body && rk.body.high_risk) riskMap = rk.body.high_risk;
-  } catch (e) { /* best-effort */ }
+    riskMap = await deviceRiskMarks();
+    if (!current()) return;
+    if (riskMap === null) {
+      riskReadable = false;
+      riskMap = {};
+    }
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", bl({ en: "Risk status could not be read. Reload before changing device risk.", ja: "リスク状態を取得できません。変更する前に再読込してください。" }),
+      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
+    return;
+  }
   // Device-group RISK FLOOR: a group can carry a risk floor, and a member device's EFFECTIVE risk is
   // max(its own overlay risk, its group's floor). Fetch the registry so this list REFLECTS the group floor.
   // NOTE: this is the display (R3). Enforcement — the decision engine acting on the floor — is the separate R1
@@ -422,7 +442,9 @@ async function renderList(host) {
     const grpSev = groupRisk[(d.group || "").trim().toLowerCase()] || "";
     // Effective risk is resolved SERVER-SIDE (effective_risk) with the decision path's helper (folds in device-store
     // metadata the Console can't see; never reads LOWER than enforcement). Fall back to max(overlay, floor) if omitted.
-    const effSev = (d.effective_risk && d.effective_risk.trim()) || riskMax(sev || "none", grpSev || "none");
+    const effSev = riskReadable
+      ? (d.effective_risk && d.effective_risk.trim()) || riskMax(sev || "none", grpSev || "none")
+      : deviceEffectiveRiskWithoutOverlay(d.effective_risk);
     const st = deviceStateOf(d, obs, rt, effSev);
     applyUpdateState(st, updates[d.identity]);
     return { d, rt, obs, sev, grpSev, effSev, st };
@@ -463,6 +485,10 @@ async function renderList(host) {
 
   if (!current()) return;
   host.innerHTML = "";
+  if (!riskReadable) host.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
+    en: "Risk settings cannot be read. Devices remain visible; missing effective risk is Unknown and risk editing is unavailable.",
+    ja: "リスク設定を取得できません。デバイス一覧は表示できますが、実効リスクのない項目は不明となり編集できません。",
+  }) }));
   const stat = (key, dot, n, label) => el("div", {
     class: "dev-stat" + (ff === key ? " is-active" : ""),
     onClick: () => { _devicesState.fleet = (ff === key ? "all" : key); renderList(host); },
@@ -588,8 +614,8 @@ async function renderList(host) {
       el("td", {}, deviceCertCell(certMap[deviceKey(d.identity)])),
       el("td", {}, postureFactsCell(st.posture)),
       el("td", {}, el("div", { class: "dev-signals" }, signals)),
-      el("td", {}, (!effSev || effSev === "none") ? el("span", { class: "dev-risk-ok", text: bl({ en: "Normal", ja: "通常" }) }) : uiBadge(riskLabel(effSev), riskTone(effSev))),
-      el("td", { class: "ui-row-actions", style: "text-align:right" }, el("div", { style: "display:flex;gap:7px;justify-content:flex-end;align-items:center" }, [primary, overflowMenu(d, host, sev, grpSev)])),
+      el("td", {}, effSev === "unknown" ? uiBadge(bl({ en: "Unknown", ja: "不明" }), "off") : (!effSev || effSev === "none") ? el("span", { class: "dev-risk-ok", text: bl({ en: "Normal", ja: "通常" }) }) : uiBadge(riskLabel(effSev), riskTone(effSev))),
+      el("td", { class: "ui-row-actions", style: "text-align:right" }, el("div", { style: "display:flex;gap:7px;justify-content:flex-end;align-items:center" }, [primary, overflowMenu(d, host, sev, grpSev, riskReadable)])),
     ]);
   });
   host.appendChild(el("table", { class: "ui-table" }, [

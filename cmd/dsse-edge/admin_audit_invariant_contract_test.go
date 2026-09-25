@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 
 	agenttool "github.com/lantern-networks/dsse-core/agenttool"
 	appcatalog "github.com/lantern-networks/dsse-core/appcatalog"
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	endpointinventory "github.com/lantern-networks/dsse-core/endpointinventory"
 	humanidentity "github.com/lantern-networks/dsse-core/humanidentity"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
@@ -99,6 +101,21 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 		{
 			name:  "adminApplicationDeleteAuditLog",
 			audit: adminApplicationDeleteAuditLog("tenant_audit_cp0020", auditID, evaluator, now),
+		},
+		{
+			name: "assetCatalogAuditLog/endpoint",
+			audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/endpoints", nil), "endpoint", auditID, "upsert", "saved",
+				assetcatalog.Endpoint{ID: auditID, TenantID: "tenant_audit_cp0020", Alias: rawSubject, Address: rawDestination, Identity: rawActorUserID, Tags: []string{rawTokenAudience}}, evaluator, now),
+		},
+		{
+			name: "assetCatalogAuditLog/group",
+			audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/groups", nil), "group", auditID, "upsert", "persistence_unconfirmed",
+				assetcatalog.Group{ID: auditID, TenantID: "tenant_audit_cp0020", Alias: rawSubject, StaticMembers: []string{rawTokenAudience}}, evaluator, now),
+		},
+		{
+			name: "assetCatalogAuditLog/service",
+			audit: assetCatalogAuditLog(httptest.NewRequest("POST", "/admin/assets/services", nil), "service", auditID, "upsert", "saved",
+				assetcatalog.Service{ID: auditID, TenantID: "tenant_audit_cp0020", Alias: rawSubject, Ports: []assetcatalog.PortProto{{Protocol: rawMetadataValue, Port: 443}}}, evaluator, now),
 		},
 		{
 			name: "adminPolicyCandidateAuditLog",
@@ -566,6 +583,7 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 		"adminApplicationCatalogAuditLog":   true,
 		"adminApplicationDeleteAuditLog":    true,
 		"adminApplicationPublishAuditLog":   true,
+		"assetCatalogAuditLog":              true,
 		"adminConnectorManagementAuditLog":  true,
 		"adminDelegatedAccessGrantAuditLog": true,
 		"adminEndpointInventoryAuditLog":    true,

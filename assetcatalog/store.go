@@ -229,7 +229,7 @@ func (s *Store) upsertEndpoint(e Endpoint, application, allowManual bool) (Endpo
 			s.aliases[e.TenantID] = previousAliases
 			s.seq = previousSeq
 			s.generation--
-			return Endpoint{}, fmt.Errorf("endpoint %s update was not confirmed persisted: %w", e.ID, err)
+			return Endpoint{}, fmt.Errorf("%w: endpoint %s update: %v", ErrPersistence, e.ID, err)
 		}
 	}
 	return e, nil
@@ -377,7 +377,7 @@ func (s *Store) deleteEndpoint(tenant, id string, application, allowManual bool)
 		s.endpoints[tenant][id] = previous
 		s.aliases[tenant] = previousAliases
 		s.generation--
-		return false, fmt.Errorf("endpoint %s deletion was not confirmed persisted: %w", id, err)
+		return false, fmt.Errorf("%w: endpoint %s deletion: %v", ErrPersistence, id, err)
 	}
 	return true, nil
 }

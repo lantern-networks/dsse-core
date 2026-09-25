@@ -308,11 +308,11 @@ async function renameConnector(id, current, host) {
   const context = connectorManagementContext(host);
   if (!context.current()) return;
   pending.add(key);
-  let closed = false, busy = false, attempted = false;
+  let closed = false, busy = false, attempted = false, confirmed = false;
   const f = uiField({ name: "name", label: bl({ en: "Connector name", ja: "コネクタ名" }), value: current || "", placeholder: bl({ en: "Tokyo DC connector", ja: "東京DC コネクタ" }), hint: bl({ en: "A friendly name shown in the console. Leave empty to clear.", ja: "コンソール表示用の分かりやすい名前。空で解除。" }) });
   const save = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
   const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
-  const m = uiModal({ title: bl({ en: "Rename connector", ja: "コネクタの名前変更" }), body: [f.el, notice], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), save], onClose: () => { closed = true; if (!busy) pending.delete(key); } });
+  const m = uiModal({ title: bl({ en: "Rename connector", ja: "コネクタの名前変更" }), body: [f.el, notice], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), save], onClose: () => { closed = true; if (!busy && (!attempted || confirmed || !context.current())) pending.delete(key); } });
   save.onclick = async () => {
     if (busy || attempted || closed || !context.current()) return;
     busy = true; attempted = true; save.disabled = true;
@@ -326,11 +326,12 @@ async function renameConnector(id, current, host) {
       if (closed || !context.current()) return;
       const row = connectorManagementReadback(read, id, context.tenant);
       if (!row || row.display_name !== name || row.name !== r.body.name) throw new Error("Unconfirmed connector readback");
+      confirmed = true;
       m.close(); uiToast(bl({ en: "Renamed.", ja: "名前を変更しました。" }), "ok"); renderSiteList(host);
     } catch (_) {
       if (closed || !context.current()) return;
       notice.textContent = connectorManagementError(); notice.style.display = "";
-    } finally { busy = false; if (closed) pending.delete(key); }
+    } finally { busy = false; if (closed && (!attempted || confirmed || !context.current())) pending.delete(key); }
   };
   f.focus();
 }

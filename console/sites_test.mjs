@@ -521,6 +521,8 @@ test('connector rename does not claim success on empty ACK or stale readback',as
   assert.equal(x.calls.filter(c=>c.method==='POST').length,1);
   assert.equal(x.modals[0].footer[1].disabled,true);
   assert.equal(x.toasts.length,0);assert.equal(x.modals[0].body[1].style.display,'');assert.equal(x.f.host.__renderSeq,undefined);
+  x.modals[0].onClose();await x.f.context.renameConnector('c','Old',x.f.host);
+  assert.equal(x.modals.length,1); // a new write needs a verified list reload first
  }
 });
 

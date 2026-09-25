@@ -128,7 +128,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			if bindingErr != nil {
 				result = "error"
 			}
-			audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: cid, TenantID: tenant}, evaluator, now)
+			audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: cid, TenantID: tenant}, r, evaluator, now)
 			audit.ActorUserID = auditActorPrincipal(r)
 			kind := "route_binding"
 			audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
@@ -347,7 +347,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_upserted", saved, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_upserted", saved, r, evaluator, now), now)
 		detail, _, derr := adminSiteGetMerged(r.Context(), registry, siteStore, tenantID, saved.SiteID, connectorTunnelStatus, now)
 		if derr != nil {
 			writeError(w, http.StatusBadRequest, derr)
@@ -388,7 +388,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_deleted", adminSiteModel{SiteID: siteID, TenantID: tenantID}, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_deleted", adminSiteModel{SiteID: siteID, TenantID: tenantID}, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "deleted": true})
 	}))
 	// Site Networks (docs/site_private_access_design.md): the networks a SITE serves, bound ONCE to the site and
@@ -484,7 +484,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		if bindingErr != nil {
 			result = "error"
 		}
-		audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: siteID, TenantID: tenant}, evaluator, now)
+		audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: siteID, TenantID: tenant}, r, evaluator, now)
 		audit.ActorUserID = auditActorPrincipal(r)
 		kind := "route_binding"
 		audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
@@ -602,7 +602,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusNotFound, fmt.Errorf("site %s is absent", r.PathValue("site_id")))
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{SiteID: result.SiteID, TenantID: tenantID, BootstrapSecretHash: connectorRuntimeSecretHash(result.BootstrapSecret)}, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminSiteAuditLog("admin_site_enrollment_command_issued", adminSiteModel{SiteID: result.SiteID, TenantID: tenantID, BootstrapSecretHash: connectorRuntimeSecretHash(result.BootstrapSecret)}, r, evaluator, now), now)
 		writeJSON(w, http.StatusOK, result)
 	}))
 }

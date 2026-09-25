@@ -166,7 +166,8 @@ func TestAssetRuleDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 		for _, group := range listed {
 			if group.ID == "group-a" {
 				found = true
-				if group.Alias != wantAlias || len(group.StaticMembers) != wantMembers {
+				if group.Alias != wantAlias || len(group.StaticMembers) != wantMembers ||
+					(wantMembers == 1 && group.StaticMembers[0] != "ep-a") {
 					t.Fatalf("Edge HTTP group=%+v, want alias=%q members=%d", group, wantAlias, wantMembers)
 				}
 			}
@@ -181,7 +182,8 @@ func TestAssetRuleDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 				saved, present = group, true
 			}
 		}
-		if present != (wantAlias != "") || (present && (saved.Alias != wantAlias || len(saved.StaticMembers) != wantMembers)) {
+		if present != (wantAlias != "") || (present && (saved.Alias != wantAlias || len(saved.StaticMembers) != wantMembers ||
+			(wantMembers == 1 && saved.StaticMembers[0] != "ep-a"))) {
 			t.Fatalf("Edge durable group present=%v value=%+v, want alias=%q members=%d", present, saved, wantAlias, wantMembers)
 		}
 	}
@@ -202,7 +204,7 @@ func TestAssetRuleDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 		for _, service := range listed {
 			if service.ID == "service-a" {
 				found = true
-				if service.Alias != wantAlias || len(service.Ports) != 1 || service.Ports[0].Port != wantPort {
+				if service.Alias != wantAlias || len(service.Ports) != 1 || service.Ports[0].Port != wantPort || service.Ports[0].Protocol != "tcp" {
 					t.Fatalf("Edge HTTP service=%+v, want alias=%q port=%d", service, wantAlias, wantPort)
 				}
 			}
@@ -217,7 +219,7 @@ func TestAssetRuleDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 				saved, present = service, true
 			}
 		}
-		if present != (wantAlias != "") || (present && (saved.Alias != wantAlias || len(saved.Ports) != 1 || saved.Ports[0].Port != wantPort)) {
+		if present != (wantAlias != "") || (present && (saved.Alias != wantAlias || len(saved.Ports) != 1 || saved.Ports[0].Port != wantPort || saved.Ports[0].Protocol != "tcp")) {
 			t.Fatalf("Edge durable service present=%v value=%+v, want alias=%q port=%d", present, saved, wantAlias, wantPort)
 		}
 	}

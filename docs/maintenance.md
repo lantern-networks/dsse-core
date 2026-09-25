@@ -105,18 +105,16 @@ connector-only label misclassified Internet Access edits. Focused English and
 Japanese label regressions and a synthetic browser rendering check pass. This
 display correction does not alter the saved rule or raw audit record.
 
-People directory readers now see Unknown instead of Normal when their risk
-overlay read is denied or unavailable, and no risk edit selector is shown in
-that state. A headed browser check against a local public-server synthetic
-fixture confirmed the auditor view in English and Japanese; focused Console
-regressions cover denied, failed, malformed and successful reads. This does not
-confirm the administrator's display of user risk marks. The current public risk
-read is scoped through enrolled devices and needs a separate tenant-safe user
-risk path before that display can be accepted.
-The People page now requests a tenant-bound user-risk response and refuses the
-device-only response, so a saved user mark is no longer mislabeled Normal by an
-empty device map. Risk remains Unknown and editing unavailable on the current
-public server until that user-risk response is implemented.
+People directory readers see Unknown instead of Normal when their risk read is
+denied or unavailable, with no risk edit selector in that state. The public
+server now saves and reads user risk separately from device risk, scoped by
+tenant, and sends typed user marks to Edges ([PR #20](https://github.com/lantern-networks/dsse-core/pull/20)).
+A headed browser check against a local synthetic fixture showed a saved High
+mark, changed it to Critical, and showed Critical again after reloading the
+People page; the saved file and audit record agreed. Focused tests cover tenant
+and device ID collisions, permissions, save failures, legacy-state migration,
+the CP-to-Edge HTTP feed, and tenant erasure. Independent deployed CP/Edge
+traffic and multi-CP shared-state operation remain release checks.
 
 Devices readers whose risk overlay request is denied can still see the permitted
 device list. The page shows a server-provided effective risk when present, says

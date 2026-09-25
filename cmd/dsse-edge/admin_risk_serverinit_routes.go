@@ -11,6 +11,7 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
+	"github.com/lantern-networks/dsse-core/revocation"
 )
 
 // Risk-signal overlay, server-initiated access, and legacy-exception admin routes,
@@ -28,6 +29,16 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		var sig model.RiskSignal
 		if err := json.NewDecoder(r.Body).Decode(&sig); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+			return
+		}
+		if strings.EqualFold(strings.TrimSpace(sig.EntityType), "user") || strings.EqualFold(strings.TrimSpace(sig.EntityType), "human") {
+			resp, tenant, ok := writeUserRisk(w, r, config, sig)
+			if !ok {
+				return
+			}
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, userRiskAuditLog(r, tenant, resp, evaluator, now), now)
+			writeJSON(w, http.StatusOK, resp)
 			return
 		}
 		// ★★★ AND THE ENTITY HAS TO BE THEIRS (2026-08-22, measured — see
@@ -51,7 +62,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		}
 		// Phase 3: reflect the marking into the shared high-risk overlay so EVERY node's decision path
 		// treats the device as high-risk (fleet-consistent risk-based deny/re-auth; reconnect-elsewhere blocked).
-		if config.HighRiskOverlay != nil && (strings.EqualFold(resp.EntityType, "device") || strings.EqualFold(resp.EntityType, "user")) {
+		if config.HighRiskOverlay != nil && strings.EqualFold(resp.EntityType, "device") {
 			// The overlay carries the GRADED severity (medium|high|critical) so a policy can gate on any level
 			// (risk_state_severity). AdminHighRisk (the high-risk behaviours) is derived from high|critical only,
 			// in the decision enrichment — a medium mark is a policy signal, not a "high-risk" device/user.
@@ -64,12 +75,32 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}))
-	// GET /admin/risk-signals: the current high-risk overlay (entity id -> severity), so the console can show a
-	// current-risk badge on the device / person's own row (no free-text id). Device and user marks share the map.
+	// GET /admin/risk-signals: device marks by default, or typed, tenant-scoped user marks when requested.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
 		snap := map[string]string{}
+		var users []revocation.UserRisk
 		if config.HighRiskOverlay != nil {
-			snap = config.HighRiskOverlay.Snapshot()
+			var err error
+			snap, users, err = config.HighRiskOverlay.CheckedSnapshot()
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is unavailable"))
+				return
+			}
+		}
+		if r.URL.Query().Get("entity_type") == "user" {
+			if config.HighRiskOverlay == nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("risk state is unavailable"))
+				return
+			}
+			tenant := adminTenantIDFromRequest(r)
+			mine := map[string]string{}
+			for _, mark := range users {
+				if mark.TenantID == tenant {
+					mine[mark.ID] = mark.Severity
+				}
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"entity_type": "user", "tenant_id": tenant, "high_risk": mine})
+			return
 		}
 		// ★★ SCOPED, LIKE THE KILL-SWITCH LIST NEXT DOOR (2026-08-18). This overlay names every entity the
 		// deployment currently considers high risk, with the severity, and it was handed whole to any caller

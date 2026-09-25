@@ -144,12 +144,12 @@ func enrichDecisionRequestWithDeviceRisk(req model.DecisionRequest, deviceStore 
 			}
 		}
 	}
-	// A USER marked at ANY level sets risk_state_severity on ANY device (the overlay is keyed by the user id too),
+	// A USER marked at ANY level sets risk_state_severity on ANY device within that tenant,
 	// so a risk-gated policy (e.g. risk >= high -> re-authenticate, or >= medium -> something) bites regardless of
 	// which device they use; high/critical additionally raise AdminHighRisk.
 	if highRisk != nil && req.UserID != "" {
-		if sev, ok := highRisk.IsHighRisk(req.UserID); ok {
-			req.RiskStateSeverity = valueOrDefault(req.RiskStateSeverity, sev)
+		if sev, ok := highRisk.UserSeverity(req.TenantID, req.UserID); ok {
+			req.RiskStateSeverity = maxRiskSeverity(req.RiskStateSeverity, sev)
 			if sev == "high" || sev == "critical" {
 				req.AdminHighRisk = true
 			}

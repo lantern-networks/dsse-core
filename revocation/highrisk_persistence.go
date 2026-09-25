@@ -9,85 +9,89 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
-// Durable persistence for the high-risk device overlay (Phase 3). The control plane persists its set so a
-// restart cannot silently CLEAR every high-risk marking (which would let risky devices be treated as clean
-// fleet-wide on the next pull — a fail-open). Mirrors the admission-revocations store; a shared (Postgres)
-// persister also carries it across a CP failover.
-
+// The v1 device map also held untyped user IDs. A nonempty v1 snapshot must be
+// attributed before serving; otherwise upgrading it could silently clear a
+// user mark or assign it to the wrong tenant.
 type highRiskOverlayStateFile struct {
-	SchemaVersion string            `json:"schema_version"`
-	Devices       map[string]string `json:"devices"`
+	SchemaVersion string              `json:"schema_version"`
+	Devices       map[string]string   `json:"devices"`
+	Users         map[string]UserRisk `json:"users,omitempty"`
 }
 
-const highRiskOverlayStateSchemaVersion = "high_risk_overlay_state.v1"
+const highRiskOverlayStateSchemaVersion = "high_risk_overlay_state.v2"
 
-// SetStatePath enables durable file persistence at path (historical behaviour). A back-compat convenience over
-// SetPersister(blobstore.FilePersister{...}).
-func (o *HighRiskOverlay) SetStatePath(path string) {
-	if o == nil {
-		return
+func (o *HighRiskOverlay) SetStatePath(path string) error {
+	if o == nil || strings.TrimSpace(path) == "" {
+		return nil
 	}
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return
-	}
-	o.SetPersister(blobstore.FilePersister{Path: path})
+	return o.SetPersister(blobstore.FilePersister{Path: strings.TrimSpace(path)})
 }
 
-// SetPersister enables durable persistence via any Persister (file or shared Postgres) and loads existing state.
-func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) {
-	if o == nil {
-		return
+// SetPersister validates a complete snapshot before publishing either risk
+// namespace. A failed load leaves the previous state in memory but makes
+// checked reads and writes unavailable until a valid snapshot is restored.
+func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
+	if o == nil || p == nil {
+		return nil
+	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+	data, err := p.Load()
+	if err != nil {
+		o.mu.Lock()
+		o.loadErr = ErrRiskUnavailable
+		o.mu.Unlock()
+		return err
+	}
+	state := highRiskOverlayStateFile{Devices: map[string]string{}, Users: map[string]UserRisk{}}
+	if data != nil {
+		state, err = decodeRiskSnapshot(data)
+		if err != nil {
+			o.mu.Lock()
+			o.loadErr = ErrRiskUnavailable
+			o.mu.Unlock()
+			return err
+		}
+	} else if o.ConfigGeneration() != 0 {
+		return ErrRiskUnavailable
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.persister = p
-	if p == nil {
-		return
-	}
-	o.loadLocked()
+	o.devices, o.users = state.Devices, state.Users
+	o.persister, o.loadErr = p, nil
+	o.legacy = state.SchemaVersion == "high_risk_overlay_state.v1" && len(state.Devices) != 0
+	o.rebuildUserIndexLocked()
+	o.generation.Add(1)
+	o.mu.Unlock()
+	log.Printf("high_risk_overlay load: restored %d device and %d user marks", len(state.Devices), len(state.Users))
+	return nil
 }
 
-func (o *HighRiskOverlay) loadLocked() {
+// saveStateLocked is called with writeMu held. Checked administrative changes
+// call it before publishing their candidate maps to readers or the fleet.
+func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[string]UserRisk) (bool, error) {
 	if o.persister == nil {
-		return
+		return true, nil
 	}
-	data, err := o.persister.Load()
+	data, err := json.Marshal(highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: devices, Users: users})
 	if err != nil {
-		log.Printf("high_risk_overlay load: cannot read store (starting empty): %v", err)
-		return
-	}
-	if len(data) == 0 {
-		return
-	}
-	var f highRiskOverlayStateFile
-	if err := json.Unmarshal(data, &f); err != nil {
-		log.Printf("high_risk_overlay load: ignoring unparseable store: %v", err)
-		return
-	}
-	if f.Devices != nil {
-		o.devices = f.Devices
-	}
-	log.Printf("high_risk_overlay load: restored %d high-risk device(s) from the durable store", len(o.devices))
-}
-
-func (o *HighRiskOverlay) persistLocked() {
-	if o == nil || o.persister == nil {
-		return
-	}
-	data, err := json.Marshal(highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: o.devices})
-	if err != nil {
-		log.Printf("high_risk_overlay persist: marshal failed: %v", err)
-		return
+		return false, ErrRiskSave
 	}
 	if err := o.persister.Save(data); err != nil {
-		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
-		// change was lost when it was written; saying nothing would hide that an interrupted write could
-		// truncate it. Both are worth exactly one accurate sentence.
 		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
-			log.Printf("high_risk_overlay persist: saved, but NOT atomically — %v", err)
-		} else {
-			log.Printf("high_risk_overlay persist: save failed: %v", err)
+			return true, nil
 		}
+		return false, ErrRiskSave
+	}
+	return false, nil
+}
+
+// Legacy device paths retain their existing API, but persist both namespaces
+// together so a later device update cannot erase previously saved user marks.
+func (o *HighRiskOverlay) persistLocked() {
+	if o == nil || o.persister == nil || o.loadErr != nil || o.legacy {
+		return
+	}
+	if _, err := o.saveStateLocked(o.devices, o.users); err != nil {
+		log.Printf("high_risk_overlay persist: %v", err)
 	}
 }

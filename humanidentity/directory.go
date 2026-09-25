@@ -511,6 +511,17 @@ func (store *HumanIdentityDirectoryStore) List(_ context.Context, tenantID strin
 	return users, nil
 }
 
+// RiskIdentitySnapshot supplies complete attribution during legacy risk migration.
+func (store *HumanIdentityDirectoryStore) RiskIdentitySnapshot(_ context.Context) ([]model.HumanIdentity, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	people := make([]model.HumanIdentity, 0, len(store.users))
+	for _, person := range store.users {
+		people = append(people, person)
+	}
+	return people, nil
+}
+
 func (store *HumanIdentityDirectoryStore) Stats(ctx context.Context, tenantID string, now time.Time) (HumanIdentityDirectoryStats, error) {
 	users, err := store.List(ctx, tenantID)
 	if err != nil {

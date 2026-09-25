@@ -61,6 +61,12 @@ separately; its storage and audit behavior has not been browser-checked for this
 change. Real connector traffic and independent control-plane/Edge propagation
 remain release checks. This correction is not in the published 0.3.0 release.
 
+If a connector's route list cannot be loaded, Sites now shows a Retry state
+instead of an empty route list and hides binding controls until the read succeeds.
+A synthetic-browser check covered a failed read followed by recovery without
+a write; HTTP, transport and malformed-response regressions cover the same
+boundary. Public-server persistence and audit behavior remain unverified here.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

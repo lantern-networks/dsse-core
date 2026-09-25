@@ -29,7 +29,22 @@ import (
 // assets the CP never received deletes them on the first pull. That is not hypothetical: it removed 47 on this
 // lab's Edge (docs/2026-08-11_asset_reconciliation_deleted_47_operator_assets.md). Copy them up first —
 // ops/migrate_edge_assets_to_cp.sh.
-func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *assetcatalog.Store, syncEnrolled func(), configSourceURL string) {
+func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *assetcatalog.Store, syncEnrolled func(), configSourceURL string, audit func(*http.Request, string, string, string, string, any)) {
+	record := func(r *http.Request, kind, id, operation string, value any, err error, found bool) {
+		result := "saved"
+		if !found {
+			result = "not_found"
+		}
+		if err != nil {
+			result = "rejected"
+			if errors.Is(err, assetcatalog.ErrPersistence) || errors.Is(err, assetcatalog.ErrSharedUpdateUnconfirmed) {
+				result = "persistence_unconfirmed"
+			}
+		}
+		if audit != nil {
+			audit(r, kind, id, operation, result, value)
+		}
+	}
 	// syncNow refreshes the enrolled (steered) endpoints from the live inventory before a read, so the
 	// catalog reflects devices enrolled after startup without a restart. No-op when not wired (OSS/tests).
 	syncNow := func() {
@@ -81,6 +96,11 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		e.TenantID = tenantForWrite
 		stored, err := store.UpsertEndpoint(e)
+		item := stored
+		if err != nil {
+			item = e
+		}
+		record(r, "endpoint", item.ID, "upsert", item, err, true)
 		if err != nil {
 			writeAssetError(w, err, http.StatusBadRequest)
 			return
@@ -93,6 +113,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
+		record(r, "endpoint", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeAssetError(w, err, http.StatusInternalServerError) // durability unconfirmed — admin must know
 			return
@@ -129,6 +150,11 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		g.TenantID = tenantForWrite
 		stored, err := store.UpsertGroup(g)
+		item := stored
+		if err != nil {
+			item = g
+		}
+		record(r, "group", item.ID, "upsert", item, err, true)
 		if err != nil {
 			writeAssetError(w, err, http.StatusBadRequest)
 			return
@@ -148,6 +174,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		ok, err := store.DeleteGroup(adminTenantIDFromRequest(r), r.PathValue("id"))
+		record(r, "group", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeAssetError(w, err, http.StatusInternalServerError)
 			return
@@ -184,6 +211,11 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		svc.TenantID = tenantForWrite
 		stored, err := store.UpsertService(svc)
+		item := stored
+		if err != nil {
+			item = svc
+		}
+		record(r, "service", item.ID, "upsert", item, err, true)
 		if err != nil {
 			writeAssetError(w, err, http.StatusBadRequest)
 			return
@@ -196,6 +228,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		ok, err := store.DeleteService(adminTenantIDFromRequest(r), r.PathValue("id"))
+		record(r, "service", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeAssetError(w, err, http.StatusInternalServerError)
 			return

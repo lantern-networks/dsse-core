@@ -6360,7 +6360,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		assetStore.SyncEnrolledEndpoints(tenant, devices, time.Now().UTC())
 	}
 	syncEnrolledAssets()
-	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL)
+	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL,
+		func(r *http.Request, kind, id, operation, result string, value any) {
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
+				assetCatalogAuditLog(r, kind, id, operation, result, value, evaluator, now), now)
+		})
 
 	// Per-tenant end-user IdP registry (federated-auth connections + default), managed from the Console.
 	// Durable when -idp-connection-store is set so registered IdPs survive a restart.

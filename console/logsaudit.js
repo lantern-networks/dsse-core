@@ -239,7 +239,7 @@ function laAuditActor(row) {
 // audit action: admin_config_change rows carry the real mutation as method + path — render that (readable),
 // with a small tooltip mapping common paths to friendly names. Other event types use the prettified label.
 const _LA_PATH_NAME = {
-  "/admin/rules": { en: "Connector-access rule", ja: "コネクタアクセスルール" },
+  "/admin/rules": { en: "Access rule", ja: "アクセスルール" },
   "/admin/policies": { en: "Access policy", ja: "アクセスポリシー" },
   "/admin/dlp-rules": { en: "DLP rule", ja: "DLPルール" },
   "/admin/dlp-policies": { en: "DLP policy", ja: "DLPポリシー" },
@@ -256,7 +256,7 @@ function laAuditActionCell(row) {
   const meta = row.metadata || {};
   const method = laVal(meta, "method") || laVal(row, "action");
   const path = laVal(meta, "path") || laVal(row, "target_id");
-  // Friendly noun for a known base path (/admin/rules/{id} → "Connector-access rule").
+  // Friendly noun for a known base path; /admin/rules serves multiple rule planes.
   const base = "/" + String(path).split("/").slice(1, 3).join("/");
   const noun = _LA_PATH_NAME[base] ? bl(_LA_PATH_NAME[base]) : "";
   const verb = { POST: bl({ en: "Changed", ja: "変更" }), PUT: bl({ en: "Changed", ja: "変更" }), PATCH: bl({ en: "Changed", ja: "変更" }), DELETE: bl({ en: "Deleted", ja: "削除" }) }[method] || method;

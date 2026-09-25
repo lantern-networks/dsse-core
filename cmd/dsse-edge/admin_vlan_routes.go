@@ -91,6 +91,10 @@ func registerVLANRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		p.TenantID = tenantForWrite
 		saved, err := vlanBoundary.UpsertPolicy(p)
 		if err != nil {
+			if errors.Is(err, vlan.ErrPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("The network policy change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

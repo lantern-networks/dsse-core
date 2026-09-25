@@ -82,3 +82,47 @@ func TestVLANObjectHTTPRejectsUnconfirmedStorageAndPermitsRetry(t *testing.T) {
 		t.Fatal("deleted object revived after reload")
 	}
 }
+
+func TestVLANPolicyHTTPRejectsUnconfirmedStorageAndPermitsRetry(t *testing.T) {
+	store := vlan.NewStore()
+	p := &vlanSaveProbe{}
+	if err := store.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	registerVLANRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h }, store, "")
+	caller := adminIdentity{PrincipalID: "adm_network", TenantID: "tenant_network", Roles: []string{"admin"}, AuthMethod: "admin_session"}
+	post := func(id, status string) (int, string) {
+		return vlanScopeCall(t, mux, http.MethodPost, "/admin/vlan-boundary-policies", `{"id":"`+id+`","source_class":"managed_endpoint","dest_class":"server","mode":"deny","status":"`+status+`"}`, caller)
+	}
+	if code, body := post("pol-old", "active"); code != http.StatusOK {
+		t.Fatalf("seed: %d %s", code, body)
+	}
+	baseGeneration := store.ConfigGeneration()
+	baseData := string(p.data)
+	p.fail = true
+	for _, tc := range []struct{ id, status string }{{"pol-new", "active"}, {"pol-old", "disabled"}} {
+		if code, body := post(tc.id, tc.status); code != http.StatusServiceUnavailable || strings.Contains(body, "private storage location") {
+			t.Fatalf("failed policy write %q: %d %s", tc.id, code, body)
+		}
+		policies := store.ListPolicies()
+		if len(policies) != 1 || policies[0].ID != "pol-old" || policies[0].Status != "active" {
+			t.Fatalf("failed policy write became live: %#v", policies)
+		}
+		if store.ConfigGeneration() != baseGeneration || string(p.data) != baseData {
+			t.Fatal("failed policy write changed generation or saved bytes")
+		}
+	}
+	p.fail = false
+	if code, body := post("pol-old", "disabled"); code != http.StatusOK {
+		t.Fatalf("retry policy edit: %d %s", code, body)
+	}
+	reloaded := vlan.NewStore()
+	if err := reloaded.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	policies := reloaded.ListPolicies()
+	if len(policies) != 1 || policies[0].ID != "pol-old" || policies[0].Status != "disabled" {
+		t.Fatalf("policy edit missing after reload: %#v", policies)
+	}
+}

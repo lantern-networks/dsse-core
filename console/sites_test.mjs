@@ -270,3 +270,58 @@ for (const [name, change] of Object.entries(siteContextChanges)) {
 test('site uncertain save guidance is Japanese and inputs remain available for explicit retry', async () => {
   const f=siteEditorFixture(siteRequest,'ja');await f.submit();assert.match(f.modal.body.at(-1).textContent,/すでに反映/);assert.match(f.modal.body.at(-1).textContent,/新たな保存操作/);assert.equal(f.modal.footer.at(-1).disabled,false);
 });
+
+const listSite = () => ({site_id:'s',name:'Site',managed:true,health:'unknown',connector_count:0,online_count:0,regions:[]});
+const listConnector = () => ({id:'c',name:'Connector',tenant_id:'tenant-a',connector_group_id:'s',online:true});
+const catalogueResponse = (key, rows) => ({ok:true,status:200,body:{[key]:rows,count:rows?.length || 0}});
+function siteListFixture(options={}) {
+  const f=fixture(),state={authority:'',token:''},calls=[];
+  f.context.baseForPlane=()=>state.authority;f.context.localStorage={getItem:()=>state.token};f.context.idpSession={auth_method:'admin_session',tenant_id:'tenant-a'};
+  f.host.__siteCreateButton={disabled:false};
+  const read=async(method,path)=>{calls.push([method,path]);const key=path==='/admin/tenant'?'tenant':path==='/admin/sites'?'sites':'connectors';const response=options[key];if(response instanceof Error)throw response;if(response!==undefined)return response;return key==='tenant'?{ok:true,status:200,body:{tenant_id:'tenant-a'}}:catalogueResponse(key,key==='sites'?[listSite()]:[]);};
+  f.context.apiFetch=read;
+  return {...f,state,calls,read,render:()=>f.context.renderSiteList(f.host)};
+}
+for(const key of ['sites','connectors']){
+ for(const [name,response] of [
+  ['HTTP 503',{ok:false,status:503,body:{error:'private diagnostic'}}],['204',{ok:true,status:204,body:{[key]:[],count:0}}],
+  ['missing rows',{ok:true,status:200,body:{count:0}}],['object rows',{ok:true,status:200,body:{[key]:{},count:0}}],
+  ['missing count',{ok:true,status:200,body:{[key]:[]}}],['wrong count',{ok:true,status:200,body:{[key]:[],count:1}}],
+  ['null row',catalogueResponse(key,[null])],['array row',catalogueResponse(key,[[]])],['network',new Error('private diagnostic')],
+ ])test(`site list ${key} ${name} is unavailable rather than empty`,async()=>{
+  const f=siteListFixture({[key]:response});await f.render();assert.equal(f.states.at(-1).state,'error');assert.equal(f.host.__siteListReady,false);assert.equal(f.host.__siteCreateButton.disabled,true);assert.equal(f.host.children.length,0);assert.ok(!f.states.at(-1).message.includes('private diagnostic'));
+ });
+}
+for(const [name,patch] of [['identity',{site_id:' '}],['name',{name:{}}],['region',{region:[]}],['policy',{ha_policy:42}],['managed',{managed:1}],['expected',{expected_connector_count:-1}],['count',{connector_count:'0'}],['online',{online_count:1}],['health',{health:'bad'}],['regions',{regions:{}}],['region element',{regions:[null]}],['tenant',{tenant_id:'foreign'}]]){
+ test(`site list rejects malformed site ${name}`,async()=>{const f=siteListFixture({sites:catalogueResponse('sites',[{...listSite(),...patch}])});await f.render();assert.equal(f.states.at(-1).state,'error');});
+}
+for(const [name,patch] of [['identity',{id:''}],['tenant',{tenant_id:'foreign'}],['online',{online:'true'}],['group',{connector_group_id:{}}],['group whitespace',{connector_group_id:' s '}],['name',{name:null}],['heartbeat',{last_heartbeat_at:42}]]){
+ test(`site list rejects malformed connector ${name}`,async()=>{const f=siteListFixture({connectors:catalogueResponse('connectors',[{...listConnector(),...patch}])});await f.render();assert.equal(f.states.at(-1).state,'error');});
+}
+test('site list rejects duplicate identities instead of rendering conflicting controls',async()=>{
+ for(const key of ['sites','connectors']){const row=key==='sites'?listSite():listConnector();const f=siteListFixture({[key]:catalogueResponse(key,[row,row])});await f.render();assert.equal(f.states.at(-1).state,'error');}
+});
+test('site list supports verified empty arrays and nil Go slices, then retry restores a valid catalogue',async()=>{
+ for(const empty of [[],null]){const f=siteListFixture({sites:catalogueResponse('sites',empty),connectors:catalogueResponse('connectors',empty)});await f.render();assert.equal(f.states.at(-1).state,'empty');assert.equal(f.host.__siteListReady,true);assert.equal(f.host.__siteCreateButton.disabled,false);}
+ const options={connectors:{ok:false,status:503}};const f=siteListFixture(options);await f.render();options.connectors=catalogueResponse('connectors',[]);await f.states.at(-1).retry.onClick();assert.equal(f.host.__siteListReady,true);assert.equal(f.host.__siteCreateButton.disabled,false);assert.ok(f.host.children.length);
+});
+test('site list groups reserved property names and keeps unknown groups visible',async()=>{
+ const f=siteListFixture({sites:catalogueResponse('sites',[{...listSite(),site_id:'__proto__',connector_count:1,online_count:1}]),connectors:catalogueResponse('connectors',[{...listConnector(),name:'Owned connector',connector_group_id:'__proto__'},{...listConnector(),id:'other',name:'Unassigned connector',connector_group_id:'constructor'}])});
+ await f.render();const text=node=>[node.textContent||'',...(node.children||[]).map(text)].join(' ');const content=text(f.host);assert.match(content,/Owned connector/);assert.match(content,/Unassigned connector/);assert.match(content,/Connectors not assigned/);assert.equal(f.host.__siteListReady,true);
+});
+test('site list checks the selected tenant and authenticated cookie session without new permissions',async()=>{
+ const selected=siteListFixture({connectors:catalogueResponse('connectors',[listConnector()])});selected.context.operateTenant='other';await selected.render();assert.equal(selected.states.at(-1).state,'error');
+ for(const tenant_id of [undefined, null, '', ' tenant-a', 42]){const f=siteListFixture();f.context.idpSession={auth_method:'admin_session',tenant_id};await f.render();assert.equal(f.states.at(-1).state,'error');assert.equal(f.calls.length,0);}
+});
+test('connector-only token does not need the tenant-model endpoint; unknown scope still rejects mixed tenants',async()=>{
+ for(const mixed of [false,true]){const conns=[listConnector()];if(mixed)conns.push({...listConnector(),id:'other',tenant_id:'foreign'});const f=siteListFixture({connectors:catalogueResponse('connectors',conns)});f.context.idpSession=null;f.state.token='connector-only';await f.render();assert.equal(f.calls.length,2);assert.ok(f.calls.every(([,path])=>path!='/admin/tenant'));assert.equal(f.host.__siteListReady,!mixed);}
+});
+
+const listContextChanges={selection:f=>{f.context.operateTenant='other';},session:f=>{f.context.idpSession={};},authority:f=>{f.state.authority='other';},credential:f=>{f.state.token='other';},detached:f=>{f.host.isConnected=false;},generation:f=>{f.context.freshRender(f.host);}};
+for(const [name,change] of Object.entries(listContextChanges))for(const stage of ['catalogues'])test(`site list drops late ${stage} ${name} responses`,async()=>{
+ for(const fail of [false,true]){
+  const f=siteListFixture(),gate=deferredSiteReply();f.context.apiFetch=async(method,path)=>{if((stage==='tenant'&&path==='/admin/tenant')||(stage==='catalogues'&&path==='/admin/sites'))return gate.promise;return f.read(method,path);};
+  const pending=f.render();await new Promise(r=>setImmediate(r));change(f);if(fail)gate.reject(Error('private diagnostic'));else gate.resolve(stage==='tenant'?{ok:true,status:200,body:{tenant_id:'tenant-a'}}:catalogueResponse('sites',[listSite()]));await pending;assert.equal(f.states.at(-1).state,'loading');assert.equal(f.host.__siteListReady,false);assert.equal(f.host.__siteCreateButton.disabled,true);assert.equal(f.host.children.length,0);
+ }
+});
+test('site list Japanese error distinguishes unavailable data from no connectors',async()=>{const f=siteListFixture({connectors:{ok:false,status:503}});f.context.bl=x=>x.ja;await f.render();assert.match(f.states.at(-1).message,/確認できませんでした/);assert.equal(f.states.at(-1).retry.label,'再試行');});

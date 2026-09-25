@@ -3435,6 +3435,7 @@ components:
       required:
         - id
         - tenant_id
+        - display_name
         - application_ids
         - private_base_url_configured
         - runtime_secret_configured
@@ -3450,6 +3451,9 @@ components:
           type: string
         name:
           type: string
+        display_name:
+          type: string
+          description: Operator-set name, empty when cleared. Present in both rename ACK and connector catalogue for readback verification.
         edge_region_id:
           type: string
         edge_cluster_id:

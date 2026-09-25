@@ -474,3 +474,72 @@ test('invalid cookie tenant refuses a site deletion dialog; scoped API token nee
   await f.modals.at(-1).opts.footer[1].onclick(); assert.equal(f.state.reloads, 1);
   assert.equal(f.calls.some(c => c[1] === '/admin/tenant'), false);
 });
+for(const action of ['rename','remove'])for(const failure of ['http','transport'])for(const language of ['en','ja'])test(`connector ${action} retains state and reports safe ${language} ${failure} failure`,async()=>{
+ const f=fixture(),toasts=[];let modal,reloads=0,closed=false;
+ f.host.isConnected=true;f.context.baseForPlane=()=>'/control';f.context.localStorage={getItem:()=>''};
+ f.context.bl=x=>x[language];f.context.uiToast=(m,kind)=>toasts.push([m,kind]);f.context.renderSiteList=()=>reloads++;
+ f.context.uiConfirm=async()=>true;f.context.uiField=()=>({el:f.context.el('input'),get:()=> 'Changed',focus(){}});
+ f.context.uiModal=opts=>{modal=opts;return{close(){closed=true;opts.onClose?.()}}};
+ f.context.apiFetch=async()=>{if(failure==='transport')throw Error('private diagnostic');return{ok:false,status:503,body:{error:'private diagnostic'}}};
+ if(action==='rename'){await f.context.renameConnector('connector','Original',f.host);await modal.footer[1].onclick();assert.equal(modal.footer[1].disabled,true);assert.equal(closed,false);assert.match(modal.body[1].textContent,language==='ja'?/再読込/:/Reload/)}
+ else await f.context.removeConnector('connector','Original',f.host);
+ if(action==='remove'){assert.equal(toasts.length,1);assert.equal(toasts[0][1],'err');assert.doesNotMatch(toasts[0][0],/private diagnostic/);assert.match(toasts[0][0],language==='ja'?/再読込/:/Reload/)}
+ assert.equal(reloads,0);
+});
+
+function connectorManagementFixture() {
+ const f=fixture(), calls=[], toasts=[], modals=[];
+ f.host.isConnected=true;
+ f.context.operateTenant='tenant';f.context.baseForPlane=()=>'/control';f.context.localStorage={getItem:()=>''};
+ f.context.uiToast=(...args)=>toasts.push(args);f.context.renderSiteList=()=>{f.host.__renderSeq=(f.host.__renderSeq||0)+1};
+ f.context.uiField=spec=>({el:f.context.el('input'),get:()=>spec.value||'',focus(){}});
+ f.context.uiModal=spec=>{modals.push(spec);return{close(){spec.onClose?.()}}};
+ f.context.uiConfirm=async()=>true;
+ return {f,calls,toasts,modals,row:(display_name,name=display_name)=>({id:'c',tenant_id:'tenant',online:false,name,display_name}),
+  reply:(method,path,body)=>{calls.push({method,path,body});return {ok:false,status:503}}};
+}
+
+test('connector rename confirms exact ACK and catalogue, including clearing display name',async()=>{
+ for(const [input,reported] of [['New','New'],['','Self reported']]) {
+  const x=connectorManagementFixture();x.f.context.uiField=()=>({el:x.f.context.el('input'),get:()=>input,focus(){}});
+  x.f.context.apiFetch=async(method,path,body)=>{x.calls.push({method,path,body});
+   return method==='POST' ? {ok:true,status:200,body:x.row(input,reported)} :
+    {ok:true,status:200,body:{connectors:[x.row(input,reported)],count:1}};
+  };
+  await x.f.context.renameConnector('c','Original',x.f.host);await x.modals[0].footer[1].onclick();
+  assert.deepEqual(x.calls.map(c=>c.method),['POST','GET']);assert.equal(x.calls[0].body.name,input);
+  assert.equal(x.toasts.at(-1)[1],'ok');assert.equal(x.f.host.__renderSeq,1);
+ }
+});
+
+test('connector rename does not claim success on empty ACK or stale readback',async()=>{
+ for(const response of [{ok:true,status:200,body:{}},{ok:true,status:200,body:{id:'c',tenant_id:'tenant',display_name:'New',name:'New'}}]) {
+  const x=connectorManagementFixture();x.f.context.uiField=()=>({el:x.f.context.el('input'),get:()=> 'New',focus(){}});
+  x.f.context.apiFetch=async(method,path,body)=>{x.calls.push({method,path,body});return method==='POST'?response:{ok:true,status:200,body:{connectors:[x.row('Old')],count:1}}};
+  await x.f.context.renameConnector('c','Old',x.f.host);await x.modals[0].footer[1].onclick();
+  await x.modals[0].footer[1].onclick();
+  assert.equal(x.calls.filter(c=>c.method==='POST').length,1);
+  assert.equal(x.modals[0].footer[1].disabled,true);
+  assert.equal(x.toasts.length,0);assert.equal(x.modals[0].body[1].style.display,'');assert.equal(x.f.host.__renderSeq,undefined);
+ }
+});
+
+test('connector removal requires matching ACK and absent readback without duplicate DELETE',async()=>{
+ for(const ack of [{ok:true,status:200,body:{}},{ok:true,status:200,body:{connector_id:'c',removed:true}}]) {
+  const x=connectorManagementFixture();let finish,entered;const started=new Promise(resolve=>entered=resolve);
+  x.f.context.apiFetch=(method,path,body)=>{x.calls.push({method,path,body});if(method==='DELETE'){entered();return new Promise(resolve=>finish=()=>resolve(ack))}
+   return Promise.resolve({ok:true,status:200,body:{connectors:[],count:0}})};
+  const first=x.f.context.removeConnector('c','Old',x.f.host);await started;
+  await x.f.context.removeConnector('c','Old',x.f.host);assert.equal(x.calls.filter(c=>c.method==='DELETE').length,1);
+  finish();await first;assert.equal(x.toasts.at(-1)[1],ack.body.removed?'ok':'err');
+  assert.equal(x.calls.filter(c=>c.method==='GET').length,ack.body.removed?1:0);
+  if(!ack.body.removed){await x.f.context.removeConnector('c','Old',x.f.host);assert.equal(x.calls.filter(c=>c.method==='DELETE').length,1)}
+ }
+});
+
+test('connector removal discards late ACK after tenant change',async()=>{
+ const x=connectorManagementFixture();let finish,entered;const started=new Promise(resolve=>entered=resolve);
+ x.f.context.apiFetch=(method,path,body)=>{x.calls.push({method,path,body});entered();return new Promise(resolve=>finish=()=>resolve({ok:true,status:200,body:{connector_id:'c',removed:true}}))};
+ const first=x.f.context.removeConnector('c','Old',x.f.host);await started;x.f.context.operateTenant='other';finish();await first;
+ assert.equal(x.calls.length,1);assert.equal(x.toasts.length,0);
+});

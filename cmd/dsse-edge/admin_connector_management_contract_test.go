@@ -42,6 +42,27 @@ func TestAdminConnectorManagementOpenAPIContract(t *testing.T) {
 	}
 }
 
+func TestAdminConnectorDisplayNameProjectionIncludesClearedValue(t *testing.T) {
+	base := model.ConnectorRegistration{ID: "c", TenantID: "tenant", Name: "self-reported"}
+	for _, want := range []string{"Tokyo", ""} {
+		projected := adminConnectorFromModel(connector.SetDisplayName(base, want))
+		if projected.DisplayName != want {
+			t.Fatalf("display name = %q, want %q", projected.DisplayName, want)
+		}
+		data, err := json.Marshal(projected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(data, &body); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := body["display_name"]; !ok || got != want {
+			t.Fatalf("JSON display_name = %v, present %v, want %q", got, ok, want)
+		}
+	}
+}
+
 func TestAdminConnectorManagementAPIListAndDetailUseAdminSafeDTO(t *testing.T) {
 	registry := seedAdminConnectorRegistry(t)
 	handler := newServerWithConfig(serverConfig{
@@ -203,12 +224,14 @@ func TestAdminConnectorManagementAPIRotatesRuntimeSecretAndAuditsNonSecretMetada
 		Evaluator:        testEvaluator(),
 		Writer:           writer,
 		Registry:         registry,
-		AdminAuth:        newAdminAuthStore(),
+		AdminAuth:        seedAdminConnectorAPITokenAuth("rotation-admin", "rotation-private-token", []string{"admin.connectors.write"}),
 		AdminAuditOutbox: outbox,
 	})
 	body := `{"runtime_secret":"rotated-runtime-secret-0001"}`
 	req := httptest.NewRequest(http.MethodPost, "/admin/connectors/conn_admin_001/runtime-secret/rotate", strings.NewReader(body))
 	req.Header.Set("content-type", "application/json")
+	req.Header.Set("Authorization", "Bearer rotation-private-token")
+	req.Header.Set("X-Actor-User-ID", "forged-actor")
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -236,12 +259,18 @@ func TestAdminConnectorManagementAPIRotatesRuntimeSecretAndAuditsNonSecretMetada
 	if _, ok := stored.Metadata["runtime_secret_rotated_by"]; ok {
 		t.Fatalf("stored connector metadata included raw actor user field: %#v", stored.Metadata)
 	}
-	if len(outbox.insertedAudits) != 1 || outbox.insertedAudits[0].EventType != "admin_connector_runtime_secret_rotated" {
-		t.Fatalf("outbox inserted audits = %#v, want connector runtime secret rotation", outbox.insertedAudits)
+	domains := []model.AuditLog{}
+	for _, a := range outbox.insertedAudits {
+		if a.EventType == "admin_connector_runtime_secret_rotated" {
+			domains = append(domains, a)
+		}
 	}
-	audit := outbox.insertedAudits[0]
-	if audit.SourceIP != nil || audit.ActorUserID != nil {
-		t.Fatalf("connector audit included raw source/user fields: %#v", audit)
+	if len(domains) != 1 {
+		t.Fatalf("rotation domain audits=%d", len(domains))
+	}
+	audit := domains[0]
+	if audit.SourceIP != nil || stringPtrValue(audit.ActorUserID) != "rotation-admin" || stringPtrValue(audit.Result) != "success" {
+		t.Fatalf("wrong authenticated actor/result: %#v", audit)
 	}
 	if audit.Metadata["connector_metadata_recorded_scope"] != "none" || audit.Metadata["runtime_secret_material_recorded"] != false || audit.Metadata["runtime_secret_hash_recorded"] != false {
 		t.Fatalf("connector audit metadata = %#v, want non-secret admin boundary", audit.Metadata)

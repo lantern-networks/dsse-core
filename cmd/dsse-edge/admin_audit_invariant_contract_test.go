@@ -233,7 +233,7 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				Status:                  "healthy",
 				RuntimeSecretConfigured: true,
 				MetadataKeyCount:        1,
-			}, evaluator, now),
+			}, nil, evaluator, now),
 		},
 		{
 			name: "adminSiteAuditLog",

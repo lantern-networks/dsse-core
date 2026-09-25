@@ -155,6 +155,78 @@ func TestAssetRuleDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 	request(http.MethodPost, ready.URL, "/admin/assets/endpoints", `{"id":"ep-a","kind":"network","alias":"example-a","address":"a.example.test"}`)
 	request(http.MethodPost, ready.URL, "/admin/rules", `{"id":"rule-a","plane":"egress","priority":10,"source":["*"],"destination":["ep-a"],"action":{"access":"deny"}}`)
 	check("a.example.test")
+	checkGroup := func(wantAlias string, wantMembers int) {
+		t.Helper()
+		check("a.example.test")
+		var listed []assetcatalog.Group
+		if err := json.Unmarshal(request(http.MethodGet, edge.URL, "/admin/assets/groups", ""), &listed); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, group := range listed {
+			if group.ID == "group-a" {
+				found = true
+				if group.Alias != wantAlias || len(group.StaticMembers) != wantMembers {
+					t.Fatalf("Edge HTTP group=%+v, want alias=%q members=%d", group, wantAlias, wantMembers)
+				}
+			}
+		}
+		if found != (wantAlias != "") {
+			t.Fatalf("Edge HTTP group present=%v, want alias=%q", found, wantAlias)
+		}
+		var saved assetcatalog.Group
+		present := false
+		for _, group := range processDistributionAssets(t, edgeAssetPath).ListGroups(processDistributionTenant) {
+			if group.ID == "group-a" {
+				saved, present = group, true
+			}
+		}
+		if present != (wantAlias != "") || (present && (saved.Alias != wantAlias || len(saved.StaticMembers) != wantMembers)) {
+			t.Fatalf("Edge durable group present=%v value=%+v, want alias=%q members=%d", present, saved, wantAlias, wantMembers)
+		}
+	}
+	request(http.MethodPost, ready.URL, "/admin/assets/groups", `{"id":"group-a","alias":"group-a","static_members":["ep-a"]}`)
+	checkGroup("group-a", 1)
+	request(http.MethodPost, ready.URL, "/admin/assets/groups", `{"id":"group-a","alias":"group-renamed","static_members":[]}`)
+	checkGroup("group-renamed", 0)
+	request(http.MethodDelete, ready.URL, "/admin/assets/groups/group-a", "")
+	checkGroup("", 0)
+	checkService := func(wantAlias string, wantPort int) {
+		t.Helper()
+		check("a.example.test")
+		var listed []assetcatalog.Service
+		if err := json.Unmarshal(request(http.MethodGet, edge.URL, "/admin/assets/services", ""), &listed); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, service := range listed {
+			if service.ID == "service-a" {
+				found = true
+				if service.Alias != wantAlias || len(service.Ports) != 1 || service.Ports[0].Port != wantPort {
+					t.Fatalf("Edge HTTP service=%+v, want alias=%q port=%d", service, wantAlias, wantPort)
+				}
+			}
+		}
+		if found != (wantAlias != "") {
+			t.Fatalf("Edge HTTP service present=%v, want alias=%q", found, wantAlias)
+		}
+		var saved assetcatalog.Service
+		present := false
+		for _, service := range processDistributionAssets(t, edgeAssetPath).ListServices(processDistributionTenant) {
+			if service.ID == "service-a" {
+				saved, present = service, true
+			}
+		}
+		if present != (wantAlias != "") || (present && (saved.Alias != wantAlias || len(saved.Ports) != 1 || saved.Ports[0].Port != wantPort)) {
+			t.Fatalf("Edge durable service present=%v value=%+v, want alias=%q port=%d", present, saved, wantAlias, wantPort)
+		}
+	}
+	request(http.MethodPost, ready.URL, "/admin/assets/services", `{"id":"service-a","alias":"service-a","ports":[{"protocol":"tcp","port":443}]}`)
+	checkService("service-a", 443)
+	request(http.MethodPost, ready.URL, "/admin/assets/services", `{"id":"service-a","alias":"service-renamed","ports":[{"protocol":"tcp","port":8443}]}`)
+	checkService("service-renamed", 8443)
+	request(http.MethodDelete, ready.URL, "/admin/assets/services/service-a", "")
+	checkService("", 0)
 	request(http.MethodPost, ready.URL, "/admin/assets/endpoints", `{"id":"ep-a","kind":"network","alias":"example-a","address":"b.example.test"}`)
 	check("b.example.test")
 	request(http.MethodDelete, ready.URL, "/admin/assets/endpoints/ep-a", "")

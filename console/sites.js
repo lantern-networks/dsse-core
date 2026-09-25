@@ -36,7 +36,37 @@ function siteExpectedConnectorCount(value) {
   return Number.isSafeInteger(count) ? count : null;
 }
 
+// The detail response's region is a runtime summary. Verify the configured region in the list readback.
+function siteSavedFields(row, request, includeRegion) {
+  if (!row || typeof row !== "object" || Array.isArray(row) || row.managed !== true || row.site_id !== request.site_id) return false;
+  const keys = ["name", "deployment_type", "routing_namespace", "ha_policy"];
+  if (includeRegion) keys.push("region");
+  if (keys.some(key => (row[key] !== undefined && typeof row[key] !== "string") ||
+      (row[key] || "") !== (request[key] || "").trim())) return false;
+  return (row.expected_connector_count === undefined ? 0 : row.expected_connector_count) === request.expected_connector_count;
+}
+
+function siteSaveAcknowledged(response, request) {
+  return !!response && response.ok && response.status === 200 && siteSavedFields(response.body, request, false);
+}
+
+function siteSaveReadback(response, request) {
+  if (!response || !response.ok || response.status !== 200 || !response.body || !Array.isArray(response.body.sites)) return false;
+  const rows = response.body.sites;
+  if (rows.some(row => !row || typeof row !== "object" || Array.isArray(row) || typeof row.site_id !== "string")) return false;
+  const matches = rows.filter(row => row.site_id === request.site_id);
+  return matches.length === 1 && siteSavedFields(matches[0], request, true);
+}
+
 function openSiteForm(host, existing) {
+  const selection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const session = () => typeof idpSession === "undefined" ? null : idpSession;
+  const authority = () => baseForPlane("control");
+  const credential = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const initial = { selection: selection(), session: session(), authority: authority(), credential: credential(), generation: host.__renderSeq };
+  let closed = false, busy = false;
+  const current = () => !closed && host.isConnected !== false && host.__renderSeq === initial.generation &&
+    selection() === initial.selection && session() === initial.session && authority() === initial.authority && credential() === initial.credential;
   const editing = !!existing;
   const s = { ...(existing || {}) };
   // Do not turn an unreadable hidden setting into an empty setting during a visible-field edit.
@@ -55,24 +85,43 @@ function openSiteForm(host, existing) {
   } });
   const deployF = uiField({ name: "deployment_type", label: bl({ en: "Deployment type", ja: "デプロイ種別" }), value: s.deployment_type || "", placeholder: "vm / container / appliance" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: editing ? bl({ en: "Save", ja: "保存" }) : bl({ en: "Create", ja: "作成" }) });
+  const notice = el("div", { role: "alert", class: "ui-state ui-state-error", style: "display:none" });
+  const fields = [idF, nameF, regionF, expectedF, deployF];
   const m = uiModal({
+    onClose: () => { closed = true; },
     title: editing ? bl({ en: "Edit site", ja: "サイトを編集" }) : bl({ en: "Create a site", ja: "サイトを作成" }),
-    body: [idF.el, nameF.el, regionF.el, expectedF.el, deployF.el],
+    body: [...fields.map(field => field.el), notice],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
+  const controls = fields.map(field => field.el.querySelector("input,select,textarea")).filter(Boolean).concat(submit);
+  const disabled = controls.map(control => !!control.disabled);
   submit.onclick = async () => {
+    if (!current()) { m.close(); return; }
+    if (busy) return;
     if (!editing && !idF.validate()) return;
     if (!expectedF.validate()) return;
-    submit.disabled = true;
+    busy = true; controls.forEach(control => { control.disabled = true; });
+    notice.textContent = ""; notice.style.display = "none";
     const body = { site_id: editing ? s.site_id : idF.get(), name: nameF.get(), region: regionF.get(), deployment_type: deployF.get() };
     if (s.routing_namespace) body.routing_namespace = s.routing_namespace; // preserve (not shown; out of scope)
     if (s.ha_policy) body.ha_policy = s.ha_policy;
     body.expected_connector_count = siteExpectedConnectorCount(expectedF.get());
     try {
-      const r = await apiFetch("POST", "/admin/sites", body);
-      if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      const r = await apiFetch("POST", "/admin/sites", body, "control");
+      if (!current()) { m.close(); return; }
+      if (!siteSaveAcknowledged(r, body)) throw new Error("Unconfirmed site save");
+      const read = await apiFetch("GET", "/admin/sites", undefined, "control");
+      if (!current()) { m.close(); return; }
+      if (!siteSaveReadback(read, body)) throw new Error("Unconfirmed site readback");
       m.close(); uiToast(editing ? bl({ en: "Site saved.", ja: "サイトを保存しました。" }) : bl({ en: "Site created.", ja: "サイトを作成しました。" }), "ok"); renderSiteList(host);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (_) {
+      if (!current()) { m.close(); return; }
+      notice.textContent = bl({ en: "The save could not be confirmed. It may already have been applied. Your input is retained. Cancel and reload to check the saved site before retrying; retrying sends another save.", ja: "保存を確認できませんでした。すでに反映されている可能性があります。入力は保持しています。再試行前にキャンセルして再読込し、保存状態を確認してください。再試行は新たな保存操作になります。" });
+      notice.style.display = "";
+    } finally {
+      busy = false;
+      if (current()) controls.forEach((control, i) => { control.disabled = disabled[i]; });
+    }
   };
   if (editing) nameF.focus(); else idF.focus();
 }

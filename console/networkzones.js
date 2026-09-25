@@ -34,6 +34,11 @@ async function nzSiteMembership() {
   return map;
 }
 
+function networkZonesCanWrite() {
+  const permissions = typeof idpSession === "undefined" ? null : idpSession?.permissions;
+  return Array.isArray(permissions) && (permissions.includes("admin.vlan.write") || permissions.includes("*"));
+}
+
 async function renderZones(section) {
   uiState(section, "loading");
   const current = freshRender(section);
@@ -42,8 +47,9 @@ async function renderZones(section) {
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderZones(section) }); return; }
   const membership = await nzSiteMembership();
   if (!current()) return;
+  const canWrite = networkZonesCanWrite();
   section.innerHTML = "";
-  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add network", ja: "+ ネットワークを追加" }), onClick: () => openNetworkForm(section) })]));
+  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), ...(canWrite ? [el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add network", ja: "+ ネットワークを追加" }), onClick: () => openNetworkForm(section) })] : [])]));
   if (!objs.length) { section.appendChild(emptyBox(bl({ en: "No networks yet.", ja: "ネットワークがありません。" }))); return; }
   const rows = objs.map((o) => {
     const sites = membership[o.id] || [];
@@ -51,11 +57,11 @@ async function renderZones(section) {
       el("td", {}, el("strong", { text: o.name || o.id })),
       el("td", { class: "ui-view-desc", text: (o.cidrs || []).join(", ") }),
       el("td", {}, sites.length ? el("span", {}, sites.map((s) => el("code", { class: "ui-chip", text: s }))) : el("span", { class: "ui-view-desc", text: bl({ en: "— not used", ja: "— 未使用" }) })),
-      el("td", { class: "ui-row-actions" }, el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), onClick: () => nzDeleteNetwork(o, section) })),
+      ...(canWrite ? [el("td", { class: "ui-row-actions" }, el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), onClick: () => nzDeleteNetwork(o, section) }))] : []),
     ]);
   });
   section.appendChild(el("table", { class: "ui-table" }, [
-    el("thead", {}, el("tr", {}, [bl({ en: "Network", ja: "ネットワーク" }), bl({ en: "Ranges", ja: "範囲" }), bl({ en: "Used by sites", ja: "利用サイト" }), bl({ en: "Manage", ja: "操作" })].map((x) => el("th", { text: x })))),
+    el("thead", {}, el("tr", {}, [bl({ en: "Network", ja: "ネットワーク" }), bl({ en: "Ranges", ja: "範囲" }), bl({ en: "Used by sites", ja: "利用サイト" }), ...(canWrite ? [bl({ en: "Manage", ja: "操作" })] : [])].map((x) => el("th", { text: x })))),
     el("tbody", {}, rows),
   ]));
 }
@@ -90,5 +96,4 @@ async function nzDeleteNetwork(o, section) {
   if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
   uiToast(bl({ en: "Network deleted.", ja: "ネットワークを削除しました。" }), "ok"); renderZones(section);
 }
-
 

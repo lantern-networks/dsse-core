@@ -247,7 +247,7 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				HAPolicy:               rawMetadataValue,
 				ExpectedConnectorCount: 1,
 				BootstrapSecretHash:    rawMetadataValue,
-			}, evaluator, now),
+			}, nil, evaluator, now),
 		},
 		{
 			name: "adminToolCallEventAuditLog",

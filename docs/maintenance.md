@@ -57,15 +57,26 @@ as information without Adopt or Hold controls that the API rejects. Existing
 configured bindings can still be removed. Local browser checks with a synthetic
 connector covered add, reload, removal, stored routes and audit records against
 the development server. The public server's rejection contract was checked
-separately; its storage and audit behavior has not been browser-checked for this
-change. Real connector traffic and independent control-plane/Edge propagation
+separately; public-server storage and audit were checked in the focused save
+failure work below. Real connector traffic and independent control-plane/Edge propagation
 remain release checks. This correction is not in the published 0.3.0 release.
 
 If a connector's route list cannot be loaded, Sites now shows a Retry state
 instead of an empty route list and hides binding controls until the read succeeds.
 A synthetic-browser check covered a failed read followed by recovery without
 a write; HTTP, transport and malformed-response regressions cover the same
-boundary. Public-server persistence and audit behavior remain unverified here.
+boundary. Public-server persistence and audit are covered by the separate check
+below.
+
+For Sites and Connectors, adding or removing a network binding now reports a
+storage failure instead of showing success for a change that cannot be saved.
+The existing binding and in-memory generation stay intact, and an explicit
+success or failure audit entry records the attempted action. Eight local
+public-server regressions cover add and remove with file and shared-store write
+failures, then a successful retry and reload. A synthetic browser session
+confirmed the Sites failure, retry, reload and matching raw audit records using
+the public server. Independent control-plane/Edge propagation and production
+storage remain release checks. This fix is not in the published 0.3.0 release.
 
 ## What still blocks 0.3.1
 

@@ -98,6 +98,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be hold | unhold | approve | unapprove | add | remove"))
 			return
 		}
+		var bindingErr error
 		switch action {
 		case "hold":
 			connectorRouteGov.SetHeld(tenant, cid, req.CIDR, true)
@@ -108,15 +109,32 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		case "unapprove":
 			connectorRouteGov.SetApproved(tenant, cid, req.CIDR, false)
 		case "add":
-			connectorRouteGov.AddAuthored(tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthored(tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case isNetwork:
-				connectorRouteGov.RemoveAuthored(tenant, cid, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, "net:"+req.NetworkID)
 			case isFQDN:
-				connectorRouteGov.RemoveAuthored(tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				connectorRouteGov.RemoveAuthored(tenant, cid, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, req.CIDR)
+			}
+		}
+		if action == "add" || action == "remove" {
+			now := time.Now().UTC()
+			result := "success"
+			if bindingErr != nil {
+				result = "error"
+			}
+			audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: cid, TenantID: tenant}, evaluator, now)
+			audit.ActorUserID = auditActorPrincipal(r)
+			kind := "route_binding"
+			audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
+			audit.Metadata = map[string]any{"network_id": req.NetworkID, "fqdn": req.FQDN, "cidr": req.CIDR, "operation": action}
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+			if bindingErr != nil {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Could not save network binding."))
+				return
 			}
 		}
 		declared, declaredFQDNs, _ := connectorDeclaredRoutes(r.Context(), tenant, cid)
@@ -434,20 +452,36 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				return
 			}
 		}
+		var bindingErr error
 		switch action {
 		case "add":
-			connectorRouteGov.AddAuthored(tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthored(tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case req.NetworkID != "":
-				connectorRouteGov.RemoveAuthored(tenant, siteID, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, "net:"+req.NetworkID)
 			case req.FQDN != "":
-				connectorRouteGov.RemoveAuthored(tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				connectorRouteGov.RemoveAuthored(tenant, siteID, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, req.CIDR)
 			}
 		default:
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be add | remove"))
+			return
+		}
+		now := time.Now().UTC()
+		result := "success"
+		if bindingErr != nil {
+			result = "error"
+		}
+		audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: siteID, TenantID: tenant}, evaluator, now)
+		audit.ActorUserID = auditActorPrincipal(r)
+		kind := "route_binding"
+		audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
+		audit.Metadata = map[string]any{"network_id": req.NetworkID, "fqdn": req.FQDN, "cidr": req.CIDR, "operation": action}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		if bindingErr != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("Could not save network binding."))
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "networks": connectorRouteGov.Routes(tenant, siteID, nil, nil)})

@@ -143,7 +143,12 @@ final class LoopbackEchoServer: @unchecked Sendable {
     private func echo(_ conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, error in
             if let data, !data.isEmpty {
-                conn.send(content: data, completion: .contentProcessed { _ in })
+                // EOF may arrive with the final payload. Keep the connection alive until the echo is sent.
+                conn.send(content: data, completion: .contentProcessed { sendError in
+                    if isComplete || error != nil || sendError != nil { conn.cancel() }
+                    else { self.echo(conn) }
+                })
+                return
             }
             if isComplete || error != nil { conn.cancel(); return }
             self.echo(conn)

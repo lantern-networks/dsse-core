@@ -6360,12 +6360,6 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		assetStore.SyncEnrolledEndpoints(tenant, devices, time.Now().UTC())
 	}
 	syncEnrolledAssets()
-	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL,
-		func(r *http.Request, kind, id, operation, result string, value any) {
-			now := time.Now().UTC()
-			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
-				assetCatalogAuditLog(r, kind, id, operation, result, value, evaluator, now), now)
-		})
 
 	// Per-tenant end-user IdP registry (federated-auth connections + default), managed from the Console.
 	// Durable when -idp-connection-store is set so registered IdPs survive a restart.
@@ -6542,6 +6536,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			recompileOneTenant(tenant)
 		}
 	}
+	registerAssetCatalogAdmin(mux, adminEndpoint, assetStore, syncEnrolledAssets, configSourceURL, recompileAuthoredRules,
+		func(r *http.Request, kind, id, operation, result string, value any) {
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
+				assetCatalogAuditLog(r, kind, id, operation, result, value, evaluator, now), now)
+		})
 	registerRulesAdmin(mux, adminEndpoint, ruleStore, assetStore, recompileAuthoredRules, func(tenant, ruleID string) {
 		// Reverse lifecycle sync: deleting a cert-pin bypass rule un-materializes the pinned-site candidate it
 		// came from, so the Pinned Sites view reflects that the bypass is gone (it does not linger "materialized").

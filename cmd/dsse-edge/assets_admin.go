@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 
 	assetcatalog "github.com/lantern-networks/dsse-core/assetcatalog"
 )
@@ -29,7 +30,13 @@ import (
 // assets the CP never received deletes them on the first pull. That is not hypothetical: it removed 47 on this
 // lab's Edge (docs/2026-08-11_asset_reconciliation_deleted_47_operator_assets.md). Copy them up first —
 // ops/migrate_edge_assets_to_cp.sh.
-func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *assetcatalog.Store, syncEnrolled func(), configSourceURL string, audit func(*http.Request, string, string, string, string, any)) {
+func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *assetcatalog.Store, syncEnrolled func(), configSourceURL string, onChanged func(), audit func(*http.Request, string, string, string, string, any)) {
+	var mutationMu sync.Mutex
+	changed := func() {
+		if onChanged != nil {
+			onChanged()
+		}
+	}
 	record := func(r *http.Request, kind, id, operation string, value any, err error, found bool) {
 		result := "saved"
 		if !found {
@@ -95,6 +102,8 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		e.TenantID = tenantForWrite
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := store.UpsertEndpoint(e)
 		item := stored
 		if err != nil {
@@ -105,6 +114,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeAssetError(w, err, http.StatusBadRequest)
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("DELETE /admin/assets/endpoints/{id}", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +122,8 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configWriteRejectedWhenSourced(w, configSourceURL, "endpoint assets") {
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "endpoint", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
@@ -122,6 +134,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusNotFound, fmt.Errorf("endpoint not found"))
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 
@@ -149,6 +162,8 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		g.TenantID = tenantForWrite
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := store.UpsertGroup(g)
 		item := stored
 		if err != nil {
@@ -159,6 +174,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeAssetError(w, err, http.StatusBadRequest)
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("GET /admin/assets/groups/{group_id}/members", adminEndpoint("admin.endpoints.read", func(w http.ResponseWriter, r *http.Request) {
@@ -173,6 +189,8 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configWriteRejectedWhenSourced(w, configSourceURL, "endpoint group assets") {
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		ok, err := store.DeleteGroup(adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "group", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
@@ -183,6 +201,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusNotFound, fmt.Errorf("group not found"))
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 
@@ -210,6 +229,8 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		svc.TenantID = tenantForWrite
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		stored, err := store.UpsertService(svc)
 		item := stored
 		if err != nil {
@@ -220,6 +241,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeAssetError(w, err, http.StatusBadRequest)
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, stored)
 	}))
 	mux.HandleFunc("DELETE /admin/assets/services/{id}", adminEndpoint("admin.endpoints.write", func(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +249,8 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configWriteRejectedWhenSourced(w, configSourceURL, "service assets") {
 			return
 		}
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		ok, err := store.DeleteService(adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "service", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
@@ -237,6 +261,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusNotFound, fmt.Errorf("service not found"))
 			return
 		}
+		changed()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "id": r.PathValue("id")})
 	}))
 }

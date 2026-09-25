@@ -25,6 +25,21 @@ import (
 )
 
 func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, applicationCatalogStore appcatalog.RuntimeStore, registry connectorRegistryStore, tunnelManager *tunnel.Manager, routeProfiles map[string]edgeplane.ApplicationRouteProfile, tenantModelStore adminTenantModelRuntimeStore, domainEventOutbox domainEventOutboxWriter, configSourceURL string) {
+	// The application update has already reached its own store when the asset catalog is updated.
+	// A failure here is partial, never a successful publish/unpublish/delete. Keep the storage
+	// error out of the response and audit because it may contain private backend details.
+	assetSavePartial := func(w http.ResponseWriter, r *http.Request, audit model.AuditLog, now time.Time) {
+		result := "partial"
+		reason := "Application state changed, but the selectable rule destination was not confirmed saved."
+		audit.Result = &result
+		audit.Reason = &reason
+		audit.Metadata["asset_endpoint_persistence_confirmed"] = false
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error":   "application_asset_update_unconfirmed",
+			"partial": true,
+		})
+	}
 	mux.HandleFunc("GET /admin/applications", adminEndpoint("admin.applications.read", func(w http.ResponseWriter, r *http.Request) {
 		options := appcatalog.ListOptions{
 			ApplicationType: strings.TrimSpace(r.URL.Query().Get("application_type")),
@@ -184,7 +199,8 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 				ID: "app-" + created.ApplicationID, TenantID: tenantID, Alias: alias,
 				Kind: assetcatalog.KindNetwork, Address: addr, Source: assetcatalog.SourceManual,
 			}); uerr != nil {
-				log.Printf("publish %s: surface asset endpoint: %v", created.ApplicationID, uerr)
+				assetSavePartial(w, r, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
+				return
 			}
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
@@ -219,7 +235,8 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		// Remove the rule-destination endpoint surfaced at publish (no longer reachable once unpublished).
 		if config.AssetStore != nil {
 			if _, err := config.AssetStore.DeleteEndpoint(tenantID, "app-"+applicationID); err != nil {
-				logWarnf("unpublish app %s: %v", applicationID, err) // cleanup persist failure; the unpublish itself succeeded
+				assetSavePartial(w, r, adminApplicationPublishAuditLog(created, evaluator, now, false), now)
+				return
 			}
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, false), now)
@@ -268,7 +285,8 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		// Drop the rule-destination endpoint surfaced at publish (the app no longer exists).
 		if config.AssetStore != nil {
 			if _, err := config.AssetStore.DeleteEndpoint(tenantID, "app-"+applicationID); err != nil {
-				logWarnf("delete app %s: %v", applicationID, err) // cleanup persist failure; the app delete itself succeeded
+				assetSavePartial(w, r, adminApplicationDeleteAuditLog(tenantID, applicationID, evaluator, now), now)
+				return
 			}
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationDeleteAuditLog(tenantID, applicationID, evaluator, now), now)

@@ -174,6 +174,12 @@ function openAppForm(content, existing) {
 // (from GET /admin/sites) -> Review & Publish. The review makes "Published != Allow" explicit: the server
 // returns published_route / policy_assigned / users_allowed_now, surfaced to the operator so a freshly
 // published app is clearly reachable-but-unauthorized until a policy is bound.
+function applicationWriteError(r) {
+  if (r.body && r.body.partial && r.body.error === "application_asset_update_unconfirmed") {
+    return bl({ en: "The application changed, but saving its rule destination was not confirmed. Reload and check both before retrying.", ja: "アプリは変更されましたが、ルールの宛先の保存は確認できません。再試行前に再読込し、両方の状態を確認してください。" });
+  }
+  return (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
+}
 function openPublishWizard(content, existing) {
   existing = existing || null;
   const idF = uiField({ name: "pub_id", label: bl({ en: "Application ID", ja: "アプリ ID" }), required: true, value: existing ? existing.application_id : "",
@@ -274,7 +280,14 @@ function openPublishWizard(content, existing) {
     try {
       const r = await apiFetch("POST", "/admin/applications/" + encodeURIComponent(idF.get()) + "/publish", body);
       if (r.status === 409 && r.body && r.body.error === "cidr_route_collision") { renderCollision(r.body); return; }
-      if (!r.ok) { submit.disabled = false; const m = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); destF.setError(m); uiToast(m, "err"); return; }
+      if (!r.ok) {
+        submit.disabled = false;
+        const m = applicationWriteError(r);
+        if (r.body && r.body.partial) reviewBox.textContent = m;
+        else destF.setError(m);
+        uiToast(m, "err");
+        return;
+      }
       const review = (r.body && r.body.review) || {};
       // review: Published route / Policy assigned / Users allowed now. Make Published != Allow explicit.
       reviewBox.innerHTML = "";
@@ -424,7 +437,7 @@ async function unpublishApp(a) {
   if (!ok) return;
   try {
     const r = await apiFetch("POST", "/admin/applications/" + encodeURIComponent(a.application_id) + "/unpublish", {});
-    if (!r.ok) { const m = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); uiToast(m, "err"); return; }
+    if (!r.ok) { uiToast(applicationWriteError(r), "err"); if (r.body && r.body.partial) renderApplicationsView(document.getElementById("content")); return; }
     uiToast(bl({ en: "Private app unpublished.", ja: "社内アプリを公開停止しました。" }), "ok");
     renderApplicationsView(document.getElementById("content"));
   } catch (e) { uiToast(String(e), "err"); }
@@ -449,7 +462,7 @@ async function deleteApp(a) {
   if (!ok) return;
   try {
     const r = await apiFetch("DELETE", "/admin/applications/" + encodeURIComponent(a.application_id));
-    if (!r.ok) { const m = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); uiToast(m, "err"); return; }
+    if (!r.ok) { uiToast(applicationWriteError(r), "err"); if (r.body && r.body.partial) renderApplicationsView(document.getElementById("content")); return; }
     uiToast(bl({ en: "Application deleted.", ja: "アプリを削除しました。" }), "ok");
     renderApplicationsView(document.getElementById("content"));
   } catch (e) { uiToast(String(e), "err"); }

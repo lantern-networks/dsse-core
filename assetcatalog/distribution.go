@@ -22,7 +22,11 @@ package assetcatalog
 // therefore does NOT propagate today; that is a known, bounded gap (a stale endpoint nothing references changes
 // no decision, whereas a stale RULE does) and it is why the asymmetry is written down rather than smoothed over.
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
 
 // ConfigGeneration returns the monotonic authored-catalog version, bumped on every authored mutation. Folded
 // into the config bundle's aggregate generation so adding an endpoint a rule needs triggers a fleet re-pull.
@@ -100,7 +104,18 @@ func (s *Store) AuthoredSnapshot() (endpoints []Endpoint, groups []Group, servic
 // policy nobody migrated.
 func (s *Store) ReplaceAuthored(endpoints []Endpoint, groups []Group, services []Service) (removed []string, err error) {
 	for _, e := range endpoints {
-		if _, uerr := s.UpsertEndpoint(e); uerr != nil {
+		var uerr error
+		if e.Source == SourceApplication {
+			if !strings.HasPrefix(e.ID, "app-") || len(e.ID) <= len("app-") {
+				return nil, fmt.Errorf("application destination id is invalid")
+			}
+			_, uerr = s.upsertEndpoint(e, true, true) // trusted control-plane snapshot
+		} else if current, found := s.GetEndpoint(e.TenantID, e.ID); found && current.Source == SourceApplication {
+			_, uerr = s.upsertEndpoint(e, true, true) // trusted older snapshot may replace owned source
+		} else {
+			_, uerr = s.UpsertEndpoint(e)
+		}
+		if uerr != nil {
 			return nil, uerr
 		}
 	}
@@ -159,7 +174,15 @@ func (s *Store) ReplaceAuthored(endpoints []Endpoint, groups []Group, services [
 	// Deletes go through the public methods so alias release, generation bump and persistence happen exactly
 	// as they do for an admin delete — a second removal path would be a second set of rules to keep in step.
 	for _, r := range dropEndpoints {
-		if ok, derr := s.DeleteEndpoint(r.tenant, r.id); derr != nil {
+		current, found := s.GetEndpoint(r.tenant, r.id)
+		var ok bool
+		var derr error
+		if found && current.Source == SourceApplication {
+			ok, derr = s.deleteEndpoint(r.tenant, r.id, true, true) // trusted control-plane snapshot
+		} else {
+			ok, derr = s.DeleteEndpoint(r.tenant, r.id)
+		}
+		if derr != nil {
 			return removed, derr
 		} else if ok {
 			removed = append(removed, "endpoint:"+r.id)

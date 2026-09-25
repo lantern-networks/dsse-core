@@ -102,3 +102,25 @@ func TestReplaceAuthoredIsTheInverseOfAuthoredSnapshot(t *testing.T) {
 		t.Errorf("a second identical apply removed %v — the apply is not idempotent", again)
 	}
 }
+
+func TestReplaceAuthoredCarriesApplicationDestinationsToEdgeAndRemovesThem(t *testing.T) {
+	source := NewStore()
+	if _, err := source.UpsertApplicationEndpoint("wiki", Endpoint{TenantID: "one", Alias: "Wiki", Kind: KindNetwork, Address: "wiki.example.test"}, false); err != nil {
+		t.Fatal(err)
+	}
+	endpoints, groups, services := source.AuthoredSnapshot()
+	edge := NewStore()
+	if removed, err := edge.ReplaceAuthored(endpoints, groups, services); err != nil || len(removed) != 0 {
+		t.Fatalf("edge apply = %v, %v", removed, err)
+	}
+	if endpoint, found := edge.GetEndpoint("one", "app-wiki"); !found || endpoint.Source != SourceApplication || endpoint.Address != "wiki.example.test" {
+		t.Fatalf("edge lost application destination: %+v found=%v", endpoint, found)
+	}
+	removed, err := edge.ReplaceAuthored(nil, nil, nil)
+	if err != nil || len(removed) != 1 || removed[0] != "endpoint:app-wiki" {
+		t.Fatalf("edge removal = %v, %v", removed, err)
+	}
+	if _, found := edge.GetEndpoint("one", "app-wiki"); found {
+		t.Fatal("deleted application destination remains on edge")
+	}
+}

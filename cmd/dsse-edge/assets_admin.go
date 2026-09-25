@@ -72,7 +72,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, err) // deleted in memory but not persisted — admin must know
+			writeError(w, http.StatusInternalServerError, err) // durability unconfirmed — admin must know
 			return
 		}
 		if !ok {

@@ -24,7 +24,7 @@ import (
 	"github.com/lantern-networks/dsse-core/vlan"
 )
 
-func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string)) {
+func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string, error)) {
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		options := policy.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
@@ -151,12 +151,20 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			vlanBoundary.ConfigGeneration() + connectorGen + connectorRouteGov.ConfigGeneration() + nhiGen + delegatedGrantGen + ruleGen +
 			tenantGen + directoryGen + siteGen + postureGen + deviceCAGen + transportTrustGen + regionGen + licenceGen + config.DLPDistribution.Generation(), configBundleEpoch
 	}
-	bundleGeneration = func() (uint64, string) {
+	bundleGeneration = func() (uint64, string, error) {
+		if assetStore != nil {
+			if err := assetStore.RefreshShared(); err != nil {
+				return 0, "", err
+			}
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, catalogGeneration, _ := applicationState.read(ctx, config.ApplicationCatalogStore)
+		_, catalogGeneration, err := applicationState.read(ctx, config.ApplicationCatalogStore)
+		if err != nil {
+			return 0, "", err
+		}
 		base, epoch := baseBundleGeneration()
-		return base + catalogGeneration, epoch
+		return base + catalogGeneration, epoch, nil
 	}
 
 	mux.HandleFunc("GET /admin/config-bundle", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
@@ -164,6 +172,12 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// region applying generations 13 and 8 while both polled in the same second.
 		if configBundleRefusedOnAStandby(w) {
 			return
+		}
+		if assetStore != nil {
+			if err := assetStore.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("asset catalog cannot be refreshed"))
+				return
+			}
 		}
 		if err := refreshManagedTenantRestrictions(policyStore); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))

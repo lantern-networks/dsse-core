@@ -456,7 +456,7 @@ func fleetInSync(edges []fleetConfigEntry) bool {
 
 // registerFleetConfigStatusRoutes wires the CP-side ingest + read. Only meaningful on a control plane; an Edge
 // with no store simply does not register them.
-func registerFleetConfigStatusRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *fleetConfigStatusStore, currentGeneration func() (uint64, string)) {
+func registerFleetConfigStatusRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *fleetConfigStatusStore, currentGeneration func() (uint64, string, error)) {
 	if store == nil {
 		return
 	}
@@ -491,7 +491,12 @@ func registerFleetConfigStatusRoutes(mux *http.ServeMux, adminEndpoint func(stri
 	mux.HandleFunc("GET /admin/fleet/config-status", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		gen, epoch := uint64(0), ""
 		if currentGeneration != nil {
-			gen, epoch = currentGeneration()
+			var err error
+			gen, epoch, err = currentGeneration()
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("control-plane configuration cannot be refreshed"))
+				return
+			}
 		}
 		now := time.Now().UTC()
 		edges := store.List(gen, epoch, now)

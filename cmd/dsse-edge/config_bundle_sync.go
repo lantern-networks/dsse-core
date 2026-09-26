@@ -1021,7 +1021,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// Which identity provider may sign a user in, for each organization. Applied beside the authorities
 	// above because it is the same kind of fact: who this deployment believes, on behalf of whom.
 	if payload.IdPConnections != nil {
-		if count, applied := applyIdPConnectionBundleSection(theIdPRegistry.Load(), payload.IdPConnections, log.Printf); applied {
+		if count, applied, err := applyIdPConnectionBundleSectionChecked(theIdPRegistry.Load(), payload.IdPConnections); err != nil {
+			return 0, fmt.Errorf("identity provider configuration: %w", err)
+		} else if applied {
 			log.Printf("config_bundle_idp_connections applied=%d", count)
 		}
 	}

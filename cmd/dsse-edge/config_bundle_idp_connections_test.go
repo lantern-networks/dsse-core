@@ -18,7 +18,7 @@ func TestTheIdPRegistryIsPublishedAndApplied(t *testing.T) {
 	for _, c := range []struct{ file, needs, why string }{
 		{"admin_policy_routes.go", "idpConnectionBundleSection(",
 			"the control plane never puts the registry in the bundle, so no Edge can learn it"},
-		{"config_bundle_sync.go", "applyIdPConnectionBundleSection(",
+		{"config_bundle_sync.go", "applyIdPConnectionBundleSectionChecked(",
 			"an Edge never applies the section, so the bundle carries it and nothing reads it"},
 	} {
 		body, err := os.ReadFile(c.file)

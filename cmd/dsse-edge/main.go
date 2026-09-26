@@ -6354,12 +6354,16 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// Publish it for the enrolment eligibility checker, which is wired BEFORE this point (its registration
 	// happens earlier in this function) and resolves the connection per request.
 	theIdPRegistry.Store(idpConnectionStore)
-	if p, e := cpStateBlobPersister(config.IdPConnectionStorePath, cpStateBlobDB, "idp_connections"); e != nil {
+	if p, e := idpPersisterForRole(config.IdPConnectionStorePath, cpStateBlobDB, config.ConfigSourceURL); e != nil {
 		log.Fatalf("resolve idp connection store: %v", e)
 	} else if err := idpConnectionStore.SetPersister(p); err != nil {
 		log.Fatalf("load idp connection store: %v", err)
 	}
-	registerIdPConnectionsAdmin(mux, adminEndpoint, idpConnectionStore, config.ConfigSourceURL)
+	registerIdPConnectionsAdmin(mux, adminEndpoint, idpConnectionStore, config.ConfigSourceURL, func(r *http.Request, tenant, id, action string) {
+		now := time.Now().UTC()
+		audit := adminIdPChangeAuditLog(r, tenant, id, action, evaluator, now)
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, audit, now)
+	})
 
 	// Organization Domains (S6): the explicit, multi-value "these domains are US" setting DLP instance-aware action
 	// references. Durable; the corporate-domain resolver is Organization Domains ∪ IdP verified_domains.

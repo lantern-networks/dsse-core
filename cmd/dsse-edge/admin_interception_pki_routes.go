@@ -73,6 +73,18 @@ func interceptionIsNotThisNodesAnswer(w http.ResponseWriter, config serverConfig
 
 func registerInterceptionPKIRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader) {
 	mux.HandleFunc("GET /admin/intercept/bypass-hosts", adminEndpoint("admin.swg.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
+		// Bind the response to the authenticated page context. These are the
+		// serving node's current patterns; a saved registration is not proof of application.
+		if r.URL.Query().Get("scoped") == "1" {
+			if interceptionIsNotThisNodesAnswer(w, config, "which destinations bypass inspection") {
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "hosts": config.NetworkExtensionLabTLS.BypassHosts()})
+			return
+		}
 		if config.NetworkExtensionLabTLS == nil {
 			writeJSON(w, http.StatusOK, []string{})
 			return

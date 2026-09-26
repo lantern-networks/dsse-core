@@ -16,7 +16,7 @@ func (s *Store) SetServerInitiatedEnabledContext(ctx context.Context, tenant str
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.editIncomingRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+	return s.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
 		f.ServerInitiatedEnabled[strings.TrimSpace(tenant)] = enabled
 		return nil
 	})
@@ -38,7 +38,7 @@ func (s *Store) MutateLegacyExceptionContext(ctx context.Context, tenant, id str
 	defer s.mu.Unlock()
 	tenant = strings.TrimSpace(tenant)
 	var candidate model.LegacyException
-	err := s.editIncomingRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+	err := s.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
 		list := f.LegacyExceptions[tenant]
 		index := -1
 		current := model.LegacyException{ID: id, TenantID: tenant, Status: "active"}
@@ -82,7 +82,7 @@ func (s *Store) RemoveLegacyExceptionContext(ctx context.Context, tenant, id str
 	defer s.mu.Unlock()
 	tenant, id = strings.TrimSpace(tenant), strings.TrimSpace(id)
 	removed := false
-	err := s.editIncomingRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+	err := s.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
 		list := f.LegacyExceptions[tenant]
 		for i, item := range list {
 			if item.ID == id {

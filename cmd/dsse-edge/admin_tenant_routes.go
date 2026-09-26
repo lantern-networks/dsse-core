@@ -358,7 +358,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		now := time.Now()
 		if err := adminStore.Delete(r.Context(), tenantID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now), now)

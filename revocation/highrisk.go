@@ -16,17 +16,23 @@ import (
 // layer — high-risk is admin-marked (CP-authoritative). Device and user namespaces are persisted together;
 // each is authoritative on the CP and replaced from an explicitly typed feed on a puller.
 type HighRiskOverlay struct {
-	writeMu            sync.Mutex
-	mu                 sync.RWMutex
-	devices            map[string]string // deviceID (normalized) -> severity (high|critical)
-	users              map[string]UserRisk
-	userIndex          map[string]string
-	legacyUnattributed map[string]string // v1 raw IDs whose tenant/type cannot be proven
-	loadErr            error
-	legacy             bool
-	deviceSavePending  bool // writeMu: a live device change has not reached durable storage
-	persister          blobstore.Persister
-	generation         atomic.Uint64
+	// writeMu serializes every writer, including persistence and pulled snapshots.
+	// Lock order is writeMu then mu. Readers take only mu; storage I/O and legacy
+	// attribution never hold mu. Published maps are replaced, not edited in place.
+	writeMu    sync.Mutex
+	mu         sync.RWMutex
+	devices    map[string]string // deviceID (normalized) -> severity (high|critical)
+	users      map[string]UserRisk
+	userIndex  map[string]string
+	loadErr    error
+	legacy     bool
+	persister  blobstore.Persister
+	generation atomic.Uint64
+	// writeMu protects this conservative retry flag for the shared snapshot.
+	automaticPending   map[string]string // writeMu: locally applied automatic marks awaiting shared commit
+	riskSavePending    bool
+	deviceSavePending  bool              // legacy Mark requires an explicit retry after an unconfirmed save
+	legacyUnattributed map[string]string // ambiguous v1 raw IDs remain enforced
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
@@ -45,51 +51,16 @@ func (o *HighRiskOverlay) ConfigGeneration() uint64 {
 	return o.generation.Load()
 }
 
-// Mark records a device as high-risk (CP-authoritative). Only a state change bumps the generation + persists.
+// Mark is the legacy automatic-signal path. Escalations remain visible before
+// saving for compatibility. DLP uses RaiseDeviceRisk to receive outcomes. De-escalations require a successful
+// save. Administrative callers must use SetDeviceRisk to receive save outcomes.
 func (o *HighRiskOverlay) Mark(deviceID, severity string) {
-	id := NormalizeDeviceID(deviceID)
-	if o == nil || id == "" {
-		return
-	}
-	severity = strings.ToLower(strings.TrimSpace(severity))
-	o.writeMu.Lock()
-	defer o.writeMu.Unlock()
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.loadErr != nil || o.legacy {
-		return
-	}
-	if prev, ok := o.devices[id]; ok && prev == severity && !o.deviceSavePending {
-		return
-	}
-	if o.devices[id] != severity {
-		o.devices[id] = severity
-		o.generation.Add(1)
-	}
-	o.persistLocked()
+	_, _ = o.setDeviceRisk(deviceID, severity, true)
 }
 
-// Clear removes a device from the high-risk set (de-escalation). Only a real removal bumps + persists.
+// Clear is the compatibility wrapper; an unconfirmed clear preserves the live mark.
 func (o *HighRiskOverlay) Clear(deviceID string) {
-	id := NormalizeDeviceID(deviceID)
-	if o == nil {
-		return
-	}
-	o.writeMu.Lock()
-	defer o.writeMu.Unlock()
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.loadErr != nil || o.legacy {
-		return
-	}
-	if _, ok := o.devices[id]; !ok && !o.deviceSavePending {
-		return
-	}
-	if _, ok := o.devices[id]; ok {
-		delete(o.devices, id)
-		o.generation.Add(1)
-	}
-	o.persistLocked()
+	_, _ = o.SetDeviceRisk(deviceID, "none")
 }
 
 // IsHighRisk reports whether a device is currently marked high-risk, with its severity.
@@ -177,30 +148,9 @@ func (o *HighRiskOverlay) CountDevices(deviceIDs []string) int {
 	return n
 }
 
-// RemoveDevices clears the marks on the named devices, returning how many were removed.
-//
-// ★ ORDER MATTERS AND IT IS THE CALLER'S TO GET RIGHT (2026-08-18). The ids come from the enrolled ledger, and
-// a tenant erasure removes that ledger's entries — so the ids must be captured BEFORE the ledger is cleared or
-// this receives an empty list and silently removes nothing, which is indistinguishable from "there were none".
+// RemoveDevices is the compatibility wrapper. A failed save removes nothing from
+// live state; callers that must distinguish failure from no matches use the checked form.
 func (o *HighRiskOverlay) RemoveDevices(deviceIDs []string) int {
-	if o == nil || len(deviceIDs) == 0 {
-		return 0
-	}
-	o.writeMu.Lock()
-	defer o.writeMu.Unlock()
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	n := 0
-	for _, id := range deviceIDs {
-		key := NormalizeDeviceID(id)
-		if _, ok := o.devices[key]; ok {
-			delete(o.devices, key)
-			n++
-		}
-	}
-	if n > 0 {
-		o.generation.Add(1)
-		o.persistLocked()
-	}
+	n, _ := o.RemoveDevicesChecked(deviceIDs)
 	return n
 }

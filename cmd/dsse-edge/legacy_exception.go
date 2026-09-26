@@ -89,9 +89,13 @@ func buildServerInitiatedExport(exs []model.LegacyException, now time.Time) serv
 		if action == "" {
 			action = "allow"
 		}
+		family := ex.ServiceFamily
+		if strings.TrimSpace(family) == "" && strings.EqualFold(strings.TrimSpace(ex.Protocol), "tcp") {
+			family = "tcp"
+		}
 		rules = append(rules, serverInitiatedExportRule{
 			ExceptionID: ex.ID, SourceServer: ex.SourceServer, DeviceGroup: ex.DeviceGroup,
-			ServiceFamily: ex.ServiceFamily, Port: ex.Port, Action: action,
+			ServiceFamily: family, Port: ex.Port, Action: action,
 		})
 	}
 	sort.Slice(rules, func(i, j int) bool { return rules[i].ExceptionID < rules[j].ExceptionID })

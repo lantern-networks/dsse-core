@@ -464,7 +464,11 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		}
 	}
 	if e.CatalogOverrides != nil {
-		add("bypass_catalog_overrides", e.CatalogOverrides.RemoveTenant(tenantID))
+		if n, err := e.CatalogOverrides.RemoveTenant(tenantID); err != nil {
+			result.Failures = append(result.Failures, "catalog override erasure could not be confirmed")
+		} else {
+			add("bypass_catalog_overrides", n)
+		}
 	}
 	if e.SeatAllocations != nil {
 		add("seat_allocation", e.SeatAllocations.RemoveTenant(tenantID))

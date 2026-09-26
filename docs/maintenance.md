@@ -538,3 +538,21 @@ Identity provider creation, editing, default selection and deletion now confirm 
 Receiving Edges save a complete registry before acknowledging the bundle; failed saves and incomplete snapshots remain retryable. Defaults and deletions survive reload. Pulling Edges use a node-local IdP cache even when another subsystem uses PostgreSQL: configure a per-node `-idp-connection-store` file for restart persistence. An unset path uses memory; explicit PostgreSQL storage for a pulling Edge is rejected to avoid writing received data into CP authority.
 
 Validation covers PostgreSQL peer CRUD/default selection, authenticated permissions and audits, signed publication, blank-secret preservation, failed-save retry, reload and copy isolation. Existing complete JSON snapshots remain supported; incomplete or inconsistent saved registries are rejected at startup. A file replacement with unconfirmed final durability returns an error; reload before retrying because disk may already contain the replacement. This change requires premerge review. Interactive IdP login, deployed fleet and release acceptance remain outstanding; no new GUI acceptance is claimed.
+
+### Inspection catalog persistence reconciliation
+
+Catalog override changes and inspection posture edits now preserve the previous
+live values when saving fails. Clearing an override and erasing an organization
+report persistence failures instead of reporting success. Shared stores merge
+updates against their current snapshot so one CP does not erase another CP's
+changes; startup validates saved snapshots before replacing the live state.
+Catalog feed application and rollback save their candidate before publication.
+
+This change supplies storage primitives. CP startup wiring and administrative
+refresh/context integration are tracked separately; it does not claim complete
+fleet acceptance. An unconfirmed final flush is still reported as a failure;
+operators must retry or reconcile storage before treating the edit as durable.
+
+Older saved and signed inspection posture patterns remain readable during upgrades; newly edited administrative input uses strict validation. Retired catalog-feed signing keys no longer prevent startup: untrusted historical entries are excluded from rollback, and a current feed signed only by a retired key falls back to the built-in catalog with a warning. The original saved file is preserved for operator review. Previously valid signed payloads retain their original restore compatibility; new submissions still use strict validation.
+
+Unchanged legacy host patterns do not block mode or known-bypass edits; newly added host patterns are validated. Rotate catalog signing keys under a new key ID. Reusing an existing key ID with different key material is rejected by saved-feed signature verification.

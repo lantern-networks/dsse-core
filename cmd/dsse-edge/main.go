@@ -4591,9 +4591,8 @@ func main() {
 		// section below would be published in every bundle and applied by nobody.
 		InspectionPostureGeneration: postureStore.ConfigGeneration,
 		SetInspectionPosture: func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error) {
-			updated, err := postureStore.Set(p)
-			// The in-memory posture IS applied either way (the engine must match what the store holds);
-			// the error tells the admin the change will not survive a restart.
+			updated, err := postureStore.SetReceived(p)
+			// Refresh enforcement from the actual live store, including after a rejected save.
 			applyInspectionPosture(tenantID)
 			return updated, err
 		},

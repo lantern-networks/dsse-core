@@ -154,7 +154,11 @@ func registerPredefinedCatalogRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		}
 		tenant := adminTenantIDFromRequest(r)
 		id := strings.TrimSpace(r.PathValue("id"))
-		cleared := config.CatalogOverrides.Clear(tenant, id)
+		cleared, err := config.CatalogOverrides.ClearContext(r.Context(), tenant, id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("catalog override removal could not be confirmed; reload and retry"))
+			return
+		}
 		if config.ApplyMaterializedCertPinBypass != nil {
 			config.ApplyMaterializedCertPinBypass(tenant)
 		}

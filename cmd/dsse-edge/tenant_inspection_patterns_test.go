@@ -151,7 +151,7 @@ func TestTenantInspectionDefaultsAndCatalogOverridesRefreshTogether(t *testing.T
 	if e.Matches(edgeplane.NetworkExtensionRuntimeCopyTCPRoute{TenantID: "unknown", Host: "authored.invalid", Port: 443}) {
 		t.Fatal("unknown tenant inherited authored inspect")
 	}
-	if cleared := o.Clear("a", "apple_push"); !cleared {
+	if cleared, err := o.Clear("a", "apple_push"); err != nil || !cleared {
 		t.Fatal("clear override failed")
 	}
 	p.Set(inspectionposture.DefaultPosture())

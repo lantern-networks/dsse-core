@@ -3,7 +3,6 @@ package policy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/model"
@@ -78,7 +77,9 @@ func (s *Store) editIncomingRuntimeLocked(ctx context.Context, edit func(*adminP
 	}
 	var err error
 	switch p := s.runtimeStatePersister.(type) {
-	case eastWestContextPersister:
+	case interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}:
 		err = p.UpdateContext(ctx, build)
 	case atomicRuntimeStatePersister:
 		err = p.Update(build)
@@ -98,7 +99,7 @@ func (s *Store) editIncomingRuntimeLocked(ctx context.Context, edit func(*adminP
 	if editErr != nil {
 		return editErr
 	}
-	if err != nil && !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+	if err = blobstore.UnconfirmedSave(err); err != nil {
 		return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
 	}
 	s.serverInitiatedEnabled = committed.ServerInitiatedEnabled

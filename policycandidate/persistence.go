@@ -2,7 +2,9 @@ package policycandidate
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -64,6 +66,11 @@ func (store *Store) persistLocked() error {
 		return fmt.Errorf("marshal policy-candidate snapshot: %w", err)
 	}
 	if err := store.persister.Save(data); err != nil {
+		// The public FilePersister uses this sentinel only after writing the new snapshot.
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			log.Printf("policy candidate snapshot saved with reduced durability")
+			return nil
+		}
 		return fmt.Errorf("persist policy candidates: %w", err)
 	}
 	return nil

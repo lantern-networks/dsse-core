@@ -31,3 +31,11 @@ func TestBuildServerInitiatedExport(t *testing.T) {
 		t.Fatalf("rule d should map deny: %+v", exp.Rules[1])
 	}
 }
+
+func TestExplicitTCPExportKeepsPortRestriction(t *testing.T) {
+	now := time.Now()
+	exp := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp-selected", Protocol: "tcp", Port: 2222, Mode: "allow", Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}}, now)
+	if len(exp.Rules) != 1 || exp.Rules[0].ServiceFamily != "tcp" || exp.Rules[0].Port != 2222 {
+		t.Fatalf("TCP port restriction lost: %+v", exp)
+	}
+}

@@ -34,6 +34,15 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Delegated operators can cancel customer export jobs using the current customer
+delegation; cancellation still refuses undelegated and unauthorized cross-tenant
+requests. Export request, queue and worker lifecycle audits retain the operator's
+principal and home-organization IDs. Cancellation identifies its own caller and
+does not inherit the requester's operator identity. Product HTTP tests exercise
+worker completion, opposite-role cancellations, spoofed metadata and delegation
+revocation. A local browser cancellation matched the customer job and audit trail.
+
+
 Log exports now include the full selected local calendar days, including the
 last nanosecond of the end date. The Console offers the supported NDJSON format,
 rejects invalid or reversed dates without starting a job, and restores refresh

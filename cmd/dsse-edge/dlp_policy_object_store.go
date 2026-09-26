@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -177,7 +178,7 @@ func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) 
 	if err != nil {
 		return err
 	}
-	return s.persister.Save(raw)
+	return blobstore.UnconfirmedSave(s.persister.Save(raw))
 }
 func (s *dlpPolicyObjectStore) UpsertDurable(obj model.DLPPolicyObject) error {
 	s.mu.Lock()
@@ -188,6 +189,7 @@ func (s *dlpPolicyObjectStore) UpsertDurable(obj model.DLPPolicyObject) error {
 	}
 	next.ByTenant[obj.TenantID][obj.ID] = obj
 	if err := s.saveSnapshotLocked(next); err != nil {
+		s.adoptReplacedSnapshotLocked(next, err)
 		return err
 	}
 	s.byTenant, s.dirty = next.ByTenant, false
@@ -203,11 +205,22 @@ func (s *dlpPolicyObjectStore) DeleteDurable(tenant, id string) (bool, error) {
 	next := s.snapshotLocked()
 	delete(next.ByTenant[tenant], id)
 	if err := s.saveSnapshotLocked(next); err != nil {
+		s.adoptReplacedSnapshotLocked(next, err)
 		return false, err
 	}
 	s.byTenant, s.dirty = next.ByTenant, false
 	s.generation++
 	return true, nil
+}
+
+// A completed file replacement must remain visible even when its directory
+// sync is unconfirmed. Keep it dirty for a later confirmed flush, and return
+// the error to the caller instead of acknowledging durable success.
+func (s *dlpPolicyObjectStore) adoptReplacedSnapshotLocked(next dlpPolicyObjectSnapshot, err error) {
+	if errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+		s.byTenant, s.dirty = next.ByTenant, true
+		s.generation++
+	}
 }
 
 // dlpPolicyObjectResolver resolves a named DLP policy for a tenant (consumed by the egress hook).

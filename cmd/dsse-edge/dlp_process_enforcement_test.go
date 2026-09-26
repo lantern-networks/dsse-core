@@ -118,7 +118,7 @@ func TestDLPAdminAcknowledgesOnlySavedPolicy(t *testing.T) {
 			if op == "delete" {
 				method = "DELETE"
 			}
-			dlpProcessRequest(t, cp.URL, method, string(raw), 500)
+			dlpProcessRequest(t, cp.URL, method, string(raw), 503)
 			if got := dlpProcessRequest(t, cp.URL, "GET", "", 200); !bytes.Equal(got, before) {
 				t.Fatal("failed save changed live policy")
 			}

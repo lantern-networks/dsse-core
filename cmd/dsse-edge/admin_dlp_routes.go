@@ -98,7 +98,7 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			obj.Status = "active"
 		}
 		if err := dlpPolicyObjects.UpsertDurable(obj); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("could not save DLP policy"))
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP policy save was not confirmed; reload before retrying"))
 			return
 		}
 		logInfof("dlp_policy_object_applied_by_admin tenant=%s id=%s name=%q identifiers=%d action=%s device_risk=%d", tenant, obj.ID, obj.Name, len(obj.Identifiers), obj.OnMatch, len(obj.DeviceRisk))
@@ -116,7 +116,7 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 		tenant := adminTenantIDFromRequest(r)
 		removed, err := dlpPolicyObjects.DeleteDurable(tenant, id)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("could not delete DLP policy"))
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP policy deletion was not confirmed; reload before retrying"))
 			return
 		}
 		logInfof("dlp_policy_object_removed_by_admin tenant=%s id=%s removed=%t", tenant, id, removed)

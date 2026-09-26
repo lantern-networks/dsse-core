@@ -97,7 +97,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 		if strings.TrimSpace(obj.Status) == "" {
 			obj.Status = "active"
 		}
-		dlpPolicyObjects.Upsert(obj)
+		if err := dlpPolicyObjects.UpsertDurable(obj); err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("could not save DLP policy"))
+			return
+		}
 		logInfof("dlp_policy_object_applied_by_admin tenant=%s id=%s name=%q identifiers=%d action=%s device_risk=%d", tenant, obj.ID, obj.Name, len(obj.Identifiers), obj.OnMatch, len(obj.DeviceRisk))
 		writeJSON(w, http.StatusOK, map[string]any{"policy": obj, "policies": dlpPolicyObjects.List(tenant)})
 	}))
@@ -111,7 +114,11 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		removed := dlpPolicyObjects.Delete(tenant, id)
+		removed, err := dlpPolicyObjects.DeleteDurable(tenant, id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("could not delete DLP policy"))
+			return
+		}
 		logInfof("dlp_policy_object_removed_by_admin tenant=%s id=%s removed=%t", tenant, id, removed)
 		writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "policies": dlpPolicyObjects.List(tenant)})
 	}))

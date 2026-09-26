@@ -146,36 +146,68 @@ func (s *dlpPolicyObjectStore) SetPersister(p blobstore.Persister) error {
 // PersistIfDirty writes a snapshot when there are unsaved changes.
 func (s *dlpPolicyObjectStore) PersistIfDirty() error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.dirty || s.persister == nil {
-		s.mu.Unlock()
 		return nil
 	}
-	snap := dlpPolicyObjectSnapshot{ByTenant: map[string]map[string]model.DLPPolicyObject{}}
-	for t, m := range s.byTenant {
-		cp := map[string]model.DLPPolicyObject{}
-		for id, p := range m {
-			cp[id] = p
+	if err := s.saveSnapshotLocked(s.snapshotLocked()); err != nil {
+		return err
+	}
+	s.dirty = false
+	return nil
+}
+
+// Keep snapshot writes serialized with acknowledged edits, so a periodic flush
+// cannot overwrite a newer, already-saved admin change.
+func (s *dlpPolicyObjectStore) snapshotLocked() dlpPolicyObjectSnapshot {
+	next := dlpPolicyObjectSnapshot{ByTenant: map[string]map[string]model.DLPPolicyObject{}}
+	for tenant, rows := range s.byTenant {
+		next.ByTenant[tenant] = map[string]model.DLPPolicyObject{}
+		for id, obj := range rows {
+			next.ByTenant[tenant][id] = obj
 		}
-		snap.ByTenant[t] = cp
 	}
-	data, err := json.Marshal(snap)
-	pr := s.persister
-	if err == nil {
-		s.dirty = false
+	return next
+}
+func (s *dlpPolicyObjectStore) saveSnapshotLocked(next dlpPolicyObjectSnapshot) error {
+	if s.persister == nil {
+		return nil
 	}
-	s.mu.Unlock()
+	raw, err := json.Marshal(next)
 	if err != nil {
 		return err
 	}
-	if err := pr.Save(data); err != nil {
-		// dirty was cleared optimistically (Save runs outside the lock); re-mark so the next periodic
-		// flush retries instead of silently dropping the snapshot (review #17).
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
+	return s.persister.Save(raw)
+}
+func (s *dlpPolicyObjectStore) UpsertDurable(obj model.DLPPolicyObject) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.snapshotLocked()
+	if next.ByTenant[obj.TenantID] == nil {
+		next.ByTenant[obj.TenantID] = map[string]model.DLPPolicyObject{}
+	}
+	next.ByTenant[obj.TenantID][obj.ID] = obj
+	if err := s.saveSnapshotLocked(next); err != nil {
 		return err
 	}
+	s.byTenant, s.dirty = next.ByTenant, false
+	s.generation++
 	return nil
+}
+func (s *dlpPolicyObjectStore) DeleteDurable(tenant, id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.byTenant[tenant][id]; !ok {
+		return false, nil
+	}
+	next := s.snapshotLocked()
+	delete(next.ByTenant[tenant], id)
+	if err := s.saveSnapshotLocked(next); err != nil {
+		return false, err
+	}
+	s.byTenant, s.dirty = next.ByTenant, false
+	s.generation++
+	return true, nil
 }
 
 // dlpPolicyObjectResolver resolves a named DLP policy for a tenant (consumed by the egress hook).

@@ -200,11 +200,12 @@ type credentialPersistence interface {
 // localAdminCredentialStore is the first-party admin credential store. Concurrency-safe. `issuer` labels the
 // TOTP otpauth URI. `persistence` (optional) makes it durable across restarts.
 type localAdminCredentialStore struct {
-	mu          sync.Mutex
-	byEmail     map[string]*localAdminCredential
-	issuer      string
-	persistence credentialPersistence
-	authority   atomic.Pointer[map[credentialAuthorityKey]credentialAuthorityRecord]
+	mu                      sync.Mutex
+	byEmail                 map[string]*localAdminCredential
+	issuer                  string
+	persistence             credentialPersistence
+	pendingLoginRestriction map[string]bool
+	authority               atomic.Pointer[map[credentialAuthorityKey]credentialAuthorityRecord]
 }
 
 func newLocalAdminCredentialStore(issuer string) *localAdminCredentialStore {
@@ -250,10 +251,17 @@ func (s *localAdminCredentialStore) persistLocked(cred *localAdminCredential) er
 		defer cancel()
 		if err := s.persistence.Upsert(ctx, cred); err != nil {
 			log.Printf("admin credential persistence failed: %v", err)
+			if s.byEmail[credentialEmailKey(cred.Email)] == cred && !errors.Is(err, errCredentialConflict) {
+				if s.pendingLoginRestriction == nil {
+					s.pendingLoginRestriction = make(map[string]bool)
+				}
+				s.pendingLoginRestriction[credentialEmailKey(cred.Email)] = true
+			}
 			s.refreshConflictLocked(ctx, err)
 			return errCredentialPersistence
 		}
 	}
+	delete(s.pendingLoginRestriction, credentialEmailKey(cred.Email))
 	previous := s.byEmail[credentialEmailKey(cred.Email)]
 	s.byEmail[credentialEmailKey(cred.Email)] = cred
 	if previous == nil || previous.PrincipalID != cred.PrincipalID || previous.TenantID != cred.TenantID || previous.Status != cred.Status || !slices.Equal(previous.Roles, cred.Roles) {
@@ -499,6 +507,9 @@ func (s *localAdminCredentialStore) CompleteActivation(rawToken, code string, no
 func (s *localAdminCredentialStore) VerifyPassword(email, password string, now time.Time) (*localAdminCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.refreshLoginCredentialLocked(email); err != nil {
+		return nil, err
+	}
 	cred := s.byEmail[credentialEmailKey(email)]
 	if cred == nil || cred.Status != credentialStatusActive {
 		return nil, fmt.Errorf("invalid credentials")
@@ -524,6 +535,9 @@ func (s *localAdminCredentialStore) VerifyPassword(email, password string, now t
 func (s *localAdminCredentialStore) VerifyTOTP(email, code string, now time.Time) (*localAdminCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.refreshLoginCredentialLocked(email); err != nil {
+		return nil, err
+	}
 	cred := s.byEmail[credentialEmailKey(email)]
 	if cred == nil || cred.Status != credentialStatusActive || !cred.TOTPEnrolled {
 		return nil, fmt.Errorf("invalid credentials")
@@ -769,6 +783,7 @@ func (s *localAdminCredentialStore) DeleteAllForTenant(tenantID string) ([]strin
 		}
 		removed = append(removed, cred.Email)
 		delete(s.byEmail, key)
+		delete(s.pendingLoginRestriction, key)
 		s.publishAuthorityLocked()
 	}
 	sort.Strings(removed)
@@ -825,4 +840,77 @@ func (s *localAdminCredentialStore) authorityFor(tenant, principal string) (cred
 	record, ok := (*records)[credentialAuthorityKey{tenant, principal}]
 	record.Roles = slices.Clone(record.Roles)
 	return record, ok
+}
+
+// Shared authorization reads the current authority on every request. A local
+// immutable index is valid only for the single-process file/in-memory backend.
+func (s *localAdminCredentialStore) authorityForPrincipal(ctx context.Context, principal adminPrincipal) (credentialAuthorityRecord, bool, error) {
+	if p, ok := s.persistence.(interface {
+		LookupAuthority(context.Context, string, string, string) (credentialAuthorityRecord, bool, error)
+	}); ok {
+		email := principal.Email
+		if email == "" {
+			email = principal.Subject
+		}
+		return p.LookupAuthority(ctx, principal.TenantID, principal.ID, credentialEmailKey(email))
+	}
+	if record, ok := s.authorityFor(principal.TenantID, principal.ID); ok {
+		return record, true, nil
+	}
+	// Older reinvites could leave principal and credential IDs different. The
+	// persisted first-party principal supplies the email, never the HTTP caller.
+	email := principal.Email
+	if email == "" {
+		email = principal.Subject
+	}
+	records := s.authority.Load()
+	if records != nil && credentialEmailKey(email) != "" {
+		for key, record := range *records {
+			if key.TenantID == principal.TenantID && credentialEmailKey(record.Email) == credentialEmailKey(email) {
+				record.Roles = slices.Clone(record.Roles)
+				return record, true, nil
+			}
+		}
+	}
+	return credentialAuthorityRecord{}, false, nil
+}
+
+// Refresh a shared login record before validation, without retrying a mutation.
+// Retain local failed-login/replay restrictions when an earlier save failed.
+// A peer reset does not clear that uncertainty; a confirmed local save does.
+func (s *localAdminCredentialStore) refreshLoginCredentialLocked(email string) error {
+	p, ok := s.persistence.(interface {
+		LoadCredential(context.Context, string) (*localAdminCredential, error)
+	})
+	if !ok {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), credentialPersistenceTimeout)
+	defer cancel()
+	next, err := p.LoadCredential(ctx, credentialEmailKey(email))
+	if err != nil {
+		return errCredentialPersistence
+	}
+	key := credentialEmailKey(email)
+	old := s.byEmail[key]
+	if next == nil {
+		delete(s.byEmail, key)
+		delete(s.pendingLoginRestriction, key)
+		s.publishAuthorityLocked()
+		return nil
+	}
+	if s.pendingLoginRestriction[key] && old != nil && old.PrincipalID == next.PrincipalID {
+		if old.LockedUntil.After(next.LockedUntil) {
+			next.LockedUntil = old.LockedUntil
+		}
+		if old.FailedAttempts > next.FailedAttempts {
+			next.FailedAttempts = old.FailedAttempts
+		}
+		if old.TOTPSecret == next.TOTPSecret && old.LastTOTPCounter > next.LastTOTPCounter {
+			next.LastTOTPCounter = old.LastTOTPCounter
+		}
+	}
+	s.byEmail[key] = next
+	s.publishAuthorityLocked()
+	return nil
 }

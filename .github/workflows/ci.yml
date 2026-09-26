@@ -67,7 +67,11 @@ jobs:
       - name: PostgreSQL administrative writes and application ownership
         env:
           POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
+<<<<<<< HEAD
         run: go test ./cmd/dsse-edge -run '^(TestPostgres(.*(Archive|Chain|Retention|Hold|Prune|Destructive|Deletion|PolicyWait|TenantErasure|TenantPurge)|BlobInitial|CandidatePeer|Observation|RuleAdmin|PolicyAdmin|RouteDistribution|DLPAllowlist|DLPLibrary|DLPPolicy|IdP|DelegatedGrant|ApplicationOwnershipUsesLatestRow)|TestCandidatePublicationPostgresRestartAndConcurrency)' -count=1
+=======
+        run: go test ./cmd/dsse-edge -run '^(TestPostgres(ManagedIdentityAndCredentialPurge|BlobInitial|CandidatePeer|Observation|RuleAdmin|PolicyAdmin|RouteDistribution|DLPAllowlist|DLPLibrary|DLPPolicy|IdP|DelegatedGrant|ApplicationOwnershipUsesLatestRow)|TestCandidatePublicationPostgresRestartAndConcurrency)' -count=1
+>>>>>>> 61105ad53e9863b1ac4b59e0b1df9417656fd582
       - name: Connector access policy traffic
         run: |
           go build -o "$RUNNER_TEMP/dsse-connector" ./cmd/dsse-connector

@@ -22,11 +22,15 @@ import (
 type postgresCredentialPersistence struct{ db *sql.DB }
 
 func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdminCredential, error) {
+	return p.loadCredentials(ctx, "")
+}
+
+func (p postgresCredentialPersistence) loadCredentials(ctx context.Context, suffix string, args ...any) ([]*localAdminCredential, error) {
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
 		       recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
 		       activation_expires_at, created_at, updated_at, last_totp_counter, revision
-		FROM admin_local_credentials`)
+		FROM admin_local_credentials`+suffix, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -209,4 +213,46 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 		}
 		return newFileCredentialPersistence(path), func() error { return nil }, nil
 	}
+}
+
+func (p postgresCredentialPersistence) LoadCredential(ctx context.Context, email string) (*localAdminCredential, error) {
+	rows, err := p.loadCredentials(ctx, " WHERE lower(btrim(email))=$1", email)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("ambiguous administrator credential")
+	}
+	return rows[0], nil
+}
+
+func (p postgresCredentialPersistence) LookupAuthority(ctx context.Context, tenant, principal, email string) (credentialAuthorityRecord, bool, error) {
+	rows, err := p.db.QueryContext(ctx, `SELECT email,status,roles FROM admin_local_credentials
+ WHERE tenant_id=$1 AND (principal_id=$2 OR ($3<>'' AND lower(btrim(email))=$3)) LIMIT 2`, tenant, principal, email)
+	if err != nil {
+		return credentialAuthorityRecord{}, false, err
+	}
+	defer rows.Close()
+	var record credentialAuthorityRecord
+	count := 0
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&record.Email, &record.Status, &raw); err != nil {
+			return credentialAuthorityRecord{}, false, err
+		}
+		if err := json.Unmarshal(raw, &record.Roles); err != nil {
+			return credentialAuthorityRecord{}, false, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return credentialAuthorityRecord{}, false, err
+	}
+	if count > 1 {
+		return credentialAuthorityRecord{}, false, fmt.Errorf("ambiguous administrator authority")
+	}
+	return record, count == 1, nil
 }

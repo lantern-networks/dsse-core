@@ -127,7 +127,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		updated, err := tenantModelStore.Update(r.Context(), tenant, adminTenantIDFromRequest(r), now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLogFor(r, updated, evaluator, now), now)
@@ -246,7 +246,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		saved, err := adminStore.Put(r.Context(), tenant, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, saved, action, evaluator, now), now)

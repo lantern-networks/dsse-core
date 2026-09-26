@@ -626,10 +626,12 @@ func (store *Store) RuntimeEvaluator(base decision.Evaluator) decision.Evaluator
 	}
 
 	// Apply server-initiated access control for this evaluator's tenant.
-	if store.serverInitiatedEnabled[tenantID] {
-		base.ServerInitiatedEnabled = true
+	// A confirmed false or empty value withdraws startup configuration too.
+	// An absent tenant entry still leaves its original configuration untouched.
+	if enabled, configured := store.serverInitiatedEnabled[tenantID]; configured {
+		base.ServerInitiatedEnabled = enabled
 	}
-	if exs := store.legacyExceptions[tenantID]; len(exs) > 0 {
+	if exs, configured := store.legacyExceptions[tenantID]; configured {
 		base.LegacyExceptions = decision.LegacyExceptionsFromModel(exs)
 	}
 	return base

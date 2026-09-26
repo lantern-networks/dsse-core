@@ -23,6 +23,7 @@ changes is included in the published 0.3.0 release:
 | Area | Change | Evidence available so far |
 |---|---|---|
 | Incoming export compatibility | Reject activation of conditions the current Windows export cannot represent; refuse unsafe legacy exports while keeping disablement available | Authenticated registration/reactivation and saved-state checks, admin/device export checks, local browser refusal and corrected SMB save with audit comparison; Windows firewall execution remains unverified |
+| Embedded evaluator configuration | Explicit false and empty tenant settings override a caller-supplied evaluator configuration | Regression tests with caller-supplied settings; the shipped executable does not populate these startup fields, so this is not a reproduced ordinary-operation defect |
 | Incoming connection saves | Report storage failures for default changes and exception creation, edits and deletion; retain the current live setting until storage confirms the change | Four product HTTP failure/retry regressions and stored-state reload; local browser toggle failure/retry and audit comparison; shared-document regression preserving other settings. Windows application and real multi-region deployment remain separate checks. |
 | Incoming connection exceptions | Preserve port, disabled state, approval/session limits and exact expiry during owner edits; show verified defaults and permission-appropriate controls; select explicit TCP ports | Local browser owner edit, reader reload and failed-read recovery; saved-state and audit comparison; editor and TCP export regression tests. Windows application and incoming persistence-failure handling remain separate release checks. |
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
@@ -332,3 +333,5 @@ an empty or TCP protocol, these remain supported and export as TCP with the
 saved port. UDP, approval/session conditions, or a port with neither family nor
 protocol cannot be represented by the current Windows export. Disable or correct
 such a record before enabling it; no automatic broadening of its rules is made.
+
+Upgrade note: older API clients could store exception statuses other than `active` or `disabled` (for example `inactive`). Review and correct those records before upgrading; the current export rejects an unknown status instead of silently skipping it. Old Console-created records used the supported default status.

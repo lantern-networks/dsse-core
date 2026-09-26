@@ -105,7 +105,7 @@ func TestAssetAdminRecompilesDependentEgressRulesAfterConfirmedSave(t *testing.T
 	checkGroup(false)
 	call(http.MethodDelete, "/admin/assets/services/service", "", http.StatusOK)
 	check("new.example.invalid", 2222, false)
-	check("new.example.invalid", 443, true)
+	check("new.example.invalid", 443, false) // missing service must not broaden a rule to every port
 	call(http.MethodDelete, "/admin/assets/endpoints/destination", "", http.StatusOK)
 	check("new.example.invalid", 443, false)
 }

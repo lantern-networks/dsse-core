@@ -31,7 +31,7 @@ func LearningCandidateID(host, sni string, port int) string {
 // observe mode; an admin reviews and materializes the candidate to bring the destination under explicit
 // policy (the generalization of cert-pinning's ObserveCertPinFailure to all observed traffic). An
 // already-decided candidate keeps its status while still counting observations.
-func (store *Store) ObserveUnmatchedFlow(_ context.Context, tenantID, host, sni string, port int, category string, now time.Time) (Candidate, error) {
+func (store *Store) ObserveUnmatchedFlow(ctx context.Context, tenantID, host, sni string, port int, category string, now time.Time) (Candidate, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
@@ -59,8 +59,32 @@ func (store *Store) ObserveUnmatchedFlow(_ context.Context, tenantID, host, sni 
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(store, ctx, func(next *Store) (Candidate, error) {
+			return next.ObserveUnmatchedFlow(ctx, tenantID, host, sni, port, category, now)
+		})
+	}
 
-	cand := Candidate{
+	existing, found := store.candidates[tenantID][id]
+	cand := unmatchedFlowCandidate(existing, found, id, tenantID, applicationID, host, sni, port, reason, observed, 1)
+	normalized, err := normalize(cand, tenantID, now)
+	if err != nil {
+		return Candidate{}, err
+	}
+	if err := store.putLocked(normalized); err != nil {
+		return Candidate{}, err
+	}
+	return copyCandidate(normalized), nil
+}
+
+// unmatchedFlowCandidate is the candidate after times more sightings of an unmatched flow.
+func unmatchedFlowCandidate(existing Candidate, found bool, id, tenantID, applicationID, host, sni string, port int, reason, observed string, times int) Candidate {
+	if found {
+		existing.FailureCount += times
+		existing.LastObserved = &observed
+		return existing
+	}
+	return Candidate{
 		CandidateID:    id,
 		TenantID:       tenantID,
 		Source:         SourceUnmatchedFlow,
@@ -74,22 +98,9 @@ func (store *Store) ObserveUnmatchedFlow(_ context.Context, tenantID, host, sni 
 		SNI:           sni,
 		Port:          port,
 		ReasonCodes:   []string{reason},
-		FailureCount:  1,
+		FailureCount:  times,
 		LastObserved:  &observed,
 	}
-	if existing, ok := store.candidates[tenantID][id]; ok {
-		cand = existing
-		cand.FailureCount++
-		cand.LastObserved = &observed
-	}
-	normalized, err := normalize(cand, tenantID, now)
-	if err != nil {
-		return Candidate{}, err
-	}
-	if err := store.putLocked(normalized); err != nil {
-		return copyCandidate(normalized), err
-	}
-	return copyCandidate(normalized), nil
 }
 
 // learningServiceFamilyForPort maps a destination port to a non-secret service family label. Defaults to

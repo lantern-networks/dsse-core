@@ -575,3 +575,9 @@ wiring using these primitives follows in a separate migration unit.
 Audit log writes now record primary-write failures separately from downstream hook failures, including short writes. Health describes only the current writer process and does not promise durable recovery or downstream delivery. ClickHouse searches reject invalid row counts instead of returning a misleading empty result. PostgreSQL can count events without a region while retaining organization, stream, text and time filters. Streamed export storage can preserve a caller-supplied coverage comment in the gzip header. Administrative audit/export integration follows separately.
 
 Package regression, race detection and the full Go suite cover these storage changes; this is not GUI or deployed-fleet acceptance.
+
+### Agent profile replacement and removal
+
+The macOS installer checks that current and replacement profile organizations are readable and that required sidecars exist before moving configuration files. Replacing a profile for the same organization retains its device identity and existing enrollment token. Windows profile removal also clears the issued-at display metadata. These changes preserve existing profile signature verification requirements.
+
+Validation includes four isolated installer-adoption cases, shell syntax checks, host configstore tests and Windows test cross-compilation. Actual Windows registry execution and signed package installation are not claimed by these checks.

@@ -8,7 +8,7 @@ import (
 type fakeEWResolver struct {
 	src   map[string][]string
 	dest  map[string][]string
-	proto map[string][]string
+	proto map[string]map[string][]int
 }
 
 func (f fakeEWResolver) SourceDeviceTokens(tenant string, ids []string) []string {
@@ -25,7 +25,7 @@ func (f fakeEWResolver) DestinationTokens(tenant string, ids []string) []string 
 	}
 	return out
 }
-func (f fakeEWResolver) ServiceProtocols(tenant, serviceID string) []string {
+func (f fakeEWResolver) ServiceTransportPorts(tenant, serviceID string) map[string][]int {
 	return f.proto[serviceID]
 }
 
@@ -33,7 +33,7 @@ func TestCompileEastWest(t *testing.T) {
 	resolver := fakeEWResolver{
 		src:   map[string][]string{"grp-clients": {"dev-alice", "dev-bob"}},
 		dest:  map[string][]string{"grp-servers": {"db.internal", "fs.internal"}},
-		proto: map[string][]string{"svc-smb": {"smb"}},
+		proto: map[string]map[string][]int{"svc-smb": {"tcp": {445}}},
 	}
 	rules := []Rule{
 		// Active outbound authenticate rule -> compiles, source wildcard, TTL carried.
@@ -67,8 +67,8 @@ func TestCompileEastWest(t *testing.T) {
 	if !reflect.DeepEqual(ew.Destinations, []string{"db.internal", "fs.internal"}) {
 		t.Fatalf("destinations = %v, want resolved server tokens", ew.Destinations)
 	}
-	if !reflect.DeepEqual(ew.Protocols, []string{"smb"}) {
-		t.Fatalf("protocols = %v, want [smb]", ew.Protocols)
+	if !reflect.DeepEqual(ew.ServiceTransportPorts, map[string][]int{"tcp": {445}}) {
+		t.Fatalf("transport/ports = %v, want tcp/445", ew.ServiceTransportPorts)
 	}
 	// Source is RESTRICTED to the authored source's device identities (not wildcard).
 	if !reflect.DeepEqual(ew.SourceDevices, []string{"dev-alice", "dev-bob"}) {

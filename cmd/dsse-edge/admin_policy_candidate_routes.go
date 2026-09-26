@@ -10,9 +10,9 @@ package main
 import (
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	appcatalog "github.com/lantern-networks/dsse-core/appcatalog"
@@ -26,14 +26,21 @@ import (
 )
 
 func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, policyCandidateStore policycandidate.RuntimeStore, applicationCatalogStore appcatalog.RuntimeStore, registry connectorRegistryStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, applyMaterializedCertPinBypass func(tenantID string), configSourceURL string) {
-	writeCandidateError := func(w http.ResponseWriter, err error) {
-		if errors.Is(err, policycandidate.ErrPersistence) {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate change could not be saved; reload and retry"))
-			return
-		}
-		writeError(w, http.StatusBadRequest, err)
+	// Serialize this server's candidate administration across its dependent writes.
+	// Other nodes and the general rule editor still require their own coordination.
+	var candidateWrites sync.Mutex
+	recordCandidate := func(r *http.Request, event string, c policycandidate.Candidate, now time.Time, outcome policyCandidateAuditOutcome) {
+		outcome.actor = auditActorPrincipal(r)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog(event, c, evaluator, now, outcome), now)
 	}
-
+	partial := func(w http.ResponseWriter, r *http.Request, event string, c policycandidate.Candidate, now time.Time, stage, operation string) {
+		recordCandidate(r, event, c, now, policyCandidateAuditOutcome{result: "partial", failedStage: stage, ruleOperation: operation})
+		message := "Bypass registration is incomplete. Candidate information was saved, but a later save could not be confirmed. Reload and retry; an existing bypass may still be active."
+		if operation == "delete" {
+			message = "Candidate review was saved, but bypass rule removal could not be confirmed. The bypass may remain active. Check Internet Access and retry removal."
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": message, "partial": true, "failed_stage": stage, "candidate_id": c.CandidateID, "candidate_status": c.Status})
+	}
 	mux.HandleFunc("GET /admin/policy-candidates", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
 		if !pinnedTenantContextMatches(w, r) {
 			return
@@ -45,7 +52,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		result, err := policyCandidateStore.List(r.Context(), adminTenantIDFromRequest(r), options)
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		rows := make([]policyCandidateView, 0, len(result.Candidates))
@@ -57,7 +64,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	mux.HandleFunc("GET /admin/policy-candidates/{candidate_id}", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
 		candidate, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"))
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -73,12 +80,14 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		now := time.Now()
+		candidateWrites.Lock()
+		defer candidateWrites.Unlock()
 		created, err := policyCandidateStore.Upsert(r.Context(), candidate, adminTenantIDFromRequest(r), now)
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_upserted", created, evaluator, now)), now)
+		recordCandidate(r, "admin_policy_candidate_upserted", created, now, policyCandidateAuditOutcome{result: "success"})
 		writeJSON(w, http.StatusOK, created)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/review", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
@@ -91,9 +100,15 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		now := time.Now()
+		candidateWrites.Lock()
+		defer candidateWrites.Unlock()
+		if c, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); err == nil && found && c.Source == policycandidate.SourceCertPinningDetection && ruleStore == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
+			return
+		}
 		reviewed, found, err := policyCandidateStore.Review(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"), review, now)
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -104,14 +119,15 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// candidate away from materialized (suppress/reject/dismiss a live bypass) must DELETE that rule — only
 		// then does the host get decrypted again. Then rebuild the bypass set (now without the rule).
 		if reviewed.Source == policycandidate.SourceCertPinningDetection && reviewed.Status != "materialized" && ruleStore != nil {
-			if _, err := ruleStore.Delete(adminTenantIDFromRequest(r), "certpin-rule-"+reviewed.CandidateID); err != nil {
-				logWarnf("cert-pin rule cleanup for candidate %s: %v", reviewed.CandidateID, err) // rule removed in memory; persist failed
+			if _, err := ruleStore.DeleteContext(r.Context(), adminTenantIDFromRequest(r), "certpin-rule-"+reviewed.CandidateID); err != nil {
+				partial(w, r, "admin_policy_candidate_reviewed", reviewed, now, "bypass_rule_removal", "delete")
+				return
 			}
 		}
 		if applyMaterializedCertPinBypass != nil {
 			applyMaterializedCertPinBypass(adminTenantIDFromRequest(r))
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now)), now)
+		recordCandidate(r, "admin_policy_candidate_reviewed", reviewed, now, policyCandidateAuditOutcome{result: "success", ruleOperation: "delete", ruleConfirmed: reviewed.Source == policycandidate.SourceCertPinningDetection && ruleStore != nil, applied: applyMaterializedCertPinBypass != nil})
 		writeJSON(w, http.StatusOK, reviewed)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/materialize", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +152,8 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 				return
 			}
 		}
+		candidateWrites.Lock()
+		defer candidateWrites.Unlock()
 		// ★ Same reasoning as POST /admin/cert-pin-bypass below, reached from the other direction: materializing a
 		// DETECTED cert-pin candidate emits the same Egress bypass rule, so on a config-pulling Edge it is the
 		// same adoption that expires at the next poll.
@@ -154,9 +172,13 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			configWriteRejectedWhenSourced(w, configSourceURL, "adopting a pinned-certificate bypass") {
 			return
 		}
+		if c, found, err := concrete.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); err == nil && found && c.Source == policycandidate.SourceCertPinningDetection && (assetStore == nil || ruleStore == nil) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
+			return
+		}
 		materialized, found, err := concrete.Materialize(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"), materializeReq.AllowHighRisk, now)
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -166,11 +188,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// Unified model (Phase C): a materialized cert-pin candidate also becomes a first-class, tagged Egress
 		// bypass rule (Any → <host> ⇒ allow × bypass) so the pinned-site bypass is authored intent the operator
 		// sees/toggles/deletes in the Egress view, not just an opaque candidate-store entry. Emitted BEFORE the
-		// re-apply below so EgressBypassFQDNs folds the new rule into the engine's raw-forward set. Best-effort:
-		// the legacy materialized-hosts path still bypasses the host even if rule emission fails.
+		// re-apply below; candidate status alone does not bypass traffic.
 		if materialized.Source == policycandidate.SourceCertPinningDetection && assetStore != nil && ruleStore != nil {
-			if err := emitCertPinBypassRule(assetStore, ruleStore, materialized); err != nil {
-				log.Printf("emit cert-pin bypass rule for %s: %v", materialized.CandidateID, err)
+			if err := emitCertPinBypassRuleContext(r.Context(), assetStore, ruleStore, materialized); err != nil {
+				partial(w, r, "admin_policy_candidate_materialized", materialized, now, certPinWriteStage(err), "upsert")
+				return
 			}
 		}
 		// Apply the bypass NOW (not just status-flip): rebuild the interception engine's decrypt-bypass
@@ -211,7 +233,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 				}
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_materialized", materialized, evaluator, now)), now)
+		recordCandidate(r, "admin_policy_candidate_materialized", materialized, now, policyCandidateAuditOutcome{result: "success", ruleOperation: "upsert", ruleConfirmed: materialized.Source == policycandidate.SourceCertPinningDetection, applied: applyMaterializedCertPinBypass != nil})
 		writeJSON(w, http.StatusOK, materialized)
 	}))
 	// Manually add a known pinned site directly to the decrypt-bypass, without waiting for the detector to
@@ -255,14 +277,24 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		now := time.Now()
 		tenantID := adminTenantIDFromRequest(r)
+		candidateWrites.Lock()
+		defer candidateWrites.Unlock()
+		if assetStore == nil || ruleStore == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
+			return
+		}
 		approved, err := concrete.AddManualCertPinBypass(r.Context(), tenantID, req.Host, now)
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		materialized, found, err := concrete.Materialize(r.Context(), tenantID, approved.CandidateID, req.AllowHighRisk, now)
 		if err != nil {
-			writeCandidateError(w, err)
+			if errors.Is(err, policycandidate.ErrPersistence) {
+				partial(w, r, "admin_cert_pin_bypass_added", approved, now, "candidate_materialization", "upsert")
+			} else {
+				writePolicyCandidateError(w, err)
+			}
 			return
 		}
 		if !found {
@@ -270,14 +302,15 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		if assetStore != nil && ruleStore != nil {
-			if err := emitCertPinBypassRule(assetStore, ruleStore, materialized); err != nil {
-				log.Printf("emit cert-pin bypass rule for %s: %v", materialized.CandidateID, err)
+			if err := emitCertPinBypassRuleContext(r.Context(), assetStore, ruleStore, materialized); err != nil {
+				partial(w, r, "admin_cert_pin_bypass_added", materialized, now, certPinWriteStage(err), "upsert")
+				return
 			}
 		}
 		if applyMaterializedCertPinBypass != nil {
 			applyMaterializedCertPinBypass(tenantID)
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_cert_pin_bypass_added", materialized, evaluator, now)), now)
+		recordCandidate(r, "admin_cert_pin_bypass_added", materialized, now, policyCandidateAuditOutcome{result: "success", ruleOperation: "upsert", ruleConfirmed: true, applied: applyMaterializedCertPinBypass != nil})
 		writeJSON(w, http.StatusOK, materialized)
 	}))
 	// Connector UX Slice 4: refresh connector-discovered candidates. Derives candidates from the
@@ -296,7 +329,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		discovered, err := refreshConnectorDiscoveredCandidates(r.Context(), registry, applicationCatalogStore, concrete, tenantID, now)
 		if err != nil {
 			if errors.Is(err, policycandidate.ErrPersistence) {
-				writeCandidateError(w, err)
+				writePolicyCandidateError(w, err)
 				return
 			}
 			writeError(w, http.StatusInternalServerError, err)
@@ -333,9 +366,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		now := time.Now()
+		candidateWrites.Lock()
+		defer candidateWrites.Unlock()
 		cand, found, err := policyCandidateStore.Get(r.Context(), tenantID, candidateID)
 		if err != nil {
-			writeCandidateError(w, err)
+			writePolicyCandidateError(w, err)
 			return
 		}
 		if !found {
@@ -437,4 +472,22 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			"review":         applicationPublishReview(created, evaluator, policyStore),
 		})
 	}))
+}
+
+// Storage details remain in the server, not in the response or common audit.
+func writePolicyCandidateError(w http.ResponseWriter, err error) {
+	// Checked first: "reload and retry" is wrong advice here, retrying cannot succeed.
+	if errors.Is(err, policycandidate.ErrReconciliationRequired) {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate storage stopped after a save whose outcome is unknown; retrying will not help. Check the control plane log, then restart this control plane"))
+		return
+	}
+	if errors.Is(err, policycandidate.ErrUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate state is unavailable; reload and retry"))
+		return
+	}
+	if errors.Is(err, policycandidate.ErrPersistence) {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate save could not be confirmed; reload and retry"))
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
 }

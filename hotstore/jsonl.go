@@ -29,15 +29,20 @@ type JSONLStore struct {
 
 type RowHandler func(row map[string]any) error
 
+type UnknownRegionCounter interface {
+	CountUnknownRegion(context.Context, SearchQuery) (int64, error)
+}
+
 type SearchQuery struct {
-	TenantID string
-	Stream   string
-	Filters  map[string]string
-	Text     string
-	From     *time.Time
-	To       *time.Time
-	Limit    int
-	Cursor   string
+	countUnknownRegion bool
+	TenantID           string
+	Stream             string
+	Filters            map[string]string
+	Text               string
+	From               *time.Time
+	To                 *time.Time
+	Limit              int
+	Cursor             string
 	// IncludeOldestMatched asks ExportRows to also report the earliest event held for this tenant+stream,
 	// ignoring From/To (see ExportResult.OldestMatchedAt). Opt-in because it is free on the JSONL backend (that
 	// scan already visits every row) but an extra statement on Postgres — the callers that do not need to state

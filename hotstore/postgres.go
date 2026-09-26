@@ -336,6 +336,10 @@ func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, e
 	conditions := []string{"tenant_id = $1", "stream = $2"}
 	nextArg := 3
 	filters := copyFilters(query.Filters)
+	if query.countUnknownRegion {
+		delete(filters, "edge_region_id")
+		conditions = append(conditions, "edge_region_id = ''")
+	}
 	filterKeys := make([]string, 0, len(filters))
 	for key := range filters {
 		if key != "tenant_id" {
@@ -381,6 +385,9 @@ func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, e
 		args = append(args, query.To.UTC())
 		nextArg++
 	}
+	if query.countUnknownRegion {
+		return postgresSearchStatement{SQL: "SELECT count(*) FROM hot_events WHERE " + strings.Join(conditions, " AND "), Args: args}, nil
+	}
 	limitArg := nextArg
 	args = append(args, query.Limit)
 	nextArg++
@@ -410,4 +417,20 @@ func buildPostgresRelatedByAccessDecisionIDStatement(query RelatedLogQuery) (pos
 	}
 	statement := "SELECT stream, payload FROM hot_events WHERE tenant_id = $1 AND access_decision_id = $2 ORDER BY occurred_at DESC, received_at DESC, event_id DESC"
 	return postgresRelatedStatement{SQL: statement, Args: []any{tenantID, decisionID}}, nil
+}
+
+// CountUnknownRegion preserves every scope/filter except region, and ignores pagination.
+func (store *PostgresStore) CountUnknownRegion(ctx context.Context, query SearchQuery) (int64, error) {
+	if store == nil || store.db == nil {
+		return 0, fmt.Errorf("postgres hot store is not configured")
+	}
+	query.countUnknownRegion = true
+	query.Cursor = ""
+	statement, err := buildPostgresSearchStatement(query)
+	if err != nil {
+		return 0, err
+	}
+	var count int64
+	err = store.db.QueryRowContext(ctx, statement.SQL, statement.Args...).Scan(&count)
+	return count, err
 }

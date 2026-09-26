@@ -81,6 +81,10 @@ func TestConfigBundleRefusesEastWestPostureChangedDuringSnapshot(t *testing.T) {
 // Covers the ordinary Connector Access posture and rule lifecycle through a
 // product CP in another OS process and the signed automatic Edge poller.
 func TestEastWestDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
+	testEastWestDistributionAcrossCPAndEdgeProcesses(t, "")
+}
+
+func testEastWestDistributionAcrossCPAndEdgeProcesses(t *testing.T, connectorBinary string) {
 	dir := t.TempDir()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -130,9 +134,15 @@ func TestEastWestDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 		return raw
 	}
 	edgePolicy := policy.NewStore(nil)
-	edge := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(),
-		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(),
-		PolicyStore: edgePolicy, ConfigSourceURL: ready.URL}))
+	var edge *httptest.Server
+	destination := "internal.example.test"
+	var traffic func(int, string)
+	if connectorBinary == "" {
+		edge = httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(),
+			OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(), PolicyStore: edgePolicy, ConfigSourceURL: ready.URL}))
+	} else {
+		edge, destination, traffic = startEastWestTrafficConnector(t, ctx, connectorBinary, dir, ready.URL, edgePolicy)
+	}
 	defer edge.Close()
 	status := &configBundleSyncStatus{source: ready.URL, interval: 20 * time.Millisecond}
 	source := configBundleSource{url: ready.URL, client: http.DefaultClient, token: processDistributionToken,
@@ -195,18 +205,40 @@ func TestEastWestDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 			}
 		}
 	}
-	request(http.MethodPost, ready.URL, `{"mode":"partial","rules":[{"id":"rule-ew","mode":"deny","destinations":["internal.example.test"],"protocols":["ssh"]}]}`)
-	check("partial", "deny")
-	request(http.MethodPost, ready.URL, `{"mode":"full","rules":[{"id":"rule-ew","mode":"allow","destinations":["internal.example.test"],"protocols":["ssh"]}]}`)
-	check("full", "allow")
-	request(http.MethodPost, ready.URL, `{"mode":"observe"}`)
-	check("observe", "allow")
-	request(http.MethodPost, ready.URL, `{"mode":"partial"}`)
-	check("partial", "allow")
-	request(http.MethodPost, ready.URL, `{"rules":[]}`)
-	check("partial", "")
-	request(http.MethodPost, ready.URL, `{"mode":"observe"}`)
-	check("observe", "")
+	if traffic != nil {
+		save := func(body, mode, rule string, code int) {
+			request(http.MethodPost, ready.URL, strings.ReplaceAll(body, "internal.example.test", destination))
+			check(mode, rule)
+			reason := ""
+			if code == 403 {
+				reason = "east_west_policy_deny"
+				if rule == "" {
+					reason = "east_west_default_deny"
+				}
+			}
+			traffic(code, reason)
+		}
+		save(`{"mode":"partial","rules":[{"id":"rule-ew","mode":"deny","destinations":["internal.example.test"],"protocols":["ssh"]}]}`, "partial", "deny", 403)
+		save(`{"mode":"observe"}`, "observe", "deny", 200)
+		save(`{"mode":"partial"}`, "partial", "deny", 403)
+		save(`{"mode":"full","rules":[{"id":"rule-ew","mode":"allow","destinations":["internal.example.test"],"protocols":["ssh"]}]}`, "full", "allow", 200)
+		save(`{"rules":[]}`, "full", "", 403)
+		save(`{"mode":"observe"}`, "observe", "", 200)
+	} else {
+
+		request(http.MethodPost, ready.URL, `{"mode":"partial","rules":[{"id":"rule-ew","mode":"deny","destinations":["internal.example.test"],"protocols":["ssh"]}]}`)
+		check("partial", "deny")
+		request(http.MethodPost, ready.URL, `{"mode":"full","rules":[{"id":"rule-ew","mode":"allow","destinations":["internal.example.test"],"protocols":["ssh"]}]}`)
+		check("full", "allow")
+		request(http.MethodPost, ready.URL, `{"mode":"observe"}`)
+		check("observe", "allow")
+		request(http.MethodPost, ready.URL, `{"mode":"partial"}`)
+		check("partial", "allow")
+		request(http.MethodPost, ready.URL, `{"rules":[]}`)
+		check("partial", "")
+		request(http.MethodPost, ready.URL, `{"mode":"observe"}`)
+		check("observe", "")
+	}
 	stopPoll()
 	<-done
 	if err := os.WriteFile(filepath.Join(dir, "stop"), []byte("done"), 0o600); err != nil {

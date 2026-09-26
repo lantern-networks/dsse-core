@@ -318,21 +318,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 	mux.HandleFunc("GET /admin/legacy-exceptions/export", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
 		// S2: export active Legacy Exceptions as Firewall / L3 rules (default-deny + explicit allow)
 		// for agentless / VLAN-boundary enforcement of server-initiated traffic.
-		var exs []model.LegacyException
-		if s, ok := policyStore.(interface {
-			LegacyExceptionsFor(string) []model.LegacyException
-		}); ok {
-			exs = s.LegacyExceptionsFor(adminTenantIDFromRequest(r))
-		}
-		exp := buildServerInitiatedExport(exs, time.Now())
-		// Reflect the tenant's Incoming-Connections default toggle (POST /admin/server-initiated) into the
-		// export: "allow by default" (enabled=false) => default_action=allow, telling the consuming enforcement
-		// point (e.g. the Windows firewall inbound backend) that DSSE is NOT managing inbound and its rules
-		// should be withdrawn. Enabled => the historical default-deny contract, unchanged.
-		if s, ok := policyStore.(interface {
-			ServerInitiatedEnabledFor(string) bool
-		}); ok && !s.ServerInitiatedEnabledFor(adminTenantIDFromRequest(r)) {
-			exp.DefaultAction = "allow"
+		exp, err := incomingExportForTenant(policyStore, adminTenantIDFromRequest(r), time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))
+			return
 		}
 		writeJSON(w, http.StatusOK, exp)
 	}))

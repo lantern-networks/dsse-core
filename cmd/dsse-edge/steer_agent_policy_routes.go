@@ -15,7 +15,6 @@ import (
 	"github.com/lantern-networks/dsse-core/agenttuning"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
-	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
 )
 
@@ -194,17 +193,10 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 					"register its organization's Tenant CA on this node", identity))
 			return
 		}
-		var exs []model.LegacyException
-		if s, ok := policyStore.(interface {
-			LegacyExceptionsFor(string) []model.LegacyException
-		}); ok {
-			exs = s.LegacyExceptionsFor(tenantID)
-		}
-		exp := buildServerInitiatedExport(exs, time.Now())
-		if s, ok := policyStore.(interface {
-			ServerInitiatedEnabledFor(string) bool
-		}); ok && !s.ServerInitiatedEnabledFor(tenantID) {
-			exp.DefaultAction = "allow" // toggle off = DSSE not managing inbound (agent withdraws its rules)
+		exp, err := incomingExportForTenant(policyStore, tenantID, time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))
+			return
 		}
 		writeJSON(w, http.StatusOK, exp)
 	})

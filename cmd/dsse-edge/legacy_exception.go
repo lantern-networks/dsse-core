@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/lantern-networks/dsse-core/policy"
 	"sort"
 	"strings"
 	"time"
@@ -31,7 +32,48 @@ func validateLegacyException(ex model.LegacyException) error {
 	if m := strings.TrimSpace(ex.Mode); m != "" && !validLegacyExceptionMode[m] {
 		return fmt.Errorf("invalid mode %q (want observe|warn|deny|allow)", ex.Mode)
 	}
+	if ex.Port < 0 || ex.Port > 65535 {
+		return fmt.Errorf("port must be from 0 to 65535")
+	}
+	if ex.MaxSessionSeconds < 0 {
+		return fmt.Errorf("max_session_seconds must not be negative")
+	}
+	if ex.Status != "active" && ex.Status != "disabled" {
+		return fmt.Errorf("status must be active or disabled")
+	}
+	if ex.Status == "active" {
+		return validateIncomingExportConditions(ex)
+	}
 	return nil
+}
+
+func validateIncomingExportConditions(ex model.LegacyException) error {
+	protocol := strings.ToLower(strings.TrimSpace(ex.Protocol))
+	if (protocol != "" && protocol != "tcp") || ex.Port < 0 || ex.Port > 65535 || ex.ApprovalRequired || ex.MaxSessionSeconds != 0 {
+		return fmt.Errorf("exception %q has conditions unsupported by this export (TCP/Any only; approval and session limits are unsupported)", ex.ID)
+	}
+	if protocol == "" && strings.TrimSpace(ex.ServiceFamily) == "" && ex.Port != 0 {
+		return fmt.Errorf("exception %q has a port without a transport", ex.ID)
+	}
+	return nil
+}
+
+// Refuse the complete export instead of silently dropping a restriction while
+// retaining a wider allow. Turning management off still withdraws all DSSE rules.
+func incomingExportForTenant(store policy.RuntimeStore, tenant string, now time.Time) (serverInitiatedExport, error) {
+	source, ok := store.(interface {
+		LegacyExceptionsFor(string) []model.LegacyException
+		ServerInitiatedEnabledFor(string) bool
+	})
+	if !ok {
+		return serverInitiatedExport{}, fmt.Errorf("incoming policy storage is unavailable")
+	}
+	if !source.ServerInitiatedEnabledFor(tenant) {
+		exp, _ := buildServerInitiatedExport(nil, now)
+		exp.DefaultAction = "allow"
+		return exp, nil
+	}
+	return buildServerInitiatedExport(source.LegacyExceptionsFor(tenant), now)
 }
 
 type adminLegacyExceptionListResponse struct {
@@ -72,25 +114,46 @@ var legacyModeToFirewallAction = map[string]string{"allow": "allow", "deny": "de
 
 // buildServerInitiatedExport emits firewall rules for active, non-expired Legacy Exceptions (S2).
 // Pure function (testable). Default action is deny (server-initiated default-deny).
-func buildServerInitiatedExport(exs []model.LegacyException, now time.Time) serverInitiatedExport {
+func buildServerInitiatedExport(exs []model.LegacyException, now time.Time) (serverInitiatedExport, error) {
 	rules := make([]serverInitiatedExportRule, 0, len(exs))
 	for _, ex := range exs {
-		if !strings.EqualFold(strings.TrimSpace(ex.Status), "active") {
+		status := strings.ToLower(strings.TrimSpace(ex.Status))
+		if status == "disabled" {
 			continue
 		}
-		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(ex.ExpiresAt)); err == nil && !now.Before(t) {
-			continue // expired
+		if status != "active" {
+			return serverInitiatedExport{}, fmt.Errorf("exception %q has an invalid status", ex.ID)
 		}
-		mode := strings.TrimSpace(ex.Mode)
+		expiry, err := time.Parse(time.RFC3339, strings.TrimSpace(ex.ExpiresAt))
+		if err != nil {
+			return serverInitiatedExport{}, fmt.Errorf("exception %q has an invalid expiry", ex.ID)
+		}
+		if !now.Before(expiry) {
+			continue
+		}
+		if err := validateIncomingExportConditions(ex); err != nil {
+			return serverInitiatedExport{}, err
+		}
+		mode := strings.ToLower(strings.TrimSpace(ex.Mode))
 		if mode == "" {
 			mode = "allow"
 		}
 		action := legacyModeToFirewallAction[mode]
 		if action == "" {
-			action = "allow"
+			return serverInitiatedExport{}, fmt.Errorf("exception %q has an invalid mode", ex.ID)
 		}
+		// Existing Windows readers derive transport from ServiceFamily. A TCP
+		// condition with no family must not be exported as Any (which drops Port).
 		family := ex.ServiceFamily
-		if strings.TrimSpace(family) == "" && strings.EqualFold(strings.TrimSpace(ex.Protocol), "tcp") {
+		switch strings.ToLower(strings.TrimSpace(family)) {
+		case "":
+			if strings.EqualFold(strings.TrimSpace(ex.Protocol), "tcp") {
+				family = "tcp"
+			}
+		case "tcp", "smb", "cifs", "rdp", "winrm", "wmi", "dcom", "rpc", "ssh", "vnc", "mssql", "mysql", "postgres", "oracle", "db", "http", "https", "rmm", "management_tcp":
+		default:
+			// Older Console versions stored catalog aliases here. Windows has
+			// always interpreted nonempty unknown families as TCP with Port.
 			family = "tcp"
 		}
 		rules = append(rules, serverInitiatedExportRule{
@@ -102,7 +165,7 @@ func buildServerInitiatedExport(exs []model.LegacyException, now time.Time) serv
 	return serverInitiatedExport{
 		SchemaVersion: "server_initiated_export.v1", GeneratedAt: now.UTC().Format(time.RFC3339),
 		DefaultAction: "deny", RuleCount: len(rules), Rules: rules, NoSecretAttestation: true,
-	}
+	}, nil
 }
 
 // buildLegacyExceptionList annotates exceptions with expiry status (renewal-decision prompt, ).

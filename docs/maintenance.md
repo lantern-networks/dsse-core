@@ -34,6 +34,17 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Log exports now include the full selected local calendar days, including the
+last nanosecond of the end date. The Console offers the supported NDJSON format,
+rejects invalid or reversed dates without starting a job, and restores refresh
+and download actions for completed exports. The API validates the request before
+handing it to a worker. Local browser checks against product handlers confirmed
+that a same-day export contains the start, midday and end-of-day records, excludes
+adjacent days and another organization, and downloads a matching gzip file.
+Creation and download audits were also checked. These checks use a local log store
+and synthetic administrator session; shared-database and deployed-fleet acceptance
+remain separate.
+
 DNS Filtering saves now publish the new live policy only after the configured
 file save succeeds. A rejected save returns a retryable error and preserves the
 previous policy. Explicitly removing the last DNS rule now reaches upgraded

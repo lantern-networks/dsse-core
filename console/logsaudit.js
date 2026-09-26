@@ -811,33 +811,80 @@ async function laExports(section) {
   uiState(section, "loading");
   const current = freshRender(section);
   let jobs;
-  try { const r = await apiFetch("GET", "/admin/export-jobs", undefined, _LA_PLANE); if (!r.ok) throw new Error("HTTP " + r.status); jobs = (r.body && r.body.jobs) || []; }
+  try { const r = await apiFetch("GET", "/admin/export-jobs", undefined, _LA_PLANE); if (!r.ok) throw new Error("HTTP " + r.status); jobs = r.body && r.body.jobs;
+    if (!Array.isArray(jobs) || jobs.some(job => !job || typeof job !== "object" || Array.isArray(job))) throw new Error("Invalid export jobs response"); }
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laExports(section) }); return; }
   if (!current()) return;
   section.innerHTML = "";
-  section.appendChild(el("div", { class: "ui-toolbar" }, [el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
+  section.appendChild(el("div", { class: "ui-toolbar" }, [el("button", { class: "ui-btn", text: bl({ en: "Refresh", ja: "更新" }), onClick: () => laExports(section) }), el("span", { class: "ui-spacer" }), el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ New export", ja: "+ エクスポート作成" }), onClick: () => openExportForm(section) })]));
   if (!jobs.length) { section.appendChild(emptyBox(bl({ en: "No exports yet.", ja: "エクスポートがありません。" }))); return; }
-  section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" })], jobs.map((j) => [
-    el("span", { text: j.stream || "—" }), el("span", { text: j.format || "—" }), uiBadge(j.status || "—", /done|complete|ready/i.test(j.status || "") ? "ok" : "off"), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+  section.appendChild(simpleTable([bl({ en: "Stream", ja: "ストリーム" }), bl({ en: "Format", ja: "形式" }), bl({ en: "Status", ja: "状態" }), bl({ en: "Created", ja: "作成" }), bl({ en: "Actions", ja: "操作" })], jobs.map((j) => [
+    el("span", { text: j.stream || "—" }), el("span", { text: j.format || "—" }), uiBadge(j.status || "—", j.status === "completed" ? "ok" : "off"), el("span", { class: "ui-view-desc", text: j.created_at ? window.dsseFormatTime(j.created_at) : "—" }),
+    typeof j.id === "string" && j.id ? el("div", {class:"ui-toolbar"}, [
+      ...(j.status === "completed" ? [el("button", { class: "ui-btn", text: bl({en:"Download",ja:"ダウンロード"}), onClick: event => laDownloadExport(j, event.currentTarget) })] : []),
+    ]) : el("span", {text:"—"}),
   ])));
+}
+
+// Resolve only the token path against the Console control-plane proxy. The server's
+// absolute URL can name an internal service behind the front door.
+async function laDownloadExport(job, button) {
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    const r = await apiFetch("POST", "/admin/export-jobs/" + encodeURIComponent(job.id) + "/download-url", {}, _LA_PLANE);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const raw = r.body && r.body.download_url;
+    if (typeof raw !== "string") throw new Error("Invalid download response");
+    const url = new URL(raw, window.location.origin);
+    if (!/^https?:$/.test(url.protocol) || !/^\/admin\/export-downloads\/[A-Za-z0-9_-]+$/.test(url.pathname) || url.search || url.hash) throw new Error("Invalid download response");
+    const response = await fetch(baseForPlane(_LA_PLANE) + url.pathname, {credentials:"same-origin", cache:"no-store", redirect:"error", referrerPolicy:"no-referrer"});
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const blob = await response.blob();
+    const objectURL = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objectURL; a.download = "dsse-export-" + job.id.replace(/[^A-Za-z0-9_-]/g, "_") + ".ndjson.gz";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectURL), 10000);
+  } catch (e) {
+    uiToast(bl({en:"Could not download the export. Retry to request a new download link.",ja:"エクスポートを取得できませんでした。再度ダウンロードを押すと、新しい取得リンクを発行します。"}), "err");
+  } finally { button.disabled = false; }
+}
+
+// Date selections use the operator's local calendar, matching log search.
+function laExportDateRange(from, to) {
+  const parseDay = value => {
+    const text = String(value || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) throw new Error(bl({en:"Select valid start and end dates.",ja:"開始日と終了日を正しく選択してください。"}));
+    const date = new Date(text + "T00:00:00");
+    if (!Number.isFinite(date.getTime()) || date.getFullYear() !== Number(text.slice(0,4)) ||
+        date.getMonth()+1 !== Number(text.slice(5,7)) || date.getDate() !== Number(text.slice(8,10))) {
+      throw new Error(bl({en:"Select valid start and end dates.",ja:"開始日と終了日を正しく選択してください。"}));
+    }
+    return date;
+  };
+  const start = parseDay(from), end = parseDay(to);
+  if (start > end) throw new Error(bl({en:"End date must not precede start date.",ja:"終了日は開始日以降を選択してください。"}));
+  end.setHours(23,59,59,999);
+  return {from:start.toISOString(),to:end.toISOString().replace(".999Z", ".999999999Z")};
 }
 
 function openExportForm(section) {
   const streamF = uiField({ name: "stream", label: bl({ en: "Log", ja: "ログ" }), type: "select", value: "access", options: _LA_STREAMS.map((s) => ({ value: s.id, label: bl(s.label) })) });
-  const fmtF = uiField({ name: "fmt", label: bl({ en: "Format", ja: "形式" }), type: "select", value: "ndjson", options: [{ value: "ndjson", label: "NDJSON" }, { value: "csv", label: "CSV" }] });
+  const fmtF = uiField({ name: "fmt", label: bl({ en: "Format", ja: "形式" }), type: "select", value: "ndjson", options: [{ value: "ndjson", label: "NDJSON" }] });
   const fromF = uiField({ name: "from", label: bl({ en: "From", ja: "開始" }), type: "date" });
   const toF = uiField({ name: "to", label: bl({ en: "To", ja: "終了" }), type: "date" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Create export", ja: "エクスポート作成" }) });
   const m = uiModal({ title: bl({ en: "New export", ja: "エクスポート作成" }), body: [streamF.el, fmtF.el, fromF.el, toF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
+    if (submit.disabled) return;
     submit.disabled = true;
-    const payload = { stream: streamF.get(), format: fmtF.get() };
-    if (fromF.get()) payload.from = new Date(fromF.get()).toISOString();
-    if (toF.get()) payload.to = new Date(toF.get()).toISOString();
     try {
+      const payload = {stream:streamF.get(),format:fmtF.get(),...laExportDateRange(fromF.get(),toF.get())};
       const r = await apiFetch("POST", "/admin/export-jobs", payload, _LA_PLANE);
-      if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+      if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
       m.close(); uiToast(bl({ en: "Export started.", ja: "エクスポートを開始しました。" }), "ok"); laExports(section);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) { uiToast(String(e), "err"); }
+    finally { submit.disabled = false; }
   });
 }

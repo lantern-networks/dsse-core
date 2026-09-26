@@ -44,6 +44,19 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Policy administration now distinguishes a saved server-side change from an
+unconfirmed Network Extension snapshot. Create, delete and status-change audits
+identify the administrator and distribution outcome; storage errors no longer
+appear as invalid input or a missing policy. Status changes also invoke snapshot
+publication. Lists and details refresh shared runtime state before returning it.
+HTTP tests cover saved-state reload, failed publication and recovery, including
+partially written files from the real local publisher. Two PostgreSQL-backed
+handlers exercise edit, disable/re-enable, deletion and peer readback. Publication
+success is not an acknowledgment from a running device; deployed acceptance remains
+outstanding. This candidate also includes the policy persistence dependency from
+PR82, which still requires premerge review.
+
+
 Authored rule creation, editing and deletion now report unconfirmed storage without
 exposing storage details, and record the administrator and outcome in domain audits.
 Rule lists refresh shared rules and catalogs before returning them. Console edits

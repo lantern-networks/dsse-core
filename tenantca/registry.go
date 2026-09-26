@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // Tenant identification + isolation. Each tenant is trusted via ITS OWN CA; the tenant a
@@ -34,11 +36,16 @@ type TenantCAEntry struct {
 }
 
 type TenantCARegistryFile struct {
-	MaterialManagedTenants []string        `json:"material_managed_tenants,omitempty"`
-	Tenants                []TenantCAEntry `json:"tenants"`
+	PendingWithdrawals     []WithdrawalReceipt `json:"pending_withdrawals,omitempty"`
+	MaterialManagedTenants []string            `json:"material_managed_tenants,omitempty"`
+	Tenants                []TenantCAEntry     `json:"tenants"`
 }
 
 type TenantCARegistry struct {
+	authoritativeLoaded     bool
+	pendingTrustWithdrawals map[string]bool
+	pendingWithdrawals      map[string]string // local removals awaiting completion of trust and persistence
+
 	// Persisted with admission anchors; only a successful material install sets ownership.
 	materialManaged map[string]bool
 	Pool            *x509.CertPool
@@ -111,6 +118,9 @@ func LoadTenantCARegistry(path string) (*TenantCARegistry, error) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("parse tenant CA registry %q: %w", path, err)
 	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return nil, ErrPendingWithdrawal
+	}
 	reg := &TenantCARegistry{Pool: x509.NewCertPool(), byAnchorKey: map[string]string{}}
 	for _, e := range doc.Tenants {
 		tid := strings.TrimSpace(e.TenantID)
@@ -123,8 +133,12 @@ func LoadTenantCARegistry(path string) (*TenantCARegistry, error) {
 				return nil, fmt.Errorf("tenant CA registry: tenant %q inline ca_pem: %w", tid, perr)
 			}
 			for _, c := range certs {
+				key := CAAnchorKey(c)
+				if existing, ok := reg.byAnchorKey[key]; ok && existing != tid {
+					return nil, fmt.Errorf("tenant CA registry: CA shared by tenants %q and %q (isolation violation)", existing, tid)
+				}
 				reg.Pool.AddCert(c)
-				reg.byAnchorKey[CAAnchorKey(c)] = tid
+				reg.byAnchorKey[key] = tid
 				reg.anchors = append(reg.anchors, c)
 			}
 			continue
@@ -238,6 +252,9 @@ func (r *TenantCARegistry) Register(tenantID string, pemBytes []byte) ([]*x509.C
 		r.byAnchorKey = map[string]string{}
 	}
 	for _, c := range certs {
+		if _, pending := r.pendingWithdrawals[CAAnchorKey(c)]; pending {
+			return nil, fmt.Errorf("CA withdrawal is pending; finish saving the withdrawal before registering it again")
+		}
 		if owner, ok := r.byAnchorKey[CAAnchorKey(c)]; ok && !strings.EqualFold(owner, tenantID) {
 			return nil, fmt.Errorf("that CA already identifies tenant %q; a CA cannot be moved to another "+
 				"organization, because every device already holding a certificate under it would move with it", owner)
@@ -355,6 +372,11 @@ func (r *TenantCARegistry) tenantCountLocked() int {
 // CA that identifies its devices; leaving that registration in memory would have moved the same failure one
 // restart away, which is how the per-tenant interception root behaves today and why it counts as broken.
 func (r *TenantCARegistry) Save(path string) error {
+	return r.SaveWithdrawals(path)
+}
+
+// SaveWithdrawals is called after the named removal has completed its trust stage.
+func (r *TenantCARegistry) SaveWithdrawals(path string, removedSHA256 ...string) error {
 	if r == nil {
 		return fmt.Errorf("tenant CA registry is not configured")
 	}
@@ -362,33 +384,11 @@ func (r *TenantCARegistry) Save(path string) error {
 	if path == "" {
 		return fmt.Errorf("no tenant CA registry path is configured, so this registration would be lost on restart")
 	}
-	r.mu.RLock()
-	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
-	for _, c := range r.anchors {
-		tenantID := r.byAnchorKey[CAAnchorKey(c)]
-		if tenantID == "" {
-			continue
-		}
-		doc.Tenants = append(doc.Tenants, TenantCAEntry{
-			TenantID: tenantID,
-			CAPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})),
-		})
-	}
-	r.mu.RUnlock()
-	sort.Slice(doc.Tenants, func(i, j int) bool { return doc.Tenants[i].TenantID < doc.Tenants[j].TenantID })
-
-	data, err := json.MarshalIndent(doc, "", "  ")
+	data, err := r.snapshot(removedSHA256, true)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeRegistryFile(path, data)
 }
 
 // NewTenantCARegistry returns an empty registry, for a deployment whose registrations live in a shared store
@@ -416,25 +416,25 @@ type Persister interface {
 // The reference lab hides it, because all its Edges bind-mount the same registry file; a real deployment does
 // not share a filesystem.
 //
-// Snapshot/Adopt are the shared-store half. Save(path) stays exactly as it was for file deployments.
+// Snapshot/Adopt are the shared-store half. File deployments use Save(path).
 
 // Snapshot serialises the registry in the same form Save writes to a file.
 func (r *TenantCARegistry) Snapshot() ([]byte, error) {
+	return r.snapshot(nil, false)
+}
+
+func (r *TenantCARegistry) snapshot(removed []string, saving bool) ([]byte, error) {
 	if r == nil {
 		return nil, fmt.Errorf("tenant CA registry is not configured")
 	}
 	r.mu.RLock()
-	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
-	for _, c := range r.anchors {
-		tenantID := r.byAnchorKey[CAAnchorKey(c)]
-		if tenantID == "" {
-			continue
+	if saving {
+		if err := r.checkWithdrawalSaveLocked(removed); err != nil {
+			r.mu.RUnlock()
+			return nil, err
 		}
-		doc.Tenants = append(doc.Tenants, TenantCAEntry{
-			TenantID: tenantID,
-			CAPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})),
-		})
 	}
+	doc := r.registryFileLocked()
 	r.mu.RUnlock()
 	sort.Slice(doc.Tenants, func(i, j int) bool { return doc.Tenants[i].TenantID < doc.Tenants[j].TenantID })
 	return json.MarshalIndent(doc, "", "  ")
@@ -458,6 +458,9 @@ func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, e
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return 0, err
 	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return 0, ErrPendingWithdrawal
+	}
 	skip := map[string]bool{}
 	for _, h := range skipSHA256 {
 		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
@@ -478,9 +481,10 @@ func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, e
 			continue // this node has just withdrawn it; the shared view is behind, not right
 		}
 		r.mu.RLock()
+		_, pending := r.pendingWithdrawals[CAAnchorKey(certs[0])]
 		_, known := r.byAnchorKey[CAAnchorKey(certs[0])]
 		r.mu.RUnlock()
-		if known {
+		if known || pending {
 			continue
 		}
 		if _, rerr := r.Register(tenantID, []byte(e.CAPEM)); rerr == nil {
@@ -509,12 +513,22 @@ func (r *TenantCARegistry) SaveTo(p Persister, removedSHA256 ...string) error {
 	if p == nil {
 		return fmt.Errorf("no shared backend is configured for the tenant CA registry")
 	}
-	if existing, err := p.Load(); err == nil && len(existing) > 0 {
+	r.mu.RLock()
+	pendingErr := r.checkWithdrawalSaveLocked(removedSHA256)
+	r.mu.RUnlock()
+	if pendingErr != nil {
+		return pendingErr
+	}
+	existing, err := p.Load()
+	if err != nil {
+		return fmt.Errorf("read shared tenant CA registry before saving: %w", err)
+	}
+	if len(existing) > 0 {
 		if _, aerr := r.adoptExcept(existing, removedSHA256); aerr != nil {
 			return aerr
 		}
 	}
-	blob, err := r.Snapshot()
+	blob, err := r.snapshot(removedSHA256, true)
 	if err != nil {
 		return err
 	}
@@ -544,6 +558,9 @@ func (r *TenantCARegistry) Reconcile(data []byte) (added, removed int, err error
 	var doc TenantCARegistryFile
 	if err := json.Unmarshal(data, &doc); err != nil {
 		return 0, 0, err
+	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return 0, 0, ErrPendingWithdrawal
 	}
 	fleet := map[string]bool{}
 	for _, e := range doc.Tenants {
@@ -721,4 +738,26 @@ func (r *TenantCARegistry) WithdrawAnchor(tenantID, sha256Hex string) (removed b
 		}
 	}
 	return removed, remaining
+}
+
+func (r *TenantCARegistry) registryFileLocked() TenantCARegistryFile {
+	doc := TenantCARegistryFile{Tenants: make([]TenantCAEntry, 0, len(r.anchors)), MaterialManagedTenants: r.materialManagedTenantsLocked()}
+	for _, c := range r.anchors {
+		tenantID := r.byAnchorKey[CAAnchorKey(c)]
+		if tenantID == "" {
+			continue
+		}
+		doc.Tenants = append(doc.Tenants, TenantCAEntry{
+			TenantID: tenantID,
+			CAPEM:    string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.Raw})),
+		})
+	}
+	return doc
+}
+
+func writeRegistryFile(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0750); err != nil {
+		return err
+	}
+	return durablefile.Write(path, data, 0600)
 }

@@ -593,3 +593,23 @@ legacy bare-ID snapshots remain readable. Older writers must not overwrite the
 new format; rollback requires a compatible backup.
 
 Authorization request paths refresh shared grant and human-approval state at most once per five-second window; explicit administrative reads remain current. Grant-batch conflicts no longer prevent other correctly attributed revocations. Invalid legacy authorization rows are skipped with a generic warning during restore, preserving valid rows and the original file. VLAN and access-grant receive failures remain unacknowledged and retryable, and failed grant reports return an error. Human-approval lookups and revocations use organization-specific keys, including when two organizations use the same approval ID.
+
+### Certificate and CA storage reconciliation
+
+Internal CA changes validate a candidate before replacing current trust data.
+Tenant CA registry operations retain other organizations and track incomplete
+withdrawals for reconciliation instead of silently forgetting their targets.
+Certificate/key replacement gains a private recovery journal; interrupted
+updates restore a valid pair before reload.
+
+The recovery journal contains private key material, is written with private
+permissions, and must be protected with the certificate files and backups.
+Only one process may own writable certificate files. A pending CA withdrawal
+requires reconciliation before serving devices; it is not automatically
+replayed against an unknown trust-store state. Administrative and startup
+wiring using these primitives follows in a separate migration unit.
+
+Existing CA files and signed snapshots may contain openssl preambles or public certificate chains. Restore keeps only the first public CA, matching the previous trust contract; new administrative inputs still require exactly one certificate. Unavailable authority stores publish an incomplete section, never an empty authoritative deletion. Invalid received CA snapshots remain unacknowledged so the next pull can retry. Failed administrative deletions return a storage error. Combined certificate/key PEM files remain readable at startup and reload; pair updates still require separate files.
+
+### Legacy CA restoration compatibility
+Saved and received legacy authority material restores its first public CA and discards accompanying text, chains and key material. New administrative submissions remain strict. Incomplete authority bundles keep the existing Edge trust without rejecting the remaining bundle. Startup also accepts a combined certificate/key file for reading; two-file updates still require distinct paths.

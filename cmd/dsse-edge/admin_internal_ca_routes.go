@@ -112,7 +112,12 @@ func registerInternalCARoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 			writeError(w, http.StatusForbidden, tenantErr)
 			return
 		}
-		if !store.Delete(r.PathValue("id"), tenant, time.Now().UTC()) {
+		deleted, err := store.DeleteChecked(r.PathValue("id"), tenant, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("internal authority deletion was not confirmed"))
+			return
+		}
+		if !deleted {
 			writeError(w, http.StatusNotFound, fmt.Errorf("no such authority in this organization"))
 			return
 		}

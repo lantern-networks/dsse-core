@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -48,6 +49,23 @@ func (r *ReloadableCert) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate,
 // Reload re-reads the cert/key from disk and atomically swaps it in. On any error the previous certificate is
 // retained (the caller logs; the link keeps working with the last good material).
 func (r *ReloadableCert) Reload() error {
+	pairMu.Lock()
+	defer pairMu.Unlock()
+	cp, err := filepath.Abs(r.certFile)
+	if err != nil {
+		return err
+	}
+	kp, err := filepath.Abs(r.keyFile)
+	if err != nil {
+		return err
+	}
+	// Combined PEM files were supported before pair-update journaling. Reading
+	// them remains valid; two-file updates still require separate paths.
+	if cp != kp {
+		if err := recoverPairLocked(cp, kp, cp+".dsse-pair-recovery.json"); err != nil {
+			return fmt.Errorf("certificate pair recovery: %w", err)
+		}
+	}
 	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
 	if err != nil {
 		return fmt.Errorf("reload cert %s/%s: %w", r.certFile, r.keyFile, err)

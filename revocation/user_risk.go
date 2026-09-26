@@ -19,6 +19,9 @@ type UserRisk struct {
 
 var ErrRiskSave = errors.New("risk state could not be saved")
 var ErrRiskUnavailable = errors.New("risk state is unavailable")
+var ErrLegacyUnattributed = errors.New("legacy risk mark cannot be attributed")
+var ErrLegacyRiskNotFound = errors.New("unattributed legacy risk mark not found")
+var ErrLegacyRiskChanged = errors.New("unattributed legacy risk mark changed")
 
 func userRiskKey(tenant, id string) string { return tenant + "\x00" + id }
 func normalizeUserRisk(mark UserRisk) (UserRisk, error) {
@@ -115,7 +118,83 @@ func (o *HighRiskOverlay) UserSeverity(tenant, subject string) (string, bool) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	sev, ok := o.userIndex[userRiskKey(strings.TrimSpace(tenant), strings.TrimSpace(subject))]
+	if legacy := o.legacyUnattributed[strings.TrimSpace(subject)]; riskRank(legacy) > riskRank(sev) {
+		return legacy, true
+	}
 	return sev, ok
+}
+
+// LegacySeverity preserves v1's raw ID match without guessing a tenant or type.
+func (o *HighRiskOverlay) LegacySeverity(id string) string {
+	if o == nil {
+		return ""
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return o.legacyUnattributed[strings.TrimSpace(id)]
+}
+
+func (o *HighRiskOverlay) LegacyUnattributedSnapshot() map[string]string {
+	out := map[string]string{}
+	if o == nil {
+		return out
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	for id, severity := range o.legacyUnattributed {
+		out[id] = severity
+	}
+	return out
+}
+
+func (o *HighRiskOverlay) LegacyUnattributedCount() int {
+	if o == nil {
+		return 0
+	}
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+	return len(o.legacyUnattributed)
+}
+
+// DiscardLegacyUnattributed is an explicit operator resolution. Ordinary
+// device/user clears must not remove an ID whose original type is unknown.
+// The expected severity protects an operator against resolving a changed mark.
+func (o *HighRiskOverlay) DiscardLegacyUnattributed(id, expectedSeverity string) (bool, error) {
+	if o == nil {
+		return false, ErrRiskUnavailable
+	}
+	id = NormalizeDeviceID(id)
+	expectedSeverity = strings.ToLower(strings.TrimSpace(expectedSeverity))
+	if id == "" || strings.ContainsRune(id, '\x00') || riskRank(expectedSeverity) == 0 {
+		return false, fmt.Errorf("legacy risk id and expected severity are required")
+	}
+	o.writeMu.Lock()
+	defer o.writeMu.Unlock()
+	if o.loadErr != nil || o.legacy || o.deviceSavePending {
+		return false, ErrRiskUnavailable
+	}
+	current, ok := o.legacyUnattributed[id]
+	if !ok {
+		return false, ErrLegacyRiskNotFound
+	}
+	if current != expectedSeverity {
+		return false, ErrLegacyRiskChanged
+	}
+	candidate := make(map[string]string, len(o.legacyUnattributed)-1)
+	for key, severity := range o.legacyUnattributed {
+		if key != id {
+			candidate[key] = severity
+		}
+	}
+	warning, err := o.saveStateLocked(o.devices, o.users, candidate)
+	if err != nil {
+		return false, err
+	}
+	o.mu.Lock()
+	o.legacyUnattributed = candidate
+	o.generation.Add(1)
+	o.mu.Unlock()
+	return warning, nil
 }
 func (o *HighRiskOverlay) UserSnapshot() []UserRisk {
 	out := []UserRisk{}
@@ -185,9 +264,8 @@ func (o *HighRiskOverlay) NeedsMigration() bool {
 	return o.legacy
 }
 
-// MigrateLegacy classifies every old untyped ID before changing anything. The
-// resolver must have a complete directory and device inventory. Ambiguous and
-// orphaned marks stop the upgrade instead of clearing or copying them to tenants.
+// MigrateLegacy classifies proven old IDs and preserves ambiguous ones in a
+// separate raw-ID namespace. No tenant or type is guessed and no mark is lost.
 func (o *HighRiskOverlay) MigrateLegacy(resolve func(string) (*UserRisk, error)) error {
 	if o == nil {
 		return nil
@@ -202,10 +280,15 @@ func (o *HighRiskOverlay) MigrateLegacy(resolve func(string) (*UserRisk, error))
 	}
 	devices := map[string]string{}
 	users := cloneUserRisks(o.users)
+	legacy := map[string]string{}
 	for id, sev := range o.devices {
 		mark, err := resolve(id)
 		if err != nil {
-			return err
+			if !errors.Is(err, ErrLegacyUnattributed) {
+				return err
+			}
+			legacy[id] = sev
+			continue
 		}
 		if mark == nil {
 			devices[id] = sev
@@ -221,12 +304,13 @@ func (o *HighRiskOverlay) MigrateLegacy(resolve func(string) (*UserRisk, error))
 			users[key] = normalized
 		}
 	}
-	if _, err := o.saveStateLocked(devices, users); err != nil {
+	if _, err := o.saveStateLocked(devices, users, legacy); err != nil {
 		return err
 	}
 	o.mu.Lock()
 	o.devices = devices
 	o.users = users
+	o.legacyUnattributed = legacy
 	o.legacy = false
 	o.rebuildUserIndexLocked()
 	o.generation.Add(1)
@@ -237,6 +321,12 @@ func (o *HighRiskOverlay) MigrateLegacy(resolve func(string) (*UserRisk, error))
 // ReplaceSyncedUsers accepts only the explicit typed-user feed. A missing field
 // from an older authority cannot silently clear risk already held on this node.
 func (o *HighRiskOverlay) ReplaceSyncedUsers(marks []UserRisk) error {
+	return o.ReplaceSyncedUserRisks(marks, nil)
+}
+
+// ReplaceSyncedUserRisks publishes the typed and unresolved v1 namespaces
+// together, after validating the entire CP feed.
+func (o *HighRiskOverlay) ReplaceSyncedUserRisks(marks []UserRisk, unresolved map[string]string) error {
 	if o == nil {
 		return nil
 	}
@@ -252,11 +342,19 @@ func (o *HighRiskOverlay) ReplaceSyncedUsers(marks []UserRisk) error {
 		}
 		fresh[k] = n
 	}
+	legacy := map[string]string{}
+	for id, severity := range unresolved {
+		if id == "" || id != NormalizeDeviceID(id) || riskRank(severity) == 0 {
+			return fmt.Errorf("invalid legacy risk feed")
+		}
+		legacy[id] = severity
+	}
 	o.writeMu.Lock()
 	defer o.writeMu.Unlock()
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.users = fresh
+	o.legacyUnattributed = legacy
 	o.rebuildUserIndexLocked()
 	return nil
 }

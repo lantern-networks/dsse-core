@@ -16,20 +16,21 @@ import (
 // layer — high-risk is admin-marked (CP-authoritative). Device and user namespaces are persisted together;
 // each is authoritative on the CP and replaced from an explicitly typed feed on a puller.
 type HighRiskOverlay struct {
-	writeMu           sync.Mutex
-	mu                sync.RWMutex
-	devices           map[string]string // deviceID (normalized) -> severity (high|critical)
-	users             map[string]UserRisk
-	userIndex         map[string]string
-	loadErr           error
-	legacy            bool
-	deviceSavePending bool // writeMu: a live device change has not reached durable storage
-	persister         blobstore.Persister
-	generation        atomic.Uint64
+	writeMu            sync.Mutex
+	mu                 sync.RWMutex
+	devices            map[string]string // deviceID (normalized) -> severity (high|critical)
+	users              map[string]UserRisk
+	userIndex          map[string]string
+	legacyUnattributed map[string]string // v1 raw IDs whose tenant/type cannot be proven
+	loadErr            error
+	legacy             bool
+	deviceSavePending  bool // writeMu: a live device change has not reached durable storage
+	persister          blobstore.Persister
+	generation         atomic.Uint64
 }
 
 func NewHighRiskOverlay() *HighRiskOverlay {
-	return &HighRiskOverlay{devices: map[string]string{}, users: map[string]UserRisk{}, userIndex: map[string]string{}}
+	return &HighRiskOverlay{devices: map[string]string{}, users: map[string]UserRisk{}, userIndex: map[string]string{}, legacyUnattributed: map[string]string{}}
 }
 
 // NormalizeDeviceID trims but PRESERVES case — device ids are opaque, case-sensitive identifiers and must
@@ -100,6 +101,9 @@ func (o *HighRiskOverlay) IsHighRisk(deviceID string) (string, bool) {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	sev, ok := o.devices[id]
+	if legacy := o.legacyUnattributed[id]; riskRank(legacy) > riskRank(sev) {
+		return legacy, true
+	}
 	return sev, ok
 }
 
@@ -113,6 +117,11 @@ func (o *HighRiskOverlay) Snapshot() map[string]string {
 	defer o.mu.RUnlock()
 	for k, v := range o.devices {
 		out[k] = v
+	}
+	for k, v := range o.legacyUnattributed {
+		if riskRank(v) > riskRank(out[k]) {
+			out[k] = v
+		}
 	}
 	return out
 }

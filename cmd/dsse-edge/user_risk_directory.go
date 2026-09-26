@@ -50,9 +50,8 @@ func resolveRiskPerson(ctx context.Context, store humanidentity.HumanIdentityDir
 	return matches[0], 0, nil
 }
 
-// prepareUserRiskState runs before serving. No persisted v1 mark is discarded or
-// assigned by guessing. Unknown or ambiguous IDs require operator review of the
-// old snapshot; the process refuses startup until that attribution is resolved.
+// prepareUserRiskState runs before serving. Unknown or ambiguous v1 IDs remain
+// raw-ID risk marks, so an upgrade does not stop the CP/Edge or weaken the mark.
 func prepareUserRiskState(ctx context.Context, overlay *revocation.HighRiskOverlay, ledger *enrolledinventory.Ledger, directory humanidentity.HumanIdentityDirectoryRuntimeStore) error {
 	if overlay == nil {
 		return nil
@@ -63,14 +62,18 @@ func prepareUserRiskState(ctx context.Context, overlay *revocation.HighRiskOverl
 	all, ok := directory.(interface {
 		RiskIdentitySnapshot(context.Context) ([]model.HumanIdentity, error)
 	})
-	if !ok {
-		return fmt.Errorf("legacy risk migration requires a complete identity directory")
-	}
-	people, err := all.RiskIdentitySnapshot(ctx)
-	if err != nil {
-		return fmt.Errorf("legacy risk migration cannot read directory: %w", err)
+	var people []model.HumanIdentity
+	if ok && ledger != nil {
+		var err error
+		people, err = all.RiskIdentitySnapshot(ctx)
+		if err != nil {
+			people = nil // retain all v1 marks as raw IDs until attribution is available
+		}
 	}
 	return overlay.MigrateLegacy(func(id string) (*revocation.UserRisk, error) {
+		if people == nil || ledger == nil {
+			return nil, revocation.ErrLegacyUnattributed
+		}
 		var matches []model.HumanIdentity
 		for _, person := range people {
 			if person.ID == id || person.Subject == id || (person.Email != nil && *person.Email == id) {
@@ -88,7 +91,7 @@ func prepareUserRiskState(ctx context.Context, overlay *revocation.HighRiskOverl
 			mark := directoryRiskMark(matches[0])
 			return &mark, nil
 		}
-		return nil, fmt.Errorf("legacy risk entry %q is ambiguous or unattributable; review the saved mark before upgrading", id)
+		return nil, revocation.ErrLegacyUnattributed
 	})
 }
 
@@ -131,6 +134,12 @@ func writeUserRisk(w http.ResponseWriter, r *http.Request, config serverConfig, 
 func enrichDecisionRequestWithDirectoryRisk(ctx context.Context, req model.DecisionRequest, directory humanidentity.HumanIdentityDirectoryRuntimeStore, overlay *revocation.HighRiskOverlay) (model.DecisionRequest, error) {
 	if overlay == nil || req.UserID == "" || req.TenantID == "" {
 		return req, nil
+	}
+	if legacy := overlay.LegacySeverity(req.UserID); legacy != "" {
+		req.RiskStateSeverity = maxRiskSeverity(req.RiskStateSeverity, legacy)
+		if legacy == "high" || legacy == "critical" {
+			req.AdminHighRisk = true
+		}
 	}
 	marks := overlay.UserSeverities(req.TenantID)
 	if len(marks) == 0 {

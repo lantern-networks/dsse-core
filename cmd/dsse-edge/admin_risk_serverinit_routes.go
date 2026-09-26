@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -75,6 +77,68 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}))
+	// An unattributed v1 mark is intentionally outside both typed namespaces.
+	// Only an operator can explicitly discard it after inspecting the raw-ID
+	// list; normal device/user edits never resolve an ambiguous mark.
+	mux.HandleFunc("POST /admin/risk-signals/legacy-unattributed/resolve", adminEndpoint("admin.risk.write", func(w http.ResponseWriter, r *http.Request) {
+		if !adminCallerIsOperator(r) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("operator access required"))
+			return
+		}
+		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy risk resolution") {
+			return
+		}
+		if config.HighRiskOverlay == nil {
+			writeError(w, http.StatusServiceUnavailable, revocation.ErrRiskUnavailable)
+			return
+		}
+		var req struct {
+			ID               string `json:"id"`
+			ExpectedSeverity string `json:"expected_severity"`
+			Reason           string `json:"reason"`
+			ConfirmDiscard   bool   `json:"confirm_discard"`
+		}
+		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+			return
+		}
+		if !req.ConfirmDiscard || strings.TrimSpace(req.Reason) == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("confirm_discard and reason are required"))
+			return
+		}
+		warning, err := config.HighRiskOverlay.DiscardLegacyUnattributed(req.ID, req.ExpectedSeverity)
+		if err != nil {
+			switch {
+			case errors.Is(err, revocation.ErrLegacyRiskNotFound):
+				writeError(w, http.StatusNotFound, err)
+			case errors.Is(err, revocation.ErrLegacyRiskChanged):
+				writeError(w, http.StatusConflict, err)
+			case errors.Is(err, revocation.ErrRiskSave), errors.Is(err, revocation.ErrRiskUnavailable):
+				writeError(w, http.StatusServiceUnavailable, err)
+			default:
+				writeError(w, http.StatusBadRequest, err)
+			}
+			return
+		}
+		now := time.Now().UTC()
+		idHash := sha256.Sum256([]byte(strings.TrimSpace(req.ID)))
+		idDigest := fmt.Sprintf("%x", idHash[:])
+		result := "success"
+		if warning {
+			result = "partial"
+		}
+		audit := model.AuditLog{
+			ID: randomEdgeID("audit_legacy_risk_", now), ActorUserID: auditActorPrincipal(r),
+			EventType: "legacy_unattributed_risk_discarded", TargetType: stringPtr("legacy_risk_id_sha256"),
+			TargetID: stringPtr(idDigest), Action: stringPtr("discard_legacy_risk"), Result: stringPtr(result),
+			PolicyBundleID: &evaluator.PolicyBundle.ID, EdgeRegionID: &evaluator.EdgeRegionID,
+			EdgeClusterID: &evaluator.EdgeClusterID, SourceIP: stringPtr(sourceIPFromRequest(r)),
+			Timestamp: now.Format(time.RFC3339),
+			Metadata:  map[string]any{"expected_severity": req.ExpectedSeverity, "reason_provided": true, "save_non_atomic": warning},
+		}
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, audit, now)
+		writeJSON(w, http.StatusOK, map[string]any{"resolved": true, "legacy_unattributed_count": config.HighRiskOverlay.LegacyUnattributedCount(), "save_non_atomic": warning})
+	}))
 	// GET /admin/risk-signals: device marks by default, or typed, tenant-scoped user marks when requested.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
 		snap := map[string]string{}
@@ -99,7 +163,12 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 					mine[mark.ID] = mark.Severity
 				}
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"entity_type": "user", "tenant_id": tenant, "high_risk": mine})
+			resp := map[string]any{"entity_type": "user", "tenant_id": tenant, "high_risk": mine}
+			if adminCallerIsOperator(r) {
+				resp["legacy_unattributed_count"] = config.HighRiskOverlay.LegacyUnattributedCount()
+				resp["legacy_unattributed"] = config.HighRiskOverlay.LegacyUnattributedSnapshot()
+			}
+			writeJSON(w, http.StatusOK, resp)
 			return
 		}
 		// ★★ SCOPED, LIKE THE KILL-SWITCH LIST NEXT DOOR (2026-08-18). This overlay names every entity the

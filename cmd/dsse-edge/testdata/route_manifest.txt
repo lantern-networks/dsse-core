@@ -341,6 +341,7 @@ POST /admin/predefined-catalog/overrides/{id}/clear
 POST /admin/retention-config
 POST /admin/revocations/report
 POST /admin/risk-signals
+POST /admin/risk-signals/legacy-unattributed/resolve
 POST /admin/rules
 POST /admin/seat-allocations
 POST /admin/server-initiated

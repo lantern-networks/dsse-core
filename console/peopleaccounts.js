@@ -46,7 +46,7 @@ function renderPeopleView(content) {
 
 async function paGet(path, plane) { const r = await apiFetch("GET", path, undefined, plane); if (!r.ok) throw new Error("HTTP " + r.status); return r.body || {}; }
 async function paList(path, key, plane) { const b = await paGet(path, plane); return (b && b[key]) || []; }
-async function paLoadRiskMarks(tenant) {
+async function paLoadRiskSnapshot(tenant) {
   if (typeof tenant !== "string" || !tenant) return null;
   try {
     // The unqualified route is a device overlay. It omits user marks when it
@@ -56,9 +56,16 @@ async function paLoadRiskMarks(tenant) {
     const marks = body && body.high_risk;
     if (body && body.entity_type === "user" && body.tenant_id === tenant &&
         marks && typeof marks === "object" && !Array.isArray(marks) &&
-        Object.values(marks).every((severity) => ["medium", "high", "critical"].includes(severity))) return marks;
+        Object.values(marks).every((severity) => ["medium", "high", "critical"].includes(severity))) {
+      const count = body.legacy_unattributed_count;
+      return { marks, legacyCount: Number.isSafeInteger(count) && count >= 0 ? count : null };
+    }
   } catch (e) { /* Directory readers may not have risk.read. */ }
   return null;
+}
+async function paLoadRiskMarks(tenant) {
+  const snapshot = await paLoadRiskSnapshot(tenant);
+  return snapshot && snapshot.marks;
 }
 
 // paWriteEnforcement writes an enforcement-config resource (delegated grant, service account / NHI, agent policy).
@@ -109,12 +116,17 @@ async function paPeople(section) {
   people = (people || []).filter((u) => (u.status || "").toLowerCase() !== "deleted");
   // Only the control plane's tenant-scoped user-risk response can verify these rows.
   // A denied or unavailable read must not render an unverified Normal value or an edit control.
-  const riskMap = await paLoadRiskMarks(tenant);
+  const riskSnapshot = await paLoadRiskSnapshot(tenant);
+  const riskMap = riskSnapshot && riskSnapshot.marks;
   if (!current()) return;
   section.innerHTML = "";
   if (riskMap === null) section.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
     en: "Risk settings are unavailable. People remain visible, but risk is Unknown and cannot be edited.",
     ja: "リスク設定を取得できません。ユーザー一覧は表示できますが、リスクは不明となり編集できません。",
+  }) }));
+  if (riskSnapshot && riskSnapshot.legacyCount > 0) section.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
+    en: `${riskSnapshot.legacyCount} legacy risk mark(s) have no confirmed person/device owner. They remain enforced by raw ID. An operator must review and resolve them.`,
+    ja: `旧形式のリスク印 ${riskSnapshot.legacyCount} 件は人物・端末への帰属を確認できません。元のID一致で適用を継続しています。運用者による確認と解決が必要です。`,
   }) }));
 
   // Directory-sync health banner: this is a SYNCED directory; the operator should see freshness, not a raw list.

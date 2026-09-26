@@ -13,9 +13,10 @@ import (
 // attributed before serving; otherwise upgrading it could silently clear a
 // user mark or assign it to the wrong tenant.
 type highRiskOverlayStateFile struct {
-	SchemaVersion string              `json:"schema_version"`
-	Devices       map[string]string   `json:"devices"`
-	Users         map[string]UserRisk `json:"users,omitempty"`
+	SchemaVersion      string              `json:"schema_version"`
+	Devices            map[string]string   `json:"devices"`
+	Users              map[string]UserRisk `json:"users,omitempty"`
+	LegacyUnattributed map[string]string   `json:"legacy_unattributed,omitempty"`
 }
 
 const highRiskOverlayStateSchemaVersion = "high_risk_overlay_state.v2"
@@ -43,7 +44,7 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 		o.mu.Unlock()
 		return err
 	}
-	state := highRiskOverlayStateFile{Devices: map[string]string{}, Users: map[string]UserRisk{}}
+	state := highRiskOverlayStateFile{Devices: map[string]string{}, Users: map[string]UserRisk{}, LegacyUnattributed: map[string]string{}}
 	if data != nil {
 		state, err = decodeRiskSnapshot(data)
 		if err != nil {
@@ -57,6 +58,7 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 	}
 	o.mu.Lock()
 	o.devices, o.users = state.Devices, state.Users
+	o.legacyUnattributed = state.LegacyUnattributed
 	o.persister, o.loadErr = p, nil
 	o.deviceSavePending = false
 	o.legacy = state.SchemaVersion == "high_risk_overlay_state.v1" && len(state.Devices) != 0
@@ -69,11 +71,15 @@ func (o *HighRiskOverlay) SetPersister(p blobstore.Persister) error {
 
 // saveStateLocked is called with writeMu held. Checked administrative changes
 // call it before publishing their candidate maps to readers or the fleet.
-func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[string]UserRisk) (bool, error) {
+func (o *HighRiskOverlay) saveStateLocked(devices map[string]string, users map[string]UserRisk, legacyOverride ...map[string]string) (bool, error) {
 	if o.persister == nil {
 		return true, nil
 	}
-	data, err := json.Marshal(highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: devices, Users: users})
+	legacy := o.legacyUnattributed
+	if len(legacyOverride) != 0 {
+		legacy = legacyOverride[0]
+	}
+	data, err := json.Marshal(highRiskOverlayStateFile{SchemaVersion: highRiskOverlayStateSchemaVersion, Devices: devices, Users: users, LegacyUnattributed: legacy})
 	if err != nil {
 		return false, ErrRiskSave
 	}

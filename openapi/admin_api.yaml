@@ -8607,6 +8607,45 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /admin/risk-signals/legacy-unattributed/resolve:
+    post:
+      summary: Discard one unresolved legacy risk mark after operator review.
+      description: Requires admin.risk.write and deployment operator access. The mark is removed only after a confirmed save. A typed user or device mark should be created first if the raw ID still needs risk enforcement.
+      tags:
+        - AdminRiskState
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, expected_severity, reason, confirm_discard]
+              properties:
+                id:
+                  type: string
+                expected_severity:
+                  type: string
+                  enum: [medium, high, critical]
+                reason:
+                  type: string
+                confirm_discard:
+                  type: boolean
+                  enum: [true]
+      responses:
+        "200":
+          description: Mark discarded, with remaining unresolved count and save status.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: No unresolved mark has that ID.
+        "409":
+          description: The mark's severity changed since review.
+        "503":
+          description: The risk state or confirmed save is unavailable.
   /admin/legal-hold:
     get:
       summary: List legal holds and whether this tenant is held.

@@ -107,6 +107,10 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			feed.HighRisk = devices
 			feed.UserRiskVersion = 1
 			feed.UserRisk = users
+			if legacy := config.HighRiskOverlay.LegacyUnattributedSnapshot(); len(legacy) != 0 {
+				feed.UserRiskVersion = 2 // old Edges reject rather than lose raw-ID risk
+				feed.LegacyUnattributed = legacy
+			}
 		}
 		writeJSON(w, http.StatusOK, feed)
 	}))

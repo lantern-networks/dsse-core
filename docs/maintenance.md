@@ -463,6 +463,16 @@ Pending DLP allowlist reconciliation: administrative writes require an explicit 
 
 DLP receiver libraries use node-local caches rather than CP authority even when another subsystem uses PostgreSQL. Explicit PostgreSQL library storage is rejected for pulling Edges; configure per-node files when restart persistence is required. Unset paths use memory. Older publishers omit allowlists and retain the receiver's previous list; explicit empty maps from updated publishers clear it. Older receivers ignore the new allowlist section, so update receiving Edges before relying on distributed exceptions. Invalid saved allowlist data now stops startup instead of silently starting with an empty list. Signed HTTP publication, receiver upload inspection, save/retry/restart, PostgreSQL peers and audit attribution are checked; deployed fleet traffic, remaining non-allowlist DLP shared-store reconciliation and release acceptance are still pending.
 
+### DLP detector definitions and exact-match datasets
+
+Custom classifier edits and dataset creation/replacement/deletion now confirm configured storage before changing the live scanner or returning success. Incomplete classifier replacements and empty or unscannable datasets are rejected without erasing existing definitions. An explicit empty classifier array clears classifiers; dataset deletion uses Delete. Organization-change guards reject stale edits.
+
+Shared PostgreSQL updates preserve other organizations and datasets, and reads/config publication refresh the shared definitions. Received classifiers and datasets are saved before the Edge acknowledges their generation. Dataset snapshots retain the source salt so matching survives an Edge restart; source dataset values are not stored or returned by the administration API.
+
+Validation covers administrative CRUD, peer reads with PostgreSQL, read-only permissions, audit attribution, signed publication and received scanning, failed-save retry, and startup/reload. No new deployed-fleet or GUI acceptance is claimed. These changes depend on the preceding allowlist/distribution work and require review before integration.
+
+Compatibility: legacy dataset snapshots without a version continue to use the configured startup salt. Newly saved version-1 snapshots include the adopted salt; older binaries do not understand that salt contract, so rolling back a receiver with a different local salt is not supported without restoring its matching prior configuration. Invalid saved classifier or dataset snapshots stop startup with a generic error instead of silently dropping detection. Separate library files are not an atomic multi-file transaction; a failed update can leave partially written files, and must be retried before claiming completion. Policy-object persistence, leader-transition write fencing, and release deployment checks remain separate work.
+
 ### Inspection source compatibility
 
 TLS inspection cannot resolve user/group/agent identity before decrypting a

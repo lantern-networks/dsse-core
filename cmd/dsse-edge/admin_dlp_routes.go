@@ -6,6 +6,7 @@ package main
 // constructor's locals so the handler bodies are untouched.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -294,7 +295,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// a count, never the matched bytes. POST replaces the whole tenant set (empty = clear); per-classifier
 	// compile errors are reported so the admin sees which were rejected while the rest still apply.
 	mux.HandleFunc("GET /admin/dlp-classifiers", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"classifiers": dlpClassifierStore.SpecsForTenant(adminTenantIDFromRequest(r))})
+		if !refreshDLPStores(w, dlpClassifierStore) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "classifiers": dlpClassifierStore.SpecsForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-classifiers", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP classifiers") {
@@ -304,18 +308,23 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Classifiers []dlp.ClassifierSpec `json:"classifiers"`
+			Classifiers      *[]dlp.ClassifierSpec `json:"classifiers"`
+			ExpectedTenantID string                `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp classifiers: %w", err))
 			return
 		}
-		if len(body.Classifiers) > dlp.MaxClassifiers {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("too many classifiers: %d (max %d)", len(body.Classifiers), dlp.MaxClassifiers))
+		if body.Classifiers == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("classifiers must be an array; use [] to clear"))
+			return
+		}
+		if len(*body.Classifiers) > dlp.MaxClassifiers {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("too many classifiers: %d (max %d)", len(*body.Classifiers), dlp.MaxClassifiers))
 			return
 		}
 		// Validate up-front so a malformed set is rejected atomically (all-or-nothing), never partially applied.
-		if _, errs := dlp.NewClassifierSet(body.Classifiers); len(errs) > 0 {
+		if _, errs := dlp.NewClassifierSet(*body.Classifiers); len(errs) > 0 {
 			msgs := make([]string, 0, len(errs))
 			for _, e := range errs {
 				msgs = append(msgs, e.Error())
@@ -324,9 +333,17 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		dlpClassifierStore.SetSpecs(tenant, body.Classifiers)
-		logInfof("dlp_classifiers_applied_by_admin tenant=%s classifiers=%d", tenant, len(body.Classifiers))
-		writeJSON(w, http.StatusOK, map[string]any{"classifiers": dlpClassifierStore.SpecsForTenant(tenant)})
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
+		if err := dlpClassifierStore.SetSpecsContext(r.Context(), tenant, *body.Classifiers); err != nil {
+			logInfof("dlp_classifiers_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving identifiers could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
+		logInfof("dlp_classifiers_applied_by_admin tenant=%s classifiers=%d", tenant, len(*body.Classifiers))
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "classifiers": dlpClassifierStore.SpecsForTenant(tenant)})
 	}))
 	// DLP allowlist (slice F, false-positive tuning): the operator-declared KNOWN-SAFE values whose DLP matches are
 	// suppressed (a test card, a sample My Number used in docs, a benign email). POST replaces the whole tenant
@@ -382,7 +399,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// stored and only the dataset name + value count are ever returned — the values are never persisted or shown
 	// back. GET lists datasets; POST creates/replaces one; DELETE removes one.
 	mux.HandleFunc("GET /admin/dlp-fingerprints", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"datasets": dlpFingerprintStore.DatasetsForTenant(adminTenantIDFromRequest(r))})
+		if !refreshDLPStores(w, dlpFingerprintStore) {
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "datasets": dlpFingerprintStore.DatasetsForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-fingerprints", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP fingerprints") {
@@ -392,8 +412,9 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Name   string   `json:"name"`
-			Values []string `json:"values"`
+			Name             string   `json:"name"`
+			Values           []string `json:"values"`
+			ExpectedTenantID string   `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp fingerprints: %w", err))
@@ -403,15 +424,27 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			writeError(w, http.StatusBadRequest, fmt.Errorf("dataset name %q must be lowercase snake_case (2–40 chars) and not a reserved identifier", body.Name))
 			return
 		}
-		const maxFingerprintValues = 100000
 		if len(body.Values) > maxFingerprintValues {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("too many values: %d (max %d)", len(body.Values), maxFingerprintValues))
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		count := dlpFingerprintStore.SetDataset(tenant, body.Name, body.Values)
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
+		count, err := dlpFingerprintStore.SetDatasetContext(r.Context(), tenant, body.Name, body.Values)
+		if err != nil {
+			if errors.Is(err, errInvalidFingerprintDataset) {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			logInfof("dlp_fingerprints_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving the dataset could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
 		logInfof("dlp_fingerprints_applied_by_admin tenant=%s dataset=%s values=%d", tenant, body.Name, count)
-		writeJSON(w, http.StatusOK, map[string]any{"dataset": dlpFingerprintDataset{Name: body.Name, Count: count}, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "dataset": dlpFingerprintDataset{Name: body.Name, Count: count}, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
 	}))
 	mux.HandleFunc("DELETE /admin/dlp-fingerprints", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP fingerprints") {
@@ -426,8 +459,27 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		removed := dlpFingerprintStore.RemoveDataset(tenant, name)
+		if expected := r.URL.Query().Get("expected_tenant_id"); expected != "" && expected != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
+		removed, err := dlpFingerprintStore.RemoveDatasetContext(r.Context(), tenant, name)
+		if err != nil {
+			logInfof("dlp_fingerprints_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving the dataset deletion could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
 		logInfof("dlp_fingerprints_removed_by_admin tenant=%s dataset=%s removed=%t", tenant, name, removed)
-		writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "removed": removed, "datasets": dlpFingerprintStore.DatasetsForTenant(tenant)})
 	}))
+}
+
+func refreshDLPStores(w http.ResponseWriter, stores ...interface{ RefreshShared() error }) bool {
+	for _, store := range stores {
+		if err := store.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP configuration is temporarily unavailable"))
+			return false
+		}
+	}
+	return true
 }

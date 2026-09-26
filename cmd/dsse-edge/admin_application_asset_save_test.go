@@ -107,7 +107,7 @@ func TestApplicationAssetSaveFailureIsPartial(t *testing.T) {
 				t.Fatalf("failed %s audits = %d, want one result audit", operation, len(outbox.insertedAudits)-before)
 			}
 			audit := outbox.insertedAudits[before]
-			if audit.EventType != wantEvent || audit.Result == nil || *audit.Result != "partial" || audit.Metadata["asset_endpoint_persistence_confirmed"] != false {
+			if audit.ActorUserID == nil || strings.TrimSpace(*audit.ActorUserID) == "" || audit.EventType != wantEvent || audit.Result == nil || *audit.Result != "partial" || audit.Metadata["asset_endpoint_persistence_confirmed"] != false {
 				t.Fatalf("failed %s audit = %#v", operation, audit)
 			}
 		})

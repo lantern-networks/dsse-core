@@ -351,9 +351,18 @@ counted in health data. Abrupt termination can lose unflushed observations, and
 the downstream spool also has retention limits. The receiver refuses a known
 standby; fencing a write across a leadership transition remains separate work.
 
-Upgrade note: the observation store reads legacy tenant maps as well as receipt-bearing
-rows. Once reports are stored, the receipt-bearing format is written; rollback to
-an older binary that cannot read it is not established by these checks.
+Upgrade requirement: upgrade **all control-plane processes that share the observation
+store together**, with report intake paused and every old writer stopped before any
+new process writes the store. Back up the observation store before upgrading. The
+new code reads legacy tenant maps, but the first saved report writes the v4 format
+with receipt records. Old control planes cannot read this format and can overwrite
+it, losing the inventory and receipts and counting retried reports twice. A rolling
+upgrade with mixed old and new writers is not supported. After v4 is written, do
+not restart an older binary against that store. Reverting requires stopping all
+writers and restoring the pre-upgrade backup; observations received since the
+backup are lost and pending Edge reports need operator reconciliation. This is not
+a transparent rollback. Resume report intake only after every shared-store writer
+runs the new version.
 
 ## What still blocks 0.3.1
 

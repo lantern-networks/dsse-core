@@ -155,6 +155,19 @@ and device ID collisions, permissions, save failures, legacy-state migration,
 the CP-to-Edge HTTP feed, and tenant erasure. Independent deployed CP/Edge
 traffic and multi-CP shared-state operation remain release checks.
 
+Older saved risk marks may have only a raw ID, with no reliable person/device or
+tenant owner. During upgrade they stay active by raw ID across tenants; the
+People page shows their count but does not assign them to a person. An operator
+must investigate each mark before using the operator-only
+`POST /admin/risk-signals/legacy-unattributed/resolve` endpoint to discard it.
+That action requires the expected severity, an explicit discard confirmation,
+and a reason, and writes an audit event. There is no atomic reassignment to a
+typed person or device mark in this release. If a replacement typed mark is
+needed, create and verify it before discarding the old mark; otherwise risk
+enforcement may weaken during the transition. The U-1 compatibility change is
+tracked in [PR #53](https://github.com/lantern-networks/dsse-core/pull/53)
+and is not part of 0.3.0.
+
 Devices readers whose risk overlay request is denied can still see the permitted
 device list. The page shows a server-provided effective risk when present, says
 Unknown when it is absent, and omits risk-edit actions. Other failed or malformed

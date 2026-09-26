@@ -52,7 +52,7 @@ func riskSnapshotString(data []byte) (string, error) {
 }
 
 func decodeRiskSnapshot(data []byte) (highRiskOverlayStateFile, error) {
-	f := highRiskOverlayStateFile{Devices: map[string]string{}, Users: map[string]UserRisk{}}
+	f := highRiskOverlayStateFile{Devices: map[string]string{}, Users: map[string]UserRisk{}, LegacyUnattributed: map[string]string{}}
 	invalid := func() (highRiskOverlayStateFile, error) { return highRiskOverlayStateFile{}, ErrInvalidRiskSnapshot }
 	if !utf8.Valid(data) {
 		return invalid()
@@ -62,7 +62,7 @@ func decodeRiskSnapshot(data []byte) (highRiskOverlayStateFile, error) {
 		return invalid()
 	}
 	for key := range fields {
-		if key != "schema_version" && key != "devices" && key != "users" {
+		if key != "schema_version" && key != "devices" && key != "users" && key != "legacy_unattributed" {
 			return invalid()
 		}
 	}
@@ -80,6 +80,22 @@ func decodeRiskSnapshot(data []byte) (highRiskOverlayStateFile, error) {
 			return invalid()
 		}
 		f.Devices[id] = severity
+	}
+	if raw, present := fields["legacy_unattributed"]; present {
+		if f.SchemaVersion != highRiskOverlayStateSchemaVersion {
+			return invalid()
+		}
+		legacy, err := riskSnapshotObject(raw)
+		if err != nil {
+			return invalid()
+		}
+		for id, raw := range legacy {
+			severity, err := riskSnapshotString(raw)
+			if err != nil || id == "" || id != NormalizeDeviceID(id) || riskRank(severity) == 0 {
+				return invalid()
+			}
+			f.LegacyUnattributed[id] = severity
+		}
 	}
 	if raw, present := fields["users"]; present {
 		users, err := riskSnapshotObject(raw)

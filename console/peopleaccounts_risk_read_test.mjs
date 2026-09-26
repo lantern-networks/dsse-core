@@ -31,3 +31,13 @@ test('a valid risk map remains available to permitted editors', async () => {
   assert.deepEqual(await readRisk({ok: true, body: {entity_type: 'user', tenant_id: 'tenant-lab', high_risk: {alice: 'high'}}}), {alice: 'high'});
   assert.deepEqual(await readRisk({ok: true, body: {entity_type: 'user', tenant_id: 'tenant-lab', high_risk: {}}}), {});
 });
+
+test('operator sees unresolved legacy count without changing person marks', async () => {
+  const context = vm.createContext({apiFetch: () => ({ok: true, body: {
+    entity_type: 'user', tenant_id: 'tenant-lab', high_risk: {alice: 'high'}, legacy_unattributed_count: 2,
+  }})});
+  vm.runInContext(source, context);
+  const snapshot = await context.paLoadRiskSnapshot('tenant-lab');
+  assert.equal(snapshot.legacyCount, 2);
+  assert.deepEqual({...snapshot.marks}, {alice: 'high'});
+});

@@ -48,12 +48,14 @@ func (s revocationSource) baseURL() string {
 // bundle: the puller re-applies on a newer generation OR a changed epoch (a CP restart resets the in-memory
 // generation; the persisted revoked set is still authoritative, so re-baselining is safe and fail-closed).
 type revocationFeed struct {
-	Generation      uint64                `json:"generation"`
-	Epoch           string                `json:"epoch,omitempty"`
-	Revoked         map[string]string     `json:"revoked"`             // identity -> non-secret reason code
-	HighRisk        map[string]string     `json:"high_risk,omitempty"` // deviceID -> severity (decision-path)
-	UserRiskVersion int                   `json:"user_risk_version,omitempty"`
-	UserRisk        []revocation.UserRisk `json:"user_risk,omitempty"`
+	Generation         uint64                `json:"generation"`
+	Epoch              string                `json:"epoch,omitempty"`
+	Revoked            map[string]string     `json:"revoked"`             // identity -> non-secret reason code
+	HighRisk           map[string]string     `json:"high_risk,omitempty"` // deviceID -> severity (decision-path)
+	UserRiskVersion    int                   `json:"user_risk_version,omitempty"`
+	UserRisk           []revocation.UserRisk `json:"user_risk,omitempty"`
+	LegacyRiskVersion  int                   `json:"legacy_risk_version,omitempty"`
+	LegacyUnattributed map[string]string     `json:"legacy_unattributed,omitempty"`
 	// Authoritative marks this as a COMPLETE set from the config authority, which is what makes an EMPTY one
 	// meaningful. Zero revocations and "I could not tell you" are the same bytes otherwise, so a puller had to
 	// assume the worse of the two and keep whatever it held — correct, but it also meant releasing the LAST
@@ -64,8 +66,17 @@ type revocationFeed struct {
 }
 
 func applyUserRiskFeed(overlay *revocation.HighRiskOverlay, feed revocationFeed) error {
-	if feed.UserRiskVersion != 0 && feed.UserRiskVersion != 1 {
+	if feed.UserRiskVersion != 0 && feed.UserRiskVersion != 1 && feed.UserRiskVersion != 2 {
 		return fmt.Errorf("unsupported user risk feed version")
+	}
+	if feed.LegacyRiskVersion != 0 && feed.LegacyRiskVersion != 1 {
+		return fmt.Errorf("unsupported legacy risk feed version")
+	}
+	if len(feed.LegacyUnattributed) != 0 && feed.LegacyRiskVersion != 1 && feed.UserRiskVersion != 2 {
+		return fmt.Errorf("legacy risk feed version is missing")
+	}
+	if feed.LegacyRiskVersion == 1 && feed.UserRiskVersion != 1 {
+		return fmt.Errorf("legacy risk extension requires user risk version 1")
 	}
 	if feed.UserRiskVersion == 0 {
 		if len(feed.UserRisk) > 0 {
@@ -79,10 +90,18 @@ func applyUserRiskFeed(overlay *revocation.HighRiskOverlay, feed revocationFeed)
 	if err := overlay.Health(); err != nil {
 		return fmt.Errorf("local risk state is not ready")
 	}
-	if len(feed.UserRisk) == 0 && !feed.Authoritative {
+	if len(feed.UserRisk) == 0 && len(feed.LegacyUnattributed) == 0 && !feed.Authoritative {
 		return nil
 	}
-	return overlay.ReplaceSyncedUsers(feed.UserRisk)
+	legacy := feed.LegacyUnattributed
+	if feed.LegacyRiskVersion == 0 && feed.UserRiskVersion != 2 {
+		// An old CP has no knowledge of unresolved v1 marks. Keep the local
+		// copy while still applying its typed users and, in the caller, its
+		// revocations and device risk. Rejecting the whole feed would block
+		// revocations during an Edge-first rolling upgrade.
+		legacy = overlay.LegacyUnattributedSnapshot()
+	}
+	return overlay.ReplaceSyncedUserRisks(feed.UserRisk, legacy)
 }
 
 // revocationReport is the node→CP propagation payload (slice 3b): a node ships its own auto-revocation up so

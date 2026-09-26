@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -192,13 +193,30 @@ func TestLegacyRiskMigrationAttributionAndRejectedSaves(t *testing.T) {
 						t.Fatal("device migration lost mark")
 					}
 				}
-			} else {
+			} else if scenario == "save-failure" {
 				if err == nil {
-					t.Fatal("ambiguous or rejected migration accepted")
+					t.Fatal("unconfirmed migration accepted")
 				}
 				after, _ := os.ReadFile(path)
 				if string(after) != raw || !reflect.DeepEqual(overlay.Snapshot(), map[string]string{"shared": "high"}) {
 					t.Fatal("rejected migration modified state")
+				}
+			} else {
+				if err != nil || overlay.Health() != nil || overlay.NeedsMigration() || overlay.LegacyUnattributedCount() != 1 {
+					t.Fatalf("unattributed v1 mark stopped startup: %v", err)
+				}
+				if sev, _ := overlay.IsHighRisk("shared"); sev != "high" {
+					t.Fatal("raw device match was lost")
+				}
+				if sev := overlay.LegacySeverity("shared"); sev != "high" {
+					t.Fatal("raw user match was lost")
+				}
+				again := revocation.NewHighRiskOverlay()
+				if err := again.SetStatePath(path); err != nil || again.Health() != nil || again.LegacyUnattributedCount() != 1 {
+					t.Fatalf("unattributed mark did not survive restart: %v", err)
+				}
+				if after, _ := os.ReadFile(path); !bytes.Contains(after, []byte(`"legacy_unattributed"`)) {
+					t.Fatal("migration did not preserve the unresolved mark in v2")
 				}
 			}
 		})
@@ -224,7 +242,7 @@ func TestUserRiskFeedRejectsBeforeClearingOtherState(t *testing.T) {
 			case "invalid":
 				feed.UserRisk = []revocation.UserRisk{{ID: "alice", Severity: "high"}}
 			case "unknown-version":
-				feed.UserRiskVersion = 2
+				feed.UserRiskVersion = 3
 			case "missing-version":
 				feed.UserRiskVersion = 0
 				feed.UserRisk = []revocation.UserRisk{{TenantID: "two", ID: "alice", Severity: "high"}}

@@ -4000,10 +4000,8 @@ func main() {
 			"fleet's reporting stops on a value nobody reads.", *agentReleaseChannel)
 	}
 
+	riskMigrationLedger := enrolledLedger
 	if lerr := enrolledLedger.SetPersisterChecked(mustCPStateBlobPersister(*enrolledInventoryStore, "enrolled_inventory")); lerr != nil {
-		if highRiskOverlay.NeedsMigration() {
-			log.Fatalf("legacy risk migration requires readable enrolled inventory: %v", lerr)
-		}
 		if enrollSigner != nil {
 			log.Fatalf("REFUSING TO START: this Edge issues device certificates and its enrolled inventory could "+
 				"not be read (%v). Continuing would treat every identity in the fleet as never enrolled, claim "+
@@ -4011,8 +4009,11 @@ func main() {
 		}
 		log.Printf("enrolled_inventory: the durable store could not be read (%v) — this Edge does not issue "+
 			"certificates, so it continues on the static seed and the control plane's next bundle", lerr)
+		// A partial inventory cannot prove a v1 risk ID is a person or device.
+		// Preserve it as a raw-ID mark instead of guessing or stopping the Edge.
+		riskMigrationLedger = nil
 	}
-	if err := prepareUserRiskState(context.Background(), highRiskOverlay, enrolledLedger, humanIdentities); err != nil {
+	if err := prepareUserRiskState(context.Background(), highRiskOverlay, riskMigrationLedger, humanIdentities); err != nil {
 		log.Fatalf("prepare risk state: %v", err)
 	}
 	// ★★★ AND READ AGAIN, BECAUSE A STANDBY THAT ONLY LEARNS BY RESTARTING IS NOT WARM (2026-08-25). Two
@@ -5444,6 +5445,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return
 		}
 		body := map[string]any{"status": "ok"}
+		if config.HighRiskOverlay != nil {
+			body["legacy_unattributed_risk_count"] = config.HighRiskOverlay.LegacyUnattributedCount()
+		}
 		// ★★★ WHAT THIS NODE IS, so the deployment's shape can be CHECKED rather than inferred from a compose
 		// file (2026-08-23). Two of the architecture's invariants are about which node holds what — the control
 		// plane holds the authority, and an enforcement Edge holds no database — and neither could be asked of

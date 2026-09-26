@@ -29,6 +29,39 @@ func (p *userRiskPersister) Save(b []byte) error {
 	}
 	return nil
 }
+
+func TestLegacyRiskDiscardRequiresConfirmedSave(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "risk.json")
+	if err := os.WriteFile(path, []byte(`{"schema_version":"high_risk_overlay_state.v1","devices":{"orphan":"critical"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	p := &userRiskPersister{base: blobstore.FilePersister{Path: path}}
+	o := NewHighRiskOverlay()
+	if err := o.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.MigrateLegacy(func(string) (*UserRisk, error) { return nil, ErrLegacyUnattributed }); err != nil {
+		t.Fatal(err)
+	}
+	p.fail = true
+	if _, err := o.DiscardLegacyUnattributed("orphan", "critical"); !errors.Is(err, ErrRiskSave) || o.LegacySeverity("orphan") != "critical" {
+		t.Fatalf("failed save published a discard: %v", err)
+	}
+	reloaded := NewHighRiskOverlay()
+	if err := reloaded.SetStatePath(path); err != nil || reloaded.LegacySeverity("orphan") != "critical" {
+		t.Fatalf("failed save erased disk risk: %v", err)
+	}
+	p.fail = false
+	if _, err := o.DiscardLegacyUnattributed("orphan", "high"); !errors.Is(err, ErrLegacyRiskChanged) {
+		t.Fatalf("stale expected severity accepted: %v", err)
+	}
+	if _, err := o.DiscardLegacyUnattributed("orphan", "critical"); err != nil {
+		t.Fatal(err)
+	}
+	if o.LegacyUnattributedCount() != 0 {
+		t.Fatal("resolved mark remained in memory")
+	}
+}
 func TestUserRiskSeparatesTenantsDevicesAndSubjects(t *testing.T) {
 	o := NewHighRiskOverlay()
 	o.Mark("shared", "medium")
@@ -192,7 +225,7 @@ func TestUserRiskFeedRejectsMalformedAndCopiesSubjects(t *testing.T) {
 	}
 }
 func TestRiskStateUnreadableAndUnknownSchemaRemainUnavailable(t *testing.T) {
-	for _, raw := range []string{"{", `{"schema_version":"future","devices":{}}`, `{"schema_version":"high_risk_overlay_state.v2","users":{"invalid":{"id":"alice","severity":"high"}}}`} {
+	for _, raw := range []string{"{", `{"schema_version":"future","devices":{}}`, `{"schema_version":"high_risk_overlay_state.v2","users":{"invalid":{"id":"alice","severity":"high"}}}`, `{"schema_version":"high_risk_overlay_state.v2","devices":{},"legacy_unattributed":null}`, `{"schema_version":"high_risk_overlay_state.v2","devices":{},"legacy_unattributed":{"id":"none"}}`, `{"schema_version":"high_risk_overlay_state.v1","devices":{},"legacy_unattributed":{"id":"high"}}`, `{"schema_version":"high_risk_overlay_state.v2","devices":{},"legacy_unattributed":{"id":"high","id":"critical"}}`} {
 		path := filepath.Join(t.TempDir(), "risk.json")
 		os.WriteFile(path, []byte(raw), 0600)
 		o := NewHighRiskOverlay()

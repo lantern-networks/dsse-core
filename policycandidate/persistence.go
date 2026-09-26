@@ -1,10 +1,8 @@
 package policycandidate
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -26,52 +24,67 @@ func (store *Store) SetStatePath(path string) error {
 func (store *Store) SetPersister(p blobstore.Persister) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.persister = p
+	if store.dirty || store.sharedUncertain {
+		return fmt.Errorf("%w: retry saving before replacing storage", ErrPersistence)
+	}
 	if p == nil {
+		store.persister = nil
+		store.sharedKnown = false
 		return nil
 	}
-	return store.loadLocked()
-}
-
-func (store *Store) loadLocked() error {
-	if store.persister == nil {
-		return nil
-	}
-	data, err := store.persister.Load()
+	data, err := p.Load()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if data == nil {
+		store.persister = p
+		store.sharedKnown = false
 		return nil
 	}
-	var snapshot map[string]map[string]Candidate
-	if err := json.Unmarshal(data, &snapshot); err != nil {
+	snapshot, receipts, err := decodeCandidateRow(data)
+	if err != nil {
 		return err
 	}
-	if snapshot != nil {
-		store.candidates = snapshot
-	}
+	store.sharedKnown = true
+	store.candidates = snapshot
+	store.receipts = receipts
+	store.persister = p
 	return nil
 }
 
-// persistLocked snapshots the candidates to the persister. The error MUST reach the mutating caller: a
-// swallowed Save meant a detected candidate (or an admin review verdict) was acknowledged while nothing hit
-// disk, silently vanishing on restart. Caller holds store.mu.
-func (store *Store) persistLocked() error {
-	if store.persister == nil {
-		return nil
-	}
-	data, err := json.MarshalIndent(store.candidates, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal policy-candidate snapshot: %w", err)
-	}
-	if err := store.persister.Save(data); err != nil {
-		// The public FilePersister uses this sentinel only after writing the new snapshot.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
-			log.Printf("policy candidate snapshot saved with reduced durability")
-			return nil
+func (store *Store) cloneLocked() map[string]map[string]Candidate {
+	next := make(map[string]map[string]Candidate, len(store.candidates))
+	for tenant, entries := range store.candidates {
+		next[tenant] = make(map[string]Candidate, len(entries))
+		for id, candidate := range entries {
+			next[tenant][id] = copyCandidate(candidate)
 		}
-		return fmt.Errorf("persist policy candidates: %w", err)
 	}
+	return next
+}
+
+// Caller holds mu across save and publication. A known file replacement remains
+// visible, but an unconfirmed save prevents replacing the writer until confirmed.
+func (store *Store) commitLocked(next map[string]map[string]Candidate) error {
+	return store.commitWithReceiptsLocked(next, store.receipts)
+}
+
+func (store *Store) commitWithReceiptsLocked(next map[string]map[string]Candidate, receipts map[string]ReportReceipt) error {
+	if store.persister != nil {
+		data, err := encodeCandidateRow(next, receipts)
+		if err == nil {
+			err = blobstore.UnconfirmedSave(store.persister.Save(data))
+		}
+		if err != nil {
+			if errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+				store.candidates, store.receipts = next, receipts
+			}
+			store.dirty = true
+			return fmt.Errorf("%w: %w", ErrPersistence, err)
+		}
+	}
+	store.candidates = next
+	store.receipts = receipts
+	store.dirty = false
 	return nil
 }

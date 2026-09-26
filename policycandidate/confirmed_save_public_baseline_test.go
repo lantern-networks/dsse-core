@@ -12,28 +12,32 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
-type candidateSaveGate struct {
+type candidateSaveGatePublicBaseline struct {
 	blobstore.Persister
 	reject bool
+	weak   bool
 }
 
-func (p *candidateSaveGate) Save(data []byte) error {
+func (p *candidateSaveGatePublicBaseline) Save(data []byte) error {
 	if p.reject {
 		return errors.New("synthetic storage rejection")
 	}
 	if err := p.Persister.Save(data); err != nil {
 		return err
 	}
+	if p.weak {
+		return blobstore.ErrSavedWithoutAtomicity
+	}
 	return nil
 }
 
-func TestCandidateFailedWritesPreserveStateAndRetry(t *testing.T) {
+func TestCandidateFailedWritesPreserveStateAndRetryPublicBaseline(t *testing.T) {
 	for _, operation := range []string{"create", "edit", "review", "materialize", "manual-bypass", "observe-flow", "observe-connector", "observe-certpin"} {
 		t.Run(operation, func(t *testing.T) {
 			ctx, now := context.Background(), time.Now()
 			path := filepath.Join(t.TempDir(), "candidates.json")
 			disk := blobstore.FilePersister{Path: path}
-			gate := &candidateSaveGate{Persister: disk}
+			gate := &candidateSaveGatePublicBaseline{Persister: disk}
 			s := NewStore()
 			if err := s.SetPersister(gate); err != nil {
 				t.Fatal(err)
@@ -134,5 +138,25 @@ func TestCandidateFailedWritesPreserveStateAndRetry(t *testing.T) {
 				t.Fatal("successful retry differs after restart")
 			}
 		})
+	}
+}
+
+func TestCandidateWrittenSnapshotWarningKeepsLiveAndReloadedStatePublicBaseline(t *testing.T) {
+	disk := blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "candidates.json")}
+	s := NewStore()
+	if err := s.SetPersister(&candidateSaveGatePublicBaseline{Persister: disk, weak: true}); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := s.ObserveUnmatchedFlow(context.Background(), "one", "wiki.example.test", "", 443, "", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := NewStore()
+	if err := fresh.SetPersister(disk); err != nil {
+		t.Fatal(err)
+	}
+	got, found, err := fresh.Get(context.Background(), "one", saved.CandidateID)
+	if err != nil || !found || !reflect.DeepEqual(saved, got) {
+		t.Fatalf("written snapshot lost: %+v %v %v", got, found, err)
 	}
 }

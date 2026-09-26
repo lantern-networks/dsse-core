@@ -209,6 +209,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))
 			return
 		}
+		if err := connectorRouteGov.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
+			return
+		}
 		tenantID := adminTenantIDFromRequest(r)
 		// The runtime policy store can change while a bundle is assembled. If its
 		// generation changes between reading the posture and assigning the bundle
@@ -319,9 +323,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			bundle.Connectors = &connectorCatalogBundle{Connectors: publicConnectorRegistrations(registry.List())}
 		}
 		// Fold the connector route-governance decisions into the bundle so a pull-model Edge converges on the
-		// CP-configured bindings + hold/adopt state without a shared governance store (non-secret; nil when there
-		// are no decisions, keeping the section lockout-safe). See docs/connector_network_route_advertisement_design.md.
-		bundle.RouteGovernance = connectorRouteGov.Export()
+		// CP-configured bindings + hold/adopt state without a shared governance store.
+		// A committed empty snapshot propagates deletion; an unknown snapshot remains omitted.
+		bundle.RouteGovernance = connectorRouteGov.ExportForBundle()
 		// /agent governance: distribute the Non-Human Identity registry + delegated-access grants so
 		// agent governance authored on the control plane reaches enforcing Edges. Present-but-empty stays lockout-
 		// safe on the Edge (apply keeps a non-empty local set). Guarded for nil stores.

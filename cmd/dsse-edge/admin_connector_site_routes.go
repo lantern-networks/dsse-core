@@ -24,6 +24,10 @@ import (
 // enrollment command). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, registry connectorRegistryStore, tunnelManager *tunnel.Manager, siteStore adminSiteStore, vlanBoundary *vlan.Store, domainEventOutbox domainEventOutboxWriter, adminAuditOutbox adminAuditOutboxDeadReader, applicationCatalogStore appcatalog.RuntimeStore, tenantModelStore adminTenantModelRuntimeStore, configSourceURL string, connectorTunnelStatus func(string) *bool, connectorDeclaredRoutes func(ctx context.Context, tenant, connectorID string) (cidrs, fqdns []string, found bool)) {
 	mux.HandleFunc("GET /admin/connectors/{connector_id}/routes", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := connectorRouteGov.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		cid := r.PathValue("connector_id")
 		declared, declaredFQDNs, found := connectorDeclaredRoutes(r.Context(), tenant, cid)
@@ -112,15 +116,15 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		case "unapprove":
 			connectorRouteGov.SetApproved(tenant, cid, req.CIDR, false)
 		case "add":
-			bindingErr = connectorRouteGov.AddAuthored(tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthoredContext(r.Context(), tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case isNetwork:
-				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, "net:"+req.NetworkID)
 			case isFQDN:
-				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				bindingErr = connectorRouteGov.RemoveAuthored(tenant, cid, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, req.CIDR)
 			}
 		}
 		if action == "add" || action == "remove" {
@@ -396,6 +400,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 	// served by ALL its connectors (active + standby are interchangeable). GET lists them; POST binds/unbinds a
 	// CIDR, a hostname (FQDN), or a Named-Network reference. Keyed by the site (connector group), never per-connector.
 	mux.HandleFunc("GET /admin/sites/{site_id}/networks", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := connectorRouteGov.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		siteID := strings.TrimSpace(r.PathValue("site_id"))
 		if siteID == "" {
@@ -466,15 +474,15 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		var bindingErr error
 		switch action {
 		case "add":
-			bindingErr = connectorRouteGov.AddAuthored(tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
+			bindingErr = connectorRouteGov.AddAuthoredContext(r.Context(), tenant, siteID, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":
 			switch {
 			case req.NetworkID != "":
-				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, "net:"+req.NetworkID)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, siteID, "net:"+req.NetworkID)
 			case req.FQDN != "":
-				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, siteID, "fqdn:"+strings.ToLower(req.FQDN))
 			default:
-				bindingErr = connectorRouteGov.RemoveAuthored(tenant, siteID, req.CIDR)
+				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, siteID, req.CIDR)
 			}
 		default:
 			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be add | remove"))

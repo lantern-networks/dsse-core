@@ -6642,7 +6642,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// deployment's shared database when there is one, which is exactly right here — a route is the
 		// authority's answer about what a connector fronts, and every control plane has to give the same one.
 		var routeGovPersister blobstore.Persister
-		if p, e := cpStateBlobPersister(connectorRouteGovPersistPath, cpStateBlobDB, "connector_route_governance"); e != nil {
+		if p, e := routeGovernancePersisterForRole(connectorRouteGovPersistPath, cpStateBlobDB, configSourceURL); e != nil {
 			log.Fatalf("connector route governance store: %v", e)
 		} else {
 			routeGovPersister = p

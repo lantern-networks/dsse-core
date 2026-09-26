@@ -1,6 +1,7 @@
 package swg
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -104,7 +105,7 @@ type TenantRestrictionUpdateRequest struct {
 // adminSWGTenantRestrictionToggleStore is the runtime rule-status override surface (implemented by
 // *policy.Store). The Admin handler type-asserts the policy store to it for SaaS enable/disable.
 type adminSWGTenantRestrictionToggleStore interface {
-	SetTenantRestrictionRuleStatus(ruleID, status string)
+	SetTenantRestrictionRuleStatusesContext(context.Context, map[string]string) error
 	TenantRestrictionRuleStatusOverrides() map[string]string
 }
 
@@ -162,6 +163,10 @@ type adminSWGTenantRestrictionAppliedSaaS struct {
 // Both take effect on the live request path with no restart. Header value writes also persist to the
 // operator config + durable value store. Non-secret only; raw values never returned.
 func ApplyTenantRestrictionUpdate(swgRuntime RuntimeConfig, baseBundle model.PolicyBundle, policyStore policy.RuntimeStore, req TenantRestrictionUpdateRequest) (TenantRestrictionUpdateResponse, error) {
+	return ApplyTenantRestrictionUpdateContext(context.Background(), swgRuntime, baseBundle, policyStore, req)
+}
+
+func ApplyTenantRestrictionUpdateContext(ctx context.Context, swgRuntime RuntimeConfig, baseBundle model.PolicyBundle, policyStore policy.RuntimeStore, req TenantRestrictionUpdateRequest) (TenantRestrictionUpdateResponse, error) {
 	if len(req.HeaderValueUpdates) == 0 && len(req.SaaSEnablement) == 0 {
 		return TenantRestrictionUpdateResponse{}, fmt.Errorf("no header_value_updates or saas_enablement provided")
 	}
@@ -192,6 +197,7 @@ func ApplyTenantRestrictionUpdate(swgRuntime RuntimeConfig, baseBundle model.Pol
 		if !ok {
 			return TenantRestrictionUpdateResponse{}, fmt.Errorf("policy store does not support saas enable/disable")
 		}
+		statuses := map[string]string{}
 		for saas, enabled := range req.SaaSEnablement {
 			saas = strings.TrimSpace(saas)
 			matched := false
@@ -208,12 +214,15 @@ func ApplyTenantRestrictionUpdate(swgRuntime RuntimeConfig, baseBundle model.Pol
 					}
 					status = "active"
 				}
-				toggleStore.SetTenantRestrictionRuleStatus(rule.ID, status)
+				statuses[rule.ID] = status
 				appliedSaaS = append(appliedSaaS, adminSWGTenantRestrictionAppliedSaaS{SaaSApplicationID: saas, RuleID: rule.ID, Status: status})
 			}
 			if !matched {
 				return TenantRestrictionUpdateResponse{}, fmt.Errorf("saas %s has no tenant restriction rule", saas)
 			}
+		}
+		if err := toggleStore.SetTenantRestrictionRuleStatusesContext(ctx, statuses); err != nil {
+			return TenantRestrictionUpdateResponse{}, err
 		}
 	}
 

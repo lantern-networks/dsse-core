@@ -324,8 +324,45 @@ TLS selector cannot evaluate are explained in rule listings. These checks cover
 HTTP edits/readback, repeated executable startup, concurrent snapshot replacement
 and isolated TLS handshakes. Browser checks use synthetic data and product rendering;
 they do not establish deployed fleet traffic acceptance. Deployment-wide posture
-controls, observation reporting and complete rule-priority/risk evaluation remain
+controls and complete rule-priority/risk evaluation remain
 separate work; this change does not claim those gates are complete.
+
+## Observation delivery and candidate management (under review)
+
+Edges report observed lateral flows and policy candidates to the control plane on
+an independent delivery queue. The Console reads these inventories and sends
+candidate edits to the control plane; a configuration-pulling Edge rejects those
+edits instead of accepting a change that its next configuration update would replace.
+Live TLS bypass status is still read from the Edge.
+
+Counts and delivery receipts are saved together before acknowledging a report.
+File-save failures, including a replacement whose final flush is unconfirmed, stay
+unsuccessful on retry until persistence is confirmed. Shared-store reads refresh
+before listing or adopting observations, so another control-plane process can see
+received counts without restarting. Retries within the receipt window do not count
+the same report twice; reports outside that window are refused explicitly.
+
+Validation covers file-save recovery, concurrent shared updates, real PostgreSQL
+report delivery and readback, request authority, Console transport tests and a
+browser check with synthetic responses. This is not deployed fleet acceptance.
+Delivery is bounded: at most 5,000 distinct observations are queued and another
+5,000 can be in the current flush. New observations rejected at capacity are
+counted in health data. Abrupt termination can lose unflushed observations, and
+the downstream spool also has retention limits. The receiver refuses a known
+standby; fencing a write across a leadership transition remains separate work.
+
+Upgrade requirement: upgrade **all control-plane processes that share the observation
+store together**, with report intake paused and every old writer stopped before any
+new process writes the store. Back up the observation store before upgrading. The
+new code reads legacy tenant maps, but the first saved report writes the v4 format
+with receipt records. Old control planes cannot read this format and can overwrite
+it, losing the inventory and receipts and counting retried reports twice. A rolling
+upgrade with mixed old and new writers is not supported. After v4 is written, do
+not restart an older binary against that store. Reverting requires stopping all
+writers and restoring the pre-upgrade backup; observations received since the
+backup are lost and pending Edge reports need operator reconciliation. This is not
+a transparent rollback. Resume report intake only after every shared-store writer
+runs the new version.
 
 ## What still blocks 0.3.1
 

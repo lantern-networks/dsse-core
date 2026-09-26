@@ -37,13 +37,16 @@ func warnAuditIngestUnverifiedOnce() {
 
 func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token string,
 	agentTelemetry agenttelemetry.RuntimeStore, observedExclusions observedExclusionStoreAPI,
-	tenantCARegistry *tenantca.TenantCARegistry, devMode bool) {
+	tenantCARegistry *tenantca.TenantCARegistry, devMode bool, reports observationReportSink) {
 	token = strings.TrimSpace(token)
 	if token == "" || writer == nil {
 		return
 	}
 	allowed := map[string]bool{}
 	for _, s := range defaultAuditShipStreams {
+		allowed[s] = true
+	}
+	for _, s := range observationReportStreams {
 		allowed[s] = true
 	}
 	mux.HandleFunc("POST /audit-ingest", func(w http.ResponseWriter, r *http.Request) {
@@ -118,6 +121,22 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 					"was issued by", shipper, want))
 				return
 			}
+		}
+		// An Edge's observations are held here, not by the Edge (observation_report.go). The store is the
+		// durable copy, so a report is acknowledged only once it has committed, and it is not also written to
+		// this node's logs.
+		if isObservationReportStream(stream) {
+			if !cpLeaderElectorInstance.IsLeader() {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation report requires current control-plane leader"))
+				return
+			}
+			status, rerr := applyObservationReport(r.Context(), reports, stream, shipper.Identity, body)
+			if rerr != nil {
+				writeError(w, status, rerr)
+				return
+			}
+			w.WriteHeader(status)
+			return
 		}
 		// Append the original record verbatim (RawMessage re-encodes as-is) -> local jsonl + postgres mirror.
 		if err := writer.Append(stream, json.RawMessage(body)); err != nil {

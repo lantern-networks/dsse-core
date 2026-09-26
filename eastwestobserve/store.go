@@ -14,6 +14,7 @@
 package eastwestobserve
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -74,11 +75,17 @@ func normalize(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 // attach a Persister (SetPersister) to make the inventory SURVIVE an Edge restart — otherwise every restart resets
 // the learning inventory to empty, which resets the "uncovered → 0" convergence readiness signal.
 type Store struct {
-	mu        sync.RWMutex
-	flows     map[string]map[string]FlowObservation // tenantID -> observationID -> observation
-	persister blobstore.Persister
-	retention time.Duration // drop observations whose LastSeen is older than this (0 = keep forever)
-	dirty     bool          // there are un-persisted changes since the last flush
+	mu              sync.RWMutex
+	flows           map[string]map[string]FlowObservation // tenantID -> observationID -> observation
+	persister       blobstore.Persister
+	retention       time.Duration // drop observations whose LastSeen is older than this (0 = keep forever)
+	sharedKnown     bool
+	sharedPending   map[string]map[string]FlowObservation
+	sharedUncertain bool
+	dirty           bool // there are un-persisted changes since the last flush
+	// receipts is the report record for a store without a shared persister (see ApplyReport). A shared store
+	// keeps it only in the row.
+	receipts map[string]ReportReceipt
 }
 
 // NewStore returns an empty observation store.
@@ -96,11 +103,41 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 		return nil
 	}
 	data, err := p.Load()
+	if _, ok := p.(sharedPersister); ok {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		// Only a row actually read is "known". A boot read failure proves nothing
+		// about the row: if it exists, every flush merges into it inside the row
+		// lock; if it is absent, creating it from this process's unsaved
+		// observations loses nothing. Marking it known made an absent row an error
+		// forever, so a fleet that booted while the database was down never
+		// persisted an observation until restarted.
+		s.sharedKnown = data != nil
+		s.sharedPending = map[string]map[string]FlowObservation{}
+		if err != nil {
+			return err
+		}
+		snap, _, err := decodeShared(data, s.sharedKnown)
+		if err != nil {
+			return err
+		}
+		if data != nil {
+			s.flows = snap
+		} else {
+			s.sharedPending = cloneFlows(s.flows)
+		}
+		s.pruneLocked(time.Now())
+		return nil
+	}
 	if err != nil || len(data) == 0 {
 		return err
 	}
+	flowsRaw, receipts, err := splitRow(data)
+	if err != nil {
+		return err
+	}
 	var snap map[string]map[string]FlowObservation
-	if err := json.Unmarshal(data, &snap); err != nil {
+	if err := json.Unmarshal(flowsRaw, &snap); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -108,6 +145,7 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 	if snap != nil {
 		s.flows = snap
 	}
+	s.receipts = receipts
 	s.pruneLocked(time.Now())
 	return nil
 }
@@ -132,33 +170,24 @@ func (s *Store) pruneLocked(now time.Time) {
 
 // PersistIfDirty writes a snapshot to durable storage when there are unsaved changes (prunes expired flows first).
 // Cheap no-op when clean or when no persister is attached. Call periodically (e.g. every 30s) — Observe() only
-// marks the store dirty, so the hot path never does I/O.
-func (s *Store) PersistIfDirty() error {
+// marks the store dirty, so it performs no I/O. Shared flush holds mu during the
+// bounded database transaction, so Observe can wait for it.
+func (s *Store) PersistIfDirty() error { return s.PersistIfDirtyContext(context.Background()) }
+
+func (s *Store) PersistIfDirtyContext(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.dirty || s.persister == nil {
 		s.mu.Unlock()
 		return nil
 	}
+	if p, ok := s.persister.(sharedPersister); ok {
+		defer s.mu.Unlock()
+		return s.persistSharedLocked(ctx, p)
+	}
+	defer s.mu.Unlock()
 	s.pruneLocked(time.Now())
-	data, err := json.Marshal(s.flows)
-	p := s.persister
-	if err == nil {
-		s.dirty = false
-	}
-	s.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if err := p.Save(data); err != nil {
-		// The dirty flag was cleared optimistically before Save (Save runs outside the lock). On a failed
-		// Save, re-mark dirty so the NEXT periodic flush retries — otherwise a transient failure silently
-		// dropped this snapshot until some future Observe happened to dirty the store again.
-		s.mu.Lock()
-		s.dirty = true
-		s.mu.Unlock()
-		return err
-	}
-	return nil
+	pruneReceipts(s.receipts, time.Now())
+	return s.saveReportLocked(s.flows, s.receipts)
 }
 
 // Observe records one sighting of a lateral flow. First sighting creates the record (Count=1, FirstSeen=now);
@@ -201,6 +230,23 @@ func (s *Store) Observe(tenantID, source, user, destination, serviceFamily strin
 	obs.Count++
 	obs.LastSeen = ts
 	s.flows[tenantID][id] = obs
+	if _, ok := s.persister.(sharedPersister); ok {
+		if s.sharedPending[tenantID] == nil {
+			s.sharedPending[tenantID] = map[string]FlowObservation{}
+		}
+		delta := s.sharedPending[tenantID][id]
+		n := delta.Count + 1
+		first := delta.FirstSeen
+		if first == "" || ts < first {
+			first = ts
+		}
+		if delta.LastSeen <= ts {
+			delta = obs
+		}
+		delta.Count = n
+		delta.FirstSeen = first
+		s.sharedPending[tenantID][id] = delta
+	}
 	s.dirty = true // a periodic PersistIfDirty() will snapshot this; the hot path stays I/O-free
 	return obs
 }

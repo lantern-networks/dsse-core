@@ -234,6 +234,9 @@ func (store *Store) ApplyReport(ctx context.Context, tenantID, reporter string, 
 	next := store.cloneLocked()
 	receipts, err := apply(next, store.receipts)
 	if errors.Is(err, errReportAlreadyApplied) {
+		if store.dirty {
+			return false, store.commitWithReceiptsLocked(store.candidates, store.receipts)
+		}
 		return false, nil
 	}
 	if err != nil {

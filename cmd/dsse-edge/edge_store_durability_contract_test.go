@@ -45,6 +45,11 @@ var edgeStoreDurabilityAnswers = map[string]string{
 	// Deliberately lost on restart, and nothing an operator reads depends on it surviving. Replay caches, rate
 	// limiters, in-flight challenges. Losing it must be harmless, not merely tolerated.
 	"ephemeral": "deliberately lost on restart; no operator-visible fact depends on it",
+	// Pending observations are a different claim from harmlessly discardable caches.
+	// The declared bound, flush lifecycle and loss semantics must be stated. This
+	// does not classify authoritative configuration/inventory as disposable: emitted
+	// records live in their own durable sink; the buffer contains unpublished work.
+	"bounded_buffer": "pending observations with a declared bound and flush/loss semantics; emitted records are stored separately",
 }
 
 // The second question, which the durability answer does not contain. `f9eb0656` and the device-runtime store
@@ -221,6 +226,7 @@ on the type:
   // restart-durability: cp_durable — the control plane persists it; hydrated at startup (see …)
   // restart-durability: edge_durable — persisted to <path/store>; the CP does not own it because …
   // restart-durability: ephemeral — a replay cache; losing it costs nothing an operator can see
+  // restart-durability: bounded_buffer — pending observations; state the bound, flush/loss semantics and emitted-record owner
 
 If the honest answer is "the operator reads this and it vanishes on restart", that is the bug, not the
 declaration.`, strings.Join(lines, "\n  "))

@@ -144,8 +144,8 @@ func TestAdminApplicationCatalogAPIUpsertThenDetailRead(t *testing.T) {
 	if len(outbox.insertedAudits) != 1 || outbox.insertedAudits[0].EventType != "admin_application_upserted" {
 		t.Fatalf("outbox inserted audits = %#v, want admin_application_upserted", outbox.insertedAudits)
 	}
-	if outbox.insertedAudits[0].SourceIP != nil || outbox.insertedAudits[0].ActorUserID != nil {
-		t.Fatalf("application audit included raw source/user fields: %#v", outbox.insertedAudits[0])
+	if outbox.insertedAudits[0].SourceIP != nil || stringPtrValue(outbox.insertedAudits[0].ActorUserID) != "admin_lab_bypass" {
+		t.Fatalf("application audit must retain the authenticated principal without raw source fields: %#v", outbox.insertedAudits[0])
 	}
 }
 
@@ -276,8 +276,8 @@ func TestAdminApplicationCatalogAPIDelete(t *testing.T) {
 			if a.TargetID == nil || *a.TargetID != "app_delete_me_001" {
 				t.Fatalf("delete audit target = %v, want app_delete_me_001", a.TargetID)
 			}
-			if a.SourceIP != nil || a.ActorUserID != nil {
-				t.Fatalf("delete audit leaked raw source/user fields: %#v", a)
+			if a.SourceIP != nil || stringPtrValue(a.ActorUserID) != "admin_lab_bypass" {
+				t.Fatalf("delete audit must retain the authenticated principal without raw source fields: %#v", a)
 			}
 		}
 	}

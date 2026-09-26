@@ -64,10 +64,10 @@ jobs:
         run: GOOS=windows go build ./...
       - run: go vet ./...
       - run: go test ./... -count=1
-      - name: PostgreSQL first administrative writes
+      - name: PostgreSQL administrative writes and application ownership
         env:
           POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
-        run: go test ./cmd/dsse-edge -run '^TestPostgresBlobInitial' -count=1
+        run: go test ./cmd/dsse-edge -run '^(TestPostgresBlobInitial|TestPostgresApplicationOwnershipUsesLatestRow)' -count=1
       - name: Connector access policy traffic
         run: |
           go build -o "$RUNNER_TEMP/dsse-connector" ./cmd/dsse-connector

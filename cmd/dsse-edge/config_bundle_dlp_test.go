@@ -15,7 +15,7 @@ import (
 )
 
 func dlpStoresForTest(salt string) *dlpConfigStores {
-	return &dlpConfigStores{policies: newDLPPolicyObjectStore(), classifiers: newDLPClassifierRuntimeStore(), fingerprints: newDLPFingerprintRuntimeStore(salt)}
+	return &dlpConfigStores{policies: newDLPPolicyObjectStore(), classifiers: newDLPClassifierRuntimeStore(), fingerprints: newDLPFingerprintRuntimeStore(salt), allowlist: newDLPAllowlistRuntimeStore(salt)}
 }
 
 func TestDistributedDLPDefinitionsBlockOnTheReceivingEdge(t *testing.T) {

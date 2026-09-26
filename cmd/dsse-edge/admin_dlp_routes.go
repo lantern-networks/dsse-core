@@ -333,6 +333,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// list (empty = clear). These are values the operator asserts are non-sensitive; the Console warns not to enter
 	// real secrets. The data plane keeps only salted hashes; the values are stored so the operator can manage them.
 	mux.HandleFunc("GET /admin/dlp-allowlist", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := dlpAllowlistStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("allowlist cannot be read"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"values": dlpAllowlistStore.ValuesForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-allowlist", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
@@ -343,21 +347,34 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Values []string `json:"values"`
+			Values           *[]string `json:"values"`
+			ExpectedTenantID string    `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp allowlist: %w", err))
 			return
 		}
-		const maxAllowlistValues = 1000
-		if len(body.Values) > maxAllowlistValues {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("too many allowlist values: %d (max %d)", len(body.Values), maxAllowlistValues))
+		if body.Values == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("values must be an array; use [] to clear"))
+			return
+		}
+		values, err := validatedAllowlistValues(*body.Values)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		dlpAllowlistStore.SetValues(tenant, body.Values)
-		logInfof("dlp_allowlist_applied_by_admin tenant=%s values=%d", tenant, len(body.Values))
-		writeJSON(w, http.StatusOK, map[string]any{"values": dlpAllowlistStore.ValuesForTenant(tenant)})
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
+		if err := dlpAllowlistStore.SetValuesContext(r.Context(), tenant, values); err != nil {
+			logInfof("dlp_allowlist_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("saving the allowlist could not be confirmed; check the saved configuration before retrying"))
+			return
+		}
+		logInfof("dlp_allowlist_applied_by_admin tenant=%s values=%d", tenant, len(values))
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": tenant, "values": dlpAllowlistStore.ValuesForTenant(tenant)})
 	}))
 	// DLP fingerprints (slice E, Exact-Data-Match): fingerprint a SENSITIVE dataset (a list of exact values —
 	// customer record ids, employee numbers) into salted hashes under a named identifier; the scan then detects any

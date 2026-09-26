@@ -209,6 +209,12 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))
 			return
 		}
+		if config.DLPDistribution != nil && config.DLPDistribution.allowlist != nil {
+			if err := config.DLPDistribution.allowlist.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("allowlist cannot be read"))
+				return
+			}
+		}
 		if err := connectorRouteGov.RefreshShared(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
 			return

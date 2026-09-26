@@ -72,12 +72,20 @@ func TestEgressServiceTransportPairsAndMissingReferences(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			assertRequests(nil)
+			restrictive := map[string]bool{}
+			if action != policyrule.AccessAllow {
+				for _, proto := range []string{"tcp", "udp", "", "sctp"} {
+					for _, port := range []int{0, 22, 53, 443, 8443, 65535} {
+						restrictive[fmt.Sprintf("%s/%d", proto, port)] = true
+					}
+				}
+			}
+			assertRequests(restrictive)
 			if !policyrule.EgressServiceUnresolved("a", "svc", a) || policyrule.EgressServiceUnresolved("b", "svc", a) {
 				t.Fatal("resolution crossed tenant")
 			}
 			r.ServiceID = " "
-			assertRequests(nil)
+			assertRequests(restrictive)
 			r.ServiceID = ""
 			all := map[string]bool{}
 			for _, proto := range []string{"tcp", "udp", "", "sctp"} {

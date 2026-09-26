@@ -3,6 +3,8 @@ package policyrule
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"reflect"
 )
 
@@ -45,6 +47,7 @@ func mutateRules[T any](ctx context.Context, s *Store, edit func(*Store) (T, err
 	var n *Store
 	var result T
 	var validation error
+	var saveErr error
 	if p, ok := s.persister.(contextUpdater); ok {
 		err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
 			var err error
@@ -70,14 +73,17 @@ func mutateRules[T any](ctx context.Context, s *Store, edit func(*Store) (T, err
 		var err error
 		result, err = edit(n)
 		if err != nil {
-			return result, err
+			if !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+				return result, err
+			}
+			saveErr = err
 		}
 	}
 	if !reflect.DeepEqual(s.rules, n.rules) {
 		s.generation++
 	}
 	s.rules, s.seq = n.rules, n.seq
-	return result, nil
+	return result, saveErr
 }
 
 // RefreshShared loads shared authority for checked administrative reads. On failure

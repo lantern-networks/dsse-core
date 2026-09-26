@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"reflect"
@@ -405,7 +406,7 @@ func decodeSnapshot(data []byte, exists bool) (bool, Posture, error) {
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return false, Posture{}, fmt.Errorf("unexpected trailing posture data")
 	}
-	next, err := Validate(p)
+	next, err := validateLegacy(p)
 	return err == nil, next, err
 }
 func clonePosture(p Posture) Posture {
@@ -413,6 +414,18 @@ func clonePosture(p Posture) Posture {
 	p.DecryptAllowlistGroups = append([]string{}, p.DecryptAllowlistGroups...)
 	p.BypassGroups = append([]string{}, p.BypassGroups...)
 	return p
+}
+
+// Saved and signed older configurations retain their authored patterns. Rejecting
+// a newly forbidden host at load time would stop every upgraded receiver.
+func validateLegacy(p Posture) (Posture, error) {
+	if p.Mode != ModeDecryptAll && p.Mode != ModeBypassDefault {
+		return Posture{}, fmt.Errorf("invalid inspection mode")
+	}
+	if _, err := Validate(p); err != nil {
+		log.Printf("inspection_posture_legacy_patterns retained=true review_required=true")
+	}
+	return p.Normalized(), nil
 }
 
 // Validate refuses settings that normalization would silently discard or that never match a host.
@@ -481,4 +494,25 @@ func (s *Store) persist(next Posture) error {
 		return nil
 	}
 	return durablefile.Write(s.statePath, data, 0o600)
+}
+
+// ValidateEdit preserves existing legacy host patterns while validating new
+// patterns and the resulting mode/groups. Operators can change mode without
+// deleting an old internal hostname from their authored policy.
+func ValidateEdit(before, next Posture) (Posture, error) {
+	check := clonePosture(next)
+	check.DecryptAllowlistHosts = nil
+	existing := map[string]bool{}
+	for _, host := range before.DecryptAllowlistHosts {
+		existing[host] = true
+	}
+	for _, host := range next.DecryptAllowlistHosts {
+		if !existing[host] {
+			check.DecryptAllowlistHosts = append(check.DecryptAllowlistHosts, host)
+		}
+	}
+	if _, err := Validate(check); err != nil {
+		return Posture{}, err
+	}
+	return next.Normalized(), nil
 }

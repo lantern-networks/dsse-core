@@ -102,19 +102,11 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				}
 			}
 		default:
-			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be hold | unhold | approve | unapprove | add | remove"))
+			writeError(w, http.StatusBadRequest, fmt.Errorf("action must be add | remove"))
 			return
 		}
 		var bindingErr error
 		switch action {
-		case "hold":
-			connectorRouteGov.SetHeld(tenant, cid, req.CIDR, true)
-		case "unhold":
-			connectorRouteGov.SetHeld(tenant, cid, req.CIDR, false)
-		case "approve":
-			connectorRouteGov.SetApproved(tenant, cid, req.CIDR, true)
-		case "unapprove":
-			connectorRouteGov.SetApproved(tenant, cid, req.CIDR, false)
 		case "add":
 			bindingErr = connectorRouteGov.AddAuthoredContext(r.Context(), tenant, cid, authoredRoute{CIDR: req.CIDR, FQDN: req.FQDN, NetworkID: req.NetworkID, Description: strings.TrimSpace(req.Description)})
 		case "remove":

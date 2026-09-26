@@ -62,7 +62,12 @@ func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver)
 		}
 		transports, resolved := egressServiceConditions(tenant, r.ServiceID, resolver)
 		if !resolved {
-			log.Printf("policyrule: egress rule %q service is unresolved or invalid — the rule matches nothing (including deny/authenticate); repair the service catalog", r.ID)
+			if r.Action.Access != AccessAllow {
+				// A missing service must not disable an existing restriction.
+				// Keep the authored source/destination and restrict every port.
+				transports = []map[string]any{{}}
+			}
+			log.Printf("policyrule: egress rule %q service is unresolved or invalid; allow matches nothing, deny/authenticate retain source and destination across ports; repair the service catalog", r.ID)
 		}
 		// Source: explicit Any => no source condition. Otherwise split the authored selectors into IDENTITY
 		// groups (idgroup:<name> ⇒ a user_groups condition matched against the authenticated session's groups —

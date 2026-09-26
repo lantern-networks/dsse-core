@@ -42,6 +42,7 @@ does not inherit the requester's operator identity. Product HTTP tests exercise
 worker completion, opposite-role cancellations, spoofed metadata and delegation
 revocation. A local browser cancellation matched the customer job and audit trail.
 
+- SaaS tenant restriction saves distinguish unavailable storage (503) from invalid input (400), without returning storage details. Failed saves keep the previous setting; retry after recovery persists the edit. A local browser exercised failure and retry with audit checks. Separate CP/Edge process tests cover four providers through create, edit, disable and re-enable, signed polling and local HTTPS header capture. External provider sign-in and deployed TLS interception remain release checks.
 
 Log exports now include the full selected local calendar days, including the
 last nanosecond of the end date. The Console offers the supported NDJSON format,

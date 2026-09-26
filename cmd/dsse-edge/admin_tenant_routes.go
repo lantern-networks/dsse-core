@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -114,18 +116,21 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		now := time.Now()
-		// ★ THE SAME PRESERVATION ON THE ORGANIZATION'S OWN UPDATE. A customer editing its display name must
-		// not be able to drop its own delegation record by omission either — and it cannot SET the envelope
-		// here, so omission is the only way it could ever change.
-		if adminStore, ok := tenantModelStore.(adminTenantModelAdminStore); ok {
-			tenant = preserveOperatorEnvelopeOnUpsert(r.Context(), adminStore, tenant, bodyNamesOperatorEnvelope(raw))
+		if supplied := strings.TrimSpace(tenant.TenantID); supplied != "" && supplied != strings.TrimSpace(adminTenantIDFromRequest(r)) {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("tenant_id does not match authenticated tenant"))
+			return
+		}
+		tenant, err := mergeTenantSettingsEdit(r.Context(), tenantModelStore, adminTenantIDFromRequest(r), raw)
+		if err != nil {
+			writeTenantSettingsEditError(w, err)
+			return
 		}
 		updated, err := tenantModelStore.Update(r.Context(), tenant, adminTenantIDFromRequest(r), now)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLog(updated, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLogFor(r, updated, evaluator, now), now)
 		writeJSON(w, http.StatusOK, updated)
 	}))
 	// Cross-tenant (super-admin) tenant administration: list every tenant, create/upsert an arbitrary tenant,
@@ -196,7 +201,10 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// caller's to name at all — see organization_id_is_not_a_name.go.
 		action := "create"
 		if strings.TrimSpace(tenant.TenantID) != "" {
-			if existing, lerr := adminStore.List(r.Context()); lerr == nil {
+			if existing, lerr := adminStore.List(r.Context()); lerr != nil {
+				writeTenantSettingsEditError(w, lerr)
+				return
+			} else {
 				action = "create"
 				for _, candidate := range existing {
 					if candidate.TenantID == strings.TrimSpace(tenant.TenantID) {
@@ -228,17 +236,14 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			}
 			tenant.TenantID = minted
 		}
-		// ★★ THE OPERATOR ENVELOPE IS NOT THIS FORM'S TO REWRITE (2026-08-18, done by accident and measured).
-		// This is a whole-record upsert, so a body that omits a field ERASES it. Sending
-		// {tenant_id, display_name, status} to flip an organization back to active wiped its timezone, plan,
-		// home region and allowed regions — and, far worse, its operator_managed flag and all sixteen of its
-		// recorded elevations. That is the standing delegation and the customer's own record of when the
-		// operator used it (the envelope design), silently revoked as collateral damage of an unrelated edit.
-		//
-		// Those fields have their OWN routes (PUT /admin/operator-delegation, the elevation routes) and are
-		// carried here only so a read/modify/write round-trip does not lose them. So they are preserved unless
-		// the body actually carries them — the same treatment CreatedAt already gets, and for the same reason.
-		tenant = preserveOperatorEnvelopeOnUpsert(r.Context(), adminStore, tenant, bodyNamesOperatorEnvelope(raw))
+		if action == "update" {
+			merged, err := mergeTenantSettingsEdit(r.Context(), tenantModelStore, tenant.TenantID, raw)
+			if err != nil {
+				writeTenantSettingsEditError(w, err)
+				return
+			}
+			tenant = merged
+		}
 		saved, err := adminStore.Put(r.Context(), tenant, now)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -704,4 +709,56 @@ func adminTenantBodyAsksForTransportAuthority(raw []byte) bool {
 		return false
 	}
 	return *body.TransportAuthority
+}
+
+var errTenantEnvelopeEdit = errors.New("operator delegation and elevation fields must be changed through the operator-access routes")
+
+// Settings forms send only the fields they edit. Preserve omitted values, including
+// customer withdrawal history. Authorization state is read-only on these routes;
+// its dedicated routes enforce customer consent and record the responsible actor.
+func mergeTenantSettingsEdit(ctx context.Context, store adminTenantModelRuntimeStore, tenantID string, raw []byte) (adminTenantModel, error) {
+	existing, err := store.Get(ctx, strings.TrimSpace(tenantID))
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	stored, err := json.Marshal(existing)
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	var fields, patch map[string]json.RawMessage
+	if err = json.Unmarshal(stored, &fields); err != nil {
+		return adminTenantModel{}, err
+	}
+	if err = json.Unmarshal(raw, &patch); err != nil {
+		return adminTenantModel{}, err
+	}
+	for key, value := range patch {
+		fields[key] = value
+	}
+	mergedRaw, err := json.Marshal(fields)
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	var merged adminTenantModel
+	if err = json.Unmarshal(mergedRaw, &merged); err != nil {
+		return adminTenantModel{}, err
+	}
+	merged.TenantID = strings.TrimSpace(tenantID)
+	if merged.OperatorManaged != existing.OperatorManaged ||
+		merged.OperatorDelegationWithdrawnByCustomer != existing.OperatorDelegationWithdrawnByCustomer ||
+		merged.OperatorElevationRequiresApproval != existing.OperatorElevationRequiresApproval ||
+		!reflect.DeepEqual(merged.OperatorElevations, existing.OperatorElevations) ||
+		!reflect.DeepEqual(merged.OperatorDelegationChangedAt, existing.OperatorDelegationChangedAt) ||
+		!reflect.DeepEqual(merged.OperatorDelegationChangedBy, existing.OperatorDelegationChangedBy) {
+		return adminTenantModel{}, errTenantEnvelopeEdit
+	}
+	return merged, nil
+}
+
+func writeTenantSettingsEditError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errTenantEnvelopeEdit) {
+		writeError(w, http.StatusForbidden, err)
+		return
+	}
+	writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant settings could not be read; no changes were saved"))
 }

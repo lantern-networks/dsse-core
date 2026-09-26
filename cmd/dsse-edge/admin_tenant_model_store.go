@@ -804,6 +804,14 @@ func adminTenantTimezone(ctx context.Context, store adminTenantModelRuntimeStore
 // and it did not.
 func adminTenantModelLifecycleAuditLogFor(r *http.Request, tenant adminTenantModel, action string, evaluator decision.Evaluator, now time.Time) model.AuditLog {
 	record := adminTenantModelLifecycleAuditLog(tenant, action, evaluator, now)
+	return stampAdminTenantModelAuditActor(record, r, tenant)
+}
+
+func adminTenantModelAuditLogFor(r *http.Request, tenant adminTenantModel, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+	return stampAdminTenantModelAuditActor(adminTenantModelAuditLog(tenant, evaluator, now), r, tenant)
+}
+
+func stampAdminTenantModelAuditActor(record model.AuditLog, r *http.Request, tenant adminTenantModel) model.AuditLog {
 	if identity, ok := adminIdentityFromRequest(r); ok {
 		// The actor goes in METADATA, not ActorUserID. The cross-tenant audit contract (CP0020) keeps raw
 		// class-2 identifiers — a person's user id, a raw subject, a session id — out of the control-plane

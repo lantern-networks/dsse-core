@@ -181,7 +181,19 @@ func WithPairUpdate(certPath, keyPath string, update func() error) error {
 func RecoverPair(certPath, keyPath string) error {
 	pairMu.Lock()
 	defer pairMu.Unlock()
-	cp, kp, jp, err := pairPaths(certPath, keyPath)
+	cp, err := filepath.Abs(certPath)
+	if err != nil {
+		return err
+	}
+	kp, err := filepath.Abs(keyPath)
+	if err != nil {
+		return err
+	}
+	if cp == kp {
+		_, err = tls.LoadX509KeyPair(cp, kp)
+		return err
+	}
+	_, _, jp, err := pairPaths(certPath, keyPath)
 	if err != nil {
 		return err
 	}

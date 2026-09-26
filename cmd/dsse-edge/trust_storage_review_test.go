@@ -37,3 +37,22 @@ func TestInternalCAInvalidSnapshotRemainsRetryable(t *testing.T) {
 		t.Fatal("retry did not restore authority")
 	}
 }
+
+func TestIncompleteInternalCAKeepsLocalWithoutRejectingBundle(t *testing.T) {
+	s, err := internalca.NewStore(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := internalca.Authority{ID: "a", TenantID: "t", CertificatePEM: anInternalAuthorityPEM(t, "Existing")}
+	if _, err = s.Upsert(a, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	generation := s.ConfigGeneration()
+	src := configBundleSource{}
+	if _, err = src.apply(configBundlePayload{InternalCAs: &internalCABundle{Complete: false}}, configApplyTargets{internalCAs: s}); err != nil {
+		t.Fatal(err)
+	}
+	if s.ConfigGeneration() != generation || len(s.AnchorsPEM("t", time.Now())) != 1 {
+		t.Fatal("incomplete snapshot changed local trust")
+	}
+}

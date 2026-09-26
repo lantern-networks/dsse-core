@@ -15,6 +15,9 @@ func TestCombinedPEMRemainsReadable(t *testing.T) {
 	if err := os.WriteFile(c, append(cert, key...), 0600); err != nil {
 		t.Fatal(err)
 	}
+	if err := RecoverPair(c, c); err != nil {
+		t.Fatal(err)
+	}
 	r, err := NewReloadableCert(c, c)
 	if err != nil {
 		t.Fatal(err)

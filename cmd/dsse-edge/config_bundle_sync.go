@@ -207,6 +207,8 @@ type configBundlePayload struct {
 	// store (the dnsresolver.Resolver, not policy.Store), so the bundle's Generation is the SUM of the policy-store
 	// and DNS generations (both monotonic). Pointer: a CP that omits it leaves the Edge's DNS policy untouched.
 	DNSPolicy *dnsresolver.PolicyDTO `json:"dns_policy,omitempty"`
+	// Explicit admin writes may remove the last rule. Legacy/boot-empty bundles retain the lockout guard.
+	DNSPolicyAuthoritative bool `json:"dns_policy_authoritative,omitempty"`
 	// Enrolled is the Enrolled Inventory (the admission allowlist — identity + enabled/disabled). A
 	// separate store (enrolledinventory.Ledger); its generation folds into the aggregate. Pointer so a CP that
 	// omits it leaves the Edge's ledger untouched (fail-safe). When present with entries it REPLACES the set
@@ -754,8 +756,8 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			// empty one does not merely relax enforcement — private hostnames stop resolving, which reaches a
 			// user as the browser reporting no internet connection rather than as anything policy-shaped.
 			// Present-but-empty means the CP is not the DNS authority far more often than it means "serve
-			// nothing", and clearing DNS deliberately is an explicit admin act with its own route.
-			if local := t.resolver.CurrentPolicy(); pol.IsEmpty() && !local.IsEmpty() {
+			// nothing". New CPs distinguish an explicit admin save from boot/legacy emptiness.
+			if local := t.resolver.CurrentPolicy(); pol.IsEmpty() && !local.IsEmpty() && !payload.DNSPolicyAuthoritative {
 				log.Printf("config-bundle sync: control plane sent an EMPTY DNS policy while this Edge serves one (%s) — keeping local to avoid breaking name resolution (lockout-safe).", local.Summary())
 			} else {
 				t.resolver.SetPolicy(pol) // hot-swap; a malformed DTO is skipped (fail-safe: keep current DNS policy)

@@ -103,6 +103,8 @@ func (store *Store) ObserveConnectorDiscovered(_ context.Context, tenantID, dest
 	if err != nil {
 		return Candidate{}, err
 	}
-	store.putLocked(normalized)
+	if err := store.putLocked(normalized); err != nil {
+		return copyCandidate(normalized), err
+	}
 	return copyCandidate(normalized), nil
 }

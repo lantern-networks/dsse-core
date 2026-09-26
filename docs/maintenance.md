@@ -23,6 +23,7 @@ changes is included in the published 0.3.0 release:
 | Area | Change | Evidence available so far |
 |---|---|---|
 | Incoming connection saves | Report storage failures for default changes and exception creation, edits and deletion; retain the current live setting until storage confirms the change | Four product HTTP failure/retry regressions and stored-state reload; local browser toggle failure/retry and audit comparison; shared-document regression preserving other settings. Windows application and real multi-region deployment remain separate checks. |
+| Incoming connection exceptions | Preserve port, disabled state, approval/session limits and exact expiry during owner edits; show verified defaults and permission-appropriate controls; select explicit TCP ports | Local browser owner edit, reader reload and failed-read recovery; saved-state and audit comparison; editor and TCP export regression tests. Windows application and incoming persistence-failure handling remain separate release checks. |
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
 | Directory updates | Preserve user-risk association after subject or email changes | Local browser risk changes, import and decision API checks, saved-state and audit comparisons; separate PostgreSQL regression |
 | DLP and access rules | Preserve existing settings and references during ordinary edits; restore permitted read-only DLP listing | Local browser checks, saved-state and audit comparisons, automated regressions |
@@ -34,6 +35,16 @@ control-plane/Edge operation, external identity-provider interoperability, or
 long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
+
+Delegated operators can cancel customer export jobs using the current customer
+delegation; cancellation still refuses undelegated and unauthorized cross-tenant
+requests. Export request, queue and worker lifecycle audits retain the operator's
+principal and home-organization IDs. Cancellation identifies its own caller and
+does not inherit the requester's operator identity. Product HTTP tests exercise
+worker completion, opposite-role cancellations, spoofed metadata and delegation
+revocation. A local browser cancellation matched the customer job and audit trail.
+
+- SaaS tenant restriction saves distinguish unavailable storage (503) from invalid input (400), without returning storage details. Failed saves keep the previous setting; retry after recovery persists the edit. A local browser exercised failure and retry with audit checks. Separate CP/Edge process tests cover four providers through create, edit, disable and re-enable, signed polling and local HTTPS header capture. External provider sign-in and deployed TLS interception remain release checks.
 
 Log exports now include the full selected local calendar days, including the
 last nanosecond of the end date. The Console offers the supported NDJSON format,

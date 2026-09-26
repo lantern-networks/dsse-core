@@ -68,10 +68,11 @@ type atomicRuntimeStatePersister interface {
 
 func (store *Store) updateTenantRestrictionsLocked(tenant string, edit func(map[string]tenantrestriction.Setting) (map[string]tenantrestriction.Setting, error)) error {
 	if store.runtimeStatePersister == nil {
-		return fmt.Errorf("durable admin configuration storage is not configured")
+		return fmt.Errorf("%w: durable admin configuration storage is not configured", ErrPolicyPersistence)
 	}
 	if atomic, ok := store.runtimeStatePersister.(atomicRuntimeStatePersister); ok {
 		var committed map[string]map[string]tenantrestriction.Setting
+		var editErr error
 		err := atomic.Update(func(raw []byte) ([]byte, error) {
 			document := map[string]json.RawMessage{}
 			if len(raw) > 0 {
@@ -95,6 +96,7 @@ func (store *Store) updateTenantRestrictionsLocked(tenant string, edit func(map[
 			}
 			next, err := edit(tenantrestriction.Copy(all[tenant]))
 			if err != nil {
+				editErr = err
 				return nil, err
 			}
 			all[tenant] = next
@@ -106,7 +108,10 @@ func (store *Store) updateTenantRestrictionsLocked(tenant string, edit func(map[
 			return json.Marshal(document)
 		})
 		if err != nil {
-			return fmt.Errorf("SaaS restriction was not saved: %w", err)
+			if editErr != nil {
+				return editErr
+			}
+			return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
 		}
 		store.tenantRestrictions = committed
 		store.generation++
@@ -124,7 +129,7 @@ func (store *Store) updateTenantRestrictionsLocked(tenant string, edit func(map[
 		} else {
 			store.tenantRestrictions[tenant] = previous
 		}
-		return err
+		return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
 	}
 	store.generation++
 	return nil

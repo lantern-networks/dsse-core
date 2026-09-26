@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
@@ -205,5 +207,59 @@ func TestManagedTenantRestrictionConfigSyncRejectsInvalidBeforeApply(t *testing.
 	}
 	if !edge.SnapshotTenantConfig("one").SaaSTenantRestrictions["google_workspace"].Enabled {
 		t.Fatal("partially applied invalid bundle")
+	}
+}
+
+// Ordinary edits must distinguish invalid input from an unavailable save destination.
+type managedTRFailingPersister struct {
+	blobstore.FilePersister
+	fail bool
+}
+
+func (p *managedTRFailingPersister) Save(raw []byte) error {
+	if p.fail {
+		return errors.New("private-storage-detail")
+	}
+	return p.FilePersister.Save(raw)
+}
+func TestManagedTenantRestrictionSaveFailureAndRetry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "admin.json")
+	disk := &managedTRFailingPersister{FilePersister: blobstore.FilePersister{Path: path}}
+	store := policy.NewStore(nil)
+	if err := store.SetRuntimeStatePersister(disk); err != nil {
+		t.Fatal(err)
+	}
+	h := managedTRRoutes(t, store, "")
+	before := `{"provider":"google_workspace","allowed_value":"one.example","enabled":true}`
+	after := `{"provider":"google_workspace","allowed_value":"two.example","enabled":false}`
+	if w := managedTRRequest(h, "one", "POST", before); w.Code != 200 {
+		t.Fatalf("initial save %d", w.Code)
+	}
+	disk.fail = true
+	w := managedTRRequest(h, "one", "POST", after)
+	if w.Code != 503 || strings.Contains(w.Body.String(), "private-storage-detail") {
+		t.Fatalf("storage failure response: %d %s", w.Code, w.Body.String())
+	}
+	saved := store.SnapshotTenantConfig("one").SaaSTenantRestrictions["google_workspace"]
+	restored := policy.NewStore(nil)
+	if err := restored.SetRuntimeStatePath(path); err != nil {
+		t.Fatal(err)
+	}
+	if saved.AllowedValue != "one.example" || !saved.Enabled || restored.SnapshotTenantConfig("one").SaaSTenantRestrictions["google_workspace"] != saved {
+		t.Fatal("failed save changed active or durable state")
+	}
+	disk.fail = false
+	if w := managedTRRequest(h, "one", "POST", `{"provider":"google_workspace","allowed_value":"bad domain","enabled":true}`); w.Code != 400 {
+		t.Fatalf("invalid input: %d", w.Code)
+	}
+	if w := managedTRRequest(h, "one", "POST", after); w.Code != 200 {
+		t.Fatalf("retry: %d %s", w.Code, w.Body.String())
+	}
+	if err := restored.SetRuntimeStatePath(path); err != nil {
+		t.Fatal(err)
+	}
+	saved = restored.SnapshotTenantConfig("one").SaaSTenantRestrictions["google_workspace"]
+	if saved.AllowedValue != "two.example" || saved.Enabled {
+		t.Fatal("retry was not persisted")
 	}
 }

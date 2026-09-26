@@ -57,5 +57,3 @@ test('export details refuse a mismatched or failed response rather than showing 
   vm.runInContext(source,c);await vm.runInContext('laExportDetails({id:"job"},button)',c);assert.equal(messages,1);assert.equal(button.disabled,false);
  }
 });
-
-

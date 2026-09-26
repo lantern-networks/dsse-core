@@ -129,3 +129,23 @@ func TestRouteGovernanceCompleteDeletionAndRetry(t *testing.T) {
 		t.Fatal("last deletion did not propagate")
 	}
 }
+
+func TestRouteErasureFailureIsReportedByTenantPurge(t *testing.T) {
+	p := &routeTransactionFixture{}
+	routes := newConnectorRouteGovernanceWithPersister("", true, p)
+	if err := routes.AddAuthored("own", "site", authoredRoute{FQDN: "own.example"}); err != nil {
+		t.Fatal(err)
+	}
+	p.failCommit = true
+	result := adminTenantPurgeResult{TenantID: "own"}
+	adminTenantExtraStores{ConnectorRoutes: routes}.erase(&result)
+	if len(result.Failures) != 1 || len(result.Erased) != 0 || routes.CountForTenant("own") != 1 {
+		t.Fatalf("failed deletion was not reported: %+v", result)
+	}
+	p.failCommit = false
+	result = adminTenantPurgeResult{TenantID: "own"}
+	adminTenantExtraStores{ConnectorRoutes: routes}.erase(&result)
+	if len(result.Failures) != 0 || len(result.Erased) != 1 || routes.CountForTenant("own") != 0 {
+		t.Fatalf("retry did not erase routes: %+v", result)
+	}
+}

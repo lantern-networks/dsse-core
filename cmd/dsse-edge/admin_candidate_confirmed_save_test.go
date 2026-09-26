@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/appcatalog"
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/policy"
 	"github.com/lantern-networks/dsse-core/policycandidate"
+	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
 func TestCandidateAdminSaveFailureAndRetry(t *testing.T) {
@@ -55,7 +57,7 @@ func TestCandidateAdminSaveFailureAndRetry(t *testing.T) {
 			}
 			outbox := &recordingAdminAuditOutboxDeadReader{}
 			applies := 0
-			handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(), AdminAuth: newAdminAuthStore(), Writer: writer, AdminAuditOutbox: outbox, PolicyCandidateStore: candidates, ApplicationCatalogStore: apps, PolicyStore: policies, ApplyMaterializedCertPinBypass: func(string) { applies++ }})
+			handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(), AdminAuth: newAdminAuthStore(), Writer: writer, AdminAuditOutbox: outbox, PolicyCandidateStore: candidates, ApplicationCatalogStore: apps, PolicyStore: policies, AssetStore: assetcatalog.NewStore(), RuleStore: policyrule.NewStore(), ApplyMaterializedCertPinBypass: func(string) { applies++ }})
 			if op == "refresh" {
 				req := httptest.NewRequest(http.MethodPost, "/connectors/register", strings.NewReader(`{"id":"conn-disc","tenant_id":"tenant_lab_001","connector_group_id":"site","name":"Fixture connector","edge_region_id":"local","edge_cluster_id":"local-edge-001","private_base_url":"http://connector.invalid","status":"registered","reachable_routes":{"fqdn_domains":["new-discovery.example.test"]}}`))
 				req.Header.Set(connectorSecretHeader, defaultConnectorSecret)

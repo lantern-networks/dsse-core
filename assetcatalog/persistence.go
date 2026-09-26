@@ -2,7 +2,9 @@ package assetcatalog
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -95,7 +97,10 @@ func (s *Store) persistLocked() error {
 		return err
 	}
 	if err := s.persister.Save(data); err != nil {
-		return fmt.Errorf("persist asset catalog: %w", err)
+		if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return fmt.Errorf("persist asset catalog: %w", err)
+		}
+		log.Print("assetcatalog: saved with weaker durability guarantee")
 	}
 	return nil
 }

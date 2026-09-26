@@ -2,11 +2,11 @@ package assetcatalog
 
 import (
 	"fmt"
+	"log"
 	"strings"
 )
 
-// Normalize at admission and snapshot loading so every consumer sees the same
-// protocol vocabulary. Work on a copy; a rejected candidate cannot mutate input.
+// Validate new edits and normalize supported transport spelling. Work on a copy.
 func normalizeServiceTransports(svc Service) (Service, error) {
 	svc = copyService(svc)
 	if len(svc.Ports) == 0 {
@@ -46,4 +46,16 @@ func (s *Store) ServiceTransportPorts(tenant, serviceID string) map[string][]int
 		return out
 	}
 	return nil
+}
+
+// Older writers accepted out-of-range ports and other protocol names. Keep the
+// original row visible for repair without blocking startup or unrelated edits.
+// ServiceTransportPorts still rejects it; never turn it into an Any service.
+func loadServiceTransports(svc Service) Service {
+	normalized, err := normalizeServiceTransports(svc)
+	if err == nil {
+		return normalized
+	}
+	log.Printf("asset catalog: legacy service %q in tenant %q requires transport correction; record retained without executable transport", svc.ID, svc.TenantID)
+	return copyService(svc)
 }

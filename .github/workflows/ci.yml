@@ -22,6 +22,18 @@ jobs:
   go:
     name: Go build + vet + test
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -52,6 +64,14 @@ jobs:
         run: GOOS=windows go build ./...
       - run: go vet ./...
       - run: go test ./... -count=1
+      - name: PostgreSQL first administrative writes
+        env:
+          POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
+        run: go test ./cmd/dsse-edge -run '^TestPostgresBlobInitial' -count=1
+      - name: Connector access policy traffic
+        run: |
+          go build -o "$RUNNER_TEMP/dsse-connector" ./cmd/dsse-connector
+          DSSE_TEST_CONNECTOR_BIN="$RUNNER_TEMP/dsse-connector" go test ./cmd/dsse-edge -run '^TestEastWestLifecycleThroughRealConnector$' -count=1
 
   macos:
     name: macOS network extension (swift build + test)

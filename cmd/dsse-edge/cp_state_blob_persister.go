@@ -86,18 +86,40 @@ func (p postgresBlobPersister) Save(data []byte) error {
 // Update serializes a read-modify-write across all CP processes. The callback's
 // state becomes visible only after commit; unknown JSON fields can be preserved.
 func (p postgresBlobPersister) Update(edit func([]byte) ([]byte, error)) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+	return p.UpdateContext(context.Background(), edit)
+}
+
+// UpdateContext locks the latest row across CP writers. Both update APIs pass
+// nil for a newly inserted row, never the placeholder used to obtain the lock.
+// Errors before COMMIT are safe to retry; a COMMIT error remains uncertain.
+func (p postgresBlobPersister) UpdateContext(parent context.Context, edit func([]byte) ([]byte, error)) (err error) {
+	commitAttempted := false
+	defer func() {
+		if err != nil && !commitAttempted {
+			err = writeNotCommittedError{err}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
 	tx, err := p.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key); err != nil {
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key)
+	if err != nil {
 		return err
 	}
 	var raw []byte
 	if err := tx.QueryRowContext(ctx, `SELECT payload FROM cp_state_blobs WHERE store_key=$1 FOR UPDATE`, p.key).Scan(&raw); err != nil {
+		return err
+	}
+	if n, err := inserted.RowsAffected(); err != nil {
+		return err
+	} else if n == 1 {
+		raw = nil
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	updated, err := edit(raw)
@@ -107,6 +129,10 @@ func (p postgresBlobPersister) Update(edit func([]byte) ([]byte, error)) error {
 	if _, err := tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	commitAttempted = true
 	return tx.Commit()
 }
 
@@ -471,4 +497,12 @@ func sharedAgentUpdateArtifactShelf(db *sql.DB) *agentUpdateArtifactShelf {
 			return err
 		},
 	}
+}
+
+// Preserve the original error text for API callers while classifying rollback.
+type writeNotCommittedError struct{ err error }
+
+func (e writeNotCommittedError) Error() string { return e.err.Error() }
+func (e writeNotCommittedError) Unwrap() []error {
+	return []error{blobstore.ErrWriteNotCommitted, e.err}
 }

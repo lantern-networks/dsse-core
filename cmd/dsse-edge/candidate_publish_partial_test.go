@@ -7,6 +7,8 @@ import (
 	"errors"
 	"github.com/lantern-networks/dsse-core/appcatalog"
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/policy"
 	"github.com/lantern-networks/dsse-core/policycandidate"
 	"net/http/httptest"
 	"strings"
@@ -93,4 +95,66 @@ func (p *publicationNthPersister) Save(b []byte) error {
 	}
 	p.data = bytes.Clone(b)
 	return nil
+}
+
+type failingCandidatePolicyStore struct {
+	*policy.Store
+	fail bool
+}
+
+func (s *failingCandidatePolicyStore) Upsert(c context.Context, p model.Policy, tenant string, now time.Time) (model.Policy, error) {
+	if s.fail {
+		return model.Policy{}, errors.New("private policy failure")
+	}
+	return s.Store.Upsert(c, p, tenant, now)
+}
+func TestCandidateAllowAdoptionReportsFailureAndRetries(t *testing.T) {
+	now := time.Now()
+	ctx := context.Background()
+	tenant := testEvaluator().PolicyBundle.TenantID
+	candidates := policycandidate.NewStore()
+	c, e := candidates.ObserveUnmatchedFlow(ctx, tenant, "internal.example", "", 443, "", now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = candidates.Review(ctx, tenant, c.CandidateID, policycandidate.ReviewRequest{Decision: "approved"}, now); e != nil {
+		t.Fatal(e)
+	}
+	ps := &failingCandidatePolicyStore{Store: policy.NewStore(nil), fail: true}
+	writer, e := logs.NewWriter(t.TempDir())
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer writer.Close()
+	out := &recordingAdminAuditOutboxDeadReader{}
+	h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: newAdminAuthStore(), PolicyCandidateStore: candidates, PolicyStore: ps, AdminAuditOutbox: out})
+	call := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("POST", "/admin/policy-candidates/"+c.CandidateID+"/materialize", strings.NewReader(`{}`)))
+		return w
+	}
+	w := call()
+	if w.Code != 500 || !strings.Contains(w.Body.String(), `"failed_stage":"allow_policy"`) {
+		t.Fatalf("policy refusal %d %s", w.Code, w.Body)
+	}
+	if len(out.insertedAudits) != 1 || stringPtrValue(out.insertedAudits[0].Result) != "partial" {
+		t.Fatal(out.insertedAudits)
+	}
+	audit := out.insertedAudits[0]
+	if stringPtrValue(audit.ActorUserID) == "" || audit.Metadata["failed_stage"] != "allow_policy" || audit.Metadata["candidate_saved"] != true || audit.Metadata["policy_save_confirmed"] != false {
+		t.Fatal("partial adoption audit is incomplete", audit)
+	}
+	if strings.Contains(w.Body.String(), "private policy failure") {
+		t.Fatal("storage details disclosed", w.Body)
+	}
+	if _, ok, _ := ps.Get(ctx, tenant, "adopted-"+c.CandidateID); ok {
+		t.Fatal("failed policy published")
+	}
+	ps.fail = false
+	if w = call(); w.Code != 200 {
+		t.Fatalf("retry %d %s", w.Code, w.Body)
+	}
+	if _, ok, _ := ps.Get(ctx, tenant, "adopted-"+c.CandidateID); !ok {
+		t.Fatal("retry policy absent")
+	}
 }

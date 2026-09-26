@@ -186,7 +186,15 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 					Action:     model.PolicyAction{Decision: "allow"},
 				}
 				if _, perr := policyStore.Upsert(r.Context(), adopted, tenantID, now); perr != nil {
-					log.Printf("adopt allow policy for %s: %v", host, perr)
+					audit := adminPolicyCandidateAuditLog("admin_policy_candidate_materialized", materialized, evaluator, now)
+					result, reason := "partial", "Candidate adoption was saved, but allow-policy saving could not be confirmed."
+					audit.Result, audit.Reason, audit.ActorUserID = &result, &reason, auditActorPrincipal(r)
+					audit.Metadata["failed_stage"] = "allow_policy"
+					audit.Metadata["candidate_saved"] = true
+					audit.Metadata["policy_save_confirmed"] = false
+					_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": reason + " Reload and retry.", "partial": true, "failed_stage": "allow_policy", "candidate_id": materialized.CandidateID})
+					return
 				}
 			}
 		}

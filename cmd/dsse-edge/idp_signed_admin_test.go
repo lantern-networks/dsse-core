@@ -70,9 +70,9 @@ func TestIdPSignedAdminLifecycle(t *testing.T) {
 	c = idpFixture("customer", "first")
 	c.ClientSecret = "synthetic-idp-secret"
 	raw, _ = json.Marshal(c)
-	send("operator", "POST", "/admin/idp-connections", string(raw), 200)
+	send("customer", "POST", "/admin/idp-connections", string(raw), 200)
 	if !strings.Contains(send("reader", "GET", "/admin/idp-connections", "", 200), "first") {
-		t.Fatal("operator target tenant incorrect")
+		t.Fatal("customer connection missing")
 	}
 	src := configBundleSource{url: server.URL, client: server.Client(), token: "token-operator", tenantID: "operator", verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
 	before, err := src.fetch(context.Background())
@@ -135,7 +135,7 @@ func TestIdPSignedAdminLifecycle(t *testing.T) {
 		before = bundle
 	}
 	count := 0
-	for _, row := range readConnectorManagementAudits(t, writer) {
+	for _, row := range readEntitlementAuditRows(t, writer) {
 		if !strings.HasPrefix(row.EventType, "idp_connection_") {
 			continue
 		}

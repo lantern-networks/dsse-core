@@ -385,7 +385,7 @@ func TestPostgresAdminAuthRuntimeAPITokenLifecycleE2E(t *testing.T) {
 	}
 }
 
-func TestPostgresAdminAuthOIDCCallbackPersistsSessionE2E(t *testing.T) {
+func TestPostgresAdminAuthRemovedOIDCCallbackDoesNotCreateSessionE2E(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
 	if dsn == "" {
 		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
@@ -408,113 +408,23 @@ func TestPostgresAdminAuthOIDCCallbackPersistsSessionE2E(t *testing.T) {
 		_ = db.Close()
 	})
 	applyPostgresExportTaskQueueMigration(t, ctx, db)
-
-	key := mustRSAKey(t)
-	keyID := "kid-admin-postgres-001"
-	issuer := "http://issuer.example/realms/dsse-lab"
-	oidcHTTPClient := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		switch req.URL.Path {
-		case "/realms/dsse-lab/protocol/openid-connect/token":
-			username, password, ok := req.BasicAuth()
-			if !ok || username != "dsse-edge" || password != "local-secret" {
-				t.Fatalf("basic auth = %q/%q/%v", username, password, ok)
-			}
-			if err := req.ParseForm(); err != nil {
-				t.Fatalf("parse token form: %v", err)
-			}
-			if req.Form.Get("redirect_uri") != "http://127.0.0.1:18086/admin/oidc/callback" {
-				t.Fatalf("redirect_uri = %q, want admin callback", req.Form.Get("redirect_uri"))
-			}
-			idToken := signedRS256JWT(t, key, keyID, map[string]any{
-				"iss":                issuer,
-				"sub":                "admin_user_postgres_001",
-				"aud":                []string{"dsse-edge"},
-				"exp":                timeNowUnixPlus(3600),
-				"auth_time":          timeNowUnixPlus(-10),
-				"nonce":              "admin-pg-nonce-001",
-				"email":              "admin_user_postgres_001@example.local",
-				"preferred_username": "admin_user_postgres_001",
-				"groups":             []string{"/dsse/admins"},
-				"amr":                []string{"pwd", "otp"},
-				"acr":                "urn:mfa:fresh",
-			})
-			return jsonHTTPResponse(http.StatusOK, map[string]any{
-				"access_token": "admin-access-token-postgres-001",
-				"id_token":     idToken,
-				"token_type":   "Bearer",
-				"expires_in":   3600,
-			}), nil
-		case "/realms/dsse-lab/protocol/openid-connect/certs":
-			return jsonHTTPResponse(http.StatusOK, map[string]any{
-				"keys": []map[string]string{rsaPublicJWK(key, keyID)},
-			}), nil
-		default:
-			t.Fatalf("unexpected oidc path: %s", req.URL.Path)
-		}
-		return nil, nil
-	})}
-
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {
-		t.Fatalf("NewWriter returned error: %v", err)
+		t.Fatal(err)
 	}
-	handler := newServerWithConfig(serverConfig{
-		Evaluator:   testEvaluator(),
-		Writer:      writer,
-		ProxyClient: oidcHTTPClient,
-		AdminAuth:   postgresAdminAuthStore{DB: db},
-		OIDC: oidcConfig{
-			Issuer:       issuer,
-			ClientID:     "dsse-edge",
-			ClientSecret: "local-secret",
-			RedirectURI:  "http://127.0.0.1:18086/auth/oidc/callback",
-		},
-	})
-
-	callbackReq := httptest.NewRequest(http.MethodGet, "/admin/oidc/callback?code=admin-auth-code-postgres-001&state=admin-pg-state-001", nil)
-	callbackReq.AddCookie(&http.Cookie{Name: "admin_oidc_state", Value: "admin-pg-state-001"})
-	callbackReq.AddCookie(&http.Cookie{Name: "admin_oidc_nonce", Value: "admin-pg-nonce-001"})
-	callbackReq.AddCookie(&http.Cookie{Name: "admin_pkce_verifier", Value: "admin-pg-verifier-001"})
-	callbackRec := httptest.NewRecorder()
-	handler.ServeHTTP(callbackRec, callbackReq)
-	if callbackRec.Code != http.StatusCreated {
-		t.Fatalf("callback status = %d, body=%s", callbackRec.Code, callbackRec.Body.String())
+	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: postgresAdminAuthStore{DB: db}})
+	req := httptest.NewRequest(http.MethodGet, "/admin/oidc/callback?code=retired-flow&state=test", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("removed admin federation route status=%d", rec.Code)
 	}
-	var payload struct {
-		Principal adminPrincipal `json:"principal"`
-		Session   adminSession   `json:"session"`
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM admin_sessions").Scan(&count); err != nil {
+		t.Fatal(err)
 	}
-	if err := json.NewDecoder(callbackRec.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode callback response: %v", err)
-	}
-	if payload.Principal.ID == "" || payload.Session.ID == "" || payload.Session.AdminPrincipalID != payload.Principal.ID {
-		t.Fatalf("callback payload = %#v", payload)
-	}
-
-	var principalCount, sessionCount int
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM admin_principals WHERE tenant_id = $1 AND admin_principal_id = $2", "tenant_lab_001", payload.Principal.ID).Scan(&principalCount); err != nil {
-		t.Fatalf("query principal count: %v", err)
-	}
-	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM admin_sessions WHERE tenant_id = $1 AND session_id = $2", "tenant_lab_001", payload.Session.ID).Scan(&sessionCount); err != nil {
-		t.Fatalf("query session count: %v", err)
-	}
-	if principalCount != 1 || sessionCount != 1 {
-		t.Fatalf("principal/session counts = %d/%d, want 1/1", principalCount, sessionCount)
-	}
-
-	sessionReq := httptest.NewRequest(http.MethodGet, "/admin/session", nil)
-	sessionReq.AddCookie(&http.Cookie{Name: "admin_session", Value: payload.Session.ID})
-	sessionRec := httptest.NewRecorder()
-	handler.ServeHTTP(sessionRec, sessionReq)
-	if sessionRec.Code != http.StatusOK {
-		t.Fatalf("session status = %d, body=%s", sessionRec.Code, sessionRec.Body.String())
-	}
-	var sessionInfo map[string]any
-	if err := json.Unmarshal(sessionRec.Body.Bytes(), &sessionInfo); err != nil {
-		t.Fatalf("decode session info: %v", err)
-	}
-	if sessionInfo["principal_id"] != payload.Principal.ID || sessionInfo["auth_method"] != "admin_session" {
-		t.Fatalf("session info = %#v", sessionInfo)
+	if count != 0 {
+		t.Fatal("removed admin federation created a session")
 	}
 }
 

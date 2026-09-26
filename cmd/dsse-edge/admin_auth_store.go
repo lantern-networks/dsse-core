@@ -1016,7 +1016,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox,
 				adminLoginAuditLog("admin_account_invite_refused_cross_tenant", nil, nil, evaluator, r, req.Email), time.Now())
 			if adminPermissionAllowed(inviteIdentity.Roles, "admin.tenant.admin") {
-				writeError(w, http.StatusConflict, err)
+				writeCredentialError(w, http.StatusConflict, err)
 				return
 			}
 			writeError(w, http.StatusConflict, fmt.Errorf(
@@ -1024,7 +1024,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			return
 		}
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeCredentialError(w, http.StatusBadRequest, err)
 			return
 		}
 		now := time.Now()
@@ -1032,7 +1032,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		if err := sendActivationEmail(config.AdminInviteEmailSinkPath, req.Email, link, now); err != nil {
 			log.Printf("send admin invite email: %v", err)
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_account_invited", nil, nil, evaluator, r, req.Email), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAccountLifecycleAuditLog("admin_account_invited", inviteTenantID, adminPrincipalIDFromRequest(r), principalID, roles, evaluator, r), now)
 		// The assembled invitation travels in the response, because the caller is the one who will deliver it.
 		// activation_link stays for compatibility with anything already reading it; `invitation` is what the
 		// screen shows. See buildAdminInvitation for why this product hands over rather than sends.
@@ -1086,7 +1086,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 					writeError(w, http.StatusNotFound, fmt.Errorf("admin %s is absent", principalID))
 					return
 				}
-				writeError(w, http.StatusBadRequest, err)
+				writeCredentialError(w, http.StatusBadRequest, err)
 				return
 			}
 			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAccountLifecycleAuditLog(eventType, tenantID, adminPrincipalIDFromRequest(r), principalID, summary.Roles, evaluator, r), time.Now())
@@ -1129,7 +1129,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				writeError(w, http.StatusNotFound, fmt.Errorf("admin %s is absent", principalID))
 				return
 			}
-			writeError(w, http.StatusBadRequest, err)
+			writeCredentialError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAccountLifecycleAuditLog("admin_account_deleted", tenantID, adminPrincipalIDFromRequest(r), principalID, summary.Roles, evaluator, r), time.Now())
@@ -1194,7 +1194,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				writeError(w, http.StatusNotFound, fmt.Errorf("admin %s is absent", principalID))
 				return
 			}
-			writeError(w, http.StatusBadRequest, err)
+			writeCredentialError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminAccountLifecycleAuditLog("admin_account_roles_changed", tenantID, adminPrincipalIDFromRequest(r), principalID, summary.Roles, evaluator, r), time.Now())

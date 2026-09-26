@@ -96,7 +96,7 @@ func TestLocalCredentialFilePersistenceDeletePersists(t *testing.T) {
 	if err := p.Upsert(ctx, cred); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := p.Delete(ctx, cred.TenantID, cred.Email); err != nil {
+	if err := p.Delete(ctx, cred.TenantID, cred.Email, cred.Revision); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestLocalCredentialFilePersistenceDeleteTenantScoped(t *testing.T) {
 	if err := p.Upsert(ctx, cred); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
-	if err := p.Delete(ctx, "some-other-tenant", cred.Email); err != nil {
+	if err := p.Delete(ctx, "some-other-tenant", cred.Email, cred.Revision); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
 	got, err := newFileCredentialPersistence(path).LoadAll(ctx)
@@ -154,5 +154,63 @@ func TestLocalCredentialFilePersistenceEmptyAndParse(t *testing.T) {
 	}
 	if _, err := newFileCredentialPersistence(corruptPath).LoadAll(ctx); err == nil {
 		t.Fatalf("corrupt snapshot must fail closed, got nil error")
+	}
+}
+
+func TestLocalCredentialFileFailureDoesNotCommitLater(t *testing.T) {
+	for _, operation := range []string{"insert", "update", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "creds.json")
+			p := newFileCredentialPersistence(path)
+			ctx := context.Background()
+			original := newTestFileCredential()
+			if err := p.Upsert(ctx, original); err != nil {
+				t.Fatal(err)
+			}
+			// A directory cannot be replaced by the snapshot file. This exercises real Save failure.
+			p.persister.Path = t.TempDir()
+			candidate := cloneCredential(original)
+			candidate.Roles = []string{"analyst"}
+			if operation == "insert" {
+				candidate.Email = "new@example.com"
+			}
+			var err error
+			if operation == "delete" {
+				err = p.Delete(ctx, original.TenantID, original.Email, original.Revision)
+			} else {
+				err = p.Upsert(ctx, candidate)
+			}
+			if err == nil {
+				t.Fatal("real file save failure was swallowed")
+			}
+			if len(p.byEmail) != 1 || len(p.byEmail[original.Email].Roles) != 2 {
+				t.Fatal("failed operation changed resident snapshot")
+			}
+			p.persister.Path = path
+			other := cloneCredential(original)
+			other.Email = "other@example.com"
+			if err := p.Upsert(ctx, other); err != nil {
+				t.Fatal(err)
+			}
+			rows, err := newFileCredentialPersistence(path).LoadAll(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 2 {
+				t.Fatal("failed operation committed with unrelated write")
+			}
+			found := false
+			for _, c := range rows {
+				if c.Email == original.Email {
+					found = true
+					if len(c.Roles) != 2 {
+						t.Fatal("old update committed later")
+					}
+				}
+			}
+			if !found {
+				t.Fatal("old deletion committed later")
+			}
+		})
 	}
 }

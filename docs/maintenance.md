@@ -621,3 +621,8 @@ Package regression, race detection and the full Go suite cover these storage cha
 License application and feature entitlement edits now acknowledge confirmed storage, preserve the shared serial floor, and refuse writes from an expired leadership term. Startup restores license authority before starting leadership election; promotion refreshes the license before advertising leadership. DLP configuration writes stop when entitlement authority cannot be read.
 
 Targeted startup, license, entitlement, cancellation and write-fencing regression tests cover these changes. GUI and multi-region deployment acceptance remain separate release checks.
+
+### Administrator identity and authorization reconciliation
+Administrator credential writes retain acknowledged state when persistence fails. Current stored roles and account status are checked for managed sessions; API token changes report save failures. Download bearers are consumed only after a confirmed shared write. Cross-organization writes retain explicit target checks, and failed authorization changes produce audit failures rather than success events.
+
+Credential schema migrations 048, 049 and 051 carry TOTP replay counters, revision checks and writer protocol coordination. File and database regression tests are separate from Console GUI and deployed-fleet acceptance.

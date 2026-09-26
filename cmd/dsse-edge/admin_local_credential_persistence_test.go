@@ -35,7 +35,7 @@ func (f *fakeCredentialPersistence) Upsert(_ context.Context, c *localAdminCrede
 	return nil
 }
 
-func (f *fakeCredentialPersistence) Delete(_ context.Context, tenantID, email string) error {
+func (f *fakeCredentialPersistence) Delete(_ context.Context, tenantID, email string, _ int64) error {
 	key := credentialEmailKey(email)
 	if row, ok := f.rows[key]; ok && row.TenantID == tenantID {
 		delete(f.rows, key)

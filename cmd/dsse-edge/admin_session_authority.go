@@ -228,10 +228,8 @@ func adminPrincipalLabel(store *localAdminCredentialStore, tenantID, principalID
 	if store == nil || strings.TrimSpace(principalID) == "" {
 		return ""
 	}
-	for _, account := range store.List(strings.TrimSpace(tenantID)) {
-		if strings.EqualFold(strings.TrimSpace(account.PrincipalID), strings.TrimSpace(principalID)) {
-			return strings.TrimSpace(account.Email)
-		}
+	if account, ok := store.authorityFor(tenantID, principalID); ok {
+		return strings.TrimSpace(account.Email)
 	}
 	return ""
 }

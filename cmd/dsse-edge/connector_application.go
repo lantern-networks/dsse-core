@@ -292,7 +292,7 @@ func applicationPublishReview(entry appcatalog.Entry, evaluator decision.Evaluat
 	evaluator = runtimeEvaluatorForPolicyStore(evaluator, policyStore)
 	policyAssigned, usersAllowedNow := applicationPolicyAssignment(entry.ApplicationID, evaluator)
 	return map[string]any{
-		"published_route":   entry.Published && strings.TrimSpace(entry.Destination) != "",
+		"published_route":   entry.Published && entry.Status != "disabled" && strings.TrimSpace(entry.Destination) != "",
 		"policy_assigned":   policyAssigned,
 		"users_allowed_now": usersAllowedNow,
 	}

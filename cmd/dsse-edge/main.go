@@ -6525,7 +6525,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				log.Printf("reverse-sync cert-pin candidate %s on rule delete: %v", candidateID, err)
 			}
 		}
-	}, configSourceURL)
+	}, configSourceURL, func(r *http.Request, rule policyrule.Rule, operation, result string) {
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
+			authoredRuleAuditLog(r, rule, operation, result, evaluator, now), now)
+	})
 	// Seed the compiled rule sets from the durable rule store at startup (see recompileAuthoredRules): without
 	// this, east-west per-hop authz + authored egress policy do not enforce after a restart until the next edit.
 	recompileAuthoredRules()

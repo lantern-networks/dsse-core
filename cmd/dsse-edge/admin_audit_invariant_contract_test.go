@@ -17,6 +17,7 @@ import (
 	endpointinventory "github.com/lantern-networks/dsse-core/endpointinventory"
 	humanidentity "github.com/lantern-networks/dsse-core/humanidentity"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
+	"github.com/lantern-networks/dsse-core/policyrule"
 	toolcallaudit "github.com/lantern-networks/dsse-core/toolcallaudit"
 
 	"github.com/lantern-networks/dsse-core/model"
@@ -101,6 +102,10 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 		{
 			name:  "adminApplicationDeleteAuditLog",
 			audit: adminApplicationDeleteAuditLog("tenant_audit_cp0020", auditID, evaluator, now),
+		},
+		{
+			name:  "authoredRuleAuditLog",
+			audit: authoredRuleAuditLog(httptest.NewRequest("POST", "/admin/rules", nil), policyrule.Rule{ID: auditID, TenantID: "tenant_audit_cp0020", Name: rawSubject, Source: []string{rawSubject}, Destination: []string{rawSubject}}, "upsert", "saved", evaluator, now),
 		},
 		{
 			name: "assetCatalogAuditLog/endpoint",
@@ -583,6 +588,7 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 		"adminApplicationCatalogAuditLog":   true,
 		"adminApplicationDeleteAuditLog":    true,
 		"adminApplicationPublishAuditLog":   true,
+		"authoredRuleAuditLog":              true,
 		"assetCatalogAuditLog":              true,
 		"adminConnectorManagementAuditLog":  true,
 		"adminDelegatedAccessGrantAuditLog": true,

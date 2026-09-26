@@ -639,3 +639,5 @@ Administrator credential writes retain acknowledged state when persistence fails
 
 Credential schema migrations 048, 049 and 051 carry TOTP replay counters, revision checks and writer protocol coordination. File and database regression tests are separate from Console GUI and deployed-fleet acceptance.
 
+
+Administrator migration checks now include live shared authority, legacy principal IDs and credential-table purge after migration 051. See [administrator credential upgrade](admin-credential-upgrade.md) before changing a multi-control-plane deployment; all credential writers must move together.

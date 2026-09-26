@@ -390,7 +390,10 @@ func refreshManagedAdminIdentity(ctx context.Context, auth adminAuthRuntimeStore
 	if principal.IDPID != "first_party" {
 		return identity, true, nil
 	}
-	credential, exists := credentials.authorityFor(identity.TenantID, identity.PrincipalID)
+	credential, exists, err := credentials.authorityForPrincipal(ctx, principal)
+	if err != nil {
+		return adminIdentity{}, false, err
+	}
 	if !exists || credential.Status != credentialStatusActive {
 		return adminIdentity{}, false, nil
 	}

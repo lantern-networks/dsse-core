@@ -105,6 +105,7 @@ const (
 )
 
 type serverConfig struct {
+	StandbyAudit *adminStandbyAudit
 	// ===================================================================================
 	// DEPLOYMENT CONFIGURATION — flag-parsed values (addresses, paths, tokens, durations, toggles).
 	// ===================================================================================
@@ -4570,7 +4571,11 @@ func main() {
 	if storeBackend(*transportAnchorAckStorePath) == "postgres" {
 		transportAnchorAckShared = mustCPStateBlobPersister(*transportAnchorAckStorePath, "transport_anchor_acks")
 	}
+	standbyAudit := newAdminStandbyAudit(writer, evaluator)
+	stopStandbyAudit := standbyAudit.start()
+	defer stopStandbyAudit()
 	mux := newServerWithConfig(serverConfig{
+		StandbyAudit:                   standbyAudit,
 		DNSConntrack:                   edgeDNSConntrack,
 		VLANObjectStorePath:            strings.TrimSpace(*vlanObjectStorePath),
 		PeerEdges:                      meshPeerEdges,
@@ -5349,7 +5354,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return false, false
 			}
 			return counts.Principals > 0, true
-		}, config.LocalCredentials)
+		}, config.LocalCredentials, config.StandbyAudit)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)

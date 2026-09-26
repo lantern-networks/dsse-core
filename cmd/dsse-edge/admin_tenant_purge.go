@@ -224,7 +224,7 @@ func purgeTenantRows(ctx context.Context, db *sql.DB, table, tenantID string) ad
 	// and these tables do not agree on one.
 	statement := "DELETE FROM " + table + " WHERE ctid IN (SELECT ctid FROM " + table + " WHERE tenant_id = $1 LIMIT $2)"
 	for {
-		res, err := db.ExecContext(ctx, statement, tenantID, adminTenantPurgeBatchSize)
+		res, err := executeAdminPurgeStatement(ctx, db, table, statement, tenantID)
 		if err != nil {
 			if isUndefinedTableError(err) {
 				return row // this deployment does not have the table: nothing to erase, and not a failure
@@ -317,4 +317,28 @@ func purgeTenantDeviceCAs(registry *tenantca.TenantCARegistry, registryPath stri
 		return removed, fmt.Errorf("the trust set a handshake reads could not be rebuilt, so those CAs may still admit devices: %w", err)
 	}
 	return removed, nil
+}
+
+// Migration 051 rejects credential DELETEs outside the versioned protocol,
+// including statements matching zero rows after the credential store's removal.
+func executeAdminPurgeStatement(ctx context.Context, db *sql.DB, table, statement, tenant string) (sql.Result, error) {
+	if table != "admin_local_credentials" {
+		return db.ExecContext(ctx, statement, tenant, adminTenantPurgeBatchSize)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `SET LOCAL dsse.credential_write_protocol = '1'`); err != nil {
+		return nil, err
+	}
+	result, err := tx.ExecContext(ctx, statement, tenant, adminTenantPurgeBatchSize)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

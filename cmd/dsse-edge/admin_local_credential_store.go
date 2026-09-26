@@ -499,6 +499,9 @@ func (s *localAdminCredentialStore) CompleteActivation(rawToken, code string, no
 func (s *localAdminCredentialStore) VerifyPassword(email, password string, now time.Time) (*localAdminCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.refreshLoginCredentialLocked(email); err != nil {
+		return nil, err
+	}
 	cred := s.byEmail[credentialEmailKey(email)]
 	if cred == nil || cred.Status != credentialStatusActive {
 		return nil, fmt.Errorf("invalid credentials")
@@ -524,6 +527,9 @@ func (s *localAdminCredentialStore) VerifyPassword(email, password string, now t
 func (s *localAdminCredentialStore) VerifyTOTP(email, code string, now time.Time) (*localAdminCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.refreshLoginCredentialLocked(email); err != nil {
+		return nil, err
+	}
 	cred := s.byEmail[credentialEmailKey(email)]
 	if cred == nil || cred.Status != credentialStatusActive || !cred.TOTPEnrolled {
 		return nil, fmt.Errorf("invalid credentials")
@@ -825,4 +831,75 @@ func (s *localAdminCredentialStore) authorityFor(tenant, principal string) (cred
 	record, ok := (*records)[credentialAuthorityKey{tenant, principal}]
 	record.Roles = slices.Clone(record.Roles)
 	return record, ok
+}
+
+// Shared authorization reads the current authority on every request. A local
+// immutable index is valid only for the single-process file/in-memory backend.
+func (s *localAdminCredentialStore) authorityForPrincipal(ctx context.Context, principal adminPrincipal) (credentialAuthorityRecord, bool, error) {
+	if p, ok := s.persistence.(interface {
+		LookupAuthority(context.Context, string, string, string) (credentialAuthorityRecord, bool, error)
+	}); ok {
+		email := principal.Email
+		if email == "" {
+			email = principal.Subject
+		}
+		return p.LookupAuthority(ctx, principal.TenantID, principal.ID, credentialEmailKey(email))
+	}
+	if record, ok := s.authorityFor(principal.TenantID, principal.ID); ok {
+		return record, true, nil
+	}
+	// Older reinvites could leave principal and credential IDs different. The
+	// persisted first-party principal supplies the email, never the HTTP caller.
+	email := principal.Email
+	if email == "" {
+		email = principal.Subject
+	}
+	records := s.authority.Load()
+	if records != nil && credentialEmailKey(email) != "" {
+		for key, record := range *records {
+			if key.TenantID == principal.TenantID && credentialEmailKey(record.Email) == credentialEmailKey(email) {
+				record.Roles = slices.Clone(record.Roles)
+				return record, true, nil
+			}
+		}
+	}
+	return credentialAuthorityRecord{}, false, nil
+}
+
+// Refresh a shared login record before validation, without retrying a mutation.
+// Retain local failed-login/replay restrictions when an earlier save failed.
+func (s *localAdminCredentialStore) refreshLoginCredentialLocked(email string) error {
+	p, ok := s.persistence.(interface {
+		LoadCredential(context.Context, string) (*localAdminCredential, error)
+	})
+	if !ok {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), credentialPersistenceTimeout)
+	defer cancel()
+	next, err := p.LoadCredential(ctx, credentialEmailKey(email))
+	if err != nil {
+		return errCredentialPersistence
+	}
+	key := credentialEmailKey(email)
+	old := s.byEmail[key]
+	if next == nil {
+		delete(s.byEmail, key)
+		s.publishAuthorityLocked()
+		return nil
+	}
+	if old != nil && old.PrincipalID == next.PrincipalID {
+		if old.LockedUntil.After(next.LockedUntil) {
+			next.LockedUntil = old.LockedUntil
+		}
+		if old.FailedAttempts > next.FailedAttempts {
+			next.FailedAttempts = old.FailedAttempts
+		}
+		if old.TOTPSecret == next.TOTPSecret && old.LastTOTPCounter > next.LastTOTPCounter {
+			next.LastTOTPCounter = old.LastTOTPCounter
+		}
+	}
+	s.byEmail[key] = next
+	s.publishAuthorityLocked()
+	return nil
 }

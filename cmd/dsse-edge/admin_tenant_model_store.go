@@ -54,7 +54,7 @@ type adminTenantModelAdminStore interface {
 type adminTenantModelFleetCarrier interface {
 	ConfigGeneration() uint64
 	DeletedTenants() []tenantDeletion
-	OrderPurge(string, time.Time)
+	OrderPurge(string, time.Time) error
 	PurgeOrders() []tenantPurgeOrder
 }
 
@@ -398,22 +398,27 @@ func (store *adminTenantModelStore) ConfigGeneration() uint64 { return store.gen
 // OrderPurge records that an operator has ordered this tenant ERASED, so the order can be carried to every
 // node that ever held its data. Idempotent: ordering twice keeps the first instant, because the order is not a
 // new fact the second time and a moving timestamp would make the audit harder to read, not easier.
-func (store *adminTenantModelStore) OrderPurge(tenantID string, now time.Time) {
+func (store *adminTenantModelStore) OrderPurge(tenantID string, now time.Time) error {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return
+		return fmt.Errorf("tenant_id is required")
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.purgeOrders == nil {
-		store.purgeOrders = map[string]string{}
-	}
 	if _, already := store.purgeOrders[tenantID]; already {
-		return
+		return nil
 	}
-	store.purgeOrders[tenantID] = now.UTC().Format(time.RFC3339)
-	store.generation.Add(1) // the bundle carries this, so it is a new config version
-	store.persistLocked()
+	orders := make(map[string]string, len(store.purgeOrders)+1)
+	for id, at := range store.purgeOrders {
+		orders[id] = at
+	}
+	orders[tenantID] = now.UTC().Format(time.RFC3339)
+	if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: store.tenants, Deleted: store.deleted, PurgeOrders: orders}); err != nil {
+		return err
+	}
+	store.purgeOrders = orders
+	store.generation.Add(1)
+	return nil
 }
 
 // PurgeOrders returns the standing erasure orders. They are never cleared: an Edge that was offline when the
@@ -580,21 +585,27 @@ func (store *adminTenantModelStore) Delete(_ context.Context, tenantID string) e
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	_, present := store.tenants[tenantID]
-	delete(store.tenants, tenantID)
-	// Record the tombstone whether or not the row was here. An operator deleting a tenant the control plane
-	// has already lost is the ghost case — the Edge still holds it, and this is the only way to say so.
-	if store.deleted == nil {
-		store.deleted = map[string]string{}
+	if _, tombstoned := store.deleted[tenantID]; !present && tombstoned {
+		return nil
 	}
-	if _, alreadyTombstoned := store.deleted[tenantID]; !present && alreadyTombstoned {
-		return nil // nothing changed: already gone and already carried. Do not churn the generation.
+	tenants := make(map[string]adminTenantModel, len(store.tenants))
+	for id, row := range store.tenants {
+		if id != tenantID {
+			tenants[id] = row
+		}
 	}
-	store.deleted[tenantID] = time.Now().UTC().Format(time.RFC3339)
-	// The registry changed, so the bundle that carries it is a new version. Bumped HERE rather than
-	// inside persistLocked, which returns early for a memory-only store — the counter must not depend
-	// on whether a durable path happens to be configured.
+	deleted := make(map[string]string, len(store.deleted)+1)
+	for id, at := range store.deleted {
+		deleted[id] = at
+	}
+	// Carry an explicit tombstone even when the local row was already absent.
+	deleted[tenantID] = time.Now().UTC().Format(time.RFC3339)
+	if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: tenants, Deleted: deleted, PurgeOrders: store.purgeOrders}); err != nil {
+		return err
+	}
+	store.tenants = tenants
+	store.deleted = deleted
 	store.generation.Add(1)
-	store.persistLocked()
 	return nil
 }
 

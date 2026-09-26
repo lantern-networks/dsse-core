@@ -256,7 +256,7 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			tenant.OperatorElevationRequiresApproval = *wantApproval
 		}
 		if err := save(r.Context(), tenant); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
 			return
 		}
 		audit(r, tenant, "operator_delegation_changed")
@@ -334,7 +334,7 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		}
 		tenant.OperatorElevations = appendOperatorElevation(tenant.OperatorElevations, elevation)
 		if err := save(r.Context(), tenant); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
 			return
 		}
 		audit(r, tenant, "operator_elevation_granted")
@@ -397,7 +397,7 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			return
 		}
 		if err := save(r.Context(), tenant); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
 			return
 		}
 		audit(r, tenant, "operator_elevation_ended")
@@ -455,7 +455,7 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			return
 		}
 		if err := save(r.Context(), tenant); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
+			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
 			return
 		}
 		audit(r, tenant, "operator_elevation_approved")

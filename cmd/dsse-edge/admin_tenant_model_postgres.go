@@ -250,7 +250,7 @@ func (p *postgresAdminTenantModelStore) Update(ctx context.Context, tenant admin
 		return adminTenantModel{}, err
 	}
 	if err := p.upsert(ctx, normalized); err != nil {
-		return adminTenantModel{}, err
+		return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
 	return stampOperatorFlag(normalized, p.operatorTenantID), nil
 }
@@ -293,7 +293,7 @@ func (p *postgresAdminTenantModelStore) Put(ctx context.Context, tenant adminTen
 		return adminTenantModel{}, err
 	}
 	if err := p.upsert(ctx, normalized); err != nil {
-		return adminTenantModel{}, err
+		return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
 	return stampOperatorFlag(normalized, p.operatorTenantID), nil
 }
@@ -373,23 +373,25 @@ func (p *postgresAdminTenantModelStore) ConfigGeneration() uint64 {
 // OrderPurge records that an operator has ordered this tenant ERASED, so the order can be carried to every node
 // that ever held its data. Idempotent, and the FIRST instant wins: ordering twice is not a new fact, and a
 // moving timestamp would make the audit harder to read. ON CONFLICT DO NOTHING is what keeps it first.
-func (p *postgresAdminTenantModelStore) OrderPurge(tenantID string, now time.Time) {
+func (p *postgresAdminTenantModelStore) OrderPurge(tenantID string, now time.Time) error {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return
+		return fmt.Errorf("tenant_id is required")
 	}
-	// The signature has no error return because the file store's has none, and the two must be
-	// interchangeable. A failure here is therefore LOUD in the log rather than returned: an erasure order that
-	// was not recorded is the whole defect this table exists for, and the caller refuses the erasure when the
-	// order does not read back (see the purge handler).
-	if _, err := p.db.ExecContext(context.Background(),
+	result, err := p.db.ExecContext(context.Background(),
 		"INSERT INTO admin_tenant_model_purge_orders (tenant_id, ordered_at) VALUES ($1, $2) "+
-			"ON CONFLICT (tenant_id) DO NOTHING",
-		tenantID, now.UTC()); err != nil {
-		log.Printf("tenant purge orders: RECORDING THE ERASURE ORDER FOR %q FAILED, so no node will be told to erase it: %v", tenantID, err)
-		return
+			"ON CONFLICT (tenant_id) DO NOTHING", tenantID, now.UTC())
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
-	atomic.AddUint64(&p.gen, 1) // the bundle carries this, so it is a new config version
+	n, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	if n > 0 {
+		atomic.AddUint64(&p.gen, 1)
+	}
+	return nil
 }
 
 // PurgeOrders returns the standing erasure orders, oldest id first. They are never cleared: an Edge that was

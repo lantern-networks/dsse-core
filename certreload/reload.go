@@ -48,6 +48,15 @@ func (r *ReloadableCert) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate,
 // Reload re-reads the cert/key from disk and atomically swaps it in. On any error the previous certificate is
 // retained (the caller logs; the link keeps working with the last good material).
 func (r *ReloadableCert) Reload() error {
+	pairMu.Lock()
+	defer pairMu.Unlock()
+	cp, kp, jp, err := pairPaths(r.certFile, r.keyFile)
+	if err != nil {
+		return err
+	}
+	if err := recoverPairLocked(cp, kp, jp); err != nil {
+		return fmt.Errorf("certificate pair recovery: %w", err)
+	}
 	cert, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
 	if err != nil {
 		return fmt.Errorf("reload cert %s/%s: %w", r.certFile, r.keyFile, err)

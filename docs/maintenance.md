@@ -554,3 +554,18 @@ wiring remains a following migration unit. Back up authorization snapshots
 before upgrading: new human-approval records use organization/ID keys, while
 legacy bare-ID snapshots remain readable. Older writers must not overwrite the
 new format; rollback requires a compatible backup.
+
+### Certificate and CA storage reconciliation
+
+Internal CA changes validate a candidate before replacing current trust data.
+Tenant CA registry operations retain other organizations and track incomplete
+withdrawals for reconciliation instead of silently forgetting their targets.
+Certificate/key replacement gains a private recovery journal; interrupted
+updates restore a valid pair before reload.
+
+The recovery journal contains private key material, is written with private
+permissions, and must be protected with the certificate files and backups.
+Only one process may own writable certificate files. A pending CA withdrawal
+requires reconciliation before serving devices; it is not automatically
+replayed against an unknown trust-store state. Administrative and startup
+wiring using these primitives follows in a separate migration unit.

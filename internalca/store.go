@@ -23,6 +23,7 @@ package internalca
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -56,6 +57,8 @@ type Persistence interface {
 }
 
 type Store struct {
+	// Serialize storage operations and snapshot adoption without blocking trust readers on I/O.
+	writeMu     sync.Mutex
 	mu          sync.RWMutex
 	authorities map[string]Authority // keyed id+"\x00"+tenant
 	persist     Persistence
@@ -93,9 +96,11 @@ func NewStore(persist Persistence) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, a := range loaded {
-		s.authorities[key(a.ID, a.TenantID)] = a
+	next, err := validatedAuthorities(loaded)
+	if err != nil {
+		return nil, err
 	}
+	s.authorities = next
 	return s, nil
 }
 
@@ -107,21 +112,11 @@ func key(id, tenant string) string {
 // and says WHICH of the reasons applies: "invalid certificate" sends a reader to re-copy a file that was
 // fine, when what was wrong was that they pasted a server's certificate instead of its issuer's.
 func Describe(certificatePEM string, now time.Time) (subject string, notAfter time.Time, err error) {
-	block, _ := pem.Decode([]byte(strings.TrimSpace(certificatePEM)))
-	if block == nil {
-		return "", time.Time{}, fmt.Errorf("this is not certificate material: no PEM block was found (it should begin with -----BEGIN CERTIFICATE-----)")
-	}
-	if block.Type != "CERTIFICATE" {
-		return "", time.Time{}, fmt.Errorf("this PEM block is a %q, not a certificate", block.Type)
-	}
-	cert, parseErr := x509.ParseCertificate(block.Bytes)
+	cert, _, parseErr := parseAuthority(certificatePEM)
 	if parseErr != nil {
-		return "", time.Time{}, fmt.Errorf("this certificate could not be read: %w", parseErr)
+		return "", time.Time{}, parseErr
 	}
-	if !cert.IsCA {
-		return "", time.Time{}, fmt.Errorf("%q is a certificate, not a certificate authority — paste the authority that ISSUED your server's certificate, not the server's own", cert.Subject.String())
-	}
-	if now.After(cert.NotAfter) {
+	if !now.Before(cert.NotAfter) {
 		return cert.Subject.String(), cert.NotAfter, fmt.Errorf("%q expired on %s", cert.Subject.String(), cert.NotAfter.UTC().Format(time.RFC3339))
 	}
 	return cert.Subject.String(), cert.NotAfter, nil
@@ -133,48 +128,75 @@ func (s *Store) Upsert(a Authority, now time.Time) (Authority, error) {
 	a.Name = strings.TrimSpace(a.Name)
 	a.CertificatePEM = strings.TrimSpace(a.CertificatePEM)
 	if s.unavailable != "" {
-		return Authority{}, fmt.Errorf("this deployment cannot store internal certificate authorities yet: %s", s.unavailable)
+		return Authority{}, fmt.Errorf("%w: %s", ErrUnavailable, s.unavailable)
 	}
-	if a.ID == "" {
+	if a.ID == "" || strings.ContainsRune(a.ID, 0) {
 		return Authority{}, fmt.Errorf("an authority needs an id")
 	}
-	if a.TenantID == "" {
+	if a.TenantID == "" || strings.ContainsRune(a.TenantID, 0) {
 		return Authority{}, fmt.Errorf("an authority belongs to one organization and none was given")
 	}
 	subject, notAfter, err := Describe(a.CertificatePEM, now)
 	if err != nil {
 		return Authority{}, err
 	}
+	_, a.CertificatePEM, _ = parseAuthority(a.CertificatePEM)
 	a.Subject, a.NotAfter, a.Expired = subject, notAfter.UTC().Format(time.RFC3339), false
 	stamp := now.UTC().Format(time.RFC3339)
-	s.mu.Lock()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.RLock()
 	if existing, ok := s.authorities[key(a.ID, a.TenantID)]; ok && existing.CreatedAt != "" {
 		a.CreatedAt = existing.CreatedAt
 	} else {
 		a.CreatedAt = stamp
 	}
 	a.UpdatedAt = stamp
+	s.mu.RUnlock()
+	if s.persist != nil {
+		if err := s.persist.Upsert(a); err != nil {
+			return Authority{}, fmt.Errorf("%w: %v", ErrPersistence, err)
+		}
+	}
+	s.mu.Lock()
 	s.authorities[key(a.ID, a.TenantID)] = a
 	s.revision[a.TenantID]++
 	s.mu.Unlock()
-	if s.persist != nil {
-		if err := s.persist.Upsert(a); err != nil {
-			return Authority{}, err
-		}
-	}
 	return a, nil
 }
 
-func (s *Store) Delete(id, tenantID string, _ time.Time) bool {
-	s.mu.Lock()
-	_, ok := s.authorities[key(id, tenantID)]
-	delete(s.authorities, key(id, tenantID))
-	s.revision[strings.TrimSpace(tenantID)]++
-	s.mu.Unlock()
-	if ok && s.persist != nil {
-		_ = s.persist.Delete(strings.TrimSpace(id), strings.TrimSpace(tenantID))
+// Delete is the compatibility form; callers needing the failure reason use DeleteChecked.
+func (s *Store) Delete(id, tenantID string, now time.Time) bool {
+	deleted, err := s.DeleteChecked(id, tenantID, now)
+	return deleted && err == nil
+}
+
+// DeleteChecked changes live trust only after the durable delete reports success.
+// A storage error is not a successful removal; the caller must restore storage and retry.
+func (s *Store) DeleteChecked(id, tenantID string, _ time.Time) (bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.Availability(); err != nil {
+		return false, err
 	}
-	return ok
+	id, tenantID = strings.TrimSpace(id), strings.TrimSpace(tenantID)
+	k := key(id, tenantID)
+	s.mu.RLock()
+	_, ok := s.authorities[k]
+	s.mu.RUnlock()
+	if !ok {
+		return false, nil
+	}
+	if s.persist != nil {
+		if err := s.persist.Delete(id, tenantID); err != nil {
+			return false, fmt.Errorf("%w: %v", ErrPersistence, err)
+		}
+	}
+	s.mu.Lock()
+	delete(s.authorities, k)
+	s.revision[tenantID]++
+	s.mu.Unlock()
+	return true, nil
 }
 
 // List returns one organization's authorities, with expiry recomputed at read time so a screen shows an
@@ -202,8 +224,21 @@ func (s *Store) List(tenantID string, now time.Time) []Authority {
 
 // ReplaceTenant is how an Edge takes a control plane's answer: the control plane is authoritative, so an
 // authority it does not list is one this Edge must stop trusting.
-func (s *Store) ReplaceTenant(tenantID string, authorities []Authority) {
+func (s *Store) ReplaceTenant(tenantID string, authorities []Authority) error {
 	tenantID = strings.TrimSpace(tenantID)
+	copied := append([]Authority(nil), authorities...)
+	for i := range copied {
+		copied[i].TenantID = tenantID
+	}
+	next, err := validatedAuthorities(copied)
+	if err != nil {
+		return err
+	}
+	if tenantID == "" || strings.ContainsRune(tenantID, 0) {
+		return fmt.Errorf("an authority needs an organization")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, a := range s.authorities {
@@ -211,11 +246,11 @@ func (s *Store) ReplaceTenant(tenantID string, authorities []Authority) {
 			delete(s.authorities, k)
 		}
 	}
-	for _, a := range authorities {
-		a.TenantID = tenantID
-		s.authorities[key(a.ID, tenantID)] = a
+	for k, a := range next {
+		s.authorities[k] = a
 	}
 	s.revision[tenantID]++
+	return nil
 }
 
 // Revision changes whenever this organization's list changes. It exists for caches downstream.
@@ -279,22 +314,41 @@ func (s *Store) ListAll(now time.Time) []Authority {
 // ReplaceAll is how an Edge takes the control plane's whole answer. It replaces EVERY organization's list,
 // including emptying one the control plane no longer lists: replacing organization by organization would keep
 // trusting an authority for an organization that was deleted, because nothing would ever mention it again.
-func (s *Store) ReplaceAll(authorities []Authority) {
+func (s *Store) ReplaceAll(authorities []Authority) error {
+	next, err := validatedAuthorities(authorities)
+	if err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	touched := map[string]bool{}
-	for tenant := range s.revision {
-		touched[tenant] = true
-	}
-	s.authorities = map[string]Authority{}
-	for _, a := range authorities {
-		a.TenantID = strings.TrimSpace(a.TenantID)
-		if a.TenantID == "" {
-			continue
+	s.adopt(next)
+	return nil
+}
+
+// adopt also refreshes display metadata; certificate-only comparison leaves renamed authorities stale.
+func (s *Store) adopt(next map[string]Authority) {
+	same := len(next) == len(s.authorities)
+	if same {
+		for k, a := range next {
+			if old, ok := s.authorities[k]; !ok || old != a {
+				same = false
+				break
+			}
 		}
-		s.authorities[key(a.ID, a.TenantID)] = a
+	}
+	if same {
+		return
+	}
+	touched := map[string]bool{}
+	for _, a := range s.authorities {
 		touched[a.TenantID] = true
 	}
+	for _, a := range next {
+		touched[a.TenantID] = true
+	}
+	s.authorities = next
 	for tenant := range touched {
 		s.revision[tenant]++
 	}
@@ -309,42 +363,25 @@ func (s *Store) ReplaceAll(authorities []Authority) {
 // invisible until every Edge was restarted — and the Console showed it saved. Both paths now refresh: an Edge
 // with a source URL pulls it, an Edge with a database re-reads it.
 func (s *Store) Reload() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if err := s.Availability(); err != nil {
+		return err
+	}
 	if s.persist == nil {
 		return nil
 	}
 	loaded, err := s.persist.LoadAll()
 	if err != nil {
-		return err // the last good list stands; a momentary database error must not empty it
+		return err
 	}
-	next := map[string]Authority{}
-	for _, a := range loaded {
-		next[key(a.ID, a.TenantID)] = a
+	next, err := validatedAuthorities(loaded)
+	if err != nil {
+		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(next) == len(s.authorities) {
-		same := true
-		for k, a := range next {
-			if existing, ok := s.authorities[k]; !ok || existing.CertificatePEM != a.CertificatePEM {
-				same = false
-				break
-			}
-		}
-		if same {
-			return nil // nothing changed: do not move the revision, or every cache downstream rebuilds on a timer
-		}
-	}
-	touched := map[string]bool{}
-	for _, a := range s.authorities {
-		touched[a.TenantID] = true
-	}
-	s.authorities = next
-	for _, a := range next {
-		touched[a.TenantID] = true
-	}
-	for tenant := range touched {
-		s.revision[tenant]++
-	}
+	s.adopt(next)
+	s.mu.Unlock()
 	return nil
 }
 
@@ -366,4 +403,58 @@ func (s *Store) ConfigGeneration() uint64 {
 		total += r
 	}
 	return total
+}
+
+var ErrPersistence = errors.New("internal certificate authority persistence is unconfirmed")
+var ErrUnavailable = errors.New("this deployment cannot store internal certificate authorities yet")
+
+// Availability is immutable after construction. An unavailable list must not be published as empty.
+func (s *Store) Availability() error {
+	if s == nil || s.unavailable != "" {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+// Exactly one public CA certificate is accepted. pem.Decode alone ignores leading text and
+// returns trailing keys/certificates separately; retaining that input can leak keys or add hidden trust.
+func parseAuthority(material string) (*x509.Certificate, string, error) {
+	material = strings.TrimSpace(material)
+	if !strings.HasPrefix(material, "-----BEGIN CERTIFICATE-----") || strings.Count(material, "-----BEGIN ") != 1 || strings.Count(material, "-----END ") != 1 {
+		return nil, "", fmt.Errorf("paste exactly one public CA certificate beginning with -----BEGIN CERTIFICATE-----")
+	}
+	block, rest := pem.Decode([]byte(material))
+	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 || strings.TrimSpace(string(rest)) != "" {
+		return nil, "", fmt.Errorf("paste exactly one public CA certificate without private keys, additional certificates or other material")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, "", fmt.Errorf("this certificate could not be read: %w", err)
+	}
+	if !cert.IsCA {
+		return nil, "", fmt.Errorf("this is not a certificate authority; paste the authority that issued the site's certificate")
+	}
+	return cert, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})), nil
+}
+
+// Loading permits expired authorities for display, but never malformed or mixed key material.
+func validatedAuthorities(authorities []Authority) (map[string]Authority, error) {
+	next := map[string]Authority{}
+	for _, a := range authorities {
+		a.ID, a.TenantID, a.Name = strings.TrimSpace(a.ID), strings.TrimSpace(a.TenantID), strings.TrimSpace(a.Name)
+		if a.ID == "" || a.TenantID == "" || strings.ContainsRune(a.ID, 0) || strings.ContainsRune(a.TenantID, 0) {
+			return nil, fmt.Errorf("invalid internal authority identity")
+		}
+		cert, material, err := parseAuthority(a.CertificatePEM)
+		if err != nil {
+			return nil, err
+		}
+		a.CertificatePEM, a.Subject, a.NotAfter, a.Expired = material, cert.Subject.String(), cert.NotAfter.UTC().Format(time.RFC3339), false
+		k := key(a.ID, a.TenantID)
+		if _, exists := next[k]; exists {
+			return nil, fmt.Errorf("duplicate internal authority identity")
+		}
+		next[k] = a
+	}
+	return next, nil
 }

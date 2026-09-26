@@ -44,6 +44,29 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+
+Delegated-access grant creation and editing now wait for confirmed storage;
+organization-scoped IDs prevent another organization's same-ID grant from being
+overwritten. Shared-store reads and edits use the latest saved grants. Revocation
+advances distribution generation and audits identify the administrator. A failed
+revocation save returns an error and denies use on that process until a retry
+confirms persistence; it is not a durable or fleet-wide revocation acknowledgment.
+Receiving nodes also report save failures without acknowledging the bundle and
+retain a local denial when saving a received revocation fails. Their
+`-delegated-grant-store` must be a node-local file path or memory cache, not the CP
+PostgreSQL authority. Empty/omitted grant bundles keep existing records.
+
+Existing legacy grant snapshots remain readable. New snapshots use
+organization-scoped keys; older binaries need a compatible pre-upgrade snapshot
+for rollback. Store capacity limits new admissions instead of evicting existing
+grants or revocations; edits and revocations remain available at capacity.
+Tests cover PostgreSQL peer registration/edit/revocation and saved-state reload,
+HTTP permissions and audits, signed distribution, receiver save retry, and
+revoked-access denial. Full Go tests, focused race checks and vet pass locally.
+These are automated HTTP/storage checks, not new GUI or deployed-fleet acceptance.
+This change awaits premerge review with its preceding dependencies.
+
+
 Policy administration now distinguishes a saved server-side change from an
 unconfirmed Network Extension snapshot. Create, delete and status-change audits
 identify the administrator and distribution outcome; storage errors no longer

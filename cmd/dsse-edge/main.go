@@ -664,7 +664,7 @@ func (config serverConfig) withDefaults() serverConfig {
 	if config.DelegatedGrants == nil {
 		config.DelegatedGrants = newDelegatedAccessGrantStore()
 	}
-	if p, e := cpStateBlobPersister(config.DelegatedGrantStorePath, cpStateBlobDB, "delegated_grants"); e != nil {
+	if p, e := delegatedGrantPersisterForRole(config.DelegatedGrantStorePath, cpStateBlobDB, config.ConfigSourceURL); e != nil {
 		log.Fatalf("resolve delegated-grant store: %v", e)
 	} else if err := config.DelegatedGrants.SetPersister(p); err != nil {
 		log.Fatalf("load delegated-grant store %q: %v", config.DelegatedGrantStorePath, err)
@@ -7481,7 +7481,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		grant, ok := delegatedGrants.Get(r.PathValue("grant_id"))
+		grant, ok := delegatedGrants.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("delegated access grant %s is absent", r.PathValue("grant_id")))
 			return
@@ -7498,7 +7498,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode delegated access grant revoke request: %w", err))
 			return
 		}
-		grant, err := delegatedGrants.Revoke(r.PathValue("grant_id"), req.RevocationReason, now)
+		grant, err := delegatedGrants.RevokeForTenantContext(r.Context(), evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"), req.RevocationReason, now)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
@@ -8928,7 +8928,7 @@ var connectorRouteCPConfigured bool
 func deriveDecisionRequestActor(req model.DecisionRequest, delegatedGrants *delegatedgrant.Store) model.DecisionRequest {
 	req.ActorType = ""
 	if grantID := strings.TrimSpace(req.DelegatedAccessGrantID); grantID != "" && delegatedGrants != nil {
-		if grant, ok := delegatedGrants.Get(grantID); ok && strings.TrimSpace(grant.TenantID) == strings.TrimSpace(req.TenantID) {
+		if grant, ok := delegatedGrants.GetForTenant(strings.TrimSpace(req.TenantID), grantID); ok && strings.TrimSpace(grant.TenantID) == strings.TrimSpace(req.TenantID) {
 			if strings.TrimSpace(req.ActorNHIID) == "" {
 				req.ActorNHIID = strings.TrimSpace(grant.ActorNHIID)
 			}
@@ -9814,7 +9814,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if grantID == "" {
 		return denyRuntimeEvidence(dec, "Delegated Access Grant is required for delegated agent access.", []string{"policy_matched", "delegated_grant_absent"}, "delegated_grant_absent")
 	}
-	grant, ok := delegatedGrants.Get(grantID)
+	grant, ok := delegatedGrants.GetForTenant(dec.TenantID, grantID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Delegated Access Grant was not found.", []string{"policy_matched", "delegated_grant_absent"}, "delegated_grant_absent")
 	}
@@ -10384,7 +10384,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.DelegatedAccessGrantID != nil && *event.DelegatedAccessGrantID != "" {
-		grant, ok := delegatedGrants.Get(*event.DelegatedAccessGrantID)
+		grant, ok := delegatedGrants.GetForTenant(event.TenantID, *event.DelegatedAccessGrantID)
 		if !ok {
 			return fmt.Errorf("delegated access grant %s is absent", *event.DelegatedAccessGrantID)
 		}

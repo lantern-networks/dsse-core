@@ -119,9 +119,17 @@ const EP_INSPECTION_SOURCES = {
 
 function epInspectionSourceText(ins) {
   if (!ins) return "";
+  if (ins.source === "device_rule") return bl({en:"a device-specific rule; verify from the source device",ja:"端末別ルールがあります。対象端末から確認してください"});
   let s = EP_INSPECTION_SOURCES[ins.source] || ins.source || "";
   if (ins.detail) s += " (" + ins.detail + ")";
   return s;
+}
+
+function epInspectionBadge(ins) {
+  if (ins?.decision === "depends_on_device") return uiBadge(bl({en:"Depends on the device",ja:"端末によって異なる"}), "warn");
+  if (ins?.decision === "bypass") return uiBadge(bl({en:"Not inspected",ja:"検査しない"}), "warn");
+  if (ins?.decision === "inspect") return uiBadge(bl({en:"Inspected",ja:"検査する"}), "ok");
+  return uiBadge(bl({en:"Not determined",ja:"未判定"}), "off");
 }
 
 // --- "Policy decision check" --------------------------------------------------------------------------------
@@ -167,7 +175,6 @@ function renderEffectivePolicyView(content) {
 function renderEffectivePolicyResult(result, data) {
   result.innerHTML = "";
   const ins = data.inspection || {};
-  const insBypass = ins.decision === "bypass";
 
   // Summary: destination + final decision + connection handling.
   const winnerLine = data.winner_policy_id
@@ -178,7 +185,7 @@ function renderEffectivePolicyResult(result, data) {
     el("div", {}, [el("strong", { text: bl({ en: "Decision: ", ja: "判定: " }) }), epDecisionBadge(data.final_decision), winnerLine]),
     el("div", { style: "margin-top:6px" }, [
       el("strong", { text: bl({ en: "Connection: ", ja: "接続: " }) }),
-      uiBadge(insBypass ? bl({ en: "Not inspected", ja: "検査しない" }) : bl({ en: "Inspected", ja: "検査する" }), insBypass ? "warn" : "ok"),
+      epInspectionBadge(ins),
       el("span", { class: "ui-view-desc", style: "margin-left:8px", text: epInspectionSourceText(ins) }),
     ]),
   ]));
@@ -340,6 +347,7 @@ async function loadInspectionPosture(result) {
     ]) : null,
     el("div", { class: "ui-view-desc", style: "margin-top:6px",
       text: bl({ en: "Destinations never inspected: ", ja: "検査しない宛先の数: " }) + (data.effective_bypass || []).length }),
+    data.device_scoped ? el("p", {class:"ui-view-desc",text:bl({en:"Device-specific inspection rules also apply. These host lists show settings shared by all source devices.",ja:"端末別の検査ルールも適用されます。この一覧は全送信元端末に共通する設定です。"})}) : null,
   ]));
 
   // Mode switch.

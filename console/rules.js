@@ -132,8 +132,8 @@ async function renderRuleList(section, plane, direction) {
     const certPins = [];
     entries.forEach((entry) => {
       if (entry.kind === "authored" && entry.rule) {
-        if (entry.rule.id && entry.rule.id.startsWith("certpin-rule-")) { certPins.push(entry.rule); return; }
-        rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved }), idx, section, plane, direction));
+        if (entry.rule.id && entry.rule.id.startsWith("certpin-rule-") && !entry.inspection_source_warning) { certPins.push(entry.rule); return; }
+        rows.push(authoredRow(Object.assign({}, entry.rule, { destination_unresolved: entry.destination_unresolved, inspection_source_warning: entry.inspection_source_warning }), idx, section, plane, direction));
         return;
       }
       if (entry.kind === "builtin_default") { rows.push(builtinRow({ policy_id: entry.policy_id, name: entry.name, priority: entry.priority, decision: entry.access, status: entry.status, service_text: entry.service_text, inspection: entry.inspection }, section, plane, direction, builtinDefaults)); return; }
@@ -302,7 +302,7 @@ function authoredRow(r, idx, section, plane, direction) {
       ? [el("span", { class: "rule-expr", text: ruleExpr(r, idx) }), document.createTextNode(" "), browserChip()]
       : [el("span", { class: "rule-expr", text: ruleExpr(r, idx) })]),
     accessCell,
-    el("td", {}, inspectionBadge(r.action.inspection)),
+    el("td", {}, [inspectionBadge(r.action.inspection), r.inspection_source_warning ? el("div", {class:"ui-view-desc",text:inspectionSourceWarningText(r.inspection_source_warning)}) : null]),
     statusCellFor(r, active),
     el("td", { class: "ui-row-actions" }, [edit, document.createTextNode(" "), toggle, document.createTextNode(" "), del]),
   ]);
@@ -1161,4 +1161,10 @@ function ruleFlowText(entry) {
     ? bl({ en: parts.length + " destination groups", ja: "宛先 " + parts.length + " グループ" })
     : dest;
   return entry.source_text + " → " + shown + " : " + entry.service_text;
+}
+
+function inspectionSourceWarningText(reason) {
+  if (reason === "identity_context_unavailable") return bl({en:"Only device sources can select TLS inspection. Person, identity-group and agent sources cannot decide it here; access rules still apply.",ja:"TLS検査の範囲は端末の送信元で指定します。人・IDグループ・エージェントの指定はここでは検査範囲に反映されません。アクセス条件は引き続き適用されます。"});
+  if (reason === "no_resolved_device") return bl({en:"No source device resolves for inspection. Check the selected device or group.",ja:"検査対象の送信元端末が見つかりません。選択した端末・グループを確認してください。"});
+  return bl({en:"Check the inspection source before relying on this rule.",ja:"このルールの検査範囲を確認してください。"});
 }

@@ -6231,7 +6231,6 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerVLANRoutes(mux, adminEndpoint, vlanBoundary, configSourceURL)
 	registerSWGTenantRestrictionRoutes(mux, adminEndpoint, evaluator, writer, policyStore, swgRuntime, config.CPVersions, configSourceURL, adminAuditOutbox)
 	registerRiskServerInitiatedRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, configSourceURL)
-	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL)
 	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride)
 	registerUsageEventsRoutes(mux, adminEndpoint, adminAuth, usageMeters, adminHotStore, humanIdentities, nonHumanIdentities)
 	registerAgentQualityRoutes(mux, adminEndpoint, evaluator, writer, deviceStore, agentTelemetry, agentRolloutPlans, agentTargetVersion, agentReleaseChannel, config.AgentRolloutCache, adminHotStore)
@@ -6544,6 +6543,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// a no-op. This is the bridge that lets the uncovered-flow count fall to 0, the readiness signal for disabling
 	// Allow-all (S5). It reuses the exact same ruleStore.Upsert + recompile as POST /admin/rules, so an adopted
 	// rule is indistinguishable from a hand-authored one and is editable/deletable in the normal Rules UI.
+	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL, func(w http.ResponseWriter) bool {
+		if !refreshAuthoredStores(w, ruleStore, assetStore) {
+			return false
+		}
+		recompileAuthoredRules()
+		return true
+	})
 	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)
 	registerPredefinedCatalogRoutes(mux, adminEndpoint, config, evaluator, writer)
 	// The one file every endpoint needs, issued by the deployment that already holds the key to sign it.

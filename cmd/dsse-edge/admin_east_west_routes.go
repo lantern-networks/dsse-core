@@ -21,13 +21,16 @@ import (
 	"github.com/lantern-networks/dsse-core/policy"
 )
 
-func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, policyStore policy.RuntimeStore, eastWestAuthChallenges *eastwest.AuthChallengeStore, cpVersions *cpConfigVersionClient, eastWestObserveStore *eastwestobserve.Store, configSourceURL string) {
+func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, policyStore policy.RuntimeStore, eastWestAuthChallenges *eastwest.AuthChallengeStore, cpVersions *cpConfigVersionClient, eastWestObserveStore *eastwestobserve.Store, configSourceURL string, refreshObservationRules func(http.ResponseWriter) bool) {
 	mux.HandleFunc("GET /admin/east-west", adminEndpoint("admin.eastwest.read", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, eastwest.AdminStatus(policyStore, adminTenantIDFromRequest(r)))
 	}))
 	// S1 (Observe): the lateral-flow inventory + convergence readiness. Read-only; recording happens on the
 	// steer-mux decision path. Coverage is computed against the CURRENT east-west rules (so it never goes stale).
 	mux.HandleFunc("GET /admin/east-west/observations", adminEndpoint("admin.eastwest.read", func(w http.ResponseWriter, r *http.Request) {
+		if refreshObservationRules != nil && !refreshObservationRules(w) {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		var obs []eastwestobserve.FlowObservation
 		if eastWestObserveStore != nil {
@@ -44,7 +47,7 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 			rules = rr.EffectiveEastWestRules(tenant)
 		}
 		for i := range obs {
-			req := model.DecisionRequest{Destination: obs[i].Destination, ServiceFamily: obs[i].ServiceFamily}
+			req := model.DecisionRequest{Destination: obs[i].Destination, ServiceFamily: obs[i].ServiceFamily, Protocol: "tcp", DestinationPort: obs[i].Port}
 			if obs[i].Source != eastwestobserve.SourceAny {
 				req.DeviceID = obs[i].Source
 			}

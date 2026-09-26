@@ -355,6 +355,27 @@ Upgrade note: the observation store reads legacy tenant maps as well as receipt-
 rows. Once reports are stored, the receipt-bearing format is written; rollback to
 an older binary that cannot read it is not established by these checks.
 
+## Adopting observed flows (under review)
+
+A batch that fails while creating destinations or rules now identifies the confirmed
+rules, failed observation and remaining observations. Confirmed rules are compiled
+even when a later item fails; retrying the batch skips already covered flows.
+Repeated observation IDs in one request no longer create duplicate rules. Audit
+records retain the administrator and partial/success result without exposing raw
+storage diagnostics.
+
+Coverage checks include the observed TCP port and refresh shared authored rules
+and assets. A rule for one port does not mark another port as covered. Console
+adoption stops when the latest observation cannot be read, uses the refreshed
+record, and excludes UDP services from TCP port matching.
+
+Checks cover file-save failures and recovery, repeated IDs, tenant boundaries,
+read-only/pulling-Edge rejection, actual PostgreSQL peer readback, and Console
+regressions. Browser checks use synthetic responses and inspect the arguments
+passed to the rule editor; they do not cover its complete save flow or deployed
+traffic. A batch is not a transaction across all rules and destinations. Review
+partial results and current state before retrying after an unconfirmed save.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with

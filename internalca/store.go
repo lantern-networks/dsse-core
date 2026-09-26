@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -445,7 +446,7 @@ func validatedAuthorities(authorities []Authority) (map[string]Authority, error)
 		if a.ID == "" || a.TenantID == "" || strings.ContainsRune(a.ID, 0) || strings.ContainsRune(a.TenantID, 0) {
 			return nil, fmt.Errorf("invalid internal authority identity")
 		}
-		cert, material, err := parseAuthority(a.CertificatePEM)
+		cert, material, err := parseSavedAuthority(a.CertificatePEM)
 		if err != nil {
 			return nil, err
 		}
@@ -457,4 +458,48 @@ func validatedAuthorities(authorities []Authority) (map[string]Authority, error)
 		next[k] = a
 	}
 	return next, nil
+}
+
+// Older writers retained openssl preambles and certificate chains. Restore only
+// their first public CA, matching the old trust contract, without retaining extra material.
+func parseSavedAuthority(material string) (*x509.Certificate, string, error) {
+	if cert, normalized, err := parseAuthority(material); err == nil {
+		return cert, normalized, nil
+	}
+	first := strings.Index(material, "-----BEGIN ")
+	if first < 0 || !strings.HasPrefix(material[first:], "-----BEGIN CERTIFICATE-----") {
+		return nil, "", fmt.Errorf("invalid saved authority certificate")
+	}
+	end := strings.Index(material[first:], "-----END CERTIFICATE-----")
+	if end < 0 {
+		return nil, "", fmt.Errorf("invalid saved authority certificate")
+	}
+	end += first + len("-----END CERTIFICATE-----")
+	if strings.Count(material[first:end], "-----BEGIN ") != 1 {
+		return nil, "", fmt.Errorf("invalid saved authority certificate")
+	}
+	block, rest := pem.Decode([]byte(material[first:end]))
+	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) > 0 || len(rest) > 0 {
+		return nil, "", fmt.Errorf("invalid saved authority certificate")
+	}
+	trailing := strings.TrimSpace(material[end:])
+	for trailing != "" {
+		if !strings.HasPrefix(trailing, "-----BEGIN CERTIFICATE-----") {
+			return nil, "", fmt.Errorf("invalid saved authority trailing material")
+		}
+		extra, remain := pem.Decode([]byte(trailing))
+		if extra == nil || extra.Type != "CERTIFICATE" || len(extra.Headers) > 0 {
+			return nil, "", fmt.Errorf("invalid saved authority chain")
+		}
+		if _, err := x509.ParseCertificate(extra.Bytes); err != nil {
+			return nil, "", fmt.Errorf("invalid saved authority chain")
+		}
+		trailing = strings.TrimSpace(string(remain))
+	}
+	normalized := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes}))
+	cert, normalized, err := parseAuthority(normalized)
+	if err == nil {
+		log.Printf("internal_ca_restore legacy_material_normalized=true")
+	}
+	return cert, normalized, err
 }

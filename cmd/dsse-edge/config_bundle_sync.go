@@ -1007,7 +1007,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// organization a client certificate belongs to, this one says which server certificates an organization's
 	// own flows may accept.
 	if payload.InternalCAs != nil && t.internalCAs != nil {
-		if count, applied := applyInternalCABundleSection(t.internalCAs, payload.InternalCAs, log.Printf); applied {
+		if count, applied, err := applyInternalCABundleSectionChecked(t.internalCAs, payload.InternalCAs, log.Printf); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("internal authorities: %w", err))
+		} else if applied {
 			log.Printf("config_bundle_internal_cas applied=%d", count)
 		}
 	}

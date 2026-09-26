@@ -569,3 +569,5 @@ Only one process may own writable certificate files. A pending CA withdrawal
 requires reconciliation before serving devices; it is not automatically
 replayed against an unknown trust-store state. Administrative and startup
 wiring using these primitives follows in a separate migration unit.
+
+Existing CA files and signed snapshots may contain openssl preambles or public certificate chains. Restore keeps only the first public CA, matching the previous trust contract; new administrative inputs still require exactly one certificate. Unavailable authority stores publish an incomplete section, never an empty authoritative deletion. Invalid received CA snapshots remain unacknowledged so the next pull can retry. Failed administrative deletions return a storage error. Combined certificate/key PEM files remain readable at startup and reload; pair updates still require separate files.

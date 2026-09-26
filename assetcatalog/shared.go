@@ -48,11 +48,7 @@ func (s *Store) sharedCandidateLocked(raw []byte) (*Store, error) {
 				if tenant == "" || id == "" || v.TenantID != tenant || v.ID != id {
 					return nil, ErrPersistence
 				}
-				norm, err := normalizeServiceTransports(v)
-				if err != nil {
-					return nil, ErrPersistence
-				}
-				rows[id] = norm
+				rows[id] = loadServiceTransports(v)
 			}
 		}
 		for tenant, rows := range snap.EnrolledAliases {

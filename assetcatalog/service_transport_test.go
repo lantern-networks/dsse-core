@@ -66,18 +66,18 @@ func TestServiceTransportAdmissionAndReload(t *testing.T) {
 	legacy.Ports[0].Protocol = "bad"
 	snap.Services["a"]["svc"] = legacy
 	raw, _ = json.Marshal(snap)
-	rejected := &serviceMemoryWriter{data: raw}
-	if e := s.SetPersister(rejected); e == nil {
-		t.Fatal("invalid loaded transport accepted")
+	legacyWriter := &serviceMemoryWriter{data: raw}
+	if e := s.SetPersister(legacyWriter); e != nil {
+		t.Fatal("legacy service blocked load", e)
 	}
-	if !s.ServiceIncludesTransport("a", "svc", "tcp", 443) {
-		t.Fatal("rejected load changed state")
+	if len(s.ServiceTransportPorts("a", "svc")) != 0 {
+		t.Fatal("invalid legacy service became executable")
 	}
 	if _, e := s.UpsertService(input); e != nil {
 		t.Fatal(e)
 	}
-	if rejected.saves != 0 || p.saves != writes+1 {
-		t.Fatal("rejected load changed writer")
+	if legacyWriter.saves != 1 || p.saves != writes {
+		t.Fatal("repair did not save to loaded writer")
 	}
 	pairs := s.ServiceTransportPorts("a", "svc")
 	pairs["tcp"][0] = 22

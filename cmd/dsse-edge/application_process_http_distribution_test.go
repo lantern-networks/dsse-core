@@ -149,6 +149,7 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {
 		want = []string{
 			"admin_asset_catalog_changed",                                                               // endpoint create
+			"admin_authored_rule_changed",                                                               // rule create
 			"admin_asset_catalog_changed", "admin_asset_catalog_changed", "admin_asset_catalog_changed", // group create/edit/delete
 			"admin_asset_catalog_changed", "admin_asset_catalog_changed", "admin_asset_catalog_changed", // service create/edit/delete
 			"admin_asset_catalog_changed", "admin_asset_catalog_changed", // endpoint edit/delete
@@ -199,12 +200,16 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 		}
 	}
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {
-		kinds := []string{"endpoint", "group", "group", "group", "service", "service", "service", "endpoint", "endpoint"}
-		actions := []string{"upsert", "upsert", "upsert", "delete", "upsert", "upsert", "delete", "upsert", "delete"}
+		kinds := []string{"endpoint", "rule", "group", "group", "group", "service", "service", "service", "endpoint", "endpoint"}
+		actions := []string{"upsert", "upsert", "upsert", "upsert", "delete", "upsert", "upsert", "delete", "upsert", "delete"}
 		for i, audit := range outbox.insertedAudits {
-			id := map[string]string{"endpoint": "ep-a", "group": "group-a", "service": "service-a"}[kinds[i]]
+			id := map[string]string{"endpoint": "ep-a", "group": "group-a", "service": "service-a", "rule": "rule-a"}[kinds[i]]
+			targetType := "asset_" + kinds[i]
+			if kinds[i] == "rule" {
+				targetType = "authored_rule"
+			}
 			if audit.TenantID != processDistributionTenant || audit.ActorUserID == nil || *audit.ActorUserID != "operator" ||
-				audit.TargetType == nil || *audit.TargetType != "asset_"+kinds[i] || *audit.TargetID != id ||
+				audit.TargetType == nil || *audit.TargetType != targetType || *audit.TargetID != id ||
 				audit.Action == nil || *audit.Action != actions[i] || audit.Result == nil || *audit.Result != "saved" {
 				t.Fatalf("CP asset audit %d = %+v, want %s/%s/%s saved by operator", i, audit, kinds[i], id, actions[i])
 			}

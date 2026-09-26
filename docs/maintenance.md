@@ -44,6 +44,17 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Authored rule creation, editing and deletion now report unconfirmed storage without
+exposing storage details, and record the administrator and outcome in domain audits.
+Rule lists refresh shared rules and catalogs before returning them. Console edits
+retain their draft after failure, reuse the draft ID on retry, verify save responses,
+and refuse actions after an organization change. Edited cert-pin rules retain an
+ordinary editable row when they no longer represent an unrestricted bypass.
+HTTP persistence/compilation/audit checks, a two-handler PostgreSQL lifecycle, and
+local Chromium create/edit/disable/enable/delete and failure/retry checks cover this
+change. Browser APIs were synthetic; deployed fleet acceptance is still outstanding.
+
+
 Delegated operators can cancel customer export jobs using the current customer
 delegation; cancellation still refuses undelegated and unauthorized cross-tenant
 requests. Export request, queue and worker lifecycle audits retain the operator's

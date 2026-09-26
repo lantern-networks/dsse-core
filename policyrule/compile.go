@@ -20,8 +20,8 @@ type InspectionHostSelection struct {
 
 // EgressInspectionHosts projects one inspection axis into TLS/443 selectors.
 // Device identities come from the tenant's catalog, never a user/agent selector
-// or the endpoint's self-reported OS username. Identity-only rules cannot be
-// applied at this pre-TLS layer; they contribute no device or shared host entry.
+// or the endpoint's self-reported OS username. When source identity cannot be
+// represented pre-TLS, inspect applies to all sources; bypass never widens.
 func EgressInspectionHosts(tenant string, rules []Rule, resolver AddressResolver, inspection string) InspectionHostSelection {
 	all := map[string]bool{}
 	devices := map[string]map[string]bool{}
@@ -33,7 +33,7 @@ func EgressInspectionHosts(tenant string, rules []Rule, resolver AddressResolver
 			continue
 		}
 		hosts := resolver.EndpointAddresses(tenant, r.Destination)
-		if IsAnySubject(r.Source) {
+		if IsAnySubject(r.Source) || inspection == InspectionInspect && InspectionSourceWarning(tenant, r, resolver) != "" {
 			for _, host := range hosts {
 				all[host] = true
 			}

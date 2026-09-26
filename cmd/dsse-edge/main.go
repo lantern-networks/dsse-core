@@ -2694,7 +2694,9 @@ func main() {
 	if p, e := cpStateBlobPersister(*admissionRevocationStore, cpStateBlobDB, "admission_revocations"); e != nil {
 		log.Fatalf("resolve admission-revocation store: %v", e)
 	} else {
-		livenessRevocations.SetPersister(p) // Phase 3: persist kill-switches across a restart
+		if err := livenessRevocations.SetPersister(p); err != nil {
+			log.Fatalf("load admission-revocation store: %v", err)
+		}
 	}
 	// Active session revocation: track live (T) connections by identity so an ADMINISTRATOR can actively CLOSE
 	// a blocked device's established tunnels (per-handshake admission already rejects NEW connections; this
@@ -6548,10 +6550,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// Allow-all (S5). It reuses the exact same ruleStore.Upsert + recompile as POST /admin/rules, so an adopted
 	// rule is indistinguishable from a hand-authored one and is editable/deletable in the normal Rules UI.
 	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL, func(w http.ResponseWriter) bool {
+		ruleGeneration, assetGeneration := ruleStore.ConfigGeneration(), assetStore.ConfigGeneration()
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return false
 		}
-		recompileAuthoredRules()
+		if ruleStore.ConfigGeneration() != ruleGeneration || assetStore.ConfigGeneration() != assetGeneration {
+			recompileAuthoredRules()
+		}
 		return true
 	})
 	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/policy"
@@ -140,5 +141,25 @@ func TestRouteDistributionBundleHTTPDeletion(t *testing.T) {
 	}
 	if receiver.CountForTenant("tenant_northwind") != 0 {
 		t.Fatal("HTTP deletion not applied")
+	}
+}
+
+func TestRouteDistributionReceiverStoreRole(t *testing.T) {
+	db := &sql.DB{}
+	p, err := routeGovernancePersisterForRole("", db, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.(routeGovernanceUpdater); !ok {
+		t.Fatal("CP did not select shared authority")
+	}
+	p, err = routeGovernancePersisterForRole("", db, "https://cp.example.test")
+	if err != nil || p != nil {
+		t.Fatal("receiver selected authority", err)
+	}
+	for _, value := range []string{"postgres", cpStateBlobPersisterImportPrefix + "unused"} {
+		if _, err := routeGovernancePersisterForRole(value, db, "https://cp.example.test"); err == nil {
+			t.Fatal("explicit receiver authority accepted")
+		}
 	}
 }

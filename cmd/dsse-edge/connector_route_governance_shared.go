@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"log"
 	"strings"
 	"time"
@@ -264,4 +266,15 @@ func (g *connectorRouteGovernance) ExportForBundle() *governancePersistState {
 	}
 	st.Complete = true
 	return &st
+}
+
+// A pulling Edge holds a received cache, never the CP's shared route authority.
+func routeGovernancePersisterForRole(value string, db *sql.DB, sourceURL string) (blobstore.Persister, error) {
+	if strings.TrimSpace(sourceURL) != "" {
+		if storeBackend(value) == "postgres" {
+			return nil, fmt.Errorf("received route decisions require a node-local file path or an in-memory cache")
+		}
+		db = nil
+	}
+	return cpStateBlobPersister(value, db, "connector_route_governance")
 }

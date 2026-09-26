@@ -473,6 +473,14 @@ Validation covers administrative CRUD, peer reads with PostgreSQL, read-only per
 
 Compatibility: legacy dataset snapshots without a version continue to use the configured startup salt. Newly saved version-1 snapshots include the adopted salt; older binaries do not understand that salt contract, so rolling back a receiver with a different local salt is not supported without restoring its matching prior configuration. Invalid saved classifier or dataset snapshots stop startup with a generic error instead of silently dropping detection. Separate library files are not an atomic multi-file transaction; a failed update can leave partially written files, and must be retried before claiming completion. Policy-object persistence, leader-transition write fencing, and release deployment checks remain separate work.
 
+### DLP policy save, peer reads and distribution
+
+Named DLP policies now confirm configured storage for creation, editing, enable/disable and deletion before returning success. Rejected saves preserve the previous live policy. A completed file replacement whose final durability cannot be confirmed still returns an error; the replacement remains visible and pending a confirmed flush. Reload the saved state before retrying such an operation.
+
+Shared PostgreSQL edits preserve policies from other CPs and organizations. Lists and bundle publication refresh policy state, and policy validation refreshes the referenced detector libraries. Received policy snapshots are saved before the Edge acknowledges the distribution update. Mutable metadata and identifier slices cannot change stored policy through a caller's copy.
+
+Validation covers PostgreSQL peer CRUD and status changes, permission/organization guards, attributed audits, signed fetch and reference-only upload decisions, save failure/retry, restore and production startup. Inline fallback behavior for an unresolved/disabled policy reference is unchanged. Saved snapshots are validated as a whole; malformed data stops startup without rewriting it or logging its contents. Separate DLP library files are still not an atomic transaction. This change depends on the preceding detector-library work and requires premerge review; deployed-fleet and release checks remain outstanding.
+
 ### Inspection source compatibility
 
 TLS inspection cannot resolve user/group/agent identity before decrypting a

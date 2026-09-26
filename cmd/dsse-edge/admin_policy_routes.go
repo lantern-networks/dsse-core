@@ -210,7 +210,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		if config.DLPDistribution != nil && config.DLPDistribution.allowlist != nil {
-			if !refreshDLPStores(w, config.DLPDistribution.classifiers, config.DLPDistribution.fingerprints) {
+			if !refreshDLPStores(w, config.DLPDistribution.policies, config.DLPDistribution.classifiers, config.DLPDistribution.fingerprints) {
 				return
 			}
 			if err := config.DLPDistribution.allowlist.RefreshShared(); err != nil {

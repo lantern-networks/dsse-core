@@ -183,6 +183,9 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	if isDLPSharedPersister(s.policies.persister) || isDLPSharedPersister(s.classifiers.persister) || isDLPSharedPersister(s.fingerprints.persister) || isDLPSharedPersister(s.allowlist.persister) {
 		return fmt.Errorf("cannot apply an Edge DLP bundle to shared authority stores")
 	}
+	if err := s.policies.saveSnapshotLocked(dlpPolicyObjectSnapshot{ByTenant: next.Policies}); err != nil {
+		return fmt.Errorf("save DLP policies: %w", err)
+	}
 	// Save received detector definitions before acknowledging this generation.
 	// Separate files are not a cross-store transaction; a failure is retried.
 	if err := s.classifiers.saveSnapshotLocked(classifierStoreSnapshot{Specs: next.Classifiers}); err != nil {
@@ -208,7 +211,7 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	s.classifiers.specs, s.classifiers.sets = next.Classifiers, classifiers
 	s.fingerprints.datasets, s.fingerprints.sets, s.fingerprints.salt = next.Datasets, fingerprints, next.Salt
 	s.policies.byTenant = next.Policies
-	s.policies.dirty, s.classifiers.dirty, s.fingerprints.dirty = true, false, false
+	s.policies.dirty, s.classifiers.dirty, s.fingerprints.dirty = false, false, false
 	s.policies.generation++
 	s.classifiers.generation++
 	s.fingerprints.generation++

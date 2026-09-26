@@ -170,7 +170,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve dlp fingerprint store %q: %v", config.DLPFingerprintStorePath, e)
 		} else if p != nil {
 			if lerr := dlpFingerprintStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp fingerprint store: load prior datasets failed (starting fresh): %v", lerr)
+				log.Fatalf("dlp fingerprint store: invalid or unavailable saved configuration")
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
@@ -189,7 +189,7 @@ func buildDLPRuntime(config serverConfig) dlpRuntime {
 			log.Fatalf("resolve dlp classifier store %q: %v", config.DLPClassifierStorePath, e)
 		} else if p != nil {
 			if lerr := dlpClassifierStore.SetPersister(p); lerr != nil {
-				log.Printf("dlp classifier store: load prior classifiers failed (starting fresh): %v", lerr)
+				log.Fatalf("dlp classifier store: invalid or unavailable saved configuration")
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {

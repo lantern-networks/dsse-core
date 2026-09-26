@@ -749,7 +749,7 @@ adopt_artefacts_from_beside_the_package() {
 		# So what moves aside depends on whether the ORGANIZATION changed, which the profile states.
 		replaced="install_profile.json agent_config.json profile_signing_key.txt interception-root.pem applied_install_profile.json"
 		if [ -n "$beside_tenant" ] && [ "$beside_tenant" = "$here_tenant" ]; then
-			echo "      (the same organization: the device identity and its token are KEPT)"
+			echo "      (the same organization: the device identity is KEPT; a supplied enrollment token takes precedence)"
 		else
 			replaced="$replaced enrolment_token.txt device_identity_pointer.json"
 		fi

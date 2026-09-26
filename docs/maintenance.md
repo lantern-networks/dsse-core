@@ -578,8 +578,6 @@ Package regression, race detection and the full Go suite cover these storage cha
 
 ### Agent profile replacement and removal
 
-The macOS installer checks that current and replacement profile organizations are readable and that required sidecars exist before moving configuration files. Replacing a profile for the same organization retains its device identity and existing enrollment token. Windows profile removal also clears the issued-at display metadata. These changes preserve existing profile signature verification requirements.
+The macOS installer checks that current and replacement profile organizations are readable and that required sidecars exist before moving configuration files. Replacing a profile for the same organization retains its device identity and, when no replacement token is supplied, its existing enrollment token. Windows profile removal also clears the issued-at display metadata. These changes preserve existing profile signature verification requirements.
 
-Validation includes four isolated installer-adoption cases, shell syntax checks, host configstore tests and Windows test cross-compilation. Actual Windows registry execution and signed package installation are not claimed by these checks.
-
-When adopting a replacement profile for the same organization, a newly supplied enrollment token takes precedence; the existing token is retained only when no new token is supplied. The existing device identity is retained.
+Validation includes five isolated installer-adoption cases, shell syntax checks, host configstore tests and Windows test cross-compilation. Actual Windows registry execution and signed package installation are not claimed by these checks.

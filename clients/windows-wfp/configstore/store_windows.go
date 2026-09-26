@@ -123,7 +123,7 @@ func (b *RegistryBackend) Clear() error {
 		return err
 	}
 	defer k.Close()
-	for _, name := range []string{valEnvelope, valPin, valSource, valAppliedAt, valVersion, valTenant} {
+	for _, name := range []string{valEnvelope, valPin, valSource, valAppliedAt, valVersion, valIssuedAt, valTenant} {
 		if err := k.DeleteValue(name); err != nil && err != registry.ErrNotExist {
 			return err
 		}

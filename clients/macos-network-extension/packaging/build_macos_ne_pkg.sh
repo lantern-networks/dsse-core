@@ -723,7 +723,8 @@ adopt_artefacts_from_beside_the_package() {
 	[ -r "$beside/profile_signing_key.txt" ] && [ -s "$beside/profile_signing_key.txt" ] ||
 		profile_adoption_refuse "The supplied profile needs its nonempty profile_signing_key.txt beside the package."
 	keep_token=0
-	if [ "$beside_tenant" = "$here_tenant" ] && [ -r "$CONFIG_DIR/enrolment_token.txt" ] \
+	if { [ ! -r "$beside/enrolment_token.txt" ] || [ -z "$(tr -d '\n\r' < "$beside/enrolment_token.txt")" ]; } \
+	   && [ "$beside_tenant" = "$here_tenant" ] && [ -r "$CONFIG_DIR/enrolment_token.txt" ] \
 	   && [ -n "$(tr -d '\n\r' < "$CONFIG_DIR/enrolment_token.txt")" ]; then
 		keep_token=1
 	fi

@@ -51,6 +51,12 @@ class AdoptionTest(unittest.TestCase):
         self.assertEqual((root / "device_identity_pointer.json").read_text(), "fixture-identity")
         self.assertEqual((root / "install_profile.json").read_text(), profile("tenant", 2))
 
+    def test_same_organization_uses_new_token_and_keeps_identity(self):
+        result, root = self.run_case(profile("tenant", 1), profile("tenant", 2), token=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((root / "enrolment_token.txt").read_text(), "new-fixture-token")
+        self.assertEqual((root / "device_identity_pointer.json").read_text(), "fixture-identity")
+
     def test_other_organization_requires_new_token(self):
         original = profile("tenant", 1)
         result, root = self.run_case(original, profile("other", 2), token=False)

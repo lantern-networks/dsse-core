@@ -410,6 +410,18 @@ func connectorApplicationReturnTo(r *http.Request) (string, bool) {
 }
 
 func connectorForApplication(ctx context.Context, r *http.Request, registry connectorRegistryStore, catalog appcatalog.RuntimeStore, tenantID, applicationID string) (model.ConnectorRegistration, bool, error) {
+	// An explicit disabled catalog entry overrides both enumerated connector apps
+	// and published-group fallback. Keep absent catalog entries compatible with
+	// existing file-defined applications.
+	if catalog != nil {
+		entry, found, err := catalog.Get(ctx, tenantID, applicationID)
+		if err != nil {
+			return model.ConnectorRegistration{}, false, fmt.Errorf("application catalog cannot be read")
+		}
+		if found && entry.Status == "disabled" {
+			return model.ConnectorRegistration{}, false, nil
+		}
+	}
 	if connectorID := r.URL.Query().Get("connector_id"); connectorID != "" {
 		conn, ok, err := connectorRegistrationForTenantWithContext(ctx, registry, connectorID, tenantID)
 		if err != nil {

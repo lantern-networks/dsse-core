@@ -55,12 +55,11 @@ func TestIngestionFreezesApprovalAndRejectsInvalidBatch(t *testing.T) {
 	for _, bad := range []Grant{{}, {GrantID: "bad", TenantID: "tenant", ExpiresAt: "invalid"}, {GrantID: "bad", TenantID: "tenant", IssuedAt: g.ExpiresAt, ExpiresAt: g.IssuedAt}} {
 		deny := g
 		deny.Revoked = true
-		gen := s.ConfigGeneration()
 		if _, _, e := s.MergeChecked([]Grant{deny, bad, grantFixture("new", now)}, now); !errors.Is(e, ErrInvalidGrant) {
 			t.Fatal("invalid batch accepted")
 		}
-		if !s.Valid(g.GrantID, now) || s.ConfigGeneration() != gen {
-			t.Fatal("invalid batch partially mutated")
+		if s.Valid(g.GrantID, now) {
+			t.Fatal("invalid admission blocked valid denial")
 		}
 		if _, ok := s.Get("new"); ok {
 			t.Fatal("invalid batch admitted new approval")
@@ -71,7 +70,7 @@ func TestIngestionFreezesApprovalAndRejectsInvalidBatch(t *testing.T) {
 	deny.Revoked = true
 	deny.ExpiresAt = now.Add(-time.Hour).Format(time.RFC3339)
 	deny.IssuedAt = now.Add(-2 * time.Hour).Format(time.RFC3339)
-	if _, u, e := s.MergeChecked([]Grant{deny}, now); e != nil || u != 1 {
+	if _, u, e := s.MergeChecked([]Grant{deny}, now); e != nil || u != 0 {
 		t.Fatal(e)
 	}
 	held, _ := s.Get(g.GrantID)

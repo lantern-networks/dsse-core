@@ -472,7 +472,7 @@ func (r *Registry) saveManagementCandidateLocked(candidate map[string]model.Conn
 	}
 	data, err := json.Marshal(registryPersistSnapshot{Connectors: candidate})
 	if err == nil {
-		err = r.persister.Save(data)
+		err = blobstore.UnconfirmedSave(r.persister.Save(data))
 	}
 	if err != nil {
 		reportRegistryPersistError(err)

@@ -621,3 +621,9 @@ Package regression, race detection and the full Go suite cover these storage cha
 
 
 Legacy CA normalization changes the in-memory and distributed public certificate only. The original database row remains until an administrator replaces it with a public CA certificate or deletes that authority in Console.
+### Agent profile replacement and removal
+
+The macOS installer checks that current and replacement profile organizations are readable and that required sidecars exist before moving configuration files. Replacing a profile for the same organization retains its device identity and, when no replacement token is supplied, its existing enrollment token. Windows profile removal also clears the issued-at display metadata. These changes preserve existing profile signature verification requirements.
+
+Validation includes five isolated installer-adoption cases, shell syntax checks, host configstore tests and Windows test cross-compilation. Actual Windows registry execution and signed package installation are not claimed by these checks.
+

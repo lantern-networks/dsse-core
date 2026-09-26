@@ -38,7 +38,7 @@ func TestRegistryBackend_RoundTrip(t *testing.T) {
 	}
 
 	// full Apply→Load round-trip through the registry backend.
-	env, pub := signProfile(t, installprofile.InstallProfile{Version: 7, TenantID: "acme", TransportURL: "https://edge.acme:18543"})
+	env, pub := signProfile(t, installprofile.InstallProfile{Version: 7, IssuedAt: "2026-07-20T00:00:00Z", TenantID: "acme", TransportURL: "https://edge.acme:18543"})
 	if _, err := Apply(b, env, pub, "bundled", "2026-07-21T00:00:00Z"); err != nil {
 		t.Fatalf("apply via registry: %v", err)
 	}
@@ -47,11 +47,31 @@ func TestRegistryBackend_RoundTrip(t *testing.T) {
 		t.Fatalf("registry round-trip: got=%+v meta=%+v err=%v", got, meta, err)
 	}
 
-	if err := b.Clear(); err != nil {
-		t.Fatalf("clear: %v", err)
+	// Capture every value actually written, so future metadata additions must also be cleared.
+	k, err := registry.OpenKey(registry.CURRENT_USER, testPath, registry.QUERY_VALUE|registry.WOW64_64KEY)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, ok, _ := b.Get(valEnvelope); ok {
-		t.Fatalf("Clear left the envelope value behind")
+	names, err := k.ReadValueNames(-1)
+	k.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set("UnrelatedSetting", "preserve"); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := b.Clear(); err != nil {
+			t.Fatalf("clear attempt %d: %v", attempt, err)
+		}
+		for _, name := range names {
+			if _, ok, err := b.Get(name); err != nil || ok {
+				t.Fatalf("Clear left %q: exists=%v err=%v", name, ok, err)
+			}
+		}
+		if v, ok, err := b.Get("UnrelatedSetting"); err != nil || !ok || v != "preserve" {
+			t.Fatalf("Clear changed unrelated setting: value=%q exists=%v err=%v", v, ok, err)
+		}
 	}
 }
 

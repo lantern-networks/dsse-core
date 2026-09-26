@@ -14,7 +14,7 @@ import (
 // path, which is cleared differently:
 //
 //   - the egress compiled set is derived and node-local, so an emptied one DROPS its key;
-//   - the east-west compiled set is persisted and distributed, where an absent value reads as "keep what you
+//   - the east-west compiled set is distributed, where an absent value reads as "keep what you
 //     have" — so an emptied one stays as an EXPLICIT empty, and must still be nameable so the loop walks it.
 func TestAnOrganizationWithOnlyEastWestRulesIsStillWalkedAfterItsLastOneGoes(t *testing.T) {
 	store := NewStore(nil)

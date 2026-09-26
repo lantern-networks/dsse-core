@@ -101,9 +101,13 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 			writeError(w, http.StatusNotFound, fmt.Errorf("no tenant-restriction rule %q in this organization", refused))
 			return
 		}
-		resp, err := swg.ApplyTenantRestrictionUpdate(swgRuntime, evaluator.PolicyBundle, policyStore, req.TenantRestrictionUpdateRequest)
+		resp, err := swg.ApplyTenantRestrictionUpdateContext(r.Context(), swgRuntime, evaluator.PolicyBundle, policyStore, req.TenantRestrictionUpdateRequest)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS rule change could not be saved"))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		// S6: ship the applied REQUEST as a version to the control plane (history + rollback). The request is
@@ -160,9 +164,13 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 			writeError(w, http.StatusNotFound, fmt.Errorf("no tenant-restriction rule %q in this organization", refused))
 			return
 		}
-		resp, err := swg.ApplyTenantRestrictionUpdate(swgRuntime, evaluator.PolicyBundle, policyStore, req)
+		resp, err := swg.ApplyTenantRestrictionUpdateContext(r.Context(), swgRuntime, evaluator.PolicyBundle, policyStore, req)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS rule change could not be saved"))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		shipConfigVersionToCP(r, cpVersions, configversion.ResourceTenantRestriction, adminTenantIDFromRequest(r),

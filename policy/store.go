@@ -995,17 +995,34 @@ func (store *Store) EffectiveEastWestRules(tenantID string) []decision.EastWestR
 // SetTenantRestrictionRuleStatus records a runtime status override ("active"/"inactive") for a SWG
 // tenant-restriction rule id (Admin API SaaS enable/disable). Applied live by RuntimeEvaluator.
 func (store *Store) SetTenantRestrictionRuleStatus(ruleID, status string) {
+	_ = store.SetTenantRestrictionRuleStatusesContext(context.Background(), map[string]string{strings.TrimSpace(ruleID): strings.TrimSpace(status)})
+}
+
+// Apply all statuses from one administrative operation only after confirmed save.
+func (store *Store) SetTenantRestrictionRuleStatusesContext(ctx context.Context, statuses map[string]string) error {
 	if store == nil {
-		return
+		return ErrPolicyPersistence
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.tenantRestrictionRuleStatus == nil {
-		store.tenantRestrictionRuleStatus = map[string]string{}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
 	}
-	store.tenantRestrictionRuleStatus[strings.TrimSpace(ruleID)] = strings.TrimSpace(status)
-	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	previous := store.tenantRestrictionRuleStatus
+	next := make(map[string]string, len(previous)+len(statuses))
+	for k, v := range previous {
+		next[k] = v
+	}
+	for k, v := range statuses {
+		next[k] = v
+	}
+	store.tenantRestrictionRuleStatus = next
+	if err := store.persistLockedChecked(); err != nil {
+		store.tenantRestrictionRuleStatus = previous
+		return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
+	}
+	store.generation++
+	return nil
 }
 
 // TenantRestrictionRuleStatusOverrides returns a copy of the current rule status overrides.

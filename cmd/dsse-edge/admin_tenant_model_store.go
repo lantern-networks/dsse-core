@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -184,7 +186,24 @@ type adminTenantModel struct {
 // stampOperatorFlag derives IsOperator from operatorTenantID (the single source of truth). Called on every read
 // path so the flag is correct regardless of any persisted value, and the persisted/stored bool is only a cache.
 func stampOperatorFlag(tenant adminTenantModel, operatorTenantID string) adminTenantModel {
+	tenant = cloneAdminTenantModel(tenant)
 	tenant.IsOperator = operatorTenantID != "" && tenant.TenantID == operatorTenantID
+	return tenant
+}
+
+// Returned models can be edited by callers without changing authorization state.
+func cloneAdminTenantModel(tenant adminTenantModel) adminTenantModel {
+	tenant.AllowedRegions = append([]string(nil), tenant.AllowedRegions...)
+	tenant.CreatedAt = copyStringPtr(tenant.CreatedAt)
+	tenant.UpdatedAt = copyStringPtr(tenant.UpdatedAt)
+	tenant.OperatorElevations = append([]operatorElevation(nil), tenant.OperatorElevations...)
+	for i := range tenant.OperatorElevations {
+		e := &tenant.OperatorElevations[i]
+		e.EndedAt = copyStringPtr(e.EndedAt)
+		e.EndedBy = copyStringPtr(e.EndedBy)
+		e.ApprovedAt = copyStringPtr(e.ApprovedAt)
+		e.ApprovedBy = copyStringPtr(e.ApprovedBy)
+	}
 	return tenant
 }
 
@@ -444,6 +463,56 @@ func (store *adminTenantModelStore) Get(_ context.Context, tenantID string) (adm
 	return stampOperatorFlag(tenant, store.operatorTenantID), nil
 }
 
+var errAdminTenantSaveUnconfirmed = errors.New("tenant save could not be confirmed")
+
+// Authoring must not publish a candidate or retire its tombstone until storage
+// confirms the save. Memory-only stores retain their existing behavior.
+func (store *adminTenantModelStore) commitAuthoredTenantLocked(tenant adminTenantModel) error {
+	tenant = cloneAdminTenantModel(tenant)
+	tenants := make(map[string]adminTenantModel, len(store.tenants)+1)
+	for id, row := range store.tenants {
+		tenants[id] = row
+	}
+	tenants[tenant.TenantID] = tenant
+	deleted := make(map[string]string, len(store.deleted))
+	for id, at := range store.deleted {
+		if id != tenant.TenantID {
+			deleted[id] = at
+		}
+	}
+	if err := store.saveCandidateLocked(adminTenantModelSnapshot{Tenants: tenants, Deleted: deleted, PurgeOrders: store.purgeOrders}); err != nil {
+		return err
+	}
+	store.tenants = tenants
+	store.deleted = deleted
+	store.generation.Add(1)
+	return nil
+}
+
+// saveCandidateLocked confirms storage before publishing a tenant-registry mutation.
+// An error can follow replacement; it does not imply the disk still holds the old snapshot.
+func (store *adminTenantModelStore) saveCandidateLocked(snapshot adminTenantModelSnapshot) error {
+	if store.path != "" {
+		raw, err := json.MarshalIndent(snapshot, "", "  ")
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+		}
+		err = (blobstore.FilePersister{Path: store.path}).Save(raw)
+		if err != nil && !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+			return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+		}
+	}
+	return nil
+}
+
+func writeAdminTenantSaveError(w http.ResponseWriter, fallback int, err error) {
+	if errors.Is(err, errAdminTenantSaveUnconfirmed) {
+		writeError(w, http.StatusServiceUnavailable, errors.New("The tenant change could not be confirmed in storage. Reload before retrying."))
+		return
+	}
+	writeError(w, fallback, err)
+}
+
 func (store *adminTenantModelStore) Update(_ context.Context, tenant adminTenantModel, tenantID string, now time.Time) (adminTenantModel, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -457,15 +526,9 @@ func (store *adminTenantModelStore) Update(_ context.Context, tenant adminTenant
 	if err != nil {
 		return adminTenantModel{}, err
 	}
-	store.tenants[normalized.TenantID] = normalized
-	// Re-creating a tenant supersedes any tombstone for it: the deletion has been undone here, so it must
-	// stop being carried, or the bundle would ask every Edge to delete the tenant it just created.
-	delete(store.deleted, normalized.TenantID)
-	// The registry changed, so the bundle that carries it is a new version. Bumped HERE rather than
-	// inside persistLocked, which returns early for a memory-only store — the counter must not depend
-	// on whether a durable path happens to be configured.
-	store.generation.Add(1)
-	store.persistLocked()
+	if err := store.commitAuthoredTenantLocked(normalized); err != nil {
+		return adminTenantModel{}, err
+	}
 	return stampOperatorFlag(normalized, store.operatorTenantID), nil
 }
 
@@ -501,15 +564,9 @@ func (store *adminTenantModelStore) Put(_ context.Context, tenant adminTenantMod
 	if err != nil {
 		return adminTenantModel{}, err
 	}
-	store.tenants[normalized.TenantID] = normalized
-	// Re-creating a tenant supersedes any tombstone for it: the deletion has been undone here, so it must
-	// stop being carried, or the bundle would ask every Edge to delete the tenant it just created.
-	delete(store.deleted, normalized.TenantID)
-	// The registry changed, so the bundle that carries it is a new version. Bumped HERE rather than
-	// inside persistLocked, which returns early for a memory-only store — the counter must not depend
-	// on whether a durable path happens to be configured.
-	store.generation.Add(1)
-	store.persistLocked()
+	if err := store.commitAuthoredTenantLocked(normalized); err != nil {
+		return adminTenantModel{}, err
+	}
 	return stampOperatorFlag(normalized, store.operatorTenantID), nil
 }
 
@@ -804,6 +861,14 @@ func adminTenantTimezone(ctx context.Context, store adminTenantModelRuntimeStore
 // and it did not.
 func adminTenantModelLifecycleAuditLogFor(r *http.Request, tenant adminTenantModel, action string, evaluator decision.Evaluator, now time.Time) model.AuditLog {
 	record := adminTenantModelLifecycleAuditLog(tenant, action, evaluator, now)
+	return stampAdminTenantModelAuditActor(record, r, tenant)
+}
+
+func adminTenantModelAuditLogFor(r *http.Request, tenant adminTenantModel, evaluator decision.Evaluator, now time.Time) model.AuditLog {
+	return stampAdminTenantModelAuditActor(adminTenantModelAuditLog(tenant, evaluator, now), r, tenant)
+}
+
+func stampAdminTenantModelAuditActor(record model.AuditLog, r *http.Request, tenant adminTenantModel) model.AuditLog {
 	if identity, ok := adminIdentityFromRequest(r); ok {
 		// The actor goes in METADATA, not ActorUserID. The cross-tenant audit contract (CP0020) keeps raw
 		// class-2 identifiers — a person's user id, a raw subject, a session id — out of the control-plane

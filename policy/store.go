@@ -1159,17 +1159,8 @@ func activeAdminPolicyIDs(policies []model.Policy) []string {
 // SetServerInitiatedEnabled toggles server-initiated enforcement for a tenant. Applied live by
 // RuntimeEvaluator.
 func (store *Store) SetServerInitiatedEnabled(tenantID string, enabled bool) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.serverInitiatedEnabled == nil {
-		store.serverInitiatedEnabled = map[string]bool{}
-	}
-	store.serverInitiatedEnabled[strings.TrimSpace(tenantID)] = enabled
-	store.generation++
-	store.persistLocked()
+	_ = store.SetServerInitiatedEnabledConfirmed(tenantID, enabled)
+
 }
 
 // ServerInitiatedEnabledFor reports whether server-initiated (server->client) default-deny enforcement is
@@ -1185,52 +1176,16 @@ func (store *Store) ServerInitiatedEnabledFor(tenantID string) bool {
 
 // UpsertLegacyException stores/updates a Legacy Exception for a tenant (validated by the caller).
 func (store *Store) UpsertLegacyException(tenantID string, ex model.LegacyException) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.legacyExceptions == nil {
-		store.legacyExceptions = map[string][]model.LegacyException{}
-	}
-	tenantID = strings.TrimSpace(tenantID)
-	list := store.legacyExceptions[tenantID]
-	replaced := false
-	for i := range list {
-		if list[i].ID == ex.ID {
-			list[i] = ex
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		list = append(list, ex)
-	}
-	store.legacyExceptions[tenantID] = list
-	store.generation++
-	store.persistLocked()
+	_ = store.UpsertLegacyExceptionConfirmed(tenantID, ex)
+
 }
 
 // RemoveLegacyException deletes a tenant's Legacy Exception by id, persisting the change so it does not
 // re-appear on restart. Returns false if no exception with that id exists for the tenant.
 func (store *Store) RemoveLegacyException(tenantID, id string) bool {
-	if store == nil {
-		return false
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	tenantID = strings.TrimSpace(tenantID)
-	id = strings.TrimSpace(id)
-	list := store.legacyExceptions[tenantID]
-	for i := range list {
-		if list[i].ID == id {
-			store.legacyExceptions[tenantID] = append(list[:i:i], list[i+1:]...)
-			store.generation++
-			store.persistLocked()
-			return true
-		}
-	}
-	return false
+	removed, _ := store.RemoveLegacyExceptionConfirmed(tenantID, id)
+	return removed
+
 }
 
 // LegacyExceptionsFor returns a copy of a tenant's Legacy Exceptions.

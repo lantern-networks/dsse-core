@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -150,5 +151,74 @@ func TestPostgresManagedIdentityAndCredentialPurge(t *testing.T) {
 	peer.persistence = postgresCredentialPersistence{db: faultDB}
 	if _, _, err := refreshManagedAdminIdentity(ctx, auth, peer, identity); err == nil {
 		t.Fatal("unavailable authority accepted stale cache")
+	}
+}
+
+type failingLoginPersistence struct {
+	*fakeCredentialPersistence
+	fail bool
+}
+
+func (p *failingLoginPersistence) Upsert(ctx context.Context, c *localAdminCredential) error {
+	if p.fail {
+		return fmt.Errorf("fixture save refused")
+	}
+	return p.fakeCredentialPersistence.Upsert(ctx, c)
+}
+func (p *failingLoginPersistence) LoadCredential(ctx context.Context, email string) (*localAdminCredential, error) {
+	rows, err := p.LoadAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range rows {
+		if credentialEmailKey(c.Email) == email {
+			return c, nil
+		}
+	}
+	return nil, nil
+}
+func TestUnconfirmedLoginRestrictionLifecycle(t *testing.T) {
+	p := &failingLoginPersistence{fakeCredentialPersistence: newFakeCredentialPersistence()}
+	now := time.Now().UTC()
+	hash, err := hashPassword("fixture-passphrase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &localAdminCredential{PrincipalID: "p", TenantID: "t", Email: "login@example.com", Status: credentialStatusActive, PasswordHash: hash}
+	if err := p.Upsert(context.Background(), c); err != nil {
+		t.Fatal(err)
+	}
+	s, err := newLocalAdminCredentialStoreWithPersistence("test", p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.fail = true
+	if _, err := s.VerifyPassword(c.Email, "wrong", now); err == nil {
+		t.Fatal("wrong password accepted")
+	}
+	key := credentialEmailKey(c.Email)
+	if !s.pendingLoginRestriction[key] {
+		t.Fatal("failed save did not retain restriction")
+	}
+	p.fail = false
+	if err := s.refreshLoginCredentialLocked(c.Email); err != nil {
+		t.Fatal(err)
+	}
+	if s.byEmail[key].FailedAttempts != 1 {
+		t.Fatal("database reset removed unconfirmed failure")
+	}
+	if err := s.persistLocked(cloneCredential(s.byEmail[key])); err != nil {
+		t.Fatal(err)
+	}
+	if s.pendingLoginRestriction[key] {
+		t.Fatal("confirmed save kept pending restriction")
+	}
+	s.pendingLoginRestriction[key] = true
+	delete(p.rows, key)
+	if err := s.refreshLoginCredentialLocked(c.Email); err != nil {
+		t.Fatal(err)
+	}
+	if s.pendingLoginRestriction[key] {
+		t.Fatal("deleted account kept pending restriction")
 	}
 }

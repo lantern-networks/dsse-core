@@ -43,7 +43,13 @@ that a same-day export contains the start, midday and end-of-day records, exclud
 adjacent days and another organization, and downloads a matching gzip file.
 Creation and download audits were also checked. These checks use a local log store
 and synthetic administrator session; shared-database and deployed-fleet acceptance
-remain separate.
+remain separate. Export details now show the latest server state, and queued or
+running jobs can be cancelled from the Console. Local browser checks cover both
+states; the running worker was held at the local reader boundary and released
+after cancellation to confirm it leaves no partial download. Cancellation audits
+identify the administrator who cancelled the job, separately from its requester.
+Log outcome badges match complete status names, so revoked or incomplete records
+are not presented as successful.
 
 DNS Filtering saves now publish the new live policy only after the configured
 file save succeeds. A rejected save returns a retryable error and preserves the

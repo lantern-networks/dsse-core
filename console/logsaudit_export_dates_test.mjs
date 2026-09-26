@@ -75,5 +75,7 @@ test('export list refreshes and offers downloads only for completed jobs', async
   await c.laExports({appendChild:n=>children.push(n)});
   assert.equal(nodes.filter(n=>n.text==='Refresh').length,1);
   assert.equal(nodes.filter(n=>n.text==='Download').length,1);
-  assert.deepEqual(Array.from(children[1].rows,r=>r[2].kind),['off','off','off','off','ok']);
+  assert.equal(nodes.filter(n=>n.text==='Cancel').length,2);
+  assert.equal(nodes.filter(n=>n.text==='Details').length,5);
+  assert.deepEqual(Array.from(children[1].rows,r=>r[2].kind),['off','off','danger','off','ok']);
 });

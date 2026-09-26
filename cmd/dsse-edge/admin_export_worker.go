@@ -1549,10 +1549,21 @@ func adminExportJobAuditLog(eventType string, job adminExportJob, evaluator deci
 		tenantID = evaluator.PolicyBundle.TenantID
 		metadata["tenant_attribution"] = "the export job named no organization; filed under this node's"
 	}
+	// Cancellation is performed by the cancelling administrator, who may differ
+	// from the requester. Keep the requester separately for the audit trail.
+	actorID := strings.TrimSpace(job.CreatedByAdminPrincipalID)
+	metadata["created_by_admin_principal_id"] = job.CreatedByAdminPrincipalID
+	if eventType == "admin_export_cancelled" {
+		actorID = strings.TrimSpace(stringMetadata(job.Metadata, "cancelled_by_admin_principal_id"))
+	}
+	var actorUserID *string
+	if actorID != "" {
+		actorUserID = &actorID
+	}
 	return model.AuditLog{
 		ID:            randomEdgeID("audit_"+eventType+"_", time.Now().UTC()),
 		TenantID:      tenantID,
-		ActorUserID:   &job.CreatedByAdminPrincipalID,
+		ActorUserID:   actorUserID,
 		EventType:     eventType,
 		TargetType:    stringPtr("export_job"),
 		TargetID:      stringPtr(job.ID),

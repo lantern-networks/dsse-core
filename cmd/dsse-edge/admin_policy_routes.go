@@ -6,9 +6,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	assetcatalog "github.com/lantern-networks/dsse-core/assetcatalog"
@@ -19,14 +21,38 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
-	"github.com/lantern-networks/dsse-core/policy"
+	policystore "github.com/lantern-networks/dsse-core/policy"
 	policyrule "github.com/lantern-networks/dsse-core/policyrule"
 	"github.com/lantern-networks/dsse-core/vlan"
 )
 
-func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, edgeDNSPolicyStore *dnsPolicyStore, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string, error)) {
+func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policystore.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, edgeDNSPolicyStore *dnsPolicyStore, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string, error)) {
+	var mutationMu sync.Mutex
+	publishAndAudit := func(w http.ResponseWriter, r *http.Request, item model.Policy, operation string, now time.Time) bool {
+		snapshotStatus := "not_requested"
+		if networkExtensionPublisher != nil {
+			snapshotStatus = "published"
+			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
+			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), item.TenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
+				snapshotStatus = "unconfirmed"
+				logInfof("admin policy snapshot publication: %v", err)
+			}
+		}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyMutationAuditLog(r, item, evaluator, now, operation, snapshotStatus), now)
+		if snapshotStatus == "unconfirmed" {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":  "Policy change applied on this server; Network Extension snapshot publication is unconfirmed. Reload the policy state and check distribution before retrying.",
+				"status": "partial", "applied": true, "policy_id": item.ID, "tenant_id": item.TenantID, "ne_snapshot_status": snapshotStatus,
+			})
+			return false
+		}
+		return true
+	}
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		options := policy.ListOptions{
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+		options := policystore.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
 			Limit:  boundedIntQuery(r.URL.Query().Get("limit"), 100, 1, 1000),
 		}
@@ -218,7 +244,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// EVERY tenant's enforcement config, not just the puller's. The two fields above stay for an Edge that
 		// predates this section; a current Edge reads this one and applies each tenant it names, leaving any
 		// tenant it does NOT name alone — absence is not a instruction here either.
-		if concrete, ok := policyStore.(*policy.Store); ok && concrete != nil {
+		if concrete, ok := policyStore.(*policystore.Store); ok && concrete != nil {
 			for _, id := range concrete.Tenants() {
 				cfg := concrete.SnapshotTenantConfig(id)
 				bundle.TenantPolicies = append(bundle.TenantPolicies, tenantPolicySection{
@@ -401,6 +427,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		writeJSON(w, http.StatusOK, bundle)
 	}))
 	mux.HandleFunc("GET /admin/policies/{policy_id}", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		policy, found, err := policyStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"))
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -416,6 +446,8 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 	// "every rule/policy has an active/disabled toggle" of the unified policy model. Persisted (survives a
 	// restart even though the policy re-seeds from config); a disabled policy is skipped at decision time.
 	mux.HandleFunc("POST /admin/policies/{policy_id}/status", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		if configWriteRejectedWhenSourced(w, configSourceURL, "policy status") {
 			return
 		}
@@ -431,18 +463,30 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, fmt.Errorf("status must be active or disabled"))
 			return
 		}
-		concrete, ok := policyStore.(*policy.Store)
+		concrete, ok := policyStore.(*policystore.Store)
 		if !ok {
 			writeError(w, http.StatusConflict, fmt.Errorf("policy status toggle is not supported on this edge"))
 			return
 		}
-		if !concrete.SetPolicyStatus(adminTenantIDFromRequest(r), r.PathValue("policy_id"), status) {
+		found, err := concrete.SetPolicyStatusContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"), status)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+			return
+		}
+		if !found {
 			writeError(w, http.StatusNotFound, fmt.Errorf("policy %s not found", r.PathValue("policy_id")))
+			return
+		}
+		item, _, _ := policyStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"))
+		item.ID, item.TenantID, item.Status = r.PathValue("policy_id"), adminTenantIDFromRequest(r), status
+		if !publishAndAudit(w, r, item, "status", time.Now()) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"policy_id": r.PathValue("policy_id"), "status": status})
 	}))
 	mux.HandleFunc("POST /admin/policies", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		if configWriteRejectedWhenSourced(w, configSourceURL, "access policies") {
 			return
 		}
@@ -455,22 +499,23 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		created, err := policyStore.Upsert(r.Context(), policy, tenantID, now)
 		if err != nil {
+			if errors.Is(err, policystore.ErrPolicyPersistence) {
+				writeError(w, http.StatusInternalServerError, policystore.ErrPolicyPersistence)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if networkExtensionPublisher != nil {
-			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), tenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("publish network extension policy snapshot: %w", err))
-				return
-			}
+		if !publishAndAudit(w, r, created, "upsert", now) {
+			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyAuditLog(created, evaluator, now), now)
 		writeJSON(w, http.StatusOK, created)
 	}))
 	// The missing half of POST: an authored policy could be created and disabled but never removed, so a
 	// mistaken one sat in every listing forever with only a status override standing in for deletion.
 	mux.HandleFunc("DELETE /admin/policies/{policy_id}", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		mutationMu.Lock()
+		defer mutationMu.Unlock()
 		if configWriteRejectedWhenSourced(w, configSourceURL, "access policies") {
 			return
 		}
@@ -478,6 +523,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		removed, existed, err := policyStore.Delete(r.Context(), tenantID, r.PathValue("policy_id"))
 		if err != nil {
+			if errors.Is(err, policystore.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+				return
+			}
 			// A bundle-sourced policy: it exists, but this API is not where it lives.
 			writeError(w, http.StatusConflict, err)
 			return
@@ -486,15 +535,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusNotFound, fmt.Errorf("no admin-authored policy %s", r.PathValue("policy_id")))
 			return
 		}
-		if networkExtensionPublisher != nil {
-			runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-			if err := networkExtensionPublisher.PublishAdminPolicySnapshot(r.Context(), tenantID, policyStore, runtimeEvaluator.PolicyBundle, now); err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("publish network extension policy snapshot: %w", err))
-				return
-			}
+		if !publishAndAudit(w, r, removed, "delete", now) {
+			return
 		}
 		logInfof("admin_policy_deleted id=%q name=%q tenant=%q", removed.ID, removed.Name, tenantID)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyAuditLog(removed, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_policies.v1",
 			"deleted":        removed.ID,

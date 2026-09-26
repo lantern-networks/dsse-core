@@ -58,6 +58,10 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 		audit model.AuditLog
 	}{
 		{
+			name:  "adminPolicyMutationAuditLog",
+			audit: adminPolicyMutationAuditLog(httptest.NewRequest("POST", "/admin/policies", nil), model.Policy{ID: auditID, TenantID: "tenant_audit_cp0020", Name: rawSubject, Conditions: map[string]any{"purpose": rawMetadataValue}}, evaluator, now, "upsert", "unconfirmed"),
+		},
+		{
 			name: "adminPolicyAuditLog",
 			audit: adminPolicyAuditLog(model.Policy{
 				ID:         auditID,
@@ -594,6 +598,7 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 		"adminDelegatedAccessGrantAuditLog": true,
 		"adminEndpointInventoryAuditLog":    true,
 		"adminHumanApprovalEventAuditLog":   true,
+		"adminPolicyMutationAuditLog":       true,
 		"adminPolicyAuditLog":               true,
 		"adminPolicyCandidateAuditLog":      true,
 		"adminSiteAuditLog":                 true,

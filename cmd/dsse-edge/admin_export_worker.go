@@ -861,12 +861,14 @@ func (s *adminDownloadTokenStore) persistLocked(now time.Time) {
 }
 
 type adminExportJobRequest struct {
-	Stream  string            `json:"stream"`
-	Format  string            `json:"format"`
-	Filters map[string]string `json:"filters"`
-	From    string            `json:"from"`
-	To      string            `json:"to"`
-	Limit   int               `json:"limit"`
+	// Authenticated provenance; never accepted from JSON request fields.
+	operatorTenantID string
+	Stream           string            `json:"stream"`
+	Format           string            `json:"format"`
+	Filters          map[string]string `json:"filters"`
+	From             string            `json:"from"`
+	To               string            `json:"to"`
+	Limit            int               `json:"limit"`
 }
 
 type adminExportJobCancelRequest struct {
@@ -959,6 +961,9 @@ func newAdminExportJob(req adminExportJobRequest, tenantID, adminPrincipalID str
 		CreatedAt:                 now.UTC().Format(time.RFC3339),
 		ExpiresAt:                 now.UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339),
 		Metadata:                  map[string]any{"export_mode": "async_lab"},
+	}
+	if req.operatorTenantID != "" && req.operatorTenantID != tenantID {
+		stampOperatorActor(job.Metadata, adminIdentity{PrincipalID: adminPrincipalID, TenantID: req.operatorTenantID})
 	}
 	return job
 }
@@ -1437,7 +1442,7 @@ func adminExportWorkerTaskDocumentFromJob(job adminExportJob, req adminExportJob
 		limit = 1000000
 	}
 	traceID := fmt.Sprintf("trace_%s", job.ID)
-	return adminExportWorkerTaskDocument{
+	document := adminExportWorkerTaskDocument{
 		ID:                        "export_task_" + job.ID,
 		TenantID:                  job.TenantID,
 		ExportJobID:               job.ID,
@@ -1465,17 +1470,20 @@ func adminExportWorkerTaskDocumentFromJob(job adminExportJob, req adminExportJob
 			"worker_mode": "phase1_sync_boundary",
 			"export_mode": stringValue(job.Metadata["export_mode"]),
 		},
-	}, nil
+	}
+	copyExportOperatorActor(document.Metadata, job.Metadata)
+	return document, nil
 }
 
 func adminExportJobRequestFromWorkerTaskDocument(document adminExportWorkerTaskDocument) adminExportJobRequest {
 	return adminExportJobRequest{
-		Stream:  document.Stream,
-		Format:  document.Format,
-		Filters: copyStringMap(document.Filters),
-		From:    document.From,
-		To:      document.To,
-		Limit:   document.Limit,
+		operatorTenantID: stringMetadata(document.Metadata, "operator_tenant_id"),
+		Stream:           document.Stream,
+		Format:           document.Format,
+		Filters:          copyStringMap(document.Filters),
+		From:             document.From,
+		To:               document.To,
+		Limit:            document.Limit,
 	}
 }
 
@@ -1617,7 +1625,7 @@ func adminExportDeadLetterBridgeFailureAuditLog(item adminExportQueuedTask, dead
 func adminExportWorkerTaskAuditLog(task adminExportWorkerTaskDocument, evaluator decision.Evaluator, sourceIP string) model.AuditLog {
 	action := "export_worker_task"
 	result := "success"
-	return model.AuditLog{
+	record := model.AuditLog{
 		ID:            randomEdgeID("audit_admin_export_task_enqueued_", time.Now().UTC()),
 		TenantID:      task.TenantID,
 		ActorUserID:   &task.CreatedByAdminPrincipalID,
@@ -1647,6 +1655,8 @@ func adminExportWorkerTaskAuditLog(task adminExportWorkerTaskDocument, evaluator
 			"worker_task_status":         task.Status,
 		},
 	}
+	copyExportOperatorActor(record.Metadata, task.Metadata)
+	return record
 }
 
 // Export-job admin routes (create/list/detail/cancel/download-url). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
@@ -1660,6 +1670,9 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		if err := validateAdminExportJobRequest(req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
+		}
+		if identity, ok := adminIdentityFromRequest(r); ok {
+			req.operatorTenantID = identity.TenantID
 		}
 		job, err := adminExportWorker.Enqueue(r.Context(), adminExportTask{
 			Writer:           writer,
@@ -1717,7 +1730,7 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			return
 		}
 		identity, _ := adminIdentityFromRequest(r)
-		if !adminCanCancelExportJob(identity, job) {
+		if !adminCanCancelExportJob(identity, job) && !delegatedOperatorCanCancelExport(r, identity, job, config.TenantModelStore) {
 			audit := adminRBACDeniedAuditLog(identity, "admin.export.cancel.owned", evaluator, sourceIPFromRequest(r), r.UserAgent())
 			audit.Metadata["target_tenant_id"] = job.TenantID
 			audit.Metadata["export_job_id"] = job.ID
@@ -1731,7 +1744,7 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminExportJobAuditLog("admin_export_cancelled", cancelled, evaluator, sourceIPFromRequest(r)), time.Now())
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, exportCancellationAuditWithActor(r, adminExportJobAuditLog("admin_export_cancelled", cancelled, evaluator, sourceIPFromRequest(r))), time.Now())
 		writeJSON(w, http.StatusOK, cancelled)
 	}))
 	mux.HandleFunc("POST /admin/export-jobs/{job_id}/download-url", adminEndpoint("admin.export.read", func(w http.ResponseWriter, r *http.Request) {
@@ -1752,4 +1765,32 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDownloadAuditLog("admin_export_url_issued", token, evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())
 		writeJSON(w, http.StatusCreated, response)
 	}))
+}
+
+// Queue documents retain only opaque operator attribution across worker handoff.
+func copyExportOperatorActor(dst, src map[string]any) {
+	for _, key := range []string{"operator_principal_id", "operator_tenant_id"} {
+		if value := strings.TrimSpace(stringMetadata(src, key)); value != "" {
+			dst[key] = value
+		}
+	}
+}
+
+// Cancellation belongs to its authenticated caller, not the original requester.
+func exportCancellationAuditWithActor(r *http.Request, record model.AuditLog) model.AuditLog {
+	delete(record.Metadata, "operator_principal_id")
+	delete(record.Metadata, "operator_tenant_id")
+	if identity, ok := adminIdentityFromRequest(r); ok && identity.TenantID != "" && identity.TenantID != record.TenantID {
+		identity.PrincipalLabel = ""
+		stampOperatorActor(record.Metadata, identity)
+	}
+	return record
+}
+
+// The operator's home organization differs from the target by design. Require
+// the current customer delegation rather than weakening the same-tenant check.
+func delegatedOperatorCanCancelExport(r *http.Request, identity adminIdentity, job adminExportJob, tenants adminTenantModelRuntimeStore) bool {
+	verdict := operatorDelegationForRequest(r.Context(), r, identity, tenants, time.Now())
+	return verdict.Resolved && verdict.Delegated && verdict.Target == job.TenantID &&
+		(!verdict.NeedsElevation || verdict.Elevated) && operatorDelegationGrants("admin.export.cancel.all")
 }

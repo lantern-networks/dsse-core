@@ -97,7 +97,7 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 		}
 	}
 	var seed []model.Policy
-	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "connector" {
+	if mode := os.Getenv("DSSE_DISTRIBUTION_CP_MODE"); mode == "connector" || mode == "eastwest" {
 		seed = []model.Policy{{ID: "allow-wiki", TenantID: processDistributionTenant, Priority: 100, Conditions: map[string]any{"application_id": "wiki", "actor_type": "human"}, Action: model.PolicyAction{Decision: "allow"}, Status: "active"}}
 	}
 	cpPolicy := policy.NewStore(seed)

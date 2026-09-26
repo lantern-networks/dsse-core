@@ -209,6 +209,12 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))
 			return
 		}
+		if config.DLPDistribution != nil && config.DLPDistribution.allowlist != nil {
+			if err := config.DLPDistribution.allowlist.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("allowlist cannot be read"))
+				return
+			}
+		}
 		if err := connectorRouteGov.RefreshShared(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
 			return
@@ -220,6 +226,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// final generation and never poll the final mode. Refuse this snapshot so
 		// the poller retries with a coherent one.
 		policyGenerationBefore := policyStore.ConfigGeneration()
+		dlpGenerationBefore := config.DLPDistribution.Generation()
 		dnsGenerationBefore := edgeDNSResolver.ConfigGeneration()
 		tenantConfig := policyStore.SnapshotTenantConfig(tenantID)
 		applications, catalogGeneration, err := applicationState.read(r.Context(), config.ApplicationCatalogStore)
@@ -260,6 +267,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		if policyStore.ConfigGeneration() != policyGenerationBefore {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("policy configuration changed while preparing the bundle; retry"))
+			return
+		}
+		if config.DLPDistribution.Generation() != dlpGenerationBefore {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP configuration changed while preparing the bundle; retry"))
 			return
 		}
 		if edgeDNSResolver != nil {

@@ -375,9 +375,18 @@ counted in health data. Abrupt termination can lose unflushed observations, and
 the downstream spool also has retention limits. The receiver refuses a known
 standby; fencing a write across a leadership transition remains separate work.
 
-Upgrade note: the observation store reads legacy tenant maps as well as receipt-bearing
-rows. Once reports are stored, the receipt-bearing format is written; rollback to
-an older binary that cannot read it is not established by these checks.
+Upgrade requirement: upgrade **all control-plane processes that share the observation
+store together**, with report intake paused and every old writer stopped before any
+new process writes the store. Back up the observation store before upgrading. The
+new code reads legacy tenant maps, but the first saved report writes the v4 format
+with receipt records. Old control planes cannot read this format and can overwrite
+it, losing the inventory and receipts and counting retried reports twice. A rolling
+upgrade with mixed old and new writers is not supported. After v4 is written, do
+not restart an older binary against that store. Reverting requires stopping all
+writers and restoring the pre-upgrade backup; observations received since the
+backup are lost and pending Edge reports need operator reconciliation. This is not
+a transparent rollback. Resume report intake only after every shared-store writer
+runs the new version.
 
 ## Adopting observed flows (under review)
 
@@ -448,3 +457,25 @@ Upgrade note: older API clients could store exception statuses other than `activ
 Pending route-distribution reconciliation: shared route edits preserve other CPs' committed decisions. Administrative reads and bundle publication refresh that shared state. A committed complete empty snapshot carries organization-wide route deletion to updated Edges; legacy omitted or empty sections retain their previous behavior. Receiver persistence failure prevents acknowledgment of the bundle so it can be retried. HTTP, real PostgreSQL peer CRUD, save-failure/retry and file-restart checks cover this change; deployed traffic and release acceptance remain pending. Older Edge versions do not understand the complete-empty marker, so all receivers must be updated before relying on organization-wide empty-set propagation. Leader-transition transaction fencing remains outside this change.
 
 Pulling Edges use a node-local route cache even when another subsystem uses PostgreSQL. Configure `-connector-route-governance-store` with a per-node file path for restart persistence; an unset path uses an in-memory cache populated by the first pull. An explicit PostgreSQL route store is rejected for a pulling Edge to avoid writing received data back into CP authority. Control planes retain shared PostgreSQL route storage.
+
+### Inspection source compatibility
+
+TLS inspection cannot resolve user/group/agent identity before decrypting a
+connection. Inspect rules using these selectors, or an unresolved device source,
+therefore apply to every source for that tenant and destination. Device-resolvable
+inspect rules retain their device scope. Bypass rules never widen when a source
+cannot be resolved. Review identity-scoped inspect rules before updating: they
+may inspect additional users to preserve inspection instead of silently disabling
+DLP under bypass-default.
+
+### Named-service and save compatibility
+
+When an egress deny or authentication rule references a missing/invalid service,
+it now retains its authored source and destination restrictions across all ports,
+until the service is repaired. Unresolved allow rules continue to match nothing.
+This prevents deleting a named service from silently disabling an existing deny.
+
+A confirmed non-atomic rule save counts as saved. If file replacement completed
+but its final flush is unconfirmed, the rule store keeps the replacement live
+and returns a storage error requiring reconciliation; it does not roll back only
+the in-memory copy while leaving the new file on disk.

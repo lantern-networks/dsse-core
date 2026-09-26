@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -105,7 +107,11 @@ func refreshConnectorDiscoveredCandidates(ctx context.Context, registry connecto
 	for _, input := range inputs {
 		cand, err := store.ObserveConnectorDiscovered(ctx, tenantID, input.Destination, 0, input.PublishProtocol, input.ConnectorID, input.Site, input.Namespace, input.Evidence, now)
 		if err != nil {
-			return nil, fmt.Errorf("record connector discovery: %w", err)
+			if errors.Is(err, policycandidate.ErrPersistence) {
+				return nil, fmt.Errorf("record connector discovery: %w", err)
+			}
+			log.Printf("observe connector-discovered candidate: %v", err)
+			continue
 		}
 		out = append(out, cand)
 	}

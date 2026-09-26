@@ -375,9 +375,18 @@ counted in health data. Abrupt termination can lose unflushed observations, and
 the downstream spool also has retention limits. The receiver refuses a known
 standby; fencing a write across a leadership transition remains separate work.
 
-Upgrade note: the observation store reads legacy tenant maps as well as receipt-bearing
-rows. Once reports are stored, the receipt-bearing format is written; rollback to
-an older binary that cannot read it is not established by these checks.
+Upgrade requirement: upgrade **all control-plane processes that share the observation
+store together**, with report intake paused and every old writer stopped before any
+new process writes the store. Back up the observation store before upgrading. The
+new code reads legacy tenant maps, but the first saved report writes the v4 format
+with receipt records. Old control planes cannot read this format and can overwrite
+it, losing the inventory and receipts and counting retried reports twice. A rolling
+upgrade with mixed old and new writers is not supported. After v4 is written, do
+not restart an older binary against that store. Reverting requires stopping all
+writers and restoring the pre-upgrade backup; observations received since the
+backup are lost and pending Edge reports need operator reconciliation. This is not
+a transparent rollback. Resume report intake only after every shared-store writer
+runs the new version.
 
 ## Adopting observed flows (under review)
 
@@ -463,3 +472,25 @@ Shared PostgreSQL updates preserve other organizations and datasets, and reads/c
 Validation covers administrative CRUD, peer reads with PostgreSQL, read-only permissions, audit attribution, signed publication and received scanning, failed-save retry, and startup/reload. No new deployed-fleet or GUI acceptance is claimed. These changes depend on the preceding allowlist/distribution work and require review before integration.
 
 Compatibility: legacy dataset snapshots without a version continue to use the configured startup salt. Newly saved version-1 snapshots include the adopted salt; older binaries do not understand that salt contract, so rolling back a receiver with a different local salt is not supported without restoring its matching prior configuration. Invalid saved classifier or dataset snapshots stop startup with a generic error instead of silently dropping detection. Separate library files are not an atomic multi-file transaction; a failed update can leave partially written files, and must be retried before claiming completion. Policy-object persistence, leader-transition write fencing, and release deployment checks remain separate work.
+
+### Inspection source compatibility
+
+TLS inspection cannot resolve user/group/agent identity before decrypting a
+connection. Inspect rules using these selectors, or an unresolved device source,
+therefore apply to every source for that tenant and destination. Device-resolvable
+inspect rules retain their device scope. Bypass rules never widen when a source
+cannot be resolved. Review identity-scoped inspect rules before updating: they
+may inspect additional users to preserve inspection instead of silently disabling
+DLP under bypass-default.
+
+### Named-service and save compatibility
+
+When an egress deny or authentication rule references a missing/invalid service,
+it now retains its authored source and destination restrictions across all ports,
+until the service is repaired. Unresolved allow rules continue to match nothing.
+This prevents deleting a named service from silently disabling an existing deny.
+
+A confirmed non-atomic rule save counts as saved. If file replacement completed
+but its final flush is unconfirmed, the rule store keeps the replacement live
+and returns a storage error requiring reconciliation; it does not roll back only
+the in-memory copy while leaving the new file on disk.

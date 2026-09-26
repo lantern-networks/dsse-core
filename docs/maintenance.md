@@ -573,3 +573,23 @@ organization erasure. These storage changes precede the remaining administrative
 route and CP startup integration; they do not claim complete GUI acceptance.
 
 Seat-allocation storage must load successfully before startup completes. Missing first-boot storage remains valid, while malformed or empty existing files stop startup with a generic diagnostic and are preserved. Connector secret rotation accepts a confirmed in-place save and returns the new secret whose hash is stored; an unconfirmed save continues to fail.
+
+### Access authorization and network boundary persistence
+
+Grant and human-approval changes retain revocations during failed saves and
+reject incompatible replayed authorization. Shared updates operate on the
+current stored state, and checked erasure reports failures rather than removing
+retry targets. Human-approval admission counts nonterminal, unexpired records;
+revocation history remains present and cannot be replayed into an active grant.
+Terminal history can grow until organization erasure and is not bounded by the
+admission limit.
+
+Steering exclusions and named-network boundaries save candidates before
+publishing them and validate saved state. The organization erasure result
+includes named-network persistence failures. Administrative context/startup
+wiring remains a following migration unit. Back up authorization snapshots
+before upgrading: new human-approval records use organization/ID keys, while
+legacy bare-ID snapshots remain readable. Older writers must not overwrite the
+new format; rollback requires a compatible backup.
+
+Authorization request paths refresh shared grant and human-approval state at most once per five-second window; explicit administrative reads remain current. Grant-batch conflicts no longer prevent other correctly attributed revocations. Invalid legacy authorization rows are skipped with a generic warning during restore, preserving valid rows and the original file. VLAN and access-grant receive failures remain unacknowledged and retryable, and failed grant reports return an error. Human-approval lookups and revocations use organization-specific keys, including when two organizations use the same approval ID.

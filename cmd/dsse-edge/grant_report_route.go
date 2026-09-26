@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -37,7 +38,15 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 			writeError(w, http.StatusBadRequest, fmt.Errorf("grant-report: %w", err))
 			return
 		}
-		added, updated := grants.Merge(body.Grants, time.Now().UTC())
+		added, updated, err := grants.MergeCheckedContext(r.Context(), body.Grants, time.Now().UTC())
+		if err != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, grantstore.ErrConflict) || errors.Is(err, grantstore.ErrInvalidGrant) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, fmt.Errorf("grant-report could not confirm the update"))
+			return
+		}
 		if added > 0 {
 			log.Printf("grant_report_recorded added=%d updated=%d — the authority now holds them, so every "+
 				"Edge learns of them and a revocation reaches all of them", added, updated)

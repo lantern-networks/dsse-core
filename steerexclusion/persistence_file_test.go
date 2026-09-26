@@ -78,8 +78,7 @@ func TestFilePersistenceDeletePersists(t *testing.T) {
 	}
 }
 
-// TestFilePersistenceSaveFailureSurfacesViaOnPersistError proves a save failure does NOT fail the operation but
-// IS surfaced through OnPersistError, so a dropped snapshot is never silent.
+// A failed save reaches both the caller and the monitoring hook.
 func TestFilePersistenceSaveFailureSurfacesViaOnPersistError(t *testing.T) {
 	// A path under a directory that does not exist makes FilePersister.Save fail (the temp write cannot be
 	// created), while LoadAll on the same missing file is a clean empty start.
@@ -94,9 +93,12 @@ func TestFilePersistenceSaveFailureSurfacesViaOnPersistError(t *testing.T) {
 	if _, err := fp.LoadAll(context.Background()); err != nil {
 		t.Fatalf("LoadAll on missing file should be a clean empty start, got: %v", err)
 	}
-	// Upsert must succeed (not fail the operation) even though the save cannot land.
-	if err := fp.Upsert(context.Background(), &Policy{ID: "sx_1", TenantID: "t1"}); err != nil {
-		t.Fatalf("Upsert should not fail the operation on a save error, got: %v", err)
+	// Neither the operation nor its backend cache may claim success.
+	if err := fp.Upsert(context.Background(), &Policy{ID: "sx_1", TenantID: "t1"}); err == nil {
+		t.Fatal("Upsert must return the save error")
+	}
+	if len(fp.byID) != 0 {
+		t.Fatal("failed save changed backend cache")
 	}
 	if gotErr == nil {
 		t.Fatalf("expected save failure to surface via OnPersistError, got nil")

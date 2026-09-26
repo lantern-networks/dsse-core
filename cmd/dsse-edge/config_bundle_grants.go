@@ -38,5 +38,13 @@ func applyGrantBundleSection(store *grantstore.Store, section *grantBundle, now 
 	if store == nil || section == nil || !section.Complete {
 		return 0, 0
 	}
-	return store.Merge(section.Grants, now)
+	a, u, _ := applyGrantBundleSectionChecked(store, section, now)
+	return a, u
+}
+
+func applyGrantBundleSectionChecked(store *grantstore.Store, section *grantBundle, now time.Time) (int, int, error) {
+	if store == nil || section == nil || !section.Complete {
+		return 0, 0, nil
+	}
+	return store.MergeChecked(section.Grants, now)
 }

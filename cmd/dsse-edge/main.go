@@ -7439,7 +7439,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		event, ok := humanApprovals.Get(r.PathValue("approval_id"))
+		event, ok := humanApprovals.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("approval_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
@@ -9847,7 +9847,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if approvalID == "" {
 		return denyRuntimeEvidence(dec, "Human Approval Event is required for this delegated agent access.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
-	approval, ok := humanApprovals.Get(approvalID)
+	approval, ok := humanApprovals.GetForAuthorization(dec.TenantID, approvalID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Human Approval Event was not found.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
@@ -10403,7 +10403,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.HumanApprovalEventID != nil && *event.HumanApprovalEventID != "" {
-		approval, ok := humanApprovals.Get(*event.HumanApprovalEventID)
+		approval, ok := humanApprovals.GetForAuthorization(event.TenantID, *event.HumanApprovalEventID)
 		if !ok {
 			return fmt.Errorf("human approval event %s is absent", *event.HumanApprovalEventID)
 		}

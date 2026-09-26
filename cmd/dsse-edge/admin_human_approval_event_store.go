@@ -124,7 +124,7 @@ func adminGetHumanApprovalEvent(s *humanapproval.Store, _ context.Context, tenan
 		return adminHumanApprovalEvent{}, false, fmt.Errorf("approval_id cannot contain slash")
 	}
 
-	approval, ok := s.Get(approvalID)
+	approval, ok := s.GetForTenant(tenantID, approvalID)
 	if !ok || approval.TenantID != tenantID {
 		return adminHumanApprovalEvent{}, false, nil
 	}
@@ -160,12 +160,12 @@ func adminRevokeHumanApprovalEvent(s *humanapproval.Store, _ context.Context, te
 		return adminHumanApprovalEvent{}, false, fmt.Errorf("reason_code is invalid")
 	}
 
-	approval, ok := s.Get(approvalID)
+	approval, ok := s.GetForTenant(tenantID, approvalID)
 	if !ok || approval.TenantID != tenantID {
 		return adminHumanApprovalEvent{}, false, nil
 	}
 	if approval.ApprovalResult != "revoked" {
-		revoked, _, err := s.Revoke(approvalID, reasonCode)
+		revoked, _, err := s.RevokeForTenantContext(context.Background(), tenantID, approvalID, reasonCode)
 		if err != nil {
 			// Revoked in memory but not on disk: the approval would resurrect on restart. Surface it —
 			// the admin must know this revoke is not durable.

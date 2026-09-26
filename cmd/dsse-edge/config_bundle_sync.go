@@ -864,9 +864,13 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			// possible, and it is only possible here.
 			log.Printf("config-bundle sync: control plane reports its VLAN boundary set is COMPLETE and empty — clearing %d object(s) and %d policy/policies.",
 				len(t.vlan.ListObjects()), len(t.vlan.ListPolicies()))
-			t.vlan.ReplaceAll(nil, nil)
+			if err := t.vlan.ReplaceAll(nil, nil); err != nil {
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("VLAN configuration: %w", err))
+			}
 		default:
-			t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies)
+			if err := t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies); err != nil {
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("VLAN configuration: %w", err))
+			}
 		}
 	}
 	if payload.Connectors != nil && t.connectors != nil {
@@ -1014,7 +1018,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// What the fleet has already approved out of band, so a flow held on a node that did not run the
 	// ceremony is released by the grant that ceremony earned.
 	if payload.Grants != nil {
-		if added, updated := applyGrantBundleSection(theGrantStore.Load(), payload.Grants, time.Now().UTC()); added > 0 || updated > 0 {
+		if added, updated, err := applyGrantBundleSectionChecked(theGrantStore.Load(), payload.Grants, time.Now().UTC()); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grant configuration: %w", err))
+		} else if added > 0 || updated > 0 {
 			log.Printf("config_bundle_grants added=%d updated=%d", added, updated)
 		}
 	}

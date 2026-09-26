@@ -23,14 +23,15 @@ func TestEgressBypassFQDNs(t *testing.T) {
 		"ep-mac":  nil, // a steered device — no address
 	}
 	rules := []Rule{
-		// An active egress bypass rule -> contributes its destination addresses.
-		{ID: "r1", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{"ep-mac"}, Destination: []string{"ep-saas", "grp-cdn"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
+		// An active Any-source bypass rule contributes tenant-wide destinations.
+		// Device-only and unresolved sources are covered by inspection_source_scope_test.go.
+		{ID: "r1", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{"*"}, Destination: []string{"ep-saas", "grp-cdn"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
 		// An egress rule that inspects (not bypass) -> excluded.
-		{ID: "r2", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{"ep-mac"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionInspect}},
+		{ID: "r2", TenantID: "acme", Plane: PlaneEgress, Status: StatusActive, Source: []string{"*"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionInspect}},
 		// A disabled bypass rule -> excluded.
-		{ID: "r3", TenantID: "acme", Plane: PlaneEgress, Status: StatusDisabled, Source: []string{"ep-mac"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
+		{ID: "r3", TenantID: "acme", Plane: PlaneEgress, Status: StatusDisabled, Source: []string{"*"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
 		// An east-west rule -> excluded (egress-only).
-		{ID: "r4", TenantID: "acme", Plane: PlaneEastWest, Direction: DirectionOutbound, Status: StatusActive, Source: []string{"ep-mac"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
+		{ID: "r4", TenantID: "acme", Plane: PlaneEastWest, Direction: DirectionOutbound, Status: StatusActive, Source: []string{"*"}, Destination: []string{"ep-saas"}, Action: Action{Access: AccessAllow, Inspection: InspectionBypass}},
 	}
 	got := EgressBypassFQDNs("acme", rules, resolver)
 	want := []string{"app.example.com", "cdn1.example.net", "cdn2.example.net"}

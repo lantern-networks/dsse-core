@@ -25,16 +25,17 @@ const systemBypassFloorPriority = 900000
 // cert-pin approval queue. Each entry is tagged by Kind and carries the capability flags the Console needs to
 // render the right control (edit a rule, toggle a policy, toggle the known-bypass floor, or info-only).
 type effectiveEgressRuleEntry struct {
-	Kind        string `json:"kind"` // authored | builtin_default | known_bypass | optimize_bypass | cert_pin_bypass
-	ID          string `json:"id"`
-	Name        string `json:"name,omitempty"`
-	Priority    int    `json:"priority"`
-	SourceText  string `json:"source_text"`      // display: "Any" or the resolved subject aliases
-	DestText    string `json:"destination_text"` // display: aliases, a group name, or a host/pattern
-	ServiceText string `json:"service_text"`     // "HTTPS"
-	Access      string `json:"access"`           // allow | deny | authenticate
-	Inspection  string `json:"inspection"`       // inspect | bypass
-	Status      string `json:"status"`           // active | disabled | off
+	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
+	Kind                    string `json:"kind"` // authored | builtin_default | known_bypass | optimize_bypass | cert_pin_bypass
+	ID                      string `json:"id"`
+	Name                    string `json:"name,omitempty"`
+	Priority                int    `json:"priority"`
+	SourceText              string `json:"source_text"`      // display: "Any" or the resolved subject aliases
+	DestText                string `json:"destination_text"` // display: aliases, a group name, or a host/pattern
+	ServiceText             string `json:"service_text"`     // "HTTPS"
+	Access                  string `json:"access"`           // allow | deny | authenticate
+	Inspection              string `json:"inspection"`       // inspect | bypass
+	Status                  string `json:"status"`           // active | disabled | off
 
 	Editable    bool             `json:"editable"`               // an authored rule the editor can open
 	Deletable   bool             `json:"deletable"`              // an authored rule that can be removed
@@ -63,15 +64,16 @@ type effectiveEgressRuleListResponse struct {
 
 // effectiveEgressInputs is everything the builder needs, gathered by the edge (which owns every surface).
 type effectiveEgressInputs struct {
-	Eval            decision.Evaluator
-	Tenant          string
-	AuthoredRules   []policyrule.Rule
-	AliasByID       map[string]string                    // asset-catalog id -> alias, for authored source/destination display
-	KnownGroups     []knownbypass.Group                  // the OS/cert known-bypass floor
-	KnownEnabled    bool                                 // the known-bypass master toggle
-	EffectiveBypass []string                             // engine's live raw-forward set, to mark a known group active
-	OptimizeLegacy  []inspectionposture.AuthDecryptGroup // SaaS Optimize groups still selected via posture.bypass_groups (pre-B-1)
-	CertPinBypasses []certPinBypassRef                   // admin-approved (materialized) cert-pin bypasses (host + candidate id)
+	InspectionSourceWarnings map[string]string
+	Eval                     decision.Evaluator
+	Tenant                   string
+	AuthoredRules            []policyrule.Rule
+	AliasByID                map[string]string                    // asset-catalog id -> alias, for authored source/destination display
+	KnownGroups              []knownbypass.Group                  // the OS/cert known-bypass floor
+	KnownEnabled             bool                                 // the known-bypass master toggle
+	EffectiveBypass          []string                             // engine's live raw-forward set, to mark a known group active
+	OptimizeLegacy           []inspectionposture.AuthDecryptGroup // SaaS Optimize groups still selected via posture.bypass_groups (pre-B-1)
+	CertPinBypasses          []certPinBypassRef                   // admin-approved (materialized) cert-pin bypasses (host + candidate id)
 	// AuthoredBypassHosts is the resolved destination set of authored bypass rules (EgressBypassFQDNs). A cert-pin
 	// host that now has an authored bypass rule (Phase C) is shown once — as that rule — not also as a derived
 	// cert_pin_bypass row, so the unified view does not double-list it.
@@ -129,7 +131,8 @@ func buildEffectiveEgressRules(in effectiveEgressInputs) effectiveEgressRuleList
 			SourceText: subjectText(r.Source, in.AliasByID), DestText: subjectText(r.Destination, in.AliasByID),
 			ServiceText: svc, Access: r.Action.Access, Inspection: r.Action.Inspection, Status: r.Status,
 			Editable: true, Deletable: true, ToggleKind: "rule", Rule: &rule,
-			DestinationUnresolved: in.UnresolvedRuleIDs[r.ID],
+			DestinationUnresolved:   in.UnresolvedRuleIDs[r.ID],
+			InspectionSourceWarning: in.InspectionSourceWarnings[r.ID],
 		})
 	}
 

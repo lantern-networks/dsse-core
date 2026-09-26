@@ -65,7 +65,7 @@ func TestCertPinProductionStartupKeepsAuthoredIntent(t *testing.T) {
 						t.Errorf("candidate history became an active row: %+v", row)
 					}
 				}
-				for _, name := range []string{"active", "disabled", "inspect", "deleted", "legacy", "partial"} {
+				for _, name := range []string{"active", "disabled", "inspect", "deleted", "legacy", "partial", "foreign"} {
 					var result effectivePolicyResponse
 					certPinStartupGet(t, base, "/admin/effective-policy?destination="+name+".startup.example", &result)
 					want := "inspect"
@@ -112,8 +112,11 @@ func seedCertPinStartup(t *testing.T, dir string) {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"active", "disabled", "inspect", "deleted", "legacy", "partial"} {
+	for _, name := range []string{"active", "disabled", "inspect", "deleted", "legacy", "partial", "foreign"} {
 		owner := "startup-own"
+		if name == "foreign" {
+			owner = "startup-other"
+		}
 		c, e := candidates.AddManualCertPinBypass(context.Background(), owner, name+".startup.example", time.Now())
 		if e != nil {
 			t.Fatal(e)

@@ -1,65 +1,139 @@
 package policyrule
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
-// AddressResolver resolves subject ids (endpoints or groups) to the FQDN/IP addresses of the network
-// endpoints they denote. The asset catalog implements this; it lets the rule layer stay address-agnostic
-// while compilation maps authored rules down to host-keyed enforcement primitives.
+// AddressResolver resolves catalog subject IDs to destination addresses.
 type AddressResolver interface {
 	EndpointAddresses(tenant string, ids []string) []string
 }
 
-// EgressBypassFQDNs compiles the authored egress rules into the set of destination FQDNs/IPs that must be
-// raw-forwarded (TLS-bypassed). Only ACTIVE egress rules whose inspection axis is bypass contribute, and
-// only their destinations that resolve to a network endpoint address. Bypass is inherently destination-
-// keyed (the interception engine bypasses a host regardless of source), so this compilation is lossless —
-// unlike access (allow/deny/authenticate), which is identity/source-scoped and compiled separately.
-//
-// The caller unions the result with other bypass sources (materialized cert-pin candidates, static bypass)
-// and applies the whole set with Engine.SetBypassHosts (a full replace), so recomputing from scratch on
-// every rule change is correct and needs no reconciliation.
-func EgressBypassFQDNs(tenant string, rules []Rule, resolver AddressResolver) []string {
-	set := map[string]bool{}
-	for _, r := range rules {
-		if r.Plane != PlaneEgress || r.Status != StatusActive || r.Action.Inspection != InspectionBypass {
-			continue
-		}
-		for _, addr := range resolver.EndpointAddresses(tenant, r.Destination) {
-			set[addr] = true
-		}
-	}
-	out := make([]string, 0, len(set))
-	for a := range set {
-		out = append(out, a)
-	}
-	sort.Strings(out)
-	return out
+// InspectionHostSelection preserves device restrictions separately from the
+// host patterns applying to any source. Empty/unresolved sources are not Any.
+// Risk and authored-rule precedence are not evaluated by this projection.
+type InspectionHostSelection struct {
+	AnySource []string
+	ByDevice  map[string][]string
 }
 
-// EgressInspectFQDNs compiles the authored egress rules into the set of destination FQDNs/IPs that must be
-// DECRYPTED (TLS-inspected). Only ACTIVE egress rules whose inspection axis is inspect and whose access is not
-// deny contribute (a denied flow is blocked, never decrypted), and only destinations that resolve to a network
-// endpoint address. This is the inspect counterpart of EgressBypassFQDNs: under the bypass-default posture the
-// intercept set is an explicit allowlist, so an authored `inspect` rule is how an operator says "decrypt these"
-// in the unified model — the caller unions the result into the engine's intercept set under bypass-default.
-// Under decrypt-all the intercept set is already "*", so this is a no-op there and need not be applied.
-func EgressInspectFQDNs(tenant string, rules []Rule, resolver AddressResolver) []string {
-	set := map[string]bool{}
+// EgressInspectionHosts projects one inspection axis into TLS/443 selectors.
+// Device identities come from the tenant's catalog, never a user/agent selector
+// or the endpoint's self-reported OS username. Identity-only rules cannot be
+// applied at this pre-TLS layer; they contribute no device or shared host entry.
+func EgressInspectionHosts(tenant string, rules []Rule, resolver AddressResolver, inspection string) InspectionHostSelection {
+	all := map[string]bool{}
+	devices := map[string]map[string]bool{}
+	if inspection != InspectionInspect && inspection != InspectionBypass {
+		return InspectionHostSelection{AnySource: []string{}}
+	}
 	for _, r := range rules {
-		if r.Plane != PlaneEgress || r.Status != StatusActive {
+		if (r.TenantID != "" && r.TenantID != tenant) || r.Plane != PlaneEgress || r.Status != StatusActive || r.Action.Inspection != inspection || r.Action.Access == AccessDeny || !inspectionServiceApplies(tenant, r.ServiceID, resolver) {
 			continue
 		}
-		if r.Action.Inspection != InspectionInspect || r.Action.Access == AccessDeny {
+		hosts := resolver.EndpointAddresses(tenant, r.Destination)
+		if IsAnySubject(r.Source) {
+			for _, host := range hosts {
+				all[host] = true
+			}
 			continue
 		}
-		for _, addr := range resolver.EndpointAddresses(tenant, r.Destination) {
-			set[addr] = true
+		source, ok := resolver.(interface {
+			SourceDeviceTokens(tenant string, ids []string) []string
+		})
+		if !ok {
+			continue
+		}
+		var ids []string
+		for _, id := range r.Source {
+			// Reserved identity namespaces are never looked up as device catalog IDs.
+			if id != strings.TrimSpace(id) || id == "" || strings.HasPrefix(id, IdentityGroupPrefix) || strings.HasPrefix(id, IdentityUserPrefix) || strings.HasPrefix(id, AgentPrefix) {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		for _, device := range source.SourceDeviceTokens(tenant, ids) {
+			if device == "" || device != strings.TrimSpace(device) {
+				continue
+			}
+			if devices[device] == nil {
+				devices[device] = map[string]bool{}
+			}
+			for _, host := range hosts {
+				devices[device][host] = true
+			}
 		}
 	}
-	out := make([]string, 0, len(set))
-	for a := range set {
-		out = append(out, a)
+	sorted := func(set map[string]bool) []string {
+		out := make([]string, 0, len(set))
+		for value := range set {
+			out = append(out, value)
+		}
+		sort.Strings(out)
+		return out
 	}
-	sort.Strings(out)
-	return out
+	result := InspectionHostSelection{AnySource: sorted(all)}
+	for device, set := range devices {
+		if len(set) == 0 {
+			continue
+		}
+		if result.ByDevice == nil {
+			result.ByDevice = map[string][]string{}
+		}
+		result.ByDevice[device] = sorted(set)
+	}
+	return result
+}
+
+// EgressBypassFQDNs returns only bypass hosts applying to any source. Device
+// exceptions must be applied separately using EgressInspectionHosts.ByDevice.
+func EgressBypassFQDNs(tenant string, rules []Rule, resolver AddressResolver) []string {
+	return EgressInspectionHosts(tenant, rules, resolver, InspectionBypass).AnySource
+}
+
+// EgressInspectFQDNs returns only inspect hosts applying to any source. Under
+// bypass-default, device-specific inspect hosts must remain scoped to that device.
+func EgressInspectFQDNs(tenant string, rules []Rule, resolver AddressResolver) []string {
+	return EgressInspectionHosts(tenant, rules, resolver, InspectionInspect).AnySource
+}
+
+// InspectionSourceWarning explains source selectors that cannot be represented
+// by the TLS device selector. It does not change the access-policy compilation.
+func InspectionSourceWarning(tenant string, rule Rule, resolver AddressResolver) string {
+	if rule.Plane != PlaneEgress || IsAnySubject(rule.Source) || rule.Action.Access == AccessDeny {
+		return ""
+	}
+	for _, id := range rule.Source {
+		id = strings.TrimSpace(id)
+		if strings.HasPrefix(id, IdentityGroupPrefix) || strings.HasPrefix(id, IdentityUserPrefix) || strings.HasPrefix(id, AgentPrefix) {
+			return "identity_context_unavailable"
+		}
+	}
+	if source, ok := resolver.(interface {
+		SourceDeviceTokens(string, []string) []string
+	}); ok {
+		for _, device := range source.SourceDeviceTokens(tenant, rule.Source) {
+			if device != "" && device == strings.TrimSpace(device) {
+				return ""
+			}
+		}
+	}
+	return "no_resolved_device"
+}
+
+// The transparent TLS engine handles TCP/443. An SSH or UDP/443 rule must not
+// change whether that traffic is decrypted. Empty service means Any; a named
+// service requires positive resolution, never a fallback to HTTPS.
+func inspectionServiceApplies(tenant, serviceID string, resolver AddressResolver) bool {
+	if serviceID == "" {
+		return true
+	}
+	transport, ok := resolver.(interface {
+		ServiceIncludesTransport(tenant, serviceID, protocol string, port int) bool
+	})
+	return ok && transport.ServiceIncludesTransport(tenant, serviceID, "tcp", 443)
 }

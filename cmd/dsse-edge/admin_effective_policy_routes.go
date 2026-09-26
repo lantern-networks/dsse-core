@@ -306,7 +306,8 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode posture request: %w", err))
 			return
 		}
-		next := config.InspectionPosture()
+		before := config.InspectionPosture()
+		next := before
 		if body.Mode != nil {
 			next.Mode = strings.TrimSpace(*body.Mode)
 		}
@@ -326,7 +327,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("mode must be %q or %q", inspectionposture.ModeDecryptAll, inspectionposture.ModeBypassDefault))
 			return
 		}
-		if _, err := inspectionposture.Validate(next); err != nil {
+		if _, err := inspectionposture.ValidateEdit(before, next); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

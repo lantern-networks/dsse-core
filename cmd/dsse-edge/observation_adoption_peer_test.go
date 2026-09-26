@@ -57,3 +57,19 @@ func TestPostgresObservationAdoptionRefreshesPeerRules(t *testing.T) {
 		t.Fatalf("missing rules showed stale coverage: %d %s", w.Code, w.Body)
 	}
 }
+
+func TestObservationReadsDoNotPublishUnchangedConfig(t *testing.T) {
+	policies := policy.NewStore(nil)
+	h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: newAdminAuthStore(), PolicyStore: policies, RuleStore: policyrule.NewStore(), AssetStore: assetcatalog.NewStore(), EastWestObserveStore: eastwestobserve.NewStore()})
+	before := policies.ConfigGeneration()
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, httptest.NewRequest("GET", "/admin/east-west/observations", nil))
+		if w.Code != 200 {
+			t.Fatalf("read failed: %d", w.Code)
+		}
+	}
+	if got := policies.ConfigGeneration(); got != before {
+		t.Fatalf("read republished unchanged config: %d -> %d", before, got)
+	}
+}

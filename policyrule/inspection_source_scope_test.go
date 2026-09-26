@@ -44,10 +44,10 @@ func TestInspectionSourcesPreserveDeviceSelectors(t *testing.T) {
 				r := Rule{ID: "r", TenantID: "a", Plane: PlaneEgress, Status: StatusActive, Source: tc.source, Destination: []string{"target"}, Action: Action{Access: AccessAllow, Inspection: axis}}
 				got := EgressInspectionHosts("a", []Rule{r}, a, axis)
 				want := InspectionHostSelection{AnySource: []string{}}
-				if tc.all {
+				if tc.all || axis == InspectionInspect && tc.warning != "" {
 					want.AnySource = []string{"a.invalid"}
 				}
-				if len(tc.devices) > 0 {
+				if len(tc.devices) > 0 && !(axis == InspectionInspect && tc.warning != "") {
 					want.ByDevice = map[string][]string{}
 					for _, d := range tc.devices {
 						want.ByDevice[d] = []string{"a.invalid"}

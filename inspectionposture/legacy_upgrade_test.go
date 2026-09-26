@@ -1,6 +1,7 @@
 package inspectionposture
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -31,5 +32,26 @@ func TestLegacyHostPatternsSurviveUpgrade(t *testing.T) {
 				t.Fatal("new invalid management input accepted")
 			}
 		})
+	}
+}
+
+func TestLegacyHostAllowsUnrelatedModeEdit(t *testing.T) {
+	s := NewStore()
+	p := DefaultPosture()
+	p.DecryptAllowlistHosts = []string{"legacy_host"}
+	if _, err := s.SetReceived(p); err != nil {
+		t.Fatal(err)
+	}
+	next := s.Get()
+	next.Mode = ModeBypassDefault
+	if _, _, err := s.UpdateContext(context.Background(), func(Posture) (Posture, error) { return next, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if s.Get().DecryptAllowlistHosts[0] != "legacy_host" {
+		t.Fatal("legacy host was lost")
+	}
+	next.DecryptAllowlistHosts = append(next.DecryptAllowlistHosts, "new_invalid")
+	if _, err := s.Set(next); err == nil {
+		t.Fatal("new invalid host accepted")
 	}
 }

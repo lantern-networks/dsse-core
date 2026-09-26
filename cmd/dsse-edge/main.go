@@ -6262,7 +6262,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerSteerAgentUpdateArtifactRoute(mux, config)
 	registerSteerAgentUpdatePlanRoutes(mux, config, agentUpdatePlanTenant{id: evaluator.PolicyBundle.TenantID})
 	registerVLANRoutes(mux, adminEndpoint, vlanBoundary, configSourceURL)
-	registerSWGTenantRestrictionRoutes(mux, adminEndpoint, evaluator, writer, policyStore, swgRuntime, config.CPVersions, configSourceURL)
+	registerSWGTenantRestrictionRoutes(mux, adminEndpoint, evaluator, writer, policyStore, swgRuntime, config.CPVersions, configSourceURL, adminAuditOutbox)
 	registerRiskServerInitiatedRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, configSourceURL)
 	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL)
 	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride)

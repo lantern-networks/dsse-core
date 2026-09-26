@@ -536,3 +536,5 @@ Enrollment inventory and token changes gain checked persistence and shared
 transaction helpers. Seat allocation removal reports storage failure during
 organization erasure. These storage changes precede the remaining administrative
 route and CP startup integration; they do not claim complete GUI acceptance.
+
+Seat-allocation storage must load successfully before startup completes. Missing first-boot storage remains valid, while malformed or empty existing files stop startup with a generic diagnostic and are preserved. Connector secret rotation accepts a confirmed in-place save and returns the new secret whose hash is stored; an unconfirmed save continues to fail.

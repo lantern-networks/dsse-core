@@ -556,3 +556,20 @@ operators must retry or reconcile storage before treating the edit as durable.
 Older saved and signed inspection posture patterns remain readable during upgrades; newly edited administrative input uses strict validation. Retired catalog-feed signing keys no longer prevent startup: untrusted historical entries are excluded from rollback, and a current feed signed only by a retired key falls back to the built-in catalog with a warning. The original saved file is preserved for operator review. Previously valid signed payloads retain their original restore compatibility; new submissions still use strict validation.
 
 Unchanged legacy host patterns do not block mode or known-bypass edits; newly added host patterns are validated. Rotate catalog signing keys under a new key ID. Reusing an existing key ID with different key material is rejected by saved-feed signature verification.
+
+### Identity and enrollment storage reconciliation
+
+Manual identity creation can reject an existing identity instead of overwriting
+it. Identity registration and connector credential rotation return save failures
+without publishing the rejected change. Non-human identities with the same ID
+in different organizations are stored separately. Existing bare-ID snapshots
+are read using each record's organization; new snapshots use organization/ID
+keys. Back up this state before upgrading; do not let older writers rewrite the
+new snapshot or assume a transparent binary rollback.
+
+Enrollment inventory and token changes gain checked persistence and shared
+transaction helpers. Seat allocation removal reports storage failure during
+organization erasure. These storage changes precede the remaining administrative
+route and CP startup integration; they do not claim complete GUI acceptance.
+
+Seat-allocation storage must load successfully before startup completes. Missing first-boot storage remains valid, while malformed or empty existing files stop startup with a generic diagnostic and are preserved. Connector secret rotation accepts a confirmed in-place save and returns the new secret whose hash is stored; an unconfirmed save continues to fail.

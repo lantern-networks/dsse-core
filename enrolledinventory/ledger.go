@@ -155,6 +155,8 @@ type Ledger struct {
 	// persistBlocked latches a failed LOAD: this process has not seen what is in the store, so it must not
 	// write over it. Cleared only by a successful load.
 	persistBlocked error
+	// A known snapshot may not later disappear and masquerade as first boot.
+	snapshotKnown bool
 }
 
 func NewLedger() *Ledger {
@@ -648,6 +650,11 @@ func (l *Ledger) EnrollDeviceForTenantWithMachine(id, tenantID, group, note, now
 // this ledger's own facts and a report must not move a machine between fleets. Only the claim step is
 // skipped, because it was taken by the node that issued the certificate this report is about.
 func (l *Ledger) RecordEnrolmentDecidedElsewhere(id, tenantID, group, note, now string) (Entry, error) {
+	return l.recordEnrolmentReport(id, tenantID, group, note, "", now)
+}
+
+// Persist the issued marker and first machine binding as one inventory update.
+func (l *Ledger) recordEnrolmentReport(id, tenantID, group, note, machineRef, now string) (Entry, error) {
 	k := NormalizeIdentity(id)
 	if k == "" {
 		return Entry{}, fmt.Errorf("identity is required")
@@ -666,6 +673,9 @@ func (l *Ledger) RecordEnrolmentDecidedElsewhere(id, tenantID, group, note, now 
 	entry, err := l.enrollGroupMutateLocked(k, tenantID, group, note, now, false, false, func(e *Entry) {
 		e.DeviceEnrolledAt = now
 		e.DeviceEnrolledNonce = e.ReenrolmentNonce
+		if NormalizeMachineRef(e.MachineRef) == "" {
+			e.MachineRef = NormalizeMachineRef(machineRef)
+		}
 	})
 	if err != nil {
 		return Entry{}, err
@@ -678,7 +688,7 @@ func (l *Ledger) RecordEnrolmentDecidedElsewhere(id, tenantID, group, note, now 
 		} else {
 			delete(l.entries, k)
 		}
-		return Entry{}, fmt.Errorf("the enrolment could not be recorded durably: %w", perr)
+		return Entry{}, ErrInventorySave
 	}
 	return entry, nil
 }
@@ -718,11 +728,9 @@ func (l *Ledger) EnrollGroupForTenant(id, claimant, assignTo, group, note, now s
 			return Entry{}, ErrIdentityOwnedByAnotherTenant
 		}
 	}
-	entry, err := l.enrollGroupLocked(k, assignTo, group, note, now, true)
-	if err != nil {
-		return Entry{}, err
-	}
-	return entry, nil
+	// A nonempty entry with an error identifies an applied local mutation whose
+	// persistence was not confirmed. Keep it available to the caller's audit.
+	return l.enrollGroupLocked(k, assignTo, group, note, now, true)
 }
 
 // AllowReenrolment is the administrator's decision that a device may enrol again.
@@ -1070,6 +1078,10 @@ func (l *Ledger) SetEnabled(id string, enabled bool, now string) (Entry, bool) {
 // setEnabled is the write, returning WHY it refused rather than leaving that on the receiver for somebody to
 // read later under a different lock.
 func (l *Ledger) setEnabled(id string, enabled bool, now string) (Entry, bool, error) {
+	return l.setEnabledForTenant(id, "", enabled, now)
+}
+
+func (l *Ledger) setEnabledForTenant(id, tenant string, enabled bool, now string) (Entry, bool, error) {
 	k := NormalizeIdentity(id)
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -1077,7 +1089,7 @@ func (l *Ledger) setEnabled(id string, enabled bool, now string) (Entry, bool, e
 	// ★ A TOMBSTONE IS NOT A DEVICE TO RE-ENABLE. Removal is deliberate, and the way back is enrolling again
 	// — which is its own decision, with its own credential and its own record. Letting "enable" resurrect a
 	// removal would make the tombstone a suggestion.
-	if !ok || e.isTombstone() {
+	if !ok || e.isTombstone() || (strings.TrimSpace(tenant) != "" && !strings.EqualFold(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenant))) {
 		return Entry{}, false, nil
 	}
 	before := e
@@ -1119,14 +1131,23 @@ func (l *Ledger) SetEnabledChecked(id string, enabled bool, now string) (Entry, 
 	}
 }
 
-// Remove deletes an identity from the ledger entirely.
+// Remove retains a removal tombstone. Use RemoveChecked to distinguish an
+// absent identity from an unconfirmed save.
 func (l *Ledger) Remove(id, now string) bool {
+	_, err := l.RemoveChecked(id, now)
+	return err == nil
+}
+
+// RemoveChecked saves a removal and expired-tombstone cleanup together. On a
+// save error it retains the complete prior local state and returns the prior
+// entry; the backend may still have written an unconfirmed candidate.
+func (l *Ledger) RemoveChecked(id, now string) (Entry, error) {
 	k := NormalizeIdentity(id)
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	removed, ok := l.entries[k]
 	if !ok || removed.isTombstone() {
-		return false
+		return Entry{}, ErrIdentityNotFound
 	}
 	// ★★★ THE ENTRY STAYS AS A TOMBSTONE. Deleting it made the removal unenforceable on every other node —
 	// see Entry.RemovedAt. Enabled goes false in the same write, so every reader that already asks "is this
@@ -1141,19 +1162,19 @@ func (l *Ledger) Remove(id, now string) bool {
 		// not a device, and keeping its description would put a removed machine's details in the one place
 		// that outlives it.
 	}
+	previous := l.entries
+	l.entries = make(map[string]Entry, len(previous))
+	for key, entry := range previous {
+		l.entries[key] = entry
+	}
 	l.entries[k] = tomb
 	l.purgeExpiredTombstonesLocked(now)
-	l.generation.Add(1) // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	// ★ REMOVING A DEVICE IS A REVOCATION, SO ITS WRITE IS THE DECISION (2026-08-13, twenty-eighth review).
-	// persistLocked discards the save error, so an operator removing a compromised machine got success in
-	// memory and in the API while the durable store still held it — and the next restart put it back. The
-	// checked seam already existed in this file for SetEnabled and enrolment; this call site was not on it.
 	if perr := l.persistCheckedLocked(); perr != nil {
-		l.entries[k] = removed
-		l.generation.Add(1)
-		return false
+		l.entries = previous
+		return removed, perr
 	}
-	return true
+	l.generation.Add(1)
+	return tomb, nil
 }
 
 // tombstoneLifetime is how long a removal is carried before the entry is dropped for good.
@@ -1199,9 +1220,15 @@ func (l *Ledger) purgeExpiredTombstonesLocked(now string) {
 // devices. Release is best-effort by construction (an unreleased claim is safe and inconvenient, the other way
 // round is not), so a failure is logged with the identity in it rather than swallowed.
 func (l *Ledger) RemoveTenant(tenantID string) []string {
+	removed, _ := l.RemoveTenantChecked(tenantID)
+	return removed
+}
+
+// RemoveTenantChecked reports an unconfirmed save separately from an empty tenant.
+func (l *Ledger) RemoveTenantChecked(tenantID string) ([]string, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
-		return nil
+		return nil, nil
 	}
 	l.mu.Lock()
 	removed := map[string]Entry{}
@@ -1212,23 +1239,22 @@ func (l *Ledger) RemoveTenant(tenantID string) []string {
 	}
 	if len(removed) == 0 {
 		l.mu.Unlock()
-		return nil
+		return nil, nil
 	}
 	for k := range removed {
 		delete(l.entries, k)
 	}
-	l.generation.Add(1) // distributed via the config bundle: advance so Edges re-pull
 	if perr := l.persistCheckedLocked(); perr != nil {
 		// Same rule as Remove: a de-admission that only happened in memory comes back on the next restart, so
 		// it did not happen at all. Put them back and report nothing removed.
 		for k, entry := range removed {
 			l.entries[k] = entry
 		}
-		l.generation.Add(1)
 		l.mu.Unlock()
 		log.Printf("enrolled_inventory: removing tenant %q was NOT durable (%v) — nothing was removed", tenantID, perr)
-		return nil
+		return nil, fmt.Errorf("tenant identity erasure saving could not be confirmed")
 	}
+	l.generation.Add(1) // publish the confirmed erasure to config consumers
 	claimer := l.claimer
 	l.mu.Unlock()
 
@@ -1248,7 +1274,7 @@ func (l *Ledger) RemoveTenant(tenantID string) []string {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 // ReplaceAll atomically replaces the WHOLE ledger with the given entries (Phase 1 config distribution: a

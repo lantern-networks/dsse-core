@@ -443,3 +443,6 @@ protocol cannot be represented by the current Windows export. Disable or correct
 such a record before enabling it; no automatic broadening of its rules is made.
 
 Upgrade note: older API clients could store exception statuses other than `active` or `disabled` (for example `inactive`). Review and correct those records before upgrading; the current export rejects an unknown status instead of silently skipping it. Old Console-created records used the supported default status.
+
+
+Pending route-distribution reconciliation: shared route edits preserve other CPs' committed decisions. Administrative reads and bundle publication refresh that shared state. A committed complete empty snapshot carries organization-wide route deletion to updated Edges; legacy omitted or empty sections retain their previous behavior. Receiver persistence failure prevents acknowledgment of the bundle so it can be retried. HTTP, real PostgreSQL peer CRUD, save-failure/retry and file-restart checks cover this change; deployed traffic and release acceptance remain pending. Older Edge versions do not understand the complete-empty marker, so all receivers must be updated before relying on organization-wide empty-set propagation. Leader-transition transaction fencing remains outside this change.

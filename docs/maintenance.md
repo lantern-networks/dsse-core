@@ -521,3 +521,5 @@ This change supplies storage primitives. CP startup wiring and administrative
 refresh/context integration are tracked separately; it does not claim complete
 fleet acceptance. An unconfirmed final flush is still reported as a failure;
 operators must retry or reconcile storage before treating the edit as durable.
+
+Older saved and signed inspection posture patterns remain readable during upgrades; newly edited administrative input uses strict validation. Retired catalog-feed signing keys no longer prevent startup: untrusted historical entries are excluded from rollback, and a current feed signed only by a retired key falls back to the built-in catalog with a warning. The original saved file is preserved for operator review. Previously valid signed payloads retain their original restore compatibility; new submissions still use strict validation.

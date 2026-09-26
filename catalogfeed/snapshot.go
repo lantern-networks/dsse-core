@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -27,13 +28,15 @@ func (s *Store) decodeSnapshot(data []byte) (snapshot, error) {
 		}
 		return snap, nil
 	}
-	if len(snap.History) == 0 || s.validateApplied(*snap.Current) != nil {
+	if len(snap.History) == 0 {
 		return snapshot{}, ErrInvalidSnapshot
 	}
-	for _, af := range snap.History {
-		if s.validateApplied(af) != nil {
-			return snapshot{}, ErrInvalidSnapshot
-		}
+	if snap.Current.SigningKeyID != "" && snap.Current.SigningKeyID == snap.Current.Envelope.SigningKeyID && len(s.trustedKeys[snap.Current.SigningKeyID]) == 0 {
+		log.Printf("catalog_feed_restore current_signer_retired=true source=builtin review_required=true")
+		return snapshot{}, nil
+	}
+	if s.validateApplied(*snap.Current) != nil {
+		return snapshot{}, ErrInvalidSnapshot
 	}
 	// Every successful Apply/Rollback appends the exact current record. Repeated
 	// catalog versions are legitimate after explicit rollback and re-application.
@@ -42,6 +45,18 @@ func (s *Store) decodeSnapshot(data []byte) (snapshot, error) {
 	if !bytes.Equal(current, last) {
 		return snapshot{}, ErrInvalidSnapshot
 	}
+	kept := make([]AppliedFeed, 0, len(snap.History))
+	for _, af := range snap.History {
+		if af.SigningKeyID != "" && af.SigningKeyID == af.Envelope.SigningKeyID && len(s.trustedKeys[af.SigningKeyID]) == 0 {
+			log.Printf("catalog_feed_restore retired_history_skipped=true")
+			continue
+		}
+		if s.validateApplied(af) != nil {
+			return snapshot{}, ErrInvalidSnapshot
+		}
+		kept = append(kept, af)
+	}
+	snap.History = kept
 	return snap, nil
 }
 
@@ -58,7 +73,7 @@ func (s *Store) validateApplied(af AppliedFeed) error {
 			when = expires
 		}
 	}
-	doc, err := s.validateEnvelope(af.Envelope, when)
+	doc, err := s.validateEnvelopeData(af.Envelope, when, false)
 	if err != nil {
 		return ErrInvalidSnapshot
 	}
@@ -74,6 +89,9 @@ func (s *Store) validateApplied(af AppliedFeed) error {
 }
 
 func (s *Store) validateEnvelope(env signedconfig.Envelope, now time.Time) (knownbypass.CatalogDocument, error) {
+	return s.validateEnvelopeData(env, now, true)
+}
+func (s *Store) validateEnvelopeData(env signedconfig.Envelope, now time.Time, strict bool) (knownbypass.CatalogDocument, error) {
 	if err := signedconfig.Validate(env, FeedType, now, s.trustedKeys); err != nil {
 		return knownbypass.CatalogDocument{}, err
 	}
@@ -83,12 +101,18 @@ func (s *Store) validateEnvelope(env signedconfig.Envelope, now time.Time) (know
 		}
 	}
 	var doc knownbypass.CatalogDocument
-	if err := feedJSON(env.Payload, &doc); err != nil || doc.Version <= 0 || len(doc.Entries) == 0 {
+	var decodeErr error
+	if strict {
+		decodeErr = feedJSON(env.Payload, &doc)
+	} else {
+		decodeErr = json.Unmarshal(env.Payload, &doc)
+	}
+	if decodeErr != nil || (strict && doc.Version <= 0) || len(doc.Entries) == 0 {
 		return knownbypass.CatalogDocument{}, errors.New("invalid feed catalog document")
 	}
 	ids := map[string]bool{}
 	for _, entry := range doc.Entries {
-		if entry.ID == "" || strings.TrimSpace(entry.ID) != entry.ID || ids[entry.ID] {
+		if strings.TrimSpace(entry.ID) == "" || (strict && (strings.TrimSpace(entry.ID) != entry.ID || ids[entry.ID])) {
 			return knownbypass.CatalogDocument{}, errors.New("invalid or duplicate feed catalog entry id")
 		}
 		ids[entry.ID] = true

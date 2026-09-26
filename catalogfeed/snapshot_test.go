@@ -149,8 +149,8 @@ func TestFeedSnapshotRestoresTrustedStaleHistory(t *testing.T) {
 	if _, e := restored.Apply(first, now); e == nil {
 		t.Fatal("expired new apply accepted")
 	}
-	// Removing trust from even a historical signer rejects the complete snapshot.
-	for _, keys := range []map[string]ed25519.PublicKey{nil, {key: bytes.Repeat([]byte{1}, ed25519.PublicKeySize)}} {
+	// A retained signer with an invalid signature still rejects corrupted state.
+	for _, keys := range []map[string]ed25519.PublicKey{{key: bytes.Repeat([]byte{1}, ed25519.PublicKeySize)}} {
 		untrusted := NewStore(keys)
 		if e := untrusted.SetStatePath(path); !errors.Is(e, ErrInvalidSnapshot) {
 			t.Fatal("untrusted restore", e)
@@ -158,6 +158,10 @@ func TestFeedSnapshotRestoresTrustedStaleHistory(t *testing.T) {
 		if untrusted.Status(now).Source != "builtin" || untrusted.statePath != "" {
 			t.Fatal("untrusted data adopted")
 		}
+	}
+	retired := NewStore(nil)
+	if err := retired.SetStatePath(path); err != nil || retired.statePath != path || retired.Status(now).Source != "builtin" {
+		t.Fatalf("retired current signer fallback: %v", err)
 	}
 	// The original formatted snapshot itself remains loadable, including signed numeric metadata.
 	original := filepath.Join(t.TempDir(), "original.json")

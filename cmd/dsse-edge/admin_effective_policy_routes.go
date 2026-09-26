@@ -326,6 +326,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("mode must be %q or %q", inspectionposture.ModeDecryptAll, inspectionposture.ModeBypassDefault))
 			return
 		}
+		if _, err := inspectionposture.Validate(next); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
 		if _, err := config.SetInspectionPosture(next, adminTenantIDFromRequest(r)); err != nil {
 			writeError(w, http.StatusInternalServerError, err) // applied in memory but not persisted — would revert on restart
 			return

@@ -76,7 +76,7 @@ func TestPostureSnapshotsDoNotAliasEnforcement(t *testing.T) {
 	}
 }
 func TestPostureBadLoadPreservesStateAndOriginalWriter(t *testing.T) {
-	for _, raw := range []string{"", "null", "{}", `{"mode":"bogus","known_bypass_enabled":true}`, `{"mode":"decrypt_all","known_bypass_enabled":null}`, `{"mode":"decrypt_all","known_bypass_enabled":false,"decrypt_allowlist_groups":["missing"]}`, `{"mode":"bypass_default","known_bypass_enabled":true,"decrypt_allowlist_hosts":["https://wiki.invalid/a"]}`} {
+	for _, raw := range []string{"", "null", "{}", `{"mode":"bogus","known_bypass_enabled":true}`, `{"mode":"decrypt_all","known_bypass_enabled":null}`} {
 		t.Run(fmt.Sprintf("length-%d", len(raw)), func(t *testing.T) {
 			s := NewStore()
 			original := &faultPosturePersistence{}

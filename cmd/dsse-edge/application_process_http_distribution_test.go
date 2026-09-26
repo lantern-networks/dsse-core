@@ -20,7 +20,9 @@ import (
 	"github.com/lantern-networks/dsse-core/appcatalog"
 	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/connector"
+	"github.com/lantern-networks/dsse-core/edgeplane"
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
 	"github.com/lantern-networks/dsse-core/policyrule"
 	_ "github.com/lib/pq"
@@ -124,7 +126,7 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	}
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
-	want := []string{"admin_application_published", "admin_application_unpublished"}
+	want := []string{"admin_application_published", "admin_application_upserted", "admin_application_upserted", "admin_application_upserted", "admin_application_unpublished", "admin_application_published", "admin_application_deleted"}
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "assets" {
 		want = []string{
 			"admin_asset_catalog_changed",                                                               // endpoint create
@@ -156,6 +158,13 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 				audit.Action == nil || *audit.Action != "POST" || audit.Result == nil || *audit.Result != "success" ||
 				audit.Metadata["status_code"] != 200 {
 				t.Fatalf("CP east-west audit %d = %+v", i, audit)
+			}
+		}
+	}
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "" {
+		for _, audit := range audits {
+			if audit.TenantID != processDistributionTenant || audit.ActorUserID == nil || *audit.ActorUserID != "operator" || audit.Result == nil || *audit.Result != "success" {
+				t.Fatalf("application audit=%+v", audit)
 			}
 		}
 	}
@@ -241,7 +250,7 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(),
 		ApplicationCatalogStore: edgeApps, AssetStore: edgeAssets, ConfigSourceURL: ready.URL}))
 	defer edge.Close()
-	request := func(method, base, path, body string) []byte {
+	request := func(method, base, path, body string, expected ...int) []byte {
 		t.Helper()
 		req, err := http.NewRequest(method, base+path, strings.NewReader(body))
 		if err != nil {
@@ -257,7 +266,11 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		}
 		defer resp.Body.Close()
 		raw, err := io.ReadAll(resp.Body)
-		if err != nil || resp.StatusCode != http.StatusOK {
+		want := http.StatusOK
+		if len(expected) > 0 {
+			want = expected[0]
+		}
+		if err != nil || resp.StatusCode != want {
 			t.Fatalf("%s %s: status=%d read=%v body=%s", method, path, resp.StatusCode, err, raw)
 		}
 		return raw
@@ -272,7 +285,11 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 	done := make(chan struct{})
 	go func() { defer close(done); source.run(pollCtx, targets) }()
 	defer func() { stopPoll(); <-done }()
-	check := func(published bool) {
+	edgeRegistry := connector.NewRegistry()
+	if _, err := edgeRegistry.Register(model.ConnectorRegistration{ID: "conn-test", TenantID: processDistributionTenant, ConnectorGroupID: "site", PrivateBaseURL: "http://connector.invalid", Status: "registered"}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	check := func(published bool, appStatus, name string, exists bool) {
 		t.Helper()
 		bundle, err := source.fetch(ctx)
 		if err != nil || !bundle.signatureVerified {
@@ -301,16 +318,43 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		if found != published {
 			t.Fatalf("Edge HTTP destination present=%v, want %v", found, published)
 		}
+		if !exists {
+			request(http.MethodGet, edge.URL, "/admin/applications/wiki", "", http.StatusNotFound)
+			for _, where := range []string{"cp-apps.json", "edge-apps.json"} {
+				_, found, err := processDistributionApps(t, filepath.Join(dir, where)).Get(ctx, processDistributionTenant, "wiki")
+				if err != nil || found {
+					t.Fatalf("deleted app in %s: found=%v err=%v", where, found, err)
+				}
+			}
+			if _, found := edgeplane.RouteProfilesWithPublishedCatalog(nil, edgeApps, processDistributionTenant)["wiki"]; found {
+				t.Fatal("deleted application route remains")
+			}
+			return
+		}
 		var app appcatalog.Entry
 		if err := json.Unmarshal(request(http.MethodGet, edge.URL, "/admin/applications/wiki", ""), &app); err != nil {
 			t.Fatal(err)
 		}
-		if app.Published != published {
+		if app.Published != published || app.Status != appStatus || app.Name != name {
 			t.Fatalf("Edge HTTP published=%v, want %v", app.Published, published)
 		}
 		reloadedApp, foundApp, err := processDistributionApps(t, filepath.Join(dir, "edge-apps.json")).Get(ctx, processDistributionTenant, "wiki")
-		if err != nil || !foundApp || reloadedApp.Published != published {
+		if err != nil || !foundApp || reloadedApp.Published != published || reloadedApp.Status != appStatus || reloadedApp.Name != name {
 			t.Fatalf("Edge saved application: found=%v published=%v err=%v", foundApp, reloadedApp.Published, err)
+		}
+		cpSaved, cpFound, err := processDistributionApps(t, filepath.Join(dir, "cp-apps.json")).Get(ctx, processDistributionTenant, "wiki")
+		if err != nil || !cpFound || cpSaved.Status != appStatus || cpSaved.Name != name || cpSaved.Published != published {
+			t.Fatalf("CP saved app=%+v found=%v err=%v", cpSaved, cpFound, err)
+		}
+		_, routed := edgeplane.RouteProfilesWithPublishedCatalog(nil, edgeApps, processDistributionTenant)["wiki"]
+		if routed != (published && appStatus == "active") {
+			t.Fatalf("status=%s published=%v route=%v", appStatus, published, routed)
+		}
+		for _, query := range []string{"", "?connector_id=conn-test"} {
+			_, selected, err := connectorForApplication(ctx, httptest.NewRequest("GET", "/apps/wiki"+query, nil), edgeRegistry, edgeApps, processDistributionTenant, "wiki")
+			if err != nil || selected != (published && appStatus == "active") {
+				t.Fatalf("connector after status=%s: %v %v", appStatus, selected, err)
+			}
 		}
 		_, saved := processDistributionAssets(t, edgeAssetPath).GetEndpoint(processDistributionTenant, "app-wiki")
 		if saved != published {
@@ -328,10 +372,28 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		}
 	}
 	path := "/admin/applications/wiki"
-	request(http.MethodPost, ready.URL, path+"/publish", `{"name":"Wiki","destination":"wiki.example.test","destination_port":443,"publish_protocol":"web"}`)
-	check(true)
+	request(http.MethodPost, ready.URL, path+"/publish", `{"name":"Wiki","destination":"wiki.example.test","destination_port":443,"publish_protocol":"web","connector_group_id":"site"}`)
+	check(true, "active", "Wiki", true)
+	edit := func(name, status string) {
+		var entry appcatalog.Entry
+		if err := json.Unmarshal(request(http.MethodGet, ready.URL, path, ""), &entry); err != nil {
+			t.Fatal(err)
+		}
+		entry.Name = name
+		entry.Status = status
+		raw, _ := json.Marshal(entry)
+		request(http.MethodPost, ready.URL, "/admin/applications", string(raw))
+		check(true, status, name, true)
+	}
+	edit("Renamed Wiki", "active")
+	edit("Renamed Wiki", "disabled")
+	edit("Renamed Wiki", "active")
 	request(http.MethodPost, ready.URL, path+"/unpublish", "")
-	check(false)
+	check(false, "active", "Renamed Wiki", true)
+	request(http.MethodPost, ready.URL, path+"/publish", `{"name":"Renamed Wiki","destination":"wiki.example.test","destination_port":443,"publish_protocol":"web","connector_group_id":"site"}`)
+	check(true, "active", "Renamed Wiki", true)
+	request(http.MethodDelete, ready.URL, path, "")
+	check(false, "", "", false)
 	stopPoll()
 	<-done
 	if err := os.WriteFile(filepath.Join(dir, "stop"), []byte("done"), 0o600); err != nil {

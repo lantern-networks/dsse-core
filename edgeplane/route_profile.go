@@ -183,7 +183,12 @@ func RouteProfilesWithPublishedCatalog(base map[string]ApplicationRouteProfile, 
 		return base
 	}
 	overlay := map[string]ApplicationRouteProfile{}
+	disabled := map[string]bool{}
 	for _, entry := range result.Applications {
+		if entry.Status == "disabled" {
+			disabled[entry.ApplicationID] = true
+			continue
+		}
 		if !entry.Published {
 			continue
 		}
@@ -193,7 +198,7 @@ func RouteProfilesWithPublishedCatalog(base map[string]ApplicationRouteProfile, 
 		}
 		overlay[entry.ApplicationID] = profile
 	}
-	if len(overlay) == 0 {
+	if len(overlay) == 0 && len(disabled) == 0 {
 		return base
 	}
 	merged := make(map[string]ApplicationRouteProfile, len(base)+len(overlay))
@@ -202,6 +207,9 @@ func RouteProfilesWithPublishedCatalog(base map[string]ApplicationRouteProfile, 
 	}
 	for id, profile := range overlay {
 		merged[id] = profile // published overlay wins; file route stays the fallback for un-published apps
+	}
+	for id := range disabled {
+		delete(merged, id)
 	}
 	return merged
 }

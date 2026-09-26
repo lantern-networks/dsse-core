@@ -34,6 +34,16 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Disabled applications are now excluded from Connector selection, including an
+explicit Connector ID, and from effective published routes. Re-enabling an
+application restores its retained publication settings. Regression tests cover
+ordinary name changes, disabling, re-enabling, withdrawal, republication and
+deletion through a separate control-plane process and an Edge signed-config
+poller, with administrative readback, file reload and audit checks. Local browser
+checks cover disabling and re-enabling, saved settings and audit attribution;
+the disabled application URL returns 404. This does not establish live Connector
+traffic, existing-session termination, PostgreSQL or deployed-fleet acceptance.
+
 Application creation, editing, publication, withdrawal and deletion now record
 the authenticated administrator in their domain audits, including partial saves
 and operator actions in another organization. Session credentials and directory

@@ -8894,7 +8894,7 @@ func publishedWebAppRoute(ctx context.Context, catalog appcatalog.RuntimeStore, 
 		return false
 	}
 	entry, found, err := catalog.Get(ctx, strings.TrimSpace(tenantID), strings.TrimSpace(applicationID))
-	if err != nil || !found || !entry.Published {
+	if err != nil || !found || !entry.Published || entry.Status == "disabled" {
 		return false
 	}
 	if strings.TrimSpace(entry.Destination) == "" {
@@ -8920,7 +8920,7 @@ func publishedConnectorGroupForApplication(ctx context.Context, catalog appcatal
 		return ""
 	}
 	entry, found, err := catalog.Get(ctx, tenantID, applicationID)
-	if err != nil || !found || !entry.Published {
+	if err != nil || !found || !entry.Published || entry.Status == "disabled" {
 		return ""
 	}
 	return strings.TrimSpace(entry.ConnectorGroupID)

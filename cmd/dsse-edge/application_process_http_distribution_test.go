@@ -21,6 +21,7 @@ import (
 	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
 	"github.com/lantern-networks/dsse-core/policyrule"
 	_ "github.com/lib/pq"
@@ -33,7 +34,7 @@ func processDistributionAuth() *adminAuthStore {
 	auth := newAdminAuthStore()
 	auth.UpsertPrincipal(adminPrincipal{ID: "operator", TenantID: processDistributionTenant, Roles: []string{"admin"}, Status: "active"})
 	auth.UpsertAPIToken(adminAPIToken{ID: "operator", TenantID: processDistributionTenant, TokenHash: adminTokenHash(processDistributionToken),
-		Roles: []string{"admin"}, Scopes: []string{"admin.policy.read", "admin.policy.write", "admin.applications.read", "admin.applications.write", "admin.endpoints.read", "admin.endpoints.write", "admin.eastwest.read", "admin.eastwest.write"},
+		Roles: []string{"admin"}, Scopes: []string{"admin.policy.read", "admin.policy.write", "admin.applications.read", "admin.applications.write", "admin.endpoints.read", "admin.endpoints.write", "admin.eastwest.read", "admin.eastwest.write", "admin.swg.read", "admin.swg.write"},
 		CreatedByAdminPrincipalID: "operator", Status: "active", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
 	return auth
 }
@@ -97,6 +98,20 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	if err := cpPolicy.SetRuntimeStatePath(filepath.Join(dir, "cp-policy.json")); err != nil {
 		t.Fatal(err)
 	}
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "saas" {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "swghttprewrite", "testdata", "swg_saas_tenant_enforcement_preflight.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var fixture struct{ Policies []model.Policy }
+		if err := json.Unmarshal(raw, &fixture); err != nil {
+			t.Fatal(err)
+		}
+		pol := fixture.Policies[0]
+		pol.TenantID = processDistributionTenant
+		pol.Conditions = map[string]any{"service_family": "https"}
+		cpPolicy.ReplaceTenant(processDistributionTenant, []model.Policy{pol}, time.Now())
+	}
 	cp := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(),
 		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(),
 		ApplicationCatalogStore: processDistributionApps(t, filepath.Join(dir, "cp-apps.json")),
@@ -135,6 +150,17 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 	}
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "eastwest" {
 		want = []string{"admin_config_change", "admin_config_change", "admin_config_change", "admin_config_change", "admin_config_change", "admin_config_change"}
+	}
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "saas" {
+		if len(outbox.wrapperAudits) != 16 {
+			t.Fatalf("SaaS audit count=%d", len(outbox.wrapperAudits))
+		}
+		for _, a := range outbox.wrapperAudits {
+			if a.TenantID != processDistributionTenant || a.ActorUserID == nil || *a.ActorUserID != "operator" || a.TargetID == nil || *a.TargetID != "/admin/swg/tenant-restriction" || a.Result == nil || *a.Result != "success" {
+				t.Fatalf("SaaS audit mismatch: %+v", a)
+			}
+		}
+		return
 	}
 	audits := outbox.insertedAudits
 	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "eastwest" {

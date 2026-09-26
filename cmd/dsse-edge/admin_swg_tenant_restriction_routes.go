@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -75,6 +76,10 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 				return
 			}
 			if err := store.SaveTenantRestriction(tenant, req.Provider, req.TenantRestrictionPatch); err != nil {
+				if errors.Is(err, policy.ErrPolicyPersistence) {
+					writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
+					return
+				}
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}

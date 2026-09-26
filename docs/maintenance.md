@@ -34,6 +34,8 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+- SaaS tenant restriction saves distinguish unavailable storage (503) from invalid input (400), without returning storage details. Failed saves keep the previous setting; retry after recovery persists the edit. A local browser exercised failure and retry with audit checks. Separate CP/Edge process tests cover four providers through create, edit, disable and re-enable, signed polling and local HTTPS header capture. External provider sign-in and deployed TLS interception remain release checks.
+
 DNS Filtering saves now publish the new live policy only after the configured
 file save succeeds. A rejected save returns a retryable error and preserves the
 previous policy. Explicitly removing the last DNS rule now reaches upgraded

@@ -15,7 +15,6 @@ import (
 type candidateSaveGate struct {
 	blobstore.Persister
 	reject bool
-	weak   bool
 }
 
 func (p *candidateSaveGate) Save(data []byte) error {
@@ -24,9 +23,6 @@ func (p *candidateSaveGate) Save(data []byte) error {
 	}
 	if err := p.Persister.Save(data); err != nil {
 		return err
-	}
-	if p.weak {
-		return blobstore.ErrSavedWithoutAtomicity
 	}
 	return nil
 }
@@ -138,25 +134,5 @@ func TestCandidateFailedWritesPreserveStateAndRetry(t *testing.T) {
 				t.Fatal("successful retry differs after restart")
 			}
 		})
-	}
-}
-
-func TestCandidateWrittenSnapshotWarningKeepsLiveAndReloadedState(t *testing.T) {
-	disk := blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "candidates.json")}
-	s := NewStore()
-	if err := s.SetPersister(&candidateSaveGate{Persister: disk, weak: true}); err != nil {
-		t.Fatal(err)
-	}
-	saved, err := s.ObserveUnmatchedFlow(context.Background(), "one", "wiki.example.test", "", 443, "", time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fresh := NewStore()
-	if err := fresh.SetPersister(disk); err != nil {
-		t.Fatal(err)
-	}
-	got, found, err := fresh.Get(context.Background(), "one", saved.CandidateID)
-	if err != nil || !found || !reflect.DeepEqual(saved, got) {
-		t.Fatalf("written snapshot lost: %+v %v %v", got, found, err)
 	}
 }

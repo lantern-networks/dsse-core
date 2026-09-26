@@ -58,7 +58,7 @@ func TestCarriedDeletionSaveFailureDoesNotEraseOrAcknowledge(t *testing.T) {
 	}
 }
 
-func TestTenantBundleUpsertFailurePreservesErasure(t *testing.T) {
+func TestTenantBundleUpsertFailureAllowsOtherTenantErasure(t *testing.T) {
 	targets, dir := purgeTargetsForTest(t, "tenant_edge")
 	path := filepath.Join(t.TempDir(), "tenants.json")
 	tenants := newDurableAdminTenantModelStore(model.PolicyBundle{TenantID: "tenant_stays"}, time.Now(), path)
@@ -75,11 +75,11 @@ func TestTenantBundleUpsertFailurePreservesErasure(t *testing.T) {
 	if _, err := (configBundleSource{}).apply(payload, targets); err == nil {
 		t.Fatal("failed upsert accepted")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "tenants", logs.SafeTenantSegment("tenant_gone"))); err != nil {
-		t.Fatal("upsert failure erased logs")
+	if _, err := os.Stat(filepath.Join(dir, "tenants", logs.SafeTenantSegment("tenant_gone"))); !os.IsNotExist(err) {
+		t.Fatal("unrelated upsert failure blocked erasure")
 	}
-	if !targets.enrolled.IsAdmitted("device-gone") || len(targets.erasureOrders.list()) != 0 {
-		t.Fatal("upsert failure erased or remembered")
+	if targets.enrolled.IsAdmitted("device-gone") || len(targets.erasureOrders.list()) != 1 {
+		t.Fatal("safe tenant erasure was not applied and remembered")
 	}
 }
 

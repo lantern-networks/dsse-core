@@ -91,7 +91,7 @@ func TestOverrideStoreSetClearListAndDurability(t *testing.T) {
 		t.Fatalf("override must survive restart: %+v", got)
 	}
 	// Clear restores the default.
-	if !s.Clear("acme", "apple_account_id") {
+	if cleared, err := s.Clear("acme", "apple_account_id"); err != nil || !cleared {
 		t.Fatal("clear should report an existing override")
 	}
 	if len(s.List("acme")) != 0 {

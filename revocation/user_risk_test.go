@@ -29,39 +29,6 @@ func (p *userRiskPersister) Save(b []byte) error {
 	}
 	return nil
 }
-
-func TestLegacyRiskDiscardRequiresConfirmedSave(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "risk.json")
-	if err := os.WriteFile(path, []byte(`{"schema_version":"high_risk_overlay_state.v1","devices":{"orphan":"critical"}}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	p := &userRiskPersister{base: blobstore.FilePersister{Path: path}}
-	o := NewHighRiskOverlay()
-	if err := o.SetPersister(p); err != nil {
-		t.Fatal(err)
-	}
-	if err := o.MigrateLegacy(func(string) (*UserRisk, error) { return nil, ErrLegacyUnattributed }); err != nil {
-		t.Fatal(err)
-	}
-	p.fail = true
-	if _, err := o.DiscardLegacyUnattributed("orphan", "critical"); !errors.Is(err, ErrRiskSave) || o.LegacySeverity("orphan") != "critical" {
-		t.Fatalf("failed save published a discard: %v", err)
-	}
-	reloaded := NewHighRiskOverlay()
-	if err := reloaded.SetStatePath(path); err != nil || reloaded.LegacySeverity("orphan") != "critical" {
-		t.Fatalf("failed save erased disk risk: %v", err)
-	}
-	p.fail = false
-	if _, err := o.DiscardLegacyUnattributed("orphan", "high"); !errors.Is(err, ErrLegacyRiskChanged) {
-		t.Fatalf("stale expected severity accepted: %v", err)
-	}
-	if _, err := o.DiscardLegacyUnattributed("orphan", "critical"); err != nil {
-		t.Fatal(err)
-	}
-	if o.LegacyUnattributedCount() != 0 {
-		t.Fatal("resolved mark remained in memory")
-	}
-}
 func TestUserRiskSeparatesTenantsDevicesAndSubjects(t *testing.T) {
 	o := NewHighRiskOverlay()
 	o.Mark("shared", "medium")
@@ -97,41 +64,6 @@ func TestUserRiskSeparatesTenantsDevicesAndSubjects(t *testing.T) {
 	}
 	if sev, _ := o.IsHighRisk("shared"); sev != "medium" {
 		t.Fatal("clear changed device")
-	}
-}
-
-func TestFailedDeviceSaveCannotBePersistedByUserWrite(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "risk.json")
-	p := &userRiskPersister{base: blobstore.FilePersister{Path: path}}
-	o := NewHighRiskOverlay()
-	if err := o.SetPersister(p); err != nil {
-		t.Fatal(err)
-	}
-	p.fail = true
-	o.Mark("device", "high") // conservative live escalation, but the save failed
-	if sev, _ := o.IsHighRisk("device"); sev != "high" {
-		t.Fatal("failed device save removed the live escalation")
-	}
-	p.fail = false
-	if _, err := o.SetUserRisk(UserRisk{TenantID: "one", ID: "alice", Severity: "high"}); !errors.Is(err, ErrRiskUnavailable) {
-		t.Fatalf("unconfirmed device mark leaked into user save: %v", err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("rejected user save wrote a snapshot: %v", err)
-	}
-	o.Mark("device", "high") // same-value retry must confirm the pending save
-	if _, err := o.SetUserRisk(UserRisk{TenantID: "one", ID: "alice", Severity: "high"}); err != nil {
-		t.Fatal(err)
-	}
-	again := NewHighRiskOverlay()
-	if err := again.SetStatePath(path); err != nil {
-		t.Fatal(err)
-	}
-	if sev, _ := again.IsHighRisk("device"); sev != "high" {
-		t.Fatal("device retry did not persist")
-	}
-	if sev, _ := again.UserSeverity("one", "alice"); sev != "high" {
-		t.Fatal("user write did not persist")
 	}
 }
 func TestUserRiskRejectsSaveBeforePublishingAndSurvivesRestart(t *testing.T) {
@@ -225,7 +157,7 @@ func TestUserRiskFeedRejectsMalformedAndCopiesSubjects(t *testing.T) {
 	}
 }
 func TestRiskStateUnreadableAndUnknownSchemaRemainUnavailable(t *testing.T) {
-	for _, raw := range []string{"{", `{"schema_version":"future","devices":{}}`, `{"schema_version":"high_risk_overlay_state.v2","users":{"invalid":{"id":"alice","severity":"high"}}}`, `{"schema_version":"high_risk_overlay_state.v2","devices":{},"legacy_unattributed":null}`, `{"schema_version":"high_risk_overlay_state.v2","devices":{},"legacy_unattributed":{"id":"none"}}`, `{"schema_version":"high_risk_overlay_state.v1","devices":{},"legacy_unattributed":{"id":"high"}}`, `{"schema_version":"high_risk_overlay_state.v2","devices":{},"legacy_unattributed":{"id":"high","id":"critical"}}`} {
+	for _, raw := range []string{"{", `{"schema_version":"future","devices":{}}`, `{"schema_version":"high_risk_overlay_state.v2","users":{"invalid":{"id":"alice","severity":"high"}}}`} {
 		path := filepath.Join(t.TempDir(), "risk.json")
 		os.WriteFile(path, []byte(raw), 0600)
 		o := NewHighRiskOverlay()

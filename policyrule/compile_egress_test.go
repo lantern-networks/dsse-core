@@ -29,6 +29,13 @@ func (f fakeEgressResolver) ServicePorts(tenant string, serviceID string) []int 
 	return f.ports[serviceID]
 }
 
+func (f fakeEgressResolver) ServiceTransportPorts(tenant, serviceID string) map[string][]int {
+	if len(f.ports[serviceID]) == 0 {
+		return nil
+	}
+	return map[string][]int{"tcp": f.ports[serviceID]}
+}
+
 func TestCompileEgressPolicies(t *testing.T) {
 	resolver := fakeEgressResolver{
 		src:  map[string][]string{"grp-macs": {"dev-alice"}},
@@ -89,7 +96,7 @@ func TestCompileEgressPortScope(t *testing.T) {
 		ports: map[string][]int{"svc-ssh": {22}},
 	}
 	// An egress rule for the SSH service (tcp/22) must compile a destination_port=22 condition — NOT match
-	// every port. A rule with no service falls back to the egress default 443.
+	// every port. A rule with no service intentionally matches any transport.
 	rules := []Rule{
 		{ID: "r-ssh", Plane: PlaneEgress, Status: StatusActive, Source: []string{"grp-macs"}, Destination: []string{"ep-ssh"}, ServiceID: "svc-ssh", Action: Action{Access: AccessAuthenticate}},
 		{ID: "r-web", Plane: PlaneEgress, Status: StatusActive, Source: []string{"grp-macs"}, Destination: []string{"ep-ssh"}, Action: Action{Access: AccessDeny}},

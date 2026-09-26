@@ -24,13 +24,12 @@ type EastWestResolver interface {
 	// DestinationTokens returns the match tokens (FQDN/IP address, else alias) for the destination subject
 	// ids, compared against req.Destination / req.FQDN / req.ApplicationID.
 	DestinationTokens(tenant string, ids []string) []string
-	// ServiceProtocols returns the east-west protocol families a service denotes (e.g. ["smb"]); empty means
-	// any east-west protocol.
-	ServiceProtocols(tenant string, serviceID string) []string
+	// ServiceTransportPorts returns exact transport/port pairs. An unresolved named service must match nothing.
+	ServiceTransportPorts(tenant string, serviceID string) map[string][]int
 }
 
 // CompileEastWest compiles authored OUTBOUND east-west rules into the live enforcement primitive. All axes
-// map faithfully: mode ← access, destination ← destination tokens, protocol ← service, and SOURCE is
+// map faithfully: mode ← access, destination ← destination tokens, transport/port ← service, and SOURCE is
 // RESTRICTED to the authored source's device identities (matched against req.DeviceID) — so a rule really
 // segments WHICH devices may reach a destination. If the authored source resolves to no enrolled device, the
 // rule is compiled fail-closed (a never-matching sentinel) rather than degrading to wildcard. Inbound rules
@@ -66,7 +65,6 @@ func CompileEastWest(tenant string, rules []Rule, resolver EastWestResolver) []d
 			Priority:      r.Priority,
 			SourceDevices: sourceDevices,
 			Destinations:  destinations,
-			Protocols:     resolver.ServiceProtocols(tenant, r.ServiceID),
 			Mode:          r.Action.Access,
 			// Learning-lifecycle Warn stage: soften authenticate/deny to allow-with-notice (non-holding).
 			Warn: r.Stage == StageWarn,
@@ -83,6 +81,16 @@ func CompileEastWest(tenant string, rules []Rule, resolver EastWestResolver) []d
 			// (compile_egress.go), so both planes read one authored RiskAtLeast identically. Previously dropped
 			// here, which silently turned an authored risk-gated east-west rule into an ungated one.
 			RiskSeverities: RiskSeveritiesAtLeast(r.RiskAtLeast),
+		}
+		if r.ServiceID != "" {
+			// Readers predating transport/port conditions must not decode this as
+			// an unrestricted service. Current readers use ServiceTransportPorts;
+			// legacy readers see a family that cannot enter the east-west layer.
+			ew.Protocols = []string{"__dsse_transport_port_service__"}
+			ew.ServiceTransportPorts = resolver.ServiceTransportPorts(tenant, r.ServiceID)
+			if ew.ServiceTransportPorts == nil {
+				ew.ServiceTransportPorts = map[string][]int{} // Missing is not Any.
+			}
 		}
 		if r.Action.GrantTTLSeconds > 0 {
 			ew.MaxTTLSeconds = r.Action.GrantTTLSeconds

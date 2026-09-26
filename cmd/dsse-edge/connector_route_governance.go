@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/lantern-networks/dsse-core/blobstore"
+	"errors"
 	"log"
 	"maps"
 	"os"
@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
@@ -218,7 +219,13 @@ func (g *connectorRouteGovernance) persistStateLocked(st governancePersistState)
 		return err
 	}
 	if g.persister != nil {
-		return g.persister.Save(raw)
+		if err := g.persister.Save(raw); err != nil {
+			if !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+				return err
+			}
+			log.Print("connector_route_governance: saved with weaker durability guarantee")
+		}
+		return nil
 	}
 	tmp := g.persistPath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {

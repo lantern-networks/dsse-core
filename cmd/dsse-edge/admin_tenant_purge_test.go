@@ -46,7 +46,7 @@ func TestPurgeErasesThisNodeAndProvesItWithACount(t *testing.T) {
 		}
 	}
 
-	result := purgeAdminTenantData(context.Background(), "node", "tenant_gone", nil, writer, credentials, ledger, nil, nil, "", nil, nil, adminTenantExtraStores{}, now)
+	result := purgeAdminTenantData(context.Background(), "node", "tenant_gone", nil, writer, credentials, ledger, nil, nil, "", nil, nil, adminTenantExtraStores{}, nil, now)
 
 	if !result.Complete {
 		t.Fatalf("the purge must report complete when nothing is left, got failures=%v remaining=%+v", result.Failures, result.Remaining.Stores)
@@ -78,7 +78,7 @@ func TestPurgingATenantThisNodeNeverHadIsCleanAndSaysNothingWasErased(t *testing
 		t.Fatalf("writer: %v", err)
 	}
 	result := purgeAdminTenantData(context.Background(), "node", "tenant_never", nil, writer,
-		newLocalAdminCredentialStore("Lantern DSSE"), enrolledinventory.NewLedger(), nil, nil, "", nil, nil, adminTenantExtraStores{}, time.Now())
+		newLocalAdminCredentialStore("Lantern DSSE"), enrolledinventory.NewLedger(), nil, nil, "", nil, nil, adminTenantExtraStores{}, nil, time.Now())
 
 	if !result.Complete {
 		t.Fatalf("a node that never held the tenant is complete, got %v", result.Failures)

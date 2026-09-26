@@ -497,6 +497,7 @@ type delegatedGrantBundle struct {
 // signatures stable as more separate-store resources fold into the bundle. Any field may be nil (that resource
 // is absent on this Edge).
 type configApplyTargets struct {
+	legalHold       *legalHoldStore
 	applications    appcatalog.RuntimeStore
 	dlp             *dlpConfigStores
 	policyStore     *policy.Store
@@ -1411,7 +1412,7 @@ func applyCarriedTenantPurges(ctx context.Context, t configApplyTargets, payload
 			t.deviceCAs, t.deviceCARegistryPath, t.deviceTrust, t.vlan,
 			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants,
 				DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, t.enrolled, tenantID).DeviceIDs},
-			now)
+			t.legalHold, now)
 		if len(result.Erased) == 0 && result.Complete {
 			continue // nothing here: already erased, or this node never served the tenant. Silence is correct.
 		}

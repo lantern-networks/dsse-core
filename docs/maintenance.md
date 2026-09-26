@@ -639,3 +639,9 @@ Administrator credential writes retain acknowledged state when persistence fails
 
 Credential schema migrations 048, 049 and 051 carry TOTP replay counters, revision checks and writer protocol coordination. File and database regression tests are separate from Console GUI and deployed-fleet acceptance.
 
+
+### Retention, legal holds and tenant erasure
+
+Retention and legal-hold edits now refresh shared state before saving and keep failed preservation requests effective locally. Pruning rechecks the saved policy inside the deletion transaction. Tenant erasure records a durable in-progress marker, checks protection between destructive steps, and retains its delivery markers after a partial failure. File erasure finishes its protection guard before reporting completion. Shared archival advances the chain and deletes exactly the archived hot rows in one SQL transaction; object-storage uncertainty stops further archival for reconciliation.
+
+Deletion starts paused after a process restart or leadership change until protection requests have been reconciled for that process/term. Read [deletion safety recovery](deletion-safety-recovery.md), [tenant erasure recovery](tenant-erasure-recovery.md), and [archive recovery](archive-recovery.md) before enabling deletion on an upgraded deployment. Ordinary configuration editing remains available. This integration is not a deployment or release acceptance.

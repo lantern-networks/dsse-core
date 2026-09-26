@@ -2990,6 +2990,9 @@ func main() {
 	auditChain := newAuditChainStore(mustCPStateBlobPersister(*auditChainStorePath, "audit_chain"))
 	// Admin-configurable per-stream retention (Console), shared by the pruner (reads it) and the admin API.
 	retentionOverride := newRetentionOverrideStore(mustCPStateBlobPersister(*retentionOverrideStorePath, "retention_override"))
+	if err := configureDeletionSafety(legalHold, retentionOverride, strings.TrimSpace(*postgresDSN) != ""); err != nil {
+		log.Fatalf("configure deletion safety: %v", err)
+	}
 
 	// W4: prune aged postgres log/outbox rows so the durable tables don't bloat unbounded (control plane).
 	// With a cold archive configured, hot_events pruning TIERS aged rows to the sovereign store before delete.
@@ -5221,6 +5224,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// stores and leave the engine enforcing the sets it compiled at boot.
 			startConfigBundleSync = func(onRulesApplied func()) {
 				go config.ConfigBundleSource.run(context.Background(), configApplyTargets{
+					legalHold:       config.LegalHold,
 					applications:    config.ApplicationCatalogStore,
 					policyStore:     concretePolicyStore,
 					dlp:             config.DLPDistribution,

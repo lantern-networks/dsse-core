@@ -46,7 +46,7 @@ func TestALegalHoldIsReadByEveryPathThatDestroysData(t *testing.T) {
 			if j := strings.Index(code, "//"); j >= 0 {
 				code = code[:j]
 			}
-			if strings.Contains(code, "LegalHold.IsHeld(") {
+			if strings.Contains(code, "LegalHold.IsHeld(") || strings.Contains(code, "LegalHold.adminStatus(") {
 				want[m[1]] = true
 				break
 			}

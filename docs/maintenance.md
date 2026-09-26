@@ -313,3 +313,10 @@ changes, or the target week changes. Published versions and delivered fixes are
 recorded in [Releases](https://github.com/lantern-networks/dsse-core/releases).
 Report ordinary reproducible bugs through [Issues](https://github.com/lantern-networks/dsse-core/issues);
 report vulnerabilities privately according to the [security policy](../SECURITY.md).
+
+Upgrade compatibility: exceptions created by older Console versions may store a
+catalog alias (for example WinRM-HTTP or PostgreSQL) as the service family. With
+an empty or TCP protocol, these remain supported and export as TCP with the
+saved port. UDP, approval/session conditions, or a port with neither family nor
+protocol cannot be represented by the current Windows export. Disable or correct
+such a record before enabling it; no automatic broadening of its rules is made.

@@ -48,13 +48,6 @@ func validateLegacyException(ex model.LegacyException) error {
 }
 
 func validateIncomingExportConditions(ex model.LegacyException) error {
-	// These are the existing TCP-family mappings of the v1 Windows consumer.
-	// Its unknown-family fallback is TCP, so arbitrary family names are unsafe.
-	switch strings.ToLower(strings.TrimSpace(ex.ServiceFamily)) {
-	case "", "tcp", "smb", "cifs", "rdp", "winrm", "wmi", "dcom", "rpc", "ssh", "vnc", "mssql", "mysql", "postgres", "oracle", "db", "http", "https", "rmm", "management_tcp":
-	default:
-		return fmt.Errorf("exception %q has a service family unsupported by this export", ex.ID)
-	}
 	protocol := strings.ToLower(strings.TrimSpace(ex.Protocol))
 	if (protocol != "" && protocol != "tcp") || ex.Port < 0 || ex.Port > 65535 || ex.ApprovalRequired || ex.MaxSessionSeconds != 0 {
 		return fmt.Errorf("exception %q has conditions unsupported by this export (TCP/Any only; approval and session limits are unsupported)", ex.ID)
@@ -152,7 +145,15 @@ func buildServerInitiatedExport(exs []model.LegacyException, now time.Time) (ser
 		// Existing Windows readers derive transport from ServiceFamily. A TCP
 		// condition with no family must not be exported as Any (which drops Port).
 		family := ex.ServiceFamily
-		if strings.TrimSpace(family) == "" && strings.EqualFold(strings.TrimSpace(ex.Protocol), "tcp") {
+		switch strings.ToLower(strings.TrimSpace(family)) {
+		case "":
+			if strings.EqualFold(strings.TrimSpace(ex.Protocol), "tcp") {
+				family = "tcp"
+			}
+		case "tcp", "smb", "cifs", "rdp", "winrm", "wmi", "dcom", "rpc", "ssh", "vnc", "mssql", "mysql", "postgres", "oracle", "db", "http", "https", "rmm", "management_tcp":
+		default:
+			// Older Console versions stored catalog aliases here. Windows has
+			// always interpreted nonempty unknown families as TCP with Port.
 			family = "tcp"
 		}
 		rules = append(rules, serverInitiatedExportRule{

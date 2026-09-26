@@ -19,10 +19,10 @@ import (
 
 func TestIncomingUnsupportedConditionsCannotBeActivated(t *testing.T) {
 	for name, change := range map[string]func(*model.LegacyException){
-		"udp":            func(x *model.LegacyException) { x.Protocol = "udp"; x.ServiceFamily = ""; x.Port = 53 },
-		"approval":       func(x *model.LegacyException) { x.ApprovalRequired = true },
-		"session limit":  func(x *model.LegacyException) { x.MaxSessionSeconds = 60 },
-		"unknown family": func(x *model.LegacyException) { x.ServiceFamily = "custom-udp" },
+		"udp":           func(x *model.LegacyException) { x.Protocol = "udp"; x.ServiceFamily = ""; x.Port = 53 },
+		"approval":      func(x *model.LegacyException) { x.ApprovalRequired = true },
+		"session limit": func(x *model.LegacyException) { x.MaxSessionSeconds = 60 },
+		"unscoped port": func(x *model.LegacyException) { x.ServiceFamily = ""; x.Protocol = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			dir := t.TempDir()

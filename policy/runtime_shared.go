@@ -105,7 +105,7 @@ func (s *Store) runtimeSnapshotLocked() adminPolicyRuntimeStateFile {
 	return adminPolicyRuntimeStateFile{SchemaVersion: adminPolicyRuntimeStateSchemaVersion, SaaSTenantRestrictions: s.tenantRestrictions, TenantRestrictionRuleStatus: s.tenantRestrictionRuleStatus, PolicyStatusOverride: s.policyStatusOverride, EastWestEnabled: s.eastWestEnabled, EastWestAllowUnmatched: s.eastWestAllowUnmatched, EastWestRules: s.eastWestRules, EastWestMaxGrantTTL: s.eastWestMaxGrantTTL, ServerInitiatedEnabled: s.serverInitiatedEnabled, LegacyExceptions: s.legacyExceptions, AdminAuthoredPolicies: s.adminAuthoredPolicies}
 }
 
-// Only confirmed authored state is published. Bundle and compiled ownership stay separate.
+// Adopt authored state while keeping bundle and compiled ownership separate.
 func (s *Store) adoptRuntimeLocked(f adminPolicyRuntimeStateFile) {
 	normalizeRuntimeMaps(&f)
 	s.tenantRestrictions = f.SaaSTenantRestrictions
@@ -193,6 +193,12 @@ func (s *Store) editRuntimeLocked(ctx context.Context, edit func(*adminPolicyRun
 	if err != nil {
 		if callbackErr != nil {
 			return callbackErr
+		}
+		if !shared && errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			// Replacement completed: preserve the same controls a restart will load.
+			s.adoptRuntimeLocked(next)
+			s.generation++
+			s.runtimeAuthorityKnown = true
 		}
 		if shared || !errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)

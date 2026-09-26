@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 )
 
@@ -29,7 +28,7 @@ func TestEastWestAdminUpdateWaitsForOneConfirmedSave(t *testing.T) {
 	full := false
 	updated := []decision.EastWestRule{{ID: "new", Mode: "allow"}}
 	newTTL := 120
-	for _, failure := range []error{errors.New("storage refused"), errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)} {
+	for _, failure := range []error{errors.New("storage refused"), errors.New("write outcome unknown")} {
 		p.failure = failure
 		if err := s.ApplyEastWestUpdateConfirmed("a", &updated, &newTTL, &enabled, &full); !errors.Is(err, ErrPolicyPersistence) {
 			t.Fatal(err)

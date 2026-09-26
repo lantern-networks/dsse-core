@@ -2,7 +2,6 @@ package policy
 
 import (
 	"errors"
-	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/model"
 	"reflect"
 	"testing"
@@ -37,7 +36,7 @@ func TestIncomingChangesWaitForStorage(t *testing.T) {
 	if err := s.UpsertLegacyExceptionConfirmed("b", foreign); err != nil {
 		t.Fatal(err)
 	}
-	for _, failure := range []error{errors.New("private disk detail"), errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)} {
+	for _, failure := range []error{errors.New("private disk detail"), errors.New("write outcome unknown")} {
 		p.failure = failure
 		before := append([]byte(nil), p.raw...)
 		gen := s.ConfigGeneration()

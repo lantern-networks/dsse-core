@@ -24,7 +24,7 @@ import (
 	"github.com/lantern-networks/dsse-core/vlan"
 )
 
-func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string, error)) {
+func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, configSourceURL string, configBundleEpoch string, registry connectorRegistryStore, nonHumanIdentities nhi.RuntimeStore, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, delegatedGrants *delegatedgrant.Store, edgeDNSResolver *dnsresolver.Resolver, edgeDNSPolicyStore *dnsPolicyStore, vlanBoundary *vlan.Store, tenantModelStore adminTenantModelRuntimeStore, networkExtensionPublisher networkExtensionSnapshotPublisher, ruleStore *policyrule.Store, assetStore *assetcatalog.Store) (bundleGeneration func() (uint64, string, error)) {
 	mux.HandleFunc("GET /admin/policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		options := policy.ListOptions{
 			Status: strings.TrimSpace(r.URL.Query().Get("status")),
@@ -190,6 +190,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// final generation and never poll the final mode. Refuse this snapshot so
 		// the poller retries with a coherent one.
 		policyGenerationBefore := policyStore.ConfigGeneration()
+		dnsGenerationBefore := edgeDNSResolver.ConfigGeneration()
 		tenantConfig := policyStore.SnapshotTenantConfig(tenantID)
 		applications, catalogGeneration, err := applicationState.read(r.Context(), config.ApplicationCatalogStore)
 		if err != nil {
@@ -232,8 +233,13 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		if edgeDNSResolver != nil {
-			dnsDTO := dnsresolver.PolicyToDTO(edgeDNSResolver.CurrentPolicy())
+			dnsDTO, authored := edgeDNSPolicyStore.snapshot(edgeDNSResolver)
 			bundle.DNSPolicy = &dnsDTO
+			bundle.DNSPolicyAuthoritative = authored
+			if edgeDNSResolver.ConfigGeneration() != dnsGenerationBefore {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DNS configuration changed while preparing the bundle; retry"))
+				return
+			}
 		}
 		if config.EnrolledLedger != nil {
 			// Authoritative, not List: a removal has to reach the fleet, and it can only do that as an entry.

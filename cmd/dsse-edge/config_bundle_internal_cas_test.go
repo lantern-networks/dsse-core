@@ -79,7 +79,7 @@ func TestTheAuthoritiesTravelInTheBundleTheFleetActuallyPulls(t *testing.T) {
 func TestTheBundleSectionIsActuallyPublishedAndApplied(t *testing.T) {
 	for path, want := range map[string]string{
 		"admin_policy_routes.go": "bundle.InternalCAs = internalCABundleSection(",
-		"config_bundle_sync.go":  "applyInternalCABundleSection(t.internalCAs,",
+		"config_bundle_sync.go":  "applyInternalCABundleSectionChecked(t.internalCAs,",
 	} {
 		body, err := os.ReadFile(path)
 		if err != nil {

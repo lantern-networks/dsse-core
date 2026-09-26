@@ -2694,7 +2694,9 @@ func main() {
 	if p, e := cpStateBlobPersister(*admissionRevocationStore, cpStateBlobDB, "admission_revocations"); e != nil {
 		log.Fatalf("resolve admission-revocation store: %v", e)
 	} else {
-		livenessRevocations.SetPersister(p) // Phase 3: persist kill-switches across a restart
+		if err := livenessRevocations.SetPersister(p); err != nil {
+			log.Fatalf("load admission-revocation store: %v", err)
+		}
 	}
 	// Active session revocation: track live (T) connections by identity so an ADMINISTRATOR can actively CLOSE
 	// a blocked device's established tunnels (per-handshake admission already rejects NEW connections; this
@@ -4589,9 +4591,8 @@ func main() {
 		// section below would be published in every bundle and applied by nobody.
 		InspectionPostureGeneration: postureStore.ConfigGeneration,
 		SetInspectionPosture: func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error) {
-			updated, err := postureStore.Set(p)
-			// The in-memory posture IS applied either way (the engine must match what the store holds);
-			// the error tells the admin the change will not survive a restart.
+			updated, err := postureStore.SetReceived(p)
+			// Refresh enforcement from the actual live store, including after a rejected save.
 			applyInspectionPosture(tenantID)
 			return updated, err
 		},
@@ -4780,7 +4781,7 @@ func main() {
 	// (T) secure transport: additive TLS listener for the encrypted endpoint↔Edge tunnel. Default
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
 	// Edge continues on -listen.
-	seatAllocations.SetPersister(mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations"))
+	mustLoadSeatAllocations(seatAllocations, mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations"))
 	vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license"))
 	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
 	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,
@@ -6552,10 +6553,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// Allow-all (S5). It reuses the exact same ruleStore.Upsert + recompile as POST /admin/rules, so an adopted
 	// rule is indistinguishable from a hand-authored one and is editable/deletable in the normal Rules UI.
 	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL, func(w http.ResponseWriter) bool {
+		ruleGeneration, assetGeneration := ruleStore.ConfigGeneration(), assetStore.ConfigGeneration()
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return false
 		}
-		recompileAuthoredRules()
+		if ruleStore.ConfigGeneration() != ruleGeneration || assetStore.ConfigGeneration() != assetGeneration {
+			recompileAuthoredRules()
+		}
 		return true
 	})
 	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)
@@ -7435,7 +7439,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		event, ok := humanApprovals.Get(r.PathValue("approval_id"))
+		event, ok := humanApprovals.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("approval_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
@@ -9843,7 +9847,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if approvalID == "" {
 		return denyRuntimeEvidence(dec, "Human Approval Event is required for this delegated agent access.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
-	approval, ok := humanApprovals.Get(approvalID)
+	approval, ok := humanApprovals.GetForAuthorization(dec.TenantID, approvalID)
 	if !ok {
 		return denyRuntimeEvidence(dec, "Human Approval Event was not found.", []string{"policy_matched", "approval_absent"}, "approval_absent")
 	}
@@ -10399,7 +10403,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.HumanApprovalEventID != nil && *event.HumanApprovalEventID != "" {
-		approval, ok := humanApprovals.Get(*event.HumanApprovalEventID)
+		approval, ok := humanApprovals.GetForAuthorization(event.TenantID, *event.HumanApprovalEventID)
 		if !ok {
 			return fmt.Errorf("human approval event %s is absent", *event.HumanApprovalEventID)
 		}

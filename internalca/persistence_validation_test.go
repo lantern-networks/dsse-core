@@ -127,6 +127,17 @@ func TestMixedPEMRejectedAcrossEveryStoreIntake(t *testing.T) {
 			if _, err := s.Upsert(bad, now); err == nil {
 				t.Fatal("upsert accepted mixed material")
 			}
+			if label == "prefix" || label == "secondCA" {
+				if err := s.ReplaceAll([]Authority{bad}); err != nil {
+					t.Fatal(err)
+				}
+				p.rows = []Authority{bad}
+				restored, err := NewStore(p)
+				if err != nil || len(restored.ListAll(now)) != 1 || restored.ListAll(now)[0].CertificatePEM != pem {
+					t.Fatal("legacy public CA material not normalized", err)
+				}
+				return
+			}
 			if err := s.ReplaceAll([]Authority{bad}); err == nil {
 				t.Fatal("bundle accepted mixed material")
 			}

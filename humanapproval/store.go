@@ -18,6 +18,9 @@ import (
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation writes through,
 // so approval outcomes survive a restart.
 type Store struct {
+	readRefreshMu      sync.Mutex
+	readRefreshAt      time.Time
+	readRefreshErr     error
 	mu                 sync.RWMutex
 	events             map[string]model.HumanApprovalEvent
 	capacity           int

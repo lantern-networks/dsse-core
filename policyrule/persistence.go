@@ -79,25 +79,30 @@ func (s *Store) loadLocked() error {
 	return nil
 }
 
-// ErrPersistence means the candidate was not adopted; the storage result may need reconciliation.
+// ErrPersistence means storage could not be confirmed. A completed file replacement
+// is retained live; callers must not report success and must reconcile/retry.
 var ErrPersistence = errors.New("authored-rule persistence is unconfirmed")
 
 // Caller holds s.mu. Save before exposing the candidate or moving its generation.
 func (s *Store) saveCandidateLocked(next map[string]map[string]Rule, seq int) error {
+	var saveErr error
 	if s.persister != nil {
 		data, err := json.MarshalIndent(persistedRules{Seq: seq, Rules: next}, "", "  ")
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrPersistence, err)
 		}
-		if err := s.persister.Save(data); err != nil {
-			return fmt.Errorf("%w: %v", ErrPersistence, err)
+		if err := blobstore.UnconfirmedSave(s.persister.Save(data)); err != nil {
+			if !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+				return fmt.Errorf("%w: %v", ErrPersistence, err)
+			}
+			saveErr = fmt.Errorf("%w: %w", ErrPersistence, err)
 		}
 	}
 	if !reflect.DeepEqual(s.rules, next) {
 		s.generation++
 	}
 	s.rules, s.seq = next, seq
-	return nil
+	return saveErr
 }
 
 func cloneRule(r Rule) Rule {

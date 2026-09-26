@@ -6,7 +6,9 @@ type stubEWResolver struct{}
 
 func (stubEWResolver) SourceDeviceTokens(string, []string) []string { return nil }
 func (stubEWResolver) DestinationTokens(string, []string) []string  { return []string{"prod-dc"} }
-func (stubEWResolver) ServiceProtocols(string, string) []string     { return []string{"smb"} }
+func (stubEWResolver) ServiceTransportPorts(string, string) map[string][]int {
+	return map[string][]int{"tcp": {445}}
+}
 
 // An authored east-west authenticate rule carries its step-up assurance (required IdP + phishing-resistant
 // AMR + freshness) through to the enforcement primitive — the controls that make a lateral hop bite.

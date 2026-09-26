@@ -125,11 +125,9 @@ func TestEvaluateTenantIsolatesPolicyMatch(t *testing.T) {
 	if dec := ev.Evaluate(base("tenant-a")); dec.Decision != "allow" || dec.PolicyID != "pol_a_allow" {
 		t.Fatalf("same-tenant: decision=%q policy=%q, want allow/pol_a_allow", dec.Decision, dec.PolicyID)
 	}
-	// Different tenant → must NOT be ALLOWED by tenant-a's policy (the isolation fix); falls through to the
-	// unmatched default (deny). (PolicyID may still be stamped by the bundle's firstPolicyID fallback even on a
-	// deny, so assert on the DECISION, which is what actually gates the flow, not on PolicyID.)
-	if dec := ev.Evaluate(base("tenant-b")); dec.Decision == "allow" {
-		t.Fatalf("cross-tenant: tenant-b was ALLOWED by tenant-a's policy (leak); decision=%q policy=%q reasons=%v", dec.Decision, dec.PolicyID, dec.ReasonCodes)
+	// A different tenant falls through to default deny, with no policy attribution.
+	if dec := ev.Evaluate(base("tenant-b")); dec.Decision != "deny" || dec.PolicyID != "" {
+		t.Fatalf("cross-tenant: want unattributed deny; decision=%q policy=%q reasons=%v", dec.Decision, dec.PolicyID, dec.ReasonCodes)
 	}
 
 	// A tenant-less (global) policy still matches any tenant (lockout-safe empty handling).

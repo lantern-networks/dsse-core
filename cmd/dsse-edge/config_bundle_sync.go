@@ -420,9 +420,9 @@ type tenantDeletion struct {
 //     same lockout the control plane's own DELETE route refuses with 409;
 //   - a tenant the same payload also asks us to keep, which is a contradiction and not an instruction;
 //   - nothing else. A tenant we do not have is not an error: the delete is idempotent by design.
-func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdminStore, section *tenantModelBundle, existing []adminTenantModel) error {
+func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdminStore, section *tenantModelBundle, existing []adminTenantModel) (map[string]bool, error) {
 	if store == nil || section == nil || len(section.Deleted) == 0 {
-		return nil
+		return nil, nil
 	}
 	kept := make(map[string]bool, len(section.Tenants))
 	for _, tenant := range section.Tenants {
@@ -432,6 +432,7 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 	for _, tenant := range existing {
 		present[strings.TrimSpace(tenant.TenantID)] = tenant
 	}
+	failedTenants := make(map[string]bool)
 	var failed error
 	for _, deletion := range section.Deleted {
 		tenantID := strings.TrimSpace(deletion.TenantID)
@@ -451,6 +452,7 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 			continue
 		}
 		if err := store.Delete(ctx, tenantID); err != nil {
+			failedTenants[tenantID] = true
 			failed = errors.Join(failed, fmt.Errorf("tenant deletion %q: %w", tenantID, err))
 			log.Printf("config-bundle sync: deleting tenant %q as instructed by the control plane failed: %v", tenantID, err)
 			continue
@@ -458,7 +460,7 @@ func applyCarriedTenantDeletions(ctx context.Context, store adminTenantModelAdmi
 		log.Printf("config-bundle sync: deleted tenant %q (control plane recorded the deletion at %s). Runtime state keyed to it is no longer served here.",
 			tenantID, strings.TrimSpace(deletion.DeletedAt))
 	}
-	return failed
+	return failedTenants, failed
 }
 
 // enrolledInventoryBundle wraps the enrolled set so the bundle can carry an explicitly-empty set (replace all)
@@ -795,10 +797,13 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		}
 	}
 	var tenantApplyErr error
+	tenantRegistryUnavailable := false
+	failedTenants := make(map[string]bool)
 	if payload.Tenants != nil && t.tenantModels != nil {
 		ctx := context.Background()
 		existing, err := t.tenantModels.List(ctx)
 		if err != nil {
+			tenantRegistryUnavailable = true
 			tenantApplyErr = fmt.Errorf("tenant registry read: %w", err)
 		} else {
 			if len(payload.Tenants.Tenants) == 0 && len(existing) > 0 {
@@ -806,21 +811,46 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			} else {
 				for _, tenant := range payload.Tenants.Tenants {
 					if _, err := t.tenantModels.Put(ctx, tenant, now); err != nil {
+						failedTenants[strings.TrimSpace(tenant.TenantID)] = true
 						tenantApplyErr = errors.Join(tenantApplyErr, fmt.Errorf("tenant %q: %w", tenant.TenantID, err))
 					}
 				}
 			}
-			tenantApplyErr = errors.Join(tenantApplyErr, applyCarriedTenantDeletions(ctx, t.tenantModels, payload.Tenants, existing))
+			failedDeletions, deletionErr := applyCarriedTenantDeletions(ctx, t.tenantModels, payload.Tenants, existing)
+			for tenantID := range failedDeletions {
+				failedTenants[tenantID] = true
+			}
+			tenantApplyErr = errors.Join(tenantApplyErr, deletionErr)
 		}
 	}
-	if tenantApplyErr != nil {
-		criticalErr = errors.Join(criticalErr, tenantApplyErr)
+	criticalErr = errors.Join(criticalErr, tenantApplyErr)
+	if tenantRegistryUnavailable {
+		if len(payload.Tenants.PurgeOrders) > 0 {
+			criticalErr = errors.Join(criticalErr, errors.New("tenant erasure deferred: registry unavailable"))
+		}
 	} else {
-		// Never erase or remember an order after uncertain tenant reconciliation.
-		// Nodes without a registry can still receive independently signed erasure orders.
-		applyCarriedTenantPurges(context.Background(), t, payload, t.nodeName, now)
-		if payload.Tenants != nil && t.erasureOrders != nil {
-			t.erasureOrders.remember(payload.Tenants.PurgeOrders)
+		// An uncertain tenant must not be erased or remembered for later erasure,
+		// but its failure must not block other tenants. Copy before filtering so a
+		// retry of the same bundle still sees every original order.
+		purgePayload := payload
+		if payload.Tenants != nil {
+			section := *payload.Tenants
+			section.PurgeOrders = nil
+			for _, order := range payload.Tenants.PurgeOrders {
+				tenantID := strings.TrimSpace(order.TenantID)
+				if failedTenants[tenantID] {
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("tenant erasure deferred for %q: registry reconciliation failed", tenantID))
+					continue
+				}
+				section.PurgeOrders = append(section.PurgeOrders, order)
+			}
+			purgePayload.Tenants = &section
+		}
+		// Existing signature, live-tenant and enforcement-tenant gates
+		// still decide whether each remaining order can be executed.
+		applyCarriedTenantPurges(context.Background(), t, purgePayload, t.nodeName, now)
+		if purgePayload.Tenants != nil && t.erasureOrders != nil {
+			t.erasureOrders.remember(purgePayload.Tenants.PurgeOrders)
 		}
 	}
 	if payload.VLAN != nil && t.vlan != nil {

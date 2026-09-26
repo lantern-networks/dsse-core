@@ -22,7 +22,7 @@ changes is included in the published 0.3.0 release:
 
 | Area | Change | Evidence available so far |
 |---|---|---|
-| Incoming connection withdrawal | Clear startup exceptions after the last exception is deleted; honor an explicitly disabled default-deny gate | Separate local CP and Edge processes, signed bundle polling, actual decision evaluation, fresh saved-state reads and five authenticated audit events; deployed Windows enforcement remains unverified |
+| Embedded evaluator configuration | Explicit false and empty tenant settings override a caller-supplied evaluator configuration | Regression tests with caller-supplied settings; the shipped executable does not populate these startup fields, so this is not a reproduced ordinary-operation defect |
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
 | Directory updates | Preserve user-risk association after subject or email changes | Local browser risk changes, import and decision API checks, saved-state and audit comparisons; separate PostgreSQL regression |
 | DLP and access rules | Preserve existing settings and references during ordinary edits; restore permitted read-only DLP listing | Local browser checks, saved-state and audit comparisons, automated regressions |

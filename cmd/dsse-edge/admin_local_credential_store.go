@@ -200,11 +200,12 @@ type credentialPersistence interface {
 // localAdminCredentialStore is the first-party admin credential store. Concurrency-safe. `issuer` labels the
 // TOTP otpauth URI. `persistence` (optional) makes it durable across restarts.
 type localAdminCredentialStore struct {
-	mu          sync.Mutex
-	byEmail     map[string]*localAdminCredential
-	issuer      string
-	persistence credentialPersistence
-	authority   atomic.Pointer[map[credentialAuthorityKey]credentialAuthorityRecord]
+	mu                      sync.Mutex
+	byEmail                 map[string]*localAdminCredential
+	issuer                  string
+	persistence             credentialPersistence
+	pendingLoginRestriction map[string]bool
+	authority               atomic.Pointer[map[credentialAuthorityKey]credentialAuthorityRecord]
 }
 
 func newLocalAdminCredentialStore(issuer string) *localAdminCredentialStore {
@@ -250,10 +251,17 @@ func (s *localAdminCredentialStore) persistLocked(cred *localAdminCredential) er
 		defer cancel()
 		if err := s.persistence.Upsert(ctx, cred); err != nil {
 			log.Printf("admin credential persistence failed: %v", err)
+			if s.byEmail[credentialEmailKey(cred.Email)] == cred && !errors.Is(err, errCredentialConflict) {
+				if s.pendingLoginRestriction == nil {
+					s.pendingLoginRestriction = make(map[string]bool)
+				}
+				s.pendingLoginRestriction[credentialEmailKey(cred.Email)] = true
+			}
 			s.refreshConflictLocked(ctx, err)
 			return errCredentialPersistence
 		}
 	}
+	delete(s.pendingLoginRestriction, credentialEmailKey(cred.Email))
 	previous := s.byEmail[credentialEmailKey(cred.Email)]
 	s.byEmail[credentialEmailKey(cred.Email)] = cred
 	if previous == nil || previous.PrincipalID != cred.PrincipalID || previous.TenantID != cred.TenantID || previous.Status != cred.Status || !slices.Equal(previous.Roles, cred.Roles) {
@@ -775,6 +783,7 @@ func (s *localAdminCredentialStore) DeleteAllForTenant(tenantID string) ([]strin
 		}
 		removed = append(removed, cred.Email)
 		delete(s.byEmail, key)
+		delete(s.pendingLoginRestriction, key)
 		s.publishAuthorityLocked()
 	}
 	sort.Strings(removed)
@@ -888,7 +897,7 @@ func (s *localAdminCredentialStore) refreshLoginCredentialLocked(email string) e
 		s.publishAuthorityLocked()
 		return nil
 	}
-	if old != nil && old.PrincipalID == next.PrincipalID {
+	if s.pendingLoginRestriction[key] && old != nil && old.PrincipalID == next.PrincipalID {
 		if old.LockedUntil.After(next.LockedUntil) {
 			next.LockedUntil = old.LockedUntil
 		}

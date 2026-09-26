@@ -96,6 +96,23 @@ func TestPostgresManagedIdentityAndCredentialPurge(t *testing.T) {
 	if got := peer.byEmail[credentialEmailKey(cred.Email)]; got == nil || got.Revision != cred.Revision {
 		t.Fatal("login did not refresh shared revision")
 	}
+	// A peer's successful login resets confirmed failures; do not restore this
+	// process's old counter unless its own persistence actually failed.
+	peer.byEmail[credentialEmailKey(cred.Email)].FailedAttempts = 4
+	if err := peer.refreshLoginCredentialLocked(cred.Email); err != nil {
+		t.Fatal(err)
+	}
+	if peer.byEmail[credentialEmailKey(cred.Email)].FailedAttempts != 0 {
+		t.Fatal("restored a confirmed stale failure count")
+	}
+	peer.pendingLoginRestriction = map[string]bool{credentialEmailKey(cred.Email): true}
+	peer.byEmail[credentialEmailKey(cred.Email)].FailedAttempts = 4
+	if err := peer.refreshLoginCredentialLocked(cred.Email); err != nil {
+		t.Fatal(err)
+	}
+	if peer.byEmail[credentialEmailKey(cred.Email)].FailedAttempts != 4 {
+		t.Fatal("lost an unconfirmed local restriction")
+	}
 	keep := cloneCredential(cred)
 	keep.Email = "other@example.com"
 	keep.PrincipalID = "other"

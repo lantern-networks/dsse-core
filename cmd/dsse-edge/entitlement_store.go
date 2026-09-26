@@ -135,6 +135,9 @@ func (s *entitlementStore) SetFeaturesContext(ctx context.Context, tenant string
 
 // RefreshShared reads authority before administrative reads and feature gates.
 func (s *entitlementStore) RefreshShared() error {
+	if s == nil {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.persister.(interface {

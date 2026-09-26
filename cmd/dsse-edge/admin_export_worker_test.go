@@ -1060,6 +1060,31 @@ func TestAdminExportJobCancelAdminCanCancelOthersJob(t *testing.T) {
 	if cancelled.Status != "cancelled" || cancelled.CreatedByAdminPrincipalID != "admin_other_001" {
 		t.Fatalf("cancelled = %#v, want other admin user's cancelled job", cancelled)
 	}
+	rows, err := writer.ReadJSONL("audit.log.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, row := range rows {
+		if row["event_type"] != "admin_export_cancelled" {
+			continue
+		}
+		found = true
+		metadata, ok := row["metadata"].(map[string]any)
+		if !ok || metadata["created_by_admin_principal_id"] != "admin_other_001" || metadata["cancelled_by_admin_principal_id"] != "admin_user_cancel_001" {
+			t.Fatal("cancellation audit must preserve both requester and cancelling administrator")
+		}
+		if row["actor_user_id"] != "admin_user_cancel_001" {
+			t.Fatalf("cancellation audit attributes actor to %v instead of the cancelling admin", row["actor_user_id"])
+		}
+		if row["target_id"] != otherJob.ID || row["tenant_id"] != "tenant_lab_001" || row["result"] != "success" {
+			t.Fatal("cancellation audit target, tenant or result mismatch")
+		}
+	}
+	if !found {
+		t.Fatal("cancellation audit missing")
+	}
+
 }
 
 func TestAdminExportJobStopsGracefullyWhenProgressSeesCancelledJob(t *testing.T) {

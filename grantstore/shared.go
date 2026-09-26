@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -33,7 +34,9 @@ func decodeShared(raw []byte) (map[string]Grant, error) {
 			return nil, ErrInvalidGrant
 		}
 		if err := validateGrant(g); err != nil {
-			return nil, err
+			log.Printf("access_grant_restore invalid_legacy_row_skipped=true")
+			delete(out, id)
+			continue
 		}
 	}
 	return out, nil
@@ -227,12 +230,37 @@ func (s *Store) RevokeForTenantContext(ctx context.Context, tenant, id string) (
 	}
 	return out, found, nil
 }
+
+// Process valid, correctly attributed denials before conflicting admissions.
 func (s *Store) MergeCheckedContext(ctx context.Context, incoming []Grant, now time.Time) (int, int, error) {
+	var denials []Grant
+	for _, g := range incoming {
+		if g.Revoked && validateGrant(g) == nil {
+			s.mu.RLock()
+			old, exists := s.grants[g.GrantID]
+			s.mu.RUnlock()
+			if !exists || old.TenantID == g.TenantID {
+				denials = append(denials, g)
+			}
+		}
+	}
+	a, u := 0, 0
+	if len(denials) > 0 {
+		var err error
+		a, u, err = s.mergeCheckedContext(ctx, denials, now)
+		if err != nil {
+			return a, u, err
+		}
+	}
+	b, v, err := s.mergeCheckedContext(ctx, incoming, now)
+	return a + b, u + v, err
+}
+func (s *Store) mergeCheckedContext(ctx context.Context, incoming []Grant, now time.Time) (int, int, error) {
 	var added, updated, denialAdded, denialUpdated int
 	handled, err := s.mutateShared(ctx, func(c *Store) error {
 		before := cloneGrants(c.grants)
 		var e error
-		added, updated, e = c.MergeChecked(s.withoutLatchedGrants(incoming, before), now)
+		added, updated, e = c.mergeLocal(s.withoutLatchedGrants(incoming, before), now)
 		if e == nil {
 			for id, g := range c.grants {
 				prev, exists := before[id]

@@ -73,7 +73,12 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		tenantID := adminTenantIDFromRequest(r)
 		id := r.PathValue("id")
 		before, hadBefore := config.SteerExclusions.Get(id, tenantID) // snapshot for the delete version (so a rollback can restore it)
-		if !config.SteerExclusions.Delete(id, tenantID, time.Now()) {
+		deleted, err := config.SteerExclusions.DeleteChecked(id, tenantID, time.Now())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("steer exclusion deletion was not confirmed"))
+			return
+		}
+		if !deleted {
 			writeError(w, http.StatusNotFound, fmt.Errorf("steer exclusion %s is absent", id))
 			return
 		}

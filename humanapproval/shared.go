@@ -29,8 +29,12 @@ func decodeSnapshot(data []byte) (map[string]model.HumanApprovalEvent, error) {
 	}
 	fresh := make(map[string]model.HumanApprovalEvent, len(snap))
 	for savedKey, event := range snap {
+		if savedKey != event.ID && savedKey != approvalKey(event.TenantID, event.ID) {
+			return nil, fmt.Errorf("invalid saved human approval key")
+		}
 		if err := validKey(event.TenantID, event.ID); err != nil {
-			return nil, err
+			log.Printf("human_approval_restore invalid_legacy_row_skipped=true")
+			continue
 		}
 		key := approvalKey(event.TenantID, event.ID)
 		if savedKey != event.ID && savedKey != key {

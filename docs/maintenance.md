@@ -554,3 +554,5 @@ wiring remains a following migration unit. Back up authorization snapshots
 before upgrading: new human-approval records use organization/ID keys, while
 legacy bare-ID snapshots remain readable. Older writers must not overwrite the
 new format; rollback requires a compatible backup.
+
+Authorization request paths refresh shared grant and human-approval state at most once per five-second window; explicit administrative reads remain current. Grant-batch conflicts no longer prevent other correctly attributed revocations. Invalid legacy authorization rows are skipped with a generic warning during restore, preserving valid rows and the original file. VLAN and access-grant receive failures remain unacknowledged and retryable, and failed grant reports return an error. Human-approval lookups and revocations use organization-specific keys, including when two organizations use the same approval ID.

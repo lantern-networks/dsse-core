@@ -28,10 +28,7 @@ func TestGrantLoadFailurePreservesStateAndWriter(t *testing.T) {
 	g, _ := s.Mint(grantFixture("revoked", now), time.Hour, now)
 	s.Revoke(g.GrantID)
 	wrong, _ := json.Marshal(map[string]Grant{"wrong": g})
-	badTime := g
-	badTime.ExpiresAt = "not-time"
-	bad, _ := json.Marshal(map[string]Grant{g.GrantID: badTime})
-	for i, p := range []*rejectedGrantLoader{{err: errors.New("unavailable")}, {data: []byte{}}, {data: []byte("null")}, {data: []byte("{bad")}, {data: wrong}, {data: bad}} {
+	for i, p := range []*rejectedGrantLoader{{err: errors.New("unavailable")}, {data: []byte{}}, {data: []byte("null")}, {data: []byte("{bad")}, {data: wrong}} {
 		snapshot := s.ListAll()
 		gen := s.ConfigGeneration()
 		if e := s.SetPersister(p); e == nil {

@@ -169,10 +169,21 @@ func TestManagedTenantRestrictionSharedAuthorityRefreshAndMerge(t *testing.T) {
 	if err := two.RefreshTenantRestrictions(); err == nil {
 		t.Fatal("unavailable DB accepted as fresh")
 	}
-	if err := two.SaveTenantRestriction("two", "openai_chatgpt", TenantRestrictionPatch{Enabled: trptr(false)}); err == nil {
+	if err := two.SaveTenantRestriction("two", "openai_chatgpt", TenantRestrictionPatch{Enabled: trptr(false)}); !errors.Is(err, ErrPolicyPersistence) {
 		t.Fatal("failed commit reported success")
 	}
 	if !two.SnapshotTenantConfig("two").SaaSTenantRestrictions["openai_chatgpt"].Enabled {
 		t.Fatal("failed commit changed local settings")
+	}
+}
+
+func TestManagedTenantRestrictionSharedValidationIsNotPersistenceFailure(t *testing.T) {
+	s := NewStore(nil)
+	if err := s.SetRuntimeStatePersister(&trSharedPersister{}); err != nil {
+		t.Fatal(err)
+	}
+	err := s.SaveTenantRestriction("one", "google_workspace", TenantRestrictionPatch{AllowedValue: trptr("bad domain"), Enabled: trptr(true)})
+	if err == nil || errors.Is(err, ErrPolicyPersistence) {
+		t.Fatalf("validation classification: %v", err)
 	}
 }

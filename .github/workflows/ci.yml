@@ -67,7 +67,7 @@ jobs:
       - name: PostgreSQL first administrative writes
         env:
           POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
-        run: go test ./cmd/dsse-edge -run '^(TestPostgres(BlobInitial|CandidatePeer)|TestCandidatePublicationPostgresRestartAndConcurrency)' -count=1
+        run: go test ./cmd/dsse-edge -run '^(TestPostgres(BlobInitial|CandidatePeer|Observation)|TestCandidatePublicationPostgresRestartAndConcurrency)' -count=1
       - name: Connector access policy traffic
         run: |
           go build -o "$RUNNER_TEMP/dsse-connector" ./cmd/dsse-connector

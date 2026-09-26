@@ -280,10 +280,12 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	// was always really about: a request that matched NO policy. Keeping the capture matters more now, not
 	// less — the same flow is denied rather than passed, so the candidate list is where an operator sees what
 	// to adopt.
-	if decision.IsDefaultDeny(dec) && config.PolicyCandidateStore != nil {
+	if decision.IsDefaultDeny(dec) {
+		at := time.Now().UTC()
 		if cs, ok := config.PolicyCandidateStore.(*policycandidate.Store); ok {
-			_, _ = cs.ObserveUnmatchedFlow(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "", time.Now().UTC())
+			_, _ = cs.ObserveUnmatchedFlow(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "", at)
 		}
+		reportCandidate(policycandidate.ReportUnmatchedFlow, req.TenantID, req.FQDN, req.SNI, "", req.DestinationPort, "", at)
 	}
 	// Record the HTTP method (non-secret) so the AI-usage report can count "messages": a POST to an assistant is
 	// a prompt / action, while GETs are page loads and polling. A finer "how much" than raw requests or sessions.
@@ -505,9 +507,11 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 		// Pinned Sites view — then the client's own TLS reaches the origin. Detection only proposes; it NEVER
 		// auto-bypasses (no inspection is silently dropped).
 		if swgEgressIsUnrecognizedName(err) {
+			at := time.Now().UTC()
 			if cs, ok := config.PolicyCandidateStore.(*policycandidate.Store); ok {
-				_, _ = cs.ObserveCertPinFailure(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "egress_tls_unrecognized_name", time.Now().UTC())
+				_, _ = cs.ObserveCertPinFailure(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "egress_tls_unrecognized_name", at)
 			}
+			reportCandidate(policycandidate.ReportCertPinFailure, req.TenantID, req.FQDN, req.SNI, "", req.DestinationPort, "egress_tls_unrecognized_name", at)
 		}
 		setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeUpstreamRequestFailed)
 		setSWGHTTPEgressUpstreamRequestErrorCategory(w, err)

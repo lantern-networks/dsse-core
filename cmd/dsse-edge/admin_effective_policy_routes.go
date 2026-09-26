@@ -23,6 +23,9 @@ import (
 // inspection posture). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
 func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, policyCandidateStore policycandidate.RuntimeStore, recompileAuthoredRules func()) {
 	mux.HandleFunc("POST /admin/east-west/observations/adopt", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
+		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "adopting east-west observations") {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		var reqBody struct {
 			ObservationIDs []string `json:"observation_ids"`
@@ -33,6 +36,10 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		if config.EastWestObserveStore == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation store unavailable"))
+			return
+		}
+		if err := config.EastWestObserveStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation inventory unavailable"))
 			return
 		}
 		// Effective rules for dedup: an observation already matched by ANY effective east-west rule needs no

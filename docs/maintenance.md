@@ -34,6 +34,19 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+DNS Filtering saves now publish the new live policy only after the configured
+file save succeeds. A rejected save returns a retryable error and preserves the
+previous policy. Explicitly removing the last DNS rule now reaches upgraded
+Edges, so an obsolete block or redirect does not remain active. Boot-time and
+legacy empty bundles retain the existing protection against losing local DNS.
+The saved record adds `admin_authored`, and the signed bundle adds
+`dns_policy_authoritative`; old records still load. Upgrade both the control
+plane and Edges before relying on final-rule removal, then save the intended
+policy again. Older Edges ignore the new marker. Local checks cover separate
+CP/Edge processes, signed automatic distribution, actual localhost UDP DNS
+answers, file reload, concurrent saves, and browser failure/retry/removal with
+mutation audit records. These checks do not establish deployed-fleet acceptance.
+
 Connector Access rule and posture edits now validate the whole request and save
 the four related settings together before publishing them. An invalid mode no
 longer leaves a rule or TTL change behind; a rejected save returns a retryable

@@ -6292,7 +6292,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerConnectorProgramRoutes(mux, adminEndpoint, config.ConnectorProgramDir, config.PullsAgentUpdates)
 	registerHumanIdentityRoutes(mux, adminEndpoint, evaluator, writer, humanIdentities, adminAuditOutbox, registry, connectorSecret, devMode, requireConnectorRuntimeSecret, configSourceURL, config.DirectoryCPReporter, config.TenantCARegistry)
 	registerNHIRegistryRoutes(mux, adminEndpoint, evaluator, writer, adminAuditOutbox, nonHumanIdentities, configSourceURL)
-	bundleGeneration := registerPolicyAdminRoutes(mux, adminEndpoint, config, evaluator, writer, adminAuditOutbox, policyStore, configSourceURL, configBundleEpoch, registry, nonHumanIdentities, humanIdentities, delegatedGrants, edgeDNSResolver, vlanBoundary, tenantModelStore, networkExtensionPublisher, ruleStore, assetStore)
+	bundleGeneration := registerPolicyAdminRoutes(mux, adminEndpoint, config, evaluator, writer, adminAuditOutbox, policyStore, configSourceURL, configBundleEpoch, registry, nonHumanIdentities, humanIdentities, delegatedGrants, edgeDNSResolver, edgeDNSPolicyStore, vlanBoundary, tenantModelStore, networkExtensionPublisher, ruleStore, assetStore)
 	// The fleet view: which Edges have actually acknowledged the current configuration. Registered wherever the
 	// bundle is SERVED (a control plane), because that is the only node every Edge already talks to. Reads the
 	// same generation function the bundle uses, so "current" cannot mean two things.

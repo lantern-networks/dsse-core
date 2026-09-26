@@ -50,14 +50,15 @@ func TestCapacityRetainsTerminalAuthorizationAcrossRestarts(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
+				if _, err := s.Upsert(capacityRecord("a", "pressure", now)); err != nil {
+					t.Fatalf("terminal history blocked active admission: %v", err)
+				}
+				if _, err := s.Upsert(capacityRecord("other", "pressure", now)); !errors.Is(err, ErrCapacity) {
+					t.Fatalf("active capacity not enforced: %v", err)
+				}
 				before, err := os.ReadFile(path)
 				if err != nil {
 					t.Fatal(err)
-				}
-				for _, tenant := range []string{"a", "other"} {
-					if _, err := s.Upsert(capacityRecord(tenant, "pressure", now)); !errors.Is(err, ErrCapacity) {
-						t.Fatalf("capacity refusal: %v", err)
-					}
 				}
 				// A fresh future expiry must not resurrect an explicitly terminal outcome, even after its old window.
 				for _, replayTime := range []time.Time{now, now.Add(2 * time.Hour)} {
@@ -66,7 +67,7 @@ func TestCapacityRetainsTerminalAuthorizationAcrossRestarts(t *testing.T) {
 					}
 				}
 				stored, ok := s.GetForTenant("a", "retained")
-				if !ok || stored.Status != terminal || IsActive(stored, now) || s.Count() != 1 {
+				if !ok || stored.Status != terminal || IsActive(stored, now) || s.Count() != 2 {
 					t.Fatalf("terminal record lost: %+v", stored)
 				}
 				after, err := os.ReadFile(path)

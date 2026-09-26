@@ -33,14 +33,20 @@ func TestActiveExpiredRevokedAndCapacity(t *testing.T) {
 		t.Fatal("a revoked grant must not be active")
 	}
 	// Capacity must not forget the revocation or the expired record.
-	if _, err := store.Upsert(mk("g3", now.Add(time.Hour).Format(time.RFC3339))); !errors.Is(err, ErrCapacity) {
+	if _, err := store.Upsert(mk("g3", now.Add(time.Hour).Format(time.RFC3339))); err != nil {
 		t.Fatalf("admission: %v", err)
 	}
 	if g, ok := store.Get("g1"); !ok || g.Status != "revoked" {
 		t.Fatal("revocation lost")
 	}
-	if store.Count() > store.Capacity() {
-		t.Fatalf("count %d exceeds capacity %d", store.Count(), store.Capacity())
+	if _, err := store.Upsert(mk("g4", now.Add(time.Hour).Format(time.RFC3339))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Upsert(mk("g5", now.Add(time.Hour).Format(time.RFC3339))); !errors.Is(err, ErrCapacity) {
+		t.Fatal("active capacity not enforced", err)
+	}
+	if store.Count() != 4 {
+		t.Fatal("terminal history was discarded")
 	}
 }
 

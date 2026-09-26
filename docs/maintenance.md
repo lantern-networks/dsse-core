@@ -58,8 +58,13 @@ PostgreSQL authority. Empty/omitted grant bundles keep existing records.
 
 Existing legacy grant snapshots remain readable. New snapshots use
 organization-scoped keys; older binaries need a compatible pre-upgrade snapshot
-for rollback. Store capacity limits new admissions instead of evicting existing
-grants or revocations; edits and revocations remain available at capacity.
+for rollback. Store capacity limits simultaneously active admissions instead of evicting existing
+grants or revocations. Revoked and expired history does not consume an active slot;
+that history is retained to reject resurrection and can grow until tenant erasure.
+An Edge receiving an authorized CP snapshot does not impose its own admission cap.
+Stale active copies never revive locally revoked/expired grants. A section save
+failure keeps the bundle unacknowledged, while independent later sections continue
+to apply. Edits and revocations remain available at capacity.
 Tests cover PostgreSQL peer registration/edit/revocation and saved-state reload,
 HTTP permissions and audits, signed distribution, receiver save retry, and
 revoked-access denial. Full Go tests, focused race checks and vet pass locally.

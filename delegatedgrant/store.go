@@ -15,7 +15,7 @@ import (
 type pendingRevocation struct{ at, reason string }
 
 // Store is the in-memory delegated-access-grant store: OOB-authenticated, short-lived east-west grants
-// (upsert / lookup / active-check / revoke), admission-bounded by capacity (capacity<=0 disables the bound).
+// (upsert / lookup / active-check / revoke), active-admission-bounded by capacity (capacity<=0 disables the bound).
 // Existing records, including revoked grants, are never evicted for a new ID.
 // Optionally durable: SetStatePath rehydrates from a JSON snapshot and each mutation write-throughs, so a
 // revoked grant stays revoked across a restart and in-flight grants are not lost.
@@ -111,28 +111,63 @@ func (s *Store) Upsert(grant model.DelegatedAccessGrant) (model.DelegatedAccessG
 	return s.UpsertContext(context.Background(), grant)
 }
 func (s *Store) UpsertContext(ctx context.Context, grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
+	return s.upsertContext(ctx, grant, false)
+}
+
+// UpsertReceived applies an already-authorized CP grant to an Edge cache. Local
+// terminal decisions prevail over stale active copies. The CP owns admission
+// capacity; a receiver must not reject its fleet snapshot at a smaller local limit.
+func (s *Store) UpsertReceived(ctx context.Context, grant model.DelegatedAccessGrant) (model.DelegatedAccessGrant, error) {
+	return s.upsertContext(ctx, grant, true)
+}
+
+var errRetainedTerminal = errors.New("retained terminal delegated grant")
+
+func (s *Store) upsertContext(ctx context.Context, grant model.DelegatedAccessGrant, received bool) (model.DelegatedAccessGrant, error) {
 	if err := validKey(grant.TenantID, grant.ID); err != nil {
 		return model.DelegatedAccessGrant{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var retained model.DelegatedAccessGrant
 	err := s.editLocked(ctx, func(next map[string]model.DelegatedAccessGrant) error {
 		key := grantKey(grant.TenantID, grant.ID)
 		old, ok := next[key]
 		if _, pending := s.pendingRevocations[key]; pending && grant.Status != "revoked" {
+			if received {
+				retained = old
+				retained.Status = "revoked"
+				return errRetainedTerminal
+			}
 			return fmt.Errorf("delegated access grant revocation is pending persistence")
 		}
 		if ok {
 			if err := validateTransition(old, grant); err != nil {
+				if received {
+					retained = old
+					return errRetainedTerminal
+				}
 				return err
 			}
 		}
-		if !ok && s.capacity > 0 && len(next) >= s.capacity {
-			return ErrCapacity
+		now := time.Now()
+		if !received && IsActive(grant, now) && (!ok || !IsActive(old, now)) && s.capacity > 0 {
+			active := 0
+			for _, stored := range next {
+				if IsActive(stored, now) {
+					active++
+				}
+			}
+			if active >= s.capacity {
+				return ErrCapacity
+			}
 		}
 		next[key] = grant
 		return nil
 	})
+	if errors.Is(err, errRetainedTerminal) {
+		return retained, nil
+	}
 	if err != nil {
 		// Received revocations must deny locally even while their save needs a retry.
 		if errors.Is(err, ErrPersistence) && grant.Status == "revoked" {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/delegatedgrant"
+	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -172,7 +173,10 @@ func TestDelegatedGrantReceiverSaveRetryAndRevoke(t *testing.T) {
 		t.Fatal("revoked grant active after reload")
 	}
 	payload.DelegatedGrants.Grants[0].Status = "active"
-	if _, err := src.apply(payload, targets); err == nil {
+	if _, err := src.apply(payload, targets); err != nil {
+		t.Fatal("stale active snapshot blocked configuration", err)
+	}
+	if g, ok := s.GetForTenant("own", "grant"); !ok || g.Status != "revoked" {
 		t.Fatal("stale active snapshot revived revoked grant")
 	}
 	if _, err := src.apply(configBundlePayload{DelegatedGrants: &delegatedGrantBundle{}}, targets); err != nil {
@@ -253,4 +257,56 @@ func TestPostgresDelegatedGrantBundleRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	fetch(503)
+}
+
+func TestDelegatedStaleActiveDoesNotStarveLaterConfig(t *testing.T) {
+	store := delegatedgrant.NewStore(1)
+	first := delegatedFixture("own", "revoked")
+	if _, err := store.Upsert(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RevokeForTenant("own", first.ID, "operator", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	current := inspectionposture.DefaultPosture()
+	next := current
+	next.Mode = inspectionposture.ModeBypassDefault
+	payload := configBundlePayload{DelegatedGrants: &delegatedGrantBundle{Grants: []model.DelegatedAccessGrant{first, delegatedFixture("own", "second"), delegatedFixture("own", "third")}}, InspectionPosture: &inspectionPostureBundle{Posture: next}}
+	targets := configApplyTargets{delegatedGrants: store, inspectionPosture: func() inspectionposture.Posture { return current }, setInspectionPosture: func(p inspectionposture.Posture, _ string) (inspectionposture.Posture, error) {
+		current = p
+		return p, nil
+	}}
+	src := configBundleSource{}
+	if _, err := src.apply(payload, targets); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := store.GetForTenant("own", first.ID); got.Status != "revoked" {
+		t.Fatal("stale grant resurrected revocation")
+	}
+	if store.Count() != 3 || current.Mode != next.Mode {
+		t.Fatal("receiver capacity or stale grant starved remaining config")
+	}
+}
+func TestDelegatedSaveFailureDoesNotStarveLaterConfig(t *testing.T) {
+	store := delegatedgrant.NewStore(1)
+	p := &allowlistSaveFixture{}
+	if err := store.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	p.err = errors.New("unavailable")
+	current := inspectionposture.DefaultPosture()
+	next := current
+	next.Mode = inspectionposture.ModeBypassDefault
+	targets := configApplyTargets{delegatedGrants: store, inspectionPosture: func() inspectionposture.Posture { return current }, setInspectionPosture: func(p inspectionposture.Posture, _ string) (inspectionposture.Posture, error) {
+		current = p
+		return p, nil
+	}}
+	payload := configBundlePayload{DelegatedGrants: &delegatedGrantBundle{Grants: []model.DelegatedAccessGrant{delegatedFixture("own", "new")}}, InspectionPosture: &inspectionPostureBundle{Posture: next}}
+	src := configBundleSource{}
+	if _, err := src.apply(payload, targets); err == nil {
+		t.Fatal("failed save acknowledged")
+	}
+	if current.Mode != next.Mode {
+		t.Fatal("save failure starved later inspection update")
+	}
 }

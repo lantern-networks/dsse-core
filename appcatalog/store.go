@@ -15,6 +15,9 @@ import (
 // tenant can never observe or affect another tenant's catalog. Handlers map it to 404.
 var ErrApplicationNotFound = errors.New("application not found")
 
+// ErrApplicationPersistence identifies a rejected durable catalog write.
+var ErrApplicationPersistence = errors.New("application catalog persistence failed")
+
 // ErrApplicationNotDeletable is returned by Delete for a CONFIG-SEED entry (one derived from the route profiles
 // / SaaS catalog at boot). Config-seed entries are reconstructed from configuration on every restart, so they
 // are not deletable via the API — removing one would only reappear on the next boot. Edit configuration (or
@@ -174,15 +177,25 @@ func (store *Store) Upsert(_ context.Context, application Entry, tenantID string
 	return copyEntry(normalized), nil
 }
 
-// putLocked stores the application and snapshots. A non-nil error means the entry IS live in memory but
-// durability failed (it would vanish on restart) — callers propagate it to the API layer.
+// putLocked holds the lock until the snapshot succeeds or the old entry is restored.
+// Readers and later writers must never observe a rejected mutation.
 func (store *Store) putLocked(application Entry) error {
-	if store.applications[application.TenantID] == nil {
-		store.applications[application.TenantID] = map[string]Entry{}
+	tenant, id := application.TenantID, application.ApplicationID
+	previous, existed := store.applications[tenant][id]
+	if store.applications[tenant] == nil {
+		store.applications[tenant] = map[string]Entry{}
 	}
-	store.applications[application.TenantID][application.ApplicationID] = copyEntry(application)
+	store.applications[tenant][id] = copyEntry(application)
 	if err := store.persistLocked(); err != nil {
-		return fmt.Errorf("application %s stored in memory but not persisted (will not survive a restart): %w", application.ApplicationID, err)
+		if existed {
+			store.applications[tenant][id] = previous
+		} else {
+			delete(store.applications[tenant], id)
+			if len(store.applications[tenant]) == 0 {
+				delete(store.applications, tenant)
+			}
+		}
+		return fmt.Errorf("%w: %w", ErrApplicationPersistence, err)
 	}
 	return nil
 }
@@ -210,12 +223,17 @@ func (store *Store) Delete(_ context.Context, tenantID, applicationID string) er
 	if _, ok := store.applications[tenantID][applicationID]; !ok {
 		return ErrApplicationNotFound
 	}
+	previous := store.applications[tenantID][applicationID]
 	delete(store.applications[tenantID], applicationID)
 	if len(store.applications[tenantID]) == 0 {
 		delete(store.applications, tenantID)
 	}
 	if err := store.persistLocked(); err != nil {
-		return fmt.Errorf("application %s deleted in memory but not persisted (would resurrect on restart): %w", applicationID, err)
+		if store.applications[tenantID] == nil {
+			store.applications[tenantID] = map[string]Entry{}
+		}
+		store.applications[tenantID][applicationID] = previous
+		return fmt.Errorf("%w: %w", ErrApplicationPersistence, err)
 	}
 	return nil
 }

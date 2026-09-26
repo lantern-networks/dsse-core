@@ -305,20 +305,31 @@ func (p *postgresAdminTenantModelStore) Delete(ctx context.Context, tenantID str
 	if tenantID == "" {
 		return fmt.Errorf("tenant_id is required")
 	}
-	if _, err := p.db.ExecContext(ctx, "DELETE FROM admin_tenant_models WHERE tenant_id = $1", tenantID); err != nil {
-		return err
+	// The profile and its carried deletion are one committed change. Otherwise a
+	// failed tombstone write removes it from the CP while leaving Edge copies live.
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM admin_tenant_models WHERE tenant_id = $1", tenantID); err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
 	// Record the tombstone (migration 038). Written even when the row was already absent: that is the ghost
 	// case, where the control plane no longer holds the tenant but an Edge still does, and naming the deletion
 	// is the only way to say so. See DeletedTenants for why absence cannot be used instead.
-	_, err := p.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		"INSERT INTO admin_tenant_model_deletions (tenant_id, deleted_at) VALUES ($1, now()) "+
 			"ON CONFLICT (tenant_id) DO UPDATE SET deleted_at = EXCLUDED.deleted_at",
 		tenantID)
-	if err == nil {
-		atomic.AddUint64(&p.gen, 1) // the bundle carries the tombstone, so it is a new config version
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
-	return err
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	atomic.AddUint64(&p.gen, 1) // publish only the confirmed transaction
+	return nil
 }
 
 // DeletedTenants returns the carried deletions, oldest id first. The config bundle publishes these so an Edge

@@ -536,3 +536,21 @@ Enrollment inventory and token changes gain checked persistence and shared
 transaction helpers. Seat allocation removal reports storage failure during
 organization erasure. These storage changes precede the remaining administrative
 route and CP startup integration; they do not claim complete GUI acceptance.
+
+### Access authorization and network boundary persistence
+
+Grant and human-approval changes retain revocations during failed saves and
+reject incompatible replayed authorization. Shared updates operate on the
+current stored state, and checked erasure reports failures rather than removing
+retry targets. Human-approval admission counts nonterminal, unexpired records;
+revocation history remains present and cannot be replayed into an active grant.
+Terminal history can grow until organization erasure and is not bounded by the
+admission limit.
+
+Steering exclusions and named-network boundaries save candidates before
+publishing them and validate saved state. The organization erasure result
+includes named-network persistence failures. Administrative context/startup
+wiring remains a following migration unit. Back up authorization snapshots
+before upgrading: new human-approval records use organization/ID keys, while
+legacy bare-ID snapshots remain readable. Older writers must not overwrite the
+new format; rollback requires a compatible backup.

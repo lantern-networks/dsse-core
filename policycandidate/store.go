@@ -2,6 +2,7 @@ package policycandidate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,9 @@ import (
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
+
+// ErrPersistence identifies a candidate change that could not be saved.
+var ErrPersistence = errors.New("policy candidate persistence failed")
 
 type RuntimeStore interface {
 	List(context.Context, string, ListOptions) (ListResponse, error)
@@ -209,15 +213,24 @@ func (store *Store) Review(_ context.Context, tenantID, candidateID string, revi
 	return copyCandidate(candidate), true, nil
 }
 
-// putLocked stores the candidate and snapshots. A non-nil error means the candidate IS live in memory but
-// durability failed (it would vanish on restart) — callers propagate it to the API layer.
+// putLocked keeps rejected changes out of subsequent reads and saves. The caller holds mu.
 func (store *Store) putLocked(candidate Candidate) error {
-	if store.candidates[candidate.TenantID] == nil {
-		store.candidates[candidate.TenantID] = map[string]Candidate{}
+	tenant, id := candidate.TenantID, candidate.CandidateID
+	previous, existed := store.candidates[tenant][id]
+	if store.candidates[tenant] == nil {
+		store.candidates[tenant] = map[string]Candidate{}
 	}
-	store.candidates[candidate.TenantID][candidate.CandidateID] = copyCandidate(candidate)
+	store.candidates[tenant][id] = copyCandidate(candidate)
 	if err := store.persistLocked(); err != nil {
-		return fmt.Errorf("candidate %s stored in memory but not persisted (will not survive a restart): %w", candidate.CandidateID, err)
+		if existed {
+			store.candidates[tenant][id] = previous
+		} else {
+			delete(store.candidates[tenant], id)
+			if len(store.candidates[tenant]) == 0 {
+				delete(store.candidates, tenant)
+			}
+		}
+		return fmt.Errorf("%w: %w", ErrPersistence, err)
 	}
 	return nil
 }

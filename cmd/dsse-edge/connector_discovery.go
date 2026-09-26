@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -106,8 +105,7 @@ func refreshConnectorDiscoveredCandidates(ctx context.Context, registry connecto
 	for _, input := range inputs {
 		cand, err := store.ObserveConnectorDiscovered(ctx, tenantID, input.Destination, 0, input.PublishProtocol, input.ConnectorID, input.Site, input.Namespace, input.Evidence, now)
 		if err != nil {
-			log.Printf("observe connector-discovered candidate: %v", err)
-			continue
+			return nil, fmt.Errorf("record connector discovery: %w", err)
 		}
 		out = append(out, cand)
 	}

@@ -34,6 +34,15 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Policy candidates now preserve the prior saved state when a change cannot be
+written, and registration, review, adoption and discovery refresh return a storage
+error instead of reporting success. If publishing an application succeeds but
+approving its discovery candidate fails, the response and audit identify the
+partial result. Store and product-HTTP regressions cover rejected saves, explicit
+retry and fresh-store readback. A synthetic-session browser check covers manual
+bypass registration failure, retry and reload; it does not establish deployed
+traffic or independent control-plane/Edge acceptance.
+
 Connector Access rule and posture edits now validate the whole request and save
 the four related settings together before publishing them. An invalid mode no
 longer leaves a rule or TTL change behind; a rejected save returns a retryable

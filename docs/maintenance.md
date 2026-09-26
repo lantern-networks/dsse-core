@@ -22,6 +22,7 @@ changes is included in the published 0.3.0 release:
 
 | Area | Change | Evidence available so far |
 |---|---|---|
+| Incoming export compatibility | Reject activation of conditions the current Windows export cannot represent; refuse unsafe legacy exports while keeping disablement available | Authenticated registration/reactivation and saved-state checks, admin/device export checks, local browser refusal and corrected SMB save with audit comparison; Windows firewall execution remains unverified |
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
 | Directory updates | Preserve user-risk association after subject or email changes | Local browser risk changes, import and decision API checks, saved-state and audit comparisons; separate PostgreSQL regression |
 | DLP and access rules | Preserve existing settings and references during ordinary edits; restore permitted read-only DLP listing | Local browser checks, saved-state and audit comparisons, automated regressions |

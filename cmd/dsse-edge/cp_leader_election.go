@@ -110,10 +110,16 @@ func (e *cpLeaderElector) tick() {
 	e.stateRefreshMu.Lock()
 	defer e.stateRefreshMu.Unlock()
 	if e.isLeader.Load() {
-		// Verify the lock-holding connection is still alive; a dead connection = lost session = lost lock.
-		e.mu.Lock()
+		// A busy writer owns this session. A health-check wait must not cancel
+		// its SQL statement or discard the leadership connection.
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), cpLeaderPingInterval)
+		lockErr := e.mu.LockContext(waitCtx)
+		waitCancel()
+		if lockErr != nil {
+			return
+		}
+		defer e.mu.Unlock()
 		conn := e.conn
-		e.mu.Unlock()
 		if conn == nil {
 			e.isLeader.Store(false)
 			return
@@ -122,12 +128,11 @@ func (e *cpLeaderElector) tick() {
 		err := conn.PingContext(ctx)
 		cancel()
 		if err != nil {
-			log.Printf("cp_leader: lost the lock connection (%v) — stepping down", err)
-			e.mu.Lock()
-			_ = e.conn.Close()
-			e.conn = nil
-			e.mu.Unlock()
+			log.Printf("cp_leader: lost lock connection; stepping down")
 			e.isLeader.Store(false)
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			_ = conn.Close()
+			e.conn = nil
 		}
 		return
 	}

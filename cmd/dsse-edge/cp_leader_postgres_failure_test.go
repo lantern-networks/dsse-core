@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/lib/pq"
 )
@@ -90,5 +91,39 @@ func TestPostgresLeaderDetectsTerminatedSessionAndRejoins(t *testing.T) {
 	a.tick()
 	if !a.IsLeader() {
 		t.Fatal("former leader cannot recover")
+	}
+}
+
+func TestPostgresLeaderPingDoesNotInterruptActiveWriter(t *testing.T) {
+	p, a, _ := blobWriterPostgresFixture(t)
+	tx, finish, err := beginCPWriteTransaction(captureCPWriteLease(context.Background()), p.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { tx.Rollback(); finish() }()
+	started := make(chan struct{})
+	done := make(chan struct{})
+	go func() { close(started); a.tick(); close(done) }()
+	<-started
+	// Keep the request lease past the health-check wait budget.
+	select {
+	case <-done:
+	case <-time.After(cpLeaderPingInterval + time.Second):
+		t.Fatal("ping did not leave busy writer alone")
+	}
+	if !a.IsLeader() {
+		t.Fatal("busy writer caused false demotion")
+	}
+	if _, err := tx.Exec("SELECT 1"); err != nil {
+		t.Fatal("health check broke writer", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	finish()
+	finish = func() {}
+	a.tick()
+	if !a.IsLeader() {
+		t.Fatal("leader unhealthy after write")
 	}
 }

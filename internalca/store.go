@@ -438,7 +438,7 @@ func parseAuthority(material string) (*x509.Certificate, string, error) {
 	return cert, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})), nil
 }
 
-// Loading permits expired authorities for display, but never malformed or mixed key material.
+// Loading permits expired authorities and normalizes legacy input to one public CA.
 func validatedAuthorities(authorities []Authority) (map[string]Authority, error) {
 	next := map[string]Authority{}
 	for _, a := range authorities {
@@ -466,35 +466,9 @@ func parseSavedAuthority(material string) (*x509.Certificate, string, error) {
 	if cert, normalized, err := parseAuthority(material); err == nil {
 		return cert, normalized, nil
 	}
-	first := strings.Index(material, "-----BEGIN ")
-	if first < 0 || !strings.HasPrefix(material[first:], "-----BEGIN CERTIFICATE-----") {
+	block, _ := pem.Decode([]byte(material))
+	if block == nil || block.Type != "CERTIFICATE" {
 		return nil, "", fmt.Errorf("invalid saved authority certificate")
-	}
-	end := strings.Index(material[first:], "-----END CERTIFICATE-----")
-	if end < 0 {
-		return nil, "", fmt.Errorf("invalid saved authority certificate")
-	}
-	end += first + len("-----END CERTIFICATE-----")
-	if strings.Count(material[first:end], "-----BEGIN ") != 1 {
-		return nil, "", fmt.Errorf("invalid saved authority certificate")
-	}
-	block, rest := pem.Decode([]byte(material[first:end]))
-	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) > 0 || len(rest) > 0 {
-		return nil, "", fmt.Errorf("invalid saved authority certificate")
-	}
-	trailing := strings.TrimSpace(material[end:])
-	for trailing != "" {
-		if !strings.HasPrefix(trailing, "-----BEGIN CERTIFICATE-----") {
-			return nil, "", fmt.Errorf("invalid saved authority trailing material")
-		}
-		extra, remain := pem.Decode([]byte(trailing))
-		if extra == nil || extra.Type != "CERTIFICATE" || len(extra.Headers) > 0 {
-			return nil, "", fmt.Errorf("invalid saved authority chain")
-		}
-		if _, err := x509.ParseCertificate(extra.Bytes); err != nil {
-			return nil, "", fmt.Errorf("invalid saved authority chain")
-		}
-		trailing = strings.TrimSpace(string(remain))
 	}
 	normalized := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes}))
 	cert, normalized, err := parseAuthority(normalized)

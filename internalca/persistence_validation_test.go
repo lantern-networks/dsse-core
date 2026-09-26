@@ -109,11 +109,11 @@ func TestPersistenceFailureNeverPublishesUnconfirmedTrust(t *testing.T) {
 		t.Fatal("successful delete not durable")
 	}
 }
-func TestMixedPEMRejectedAcrossEveryStoreIntake(t *testing.T) {
+func TestNewAuthorityInputStrictAndLegacyRestoreNormalizes(t *testing.T) {
 	now := time.Now()
 	pem := caPEM(t, "Safe", now.Add(time.Hour), true)
 	a := Authority{ID: "one", TenantID: "tenant", CertificatePEM: pem}
-	for label, material := range map[string]string{"key": pem + "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----", "secondCA": pem + pem, "prefix": "secret\n" + pem, "trailing": pem + "secret", "header": strings.Replace(pem, "-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE-----\nComment: secret\n", 1), "malformedFirst": "-----BEGIN CERTIFICATE-----\ninvalid\n" + pem} {
+	for label, material := range map[string]string{"key": pem + "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----", "secondCA": pem + pem, "pkcs12": "Bag Attributes\n" + pem + "Bag Attributes\nsubject=legacy\n" + pem, "prefix": "secret\n" + pem, "trailing": pem + "secret", "header": strings.Replace(pem, "-----BEGIN CERTIFICATE-----", "-----BEGIN CERTIFICATE-----\nComment: secret\n", 1), "malformedFirst": "-----BEGIN CERTIFICATE-----\ninvalid\n" + pem, "unparseable": "invalid certificate"} {
 		t.Run(label, func(t *testing.T) {
 			p := &faultPersistence{}
 			s, _ := NewStore(p)
@@ -127,13 +127,15 @@ func TestMixedPEMRejectedAcrossEveryStoreIntake(t *testing.T) {
 			if _, err := s.Upsert(bad, now); err == nil {
 				t.Fatal("upsert accepted mixed material")
 			}
-			if label == "prefix" || label == "secondCA" {
+			if label != "unparseable" {
 				if err := s.ReplaceAll([]Authority{bad}); err != nil {
 					t.Fatal(err)
 				}
-				p.rows = []Authority{bad}
+				other := a
+				other.TenantID = "other"
+				p.rows = []Authority{bad, other}
 				restored, err := NewStore(p)
-				if err != nil || len(restored.ListAll(now)) != 1 || restored.ListAll(now)[0].CertificatePEM != pem {
+				if err != nil || len(restored.List("tenant", now)) != 1 || restored.List("tenant", now)[0].CertificatePEM != pem || len(restored.AnchorsPEM("other", now)) != 1 {
 					t.Fatal("legacy public CA material not normalized", err)
 				}
 				return

@@ -186,7 +186,15 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 					Action:     model.PolicyAction{Decision: "allow"},
 				}
 				if _, perr := policyStore.Upsert(r.Context(), adopted, tenantID, now); perr != nil {
-					log.Printf("adopt allow policy for %s: %v", host, perr)
+					audit := adminPolicyCandidateAuditLog("admin_policy_candidate_materialized", materialized, evaluator, now)
+					result, reason := "partial", "Candidate adoption was saved, but allow-policy saving could not be confirmed."
+					audit.Result, audit.Reason, audit.ActorUserID = &result, &reason, auditActorPrincipal(r)
+					audit.Metadata["failed_stage"] = "allow_policy"
+					audit.Metadata["candidate_saved"] = true
+					audit.Metadata["policy_save_confirmed"] = false
+					_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": reason + " Reload and retry.", "partial": true, "failed_stage": "allow_policy", "candidate_id": materialized.CandidateID})
+					return
 				}
 			}
 		}
@@ -369,7 +377,17 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			Published:        true,
 			Status:           "active",
 		}
-		created, err := applicationCatalogStore.Upsert(r.Context(), entry, tenantID, now)
+		publisher, canPublish := applicationCatalogStore.(appcatalog.CandidatePublisher)
+		reviewer, canReview := policyCandidateStore.(policycandidate.PublicationReviewer)
+		if !canPublish || !canReview {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate publication is not supported by the configured stores"))
+			return
+		}
+		created, err := publisher.CreateOrMatch(r.Context(), entry, tenantID, now)
+		if errors.Is(err, appcatalog.ErrCandidateApplicationConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -380,7 +398,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if reviewReason == "" {
 			reviewReason = "connector_candidate_published"
 		}
-		reviewed, reviewFound, rerr := policyCandidateStore.Review(r.Context(), tenantID, candidateID, policycandidate.ReviewRequest{Decision: "approved", ReviewReasonCode: reviewReason}, now)
+		reviewed, reviewFound, rerr := reviewer.ApprovePublication(r.Context(), cand, reviewReason, now)
 		if rerr != nil || !reviewFound {
 			published := adminApplicationPublishAuditLog(created, evaluator, now, true)
 			published.ActorUserID = auditActorPrincipal(r)

@@ -380,3 +380,15 @@ inspect rules retain their device scope. Bypass rules never widen when a source
 cannot be resolved. Review identity-scoped inspect rules before updating: they
 may inspect additional users to preserve inspection instead of silently disabling
 DLP under bypass-default.
+
+### Named-service and save compatibility
+
+When an egress deny or authentication rule references a missing/invalid service,
+it now retains its authored source and destination restrictions across all ports,
+until the service is repaired. Unresolved allow rules continue to match nothing.
+This prevents deleting a named service from silently disabling an existing deny.
+
+A confirmed non-atomic rule save counts as saved. If file replacement completed
+but its final flush is unconfirmed, the rule store keeps the replacement live
+and returns a storage error requiring reconciliation; it does not roll back only
+the in-memory copy while leaving the new file on disk.

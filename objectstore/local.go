@@ -39,6 +39,10 @@ func (s *LocalStore) WriteGzipJSONL(filename string, values []map[string]any) (s
 }
 
 func (s *LocalStore) WriteGzipJSONLStream(filename string, next func() (map[string]any, bool, error)) (string, error) {
+	return s.WriteGzipJSONLStreamWithComment(filename, "", next)
+}
+
+func (s *LocalStore) WriteGzipJSONLStreamWithComment(filename, comment string, next func() (map[string]any, bool, error)) (string, error) {
 	if s == nil {
 		return "", fmt.Errorf("object store is not configured")
 	}
@@ -70,6 +74,7 @@ func (s *LocalStore) WriteGzipJSONLStream(filename string, next func() (map[stri
 
 	hash := sha256.New()
 	gzipWriter := gzip.NewWriter(io.MultiWriter(file, hash))
+	gzipWriter.Comment = comment
 	encoder := json.NewEncoder(gzipWriter)
 	for {
 		value, ok, err := next()

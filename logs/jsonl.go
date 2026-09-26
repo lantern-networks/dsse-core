@@ -41,6 +41,7 @@ const defaultMaxOpenLogFiles = 512
 var logLineBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 type Writer struct {
+	auditMonitor   auditWriteMonitor
 	dir            string
 	mu             sync.Mutex
 	appendHook     AppendHook
@@ -294,10 +295,15 @@ func (w *Writer) AddAppendHook(hook AppendHook) {
 	}
 }
 
-func (w *Writer) Append(filename string, value any) error {
+func (w *Writer) Append(filename string, value any) (appendErr error) {
 	clean, err := safeRelativeLogPath(filename)
 	if err != nil {
 		return err
+	}
+
+	phase := "encode"
+	if clean == "audit.log.jsonl" {
+		defer func() { w.observeAuditWrite(phase, appendErr) }()
 	}
 
 	// Marshal off any shared lock, into a pooled buffer. json.Encoder.Encode appends the
@@ -327,6 +333,7 @@ func (w *Writer) Append(filename string, value any) error {
 		writeClean = tenantPartitionPath(tenantIDFromEncoded(line), clean)
 	}
 
+	phase = "open"
 	lf, err := w.fileFor(writeClean)
 	if err != nil {
 		logLineBufPool.Put(buf)
@@ -349,7 +356,11 @@ func (w *Writer) Append(filename string, value any) error {
 		}
 		lf.mu.Lock()
 	}
+	phase = "write"
 	n, writeErr := lf.f.Write(line)
+	if writeErr == nil && n != len(line) {
+		writeErr = io.ErrShortWrite
+	}
 	lf.size += int64(n)
 	rotateNow := writeErr == nil && maxBytes > 0 && lf.size >= maxBytes
 	var rotErr error
@@ -362,9 +373,11 @@ func (w *Writer) Append(filename string, value any) error {
 		return fmt.Errorf("write jsonl value: %w", writeErr)
 	}
 	if rotErr != nil {
+		phase = "rotation"
 		return fmt.Errorf("rotate jsonl log: %w", rotErr)
 	}
 
+	phase = "hook"
 	if hook != nil {
 		if err := hook(clean, hookBytes); err != nil {
 			return fmt.Errorf("jsonl append hook: %w", err)
@@ -573,6 +586,10 @@ func (w *Writer) WriteGzipJSONL(filename string, values []map[string]any) (strin
 }
 
 func (w *Writer) WriteGzipJSONLStream(filename string, next func() (map[string]any, bool, error)) (string, error) {
+	return w.WriteGzipJSONLStreamWithComment(filename, "", next)
+}
+
+func (w *Writer) WriteGzipJSONLStreamWithComment(filename, comment string, next func() (map[string]any, bool, error)) (string, error) {
 	if next == nil {
 		return "", fmt.Errorf("jsonl export stream source is required")
 	}
@@ -601,6 +618,7 @@ func (w *Writer) WriteGzipJSONLStream(filename string, next func() (map[string]a
 
 	hash := sha256.New()
 	gzipWriter := gzip.NewWriter(io.MultiWriter(file, hash))
+	gzipWriter.Comment = comment
 	encoder := json.NewEncoder(gzipWriter)
 	for {
 		value, ok, err := next()

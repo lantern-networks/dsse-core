@@ -569,3 +569,9 @@ Only one process may own writable certificate files. A pending CA withdrawal
 requires reconciliation before serving devices; it is not automatically
 replayed against an unknown trust-store state. Administrative and startup
 wiring using these primitives follows in a separate migration unit.
+
+### Audit and search storage reconciliation
+
+Audit log writes now record primary-write failures separately from downstream hook failures, including short writes. Health describes only the current writer process and does not promise durable recovery or downstream delivery. ClickHouse searches reject invalid row counts instead of returning a misleading empty result. PostgreSQL can count events without a region while retaining organization, stream, text and time filters. Streamed export storage can preserve a caller-supplied coverage comment in the gzip header. Administrative audit/export integration follows separately.
+
+Package regression, race detection and the full Go suite cover these storage changes; this is not GUI or deployed-fleet acceptance.

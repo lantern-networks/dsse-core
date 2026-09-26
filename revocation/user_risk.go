@@ -1,6 +1,7 @@
 package revocation
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -373,77 +374,7 @@ func (o *HighRiskOverlay) CountUsers(tenant string) int {
 	return n
 }
 func (o *HighRiskOverlay) RemoveUsers(tenant string) (int, error) {
-	if o == nil {
-		return 0, nil
-	}
-	o.writeMu.Lock()
-	defer o.writeMu.Unlock()
-	if o.loadErr != nil || o.legacy || o.deviceSavePending {
-		return 0, ErrRiskUnavailable
-	}
-	candidate := cloneUserRisks(o.users)
-	removed := 0
-	for key, mark := range candidate {
-		if mark.TenantID == tenant {
-			delete(candidate, key)
-			removed++
-		}
-	}
-	if removed == 0 {
-		return 0, nil
-	}
-	if _, err := o.saveStateLocked(o.devices, candidate); err != nil {
-		return 0, err
-	}
-	o.mu.Lock()
-	o.users = candidate
-	o.rebuildUserIndexLocked()
-	o.generation.Add(1)
-	o.mu.Unlock()
-	return removed, nil
-}
-
-// RemoveTenantRisksChecked erases both namespaces in one saved snapshot.
-func (o *HighRiskOverlay) RemoveTenantRisksChecked(tenant string, deviceIDs []string) (int, error) {
-	if o == nil {
-		return 0, nil
-	}
-	o.writeMu.Lock()
-	defer o.writeMu.Unlock()
-	if o.loadErr != nil || o.legacy || o.deviceSavePending {
-		return 0, ErrRiskUnavailable
-	}
-	devices := make(map[string]string, len(o.devices))
-	for id, severity := range o.devices {
-		devices[id] = severity
-	}
-	users := cloneUserRisks(o.users)
-	removed := 0
-	for _, id := range deviceIDs {
-		key := NormalizeDeviceID(id)
-		if _, exists := devices[key]; exists {
-			delete(devices, key)
-			removed++
-		}
-	}
-	for key, mark := range users {
-		if mark.TenantID == tenant {
-			delete(users, key)
-			removed++
-		}
-	}
-	if removed == 0 {
-		return 0, nil
-	}
-	if _, err := o.saveStateLocked(devices, users); err != nil {
-		return 0, err
-	}
-	o.mu.Lock()
-	o.devices, o.users = devices, users
-	o.rebuildUserIndexLocked()
-	o.generation.Add(1)
-	o.mu.Unlock()
-	return removed, nil
+	return o.RemoveTenantRisksChecked(tenant, nil)
 }
 
 // UserSeverities returns canonical user IDs and severities for one tenant.
@@ -461,4 +392,29 @@ func (o *HighRiskOverlay) UserSeverities(tenant string) map[string]string {
 		}
 	}
 	return result
+}
+
+// DiscardLegacyUnattributedContext resolves only the selected raw ID in the
+// latest shared snapshot, preserving concurrent changes from other writers.
+func (o *HighRiskOverlay) DiscardLegacyUnattributedContext(ctx context.Context, id, expectedSeverity string) (bool, error) {
+	id = NormalizeDeviceID(id)
+	expectedSeverity = strings.ToLower(strings.TrimSpace(expectedSeverity))
+	if id == "" || strings.ContainsRune(id, '\x00') || riskRank(expectedSeverity) == 0 {
+		return false, fmt.Errorf("legacy risk id and expected severity are required")
+	}
+	handled, err := o.changeRiskContextChecked(ctx, func(f *highRiskOverlayStateFile) error {
+		current, ok := f.LegacyUnattributed[id]
+		if !ok {
+			return ErrLegacyRiskNotFound
+		}
+		if current != expectedSeverity {
+			return ErrLegacyRiskChanged
+		}
+		delete(f.LegacyUnattributed, id)
+		return nil
+	})
+	if !handled {
+		return o.DiscardLegacyUnattributed(id, expectedSeverity)
+	}
+	return false, err
 }

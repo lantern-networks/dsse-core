@@ -52,6 +52,10 @@ jobs:
         run: GOOS=windows go build ./...
       - run: go vet ./...
       - run: go test ./... -count=1
+      - name: Connector access policy traffic
+        run: |
+          go build -o "$RUNNER_TEMP/dsse-connector" ./cmd/dsse-connector
+          DSSE_TEST_CONNECTOR_BIN="$RUNNER_TEMP/dsse-connector" go test ./cmd/dsse-edge -run '^TestEastWestLifecycleThroughRealConnector$' -count=1
 
   macos:
     name: macOS network extension (swift build + test)

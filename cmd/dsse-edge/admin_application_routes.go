@@ -25,6 +25,13 @@ import (
 )
 
 func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, adminAuditOutbox adminAuditOutboxDeadReader, policyStore policy.RuntimeStore, applicationCatalogStore appcatalog.RuntimeStore, registry connectorRegistryStore, tunnelManager *tunnel.Manager, routeProfiles map[string]edgeplane.ApplicationRouteProfile, tenantModelStore adminTenantModelRuntimeStore, domainEventOutbox domainEventOutboxWriter, configSourceURL string) {
+	applicationWriteError := func(w http.ResponseWriter, err error) {
+		if errors.Is(err, appcatalog.ErrApplicationPersistence) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application catalog could not be saved; reload and retry"))
+			return
+		}
+		writeError(w, http.StatusBadRequest, err)
+	}
 	manualEndpointAllowed := func(r *http.Request) bool {
 		identity, ok := adminIdentityFromRequest(r)
 		return ok && adminPermissionAllowed(identity.Roles, "admin.endpoints.write") && adminScopeAllowed(identity, "admin.endpoints.write")
@@ -118,7 +125,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		now := time.Now()
 		created, err := applicationCatalogStore.Upsert(r.Context(), application, tenantID, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			applicationWriteError(w, err)
 			return
 		}
 		if renameEndpoint {
@@ -232,7 +239,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		}
 		created, err := applicationCatalogStore.Upsert(r.Context(), entry, tenantID, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			applicationWriteError(w, err)
 			return
 		}
 		// Surface the published private app as a selectable rule destination: the Connector Access (east-west)
@@ -282,7 +289,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		entry.Published = false
 		created, err := applicationCatalogStore.Upsert(r.Context(), entry, tenantID, now)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			applicationWriteError(w, err)
 			return
 		}
 		// Remove the rule-destination endpoint surfaced at publish (no longer reachable once unpublished).
@@ -344,7 +351,7 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			writeError(w, http.StatusNotFound, fmt.Errorf("application %s is config-seeded and cannot be deleted (it is derived from configuration and would be re-created on restart); disable or edit configuration instead", applicationID))
 			return
 		default:
-			writeError(w, http.StatusBadRequest, err)
+			applicationWriteError(w, err)
 			return
 		}
 		// Drop the rule-destination endpoint surfaced at publish (the app no longer exists).

@@ -22,6 +22,7 @@ changes is included in the published 0.3.0 release:
 
 | Area | Change | Evidence available so far |
 |---|---|---|
+| Legacy SaaS rule switches | Enable/disable and version rollback wait for a successful save; failed saves retain the live setting and do not record a successful version | Product HTTP failure/retry and fresh-store reload tests for switching and rollback; local browser failed save, retry and reload with saved data and actor/status audits; managed-provider behavior is separate |
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
 | Directory updates | Preserve user-risk association after subject or email changes | Local browser risk changes, import and decision API checks, saved-state and audit comparisons; separate PostgreSQL regression |
 | DLP and access rules | Preserve existing settings and references during ordinary edits; restore permitted read-only DLP listing | Local browser checks, saved-state and audit comparisons, automated regressions |

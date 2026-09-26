@@ -153,8 +153,9 @@ func (g *federatedAuthGate) hasLiveGrantFor(tenantID, deviceID, requiredACR stri
 	deviceID = strings.TrimSpace(deviceID)
 	requiredACR = strings.TrimSpace(requiredACR)
 	now := time.Now().UTC()
-	for _, gr := range g.grants.List(strings.TrimSpace(tenantID)) {
-		if !g.grants.Valid(gr.GrantID, now) {
+	for _, gr := range g.grants.ListForAuthorization(strings.TrimSpace(tenantID)) {
+		expires, err := time.Parse(time.RFC3339, gr.ExpiresAt)
+		if gr.Revoked || err != nil || !now.Before(expires) {
 			continue
 		}
 		if deviceID != "" && strings.TrimSpace(gr.DeviceID) != "" && gr.DeviceID != deviceID {

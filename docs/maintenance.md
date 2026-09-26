@@ -403,9 +403,18 @@ counted in health data. Abrupt termination can lose unflushed observations, and
 the downstream spool also has retention limits. The receiver refuses a known
 standby; fencing a write across a leadership transition remains separate work.
 
-Upgrade note: the observation store reads legacy tenant maps as well as receipt-bearing
-rows. Once reports are stored, the receipt-bearing format is written; rollback to
-an older binary that cannot read it is not established by these checks.
+Upgrade requirement: upgrade **all control-plane processes that share the observation
+store together**, with report intake paused and every old writer stopped before any
+new process writes the store. Back up the observation store before upgrading. The
+new code reads legacy tenant maps, but the first saved report writes the v4 format
+with receipt records. Old control planes cannot read this format and can overwrite
+it, losing the inventory and receipts and counting retried reports twice. A rolling
+upgrade with mixed old and new writers is not supported. After v4 is written, do
+not restart an older binary against that store. Reverting requires stopping all
+writers and restoring the pre-upgrade backup; observations received since the
+backup are lost and pending Edge reports need operator reconciliation. This is not
+a transparent rollback. Resume report intake only after every shared-store writer
+runs the new version.
 
 ## Adopting observed flows (under review)
 
@@ -500,6 +509,28 @@ Shared PostgreSQL edits preserve policies from other CPs and organizations. List
 
 Validation covers PostgreSQL peer CRUD and status changes, permission/organization guards, attributed audits, signed fetch and reference-only upload decisions, save failure/retry, restore and production startup. Inline fallback behavior for an unresolved/disabled policy reference is unchanged. Saved snapshots are validated as a whole; malformed data stops startup without rewriting it or logging its contents. Separate DLP library files are still not an atomic transaction. This change depends on the preceding detector-library work and requires premerge review; deployed-fleet and release checks remain outstanding.
 
+### Inspection source compatibility
+
+TLS inspection cannot resolve user/group/agent identity before decrypting a
+connection. Inspect rules using these selectors, or an unresolved device source,
+therefore apply to every source for that tenant and destination. Device-resolvable
+inspect rules retain their device scope. Bypass rules never widen when a source
+cannot be resolved. Review identity-scoped inspect rules before updating: they
+may inspect additional users to preserve inspection instead of silently disabling
+DLP under bypass-default.
+
+### Named-service and save compatibility
+
+When an egress deny or authentication rule references a missing/invalid service,
+it now retains its authored source and destination restrictions across all ports,
+until the service is repaired. Unresolved allow rules continue to match nothing.
+This prevents deleting a named service from silently disabling an existing deny.
+
+A confirmed non-atomic rule save counts as saved. If file replacement completed
+but its final flush is unconfirmed, the rule store keeps the replacement live
+and returns a storage error requiring reconciliation; it does not roll back only
+the in-memory copy while leaving the new file on disk.
+
 ### Identity provider connection saves and distribution
 
 Identity provider creation, editing, default selection and deletion now confirm configured storage before returning success. Rejected saves leave the prior live registry intact. Blank client-secret fields retain the latest saved secret, including when another CP performed the previous edit. Shared PostgreSQL mutations preserve other connections and organizations, and administrative reads and bundle publication refresh that state. Successful changes record the target organization and administrator without connection secrets or endpoints.
@@ -522,6 +553,10 @@ refresh/context integration are tracked separately; it does not claim complete
 fleet acceptance. An unconfirmed final flush is still reported as a failure;
 operators must retry or reconcile storage before treating the edit as durable.
 
+Older saved and signed inspection posture patterns remain readable during upgrades; newly edited administrative input uses strict validation. Retired catalog-feed signing keys no longer prevent startup: untrusted historical entries are excluded from rollback, and a current feed signed only by a retired key falls back to the built-in catalog with a warning. The original saved file is preserved for operator review. Previously valid signed payloads retain their original restore compatibility; new submissions still use strict validation.
+
+Unchanged legacy host patterns do not block mode or known-bypass edits; newly added host patterns are validated. Rotate catalog signing keys under a new key ID. Reusing an existing key ID with different key material is rejected by saved-feed signature verification.
+
 ### Identity and enrollment storage reconciliation
 
 Manual identity creation can reject an existing identity instead of overwriting
@@ -536,6 +571,8 @@ Enrollment inventory and token changes gain checked persistence and shared
 transaction helpers. Seat allocation removal reports storage failure during
 organization erasure. These storage changes precede the remaining administrative
 route and CP startup integration; they do not claim complete GUI acceptance.
+
+Seat-allocation storage must load successfully before startup completes. Missing first-boot storage remains valid, while malformed or empty existing files stop startup with a generic diagnostic and are preserved. Connector secret rotation accepts a confirmed in-place save and returns the new secret whose hash is stored; an unconfirmed save continues to fail.
 
 ### Access authorization and network boundary persistence
 
@@ -555,6 +592,8 @@ before upgrading: new human-approval records use organization/ID keys, while
 legacy bare-ID snapshots remain readable. Older writers must not overwrite the
 new format; rollback requires a compatible backup.
 
+Authorization request paths refresh shared grant and human-approval state at most once per five-second window; explicit administrative reads remain current. Grant-batch conflicts no longer prevent other correctly attributed revocations. Invalid legacy authorization rows are skipped with a generic warning during restore, preserving valid rows and the original file. VLAN and access-grant receive failures remain unacknowledged and retryable, and failed grant reports return an error. Human-approval lookups and revocations use organization-specific keys, including when two organizations use the same approval ID.
+
 ### Certificate and CA storage reconciliation
 
 Internal CA changes validate a candidate before replacing current trust data.
@@ -570,14 +609,21 @@ requires reconciliation before serving devices; it is not automatically
 replayed against an unknown trust-store state. Administrative and startup
 wiring using these primitives follows in a separate migration unit.
 
+Existing CA files and signed snapshots may contain openssl preambles or public certificate chains. Restore keeps only the first public CA, matching the previous trust contract; new administrative inputs still require exactly one certificate. Unavailable authority stores publish an incomplete section, never an empty authoritative deletion. Invalid received CA snapshots remain unacknowledged so the next pull can retry. Failed administrative deletions return a storage error. Combined certificate/key PEM files remain readable at startup and reload; pair updates still require separate files.
+
+### Legacy CA restoration compatibility
+Saved and received legacy authority material restores its first public CA and discards accompanying text, chains and key material. New administrative submissions remain strict. Incomplete authority bundles keep the existing Edge trust without rejecting the remaining bundle. Startup also accepts a combined certificate/key file for reading; two-file updates still require distinct paths.
 ### Audit and search storage reconciliation
 
 Audit log writes now record primary-write failures separately from downstream hook failures, including short writes. Health describes only the current writer process and does not promise durable recovery or downstream delivery. ClickHouse searches reject invalid row counts instead of returning a misleading empty result. PostgreSQL can count events without a region while retaining organization, stream, text and time filters. Streamed export storage can preserve a caller-supplied coverage comment in the gzip header. Administrative audit/export integration follows separately.
 
 Package regression, race detection and the full Go suite cover these storage changes; this is not GUI or deployed-fleet acceptance.
 
+
+Legacy CA normalization changes the in-memory and distributed public certificate only. The original database row remains until an administrator replaces it with a public CA certificate or deletes that authority in Console.
 ### Agent profile replacement and removal
 
 The macOS installer checks that current and replacement profile organizations are readable and that required sidecars exist before moving configuration files. Replacing a profile for the same organization retains its device identity and, when no replacement token is supplied, its existing enrollment token. Windows profile removal also clears the issued-at display metadata. These changes preserve existing profile signature verification requirements.
 
 Validation includes five isolated installer-adoption cases, shell syntax checks, host configstore tests and Windows test cross-compilation. Actual Windows registry execution and signed package installation are not claimed by these checks.
+

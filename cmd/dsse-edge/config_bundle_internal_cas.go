@@ -1,7 +1,6 @@
 package main
 
 import (
-	"strings"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/internalca"
@@ -46,30 +45,34 @@ func internalCABundleSection(store organizationInternalCAPool) *internalCABundle
 	if !ok || concrete == nil {
 		return nil
 	}
+	if concrete.Availability() != nil {
+		return &internalCABundle{Complete: false}
+	}
 	return &internalCABundle{Authorities: concrete.ListAll(time.Now().UTC()), Complete: true}
 }
 
 // applyInternalCABundleSection makes this Edge's list match the control plane's. Returns how many authorities
 // this Edge now vouches for, and whether it changed anything.
 func applyInternalCABundleSection(store organizationInternalCAPool, section *internalCABundle, logf func(string, ...interface{})) (count int, applied bool) {
+	n, applied, err := applyInternalCABundleSectionChecked(store, section, logf)
+	if err != nil && logf != nil {
+		logf("config_bundle_internal_cas_save_unconfirmed=true")
+	}
+	return n, applied
+}
+func applyInternalCABundleSectionChecked(store organizationInternalCAPool, section *internalCABundle, logf func(string, ...interface{})) (int, bool, error) {
 	concrete, ok := store.(*internalca.Store)
 	if !ok || concrete == nil || section == nil {
-		return 0, false
+		return 0, false, nil
 	}
 	if !section.Complete {
 		if logf != nil {
-			logf("config_bundle_internal_cas_kept_local reason=%q",
-				"the control plane did not report a complete list of internal certificate authorities")
+			logf("config_bundle_internal_cas_kept_local=true reason=incomplete")
 		}
-		return 0, false
+		return 0, false, nil
 	}
-	kept := []internalca.Authority{}
-	for _, a := range section.Authorities {
-		if strings.TrimSpace(a.TenantID) == "" || strings.TrimSpace(a.CertificatePEM) == "" {
-			continue
-		}
-		kept = append(kept, a)
+	if err := concrete.ReplaceAll(section.Authorities); err != nil {
+		return 0, false, err
 	}
-	concrete.ReplaceAll(kept)
-	return len(kept), true
+	return len(section.Authorities), true, nil
 }

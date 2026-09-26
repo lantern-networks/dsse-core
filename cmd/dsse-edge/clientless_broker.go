@@ -342,11 +342,11 @@ func (b *clientlessBroker) handleWhoami(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnauthorized, fmt.Errorf("no grant"))
 		return
 	}
-	if !b.grants.Valid(c.Value, time.Now().UTC()) {
+	if !b.grants.ValidForAuthorization(c.Value, time.Now().UTC()) {
 		writeError(w, http.StatusUnauthorized, fmt.Errorf("grant is revoked or expired"))
 		return
 	}
-	g, _ := b.grants.Get(c.Value)
+	g, _ := b.grants.GetForAuthorization(c.Value)
 	writeJSON(w, http.StatusOK, map[string]any{"status": "authenticated", "user_id": g.UserID, "idp_id": g.IdPID, "grant_id": g.GrantID})
 }
 

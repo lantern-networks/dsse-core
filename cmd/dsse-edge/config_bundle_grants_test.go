@@ -19,7 +19,7 @@ func TestGrantsAreReportedPublishedAndApplied(t *testing.T) {
 			"a node never tells the authority what it minted"},
 		{"admin_policy_routes.go", "grantBundleSection(",
 			"the authority never puts the grants in the bundle, so no Edge can learn them"},
-		{"config_bundle_sync.go", "applyGrantBundleSection(",
+		{"config_bundle_sync.go", "applyGrantBundleSectionChecked(",
 			"an Edge never applies them, so the bundle carries them and nothing reads them"},
 	} {
 		body, err := os.ReadFile(c.file)

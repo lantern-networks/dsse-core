@@ -25,6 +25,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -437,7 +438,7 @@ func parseAuthority(material string) (*x509.Certificate, string, error) {
 	return cert, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})), nil
 }
 
-// Loading permits expired authorities for display, but never malformed or mixed key material.
+// Loading permits expired authorities and normalizes legacy input to one public CA.
 func validatedAuthorities(authorities []Authority) (map[string]Authority, error) {
 	next := map[string]Authority{}
 	for _, a := range authorities {
@@ -445,7 +446,7 @@ func validatedAuthorities(authorities []Authority) (map[string]Authority, error)
 		if a.ID == "" || a.TenantID == "" || strings.ContainsRune(a.ID, 0) || strings.ContainsRune(a.TenantID, 0) {
 			return nil, fmt.Errorf("invalid internal authority identity")
 		}
-		cert, material, err := parseAuthority(a.CertificatePEM)
+		cert, material, err := parseSavedAuthority(a.CertificatePEM)
 		if err != nil {
 			return nil, err
 		}
@@ -457,4 +458,22 @@ func validatedAuthorities(authorities []Authority) (map[string]Authority, error)
 		next[k] = a
 	}
 	return next, nil
+}
+
+// Older writers retained openssl preambles and certificate chains. Restore only
+// their first public CA, matching the old trust contract, without retaining extra material.
+func parseSavedAuthority(material string) (*x509.Certificate, string, error) {
+	if cert, normalized, err := parseAuthority(material); err == nil {
+		return cert, normalized, nil
+	}
+	block, _ := pem.Decode([]byte(material))
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, "", fmt.Errorf("invalid saved authority certificate")
+	}
+	normalized := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: block.Bytes}))
+	cert, normalized, err := parseAuthority(normalized)
+	if err == nil {
+		log.Printf("internal_ca_restore legacy_material_normalized=true")
+	}
+	return cert, normalized, err
 }

@@ -41,6 +41,9 @@ type Grant struct {
 
 // Store holds tenant-attributed grants with globally unique bearer IDs, safe for concurrent use.
 type Store struct {
+	readRefreshMu  sync.Mutex
+	readRefreshAt  time.Time
+	readRefreshErr error
 	mu             sync.RWMutex
 	grants         map[string]Grant // grant_id -> grant
 	persister      blobstore.Persister
@@ -236,7 +239,9 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 			return ErrInvalidGrant
 		}
 		if err := validateGrant(g); err != nil {
-			return err
+			log.Printf("access_grant_restore invalid_legacy_row_skipped=true")
+			delete(fresh, key)
+			continue
 		}
 		fresh[key] = cloneGrant(g)
 	}

@@ -3,6 +3,7 @@ package connector
 import (
 	"bytes"
 	"errors"
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"reflect"
 	"strings"
 	"testing"
@@ -72,5 +73,36 @@ func TestRuntimeSecretSaveFailureDoesNotPublishOrAlias(t *testing.T) {
 				t.Fatal("rotation retry not persisted or changed route generation")
 			}
 		})
+	}
+}
+
+type confirmedInPlaceSecretPersister struct{ managementPersister }
+
+func (p *confirmedInPlaceSecretPersister) Save(b []byte) error {
+	p.data = bytes.Clone(b)
+	return blobstore.ErrSavedWithoutAtomicity
+}
+func TestRuntimeSecretConfirmedInPlaceSaveSurvivesRestart(t *testing.T) {
+	p := &confirmedInPlaceSecretPersister{}
+	r := NewRegistry()
+	if err := r.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := r.Register(testRegistration("target"), now); err != nil {
+		t.Fatal(err)
+	}
+	hash := "sha256:" + strings.Repeat("b", 64)
+	if _, found, err := r.RotateRuntimeSecretHashForTenantWithMetadata("tenant_a", "target", hash, now, "actor"); err != nil || !found {
+		t.Fatalf("confirmed rotation failed: %v", err)
+	}
+	reopened := NewRegistry()
+	if err := reopened.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	live, _ := r.Get("target")
+	saved, _ := reopened.Get("target")
+	if live.Metadata[runtimeSecretHashMetadataKey] != hash || !reflect.DeepEqual(live, saved) {
+		t.Fatal("returned secret differs after restart")
 	}
 }

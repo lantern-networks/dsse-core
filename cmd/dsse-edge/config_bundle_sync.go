@@ -987,8 +987,8 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			}
 		} else {
 			for _, grant := range payload.DelegatedGrants.Grants {
-				if _, err := t.delegatedGrants.Upsert(grant); err != nil {
-					log.Printf("config-bundle sync: skipping invalid delegated grant %q from the control plane: %v", grant.ID, err)
+				if _, err := t.delegatedGrants.UpsertReceived(context.Background(), grant); err != nil {
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("delegated grant configuration could not be applied: %w", err))
 				}
 			}
 		}

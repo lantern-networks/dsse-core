@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -54,7 +55,7 @@ type adminDelegatedAccessGrantRevokeRequest struct {
 	RevocationReasonCode string `json:"revocation_reason_code"`
 }
 
-func adminListDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, tenantID string, options adminDelegatedAccessGrantListOptions) (adminDelegatedAccessGrantListResponse, error) {
+func adminListDelegatedAccessGrant(s *delegatedgrant.Store, ctx context.Context, tenantID string, options adminDelegatedAccessGrantListOptions) (adminDelegatedAccessGrantListResponse, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return adminDelegatedAccessGrantListResponse{}, fmt.Errorf("tenant_id is required")
@@ -76,6 +77,9 @@ func adminListDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, t
 		limit = 100
 	}
 
+	if err := s.RefreshShared(); err != nil {
+		return adminDelegatedAccessGrantListResponse{}, err
+	}
 	rows := []adminDelegatedAccessGrant{}
 	for _, grant := range s.Snapshot() {
 		if grant.TenantID != tenantID {
@@ -104,7 +108,7 @@ func adminListDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, t
 	}, nil
 }
 
-func adminGetDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, tenantID, grantID string) (adminDelegatedAccessGrant, bool, error) {
+func adminGetDelegatedAccessGrant(s *delegatedgrant.Store, ctx context.Context, tenantID, grantID string) (adminDelegatedAccessGrant, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	grantID = strings.TrimSpace(grantID)
 	if tenantID == "" {
@@ -117,26 +121,29 @@ func adminGetDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, te
 		return adminDelegatedAccessGrant{}, false, fmt.Errorf("grant_id cannot contain slash")
 	}
 
-	grant, ok := s.Get(grantID)
+	grant, ok, err := s.GetForTenantContext(ctx, tenantID, grantID)
+	if err != nil {
+		return adminDelegatedAccessGrant{}, false, err
+	}
 	if !ok || grant.TenantID != tenantID {
 		return adminDelegatedAccessGrant{}, false, nil
 	}
 	return adminDelegatedAccessGrantFromModel(grant), true, nil
 }
 
-func adminUpsertDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, grant adminDelegatedAccessGrant, tenantID string, now time.Time) (adminDelegatedAccessGrant, error) {
+func adminUpsertDelegatedAccessGrant(s *delegatedgrant.Store, ctx context.Context, grant adminDelegatedAccessGrant, tenantID string, now time.Time) (adminDelegatedAccessGrant, error) {
 	modelGrant, err := normalizeAdminDelegatedAccessGrant(grant, tenantID, now)
 	if err != nil {
 		return adminDelegatedAccessGrant{}, err
 	}
-	stored, err := s.Upsert(modelGrant)
+	stored, err := s.UpsertContext(ctx, modelGrant)
 	if err != nil {
 		return adminDelegatedAccessGrant{}, err
 	}
 	return adminDelegatedAccessGrantFromModel(stored), nil
 }
 
-func adminRevokeDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context, tenantID, grantID string, request adminDelegatedAccessGrantRevokeRequest, now time.Time) (adminDelegatedAccessGrant, bool, error) {
+func adminRevokeDelegatedAccessGrant(s *delegatedgrant.Store, ctx context.Context, tenantID, grantID string, request adminDelegatedAccessGrantRevokeRequest, now time.Time) (adminDelegatedAccessGrant, bool, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	grantID = strings.TrimSpace(grantID)
 	if tenantID == "" {
@@ -156,17 +163,17 @@ func adminRevokeDelegatedAccessGrant(s *delegatedgrant.Store, _ context.Context,
 		now = time.Now().UTC()
 	}
 
-	grant, ok := s.Get(grantID)
-	if !ok || grant.TenantID != tenantID {
+	grant, err := s.RevokeForTenantContext(ctx, tenantID, grantID, reasonCode, now)
+	if errors.Is(err, delegatedgrant.ErrAbsent) {
 		return adminDelegatedAccessGrant{}, false, nil
 	}
-	if grant.Status != "revoked" {
-		revoked, err := s.Revoke(grantID, reasonCode, now)
-		if err != nil {
-			return adminDelegatedAccessGrant{}, false, err
+	if err != nil {
+		if errors.Is(err, delegatedgrant.ErrPersistence) && grant.TenantID == tenantID && grant.ID == grantID && grant.Status == "revoked" {
+			return adminDelegatedAccessGrantFromModel(grant), true, err
 		}
-		grant = revoked
+		return adminDelegatedAccessGrant{}, false, err
 	}
+
 	return adminDelegatedAccessGrantFromModel(grant), true, nil
 }
 

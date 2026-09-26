@@ -218,6 +218,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 				return
 			}
 		}
+		if err := delegatedGrants.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("delegated grants cannot be read"))
+			return
+		}
 		if err := theIdPRegistry.Load().RefreshShared(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("identity provider settings cannot be read"))
 			return
@@ -232,6 +236,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// generation, an Edge can accept an intermediate east-west mode under the
 		// final generation and never poll the final mode. Refuse this snapshot so
 		// the poller retries with a coherent one.
+		delegatedGenerationBefore := delegatedGrants.ConfigGeneration()
 		idpGenerationBefore := theIdPRegistry.Load().ConfigGeneration()
 		policyGenerationBefore := policyStore.ConfigGeneration()
 		dlpGenerationBefore := config.DLPDistribution.Generation()
@@ -376,6 +381,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		if delegatedGrants != nil {
 			bundle.DelegatedGrants = &delegatedGrantBundle{Grants: delegatedGrants.Snapshot()}
+			if delegatedGrants.ConfigGeneration() != delegatedGenerationBefore {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("delegated grants changed while preparing the bundle; retry"))
+				return
+			}
 		}
 		// The Site / Connector Group catalog. Measured absent before this existed: the control plane held one
 		// Site and the enforcing Edge held three, two of which the control plane had never heard of, and a Site

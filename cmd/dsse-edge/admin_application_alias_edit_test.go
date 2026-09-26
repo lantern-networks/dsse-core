@@ -120,7 +120,7 @@ func TestApplicationRenameSaveFailureIsPartialAndRetryable(t *testing.T) {
 	if current, _ := assets.GetEndpoint("tenant_lab_001", "app-wiki"); current.Alias != "Old Wiki" {
 		t.Fatalf("failed destination save changed live alias: %+v", current)
 	}
-	if len(outbox.insertedAudits) != before+1 || outbox.insertedAudits[before].Result == nil || *outbox.insertedAudits[before].Result != "partial" {
+	if len(outbox.insertedAudits) != before+1 || outbox.insertedAudits[before].ActorUserID == nil || outbox.insertedAudits[before].Result == nil || *outbox.insertedAudits[before].Result != "partial" {
 		t.Fatal("partial edit audit missing")
 	}
 	gate.fail = false

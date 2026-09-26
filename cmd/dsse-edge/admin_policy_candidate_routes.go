@@ -394,7 +394,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": reason + " Reload and reconcile before retrying.", "partial": true, "failed_stage": "candidate_review", "application_id": created.ApplicationID, "candidate_id": candidateID})
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "connector_candidate_publish.v1",

@@ -43,6 +43,14 @@ retry and fresh-store readback. A synthetic-session browser check covers manual
 bypass registration failure, retry and reload; it does not establish deployed
 traffic or independent control-plane/Edge acceptance.
 
+Application creation, editing, publication, withdrawal and deletion now record
+the authenticated administrator in their domain audits, including partial saves
+and operator actions in another organization. Session credentials and directory
+labels are excluded. Local HTTP regressions cover authenticated attribution and
+partial outcomes. Local browser checks cover application edits, withdrawal and
+deletion with saved-state and audit checks; this does not establish deployed-fleet
+or remote audit delivery acceptance.
+
 Connector Access rule and posture edits now validate the whole request and save
 the four related settings together before publishing them. An invalid mode no
 longer leaves a rule or TTL change behind; a rejected save returns a retryable

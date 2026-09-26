@@ -51,10 +51,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, candidate)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates", adminEndpoint("admin.policy_candidates.write", func(w http.ResponseWriter, r *http.Request) {
-		// Changes belong to the control plane when this Edge pulls configuration.
-		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
-			return
-		}
 		var candidate policycandidate.Candidate
 		if err := decodeLimitedJSONBody(w, r, &candidate, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode policy candidate: %w", err))
@@ -70,10 +66,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, created)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/review", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
-		// Changes belong to the control plane when this Edge pulls configuration.
-		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
-			return
-		}
 		var review policycandidate.ReviewRequest
 		if err := decodeLimitedJSONBody(w, r, &review, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode policy candidate review: %w", err))
@@ -104,10 +96,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, reviewed)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/materialize", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
-		// Changes belong to the control plane when this Edge pulls configuration.
-		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
-			return
-		}
 		concrete, ok := policyCandidateStore.(*policycandidate.Store)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, fmt.Errorf("policy candidate store does not support materialize"))
@@ -265,10 +253,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// the only effect is proposing pending review items (fail-closed). Tenant-scoped + secret-safe (reachable
 	// route domains are already non-secret; private base URLs/secrets are never touched).
 	mux.HandleFunc("POST /admin/connector-discovery/refresh", adminEndpoint("admin.policy_candidates.write", func(w http.ResponseWriter, r *http.Request) {
-		// Changes belong to the control plane when this Edge pulls configuration.
-		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
-			return
-		}
 		concrete, ok := policyCandidateStore.(*policycandidate.Store)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, fmt.Errorf("policy candidate store does not support connector discovery"))
@@ -295,10 +279,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// here. Published != Allow: the response carries the same review block, so a freshly published app still
 	// authorizes nobody until a policy is bound (fail-closed).
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/approve-private-app", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
-		// Changes belong to the control plane when this Edge pulls configuration.
-		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
-			return
-		}
 		tenantID := adminTenantIDFromRequest(r)
 		candidateID := strings.TrimSpace(r.PathValue("candidate_id"))
 		var body struct {

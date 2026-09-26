@@ -269,24 +269,58 @@ async function openEnrolTokenForm(content) {
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
   submit.addEventListener("click", async () => {
-    if (!labelF.validate()) return;
+    if (submit.disabled || !labelF.validate()) return;
+    const count = enrolTokenCount(countF);
+    if (count === null) return;
     submit.disabled = true;
     try {
-      const count = Math.max(1, Number(countF.get()) || 1);
       const r = await apiFetch("POST", "/admin/enrolment-tokens",
         { label: labelF.get(), group: groupF.get(), expires_in_hours: Number(validF.get()), count },
         _ENROL_PLANE);
+      if (!r.ok && r.status === 409 && r.body && r.body.partial === true &&
+          Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
+        m.close();
+        showEnrolTokenOnce({ ...r.body, requested_count: count });
+        renderEnrolmentTokensView(content);
+        return;
+      }
       if (!r.ok) {
         submit.disabled = false;
-        const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
+        const uncertainPartial = (r.status === 409 && r.body && r.body.partial === true) || r.status >= 500;
+        const msg = uncertainPartial ? enrolTokenResponseWarning() :
+          (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
         labelF.setError(msg); uiToast(msg, "err"); return;
+      }
+      if (!enrolTokenCompleteBody(r.body, count)) {
+        const msg = enrolTokenResponseWarning();
+        submit.disabled = false; labelF.setError(msg); uiToast(msg, "err"); return;
       }
       m.close();
       showEnrolTokenOnce(r.body);
       renderEnrolmentTokensView(content);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+    } catch (e) {
+      submit.disabled = false; const msg = enrolTokenResponseWarning();
+      labelF.setError(msg); uiToast(msg, "err");
+    }
   });
   labelF.focus();
+}
+
+// Keep the two issuance forms within the API's per-request bound without silently changing the count.
+function enrolTokenCount(field) {
+  const raw = String(field.get()).trim();
+  const count = /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(count) || count < 1 || count > 500) {
+    field.setError(bl({ en: "Enter a whole number from 1 to 500.", ja: "1から500までの整数を入力してください。" }));
+    return null;
+  }
+  field.setError("");
+  return count;
+}
+
+function enrolTokenCompleteBody(body, count) {
+  return !!body && body.partial !== true && Array.isArray(body.tokens) && body.tokens.length === count &&
+    enrolTokenRowsValid(body.tokens);
 }
 
 // A batch cannot be read off a screen. Fifty secrets in a modal is a list nobody can transcribe without losing
@@ -295,11 +329,11 @@ async function openEnrolTokenForm(content) {
 function downloadTokenBatch(rows, count) {
   const header = "label,token_id,secret,expires_at\n";
   const csv = header + rows.map((r) => [
-    JSON.stringify(r.token.label || ""),
+    r.token.label || "",
     r.token.id,
     r.secret,
     r.token.expires_at,
-  ].join(",")).join("\n") + "\n";
+  ].map(value => '"' + String(value == null ? "" : value).replace(/"/g, '""') + '"').join(",")).join("\n") + "\n";
   const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
   const a = document.createElement("a");
   a.href = url;
@@ -312,8 +346,25 @@ function downloadTokenBatch(rows, count) {
 
 // The secret exists in this one response and nowhere else — the Edge keeps only a hash — so the modal has to be
 // unmistakable about that. A lost token is re-approved, not looked up.
+function enrolTokenRowsValid(rows) {
+  return rows.every(r => r && r.token && typeof r.token === "object" && !Array.isArray(r.token) &&
+    typeof r.token.id === "string" && r.token.id.length > 0 && typeof r.secret === "string" && r.secret.length > 0);
+}
+function enrolTokenResponseWarning() {
+  return bl({
+    en: "Token issuance could not be confirmed. Tokens may already have been created. Resolve the failure and reload the unused-token list before issuing more; revoke any unneeded tokens.",
+    ja: "トークンの発行結果を確認できません。サーバー側では発行済みの可能性があります。障害を解消し、未使用トークンの一覧を再読込してから追加発行してください。不要なものは失効してください。"
+  });
+}
 function showEnrolTokenOnce(body) {
   const rows = (body && body.tokens) || [];
+  if (!Array.isArray(rows) || !enrolTokenRowsValid(rows)) {
+    uiToast(enrolTokenResponseWarning(), "err"); return;
+  }
+  const notice = body && body.partial === true ? [el("p", { class: "ui-view-desc", text: bl({
+    en: "Issuance stopped: " + rows.length + " of " + body.requested_count + " requested tokens were returned. Save these tokens and investigate the failure before issuing more.",
+    ja: "発行が途中で停止しました。要求 " + body.requested_count + " 件中 " + rows.length + " 件を受け取りました。このトークンを保存し、追加発行の前に失敗原因を確認してください。"
+  }) })] : [];
   if (rows.length > 1) {
     let downloaded = false;
     const dl = el("button", { class: "ui-btn ui-btn-primary",
@@ -321,6 +372,7 @@ function showEnrolTokenOnce(body) {
     const m2 = uiModal({
       title: bl({ en: rows.length + " devices approved", ja: rows.length + " 台を承認しました" }),
       body: [
+        ...notice,
         el("p", { class: "ui-view-desc", text: bl({
           en: "This is the only time these tokens are shown. Download them now — they cannot be retrieved later, and an approval that is lost has to be made again.",
           ja: "これらのトークンが表示されるのはこの一度だけです。いまダウンロードしてください — 後から取得はできず、失った分は承認をやり直すことになります。" }) }),
@@ -346,8 +398,8 @@ function showEnrolTokenOnce(body) {
     });
     return;
   }
-  const secret = body && body.secret;
-  if (!secret) { uiToast(bl({ en: "Device approved.", ja: "端末を承認しました。" }), "ok"); return; }
+  const secret = (body && body.secret) || (rows.length === 1 && rows[0].secret);
+  if (typeof secret !== "string" || !secret) { uiToast(enrolTokenResponseWarning(), "err"); return; }
   // ★★★ THE TOKEN IS A FILE, NOT A FIELD (2026-08-30). This offered the secret as text to read, and said to
   // "put it in the device's installer settings" — there are no installer settings. What the installer reads is
   // a file named enrolment_token.txt sitting next to it, so that is what this hands over. Typing a 43-character
@@ -369,6 +421,7 @@ function showEnrolTokenOnce(body) {
   const m = uiModal({
     title: bl({ en: "Device approved — take the token now", ja: "端末を承認しました — トークンを今受け取ってください" }),
     body: [
+        ...notice,
       el("p", { class: "ui-view-desc", text: bl({
         en: "This is the only time this token is shown. If it is lost, approve the device again — it cannot be looked up.",
         ja: "このトークンが表示されるのはこの一度だけです。紛失した場合は再度承認してください — 後から確認することはできません。" }) }),
@@ -394,7 +447,9 @@ async function revokeEnrolToken(t, host) {
     confirmLabel: bl({ en: "Revoke", ja: "失効" }), danger: true,
   });
   if (!ok) return;
-  const r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(t.id) + "/revoke", {}, _ENROL_PLANE);
+  let r;
+  try { r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(t.id) + "/revoke", {}, _ENROL_PLANE); }
+  catch (e) { uiToast(String(e), "err"); return; }
   if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
   // An admin who revokes AFTER the device enrolled is reaching for the wrong control, and the API says so.
   // Surfacing that is the difference between them fixing the problem and believing it is already fixed.

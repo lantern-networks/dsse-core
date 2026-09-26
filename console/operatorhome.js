@@ -114,7 +114,7 @@ async function renderOperatorCapacity(host) {
     const body = r.body || {};
     const allocations = (body.tenants || []).map((t) => ({ tenant_id: t.display_name || t.tenant_id, seats: t.allocated || 0, used: t.used || 0 }));
     const allocated = typeof body.allocated === "number" ? body.allocated : allocations.reduce((n, a) => n + a.seats, 0);
-    const pool = typeof body.pool_seats === "number" ? body.pool_seats : (body.licensed ? null : 0);
+    const pool = typeof body.seats === "number" ? body.seats : (body.licensed ? null : 0);
     if (!current()) return;
     host.innerHTML = "";
     host.appendChild(el("div", { class: "ui-toolbar" }, [

@@ -3,7 +3,7 @@
 // grants.js — "Access Approvals" on the shared ui.js pattern (product-quality, see
 // docs/console_ux_design_direction.md). These are the access approvals minted after a user signs in
 // through your identity provider: access is permitted only while an approval is live, and Revoke is
-// continuous revocation (the next request is denied immediately).
+// checked by the receiving server; other servers need the configuration update.
 //
 // Loaded after app.js (apiFetch / bl / escapeHtml / el / ui* in scope). app.js dispatches here for
 // custom: "grants". Backend: GET /admin/grants -> {grants:[…]} + POST /admin/grants/{id}/revoke.
@@ -11,10 +11,20 @@
 // _grantsShowAll: list filter state — false (default) shows only live approvals; true includes history.
 let _grantsShowAll = false;
 
+function grantExpiryTime(g) {
+  const m = typeof g.expires_at === "string" && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.exec(g.expires_at);
+  if (!m) return NaN;
+  const [year,month,day,hour,minute,second] = m.slice(1).map(Number);
+  const days = new Date(Date.UTC(2000 + year % 400,month,0)).getUTCDate();
+  if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return NaN;
+  return Date.parse(g.expires_at);
+}
+
 function grantStatus(g, nowMs) {
   if (g.revoked) return { label: { en: "Revoked", ja: "失効" }, kind: "off" };
-  const exp = Date.parse(g.expires_at || "");
-  if (!isNaN(exp) && exp < nowMs) return { label: { en: "Expired", ja: "期限切れ" }, kind: "warn" };
+  const exp = grantExpiryTime(g);
+  if (!Number.isFinite(exp)) return { label: { en: "Unknown expiry", ja: "期限不明" }, kind: "warn" };
+  if (exp <= nowMs) return { label: { en: "Expired", ja: "期限切れ" }, kind: "warn" };
   return { label: { en: "Active", ja: "有効" }, kind: "ok" };
 }
 
@@ -30,7 +40,7 @@ function grantTime(s) {
 // operator's real question — "is this still letting someone in, and for how much longer?"
 function grantRemaining(g, nowMs) {
   if (g.revoked) return "";
-  const exp = Date.parse(g.expires_at || "");
+  const exp = grantExpiryTime(g);
   if (isNaN(exp) || exp <= nowMs) return "";
   const min = Math.round((exp - nowMs) / 60000);
   if (min < 60) return bl({ en: "in " + min + " min", ja: "あと" + min + "分" });
@@ -79,8 +89,8 @@ function renderGrantsView(content) {
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Access Approvals", ja: "アクセス承認" }) }),
       el("p", { class: "ui-view-desc", text: bl({
-        en: "Access granted to people after they sign in through your identity provider. Access lasts only while an approval is live — revoking one denies the next request immediately.",
-        ja: "ユーザーが ID プロバイダでサインインした後に付与されるアクセスです。承認が有効な間だけアクセスでき、失効させると次のリクエストが直ちに拒否されます。",
+        en: "Access granted to people after they sign in through your identity provider. Revocation takes effect on this server; other servers must receive the configuration update.",
+        ja: "ユーザーが ID プロバイダでサインインした後に付与されるアクセスです。失効はこのサーバーで反映されます。他のサーバーには設定の配布が必要です。",
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderGrantsList(host) }),
@@ -95,15 +105,19 @@ async function renderGrantsList(host) {
   const current = freshRender(host);
   let grants;
   try {
-    const r = await apiFetch("GET", "/admin/grants");
-    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderGrantsList(host) }); return; }
-    grants = (r.body && r.body.grants) || [];
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderGrantsList(host) }); return; }
+    const [r, tenant] = await Promise.all([apiFetch("GET", "/admin/grants"), apiFetch("GET", "/admin/tenant")]);
+    if (!r?.ok || !tenant?.ok) throw new Error("HTTP " + (!r?.ok ? r?.status : tenant?.status));
+    grants = validatedAccessGrants(r.body, tenant.body);
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderGrantsList(host) });
+    drawGrantNotices(host); return;
+  }
 
   if (!grants.length) {
     if (!current()) return;
     uiState(host, "empty", bl({ en: "No access approvals yet. One appears here after a person signs in through your identity provider.", ja: "アクセス承認はまだありません。ユーザーが ID プロバイダでサインインすると表示されます。" }));
-    return;
+    drawGrantNotices(host); return;
   }
 
   // Resolve the opaque IdP subject (g.user_id — a sub/UUID) to a readable person via the synced directory. The
@@ -191,11 +205,7 @@ async function renderGrantsList(host) {
       el("td", { text: signInMethod(g) }),
       el("td", {}, expireKids),
       el("td", {}, uiBadge(bl(st.label), st.kind)),
-      el("td", { class: "ui-row-actions" }, g.revoked ? null : el("button", {
-        class: "ui-btn ui-btn-sm ui-btn-danger",
-        text: bl({ en: "Revoke", ja: "失効" }),
-        onClick: () => revokeGrant(g, host, primary || email || g.user_id),
-      })),
+      el("td", { class: "ui-row-actions" }, g.revoked ? null : grantRevokeButton(g, host, primary || email || g.user_id)),
     ]);
   };
   // Searchable: person (name / email / username), device, destination, IdP, or status.
@@ -235,26 +245,70 @@ async function renderGrantsList(host) {
 
   if (!current()) return;
   host.innerHTML = "";
+  drawGrantNotices(host);
   host.appendChild(filterBar);
   host.appendChild(paSearchTable(bl({ en: "Search by user, email, device, destination, or identity provider…", ja: "ユーザー・email・デバイス・宛先・ID プロバイダで検索…" }), shown, hay, table, bl({ en: "No matches.", ja: "一致なし。" })));
 }
 
-async function revokeGrant(g, host, label) {
-  const who = label || g.user_id || g.grant_id || "";
-  const ok = await uiConfirm({
-    title: bl({ en: "Revoke this access?", ja: "このアクセスを失効?" }),
-    body: bl({
-      en: "The next request from " + (who || "this user") + " will be denied immediately. This cannot be undone.",
-      ja: (who || "このユーザー") + " からの次のリクエストは直ちに拒否されます。この操作は取り消せません。",
-    }),
-    confirmLabel: bl({ en: "Revoke", ja: "失効" }),
-    danger: true,
-  });
-  if (!ok) return;
+function accessGrantObject(v) { return v && typeof v === "object" && !Array.isArray(v); }
+function accessGrantText(v) { return typeof v === "string" && v.trim() !== ""; }
+function validatedAccessGrants(body, tenant) {
+  if (!accessGrantObject(tenant) || !accessGrantText(tenant.tenant_id) || !accessGrantObject(body) || !Array.isArray(body.grants)) throw new Error("Invalid access approval response");
+  const ids = new Set();
+  for (const g of body.grants) {
+    if (!accessGrantObject(g) || !accessGrantText(g.grant_id) || g.tenant_id !== tenant.tenant_id || ids.has(g.grant_id) ||
+        (g.revoked !== undefined && typeof g.revoked !== "boolean") ||
+        ["user_id","user_email","username","user_display_name","device_id","idp_id","acr","scope","issued_at","expires_at"].some(k => g[k] !== undefined && typeof g[k] !== "string") ||
+        (g.amr !== undefined && (!Array.isArray(g.amr) || g.amr.some(v => typeof v !== "string")))) throw new Error("Invalid access approval record");
+    ids.add(g.grant_id);
+  }
+  return body.grants;
+}
+function grantUnconfirmed() { return bl({en:"The revocation outcome is unconfirmed. Check the approval and retry revocation.",ja:"失効の結果を確認できません。承認の状態を確認し、失効を再試行してください。"}); }
+function grantRevokeOutcome(r, g) {
+  const b = r?.body;
+  const same = accessGrantObject(b) && b.grant_id === g.grant_id && b.tenant_id === g.tenant_id;
+  if (r?.ok && r.status === 200 && same && b.status === "revoked" && (b.persistence === undefined || b.persistence === "saved_non_atomic")) return {partial:false,nonAtomic:b.persistence === "saved_non_atomic"};
+  if (!r?.ok && r?.status === 500 && same && b.status === "partial" && b.applied === true && b.persistence === "unconfirmed") return {partial:true};
+  if (r?.ok || (accessGrantObject(b) && b.status === "partial")) throw new Error(grantUnconfirmed());
+  throw new Error(accessGrantText(b?.error) ? b.error : grantUnconfirmed());
+}
+function grantRevokeButton(g, host, label, retry = false, partial = false) {
+  const button = el("button", {class:"ui-btn ui-btn-sm ui-btn-danger", text: retry ? (partial ? bl({en:"Retry saving revocation",ja:"失効の保存を再試行"}) : bl({en:"Retry revocation",ja:"失効を再試行"})) : bl({en:"Revoke",ja:"失効"}), onClick: async () => {
+    if (button.disabled) return; button.disabled = true;
+    try { await revokeGrant(g, host, label, retry); } finally { button.disabled = false; }
+  }});
+  return button;
+}
+function drawGrantNotices(host) {
+  for (const notice of (host.__grantNotices || new Map()).values()) {
+    host.appendChild(el("div", {class:"ui-callout ui-callout-warn",role:"alert"}, [
+      el("p",{text:(notice.label || bl({en:"Access approval",ja:"アクセス承認"})) + ": " + notice.message}),
+      notice.retry === false ? null : grantRevokeButton(notice.grant,host,notice.label,true,notice.partial),
+    ]));
+  }
+}
+async function revokeGrant(g, host, label, retry = false) {
+  const pending = host.__grantPending || (host.__grantPending = new Set());
+  const notices = host.__grantNotices || (host.__grantNotices = new Map());
+  const key = g.tenant_id + "\0" + g.grant_id;
+  if (pending.has(key)) return; pending.add(key);
   try {
-    const r = await apiFetch("POST", "/admin/grants/" + encodeURIComponent(g.grant_id) + "/revoke");
-    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-    uiToast(bl({ en: "Access revoked.", ja: "アクセスを失効しました。" }), "ok");
-    renderGrantsList(host);
-  } catch (e) { uiToast(String(e), "err"); }
+    if (!retry && !await uiConfirm({
+      title:bl({en:"Revoke this access?",ja:"このアクセスを失効?"}),
+      body:bl({en:"Revoke this approval on this server. Other servers must receive the update. This cannot be undone.",ja:"このサーバーで承認を失効します。他のサーバーには更新の配布が必要です。この操作は取り消せません。"}),
+      confirmLabel:bl({en:"Revoke",ja:"失効"}),danger:true,
+    })) return;
+    let r;
+    try { r = await apiFetch("POST", "/admin/grants/" + encodeURIComponent(g.grant_id) + "/revoke"); }
+    catch (_) { throw new Error(grantUnconfirmed()); }
+    const outcome = grantRevokeOutcome(r,g);
+    if (outcome.partial) {
+      notices.set(key,{grant:g,label,partial:true,message:bl({en:"Revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",ja:"このサーバーでは失効済みですが、保存を確認できません。保存先を復旧し、再起動前に失効の保存を再試行してください。"})});
+    } else if (outcome.nonAtomic) {
+      notices.set(key,{grant:g,label,retry:false,message:bl({en:"Revoked and saved without atomic replacement. This save completed, but interrupted future writes could damage the snapshot. Use storage that supports atomic replacement.",ja:"失効を保存しましたが、原子的な置き換えはできませんでした。今回の保存は完了しています。今後の書き込み中断による破損を避けるため、原子的な置き換えが可能な保存先を使用してください。"})});
+    } else { notices.delete(key); if (host.isConnected !== false) uiToast((label || bl({en:"Access approval",ja:"アクセス承認"})) + ": " + bl({en:"Revocation accepted.",ja:"失効を受け付けました。"}),"ok"); }
+  } catch (e) { notices.set(key,{grant:g,label,message:e.message || String(e)}); }
+  finally { pending.delete(key); }
+  if (host.isConnected !== false) await renderGrantsList(host);
 }

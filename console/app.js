@@ -312,9 +312,10 @@ function applyI18n() {
   document.querySelectorAll("[data-i18n]").forEach((el) => { el.textContent = t(el.getAttribute("data-i18n")); });
   document.getElementById("lang-en").classList.toggle("active", lang === "en");
   document.getElementById("lang-ja").classList.toggle("active", lang === "ja");
+  const activeGroup = document.querySelector(".nav button.active")?.dataset.group;
   buildNav();
   warnIfViewsMissing();
-  const active = document.querySelector(".nav button.active");
+  const active = Array.from(document.querySelectorAll(".nav button")).find(button => button.dataset.group === activeGroup);
   // ★ AN OPERATOR LANDS ON THEIR OWN SCREEN. The customer Overview shows them a deployment full of things
   // they cannot touch — super_admin holds none of the customer-side write permissions — and hides the three
   // they actually work on. Only for the operator's own organization; a customer administrator is unaffected.
@@ -578,6 +579,7 @@ const CP_AUTHORED_READS = [
   "GET /admin/connectors",
   "GET /admin/enrolled-devices",
   "GET /admin/device-runtime",
+  // An Edge is started and stopped at any time, so what the fleet observed is held by the control plane.
   "GET /admin/policy-candidates",
   "GET /admin/east-west/observations",
 ];
@@ -817,7 +819,7 @@ const OPERATOR_NAV_SECTIONS = [
     // Not "overview": the operator already lands on their own home, and two screens both called Overview is
     // the kind of duplication that makes a person doubt which one they are reading.
     ids: ["enrolled", "enrolment-tokens", "agent-profile", "egress-rules", "eastwest-rules",
-      "effective-policy", "apps", "sites", "assets", "identities", "idp", "grants", "steerexcl",
+      "effective-policy", "apps", "sites", "vlan", "assets", "identities", "idp", "grants", "steerexcl",
       "inspection-posture", "dns"] },
   { t: { en: "Commercial", ja: "契約・課金" }, ids: ["licensing"] },
   { t: { en: "Record", ja: "記録" }, ids: ["audit"] },

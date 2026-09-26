@@ -6544,10 +6544,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// Allow-all (S5). It reuses the exact same ruleStore.Upsert + recompile as POST /admin/rules, so an adopted
 	// rule is indistinguishable from a hand-authored one and is editable/deletable in the normal Rules UI.
 	registerEastWestRoutes(mux, adminEndpoint, policyStore, eastWestAuthChallenges, config.CPVersions, config.EastWestObserveStore, configSourceURL, func(w http.ResponseWriter) bool {
+		ruleGeneration, assetGeneration := ruleStore.ConfigGeneration(), assetStore.ConfigGeneration()
 		if !refreshAuthoredStores(w, ruleStore, assetStore) {
 			return false
 		}
-		recompileAuthoredRules()
+		if ruleStore.ConfigGeneration() != ruleGeneration || assetStore.ConfigGeneration() != assetGeneration {
+			recompileAuthoredRules()
+		}
 		return true
 	})
 	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)

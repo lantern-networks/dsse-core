@@ -104,7 +104,10 @@ func (e Evaluator) Evaluate(req model.DecisionRequest) model.AccessDecision {
 	reasonCodes := []string{"no_policy_match"}
 	matched := []string{}
 	actions := []model.DecisionAction{}
-	policyID := e.firstPolicyID()
+	// A default denial has no matching policy. The first configured policy may
+	// be unrelated, disabled or owned by another tenant; never attribute it to
+	// this decision. Matching and dedicated authorization branches set the ID.
+	policyID := ""
 	tokenBindingState := req.TokenBindingState
 	workloadAttestationState := req.WorkloadAttestationState
 	metadata := decisionMetadata(req)
@@ -606,15 +609,6 @@ func policyDecisionRestrictivenessRank(decision string) int {
 	default:
 		return 2
 	}
-}
-
-func (e Evaluator) firstPolicyID() string {
-	for _, policy := range e.orderedPolicies() {
-		if policy.ID != "" {
-			return policy.ID
-		}
-	}
-	return ""
 }
 
 func (e Evaluator) firstPolicyTenantID() string {

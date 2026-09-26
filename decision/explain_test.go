@@ -76,6 +76,9 @@ func TestExplainDecisionDefaultDeny(t *testing.T) {
 	if exp.WinnerPolicyID != "" {
 		t.Fatalf("winner = %q, want empty (no match)", exp.WinnerPolicyID)
 	}
+	if exp.FinalDecision != "deny" || exp.FinalPolicyID != "" {
+		t.Fatalf("final = %q/%q, want deny without policy attribution", exp.FinalDecision, exp.FinalPolicyID)
+	}
 	if len(exp.Trace) != 1 || exp.Trace[0].Matched {
 		t.Fatalf("trace = %+v, want one non-matching entry", exp.Trace)
 	}

@@ -28,32 +28,32 @@ func NewStore() *Store {
 	return &Store{rules: map[string]map[string]Rule{}}
 }
 
-func (s *Store) nextIDLocked() string {
-	s.seq++
-	return "rule-" + strconv.Itoa(s.seq)
-}
-
-// Upsert validates and stores a rule (creating an id when absent), returning the stored rule.
-func (s *Store) Upsert(r Rule) (Rule, error) {
+// Upsert validates and persists a candidate before publishing it to readers.
+func (s *Store) upsert(r Rule) (Rule, error) {
+	r = cloneRule(r)
 	if err := r.normalizeAndValidate(); err != nil {
 		return Rule{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	next, seq := cloneRules(s.rules), s.seq
+	if next[r.TenantID] == nil {
+		next[r.TenantID] = map[string]Rule{}
+	}
 	if strings.TrimSpace(r.ID) == "" {
-		r.ID = s.nextIDLocked()
+		for {
+			seq++
+			r.ID = "rule-" + strconv.Itoa(seq)
+			if _, exists := next[r.TenantID][r.ID]; !exists {
+				break
+			}
+		}
 	}
-	if s.rules[r.TenantID] == nil {
-		s.rules[r.TenantID] = map[string]Rule{}
+	next[r.TenantID][r.ID] = r
+	if err := s.saveCandidateLocked(next, seq); err != nil {
+		return Rule{}, err
 	}
-	s.rules[r.TenantID][r.ID] = r
-	s.generation++
-	if err := s.persistLocked(); err != nil {
-		// The rule IS live in memory (hot-applied); the caller must surface that durability failed so the
-		// admin knows it will not survive a restart.
-		return r, fmt.Errorf("rule %s applied in memory but not persisted (will not survive a restart): %w", r.ID, err)
-	}
-	return r, nil
+	return cloneRule(r), nil
 }
 
 // Get returns a rule by id.
@@ -61,21 +61,20 @@ func (s *Store) Get(tenantID, id string) (Rule, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r, ok := s.rules[tenantID][id]
-	return r, ok
+	return cloneRule(r), ok
 }
 
-// Delete removes a rule; it reports whether the rule existed. A non-nil error means the delete IS live in
-// memory but the snapshot failed to persist — the rule would resurrect on restart, so callers must surface it.
-func (s *Store) Delete(tenantID, id string) (bool, error) {
+// Delete returns success only after the updated snapshot is saved.
+func (s *Store) delete(tenantID, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.rules[tenantID][id]; !ok {
 		return false, nil
 	}
-	delete(s.rules[tenantID], id)
-	s.generation++
-	if err := s.persistLocked(); err != nil {
-		return true, fmt.Errorf("rule %s deleted in memory but not persisted (would resurrect on restart): %w", id, err)
+	next := cloneRules(s.rules)
+	delete(next[tenantID], id)
+	if err := s.saveCandidateLocked(next, s.seq); err != nil {
+		return false, err
 	}
 	return true, nil
 }
@@ -90,23 +89,28 @@ func (s *Store) Delete(tenantID, id string) (bool, error) {
 // the credential store, the enrolled ledger and the log files; the authored-rule store is file-backed and was
 // not among them, so the one thing the organization had authored outlived the organization.
 func (s *Store) RemoveTenant(tenantID string) int {
-	if s == nil {
-		return 0
+	removed, _ := s.RemoveTenantChecked(tenantID)
+	return removed
+}
+
+// RemoveTenantChecked preserves the original rule set when deletion cannot be saved.
+func (s *Store) removeTenantChecked(tenantID string) (int, error) {
+	if s == nil || strings.TrimSpace(tenantID) == "" {
+		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
-	if tenantID == "" {
-		return 0
-	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	removed := len(s.rules[tenantID])
 	if removed == 0 {
-		return 0
+		return 0, nil
 	}
-	delete(s.rules, tenantID)
-	s.generation++
-	s.persistLocked()
-	return removed
+	next := cloneRules(s.rules)
+	delete(next, tenantID)
+	if err := s.saveCandidateLocked(next, s.seq); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // Tenants names every organization that has authored rules here.
@@ -137,7 +141,7 @@ func (s *Store) List(tenantID, plane string) []Rule {
 		if plane != "" && r.Plane != plane {
 			continue
 		}
-		out = append(out, r)
+		out = append(out, cloneRule(r))
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Priority != out[j].Priority {

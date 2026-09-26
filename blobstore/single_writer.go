@@ -3,6 +3,7 @@ package blobstore
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 )
@@ -70,9 +71,9 @@ func (p *SingleWriterFilePersister) saveLocked(data []byte) error {
 				ErrConcurrentWriter, p.File.Path, short(p.seen), short(got))
 		}
 	}
-	if serr := p.File.Save(data); serr != nil && serr != ErrSavedWithoutAtomicity {
+	if serr := p.File.Save(data); serr != nil && !errors.Is(serr, ErrSavedWithoutAtomicity) {
 		return serr
-	} else if serr == ErrSavedWithoutAtomicity {
+	} else if errors.Is(serr, ErrSavedWithoutAtomicity) {
 		p.seen, p.have = digestOf(data), true
 		return serr
 	}

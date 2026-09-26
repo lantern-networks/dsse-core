@@ -369,7 +369,17 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			Published:        true,
 			Status:           "active",
 		}
-		created, err := applicationCatalogStore.Upsert(r.Context(), entry, tenantID, now)
+		publisher, canPublish := applicationCatalogStore.(appcatalog.CandidatePublisher)
+		reviewer, canReview := policyCandidateStore.(policycandidate.PublicationReviewer)
+		if !canPublish || !canReview {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate publication is not supported by the configured stores"))
+			return
+		}
+		created, err := publisher.CreateOrMatch(r.Context(), entry, tenantID, now)
+		if errors.Is(err, appcatalog.ErrCandidateApplicationConflict) {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -380,7 +390,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if reviewReason == "" {
 			reviewReason = "connector_candidate_published"
 		}
-		reviewed, reviewFound, rerr := policyCandidateStore.Review(r.Context(), tenantID, candidateID, policycandidate.ReviewRequest{Decision: "approved", ReviewReasonCode: reviewReason}, now)
+		reviewed, reviewFound, rerr := reviewer.ApprovePublication(r.Context(), cand, reviewReason, now)
 		if rerr != nil || !reviewFound {
 			published := adminApplicationPublishAuditLog(created, evaluator, now, true)
 			published.ActorUserID = auditActorPrincipal(r)

@@ -904,6 +904,7 @@ type adminDownloadToken struct {
 	LocalFilename            string `json:"local_filename"`
 	PayloadChecksum          string `json:"payload_checksum"`
 	IssuedByAdminPrincipalID string `json:"issued_by_admin_principal_id"`
+	IssuedByOperatorTenantID string `json:"issued_by_operator_tenant_id,omitempty"`
 	IssuedAt                 string `json:"issued_at"`
 	ExpiresAt                string `json:"expires_at"`
 	Status                   string `json:"status"`
@@ -1151,7 +1152,7 @@ func (s *adminExportJobStore) MarkCancelled(id, tenantID, cancelledBy, reason st
 	return job, nil
 }
 
-func (s *adminDownloadTokenStore) Create(job adminExportJob, localFilename, issuedBy string, payload []byte, now time.Time) (adminDownloadToken, error) {
+func (s *adminDownloadTokenStore) Create(job adminExportJob, localFilename, issuedBy string, payload []byte, now time.Time, issuerOperatorTenant ...string) (adminDownloadToken, error) {
 	if s == nil {
 		return adminDownloadToken{}, fmt.Errorf("download token store is not configured")
 	}
@@ -1178,6 +1179,10 @@ func (s *adminDownloadTokenStore) Create(job adminExportJob, localFilename, issu
 		Status:                   "active",
 		Payload:                  payload,
 	}
+	if len(issuerOperatorTenant) > 0 {
+		token.IssuedByOperatorTenantID = strings.TrimSpace(issuerOperatorTenant[0])
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tokens[token.Token] = token
@@ -1508,7 +1513,11 @@ func createAdminExportDownloadURL(r *http.Request, store *adminDownloadTokenStor
 				"work on this node", localFilename, rerr)
 		}
 	}
-	token, err := store.Create(job, localFilename, issuedBy, payload, now)
+	issuerHome := ""
+	if identity, ok := adminIdentityFromRequest(r); ok && identity.PrincipalID == issuedBy && identity.TenantID != job.TenantID && adminCallerIsOperator(r) {
+		issuerHome = identity.TenantID
+	}
+	token, err := store.Create(job, localFilename, issuedBy, payload, now, issuerHome)
 	if err != nil {
 		return adminDownloadURLResponse{}, adminDownloadToken{}, err
 	}

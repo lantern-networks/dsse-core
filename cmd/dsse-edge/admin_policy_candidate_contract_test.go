@@ -120,8 +120,8 @@ func TestAdminPolicyCandidateAPIUpsertListDetailAndReview(t *testing.T) {
 		t.Fatalf("outbox inserted audits = %#v, want candidate upsert/review", outbox.insertedAudits)
 	}
 	for _, audit := range outbox.insertedAudits {
-		if audit.SourceIP != nil || audit.ActorUserID != nil {
-			t.Fatalf("candidate audit included raw source/user fields: %#v", audit)
+		if audit.SourceIP != nil || audit.ActorUserID == nil || *audit.ActorUserID == "" {
+			t.Fatalf("candidate audit must identify its administrator without raw source fields: %#v", audit)
 		}
 	}
 }

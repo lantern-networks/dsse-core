@@ -35,6 +35,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	}
 
 	mux.HandleFunc("GET /admin/policy-candidates", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		options := policycandidate.ListOptions{
 			Status:        strings.TrimSpace(r.URL.Query().Get("status")),
 			CandidateType: strings.TrimSpace(r.URL.Query().Get("candidate_type")),
@@ -45,7 +48,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeCandidateError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, result)
+		rows := make([]policyCandidateView, 0, len(result.Candidates))
+		for _, candidate := range result.Candidates {
+			rows = append(rows, policyCandidateForView(candidate))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"candidates": rows, "count": result.Count, "limit": result.Limit, "tenant_id": adminTenantIDFromRequest(r)})
 	}))
 	mux.HandleFunc("GET /admin/policy-candidates/{candidate_id}", adminEndpoint("admin.policy_candidates.read", func(w http.ResponseWriter, r *http.Request) {
 		candidate, found, err := policyCandidateStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"))
@@ -71,10 +78,13 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeCandidateError(w, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_upserted", created, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_upserted", created, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, created)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/review", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		var review policycandidate.ReviewRequest
 		if err := decodeLimitedJSONBody(w, r, &review, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode policy candidate review: %w", err))
@@ -101,10 +111,13 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if applyMaterializedCertPinBypass != nil {
 			applyMaterializedCertPinBypass(adminTenantIDFromRequest(r))
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, reviewed)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/materialize", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		concrete, ok := policyCandidateStore.(*policycandidate.Store)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, fmt.Errorf("policy candidate store does not support materialize"))
@@ -198,7 +211,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 				}
 			}
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_materialized", materialized, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_materialized", materialized, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, materialized)
 	}))
 	// Manually add a known pinned site directly to the decrypt-bypass, without waiting for the detector to
@@ -216,6 +229,9 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// and the rule then reaches every Edge in the fleet, which is what an inspection bypass has to do: a site
 	// that must not be decrypted must not be decrypted by whichever Edge the device happens to reach.
 	mux.HandleFunc("POST /admin/cert-pin-bypass", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		if configWriteRejectedWhenSourced(w, configSourceURL, "cert-pin bypass") {
 			return
 		}
@@ -261,7 +277,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if applyMaterializedCertPinBypass != nil {
 			applyMaterializedCertPinBypass(tenantID)
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_cert_pin_bypass_added", materialized, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_cert_pin_bypass_added", materialized, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, materialized)
 	}))
 	// Connector UX Slice 4: refresh connector-discovered candidates. Derives candidates from the
@@ -413,7 +429,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now)), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "connector_candidate_publish.v1",
 			"application":    created,

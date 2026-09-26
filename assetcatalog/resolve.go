@@ -179,3 +179,18 @@ func (s *Store) ServicePorts(tenant, serviceID string) []int {
 	}
 	return nil
 }
+
+// ServiceIncludesTransport resolves an exact protocol/port pair without losing
+// the protocol as ServicePorts does. An absent or unresolved service never
+// grants a transport-specific inspection exception.
+func (s *Store) ServiceIncludesTransport(tenant, serviceID, protocol string, port int) bool {
+	if s == nil || strings.TrimSpace(serviceID) == "" {
+		return false
+	}
+	for _, p := range s.ServiceTransportPorts(tenant, serviceID)[protocol] {
+		if p == port {
+			return true
+		}
+	}
+	return false
+}

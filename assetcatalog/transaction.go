@@ -7,10 +7,13 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+
+	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
 // ErrPersistence means storage did not confirm the candidate. The previous
-// live catalog is retained; an ambiguous external commit still needs a reload.
+// live catalog is retained unless a file replacement is known to have completed.
+// An ambiguous external commit still needs a reload.
 var ErrPersistence = errors.New("asset catalog persistence was not confirmed")
 
 func copyEndpoint(e Endpoint) Endpoint {
@@ -128,6 +131,9 @@ func mutateCatalogContext[T any](ctx context.Context, s *Store, apply func(*Stor
 	} // absent delete
 	n.persister = s.persister
 	if err := n.persistLocked(); err != nil {
+		if errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+			s.adoptLocked(n)
+		}
 		var zero T
 		return zero, fmt.Errorf("%w: %v", ErrPersistence, err)
 	}

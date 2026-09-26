@@ -457,7 +457,11 @@ func (e adminTenantExtraStores) erase(result *adminTenantPurgeResult) {
 		add("admission_kill_switches", e.Admissions.RemoveDevices(e.DeviceIDs))
 	}
 	if e.ConnectorRoutes != nil {
-		add("connector_route_governance", e.ConnectorRoutes.RemoveTenant(tenantID))
+		if n, err := e.ConnectorRoutes.RemoveTenantChecked(tenantID); err != nil {
+			result.Failures = append(result.Failures, "connector route erasure could not be confirmed")
+		} else {
+			add("connector_route_governance", n)
+		}
 	}
 	if e.CatalogOverrides != nil {
 		add("bypass_catalog_overrides", e.CatalogOverrides.RemoveTenant(tenantID))

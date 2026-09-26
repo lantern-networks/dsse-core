@@ -921,7 +921,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 				// Route governance: record the advertised routes. First sight grandfathers the current set
 				// (existing deployments keep working); a route advertised LATER is pending until approved.
 				if connectorRouteGov != nil {
-					connectorRouteGov.SeeRoutes(conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, now)
+					if err := connectorRouteGov.SeeRoutesContext(context.Background(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, now); err != nil {
+						criticalErr = errors.Join(criticalErr, fmt.Errorf("route discovery: %w", err))
+					}
 				}
 			}
 		}
@@ -1163,9 +1165,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		}
 	}
 	// Route-governance decisions distributed as config: a pull-model Edge adopts the CP's configured bindings +
-	// hold/adopt state, so it converges WITHOUT a shared governance store. Lockout-safe (empty/omitted = keep local).
+	// hold/adopt state. Legacy empty/omitted sections keep local decisions; complete empty snapshots clear them.
 	if payload.RouteGovernance != nil && connectorRouteGov != nil {
-		connectorRouteGov.ImportShared(payload.RouteGovernance)
+		if err := connectorRouteGov.ImportReceived(context.Background(), payload.RouteGovernance); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("route governance: %w", err))
+		}
 	}
 	return n, criticalErr
 }

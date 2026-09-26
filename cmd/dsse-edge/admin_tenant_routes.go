@@ -358,7 +358,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		now := time.Now()
 		if err := adminStore.Delete(r.Context(), tenantID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now), now)
@@ -520,10 +520,11 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 					"its data with nothing to tell them — refusing rather than erasing part of it", tenantID))
 			return
 		}
-		orderer.OrderPurge(tenantID, now)
-		// Read the order back. OrderPurge cannot return an error (the file store's signature has none, and the
-		// two backends must be interchangeable), so the only way to know the order was actually recorded — a
-		// failed INSERT, a table that migration 041 never created — is to look for it.
+		if err := orderer.OrderPurge(tenantID, now); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant erasure order could not be saved; retry later"))
+			return
+		}
+		// Verify the standing order before erasing any local data.
 		if !tenantPurgeOrderStands(orderer, tenantID) {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf(
 				"the erasure order for %q was not recorded, so no other node would ever be told to erase it — "+

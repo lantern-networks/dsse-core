@@ -158,7 +158,10 @@ traffic and multi-CP shared-state operation remain release checks.
 Older saved risk marks may have only a raw ID, with no reliable person/device or
 tenant owner. During upgrade they stay active by raw ID across tenants; the
 People page shows their count but does not assign them to a person. An operator
-must investigate each mark before using the operator-only
+should upgrade Edges before relying on such a mark for person-risk enforcement:
+an older Edge recognizes the raw ID only as a device ID, even while a newer
+control plane sends the mark in a rolling upgrade. The operator must investigate
+each mark before using the operator-only
 `POST /admin/risk-signals/legacy-unattributed/resolve` endpoint to discard it.
 That action requires the expected severity, an explicit discard confirmation,
 and a reason, and writes an audit event. There is no atomic reassignment to a

@@ -64,7 +64,7 @@ func adminDownloadAuditLog(eventType string, token adminDownloadToken, evaluator
 		actorUserID = stringPtr("anonymous_token_bearer")
 		downloadActorKnown = false
 	}
-	return model.AuditLog{
+	record := model.AuditLog{
 		ID:            randomEdgeID("audit_"+eventType+"_", time.Now().UTC()),
 		TenantID:      token.TenantID,
 		ActorUserID:   actorUserID,
@@ -87,6 +87,16 @@ func adminDownloadAuditLog(eventType string, token adminDownloadToken, evaluator
 			"user_agent":                   userAgent,
 		},
 	}
+	// A bearer may be forwarded. Preserve who issued the link without claiming
+	// that its anonymous downloader is the authenticated operator.
+	if token.IssuedByOperatorTenantID != "" {
+		record.Metadata["issued_by_operator_tenant_id"] = token.IssuedByOperatorTenantID
+		if eventType == "admin_export_url_issued" {
+			record.Metadata["operator_tenant_id"] = token.IssuedByOperatorTenantID
+			record.Metadata["operator_principal_id"] = token.IssuedByAdminPrincipalID
+		}
+	}
+	return record
 }
 
 func adminAPITokenAuditLog(eventType string, token adminAPIToken, evaluator decision.Evaluator, sourceIP string) model.AuditLog {

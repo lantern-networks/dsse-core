@@ -8,6 +8,13 @@ The target is the week of September 28–October 4, 2026, subject to the release
 below. This is a planning target, not an availability commitment. If it moves, this
 page will record the remaining blockers and revised outlook.
 
+Download audit follow-up: customer export links now retain the issuing operator's
+organization through token persistence and restoration. Download events distinguish
+that issuer from the anonymous bearer of a transferable link. Customer-issued links
+do not inherit attribution from the export job's creator. Authenticated HTTP tests
+cover issuance, restoration and consumption; this does not establish production audit
+delivery or change download authorization.
+
 ## What is being maintained
 
 The current priority is reliability in everyday administration: creating, editing,

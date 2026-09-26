@@ -114,7 +114,9 @@ func (store *Store) observeCertPin(tenantID, host, sni, observedIP, attributionS
 	if err != nil {
 		return Candidate{}, err
 	}
-	store.putLocked(normalized)
+	if err := store.putLocked(normalized); err != nil {
+		return copyCandidate(normalized), err
+	}
 	return copyCandidate(normalized), nil
 }
 
@@ -175,7 +177,9 @@ func (store *Store) AddManualCertPinBypass(_ context.Context, tenantID, host str
 	if err != nil {
 		return Candidate{}, err
 	}
-	store.putLocked(normalized)
+	if err := store.putLocked(normalized); err != nil {
+		return copyCandidate(normalized), err
+	}
 	return copyCandidate(normalized), nil
 }
 
@@ -211,6 +215,8 @@ func (store *Store) Materialize(_ context.Context, tenantID, candidateID string,
 	}
 	cand.Status = "materialized"
 	cand.UpdatedAt = &ts
-	store.putLocked(cand)
+	if err := store.putLocked(cand); err != nil {
+		return copyCandidate(cand), true, err
+	}
 	return copyCandidate(cand), true, nil
 }

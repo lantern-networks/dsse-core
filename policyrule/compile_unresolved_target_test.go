@@ -44,7 +44,7 @@ func TestCompileEgressUnresolvedDestinationDoesNotVanish(t *testing.T) {
 }
 
 // A missing named service must not acquire an unrelated HTTPS meaning.
-func TestCompileEgressNamedServiceZeroPortsMatchesNothing(t *testing.T) {
+func TestCompileEgressNamedServiceZeroPortsPreservesDeny(t *testing.T) {
 	resolver := fakeEgressResolver{
 		src:   map[string][]string{"grp": {"dev-a"}},
 		addr:  map[string][]string{"ep": {"site.example.com"}},
@@ -56,8 +56,8 @@ func TestCompileEgressNamedServiceZeroPortsMatchesNothing(t *testing.T) {
 		t.Fatal("expected compiled policies")
 	}
 	for _, p := range got {
-		if values, ok := p.Conditions["protocol"].([]any); !ok || len(values) != 0 {
-			t.Fatalf("missing service must match no protocol, got %v", p.Conditions)
+		if _, ok := p.Conditions["protocol"]; ok {
+			t.Fatalf("missing service must retain deny across protocols, got %v", p.Conditions)
 		}
 	}
 

@@ -152,9 +152,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			}
 		}
 		bypassSources.AuthoredBypass = policyrule.EgressBypassFQDNs(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore)
-		if cs, ok := policyCandidateStore.(*policycandidate.Store); ok {
-			bypassSources.CertPinBypass = materializedCertPinBypassHosts(cs, tenant)
-		}
+		// Candidate history is not an effective bypass; saved rules supply this state.
 		// ★ The preview must be the answer THIS organization would get. Measured while operating inside a newly
 		// created organization: the trace listed another organization's policies and named one of them as the
 		// deciding policy. The enforcement path already refuses to match across organizations (evaluator.go,
@@ -209,9 +207,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 				}
 			}
 		}
-		if cs, ok := policyCandidateStore.(*policycandidate.Store); ok {
-			in.CertPinBypasses = materializedCertPinBypassRefs(cs, tenant)
-		}
+		// Candidate history is not an effective bypass; saved rules supply this state.
 		writeJSON(w, http.StatusOK, buildEffectiveEgressRules(in))
 	}))
 	// Built-in SaaS catalog groups presented as endpoint groups (Phase A of the unified policy model): the SaaS

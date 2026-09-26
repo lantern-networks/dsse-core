@@ -5,77 +5,61 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/assetcatalog"
 	"github.com/lantern-networks/dsse-core/edgeplane"
-	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
+	"github.com/lantern-networks/dsse-core/policycandidate"
+	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
-// The certificate-pinning bypass-candidate workflow's central property — nothing is bypassed until it is
-// MATERIALISED — checked through the Edge's real wiring: materializedCertPinBypassHosts feeding
-// interception.SetBypassHosts.
-func TestMaterializedCertPinCandidateBypassesOnlyAfterMaterialize(t *testing.T) {
+// Use the authored-rule selection used by the current public applier: even a materialized candidate is only history
+// until its authored rule exists. Deleting the rule does not require erasing history.
+func TestCertPinCandidateStatusRequiresAuthoredRule(t *testing.T) {
 	ctx := context.Background()
-	now := time.Unix(1_700_000_000, 0).UTC()
+	now := time.Now()
 	store := policycandidate.NewStore()
-
-	// Detection: a pinning destination's handshake failures make it a pending candidate.
-	c, err := store.ObserveCertPinFailure(ctx, "acme", "gateway.icloud.com", "gateway.icloud.com", 443, "interception_handshake_rejected", now)
+	assets := assetcatalog.NewStore()
+	rules := policyrule.NewStore()
+	engine := edgeplane.NewNetworkExtensionLabTLSInterceptionMatchOnly([]string{"*"})
+	apply := func(string) {
+		engine.SetBypassHosts(policyrule.EgressBypassFQDNs("acme", rules.List("acme", policyrule.PlaneEgress), assets))
+	}
+	c, err := store.ObserveCertPinFailure(ctx, "acme", "pinned.example", "pinned.example", 443, "interception_handshake_rejected", now)
 	if err != nil {
-		t.Fatalf("observe: %v", err)
+		t.Fatal(err)
 	}
-
-	// Build the interception engine under decrypt-all.
-	interception, err := edgeplane.NewNetworkExtensionLabTLSInterception([]string{"*"}, func() time.Time { return now })
-	if err != nil {
-		t.Fatalf("new interception: %v", err)
+	check := func(want bool) {
+		t.Helper()
+		apply("")
+		for _, tenant := range []string{"acme"} {
+			expect := want
+			if tenant == "other" {
+				expect = true
+			}
+			if got := engine.Matches(edgeplane.NetworkExtensionRuntimeCopyTCPRoute{TenantID: tenant, Host: "pinned.example", Port: 443}); got != expect {
+				t.Fatalf("%s inspects=%v want %v", tenant, got, expect)
+			}
+		}
 	}
-	interception.SetSNIBasedDecision(true)
-	route := edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: "17.253.1.1", Port: 443, SNI: "gateway.icloud.com"}
-
-	applyBypass := func(tenant string) {
-		interception.SetBypassHosts(materializedCertPinBypassHosts(store, tenant))
+	check(true)
+	if _, ok, err := store.Review(ctx, "acme", c.CandidateID, policycandidate.ReviewRequest{Decision: "approved"}, now); err != nil || !ok {
+		t.Fatal(ok, err)
 	}
-
-	// While it is only pending it is not in the bypass set, so it is still intercepted.
-	applyBypass("acme")
-	if got := materializedCertPinBypassHosts(store, "acme"); len(got) != 0 {
-		t.Fatalf("pending candidate must not be a bypass host, got %v", got)
+	check(true)
+	c, ok, err := store.Materialize(ctx, "acme", c.CandidateID, false, now)
+	if err != nil || !ok {
+		t.Fatal(ok, err)
 	}
-	if !interception.Matches(route) {
-		t.Fatalf("pending candidate: host must stay intercepted")
+	check(true)
+	if err := emitCertPinBypassRule(assets, rules, c); err != nil {
+		t.Fatal(err)
 	}
-
-	// Approving alone does not materialise it, so it is still not bypassed.
-	if _, ok, err := store.Review(ctx, "acme", c.CandidateID, policycandidate.ReviewRequest{Decision: "approved", ReviewReasonCode: "operator_approved"}, now); err != nil || !ok {
-		t.Fatalf("review approved: ok=%v err=%v", ok, err)
+	check(false)
+	if _, err := rules.Delete("acme", "certpin-rule-"+c.CandidateID); err != nil {
+		t.Fatal(err)
 	}
-	applyBypass("acme")
-	if !interception.Matches(route) {
-		t.Fatalf("approved-but-not-materialized: host must stay intercepted")
-	}
-
-	// Only materialising puts it in the bypass set, and it is raw-forwarded from then on.
-	if _, ok, err := store.Materialize(ctx, "acme", c.CandidateID, false, now); err != nil || !ok {
-		t.Fatalf("materialize: ok=%v err=%v", ok, err)
-	}
-	hosts := materializedCertPinBypassHosts(store, "acme")
-	if len(hosts) == 0 {
-		t.Fatalf("materialized candidate must be a bypass host")
-	}
-	applyBypass("acme")
-	if interception.Matches(route) {
-		t.Fatalf("materialized candidate: host must be raw_forwarded (Matches=false)")
-	}
-
-	// And it reverts: an administrator suppressing a live bypass takes it out of the materialised set and it
-	// is intercepted again, which is how a bypass is disabled.
-	if _, ok, err := store.Review(ctx, "acme", c.CandidateID, policycandidate.ReviewRequest{Decision: "suppressed", ReviewReasonCode: "operator_revoked"}, now); err != nil || !ok {
-		t.Fatalf("review suppressed: ok=%v err=%v", ok, err)
-	}
-	if got := materializedCertPinBypassHosts(store, "acme"); len(got) != 0 {
-		t.Fatalf("suppressed candidate must drop out of the bypass set, got %v", got)
-	}
-	applyBypass("acme")
-	if !interception.Matches(route) {
-		t.Fatalf("reverted candidate: host must be intercepted again (Matches=true)")
+	check(true)
+	history, ok, err := store.Get(ctx, "acme", c.CandidateID)
+	if err != nil || !ok || history.Status != "materialized" {
+		t.Fatal(history, ok, err)
 	}
 }

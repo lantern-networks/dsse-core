@@ -108,6 +108,17 @@ retry and fresh-store readback. A synthetic-session browser check covers manual
 bypass registration failure, retry and reload; it does not establish deployed
 traffic or independent control-plane/Edge acceptance.
 
+Pinned-site adoption also checks destination and bypass-rule saves before reporting
+success. A later failed save returns a partial result and does not request local
+application; retry can complete the same registration without duplicate rules.
+Failed bypass removal reports that the prior bypass may remain active. Candidate
+history no longer appears as an effective rule or recreates deleted, disabled or
+edited rules during startup. **Upgrade note:** a legacy materialized candidate
+without a saved Egress rule no longer grants a bypass. Review the intended target
+and explicitly register any still-required exception at the configuration authority.
+HTTP, persistence, audit and repeated executable-startup checks cover these changes;
+tenant-specific engine selection and deployed traffic remain separate checks.
+
 Application creation, editing, publication, withdrawal and deletion now record
 the authenticated administrator in their domain audits, including partial saves
 and operator actions in another organization. Session credentials and directory

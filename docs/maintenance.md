@@ -324,8 +324,36 @@ TLS selector cannot evaluate are explained in rule listings. These checks cover
 HTTP edits/readback, repeated executable startup, concurrent snapshot replacement
 and isolated TLS handshakes. Browser checks use synthetic data and product rendering;
 they do not establish deployed fleet traffic acceptance. Deployment-wide posture
-controls, observation reporting and complete rule-priority/risk evaluation remain
+controls and complete rule-priority/risk evaluation remain
 separate work; this change does not claim those gates are complete.
+
+## Observation delivery and candidate management (under review)
+
+Edges report observed lateral flows and policy candidates to the control plane on
+an independent delivery queue. The Console reads these inventories and sends
+candidate edits to the control plane; a configuration-pulling Edge rejects those
+edits instead of accepting a change that its next configuration update would replace.
+Live TLS bypass status is still read from the Edge.
+
+Counts and delivery receipts are saved together before acknowledging a report.
+File-save failures, including a replacement whose final flush is unconfirmed, stay
+unsuccessful on retry until persistence is confirmed. Shared-store reads refresh
+before listing or adopting observations, so another control-plane process can see
+received counts without restarting. Retries within the receipt window do not count
+the same report twice; reports outside that window are refused explicitly.
+
+Validation covers file-save recovery, concurrent shared updates, real PostgreSQL
+report delivery and readback, request authority, Console transport tests and a
+browser check with synthetic responses. This is not deployed fleet acceptance.
+Delivery is bounded: at most 5,000 distinct observations are queued and another
+5,000 can be in the current flush. New observations rejected at capacity are
+counted in health data. Abrupt termination can lose unflushed observations, and
+the downstream spool also has retention limits. The receiver refuses a known
+standby; fencing a write across a leadership transition remains separate work.
+
+Upgrade note: the observation store reads legacy tenant maps as well as receipt-bearing
+rows. Once reports are stored, the receipt-bearing format is written; rollback to
+an older binary that cannot read it is not established by these checks.
 
 ## What still blocks 0.3.1
 

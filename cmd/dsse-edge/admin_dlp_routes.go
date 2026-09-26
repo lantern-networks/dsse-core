@@ -71,21 +71,35 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// DLP Policies (S5): the reusable named DLP Policy objects an egress rule references by id (detectors + action
 	// + instance scope + device-risk conditions). CRUD: GET lists, POST creates/updates (id optional), DELETE by id.
 	mux.HandleFunc("GET /admin/dlp-policies", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshDLPStores(w, dlpPolicyObjects) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"policies": dlpPolicyObjects.List(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-policies", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP policies") || dlpFeatureGate(w, r) {
 			return
 		}
-		var obj model.DLPPolicyObject
-		if err := decodeLimitedJSONBody(w, r, &obj, maxEdgeRuntimeJSONBodyBytes); err != nil {
+		var body struct {
+			model.DLPPolicyObject
+			ExpectedTenantID string `json:"expected_tenant_id,omitempty"`
+		}
+		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp policy: %w", err))
 			return
 		}
+		obj := body.DLPPolicyObject
 		tenant := adminTenantIDFromRequest(r)
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload before editing"))
+			return
+		}
 		obj.TenantID = tenant
 		if strings.TrimSpace(obj.Name) == "" {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("name is required"))
+			return
+		}
+		if !refreshDLPStores(w, dlpClassifierStore, dlpFingerprintStore) {
 			return
 		}
 		if err := validateDLPPolicyObject(obj, dlpClassifierStore.ClassifierSetForTenant(tenant), dlpFingerprintStore.FingerprintSetForTenant(tenant)); err != nil {
@@ -98,7 +112,10 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 		if strings.TrimSpace(obj.Status) == "" {
 			obj.Status = "active"
 		}
-		dlpPolicyObjects.Upsert(obj)
+		if err := dlpPolicyObjects.UpsertContext(r.Context(), obj); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP policy save was not confirmed; reload before retrying"))
+			return
+		}
 		logInfof("dlp_policy_object_applied_by_admin tenant=%s id=%s name=%q identifiers=%d action=%s device_risk=%d", tenant, obj.ID, obj.Name, len(obj.Identifiers), obj.OnMatch, len(obj.DeviceRisk))
 		writeJSON(w, http.StatusOK, map[string]any{"policy": obj, "policies": dlpPolicyObjects.List(tenant)})
 	}))
@@ -112,7 +129,15 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
-		removed := dlpPolicyObjects.Delete(tenant, id)
+		if expected := r.URL.Query().Get("expected_tenant_id"); expected != "" && expected != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload before editing"))
+			return
+		}
+		removed, err := dlpPolicyObjects.DeleteContext(r.Context(), tenant, id)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP policy deletion was not confirmed; reload before retrying"))
+			return
+		}
 		logInfof("dlp_policy_object_removed_by_admin tenant=%s id=%s removed=%t", tenant, id, removed)
 		writeJSON(w, http.StatusOK, map[string]any{"removed": removed, "policies": dlpPolicyObjects.List(tenant)})
 	}))

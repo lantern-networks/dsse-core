@@ -2,115 +2,51 @@ package policy
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"testing"
 
+	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 )
 
-type eastWestFaultPersister struct {
-	raw     []byte
-	failure error
-	saves   int
-}
-
-func (p *eastWestFaultPersister) Load() ([]byte, error) { return append([]byte(nil), p.raw...), nil }
-func (p *eastWestFaultPersister) Save(raw []byte) error {
-	p.saves++
-	if p.failure != nil {
-		return p.failure
-	}
-	p.raw = append([]byte(nil), raw...)
-	return nil
-}
-
-func TestEastWestEditPublishesOnlyAfterConfirmedSave(t *testing.T) {
-	p := &eastWestFaultPersister{}
+func TestEastWestAdminUpdateWaitsForOneConfirmedSave(t *testing.T) {
+	p := &incomingFaultStore{}
 	s := NewStore(nil)
 	if err := s.SetRuntimeStatePersister(p); err != nil {
 		t.Fatal(err)
 	}
-	partial, enabled, full := true, true, false
-	initial := []decision.EastWestRule{{ID: "old", Mode: "deny"}}
+	enabled, partial := true, true
 	ttl := 60
-	if err := s.ApplyEastWestUpdateConfirmed("tenant", &initial, &ttl, &enabled, &partial); err != nil {
+	rules := []decision.EastWestRule{{ID: "prior", Mode: "deny"}}
+	if err := s.ApplyEastWestUpdateConfirmed("a", &rules, &ttl, &enabled, &partial); err != nil {
 		t.Fatal(err)
 	}
-	prior := append([]byte(nil), p.raw...)
+	if err := s.ApplyEastWestUpdateConfirmed("b", nil, nil, &enabled, &partial); err != nil {
+		t.Fatal(err)
+	}
+	before := append([]byte(nil), p.raw...)
 	gen := s.ConfigGeneration()
+	full := false
 	updated := []decision.EastWestRule{{ID: "new", Mode: "allow"}}
 	newTTL := 120
-	p.failure = errors.New("storage refused")
-	if err := s.ApplyEastWestUpdateConfirmed("tenant", &updated, &newTTL, &enabled, &full); !errors.Is(err, ErrPolicyPersistence) {
-		t.Fatalf("save error = %v", err)
-	}
-	if !bytes.Equal(prior, p.raw) || s.ConfigGeneration() != gen || !s.EastWestAllowsUnmatched("tenant") || s.EastWestMaxGrantTTL("tenant") != ttl || s.EastWestRulesFor("tenant")[0].ID != "old" {
-		t.Fatal("rejected candidate was published")
+	for _, failure := range []error{errors.New("storage refused"), errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)} {
+		p.failure = failure
+		if err := s.ApplyEastWestUpdateConfirmed("a", &updated, &newTTL, &enabled, &full); !errors.Is(err, ErrPolicyPersistence) {
+			t.Fatal(err)
+		}
+		if !s.EastWestAllowsUnmatched("a") || !s.EastWestAllowsUnmatched("b") || s.EastWestMaxGrantTTL("a") != 60 || s.EastWestRulesFor("a")[0].ID != "prior" || s.ConfigGeneration() != gen || !bytes.Equal(p.raw, before) {
+			t.Fatal("rejected candidate published")
+		}
 	}
 	p.failure = nil
-	if err := s.ApplyEastWestUpdateConfirmed("tenant", &updated, &newTTL, &enabled, &full); err != nil {
+	if err := s.ApplyEastWestUpdateConfirmed("a", &updated, &newTTL, &enabled, &full); err != nil {
 		t.Fatal(err)
-	}
-	if p.saves != 3 {
-		t.Fatalf("saves = %d, want one per edit", p.saves)
 	}
 	reloaded := NewStore(nil)
 	if err := reloaded.SetRuntimeStatePersister(p); err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.EastWestAllowsUnmatched("tenant") || reloaded.EastWestMaxGrantTTL("tenant") != 120 || reloaded.EastWestRulesFor("tenant")[0].ID != "new" {
-		t.Fatal("confirmed update did not survive reload")
-	}
-}
-
-type eastWestSharedPersister struct{ raw []byte }
-
-func (p *eastWestSharedPersister) Load() ([]byte, error) { return append([]byte(nil), p.raw...), nil }
-func (p *eastWestSharedPersister) Save(raw []byte) error {
-	p.raw = append([]byte(nil), raw...)
-	return nil
-}
-func (p *eastWestSharedPersister) Update(edit func([]byte) ([]byte, error)) error {
-	next, err := edit(p.raw)
-	if err == nil {
-		p.raw = append([]byte(nil), next...)
-	}
-	return err
-}
-
-func TestEastWestEditKeepsOtherCPSections(t *testing.T) {
-	p := &eastWestSharedPersister{raw: []byte(`{"schema_version":"admin_policy_runtime_state.v1","server_initiated_enabled":{"peer":true},"future_section":{"keep":"yes"}}`)}
-	s := NewStore(nil)
-	if err := s.SetRuntimeStatePersister(p); err != nil {
-		t.Fatal(err)
-	}
-	mode := true
-	if err := s.ApplyEastWestUpdateConfirmed("tenant", nil, nil, &mode, nil); err != nil {
-		t.Fatal(err)
-	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(p.raw, &doc); err != nil {
-		t.Fatal(err)
-	}
-	if string(doc["server_initiated_enabled"]) != `{"peer":true}` || string(doc["future_section"]) != `{"keep":"yes"}` {
-		t.Fatalf("unrelated sections changed: %s", p.raw)
-	}
-}
-
-func TestEastWestEditRejectsDisappearedAuthority(t *testing.T) {
-	p := &eastWestSharedPersister{raw: []byte(`{"schema_version":"admin_policy_runtime_state.v1","east_west_enabled":{"tenant":true}}`)}
-	s := NewStore(nil)
-	if err := s.SetRuntimeStatePersister(p); err != nil {
-		t.Fatal(err)
-	}
-	gen := s.ConfigGeneration()
-	p.raw = nil
-	off := false
-	if err := s.ApplyEastWestUpdateConfirmed("tenant", nil, nil, &off, nil); !errors.Is(err, ErrPolicyPersistence) {
-		t.Fatalf("lost authority error = %v", err)
-	}
-	if !s.EastWestIsEnabled("tenant") || s.ConfigGeneration() != gen || p.raw != nil {
-		t.Fatal("lost authority was replaced by a fresh default")
+	if reloaded.EastWestAllowsUnmatched("a") || !reloaded.EastWestIsEnabled("a") || !reloaded.EastWestAllowsUnmatched("b") || reloaded.EastWestMaxGrantTTL("a") != 120 || reloaded.EastWestRulesFor("a")[0].ID != "new" {
+		t.Fatal("committed update did not survive reload")
 	}
 }

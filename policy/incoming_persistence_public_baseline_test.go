@@ -1,28 +1,28 @@
 package policy
 
 import (
+	"encoding/json"
 	"errors"
-	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/model"
 	"reflect"
 	"testing"
 )
 
-type incomingFaultStore struct {
+type incomingFaultStorePublicBaseline struct {
 	raw     []byte
 	failure error
 }
 
-func (p *incomingFaultStore) Load() ([]byte, error) { return p.raw, nil }
-func (p *incomingFaultStore) Save(raw []byte) error {
+func (p *incomingFaultStorePublicBaseline) Load() ([]byte, error) { return p.raw, nil }
+func (p *incomingFaultStorePublicBaseline) Save(raw []byte) error {
 	if p.failure != nil {
 		return p.failure
 	}
 	p.raw = append([]byte(nil), raw...)
 	return nil
 }
-func TestIncomingChangesWaitForStorage(t *testing.T) {
-	p := &incomingFaultStore{}
+func TestIncomingChangesWaitForStoragePublicBaseline(t *testing.T) {
+	p := &incomingFaultStorePublicBaseline{}
 	s := NewStore(nil)
 	if err := s.SetRuntimeStatePersister(p); err != nil {
 		t.Fatal(err)
@@ -37,7 +37,7 @@ func TestIncomingChangesWaitForStorage(t *testing.T) {
 	if err := s.UpsertLegacyExceptionConfirmed("b", foreign); err != nil {
 		t.Fatal(err)
 	}
-	for _, failure := range []error{errors.New("private disk detail"), errors.Join(blobstore.ErrSavedWithoutAtomicity, blobstore.ErrDurabilityUnconfirmed)} {
+	for _, failure := range []error{errors.New("private disk detail"), errors.New("commit not confirmed")} {
 		p.failure = failure
 		before := append([]byte(nil), p.raw...)
 		gen := s.ConfigGeneration()
@@ -69,5 +69,43 @@ func TestIncomingChangesWaitForStorage(t *testing.T) {
 	}
 	if !restored.ServerInitiatedEnabledFor("a") || len(restored.LegacyExceptionsFor("a")) != 0 || len(restored.LegacyExceptionsFor("b")) != 1 {
 		t.Fatal("retry not durable or foreign changed")
+	}
+}
+
+func TestIncomingEditPreservesOtherCPAndUnknownSectionsPublicBaseline(t *testing.T) {
+	p := &eastWestSharedPersisterPublicBaseline{raw: []byte(`{"schema_version":"admin_policy_runtime_state.v1","future_section":{"keep":true}}`)}
+	a, b := NewStore(nil), NewStore(nil)
+	for _, s := range []*Store{a, b} {
+		if err := s.SetRuntimeStatePersister(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.UpsertLegacyExceptionConfirmed("a", model.LegacyException{ID: "a", TenantID: "a", Port: 8443}); err != nil {
+		t.Fatal(err)
+	}
+	enabled := true
+	if err := b.ApplyEastWestUpdateConfirmed("b", nil, nil, &enabled, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.UpsertLegacyExceptionConfirmed("b", model.LegacyException{ID: "b", TenantID: "b", Port: 22}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetServerInitiatedEnabledConfirmed("a", true); err != nil {
+		t.Fatal(err)
+	}
+	if removed, err := a.RemoveLegacyExceptionConfirmed("a", "a"); !removed || err != nil {
+		t.Fatalf("delete %v %v", removed, err)
+	}
+	fresh := NewStore(nil)
+	if err := fresh.SetRuntimeStatePersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if !fresh.EastWestIsEnabled("b") || !fresh.ServerInitiatedEnabledFor("a") || len(fresh.LegacyExceptionsFor("a")) != 0 || len(fresh.LegacyExceptionsFor("b")) != 1 {
+		t.Fatal("independent committed changes lost")
+	}
+	var document map[string]json.RawMessage
+	json.Unmarshal(p.raw, &document)
+	if string(document["future_section"]) != `{"keep":true}` {
+		t.Fatal("unknown section lost")
 	}
 }

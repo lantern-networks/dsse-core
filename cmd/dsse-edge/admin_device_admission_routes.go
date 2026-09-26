@@ -107,9 +107,12 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			feed.HighRisk = devices
 			feed.UserRiskVersion = 1
 			feed.UserRisk = users
-			if legacy := config.HighRiskOverlay.LegacyUnattributedSnapshot(); len(legacy) != 0 {
-				feed.UserRiskVersion = 2 // old Edges reject rather than lose raw-ID risk
-				feed.LegacyUnattributed = legacy
+			feed.LegacyRiskVersion = 1 // old Edges ignore the extension and keep applying revocations
+			feed.LegacyUnattributed = config.HighRiskOverlay.LegacyUnattributedSnapshot()
+			// Old Edges apply high_risk to device IDs and ignore the new field.
+			// Keep the raw-ID device match until those Edges are upgraded too.
+			for id, severity := range config.HighRiskOverlay.Snapshot() {
+				feed.HighRisk[id] = severity
 			}
 		}
 		writeJSON(w, http.StatusOK, feed)

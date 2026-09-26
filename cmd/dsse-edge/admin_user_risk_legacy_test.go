@@ -34,7 +34,9 @@ func TestUnattributedLegacyRiskStartsAndReachesEdge(t *testing.T) {
 		t.Fatal(err)
 	}
 	outbox := &recordingAdminAuditOutboxDeadReader{}
-	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: newAdminAuthStore(), HighRiskOverlay: cp, Writer: writer, AdminAuditOutbox: outbox})
+	revoked := revocation.NewAdmissionRevocations()
+	revoked.Revoke("blocked-device", "operator")
+	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: newAdminAuthStore(), AdmissionRevocations: revoked, HighRiskOverlay: cp, Writer: writer, AdminAuditOutbox: outbox})
 	health := httptest.NewRecorder()
 	handler.ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	var healthBody map[string]any
@@ -44,8 +46,33 @@ func TestUnattributedLegacyRiskStartsAndReachesEdge(t *testing.T) {
 	response := doAdmin(t, handler, http.MethodGet, "/admin/revocations", "")
 	var feed revocationFeed
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &feed) != nil ||
-		feed.UserRiskVersion != 2 || feed.LegacyUnattributed["retired-id"] != "critical" {
+		feed.UserRiskVersion != 1 || feed.LegacyRiskVersion != 1 || feed.LegacyUnattributed["retired-id"] != "critical" || feed.HighRisk["retired-id"] != "critical" {
 		t.Fatalf("CP feed dropped unresolved raw-ID risk: status=%d body=%s", response.Code, response.Body.String())
+	}
+	// Decode the actual response with the fields understood by main 603f981's
+	// Edge. Its v1 guard runs before revocation application; a v2 feed would
+	// discard the entire response, including the operator's device block.
+	var oldEdgeFeed struct {
+		Revoked         map[string]string     `json:"revoked"`
+		HighRisk        map[string]string     `json:"high_risk"`
+		UserRiskVersion int                   `json:"user_risk_version"`
+		UserRisk        []revocation.UserRisk `json:"user_risk"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &oldEdgeFeed); err != nil || oldEdgeFeed.UserRiskVersion != 1 {
+		t.Fatalf("old Edge cannot decode CP feed: %v", err)
+	}
+	oldEdgeRisk := revocation.NewHighRiskOverlay()
+	if err := oldEdgeRisk.ReplaceSyncedUsers(oldEdgeFeed.UserRisk); err != nil {
+		t.Fatal(err)
+	}
+	oldEdgeAdmission := revocation.NewAdmissionRevocations()
+	oldEdgeAdmission.ReplaceSynced(oldEdgeFeed.Revoked)
+	oldEdgeRisk.ReplaceSynced(oldEdgeFeed.HighRisk)
+	if _, ok := oldEdgeAdmission.IsRevoked("blocked-device"); !ok {
+		t.Fatal("old Edge lost operator device revocation after CP upgrade")
+	}
+	if severity, ok := oldEdgeRisk.IsHighRisk("retired-id"); !ok || severity != "critical" {
+		t.Fatal("old Edge lost legacy raw-ID device match")
 	}
 	tenantAuth := seedAdminConnectorAPITokenAuth("tenant-risk-admin", "tenant-risk-token", []string{"admin.risk.read", "admin.risk.write"})
 	tenantHandler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: tenantAuth, HighRiskOverlay: cp})
@@ -82,8 +109,14 @@ func TestUnattributedLegacyRiskStartsAndReachesEdge(t *testing.T) {
 	if err := applyUserRiskFeed(edge, revocationFeed{UserRiskVersion: 1, LegacyUnattributed: map[string]string{"other": "high"}}); err == nil {
 		t.Fatal("old feed version accepted unresolved marks")
 	}
-	if err := applyUserRiskFeed(edge, revocationFeed{UserRiskVersion: 1, Authoritative: true}); err == nil {
-		t.Fatal("older authority cleared existing unresolved marks")
+	if err := applyUserRiskFeed(edge, revocationFeed{UserRiskVersion: 1, Authoritative: true}); err != nil || edge.LegacyUnattributedCount() != 1 {
+		t.Fatal("older authority cleared existing unresolved marks or blocked revocations")
+	}
+	if err := applyUserRiskFeed(edge, revocationFeed{UserRiskVersion: 1, LegacyRiskVersion: 1, Authoritative: true}); err != nil || edge.LegacyUnattributedCount() != 0 {
+		t.Fatal("new authority could not explicitly clear unresolved marks")
+	}
+	if err := applyUserRiskFeed(edge, feed); err != nil {
+		t.Fatal(err)
 	}
 	if err := applyUserRiskFeed(edge, revocationFeed{UserRiskVersion: 2, LegacyUnattributed: map[string]string{"bad ": "high"}}); err == nil {
 		t.Fatal("invalid raw-ID mark accepted")

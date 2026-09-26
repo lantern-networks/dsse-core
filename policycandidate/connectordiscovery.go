@@ -45,7 +45,7 @@ func connectorDiscoveryAttribution(destination string) (confidence, suggestedAct
 // publishes or allows anything — an administrator must approve to publish. An already-decided candidate
 // (approved/rejected/suppressed/dismissed) keeps its status while its evidence is refreshed, so a prior admin
 // decision is never silently reset to pending (fail-closed).
-func (store *Store) ObserveConnectorDiscovered(_ context.Context, tenantID, destination string, port int, publishProtocol, connectorID, site, namespace string, evidence []string, now time.Time) (Candidate, error) {
+func (store *Store) ObserveConnectorDiscovered(ctx context.Context, tenantID, destination string, port int, publishProtocol, connectorID, site, namespace string, evidence []string, now time.Time) (Candidate, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
@@ -62,6 +62,11 @@ func (store *Store) ObserveConnectorDiscovered(_ context.Context, tenantID, dest
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if _, ok := store.persister.(candidateSharedPersister); ok {
+		return sharedCandidateMutation(store, ctx, func(next *Store) (Candidate, error) {
+			return next.ObserveConnectorDiscovered(ctx, tenantID, destination, port, publishProtocol, connectorID, site, namespace, evidence, now)
+		})
+	}
 
 	cand := Candidate{
 		CandidateID:             id,
@@ -99,12 +104,12 @@ func (store *Store) ObserveConnectorDiscovered(_ context.Context, tenantID, dest
 	// Classify attribution from the destination each observation so it stays correct: a named FQDN -> medium,
 	// a CIDR/raw-IP -> investigate_only.
 	cand.Confidence, cand.SuggestedAction = connectorDiscoveryAttribution(cand.Host)
-	normalized, err := normalize(cand, tenantID, now)
+	normalized, err := normalizeObservation(cand, tenantID, now)
 	if err != nil {
 		return Candidate{}, err
 	}
 	if err := store.putLocked(normalized); err != nil {
-		return copyCandidate(normalized), err
+		return Candidate{}, err
 	}
 	return copyCandidate(normalized), nil
 }

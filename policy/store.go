@@ -3,6 +3,7 @@ package policy
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -106,6 +107,7 @@ type Store struct {
 	// (east-west grants) is NOT persisted. nil = no persistence. A shared (Postgres) persister survives a CP failover.
 	runtimeStatePersister blobstore.Persister
 	runtimeAuthorityKnown bool
+	runtimeBasePolicies   map[string]map[string]model.Policy
 	// generation is a monotonic counter bumped on every policy mutation (Upsert / ReplaceTenant). Phase 1
 	// config distribution uses it as the policy "config
 	// version": the control plane serves {generation, policies} via GET /admin/config-bundle and each Edge
@@ -142,6 +144,7 @@ func NewStore(seed []model.Policy) *Store {
 		}
 		store.putLocked(normalized)
 	}
+	store.runtimeBasePolicies = cloneRuntimePolicies(store.policies)
 	store.rebuildPolicyCacheLocked()
 	return store
 }
@@ -202,33 +205,24 @@ func (store *Store) Get(_ context.Context, tenantID, policyID string) (model.Pol
 	return copyAdminPolicy(policy), true, nil
 }
 
-func (store *Store) Upsert(_ context.Context, policy model.Policy, tenantID string, now time.Time) (model.Policy, error) {
-	normalized, err := normalizeAdminPolicy(policy, tenantID, now)
+func (store *Store) Upsert(ctx context.Context, item model.Policy, tenantID string, now time.Time) (model.Policy, error) {
+	normalized, err := normalizeAdminPolicy(item, tenantID, now)
 	if err != nil {
 		return model.Policy{}, err
 	}
-
 	store.mu.Lock()
 	defer store.mu.Unlock()
-
-	store.putLocked(normalized)
-	store.recordAdminAuthoredLocked(normalized)
-	store.generation++
-	store.rebuildPolicyCacheLocked()
-	store.persistLocked() // durable: an admin-authored policy must survive a restart (was in-memory-only)
+	err = store.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+		if f.AdminAuthoredPolicies[normalized.TenantID] == nil {
+			f.AdminAuthoredPolicies[normalized.TenantID] = map[string]model.Policy{}
+		}
+		f.AdminAuthoredPolicies[normalized.TenantID][normalized.ID] = copyAdminPolicy(normalized)
+		return nil
+	})
+	if err != nil {
+		return model.Policy{}, err
+	}
 	return copyAdminPolicy(normalized), nil
-}
-
-// recordAdminAuthoredLocked marks a policy as admin-authored (created via the Admin API) so persistLocked can
-// persist ONLY these — not the bundle-seeded set — and restore them as an overlay on boot. Caller holds store.mu.
-func (store *Store) recordAdminAuthoredLocked(policy model.Policy) {
-	if store.adminAuthoredPolicies == nil {
-		store.adminAuthoredPolicies = map[string]map[string]model.Policy{}
-	}
-	if store.adminAuthoredPolicies[policy.TenantID] == nil {
-		store.adminAuthoredPolicies[policy.TenantID] = map[string]model.Policy{}
-	}
-	store.adminAuthoredPolicies[policy.TenantID][policy.ID] = copyAdminPolicy(policy)
 }
 
 // Delete removes an ADMIN-AUTHORED policy, its authored record, and any status override for it. Only
@@ -239,35 +233,31 @@ func (store *Store) recordAdminAuthoredLocked(policy model.Policy) {
 //
 // This closes a one-way door: POST /admin/policies could create a policy and nothing could remove it, so
 // a mistaken one could only ever be disabled and sat in every listing from then on.
-func (store *Store) Delete(_ context.Context, tenantID, policyID string) (model.Policy, bool, error) {
-	tenantID = strings.TrimSpace(tenantID)
-	policyID = strings.TrimSpace(policyID)
-	if tenantID == "" {
-		return model.Policy{}, false, fmt.Errorf("tenant_id is required")
+func (store *Store) Delete(ctx context.Context, tenantID, policyID string) (model.Policy, bool, error) {
+	tenantID, policyID = strings.TrimSpace(tenantID), strings.TrimSpace(policyID)
+	if tenantID == "" || policyID == "" {
+		return model.Policy{}, false, fmt.Errorf("tenant_id and policy_id are required")
 	}
-	if policyID == "" {
-		return model.Policy{}, false, fmt.Errorf("policy_id is required")
-	}
-
 	store.mu.Lock()
 	defer store.mu.Unlock()
-
-	authored, isAuthored := store.adminAuthoredPolicies[tenantID][policyID]
-	if !isAuthored {
-		if _, exists := store.policies[tenantID][policyID]; exists {
-			return model.Policy{}, false, fmt.Errorf("policy %s comes from the policy bundle, not the Admin API — remove it from the bundle configuration instead", policyID)
+	var removed model.Policy
+	var found bool
+	err := store.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+		removed, found = f.AdminAuthoredPolicies[tenantID][policyID]
+		if !found {
+			if _, exists := store.runtimeBasePolicies[tenantID][policyID]; exists {
+				return fmt.Errorf("policy %s comes from the policy bundle, not the Admin API", policyID)
+			}
+			return nil
 		}
-		return model.Policy{}, false, nil
+		delete(f.AdminAuthoredPolicies[tenantID], policyID)
+		delete(f.PolicyStatusOverride[tenantID], policyID)
+		return nil
+	})
+	if err != nil {
+		return model.Policy{}, false, err
 	}
-	delete(store.adminAuthoredPolicies[tenantID], policyID)
-	delete(store.policies[tenantID], policyID)
-	if overrides := store.policyStatusOverride[tenantID]; overrides != nil {
-		delete(overrides, policyID)
-	}
-	store.generation++
-	store.rebuildPolicyCacheLocked()
-	store.persistLocked()
-	return copyAdminPolicy(authored), true, nil
+	return copyAdminPolicy(removed), found, nil
 }
 
 // ConfigGeneration returns the monotonic policy config version (see the generation field). The control
@@ -359,6 +349,10 @@ func (store *Store) replacePoliciesLocked(tenantID string, policies []model.Poli
 		}
 		fresh[normalized.ID] = normalized
 	}
+	if store.runtimeBasePolicies == nil {
+		store.runtimeBasePolicies = map[string]map[string]model.Policy{}
+	}
+	store.runtimeBasePolicies[tenantID] = maps.Clone(fresh)
 	store.policies[tenantID] = fresh
 	n := len(fresh)
 	store.reapplyRuntimeOverlaysLocked(tenantID)
@@ -470,34 +464,34 @@ func (store *Store) rebuildPolicyCacheLocked() {
 // override so it survives a restart even though the policy re-seeds from config. Returns false if the policy is
 // not present. A disabled policy is skipped at decision time (matchPolicy requires status active).
 func (store *Store) SetPolicyStatus(tenantID, policyID, status string) bool {
+	found, err := store.SetPolicyStatusContext(context.Background(), tenantID, policyID, status)
+	return err == nil && found
+}
+func (store *Store) SetPolicyStatusContext(ctx context.Context, tenantID, policyID, status string) (bool, error) {
 	if store == nil {
-		return false
+		return false, ErrPolicyPersistence
 	}
-	tenantID = strings.TrimSpace(tenantID)
-	policyID = strings.TrimSpace(policyID)
-	status = strings.ToLower(strings.TrimSpace(status))
+	tenantID, policyID, status = strings.TrimSpace(tenantID), strings.TrimSpace(policyID), strings.ToLower(strings.TrimSpace(status))
 	if status != "active" && status != "disabled" {
-		return false
+		return false, fmt.Errorf("invalid policy status")
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	tenantPolicies, ok := store.policies[tenantID]
-	if !ok {
-		return false
-	}
-	policy, ok := tenantPolicies[policyID]
-	if !ok {
-		return false
-	}
-	policy.Status = status
-	tenantPolicies[policyID] = policy
-	if store.policyStatusOverride[tenantID] == nil {
-		store.policyStatusOverride[tenantID] = map[string]string{}
-	}
-	store.policyStatusOverride[tenantID][policyID] = status
-	store.rebuildPolicyCacheLocked()
-	store.persistLocked()
-	return true
+	found := false
+	err := store.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+		_, found = f.AdminAuthoredPolicies[tenantID][policyID]
+		if !found {
+			_, found = store.runtimeBasePolicies[tenantID][policyID]
+		}
+		if found {
+			if f.PolicyStatusOverride[tenantID] == nil {
+				f.PolicyStatusOverride[tenantID] = map[string]string{}
+			}
+			f.PolicyStatusOverride[tenantID][policyID] = status
+		}
+		return nil
+	})
+	return found && err == nil, err
 }
 
 // applyPolicyStatusOverridesLocked re-applies persisted enable/disable overrides onto the (re-seeded) policies.
@@ -704,20 +698,7 @@ func (store *Store) RevokeEastWestGrants(tenantID, scopeType, scopeID string) in
 // SetEastWestMaxGrantTTL sets the per-tenant ceiling (seconds) on east-west grant lifetime (E6). 0 = no
 // cap. The maximum is admin-configurable and intentionally not hard-capped.
 func (store *Store) SetEastWestMaxGrantTTL(tenantID string, seconds int) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.eastWestMaxGrantTTL == nil {
-		store.eastWestMaxGrantTTL = map[string]int{}
-	}
-	if seconds < 0 {
-		seconds = 0
-	}
-	store.eastWestMaxGrantTTL[strings.TrimSpace(tenantID)] = seconds
-	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	_ = store.ApplyEastWestUpdateConfirmed(tenantID, nil, &seconds, nil, nil)
 }
 
 // EastWestMaxGrantTTL returns the per-tenant grant TTL ceiling in seconds (0 = none).
@@ -799,17 +780,7 @@ func (store *Store) SetEastWestInternalNetworks(tenantID string, networks decisi
 }
 
 func (store *Store) SetEastWestEnabled(tenantID string, enabled bool) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.eastWestEnabled == nil {
-		store.eastWestEnabled = map[string]bool{}
-	}
-	store.eastWestEnabled[strings.TrimSpace(tenantID)] = enabled
-	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	_ = store.ApplyEastWestUpdateConfirmed(tenantID, nil, nil, &enabled, nil)
 }
 
 // EastWestIsEnabled reports whether east-west authorization is enabled for a tenant.
@@ -825,17 +796,7 @@ func (store *Store) EastWestIsEnabled(tenantID string) bool {
 // SetEastWestAllowUnmatched toggles Partial Enforce (S4) for a tenant: when true, enabled rules bite but a flow
 // matching no rule is allowed (allow-all default) instead of default-denied. Applied live.
 func (store *Store) SetEastWestAllowUnmatched(tenantID string, allow bool) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.eastWestAllowUnmatched == nil {
-		store.eastWestAllowUnmatched = map[string]bool{}
-	}
-	store.eastWestAllowUnmatched[strings.TrimSpace(tenantID)] = allow
-	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	_ = store.ApplyEastWestUpdateConfirmed(tenantID, nil, nil, nil, &allow)
 }
 
 // EastWestAllowsUnmatched reports whether unmatched east-west flows are allowed (Partial Enforce) for a tenant.
@@ -850,17 +811,7 @@ func (store *Store) EastWestAllowsUnmatched(tenantID string) bool {
 
 // SetEastWestRules replaces the east-west rule set for a tenant (E1.5). Applied live.
 func (store *Store) SetEastWestRules(tenantID string, rules []decision.EastWestRule) {
-	if store == nil {
-		return
-	}
-	store.mu.Lock()
-	defer store.mu.Unlock()
-	if store.eastWestRules == nil {
-		store.eastWestRules = map[string][]decision.EastWestRule{}
-	}
-	store.eastWestRules[strings.TrimSpace(tenantID)] = append([]decision.EastWestRule(nil), rules...)
-	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	_ = store.ApplyEastWestUpdateConfirmed(tenantID, &rules, nil, nil, nil)
 }
 
 // SetCompiledEastWestRules replaces the east-west rules compiled from the authored-rule model for a tenant.
@@ -876,12 +827,14 @@ func (store *Store) SetCompiledEastWestRules(tenantID string, rules []decision.E
 		store.compiledEastWestRules = map[string][]decision.EastWestRule{}
 	}
 	// Deliberately kept as an explicit empty set rather than a deleted key when there are no rules: this map is
-	// persisted and distributed, and an absent value reads as "keep what you have" downstream — which would
+	// distributed, and an absent value reads as "keep what you have" downstream — which would
 	// turn deleting the last east-west rule into a no-op. The egress compiled set is not distributed and does
 	// drop its key; see SetCompiledPolicies.
 	store.compiledEastWestRules[strings.TrimSpace(tenantID)] = append([]decision.EastWestRule(nil), rules...)
 	store.generation++ // distributed via the config bundle (Phase 1): advance so Edges re-pull
-	store.persistLocked()
+	// Compiled rules are rebuilt from the durable authored-rule store. They are
+	// not part of the runtime overlay; saving it here can erase a peer CP's
+	// newer security controls with this process's stale snapshot.
 }
 
 // SetCompiledPolicies replaces the egress policies compiled from the authored-rule model for a tenant. Kept
@@ -997,32 +950,18 @@ func (store *Store) EffectiveEastWestRules(tenantID string) []decision.EastWestR
 func (store *Store) SetTenantRestrictionRuleStatus(ruleID, status string) {
 	_ = store.SetTenantRestrictionRuleStatusesContext(context.Background(), map[string]string{strings.TrimSpace(ruleID): strings.TrimSpace(status)})
 }
-
-// Apply all statuses from one administrative operation only after confirmed save.
 func (store *Store) SetTenantRestrictionRuleStatusesContext(ctx context.Context, statuses map[string]string) error {
 	if store == nil {
 		return ErrPolicyPersistence
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
-	}
-	previous := store.tenantRestrictionRuleStatus
-	next := make(map[string]string, len(previous)+len(statuses))
-	for k, v := range previous {
-		next[k] = v
-	}
-	for k, v := range statuses {
-		next[k] = v
-	}
-	store.tenantRestrictionRuleStatus = next
-	if err := store.persistLockedChecked(); err != nil {
-		store.tenantRestrictionRuleStatus = previous
-		return fmt.Errorf("%w: %v", ErrPolicyPersistence, err)
-	}
-	store.generation++
-	return nil
+	return store.editRuntimeLocked(ctx, func(f *adminPolicyRuntimeStateFile) error {
+		for id, status := range statuses {
+			f.TenantRestrictionRuleStatus[id] = status
+		}
+		return nil
+	})
 }
 
 // TenantRestrictionRuleStatusOverrides returns a copy of the current rule status overrides.
@@ -1177,7 +1116,6 @@ func activeAdminPolicyIDs(policies []model.Policy) []string {
 // RuntimeEvaluator.
 func (store *Store) SetServerInitiatedEnabled(tenantID string, enabled bool) {
 	_ = store.SetServerInitiatedEnabledConfirmed(tenantID, enabled)
-
 }
 
 // ServerInitiatedEnabledFor reports whether server-initiated (server->client) default-deny enforcement is
@@ -1194,15 +1132,12 @@ func (store *Store) ServerInitiatedEnabledFor(tenantID string) bool {
 // UpsertLegacyException stores/updates a Legacy Exception for a tenant (validated by the caller).
 func (store *Store) UpsertLegacyException(tenantID string, ex model.LegacyException) {
 	_ = store.UpsertLegacyExceptionConfirmed(tenantID, ex)
-
 }
 
-// RemoveLegacyException deletes a tenant's Legacy Exception by id, persisting the change so it does not
-// re-appear on restart. Returns false if no exception with that id exists for the tenant.
+// RemoveLegacyException retains the legacy absent-or-unsaved boolean contract.
 func (store *Store) RemoveLegacyException(tenantID, id string) bool {
 	removed, _ := store.RemoveLegacyExceptionConfirmed(tenantID, id)
 	return removed
-
 }
 
 // LegacyExceptionsFor returns a copy of a tenant's Legacy Exceptions.

@@ -495,3 +495,24 @@ func (s *Store) persist(next Posture) error {
 	}
 	return durablefile.Write(s.statePath, data, 0o600)
 }
+
+// ValidateEdit preserves existing legacy host patterns while validating new
+// patterns and the resulting mode/groups. Operators can change mode without
+// deleting an old internal hostname from their authored policy.
+func ValidateEdit(before, next Posture) (Posture, error) {
+	check := clonePosture(next)
+	check.DecryptAllowlistHosts = nil
+	existing := map[string]bool{}
+	for _, host := range before.DecryptAllowlistHosts {
+		existing[host] = true
+	}
+	for _, host := range next.DecryptAllowlistHosts {
+		if !existing[host] {
+			check.DecryptAllowlistHosts = append(check.DecryptAllowlistHosts, host)
+		}
+	}
+	if _, err := Validate(check); err != nil {
+		return Posture{}, err
+	}
+	return next.Normalized(), nil
+}

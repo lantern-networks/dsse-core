@@ -24,7 +24,7 @@ func (s *Store) InitializeContext(ctx context.Context, seed Posture) (Posture, e
 }
 
 func (s *Store) SetContext(ctx context.Context, p Posture) (Posture, error) {
-	_, next, err := s.UpdateContext(ctx, func(Posture) (Posture, error) { return p, nil })
+	_, next, err := s.updateContextValidated(ctx, func(Posture) (Posture, error) { return p, nil }, false, Validate)
 	return next, err
 }
 
@@ -35,7 +35,7 @@ func (s *Store) SetReceived(p Posture) (Posture, error) {
 	return next, err
 }
 func (s *Store) updateContext(ctx context.Context, edit func(Posture) (Posture, error), initialize bool) (Posture, Posture, error) {
-	return s.updateContextValidated(ctx, edit, initialize, Validate)
+	return s.updateContextValidated(ctx, edit, initialize, nil)
 }
 func (s *Store) updateContextValidated(ctx context.Context, edit func(Posture) (Posture, error), initialize bool, validate func(Posture) (Posture, error)) (before, next Posture, err error) {
 	s.writeMu.Lock()
@@ -48,7 +48,11 @@ func (s *Store) updateContextValidated(ctx context.Context, edit func(Posture) (
 		before = clonePosture(p)
 		next, editErr = edit(clonePosture(p))
 		if editErr == nil {
-			next, editErr = validate(next)
+			if validate == nil {
+				next, editErr = ValidateEdit(before, next)
+			} else {
+				next, editErr = validate(next)
+			}
 		}
 		return editErr
 	}

@@ -9,24 +9,10 @@ package assetcatalog
 // hop. Distributing rules without the catalog they reference would therefore have converted a silent
 // no-op into a silent widening. See docs/authored_policy_reaches_one_edge_not_the_serving_one.md.
 //
-// ★ AND THIS IS UPSERT, NOT REPLACE — deliberately different from policyrule.ReplaceAll, which is a few
-// hundred lines away and does the opposite. The catalog is not one authority's set. It holds three kinds of
-// entry with three different owners:
-//
-//   authored          the control plane's — distributed here
-//   enrolled-derived  SyncEnrolledEndpoints, regenerated on each Edge from the (already distributed) inventory
-//   built-in          seeded from code at boot, never persisted
-//
-// A replace-all would delete the other two owners' entries on every pull, and they would come back on the next
-// local sync — a catalog that flickers, and enforcement that flickers with it. Deletion of an authored asset
-// therefore does NOT propagate today; that is a known, bounded gap (a stale endpoint nothing references changes
-// no decision, whereas a stale RULE does) and it is why the asymmetry is written down rather than smoothed over.
+// Authored entries reconcile as one saved candidate; enrolled-derived and built-in
+// entries retain their separate ownership.
 
-import (
-	"fmt"
-	"sort"
-	"strings"
-)
+import "sort"
 
 // ConfigGeneration returns the monotonic authored-catalog version, bumped on every authored mutation. Folded
 // into the config bundle's aggregate generation so adding an endpoint a rule needs triggers a fleet re-pull.
@@ -48,17 +34,17 @@ func (s *Store) AuthoredSnapshot() (endpoints []Endpoint, groups []Group, servic
 	endpoints, groups, services = []Endpoint{}, []Group{}, []Service{}
 	for _, byID := range s.endpoints {
 		for _, e := range byID {
-			endpoints = append(endpoints, e)
+			endpoints = append(endpoints, copyEndpoint(e))
 		}
 	}
 	for _, byID := range s.groups {
 		for _, g := range byID {
-			groups = append(groups, g)
+			groups = append(groups, copyGroup(g))
 		}
 	}
 	for _, byID := range s.services {
 		for _, svc := range byID {
-			services = append(services, svc)
+			services = append(services, copyService(svc))
 		}
 	}
 	// Deterministic order so an unchanged catalog serialises identically and does not churn the bundle.
@@ -102,30 +88,19 @@ func (s *Store) AuthoredSnapshot() (endpoints []Endpoint, groups []Group, servic
 //
 // Returns the ids removed, so the caller can NAME them. Authority that erases quietly is how a cutover loses
 // policy nobody migrated.
-func (s *Store) ReplaceAuthored(endpoints []Endpoint, groups []Group, services []Service) (removed []string, err error) {
+func (s *Store) replaceAuthored(endpoints []Endpoint, groups []Group, services []Service) (removed []string, err error) {
 	for _, e := range endpoints {
-		var uerr error
-		if e.Source == SourceApplication {
-			if !strings.HasPrefix(e.ID, "app-") || len(e.ID) <= len("app-") {
-				return nil, fmt.Errorf("application destination id is invalid")
-			}
-			_, uerr = s.upsertEndpoint(e, true, true) // trusted control-plane snapshot
-		} else if current, found := s.GetEndpoint(e.TenantID, e.ID); found && current.Source == SourceApplication {
-			_, uerr = s.upsertEndpoint(e, true, true) // trusted older snapshot may replace owned source
-		} else {
-			_, uerr = s.UpsertEndpoint(e)
-		}
-		if uerr != nil {
+		if _, uerr := s.upsertEndpoint(e); uerr != nil {
 			return nil, uerr
 		}
 	}
 	for _, g := range groups {
-		if _, uerr := s.UpsertGroup(g); uerr != nil {
+		if _, uerr := s.upsertGroup(g); uerr != nil {
 			return nil, uerr
 		}
 	}
 	for _, svc := range services {
-		if _, uerr := s.UpsertService(svc); uerr != nil {
+		if _, uerr := s.upsertService(svc); uerr != nil {
 			return nil, uerr
 		}
 	}
@@ -171,32 +146,24 @@ func (s *Store) ReplaceAuthored(endpoints []Endpoint, groups []Group, services [
 	}
 	s.mu.Unlock()
 
-	// Deletes go through the public methods so alias release, generation bump and persistence happen exactly
-	// as they do for an admin delete — a second removal path would be a second set of rules to keep in step.
+	// Candidate deletes share alias release and generation updates with admin mutations.
+	// The public transaction wrapper saves the complete reconciliation once.
 	for _, r := range dropEndpoints {
-		current, found := s.GetEndpoint(r.tenant, r.id)
-		var ok bool
-		var derr error
-		if found && current.Source == SourceApplication {
-			ok, derr = s.deleteEndpoint(r.tenant, r.id, true, true) // trusted control-plane snapshot
-		} else {
-			ok, derr = s.DeleteEndpoint(r.tenant, r.id)
-		}
-		if derr != nil {
+		if ok, derr := s.deleteEndpoint(r.tenant, r.id); derr != nil {
 			return removed, derr
 		} else if ok {
 			removed = append(removed, "endpoint:"+r.id)
 		}
 	}
 	for _, r := range dropGroups {
-		if ok, derr := s.DeleteGroup(r.tenant, r.id); derr != nil {
+		if ok, derr := s.deleteGroup(r.tenant, r.id); derr != nil {
 			return removed, derr
 		} else if ok {
 			removed = append(removed, "group:"+r.id)
 		}
 	}
 	for _, r := range dropServices {
-		if ok, derr := s.DeleteService(r.tenant, r.id); derr != nil {
+		if ok, derr := s.deleteService(r.tenant, r.id); derr != nil {
 			return removed, derr
 		} else if ok {
 			removed = append(removed, "service:"+r.id)

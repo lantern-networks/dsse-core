@@ -1,7 +1,6 @@
 package assetcatalog
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -11,21 +10,18 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
-// ErrPersistence means an authored catalog change was not confirmed saved.
-// Callers must not report success or disclose the storage error to an administrator.
-var ErrPersistence = errors.New("asset catalog persistence was not confirmed")
-
 // Store is an in-memory catalog of endpoints, groups, and services for one or more tenants, with a shared
 // per-tenant alias namespace (so an alias is unique across all three kinds). Methods are safe for
 // concurrent use. The admin API persists/serves it; the proprietary Console reads/writes through that API.
 type Store struct {
-	mu        sync.Mutex
-	seq       int
-	endpoints map[string]map[string]Endpoint // tenant -> id -> endpoint
-	groups    map[string]map[string]Group    // tenant -> id -> group
-	services  map[string]map[string]Service  // tenant -> id -> service
-	aliases   map[string]map[string]string   // tenant -> alias -> ownerID (the shared namespace)
-	persister blobstore.Persister            // when set, operator-authored entries are persisted here (survive restart)
+	mu              sync.Mutex
+	seq             int
+	endpoints       map[string]map[string]Endpoint // tenant -> id -> endpoint
+	groups          map[string]map[string]Group    // tenant -> id -> group
+	services        map[string]map[string]Service  // tenant -> id -> service
+	aliases         map[string]map[string]string   // tenant -> alias -> ownerID (the shared namespace)
+	enrolledAliases map[string]map[string]string   // tenant -> inventory ID -> operator alias; never identity
+	persister       blobstore.Persister            // when set, operator-authored entries are persisted here (survive restart)
 	// builtInEndpoints / builtInGroups are the shipped SaaS catalog presented as endpoint groups: tenant-
 	// agnostic, read-only, NOT persisted (re-seeded from code each boot), not deletable. They are unioned into
 	// List/Get/Resolve so a rule can reference a catalog group and the engine resolves it to the host patterns.
@@ -42,6 +38,7 @@ type Store struct {
 func NewStore() *Store {
 	return &Store{
 		endpoints:        map[string]map[string]Endpoint{},
+		enrolledAliases:  map[string]map[string]string{},
 		groups:           map[string]map[string]Group{},
 		services:         map[string]map[string]Service{},
 		aliases:          map[string]map[string]string{},
@@ -60,7 +57,7 @@ func (s *Store) SetBuiltInServices(services []Service) {
 	s.builtInServices = map[string]Service{}
 	for _, svc := range services {
 		svc.BuiltIn = true
-		s.builtInServices[svc.ID] = svc
+		s.builtInServices[svc.ID] = copyService(svc)
 	}
 }
 
@@ -74,11 +71,11 @@ func (s *Store) SetBuiltInCatalog(endpoints []Endpoint, groups []Group) {
 	s.builtInGroups = map[string]Group{}
 	for _, e := range endpoints {
 		e.BuiltIn = true
-		s.builtInEndpoints[e.ID] = e
+		s.builtInEndpoints[e.ID] = copyEndpoint(e)
 	}
 	for _, g := range groups {
 		g.BuiltIn = true
-		s.builtInGroups[g.ID] = g
+		s.builtInGroups[g.ID] = copyGroup(g)
 	}
 }
 
@@ -107,81 +104,10 @@ func (s *Store) claimAliasLocked(tenant, desired, ownerID string) string {
 	return a
 }
 
-// UpsertEndpoint stores an endpoint, assigning an id if absent and a tenant-unique alias (auto-suffixed on
-// collision). Returns the stored endpoint with its resolved id and alias.
-func (s *Store) UpsertEndpoint(e Endpoint) (Endpoint, error) {
-	if e.Source != SourceEnrolled {
-		if shared, ok := s.getSharedUpdater(); ok {
-			return sharedCatalogMutation(s, shared, func(latest *Store) (Endpoint, error) {
-				return latest.upsertEndpoint(e, false, false)
-			})
-		}
-	}
-	return s.upsertEndpoint(e, false, false)
-}
-
-// UpsertApplicationEndpoint owns the stable destination used by a published app.
-// An existing manual endpoint may only be adopted by an endpoint administrator.
-func (s *Store) UpsertApplicationEndpoint(applicationID string, e Endpoint, allowManual bool) (Endpoint, error) {
-	applicationID = strings.TrimSpace(applicationID)
-	if applicationID == "" {
-		return Endpoint{}, fmt.Errorf("application_id is required")
-	}
-	e.ID, e.Source = "app-"+applicationID, SourceApplication
-	shared, ok := s.getSharedUpdater()
-	if ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (Endpoint, error) {
-			return latest.upsertEndpoint(e, true, allowManual)
-		})
-	}
-	return s.upsertEndpoint(e, true, allowManual)
-}
-
-// RenameApplicationEndpoint changes only the existing rule destination's
-// display alias. An ordinary application edit must preserve its address,
-// ownership, tags, and the stable ID used by group and policy references.
-func (s *Store) RenameApplicationEndpoint(tenant, applicationID, alias string, allowManual bool) error {
-	applicationID = strings.TrimSpace(applicationID)
-	if applicationID == "" {
-		return fmt.Errorf("application_id is required")
-	}
-	if shared, ok := s.getSharedUpdater(); ok {
-		_, err := sharedCatalogMutation(s, shared, func(latest *Store) (Endpoint, error) {
-			return latest.renameApplicationEndpoint(tenant, applicationID, alias, allowManual)
-		})
-		return err
-	}
-	_, err := s.renameApplicationEndpoint(tenant, applicationID, alias, allowManual)
-	return err
-}
-
-func (s *Store) renameApplicationEndpoint(tenant, applicationID, alias string, allowManual bool) (Endpoint, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := "app-" + applicationID
-	previous, found := s.endpoints[tenant][id]
-	if !found || previous.BuiltIn || previous.Source != SourceApplication &&
-		!(allowManual && (previous.Source == SourceManual || previous.Source == "")) {
-		return Endpoint{}, fmt.Errorf("admin.endpoints.write is required to rename the existing destination")
-	}
-	previousAliases := make(map[string]string, len(s.aliases[tenant]))
-	for name, owner := range s.aliases[tenant] {
-		previousAliases[name] = owner
-	}
-	updated := previous
-	updated.Alias = s.claimAliasLocked(tenant, alias, id)
-	s.endpoints[tenant][id] = updated
-	s.generation++
-	if err := s.persistLocked(); err != nil {
-		s.endpoints[tenant][id] = previous
-		s.aliases[tenant] = previousAliases
-		s.generation--
-		return Endpoint{}, fmt.Errorf("endpoint alias update was not confirmed persisted: %w", err)
-	}
-	return updated, nil
-}
-
-func (s *Store) upsertEndpoint(e Endpoint, application, allowManual bool) (Endpoint, error) {
+// These helpers mutate an isolated candidate. The public wrappers persist and
+// publish it atomically. Enrolled-derived endpoints alone update volatile state.
+// Alias allocation and validation are shared with batch reconciliation.
+func (s *Store) upsertEndpoint(e Endpoint) (Endpoint, error) {
 	e.TenantID = strings.TrimSpace(e.TenantID)
 	if e.TenantID == "" {
 		return Endpoint{}, fmt.Errorf("tenant_id is required")
@@ -191,257 +117,117 @@ func (s *Store) upsertEndpoint(e Endpoint, application, allowManual bool) (Endpo
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	previousSeq := s.seq
-	if e.Source == SourceApplication && !application {
-		return Endpoint{}, fmt.Errorf("application endpoints are managed by application publish")
-	}
+	return s.upsertEndpointLocked(e)
+}
+
+func (s *Store) upsertEndpointLocked(e Endpoint) (Endpoint, error) {
 	if strings.TrimSpace(e.ID) == "" {
 		e.ID = s.nextIDLocked("ep")
-	}
-	if current, found := s.endpoints[e.TenantID][e.ID]; found {
-		if application && current.Source != SourceApplication && !(allowManual && (current.Source == SourceManual || current.Source == "")) {
-			return Endpoint{}, fmt.Errorf("admin.endpoints.write is required to replace the existing destination")
-		}
-		if !application && current.Source == SourceApplication {
-			return Endpoint{}, fmt.Errorf("application endpoints are managed by application publish")
-		}
-	}
-	previous, hadPrevious := s.endpoints[e.TenantID][e.ID]
-	previousAliases := make(map[string]string, len(s.aliases[e.TenantID]))
-	for alias, owner := range s.aliases[e.TenantID] {
-		previousAliases[alias] = owner
 	}
 	e.Alias = s.claimAliasLocked(e.TenantID, e.Alias, e.ID)
 	if s.endpoints[e.TenantID] == nil {
 		s.endpoints[e.TenantID] = map[string]Endpoint{}
 	}
-	s.endpoints[e.TenantID][e.ID] = e
+	s.endpoints[e.TenantID][e.ID] = copyEndpoint(e)
 	// Enrolled-device endpoints are re-derived from the enrolled inventory on boot, so they do not trigger a
 	// persist (avoids per-list churn and stale lingering); only operator-authored endpoints are persisted.
 	if e.Source != SourceEnrolled {
 		s.generation++
-		if err := s.persistLocked(); err != nil {
-			if hadPrevious {
-				s.endpoints[e.TenantID][e.ID] = previous
-			} else {
-				delete(s.endpoints[e.TenantID], e.ID)
-			}
-			s.aliases[e.TenantID] = previousAliases
-			s.seq = previousSeq
-			s.generation--
-			return Endpoint{}, fmt.Errorf("%w: endpoint %s update: %v", ErrPersistence, e.ID, err)
-		}
 	}
 	return e, nil
 }
 
 // UpsertGroup stores a group (static and/or dynamic membership) with a tenant-unique alias.
-func (s *Store) UpsertGroup(g Group) (Group, error) {
-	if shared, ok := s.getSharedUpdater(); ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (Group, error) {
-			return latest.UpsertGroup(g)
-		})
-	}
+func (s *Store) upsertGroup(g Group) (Group, error) {
 	g.TenantID = strings.TrimSpace(g.TenantID)
 	if g.TenantID == "" {
 		return Group{}, fmt.Errorf("tenant_id is required")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	previousSeq := s.seq
 	if strings.TrimSpace(g.ID) == "" {
 		g.ID = s.nextIDLocked("grp")
-	}
-	previous, hadPrevious := s.groups[g.TenantID][g.ID]
-	previousAliases := make(map[string]string, len(s.aliases[g.TenantID]))
-	for alias, owner := range s.aliases[g.TenantID] {
-		previousAliases[alias] = owner
 	}
 	g.Alias = s.claimAliasLocked(g.TenantID, g.Alias, g.ID)
 	if s.groups[g.TenantID] == nil {
 		s.groups[g.TenantID] = map[string]Group{}
 	}
-	s.groups[g.TenantID][g.ID] = g
+	s.groups[g.TenantID][g.ID] = copyGroup(g)
 	s.generation++
-	if err := s.persistLocked(); err != nil {
-		if hadPrevious {
-			s.groups[g.TenantID][g.ID] = previous
-		} else {
-			delete(s.groups[g.TenantID], g.ID)
-		}
-		s.aliases[g.TenantID] = previousAliases
-		s.seq = previousSeq
-		s.generation--
-		return Group{}, fmt.Errorf("%w: group %s update: %v", ErrPersistence, g.ID, err)
-	}
 	return g, nil
 }
 
 // UpsertService stores a named port/protocol service with a tenant-unique alias.
-func (s *Store) UpsertService(svc Service) (Service, error) {
-	if shared, ok := s.getSharedUpdater(); ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (Service, error) {
-			return latest.UpsertService(svc)
-		})
-	}
+func (s *Store) upsertService(svc Service) (Service, error) {
 	svc.TenantID = strings.TrimSpace(svc.TenantID)
 	if svc.TenantID == "" {
 		return Service{}, fmt.Errorf("tenant_id is required")
 	}
-	if len(svc.Ports) == 0 {
-		return Service{}, fmt.Errorf("service requires at least one port")
+	var err error
+	svc, err = normalizeServiceTransports(svc)
+	if err != nil {
+		return Service{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	previousSeq := s.seq
 	if strings.TrimSpace(svc.ID) == "" {
 		svc.ID = s.nextIDLocked("svc")
-	}
-	previous, hadPrevious := s.services[svc.TenantID][svc.ID]
-	previousAliases := make(map[string]string, len(s.aliases[svc.TenantID]))
-	for alias, owner := range s.aliases[svc.TenantID] {
-		previousAliases[alias] = owner
 	}
 	svc.Alias = s.claimAliasLocked(svc.TenantID, svc.Alias, svc.ID)
 	if s.services[svc.TenantID] == nil {
 		s.services[svc.TenantID] = map[string]Service{}
 	}
-	s.services[svc.TenantID][svc.ID] = svc
+	s.services[svc.TenantID][svc.ID] = copyService(svc)
 	s.generation++
-	if err := s.persistLocked(); err != nil {
-		if hadPrevious {
-			s.services[svc.TenantID][svc.ID] = previous
-		} else {
-			delete(s.services[svc.TenantID], svc.ID)
-		}
-		s.aliases[svc.TenantID] = previousAliases
-		s.seq = previousSeq
-		s.generation--
-		return Service{}, fmt.Errorf("%w: service %s update: %v", ErrPersistence, svc.ID, err)
-	}
 	return svc, nil
 }
 
 // DeleteEndpoint removes an endpoint and frees its alias. Returns false if it was not present. A group that
 // still lists the deleted endpoint as a static member resolves gracefully (missing members are skipped).
-// A failed snapshot restores the previous in-memory endpoint so a retry can persist the delete.
-func (s *Store) DeleteEndpoint(tenant, id string) (bool, error) {
-	if shared, ok := s.getSharedUpdater(); ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
-			return latest.deleteEndpoint(tenant, id, false, false)
-		})
-	}
-	return s.deleteEndpoint(tenant, id, false, false)
-}
-
-// DeleteApplicationEndpoint removes only a destination owned by the application,
-// or a legacy manual destination when the caller has endpoint-write permission.
-func (s *Store) DeleteApplicationEndpoint(tenant, applicationID string, allowManual bool) (bool, error) {
-	applicationID = strings.TrimSpace(applicationID)
-	if applicationID == "" {
-		return false, fmt.Errorf("application_id is required")
-	}
-	shared, ok := s.getSharedUpdater()
-	if ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
-			return latest.deleteEndpoint(tenant, "app-"+applicationID, true, allowManual)
-		})
-	}
-	return s.deleteEndpoint(tenant, "app-"+applicationID, true, allowManual)
-}
-
-func (s *Store) deleteEndpoint(tenant, id string, application, allowManual bool) (bool, error) {
+// Public mutations publish this candidate only after persistence succeeds.
+func (s *Store) deleteEndpoint(tenant, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.builtInEndpoints[id]; ok {
 		return false, nil // built-in catalog endpoints are read-only
 	}
-	previous, ok := s.endpoints[tenant][id]
-	if !ok {
+	if _, ok := s.endpoints[tenant][id]; !ok {
 		return false, nil
-	}
-	if application && previous.Source != SourceApplication && !(allowManual && (previous.Source == SourceManual || previous.Source == "")) {
-		return false, fmt.Errorf("admin.endpoints.write is required to remove the existing destination")
-	}
-	if !application && previous.Source == SourceApplication {
-		return false, fmt.Errorf("application endpoints are managed by application publish")
-	}
-	previousAliases := make(map[string]string, len(s.aliases[tenant]))
-	for alias, owner := range s.aliases[tenant] {
-		previousAliases[alias] = owner
 	}
 	delete(s.endpoints[tenant], id)
 	s.releaseAliasLocked(tenant, id)
 	s.generation++
-	if err := s.persistLocked(); err != nil {
-		s.endpoints[tenant][id] = previous
-		s.aliases[tenant] = previousAliases
-		s.generation--
-		return false, fmt.Errorf("%w: endpoint %s deletion: %v", ErrPersistence, id, err)
-	}
 	return true, nil
 }
 
 // DeleteGroup removes a group and frees its alias. Returns false if it was not present. Error semantics as
 // DeleteEndpoint.
-func (s *Store) DeleteGroup(tenant, id string) (bool, error) {
-	if shared, ok := s.getSharedUpdater(); ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
-			return latest.DeleteGroup(tenant, id)
-		})
-	}
+func (s *Store) deleteGroup(tenant, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.builtInGroups[id]; ok {
 		return false, nil // built-in catalog groups are read-only
 	}
-	previous, ok := s.groups[tenant][id]
-	if !ok {
+	if _, ok := s.groups[tenant][id]; !ok {
 		return false, nil
-	}
-	previousAliases := make(map[string]string, len(s.aliases[tenant]))
-	for alias, owner := range s.aliases[tenant] {
-		previousAliases[alias] = owner
 	}
 	delete(s.groups[tenant], id)
 	s.releaseAliasLocked(tenant, id)
 	s.generation++
-	if err := s.persistLocked(); err != nil {
-		s.groups[tenant][id] = previous
-		s.aliases[tenant] = previousAliases
-		s.generation--
-		return false, fmt.Errorf("%w: group %s deletion: %v", ErrPersistence, id, err)
-	}
 	return true, nil
 }
 
 // DeleteService removes a service and frees its alias. Returns false if it was not present. Error semantics
 // as DeleteEndpoint.
-func (s *Store) DeleteService(tenant, id string) (bool, error) {
-	if shared, ok := s.getSharedUpdater(); ok {
-		return sharedCatalogMutation(s, shared, func(latest *Store) (bool, error) {
-			return latest.DeleteService(tenant, id)
-		})
-	}
+func (s *Store) deleteService(tenant, id string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	previous, ok := s.services[tenant][id]
-	if !ok {
+	if _, ok := s.services[tenant][id]; !ok {
 		return false, nil
-	}
-	previousAliases := make(map[string]string, len(s.aliases[tenant]))
-	for alias, owner := range s.aliases[tenant] {
-		previousAliases[alias] = owner
 	}
 	delete(s.services[tenant], id)
 	s.releaseAliasLocked(tenant, id)
 	s.generation++
-	if err := s.persistLocked(); err != nil {
-		s.services[tenant][id] = previous
-		s.aliases[tenant] = previousAliases
-		s.generation--
-		return false, fmt.Errorf("%w: service %s deletion: %v", ErrPersistence, id, err)
-	}
 	return true, nil
 }
 
@@ -450,10 +236,10 @@ func (s *Store) GetEndpoint(tenant, id string) (Endpoint, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.endpoints[tenant][id]; ok {
-		return e, true
+		return copyEndpoint(e), true
 	}
 	e, ok := s.builtInEndpoints[id]
-	return e, ok
+	return copyEndpoint(e), ok
 }
 
 // ListEndpoints returns an alias-sorted snapshot for the tenant, including the built-in catalog endpoints.
@@ -462,10 +248,10 @@ func (s *Store) ListEndpoints(tenant string) []Endpoint {
 	defer s.mu.Unlock()
 	out := make([]Endpoint, 0, len(s.endpoints[tenant])+len(s.builtInEndpoints))
 	for _, e := range s.endpoints[tenant] {
-		out = append(out, e)
+		out = append(out, copyEndpoint(e))
 	}
 	for _, e := range s.builtInEndpoints {
-		out = append(out, e)
+		out = append(out, copyEndpoint(e))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
 	return out
@@ -477,10 +263,10 @@ func (s *Store) ListGroups(tenant string) []Group {
 	defer s.mu.Unlock()
 	out := make([]Group, 0, len(s.groups[tenant])+len(s.builtInGroups))
 	for _, g := range s.groups[tenant] {
-		out = append(out, g)
+		out = append(out, copyGroup(g))
 	}
 	for _, g := range s.builtInGroups {
-		out = append(out, g)
+		out = append(out, copyGroup(g))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
 	return out
@@ -493,12 +279,12 @@ func (s *Store) ListServices(tenant string) []Service {
 	out := make([]Service, 0, len(s.services[tenant])+len(s.builtInServices))
 	seen := map[string]bool{} // lowercased alias -> a tenant-authored service shadows a built-in of the same name
 	for _, svc := range s.services[tenant] {
-		out = append(out, svc)
+		out = append(out, copyService(svc))
 		seen[strings.ToLower(svc.Alias)] = true
 	}
 	for _, svc := range s.builtInServices {
 		if !seen[strings.ToLower(svc.Alias)] {
-			out = append(out, svc)
+			out = append(out, copyService(svc))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })

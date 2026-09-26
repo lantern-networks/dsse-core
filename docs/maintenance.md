@@ -370,3 +370,13 @@ protocol cannot be represented by the current Windows export. Disable or correct
 such a record before enabling it; no automatic broadening of its rules is made.
 
 Upgrade note: older API clients could store exception statuses other than `active` or `disabled` (for example `inactive`). Review and correct those records before upgrading; the current export rejects an unknown status instead of silently skipping it. Old Console-created records used the supported default status.
+
+### Inspection source compatibility
+
+TLS inspection cannot resolve user/group/agent identity before decrypting a
+connection. Inspect rules using these selectors, or an unresolved device source,
+therefore apply to every source for that tenant and destination. Device-resolvable
+inspect rules retain their device scope. Bypass rules never widen when a source
+cannot be resolved. Review identity-scoped inspect rules before updating: they
+may inspect additional users to preserve inspection instead of silently disabling
+DLP under bypass-default.

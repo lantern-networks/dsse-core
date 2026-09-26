@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -8,6 +9,34 @@ import (
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/model"
 )
+
+// The store has already accepted the change. Snapshot publication is a separate
+// outcome and may have written some files before failing.
+func adminPolicyMutationAuditLog(r *http.Request, item model.Policy, evaluator decision.Evaluator, now time.Time, operation, snapshotStatus string) model.AuditLog {
+	audit := adminPolicyAuditLog(item, evaluator, now)
+	audit.ActorUserID = auditActorPrincipal(r)
+	audit.Metadata["allowed_tool_id_count"] = len(item.AllowedToolIDs)
+	audit.Metadata["applied"] = true
+	audit.Metadata["ne_snapshot_status"] = snapshotStatus
+	if operation == "delete" {
+		audit.EventType = "admin_policy_deleted"
+		audit.Action = stringPtr("delete")
+		audit.Reason = stringPtr("Admin policy removed from this server.")
+	}
+	if operation == "status" {
+		audit.EventType = "admin_policy_status_changed"
+		audit.Action = stringPtr("status")
+		audit.Reason = stringPtr("Admin policy status changed on this server.")
+	}
+	if snapshotStatus == "unconfirmed" {
+		audit.Result = stringPtr("partial")
+		audit.Reason = stringPtr("Policy change applied on this server; Network Extension snapshot publication is unconfirmed.")
+	}
+	if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && !strings.EqualFold(identity.TenantID, item.TenantID) {
+		stampOperatorActor(audit.Metadata, identity)
+	}
+	return audit
+}
 
 // adminPolicyAuditLog builds the audit record for a policy upsert. Kept in cmd/edge (not the policy store
 // package) because it depends on the decision.Evaluator binding + the shared audit-id mint (randomEdgeID) and

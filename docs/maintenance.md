@@ -352,3 +352,15 @@ protocol cannot be represented by the current Windows export. Disable or correct
 such a record before enabling it; no automatic broadening of its rules is made.
 
 Upgrade note: older API clients could store exception statuses other than `active` or `disabled` (for example `inactive`). Review and correct those records before upgrading; the current export rejects an unknown status instead of silently skipping it. Old Console-created records used the supported default status.
+
+### Named-service and save compatibility
+
+When an egress deny or authentication rule references a missing/invalid service,
+it now retains its authored source and destination restrictions across all ports,
+until the service is repaired. Unresolved allow rules continue to match nothing.
+This prevents deleting a named service from silently disabling an existing deny.
+
+A confirmed non-atomic rule save counts as saved. If file replacement completed
+but its final flush is unconfirmed, the rule store keeps the replacement live
+and returns a storage error requiring reconciliation; it does not roll back only
+the in-memory copy while leaving the new file on disk.

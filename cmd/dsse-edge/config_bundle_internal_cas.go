@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/internalca"
@@ -67,7 +66,10 @@ func applyInternalCABundleSectionChecked(store organizationInternalCAPool, secti
 		return 0, false, nil
 	}
 	if !section.Complete {
-		return 0, false, fmt.Errorf("internal authority list is incomplete")
+		if logf != nil {
+			logf("config_bundle_internal_cas_kept_local=true reason=incomplete")
+		}
+		return 0, false, nil
 	}
 	if err := concrete.ReplaceAll(section.Authorities); err != nil {
 		return 0, false, err

@@ -611,15 +611,20 @@ wiring using these primitives follows in a separate migration unit.
 
 Existing CA files and signed snapshots may contain openssl preambles or public certificate chains. Restore keeps only the first public CA, matching the previous trust contract; new administrative inputs still require exactly one certificate. Unavailable authority stores publish an incomplete section, never an empty authoritative deletion. Invalid received CA snapshots remain unacknowledged so the next pull can retry. Failed administrative deletions return a storage error. Combined certificate/key PEM files remain readable at startup and reload; pair updates still require separate files.
 
+### Legacy CA restoration compatibility
+Saved and received legacy authority material restores its first public CA and discards accompanying text, chains and key material. New administrative submissions remain strict. Incomplete authority bundles keep the existing Edge trust without rejecting the remaining bundle. Startup also accepts a combined certificate/key file for reading; two-file updates still require distinct paths.
 ### Audit and search storage reconciliation
 
 Audit log writes now record primary-write failures separately from downstream hook failures, including short writes. Health describes only the current writer process and does not promise durable recovery or downstream delivery. ClickHouse searches reject invalid row counts instead of returning a misleading empty result. PostgreSQL can count events without a region while retaining organization, stream, text and time filters. Streamed export storage can preserve a caller-supplied coverage comment in the gzip header. Administrative audit/export integration follows separately.
 
 Package regression, race detection and the full Go suite cover these storage changes; this is not GUI or deployed-fleet acceptance.
 
+
+Legacy CA normalization changes the in-memory and distributed public certificate only. The original database row remains until an administrator replaces it with a public CA certificate or deletes that authority in Console.
 ### Licensing and control-plane write authority
 License application and feature entitlement edits now acknowledge confirmed storage, preserve the shared serial floor, and refuse writes from an expired leadership term. Startup restores license authority before starting leadership election; promotion refreshes the license before advertising leadership. DLP configuration writes stop when entitlement authority cannot be read.
 
 Targeted startup, license, entitlement, cancellation and write-fencing regression tests cover these changes. GUI and multi-region deployment acceptance remain separate release checks.
 
 An unreadable configured license or entitlement snapshot stops startup instead of silently starting with empty authority. A license serial that cannot be restored also prevents that CP from advertising leadership; this affects leader-only management and audit intake. Repair the authoritative stored snapshot from a valid backup before retrying startup/promotion. Never reset the accepted serial to bypass this check. Write-term fencing here covers administrative blob UpdateContext calls; remaining background/runtime integrations follow separately.
+

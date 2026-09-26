@@ -201,7 +201,6 @@ components:
           type: string
           enum:
             - ndjson
-            - csv
         filters:
           type: object
           additionalProperties:
@@ -14039,7 +14038,6 @@ paths:
                   type: string
                   enum:
                     - ndjson
-                    - csv
                   default: ndjson
                 limit:
                   type: integer

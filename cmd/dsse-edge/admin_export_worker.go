@@ -1360,11 +1360,16 @@ func validateAdminExportJobRequest(req adminExportJobRequest) error {
 	if strings.TrimSpace(req.From) == "" || strings.TrimSpace(req.To) == "" {
 		return fmt.Errorf("export job requires from and to")
 	}
-	if _, err := time.Parse(time.RFC3339, strings.TrimSpace(req.From)); err != nil {
+	from, err := time.Parse(time.RFC3339, strings.TrimSpace(req.From))
+	if err != nil {
 		return fmt.Errorf("parse export from: %w", err)
 	}
-	if _, err := time.Parse(time.RFC3339, strings.TrimSpace(req.To)); err != nil {
+	to, err := time.Parse(time.RFC3339, strings.TrimSpace(req.To))
+	if err != nil {
 		return fmt.Errorf("parse export to: %w", err)
+	}
+	if to.Before(from) {
+		return fmt.Errorf("export to must not precede from")
 	}
 	return nil
 }
@@ -1544,10 +1549,21 @@ func adminExportJobAuditLog(eventType string, job adminExportJob, evaluator deci
 		tenantID = evaluator.PolicyBundle.TenantID
 		metadata["tenant_attribution"] = "the export job named no organization; filed under this node's"
 	}
+	// Cancellation is performed by the cancelling administrator, who may differ
+	// from the requester. Keep the requester separately for the audit trail.
+	actorID := strings.TrimSpace(job.CreatedByAdminPrincipalID)
+	metadata["created_by_admin_principal_id"] = job.CreatedByAdminPrincipalID
+	if eventType == "admin_export_cancelled" {
+		actorID = strings.TrimSpace(stringMetadata(job.Metadata, "cancelled_by_admin_principal_id"))
+	}
+	var actorUserID *string
+	if actorID != "" {
+		actorUserID = &actorID
+	}
 	return model.AuditLog{
 		ID:            randomEdgeID("audit_"+eventType+"_", time.Now().UTC()),
 		TenantID:      tenantID,
-		ActorUserID:   &job.CreatedByAdminPrincipalID,
+		ActorUserID:   actorUserID,
 		EventType:     eventType,
 		TargetType:    stringPtr("export_job"),
 		TargetID:      stringPtr(job.ID),
@@ -1639,6 +1655,10 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		var req adminExportJobRequest
 		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode export job request: %w", err))
+			return
+		}
+		if err := validateAdminExportJobRequest(req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		job, err := adminExportWorker.Enqueue(r.Context(), adminExportTask{

@@ -34,6 +34,23 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Log exports now include the full selected local calendar days, including the
+last nanosecond of the end date. The Console offers the supported NDJSON format,
+rejects invalid or reversed dates without starting a job, and restores refresh
+and download actions for completed exports. The API validates the request before
+handing it to a worker. Local browser checks against product handlers confirmed
+that a same-day export contains the start, midday and end-of-day records, excludes
+adjacent days and another organization, and downloads a matching gzip file.
+Creation and download audits were also checked. These checks use a local log store
+and synthetic administrator session; shared-database and deployed-fleet acceptance
+remain separate. Export details now show the latest server state, and queued or
+running jobs can be cancelled from the Console. Local browser checks cover both
+states; the running worker was held at the local reader boundary and released
+after cancellation to confirm it leaves no partial download. Cancellation audits
+identify the administrator who cancelled the job, separately from its requester.
+Log outcome badges match complete status names, so revoked or incomplete records
+are not presented as successful.
+
 Disabled applications are now excluded from Connector selection, including an
 explicit Connector ID, and from effective published routes. Re-enabling an
 application restores its retained publication settings. Regression tests cover

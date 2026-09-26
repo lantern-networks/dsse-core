@@ -626,4 +626,11 @@ Legacy CA normalization changes the in-memory and distributed public certificate
 The macOS installer checks that current and replacement profile organizations are readable and that required sidecars exist before moving configuration files. Replacing a profile for the same organization retains its device identity and, when no replacement token is supplied, its existing enrollment token. Windows profile removal also clears the issued-at display metadata. These changes preserve existing profile signature verification requirements.
 
 Validation includes five isolated installer-adoption cases, shell syntax checks, host configstore tests and Windows test cross-compilation. Actual Windows registry execution and signed package installation are not claimed by these checks.
+### Licensing and control-plane write authority
+License application and feature entitlement edits now acknowledge confirmed storage, preserve the shared serial floor, and refuse writes from an expired leadership term. Startup restores license authority before starting leadership election; promotion refreshes the license before advertising leadership. DLP configuration writes stop when entitlement authority cannot be read.
+
+Targeted startup, license, entitlement, cancellation and write-fencing regression tests cover these changes. GUI and multi-region deployment acceptance remain separate release checks.
+
+An unreadable configured license or entitlement snapshot stops startup instead of silently starting with empty authority. A license serial that cannot be restored prevents every CP using that shared authority from advertising leadership; this affects leader-only management and audit intake. First distinguish storage connectivity failure from invalid stored data. If restoration is needed, use a verified authoritative snapshot at or above the last accepted license serial before retrying startup/promotion. Never reset the accepted serial to bypass this check. Write-term fencing here covers administrative blob UpdateContext calls; remaining background/runtime integrations follow separately.
+
 

@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ecdh"
 	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,12 +33,13 @@ type adminLicenseDeps struct {
 	}
 	// displayName resolves a tenant's human name. Optional: with no tenant model available the rows fall back to
 	// the identifier, which is worse to read but never wrong.
-	displayName   func(tenantID string) string
-	acceptedKeys  []*ecdsa.PublicKey
-	recipientKey  *ecdh.PrivateKey
-	msspID        string
-	oversubscribe bool
-	now           func() time.Time
+	displayName     func(tenantID string) string
+	acceptedKeys    []*ecdsa.PublicKey
+	recipientKey    *ecdh.PrivateKey
+	msspID          string
+	oversubscribe   bool
+	now             func() time.Time
+	auditAllocation func(*http.Request, string, string, string, *int)
 }
 
 // tenantSeatView is one row of the thing an operator actually reads.
@@ -148,10 +150,17 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("licensing is not configured on this Edge"))
 			return false
 		}
+		if d.licence.Health() != nil {
+			writeError(w, http.StatusServiceUnavailable, errLicenseLoad)
+			return false
+		}
 		return true
 	}
 
 	mux.HandleFunc("GET /admin/license", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
+		if licenseReadRefusedOnAStandby(w) {
+			return
+		}
 		if !ready(w) {
 			return
 		}
@@ -320,9 +329,13 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			return
 		}
 
-		p, err := d.licence.Apply(env, d.acceptedKeys, d.msspID, adminOf(r), now.Format(time.RFC3339))
+		p, err := d.licence.ApplyContext(r.Context(), env, d.acceptedKeys, d.msspID, adminOf(r), now.Format(time.RFC3339))
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
+			if errors.Is(err, errLicensePersistence) || errors.Is(err, errLicenseLoad) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Licence save could not be confirmed. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		if d.licensing != nil {
@@ -401,9 +414,20 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			pool = p.SeatsAt(now)
 		}
 		policy := seatallocation.Policy{PoolSeats: pool, AllowOversubscription: d.oversubscribe}
-		a, err := d.allocations.Allocate(policy, req.TenantID, *req.Seats, adminOf(r), req.Note, now.Format(time.RFC3339))
+		a, err := d.allocations.AllocateContext(r.Context(), policy, req.TenantID, *req.Seats, adminOf(r), req.Note, now.Format(time.RFC3339))
+		if d.auditAllocation != nil {
+			result := "success"
+			if err != nil {
+				result = "error"
+			}
+			d.auditAllocation(r, req.TenantID, "allocate", result, req.Seats)
+		}
 		if err != nil {
 			status := http.StatusBadRequest
+			if errors.Is(err, seatallocation.ErrPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Seat allocation save could not be confirmed. Reload before retrying."))
+				return
+			}
 			if strings.Contains(err.Error(), "exceed the licensed pool") {
 				status = http.StatusConflict
 			}
@@ -430,22 +454,30 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 		if !ready(w) {
 			return
 		}
-		// Same rule as the POST above: the path may not name a tenant the caller is not operating as.
-		tenant := r.PathValue("tenant")
-		callerTenant := adminTenantIDFromRequest(r)
-		if callerTenant == "" {
-			writeError(w, http.StatusForbidden, fmt.Errorf("this identity has no tenant"))
+		// Like allocation, release is an operator quota operation for the explicitly named tenant.
+		// The endpoint permission remains admin.quota.write; customer administrators cannot use it.
+		tenant := strings.TrimSpace(r.PathValue("tenant"))
+		if adminTenantIDFromRequest(r) == "" || tenant == "" {
+			writeError(w, http.StatusForbidden, errors.New("an authenticated tenant and allocation target are required"))
 			return
 		}
-		if strings.TrimSpace(tenant) != "" && !strings.EqualFold(strings.TrimSpace(tenant), callerTenant) {
-			writeError(w, http.StatusForbidden, fmt.Errorf("this identity may only release seats for %s", callerTenant))
+		removed, err := d.allocations.RemoveConfirmedContext(r.Context(), tenant)
+		if d.auditAllocation != nil {
+			result := "success"
+			if err != nil || !removed {
+				result = "error"
+			}
+			d.auditAllocation(r, tenant, "remove", result, nil)
+		}
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("Seat allocation removal could not be confirmed. Reload before retrying."))
 			return
 		}
-		tenant = callerTenant
-		if !d.allocations.Remove(tenant) {
-			writeError(w, http.StatusNotFound, fmt.Errorf("no allocation for that tenant"))
+		if !removed {
+			writeError(w, http.StatusNotFound, errors.New("no allocation for that tenant"))
 			return
 		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "admin_license.v1",
 			"tenant_id":      tenant,

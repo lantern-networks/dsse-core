@@ -2402,8 +2402,6 @@ func main() {
 	if cpLeaderErr != nil {
 		log.Fatalf("start CP leader election: %v", cpLeaderErr)
 	}
-	cpLeaderElectorInstance.Start()
-	defer cpLeaderElectorInstance.Stop()
 	ruleStore := policyrule.NewStore()
 	rulePersister, rulePersisterErr := cpStateBlobPersister(*policyRuleStorePath, cpStateBlobDB, "policy_rules")
 	if rulePersisterErr != nil {
@@ -4782,7 +4780,9 @@ func main() {
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
 	// Edge continues on -listen.
 	mustLoadSeatAllocations(seatAllocations, mustCPStateBlobPersister(*seatAllocationStore, "seat_allocations"))
-	vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license"))
+	if err := vendorLicenceStore.SetPersister(mustCPStateBlobPersister(*licenseStorePath, "vendor_license")); err != nil {
+		log.Fatal("setup vendor license store: cannot restore authority")
+	}
 	// Put the stored licence back in force at boot. Without this a restart would leave the gate with no licence
 	// while the store still held one — enforcement would read as "no valid licence" and hold every enrolment,
 	// which is the wrong answer to a restart.
@@ -4793,6 +4793,9 @@ func main() {
 	} else if len(licenseAcceptedKeys) > 0 {
 		log.Printf("vendor licence: NONE in force — enrolment is held until a licence is applied")
 	}
+	configureLicensePromotion(cpLeaderElectorInstance, *licenseStorePath, vendorLicenceStore, enrolmentLicensingGate, licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID))
+	cpLeaderElectorInstance.Start()
+	defer cpLeaderElectorInstance.Stop()
 	// single-tenant Edge isolation: when a tenant CA registry is configured, bind this Edge to its
 	// own tenant (the policy bundle's tenant) so cross-tenant certs are denied at admission even if the
 	// registry trusts other tenants' CAs.

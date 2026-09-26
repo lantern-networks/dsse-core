@@ -82,8 +82,9 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 		out := make([]ruleWithEnforcement, 0, len(listed))
 		for _, rule := range listed {
 			out = append(out, ruleWithEnforcement{
-				Rule:                  rule,
-				DestinationUnresolved: destinationResolvesToNothing(rule, assets, tenant),
+				Rule:                    rule,
+				DestinationUnresolved:   destinationResolvesToNothing(rule, assets, tenant),
+				InspectionSourceWarning: policyrule.InspectionSourceWarning(tenant, rule, assets),
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -191,6 +192,7 @@ func validateInboundReceivers(rule policyrule.Rule, assets *assetcatalog.Store, 
 // ruleWithEnforcement is an authored rule plus the one thing the rule itself cannot say: whether it will
 // actually match anything once compiled. See the GET handler for the defect this exists for.
 type ruleWithEnforcement struct {
+	InspectionSourceWarning string `json:"inspection_source_warning,omitempty"`
 	policyrule.Rule
 	// DestinationUnresolved: the destination names nothing this organization's endpoint catalog knows, so the
 	// compiled policy is the match-nothing sentinel. The rule is present, active, and enforces nothing.

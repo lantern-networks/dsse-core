@@ -136,8 +136,9 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		// docs/invisible_effective_configuration.md).
 		bypassSources := inspectionSources{KnownGroups: knownbypass.Groups, InterceptHosts: []string{"*"}}
 		if config.NetworkExtensionLabTLS != nil {
-			bypassSources.EffectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
-			bypassSources.InterceptHosts = config.NetworkExtensionLabTLS.InterceptHosts()
+			patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
+			bypassSources.EffectiveBypass, bypassSources.InterceptHosts = patterns.Bypass, patterns.Intercept
+			bypassSources.DeviceIntercept, bypassSources.DeviceBypass = patterns.InterceptByDevice, patterns.BypassByDevice
 		}
 		// Attribute SaaS Optimize bypass: pass the groups enabled in the live posture.
 		if config.InspectionPosture != nil {
@@ -182,17 +183,22 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			aliasByID[g.ID] = g.Alias
 		}
 		egressRules := ruleStore.List(tenant, policyrule.PlaneEgress)
+		sourceWarnings := map[string]string{}
+		for _, rule := range egressRules {
+			sourceWarnings[rule.ID] = policyrule.InspectionSourceWarning(tenant, rule, assetStore)
+		}
 		in := effectiveEgressInputs{
-			Eval:                evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
-			Tenant:              tenant,
-			AuthoredRules:       egressRules,
-			AliasByID:           aliasByID,
-			KnownGroups:         knownbypass.Groups,
-			AuthoredBypassHosts: policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
-			UnresolvedRuleIDs:   unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
+			Eval:                     evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
+			Tenant:                   tenant,
+			AuthoredRules:            egressRules,
+			InspectionSourceWarnings: sourceWarnings,
+			AliasByID:                aliasByID,
+			KnownGroups:              knownbypass.Groups,
+			AuthoredBypassHosts:      policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
+			UnresolvedRuleIDs:        unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
 		}
 		if config.NetworkExtensionLabTLS != nil {
-			in.EffectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
+			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass
 		}
 		if config.InspectionPosture != nil {
 			p := config.InspectionPosture()
@@ -220,7 +226,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// decrypt allowlist (explicit hosts + SaaS auth-group presets), and the curated known-bypass list. The
 	// "make the hidden default visible and editable" of docs/invisible_effective_configuration.md.
 	mux.HandleFunc("GET /admin/inspection-posture", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config))
+		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config, adminTenantIDFromRequest(r)))
 	}))
 	// Change the inspection posture (partial update — only provided fields change). bypass_default decrypts ONLY
 	// the allowlist and raw-forwards the rest (still steered + policy-gated); keep a SaaS auth group selected to
@@ -272,7 +278,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusInternalServerError, err) // applied in memory but not persisted — would revert on restart
 			return
 		}
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config))
+		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config, adminTenantIDFromRequest(r)))
 	}))
 
 	// Predefined pinned-bypass catalog: the curated set of well-known un-interceptable services (no-decrypt

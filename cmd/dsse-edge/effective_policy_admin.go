@@ -36,6 +36,8 @@ type inspectionBasis struct {
 // engine's own Matches decision: a flow is decrypted IFF it is in InterceptHosts AND not in EffectiveBypass.
 // The per-bypass-source fields are only for attribution — labelling WHICH source put a host in the bypass set.
 type inspectionSources struct {
+	DeviceIntercept map[string][]string
+	DeviceBypass    map[string][]string
 	InterceptHosts  []string                             // the engine's live intercept set ("*" = decrypt-all; narrower = decrypt allowlist)
 	EffectiveBypass []string                             // the engine's live raw-forward set — always wins over intercept
 	KnownGroups     []knownbypass.Group                  // curated named bypass groups, for attribution
@@ -154,6 +156,20 @@ func classifyInspection(host string, src inspectionSources) inspectionBasis {
 			return inspectionBasis{Decision: "bypass", Source: "cert_pin_materialized"}
 		}
 		return inspectionBasis{Decision: "bypass", Source: "static_bypass"}
+	}
+	deviceHost := func(patterns map[string][]string) bool {
+		for _, hosts := range patterns {
+			if interception.HostMatchesPatterns(host, hosts) {
+				return true
+			}
+		}
+		return false
+	}
+	// A destination-only preview has no authenticated source device. Do not
+	// present one device's exception as the answer for every connection.
+	baseInspect := interception.HostMatchesPatterns(host, src.InterceptHosts)
+	if (baseInspect && deviceHost(src.DeviceBypass)) || (!baseInspect && deviceHost(src.DeviceIntercept)) {
+		return inspectionBasis{Decision: "depends_on_device", Source: "device_rule"}
 	}
 	// 2. Not bypassed: decrypted IFF in the intercept set.
 	if interception.HostMatchesPatterns(host, src.InterceptHosts) {

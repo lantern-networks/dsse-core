@@ -31,17 +31,21 @@ func catalogGroups() []catalogGroupView {
 
 // inspectionPostureSnapshot gathers the live posture view: the configured posture plus the engine's actual
 // intercept + bypass sets. Used by both the GET and POST handlers.
-func inspectionPostureSnapshot(config serverConfig) inspectionPostureResponse {
+func inspectionPostureSnapshot(config serverConfig, tenant string) inspectionPostureResponse {
 	posture := inspectionposture.DefaultPosture()
 	if config.InspectionPosture != nil {
 		posture = config.InspectionPosture()
 	}
 	var interceptHosts, effectiveBypass []string
+	deviceScoped := false
 	if config.NetworkExtensionLabTLS != nil {
-		interceptHosts = config.NetworkExtensionLabTLS.InterceptHosts()
-		effectiveBypass = config.NetworkExtensionLabTLS.BypassHosts()
+		patterns := config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant)
+		interceptHosts, effectiveBypass = patterns.Intercept, patterns.Bypass
+		deviceScoped = len(patterns.InterceptByDevice) > 0 || len(patterns.BypassByDevice) > 0
 	}
-	return buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
+	result := buildInspectionPosture(posture, interceptHosts, effectiveBypass, knownbypass.Groups)
+	result.TenantID, result.DeviceScoped = tenant, deviceScoped
+	return result
 }
 
 // knownBypassGroupView is one curated known-bypass group made visible to the operator, with whether it is
@@ -69,6 +73,8 @@ type authDecryptGroupView struct {
 // bypass_default), the decrypt allowlist (explicit hosts + selected SaaS auth groups) and the curated
 // known-bypass list, plus the live intercept/bypass sets the engine actually applies.
 type inspectionPostureResponse struct {
+	TenantID               string                 `json:"tenant_id"`
+	DeviceScoped           bool                   `json:"device_scoped"`
 	DefaultMode            string                 `json:"default_mode"`     // decrypt_all | bypass_default
 	InterceptHosts         []string               `json:"intercept_hosts"`  // live engine intercept set ("*" = decrypt-all)
 	EffectiveBypass        []string               `json:"effective_bypass"` // live engine raw-forward set

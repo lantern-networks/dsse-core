@@ -309,6 +309,24 @@ operation and saved result. Deployed fleet communication remains unverified.
 | Asset catalogue audit and endpoint save errors | Endpoint, group and service writes now record a targeted audit with tenant, actor, asset ID, action and confirmed or unconfirmed outcome, without raw names, addresses or storage errors. A product HTTP check covered seven confirmed writes and three refused saves, including endpoint creation and deletion; endpoint save failures return 503 without exposing storage details or changing the live generation. | The HTTP and local outbox checks do not prove GUI acceptance, external audit delivery or independently deployed CP/Edge propagation. An error after storage writes can leave the storage outcome uncertain. |
 | Asset-dependent rule refresh | Confirmed endpoint, group and service changes now recompile authored rules before the admin API reports success. A product-handler regression checked endpoint address and service-port edits, group membership edits and deletion, service and endpoint deletion, and that a refused save leaves the prior compiled rule active. | This checks one local product process and its in-memory effective policies. It is not a new GUI check or independent deployed CP/Edge traffic acceptance. |
 
+Tenant inspection selections are now rebuilt as a complete snapshot. Updating,
+disabling, re-enabling or deleting one tenant's HTTPS inspection exception no
+longer replaces another tenant's exceptions. The runtime and administrative
+readback use the same tenant selection, including after local or configuration-fed
+Edge restarts. Device-scoped exceptions remain tied to their source device;
+unresolved sources and services that do not include TCP/443 do not become
+whole-tenant HTTPS exceptions. Pin-detection state and candidate attribution also
+follow the connection's tenant.
+
+Destination-only previews display a device-dependent result when necessary,
+rather than claiming every device is inspected. Identity-only sources that the
+TLS selector cannot evaluate are explained in rule listings. These checks cover
+HTTP edits/readback, repeated executable startup, concurrent snapshot replacement
+and isolated TLS handshakes. Browser checks use synthetic data and product rendering;
+they do not establish deployed fleet traffic acceptance. Deployment-wide posture
+controls, observation reporting and complete rule-priority/risk evaluation remain
+separate work; this change does not claim those gates are complete.
+
 ## What still blocks 0.3.1
 
 - Finish outstanding everyday-operation checks and fix reproduced defects with
@@ -352,6 +370,16 @@ protocol cannot be represented by the current Windows export. Disable or correct
 such a record before enabling it; no automatic broadening of its rules is made.
 
 Upgrade note: older API clients could store exception statuses other than `active` or `disabled` (for example `inactive`). Review and correct those records before upgrading; the current export rejects an unknown status instead of silently skipping it. Old Console-created records used the supported default status.
+
+### Inspection source compatibility
+
+TLS inspection cannot resolve user/group/agent identity before decrypting a
+connection. Inspect rules using these selectors, or an unresolved device source,
+therefore apply to every source for that tenant and destination. Device-resolvable
+inspect rules retain their device scope. Bypass rules never widen when a source
+cannot be resolved. Review identity-scoped inspect rules before updating: they
+may inspect additional users to preserve inspection instead of silently disabling
+DLP under bypass-default.
 
 ### Named-service and save compatibility
 

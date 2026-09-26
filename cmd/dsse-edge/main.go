@@ -2433,8 +2433,10 @@ func main() {
 		// rejections the engine proposes the host for admin review. Detection is on by default and safe:
 		// it never auto-bypasses (auto raw_forward stays opt-in above); only admin approve+materialize
 		// applies a decrypt-bypass.
-		certPinTenant := pb.TenantID
-		networkExtensionLabTLS.SetCertPinCandidateEmitter(func(host string) {
+		networkExtensionLabTLS.SetTenantCertPinCandidateEmitter(func(certPinTenant, host string) {
+			if strings.TrimSpace(certPinTenant) == "" {
+				return
+			}
 			now := time.Now().UTC()
 			// Central point for every interception handshake rejection — count it for /metrics before the
 			// DNS-correlation branch below decides how to record the candidate.
@@ -2449,21 +2451,10 @@ func main() {
 			_, _ = policyCandidateStore.ObserveCertPinFailure(context.Background(), certPinTenant, host, "", 443, "interception_handshake_rejected", now)
 		})
 	}
-	// applyMaterializedCertPinBypass rebuilds the interception decrypt-bypass set from its sources: the static
-	// bypass list + authored egress rules whose inspection axis is bypass. A materialized cert-pinning candidate
-	// is NO LONGER a separate bypass source — on materialize it is emitted as an authored bypass rule (historical
-	// candidates do not recreate rules on startup), so the rule is the cert-pin bypass's SINGLE
-	// source. That makes the lifecycle coherent: deleting/disabling the rule actually stops the bypass (it would
-	// not if the candidate-store path still bypassed in parallel). SetBypassHosts is a full replace, recomputed
-	// from scratch on every change. Called on cert-pin materialize, on authored-rule change, and once at startup.
-	applyMaterializedCertPinBypass := func(tenantID string) {
-		if networkExtensionLabTLS == nil {
-			return
-		}
-		hosts := staticBypass()
-		hosts = append(hosts, policyrule.EgressBypassFQDNs(tenantID, ruleStore.List(tenantID, policyrule.PlaneEgress), assetStore)...)
-		networkExtensionLabTLS.SetBypassHosts(hosts)
-	}
+	// Rebuild all tenants together so a change never replaces another tenant's selection.
+	applyInspectionPosture := newTenantInspectionApplier(networkExtensionLabTLS, postureStore, ruleStore, assetStore, catalogOverrides,
+		func() []knownbypass.Group { return catalogFeed.EffectiveCatalog().Entries }, configuredInterceptHosts, operatorStaticBypass)
+	applyMaterializedCertPinBypass := applyInspectionPosture
 	// Candidate status is history, not current authored intent. Recreating a rule
 	// here would undo deletion, disabling, inspection edits or an incomplete save.
 	// This applies to local stores as well as configuration-pulling Edges.
@@ -2477,27 +2468,6 @@ func main() {
 	// no Optimize group is enabled (the default), so the decrypt-all North Star path is unchanged.
 	if n := migratePostureOptimizeBypassToRules(postureStore, ruleStore, pb.TenantID); n > 0 {
 		log.Printf("migrated %d legacy SaaS Optimize bypass group(s) to authored Egress rules", n)
-	}
-	// applyInspectionPosture applies BOTH layers from the live posture: the intercept (decrypt) host set —
-	// decrypt_all restores the configured intercept hosts (typically "*"); bypass_default applies the decrypt
-	// allowlist so only those hosts are decrypted and everything else is raw-forwarded (still steered +
-	// policy-gated) — and the bypass set. Called at startup (restore a persisted posture) and on posture change.
-	applyInspectionPosture := func(tenantID string) {
-		if networkExtensionLabTLS != nil {
-			p := postureStore.Get()
-			if p.Mode == inspectionposture.ModeBypassDefault {
-				// bypass-default: the intercept set is an explicit allowlist (posture hosts/groups) UNIONED with
-				// authored `inspect` egress rules — so an operator says "decrypt these" by writing a rule, the
-				// unified-model counterpart of an authored bypass rule (Phase B-2). Under decrypt-all the intercept
-				// set is "*" already, so authored inspect rules are a no-op there and are not folded in.
-				hosts := inspectionposture.EffectiveInterceptHosts(p)
-				hosts = append(hosts, policyrule.EgressInspectFQDNs(tenantID, ruleStore.List(tenantID, policyrule.PlaneEgress), assetStore)...)
-				networkExtensionLabTLS.SetInterceptHosts(hosts)
-			} else {
-				networkExtensionLabTLS.SetInterceptHosts(configuredInterceptHosts)
-			}
-		}
-		applyMaterializedCertPinBypass(tenantID)
 	}
 	applyInspectionPosture(pb.TenantID)
 	policyStore := policy.NewStore(policies)

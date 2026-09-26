@@ -218,6 +218,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 				return
 			}
 		}
+		if err := theIdPRegistry.Load().RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("identity provider settings cannot be read"))
+			return
+		}
 		if err := connectorRouteGov.RefreshShared(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
 			return
@@ -228,6 +232,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// generation, an Edge can accept an intermediate east-west mode under the
 		// final generation and never poll the final mode. Refuse this snapshot so
 		// the poller retries with a coherent one.
+		idpGenerationBefore := theIdPRegistry.Load().ConfigGeneration()
 		policyGenerationBefore := policyStore.ConfigGeneration()
 		dlpGenerationBefore := config.DLPDistribution.Generation()
 		dnsGenerationBefore := edgeDNSResolver.ConfigGeneration()
@@ -406,6 +411,10 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// these registries; the one that is authoritative is the one authored against.
 		if edgeIsControlPlane {
 			bundle.IdPConnections = idpConnectionBundleSection(theIdPRegistry.Load())
+			if bundle.IdPConnections != nil && !bundle.IdPConnections.Complete || theIdPRegistry.Load().ConfigGeneration() != idpGenerationBefore {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("identity provider settings changed or could not be read; retry"))
+				return
+			}
 			// What the fleet has already approved out of band. See config_bundle_grants.go.
 			bundle.Grants = grantBundleSection(theGrantStore.Load())
 		}

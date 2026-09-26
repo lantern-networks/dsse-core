@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 
 	"github.com/lantern-networks/dsse-core/idpregistry"
 )
@@ -47,29 +48,38 @@ func idpConnectionBundleSection(store *idpregistry.Store) *idpConnectionBundle {
 	if store == nil {
 		return nil
 	}
-	return &idpConnectionBundle{Connections: store.ListAll(), Defaults: store.DefaultsAll(), Complete: true}
+	connections, defaults, err := store.SnapshotAll()
+	if err != nil {
+		return &idpConnectionBundle{Complete: false}
+	}
+	return &idpConnectionBundle{Connections: connections, Defaults: defaults, Complete: true}
 }
 
 // applyIdPConnectionBundleSection makes this Edge's registry match the control plane's. Returns how many
 // connections this Edge now holds, and whether it changed anything.
 func applyIdPConnectionBundleSection(store *idpregistry.Store, section *idpConnectionBundle, logf func(string, ...interface{})) (count int, applied bool) {
-	if store == nil || section == nil {
-		return 0, false
+	count, applied, err := applyIdPConnectionBundleSectionChecked(store, section)
+	if err != nil && logf != nil {
+		logf("config_bundle_idp_connections: settings were not applied")
+	}
+	return count, applied
+}
+
+func applyIdPConnectionBundleSectionChecked(store *idpregistry.Store, section *idpConnectionBundle) (int, bool, error) {
+	if section == nil {
+		return 0, false, nil
+	}
+	if store == nil {
+		return 0, false, fmt.Errorf("identity provider registry is unavailable")
 	}
 	if !section.Complete {
-		if logf != nil {
-			logf("config_bundle_idp_connections: the control plane could not read its whole registry — " +
-				"keeping the %d connection(s) this Edge already holds. An incomplete read is not an absence")
-		}
-		return len(store.ListAll()), false
+		return len(store.ListAll()), false, fmt.Errorf("identity provider snapshot is incomplete")
 	}
-	// ★ COMPARED BY WHAT IT SERIALISES TO. A Connection carries slices, so it is not comparable with ==,
-	// and a hand-written field comparison is a list somebody forgets to extend the day a field is added —
-	// which shows up as an Edge that quietly never applies a change to that field.
 	before := connectionsFingerprint(store)
-	store.ReplaceAll(section.Connections, section.Defaults)
-	after := connectionsFingerprint(store)
-	return len(store.ListAll()), before != after
+	if err := store.ReplaceAllChecked(section.Connections, section.Defaults); err != nil {
+		return len(store.ListAll()), false, err
+	}
+	return len(store.ListAll()), before != connectionsFingerprint(store), nil
 }
 
 // connectionsFingerprint is the registry's whole content as one string, so "did this change anything" is

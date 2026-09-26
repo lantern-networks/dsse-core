@@ -502,3 +502,11 @@ A confirmed non-atomic rule save counts as saved. If file replacement completed
 but its final flush is unconfirmed, the rule store keeps the replacement live
 and returns a storage error requiring reconciliation; it does not roll back only
 the in-memory copy while leaving the new file on disk.
+
+### Identity provider connection saves and distribution
+
+Identity provider creation, editing, default selection and deletion now confirm configured storage before returning success. Rejected saves leave the prior live registry intact. Blank client-secret fields retain the latest saved secret, including when another CP performed the previous edit. Shared PostgreSQL mutations preserve other connections and organizations, and administrative reads and bundle publication refresh that state. Successful changes record the target organization and administrator without connection secrets or endpoints.
+
+Receiving Edges save a complete registry before acknowledging the bundle; failed saves and incomplete snapshots remain retryable. Defaults and deletions survive reload. Pulling Edges use a node-local IdP cache even when another subsystem uses PostgreSQL: configure a per-node `-idp-connection-store` file for restart persistence. An unset path uses memory; explicit PostgreSQL storage for a pulling Edge is rejected to avoid writing received data into CP authority.
+
+Validation covers PostgreSQL peer CRUD/default selection, authenticated permissions and audits, signed publication, blank-secret preservation, failed-save retry, reload and copy isolation. Existing complete JSON snapshots remain supported; incomplete or inconsistent saved registries are rejected at startup. A file replacement with unconfirmed final durability returns an error; reload before retrying because disk may already contain the replacement. This change requires premerge review. Interactive IdP login, deployed fleet and release acceptance remain outstanding; no new GUI acceptance is claimed.

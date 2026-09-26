@@ -692,7 +692,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		return 0, fmt.Errorf("application catalog requires a verified config bundle")
 	}
 	if err := applyApplicationBundle(t.applications, payload.Applications); err != nil {
-		return 0, fmt.Errorf("application catalog: %w", err)
+		criticalErr = errors.Join(criticalErr, fmt.Errorf("application catalog: %w", err))
 	}
 	if payload.TenantConfig != nil {
 		if err := policy.ValidateTenantRestrictions(payload.TenantConfig.SaaSTenantRestrictions); err != nil {
@@ -708,7 +708,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	}
 	if payload.DLP != nil {
 		if err := t.dlp.Apply(payload.DLP); err != nil {
-			return 0, fmt.Errorf("DLP configuration: %w", err)
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("DLP configuration: %w", err))
 		}
 	}
 	now := time.Now().UTC()
@@ -1021,7 +1021,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// Which identity provider may sign a user in, for each organization. Applied beside the authorities
 	// above because it is the same kind of fact: who this deployment believes, on behalf of whom.
 	if payload.IdPConnections != nil {
-		if count, applied := applyIdPConnectionBundleSection(theIdPRegistry.Load(), payload.IdPConnections, log.Printf); applied {
+		if count, applied, err := applyIdPConnectionBundleSectionChecked(theIdPRegistry.Load(), payload.IdPConnections); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("identity provider configuration: %w", err))
+		} else if applied {
 			log.Printf("config_bundle_idp_connections applied=%d", count)
 		}
 	}

@@ -616,3 +616,8 @@ Existing CA files and signed snapshots may contain openssl preambles or public c
 Audit log writes now record primary-write failures separately from downstream hook failures, including short writes. Health describes only the current writer process and does not promise durable recovery or downstream delivery. ClickHouse searches reject invalid row counts instead of returning a misleading empty result. PostgreSQL can count events without a region while retaining organization, stream, text and time filters. Streamed export storage can preserve a caller-supplied coverage comment in the gzip header. Administrative audit/export integration follows separately.
 
 Package regression, race detection and the full Go suite cover these storage changes; this is not GUI or deployed-fleet acceptance.
+
+### Licensing and control-plane write authority
+License application and feature entitlement edits now acknowledge confirmed storage, preserve the shared serial floor, and refuse writes from an expired leadership term. Startup restores license authority before starting leadership election; promotion refreshes the license before advertising leadership. DLP configuration writes stop when entitlement authority cannot be read.
+
+Targeted startup, license, entitlement, cancellation and write-fencing regression tests cover these changes. GUI and multi-region deployment acceptance remain separate release checks.

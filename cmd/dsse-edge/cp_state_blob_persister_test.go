@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -55,7 +56,7 @@ func TestPostgresBlobPersisterRoundTrip(t *testing.T) {
 	if dsn == "" {
 		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
 	}
-	db, err := newCPStateBlobDB(dsn, "migrations", true)
+	db, err := newCPStateBlobDB(dsn, filepath.Join("..", "..", "migrations"), true)
 	if err != nil {
 		t.Fatalf("open cp-state blob db: %v", err)
 	}

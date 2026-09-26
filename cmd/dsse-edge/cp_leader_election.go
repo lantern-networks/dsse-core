@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -44,10 +45,15 @@ type cpLeaderElector struct {
 	// missing is that "this is the fleet" and "this is who has managed to reach me since I took over" are
 	// different sentences, and only one of them was being said. See fleetViewHasFormed.
 	leaderSince atomic.Int64
-	mu          sync.Mutex
+	mu          cpWriterMutex
 	conn        *sql.Conn // the dedicated connection holding the advisory lock while leader; nil when standby
 	stop        chan struct{}
 	stopped     chan struct{}
+	// Installed before Start. It refreshes shared revocation state while the
+	// advisory lock is held but /leader and administrative writes remain closed.
+	prepareLeadership func() error
+	// Serialize standby refreshes with the entire promotion, including publication.
+	stateRefreshMu sync.Mutex
 }
 
 // newCPLeaderElector opens a small dedicated pool for the leader lock. Returns nil when dsn is empty (single-node
@@ -101,6 +107,8 @@ func (e *cpLeaderElector) loop() {
 }
 
 func (e *cpLeaderElector) tick() {
+	e.stateRefreshMu.Lock()
+	defer e.stateRefreshMu.Unlock()
 	if e.isLeader.Load() {
 		// Verify the lock-holding connection is still alive; a dead connection = lost session = lost lock.
 		e.mu.Lock()
@@ -138,6 +146,23 @@ func (e *cpLeaderElector) tick() {
 	e.mu.Lock()
 	e.conn = conn // hold this connection (and thus the lock) for as long as we are leader
 	e.mu.Unlock()
+	if e.prepareLeadership != nil {
+		if err := e.prepareLeadership(); err != nil {
+			log.Printf("cp_leader: shared state could not be prepared; leadership remains unavailable")
+			e.release()
+			return
+		}
+		// A slow read may outlive the connection that held the lock. Do not
+		// publish leadership on a connection already known to be unavailable.
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), cpLeaderPingInterval)
+		err := conn.PingContext(checkCtx)
+		checkCancel()
+		if err != nil {
+			log.Printf("cp_leader: lock connection unavailable after revocation refresh")
+			e.release()
+			return
+		}
+	}
 	e.leaderSince.Store(time.Now().UnixNano())
 	e.isLeader.Store(true)
 	log.Printf("cp_leader: acquired leadership (advisory lock %d)", cpLeaderAdvisoryLockKey)
@@ -147,14 +172,20 @@ func (e *cpLeaderElector) tick() {
 func (e *cpLeaderElector) release() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.isLeader.Store(false)
 	if e.conn != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		_, _ = e.conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", cpLeaderAdvisoryLockKey)
+		_, err := e.conn.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", cpLeaderAdvisoryLockKey)
 		cancel()
+		if err != nil {
+			// sql.Conn.Close returns a healthy session to its pool. After a failed
+			// unlock that session may still hold the lock; discard it so the peer
+			// can take over instead of leaving an unadvertised authority in the pool.
+			_ = e.conn.Raw(func(any) error { return driver.ErrBadConn })
+		}
 		_ = e.conn.Close()
 		e.conn = nil
 	}
-	e.isLeader.Store(false)
 }
 
 // Stop ends the election loop and releases the lock. Safe on a nil elector.

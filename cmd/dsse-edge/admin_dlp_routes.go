@@ -8,6 +8,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"slices"
 	"sort"
@@ -24,6 +25,10 @@ import (
 
 func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, adminHotStore hotstore.Store, dlpRuleStore *dlpRuleRuntimeStore, dlpAllowlistStore *dlpAllowlistRuntimeStore, dlpPolicyObjects *dlpPolicyObjectStore, dlpFingerprintStore *dlpFingerprintRuntimeStore, dlpClassifierStore *dlpClassifierRuntimeStore, entitlementStore *entitlementStore, inspectionEvents *inspection.Store, configSourceURL string) {
 	mux.HandleFunc("GET /admin/entitlements", adminEndpoint("admin.config.read", func(w http.ResponseWriter, r *http.Request) {
+		if err := entitlementStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("entitlements are unavailable"))
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"features": entitlementStore.FeaturesForTenant(adminTenantIDFromRequest(r))})
 	}))
 	// ★ A TENANT COULD GRANT ITSELF PAID FEATURES (2026-08-15). Entitlements are the licensing boundary, and
@@ -52,14 +57,24 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 				return
 			}
 		}
-		for f, granted := range body.Features {
-			entitlementStore.SetFeature(tenant, f, granted)
+		if err := entitlementStore.SetFeaturesContext(r.Context(), tenant, body.Features); err != nil {
+			log.Printf("entitlements update not saved: %v", err)
+			if errors.Is(err, errEntitlementAuthorityMissing) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("the shared entitlement record is missing; retrying will not help. Restore it, or restart this control plane so it starts from the stored record"))
+				return
+			}
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("entitlement persistence could not be confirmed"))
+			return
 		}
 		logInfof("entitlements_applied_by_admin tenant=%s features=%v", tenant, body.Features)
 		writeJSON(w, http.StatusOK, map[string]any{"features": entitlementStore.FeaturesForTenant(tenant)})
 	}))
 	// dlpFeatureGate rejects a DLP config write when the tenant is not licensed for DLP (the paid-feature gate).
 	dlpFeatureGate := func(w http.ResponseWriter, r *http.Request) bool {
+		if err := entitlementStore.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("entitlements are unavailable"))
+			return true
+		}
 		if !entitlementStore.Entitled(adminTenantIDFromRequest(r), featureDLP) {
 			writeError(w, http.StatusForbidden, fmt.Errorf("DLP is not licensed for this tenant"))
 			return true
@@ -176,16 +191,24 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 		servedFromHotStore := false
 		if adminHotStore != nil {
 			from := time.Now().Add(-dlpFindingsHotStoreWindow)
-			if res, err := adminHotStore.Search(r.Context(), hotstore.SearchQuery{TenantID: tenant, Stream: dlpFindingsHotStoreStream, From: &from, Limit: dlpFindingsHotStoreScan}); err == nil {
-				servedFromHotStore = true
-				for _, row := range res.Rows {
-					if ev, ok := inspectionEventFromRow(row); ok {
-						events = append(events, ev)
-					}
+			res, err := adminHotStore.Search(r.Context(), hotstore.SearchQuery{TenantID: tenant, Stream: dlpFindingsHotStoreStream, From: &from, Limit: dlpFindingsHotStoreScan})
+			if err != nil {
+				// A local cache cannot stand in for an unavailable fleet-wide result.
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP findings are temporarily unavailable; retry the request"))
+				return
+			}
+			servedFromHotStore = true
+			for _, row := range res.Rows {
+				if ev, ok := inspectionEventFromRow(row); ok {
+					events = append(events, ev)
 				}
 			}
 		}
 		if !servedFromHotStore && inspectionEvents != nil {
+			if err := inspectionEvents.RefreshShared(); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DLP findings are temporarily unavailable; retry the request"))
+				return
+			}
 			events = inspectionEvents.ListByTenant(tenant)
 		}
 		findings := make([]map[string]any, 0, len(events))
@@ -310,8 +333,8 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	}))
 	// DLP custom classifiers (slice C): read/hot-apply the operator-defined identifiers (regex + keyword
 	// dictionaries) the DLP scan detects alongside the built-ins. Non-secret: a classifier emits only its name +
-	// a count, never the matched bytes. POST replaces the whole tenant set (empty = clear); per-classifier
-	// compile errors are reported so the admin sees which were rejected while the rest still apply.
+	// a count, never the matched bytes. POST replaces the whole tenant set ([] = clear);
+	// validation and configured storage must succeed before the live set changes.
 	mux.HandleFunc("GET /admin/dlp-classifiers", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
 		if !refreshDLPStores(w, dlpClassifierStore) {
 			return
@@ -366,13 +389,12 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// DLP allowlist (slice F, false-positive tuning): the operator-declared KNOWN-SAFE values whose DLP matches are
 	// suppressed (a test card, a sample My Number used in docs, a benign email). POST replaces the whole tenant
 	// list (empty = clear). These are values the operator asserts are non-sensitive; the Console warns not to enter
-	// real secrets. The data plane keeps only salted hashes; the values are stored so the operator can manage them.
+	// real secrets. The scanner keeps hashes; authored values are stored and distributed for management.
 	mux.HandleFunc("GET /admin/dlp-allowlist", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
-		if err := dlpAllowlistStore.RefreshShared(); err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("allowlist cannot be read"))
+		if !refreshDLPStores(w, dlpAllowlistStore) {
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"values": dlpAllowlistStore.ValuesForTenant(adminTenantIDFromRequest(r))})
+		writeJSON(w, http.StatusOK, map[string]any{"tenant_id": adminTenantIDFromRequest(r), "values": dlpAllowlistStore.ValuesForTenant(adminTenantIDFromRequest(r))})
 	}))
 	mux.HandleFunc("POST /admin/dlp-allowlist", adminEndpoint("admin.dlp.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "DLP allowlist") {

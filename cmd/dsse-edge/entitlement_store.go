@@ -1,12 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"sync"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
+
+// errEntitlementAuthorityMissing: this process holds grants but the shared row is
+// gone. A retry cannot fix it (this node must not rebuild authority from memory);
+// the row must be restored, or the process restarted so it starts from the row.
+var errEntitlementAuthorityMissing = errors.New("entitlement authority is missing")
 
 // Per-tenant feature entitlements — the license/contract gate for optional PAID features (starting with DLP). A
 // feature is entitled when explicitly granted for the tenant, or — when the tenant has no explicit entry — by the
@@ -71,6 +79,90 @@ func (s *entitlementStore) SetFeature(tenantID, feature string, granted bool) {
 	s.mu.Unlock()
 }
 
+// SetFeaturesContext acknowledges only confirmed persistence. Shared storage edits
+// the latest row, preserving grants made by another control plane.
+func (s *entitlementStore) SetFeaturesContext(ctx context.Context, tenant string, patch map[string]bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var next entitlementSnapshot
+	edit := func(raw []byte) ([]byte, error) {
+		next = entitlementSnapshot{Features: map[string]map[string]bool{}}
+		if raw == nil && len(s.features) > 0 {
+			return nil, errEntitlementAuthorityMissing
+		}
+		if raw != nil {
+			next = entitlementSnapshot{}
+			if err := json.Unmarshal(raw, &next); err != nil {
+				return nil, err
+			}
+			if next.Features == nil {
+				return nil, fmt.Errorf("invalid entitlement snapshot")
+			}
+		}
+		if next.Features[tenant] == nil {
+			next.Features[tenant] = map[string]bool{}
+		}
+		for f, granted := range patch {
+			next.Features[tenant][f] = granted
+		}
+		return json.Marshal(next)
+	}
+	if p, ok := s.persister.(interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}); ok {
+		if err := p.UpdateContext(ctx, edit); err != nil {
+			return err
+		}
+	} else {
+		raw, err := json.Marshal(entitlementSnapshot{Features: s.features})
+		if err != nil {
+			return err
+		}
+		raw, err = edit(raw)
+		if err != nil {
+			return err
+		}
+		if s.persister != nil {
+			if err := s.persister.Save(raw); err != nil &&
+				(!errors.Is(err, blobstore.ErrSavedWithoutAtomicity) || errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
+				return err
+			}
+		}
+	}
+	s.features, s.dirty = next.Features, false
+	return nil
+}
+
+// RefreshShared reads authority before administrative reads and feature gates.
+func (s *entitlementStore) RefreshShared() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.persister.(interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}); !ok {
+		return nil
+	}
+	raw, err := s.persister.Load()
+	if err != nil {
+		return err
+	}
+	if raw == nil && len(s.features) > 0 {
+		return errEntitlementAuthorityMissing
+	}
+	next := entitlementSnapshot{Features: map[string]map[string]bool{}}
+	if raw != nil {
+		next = entitlementSnapshot{}
+		if err := json.Unmarshal(raw, &next); err != nil {
+			return err
+		}
+		if next.Features == nil {
+			return fmt.Errorf("invalid entitlement snapshot")
+		}
+	}
+	s.features = next.Features
+	return nil
+}
+
 // Tenants returns the tenant ids with explicit entitlements, ordered.
 func (s *entitlementStore) Tenants() []string {
 	s.mu.RLock()
@@ -90,24 +182,30 @@ type entitlementSnapshot struct {
 // SetPersister attaches durable storage and rehydrates explicit entitlements on boot.
 func (s *entitlementStore) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
-	s.persister = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if s.dirty {
+		return fmt.Errorf("save pending entitlements before replacing storage")
+	}
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
-	if err != nil || len(data) == 0 {
+	if err != nil {
 		return err
+	}
+	if data == nil {
+		s.persister = p
+		return nil
 	}
 	var snap entitlementSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if snap.Features != nil {
-		s.features = snap.Features
+	if snap.Features == nil {
+		return fmt.Errorf("invalid entitlement snapshot")
 	}
+	s.features, s.persister = snap.Features, p
 	return nil
 }
 

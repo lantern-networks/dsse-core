@@ -371,7 +371,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if rerr != nil {
 			log.Printf("review connector-discovered candidate %s after publish: %v", candidateID, rerr)
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminApplicationPublishAuditLog(created, evaluator, now, true), now)
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now), now)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "connector_candidate_publish.v1",

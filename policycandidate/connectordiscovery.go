@@ -104,7 +104,7 @@ func (store *Store) ObserveConnectorDiscovered(ctx context.Context, tenantID, de
 	// Classify attribution from the destination each observation so it stays correct: a named FQDN -> medium,
 	// a CIDR/raw-IP -> investigate_only.
 	cand.Confidence, cand.SuggestedAction = connectorDiscoveryAttribution(cand.Host)
-	normalized, err := normalize(cand, tenantID, now)
+	normalized, err := normalizeObservation(cand, tenantID, now)
 	if err != nil {
 		return Candidate{}, err
 	}

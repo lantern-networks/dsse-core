@@ -1,6 +1,7 @@
 package policycandidate
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -62,8 +63,8 @@ func (store *Store) cloneLocked() map[string]map[string]Candidate {
 	return next
 }
 
-// Caller holds mu across save and publication. An uncertain save leaves live state
-// unchanged and prevents changing the writer until a subsequent save is confirmed.
+// Caller holds mu across save and publication. A known file replacement remains
+// visible, but an unconfirmed save prevents replacing the writer until confirmed.
 func (store *Store) commitLocked(next map[string]map[string]Candidate) error {
 	return store.commitWithReceiptsLocked(next, store.receipts)
 }
@@ -75,6 +76,9 @@ func (store *Store) commitWithReceiptsLocked(next map[string]map[string]Candidat
 			err = blobstore.UnconfirmedSave(store.persister.Save(data))
 		}
 		if err != nil {
+			if errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
+				store.candidates, store.receipts = next, receipts
+			}
 			store.dirty = true
 			return fmt.Errorf("%w: %w", ErrPersistence, err)
 		}

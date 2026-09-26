@@ -252,6 +252,23 @@ func (store *Store) putLocked(candidate Candidate) error {
 }
 
 func normalize(candidate Candidate, tenantID string, now time.Time) (Candidate, error) {
+	return normalizeWithEvidenceValidation(candidate, tenantID, now, true)
+}
+
+// Observations author new counters/timestamps but do not edit an administrator's
+// historical review metadata. Validate the new observation and preserve that review.
+func normalizeObservation(candidate Candidate, tenantID string, now time.Time) (Candidate, error) {
+	reason, reviewed := candidate.ReviewReasonCode, candidate.ReviewedAt
+	candidate.ReviewReasonCode, candidate.ReviewedAt, candidate.UpdatedAt = "", nil, nil
+	next, err := normalize(candidate, tenantID, now)
+	if err != nil {
+		return Candidate{}, err
+	}
+	next.ReviewReasonCode, next.ReviewedAt = reason, reviewed
+	return next, nil
+}
+
+func normalizeWithEvidenceValidation(candidate Candidate, tenantID string, now time.Time, validateEvidence bool) (Candidate, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return Candidate{}, fmt.Errorf("tenant_id is required")
@@ -368,8 +385,10 @@ func normalize(candidate Candidate, tenantID string, now time.Time) (Candidate, 
 	if !validStatus(candidate.Status) {
 		return Candidate{}, fmt.Errorf("candidate status %s is invalid", candidate.Status)
 	}
-	if err := validateCandidateEvidence(candidate); err != nil {
-		return Candidate{}, err
+	if validateEvidence {
+		if err := validateCandidateEvidence(candidate); err != nil {
+			return Candidate{}, err
+		}
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()

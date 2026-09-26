@@ -67,7 +67,7 @@ func (store *Store) ObserveUnmatchedFlow(ctx context.Context, tenantID, host, sn
 
 	existing, found := store.candidates[tenantID][id]
 	cand := unmatchedFlowCandidate(existing, found, id, tenantID, applicationID, host, sni, port, reason, observed, 1)
-	normalized, err := normalize(cand, tenantID, now)
+	normalized, err := normalizeObservation(cand, tenantID, now)
 	if err != nil {
 		return Candidate{}, err
 	}

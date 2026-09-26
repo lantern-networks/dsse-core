@@ -84,7 +84,7 @@ func (store *Store) observeCertPin(ctx context.Context, tenantID, host, sni, obs
 
 	existing, found := store.candidates[tenantID][id]
 	cand := certPinCandidate(existing, found, id, tenantID, host, sni, observedIP, attributionSource, port, reason, observed, 1)
-	normalized, err := normalize(cand, tenantID, now)
+	normalized, err := normalizeObservation(cand, tenantID, now)
 	if err != nil {
 		return Candidate{}, err
 	}
@@ -184,7 +184,7 @@ func (store *Store) AddManualCertPinBypass(ctx context.Context, tenantID, host s
 		cand.Status = "approved"
 	}
 	cand.Confidence, cand.SuggestedAction = certPinAttribution(cand.Host, cand.SNI, cand.AttributionSource)
-	normalized, err := normalize(cand, tenantID, now)
+	normalized, err := normalizeObservation(cand, tenantID, now)
 	if err != nil {
 		return Candidate{}, err
 	}

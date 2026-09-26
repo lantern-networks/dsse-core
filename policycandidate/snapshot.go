@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"reflect"
 	"strings"
 	"time"
@@ -58,8 +59,13 @@ func decodeCandidateSnapshot(data []byte) (map[string]map[string]Candidate, erro
 			}
 			// Reuse admission checks without adopting normalization or regenerating a
 			// timestamp. Historical decisions and evidence must remain byte-equivalent.
-			if _, err := normalize(c, tenant, time.Unix(0, 0)); err != nil {
+			if _, err := normalizeWithEvidenceValidation(c, tenant, time.Unix(0, 0), false); err != nil {
 				return nil, errInvalidSnapshot
+			}
+			// Previous API writers accepted free-form review reasons and timestamps.
+			// Keep that history; only new writes must meet the evidence contract.
+			if err := validateCandidateEvidence(c); err != nil {
+				log.Printf("policy candidate: retained legacy evidence for tenant %q candidate %q", tenant, id)
 			}
 			snapshot[tenant][id] = c
 		}

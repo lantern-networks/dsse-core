@@ -131,10 +131,10 @@ type tenantModelStoreThatSwallowsTheOrder struct {
 	tenantModelStoreThatCannotCarry
 }
 
-func (s *tenantModelStoreThatSwallowsTheOrder) ConfigGeneration() uint64         { return 1 }
-func (s *tenantModelStoreThatSwallowsTheOrder) DeletedTenants() []tenantDeletion { return nil }
-func (s *tenantModelStoreThatSwallowsTheOrder) OrderPurge(string, time.Time)     {}
-func (s *tenantModelStoreThatSwallowsTheOrder) PurgeOrders() []tenantPurgeOrder  { return nil }
+func (s *tenantModelStoreThatSwallowsTheOrder) ConfigGeneration() uint64           { return 1 }
+func (s *tenantModelStoreThatSwallowsTheOrder) DeletedTenants() []tenantDeletion   { return nil }
+func (s *tenantModelStoreThatSwallowsTheOrder) OrderPurge(string, time.Time) error { return nil }
+func (s *tenantModelStoreThatSwallowsTheOrder) PurgeOrders() []tenantPurgeOrder    { return nil }
 
 // ★ AND THE SAME REFUSAL WHEN THE STORE ACCEPTS THE ORDER AND KEEPS NOTHING (2026-08-18).
 //

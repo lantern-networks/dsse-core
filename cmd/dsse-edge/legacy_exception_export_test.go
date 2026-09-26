@@ -17,7 +17,10 @@ func TestBuildServerInitiatedExport(t *testing.T) {
 		{ID: "c", BusinessOwner: "o", ExpiresAt: fut, SourceServer: "rmm", Mode: "warn", Status: "disabled"}, // disabled -> skip
 		{ID: "d", BusinessOwner: "o", ExpiresAt: fut, SourceServer: "mon", ServiceFamily: "ssh", Mode: "deny", Status: "active"},
 	}
-	exp := buildServerInitiatedExport(exs, now)
+	exp, err := buildServerInitiatedExport(exs, now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if exp.DefaultAction != "deny" {
 		t.Fatalf("default action should be deny")
 	}
@@ -34,7 +37,10 @@ func TestBuildServerInitiatedExport(t *testing.T) {
 
 func TestExplicitTCPExportKeepsPortRestriction(t *testing.T) {
 	now := time.Now()
-	exp := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp-selected", Protocol: "tcp", Port: 2222, Mode: "allow", Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}}, now)
+	exp, err := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp-selected", Protocol: "tcp", Port: 2222, Mode: "allow", Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(exp.Rules) != 1 || exp.Rules[0].ServiceFamily != "tcp" || exp.Rules[0].Port != 2222 {
 		t.Fatalf("TCP port restriction lost: %+v", exp)
 	}

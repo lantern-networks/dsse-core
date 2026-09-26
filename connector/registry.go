@@ -271,9 +271,11 @@ func (r *Registry) rotateRuntimeSecretHashWithMetadata(tenantID, id, hash string
 	if tenantID != "" && conn.TenantID != tenantID {
 		return model.ConnectorRegistration{}, false, nil
 	}
-	if conn.Metadata == nil {
-		conn.Metadata = map[string]any{}
+	metadata := make(map[string]any, len(conn.Metadata)+3)
+	for key, value := range conn.Metadata {
+		metadata[key] = value
 	}
+	conn.Metadata = metadata
 	conn.Metadata[runtimeSecretHashMetadataKey] = strings.TrimSpace(hash)
 	if !rotatedAt.IsZero() {
 		conn.Metadata[runtimeSecretRotatedAtKey] = rotatedAt.UTC().Format(time.RFC3339)
@@ -281,8 +283,15 @@ func (r *Registry) rotateRuntimeSecretHashWithMetadata(tenantID, id, hash string
 	if strings.TrimSpace(rotatedBy) != "" {
 		conn.Metadata[runtimeSecretRotatedByKey] = strings.TrimSpace(rotatedBy)
 	}
-	r.connectors[id] = conn
-	r.persistLocked()
+	candidate := make(map[string]model.ConnectorRegistration, len(r.connectors))
+	for key, value := range r.connectors {
+		candidate[key] = value
+	}
+	candidate[id] = conn
+	if err := r.saveManagementCandidateLocked(candidate); err != nil {
+		return model.ConnectorRegistration{}, true, err
+	}
+	r.connectors = candidate
 	return conn, true, nil
 }
 

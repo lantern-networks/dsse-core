@@ -521,3 +521,18 @@ This change supplies storage primitives. CP startup wiring and administrative
 refresh/context integration are tracked separately; it does not claim complete
 fleet acceptance. An unconfirmed final flush is still reported as a failure;
 operators must retry or reconcile storage before treating the edit as durable.
+
+### Identity and enrollment storage reconciliation
+
+Manual identity creation can reject an existing identity instead of overwriting
+it. Identity registration and connector credential rotation return save failures
+without publishing the rejected change. Non-human identities with the same ID
+in different organizations are stored separately. Existing bare-ID snapshots
+are read using each record's organization; new snapshots use organization/ID
+keys. Back up this state before upgrading; do not let older writers rewrite the
+new snapshot or assume a transparent binary rollback.
+
+Enrollment inventory and token changes gain checked persistence and shared
+transaction helpers. Seat allocation removal reports storage failure during
+organization erasure. These storage changes precede the remaining administrative
+route and CP startup integration; they do not claim complete GUI acceptance.

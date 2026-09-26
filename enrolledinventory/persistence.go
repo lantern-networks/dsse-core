@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"sort"
+	"reflect"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
@@ -104,44 +104,24 @@ func (l *Ledger) loadLocked() error {
 	}
 	data, err := l.persister.Load()
 	if err != nil {
-		log.Printf("enrolled_inventory load: cannot read store (starting from static seed): %v", err)
-		return fmt.Errorf("read the enrolled inventory store: %w", err)
+		return ErrInventoryLoad
 	}
 	if len(data) == 0 {
-		return nil
-	}
-	var f stateFile
-	if err := json.Unmarshal(data, &f); err != nil {
-		log.Printf("enrolled_inventory load: ignoring unparseable store (static seed only): %v", err)
-		return fmt.Errorf("parse the enrolled inventory store: %w", err)
-	}
-	if f.Entries != nil {
-		l.entries = f.Entries // durable runtime state is authoritative over the re-applied static seed
-		// ★ A v1 STORE'S SILENCE IS NOT "NEVER ENROLLED" (2026-08-12, twenty-first review). Every entry from
-		// before the marker existed — a durable store, a static seed, a bundle from an older CP — would
-		// otherwise read as available for a first enrolment, so the whole existing fleet is impersonable once
-		// each. Closed by assuming the opposite: they are treated as enrolled, and the devices that genuinely
-		// need to enrol are re-armed by an administrator, deliberately and one at a time.
-		if strings.TrimSpace(f.SchemaVersion) != enrolledInventoryStateSchemaVersion {
-			migrated := 0
-			for k, e := range l.entries {
-				if strings.TrimSpace(e.DeviceEnrolledAt) == "" {
-					e.DeviceEnrolledAt = migratedDeviceEnrolmentSentinel
-					l.entries[k] = e
-					migrated++
-				}
-			}
-			if migrated > 0 {
-				log.Printf("enrolled_inventory load: %d identity(ies) from a %q store are treated as ALREADY "+
-					"ENROLLED (no marker was recorded before this version). A device that genuinely needs to "+
-					"enrol again must be re-armed by an administrator.", migrated, strings.TrimSpace(f.SchemaVersion))
-			}
+		if l.snapshotKnown || l.persistBlocked != nil {
+			return ErrInventoryLoad
 		}
+		return nil // first boot retains the static seed
 	}
-	if f.Groups != nil {
-		l.groups = f.Groups // restore the device-group registry
+	f, err := decodeInventorySnapshot(data)
+	if err != nil {
+		return err
 	}
-	log.Printf("enrolled_inventory load: restored %d managed identity(ies) + %d device group(s) from the durable store", len(l.entries), len(l.groups))
+	changed := !reflect.DeepEqual(l.entries, f.Entries) || !reflect.DeepEqual(l.groups, f.Groups)
+	l.entries, l.groups = f.Entries, f.Groups
+	l.snapshotKnown = true
+	if changed {
+		l.generation.Add(1)
+	}
 	return nil
 }
 
@@ -179,16 +159,20 @@ func (l *Ledger) persistCheckedLocked() error {
 		return err
 	}
 	if err := l.persister.Save(data); err != nil {
-		// Saved-but-not-atomically is not a failure. Reporting it as one would tell an operator their
+		// A completed synced in-place write is not a failure; an unconfirmed flush
+		// is still rejected even when it carries that compatibility warning. Reporting a completed write
+		// as failed would tell an operator their
 		// change was lost when it was written; saying nothing would hide that an interrupted write could
 		// truncate it. Both are worth exactly one accurate sentence.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("enrolled_inventory persist: saved, but NOT atomically — %v", err)
+			l.snapshotKnown = true
 			return nil
 		}
 		log.Printf("enrolled_inventory persist: save failed: %v", err)
 		return err
 	}
+	l.snapshotKnown = true
 	return nil
 }
 
@@ -212,29 +196,11 @@ func (l *Ledger) ReloadFromStore() (changed bool, err error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	before := len(l.entries)
-	beforeSig := l.storeSignatureLocked()
-	if lerr := l.loadLocked(); lerr != nil {
-		return false, lerr
+	before := l.generation.Load()
+	if err := l.loadLocked(); err != nil {
+		l.persistBlocked = err
+		return false, err
 	}
-	return before != len(l.entries) || beforeSig != l.storeSignatureLocked(), nil
-}
-
-// storeSignatureLocked is a cheap "has anything changed" summary: every identity with whether it is admitted
-// and whether it is a tombstone. Cheap enough to run on a timer, and it moves when a block, an unblock or a
-// removal arrives — which are the changes a standby must not miss.
-func (l *Ledger) storeSignatureLocked() string {
-	ids := make([]string, 0, len(l.entries))
-	for k, e := range l.entries {
-		mark := "+"
-		if !e.Enabled {
-			mark = "-"
-		}
-		if e.isTombstone() {
-			mark = "x"
-		}
-		ids = append(ids, mark+k)
-	}
-	sort.Strings(ids)
-	return strings.Join(ids, ",")
+	l.persistBlocked = nil
+	return before != l.generation.Load(), nil
 }

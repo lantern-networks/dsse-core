@@ -109,9 +109,9 @@ func (s *Store) persistLocked() error {
 		// and the edge routes map a persist error to Register=400 and Heartbeat=404. On a bind-mounted file —
 		// the exact case the fallback was written for and documented with — the data would be written, every
 		// registration answered 400, every heartbeat 404, and the fleet view would empty while the agents read
-		// themselves as unenrolled. The error the previous round started returning has to mean "not saved", or
-		// callers cannot act on it.
-		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) {
+		// themselves as unenrolled. Only a confirmed in-place save is accepted here. An unconfirmed flush
+		// may already have replaced the file; callers must not infer that an error means no bytes were saved.
+		if errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
 			log.Printf("device inventory persist: saved, but NOT atomically — %v", err)
 			return nil
 		}

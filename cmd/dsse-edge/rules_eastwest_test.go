@@ -82,7 +82,7 @@ func TestAdminRulesEastWestCompilesToPolicyStore(t *testing.T) {
 
 	// The compiled rule restricts to the named device: it matches alice's device, not another.
 	matchReq := func(deviceID string) model.DecisionRequest {
-		return model.DecisionRequest{DeviceID: deviceID, Destination: "db.internal", ServiceFamily: "smb"}
+		return model.DecisionRequest{DeviceID: deviceID, Destination: "db.internal", ServiceFamily: "smb", Protocol: "tcp", DestinationPort: 445}
 	}
 	if _, ok := decision.MatchedEastWestRule([]decision.EastWestRule{*authored}, matchReq("dev-alice")); !ok {
 		t.Fatalf("compiled rule should match dev-alice")

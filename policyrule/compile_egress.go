@@ -13,15 +13,15 @@ import (
 type EgressResolver interface {
 	SourceDeviceTokens(tenant string, ids []string) []string
 	EndpointAddresses(tenant string, ids []string) []string
-	// ServicePorts resolves the rule's service to its destination port(s) so the compiled policy is scoped to
-	// them; nil for a no-service rule = no port scope (Any). A NAMED service that resolves to nil is
-	// fail-closed to 443 by the compiler, not here.
+	// ServicePorts is retained for resolver compatibility; ports alone cannot
+	// establish named-service transport scope. Implement ServiceTransportPorts
+	// as well to retain exact protocol/port pairs; otherwise the rule matches nothing.
 	ServicePorts(tenant string, serviceID string) []int
 }
 
 // CompileEgressPolicies compiles authored egress rules (allow / deny / authenticate) into model.Policy
 // entries, each matched by destination FQDN, restricted to the authored source's device identities
-// (device_id ∈ source), AND SCOPED TO THE RULE'S SERVICE PORT (destination_port from ServicePorts; empty
+// (device_id ∈ source), AND SCOPED TO THE RULE'S TRANSPORT PAIRS (protocol + destination_port; empty
 // service ⇒ Any, i.e. port-agnostic) — without the port scope a rule for one service (e.g. SSH tcp/22) matched
 // EVERY port. `authenticate` compiles to require_reauthentication (the step-up decision the evaluator + egress
 // gate act on; the OOB-browser trigger for a steered flow is a separate wiring — see the steer-mux path). A
@@ -60,25 +60,9 @@ func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver)
 		default:
 			continue
 		}
-		// Scope by the rule's service port so a rule authored for one service (e.g. SSH tcp/22) does NOT match
-		// every port. ONLY when the rule names a service: a no-service rule stays port-agnostic (a broad
-		// deny/allow across ports must keep working). Single port ⇒ scalar; multiple ⇒ an OR-list the evaluator
-		// matches against req.DestinationPort.
-		var destPortCond any // nil ⇒ no destination_port condition (any port)
-		if ports := resolver.ServicePorts(tenant, r.ServiceID); len(ports) == 1 {
-			destPortCond = ports[0]
-		} else if len(ports) > 1 {
-			vals := make([]any, len(ports))
-			for i, p := range ports {
-				vals[i] = p
-			}
-			destPortCond = vals
-		} else if strings.TrimSpace(r.ServiceID) != "" {
-			// A NAMED service that resolves to ZERO ports must NOT widen to any-port (fail-open review #10) — apply
-			// the DOCUMENTED egress default (HTTPS/443) and surface the unresolved service, instead of silently
-			// matching every port. A no-service rule (ServiceID == "") stays intentionally port-agnostic (any port).
-			log.Printf("policyrule: egress rule %q names service %q which resolved to ZERO ports — scoping to the documented 443 default instead of any-port (check the service catalog)", r.ID, r.ServiceID)
-			destPortCond = 443
+		transports, resolved := egressServiceConditions(tenant, r.ServiceID, resolver)
+		if !resolved {
+			log.Printf("policyrule: egress rule %q service is unresolved or invalid — the rule matches nothing (including deny/authenticate); repair the service catalog", r.ID)
 		}
 		// Source: explicit Any => no source condition. Otherwise split the authored selectors into IDENTITY
 		// groups (idgroup:<name> ⇒ a user_groups condition matched against the authenticated session's groups —
@@ -134,7 +118,7 @@ func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver)
 			}
 		}
 		// appendPolicy emits one compiled policy per (source restriction × the given host condition), folding in
-		// the destination-port scope. Host conditions are copied per source variant so the source OR does not
+		// the exact protocol/port combinations. Conditions are copied per variant so the OR does not
 		// alias one map across policies.
 		var riskVals []any // gate on the subject's CURRENT risk (device or user marked ≥ RiskAtLeast); nil ⇒ no gate
 		for _, s := range RiskSeveritiesAtLeast(r.RiskAtLeast) {
@@ -142,35 +126,40 @@ func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver)
 		}
 		appendPolicy := func(idSuffix string, hostConditions map[string]any) {
 			for si, sc := range sourceConds {
-				conditions := map[string]any{}
-				for k, v := range hostConditions {
-					conditions[k] = v
+				for _, transport := range transports {
+					conditions := map[string]any{}
+					for k, v := range hostConditions {
+						conditions[k] = v
+					}
+					for k, v := range sc {
+						conditions[k] = v
+					}
+					for k, v := range transport {
+						conditions[k] = v
+					}
+					if len(riskVals) > 0 { // risk_state_severity ∈ {threshold..critical} ⇒ rule bites only when high-risk
+						conditions["risk_state_severity"] = riskVals
+					}
+					suffix := idSuffix
+					if len(sourceConds) > 1 {
+						suffix = idSuffix + "-s" + strconv.Itoa(si)
+					}
+					if len(transports) > 1 {
+						suffix += "-" + transport["protocol"].(string)
+					}
+					out = append(out, model.Policy{
+						ID:             "rule-egress-" + r.ID + suffix,
+						TenantID:       tenant,
+						Name:           "Authored egress rule " + r.ID,
+						Priority:       r.Priority,
+						Status:         "active",
+						Conditions:     conditions,
+						Action:         model.PolicyAction{Decision: dec},
+						DLP:            r.Action.DLP,     // Access × Inspection × DLP — carry the rule's DLP onto the policy
+						AllowedToolIDs: r.AllowedToolIDs, // agent rule (Who = nhi:) ⇒ the agentic tool boundary
+						Metadata:       stepUpMeta,
+					})
 				}
-				for k, v := range sc {
-					conditions[k] = v
-				}
-				if destPortCond != nil { // scope to the rule's service port (not every port); nil ⇒ port-agnostic
-					conditions["destination_port"] = destPortCond
-				}
-				if len(riskVals) > 0 { // risk_state_severity ∈ {threshold..critical} ⇒ rule bites only when high-risk
-					conditions["risk_state_severity"] = riskVals
-				}
-				suffix := idSuffix
-				if len(sourceConds) > 1 {
-					suffix = idSuffix + "-s" + strconv.Itoa(si)
-				}
-				out = append(out, model.Policy{
-					ID:             "rule-egress-" + r.ID + suffix,
-					TenantID:       tenant,
-					Name:           "Authored egress rule " + r.ID,
-					Priority:       r.Priority,
-					Status:         "active",
-					Conditions:     conditions,
-					Action:         model.PolicyAction{Decision: dec},
-					DLP:            r.Action.DLP,     // Access × Inspection × DLP — carry the rule's DLP onto the policy
-					AllowedToolIDs: r.AllowedToolIDs, // agent rule (Who = nhi:) ⇒ the agentic tool boundary
-					Metadata:       stepUpMeta,
-				})
 			}
 		}
 		// Destination: explicit Any => one policy with no host condition (any destination). Otherwise, for each

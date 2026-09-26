@@ -48,8 +48,11 @@ type EastWestRule struct {
 	// east-west micro-segmentation can say WHICH devices may reach a destination — not just which users.
 	SourceDevices []string
 	Destinations  []string // matches req.Destination / req.ApplicationID / req.FQDN
-	Protocols     []string // matches req.ServiceFamily (east-west protocols)
-	Mode          string   // allow | authenticate | deny
+	Protocols     []string // legacy family selector; used only when ServiceTransportPorts is nil
+	// ServiceTransportPorts is an authored service's exact transport/port set.
+	// Nil preserves legacy family-only rules and explicit Any; empty matches nothing.
+	ServiceTransportPorts map[string][]int
+	Mode                  string // allow | authenticate | deny
 	// Warn (learning-lifecycle Warn stage) softens this rule to a NON-HOLDING dry-run: an authenticate/deny rule
 	// allows the flow through but flags a "monitored; authentication will soon be required" notice, so the
 	// operator can watch what the rule WOULD affect before it bites. No effect on an allow rule. See
@@ -136,8 +139,20 @@ func (r EastWestRule) matches(req model.DecisionRequest) bool {
 	if !eastWestSelectorMatches(r.Destinations, req.Destination, req.ApplicationID, req.FQDN) {
 		return false
 	}
-	if !eastWestSelectorMatches(r.Protocols, req.ServiceFamily) {
+	if r.ServiceTransportPorts == nil && !eastWestSelectorMatches(r.Protocols, req.ServiceFamily) {
 		return false
+	}
+	if r.ServiceTransportPorts != nil {
+		matched := false
+		for _, port := range r.ServiceTransportPorts[strings.ToLower(strings.TrimSpace(req.Protocol))] {
+			if port == req.DestinationPort && port > 0 {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
+		}
 	}
 	// Risk gate: an empty set is wildcard (no gate), so an ungated rule behaves exactly as before. A gated rule
 	// bites ONLY at or above its authored threshold — a rule that does not match here falls through to the next

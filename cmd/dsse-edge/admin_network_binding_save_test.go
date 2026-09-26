@@ -21,13 +21,44 @@ import (
 type rejectingRoutePersister struct {
 	blobstore.Persister
 	fail bool
+	weak bool
 }
 
 func (p *rejectingRoutePersister) Save(raw []byte) error {
 	if p.fail {
 		return errors.New("private database connection detail")
 	}
-	return p.Persister.Save(raw)
+	if err := p.Persister.Save(raw); err != nil {
+		return err
+	}
+	if p.weak {
+		return blobstore.ErrSavedWithoutAtomicity
+	}
+	return nil
+}
+
+func TestRouteGovernanceAcceptsSavedWithoutAtomicityAndReloads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "routes.json")
+	p := &rejectingRoutePersister{Persister: blobstore.FilePersister{Path: path}, weak: true}
+	g := newConnectorRouteGovernanceWithPersister("", true, p)
+	route := authoredRoute{CIDR: "192.0.2.0/24"}
+	if err := g.AddAuthored("tenant-a", "connector-one", route); err != nil {
+		t.Fatalf("saved route was reported as failed: %v", err)
+	}
+	if g.ConfigGeneration() != 1 || len(g.Routes("tenant-a", "connector-one", nil, nil)) != 1 {
+		t.Fatal("saved route was not published to live readers")
+	}
+	reloaded := newConnectorRouteGovernanceWithPersistence(path)
+	if got := reloaded.Routes("tenant-a", "connector-one", nil, nil); len(got) != 1 || got[0].CIDR != route.CIDR {
+		t.Fatalf("saved route was not readable from a fresh store: %+v", got)
+	}
+	if err := g.RemoveAuthored("tenant-a", "connector-one", route.CIDR); err != nil {
+		t.Fatalf("saved route removal was reported as failed: %v", err)
+	}
+	afterRemove := newConnectorRouteGovernanceWithPersistence(path)
+	if got := afterRemove.Routes("tenant-a", "connector-one", nil, nil); len(got) != 0 || g.ConfigGeneration() != 2 {
+		t.Fatalf("saved removal did not reach live and fresh readers: %+v", got)
+	}
 }
 
 func TestAdminNetworkBindingSaveFailureAndRetry(t *testing.T) {

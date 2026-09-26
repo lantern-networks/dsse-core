@@ -12,6 +12,7 @@ import (
 type rejectingCatalogPersister struct {
 	raw  []byte
 	fail bool
+	weak bool
 }
 
 func (p *rejectingCatalogPersister) Load() ([]byte, error) {
@@ -23,10 +24,54 @@ func (p *rejectingCatalogPersister) Save(raw []byte) error {
 		return errors.New("private-storage-location")
 	}
 	p.raw = bytes.Clone(raw)
+	if p.weak {
+		return blobstore.ErrSavedWithoutAtomicity
+	}
 	return nil
 }
 
 var _ blobstore.Persister = (*rejectingCatalogPersister)(nil)
+
+func TestCatalogAcceptsSavedWithoutAtomicityAndReloads(t *testing.T) {
+	p := &rejectingCatalogPersister{weak: true}
+	s := NewStore()
+	if err := s.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	group := Group{ID: "group-one", TenantID: "tenant-a", Alias: "operators"}
+	service := Service{ID: "service-one", TenantID: "tenant-a", Alias: "ssh", Ports: []PortProto{{Protocol: "tcp", Port: 22}}}
+	if _, err := s.UpsertGroup(group); err != nil {
+		t.Fatalf("saved group was reported as failed: %v", err)
+	}
+	if _, err := s.UpsertService(service); err != nil {
+		t.Fatalf("saved service was reported as failed: %v", err)
+	}
+	if s.ConfigGeneration() != 2 || len(s.ListGroups("tenant-a")) != 1 || len(s.ListServices("tenant-a")) != 1 {
+		t.Fatal("saved create was not published to live readers")
+	}
+	reloaded := NewStore()
+	if err := reloaded.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(reloaded.ListGroups("tenant-a"), s.ListGroups("tenant-a")) ||
+		!reflect.DeepEqual(reloaded.ListServices("tenant-a"), s.ListServices("tenant-a")) {
+		t.Fatal("saved create was not readable from a fresh store")
+	}
+	if _, err := s.DeleteGroup("tenant-a", group.ID); err != nil {
+		t.Fatalf("saved group deletion was reported as failed: %v", err)
+	}
+	if _, err := s.DeleteService("tenant-a", service.ID); err != nil {
+		t.Fatalf("saved service deletion was reported as failed: %v", err)
+	}
+	afterDelete := NewStore()
+	if err := afterDelete.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if len(afterDelete.ListGroups("tenant-a")) != 0 || len(afterDelete.ListServices("tenant-a")) != 0 ||
+		len(s.ListGroups("tenant-a")) != 0 || len(s.ListServices("tenant-a")) != 0 || s.ConfigGeneration() != 4 {
+		t.Fatal("saved deletion did not reach live and fresh readers")
+	}
+}
 
 func TestGroupServiceMutationsDoNotPublishUnconfirmedSaves(t *testing.T) {
 	type action struct {

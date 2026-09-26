@@ -41,8 +41,13 @@ ordinary name changes, disabling, re-enabling, withdrawal, republication and
 deletion through a separate control-plane process and an Edge signed-config
 poller, with administrative readback, file reload and audit checks. Local browser
 checks cover disabling and re-enabling, saved settings and audit attribution;
-the disabled application URL returns 404. This does not establish live Connector
-traffic, existing-session termination, PostgreSQL or deployed-fleet acceptance.
+the disabled application URL returns 404. An opt-in check using the built product
+Connector in a separate process also verifies real localhost HTTP traffic after
+publication, name edits, re-enabling and republication, and no backend requests
+after disabling, withdrawal or deletion, with and without an explicit Connector
+ID. The check uses local lab transport and a fixed Connector route allowlist;
+it does not establish production certificate authentication, existing-session
+termination, PostgreSQL or deployed-fleet acceptance.
 
 DNS Filtering saves now publish the new live policy only after the configured
 file save succeeds. A rejected save returns a retryable error and preserves the

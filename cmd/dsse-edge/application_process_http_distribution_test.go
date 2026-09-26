@@ -25,6 +25,7 @@ import (
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
 	"github.com/lantern-networks/dsse-core/policyrule"
+	"github.com/lantern-networks/dsse-core/tunnel"
 	_ "github.com/lib/pq"
 )
 
@@ -95,7 +96,11 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cpPolicy := policy.NewStore(nil)
+	var seed []model.Policy
+	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "connector" {
+		seed = []model.Policy{{ID: "allow-wiki", TenantID: processDistributionTenant, Priority: 100, Conditions: map[string]any{"application_id": "wiki", "actor_type": "human"}, Action: model.PolicyAction{Decision: "allow"}, Status: "active"}}
+	}
+	cpPolicy := policy.NewStore(seed)
 	if err := cpPolicy.SetRuntimeStatePath(filepath.Join(dir, "cp-policy.json")); err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +166,7 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 			}
 		}
 	}
-	if os.Getenv("DSSE_DISTRIBUTION_CP_MODE") == "" {
+	if mode := os.Getenv("DSSE_DISTRIBUTION_CP_MODE"); mode == "" || mode == "connector" {
 		for _, audit := range audits {
 			if audit.TenantID != processDistributionTenant || audit.ActorUserID == nil || *audit.ActorUserID != "operator" || audit.Result == nil || *audit.Result != "success" {
 				t.Fatalf("application audit=%+v", audit)
@@ -183,17 +188,17 @@ func TestApplicationDistributionCPChild(t *testing.T) {
 }
 
 func TestApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
-	testApplicationDistributionAcrossCPAndEdgeProcesses(t, false)
+	testApplicationDistributionAcrossCPAndEdgeProcesses(t, false, "")
 }
 
 func TestApplicationDistributionAcrossCPAndEdgeProcessesPostgres(t *testing.T) {
 	if os.Getenv("DSSE_TEST_POSTGRES_DSN") == "" {
 		t.Skip("set DSSE_TEST_POSTGRES_DSN for the real PostgreSQL distribution check")
 	}
-	testApplicationDistributionAcrossCPAndEdgeProcesses(t, true)
+	testApplicationDistributionAcrossCPAndEdgeProcesses(t, true, "")
 }
 
-func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgres bool) {
+func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgres bool, connectorBinary string) {
 	dir := t.TempDir()
 	var pgDB *sql.DB
 	var pgKey string
@@ -218,6 +223,9 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 	defer cancel()
 	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestApplicationDistributionCPChild$", "-test.v")
 	child.Env = append(os.Environ(), "DSSE_DISTRIBUTION_CP_CHILD="+dir)
+	if connectorBinary != "" {
+		child.Env = append(child.Env, "DSSE_DISTRIBUTION_CP_MODE=connector")
+	}
 	if usePostgres {
 		child.Env = append(child.Env, "DSSE_DISTRIBUTION_CP_POSTGRES_KEY="+pgKey)
 	}
@@ -246,9 +254,23 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 	edgeAssetPath := filepath.Join(dir, "edge-assets.json")
 	edgeAssets := processDistributionAssets(t, edgeAssetPath)
 	edgeApps := processDistributionApps(t, filepath.Join(dir, "edge-apps.json"))
-	edge := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(),
+	edgeRegistry := connector.NewRegistry()
+	edgePolicy := policy.NewStore(nil)
+	tunnelManager := tunnel.NewManagerWithRequestTimeout(3 * time.Second)
+	writer, err := logs.NewWriter(filepath.Join(dir, "edge-logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	labMode := connectorBinary != ""
+	edge := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: edgeRegistry, LabMode: &labMode,
 		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(),
-		ApplicationCatalogStore: edgeApps, AssetStore: edgeAssets, ConfigSourceURL: ready.URL}))
+		ApplicationCatalogStore: edgeApps, AssetStore: edgeAssets, ConfigSourceURL: ready.URL,
+		PolicyStore: edgePolicy, TunnelManager: tunnelManager, Writer: writer, ConnectorSecret: "synthetic-application-traffic"}))
+	destination, destinationPort := "wiki.example.test", 443
+	var traffic func(bool)
+	if connectorBinary != "" {
+		destination, destinationPort, traffic = startApplicationTrafficConnector(t, ctx, connectorBinary, dir, edge.URL, tunnelManager)
+	}
 	defer edge.Close()
 	request := func(method, base, path, body string, expected ...int) []byte {
 		t.Helper()
@@ -280,14 +302,15 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		tenantID: processDistributionTenant, verifyPubKeyHex: ready.PublicKey, requireSigned: true,
 		status: status, interval: 20 * time.Millisecond}
 	targets := configApplyTargets{applications: edgeApps, assets: edgeAssets, rules: policyrule.NewStore(),
-		policyStore: policy.NewStore(nil), dlp: dlpStoresForTest("application-process-http")}
+		policyStore: edgePolicy, dlp: dlpStoresForTest("application-process-http")}
 	pollCtx, stopPoll := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() { defer close(done); source.run(pollCtx, targets) }()
 	defer func() { stopPoll(); <-done }()
-	edgeRegistry := connector.NewRegistry()
-	if _, err := edgeRegistry.Register(model.ConnectorRegistration{ID: "conn-test", TenantID: processDistributionTenant, ConnectorGroupID: "site", PrivateBaseURL: "http://connector.invalid", Status: "registered"}, time.Now()); err != nil {
-		t.Fatal(err)
+	if connectorBinary == "" {
+		if _, err := edgeRegistry.Register(model.ConnectorRegistration{ID: "conn-test", TenantID: processDistributionTenant, ConnectorGroupID: "site", PrivateBaseURL: "http://connector.invalid", Status: "registered"}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	check := func(published bool, appStatus, name string, exists bool) {
 		t.Helper()
@@ -305,13 +328,16 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		if snapshot := status.snapshot(); snapshot["have_applied"] != true || snapshot["last_applied_generation"].(uint64) < bundle.Generation {
 			t.Fatalf("Edge did not apply CP generation %d: %+v", bundle.Generation, snapshot)
 		}
+		if traffic != nil {
+			traffic(exists && published && appStatus == "active")
+		}
 		var endpoints []assetcatalog.Endpoint
 		if err := json.Unmarshal(request(http.MethodGet, edge.URL, "/admin/assets/endpoints", ""), &endpoints); err != nil {
 			t.Fatal(err)
 		}
 		found := false
 		for _, endpoint := range endpoints {
-			if endpoint.ID == "app-wiki" && endpoint.Address == "wiki.example.test" {
+			if endpoint.ID == "app-wiki" && endpoint.Address == destination {
 				found = true
 			}
 		}
@@ -372,7 +398,7 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		}
 	}
 	path := "/admin/applications/wiki"
-	request(http.MethodPost, ready.URL, path+"/publish", `{"name":"Wiki","destination":"wiki.example.test","destination_port":443,"publish_protocol":"web","connector_group_id":"site"}`)
+	request(http.MethodPost, ready.URL, path+"/publish", fmt.Sprintf(`{"name":"Wiki","destination":%q,"destination_port":%d,"publish_protocol":"web","connector_group_id":"site"}`, destination, destinationPort))
 	check(true, "active", "Wiki", true)
 	edit := func(name, status string) {
 		var entry appcatalog.Entry
@@ -390,7 +416,7 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 	edit("Renamed Wiki", "active")
 	request(http.MethodPost, ready.URL, path+"/unpublish", "")
 	check(false, "active", "Renamed Wiki", true)
-	request(http.MethodPost, ready.URL, path+"/publish", `{"name":"Renamed Wiki","destination":"wiki.example.test","destination_port":443,"publish_protocol":"web","connector_group_id":"site"}`)
+	request(http.MethodPost, ready.URL, path+"/publish", fmt.Sprintf(`{"name":"Renamed Wiki","destination":%q,"destination_port":%d,"publish_protocol":"web","connector_group_id":"site"}`, destination, destinationPort))
 	check(true, "active", "Renamed Wiki", true)
 	request(http.MethodDelete, ready.URL, path, "")
 	check(false, "", "", false)
@@ -401,5 +427,15 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 	}
 	if err := child.Wait(); err != nil {
 		t.Fatalf("CP process or audit verification failed: %v; output=%s", err, childOutput.String())
+	}
+	if connectorBinary != "" {
+		raw, err := os.ReadFile(filepath.Join(writer.Dir(), "connector.log.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := bytes.Count(raw, []byte(`"event_type":"private_app_web_session_started"`)); got != 8 {
+			t.Fatalf("Connector web-session audit count=%d, want 8", got)
+		}
+		t.Log("Product Connector: 8 successful upstream HTTP requests; 6 stopped requests never reached the backend; 8 web-session and 7 administrative audit records checked")
 	}
 }

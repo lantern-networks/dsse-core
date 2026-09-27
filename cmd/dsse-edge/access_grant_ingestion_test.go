@@ -62,7 +62,7 @@ func TestAccessGrantReportPreservesDenialAndRejectsUnsavedAdmission(t *testing.T
 	}
 	fresh := accessIngestGrant("new", now)
 	p.fail.Store(true)
-	report([]grantstore.Grant{fresh}, 500)
+	report([]grantstore.Grant{fresh}, 503)
 	if _, ok := s.Get(fresh.GrantID); ok {
 		t.Fatal("unsaved admission visible")
 	}
@@ -71,7 +71,7 @@ func TestAccessGrantReportPreservesDenialAndRejectsUnsavedAdmission(t *testing.T
 	p.fail.Store(true)
 	fresh.Revoked = true
 	for _, changed := range []bool{true, false} {
-		response := report([]grantstore.Grant{fresh}, 500)
+		response := report([]grantstore.Grant{fresh}, 503)
 		var outcome map[string]any
 		if err := json.Unmarshal(response.Body.Bytes(), &outcome); err != nil {
 			t.Fatal(err)

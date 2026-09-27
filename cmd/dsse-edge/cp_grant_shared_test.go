@@ -119,7 +119,7 @@ func TestPostgresGrantPeerTermReportReadAndAudit(t *testing.T) {
 		want := 200
 		if oldRequest {
 			reader.before = rotate
-			want = 500
+			want = 503
 		}
 		r := httptest.NewRequest("POST", "/grant-report", reader)
 		w := httptest.NewRecorder()

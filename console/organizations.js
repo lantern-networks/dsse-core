@@ -6,6 +6,54 @@
 // home_region,allowed_regions}, DELETE /admin/tenants/{tenant_id}. (Super-admin.)
 
 let _orgSearch = "";
+const _orgErasures = new Map();
+let _orgErasureOwner = "";
+function orgErasureOwner() { return idpSession ? String(idpSession.tenant_id) + ":" + String(idpSession.principal_id) : ""; }
+function orgErasureCurrent(host, owner) { return host.isConnected !== false && answeringForTheDeployment() && owner === orgErasureOwner(); }
+function renderOrgErasureNotices(host) {
+  const box = host.__orgErasureNotices;
+  if (!box) return;
+  if (_orgErasureOwner !== orgErasureOwner()) { _orgErasures.clear(); _orgErasureOwner = orgErasureOwner(); }
+  box.innerHTML = "";
+  if (!answeringForTheDeployment()) return;
+  for (const [id, state] of _orgErasures) {
+    const notice = el("div", {class: "ui-state", role: "alert", "data-tenant-erasure": id}, [
+      el("strong", {text: id}), el("p", {text: (state.message && bl(state.message)) || (state.busy ? bl({en: "Erasing local records…", ja: "このノードの記録を消去しています…"}) : bl({en: "Local erasure is not yet confirmed. Retry to check and complete it.", ja: "このノードでの消去は未確認です。再試行して結果を確認してください。"}))}),
+    ]);
+    if (!state.busy && state.confirmed) notice.appendChild(el("button", {class: "ui-btn ui-btn-sm", text: bl({en: "Retry erasure", ja: "消去を再試行"}),
+      onClick: () => eraseOrgRecords(id, host, state)}));
+    box.appendChild(notice);
+  }
+}
+function orgErasureAcknowledged(body, id) {
+  return body && body.tenant_id === id && typeof body.complete === "boolean" &&
+    body.remaining && body.remaining.tenant_id === id && Number.isSafeInteger(body.remaining.total) && body.remaining.total >= 0 &&
+    Array.isArray(body.failures) && body.failures.every(x => typeof x === "string");
+}
+async function eraseOrgRecords(id, host, state) {
+  if (!state.confirmed || state.busy || !orgErasureCurrent(host, state.owner)) return;
+  state.busy = true; state.message = ""; renderOrgErasureNotices(host);
+  try {
+    const purge = await apiFetch("POST", "/admin/tenants/" + encodeURIComponent(id) + "/purge", {confirm_tenant_id: id}, "control");
+    if (!orgErasureCurrent(host, state.owner)) return;
+    if (!purge.ok || !orgErasureAcknowledged(purge.body, id)) throw new Error("unconfirmed erasure response");
+    if (!purge.body.complete || purge.body.remaining.total !== 0 || purge.body.failures.length) {
+      const cleanup = purge.body.artifact_cleanup;
+      if (cleanup && cleanup.manifests === "absence_confirmed" &&
+          (cleanup.local === "unconfirmed" || cleanup.shared === "unconfirmed")) {
+        state.message = {en: "Release manifests were removed, but installer file cleanup is not confirmed. Repair the artifact storage, then retry erasure. Other erasure failures may also remain.", ja: "リリースmanifestは消去済みですが、インストーラファイルの消去は未確認です。配布ファイルの保存先を復旧してから消去を再試行してください。他の消去障害も残っている場合があります。"};
+      }
+      throw new Error("incomplete erasure");
+    }
+    _orgErasures.delete(id);
+    uiToast(bl({en: "Local erasure confirmed: ", ja: "このノードでの消去を確認: "}) + id + bl({en: ". Other nodes and uncounted storage still require verification.", ja: "。他ノードと集計対象外の保存先は別途確認が必要です。"}), "ok");
+  } catch (_) {
+    state.message = state.message || {en: "This tenant was deleted, but local erasure is not confirmed. Repair the reported storage failure, then retry erasure.", ja: "テナントは削除されましたが、このノードでの消去を確認できません。報告された保存障害を解消してから、消去を再試行してください。"};
+  } finally {
+    state.busy = false;
+    if (orgErasureCurrent(host, state.owner)) { renderOrgErasureNotices(host); renderOrgList(host); }
+  }
+}
 
 function renderOrganizationsView(content) {
   content.innerHTML = "";
@@ -28,7 +76,10 @@ function renderOrganizationsView(content) {
   search.addEventListener("input", () => { _orgSearch = search.value; renderOrgList(host); });
   content.appendChild(el("div", { class: "ui-toolbar" }, [search, el("span", { class: "ui-spacer" }),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderOrgList(host) })]));
+  host.__orgErasureNotices = el("div", {});
+  content.appendChild(host.__orgErasureNotices);
   content.appendChild(host);
+  renderOrgErasureNotices(host);
   renderOrgList(host);
 }
 
@@ -111,45 +162,27 @@ function openOrgForm(content, existing) {
 }
 
 async function removeOrg(t2, host) {
+  if (_orgErasures.has(t2.tenant_id) || !answeringForTheDeployment()) return;
+  const owner = orgErasureOwner();
   const ok = await uiConfirm({ title: bl({ en: "Delete this tenant?", ja: "このテナントを削除?" }), body: bl({ en: "Permanently deletes \"" + (t2.display_name || t2.tenant_id) + "\". This is destructive.", ja: "「" + (t2.display_name || t2.tenant_id) + "」を完全に削除します。破壊的操作です。" }), confirmLabel: bl({ en: "Delete permanently", ja: "完全に削除" }), danger: true });
-  if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/tenants/" + encodeURIComponent(t2.tenant_id));
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-
-  // ★ "DELETE PERMANENTLY" HAS TO MEAN IT (2026-08-17, measured). This called the registry delete and stopped:
-  // the organization vanished from the list while the access rules it had authored were still on BOTH planes,
-  // carrying its id. The button said "permanently deletes … this is destructive", and what it did was remove
-  // the row. The erasure is a separate route that reports a FOOTPRINT — what it erased, and what is left — so
-  // the delete runs it and says what it found rather than claiming success on the strength of one 200.
-  // Named to the CONTROL PLANE: the erasure order is recorded there and carried to every node, and purging
-  // only the Edge the front door happens to proxy to is the per-node blindness this product has paid for
-  // before.
-  const purge = await apiFetch("POST", "/admin/tenants/" + encodeURIComponent(t2.tenant_id) + "/purge",
-    // The route refuses without the organization named back to it, which is right: this cannot be undone. The
-    // operator has already named it in the confirmation above, so the console does not ask twice.
-    { confirm_tenant_id: t2.tenant_id }, "control");
-  const remaining = (purge.ok && purge.body && purge.body.remaining && purge.body.remaining.total) || 0;
-  const failures = (purge.ok && purge.body && purge.body.failures) || [];
-  if (!purge.ok) {
-    uiToast(bl({
-      en: "Removed from the list, but erasing what it left behind failed — its data is still on this deployment.",
-      ja: "一覧からは消えましたが、残ったデータの消去に失敗しました。この配備にまだ残っています。" }), "err");
-  } else if (remaining > 0 || failures.length) {
-    uiToast(bl({
-      en: "Deleted, and " + remaining + " record(s) could not be erased — see the tenant's footprint.",
-      ja: "削除しましたが、" + remaining + " 件を消去できませんでした。" }), "err");
-  } else {
-    uiToast(bl({ en: "Tenant deleted, and everything it held is erased.", ja: "テナントを削除し、保持していたものも消去しました。" }), "ok");
+  if (!ok || !orgErasureCurrent(host, owner) || _orgErasures.has(t2.tenant_id)) return;
+  // Reserve this identity while deletion is pending. An erasure retry never deletes it again.
+  const state = {owner, busy: true, confirmed: false, message: ""};
+  _orgErasures.set(t2.tenant_id, state); _orgErasureOwner = owner;
+  try {
+    const r = await apiFetch("DELETE", "/admin/tenants/" + encodeURIComponent(t2.tenant_id), undefined, "control");
+    if (!r.ok || r.body?.deleted !== true || r.body?.tenant_id !== t2.tenant_id) throw new Error("unconfirmed deletion");
+    state.confirmed = true;
+    if (!orgErasureCurrent(host, owner)) return;
+    state.busy = false;
+    await eraseOrgRecords(t2.tenant_id, host, state);
+  } catch (_) {
+    _orgErasures.delete(t2.tenant_id);
+    if (orgErasureCurrent(host, owner)) uiToast(bl({en: "Tenant deletion could not be confirmed. Reload and check its state before trying again.", ja: "テナント削除を確認できません。再読込して状態を確認してから、操作をやり直してください。"}), "err");
+  } finally {
+    state.busy = false;
+    if (orgErasureCurrent(host, owner)) { renderOrgErasureNotices(host); renderOrgList(host); }
   }
-  // ★ AND STOP OPERATING WITHIN IT. Deleting the organization you are inside left the console carrying its
-  // id on every request, with the banner still saying you were working in it — an organization that no
-  // longer exists. Measured after a wizard run: "tenant_half_built_ltd を運営として操作中", for a tenant that
-  // had just been removed.
-  if (operateTenant && String(operateTenant).toLowerCase() === String(t2.tenant_id).toLowerCase()) {
-    exitTenant(); // reloads, which is what clears every screen drawn in that organization's context
-    return;
-  }
-  renderOrgList(host);
 }
 
 // fillOrgSetupColumn asks each organization's setup state after the table is on screen.

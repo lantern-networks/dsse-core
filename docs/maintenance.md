@@ -649,3 +649,13 @@ Retention and legal-hold edits now refresh shared state before saving and keep f
 Only explicitly installed version 3 protection snapshots pause deletion after restart or leadership change for reconciliation. Default and version 2 deployments continue with their confirmed protection checks. Read [deletion safety recovery](deletion-safety-recovery.md), [tenant erasure recovery](tenant-erasure-recovery.md), and [archive recovery](archive-recovery.md) before enabling deletion on an upgraded deployment. Ordinary configuration editing remains available. This integration is not a deployment or release acceptance.
 
 Retention migration review corrected two operational regressions before publication: normal restarts do not impose manual deletion permits (explicit v3 recovery policies retain their gate), and each transaction handles at most 1000 rows; a sweep repeats transactions for up to two minutes per stream. Old and new hold writers must be upgraded together; see the erasure recovery and archive preflight guides. Failed protective saves are unconfirmed and require reconciliation before restart.
+
+### Console identity and account forms
+
+People, device, identity-provider, access-approval, organization and enrollment screens retain the intended tenant and form state across asynchronous reads and failed writes. API token creation uses the server role catalog and its default role, sends the roles array, and shows only the returned one-time raw token. Profile and device-package forms validate the required deployment inputs before generating output. Existing risk warnings remain visible.
+
+The Console regression suite and synthetic browser checks cover these form contracts; they do not establish acceptance of real identity providers, signed installers or deployed CP/Edge communication.
+
+Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
+
+Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.

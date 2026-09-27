@@ -243,6 +243,7 @@ function renderAgentProfileForm(host) {
   const errHost = el("div", {});
 
   submit.addEventListener("click", async () => {
+    if (submit.disabled) return;
     errHost.innerHTML = "";
     const chosen = _profileEndpoints.filter((e) => e.on).map((e) => e.value);
     if (!chosen.length) {
@@ -259,10 +260,12 @@ function renderAgentProfileForm(host) {
       vmAckF.setError(bl({ en: "This has to be chosen deliberately.", ja: "これは明示的に選ぶ必要があります。" }));
       return;
     }
+    // Keep the profile and its later tokens bound to the same submitted group.
+    const group = groupF.get();
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/agent-profile", {
-        group: groupF.get(),
+        group,
         transport_endpoints: chosen,
         posture: failOpen ? "fail-open" : "fail-closed",
         ack_fail_open: failOpen,
@@ -277,7 +280,7 @@ function renderAgentProfileForm(host) {
         uiToast(msg, "err");
         return;
       }
-      showAgentProfileMade(r.body, groupF.get());
+      showAgentProfileMade(r.body, group);
     } catch (e) {
       submit.disabled = false;
       uiToast(String(e), "err");
@@ -429,6 +432,8 @@ function showAgentProfileMade(envelope, group) {
       ? bl({ en: "One token per device, for the group “" + group + "”.",
              ja: "1台につき1枚、グループ「" + group + "」で作ります。" })
       : bl({ en: "One token per device.", ja: "1台につき1枚です。" }) });
+  const tokenError = el("div", { class: "ui-callout ui-callout-warn", role: "alert" });
+  tokenError.style.display = "none";
   const makeTokens = el("button", { class: "ui-btn",
     text: bl({ en: "Make the tokens", ja: "まとめて作る" }) });
 
@@ -513,6 +518,7 @@ function showAgentProfileMade(envelope, group) {
         ja: "端末はまだ証明書を持っていません。この設定は「どこへ・どう繋ぐか」だけで、身元は運びません"
           + "（グループの全端末で同じものだからです）。1台ごとに一度きりのトークンが1枚要ります。" }) }),
       countF.el,
+      tokenError,
       makeTokens,
       el("hr", {}),
       el("p", { class: "ui-view-desc", text: bl({
@@ -545,34 +551,56 @@ function showAgentProfileMade(envelope, group) {
   // that way. Changing the machine changes what the button would produce, so it goes back to offering it.
   const bundleLabel = bundle.textContent;
   platformF.el.addEventListener("change", () => {
+    if (bundle.__bundlePending) return;
     bundle.textContent = bundleLabel;
     bundle.disabled = false;
   });
 
-  bundle.addEventListener("click", () => {
+  bundle.addEventListener("click", async () => {
+    if (bundle.__bundlePending) return;
     const [platform, arch] = String(platformF.get() || guessedPlatform).split("/");
-    downloadDeviceBundle(envelope, group, platform, arch, bundle);
+    const select = platformF.el.querySelector("select");
+    if (select) select.disabled = true;
+    try { await downloadDeviceBundle(envelope, group, platform, arch, bundle); }
+    finally { if (select) select.disabled = false; }
   });
 
   makeTokens.addEventListener("click", async () => {
-    const count = Math.max(1, Number(countF.get()) || 1);
+    if (makeTokens.disabled) return;
+    const count = enrolTokenCount(countF);
+    if (count === null) return;
+    tokenError.style.display = "none";
+    const showError = (message) => {
+      tokenError.textContent = message;
+      tokenError.style.display = "";
+      uiToast(message, "err");
+    };
     makeTokens.disabled = true;
     try {
-      // The SAME group the configuration was made for. A profile for one group and tokens for another is the
-      // mismatch nobody notices until the devices are built.
       const r = await apiFetch("POST", "/admin/enrolment-tokens", {
         label: group ? group : bl({ en: "Device configuration", ja: "端末の設定" }),
         group, expires_in_hours: 168, count,
       }, _PROFILE_PLANE);
-      makeTokens.disabled = false;
-      if (!r.ok) {
-        uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err");
+      if (!r.ok && r.status === 409 && r.body && r.body.partial === true &&
+          Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
+        showError(enrolTokenResponseWarning());
+        showEnrolTokenOnce({ ...r.body, requested_count: count });
         return;
       }
-      if (typeof showEnrolTokenOnce === "function") showEnrolTokenOnce(r.body);
+      if (!r.ok) {
+        const uncertain = r.status >= 500 || (r.status === 409 && r.body && r.body.partial === true);
+        showError(uncertain ? enrolTokenResponseWarning() :
+          (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+        return;
+      }
+      if (!enrolTokenCompleteBody(r.body, count)) {
+        showError(enrolTokenResponseWarning()); return;
+      }
+      showEnrolTokenOnce(r.body);
     } catch (e) {
+      showError(enrolTokenResponseWarning());
+    } finally {
       makeTokens.disabled = false;
-      uiToast(String(e), "err");
     }
   });
 }

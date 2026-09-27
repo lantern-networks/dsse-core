@@ -14,6 +14,37 @@
 
 let _idpSearch = "";
 
+function idpObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+function idpText(v) { return typeof v === "string" && v.trim() !== ""; }
+function idpConnection(c) {
+  return idpObject(c) && ["idp_id", "tenant_id", "issuer", "authorization_endpoint", "client_id"].every(k => idpText(c[k])) &&
+    /^[A-Za-z0-9_-]+$/.test(c.idp_id) && ["oidc","entra","google","okta"].includes(c.type) &&
+    ["email_domain","google_hd"].includes(c.domain_mode) && !c.client_secret &&
+    ["display_name","jwks_uri","token_endpoint","groups_claim","acr_claim","amr_claim","hosted_domain_claim","ca_pem"].every(k => c[k] == null || typeof c[k] === "string") &&
+    (c.use_pkce == null || typeof c.use_pkce === "boolean") && (c.verified_domains == null || (Array.isArray(c.verified_domains) && c.verified_domains.every(idpText)));
+}
+function idpError(r) { return r?.body?.error || r?.body?.message || ("HTTP " + (r?.status || "unknown")); }
+function idpUncertain() { return bl({en:"The provider change could not be confirmed and may already be applied. Reload before retrying.",ja:"プロバイダの変更結果を確認できません。反映済みの可能性があるため、再読込してから再試行してください。"}); }
+function idpRefresh(content) {
+  if (content.__idpAnchor?.isConnected && content.contains(content.__idpAnchor)) renderIdPConnectionsView(content);
+}
+function idpNotice(content, message) { content.__idpNotice = message; }
+function idpShowNotice(content, host) {
+  if (content.__idpNotice) host.appendChild(el("div", {class:"ui-callout ui-callout-warn",role:"alert",text:content.__idpNotice}));
+}
+async function idpGet(path) {
+  const r = await apiFetch("GET", path, undefined, "control");
+  if (!r.ok) throw new Error(idpError(r));
+  return r.body;
+}
+function idpConfirmConnection(r, expected) {
+  if (!r?.ok) throw new Error(idpError(r));
+  const c = r.body;
+  const keys = ["idp_id","tenant_id","type","display_name","issuer","authorization_endpoint","token_endpoint","jwks_uri","client_id","domain_mode","acr_claim","amr_claim","groups_claim","hosted_domain_claim","ca_pem"];
+  if (!idpConnection(c) || keys.some(k => (c[k] || "") !== (expected[k] || "")) || !!c.use_pkce !== !!expected.use_pkce ||
+      JSON.stringify(c.verified_domains || []) !== JSON.stringify(expected.verified_domains || [])) throw new Error(idpUncertain());
+}
+
 function idpTypeLabel(t) {
   switch (t) {
     case "oidc": return bl({ en: "OpenID Connect", ja: "OpenID Connect" });
@@ -32,6 +63,8 @@ function idpDomainModeLabel(m) {
 
 function renderIdPConnectionsView(content) {
   content.innerHTML = "";
+  const add = el("button", {class:"ui-btn ui-btn-primary",text:bl({en:"+ Add provider",ja:"+ プロバイダを追加"}),onClick:()=>openIdpForm(content)});
+  add.disabled = true; content.__idpAnchor = add;
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "IdP integration", ja: "IdP 連携" }) }),
@@ -40,11 +73,12 @@ function renderIdPConnectionsView(content) {
         ja: "このテナントがユーザー認証に使う信頼済みサインインプロバイダ。1つが既定です。アクセスルールの「本人確認を要求」で、使うプロバイダを指定できます。クライアントシークレットは書き込み専用で、再表示されません。",
       }) }),
     ]),
-    el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add provider", ja: "+ プロバイダを追加" }), onClick: () => openIdpForm(content) }),
+    add,
   ]));
   const search = el("input", { class: "ui-input ui-search", type: "search", placeholder: bl({ en: "Search providers…", ja: "プロバイダを検索…" }) });
   search.value = _idpSearch;
   const host = el("div", {});
+  host.__idpContent = content; host.__idpAdd = add;
   search.addEventListener("input", () => { _idpSearch = search.value; renderIdPList(host); });
   content.appendChild(el("div", { class: "ui-toolbar" }, [search, el("span", { class: "ui-spacer" }),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderIdPList(host) })]));
@@ -56,31 +90,40 @@ async function renderIdPList(host) {
   uiState(host, "loading");
   const current = freshRender(host);
   let connections, defaultID;
+  const content = host.__idpContent;
+  host.__idpAdd.disabled = true;
   try {
-    const r = await apiFetch("GET", "/admin/idp-connections");
-    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderIdPList(host) }); return; }
-    connections = (r.body && r.body.connections) || [];
-    defaultID = (r.body && r.body.default_idp_id) || "";
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderIdPList(host) }); return; }
+    const [body, tenant] = await Promise.all([idpGet("/admin/idp-connections"), idpGet("/admin/tenant")]);
+    if (!idpObject(tenant) || !idpText(tenant.tenant_id) || !idpObject(body) || !Array.isArray(body.connections) || typeof body.default_idp_id !== "string" ||
+        !body.connections.every(c => idpConnection(c) && c.tenant_id === tenant.tenant_id) || new Set(body.connections.map(c => c.idp_id)).size !== body.connections.length ||
+        (body.connections.length ? !body.connections.some(c => c.idp_id === body.default_idp_id) : body.default_idp_id !== "")) throw new Error("Invalid provider response");
+    if (!current()) return;
+    connections = body.connections; defaultID = body.default_idp_id; content.__idpTenant = tenant.tenant_id;
+    host.__idpAdd.disabled = !!content.__idpPending;
+  } catch (e) {
+    if (!current()) return;
+    uiState(host, "error", String(e), {label:bl({en:"Retry",ja:"再試行"}),onClick:()=>renderIdPList(host)});
+    idpShowNotice(content, host); return;
+  }
 
   const q = _idpSearch.trim().toLowerCase();
   const filtered = connections.filter((c) => !q ||
     (c.display_name || "").toLowerCase().includes(q) ||
     (c.idp_id || "").toLowerCase().includes(q) ||
     (c.issuer || "").toLowerCase().includes(q));
-  if (!connections.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No sign-in providers yet. Add one so your access rules can require it.", ja: "サインインプロバイダがありません。アクセスルールから要求できるよう追加してください。" })); return; }
-  if (!filtered.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No providers match your search.", ja: "検索に一致するプロバイダがありません。" })); return; }
+  if (!connections.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No sign-in providers yet. Add one so your access rules can require it.", ja: "サインインプロバイダがありません。アクセスルールから要求できるよう追加してください。" })); idpShowNotice(content, host); return; }
+  if (!filtered.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No providers match your search.", ja: "検索に一致するプロバイダがありません。" })); idpShowNotice(content, host); return; }
 
   const rows = filtered.map((c) => {
     const isDefault = c.idp_id === defaultID;
     const nameCell = [el("strong", { text: c.display_name || c.idp_id }), el("div", { class: "ui-view-desc" }, el("code", { text: c.idp_id }))];
     if (isDefault) nameCell.splice(1, 0, document.createTextNode(" "), uiBadge(bl({ en: "Default", ja: "既定" }), "ok"));
     const actions = [];
-    if (!isDefault) actions.push(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Set default", ja: "既定にする" }), onClick: () => setIdpDefault(c, host) }), document.createTextNode(" "));
+    if (!isDefault) actions.push(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Set default", ja: "既定にする" }), disabled:content.__idpPending ? true : null, onClick: () => setIdpDefault(c, host) }), document.createTextNode(" "));
     actions.push(
       el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Test", ja: "テスト" }), onClick: () => testIdp(c) }), document.createTextNode(" "),
-      el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }), onClick: () => openIdpForm(document.getElementById("content"), c) }), document.createTextNode(" "),
-      el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), onClick: () => removeIdp(c, host) }),
+      el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit", ja: "編集" }), disabled:content.__idpPending ? true : null, onClick: () => openIdpForm(content, c) }), document.createTextNode(" "),
+      el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Delete", ja: "削除" }), disabled:content.__idpPending ? true : null, onClick: () => removeIdp(c, host) }),
     );
     return el("tr", {}, [
       el("td", {}, nameCell),
@@ -92,6 +135,7 @@ async function renderIdPList(host) {
   });
   if (!current()) return;
   host.innerHTML = "";
+  idpShowNotice(content, host);
   host.appendChild(el("table", { class: "ui-table" }, [
     el("thead", {}, el("tr", {}, [
       bl({ en: "Provider", ja: "プロバイダ" }),
@@ -105,21 +149,36 @@ async function renderIdPList(host) {
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Showing ", ja: "表示 " }) + filtered.length + " / " + connections.length }));
 }
 
-async function setIdpDefault(c, host) {
-  const r = await apiFetch("POST", "/admin/idp-connections/" + encodeURIComponent(c.idp_id) + "/default");
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Default provider updated.", ja: "既定プロバイダを更新しました。" }), "ok");
-  renderIdPList(host);
+async function idpRowChange(c, host, remove) {
+  const content = host.__idpContent;
+  if (content.__idpPending) return;
+  content.__idpPending = true;
+  const controls = content.querySelectorAll("button"); controls.forEach(b => { b.disabled = true; });
+  try {
+    if (remove && !await uiConfirm({title:bl({en:"Delete this provider?",ja:"このプロバイダを削除?"}),body:bl({en:"Access rules that require this provider will no longer be able to authenticate users through it.",ja:"このプロバイダを要求するアクセスルールは、これを使ってユーザーを認証できなくなります。"}),confirmLabel:bl({en:"Delete permanently",ja:"完全に削除"}),danger:true})) return;
+    let r;
+    try { r = await apiFetch(remove ? "DELETE" : "POST", "/admin/idp-connections/" + encodeURIComponent(c.idp_id) + (remove ? "" : "/default"), undefined, "control"); }
+    catch (_) { throw new Error(idpUncertain()); }
+    if (!r?.ok) throw new Error(idpError(r));
+    if (!idpObject(r.body) || r.body.id !== c.idp_id || r.body.status !== (remove ? "deleted" : "default_set")) throw new Error(idpUncertain());
+    idpNotice(content, "");
+    uiToast(remove ? bl({en:"Provider deleted.",ja:"プロバイダを削除しました。"}) : bl({en:"Default provider updated.",ja:"既定プロバイダを更新しました。"}), "ok");
+  } catch (e) { idpNotice(content, e.message || String(e)); }
+  finally { content.__idpPending = false; controls.forEach(b => { b.disabled = false; }); await renderIdPList(host); }
 }
+async function setIdpDefault(c, host) { return idpRowChange(c, host, false); }
+async function removeIdp(c, host) { return idpRowChange(c, host, true); }
 
 // Non-interactive connectivity probe (discovery + JWKS reachable/parseable, issuer match) — no end-user login.
 async function testIdp(c) {
   uiToast(bl({ en: "Testing…", ja: "テスト中…" }), "info");
   let res;
   try {
-    const r = await apiFetch("GET", "/admin/idp-connections/" + encodeURIComponent(c.idp_id) + "/test");
+    const r = await apiFetch("GET", "/admin/idp-connections/" + encodeURIComponent(c.idp_id) + "/test", undefined, "control");
     if (!r.ok) { uiToast((typeof r.body === "string" ? r.body : (r.body && (r.body.error || r.body.message))) || ("HTTP " + r.status), "err"); return; }
-    res = r.body || {};
+    res = r.body;
+    if (!idpObject(res) || typeof res.ok !== "boolean" || !Array.isArray(res.checks) || !res.checks.length ||
+        !res.checks.every(k => idpObject(k) && idpText(k.name) && typeof k.ok === "boolean" && typeof k.detail === "string")) throw new Error("Invalid provider test response");
   } catch (e) { uiToast(String(e), "err"); return; }
   const checks = res.checks || [];
   const body = checks.length
@@ -139,25 +198,12 @@ async function testIdp(c) {
   uiToast(res.ok ? bl({ en: "Provider reachable.", ja: "プロバイダは到達可能です。" }) : bl({ en: "Provider not reachable.", ja: "プロバイダに到達できません。" }), res.ok ? "ok" : "err");
 }
 
-async function removeIdp(c, host) {
-  const label = c.display_name || c.idp_id;
-  const ok = await uiConfirm({
-    title: bl({ en: "Delete this provider?", ja: "このプロバイダを削除?" }),
-    body: bl({ en: "Permanently removes the sign-in provider \"" + label + "\". Access rules that require it will no longer be able to authenticate users through it.", ja: "サインインプロバイダ「" + label + "」を完全に削除します。これを要求するアクセスルールはこのプロバイダで認証できなくなります。" }),
-    confirmLabel: bl({ en: "Delete permanently", ja: "完全に削除" }), danger: true,
-  });
-  if (!ok) return;
-  const r = await apiFetch("DELETE", "/admin/idp-connections/" + encodeURIComponent(c.idp_id));
-  if (!r.ok) { uiToast((typeof r.body === "string" ? r.body : (r.body && (r.body.error || r.body.message))) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Provider deleted.", ja: "プロバイダを削除しました。" }), "ok");
-  renderIdPList(host);
-}
-
 function openIdpForm(content, existing) {
+  if (content.__idpPending || !content.__idpTenant) return;
   existing = existing || null;
   const idF = uiField({ name: "id", label: bl({ en: "Provider ID", ja: "プロバイダ ID" }), required: true, value: existing ? existing.idp_id : "",
     placeholder: "idp_corp", hint: bl({ en: "A short unique key. Editing an existing provider keeps this fixed.", ja: "短い一意キー。既存プロバイダの編集では固定されます。" }),
-    validate: (v) => (/\s/.test(v) ? bl({ en: "No spaces allowed.", ja: "空白は使えません。" }) : "") });
+    validate: (v) => (!/^[A-Za-z0-9_-]+$/.test(v) ? bl({ en: "Use letters, numbers, underscore or hyphen.", ja: "英数字・アンダースコア・ハイフンを使用してください。" }) : "") });
   if (existing) idF.el.querySelector("input").setAttribute("readonly", "true");
   const nameF = uiField({ name: "name", label: bl({ en: "Display name", ja: "表示名" }), value: existing ? existing.display_name : "", placeholder: bl({ en: "Corporate sign-in", ja: "社内サインイン" }) });
   const typeF = uiField({ name: "type", label: bl({ en: "Type", ja: "種別" }), type: "select", value: existing ? existing.type : "oidc", options: [
@@ -207,19 +253,25 @@ function openIdpForm(content, existing) {
                ja: "社内にあるプロバイダのときだけ。その TLS 証明書を発行している側の証明書を貼ってください。空欄なら、インターネットが既に信頼している発行元だという意味です(Entra・Okta・Google はこちら)。" }) });
 
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: existing ? bl({ en: "Save changes", ja: "変更を保存" }) : bl({ en: "Add provider", ja: "プロバイダを追加" }) });
+  const error = el("div", {class:"ui-field-error-msg",role:"alert",style:"display:block;white-space:pre-wrap"});
+  let pending = false, closed = false, completed = false;
+  const tenant = content.__idpTenant;
   const m = uiModal({
+    onClose:()=>{ closed = true; if (pending && !completed) { idpNotice(content, idpUncertain()); idpRefresh(content); } },
     title: existing ? bl({ en: "Edit sign-in provider", ja: "サインインプロバイダを編集" }) : bl({ en: "Add a sign-in provider", ja: "サインインプロバイダを追加" }),
     body: [
       idF.el, nameF.el, typeF.el, issuerF.el, authzF.el, tokenF.el, jwksF.el, clientF.el, secretF.el, domainsF.el, domainModeF.el, pkceF.el,
       el("p", { class: "ui-view-desc", text: bl({ en: "Advanced claim mapping", ja: "詳細: クレームマッピング" }) }),
-      acrF.el, amrF.el, groupsF.el, hdF.el, caF.el,
+      acrF.el, amrF.el, groupsF.el, hdF.el, caF.el, error,
     ],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
   submit.addEventListener("click", async () => {
-    if (!idF.validate() || !issuerF.validate() || !clientF.validate()) return;
-    submit.disabled = true;
+    if (pending || closed || content.__idpPending) return;
+    if (![idF,issuerF,authzF,clientF].map(f => f.validate()).every(Boolean)) return;
+    error.textContent = "";
     const body = {
+      tenant_id: tenant,
       idp_id: idF.get(),
       display_name: nameF.get(),
       type: typeF.get(),
@@ -229,7 +281,7 @@ function openIdpForm(content, existing) {
       jwks_uri: jwksF.get(),
       client_id: clientF.get(),
       domain_mode: domainModeF.get(),
-      verified_domains: domainsF.get().split(",").map((s) => s.trim()).filter(Boolean),
+      verified_domains: [...new Set(domainsF.get().split(",").map(s => s.trim().toLowerCase()).filter(Boolean))],
       use_pkce: pkceF.get(),
       acr_claim: acrF.get(),
       amr_claim: amrF.get(),
@@ -238,13 +290,20 @@ function openIdpForm(content, existing) {
       ca_pem: caF.get(),
     };
     if (secretF.get()) body.client_secret = secretF.get();
+    const controls = m.el.querySelectorAll("input,select,textarea,button");
+    pending = true; content.__idpPending = true; controls.forEach(c => { c.disabled = true; });
     try {
-      const r = await apiFetch("POST", "/admin/idp-connections", body);
-      if (!r.ok) { submit.disabled = false; const msg = (typeof r.body === "string" ? r.body : (r.body && (r.body.error || r.body.message))) || ("HTTP " + r.status); idF.setError(msg); uiToast(msg, "err"); return; }
-      m.close();
-      uiToast(existing ? bl({ en: "Provider saved.", ja: "プロバイダを保存しました。" }) : bl({ en: "Provider added.", ja: "プロバイダを追加しました。" }), "ok");
-      renderIdPConnectionsView(content);
-    } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
+      let r;
+      try { r = await apiFetch("POST", "/admin/idp-connections", body, "control"); }
+      catch (_) { throw new Error(idpUncertain()); }
+      idpConfirmConnection(r, body);
+      completed = true; idpNotice(content, "");
+      if (!closed) { m.close(); uiToast(existing ? bl({en:"Provider saved.",ja:"プロバイダを保存しました。"}) : bl({en:"Provider added.",ja:"プロバイダを追加しました。"}), "ok"); }
+    } catch (e) { const message = e.message || String(e); idpNotice(content, message); if (!closed) error.textContent = message; }
+    finally {
+      pending = false; content.__idpPending = false; controls.forEach(c => { c.disabled = false; });
+      if (closed) idpRefresh(content);
+    }
   });
   (existing ? nameF : idF).focus();
 }

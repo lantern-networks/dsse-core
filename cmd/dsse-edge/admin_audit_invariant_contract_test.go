@@ -651,6 +651,9 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 
 func deferredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
+		// Administrative kill-switch audits intentionally retain the acting principal and source IP.
+		// admin_transport_admission_audit_test covers attribution and secret exclusion.
+		"transportAdmissionAuditLog": true,
 		// Dedicated user-risk HTTP tests verify attribution and reject evidence,
 		// subject aliases, and bearer credentials in the audit record.
 		"userRiskAuditLog":              true,

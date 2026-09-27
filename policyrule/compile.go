@@ -32,7 +32,13 @@ func EgressInspectionHosts(tenant string, rules []Rule, resolver AddressResolver
 		if (r.TenantID != "" && r.TenantID != tenant) || r.Plane != PlaneEgress || r.Status != StatusActive || r.Action.Inspection != inspection || r.Action.Access == AccessDeny || !inspectionServiceApplies(tenant, r.ServiceID, resolver) {
 			continue
 		}
-		hosts := resolver.EndpointAddresses(tenant, r.Destination)
+		var hosts []string
+		if IsAnySubject(r.Destination) {
+			// Any is an explicit rule selector, not an endpoint catalog ID.
+			hosts = []string{SubjectAny}
+		} else {
+			hosts = resolver.EndpointAddresses(tenant, r.Destination)
+		}
 		if IsAnySubject(r.Source) || inspection == InspectionInspect && InspectionSourceWarning(tenant, r, resolver) != "" {
 			for _, host := range hosts {
 				all[host] = true

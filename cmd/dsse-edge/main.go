@@ -6264,7 +6264,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		seedConnectorProgramFromThisImage(config.ConnectorProgramDir, connectorProgramsBesideThisBinary(),
 			runtime.GOOS, runtime.GOARCH)
 	}
-	registerConnectorProgramRoutes(mux, adminEndpoint, config.ConnectorProgramDir, config.PullsAgentUpdates)
+	registerConnectorProgramRoutes(mux, adminEndpoint, config.ConnectorProgramDir, config.PullsAgentUpdates, writer, config.AdminAuditOutbox, evaluator)
 	registerHumanIdentityRoutes(mux, adminEndpoint, evaluator, writer, humanIdentities, adminAuditOutbox, registry, connectorSecret, devMode, requireConnectorRuntimeSecret, configSourceURL, config.DirectoryCPReporter, config.TenantCARegistry)
 	registerNHIRegistryRoutes(mux, adminEndpoint, evaluator, writer, adminAuditOutbox, nonHumanIdentities, configSourceURL)
 	bundleGeneration := registerPolicyAdminRoutes(mux, adminEndpoint, config, evaluator, writer, adminAuditOutbox, policyStore, configSourceURL, configBundleEpoch, registry, nonHumanIdentities, humanIdentities, delegatedGrants, edgeDNSResolver, edgeDNSPolicyStore, vlanBoundary, tenantModelStore, networkExtensionPublisher, ruleStore, assetStore)

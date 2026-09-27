@@ -4800,6 +4800,7 @@ func main() {
 		log.Printf("vendor licence: NONE in force — enrolment is held until a licence is applied")
 	}
 	configureAdmissionPromotion(cpLeaderElectorInstance, *admissionRevocationStore, livenessRevocations)
+	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
 	configureLicensePromotion(cpLeaderElectorInstance, *licenseStorePath, vendorLicenceStore, enrolmentLicensingGate, licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID))
 	cpLeaderElectorInstance.Start()
 	defer cpLeaderElectorInstance.Stop()

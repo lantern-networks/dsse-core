@@ -55,7 +55,7 @@ func TestTheSharedStateListMatchesTheCallSites(t *testing.T) {
 
 	want := []string{}
 	for key := range defaultedByStatePath {
-		if resolvedByPersister[key] {
+		if resolvedByPersister[sharedStoreKey(key)] {
 			want = append(want, key)
 		}
 	}

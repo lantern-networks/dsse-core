@@ -1,156 +1,112 @@
 "use strict";
 
-// ---------------------------------------------------------------------------
-// "Internal site certificates" — the authorities an organization vouches for over ITS OWN private sites.
-//
-// ★★★ WHY THIS SCREEN EXISTS (2026-09-01). An internal site behind a connector is opened by the Edge on the
-// device's behalf, and the Edge checked its certificate against the list of public authorities every browser
-// ships with — a list that will never contain a company's own. So an internal site was reached, decrypted
-// correctly, and then refused, and the person at the browser saw a page that would not open with nothing to
-// tell them apart from the site being down.
-//
-// The screen is written for the person who administers the sites, not for the person who wrote the Edge: it
-// asks for the certificate of the authority that issued their internal sites' certificates, and it shows what
-// it read out of what they pasted, so a wrong file is visible immediately.
-//
-// Backend: GET/POST /admin/internal-cas, DELETE /admin/internal-cas/{id}. Scoped to the signed-in
-// organization on every route. Loaded after app.js, so apiFetch / bl / escapeHtml are in scope.
-// ---------------------------------------------------------------------------
+// Each entry trusts one public CA certificate for this organization's upstream TLS connections.
+function internalCAObject(v) { return v && typeof v === "object" && !Array.isArray(v); }
+function internalCAText(v) { return typeof v === "string" && v.trim() !== ""; }
+function internalCAPEM(v) {
+  return typeof v === "string" && /^-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----$/.test(v.trim());
+}
+function validatedInternalCAs(body, tenant) {
+  if (!internalCAObject(tenant) || !internalCAText(tenant.tenant_id) || !internalCAObject(body) || !Array.isArray(body.internal_cas)) throw new Error("Invalid internal certificate list or organization response");
+  const ids = new Set();
+  for (const a of body.internal_cas) {
+    if (!internalCAObject(a) || !internalCAText(a.id) || a.tenant_id !== tenant.tenant_id || ids.has(a.id) || !internalCAPEM(a.certificate_pem) ||
+        ["name","subject","not_after","created_at","updated_at"].some(k => a[k] !== undefined && typeof a[k] !== "string") ||
+        (a.expired !== undefined && typeof a.expired !== "boolean")) throw new Error("Invalid internal certificate record");
+    ids.add(a.id);
+  }
+  return body.internal_cas;
+}
+function internalCAUnconfirmed() { return bl({en:"The outcome is unconfirmed. Reload the list and retry if needed; your input has been kept.",ja:"結果を確認できません。一覧を再読込し、必要なら再試行してください。入力内容は保持しています。"}); }
+function internalCAOutcome(r, action, expected) {
+  if (!r?.ok) throw new Error(internalCAText(r?.body?.error) ? r.body.error : internalCAUnconfirmed());
+  const a = r.body;
+  if (r.status !== 200 || !internalCAObject(a) || a.id !== expected.id || a.tenant_id !== expected.tenant_id) throw new Error(internalCAUnconfirmed());
+  if (action === "delete") { if (a.deleted !== true) throw new Error(internalCAUnconfirmed()); }
+  else {
+    validatedInternalCAs({internal_cas:[a]},{tenant_id:expected.tenant_id});
+    if (a.name !== expected.name.trim() || a.certificate_pem.replace(/\s/g,"") !== expected.certificate_pem.replace(/\s/g,"")) throw new Error(internalCAUnconfirmed());
+  }
+}
 
 async function renderInternalCAsView(content) {
   content.innerHTML = "";
-  const h = document.createElement("h2");
-  h.className = "group-title";
-  h.textContent = bl({ en: "Internal site certificates", ja: "社内サイトの証明書" });
-  content.appendChild(h);
-  const d = document.createElement("p");
-  d.className = "group-desc";
-  d.textContent = bl({
-    en: "Your internal sites use certificates your company issued itself. Add the authority that issued them, " +
-      "so your devices can open those sites.",
-    ja: "社内サイトの証明書は、自社で発行したものです。それを発行した証明機関をここに登録すると、社内サイトが開けるようになります。",
-  });
-  content.appendChild(d);
-
-  const list = document.createElement("div");
-  content.appendChild(list);
-
-  const form = document.createElement("div");
-  form.style.cssText = "margin-top:18px;padding:14px;border:1px solid #e5e7eb;border-radius:8px;max-width:760px";
-  const formTitle = document.createElement("div");
-  formTitle.style.cssText = "font-weight:600;margin-bottom:8px";
-  formTitle.textContent = bl({ en: "Add an authority", ja: "証明機関を追加" });
-  form.appendChild(formTitle);
-
-  const name = document.createElement("input");
-  name.type = "text";
-  name.placeholder = bl({ en: "A name you will recognise", ja: "自分でわかる名前" });
-  name.style.cssText = "width:100%;padding:6px 9px;margin-bottom:8px";
-  form.appendChild(name);
-
-  const material = document.createElement("textarea");
-  material.rows = 8;
-  material.placeholder = "-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----";
-  material.style.cssText = "width:100%;padding:6px 9px;font-family:ui-monospace,monospace;font-size:12px";
-  form.appendChild(material);
-
-  const hint = document.createElement("div");
-  hint.style.cssText = "color:#6b7280;font-size:12px;margin:6px 0 10px";
-  hint.textContent = bl({
-    en: "Paste the certificate of the AUTHORITY that issued your internal sites' certificates — not a site's own.",
-    ja: "社内サイトの証明書を「発行した側」の証明書を貼ってください。サイト自身の証明書ではありません。",
-  });
-  form.appendChild(hint);
-
-  const save = document.createElement("button");
-  save.textContent = bl({ en: "Add", ja: "追加" });
-  form.appendChild(save);
-  const status = document.createElement("span");
-  status.style.cssText = "margin-left:10px;font-size:13px";
-  form.appendChild(status);
-  content.appendChild(form);
-
-  async function reload() {
-    list.innerHTML = `<div style="color:#6b7280">${escapeHtml(bl({ en: "Loading…", ja: "読み込み中…" }))}</div>`;
-    let data;
-    try {
-      // apiFetch(method, path, ...) returns { status, ok, body } with body already parsed — NOT a Response.
-      const r = await apiFetch("GET", "/admin/internal-cas");
-      if (!r.ok) {
-        list.innerHTML = `<div style="color:#991b1b">HTTP ${r.status} — ${escapeHtml(String((r.body && r.body.error) || ""))}</div>`;
-        return;
-      }
-      data = r.body;
-    } catch (e) {
-      list.innerHTML = `<div style="color:#991b1b">${escapeHtml(String(e && e.message ? e.message : e))}</div>`;
-      return;
-    }
-    const rows = (data && data.internal_cas) || [];
-    if (!rows.length) {
-      // ★ AN EMPTY LIST IS NOT AN ERROR AND MUST NOT LOOK LIKE ONE. Most organizations have no internal sites.
-      list.innerHTML = `<div style="color:#6b7280">${escapeHtml(bl({
-        en: "Nothing added. Your devices open internal sites only if the authority that issued their certificates is listed here.",
-        ja: "まだありません。社内サイトの証明書を発行した証明機関がここに無いと、そのサイトは開けません。",
-      }))}</div>`;
-      return;
-    }
-    const t = document.createElement("table");
-    t.className = "data-table";
-    t.innerHTML = `<thead><tr>
-      <th>${escapeHtml(bl({ en: "Name", ja: "名前" }))}</th>
-      <th>${escapeHtml(bl({ en: "Issued to", ja: "証明機関" }))}</th>
-      <th>${escapeHtml(bl({ en: "Valid until", ja: "有効期限" }))}</th>
-      <th></th></tr></thead>`;
-    const tb = document.createElement("tbody");
-    rows.forEach((row) => {
-      const tr = document.createElement("tr");
-      // ★ EXPIRY IS SHOWN, NOT HIDDEN. An authority that has expired since it was pasted stops being used, and
-      // a screen that still listed it as fine would send its reader to look at the connector instead.
-      const until = row.expired
-        ? `<span style="color:#991b1b">${escapeHtml(bl({ en: "expired — internal sites it issued will not open", ja: "期限切れ —— このもとで発行されたサイトは開けません" }))}</span>`
-        : escapeHtml(String(row.not_after || "").slice(0, 10));
-      tr.innerHTML = `<td>${escapeHtml(row.name || "")}</td>
-        <td style="font-size:12px;color:#4b5563">${escapeHtml(row.subject || "")}</td>
-        <td>${until}</td><td></td>`;
-      const del = document.createElement("button");
-      del.textContent = bl({ en: "Remove", ja: "削除" });
-      del.onclick = async () => {
-        del.disabled = true;
-        try {
-          const r = await apiFetch("DELETE", `/admin/internal-cas/${encodeURIComponent(row.id)}`);
-          if (!r.ok) throw new Error((r.body && r.body.error) || `HTTP ${r.status}`);
-          await reload();
-        } catch (e) {
-          del.disabled = false;
-          alert(String(e && e.message ? e.message : e));
-        }
-      };
-      tr.lastChild.appendChild(del);
-      tb.appendChild(tr);
-    });
-    t.appendChild(tb);
-    list.innerHTML = "";
-    list.appendChild(t);
+  const fresh = freshRender(content);
+  const current = () => fresh() && content.isConnected !== false && form.isConnected !== false;
+  let tenantID = "", loaded = false, pending = false, draft = null;
+  const list = el("div",{});
+  const status = el("p",{role:"status","aria-live":"polite"});
+  const name = el("input",{class:"ui-input",type:"text",placeholder:bl({en:"A name you will recognise",ja:"自分でわかる名前"}),"aria-label":bl({en:"Name",ja:"名前"})});
+  const material = el("textarea",{class:"ui-input",rows:8,placeholder:"-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----","aria-label":bl({en:"CA certificate",ja:"CA証明書"})});
+  const add = el("button",{class:"ui-btn ui-btn-primary",text:bl({en:"Add",ja:"追加"}),onClick:save});
+  const reloadButton = el("button",{class:"ui-btn",text:bl({en:"Reload",ja:"再読込"}),onClick:reload});
+  const form = el("div",{class:"ui-card",style:"margin-top:18px;padding:16px;max-width:760px"},[
+    el("h3",{text:bl({en:"Add an authority",ja:"証明機関を追加"})}), name, material,
+    el("p",{class:"ui-view-desc",text:bl({en:"Paste exactly one public CA certificate that issued your internal site's certificate. Do not include a private key or a certificate chain.",ja:"社内サイトの証明書を発行したCAの公開証明書を1件貼ってください。秘密鍵や証明書チェーンを含めないでください。"})}),add,
+  ]);
+  content.appendChild(el("div",{class:"ui-view-head"},[
+    el("div",{},[el("h2",{class:"ui-view-title",text:bl({en:"Internal site certificates",ja:"社内サイトの証明書"})}),
+      el("p",{class:"ui-view-desc",text:bl({en:"Authorities trusted for your organization's internal sites. Changes are saved on this server; other servers must receive the update.",ja:"自組織の社内サイトで信頼する証明機関です。変更はこのサーバーで保存され、他のサーバーには更新の配布が必要です。"})})]),reloadButton,
+  ]));
+  content.append(list,status,form);
+  function lock() {
+    name.disabled = material.disabled = add.disabled = pending || !loaded;
+    reloadButton.disabled = pending;
+    list.querySelectorAll("button").forEach(b=>{b.disabled=pending});
   }
-
-  save.onclick = async () => {
-    status.textContent = "";
-    save.disabled = true;
+  function message(text, error=false) { status.textContent = text; status.className = error ? "ui-callout ui-callout-warn" : ""; }
+  async function reload() {
+    if (pending || !current()) return;
+    loaded=false;lock();uiState(list,"loading");const latest=freshRender(list);
     try {
-      const r = await apiFetch("POST", "/admin/internal-cas", { name: name.value, certificate_pem: material.value });
-      if (!r.ok) throw new Error((r.body && r.body.error) || `HTTP ${r.status}`);
-      name.value = "";
-      material.value = "";
-      await reload();
-    } catch (e) {
-      // The server's refusals name WHICH mistake was made (a site's own certificate, an expired one, not
-      // certificate material at all). Show them as they are rather than replacing them with "invalid".
-      status.style.color = "#991b1b";
-      status.textContent = String(e && e.message ? e.message : e);
-    } finally {
-      save.disabled = false;
-    }
-  };
-
+      const [r,t]=await Promise.all([apiFetch("GET","/admin/internal-cas"),apiFetch("GET","/admin/tenant")]);
+      if (!current() || !latest()) return;
+      if (!r?.ok || !t?.ok) throw new Error("HTTP " + (!r?.ok ? r?.status : t?.status));
+      const rows=validatedInternalCAs(r.body,t.body);
+      if (tenantID && tenantID !== t.body.tenant_id) { draft=null;name.value="";material.value="";message(bl({en:"The organization changed. Enter the certificate again for this organization.",ja:"組織が変わりました。この組織の証明書を改めて入力してください。"}),true); }
+      tenantID=t.body.tenant_id;loaded=true;list.innerHTML="";
+      if (!rows.length) uiState(list,"empty",bl({en:"No internal authorities added.",ja:"社内証明機関はまだ登録されていません。"}));
+      else list.appendChild(el("table",{class:"ui-table"},[
+        el("thead",{},el("tr",{},[bl({en:"Name",ja:"名前"}),bl({en:"Issued to",ja:"証明機関"}),bl({en:"Valid until",ja:"有効期限"}),bl({en:"Actions",ja:"操作"})].map(text=>el("th",{text})))),
+        el("tbody",{},rows.map(a=>el("tr",{},[
+          el("td",{text:a.name || a.id}),el("td",{text:a.subject || "—"}),
+          el("td",{text:a.expired ? bl({en:"Expired — not trusted",ja:"期限切れ・信頼対象外"}) : (Number.isFinite(Date.parse(a.not_after)) ? a.not_after : bl({en:"Unknown expiry",ja:"期限不明"}))}),
+          el("td",{},el("button",{class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Remove",ja:"削除"}),onClick:()=>remove(a)})),
+        ]))),
+      ]));
+    } catch(e) {
+      if (!current() || !latest()) return;
+      uiState(list,"error",String(e.message || e),{label:bl({en:"Retry",ja:"再試行"}),onClick:reload});
+    } finally { if(current() && latest()) lock(); }
+  }
+  async function save() {
+    if (pending || !loaded || !current()) return;
+    const values={tenant_id:tenantID,name:name.value,certificate_pem:material.value};
+    if (!internalCAPEM(values.certificate_pem)) { message(bl({en:"Paste one public CA certificate only; remove private keys and other material.",ja:"CAの公開証明書だけを1件貼ってください。秘密鍵やその他の内容を除いてください。"}),true);return; }
+    // Keep a stable request ID when retrying the same input after an uncertain response.
+    if (!draft || Object.keys(values).some(k=>draft[k]!==values[k])) draft={...values,id:"ica-"+crypto.randomUUID()};
+    const submitted={...draft};pending=true;lock();message("");
+    try {
+      let r;try {r=await apiFetch("POST","/admin/internal-cas",submitted)}catch(_){throw new Error(internalCAUnconfirmed())}
+      internalCAOutcome(r,"upsert",submitted);
+      if(!current())return;
+      draft=null;name.value="";material.value="";message(bl({en:"Authority saved.",ja:"証明機関を保存しました。"}));
+    } catch(e) { if(current())message(e.message || String(e),true); }
+    finally { pending=false;if(current())lock(); }
+    if(current())await reload();
+  }
+  async function remove(a) {
+    if(pending || !loaded || !current())return;
+    pending=true;lock();let attempted=false;
+    try {
+      if(!await uiConfirm({title:bl({en:"Remove this authority?",ja:"この証明機関を削除しますか？"}),body:(a.name || a.id)+" — "+bl({en:"Internal sites using this authority may stop opening. Other servers must receive the update.",ja:"この証明機関を使う社内サイトが開けなくなる場合があります。他のサーバーには更新の配布が必要です。"}),confirmLabel:bl({en:"Remove",ja:"削除"}),danger:true}))return;
+      if(!current())return;attempted=true;message("");
+      let r;try{r=await apiFetch("DELETE","/admin/internal-cas/"+encodeURIComponent(a.id)+"?tenant_id="+encodeURIComponent(a.tenant_id))}catch(_){throw new Error(internalCAUnconfirmed())}
+      internalCAOutcome(r,"delete",a);
+      if(current())message(bl({en:"Authority removed.",ja:"証明機関を削除しました。"}));
+    }catch(e){if(current())message(e.message || String(e),true)}
+    finally{pending=false;if(current())lock()}
+    if(attempted && current())await reload();
+  }
   await reload();
 }

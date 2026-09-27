@@ -5018,61 +5018,7 @@ func configWriteRejectedWhenSourced(w http.ResponseWriter, configSourceURL, reso
 	return true
 }
 
-// materializedCertPinBypassHosts returns the host/SNI of every materialized cert-pinning candidate for
-// the tenant — the destinations the interception engine should raw-forward (decrypt-bypass). Only
-// candidates that an admin has approved and materialized appear here; pending/approved ones do not.
-func materializedCertPinBypassHosts(store *policycandidate.Store, tenantID string) []string {
-	if store == nil {
-		return nil
-	}
-	resp, err := store.List(context.Background(), tenantID, policycandidate.ListOptions{Status: "materialized", Limit: 1000})
-	if err != nil {
-		return nil
-	}
-	hosts := []string{}
-	for _, c := range resp.Candidates {
-		if c.Source != policycandidate.SourceCertPinningDetection {
-			continue
-		}
-		if h := strings.TrimSpace(c.SNI); h != "" {
-			hosts = append(hosts, h)
-		}
-		if h := strings.TrimSpace(c.Host); h != "" {
-			hosts = append(hosts, h)
-		}
-	}
-	return hosts
-}
-
-// materializedCertPinBypassRefs is materializedCertPinBypassHosts paired with the candidate id of each bypass, so
-// the Egress view can offer a Revoke (suppress the candidate → re-intercept the host), not just display it.
-func materializedCertPinBypassRefs(store *policycandidate.Store, tenantID string) []certPinBypassRef {
-	if store == nil {
-		return nil
-	}
-	resp, err := store.List(context.Background(), tenantID, policycandidate.ListOptions{Status: "materialized", Limit: 1000})
-	if err != nil {
-		return nil
-	}
-	refs := []certPinBypassRef{}
-	for _, c := range resp.Candidates {
-		if c.Source != policycandidate.SourceCertPinningDetection {
-			continue
-		}
-		host := strings.TrimSpace(c.SNI)
-		if host == "" {
-			host = strings.TrimSpace(c.Host)
-		}
-		if host != "" {
-			refs = append(refs, certPinBypassRef{Host: host, CandidateID: c.CandidateID})
-		}
-	}
-	return refs
-}
-
-// materializedCertPinCandidates returns the full materialized cert-pinning candidates for a tenant — used at
-// startup to migrate any that predate the cert-pin-bypass-as-rule model into emitted Egress rules, so every
-// pinned-site bypass is a single, consistent authored rule (the rule is the bypass's only source).
+// materializedCertPinCandidates returns historical adoption requests for review only.
 func materializedCertPinCandidates(store *policycandidate.Store, tenantID string) []policycandidate.Candidate {
 	if store == nil {
 		return nil
@@ -6544,7 +6490,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		return true
 	})
-	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, policyCandidateStore, recompileAuthoredRules)
+	registerEffectivePolicyRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, assetStore, ruleStore, recompileAuthoredRules)
 	registerPredefinedCatalogRoutes(mux, adminEndpoint, config, evaluator, writer)
 	// The one file every endpoint needs, issued by the deployment that already holds the key to sign it.
 	// See admin_agent_profile_routes.go.

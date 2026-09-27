@@ -50,13 +50,6 @@ async function loadLicensing(host, content) {
   let body;
   try {
     const r = await apiFetch("GET", "/admin/license");
-    if (r.status === 503) {
-      if (!current()) return;
-      uiState(host, "empty", bl({
-        en: "This deployment does not use licensing. Seats are not limited and there is nothing to divide.",
-        ja: "この環境はライセンス管理を使っていません。シート数の制限も配分もありません。" }));
-      return;
-    }
     if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadLicensing(host, content) }); return; }
     body = r.body || {};
   } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadLicensing(host, content) }); return; }

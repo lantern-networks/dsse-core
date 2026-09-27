@@ -17,14 +17,13 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
-	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
 	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
 // Observe-mode adoption plus the effective-policy read surface (per-device effective
 // policy, tenant effective policies, egress effective rules, catalog groups,
 // inspection posture). // Moved verbatim out of newServerWithConfig (Phase 2 route-registration split,
-func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, policyCandidateStore policycandidate.RuntimeStore, recompileAuthoredRules func()) {
+func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, assetStore *assetcatalog.Store, ruleStore *policyrule.Store, recompileAuthoredRules func()) {
 	mux.HandleFunc("POST /admin/east-west/observations/adopt", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
 		// Observations are held by the control plane (observation_report.go), and adoption authors rules there.
 		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "adopting east-west observations") {
@@ -101,7 +100,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 				ID: randomEdgeID("audit_observation_adopt_", now), TenantID: tenant,
 				EventType: "east_west_observations_adopted", TargetType: stringPtr("east_west_observations"),
 				Action: stringPtr("adopt"), Result: stringPtr(result),
-				Timestamp:    now.Format(time.RFC3339),
+				Timestamp: now.Format(time.RFC3339), SourceIP: stringPtr(r.RemoteAddr),
 				EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID,
 				Metadata: body,
 			}
@@ -167,13 +166,14 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// Effective-Policy ("Why") view: the precedence-ordered, provenance-tagged decision basis for one
 	// destination — every policy that competes (authored rules AND built-in base policies loaded via -policy),
 	// in the exact order the engine evaluates them, with the winner and shadowed matches marked — PLUS the
-	// inspect/bypass basis (decrypt-all default vs known-bypass / authored bypass / materialized cert-pin). This
+	// inspect/bypass basis (decrypt-all default vs known-bypass / authored bypass). This
 	// is the visibility that was missing on 2026-06-23, when an authored Authenticate rule silently lost a
 	// priority tie to a built-in Google allow and we had to hand-curl /decisions/evaluate to find it. Read-only.
 	mux.HandleFunc("GET /admin/effective-policy", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
 		if !refreshRuntimeManagement(w, policyStore) {
 			return
 		}
+
 		if !refreshCatalogOverrides(w, config) {
 			return
 		}
@@ -199,18 +199,6 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			bypassSources.EffectiveBypass, bypassSources.InterceptHosts = patterns.Bypass, patterns.Intercept
 			bypassSources.DeviceIntercept, bypassSources.DeviceBypass = patterns.InterceptByDevice, patterns.BypassByDevice
 		}
-		// Attribute SaaS Optimize bypass: pass the groups enabled in the live posture.
-		if config.InspectionPosture != nil {
-			enabled := map[string]bool{}
-			for _, name := range config.InspectionPosture().BypassGroups {
-				enabled[name] = true
-			}
-			for _, g := range inspectionposture.SaaSBypassGroups {
-				if enabled[g.Name] {
-					bypassSources.OptimizeGroups = append(bypassSources.OptimizeGroups, g)
-				}
-			}
-		}
 		bypassSources.AuthoredBypass = policyrule.EgressBypassFQDNs(tenant, ruleStore.List(tenant, policyrule.PlaneEgress), assetStore)
 		// Candidate history is not an effective bypass; saved rules supply this state.
 		// ★ The preview must be the answer THIS organization would get. Measured while operating inside a newly
@@ -228,10 +216,11 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if !refreshRuntimeManagement(w, policyStore) {
 			return
 		}
+
 		writeJSON(w, http.StatusOK, effectivePolicyList(evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r)))
 	}))
 	// The unified Egress view's data source: EVERY effective egress rule across all surfaces — authored rules,
-	// the built-in default, the known-bypass OS/cert floor, legacy SaaS Optimize posture bypass, and approved
+	// the built-in default, the known-bypass OS/cert floor, and authored SaaS Optimize or
 	// cert-pin bypass — normalized to one source → destination : service ⇒ access × inspection shape. An operator
 	// expects the Egress view to reflect all egress decisions in one place, not just authored rules; this gathers
 	// them (the edge owns every surface) so the Console renders a single list. Read-only aggregation.
@@ -239,6 +228,7 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if !refreshRuntimeManagement(w, policyStore) {
 			return
 		}
+
 		if !refreshCatalogOverrides(w, config) {
 			return
 		}
@@ -252,36 +242,28 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		egressRules := ruleStore.List(tenant, policyrule.PlaneEgress)
 		sourceWarnings := map[string]string{}
+		serviceWarnings := map[string]bool{}
 		for _, rule := range egressRules {
 			sourceWarnings[rule.ID] = policyrule.InspectionSourceWarning(tenant, rule, assetStore)
+			serviceWarnings[rule.ID] = policyrule.EgressServiceUnresolved(tenant, rule.ServiceID, assetStore)
 		}
 		in := effectiveEgressInputs{
 			Eval:                     evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r),
 			Tenant:                   tenant,
 			AuthoredRules:            egressRules,
-			InspectionSourceWarnings: sourceWarnings,
 			AliasByID:                aliasByID,
 			KnownGroups:              knownbypass.Groups,
-			AuthoredBypassHosts:      policyrule.EgressBypassFQDNs(tenant, egressRules, assetStore),
 			UnresolvedRuleIDs:        unresolvedDestinationRuleIDs(egressRules, assetStore, tenant),
+			InspectionSourceWarnings: sourceWarnings,
+			UnresolvedServiceRuleIDs: serviceWarnings,
 		}
 		if config.NetworkExtensionLabTLS != nil {
 			in.EffectiveBypass = config.NetworkExtensionLabTLS.InspectionPatternsForTenant(tenant).Bypass
 		}
+
 		if config.InspectionPosture != nil {
-			p := config.InspectionPosture()
-			in.KnownEnabled = p.KnownBypassEnabled
-			enabled := map[string]bool{}
-			for _, name := range p.BypassGroups {
-				enabled[name] = true
-			}
-			for _, g := range inspectionposture.SaaSBypassGroups {
-				if enabled[g.Name] {
-					in.OptimizeLegacy = append(in.OptimizeLegacy, g)
-				}
-			}
+			in.KnownEnabled = config.InspectionPosture().KnownBypassEnabled
 		}
-		// Candidate history is not an effective bypass; saved rules supply this state.
 		writeJSON(w, http.StatusOK, buildEffectiveEgressRules(in))
 	}))
 	// Built-in SaaS catalog groups presented as endpoint groups (Phase A of the unified policy model): the SaaS

@@ -144,3 +144,25 @@ func TestAConfigPullingEdgeRefusesToAuthorThePosture(t *testing.T) {
 			"silently overwrite them, on that node only")
 	}
 }
+
+func TestInspectionPostureBundleRetainsLegacyHostPatterns(t *testing.T) {
+	store := inspectionposture.NewStore()
+	admin := newInspectionPostureAdmin(store, nil)
+	posture := bypassDefaultWith("legacy_host.internal", "example.com:443", "https://example.com/path", "[::1]")
+	section := &inspectionPostureBundle{Posture: posture}
+	changed, err := applyInspectionPostureBundleSection(section, store.Get, admin.set, nil)
+	if err != nil || !changed || !inspectionPostureEqual(store.Get(), posture) {
+		t.Fatalf("legacy delivery changed=%v err=%v", changed, err)
+	}
+	changed, err = applyInspectionPostureBundleSection(section, store.Get, admin.set, nil)
+	if err != nil || changed {
+		t.Fatalf("same delivery changed=%v err=%v", changed, err)
+	}
+	section.Posture.Mode = "unknown"
+	if _, err := applyInspectionPostureBundleSection(section, store.Get, admin.set, nil); err == nil {
+		t.Fatal("invalid mode accepted")
+	}
+	if !inspectionPostureEqual(store.Get(), posture) {
+		t.Fatal("invalid mode changed saved posture")
+	}
+}

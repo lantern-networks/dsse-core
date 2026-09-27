@@ -324,7 +324,7 @@ func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
 	if _, err := store.MarkProgress(job.ID, 7, "exporting", now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("MarkProgress returned error: %v", err)
 	}
-	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", now.Add(3*time.Minute))
+	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", nil, now.Add(3*time.Minute))
 	if err != nil {
 		t.Fatalf("MarkCompleted returned error: %v", err)
 	}

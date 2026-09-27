@@ -684,4 +684,10 @@ Risk edits report whether the requested state was applied and durably saved; fai
 
 Risk backend upgrades must explicitly reconcile every CP onto the same reviewed backend before enabling HA. Existing files are not implicitly imported; use the documented `-high-risk-store=postgres+import:` procedure with writers stopped. Existing empty/unreadable local paths (also for admission and policy stores) are retained for checked loading instead of silently selecting an empty shared backend; repair those paths or explicitly configure the intended backend before upgrade.
 
+### Regional log searches and exports
+
+Regional searches and export previews report whether the number of excluded records without region attribution is known. Downloaded regional exports carry the same limitation in gzip metadata; an unavailable count is never reported as zero. The count is a separate live query, not an export snapshot. Export jobs return detached metadata and check cancellation before the final object is committed, including small exports.
+
+Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.
+
 AI service usage now verifies organization, requested period, coverage and totals before showing a report. Unavailable or inconsistent responses show Retry rather than zero usage; stale responses after a tenant or period change are ignored. Deploy the Console with its matching CP version: an older CP without the report tenant field is shown as unavailable, not as zero usage.

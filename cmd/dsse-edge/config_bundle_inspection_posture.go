@@ -54,10 +54,12 @@ func applyInspectionPostureBundleSection(section *inspectionPostureBundle, curre
 	if set == nil || current == nil {
 		return false, fmt.Errorf("inspection posture target is unavailable")
 	}
-	next, err := inspectionposture.Validate(section.Posture)
-	if err != nil {
-		return false, err
+	// Signed settings may contain host patterns accepted by earlier CPs.
+	// New edits are validated strictly at the author, not on delivery.
+	if section.Posture.Mode != inspectionposture.ModeDecryptAll && section.Posture.Mode != inspectionposture.ModeBypassDefault {
+		return false, fmt.Errorf("invalid inspection posture mode")
 	}
+	next := section.Posture.Normalized()
 	if inspectionPostureEqual(current(), next) {
 		return false, nil
 	}

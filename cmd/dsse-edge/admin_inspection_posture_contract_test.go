@@ -36,7 +36,7 @@ func TestInspectionPostureOperatorScopePersistenceRuntimeAndAudit(t *testing.T) 
 		t.Fatal(err)
 	}
 	engine := edgeplane.NewNetworkExtensionLabTLSInterceptionMatchOnly([]string{"*"})
-	setter := newInspectionPostureSetter(store, func(_ string) { engine.SetInterceptHosts(inspectionposture.EffectiveInterceptHosts(store.Get())) })
+	postureAdmin := newInspectionPostureAdmin(store, func(_ string) { engine.SetInterceptHosts(inspectionposture.EffectiveInterceptHosts(store.Get())) })
 	auth := newAdminAuthStore()
 	for id, tenant := range map[string]string{"operator": "tenant_lab_001", "customer": "tenant_customer", "reader": "tenant_lab_001"} {
 		roles := []string{"admin", "super_admin"}
@@ -46,7 +46,7 @@ func TestInspectionPostureOperatorScopePersistenceRuntimeAndAudit(t *testing.T) 
 		auth.UpsertPrincipal(adminPrincipal{ID: id, TenantID: tenant, Roles: roles, Status: "active"})
 		auth.UpsertAPIToken(adminAPIToken{ID: id, TenantID: tenant, Roles: roles, Scopes: []string{"*"}, TokenHash: adminTokenHash("test-" + id), CreatedByAdminPrincipalID: id, Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)})
 	}
-	config := serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, OperatorTenantID: "tenant_lab_001", NetworkExtensionLabTLS: engine, InspectionPosture: store.Get, SetInspectionPosture: setter}
+	config := serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, OperatorTenantID: "tenant_lab_001", NetworkExtensionLabTLS: engine, InspectionPosture: store.Get, SetInspectionPosture: postureAdmin.set, UpdateInspectionPosture: postureAdmin.update, RefreshInspectionPosture: postureAdmin.refresh}
 	h := newServerWithConfig(config)
 	call := func(method, body, actor string, status int) inspectionPostureResponse {
 		t.Helper()

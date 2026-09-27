@@ -59,9 +59,13 @@ func registerCertsAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 			configversion.ActionUpsert, certNote, certVersionSnapshot{CertPEM: req.CertPEM, KeyPEM: req.KeyPEM})
 		// The versions record WHAT this node now serves; they do not record who put it there. For the
 		// certificate a component presents, both questions get asked, and only one had an answer.
+		reason := "The certificate this node serves was replaced."
+		if config.CPVersions != nil {
+			reason += " The previous version is retained and can be rolled back."
+		}
 		recordPKIMaterialChange(writer, r, evaluator, adminTenantIDFromRequest(r),
 			"certificate_replaced", "certificate", r.PathValue("name"),
-			"The certificate this node serves was replaced. The previous version is retained and can be rolled back.",
+			reason,
 			map[string]any{
 				"subject":            entry.Subject,
 				"not_after":          entry.NotAfter,

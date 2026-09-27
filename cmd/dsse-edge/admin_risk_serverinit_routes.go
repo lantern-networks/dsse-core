@@ -213,33 +213,60 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			"withheld_unattributable": withheld,
 		})
 	}))
+	auditIncoming := func(r *http.Request, tenant, target, action string, err error) {
+		now := time.Now().UTC()
+		result := "success"
+		if err != nil {
+			result = "error"
+		}
+		row := model.AuditLog{ID: randomEdgeID("audit_incoming_", now), TenantID: tenant, ActorUserID: auditActorPrincipal(r), EventType: "admin_incoming_changed", TargetType: stringPtr("incoming_policy"), TargetID: stringPtr(target), Action: stringPtr(action), Result: &result, Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID}
+		row.Metadata = map[string]any{"target_tenant_id": tenant}
+		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && !strings.EqualFold(identity.TenantID, tenant) {
+			stampOperatorActor(row.Metadata, identity)
+		}
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, row, now)
+	}
 	mux.HandleFunc("POST /admin/server-initiated", adminEndpoint("admin.serverinitiated.write", func(w http.ResponseWriter, r *http.Request) {
 		if configWriteRejectedWhenSourced(w, configSourceURL, "server-initiated config") {
 			return
 		}
 		// toggle server-initiated (server->client) default-deny enforcement for the tenant.
-		var req struct {
-			Enabled bool `json:"enabled"`
-		}
-		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		var req map[string]json.RawMessage
+		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil || len(req) != 1 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("enabled must be an explicit boolean"))
 			return
 		}
-		s, ok := policyStore.(interface {
+		rawEnabled, present := req["enabled"]
+		var enabled bool
+		if !present || strings.TrimSpace(string(rawEnabled)) == "null" || json.Unmarshal(rawEnabled, &enabled) != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("enabled must be an explicit boolean"))
+			return
+		}
+		setter, ok := policyStore.(interface {
 			SetServerInitiatedEnabledContext(context.Context, string, bool) error
 		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		if err := s.SetServerInitiatedEnabledContext(r.Context(), adminTenantIDFromRequest(r), req.Enabled); err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy could not be saved"))
+		err := setter.SetServerInitiatedEnabledContext(r.Context(), adminTenantIDFromRequest(r), enabled)
+		action := "allow_default"
+		if enabled {
+			action = "block_default"
+		}
+		auditIncoming(r, adminTenantIDFromRequest(r), adminTenantIDFromRequest(r), action, err)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy save could not be confirmed. Reload before retrying."))
 			return
 		}
 
-		writeJSON(w, http.StatusOK, map[string]any{"server_initiated_enabled": req.Enabled})
+		writeJSON(w, http.StatusOK, map[string]any{"server_initiated_enabled": enabled})
 	}))
 	mux.HandleFunc("GET /admin/server-initiated", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		// The live default for incoming (server-initiated) connections, so the Console shows which is in effect.
 		enabled := false
 		if s, ok := policyStore.(interface {
@@ -253,36 +280,42 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy exceptions") {
 			return
 		}
-		// register/update a Legacy Exception (explicit governed allow for a server-initiated flow).
-		var ex model.LegacyException
-		if err := json.NewDecoder(r.Body).Decode(&ex); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body: %w", err))
+		var patch map[string]json.RawMessage
+		if err := decodeLimitedJSONBody(w, r, &patch, maxEdgeRuntimeJSONBodyBytes); err != nil || patch == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid incoming exception object"))
 			return
 		}
-		// A legacy exception is an explicit governed ALLOW for a server-initiated flow. Whose it is comes from
-		// the caller, not from the body they wrote.
-		tenantForWrite, terr := adminTenantForWrite(r, ex.TenantID)
-		if terr != nil {
-			writeError(w, http.StatusForbidden, terr)
+		var key struct {
+			ID       string `json:"id"`
+			TenantID string `json:"tenant_id"`
+		}
+		raw, _ := json.Marshal(patch)
+		if err := json.Unmarshal(raw, &key); err != nil || strings.TrimSpace(key.ID) == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("id is required"))
 			return
 		}
-		ex.TenantID = tenantForWrite
-		if strings.TrimSpace(ex.Status) == "" {
-			ex.Status = "active"
-		}
-		if err := validateLegacyException(ex); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+		tenantForWrite, err := adminTenantForWrite(r, key.TenantID)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err)
 			return
 		}
-		s, ok := policyStore.(interface {
+		setter, ok := policyStore.(interface {
 			MutateLegacyExceptionContext(context.Context, string, string, func(model.LegacyException) (model.LegacyException, error)) (model.LegacyException, error)
 		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		if _, err := s.MutateLegacyExceptionContext(r.Context(), ex.TenantID, ex.ID, func(model.LegacyException) (model.LegacyException, error) { return ex, nil }); err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming exception could not be saved"))
+		ex, err := setter.MutateLegacyExceptionContext(r.Context(), tenantForWrite, key.ID, func(current model.LegacyException) (model.LegacyException, error) {
+			return mergeLegacyException(current, patch, tenantForWrite)
+		})
+		auditIncoming(r, tenantForWrite, key.ID, "upsert_exception", err)
+		if err != nil {
+			if errors.Is(err, policy.ErrPolicyPersistence) {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception save could not be confirmed. Reload before retrying."))
+			} else {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 
@@ -292,17 +325,21 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		if configWriteRejectedWhenSourced(w, configSourceURL, "legacy exceptions") {
 			return
 		}
-		s, ok := policyStore.(interface {
+		setter, ok := policyStore.(interface {
 			RemoveLegacyExceptionContext(context.Context, string, string) (bool, error)
 		})
 		if !ok {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming policy storage is unavailable"))
 			return
 		}
-		removed, err := s.RemoveLegacyExceptionContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
+		removed, err := setter.RemoveLegacyExceptionContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("incoming exception could not be deleted"))
+			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming exception removal could not be confirmed. Reload before retrying."))
 			return
+		}
+		if removed {
+			auditIncoming(r, adminTenantIDFromRequest(r), r.PathValue("id"), "remove_exception", nil)
 		}
 
 		if !removed {
@@ -312,6 +349,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, map[string]string{"id": r.PathValue("id"), "status": "deleted"})
 	}))
 	mux.HandleFunc("GET /admin/legacy-exceptions", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		var exs []model.LegacyException
 		if s, ok := policyStore.(interface {
 			LegacyExceptionsFor(string) []model.LegacyException
@@ -321,8 +362,10 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		writeJSON(w, http.StatusOK, buildLegacyExceptionList(exs, time.Now()))
 	}))
 	mux.HandleFunc("GET /admin/legacy-exceptions/export", adminEndpoint("admin.serverinitiated.read", func(w http.ResponseWriter, r *http.Request) {
-		// S2: export active Legacy Exceptions as Firewall / L3 rules (default-deny + explicit allow)
-		// for agentless / VLAN-boundary enforcement of server-initiated traffic.
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		exp, err := incomingExportForTenant(policyStore, adminTenantIDFromRequest(r), time.Now())
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Incoming policy cannot be exported safely: %w", err))

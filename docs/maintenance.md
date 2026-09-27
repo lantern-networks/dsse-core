@@ -659,3 +659,7 @@ The Console regression suite and synthetic browser checks cover these form contr
 Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
+
+### Incoming exception edits and audit attribution
+
+Partial incoming-exception updates preserve omitted restrictions and reject null or unknown fields. Storage failures keep the previous confirmed policy; successful changes and failures are attributed to the target tenant, including operator actions. Existing export checks continue to reject unsupported conditions instead of silently widening access.

@@ -51,16 +51,6 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		//
 		// 404 rather than 403, like the kill-switch and the concern report: whether an entity exists on this
 		// node is itself the answer being withheld.
-		if strings.EqualFold(strings.TrimSpace(sig.EntityType), "user") || strings.EqualFold(strings.TrimSpace(sig.EntityType), "human") {
-			resp, tenant, ok := writeUserRisk(w, r, config, sig)
-			if !ok {
-				return
-			}
-			now := time.Now().UTC()
-			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, userRiskAuditLog(r, tenant, resp, evaluator, now), now)
-			writeJSON(w, http.StatusOK, resp)
-			return
-		}
 		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
 			if owned, why := riskEntityOwnedByCaller(r.Context(), sig.EntityType, sig.EntityID,
 				adminTenantIDFromRequest(r), config.EnrolledLedger, config.HumanIdentities); !owned {
@@ -89,7 +79,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			delete(failure.Metadata, "severity")
 			delete(failure.Metadata, "high_risk")
 			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, failure, now)
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk save was not confirmed; the live overlay and runtime were not changed"))
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk save was not confirmed; live state was retained, but storage may contain the change. Reload and verify after storage recovery before reapplying"))
 			return
 		}
 		resp, err := applyAdminRiskSignal(deviceStore, adminTenantIDFromRequest(r), sig, time.Now())

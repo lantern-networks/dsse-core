@@ -74,6 +74,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, candidate)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates", adminEndpoint("admin.policy_candidates.write", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
 			return
 		}
@@ -94,6 +95,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, created)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/review", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
 			return
 		}
@@ -137,6 +139,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		writeJSON(w, http.StatusOK, reviewed)
 	}))
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/materialize", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
 			return
 		}
@@ -163,24 +166,6 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		}
 		candidateWrites.Lock()
 		defer candidateWrites.Unlock()
-		// ★ Same reasoning as POST /admin/cert-pin-bypass below, reached from the other direction: materializing a
-		// DETECTED cert-pin candidate emits the same Egress bypass rule, so on a config-pulling Edge it is the
-		// same adoption that expires at the next poll.
-		//
-		// Checked BEFORE the transition, which required looking the candidate up first. Guarding after
-		// Materialize would flip the candidate to materialized and THEN refuse — leaving the console showing an
-		// adoption with nothing behind it, which is worse than either outcome it is choosing between.
-		// cp-authored-conditional: this route is guarded only for cert-pin candidates. The same route also
-		// materializes allow-policy and private-app candidates, which stay Edge-local, so it must NOT go in the
-		// console's CP_AUTHORED_WRITES table — sending every materialize to the control plane would 404, because
-		// candidates are observations of traffic and only an Edge has them. The console adopts a cert-pin
-		// candidate by posting its host to /admin/cert-pin-bypass instead, which IS CP-authored and is
-		// self-contained. This guard is what stops an API caller from taking the old path.
-		if existing, ok, gerr := concrete.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); gerr == nil && ok &&
-			existing.Source == policycandidate.SourceCertPinningDetection &&
-			configWriteRejectedWhenSourced(w, configSourceURL, "adopting a pinned-certificate bypass") {
-			return
-		}
 		if c, found, err := concrete.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); err == nil && found && c.Source == policycandidate.SourceCertPinningDetection && (assetStore == nil || ruleStore == nil) {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
 			return
@@ -331,6 +316,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// the only effect is proposing pending review items (fail-closed). Tenant-scoped + secret-safe (reachable
 	// route domains are already non-secret; private base URLs/secrets are never touched).
 	mux.HandleFunc("POST /admin/connector-discovery/refresh", adminEndpoint("admin.policy_candidates.write", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
 			return
 		}
@@ -343,11 +329,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		tenantID := adminTenantIDFromRequest(r)
 		discovered, err := refreshConnectorDiscoveredCandidates(r.Context(), registry, applicationCatalogStore, concrete, tenantID, now)
 		if err != nil {
-			if errors.Is(err, policycandidate.ErrPersistence) {
+			if errors.Is(err, policycandidate.ErrPersistence) || errors.Is(err, policycandidate.ErrUnavailable) || errors.Is(err, policycandidate.ErrReconciliationRequired) {
 				writePolicyCandidateError(w, err)
-				return
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("connector discovery is temporarily unavailable"))
 			}
-			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -364,6 +350,7 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// here. Published != Allow: the response carries the same review block, so a freshly published app still
 	// authorizes nobody until a policy is bound (fail-closed).
 	mux.HandleFunc("POST /admin/policy-candidates/{candidate_id}/approve-private-app", adminEndpoint("admin.policy_candidates.review", func(w http.ResponseWriter, r *http.Request) {
+		// Candidates are held by the control plane (observation_report.go); this Edge's copy is not the record.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "policy candidates") {
 			return
 		}
@@ -446,10 +433,14 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			Published:        true,
 			Status:           "active",
 		}
-		publisher, canPublish := applicationCatalogStore.(appcatalog.CandidatePublisher)
-		reviewer, canReview := policyCandidateStore.(policycandidate.PublicationReviewer)
-		if !canPublish || !canReview {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate publication is not supported by the configured stores"))
+		publisher, ok := applicationCatalogStore.(appcatalog.CandidatePublisher)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application storage cannot safely adopt this candidate"))
+			return
+		}
+		reviewer, ok := policyCandidateStore.(policycandidate.PublicationReviewer)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("candidate storage cannot safely confirm this publication"))
 			return
 		}
 		created, err := publisher.CreateOrMatch(r.Context(), entry, tenantID, now)
@@ -468,21 +459,18 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			reviewReason = "connector_candidate_published"
 		}
 		reviewed, reviewFound, rerr := reviewer.ApprovePublication(r.Context(), cand, reviewReason, now)
+		// Reachability was saved independently. Do not claim candidate approval
+		// or discard the confirmed application when the second store fails.
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
 		if rerr != nil || !reviewFound {
-			published := adminApplicationPublishAuditLog(created, evaluator, now, true)
-			published.ActorUserID = auditActorPrincipal(r)
-			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, published, now)
-			audit := adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", cand, evaluator, now)
-			result, reason := "partial", "Application saved, but candidate approval could not be confirmed."
-			audit.Result, audit.Reason, audit.ActorUserID = &result, &reason, auditActorPrincipal(r)
-			audit.Metadata["application_saved"] = true
-			audit.Metadata["candidate_saved"] = false
-			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": reason + " Reload and reconcile before retrying.", "partial": true, "failed_stage": "candidate_review", "application_id": created.ApplicationID, "candidate_id": candidateID})
+			record := adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", cand, evaluator, now, policyCandidateAuditOutcome{actor: auditActorPrincipal(r), result: "partial", failedStage: "candidate_review"})
+			record.Metadata["candidate_saved"] = false
+			record.Metadata["application_saved"] = true
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, now)
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "Application publication was saved, but candidate review could not be confirmed. Reload and reconcile the application before retrying.", "partial": true, "failed_stage": "candidate_review", "candidate_id": candidateID, "application_id": created.ApplicationID})
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminApplicationPublishAuditLog(created, evaluator, now, true)), now)
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, applicationAuditWithActor(r, adminPolicyCandidateAuditLog("admin_policy_candidate_reviewed", reviewed, evaluator, now)), now)
+		recordCandidate(r, "admin_policy_candidate_reviewed", reviewed, now, policyCandidateAuditOutcome{result: "success"})
 		writeJSON(w, http.StatusOK, map[string]any{
 			"schema_version": "connector_candidate_publish.v1",
 			"application":    created,

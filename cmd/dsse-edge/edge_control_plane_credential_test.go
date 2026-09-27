@@ -32,7 +32,7 @@ func TestTheControlPlaneCredentialCoversExactlyTheCallsItMakes(t *testing.T) {
 		t.Skip("the admin handler is not a mux in this build")
 	}
 
-	adminPath := regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)"`)
+	adminPath := regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)(?:\?|")`)
 	called := map[string]bool{}
 	for _, name := range edgeControlPlaneSyncFiles {
 		raw, err := os.ReadFile(filepath.Join(".", name))

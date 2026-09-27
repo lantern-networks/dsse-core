@@ -45,3 +45,13 @@ func TestExplicitTCPExportKeepsPortRestriction(t *testing.T) {
 		t.Fatalf("TCP port restriction lost: %+v", exp)
 	}
 }
+
+func TestTCPIncomingExportKeepsPortWithoutFamily(t *testing.T) {
+	exp, err := buildServerInitiatedExport([]model.LegacyException{{ID: "tcp", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339), Status: "active", Mode: "allow", Protocol: "tcp", Port: 22}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exp.Rules) != 1 || exp.Rules[0].ServiceFamily != "tcp" || exp.Rules[0].Port != 22 {
+		t.Fatalf("TCP port broadened by export: %+v", exp)
+	}
+}

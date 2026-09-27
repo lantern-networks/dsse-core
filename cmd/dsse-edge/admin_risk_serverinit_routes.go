@@ -23,8 +23,8 @@ import (
 func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, policyStore policy.RuntimeStore, deviceStore deviceRuntimeStore, configSourceURL string) {
 	mux.HandleFunc("POST /admin/risk-signals", adminEndpoint("admin.risk.write", func(w http.ResponseWriter, r *http.Request) {
 		// Risk State: ingest a risk signal (incl. Manual High Risk Marking). High risk folds into
-		// the device's risk state (decisions react via risk_state_severity/admin_high_risk) and revokes
-		// the device's standing east-west grants (acceleration). Phase 3: the high-risk marking is
+		// the device's risk state (decisions react via risk_state_severity/admin_high_risk); enforcement
+		// is determined by policy, not by ingesting the signal. Phase 3: the high-risk marking is
 		// CP-authoritative + fleet-distributed, so author it on the control plane.
 		if configWriteRejectedWhenSourced(w, configSourceURL, "risk signals (high-risk marking)") {
 			return
@@ -51,6 +51,16 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		//
 		// 404 rather than 403, like the kill-switch and the concern report: whether an entity exists on this
 		// node is itself the answer being withheld.
+		if strings.EqualFold(strings.TrimSpace(sig.EntityType), "user") || strings.EqualFold(strings.TrimSpace(sig.EntityType), "human") {
+			resp, tenant, ok := writeUserRisk(w, r, config, sig)
+			if !ok {
+				return
+			}
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, userRiskAuditLog(r, tenant, resp, evaluator, now), now)
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
 		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
 			if owned, why := riskEntityOwnedByCaller(r.Context(), sig.EntityType, sig.EntityID,
 				adminTenantIDFromRequest(r), config.EnrolledLedger, config.HumanIdentities); !owned {
@@ -58,23 +68,46 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 				return
 			}
 		}
+		_, entityID, err := validateAdminRiskSignal(deviceStore, sig)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		tenantID := adminTenantIDFromRequest(r)
+		if config.EnrolledLedger != nil {
+			if entry, ok := config.EnrolledLedger.EntryFor(entityID); ok && strings.TrimSpace(entry.TenantID) != "" {
+				tenantID = entry.TenantID
+			}
+		}
+		warning, err := config.HighRiskOverlay.SetDeviceRiskContext(r.Context(), entityID, sig.Severity)
+		if err != nil {
+			now := time.Now().UTC()
+			failure := deviceRiskAuditLog(r, tenantID, adminRiskSignalResponse{EntityType: "device", EntityID: entityID, Severity: strings.ToLower(strings.TrimSpace(sig.Severity))}, evaluator, now)
+			failure.EventType = "device_risk_change_failed"
+			failure.Result = stringPtr("error")
+			failure.Metadata["requested_severity"] = failure.Metadata["severity"]
+			delete(failure.Metadata, "severity")
+			delete(failure.Metadata, "high_risk")
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, failure, now)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk save was not confirmed; the live overlay and runtime were not changed"))
+			return
+		}
 		resp, err := applyAdminRiskSignal(deviceStore, adminTenantIDFromRequest(r), sig, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		// Phase 3: reflect the marking into the shared high-risk overlay so EVERY node's decision path
-		// treats the device as high-risk (fleet-consistent risk-based deny/re-auth; reconnect-elsewhere blocked).
-		if config.HighRiskOverlay != nil && strings.EqualFold(resp.EntityType, "device") {
-			// The overlay carries the GRADED severity (medium|high|critical) so a policy can gate on any level
-			// (risk_state_severity). AdminHighRisk (the high-risk behaviours) is derived from high|critical only,
-			// in the decision enrichment — a medium mark is a policy signal, not a "high-risk" device/user.
-			switch strings.ToLower(strings.TrimSpace(resp.Severity)) {
-			case "medium", "high", "critical":
-				config.HighRiskOverlay.Mark(resp.EntityID, strings.ToLower(strings.TrimSpace(resp.Severity)))
-			default:
-				config.HighRiskOverlay.Clear(resp.EntityID)
+		resp.OverlayPersistenceWarning = warning
+		if warning {
+			if resp.NotStoredDurably != "" {
+				resp.NotStoredDurably += " "
 			}
+			resp.NotStoredDurably += "Risk is applied with a volatile or non-atomic overlay save. Reapply after storage is healthy."
+		}
+		if resp.EntityType == "device" {
+			now := time.Now().UTC()
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox,
+				deviceRiskAuditLog(r, tenantID, resp, evaluator, now), now)
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}))
@@ -107,7 +140,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			writeError(w, http.StatusBadRequest, fmt.Errorf("confirm_discard and reason are required"))
 			return
 		}
-		warning, err := config.HighRiskOverlay.DiscardLegacyUnattributed(req.ID, req.ExpectedSeverity)
+		warning, err := config.HighRiskOverlay.DiscardLegacyUnattributedContext(r.Context(), req.ID, req.ExpectedSeverity)
 		if err != nil {
 			switch {
 			case errors.Is(err, revocation.ErrLegacyRiskNotFound):
@@ -143,6 +176,9 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 	// GET /admin/risk-signals: device marks by default, or typed, tenant-scoped user marks when requested.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
 		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
+		if riskReadRefusedOnAStandby(w) {
 			return
 		}
 		snap := map[string]string{}

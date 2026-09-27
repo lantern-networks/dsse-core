@@ -651,3 +651,7 @@ The Console regression suite and synthetic browser checks cover these form contr
 Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
+
+### Device and user risk persistence
+
+Risk edits report whether the requested state was applied and durably saved; failed protective saves remain visibly unconfirmed. Standby risk management does not serve stale authority, and promotion reloads shared device and user marks. Existing local snapshots retain their backend instead of being silently replaced by empty shared state. DLP-derived device risk records the actual application and persistence outcome separately from the original finding, and Edge synchronization preserves locally raised marks while applying authoritative CP updates.

@@ -215,9 +215,9 @@ func TestTenantErasureFenceHTTPRefusalAndAudit(t *testing.T) {
 	for _, method := range []string{"GET", "POST"} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(method, "/admin/legal-hold", strings.NewReader(`{"active":true}`)))
-		want := http.StatusServiceUnavailable
+		want := http.StatusConflict
 		if method == "POST" {
-			want = http.StatusInternalServerError
+			want = http.StatusConflict
 		}
 		if rec.Code != want {
 			t.Fatalf("%s status=%d body=%s", method, rec.Code, rec.Body.String())

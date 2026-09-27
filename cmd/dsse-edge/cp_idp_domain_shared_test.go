@@ -126,7 +126,11 @@ func TestPostgresIdPDomainLatestRowAndTerm(t *testing.T) {
 			}
 			for _, raw := range [][]byte{[]byte(`null`), []byte(`{}`), {}} {
 				db.Exec("UPDATE cp_state_blobs SET payload=$2 WHERE store_key=$1", key, raw)
-				call("GET", path, "", 500)
+				readFailureStatus := 500
+				if key == "idp_connections" {
+					readFailureStatus = 503
+				}
+				call("GET", path, "", readFailureStatus)
 				call(method, path, body, 500)
 			}
 			db.Exec("DELETE FROM cp_state_blobs WHERE store_key=$1", key)

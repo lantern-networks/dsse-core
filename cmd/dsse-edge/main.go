@@ -4367,6 +4367,7 @@ func main() {
 		// fact, and an Edge acts on it. See refreshedRowLocked.
 		tenantTransportAuthorityStoreValue = newTenantTransportAuthorityWithReload(seed, persister.Save,
 			persister.Load, time.Now)
+		tenantTransportAuthorityStoreValue.persistContext = func(ctx context.Context, raw []byte) error { return saveAuthorityContext(ctx, persister, raw) }
 		// What the published agent configuration names as the organization's transport server name. A control
 		// plane serves no organization's certificate itself, so the authority's record is the only source it
 		// has — see agentConfigOrganization.
@@ -4407,6 +4408,7 @@ func main() {
 		// receive the write hands its Edges no interception tier for an organization that has one.
 		tenantInterceptionAuthorityValue = newTenantInterceptionAuthorityWithReload(seed, persister.Save,
 			persister.Load, time.Now)
+		tenantInterceptionAuthorityValue.persistContext = func(ctx context.Context, raw []byte) error { return saveAuthorityContext(ctx, persister, raw) }
 		log.Printf("tenant interception authorities loaded: %d organization(s) have delegated interception to "+
 			"this control plane", len(tenantInterceptionAuthorityValue.Organizations()))
 	}

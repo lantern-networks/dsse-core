@@ -216,3 +216,61 @@ func TestCanonicalTrustUnavailableDoesNotFallBackOnAdminPage(t *testing.T) {
 		t.Fatalf("screen substituted fallback anchors: %d", rec.Code)
 	}
 }
+
+func TestPostgresTrustDistributionStandbyReadDoesNotTakeWriter(t *testing.T) {
+	d, tr, a, b := trustDistributionPostgresFixture(t)
+	publishTrustForTest(t, d, tr)
+	before, err := d.store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.release()
+	b.tick()
+	if !b.IsLeader() {
+		t.Fatal("no peer leader")
+	}
+	// A standby has no term; locking the writer must not delay a public read.
+	a.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	_, ok := d.ForContext(ctx, "tenant_a")
+	cancel()
+	a.mu.Unlock()
+	if !ok {
+		t.Fatal("standby could not read committed trust")
+	}
+	after, err := d.store.Load()
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("read changed trust")
+	}
+}
+
+func TestPostgresAuthorityErasureKeepsRequestTerm(t *testing.T) {
+	d, _, a, b := trustDistributionPostgresFixture(t)
+	pg := d.store.(postgresBlobPersister)
+	p := protectPKIAuthorityPersister(postgresBlobPersister{db: pg.db, key: "tenant_transport_authorities"}, "tenant_transport_authorities")
+	raw, err := p.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := newTenantTransportAuthorityWithReload(raw, p.Save, p.Load, time.Now)
+	tr.persistContext = func(ctx context.Context, raw []byte) error { return saveAuthorityContext(ctx, p, raw) }
+	before, _ := p.Load()
+	stale := captureCPWriteLease(context.Background())
+	a.release()
+	b.tick()
+	if !b.IsLeader() {
+		t.Fatal("no peer")
+	}
+	b.release()
+	a.tick()
+	if _, err := tr.RemoveTenantContext(stale, "tenant_a"); err == nil {
+		t.Fatal("stale request erased authority")
+	}
+	after, err := p.Load()
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatal("stale erasure changed storage")
+	}
+	if n, err := tr.RemoveTenantContext(captureCPWriteLease(context.Background()), "tenant_a"); err != nil || n != 1 {
+		t.Fatal("current removal", n, err)
+	}
+}

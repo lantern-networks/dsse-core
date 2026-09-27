@@ -159,7 +159,8 @@ func registerCertsAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 // is actually serving. The caller serializes this with the ensuing replacement.
 func preserveNamedCertVersion(r *http.Request, client *cpConfigVersionClient, name string) error {
 	if client == nil {
-		return fmt.Errorf("config versioning is not enabled")
+		// Standalone nodes have no remote history service. Replacement remains available.
+		return nil
 	}
 	var selected *certreload.ReloadableCert
 	for _, c := range certreload.Registered() {

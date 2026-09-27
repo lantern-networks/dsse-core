@@ -183,6 +183,12 @@ func TestInspectionPostureEndpointNoEngine(t *testing.T) {
 
 func TestInspectionPostureToggleFullPosture(t *testing.T) {
 	store := inspectionposture.NewStore()
+	// Legacy selections may be retained/removed, but new bypasses are tenant rules.
+	legacy := store.Get()
+	legacy.BypassGroups = []string{"m365_optimize"}
+	if _, err := store.Set(legacy); err != nil {
+		t.Fatal(err)
+	}
 	eval := decision.Evaluator{PolicyBundle: model.PolicyBundle{TenantID: "tenant_lab_001"}}
 	handler := newServerWithConfig(serverConfig{
 		Evaluator: eval, Registry: connector.NewRegistry(), AdminAuth: newAdminAuthStore(),

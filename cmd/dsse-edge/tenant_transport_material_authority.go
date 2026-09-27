@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -50,7 +51,8 @@ import (
 // and only mints one for an organization it finds none for. Nothing here is rebuilt from what Edges happen to
 // ask for; a request for an unknown organization is refused rather than answered by creating something.
 type tenantTransportAuthority struct {
-	snapshot []byte
+	persistContext func(context.Context, []byte) error
+	snapshot       []byte
 
 	mu  sync.Mutex
 	cas map[string]*storedTenantTransportCA
@@ -774,6 +776,13 @@ func (a *tenantTransportAuthority) RemoveTenant(tenant string) int {
 }
 
 func (a *tenantTransportAuthority) RemoveTenantChecked(tenant string) (int, error) {
+	return a.RemoveTenantContext(context.Background(), tenant)
+}
+
+func (a *tenantTransportAuthority) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if a == nil {
 		return 0, nil
 	}
@@ -787,7 +796,12 @@ func (a *tenantTransportAuthority) RemoveTenantChecked(tenant string) (int, erro
 		return 0, nil
 	}
 	delete(a.cas, key)
-	// saveLocked restores the previous snapshot when the save is unconfirmed.
+	// Bind the existing save/rollback path to this request, under the authority mutex.
+	oldPersist := a.persist
+	if a.persistContext != nil {
+		a.persist = func(raw []byte) error { return a.persistContext(ctx, raw) }
+	}
+	defer func() { a.persist = oldPersist }()
 	if err := a.saveLocked(); err != nil {
 		return 0, err
 	}

@@ -106,7 +106,7 @@ type WithdrawalReceipt struct {
 	TrustRequired bool   `json:"trust_required"`
 }
 
-var ErrPendingWithdrawal = errors.New("tenant CA withdrawal is unfinished; keep device serving stopped and reconcile the saved registry and trust store before startup")
+var ErrPendingWithdrawal = errors.New("tenant CA withdrawal is unfinished; keep device serving stopped and reconcile the saved registry and trust store before startup (docs/ca-withdrawal-recovery.md)")
 
 // SavePendingWithdrawals writes an intent before either side of a file-backed
 // withdrawal is changed. Its caller serializes all administrative CA writes.

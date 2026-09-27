@@ -141,6 +141,9 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	if err != nil {
 		return err
 	}
+	if bytes.Equal(raw, updated) {
+		return tx.Commit()
+	}
 	if _, err := budget.exec(tx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
 		return err
 	}

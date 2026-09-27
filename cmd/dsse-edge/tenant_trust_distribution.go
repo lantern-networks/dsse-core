@@ -54,6 +54,30 @@ func (d *tenantTrustDistributor) For(tenant string) (agentpolicy.Envelope, bool)
 }
 
 func (d *tenantTrustDistributor) ForContext(ctx context.Context, tenant string) (agentpolicy.Envelope, bool) {
+	// Shared deployments serve the committed signed envelope without authoring a
+	// revision. This works on standby CPs and keeps anonymous reads off the writer.
+	if pg, ok := d.store.(postgresBlobPersister); ok {
+		ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+		defer cancel()
+		var raw []byte
+		if err := pg.db.QueryRowContext(ctx, "SELECT payload FROM cp_state_blobs WHERE store_key=$1", pg.key).Scan(&raw); err != nil {
+			return agentpolicy.Envelope{}, false
+		}
+		state, err := decodeTenantTrustDistributions(raw)
+		if err != nil || d.config.AgentPolicySigner == nil {
+			return agentpolicy.Envelope{}, false
+		}
+		item, ok := state.Tenants[tenant]
+		if !ok {
+			return agentpolicy.Envelope{}, false
+		}
+		payload, err := agentpolicy.VerifyTrustBundleWithKeys(item.Distribution.Envelope, append([]string{d.config.AgentPolicySigner.PublicKeyHex()}, d.config.AgentPolicyNextPublicKeys...), 0)
+		if err != nil || payload.TenantID != tenant {
+			return agentpolicy.Envelope{}, false
+		}
+		return item.Distribution.Envelope, true
+	}
+
 	ctx = trustDistributionWriteContext(ctx)
 	tr, err := d.config.TenantTransportAuthority.materialSnapshot()
 	if err != nil {
@@ -544,4 +568,20 @@ func (d *tenantTrustDistributor) RemoveTenantContext(ctx context.Context, tenant
 		return 0, err
 	}
 	return removed, nil
+}
+
+// The authority's refresh loop and authenticated material requests publish changes;
+// read-only clients only consume the last committed signed revision.
+func (d *tenantTrustDistributor) refreshPublication() error {
+	ctx := trustDistributionWriteContext(context.Background())
+	tr, err := d.config.TenantTransportAuthority.materialSnapshot()
+	if err != nil {
+		return err
+	}
+	in, err := d.config.TenantInterceptionAuthority.materialSnapshot()
+	if err != nil {
+		return err
+	}
+	_, err = d.PublishContext(ctx, tr, in)
+	return err
 }

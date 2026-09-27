@@ -196,13 +196,28 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 		return nil // the single-point check beside this one already says the peers were not given
 	}
 	type answer struct {
-		url   string
-		count int
-		err   error
+		url     string
+		count   int
+		err     error
+		standby bool
 	}
 	answers := make([]answer, 0, len(live))
 	for _, peer := range live {
 		code, raw, err := get(client, peer+"/admin/enrolled-devices", token)
+		if err == nil && code == http.StatusConflict {
+			var refusal struct {
+				Error string `json:"error"`
+			}
+			if json.Unmarshal(raw, &refusal) == nil && strings.Contains(refusal.Error, "admission state is not authoritative here") {
+				// Admission snapshots are reloaded on promotion, not continuously on a
+				// standby. Confirm its role rather than passing an arbitrary 409.
+				status, _, roleErr := get(client, peer+"/leader", "")
+				if roleErr == nil && status == http.StatusServiceUnavailable {
+					answers = append(answers, answer{url: peer, standby: true})
+					continue
+				}
+			}
+		}
 		if err != nil || code != 200 {
 			answers = append(answers, answer{url: peer, err: fmt.Errorf("%d %v", code, err)})
 			continue
@@ -233,6 +248,19 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 				note: fmt.Sprintf("%s could not be asked: %v%s", a.url, a.err, hint)}}
 		}
 	}
+	standbys := 0
+	readable := make([]answer, 0, len(answers))
+	for _, a := range answers {
+		if a.standby {
+			standbys++
+		} else {
+			readable = append(readable, a)
+		}
+	}
+	if len(readable) == 0 {
+		return []verifyResult{{name: "the control planes hold the same authority", note: "no control plane returned an authoritative enrolled roster"}}
+	}
+	answers = readable
 	first := answers[0]
 	for _, a := range answers[1:] {
 		if a.count != first.count {
@@ -242,6 +270,10 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 					"receives an empty roster keeps its own, which means every node ends up with a different "+
 					"one and blocking a device stops it nowhere", first.url, first.count, a.url, a.count)}}
 		}
+	}
+	if standbys > 0 {
+		return []verifyResult{{name: "the control planes hold the same authority", skipped: true,
+			note: fmt.Sprintf("%d standby control plane(s) intentionally refuse admission reads; their snapshots reload on promotion. This check cannot compare their rosters. Verify roster preservation during a leadership change with enrolled customer devices", standbys)}}
 	}
 	if first.count == 0 {
 		// ★ AGREEING ON NOTHING IS NOT AGREEMENT (2026-08-24, caught by reading the number this printed). Two

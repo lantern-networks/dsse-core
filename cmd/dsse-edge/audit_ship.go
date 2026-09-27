@@ -297,6 +297,23 @@ func (s *remoteAuditShipper) run() {
 		}
 		s.pending.Store(int64(len(q)))
 	}
+	// Records a caller handed over just before stop are spooled rather than dropped: the caller's "stop" follows
+	// its last Append, and what it appended must still be delivered by the next process. The loop absorbs the
+	// channel on every pass, so this closes only the window between that absorb and the next select, where a
+	// record and stop arriving together were chosen between at random.
+	absorbBeforeStop := func() {
+		for {
+			select {
+			case item, ok := <-s.ch:
+				if !ok {
+					return
+				}
+				enqueue(item)
+			default:
+				return
+			}
+		}
+	}
 	for {
 		// Absorb any queued new records without blocking.
 		drained := false
@@ -319,6 +336,7 @@ func (s *remoteAuditShipper) run() {
 				}
 				enqueue(item)
 			case <-s.quit:
+				absorbBeforeStop()
 				return
 			}
 			continue
@@ -334,6 +352,7 @@ func (s *remoteAuditShipper) run() {
 			case <-timer.C:
 				armed = false
 			case <-s.quit:
+				absorbBeforeStop()
 				return
 			}
 		}

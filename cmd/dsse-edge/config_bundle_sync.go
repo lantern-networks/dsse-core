@@ -36,7 +36,8 @@ import (
 // CP→Edge config distribution (Phase 1 — docs/edge_config_distribution_phase1_design.md). The control plane
 // is the source of truth for runtime admin config; each Edge PULLS a versioned config bundle and applies it
 // to its in-memory stores so a fleet enforces identically. Generalizes steer_exclusion_sync. Fail-safe: a
-// fetch/decode error keeps the last good config. Atomic per generation: a bundle applies whole or not at all.
+// fetch/decode error keeps the last good config. Required section errors leave a generation unapplied
+// for retry; sections already changed are not rolled back.
 // Slice 1 carries access policies; further resources (east-west, dns, …) fold into the bundle.
 
 type configBundleSource struct {
@@ -542,7 +543,7 @@ type configApplyTargets struct {
 	// went on enforcing the ones it compiled at boot — the same divergence this section exists to end, moved one
 	// layer inward where no admin surface would show it at all.
 	onRulesApplied func()
-	// The four below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
+	// The fields below exist only for the carried tenant ERASURE. They are what makes a node able to erase its
 	// own copy of a terminated tenant's data — the logs on its disk above all, which nothing else can reach.
 	logWriter           *logs.Writer
 	localCredentials    *localAdminCredentialStore
@@ -730,7 +731,14 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	}
 	var n int
 	if payload.TenantConfig != nil {
-		n = t.policyStore.ApplyBundle(s.tenantID, policies, *payload.TenantConfig, now)
+		var err error
+		n, err = t.policyStore.ApplyReceivedBundle(s.tenantID, policies, *payload.TenantConfig, now)
+		if err != nil {
+			if !errors.Is(err, policy.ErrReceivedRuntimeCache) {
+				return 0, fmt.Errorf("runtime configuration: %w", err)
+			}
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("runtime configuration: %w", err))
+		}
 	} else {
 		n = t.policyStore.ReplaceTenant(s.tenantID, policies, now)
 	}
@@ -749,7 +757,14 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		}
 		applied := 0
 		if section.Config != nil {
-			applied = t.policyStore.ApplyBundle(tenantID, section.Policies, *section.Config, now)
+			var err error
+			applied, err = t.policyStore.ApplyReceivedBundle(tenantID, section.Policies, *section.Config, now)
+			if err != nil {
+				if !errors.Is(err, policy.ErrReceivedRuntimeCache) {
+					return 0, fmt.Errorf("runtime configuration for %s: %w", tenantID, err)
+				}
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("runtime configuration for %s: %w", tenantID, err))
+			}
 		} else {
 			applied = t.policyStore.ReplaceTenant(tenantID, section.Policies, now)
 		}
@@ -788,7 +803,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 				// the GENERATION must not be recorded as applied, or the retry never happens and the Edge
 				// reports itself current while a disabled device stays admitted.
 				log.Printf("config-bundle sync: the enrolled inventory was NOT applied: %v", merr)
-				criticalErr = fmt.Errorf("enrolled inventory: %w", merr)
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("enrolled inventory: %w", merr))
 			}
 		}
 		// Device-group registry: nil = CP omitted (leave local); present (even empty) = authoritative. An empty
@@ -866,11 +881,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			log.Printf("config-bundle sync: control plane reports its VLAN boundary set is COMPLETE and empty — clearing %d object(s) and %d policy/policies.",
 				len(t.vlan.ListObjects()), len(t.vlan.ListPolicies()))
 			if err := t.vlan.ReplaceAll(nil, nil); err != nil {
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("VLAN configuration: %w", err))
+				criticalErr = errors.Join(criticalErr, err)
 			}
 		default:
 			if err := t.vlan.ReplaceAll(payload.VLAN.Objects, payload.VLAN.Policies); err != nil {
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("VLAN configuration: %w", err))
+				criticalErr = errors.Join(criticalErr, err)
 			}
 		}
 	}
@@ -993,7 +1008,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		} else {
 			for _, grant := range payload.DelegatedGrants.Grants {
 				if _, err := t.delegatedGrants.UpsertReceived(context.Background(), grant); err != nil {
-					criticalErr = errors.Join(criticalErr, fmt.Errorf("delegated grant configuration could not be applied: %w", err))
+					// Continue so updates/revocations of retained IDs can still be applied at capacity.
+					// A rejected grant must leave the generation unapplied and eligible for retry.
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("delegated grant %q: %w", grant.ID, err))
 				}
 			}
 		}
@@ -1011,19 +1028,23 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// device-CA registry, because they are the same kind of fact from opposite directions: that one says which
 	// organization a client certificate belongs to, this one says which server certificates an organization's
 	// own flows may accept.
-	if payload.InternalCAs != nil && t.internalCAs != nil {
-		if count, applied, err := applyInternalCABundleSectionChecked(t.internalCAs, payload.InternalCAs, log.Printf); err != nil {
+	if payload.InternalCAs != nil {
+		count, applied, err := applyInternalCABundleSectionChecked(t.internalCAs, payload.InternalCAs, log.Printf)
+		if err != nil {
 			criticalErr = errors.Join(criticalErr, fmt.Errorf("internal authorities: %w", err))
-		} else if applied {
+		}
+		if applied {
 			log.Printf("config_bundle_internal_cas applied=%d", count)
 		}
 	}
 	// What the fleet has already approved out of band, so a flow held on a node that did not run the
 	// ceremony is released by the grant that ceremony earned.
 	if payload.Grants != nil {
-		if added, updated, err := applyGrantBundleSectionChecked(theGrantStore.Load(), payload.Grants, time.Now().UTC()); err != nil {
-			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grant configuration: %w", err))
-		} else if added > 0 || updated > 0 {
+		added, updated, err := applyGrantBundleSectionChecked(theGrantStore.Load(), payload.Grants, time.Now().UTC())
+		if err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grants: %w", err))
+		}
+		if added > 0 || updated > 0 {
 			log.Printf("config_bundle_grants added=%d updated=%d", added, updated)
 		}
 	}
@@ -1059,7 +1080,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		applyLicenceBundleSection(payload.Licence, t.licenceStore, t.licensingGate, t.licenceAcceptedKeys,
 			t.licenceMSSPID, time.Now().UTC().Format(time.RFC3339), log.Printf)
 	}
-	if payload.InspectionPosture != nil && t.inspectionPosture != nil && t.setInspectionPosture != nil {
+	if payload.InspectionPosture != nil {
 		if _, err := applyInspectionPostureBundleSection(payload.InspectionPosture, t.inspectionPosture, t.setInspectionPosture, log.Printf); err != nil {
 			criticalErr = errors.Join(criticalErr, fmt.Errorf("inspection posture: %w", err))
 		}
@@ -1086,6 +1107,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// assetcatalog/distribution.go and policyrule/distribution.go. Briefly: the catalog has three owners (CP,
 	// enrolled-device sync, built-ins) so replacing it would delete the other two every pull; the rule set has
 	// one owner, and an authored allow/bypass that survives its own deletion fails permissive.
+	if payload.Rules != nil && t.rules == nil {
+		criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rule target is unavailable"))
+	}
 	if payload.Rules != nil && t.rules != nil {
 		// ★ PRESENT-BUT-EMPTY CLEARS, and this is the one section where it must — reversing the rule every
 		// other section follows, after live testing showed the alternative is broken (2026-08-10).
@@ -1140,40 +1164,49 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		//
 		// Before the rule apply, because a rule may reference an endpoint this bundle introduces. Safe in the
 		// other order too: policyrule validation never consults the asset catalog.
+		assetsReady := true
+		if t.assets == nil && (len(payload.Rules.Endpoints)+len(payload.Rules.Groups)+len(payload.Rules.Services) > 0) {
+			assetsReady = false
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("authored asset target is unavailable"))
+		}
 		if t.assets != nil {
 			removed, aerr := t.assets.ReplaceAuthored(payload.Rules.Endpoints, payload.Rules.Groups, payload.Rules.Services)
 			if aerr != nil {
+				assetsReady = false
+				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored assets: %w", aerr))
 				log.Printf("config-bundle sync: the control plane's asset catalog was REFUSED, keeping the last good one: %v", aerr)
 			} else if len(removed) > 0 {
 				log.Printf("config-bundle sync: removed %d asset(s) the control plane does not author: %s",
 					len(removed), strings.Join(removed, ", "))
 			}
 		}
-		incoming := payload.Rules.Rules
-		if len(incoming) == 0 {
-			if local := t.rules.Snapshot(); len(local) > 0 {
-				log.Printf("config-bundle sync: the control plane authors NO rules; removing %d rule(s) this Edge still holds: %s", len(local), ruleIDsForLog(local))
-			}
-			if err := t.rules.ReplaceAll(nil); err != nil {
-				log.Printf("config-bundle sync: could not clear the authored rule set: %v", err)
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules (clear): %w", err))
-			} else if t.onRulesApplied != nil {
-				t.onRulesApplied()
-			}
-		} else {
-			// ★ NAME WHAT IS BEING REMOVED. The control plane is authoritative, so a rule this Edge holds and
-			// the CP does not is deleted — including one authored locally before the CP became the authority.
-			// That is correct and it is also how a cutover silently drops policy nobody migrated: on the first
-			// pull, every Edge-local rule that was never copied up simply disappears. It happened here, to the
-			// cert-pin bypass this fleet had adopted. Authority does not have to be quiet about what it erases.
-			logRemovedByDistribution(t.rules.Snapshot(), incoming)
-			// ALL-OR-NOTHING. ReplaceAll refuses the whole set if any rule is invalid, and the Edge then keeps
-			// the last good one: a half-applied policy is an access posture nobody authored.
-			if err := t.rules.ReplaceAll(payload.Rules.Rules); err != nil {
-				log.Printf("config-bundle sync: REFUSED the control plane's authored rule set, keeping the last good one: %v", err)
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules: %w", err))
-			} else if t.onRulesApplied != nil {
-				t.onRulesApplied()
+		if assetsReady {
+			incoming := payload.Rules.Rules
+			if len(incoming) == 0 {
+				if local := t.rules.Snapshot(); len(local) > 0 {
+					log.Printf("config-bundle sync: the control plane authors NO rules; removing %d rule(s) this Edge still holds: %s", len(local), ruleIDsForLog(local))
+				}
+				if err := t.rules.ReplaceAll(nil); err != nil {
+					log.Printf("config-bundle sync: could not clear the authored rule set: %v", err)
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules (clear): %w", err))
+				} else if t.onRulesApplied != nil {
+					t.onRulesApplied()
+				}
+			} else {
+				// ★ NAME WHAT IS BEING REMOVED. The control plane is authoritative, so a rule this Edge holds and
+				// the CP does not is deleted — including one authored locally before the CP became the authority.
+				// That is correct and it is also how a cutover silently drops policy nobody migrated: on the first
+				// pull, every Edge-local rule that was never copied up simply disappears. It happened here, to the
+				// cert-pin bypass this fleet had adopted. Authority does not have to be quiet about what it erases.
+				logRemovedByDistribution(t.rules.Snapshot(), incoming)
+				// ALL-OR-NOTHING. ReplaceAll refuses the whole set if any rule is invalid, and the Edge then keeps
+				// the last good one: a half-applied policy is an access posture nobody authored.
+				if err := t.rules.ReplaceAll(payload.Rules.Rules); err != nil {
+					log.Printf("config-bundle sync: REFUSED the control plane's authored rule set, keeping the last good one: %v", err)
+					criticalErr = errors.Join(criticalErr, fmt.Errorf("authored rules: %w", err))
+				} else if t.onRulesApplied != nil {
+					t.onRulesApplied()
+				}
 			}
 		}
 	}
@@ -1245,7 +1278,7 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 			// ★ AND THE STATUS KEEPS THE REASON (2026-08-13, twenty-sixth review). recordPoll CLEARS lastError,
 			// so the log said "knowingly behind" while the health view went back to looking like a clean poll —
 			// the operator's window onto this lost the one fact that explains why the generation is not moving.
-			log.Printf("config-bundle sync: generation %d is NOT applied (%v) — it will be retried; this Edge "+
+			log.Printf("config-bundle sync: generation %d is not fully converged (%v) — it will be retried; this Edge "+
 				"is knowingly behind the control plane until it succeeds", payload.Generation, aerr)
 			s.status.recordError(aerr, time.Now().UTC())
 			return

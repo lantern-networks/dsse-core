@@ -171,6 +171,12 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// is the visibility that was missing on 2026-06-23, when an authored Authenticate rule silently lost a
 	// priority tie to a built-in Google allow and we had to hand-curl /decisions/evaluate to find it. Read-only.
 	mux.HandleFunc("GET /admin/effective-policy", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		destination := strings.TrimSpace(r.URL.Query().Get("destination"))
 		if destination == "" {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("destination query parameter is required (e.g. ?destination=accounts.google.com)"))
@@ -219,6 +225,9 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// policies), in precedence order, source-tagged — so the full policy set is visible, not discoverable only
 	// per-destination. Read-only.
 	mux.HandleFunc("GET /admin/effective-policies", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
 		writeJSON(w, http.StatusOK, effectivePolicyList(evaluatorForCaller(runtimeEvaluatorForPolicyStore(evaluator, policyStore), r)))
 	}))
 	// The unified Egress view's data source: EVERY effective egress rule across all surfaces — authored rules,
@@ -227,6 +236,12 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// expects the Egress view to reflect all egress decisions in one place, not just authored rules; this gathers
 	// them (the edge owns every surface) so the Console renders a single list. Read-only aggregation.
 	mux.HandleFunc("GET /admin/egress-effective-rules", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
 		aliasByID := map[string]string{}
 		for _, e := range assetStore.ListEndpoints(tenant) {

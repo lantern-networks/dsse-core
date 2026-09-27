@@ -693,3 +693,8 @@ Export creation for an unknown stream now returns 404 consistently with searches
 AI service usage now verifies organization, requested period, coverage and totals before showing a report. Unavailable or inconsistent responses show Retry rather than zero usage; stale responses after a tenant or period change are ignored. Deploy the Console with its matching CP version: an older CP without the report tenant field is shown as unavailable, not as zero usage.
 
 For the AI usage Console, API tokens need both `admin.ai.read` and `admin.tenant.read` so the displayed report can be verified against its organization. Standard administrative session roles already include both permissions.
+### Steering exclusions and boundary administration
+
+Steering exclusions now keep saved state on failed writes, attribute audit and version history to the target organization, and validate tenant/schema on CP feeds before replacing an Edge cache. VLAN edits preserve unrelated records and distinguish rejected input from unconfirmed storage; auditors remain read-only. East-west and SaaS restriction reads report unavailable shared storage instead of presenting stale authority. Candidate publication errors retain retryable storage failures. Update CP before Edges that require the validated exclusion feed.
+
+Before updating an Edge that downloads steering exclusions, ensure its retrieval token belongs to the same tenant as its configuration bundle. An operator token or a token from another tenant now receives a tenant-mismatch response; the Edge retains its cached exclusions but cannot receive subsequent updates. Update the CP first, then update Edges after checking this token-to-tenant mapping.

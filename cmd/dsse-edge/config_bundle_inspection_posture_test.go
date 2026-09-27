@@ -36,7 +36,7 @@ func TestAnEdgeTakesTheControlPlanesInspectionPosture(t *testing.T) {
 	if section == nil {
 		t.Fatal("a control plane holding a posture published no section")
 	}
-	if !applyInspectionPostureBundleSection(section, edge.get, edge.set, nil) {
+	if changed, err := applyInspectionPostureBundleSection(section, edge.get, edge.set, nil); !changed || err != nil {
 		t.Fatal("the Edge did not take the control plane's posture")
 	}
 	if edge.get().Mode != inspectionposture.ModeBypassDefault {
@@ -76,7 +76,7 @@ func TestTheAllowlistTravelsAndNotOnlyTheMode(t *testing.T) {
 func TestAnUnchangedPostureIsNotReapplied(t *testing.T) {
 	cp := &postureHolder{p: bypassDefaultWith("accounts.google.com")}
 	edge := &postureHolder{p: bypassDefaultWith("accounts.google.com")}
-	if applyInspectionPostureBundleSection(inspectionPostureBundleSection(cp.get), edge.get, edge.set, nil) {
+	if changed, _ := applyInspectionPostureBundleSection(inspectionPostureBundleSection(cp.get), edge.get, edge.set, nil); changed {
 		t.Fatal("an identical posture was reported as a change")
 	}
 }
@@ -85,7 +85,7 @@ func TestAnUnchangedPostureIsNotReapplied(t *testing.T) {
 // authority question, because a posture has no "empty" that could be confused with absence.
 func TestAControlPlaneThatAuthorsNoPostureChangesNothing(t *testing.T) {
 	edge := &postureHolder{p: bypassDefaultWith("accounts.google.com")}
-	if applyInspectionPostureBundleSection(nil, edge.get, edge.set, nil) {
+	if changed, _ := applyInspectionPostureBundleSection(nil, edge.get, edge.set, nil); changed {
 		t.Fatal("an absent section changed this Edge's posture")
 	}
 	if inspectionPostureBundleSection(nil) != nil {
@@ -142,5 +142,27 @@ func TestAConfigPullingEdgeRefusesToAuthorThePosture(t *testing.T) {
 	if !strings.Contains(window, "configWriteRejectedWhenSourced(") {
 		t.Fatal("POST /admin/inspection-posture accepts writes on a config-pulling Edge: the next poll would " +
 			"silently overwrite them, on that node only")
+	}
+}
+
+func TestInspectionPostureBundleRetainsLegacyHostPatterns(t *testing.T) {
+	store := inspectionposture.NewStore()
+	admin := newInspectionPostureAdmin(store, nil)
+	posture := bypassDefaultWith("legacy_host.internal", "example.com:443", "https://example.com/path", "[::1]")
+	section := &inspectionPostureBundle{Posture: posture}
+	changed, err := applyInspectionPostureBundleSection(section, store.Get, admin.set, nil)
+	if err != nil || !changed || !inspectionPostureEqual(store.Get(), posture) {
+		t.Fatalf("legacy delivery changed=%v err=%v", changed, err)
+	}
+	changed, err = applyInspectionPostureBundleSection(section, store.Get, admin.set, nil)
+	if err != nil || changed {
+		t.Fatalf("same delivery changed=%v err=%v", changed, err)
+	}
+	section.Posture.Mode = "unknown"
+	if _, err := applyInspectionPostureBundleSection(section, store.Get, admin.set, nil); err == nil {
+		t.Fatal("invalid mode accepted")
+	}
+	if !inspectionPostureEqual(store.Get(), posture) {
+		t.Fatal("invalid mode changed saved posture")
 	}
 }

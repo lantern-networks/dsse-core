@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/lantern-networks/dsse-core/inspectionposture"
 )
 
@@ -45,28 +47,35 @@ func inspectionPostureBundleSection(get func() inspectionposture.Posture) *inspe
 // log with a before and an after.
 func applyInspectionPostureBundleSection(section *inspectionPostureBundle, current func() inspectionposture.Posture,
 	set func(inspectionposture.Posture, string) (inspectionposture.Posture, error),
-	logf func(string, ...interface{})) (changed bool) {
-	if section == nil || set == nil || current == nil {
-		return false
+	logf func(string, ...interface{})) (changed bool, err error) {
+	if section == nil {
+		return false, nil
+	}
+	if set == nil || current == nil {
+		return false, fmt.Errorf("inspection posture target is unavailable")
+	}
+	// Signed settings may contain host patterns accepted by earlier CPs.
+	// New edits are validated strictly at the author, not on delivery.
+	if section.Posture.Mode != inspectionposture.ModeDecryptAll && section.Posture.Mode != inspectionposture.ModeBypassDefault {
+		return false, fmt.Errorf("invalid inspection posture mode")
 	}
 	next := section.Posture.Normalized()
 	if inspectionPostureEqual(current(), next) {
-		return false
+		return false, nil
 	}
 	before := current()
 	if _, err := set(next, ""); err != nil {
-		// The posture IS live in memory and durability failed, or the set was refused. Either way it is said out
-		// loud: an Edge quietly enforcing a different posture from its fleet is the whole defect.
+		// Keep this generation unapplied when the target cannot save it.
 		if logf != nil {
 			logf("config_bundle_inspection_posture_apply_failed err=%v", err)
 		}
-		return false
+		return false, err
 	}
 	if logf != nil {
 		logf("config_bundle_inspection_posture_applied from_mode=%q to_mode=%q from_allowlist=%d to_allowlist=%d",
 			before.Mode, next.Mode, len(before.DecryptAllowlistHosts), len(next.DecryptAllowlistHosts))
 	}
-	return true
+	return true, nil
 }
 
 // inspectionPostureEqual compares two normalized postures. Written out rather than reflect.DeepEqual so a field

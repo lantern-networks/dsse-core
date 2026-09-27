@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/lantern-networks/dsse-core/policy"
 	"sort"
@@ -56,6 +57,47 @@ func validateIncomingExportConditions(ex model.LegacyException) error {
 		return fmt.Errorf("exception %q has a port without a transport", ex.ID)
 	}
 	return nil
+}
+
+// Omitted fields retain the current restriction; explicit empty/zero/false values
+// remain intentional changes. Null is not an explicit wildcard or activation.
+func mergeLegacyException(current model.LegacyException, patch map[string]json.RawMessage, tenant string) (model.LegacyException, error) {
+	raw, err := json.Marshal(current)
+	if err != nil {
+		return current, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return current, err
+	}
+	for key, value := range patch {
+		if _, known := fields[key]; !known {
+			return current, fmt.Errorf("unknown incoming exception field %q", key)
+		}
+		if strings.TrimSpace(string(value)) == "null" {
+			return current, fmt.Errorf("incoming exception field %q cannot be null", key)
+		}
+		fields[key] = value
+	}
+	raw, err = json.Marshal(fields)
+	if err != nil {
+		return current, err
+	}
+	var result model.LegacyException
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return current, fmt.Errorf("invalid incoming exception field type")
+	}
+	result.TenantID = tenant
+	result.Protocol = strings.ToLower(strings.TrimSpace(result.Protocol))
+	result.Mode = strings.ToLower(strings.TrimSpace(result.Mode))
+	result.Status = strings.ToLower(strings.TrimSpace(result.Status))
+	if result.Protocol != "" && result.Protocol != "tcp" && !(result.Status == "disabled" && result.Protocol == strings.ToLower(strings.TrimSpace(current.Protocol))) {
+		return current, fmt.Errorf("non-TCP incoming conditions cannot be created or activated; disable or correct an existing record")
+	}
+	if err := validateLegacyException(result); err != nil {
+		return current, err
+	}
+	return result, nil
 }
 
 // Refuse the complete export instead of silently dropping a restriction while

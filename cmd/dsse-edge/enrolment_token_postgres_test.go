@@ -32,7 +32,7 @@ func openEnrolmentTokenDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	selected, err := selectPostgresComponentMigrations(migrations, "enrolment tokens", postgresMigrationEnrolmentTokens)
+	selected, err := selectPostgresComponentMigrations(migrations, "enrolment tokens", postgresMigrationEnrolmentTokens, postgresMigrationEnrolmentTokenIssuerLabel)
 	if err != nil {
 		t.Fatalf("select: %v", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
@@ -112,6 +113,7 @@ func normalize(c Connection) (Connection, error) {
 // use; persists to a JSON state path when configured (see persistence.go) so registered IdPs survive a
 // restart.
 type Store struct {
+	appliedDomains atomic.Pointer[map[string][]string]
 	mu             sync.RWMutex
 	connections    map[string]map[string]Connection // tenant -> idp_id -> connection
 	defaults       map[string]string                // tenant -> default idp_id
@@ -451,4 +453,26 @@ func (s *Store) ReplaceAllChecked(conns []Connection, defaults map[string]string
 	}
 	s.publishLocked(next)
 	return nil
+}
+
+// AppliedVerifiedDomains is the last confirmed runtime view. It never reads the
+// database or waits for an administrative storage operation.
+func (s *Store) AppliedVerifiedDomains(tenant string) []string {
+	if s == nil {
+		return nil
+	}
+	snapshot := s.appliedDomains.Load()
+	if snapshot == nil {
+		return nil
+	}
+	return append([]string(nil), (*snapshot)[strings.TrimSpace(tenant)]...)
+}
+func (s *Store) publishDomainsLocked() {
+	out := map[string][]string{}
+	for tenant, rows := range s.connections {
+		for _, c := range rows {
+			out[tenant] = append(out[tenant], c.VerifiedDomains...)
+		}
+	}
+	s.appliedDomains.Store(&out)
 }

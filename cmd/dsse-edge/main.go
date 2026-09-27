@@ -6384,10 +6384,18 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			log.Fatalf("resolve organization domains store %q: %v", config.OrganizationDomainsStorePath, e)
 		} else if p != nil {
 			if lerr := organizationDomains.SetPersister(p); lerr != nil {
-				log.Printf("organization domains store: load failed (starting fresh): %v", lerr)
+				log.Fatalf("organization domains store: initial load failed: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
+					if err := organizationDomains.RefreshShared(); err != nil {
+						log.Printf("organization domains store: refresh failed; keeping applied classification: %v", err)
+					}
+					if idp := theIdPRegistry.Load(); idp != nil {
+						if err := idp.RefreshShared(); err != nil {
+							log.Printf("identity domains refresh failed; keeping applied classification: %v", err)
+						}
+					}
 					if err := organizationDomains.PersistIfDirty(); err != nil {
 						log.Printf("organization domains store: persist failed: %v", err)
 					}
@@ -8400,6 +8408,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// is a property of this node's conversation with the authority and of nothing else.
 	connectorLiveness := newConnectorLivenessCarrier()
 	mux.HandleFunc("POST /connectors/register", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		var req model.ConnectorRegistration
 		if err := decodeLimitedJSONBody(w, r, &req, maxConnectorRegistrationBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode connector registration: %w", err))
@@ -8438,8 +8447,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		// Route governance: record the advertised routes. First sight grandfathers the current set; a route
 		// advertised LATER (a re-register with a new CIDR) is pending until an operator approves it.
+		// The registration has taken effect whatever happens to discovery: record it,
+		// report it and refresh the boundary below, then say what did not save.
+		var discoveryErr error
 		if connectorRouteGov != nil {
-			connectorRouteGov.SeeRoutes(conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
+			discoveryErr = connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
 		}
 		// A connector's routes ARE this tenant's declaration of what is internal, so the east-west plane
 		// boundary moves with them. Refreshed here rather than read at decision time: the decision path must
@@ -8456,9 +8468,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		if discoveryErr != nil {
+			log.Printf("connector %q registered; route discovery not saved: %v", conn.ID, discoveryErr)
+			writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
+			return
+		}
 		writeJSON(w, http.StatusCreated, publicConnectorRegistration(conn))
 	})
 	mux.HandleFunc("POST /connectors/{connector_id}/heartbeat", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		if !authorizeConnectorRuntimeRequest(w, r, connectorSecret, registry, r.PathValue("connector_id"), evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -8497,8 +8515,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// Live discovery refresh: when the heartbeat re-reports the connector's routes, refresh the discovery
 		// timing + apply the fail-safe to any NEWLY seen CIDR — without a reconnect. Discovery only (routing is
 		// CP-configured). See docs/connector_network_route_advertisement_design.md.
+		// Liveness below has taken effect whatever happens to discovery; the status
+		// change and the report to the authority must not be skipped because of it.
+		var discoveryErr error
 		if connectorRouteGov != nil && req.ReachableRoutes != nil {
-			connectorRouteGov.SeeRoutes(conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
+			discoveryErr = connectorRouteGov.SeeRoutesContext(r.Context(), conn.TenantID, conn.ID, conn.ReachableRoutes.CIDRs, time.Now())
 		}
 		if req.ReachableRoutes != nil {
 			refreshEastWestInternalNetworks(r.Context(), policyStore, registry, conn.TenantID)
@@ -8519,6 +8540,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if connectorCPReport != nil && connectorLiveness.shouldCarry(conn.ID, conn.Status, evaluator.EdgeRegionID, time.Now()) {
 			connectorCPReport.Report(connectorReport{Registration: conn, TenantID: conn.TenantID,
 				AttachedRegionID: evaluator.EdgeRegionID})
+		}
+		if discoveryErr != nil {
+			log.Printf("connector %q heartbeat recorded; route discovery not saved: %v", conn.ID, discoveryErr)
+			writeError(w, http.StatusServiceUnavailable, errors.New("Connector saved but route discovery could not be saved; retry."))
+			return
 		}
 		writeJSON(w, http.StatusAccepted, conn)
 	})
@@ -8744,6 +8770,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		rotatedBy := adminPrincipalIDFromRequest(r)
 		conn, ok, err := registry.RotateRuntimeSecretHashForTenantWithMetadata(adminTenantIDFromRequest(r), connectorID, connectorRuntimeSecretHash(runtimeSecret), now, rotatedBy)
 		if err != nil {
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector secret change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}

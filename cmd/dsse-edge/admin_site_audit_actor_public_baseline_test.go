@@ -1,18 +1,21 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
-func TestSiteLifecycleAuditsUseAuthenticatedActor(t *testing.T) {
+func TestSiteLifecycleAuditsUseAuthenticatedActorPublicBaseline(t *testing.T) {
 	for _, mode := range []string{"session-own", "token-own", "session-selected-tenant"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
@@ -69,7 +72,7 @@ func TestSiteLifecycleAuditsUseAuthenticatedActor(t *testing.T) {
 			if rec := request("DELETE", "/admin/sites/actor-site", ""); rec.Code != 200 {
 				t.Fatalf("delete %d %s", rec.Code, rec.Body.String())
 			}
-			rows := readTransportAudits(t, writer)
+			rows := readSiteActorAuditsPublicBaseline(t, writer)
 			domains := 0
 			actions := map[string]int{}
 			for _, a := range rows {
@@ -111,7 +114,7 @@ func TestSiteLifecycleAuditsUseAuthenticatedActor(t *testing.T) {
 	}
 }
 
-func TestSiteLifecycleAuditDoesNotInventAnActor(t *testing.T) {
+func TestSiteLifecycleAuditDoesNotInventAnActorPublicBaseline(t *testing.T) {
 	for _, r := range []*http.Request{nil, httptest.NewRequest("POST", "/admin/sites", nil), adminRequestBy(" ")} {
 		if r != nil {
 			r.Header.Set("X-Actor-User-ID", "forged-actor")
@@ -125,4 +128,26 @@ func TestSiteLifecycleAuditDoesNotInventAnActor(t *testing.T) {
 	if stringPtrValue(a.ActorUserID) != "operator" || a.TenantID != "target" {
 		t.Fatal("request actor changed the target tenant")
 	}
+}
+
+func readSiteActorAuditsPublicBaseline(t *testing.T, writer *logs.Writer) []model.AuditLog {
+	t.Helper()
+	file, err := os.Open(filepath.Join(writer.Dir(), "audit.log.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	var rows []model.AuditLog
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		var row model.AuditLog
+		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
+			t.Fatal(err)
+		}
+		rows = append(rows, row)
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return rows
 }

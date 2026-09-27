@@ -27,6 +27,8 @@ func routeGovernanceWriteContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// Admin middleware carries its captured term. Connector observations are
+	// accepted by each regional node and do not author administrative routes.
 	return ctx
 }
 func routeState(g *connectorRouteGovernance) governancePersistState {

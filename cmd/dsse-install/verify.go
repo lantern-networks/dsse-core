@@ -975,6 +975,10 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 		}
 	}
 
+	return reportVerificationResults(dir, results)
+}
+
+func reportVerificationResults(dir string, results []verifyResult) error {
 	failed, skipped := 0, 0
 	fmt.Printf("dsse-install -verify: %s\n\n", dir)
 	for _, r := range results {
@@ -998,8 +1002,8 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 			failed, len(results))
 		return fmt.Errorf("%d check(s) failed", failed)
 	}
-	fmt.Printf("dsse-install -verify: %d checks passed — the control plane holds the authority, the Edge is "+
-		"applying it, and a device can enrol exactly once.\n", len(results))
+	fmt.Printf("dsse-install -verify: %d checks passed; %d not checked. See the individual results for the verified scope.\n",
+		len(results)-skipped, skipped)
 	return nil
 }
 

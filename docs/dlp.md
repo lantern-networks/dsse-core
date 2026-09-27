@@ -42,6 +42,158 @@ The known-safe **allowlist retains its authored values in readable form** for ad
 Use it only for deliberate non-sensitive exceptions, and test that nearby real matches
 remain detectable. Custom keywords are also authored configuration, not secret storage.
 
+## Loading and confirming library changes
+
+The three **Sensitive Data** tabs require a valid list and matching organization before
+editing. A failed or malformed response displays a reload action instead of an editable
+empty list. If a save response is missing, malformed or does not match the submitted
+change, the Console keeps the draft and reports an unconfirmed result. The server may
+already have saved it. Close the editor, reload the list and inspect the saved state before
+making another change. Administrative audit records describe the server's outcome, so a
+committed change can have a successful audit even when its browser response was lost.
+
+List and mutation responses include `tenant_id`. The Console sends `expected_tenant_id`
+on writes (a query parameter for dataset deletion); a nonempty value that differs from
+the authenticated request context is rejected without changing the library. Older API
+clients may omit this precondition and remain scoped to their authenticated request context. Serve the Console and API from
+compatible versions: the updated editors refuse responses without organization identity.
+This guards context changes, not simultaneous edits by administrators in one tenant.
+
+## Managing known-safe exceptions
+
+Use **Sensitive Data → Allowlist** only for confirmed non-sensitive values. Numeric
+identifiers accept digits with spaces, hyphens, parentheses or periods as grouping;
+email addresses ignore case. All other detector types, including custom identifiers,
+EDM and secrets, compare the trimmed literal value exactly. An alphanumeric value such
+as `ORDER-4111111111111111` does not authorize the card number embedded inside it.
+
+With `-dlp-allowlist-store` configured, an edit is published only after the save succeeds.
+An error retains the previous live exceptions, but cannot prove disk rollback if storage
+wrote before reporting failure. Check saved configuration before retrying. With no store,
+changes are in memory only. The API replaces the whole list: `{"values":[]}` clears it;
+a missing/null field, blank entry or more than 1,000 entries is rejected. Exact duplicates
+are removed. Reload before editing when other administrators may be changing the list;
+there is no revision-based conflict detection.
+
+The signed configuration bundle carries authored known-safe values, and receivers compile
+them with their local allowlist salt. Protect configuration access and backups. Update
+both the publisher and receiving nodes to use this distribution support: older receivers
+ignore the section. A section missing from an older publisher preserves the receiver's
+existing exceptions; an explicit empty map clears them. A receiving save failure leaves
+the DLP library unapplied so the same generation can be retried. This is not a transaction
+across every configuration store. Verify the applied generation and both an exempted
+sample and an unlisted control through each Edge.
+
+The administration audit records actor, tenant, endpoint and outcome without values.
+It is not a per-value change diff. A suppressed finding produces no DLP finding event;
+confirm the upload result and access logs as well as an unsuppressed control.
+
+## Saving custom identifiers
+
+Use **Sensitive Data → Identifiers** to add, edit, or delete patterns and keyword lists.
+When `-dlp-classifier-store` is configured, these edits must be accepted by that store
+before the authored definitions and compiled scanner are updated. A failed or unconfirmed
+save returns an error and leaves the current live definitions in place. A storage error
+can occur after bytes were written: the error does not prove that the on-disk snapshot
+is unchanged. Check storage health and the saved configuration before retrying. Without
+a configured store, changes are in memory only and do not survive a restart.
+
+The API replaces the entire tenant list; send `{"classifiers":[]}` to clear it explicitly.
+A missing or null `classifiers` field is rejected. Concurrent administrators should reload
+before editing: this endpoint does not provide revision-based conflict detection.
+Successful local saving does not establish delivery to another Edge or inspection of traffic.
+
+Configured identifier and allowlist stores now validate the entire saved collection
+before adopting it. An invalid regex, classifier definition or allowlist value prevents
+restoration of the whole candidate; it is not silently omitted from the scanner while
+remaining visible in the Console. Loading failure retains the previous runtime state
+and writer, and configured startup fails instead of continuing with an empty library.
+Startup refusals appear in the process log; no administrator mutation has occurred.
+
+A missing file permits first startup. An existing empty file, missing or null top-level
+collection, unknown fields or invalid tenant keys are rejected. The existing `specs`
+and `values` snapshot formats are retained. An explicit empty collection replaces the
+previous library; an empty or null tenant list clears that tenant. Allowlist values use
+the same whitespace trimming and exact deduplication as administrator writes, and are
+compiled with the local salt. Loading does not rewrite the snapshot.
+
+Keep a failed snapshot for diagnosis and restore a known-good copy or correct the source
+configuration; removing the file would discard its definitions. Pending unsaved changes
+must be saved before replacing or detaching the writer. This does not provide conflict
+detection between independent writers or prevent selection of an older valid snapshot.
+
+The administration write audit records the actor, tenant, endpoint and outcome, without
+classifier patterns, keyword values or preview text. It is not a per-identifier change diff
+or a detection event. Follow the traffic checks below to confirm actual DLP coverage.
+
+## Restoring named DLP policies
+
+With `-dlp-policy-object-store` configured, startup validates the complete saved
+`by_tenant` collection before loading any named policy. Each policy's tenant and ID
+must match its map keys. Invalid actions, detector names, scopes, statuses, negative
+thresholds or invalid device-risk conditions reject the whole snapshot. Empty status
+remains compatible with older active policies. A missing file permits first startup;
+an existing empty or malformed file, missing/null collection, unknown fields or null
+tenant map prevents startup. An explicit empty map clears the corresponding collection.
+
+Preserve a rejected file for diagnosis and restore a known-good copy or repair its
+source. Startup refusal is reported in the process log, not an administrator write
+audit. Failed loading keeps the previous live state and storage writer; pending changes
+must be saved before changing that writer. Edits and returned policy values no longer
+share mutable detector, risk-condition or metadata collections with the runtime store.
+The snapshot format is unchanged, but older invalid data that was previously accepted
+now needs correction before startup.
+
+This restoration check validates each policy's own fields. It does not verify that
+all referenced custom identifiers or datasets still exist after all libraries load,
+or that every Internet Access rule references a present policy. Check these references
+and actual detection after restart. It also does not provide an atomic transaction
+across all DLP stores or revision-based protection against concurrent administrators.
+
+## Saving exact-match datasets
+
+Use **Sensitive Data → Exact-Data-Match** to create or replace a named dataset.
+Values must be single ASCII tokens containing letters, digits, or `- _ . @ +`, up to
+128 bytes after surrounding whitespace is trimmed. Matching lowercases letters and
+removes `-` and `_`. Normalized duplicates count once; values shorter than five
+normalized characters are ignored. Multiword phrases, other character sets and longer
+tokens are unsupported and rejected. A replacement with no usable values is rejected
+without deleting the previous dataset. Use **Delete** to remove it explicitly.
+Previously stored hashes cannot reveal whether the original values met these rules.
+Reimport an older dataset from its source values to apply the current validation.
+
+With `-dlp-fingerprint-store` configured, creation, replacement and deletion confirm
+storage before updating the local scanner. A rejected or unconfirmed save leaves the
+previous live dataset in place and reports an error. As with custom identifiers, an
+error may follow a disk write; inspect storage before retrying. Without configured
+storage, changes are in memory only. These local outcomes do not confirm delivery to
+other Edges or inspection of traffic. The write audit records endpoint, actor, tenant
+and outcome without submitted values; it is not a dataset-level change history.
+
+EDM snapshots now save a format version, the hashing salt and the dataset hashes
+together. A restarted node restores that salt even when it differs from its startup
+default. Hashes cannot be moved to a different salt without the original values.
+Protect snapshots and backups: salts and hashes still permit guessing attacks.
+
+Existing snapshots without a version use the node's original startup salt. They are
+not rewritten during loading; a subsequent save writes the versioned format. If an
+older receiver previously saved hashes from a different salt, that lost salt cannot
+be recovered from the snapshot. Restore the correct source configuration or reimport
+the original values. Do not downgrade a node that adopted a different salt: older
+binaries ignore the stored salt and may silently stop matching those datasets.
+
+A missing configured snapshot permits first startup, but an existing empty, malformed,
+unsupported-version or invalid dataset snapshot now prevents startup. Preserve the
+file, investigate the storage failure and restore a known-good backup or the authoritative
+configuration; deleting it would discard the detectors. A valid explicit empty dataset
+map represents a cleared library. Runtime store replacement validates the whole candidate
+before replacing its state and writer; failed loads retain both. Pending unsaved changes
+must reach the existing writer before it can be replaced or detached.
+
+This restoration guarantee applies to the EDM store; identifier and allowlist restoration
+is described above. Named DLP policy restoration and the atomic persistence of a received
+configuration bundle require separate validation.
+
 ## Actions and account scope
 
 | Action | Current behavior on a qualifying match |
@@ -92,6 +244,31 @@ bodies do not produce a per-request skipped-scan finding. No finding can mean no
 no applicable policy, or no inspection. Findings carry types/counts and context rather
 than the matched value; context can still identify a user or destination. See
 [Audit logs and data handling](audit-and-data.md).
+
+## Reading DLP findings
+
+The summary counts detection **events**. One upload event with both an email and a
+card counts once in the total and once in each identifier filter; adding the filter
+counts does not give the event total or the number of matched values. **Showing** is
+the number of rows returned. The configured aggregate query covers the last 30 days
+and examines at most the latest 20,000 inspection records before applying the DLP
+filters. The response defaults to 200 rows. These bounded counts do not describe the
+entire retained history. Use the log search/export tools for further investigation.
+
+A configured findings-store failure now returns HTTP 503. The Console displays Retry
+instead of showing an empty or smaller local cache as a successful result. It also
+refuses malformed results or results for another organization, and ignores obsolete
+responses after navigation or another request. A valid empty result still shows the
+normal no-detections message. If a policy was deleted or its name cannot be read, the
+recorded policy ID is displayed. That current name is not a historical name snapshot.
+
+Inspect original `inspection_events` records in **Logs & Audit** to correlate the
+identifier types, decision ID, user/device and destination. These detection records
+are distinct from administrator configuration audits; merely reading the findings
+page does not constitute a configuration mutation. Event append remains best effort:
+an upload in Observe mode is not interrupted by a logging failure. Check service
+logs and storage health, and verify forwarding and retention across your deployment.
+A surviving local JSONL record does not prove independent control-plane delivery.
 
 ## Acceptance checks
 

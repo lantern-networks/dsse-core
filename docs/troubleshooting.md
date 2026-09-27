@@ -52,6 +52,20 @@ Get-Service DsseSteer,DsseWfp
 & .\clients\windows-wfp\packaging\verify-windows-install.ps1
 ```
 
+## A retired deployment still captures device traffic
+
+Restore direct networking with the installed agent before removing it. These operations
+work without a live deployment:
+
+- [Windows recovery](windows-agent.md#restore-normal-networking): use administrator
+  PowerShell and run each command separately. The guide also explains command-not-found,
+  `UnexpectedToken`, and service-startup spelling errors.
+- [macOS recovery](macos-agent.md#restore-normal-networking): disable the transparent
+  proxy as the logged-in user, without `sudo`.
+
+Check actual browsing after recovery. Do not delete the executable needed to undo its
+network settings or reset unrelated firewall rules.
+
 ## Traffic, policy, and audit
 
 | Symptom | Check first | Next step |

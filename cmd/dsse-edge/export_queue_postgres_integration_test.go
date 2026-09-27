@@ -1487,3 +1487,83 @@ func (db *recordingPostgresExportTaskSQLDB) countQueriesContaining(needle string
 	}
 	return count
 }
+
+func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("sql.Open returned error: %v", err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext returned error: %v", err)
+	}
+	resetPostgresExportTaskQueueTables(t, ctx, db)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		resetPostgresExportTaskQueueTables(t, cleanupCtx, db)
+		_ = db.Close()
+	})
+	applyPostgresExportTaskQueueMigration(t, ctx, db)
+
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewWriter returned error: %v", err)
+	}
+	objectStore, err := objectstore.NewLocalStore(writer.Dir())
+	if err != nil {
+		t.Fatalf("NewLocalStore returned error: %v", err)
+	}
+	postgresJobStore := postgresAdminExportJobStore{DB: db}
+	handler := newServerWithConfig(serverConfig{
+		Evaluator:         testEvaluator(),
+		Writer:            writer,
+		ExportObjectStore: objectStore,
+		HotStore:          hotstore.NewJSONLStore(writer, adminLogStreamFilenameMap()),
+		AdminExportJobs:   postgresJobStore,
+		AdminExportWorker: postgresQueueAdminExportWorker{
+			Queue:                   postgresExportTaskQueueAdapter{DB: postgresExportTaskSQLDB{DB: db}},
+			DB:                      db,
+			DisableDirectAuditJSONL: true,
+		},
+	})
+
+	body := bytes.NewBufferString(`{"stream":"access","format":"ndjson","from":"2026-05-23T00:00:00Z","to":"2026-05-23T05:00:00Z","limit":10}`)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/export-jobs", body)
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /admin/export-jobs status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var job adminExportJob
+	if err := json.Unmarshal(rec.Body.Bytes(), &job); err != nil {
+		t.Fatalf("decode export job response: %v", err)
+	}
+	if job.Status != "queued" {
+		t.Fatalf("job response = %#v, want queued", job)
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 1 {
+		t.Fatalf("active queue rows = %d, want 1", count)
+	}
+	if count := countPostgresAdminAuditOutboxRows(t, ctx, db, "tenant_lab_001"); count != 2 {
+		t.Fatalf("admin audit outbox rows = %d, want 2", count)
+	}
+	auditRows, err := writer.ReadJSONL("audit.log.jsonl")
+	if err != nil {
+		t.Fatalf("ReadJSONL returned error: %v", err)
+	}
+	// The worker suppresses its domain JSONL events; the shared HTTP audit remains mandatory.
+	if len(auditRows) != 1 || auditRows[0]["event_type"] != "admin_config_change" || auditRows[0]["result"] != "success" {
+		t.Fatalf("expected one shared HTTP audit, got %#v", auditRows)
+	}
+	metadata, ok := auditRows[0]["metadata"].(map[string]any)
+	if !ok || metadata["path"] != "/admin/export-jobs" || metadata["status_code"] != float64(202) {
+		t.Fatalf("HTTP audit metadata=%#v", metadata)
+	}
+}

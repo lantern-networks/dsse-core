@@ -60,7 +60,7 @@ func idpConnectionBundleSection(store *idpregistry.Store) *idpConnectionBundle {
 func applyIdPConnectionBundleSection(store *idpregistry.Store, section *idpConnectionBundle, logf func(string, ...interface{})) (count int, applied bool) {
 	count, applied, err := applyIdPConnectionBundleSectionChecked(store, section)
 	if err != nil && logf != nil {
-		logf("config_bundle_idp_connections: settings were not applied")
+		logf("config_bundle_idp_connections: settings were not applied; keeping the %d connection(s)", count)
 	}
 	return count, applied
 }

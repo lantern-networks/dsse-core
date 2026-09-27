@@ -1,15 +1,21 @@
-# dsse-core
+<img src="console/brand/lantern-symbol.svg" alt="Lantern Networks logo" width="72" height="72">
 
-**Lantern DSSE** is developed and maintained by
-[Lantern Networks, Inc.](https://lantern-networks.co.jp/).
-This is its official source repository, published as `dsse-core` under Apache-2.0.
-See the [company website](https://lantern-networks.co.jp/) for the project overview
-and [company information](https://lantern-networks.co.jp/company/).
+# Lantern DSSE
 
-An open-source Secure Service Edge (SSE / ZTNA) implementation for self-hosted labs.
-DSSE provides TLS inspection, mTLS device identity, policy enforcement, DNS control, and
-access to private applications through outbound connectors. The repository contains
-Go packages, runnable services, an Admin Console, and Windows and macOS endpoint agents.
+**Self-hosted network access and web inspection, built as one layer of ransomware defense.**
+
+Lantern DSSE is an open-source Secure Service Edge (SSE / ZTNA) implementation for
+self-hosted labs. Connect Windows and macOS devices to an Edge, inspect selected web
+traffic, and reach private applications through outbound connectors. Configure customer
+organizations and policies in the Admin Console.
+
+Developed by [Lantern Networks, Inc.](https://lantern-networks.co.jp/).
+This is the official `dsse-core` source repository, licensed under [Apache-2.0](LICENSE).
+[Company information](https://lantern-networks.co.jp/company/).
+
+[Try the local API](docs/getting-started.md) · [Deploy a lab](docs/deployment.md) ·
+[Download signed agents](https://github.com/lantern-networks/dsse-core/releases) ·
+[Read the docs](docs/README.md)
 
 **This is an experimental release, not production-ready.** Interfaces, defaults, and configuration may
 change without a migration path. Use an isolated lab with recoverable devices and data.
@@ -17,18 +23,74 @@ A successful installation check is not evidence of long-duration reliability or 
 security audit. It has not been independently run at length by anyone who did not write it.
 See the [threat model](docs/threat-model.md) and each platform's limitations.
 
-Signed endpoint packages, checksums and known release limitations are listed in
-[GitHub Releases](https://github.com/lantern-networks/dsse-core/releases).
-
-Start with the [documentation index](docs/README.md) for a reading path by role and
-the [verification guide](docs/verification.md) for what each check establishes.
-
 ## Maintenance status
 
 Development of 0.3.1 is focused on everyday reliability. See
 [maintenance and 0.3.1 progress](docs/maintenance.md) for implemented fixes,
 remaining release checks and the target week. Development changes are not yet
 part of the published 0.3.0 experimental release.
+
+## Why we built it
+
+Lantern DSSE grew out of work on ransomware defense: if a device is compromised,
+which internal systems can it reach, and what can it send outside the organization?
+The aim is to help limit the spread and impact of a compromise through explicit
+network access policy and selected outbound content inspection.
+
+[East-West policies](docs/east-west-policy.md) let operators evaluate and restrict
+supported internal connections, including access to private applications through
+connectors. [Internet Access](docs/egress-policy.md) and [DLP](docs/dlp.md) address
+outbound access and supported upload content. These controls apply only to traffic
+that reaches their enforcement paths; they are not a claim of ransomware prevention.
+DSSE does not detect local file encryption, remove malware, or restore encrypted data.
+It complements endpoint protection and recovery measures.
+
+Start by observing legitimate traffic, then deliberately enable and verify enforcement.
+The default Connector Access posture is **OBSERVE**, and DLP **Observe** permits uploads;
+observation alone does not contain an attack.
+
+## What can you explore?
+
+| Your question | What to try in DSSE |
+|---|---|
+| If a device is compromised, which internal systems could it reach? | Review observed connections, narrow access to required destinations and services, then verify the intended East-West enforcement. [Internal access guide](docs/east-west-policy.md) |
+| What sensitive content might devices send to an AI or web service? | Attach an **Observe** DLP policy to inspected web traffic and check the corresponding detections in **DLP Findings**. Observe permits the upload. [DLP guide](docs/dlp.md) |
+| Can I restrict which organization accounts people use in supported SaaS services? | Configure provider-specific restriction headers for Google Workspace, Microsoft 365, ChatGPT, or Anthropic Claude. The request must be inspected, and enforcement depends on the provider. [SaaS tenant restriction](docs/saas-tenant-restriction.md) |
+| How can enrolled devices reach a private application? | Publish it through an outbound connector, configure access policy, and verify the result from an enrolled device. [Connector guide](docs/connector.md) |
+
+DLP inspects supported upload bodies that reach the decrypted HTTP path. It does not
+cover every protocol or every AI application. SaaS providers start with account
+restrictions **off**; configuring a provider is separate from configuring DLP.
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    device[Windows / macOS agent] -->|Selected traffic over mTLS| edge[Edge]
+    console[Admin Console] --> cp[Control plane]
+    cp -. Signed configuration .-> edge
+    edge -->|Web access and selected TLS inspection| web[Internet / SaaS]
+    connector[Outbound connector] -->|Establishes tunnel| edge
+    connector --> app[Private application]
+```
+
+The Edge handles traffic and policy decisions. The control plane distributes configuration;
+connectors establish outbound tunnels from the private network. The diagram shows roles,
+not a complete deployment topology. See [Architecture](docs/architecture.md) for the data
+paths and [PKI](docs/pki.md) for device identity and certificate lifecycle.
+
+## Choose your first step
+
+- **Explore the code locally:** the [local API quickstart](docs/getting-started.md) runs
+  one Edge on loopback and lets you query its policy API. It does not install an agent,
+  steer your browser, or demonstrate DLP.
+- **Evaluate the system:** follow [Deployment](docs/deployment.md), then enrol a device.
+  The guide includes a single-machine lab and three regions with one node each.
+  Signed Windows and macOS packages, checksums, and release limitations are in
+  [GitHub Releases](https://github.com/lantern-networks/dsse-core/releases).
+
+Use the [verification guide](docs/verification.md) to distinguish a successful setup
+step from a working end-to-end flow.
 
 ## Install and start a deployment
 
@@ -98,6 +160,11 @@ these commands do not build or test it. Platform-specific endpoint builds are de
 in [Building](docs/building.md).
 
 ## Contributing and security
+
+Trying DSSE in an independent lab is a useful contribution. Tell us what you tried,
+which release and platform you used, and where the instructions or behavior differed
+from your expectations. [Open an issue](https://github.com/lantern-networks/dsse-core/issues)
+with sanitized details; keep tokens, private keys, and personal data out of reports.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the Developer Certificate of Origin and
 contribution checks. Report vulnerabilities privately using [SECURITY.md](SECURITY.md).

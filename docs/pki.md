@@ -220,3 +220,163 @@ Source entry points for checking a changed revision:
 - [Customer transport authority](../cmd/dsse-edge/tenant_transport_material_authority.go), [device authority](../cmd/dsse-edge/tenant_device_material_authority.go), [inspection authority](../cmd/dsse-edge/tenant_interception_material_authority.go), and [managed inspection minting](../cmd/dsse-edge/tenant_interception_authority_mint.go).
 - [Edge material refresh and expiry](../cmd/dsse-edge/tenant_transport_material_fetch.go), [trust distribution](../cmd/dsse-edge/tenant_trust_distribution.go), and [PKI readiness](../cmd/dsse-edge/admin_pki_readiness.go).
 - [Device renewal timing](../enroll/renewal_due.go), [connector identity](../cmd/dsse-connector/identity.go), and [signer options](../cmd/dsse-edge/main.go).
+
+## Trusting certificates for internal sites
+
+Open **Internal site certificates** in the control-plane Console. Add a recognizable
+name and the public CA certificate that issued the internal site's certificate.
+Paste exactly one PEM `CERTIFICATE` block per entry. Do not paste a private key,
+a certificate chain, or the site's leaf certificate. This authority is separate
+from the inspection CA that your devices trust.
+
+The list belongs to the selected organization. A successful addition lets its
+upstream TLS connections use that CA alongside the platform's public roots. It does
+not add trust for another organization. Expired authorities remain visible but are
+excluded from the trust material. Removing an authority requires confirmation;
+private sites that rely on it may stop opening after the change reaches the
+serving Edge. Established connections are not forcibly closed by this operation.
+
+Additions, replacements and deletions change live trust only after the storage
+operation reports success. A storage error is shown as a failure, not a completed
+removal. Restore storage, reload the list and retry. The Console keeps the same
+request ID when retrying unchanged input after an uncertain response. A remote
+storage error can leave the durable outcome uncertain; recheck the list instead
+of assuming the storage operation rolled back. Nodes that receive configuration
+from a source reject local writes; make the change on the control plane.
+
+Malformed stored records or configuration sections are rejected as a whole;
+reload keeps the last valid list. If an older stored entry contains mixed PEM
+material, correct it to one public CA certificate through a controlled maintenance
+procedure before loading it with this version. This validation does not remove
+private keys from old database backups or previously distributed copies.
+
+**Logs & Audit** records `admin_internal_ca_changed` with the administrator,
+organization, authority ID, action and result. Results include `saved`, `deleted`,
+`rejected`, `not_found`, and `persistence_unconfirmed`. Addition attempts can include
+a SHA-256 certificate fingerprint; certificate PEM, private keys and display names
+are not copied into this event. The common configuration-change audit also records
+the HTTP outcome. Fleet propagation and storage/audit durability require deployment
+verification in addition to a successful Console response.
+
+
+### Importing and replacing a tenant interception CA
+
+In **Certificates**, use **Load this tenant's interception CA** for the first import.
+Provide the public root certificate, the issuing CA certificate and its matching
+issuing private key. Keep the root private key offline. Devices must trust the root
+before inspection, and each Edge receives the saved authority on its next refresh.
+
+Once an authority exists, **Stage a replacement CA** registers the next authority.
+The current authority continues signing while devices adopt the incoming root.
+The Console disables another import while a replacement is staged. Switch only
+after the adoption checks permit it. Missing fleet evidence prevents promotion
+and withdrawal; saving the replacement alone does not complete the rotation.
+If saving fails, reload the authority state after restoring storage before retrying.
+
+**Logs & Audit** records successful first imports and staged replacements as
+`pki_material_changed`, including the organization, administrator, root and issuing
+certificate fingerprints, and whether the import was staged. The common audit
+records rejected requests. Device CA registration records the submitted public
+certificate fingerprints and its reported durability. No private key is included
+in these audit records. Audit delivery and fleet adoption need separate verification.
+
+## Replacing a node certificate from the Console
+
+In **Certificates**, select **Replace** for the intended node and supply its leaf
+certificate chain and matching private key. This changes that node's registered
+listener files; it is not a fleet-wide CA rotation. The current trust/admission
+checks still apply to replacements and rollbacks.
+
+Before changing the files, the server must save the currently served pair in the
+control-plane version store. This includes the original pair on the first
+replacement. If versioning is unavailable or that save fails, the request is
+refused and the replacement is not applied. **History / roll back** lists versions
+without their private-key payload; choosing a version restores its certificate
+and key after validating them against current trust. The internal version store
+contains private keys and needs the same access and backup protections as other
+PKI stores. A failed replacement can still leave a retained copy of the unchanged
+previous pair in history.
+
+Both destination files must be writable regular files. New material is staged
+before changing either file. A private recovery journal beside the certificate
+(`CERT_PATH.dsse-pair-recovery.json`) durably retains the previous pair before
+replacement. If the process terminates before the update is confirmed, startup
+and reload restore that pair before loading it. Recovery is retryable if it is
+interrupted again. A malformed or inaccessible recovery journal prevents loading
+or updating that pair; an already-running listener keeps its last loaded pair.
+
+Keep the recovery journal with its backing files and protect it like a private
+key. After completion its contents become a durable marker without key material.
+Do not delete a pending journal or edit the backing files while recovering. If
+recovery fails, correct the storage problem and retry reload/startup. Separate
+processes must not share writable certificate files. This is recovery for the
+Console's file-pair update, not an atomic transaction with the version database
+or a guarantee about storage hardware surviving a power failure. A commit whose
+durability could not be confirmed is reported as a failure; reload and inspect
+the served fingerprint before retrying.
+
+## Interrupted device-CA withdrawal on combined nodes
+
+On a node that both authors CA registrations and enforces device trust, withdrawing
+one CA changes two separate stores. A `500` partial response does not confirm that
+the CA has stopped admitting devices. Keep the original tenant and fingerprint,
+restore storage, and retry the same single-anchor DELETE before restarting.
+While that withdrawal is unfinished, other CA registration changes return `503`;
+a tenant-wide attribution deletion cannot finish a single-anchor trust removal.
+
+For a file-backed author, the registry now saves a `pending_withdrawals` record
+before changing attribution or device trust. If this first save cannot be
+confirmed, a new withdrawal returns `503` with `applied: false`; neither live
+attribution nor trust is changed. A retry of an already-applied partial withdrawal
+continues to report that partial state. A recovery record can be present on disk
+even when its save returned an error. The same operation remains retryable in the
+running process. Only completion of the trust stage and the final registry save
+removes the record. Writes use flushed temporary files and durable replacement;
+filesystems that cannot confirm replacement are treated as failures.
+
+If the process stops with a pending record, startup refuses to load that registry,
+including when it is used as a config-pulling Edge's cache. Importing that snapshot
+also refuses it. This prevents an old saved attribution from silently returning
+to service. It does not replay the withdrawal automatically. Keep all writers and
+device serving stopped, preserve both stores and the failed operation's records,
+and reconcile the named tenant and certificate with authoritative ownership.
+For a single-anchor withdrawal, the completed state must exclude that certificate
+from both attribution and device trust. When the saved trust set changes, advance
+its distribution serial once above the saved value and preserve the other
+distribution metadata; devices must not receive a changed set under an unchanged
+serial. Keep the pending record through intermediate saves and verify the saved
+certificate fingerprints and serial before clearing it. A tenant-wide attribution deletion does
+not itself remove device trust. Preserve unrelated tenants and anchors. Remove
+the pending record only after both saved stores have been reconciled and their
+writes confirmed, then verify the loaded state before returning to service. If
+the operation or ownership is uncertain, retain the record and leave serving
+stopped. Do not simply delete the record or downgrade to a reader that ignores it.
+
+Shared paths outside the pure control-plane transactional author (including
+combined enforcement nodes using shared persistence) still retain only a
+process-local withdrawal receipt. Their
+last saved registry may restore the old attribution on restart. Keep such nodes
+out of device-serving traffic during reconciliation; do not treat a lost pending
+flag or a `404` as proof that device trust was removed. If the original CA remains
+attributed to its verified original tenant, restore the withdrawal prerequisites
+and retry the same DELETE, then inspect both saved stores and the success audit.
+
+The file record is a startup interlock, not an atomic update across both stores
+or a guarantee of fleet propagation. Automatic restart recovery, weak-backend
+receipt durability, and recovery from an unknown database commit remain separate
+boundaries. The transactional shared-authority path is unchanged.
+
+## Ambiguous device-CA ownership at startup
+
+A CA certificate may belong to only one tenant. Startup rejects a registry that
+assigns the same certificate to different tenants, whether the earlier entry uses
+a PEM file or inline `ca_pem`. The file remains unchanged. A malformed existing
+registry is not treated as an absent cache on a config-pulling Edge, so the node
+stops rather than accepting an ambiguous tenant mapping.
+
+Keep that node out of service, preserve the rejected registry, and reconcile its
+entries with authoritative ownership records. Do not choose the last entry or
+reassign a CA just to make startup pass. Restore a consistent registry through
+the deployment's controlled maintenance procedure, then verify the owning tenant
+before serving devices. This check does not persist an interrupted withdrawal's
+pending receipt; the separate recovery procedure above still applies.

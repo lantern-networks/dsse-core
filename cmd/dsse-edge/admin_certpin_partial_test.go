@@ -255,3 +255,54 @@ func TestCertPinExistingBypassAfterUnconfirmedRegistration(t *testing.T) {
 		t.Fatal("retry", w.Code, w.Body)
 	}
 }
+
+func TestCertPinReviewRemovalFailureAndSourceGuard(t *testing.T) {
+	for _, sourced := range []bool{false, true} {
+		t.Run(map[bool]string{false: "local", true: "sourced"}[sourced], func(t *testing.T) {
+			cp, ap, rp := &candidateNthPersister{}, &candidateNthPersister{}, &candidateNthPersister{}
+			f := newCertPinPartialFixture(t, cp, ap, rp, "")
+			if w := f.post("/admin/cert-pin-bypass", `{"host":"manual.example"}`); w.Code != 200 {
+				t.Fatal(w.Code)
+			}
+			if sourced {
+				f = newCertPinPartialFixture(t, cp, ap, rp, "https://control.example/bundle")
+			}
+			path := "/admin/policy-candidates/" + f.candidate.CandidateID + "/review"
+			rp.failAt = rp.calls + 1
+			beforeApplies := f.applies
+			w := f.post(path, `{"decision":"rejected"}`)
+			if sourced {
+				if w.Code != 409 || f.applies != beforeApplies || f.inspect(f.tenant) {
+					t.Fatalf("sourced guard %d %s", w.Code, w.Body)
+				}
+				c, _, _ := f.candidates.Get(context.Background(), f.tenant, f.candidate.CandidateID)
+				if c.Status != "approved" {
+					t.Fatal("guard changed candidate", c.Status)
+				}
+				return
+			}
+			var body map[string]any
+			json.Unmarshal(w.Body.Bytes(), &body)
+			if w.Code != 500 || body["partial"] != true || body["failed_stage"] != "bypass_rule_removal" || f.applies != beforeApplies || f.inspect(f.tenant) {
+				t.Fatalf("removal failure %d %s", w.Code, w.Body)
+			}
+			c, _, _ := f.candidates.Get(context.Background(), f.tenant, f.candidate.CandidateID)
+			if c.Status != "rejected" {
+				t.Fatal("candidate stage not saved")
+			}
+			if w = f.post(path, `{"decision":"rejected"}`); w.Code != 200 || !f.inspect(f.tenant) || !f.inspect("other") {
+				t.Fatalf("cleanup retry %d %s", w.Code, w.Body)
+			}
+			rows, e := f.writer.ReadJSONL("audit.log.jsonl")
+			if e != nil || len(rows) != 6 {
+				t.Fatal("audit count", len(rows), e)
+			}
+			for _, idx := range []int{2, 4} {
+				m := rows[idx]["metadata"].(map[string]any)
+				if rows[idx]["actor_user_id"] != "reviewer" || m["rule_operation"] != "delete" || m["rule_state_confirmed"] != (idx == 4) || m["policy_materialized"] != false || m["local_apply_requested"] != (idx == 4) {
+					t.Fatal("removal audit", rows[idx])
+				}
+			}
+		})
+	}
+}

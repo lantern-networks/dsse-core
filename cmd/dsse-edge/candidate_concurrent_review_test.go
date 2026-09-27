@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"github.com/lantern-networks/dsse-core/appcatalog"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/policycandidate"
@@ -64,5 +65,64 @@ func TestCandidatePublicationPreservesConcurrentReview(t *testing.T) {
 		if a.EventType == "admin_policy_candidate_reviewed" && stringPtrValue(a.Result) != "partial" {
 			t.Fatal("false approval audit", a)
 		}
+	}
+}
+
+func TestPostgresCandidatePublicationPreservesPeerReview(t *testing.T) {
+	d, _, _, _ := trustDistributionPostgresFixture(t)
+	p := d.store.(postgresBlobPersister)
+	p.key = "policy_candidates"
+	a, b := policycandidate.NewStore(), policycandidate.NewStore()
+	if e := a.SetPersister(p); e != nil {
+		t.Fatal(e)
+	}
+	if e := b.SetPersister(p); e != nil {
+		t.Fatal(e)
+	}
+	ctx := captureCPWriteLease(context.Background())
+	now := time.Now()
+	c, e := a.ObserveConnectorDiscovered(ctx, "own", "peer-review.example", 443, "web", "conn", "site", "ns", nil, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, _, e = b.Review(ctx, "own", c.CandidateID, policycandidate.ReviewRequest{Decision: "suppressed"}, now); e != nil {
+		t.Fatal(e)
+	}
+	before, _ := p.Load()
+	if _, _, e = a.ApprovePublication(ctx, c, "published", now); !errors.Is(e, policycandidate.ErrPublicationChanged) {
+		t.Fatal("peer review overwritten", e)
+	}
+	after, _ := p.Load()
+	if string(before) != string(after) {
+		t.Fatal("conditional refusal rewrote row")
+	}
+	got, _, e := a.Get(ctx, "own", c.CandidateID)
+	if e != nil || got.Status != "suppressed" {
+		t.Fatal(got, e)
+	}
+	if _, e = b.RemoveTenantContext(ctx, "own"); e != nil {
+		t.Fatal(e)
+	}
+	if _, found, e := a.ApprovePublication(ctx, c, "published", now); e != nil || found {
+		t.Fatal("erased candidate recreated", found, e)
+	}
+	c, e = a.ObserveConnectorDiscovered(ctx, "other", "live.example", 443, "web", "conn", "site", "ns", nil, now)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, e = b.ObserveConnectorDiscovered(ctx, "other", "live.example", 443, "web", "conn", "site", "ns", nil, now.Add(time.Second)); e != nil {
+		t.Fatal(e)
+	}
+	got, found, e := a.ApprovePublication(ctx, c, "published", now)
+	if e != nil || !found || got.Status != "approved" || got.LastObserved == nil || *got.LastObserved == *c.LastObserved {
+		t.Fatal("observation lost or approval rejected", got, e)
+	}
+	fresh := policycandidate.NewStore()
+	if e = fresh.SetPersister(p); e != nil {
+		t.Fatal(e)
+	}
+	got, _, e = fresh.Get(ctx, "other", c.CandidateID)
+	if e != nil || got.Status != "approved" {
+		t.Fatal(got, e)
 	}
 }

@@ -166,3 +166,28 @@ func TestAdminCandidateSaveFailureStopsDependentChanges(t *testing.T) {
 		})
 	}
 }
+
+func TestCandidateErasureFailureRemainsCounted(t *testing.T) {
+	s := policycandidate.NewStore()
+	p := &candidateNthPersister{}
+	if e := s.SetPersister(p); e != nil {
+		t.Fatal(e)
+	}
+	for _, tenant := range []string{"own", "other"} {
+		if _, e := s.AddManualCertPinBypass(context.Background(), tenant, "named.example", time.Now()); e != nil {
+			t.Fatal(e)
+		}
+	}
+	extra := adminTenantExtraStores{PolicyCandidates: s}
+	p.failAt = p.calls + 1
+	r := adminTenantPurgeResult{TenantID: "own"}
+	extra.erase(&r)
+	if len(r.Failures) != 1 || len(r.Erased) != 0 || s.CountForTenant("own") != 1 {
+		t.Fatal("erasure falsely completed", r)
+	}
+	r = adminTenantPurgeResult{TenantID: "own"}
+	extra.erase(&r)
+	if len(r.Failures) != 0 || s.CountForTenant("own") != 0 || s.CountForTenant("other") != 1 {
+		t.Fatal("erasure retry", r)
+	}
+}

@@ -85,10 +85,168 @@ function arErrorText(r) {
   return bl({ en: "unknown error", ja: "不明なエラー" });
 }
 
+function arReleaseReadError() { return bl({ en: "Could not verify release information. Retry before publishing or choosing a version.", ja: "配布情報を確認できません。公開やバージョンの選択前に再試行してください。" }); }
+function arSigningReadError() { return bl({ en: "Signing information could not be verified. Retry before publishing; the signing key and minimum versions are unknown.", ja: "署名情報を確認できません。署名鍵と最低バージョンは不明です。公開前に再試行してください。" }); }
+function arKnownTarget(key) { return _AR_TARGETS.some(t => arTargetKey(t.platform, t.arch) === key); }
+function arReleaseResponse(response, schema, scope) {
+  const d = response?.body;
+  if (!response?.ok || response.status !== 200 || !arReadObject(d) || d.schema_version !== schema || d.tenant_id !== scope) throw new Error(arReleaseReadError());
+  return d;
+}
+// This checks the display contract, not cryptographic trust or installer bytes.
+// Signature verification remains the authority's and the endpoint's responsibility.
+function arCatalogueBody(response, scope) {
+  const d = arReleaseResponse(response, "admin_agent_updates.v1", scope);
+  const text = v => typeof v === "string" && v.trim() !== "";
+  const date = v => typeof v === "string" && Number.isFinite(Date.parse(v));
+  for (const map of [d.envelopes, d.pending]) {
+    if (!arReadObject(map)) throw new Error(arReleaseReadError());
+    for (const [key, envelope] of Object.entries(map)) {
+      if (!arKnownTarget(key) || !arReadObject(envelope) || envelope.type !== "dsse_agent_update_manifest.v1" || envelope.version !== "1" ||
+          !text(envelope.signing_key_id) || !date(envelope.created_at) || !text(envelope.signature) ||
+          !/^[a-f0-9]{64}$/.test(envelope.payload_sha256) || typeof envelope.payload_b64 !== "string" || !envelope.payload_b64) throw new Error(arReleaseReadError());
+      const m = arManifestOf(envelope);
+      if (!arReadObject(m) || m.schema !== "1" || arTargetKey(m.platform, m.arch) !== key || !text(m.version) ||
+          !text(m.channel) || !["dsse", "mdm"].includes(m.delivery) || !["pkg", "msi"].includes(m.artifact_kind) ||
+          typeof m.artifact_url !== "string" || (m.delivery === "dsse" && !text(m.artifact_url)) ||
+          !/^[a-f0-9]{64}$/.test(m.artifact_sha256) || !Number.isSafeInteger(m.artifact_size) || m.artifact_size <= 0 ||
+          !date(m.released_at) || !date(m.not_after)) throw new Error(arReleaseReadError());
+    }
+  }
+  return d;
+}
+function arSigningBody(response, scope) {
+  const d = arReleaseResponse(response, "admin_agent_update_sign_floor.v1", scope), key = d.signing_public_key;
+  if (!arReadObject(d.floors) || typeof key !== "string" || !(key === "no" || /^[a-f0-9]{64}$/.test(key) || /^04[a-f0-9]{128}$/.test(key)) ||
+      Object.entries(d.floors).some(([target, version]) => !arKnownTarget(target) || typeof version !== "string" || !version.trim())) throw new Error(arSigningReadError());
+  return d;
+}
+
+function arRolloutSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
+function arRolloutReadError() { return bl({ en: "Could not verify rollout settings. Retry before making changes.", ja: "配布設定を確認できません。変更する前に再試行してください。" }); }
+// Membership hints come from the tenant inventory, not from a failed or partial read.
+function arDeviceGroupsBody(response, tenant) {
+  const b = response?.body;
+  if (!response?.ok || response.status !== 200 || !arReadObject(b) ||
+      b.schema_version !== "admin_enrolled_inventory.v1" || b.tenant_id !== tenant || !Array.isArray(b.devices)) throw new Error();
+  const identities = new Set(), groups = new Set();
+  for (const d of b.devices) {
+    if (!arReadObject(d) || typeof d.identity !== "string" || !d.identity || d.identity.trim() !== d.identity ||
+        identities.has(d.identity) || (d.tenant_id === undefined ? "" : d.tenant_id) !== tenant ||
+        (d.group !== undefined && (typeof d.group !== "string" || d.group.trim() !== d.group))) throw new Error();
+    identities.add(d.identity);
+    if (d.group) groups.add(d.group);
+  }
+  return [...groups].sort();
+}
+function arDeviceGroupsReadError() { return bl({
+  en: "Device group memberships could not be verified. Retry before changing rollout order.",
+  ja: "端末のグループ所属を確認できません。配布の順番を変更する前に再試行してください。" }); }
+function arReadObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+function arRolloutPlanBody(response, tenant) {
+  const d = response?.body, p = d?.plan;
+  const invalid = () => { throw new Error(arRolloutReadError()); };
+  if (!response?.ok || response.status !== 200 || !arReadObject(d) || d.schema_version !== "admin_agent_rollout.v1" ||
+      d.tenant_id !== tenant || !arReadObject(p) || typeof p.frozen !== "boolean" ||
+      ["desired_version", "release_channel", "intent", "reason", "updated_at"].some(k => typeof p[k] !== "string") ||
+      !["", "rollout", "rollback", "freeze", "follow", "schedule"].includes(p.intent)) invalid();
+  const whole = n => Number.isSafeInteger(n) && n >= 0;
+  if (p.window !== undefined && p.window !== null) {
+    const w = p.window, clock = v => typeof v === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(v.trim());
+    if (!arReadObject(w) || !clock(w.local_start) || !clock(w.local_end) ||
+        typeof w.require_ac_power !== "boolean" || typeof w.require_unattended !== "boolean" ||
+        !whole(w.require_idle_minutes) || !whole(w.deadline_days) || w.deadline_days > 365) invalid();
+  }
+  if (p.waves !== undefined && p.waves !== null) {
+    const w = p.waves, groups = new Set();
+    if (!arReadObject(w) || (w.waves !== null && !Array.isArray(w.waves)) ||
+        (w.default_delay_days !== undefined && w.default_delay_days !== null && !whole(w.default_delay_days))) invalid();
+    for (const row of w.waves || []) {
+      if (!arReadObject(row) || typeof row.group !== "string" || !row.group.trim() || !whole(row.delay_days) ||
+          (row.priority !== undefined && !Number.isSafeInteger(row.priority))) invalid();
+      const key = row.group.trim().toLowerCase();
+      if (groups.has(key)) invalid();
+      groups.add(key);
+    }
+  }
+  return p;
+}
+
+// Check the fields this editor requested. The authority merges unrelated settings
+// under its lock; comparing them with the old form would falsely imply a CAS.
+function arRolloutSaveConfirmed(response, tenant, request) {
+  let p;
+  try { p = arRolloutPlanBody(response, tenant); } catch (_) { return false; }
+  if (p.intent !== request.intent) return false;
+  if (request.intent === "rollout") return p.desired_version === request.desired_version && p.release_channel === (request.release_channel || "");
+  if (request.intent === "follow") return p.desired_version === "" && p.release_channel === "";
+  if (request.intent !== "schedule") return false;
+  if (request.window && (!p.window || Object.keys(request.window).some(k => p.window[k] !== request.window[k]))) return false;
+  if (request.waves) {
+    const expected = request.waves, actual = p.waves;
+    if (!actual || (expected.default_delay_days ?? null) !== (actual.default_delay_days ?? null) ||
+        (expected.waves || []).length !== (actual.waves || []).length) return false;
+    if ((expected.waves || []).some((w, i) => {
+      const a = actual.waves[i];
+      return a.group !== w.group || a.delay_days !== w.delay_days || (a.priority ?? 0) !== (w.priority ?? 0);
+    })) return false;
+  }
+  return !!(request.window || request.waves);
+}
+
+// The verified read owns this dialog's tenant and render context. Leaving it
+// suppresses late UI completion, but cannot cancel a write already on the server.
+function arRolloutDialog(opts) {
+  let closed = false, pending = false, observer;
+  const notice = el("div", { role: "status" });
+  const close = () => { if (closed) return; closed = true; observer?.disconnect(); backdrop.remove(); document.removeEventListener("keydown", onKey); };
+  const active = () => {
+    if (closed) return false;
+    if (opts.host.isConnected === false || typeof opts.context?.tenant !== "string" || !opts.context.current()) { close(); return false; }
+    return true;
+  };
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => { if (!pending) close(); } });
+  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
+  const onKey = e => { if (e.key === "Escape" && !pending) close(); };
+  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: e => { if (e.target === backdrop && !pending) close(); } }, [
+    el("div", { class: "ui-modal", role: "dialog" }, [
+      el("div", { class: "ui-modal-head", text: opts.title }),
+      el("div", { class: "ui-modal-body" }, [...opts.body, notice]),
+      el("div", { class: "ui-modal-foot" }, [cancel, submit]),
+    ]),
+  ]);
+  const lock = () => backdrop.querySelectorAll("input,select,textarea,button").forEach(n => { n.disabled = pending; });
+  document.body.appendChild(backdrop);
+  document.addEventListener("keydown", onKey);
+  submit.addEventListener("click", async () => {
+    if (!active() || pending) return;
+    const request = opts.request();
+    if (!request) return;
+    pending = true; lock(); notice.textContent = ""; notice.setAttribute("role", "status");
+    try {
+      const r = await apiFetch("PUT", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(opts.context.tenant), request, _AR_PLANE);
+      if (!active()) return;
+      if (!arRolloutSaveConfirmed(r, opts.context.tenant, request)) throw new Error();
+      close();
+      uiToast(bl({ en: "Saved. Devices pick it up on their next check.", ja: "保存しました。端末は次の確認時に反映します。" }), "ok");
+      renderAgentReleaseList(opts.host);
+    } catch (_) {
+      if (active()) {
+        notice.setAttribute("role", "alert");
+        notice.textContent = bl({ en: "The save could not be confirmed. The change may already be saved. Retry with Save, or cancel and reload the settings before making another change.",
+          ja: "保存結果を確認できません。変更は保存済みの可能性があります。保存ボタンで再試行するか、キャンセルして設定を再読込してから次の変更を行ってください。" });
+      }
+    } finally { pending = false; if (active()) lock(); }
+  });
+  observer = new MutationObserver(() => { active(); });
+  observer.observe(document.body, { childList: true, subtree: true });
+  active();
+}
+
 // The artifact upload is raw bytes, so it cannot go through apiFetch (which sends JSON). The session and the
 // headers are built from the same globals rather than copied, so a change to how the Console authenticates
 // does not leave this one call behind.
-async function arUploadArtifact(file, platform, arch) {
+async function arUploadArtifact(file, platform, arch, context) {
   const base = baseForPlane(_AR_PLANE);
   const token = localStorage.getItem("adminToken") || "";
   const signedIn = idpSession && idpSession.auth_method === "admin_session";
@@ -97,7 +255,8 @@ async function arUploadArtifact(file, platform, arch) {
   if (signedIn && idpSession.csrf_token) headers["x-csrf-token"] = idpSession.csrf_token;
   if (operateTenant) headers["x-operate-tenant"] = operateTenant;
   const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
-    "&arch=" + encodeURIComponent(arch);
+    "&arch=" + encodeURIComponent(arch) + "&expected_tenant_id=" + encodeURIComponent(context.scope) +
+    "&expected_manifest_sha256=" + encodeURIComponent(context.manifestSHA256);
   try {
     const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", body: file });
     const text = await res.text();
@@ -109,45 +268,74 @@ async function arUploadArtifact(file, platform, arch) {
   }
 }
 
-// arDownloadArtifact hands the operator the package this deployment published.
-//
-// ★★★ A DEPLOYMENT COULD PUBLISH A RELEASE AND HAD NO WAY TO HAND ANYONE THE INSTALLER (2026-08-29, found by
-// trying to put an agent on a Mac using only this Console). The device-facing route needs a verified device
-// transport identity — which a machine that has no agent yet does not have — so the update path serves
-// devices that are ALREADY enrolled and says nothing about the first install. The Device configuration screen
-// hands out the profile and the tokens and tells the operator to "install this on the devices it is for",
-// without ever giving them the thing to install. Every first install had to come from outside the product.
-//
-// The bytes were always reachable at GET /admin/agent-update-artifact, authenticated as the operator. What was
-// missing was the button.
-async function arDownloadArtifact(platform, arch, version) {
-  const base = baseForPlane(_AR_PLANE);
-  const token = localStorage.getItem("adminToken") || "";
-  const signedIn = idpSession && idpSession.auth_method === "admin_session";
-  const headers = {};
-  if (!signedIn && token) headers["authorization"] = "Bearer " + token;
-  if (signedIn && idpSession.csrf_token) headers["x-csrf-token"] = idpSession.csrf_token;
-  if (operateTenant) headers["x-operate-tenant"] = operateTenant;
-  const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
-    "&arch=" + encodeURIComponent(arch);
-  const res = await fetch(base + path, { headers, credentials: "include" });
-  if (!res.ok) {
-    let why = "";
-    try { why = (await res.text()).slice(0, 300); } catch (e) { why = ""; }
-    uiToast(bl({ en: "Could not download it: " + (why || res.status),
-                 ja: "取得できませんでした: " + (why || res.status) }), "err");
-    return;
+// Keep remediation tied to the failed check. A byte mismatch is not evidence
+// that refreshing the catalogue will repair the stored package.
+function arArtifactDownloadError(reason) {
+  if (reason === "scope") return bl({
+    en: "Download blocked: the package response does not match the selected organization. Check the organization selection and reload the release list.",
+    ja: "ダウンロードを停止しました。応答の組織が選択中の組織と一致しません。組織の選択を確認し、配布一覧を再読込してください。" });
+  if (reason === "size" || reason === "digest") return bl({
+    en: "Download blocked: the package " + (reason === "size" ? "size" : "SHA-256 digest") + " does not match the published release. Do not distribute this package. Ask the deployment operator to investigate the stored artifact and delivery path.",
+    ja: "ダウンロードを停止しました。パッケージの" + (reason === "size" ? "サイズ" : "SHA-256 ハッシュ") + "が公開済みリリースと一致しません。このパッケージは配布せず、配備の運用者に保存されたファイルと配信経路の調査を依頼してください。" });
+  if (reason === "verification") return bl({
+    en: "The package integrity check could not be completed. No package was saved. Check browser support and try again; this does not establish that the package is corrupt.",
+    ja: "パッケージの完全性確認を完了できず、保存していません。ブラウザの対応状況を確認して再試行してください。パッケージの破損を確認したわけではありません。" });
+  if (reason === "transfer") return bl({
+    en: "The package transfer could not be completed. No package was saved. Check your connection and access, then reload the release list and try again.",
+    ja: "パッケージを取得できず、保存していません。接続とアクセス権を確認し、配布一覧を再読込してから再試行してください。" });
+  return bl({ en: "The package could not be verified. Reload the release list and try again.",
+    ja: "パッケージを確認できません。配布一覧を再読込してから、もう一度ダウンロードしてください。" });
+}
+
+// Download the active package described by this verified catalogue snapshot.
+// Header checks bind the response context; the selected manifest's digest and
+// size decide which bytes may be handed to the browser as a download.
+async function arDownloadArtifact(platform, arch, manifest, context) {
+  const current = context?.current;
+  if (typeof current !== "function" || !current()) return;
+  const scope = context.scope, manifestSHA256 = context.manifestSHA256, expected = { ...manifest };
+  let failure = "catalogue";
+  try {
+    if (typeof scope !== "string" || !/^[a-f0-9]{64}$/.test(manifestSHA256) ||
+        expected.platform !== platform || expected.arch !== arch || !arKnownTarget(arTargetKey(platform, arch)) ||
+        typeof expected.version !== "string" || !expected.version ||
+        !Number.isSafeInteger(expected.artifact_size) || expected.artifact_size <= 0 ||
+        !/^[a-fA-F0-9]{64}$/.test(expected.artifact_sha256)) throw new Error();
+    const headers = {}, token = localStorage.getItem("adminToken") || "";
+    const signedIn = idpSession && idpSession.auth_method === "admin_session";
+    if (!signedIn && token) headers["authorization"] = "Bearer " + token;
+    if (signedIn && idpSession.csrf_token) headers["x-csrf-token"] = idpSession.csrf_token;
+    if (operateTenant) headers["x-operate-tenant"] = operateTenant;
+    const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
+      "&arch=" + encodeURIComponent(arch) + "&artifact_scope=publication&expected_tenant_id=" + encodeURIComponent(scope) +
+      "&expected_manifest_sha256=" + encodeURIComponent(manifestSHA256);
+    failure = "transfer";
+    const res = await fetch(baseForPlane(_AR_PLANE) + path, { headers, credentials: "include", redirect: "error", cache: "no-store" });
+    if (!current()) return;
+    if (!res.ok || res.status !== 200) throw new Error();
+    failure = "scope";
+    if (!res.headers.has("X-Dsse-Agent-Update-Scope") || res.headers.get("X-Dsse-Agent-Update-Scope") !== scope) throw new Error();
+    failure = "catalogue";
+    if (res.headers.get("X-Dsse-Agent-Update-Manifest-SHA256") !== manifestSHA256 ||
+        res.headers.get("X-Dsse-Agent-Update-Version") !== expected.version) throw new Error();
+    failure = "transfer";
+    const blob = await res.blob();
+    if (!current()) return;
+    failure = "size";
+    if (blob.size !== expected.artifact_size) throw new Error();
+    failure = "verification";
+    const digest = await arHash(blob);
+    if (!current()) return;
+    failure = "digest";
+    if (digest !== expected.artifact_sha256.toLowerCase()) throw new Error();
+    failure = "catalogue";
+    const ext = platform === "windows" ? "msi" : "pkg", url = URL.createObjectURL(blob), a = document.createElement("a");
+    a.href = url; a.download = "dsse-agent-" + expected.version + "-" + platform + "-" + arch + "." + ext;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (_) {
+    if (current()) uiToast(arArtifactDownloadError(failure), "err");
   }
-  const blob = await res.blob();
-  // The name says what it is and which deployment it came from, because an installer in a downloads folder
-  // with a generic name is the one an operator installs on the wrong fleet.
-  const ext = platform === "windows" ? "msi" : "pkg";
-  const name = "dsse-agent-" + (version || "release") + "-" + platform + "-" + arch + "." + ext;
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 10000);
 }
 
 // ★ THE WINDOW IS A RULE AN OPERATOR OWNS, AND IT HAD NO SCREEN (2026-08-13, raised by the operator). The plan
@@ -182,7 +370,7 @@ function arWindowSummary(w) {
 
 // openAgentWindowForm edits the window and nothing else: intent=schedule leaves the halt and the wave schedule
 // exactly as they were, which is why this form cannot accidentally release a frozen fleet.
-function openAgentWindowForm(host, current) {
+function openAgentWindowForm(host, current, context) {
   const w = current || {};
   const startF = uiField({ name: "start", label: bl({ en: "From", ja: "開始" }), value: w.local_start || "00:00",
     placeholder: "01:00", hint: bl({ en: "The device's own local time, not yours.", ja: "端末のローカル時刻です(管理者の時刻ではありません)。" }) });
@@ -205,42 +393,23 @@ function openAgentWindowForm(host, current) {
     ja: "端末は「この設定」と「端末自身の設定」の厳しい方を使います。ここでチェックを外しても、端末側が" +
         "禁じているインストールが許可されるわけではありません。" }) });
 
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({
+  arRolloutDialog({ host, context,
     title: bl({ en: "When updates may install", ja: "更新してよいとき" }),
     body: [startF.el, endF.el, acF.el, unattendedF.el, idleF.el, deadlineF.el, note],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
+    request: () => {
+      const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
+      if (!hhmm.test(startF.get())) { startF.setError(bl({ en: "Use HH:MM, e.g. 01:00", ja: "HH:MM 形式で入力してください(例 01:00)" })); return; }
+      if (!hhmm.test(endF.get())) { endF.setError(bl({ en: "Use HH:MM, e.g. 05:00", ja: "HH:MM 形式で入力してください(例 05:00)" })); return; }
+      const idle = Number(idleF.get());
+      const deadline = Number(deadlineF.get());
+      if (!Number.isSafeInteger(idle) || idle < 0) { idleF.setError(bl({ en: "A whole number of minutes.", ja: "分を整数で入力してください。" })); return; }
+      if (!Number.isSafeInteger(deadline) || deadline < 0 || deadline > 365) { deadlineF.setError(bl({ en: "A whole number of days from 0 to 365.", ja: "日数は0から365の整数で入力してください。" })); return; }
 
-  submit.addEventListener("click", async () => {
-    const hhmm = /^([01]\d|2[0-3]):[0-5]\d$/;
-    if (!hhmm.test(startF.get())) { startF.setError(bl({ en: "Use HH:MM, e.g. 01:00", ja: "HH:MM 形式で入力してください(例 01:00)" })); return; }
-    if (!hhmm.test(endF.get())) { endF.setError(bl({ en: "Use HH:MM, e.g. 05:00", ja: "HH:MM 形式で入力してください(例 05:00)" })); return; }
-    const idle = Number(idleF.get());
-    const deadline = Number(deadlineF.get());
-    if (!Number.isFinite(idle) || idle < 0) { idleF.setError(bl({ en: "A whole number of minutes.", ja: "分を整数で入力してください。" })); return; }
-    if (!Number.isFinite(deadline) || deadline < 0) { deadlineF.setError(bl({ en: "A whole number of days.", ja: "日数を整数で入力してください。" })); return; }
-
-    submit.disabled = true;
-    // ★ intent=schedule, so the halt and the wave schedule are left exactly as they are. A form about timing
-    // must not be able to release a fleet somebody stopped.
-    const r = await apiFetch("PUT", "/admin/agent-rollout", {
-      intent: "schedule",
-      window: {
-        local_start: startF.get(), local_end: endF.get(),
-        require_idle_minutes: idle, require_unattended: unattendedF.get(),
-        require_ac_power: acF.get(), deadline_days: deadline,
-      },
-    }, _AR_PLANE);
-    if (!r.ok) {
-      submit.disabled = false;
-      startF.setError(arErrorText(r));
-      uiToast(arErrorText(r), "err");
-      return;
-    }
-    m.close();
-    uiToast(bl({ en: "Saved. Devices pick it up on their next check.", ja: "保存しました。端末は次の確認時に反映します。" }), "ok");
-    renderAgentReleaseList(host);
+      return { intent: "schedule", window: {
+        local_start: startF.get(), local_end: endF.get(), require_idle_minutes: idle,
+        require_unattended: unattendedF.get(), require_ac_power: acF.get(), deadline_days: deadline,
+      } };
+    },
   });
 }
 
@@ -251,22 +420,27 @@ function openAgentWindowForm(host, current) {
 function arWavesSummary(waves) {
   const list = (waves && waves.waves) || [];
   if (!list.length) {
+    if (waves?.default_delay_days !== undefined && waves.default_delay_days !== null) return bl({
+      en: "all groups after " + waves.default_delay_days + "d", ja: "全グループは " + waves.default_delay_days + "日後" });
     return bl({ en: "everything at once, as soon as a release is published",
                 ja: "公開と同時に全端末へ(段階分けなし)" });
   }
   const ordered = list.slice().sort((a, b) => (a.delay_days || 0) - (b.delay_days || 0));
-  return ordered.map((w) => {
+  const summary = ordered.map((w) => {
     const d = w.delay_days || 0;
-    return d === 0
+    const when = d === 0
       ? bl({ en: w.group + " immediately", ja: w.group + " はすぐ" })
       : bl({ en: w.group + " after " + d + "d", ja: w.group + " は " + d + "日後" });
+    return when + (w.priority ? bl({ en: " (priority " + w.priority + ")", ja: "（優先度 " + w.priority + "）" }) : "");
   }).join(" → ");
+  return summary + (waves.default_delay_days !== undefined && waves.default_delay_days !== null
+    ? bl({ en: "; other groups after " + waves.default_delay_days + "d", ja: "、その他のグループは " + waves.default_delay_days + "日後" }) : "");
 }
 
 // openAgentWavesForm edits the rollout order and nothing else — intent=schedule again, so the halt and the
 // window are untouched.
-function openAgentWavesForm(host, current, groupsInUse) {
-  const rows = ((current && current.waves) || []).map((w) => ({ group: w.group || "", days: String(w.delay_days || 0) }));
+function openAgentWavesForm(host, current, groupsInUse, context) {
+  const rows = ((current && current.waves) || []).map((w) => ({ group: w.group || "", days: String(w.delay_days || 0), priority: w.priority }));
   if (!rows.length) rows.push({ group: "", days: "0" });
 
   const list = el("div", {});
@@ -290,51 +464,37 @@ function openAgentWavesForm(host, current, groupsInUse) {
 
   // ★ THE TWO RULES AN OPERATOR HAS TO KNOW, because both are silent when they bite.
   const rules = el("div", { class: "ui-field-hint", text: bl({
-    en: "A device in several groups takes the SLOWEST of them. A group not listed here also takes the slowest " +
-        "wave — so forgetting one delays it, it never causes a same-day rollout to everybody.",
-    ja: "複数のグループに属する端末は、いちばん遅い方が適用されます。ここに無いグループも最も遅い波になります — " +
-        "書き忘れは「遅れる」方に倒れ、全端末への即日展開にはなりません。" }) });
+    en: "The highest configured group priority wins; ties take the slowest wave. Unlisted groups use the configured default, or the slowest wave if no default is set. Existing priorities and the default stay unchanged here.",
+    ja: "設定済みの優先度が高いグループを使い、同じ優先度では遅い方を使います。未指定のグループは既定の日数を使い、既定がなければ最も遅い日数を使います。この画面では既存の優先度と既定の日数を維持します。" }) });
 
   const reality = el("div", { class: "ui-field-hint", text: groupsInUse.length
-    ? bl({ en: "Groups your devices currently carry: " + groupsInUse.join(", "),
-           ja: "いま端末が持っているグループ: " + groupsInUse.join("、") })
-    : bl({ en: "★ No device carries a group yet, so a schedule here applies to nobody until devices are grouped.",
-           ja: "★ いまグループを持つ端末がありません。端末にグループを付けるまで、この設定は誰にも当たりません。" }) });
+    ? bl({ en: "Groups in the enrolled-device inventory: " + groupsInUse.join(", "),
+           ja: "登録端末の一覧にあるグループ: " + groupsInUse.join("、") })
+    : bl({ en: "No group assignments were reported in this inventory snapshot. Unlisted devices still use the default delay.",
+           ja: "取得した登録端末の一覧にはグループ所属がありません。未指定の端末にも既定の待機日数は適用されます。" }) });
 
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({
+  arRolloutDialog({ host, context,
     title: bl({ en: "Rollout order", ja: "配布の順番" }),
     body: [list, rules, reality],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
-
-  submit.addEventListener("click", async () => {
-    const waves = [];
-    for (const row of rows) {
-      const group = (row.group || "").trim();
-      if (!group) continue;
-      const days = Number(row.days);
-      if (!Number.isFinite(days) || days < 0) {
-        uiToast(bl({ en: "Days must be a whole number, 0 or more.", ja: "日数は 0 以上の整数で入力してください。" }), "err");
+    request: () => {
+      const waves = [];
+      for (const row of rows) {
+        const group = (row.group || "").trim();
+        if (!group) continue;
+        const days = Number(row.days);
+        if (!Number.isSafeInteger(days) || days < 0) {
+          uiToast(bl({ en: "Days must be a whole number, 0 or more.", ja: "日数は 0 以上の整数で入力してください。" }), "err");
+          return;
+        }
+        waves.push({ group: group, delay_days: days, ...(row.priority !== undefined ? { priority: row.priority } : {}) });
+      }
+      if (!waves.length) {
+        uiToast(bl({ en: "Name at least one group, or cancel to leave the order as it is.",
+                     ja: "グループを1つ以上入力してください(変更しない場合はキャンセル)。" }), "err");
         return;
       }
-      waves.push({ group: group, delay_days: days });
-    }
-    if (!waves.length) {
-      uiToast(bl({ en: "Name at least one group, or cancel to leave the order as it is.",
-                   ja: "グループを1つ以上入力してください(変更しない場合はキャンセル)。" }), "err");
-      return;
-    }
-    submit.disabled = true;
-    const r = await apiFetch("PUT", "/admin/agent-rollout", { intent: "schedule", waves: { waves: waves } }, _AR_PLANE);
-    if (!r.ok) {
-      submit.disabled = false;
-      uiToast(arErrorText(r), "err");
-      return;
-    }
-    m.close();
-    uiToast(bl({ en: "Saved. Devices pick it up on their next check.", ja: "保存しました。端末は次の確認時に反映します。" }), "ok");
-    renderAgentReleaseList(host);
+      return { intent: "schedule", waves: { ...(current || {}), waves } };
+    },
   });
 }
 
@@ -379,67 +539,87 @@ function renderAgentReleasesView(content) {
 }
 
 async function renderAgentReleaseList(host) {
+  if (host.isConnected === false) return;
   uiState(host, "loading");
-  const current = freshRender(host);
-  let updates, floor;
+  const fresh = freshRender(host), selection = arRolloutSelection(), deployment = answeringForTheDeployment();
+  const session = typeof idpSession === "undefined" ? null : idpSession, authority = baseForPlane(_AR_PLANE);
+  const token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "", credential = token();
+  const current = () => fresh() && host.isConnected !== false && selection === arRolloutSelection() && deployment === answeringForTheDeployment() &&
+    session === (typeof idpSession === "undefined" ? null : idpSession) && authority === baseForPlane(_AR_PLANE) && credential === token();
+  // Publication caches belong to this verified page/context. An unavailable new
+  // read must not leave a previous tenant's data available to the publish form.
+  delete window._arLastPublished;
+  delete window._arCanSign;
+  window._arReleaseReadContext = null;
+  let catalogue, signing = null, rolloutTenant;
   try {
-    updates = await apiFetch("GET", "/admin/agent-updates", undefined, _AR_PLANE);
-  } catch (e) {
+    const organization = await apiFetch("GET", "/admin/tenant", undefined, _AR_PLANE);
     if (!current()) return;
-    uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
+    const tenant = organization?.body?.tenant_id;
+    if (!organization?.ok || organization.status !== 200 || !arReadObject(organization.body) ||
+        typeof tenant !== "string" || tenant.trim() !== tenant || (selection && selection !== tenant)) throw new Error();
+    rolloutTenant = tenant;
+    const scope = deployment ? "deployment" : tenant;
+    const updates = await apiFetch("GET", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(scope), undefined, _AR_PLANE);
+    if (!current()) return;
+    catalogue = arCatalogueBody(updates, scope);
+    try {
+      const floor = await apiFetch("GET", "/admin/agent-update-sign-floor?expected_tenant_id=" + encodeURIComponent(scope), undefined, _AR_PLANE);
+      if (!current()) return;
+      signing = arSigningBody(floor, scope);
+    } catch (_) { signing = null; }
+  } catch (_) {
+    if (!current()) return;
+    uiState(host, "error", arReleaseReadError(), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
     return;
   }
-  if (!updates.ok) {
-    if (!current()) return;
-    uiState(host, "error", arErrorText(updates), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderAgentReleaseList(host) });
-    return;
-  }
-  // The floor is a newer endpoint than the published set. A control plane without it must not blank this page
-  // — but it must not be shown a floor it never reported either, so the column simply stays empty.
-  try {
-    floor = await apiFetch("GET", "/admin/agent-update-sign-floor", undefined, _AR_PLANE);
-  } catch (e) {
-    floor = { ok: false };
-  }
-
-  // The timing rule, read from the same control plane. Best-effort: a page about releases must not go blank
-  // because the schedule could not be read, but it must not pretend there is no rule either.
-  let plan = null;
-  try {
-    const r = await apiFetch("GET", "/admin/agent-rollout", undefined, _AR_PLANE);
-    if (r.ok && r.body && r.body.plan) plan = r.body.plan;
-  } catch (e) {
-    plan = null;
-  }
-
-  // Which groups devices ACTUALLY carry. A rollout order naming groups nothing is in is a schedule that
-  // applies to nobody, and that is invisible from the schedule itself.
-  let groupsInUse = [];
-  try {
-    const g = await apiFetch("GET", "/admin/enrolled-devices", undefined, _AR_PLANE);
-    const seen = {};
-    ((g.body && (g.body.devices || g.body.entries)) || []).forEach((d) => {
-      const name = ((d && d.group) || "").trim();
-      if (name) seen[name] = true;
-    });
-    groupsInUse = Object.keys(seen).sort();
-  } catch (e) {
-    groupsInUse = [];
-  }
-
-  const published = (updates.body && updates.body.envelopes) || {};
-  const pending = (updates.body && updates.body.pending) || {};
-  const floors = (floor && floor.ok && floor.body && floor.body.floors) || {};
-  const signingKey = (floor && floor.ok && floor.body && floor.body.signing_public_key) || "";
-  window._arLastPublished = published; // so the form can reuse the address this target used last time
-
   if (!current()) return;
+
+  let plan = null, planUnread = false;
+  try {
+    const r = await apiFetch("GET", "/admin/agent-rollout?expected_tenant_id=" + encodeURIComponent(rolloutTenant), undefined, _AR_PLANE);
+    if (!current()) return;
+    plan = arRolloutPlanBody(r, rolloutTenant);
+  } catch (_) { planUnread = true; }
+  if (!current()) return;
+
+  // Show the groups recorded in the same tenant inventory. An unreadable roster
+  // cannot establish that no devices belong to a configured wave.
+  let groupsInUse = null;
+  try {
+    const g = await apiFetch("GET", "/admin/enrolled-devices?expected_tenant_id=" + encodeURIComponent(rolloutTenant), undefined, _AR_PLANE);
+    if (!current()) return;
+    groupsInUse = arDeviceGroupsBody(g, rolloutTenant);
+  } catch (_) {
+    if (!current()) return;
+  }
+
+  const published = catalogue.envelopes, pending = catalogue.pending;
+  const floors = signing?.floors || {};
+  const signingKey = signing?.signing_public_key;
+  if (!current()) return;
+  window._arLastPublished = published; // so the form can reuse the address this target used last time
   host.innerHTML = "";
+
+  if (planUnread) host.appendChild(el("div", { class: "ui-state ui-state-error" }, [
+    el("p", { text: arRolloutReadError() }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
+  ]));
+
+  if (groupsInUse === null) host.appendChild(el("div", { class: "ui-state ui-state-warn", role: "alert" }, [
+    el("p", { text: arDeviceGroupsReadError() }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
+  ]));
 
   // ★ SAID BEFORE THE TABLE, NOT AFTER A FAILED ATTEMPT. A control plane with no signing key cannot publish
   // from this screen at all, and finding that out by filling in a form and pressing the button is the version
   // of this that wastes an operator's afternoon.
-  window._arCanSign = !(!signingKey || signingKey === "no");
+  window._arCanSign = signing ? signingKey !== "no" : undefined;
+  window._arReleaseReadContext = { host, current, scope: catalogue.tenant_id, signingKnown: signing !== null, canSign: window._arCanSign };
+  if (!signing) host.appendChild(el("div", { class: "ui-state ui-state-warn" }, [
+    el("p", { text: arSigningReadError() }),
+    el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => { if (current()) renderAgentReleaseList(host); } }),
+  ]));
   // ★★ AND IT IS SAID ONLY TO WHOEVER CAN ACT ON IT (2026-08-28, caught the same day it was written). The
   // sentence below tells the reader to sign a manifest with the deployment's key and choose the file "below" —
   // and the form it names is rendered only for the operator, because publishing is the operator's. A customer
@@ -448,7 +628,7 @@ async function renderAgentReleaseList(host) {
   //
   // What an organization needs from this screen is which version its devices are being offered. That the
   // deployment cannot sign is the operator's problem to fix and nobody else's to read.
-  if (!window._arCanSign && answeringForTheDeployment()) {
+  if (signing && !window._arCanSign && answeringForTheDeployment()) {
     // ★★★ IT SAID "NOTHING CAN BE PUBLISHED FROM HERE" AND THAT WAS NOT TRUE (2026-08-28, measured on a
     // deployment this product's own installer built). The signing key has NO on-disk fallback by design — it
     // belongs in a token — so a control plane without one cannot SIGN. Publishing an envelope signed elsewhere
@@ -490,26 +670,28 @@ async function renderAgentReleaseList(host) {
       badge = uiBadge(bl({ en: "Nothing published", ja: "未公開" }), "off");
     }
 
-    const floorFor = floors[key] || floors["|" + key];
+    const floorFor = floors[key];
+    let downloading = false;
+    const download = active ? el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Download", ja: "ダウンロード" }) }) : null;
+    if (download) download.addEventListener("click", async () => {
+      if (downloading || !current()) return;
+      downloading = true; download.disabled = true;
+      try { await arDownloadArtifact(target.platform, target.arch, active, { current, scope: catalogue.tenant_id, manifestSHA256: published[key].payload_sha256 }); }
+      finally { downloading = false; if (current()) download.disabled = false; }
+    });
     return el("tr", {}, [
       el("td", {}, [el("div", { text: arTargetLabel(target.platform, target.arch) })]),
       el("td", {}, [el("div", { text: version }), second].filter(Boolean)),
       el("td", {}, badge),
       el("td", { class: "ui-muted", text: active && active.not_after ? uiWhen(active.not_after) : "—" }),
-      el("td", { class: "ui-muted", text: floorFor
+      el("td", { class: "ui-muted", text: !signing ? bl({ en: "Unknown", ja: "不明" }) : floorFor
         ? bl({ en: "no older than " + floorFor, ja: floorFor + " より古いものは不可" })
         : "—" }),
       // ★ THE FIRST INSTALL HAS NO OTHER SOURCE. A device with no agent cannot use the device-facing route —
       // it has no transport identity yet — so without this the operator is told to install something the
       // product never hands them. Only an ACTIVE release: a manifest whose package has not arrived would
       // download nothing and look like a broken button.
-      el("td", {}, active
-        ? el("button", {
-            class: "ui-btn ui-btn-sm",
-            text: bl({ en: "Download", ja: "ダウンロード" }),
-            onClick: () => arDownloadArtifact(target.platform, target.arch, active.version),
-          })
-        : el("span", { class: "ui-muted", text: "—" })),
+      el("td", {}, download || el("span", { class: "ui-muted", text: "—" })),
     ]);
   });
 
@@ -529,7 +711,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => openAgentWindowForm(host, w),
+      onClick: () => { if (current() && plan !== null) openAgentWindowForm(host, w, { tenant: rolloutTenant, current }); },
     }),
   ]));
 
@@ -550,7 +732,7 @@ async function renderAgentReleaseList(host) {
       class: "ui-btn ui-btn-sm",
       disabled: plan === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => openAgentVersionForm(host, plan, published),
+      onClick: () => { if (current() && plan !== null) openAgentVersionForm(host, plan, published, { tenant: rolloutTenant, current }); },
     }),
   ]));
 
@@ -564,9 +746,9 @@ async function renderAgentReleaseList(host) {
     el("span", { class: "ui-spacer" }),
     el("button", {
       class: "ui-btn ui-btn-sm",
-      disabled: plan === null ? "disabled" : undefined,
+      disabled: plan === null || groupsInUse === null ? "disabled" : undefined,
       text: bl({ en: "Change", ja: "変更" }),
-      onClick: () => openAgentWavesForm(host, plan && plan.waves, groupsInUse),
+      onClick: () => { if (current() && plan !== null && groupsInUse !== null) openAgentWavesForm(host, plan.waves, groupsInUse, { tenant: rolloutTenant, current }); },
     }),
   ]));
 
@@ -576,51 +758,57 @@ async function renderAgentReleaseList(host) {
       el("th", { text: bl({ en: "Version", ja: "バージョン" }) }),
       el("th", { text: bl({ en: "State", ja: "状態" }) }),
       el("th", { text: bl({ en: "Stops being offered", ja: "配布終了" }) }),
-      el("th", { text: bl({ en: "Can go back to", ja: "戻せる範囲" }) }),
+      el("th", { text: bl({ en: "Minimum version to sign", ja: "署名できる最低バージョン" }) }),
       el("th", { text: bl({ en: "The installer", ja: "インストーラ" }) }),
     ])),
     el("tbody", {}, rows),
   ]));
 
-  // ★★★ AND THE CONNECTOR PROGRAM HAD NO SCREEN AT ALL (2026-09-06, found by walking a connector onto a
-  // machine in a customer's own network). Add connector lists only what this deployment holds, and when it
-  // holds nothing for that machine's platform it says so plainly and ends with "ask whoever runs this
-  // deployment to add one". The person asked is the operator — and the operator, on their own screens, had
-  // nowhere to add one either. The API's refusal names the remedy as an HTTP call:
-  //
-  //	404 this deployment holds no connector program for linux-amd64: an operator publishes one
-  //	    with PUT /admin/connector-program
-  //
-  // A deployment seeds ONE program from its own image, its own architecture and no other, so a branch office
-  // on a different architecture is the ordinary case and not an edge one. This is the same chain that pointed
-  // at itself on the device lane this morning, one screen along.
-  if (answeringForTheDeployment()) {
-    host.appendChild(arConnectorProgramsSection());
+  // Operators publish a tenant replacement here, including while managing a customer.
+  // Tenant administrators obtain programs from Sites; this does not grant publication rights.
+  if (signedInAsOperator()) {
+    host.appendChild(arConnectorProgramsSection(current, rolloutTenant));
   }
 }
 
-// arConnectorProgramsSection lists what this deployment can put on a connector machine, and lets the operator
-// add one. The bytes live with the authority, like agent artifacts, so both calls are control-plane.
-function arConnectorProgramsSection() {
+// Connector publication writes one tenant override, including in the deployment view.
+// Use the verified tenant read; the selected-tenant string is empty in that view.
+function arConnectorProgramsSection(parentCurrent = () => true, tenant) {
+  const selection = arRolloutSelection(), session = typeof idpSession === "undefined" ? null : idpSession;
+  const authority = baseForPlane(_AR_PLANE), token = () => typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  const credential = token();
+  const context = () => parentCurrent() && selection === arRolloutSelection() &&
+    session === (typeof idpSession === "undefined" ? null : idpSession) && authority === baseForPlane(_AR_PLANE) && credential === token();
+  const current = () => card.isConnected !== false && context();
   const card = el("div", { class: "ui-card", style: "margin-top:18px" });
   card.appendChild(el("strong", { text: bl({ en: "Connector programs", ja: "コネクタのプログラム" }) }));
+  if (typeof tenant !== "string" || !tenant || tenant.trim() !== tenant) {
+    card.appendChild(el("div", { role: "alert", text: bl({
+      en: "The publication organization could not be verified. Reload before uploading.",
+      ja: "公開先のテナントを確認できません。アップロード前に再読込してください。" }) }));
+    return card;
+  }
+  card.appendChild(el("div", { class: "ui-field-hint", style: "margin-top:8px" }, [
+    el("span", { text: bl({ en: "Publication organization: ", ja: "公開先テナント: " }) }),
+    el("code", { text: tenant }),
+  ]));
   card.appendChild(el("div", { class: "ui-view-desc", text: bl({
-    en: "What an administrator can put on a machine in a customer's own network, from Sites → Add connector. "
-      + "This deployment seeded one from its own image — its own architecture, and no other — so a location "
-      + "on a different one has nothing to install until it is added here.",
-    ja: "顧客側のネットワークにあるマシンへ、管理者が「サイト → コネクタを追加」から置けるものです。この配備は"
-      + "自身のイメージから1つだけ用意しています（自身のアーキテクチャのみ）。異なるものを使う拠点は、ここで"
-      + "追加するまで導入するものがありません。" }) }));
+    en: "These programs are available to this organization from Sites → Add connector. Uploading replaces "
+      + "the program for the selected platform and architecture in this organization only. It does not change "
+      + "other organizations or the shared deployment programs. Shared programs remain available where this "
+      + "organization has no replacement. To publish for another organization, choose Exit tenant if needed, then open Tenants and choose Manage.",
+    ja: "このテナントでは「サイト → コネクタを追加」から以下のプログラムを取得できます。アップロードすると、"
+      + "選択したOS・アーキテクチャのプログラムをこのテナントだけで置き換えます。他のテナントや配備共通の"
+      + "プログラムは変更しません。このテナントで置き換えていない対象には共通プログラムが表示されます。"
+      + "別のテナントへ公開するには、必要に応じて「テナントを出る」を選び、「テナント」で対象の「管理」を選んでください。" }) }));
   const list = el("div", { style: "margin-top:8px" });
   card.appendChild(list);
 
-  const refresh = async () => {
-    list.innerHTML = "";
-    const programs = await connectorProgramsFetch();
+  const refresh = connectorProgramsLoader(list, (programs) => {
     if (!programs.length) {
       list.appendChild(el("div", { class: "ui-view-desc", text: bl({
-        en: "None yet — no location can install a connector until one is added.",
-        ja: "まだありません。1つ追加するまで、どの拠点もコネクタを導入できません。" }) }));
+        en: "None yet for this organization. Add a program before installing a connector here.",
+        ja: "このテナントで取得できるプログラムはまだありません。コネクタの導入前に追加してください。" }) }));
     }
     for (const p of programs) {
       list.appendChild(el("div", { style: "margin-top:4px" }, [
@@ -631,7 +819,7 @@ function arConnectorProgramsSection() {
                           : bl({ en: "build not stated", ja: "ビルド不明" }) }),
       ]));
     }
-  };
+  }, context);
   refresh();
 
   const fileF = el("input", { class: "ui-input", type: "file", style: "max-width:340px" });
@@ -639,28 +827,44 @@ function arConnectorProgramsSection() {
   for (const t of ["linux/amd64", "linux/arm64"]) pairF.appendChild(el("option", { value: t, text: t }));
   const verF = el("input", { class: "ui-input", type: "text", style: "max-width:200px", placeholder: "0.3.0+9d0ccdb" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Add it", ja: "追加する" }) });
+  const error = el("div", { role: "alert", class: "ui-callout ui-callout-warn", style: "display:none;margin-top:8px" });
+  card.appendChild(error);
+  let pending = false;
   submit.addEventListener("click", async () => {
+    if (pending || !current()) return;
     const file = fileF.files && fileF.files[0];
     if (!file) { uiToast(bl({ en: "Choose the program first.", ja: "先にプログラムを選んでください。" }), "err"); return; }
-    submit.disabled = true;
+    const [platform, arch] = String(pairF.value).split("/"), version = String(verF.value || "").trim();
+    pending = true;
+    for (const c of [fileF, pairF, verF, submit]) c.disabled = true;
+    error.textContent = ""; error.style.display = "none";
+    let sent = false;
     try {
-      // ★ THE DIGEST IS COMPUTED HERE AND DECLARED, because the route refuses an upload without one: without
-      // something to check against it is a place to stage anything and call it published. A truncated upload
-      // is then refused at the deployment rather than carried to a machine and run.
+      if (platform !== "linux" || !["amd64", "arm64"].includes(arch) ||
+          !Number.isSafeInteger(file.size) || file.size < 0 || file.size > 64 * 1024 * 1024) throw new Error();
       const bytes = await file.arrayBuffer();
+      if (!current()) return;
+      if (bytes.byteLength !== file.size) throw new Error();
       const sum = await crypto.subtle.digest("SHA-256", bytes);
-      const digest = [...new Uint8Array(sum)].map((b) => b.toString(16).padStart(2, "0")).join("");
-      const [platform, arch] = String(pairF.value).split("/");
-      const r = await arUploadConnectorProgram(bytes, platform, arch, digest, String(verF.value || "").trim());
-      if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-      uiToast(bl({ en: "Added. A location on " + platform + "/" + arch + " can install a connector now.",
-                   ja: "追加しました。" + platform + "/" + arch + " の拠点はコネクタを導入できます。" }), "ok");
+      if (!current()) return;
+      const digest = [...new Uint8Array(sum)].map(b => b.toString(16).padStart(2, "0")).join("");
+      sent = true;
+      const r = await arUploadConnectorProgram(bytes, platform, arch, digest, version);
+      if (!current()) return;
+      arConnectorProgramAck(r, { platform, arch, version, sha256: digest, size: bytes.byteLength });
+      uiToast(bl({ en: "Added for organization " + tenant + " (" + platform + "/" + arch + ").",
+                   ja: "テナント " + tenant + " に追加しました（" + platform + "/" + arch + "）。" }), "ok");
       fileF.value = "";
       refresh();
-    } catch (e) {
-      uiToast(String(e && e.message || e), "err");
+    } catch (_) {
+      if (current()) {
+        error.textContent = arConnectorUploadError(sent);
+        error.style.display = "";
+        if (sent) refresh();
+      }
     } finally {
-      submit.disabled = false;
+      pending = false;
+      for (const c of [fileF, pairF, verF, submit]) c.disabled = false;
     }
   });
   card.appendChild(el("div", { style: "display:flex;align-items:center;gap:10px;margin-top:12px;flex-wrap:wrap" },
@@ -671,6 +875,25 @@ function arConnectorProgramsSection() {
     ja: "ビルドの記入は任意ですが、書く価値があります。-verify は全ノードが同じビルドかを問うので、名前の無い"
       + "プログラムから入れたコネクタはその問いの外に出ます。" }) }));
   return card;
+}
+
+function arConnectorUploadError(sent) {
+  return sent ? bl({
+    en: "The connector upload could not be confirmed. It may already be saved. Your file and settings are retained; check the catalogue before choosing Add it to retry. A retry is another audited upload.",
+    ja: "コネクタのアップロード結果を確認できません。保存済みの可能性があります。ファイルと入力を保持しています。一覧を確認してから「追加する」で再試行してください。再試行は別のアップロードとして監査されます。" }) : bl({
+    en: "The connector program could not be prepared; no upload was sent. Check the selected file (maximum 64 MiB) and browser hashing support, then try again.",
+    ja: "コネクタのプログラムを準備できず、送信していません。選択ファイル（最大67,108,864バイト）とブラウザのハッシュ計算対応を確認して再試行してください。" });
+}
+
+function arConnectorProgramAck(response, expected) {
+  const p = response?.body;
+  if (!response?.ok || response.status !== 200 || !arReadObject(p) ||
+      p.platform !== expected.platform || p.arch !== expected.arch ||
+      p.file_name !== "dsse-connector-" + expected.platform + "-" + expected.arch + ".tar.gz" ||
+      p.sha256 !== expected.sha256 || p.size !== expected.size || (p.version === undefined ? "" : p.version) !== expected.version ||
+      typeof p.published_at !== "string" || !Number.isFinite(Date.parse(p.published_at)) ||
+      (p.published_by !== undefined && typeof p.published_by !== "string")) throw new Error();
+  return p;
 }
 
 // arUploadConnectorProgram publishes the bytes. Raw, like the agent artifact beside it, and for the same
@@ -687,11 +910,11 @@ async function arUploadConnectorProgram(bytes, platform, arch, digest, version) 
   const path = "/admin/connector-program?platform=" + encodeURIComponent(platform) +
     "&arch=" + encodeURIComponent(arch);
   try {
-    const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", body: bytes });
+    const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", redirect: "error", cache: "no-store", body: bytes });
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
-    return { ok: res.ok, status: res.status, body: parsed };
+    return { ok: res.ok && !res.redirected, status: res.status, body: parsed };
   } catch (e) {
     return { ok: false, status: 0, body: { error: String(e) } };
   }
@@ -703,6 +926,8 @@ async function arUploadConnectorProgram(bytes, platform, arch, digest, version) 
 // consequence — this tenant moves when the operator publishes — and naming a version is a different one. A
 // summary that said "not set" for the first would describe the ordinary state as a gap.
 function arRunningSummary(plan, published) {
+  if (plan?.frozen) return bl({ en: "Updates paused", ja: "更新を停止中" }) +
+    (plan.reason ? ": " + plan.reason : "") + " · " + arRunningSummary({ ...plan, frozen: false }, published);
   const want = plan && String(plan.desired_version || "").trim();
   const offered = Object.keys(published || {}).map((k) => {
     const m = arManifestOf(published[k]);
@@ -728,7 +953,7 @@ function arRunningSummary(plan, published) {
 // ★ IT OFFERS WHAT IS PUBLISHED AND ACCEPTS ANY VERSION. Choosing from the list is the ordinary act; typing
 // one that is not offered is how a fleet is HELD where it is, deliberately, and refusing that would take away
 // the one control a tenant has when a release is going badly.
-function openAgentVersionForm(host, plan, published) {
+function openAgentVersionForm(host, plan, published, context) {
   const offered = Object.keys(published || {}).map((k) => {
     const m = arManifestOf(published[k]);
     return m && m.version;
@@ -745,8 +970,7 @@ function openAgentVersionForm(host, plan, published) {
       ? bl({ en: "Offered now: " + offered.join(", "), ja: "現在提供中: " + offered.join(", ") })
       : bl({ en: "Nothing is published yet.", ja: "まだ何も公開されていません。" }),
   });
-  const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }) });
-  const m = uiModal({
+  arRolloutDialog({ host, context,
     title: bl({ en: "The version this tenant runs", ja: "このテナントが動かすバージョン" }),
     body: [
       el("div", { class: "ui-field" }, [
@@ -765,42 +989,65 @@ function openAgentVersionForm(host, plan, published) {
       ]),
       versionF.el,
     ],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
-  submit.addEventListener("click", async () => {
-    const want = nameF.checked ? versionF.get().trim() : "";
-    if (nameF.checked && !want) {
-      versionF.setError(bl({ en: "Name the version, or follow what is offered.",
-                             ja: "バージョンを入力するか、提供されるものに従ってください。" }));
-      return;
-    }
-    submit.disabled = true;
-    // intent=rollout carries the version and leaves the halt and the schedule alone — a form about WHICH
-    // version must not release a fleet somebody stopped, for the same reason the window form says so.
-    // ★ FOLLOWING IS ITS OWN ACT, not "rollout to nothing": rollout requires a version, so sending an empty one
-    // was refused and the control was one-way — an organization could hold its fleet and never release it.
-    const r = want
-      ? await apiFetch("PUT", "/admin/agent-rollout", { intent: "rollout", desired_version: want }, _AR_PLANE)
-      : await apiFetch("PUT", "/admin/agent-rollout", { intent: "follow" }, _AR_PLANE);
-    if (!r.ok) {
-      submit.disabled = false;
-      versionF.setError(arErrorText(r));
-      uiToast(arErrorText(r), "err");
-      return;
-    }
-    m.close();
-    uiToast(want
-      ? bl({ en: "These devices run " + want + ".", ja: "端末は " + want + " を動かします。" })
-      : bl({ en: "These devices follow what this deployment offers.", ja: "端末は配備が提供するものに従います。" }), "ok");
-    renderAgentReleaseList(host);
+    request: () => {
+      const want = nameF.checked ? versionF.get().trim() : "";
+      if (nameF.checked && !want) {
+        versionF.setError(bl({ en: "Name the version, or follow what is offered.",
+                               ja: "バージョンを入力するか、提供されるものに従ってください。" }));
+        return;
+      }
+      return want ? { intent: "rollout", desired_version: want } : { intent: "follow" };
+    },
   });
   (nameF.checked ? versionF : { focus: () => followF.focus() }).focus();
+}
+
+// The external manifest names the upload target and version. Match its declared
+// bytes against the selected package before asking the authority to verify and
+// publish its signature. This is not browser-side signature verification.
+function arSignedPackage(env, file, digest) {
+  const m = arManifestOf(env);
+  if (!arReadObject(m) || !arKnownTarget(arTargetKey(m.platform, m.arch)) ||
+      typeof m.version !== "string" || !m.version.trim() || !Number.isSafeInteger(m.artifact_size) ||
+      m.artifact_size <= 0 || m.artifact_size !== file.size || typeof m.artifact_sha256 !== "string" ||
+      m.artifact_sha256.toLowerCase() !== digest.toLowerCase()) {
+    throw new Error(bl({
+      en: "The signed file must name a supported target and version, and its package size and digest must match the selected file.",
+      ja: "署名済みファイルの対象端末・バージョンを確認してください。パッケージのサイズとハッシュ値は、選んだファイルとの一致が必要です。" }));
+  }
+  return m;
+}
+
+// Match the acknowledged scope and package before continuing the two-step
+// publication. HTTP success alone is not confirmation of the requested release.
+function arPublicationAck(response, scope, manifest, expectedHash) {
+  const b = arReleaseResponse(response, "admin_agent_updates.v1", scope), p = b.published;
+  if (!arReadObject(p) || p.platform !== manifest.platform || p.arch !== manifest.arch || p.version !== manifest.version ||
+      p.artifact_size !== manifest.artifact_size || typeof p.artifact_sha256 !== "string" ||
+      p.artifact_sha256.toLowerCase() !== manifest.artifact_sha256.toLowerCase() ||
+      !/^[a-f0-9]{64}$/.test(b.manifest_sha256) || !["pending", "active"].includes(b.state) ||
+      (expectedHash !== undefined && (typeof expectedHash !== "string" || b.manifest_sha256 !== expectedHash.toLowerCase()))) throw new Error();
+  return b.manifest_sha256;
+}
+function arArtifactAck(response, scope, manifest, manifestSHA256) {
+  const b = arReleaseResponse(response, "admin_agent_updates.v1", scope), p = b.stored;
+  if (!arReadObject(p) || p.platform !== manifest.platform || p.arch !== manifest.arch || p.version !== manifest.version ||
+      p.bytes !== manifest.artifact_size || typeof p.artifact_sha256 !== "string" ||
+      p.artifact_sha256.toLowerCase() !== manifest.artifact_sha256.toLowerCase() ||
+      b.manifest_sha256 !== manifestSHA256 || b.active !== true || typeof b.activated !== "boolean") throw new Error();
 }
 
 // ★ THE FORM IS THE SCREEN'S REASON TO EXIST. A page that shows what is published and cannot publish sends the
 // reader back to a terminal — which is exactly where the risk this lane was built to remove lives.
 function openAgentReleaseForm(host) {
+  if (window._arReleaseDialog?.active()) return;
+  const read = window._arReleaseReadContext;
+  if (!read || read.host !== host || !read.current() || !read.signingKnown || typeof read.scope !== "string") {
+    uiToast(arReleaseReadError(), "err");
+    return;
+  }
   let chosen = null;
+  const canSign = read.canSign === true;
 
   const fileInput = el("input", { class: "ui-input", type: "file", accept: ".pkg,.msi" });
   const fileField = el("div", { class: "ui-field" }, [
@@ -819,7 +1066,7 @@ function openAgentReleaseForm(host) {
   const envField = el("div", { class: "ui-field" }, [
     el("label", { class: "ui-field-label" }, [
       bl({ en: "Signed release file", ja: "署名済みリリースファイル" }),
-      window._arCanSign ? el("span", { class: "ui-field-hint", text: bl({ en: " (optional)", ja: "（任意）" }) })
+      canSign ? el("span", { class: "ui-field-hint", text: bl({ en: " (optional)", ja: "（任意）" }) })
                         : el("span", { class: "ui-field-req", text: "*" })]),
     envInput,
     el("span", { class: "ui-field-hint", text: bl({
@@ -869,137 +1116,100 @@ function openAgentReleaseForm(host) {
     if (prev && prev.artifact_url) urlF.set(prev.artifact_url);
   });
 
-  const progress = el("div", { class: "ui-muted" });
+  let pending = false, closed = false, staged = null, observer;
+  const progress = el("div", { class: "ui-muted", role: "status" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Publish", ja: "公開" }) });
-  const m = uiModal({
-    title: bl({ en: "Publish a version", ja: "バージョンを公開" }),
-    body: [fileField, envField, targetF.el, versionF.el, urlF.el, progress],
-    footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
-  });
-
+  const close = () => {
+    if (closed) return;
+    closed = true; observer?.disconnect(); backdrop.remove(); document.removeEventListener("keydown", onKey);
+    if (window._arReleaseDialog === controller) delete window._arReleaseDialog;
+  };
+  const active = () => {
+    if (closed) return false;
+    if (host.isConnected === false || !read.current()) { close(); return false; }
+    return true;
+  };
+  const cancel = el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => { if (!pending) close(); } });
+  const onKey = e => { if (e.key === "Escape" && !pending) close(); };
+  const backdrop = el("div", { class: "ui-modal-backdrop", onClick: e => { if (e.target === backdrop && !pending) close(); } }, [
+    el("div", { class: "ui-modal", role: "dialog" }, [
+      el("div", { class: "ui-modal-head", text: bl({ en: "Publish a version", ja: "バージョンを公開" }) }),
+      el("div", { class: "ui-modal-body" }, [fileField, envField, targetF.el, versionF.el, urlF.el, progress]),
+      el("div", { class: "ui-modal-foot" }, [cancel, submit]),
+    ]),
+  ]);
+  const controller = { active };
+  window._arReleaseDialog = controller;
+  const lock = () => {
+    backdrop.querySelectorAll("input,select,textarea").forEach(n => { n.disabled = pending || staged !== null; });
+    cancel.disabled = submit.disabled = pending;
+    submit.textContent = staged
+      ? bl({ en: "Retry package", ja: "パッケージ送信を再試行" })
+      : bl({ en: "Publish", ja: "公開" });
+  };
+  document.body.appendChild(backdrop); document.addEventListener("keydown", onKey);
   submit.addEventListener("click", async () => {
-    if (!chosen) {
-      uiToast(bl({ en: "Choose the package file.", ja: "パッケージファイルを選んでください。" }), "err");
-      return;
+    if (!active() || pending) return;
+    // Capture this attempt before the first await; programmatic input changes
+    // must not substitute another file even while the controls are disabled.
+    const file = staged ? staged.file : chosen, signedFile = chosenEnvelope;
+    let version = staged ? staged.manifest.version : versionF.get();
+    const artifactURL = urlF.get(), parts = String(targetF.get()).split("/");
+    if (!file) { uiToast(bl({ en: "Choose the package file.", ja: "パッケージファイルを選んでください。" }), "err"); return; }
+    if (!staged && !canSign && !signedFile) {
+      uiToast(bl({ en: "Choose the signed release file — this control plane cannot sign one.", ja: "署名済みリリースファイルを選んでください。この管理サーバーは署名できません。" }), "err"); return;
     }
-    if (!window._arCanSign && !chosenEnvelope) {
-      uiToast(bl({ en: "Choose the signed release file — this control plane cannot sign one.",
-                   ja: "署名済みリリースファイルを選んでください。この管理サーバーは署名できません。" }), "err");
-      return;
-    }
-    if (!chosenEnvelope && (!versionF.validate() || !urlF.validate())) return;
-    const parts = String(targetF.get()).split("/");
-    const platform = parts[0];
-    const arch = parts[1];
-
-    submit.disabled = true;
-    progress.textContent = bl({ en: "Checking the package…", ja: "パッケージを確認中…" });
-    let digest;
+    if (!staged && !signedFile && (!versionF.validate() || !urlF.validate())) return;
+    pending = true; lock(); progress.setAttribute("role", "status");
+    let sent = staged !== null, published = staged !== null;
     try {
-      digest = await arHash(chosen);
-    } catch (e) {
-      submit.disabled = false;
-      progress.textContent = "";
-      uiToast(String(e), "err");
-      return;
-    }
-
-    const now = new Date();
-    const iso = (d) => d.toISOString().replace(/\.\d+Z$/, "Z");
-    const manifest = {
-      // No schema field: the control plane stamps it when it signs, and a constant restated here is one more
-      // place to be wrong. It was wrong — the first version of this file sent "schema_version" where the
-      // document says "schema", and the endpoint refused it rather than signing a manifest with a field the
-      // operator never meant to set. That refusal is the strict decode doing its job.
-      version: versionF.get(),
-      platform: platform,
-      arch: arch,
-      channel: "stable",
-      delivery: "dsse",
-      artifact_kind: platform === "windows" ? "msi" : "pkg",
-      artifact_url: urlF.get(),
-      artifact_sha256: digest,
-      artifact_size: chosen.size,
-      released_at: iso(now),
-      // How long the DOCUMENT may be acted on — a bound on a stolen copy, not a support window. Set here
-      // rather than asked: a field whose right answer is always "a few months" is a question that only
-      // produces mistakes.
-      not_after: iso(new Date(now.getTime() + 180 * 24 * 3600 * 1000)),
-    };
-
-    let signed;
-    if (chosenEnvelope) {
-      // ★★★ THE ENVELOPE MUST DESCRIBE THE BYTES BEING UPLOADED, AND THIS IS THE ONLY MOMENT BOTH ARE HERE.
-      // A manifest signed for a different copy of the package publishes cleanly and is refused by every device
-      // in the fleet at download time — days later, as "the update is broken", with the cause in no screen.
-      // The signature itself is checked by the control plane, which is the only check that means anything; this
-      // one is about which FILE, and only this screen is holding both.
-      progress.textContent = bl({ en: "Checking the signed file…", ja: "署名済みファイルを確認中…" });
-      let envelope;
-      try {
-        envelope = JSON.parse(await chosenEnvelope.text());
-      } catch (e) {
-        submit.disabled = false;
-        progress.textContent = "";
-        uiToast(bl({ en: "That is not a signed release file.", ja: "署名済みリリースファイルではありません。" }), "err");
-        return;
+      if (!staged) {
+        progress.textContent = bl({ en: "Checking the package…", ja: "パッケージを確認中…" });
+        const digest = await arHash(file);
+        if (!active()) return;
+        const now = new Date(), iso = d => d.toISOString().replace(/\.\d+Z$/, "Z");
+        let envelope, manifest = { version, platform: parts[0], arch: parts[1], channel: "stable", delivery: "dsse",
+          artifact_kind: parts[0] === "windows" ? "msi" : "pkg", artifact_url: artifactURL,
+          artifact_sha256: digest, artifact_size: file.size, released_at: iso(now), not_after: iso(new Date(now.getTime() + 180 * 24 * 3600 * 1000)) };
+        if (signedFile) {
+          progress.textContent = bl({ en: "Checking the signed file…", ja: "署名済みファイルを確認中…" });
+          try { envelope = JSON.parse(await signedFile.text()); }
+          catch (_) { throw new Error(bl({ en: "That is not a signed release file.", ja: "署名済みリリースファイルではありません。" })); }
+          if (!active()) return;
+          manifest = arSignedPackage(envelope, file, digest); version = manifest.version;
+        }
+        if (!active()) return;
+        progress.textContent = bl({ en: "Publishing…", ja: "公開中…" }); sent = true;
+        const signed = await apiFetch(signedFile ? "PUT" : "POST", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(read.scope), signedFile ? envelope : manifest, _AR_PLANE);
+        if (!active()) return;
+        const manifestSHA256 = arPublicationAck(signed, read.scope, manifest, signedFile ? envelope.payload_sha256 : undefined);
+        published = true;
+        // Keep the acknowledged file and manifest for this dialog. An upload retry
+        // must not sign or publish again, or replace another writer's newer release.
+        staged = { file, manifest, manifestSHA256 };
       }
-      const said = arManifestOf(envelope);
-      if (!said) {
-        submit.disabled = false;
-        progress.textContent = "";
-        uiToast(bl({ en: "That file carries no release manifest.",
-                     ja: "そのファイルにリリースマニフェストが入っていません。" }), "err");
-        return;
-      }
-      if (String(said.artifact_sha256 || "").toLowerCase() !== String(digest).toLowerCase()) {
-        submit.disabled = false;
-        progress.textContent = "";
-        uiToast(bl({
-          en: "The signed file describes a different package (" + String(said.artifact_sha256 || "—").slice(0, 12) +
-              "…) than the one chosen. Publishing it would give every device a download it refuses.",
-          ja: "署名済みファイルが指しているのは、選んだパッケージとは別のもの（" +
-              String(said.artifact_sha256 || "—").slice(0, 12) + "…）です。このまま公開すると、" +
-              "全端末がダウンロードを拒否します。" }), "err");
-        return;
-      }
-      // The envelope names its own target and version; the form's are not consulted, so the two cannot disagree.
-      progress.textContent = bl({ en: "Publishing…", ja: "公開中…" });
-      signed = await apiFetch("PUT", "/admin/agent-updates", envelope, _AR_PLANE);
-    } else {
-      progress.textContent = bl({ en: "Signing…", ja: "署名中…" });
-      signed = await apiFetch("POST", "/admin/agent-updates", manifest, _AR_PLANE);
-    }
-    if (!signed.ok) {
-      submit.disabled = false;
-      progress.textContent = "";
-      const msg = arErrorText(signed);
-      versionF.setError(msg);
-      uiToast(msg, "err");
-      return;
-    }
-
-    progress.textContent = bl({ en: "Sending the package…", ja: "パッケージを送信中…" });
-    const up = await arUploadArtifact(chosen, platform, arch);
-    if (!up.ok) {
-      // ★ THE HALF-DONE STATE, NAMED. The manifest is stored and devices are still on the previous release.
-      // The fix is to send the file again — NOT to publish again — and saying so is the difference between a
-      // five-second retry and an operator inventing a version number to get unstuck.
-      submit.disabled = false;
-      progress.textContent = "";
-      uiToast(bl({
-        en: versionF.get() + " is published and waiting for its package — sending it failed (" + arErrorText(up) +
-            "). Press Publish again with the same file; the version does not change.",
-        ja: versionF.get() + " は公開済みでパッケージ待ちです。送信に失敗しました(" + arErrorText(up) +
-            ")。同じファイルで再度「公開」してください。バージョンは変わりません。" }), "err");
+      const { manifest, manifestSHA256 } = staged;
+      progress.textContent = bl({ en: "Sending the package…", ja: "パッケージを送信中…" });
+      const upload = await arUploadArtifact(file, manifest.platform, manifest.arch, { scope: read.scope, manifestSHA256 });
+      if (!active()) return;
+      arArtifactAck(upload, read.scope, manifest, manifestSHA256);
+      close();
+      uiToast(bl({ en: version + " is now what these devices are offered.", ja: version + " をこれらの端末に配布します。" }), "ok");
       renderAgentReleaseList(host);
-      return;
-    }
-
-    m.close();
-    uiToast(bl({
-      en: versionF.get() + " is now what these devices are offered.",
-      ja: versionF.get() + " をこれらの端末に配布します。" }), "ok");
-    renderAgentReleaseList(host);
+    } catch (e) {
+      if (!active()) return;
+      if (!sent) { progress.textContent = ""; uiToast(e.message || String(e), "err"); }
+      else {
+        progress.setAttribute("role", "alert");
+        progress.textContent = published
+          ? bl({ en: version + " was published, but package delivery could not be confirmed. It may already be active. Retry package sends the same file without publishing again. If the release changed, cancel and reload before continuing.",
+                 ja: version + " の公開後、パッケージ送信の結果を確認できません。すでに有効な可能性があります。「パッケージ送信を再試行」で同じファイルを送信します。再公開はしません。公開内容が変わった場合はキャンセルして再読込してください。" })
+          : bl({ en: "Publication could not be confirmed. The release may already be saved. Retry with Publish, or cancel and reload before making another change.",
+                 ja: "公開結果を確認できません。すでに保存済みの可能性があります。公開ボタンで再試行するか、キャンセルして再読込してから次の変更を行ってください。" });
+      }
+    } finally { pending = false; if (active()) lock(); }
   });
+  observer = new MutationObserver(() => { active(); });
+  observer.observe(document.body, { childList: true, subtree: true });
+  active();
 }

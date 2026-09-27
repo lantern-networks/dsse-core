@@ -6225,7 +6225,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerRiskServerInitiatedRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, configSourceURL)
 	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride)
 	registerUsageEventsRoutes(mux, adminEndpoint, adminAuth, usageMeters, adminHotStore, humanIdentities, nonHumanIdentities)
-	registerAgentQualityRoutes(mux, adminEndpoint, evaluator, writer, deviceStore, agentTelemetry, agentRolloutPlans, agentTargetVersion, agentReleaseChannel, config.AgentRolloutCache, adminHotStore)
+	registerAgentQualityRoutes(mux, adminEndpoint, evaluator, writer, deviceStore, agentTelemetry, agentRolloutPlans, agentTargetVersion, agentReleaseChannel, config.AgentRolloutCache, adminHotStore, config.AdminAuditOutbox)
 	// The per-device view the Devices list folds in: everything this lane does has otherwise been reachable
 	// only by curl.
 	registerAgentDeviceUpdateRoutes(mux, adminEndpoint, deviceStore, config.EnrolledLedger, agentTelemetry,

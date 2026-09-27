@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -75,13 +76,13 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 				}
 			}
 			store, ok := policyStore.(interface {
-				SaveTenantRestriction(string, string, policy.TenantRestrictionPatch) error
+				SaveTenantRestrictionContext(context.Context, string, string, policy.TenantRestrictionPatch) error
 			})
 			if !ok {
 				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("managed SaaS configuration is unavailable"))
 				return
 			}
-			if err := store.SaveTenantRestriction(tenant, req.Provider, req.TenantRestrictionPatch); err != nil {
+			if err := store.SaveTenantRestrictionContext(r.Context(), tenant, req.Provider, req.TenantRestrictionPatch); err != nil {
 				if errors.Is(err, policy.ErrPolicyPersistence) {
 					writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
 					return
@@ -113,10 +114,10 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 				return
 			}
 			if errors.Is(err, policy.ErrPolicyPersistence) {
-				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS rule change could not be saved"))
-			} else {
-				writeError(w, http.StatusBadRequest, err)
+				writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
+				return
 			}
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		// S6: ship the applied REQUEST as a version to the control plane (history + rollback). The request is
@@ -179,10 +180,10 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 				return
 			}
 			if errors.Is(err, policy.ErrPolicyPersistence) {
-				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS rule change could not be saved"))
-			} else {
-				writeError(w, http.StatusBadRequest, err)
+				writeError(w, http.StatusServiceUnavailable, policy.ErrPolicyPersistence)
+				return
 			}
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		shipConfigVersionToCP(r, cpVersions, configversion.ResourceTenantRestriction, adminTenantIDFromRequest(r),

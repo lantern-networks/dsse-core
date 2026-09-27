@@ -649,3 +649,5 @@ People, device, identity-provider, access-approval, organization and enrollment 
 The Console regression suite and synthetic browser checks cover these form contracts; they do not establish acceptance of real identity providers, signed installers or deployed CP/Edge communication.
 
 Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
+
+Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.

@@ -137,3 +137,30 @@ func TestAdminTransportAdmissionUnconfiguredReadIsUnavailable(t *testing.T) {
 		t.Fatalf("%d: %s", w.Code, w.Body)
 	}
 }
+
+func TestDeviceConsoleResponseContextContract(t *testing.T) {
+	h, writer, _, _ := transportAuditHandler(t)
+	defer writer.Close()
+	for _, step := range []struct{ method, path, body string }{
+		{"POST", "/admin/transport-admission/revoke", `{"identity":"owned-device","reason":"admin_request"}`},
+		{"POST", "/admin/transport-admission/restore", `{"identity":"owned-device"}`},
+		{"POST", "/admin/enrolled-devices/owned-device/disable", `{}`},
+		{"POST", "/admin/enrolled-devices/owned-device/enable", `{}`},
+		{"GET", "/admin/risk-signals", ""},
+	} {
+		r := admissionStateRequest(h, step.method, step.path, step.body)
+		if r.Code != 200 {
+			t.Fatalf("%s status %d: %s", step.path, r.Code, r.Body.String())
+		}
+		var b map[string]any
+		if err := json.Unmarshal(r.Body.Bytes(), &b); err != nil {
+			t.Fatal(err)
+		}
+		if b["tenant_id"] != "tenant_lab_001" {
+			t.Fatalf("%s missing tenant context", step.path)
+		}
+		if step.method == "GET" && b["entity_type"] != "device" {
+			t.Fatal("missing device risk type")
+		}
+	}
+}

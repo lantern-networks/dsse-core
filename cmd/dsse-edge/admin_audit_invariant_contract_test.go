@@ -651,6 +651,8 @@ func coveredAuditEmitterInvariantFunctions() map[string]bool {
 
 func deferredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
+		"deviceRiskAuditLog": true, // Device-risk HTTP tests cover actor attribution and secret exclusion.
+
 		// Administrative kill-switch audits intentionally retain the acting principal and source IP.
 		// admin_transport_admission_audit_test covers attribution and secret exclusion.
 		"transportAdmissionAuditLog": true,

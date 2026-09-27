@@ -659,3 +659,9 @@ The Console regression suite and synthetic browser checks cover these form contr
 Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
+
+### Device and user risk persistence
+
+Risk edits report whether the requested state was applied and durably saved; failed protective saves remain visibly unconfirmed. Standby risk management does not serve stale authority, and promotion reloads shared device and user marks. Existing local snapshots retain their backend instead of being silently replaced by empty shared state. DLP-derived device risk records the actual application and persistence outcome separately from the original finding, and Edge synchronization retains marks on an unconfirmed empty feed. An authoritative CP feed still replaces the device map, including local DLP marks; separating those sources is not part of this integration.
+
+Risk backend upgrades must explicitly reconcile every CP onto the same reviewed backend before enabling HA. Existing files are not implicitly imported; use the documented `-high-risk-store=postgres+import:` procedure with writers stopped. Existing empty/unreadable local paths (also for admission and policy stores) are retained for checked loading instead of silently selecting an empty shared backend; repair those paths or explicitly configure the intended backend before upgrade.

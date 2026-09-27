@@ -157,3 +157,39 @@ func TestSharedMeshPendingSurvivesAnotherDelivery(t *testing.T) {
 		t.Fatal("pending mesh block lost")
 	}
 }
+
+func TestSharedAutomaticPendingSurvivesLeadershipReload(t *testing.T) {
+	p := &automaticSharedStore{}
+	o := NewHighRiskOverlay()
+	if err := o.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.SetDeviceRiskContext(context.Background(), "peer", "medium"); err != nil {
+		t.Fatal(err)
+	}
+	p.failAfter = true
+	if _, err := o.RaiseDeviceRisk("target", "critical"); err != ErrRiskSave {
+		t.Fatal(err)
+	}
+	before := bytes.Clone(p.raw)
+	p.failAfter = false
+	if err := o.ReloadFromStore(); err != nil {
+		t.Fatal(err)
+	}
+	if o.Snapshot()["target"] != "critical" || o.Snapshot()["peer"] != "medium" || !o.riskSavePending || o.automaticPending["target"] != "critical" {
+		t.Fatal("reload discarded unconfirmed protection")
+	}
+	if !bytes.Equal(before, p.raw) {
+		t.Fatal("reload wrote storage")
+	}
+	if _, err := o.SetUserRiskContext(context.Background(), UserRisk{TenantID: "other", ID: "person", Severity: "high"}); err != nil {
+		t.Fatal(err)
+	}
+	restored := NewHighRiskOverlay()
+	if err := restored.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if restored.Snapshot()["target"] != "critical" || restored.Snapshot()["peer"] != "medium" || len(restored.UserSnapshot()) != 1 {
+		t.Fatal("next independent edit lost pending mark")
+	}
+}

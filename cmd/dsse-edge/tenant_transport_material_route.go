@@ -69,6 +69,7 @@ func registerTenantTransportMaterialRoute(mux *http.ServeMux, authority *tenantT
 		ttl = 12 * time.Hour
 	}
 	mux.HandleFunc("POST /tenant-edge-material", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(trustDistributionWriteContext(r.Context()))
 		if !auditIngestBearerValid(r, token) {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("tenant-edge-material: unauthorized"))
 			return
@@ -149,7 +150,7 @@ func registerTenantTransportMaterialRoute(mux *http.ServeMux, authority *tenantT
 			Unchanged      bool                   `json:"unchanged,omitempty"`
 		}{TTL: ttl.String(), Generation: materialGeneration(authority, interception, deviceIdentity, registrations)}
 		if len(distributors) == 1 && distributors[0] != nil {
-			out.TrustBundles, err = distributors[0].Publish(authority, interception)
+			out.TrustBundles, err = distributors[0].PublishContext(r.Context(), authority, interception)
 			if err != nil {
 				writeError(w, http.StatusServiceUnavailable, err)
 				return
@@ -631,7 +632,7 @@ func registerTenantTransportRotationAdminRoutes(mux *http.ServeMux,
 // asking every device to trust something the operator made.
 func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 	adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, authority *tenantInterceptionAuthority,
-	tenantModels adminTenantModelRuntimeStore, gates ...pkiTransitionAdmission) {
+	tenantModels adminTenantModelRuntimeStore, audit func(*http.Request, string, string, *storedTenantInterceptionIssuer), gates ...pkiTransitionAdmission) {
 	mux.HandleFunc("POST /admin/tenant-interception-authority", adminEndpoint("admin.enrollment.write|admin.tenant.admin",
 		func(w http.ResponseWriter, r *http.Request) {
 			var body struct {
@@ -710,6 +711,13 @@ func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 			// answer that read the same for both is how somebody hands over a replacement, sees "applies to
 			// every Edge", and believes the switch has happened.
 			staged := authority.IsStaged(tenant)
+			if audit != nil {
+				action := "interception_authority_imported"
+				if staged {
+					action = "interception_authority_staged"
+				}
+				audit(r, row.TenantID, action, row)
+			}
 			applies := "every Edge in the fleet, as each one next fetches its material — this organization's " +
 				"devices keep trusting the same root, so nothing on a device changes"
 			if staged {

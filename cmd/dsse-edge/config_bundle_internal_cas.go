@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/internalca"
@@ -62,14 +63,17 @@ func applyInternalCABundleSection(store organizationInternalCAPool, section *int
 }
 func applyInternalCABundleSectionChecked(store organizationInternalCAPool, section *internalCABundle, logf func(string, ...interface{})) (int, bool, error) {
 	concrete, ok := store.(*internalca.Store)
-	if !ok || concrete == nil || section == nil {
+	if section == nil {
 		return 0, false, nil
+	}
+	if !ok || concrete == nil {
+		return 0, false, fmt.Errorf("internal authority store unavailable")
 	}
 	if !section.Complete {
 		if logf != nil {
 			logf("config_bundle_internal_cas_kept_local=true reason=incomplete")
 		}
-		return 0, false, nil
+		return 0, false, fmt.Errorf("internal authority section is incomplete")
 	}
 	if err := concrete.ReplaceAll(section.Authorities); err != nil {
 		return 0, false, err

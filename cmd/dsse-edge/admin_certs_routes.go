@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/certreload"
 	"github.com/lantern-networks/dsse-core/configversion"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
@@ -36,7 +41,13 @@ func registerCertsAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 			writeError(w, http.StatusBadRequest, verr)
 			return
 		}
-		entry, err := rotateNamedCert(r.PathValue("name"), req.CertPEM, req.KeyPEM, time.Now())
+		certRotationMu.Lock()
+		defer certRotationMu.Unlock()
+		if err := preserveNamedCertVersion(r, config.CPVersions, r.PathValue("name")); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("previous certificate could not be saved in history; no replacement applied: %w", err))
+			return
+		}
+		entry, err := rotateNamedCertLocked(r.PathValue("name"), req.CertPEM, req.KeyPEM, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -112,7 +123,13 @@ func registerCertsAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 			writeError(w, http.StatusBadRequest, fmt.Errorf("rollback refused: %w", verr))
 			return
 		}
-		entry, err := rotateNamedCert(name, snap.CertPEM, snap.KeyPEM, time.Now())
+		certRotationMu.Lock()
+		defer certRotationMu.Unlock()
+		if err := preserveNamedCertVersion(r, config.CPVersions, name); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("current certificate could not be saved before rollback; no replacement applied: %w", err))
+			return
+		}
+		entry, err := rotateNamedCertLocked(name, snap.CertPEM, snap.KeyPEM, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -136,4 +153,49 @@ func registerCertsAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, htt
 
 	// Admin-managed steer exclusions (per tenant / device-group / device). The control plane is the authority;
 	// the resolved set is later signed and delivered to the agent so the endpoint user cannot change it.
+}
+
+// A first replacement has no previous version until we record the material that
+// is actually serving. The caller serializes this with the ensuing replacement.
+func preserveNamedCertVersion(r *http.Request, client *cpConfigVersionClient, name string) error {
+	if client == nil {
+		return fmt.Errorf("config versioning is not enabled")
+	}
+	var selected *certreload.ReloadableCert
+	for _, c := range certreload.Registered() {
+		if deriveCertName(c.CertFile()) != name {
+			continue
+		}
+		if selected != nil && (filepath.Clean(selected.CertFile()) != filepath.Clean(c.CertFile()) || filepath.Clean(selected.KeyFile()) != filepath.Clean(c.KeyFile())) {
+			return fmt.Errorf("certificate name is ambiguous across backing files")
+		}
+		selected = c
+	}
+	if selected == nil {
+		return fmt.Errorf("no registered certificate with this name")
+	}
+	cert, err := os.ReadFile(selected.CertFile())
+	if err != nil {
+		return err
+	}
+	key, err := os.ReadFile(selected.KeyFile())
+	if err != nil {
+		return err
+	}
+	pair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		return fmt.Errorf("current certificate backing files do not form a valid pair")
+	}
+	current := selected.Current()
+	if current == nil || len(current.Certificate) != len(pair.Certificate) {
+		return fmt.Errorf("backing certificate differs from the serving certificate")
+	}
+	for i, der := range current.Certificate {
+		if !bytes.Equal(der, pair.Certificate[i]) {
+			return fmt.Errorf("backing certificate differs from the serving certificate")
+		}
+	}
+	entry, _ := certEntryFor(selected)
+	return client.Ship(r.Context(), configversion.ResourceCertificate, name, configversion.ActionUpsert, principalIDForAudit(r),
+		fmt.Sprintf("retained before change subject=%s fp=%s", entry.Subject, entry.FingerprintSHA256), certVersionSnapshot{CertPEM: string(cert), KeyPEM: string(key)})
 }

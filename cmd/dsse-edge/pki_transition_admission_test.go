@@ -72,7 +72,7 @@ func TestPKIAdminTransitionsRequireEvidence(t *testing.T) {
 				admin := func(_ string, h http.HandlerFunc) http.HandlerFunc { return h }
 				registerTenantTransportRotationAdminRoutes(mux, admin, tr, "", gates...)
 				registerTenantDeviceAuthorityAdminRoute(mux, admin, de, "", nil, gates...)
-				registerTenantInterceptionAuthorityAdminRoute(mux, admin, in, nil, gates...)
+				registerTenantInterceptionAuthorityAdminRoute(mux, admin, in, nil, nil, gates...)
 				parts := strings.Split(route, "/")
 				response := httptest.NewRecorder()
 				mux.ServeHTTP(response, httptest.NewRequest("POST", "/admin/tenant-"+parts[0]+"-authority/"+parts[1], strings.NewReader(`{"tenant_id":"tenant_a"}`)))

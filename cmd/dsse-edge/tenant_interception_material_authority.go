@@ -490,23 +490,29 @@ func (a *tenantInterceptionAuthority) CountForTenant(tenant string) int {
 }
 
 func (a *tenantInterceptionAuthority) RemoveTenant(tenant string) int {
+	n, _ := a.RemoveTenantChecked(tenant)
+	return n
+}
+
+func (a *tenantInterceptionAuthority) RemoveTenantChecked(tenant string) (int, error) {
 	if a == nil {
-		return 0
+		return 0, nil
 	}
 	key := strings.ToLower(strings.TrimSpace(tenant))
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
-		return 0
+		return 0, err
 	}
 	if _, ok := a.issuers[key]; !ok {
-		return 0
+		return 0, nil
 	}
 	delete(a.issuers, key)
+	// saveLocked restores the previous snapshot when the save is unconfirmed.
 	if err := a.saveLocked(); err != nil {
-		return 0
+		return 0, err
 	}
-	return 1
+	return 1, nil
 }
 
 // registerTenantInterceptionAuthorityFlag declares where a control plane keeps the authorities organizations

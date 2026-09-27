@@ -663,7 +663,8 @@ func registerAdminPKIReadinessEndpoint(mux *http.ServeMux, assess func() pkiRead
 	// That gap is where someone gives up and starts changing other things.
 	//
 	// Safe to expose: it signs a throwaway payload with the key already in use and verifies the result. It
-	// changes nothing, and the worst outcome is learning sooner that the key cannot sign.
+	// changes nothing, and the worst outcome is learning sooner that the key cannot sign. It does not count
+	// towards the consecutive slow checks that drain a node (KeyCustodyMonitor.CheckNow).
 	mux.HandleFunc("POST /admin/pki/readiness/check-signing", wrap("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
 		if checkSigning == nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("no interception key store is configured on this Edge"))

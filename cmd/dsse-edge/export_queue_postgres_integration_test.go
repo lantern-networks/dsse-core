@@ -324,7 +324,7 @@ func TestPostgresAdminExportJobStoreE2E(t *testing.T) {
 	if _, err := store.MarkProgress(job.ID, 7, "exporting", now.Add(2*time.Minute)); err != nil {
 		t.Fatalf("MarkProgress returned error: %v", err)
 	}
-	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", now.Add(3*time.Minute))
+	completed, err := store.MarkCompleted(job.ID, 7, 10, true, "evidence://tenant/tenant_lab_001/exports/export.ndjson.gz", "sha256:test", nil, now.Add(3*time.Minute))
 	if err != nil {
 		t.Fatalf("MarkCompleted returned error: %v", err)
 	}
@@ -498,7 +498,7 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskE2E(t *testing.T) {
 	}
 }
 
-func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t *testing.T) {
+func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectWorkerAuditJSONLE2E(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
 	if dsn == "" {
 		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
@@ -537,6 +537,7 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 		ExportObjectStore: objectStore,
 		HotStore:          hotstore.NewJSONLStore(writer, adminLogStreamFilenameMap()),
 		AdminExportJobs:   postgresJobStore,
+		AdminAuditOutbox:  postgresAdminAuditOutboxReader{DB: db},
 		AdminExportWorker: postgresQueueAdminExportWorker{
 			Queue:                   postgresExportTaskQueueAdapter{DB: postgresExportTaskSQLDB{DB: db}},
 			DB:                      db,
@@ -561,15 +562,17 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 1 {
 		t.Fatalf("active queue rows = %d, want 1", count)
 	}
-	if count := countPostgresAdminAuditOutboxRows(t, ctx, db, "tenant_lab_001"); count != 2 {
-		t.Fatalf("admin audit outbox rows = %d, want 2", count)
+	if count := countPostgresAdminAuditOutboxRows(t, ctx, db, "tenant_lab_001"); count != 3 {
+		t.Fatalf("admin audit outbox rows = %d, want 3", count)
 	}
 	auditRows, err := writer.ReadJSONL("audit.log.jsonl")
 	if err != nil {
 		t.Fatalf("ReadJSONL returned error: %v", err)
 	}
-	if len(auditRows) != 0 {
-		t.Fatalf("audit rows = %#v, want no direct JSONL audit writes", auditRows)
+	// The worker switch covers its own enqueue audits. Middleware still
+	// records the authenticated HTTP operation and mirrors it to the outbox.
+	if len(auditRows) != 1 || auditRows[0]["event_type"] != "admin_config_change" {
+		t.Fatalf("audit rows = %#v, want only the common HTTP audit", auditRows)
 	}
 }
 

@@ -684,6 +684,12 @@ Risk edits report whether the requested state was applied and durably saved; fai
 
 Risk backend upgrades must explicitly reconcile every CP onto the same reviewed backend before enabling HA. Existing files are not implicitly imported; use the documented `-high-risk-store=postgres+import:` procedure with writers stopped. Existing empty/unreadable local paths (also for admission and policy stores) are retained for checked loading instead of silently selecting an empty shared backend; repair those paths or explicitly configure the intended backend before upgrade.
 
+### Regional log searches and exports
+
+Regional searches and export previews report whether the number of excluded records without region attribution is known. Downloaded regional exports carry the same limitation in gzip metadata; an unavailable count is never reported as zero. The count is a separate live query, not an export snapshot. Export jobs return detached metadata and check cancellation before the final object is committed, including small exports.
+
+Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.
+
 ### Steering exclusions and boundary administration
 
 Steering exclusions now keep saved state on failed writes, attribute audit and version history to the target organization, and validate tenant/schema on CP feeds before replacing an Edge cache. VLAN edits preserve unrelated records and distinguish rejected input from unconfirmed storage; auditors remain read-only. East-west and SaaS restriction reads report unavailable shared storage instead of presenting stale authority. Candidate publication errors retain retryable storage failures. Update CP before Edges that require the validated exclusion feed.

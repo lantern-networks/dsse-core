@@ -52,7 +52,7 @@ func TestDownloadIssuerAttributionSurvivesRestore(t *testing.T) {
 			if _, err := jobs.MarkRunning(job.ID, now); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := jobs.MarkCompleted(job.ID, 1, 1, false, "evidence://tenant/customer/result.gz", "sha256:synthetic", now); err != nil {
+			if _, err := jobs.MarkCompleted(job.ID, 1, 1, false, "evidence://tenant/customer/result.gz", "sha256:synthetic", nil, now); err != nil {
 				t.Fatal(err)
 			}
 			jobs.mu.Lock()

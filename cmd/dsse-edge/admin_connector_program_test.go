@@ -25,7 +25,7 @@ func connectorProgramTestMux(root string, enforcingEdge bool, tenantID string) *
 			h(w, r.WithContext(ctx))
 		}
 	}
-	registerConnectorProgramRoutes(mux, as, root, enforcingEdge)
+	registerConnectorProgramRoutes(mux, as, root, enforcingEdge, nil, nil, testEvaluator())
 	return mux
 }
 
@@ -64,9 +64,17 @@ func TestAConnectorProgramWhoseBytesAreNotTheOnesDeclaredIsRefused(t *testing.T)
 	// ★ THE PATH COMES FROM THE CODE UNDER TEST, NOT FROM A COPY OF IT. Written by hand, this looked at
 	// root/t1/… while the store had moved to root/tenants/t1/… — a check that passed because it was looking
 	// somewhere nothing is ever written. A negative assertion needs to be aimed at the real place.
+	listed := httptest.NewRecorder()
+	mux.ServeHTTP(listed, httptest.NewRequest("GET", "/admin/connector-programs", nil))
+	if listed.Code != 200 {
+		t.Fatalf("failed upload broke catalogue: %d", listed.Code)
+	}
 	refusedDir, derr := connectorProgramDir(root, "t1", "linux-arm64")
 	if derr != nil {
 		t.Fatal(derr)
+	}
+	if _, err := os.Stat(refusedDir); !os.IsNotExist(err) {
+		t.Fatal("rejected upload created a target directory")
 	}
 	if _, err := os.Stat(filepath.Join(refusedDir, connectorProgramBytesName)); err == nil {
 		t.Fatalf("a refused publish stored its bytes anyway")
@@ -361,5 +369,159 @@ func TestSeedingNeverTouchesWhatAnOperatorPublished(t *testing.T) {
 	m, ok := readConnectorProgramMeta(dir)
 	if !ok || m.SHA256 != sha256Of(theirs) {
 		t.Fatalf("the seed replaced what an operator published: %+v", m)
+	}
+}
+
+func TestConnectorProgramCatalogueRefusesIncompleteStorage(t *testing.T) {
+	for _, kind := range []string{"scope-file", "missing-meta", "broken-meta", "wrong-target", "bad-digest", "negative-size", "unsafe-name", "missing-bytes", "short-bytes"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			mux := connectorProgramTestMux(root, false, "t1")
+			body := []byte("original-program")
+			if rr := publishConnectorProgram(t, mux, "linux", "amd64", body, sha256Of(body)); rr.Code != 200 {
+				t.Fatal(rr.Body.String())
+			}
+			dir, _ := connectorProgramDir(root, "t1", "linux-amd64")
+			metadata := filepath.Join(dir, connectorProgramMetaName)
+			raw, err := os.ReadFile(metadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			must := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			switch kind {
+			case "scope-file":
+				must(os.RemoveAll(filepath.Dir(dir)))
+				must(os.WriteFile(filepath.Dir(dir), []byte("broken"), 0600))
+			case "missing-meta":
+				must(os.Remove(metadata))
+			case "broken-meta":
+				must(os.WriteFile(metadata, []byte("{"), 0600))
+			case "missing-bytes":
+				must(os.Remove(filepath.Join(dir, connectorProgramBytesName)))
+			case "short-bytes":
+				must(os.WriteFile(filepath.Join(dir, connectorProgramBytesName), []byte("short"), 0600))
+			default:
+				var m connectorProgramMeta
+				must(json.Unmarshal(raw, &m))
+				switch kind {
+				case "wrong-target":
+					m.Arch = "arm64"
+				case "bad-digest":
+					m.SHA256 = "bad"
+				case "negative-size":
+					m.Size = -1
+				case "unsafe-name":
+					m.FileName = "../program"
+				}
+				changed, _ := json.Marshal(m)
+				must(os.WriteFile(metadata, changed, 0600))
+			}
+			// A healthy shared seed must not hide a broken override as an apparent fallback.
+			seed := filepath.Join(root, "deployment", "linux-amd64")
+			must(os.MkdirAll(seed, 0700))
+			must(os.WriteFile(filepath.Join(seed, connectorProgramMetaName), raw, 0600))
+			must(os.WriteFile(filepath.Join(seed, connectorProgramBytesName), body, 0600))
+			rr := httptest.NewRecorder()
+			mux.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/connector-programs", nil))
+			if rr.Code != 503 || strings.Contains(rr.Body.String(), root) || strings.Contains(rr.Body.String(), "programs\"") {
+				t.Fatalf("unverified catalogue: %d %s", rr.Code, rr.Body.String())
+			}
+			other := httptest.NewRecorder()
+			connectorProgramTestMux(root, false, "t2").ServeHTTP(other, httptest.NewRequest(http.MethodGet, "/admin/connector-programs", nil))
+			if other.Code != 200 || !strings.Contains(other.Body.String(), "linux") {
+				t.Fatalf("foreign damage leaked: %d %s", other.Code, other.Body.String())
+			}
+			// Explicit repair restores the same record; reads must not repair or delete it themselves.
+			if kind == "scope-file" {
+				must(os.Remove(filepath.Dir(dir)))
+			}
+			must(os.MkdirAll(dir, 0700))
+			must(os.WriteFile(metadata, raw, 0600))
+			must(os.WriteFile(filepath.Join(dir, connectorProgramBytesName), body, 0600))
+			recovered := httptest.NewRecorder()
+			mux.ServeHTTP(recovered, httptest.NewRequest(http.MethodGet, "/admin/connector-programs", nil))
+			if recovered.Code != 200 || recovered.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("retry: %d %s", recovered.Code, recovered.Body.String())
+			}
+			after, _ := os.ReadFile(metadata)
+			if string(after) != string(raw) {
+				t.Fatal("read changed metadata")
+			}
+		})
+	}
+}
+
+func TestConnectorProgramCatalogueDistinguishesMissingAndUnavailableRoots(t *testing.T) {
+	for _, kind := range []string{"fresh", "missing", "unconfigured", "root-file", "deployment-file", "deployment-empty", "deployment-corrupt"} {
+		t.Run(kind, func(t *testing.T) {
+			root := t.TempDir()
+			code := 200
+			switch kind {
+			case "missing":
+				root = filepath.Join(root, "not-created")
+			case "unconfigured":
+				root = ""
+				code = 503
+			case "root-file":
+				root = filepath.Join(root, "file")
+				if err := os.WriteFile(root, []byte("bad"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				code = 503
+			case "deployment-file":
+				if err := os.WriteFile(filepath.Join(root, "deployment"), []byte("bad"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				code = 503
+			case "deployment-empty", "deployment-corrupt":
+				if err := os.MkdirAll(filepath.Join(root, "deployment", "linux-amd64"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "deployment-corrupt" {
+					if err := os.WriteFile(filepath.Join(root, "deployment", "linux-amd64", connectorProgramBytesName), []byte("incomplete"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					code = 503
+				}
+			}
+			rr := httptest.NewRecorder()
+			connectorProgramTestMux(root, false, "t1").ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/connector-programs", nil))
+			if rr.Code != code {
+				t.Fatalf("%d %s", rr.Code, rr.Body.String())
+			}
+			if code == 200 {
+				var b struct {
+					Programs []connectorProgramMeta `json:"programs"`
+					Count    int                    `json:"count"`
+				}
+				if err := json.Unmarshal(rr.Body.Bytes(), &b); err != nil || b.Programs == nil || len(b.Programs) != 0 || b.Count != 0 {
+					t.Fatal(rr.Body.String())
+				}
+			}
+		})
+	}
+}
+
+func TestConnectorProgramDownloadRefusesIncompleteTenantOverride(t *testing.T) {
+	root := t.TempDir()
+	dir, err := connectorProgramDir(root, "t1", "linux-amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, connectorProgramBytesName), []byte("unfinished"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	connectorProgramTestMux(root, false, "t1").ServeHTTP(rr, httptest.NewRequest("GET", "/admin/connector-program?platform=linux&arch=amd64", nil))
+	if rr.Code != 503 {
+		t.Fatalf("incomplete override status=%d", rr.Code)
 	}
 }

@@ -61,6 +61,10 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 		audit model.AuditLog
 	}{
 		{
+			name:  "connectorProgramPublishedAuditLog",
+			audit: connectorProgramPublishedAuditLog(httptest.NewRequest("PUT", "/admin/connector-program", strings.NewReader(rawMetadataValue)), "tenant_audit_cp0020", connectorProgramMeta{Platform: "linux", Arch: "amd64", Version: "0.3.1", SHA256: strings.Repeat("a", 64), FileName: "connector", Size: 12}, evaluator, now),
+		},
+		{
 			name:  "inspectionPostureAuditLog",
 			audit: inspectionPostureAuditLog(httptest.NewRequest("POST", "/admin/inspection-posture", nil), inspectionposture.Posture{}, inspectionposture.Posture{Mode: "bypass_default", DecryptAllowlistHosts: []string{rawDestination}}, "success", evaluator, now),
 		},
@@ -626,6 +630,7 @@ func mustAuditEmitterFunctionNames(t *testing.T) []string {
 func coveredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
 		"inspectionPostureAuditLog":          true,
+		"connectorProgramPublishedAuditLog":  true,
 		"internalAuthorityAuditLog":          true,
 		"adminHumanApprovalMutationAuditLog": true,
 		"adminAccessGrantRevocationAuditLog": true,

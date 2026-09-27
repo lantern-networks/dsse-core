@@ -36,7 +36,7 @@ func TestPostgresIdPDomainLatestRowAndTerm(t *testing.T) {
 					db.Exec("INSERT INTO cp_state_blobs(store_key,payload)VALUES($1,$2)ON CONFLICT(store_key)DO UPDATE SET payload=$2", key, original)
 				}
 			}()
-			gate := &runtimeLeaseGate{postgresBlobPersister: p}
+			gate := &organizationRuntimeLeaseGate{postgresBlobPersister: p}
 			writer, e := logs.NewWriter(t.TempDir())
 			if e != nil {
 				t.Fatal(e)

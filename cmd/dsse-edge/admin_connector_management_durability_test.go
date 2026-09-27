@@ -75,7 +75,7 @@ func TestConnectorManagementSaveFailureAndAuditActor(t *testing.T) {
 				p.fail = true
 				failed := request("POST", path, `{"runtime_secret":"rotation-private-secret-0001"}`)
 				if failed.Code != 503 || strings.Contains(failed.Body.String(), "private save") || strings.Contains(failed.Body.String(), "rotation-private-secret") {
-					t.Fatalf("rotation failure status=%d", failed.Code)
+					t.Fatalf("rotation failure path=%s status=%d body=%s", path, failed.Code, failed.Body)
 				}
 				p.fail = false
 				saved := request("POST", path, `{"runtime_secret":"rotation-private-secret-0001"}`)

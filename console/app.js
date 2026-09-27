@@ -565,6 +565,7 @@ const CP_AUTHORED_READS = [
   // their local object stores cannot populate the policy editor or its detector library.
   "GET /admin/dlp-policies",
   "GET /admin/dlp-classifiers",
+  "GET /admin/dlp-allowlist",
   "GET /admin/dlp-fingerprints",
   "GET /admin/tenants",
   "GET /admin/tenant",

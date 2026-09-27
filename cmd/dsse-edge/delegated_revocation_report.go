@@ -28,6 +28,8 @@ type delegatedRevocationReport struct {
 // restart-durability: ephemeral — confirmed is only a duplicate-report cache.
 // Revocations live in the delegated-grant store; restart resends its revoked
 // records, so a node-local store file is required for durable pending reports.
+// populated-by: side_effect — report records a matching CP acknowledgment.
+// An absent cache entry triggers another idempotent report, not a lost revocation.
 type delegatedRevocationReporter struct {
 	url       string
 	client    *http.Client

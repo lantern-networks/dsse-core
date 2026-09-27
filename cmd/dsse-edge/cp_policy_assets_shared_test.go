@@ -186,7 +186,11 @@ func TestPostgresPolicyAssetsOldRequestAndReadFailure(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("request deadline")
 			}
-			if rec.Code != 500 || !strings.Contains(rec.Body.String(), "not confirmed") {
+			wantStatus := http.StatusServiceUnavailable
+			if tc.path == "/admin/rules" {
+				wantStatus = http.StatusInternalServerError
+			}
+			if rec.Code != wantStatus || !strings.Contains(rec.Body.String(), "not confirmed") {
 				t.Fatalf("old request escaped persistence boundary: %d %s", rec.Code, rec.Body)
 			}
 			if _, err := rules.DeleteContext(lease, tenant, "keep"); !errors.Is(err, policyrule.ErrPersistence) {

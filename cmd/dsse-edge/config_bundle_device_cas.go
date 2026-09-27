@@ -4,6 +4,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/tenantca"
@@ -97,14 +99,14 @@ func deviceCABundleSection(reg *tenantca.TenantCARegistry, managed *tenantDevice
 // organization the control plane did not mention stays: the section is a statement about what it looked at,
 // never about the rest of the world.
 func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceCARegistryBundle,
-	persist func(*tenantca.TenantCARegistry) error, logf func(string, ...interface{})) (added, removed int) {
+	persist func(*tenantca.TenantCARegistry) error, logf func(string, ...interface{})) (added, removed int, applyErr error) {
 	deviceCAUpdateMu.Lock()
 	defer deviceCAUpdateMu.Unlock()
 	if section != nil && !section.ManagedComplete {
 		if logf != nil {
 			logf("config_bundle_device_cas_kept_local reason=%q", "the control plane did not identify its managed organizations")
 		}
-		return 0, 0
+		return 0, 0, nil
 	}
 	managed := map[string]bool{}
 	if section != nil {
@@ -141,7 +143,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 			logf("config_bundle_device_cas_kept_local reason=%q",
 				"the control plane did not report a complete device-CA registry")
 		}
-		return 0, 0
+		return 0, 0, nil
 	}
 	if len(section.Tenants) == 0 || len(section.Snapshot) == 0 {
 		// Nothing named. See the file header: applying this as "there are none" would stop every device of
@@ -151,7 +153,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 			logf("config_bundle_device_cas_kept_local reason=%q",
 				"the control plane named no organization, and an empty registry would refuse every device")
 		}
-		return 0, 0
+		return 0, 0, nil
 	}
 
 	n, err := reg.Adopt(section.Snapshot)
@@ -159,7 +161,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 		if logf != nil {
 			logf("config_bundle_device_cas_adopt_failed err=%v", err)
 		}
-		return 0, 0
+		return 0, 0, err
 	}
 	added = n
 
@@ -170,7 +172,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 		if logf != nil {
 			logf("config_bundle_device_cas_snapshot_unreadable err=%v", err)
 		}
-		return added, 0
+		return added, 0, nil
 	}
 	// ★★★ AND ONLY ORGANIZATIONS THE SNAPSHOT ACTUALLY CARRIES AN ENTRY FOR (2026-08-23, found by planting the
 	// fault). Naming an organization and carrying nothing for it is the shape a half-migrated control plane has
@@ -193,7 +195,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 			if logf != nil {
 				logf("config_bundle_device_cas_entry_unreadable tenant=%q err=%v", e.TenantID, perr)
 			}
-			return added, 0
+			return added, 0, nil
 		}
 		for _, cert := range certs {
 			authored[tenantca.CAAnchorKey(cert)] = true
@@ -264,17 +266,21 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 		}
 	}
 
-	if (added > 0 || removed > 0) && persist != nil {
-		if err := persist(reg); err != nil && logf != nil {
-			// Live but not durable: this node admits the right organizations now and would forget on restart.
-			logf("config_bundle_device_cas_applied_but_not_persisted err=%v", err)
+	// Retry persistence even when a previous attempt changed memory but failed to save.
+	if persist != nil {
+		if err := persist(reg); err != nil {
+			applyErr = errors.Join(applyErr, fmt.Errorf("save device authorities: %w", err))
+			if logf != nil {
+				// Live but not durable: this node admits the right organizations now and would forget on restart.
+				logf("config_bundle_device_cas_applied_but_not_persisted err=%v", err)
+			}
 		}
 	}
 	if logf != nil && (added > 0 || removed > 0) {
 		logf("config_bundle_device_cas_applied added=%d removed=%d", added, removed)
 	}
 	setEdgeClientRegistryCAs(reg.Anchors())
-	return added, removed
+	return added, removed, applyErr
 }
 
 // encodeCertPEM re-encodes a parsed certificate. Used to put back an anchor that turned out to be an

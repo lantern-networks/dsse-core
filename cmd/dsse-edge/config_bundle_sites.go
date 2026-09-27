@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -113,15 +115,15 @@ func siteBundleSection(ctx context.Context, store adminSiteStore, tenants []stri
 // read one of its organizations, says so — and then the Edge keeps what it has, because "I could not look"
 // must never be read as "there are none".
 func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *siteCatalogBundle,
-	now time.Time, logf func(string, ...interface{})) (applied int, removed int) {
+	now time.Time, logf func(string, ...interface{})) (applied int, removed int, applyErr error) {
 	if store == nil || section == nil {
-		return 0, 0
+		return 0, 0, nil
 	}
 	if !section.Complete {
 		if logf != nil {
 			logf("config_bundle_sites_kept_local reason=%q", "the control plane did not report a complete Site catalog")
 		}
-		return 0, 0
+		return 0, 0, errors.New("incomplete site catalog")
 	}
 	wanted := map[string]adminSiteModel{}
 	tenants := map[string]bool{}
@@ -148,6 +150,7 @@ func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *
 	for tenant := range tenants {
 		local, err := store.List(ctx, tenant)
 		if err != nil {
+			applyErr = errors.Join(applyErr, fmt.Errorf("read sites for %q: %w", tenant, err))
 			continue
 		}
 		for _, site := range local {
@@ -156,6 +159,7 @@ func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *
 				continue
 			}
 			if err := store.Delete(ctx, site.TenantID, site.SiteID); err != nil {
+				applyErr = errors.Join(applyErr, fmt.Errorf("remove site %q: %w", site.SiteID, err))
 				if logf != nil {
 					logf("config_bundle_site_remove_failed tenant=%q site=%q err=%v", site.TenantID, site.SiteID, err)
 				}
@@ -174,6 +178,7 @@ func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *
 	}
 	for _, site := range wanted {
 		if _, err := store.Upsert(ctx, site, now); err != nil {
+			applyErr = errors.Join(applyErr, fmt.Errorf("save site %q: %w", site.SiteID, err))
 			if logf != nil {
 				logf("config_bundle_site_apply_failed tenant=%q site=%q err=%v", site.TenantID, site.SiteID, err)
 			}
@@ -184,7 +189,7 @@ func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *
 	if logf != nil && (applied > 0 || removed > 0) {
 		logf("config_bundle_sites_applied applied=%d removed=%d", applied, removed)
 	}
-	return applied, removed
+	return applied, removed, applyErr
 }
 
 // adminSiteStoreIsDurable reports whether this store survives a restart. An in-memory one is empty after a

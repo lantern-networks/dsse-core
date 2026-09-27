@@ -18,6 +18,7 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	migrationstore "github.com/lantern-networks/dsse-core/migrations"
 	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/tenantca"
 
 	_ "github.com/lib/pq"
 )
@@ -128,7 +129,15 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 	}
 	devMode := false
 	attestationSecret := "runtime-attestation-secret"
+	dir := t.TempDir()
+	ca := makeTestCA(t, dir, "Runtime test CA", 91)
+	reg, err := tenantca.LoadTenantCARegistry(writeRegistry(t, dir, map[string]string{"tenant_lab_001": ca.pemPath}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chains := leafSignedBy(t, ca, "conn_pg_test", reg.Pool)
 	handler := newServerWithConfig(serverConfig{
+		TenantCARegistry: reg,
 		Evaluator: testEvaluatorWithPolicies([]model.Policy{{
 			ID:       "pol_lab_nhi_tool_attested_allow_001",
 			TenantID: "tenant_lab_001",
@@ -172,6 +181,7 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 		DelegatedAccessGrantID: "dag_lab_001",
 		AgentTaskSessionID:     "ats_lab_001",
 		ToolID:                 "tool_ticket_create_001",
+		ToolActionType:         "ticket:create",
 		ApplicationID:          "app_dummy_https",
 	}
 	timestamp := now.Format(time.RFC3339)
@@ -181,6 +191,8 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 	req := httptest.NewRequest(http.MethodPost, "/decisions/evaluate", bytes.NewReader(body))
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(connectorSecretHeader, defaultConnectorSecret)
+	req.Header.Set(connectorIDHeader, "conn_pg_test")
+	req.TLS = reqWithVerifiedChains(chains).TLS
 	req.Header.Set(workloadAttestationStateHeader, "verified")
 	req.Header.Set(workloadAttestationTimestampHeader, timestamp)
 	req.Header.Set(workloadAttestationNonceHeader, nonce)
@@ -201,6 +213,8 @@ func TestPostgresWorkloadAttestationNonceStoreDecisionEvaluateE2E(t *testing.T) 
 	req = httptest.NewRequest(http.MethodPost, "/decisions/evaluate", bytes.NewReader(body))
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(connectorSecretHeader, defaultConnectorSecret)
+	req.Header.Set(connectorIDHeader, "conn_pg_test")
+	req.TLS = reqWithVerifiedChains(chains).TLS
 	req.Header.Set(workloadAttestationStateHeader, "verified")
 	req.Header.Set(workloadAttestationTimestampHeader, timestamp)
 	req.Header.Set(workloadAttestationNonceHeader, nonce)

@@ -389,6 +389,7 @@ POST /connectors/register
 POST /connectors/{connector_id}/heartbeat
 POST /connectors/{connector_id}/runtime-secret/rotate
 POST /decisions/evaluate
+POST /delegated-grant-revocations
 POST /delegated-grants
 POST /delegated-grants/{grant_id}/revoke
 POST /devices/register

@@ -14,6 +14,7 @@ import (
 
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/tenantca"
 
 	_ "github.com/lib/pq"
 )
@@ -114,12 +115,20 @@ func TestDecisionEvaluateRecordsUsageMeterPostgresE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWriter returned error: %v", err)
 	}
+	dir := t.TempDir()
+	ca := makeTestCA(t, dir, "Runtime test CA", 91)
+	reg, err := tenantca.LoadTenantCARegistry(writeRegistry(t, dir, map[string]string{"tenant_lab_001": ca.pemPath}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chains := leafSignedBy(t, ca, "conn_pg_test", reg.Pool)
 	handler := newServerWithConfig(serverConfig{
-		Evaluator:       testEvaluator(),
-		Writer:          writer,
-		UsageMeters:     store,
-		ConnectorSecret: defaultConnectorSecret,
-		LabMode:         boolPtr(false),
+		TenantCARegistry: reg,
+		Evaluator:        testEvaluator(),
+		Writer:           writer,
+		UsageMeters:      store,
+		ConnectorSecret:  defaultConnectorSecret,
+		LabMode:          boolPtr(false),
 	})
 	body := []byte(`{
 		"tenant_id":"tenant_lab_001",
@@ -144,6 +153,8 @@ func TestDecisionEvaluateRecordsUsageMeterPostgresE2E(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/decisions/evaluate", bytes.NewReader(body))
 	req.Header.Set("content-type", "application/json")
 	req.Header.Set(connectorSecretHeader, defaultConnectorSecret)
+	req.Header.Set(connectorIDHeader, "conn_pg_test")
+	req.TLS = reqWithVerifiedChains(chains).TLS
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)

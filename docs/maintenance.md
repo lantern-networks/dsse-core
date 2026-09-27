@@ -8,6 +8,16 @@ The target is the week of September 28–October 4, 2026, subject to the release
 below. This is a planning target, not an availability commitment. If it moves, this
 page will record the remaining blockers and revised outlook.
 
+## Log retention blocker
+
+The standard ClickHouse deployment does not enforce Console retention overrides or
+legal holds, and the PostgreSQL archive worker does not archive its rows. These
+controls now report that limitation. New schemas preserve logs without automatic
+expiry; existing volumes require the [schema correction](audit-and-data.md#clickhouse-retention-limitation-and-upgrade).
+That correction prevents the old independent TTL deletion but does not implement
+ClickHouse archival or hold-aware retention. Completing that data lifecycle and
+checking storage capacity remain release work.
+
 ## What is being maintained
 
 The current priority is reliability in everyday administration: creating, editing,

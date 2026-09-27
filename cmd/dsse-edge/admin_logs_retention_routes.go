@@ -49,6 +49,15 @@ func adminLogReadScope(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, adminHotStore hotstore.Store, decisionStore *accessdecision.Store, coldArchive archive.ColdArchive, legalHold *legalHoldStore, retentionOverride *retentionOverrideStore) {
+	// ClickHouse expiry is controlled by its table schema. The PostgreSQL
+	// pruner cannot enforce these settings on the store serving these logs.
+	unsupportedRetention := func(w http.ResponseWriter) bool {
+		if _, clickhouse := adminHotStore.(*hotstore.ClickHouseStore); clickhouse {
+			writeError(w, http.StatusNotImplemented, fmt.Errorf("log retention and legal hold are not enforced for ClickHouse; stored settings do not protect its logs. Check the ClickHouse table expiry configuration"))
+			return true
+		}
+		return false
+	}
 	mux.HandleFunc("GET /admin/access-decisions/{decision_id}", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
 		detail, err := adminAccessDecisionDetail(adminHotStore, decisionStore, adminTenantIDFromRequest(r), r.PathValue("decision_id"))
 		if err != nil {
@@ -109,6 +118,9 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		return mine
 	}
 	writeHoldStatus := func(w http.ResponseWriter, r *http.Request) {
+		if unsupportedRetention(w) {
+			return
+		}
 		rows, held, pending, err := legalHold.adminStatus(r.Context(), adminTenantIDFromRequest(r))
 		if err != nil {
 			status := http.StatusServiceUnavailable
@@ -122,6 +134,9 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	}
 	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", writeHoldStatus))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		if unsupportedRetention(w) {
+			return
+		}
 		r = r.WithContext(retentionWriteContext(r.Context()))
 		if err := legalHold.healthBeforeWrite(); err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
@@ -166,6 +181,9 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	}))
 	// Admin-configurable per-stream retention (days), overriding the startup flags at runtime (no redeploy).
 	mux.HandleFunc("GET /admin/retention-config", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if unsupportedRetention(w) {
+			return
+		}
 		if retentionOverride == nil || retentionOverride.HealthContext(r.Context()) != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
@@ -173,6 +191,9 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
+		if unsupportedRetention(w) {
+			return
+		}
 		r = r.WithContext(retentionWriteContext(r.Context()))
 		var req struct {
 			Stream string `json:"stream"`

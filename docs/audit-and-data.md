@@ -4,6 +4,31 @@ Use this guide to locate evidence and define a deployment's data lifecycle. It d
 the current implementation, which may change; it is not a compliance certification.
 See [Operations](operations.md) for state and backup preparation.
 
+## ClickHouse retention limitation and upgrade
+
+The standard deployment stores logs in ClickHouse. Console retention overrides and
+legal holds are implemented by the PostgreSQL retention worker and **do not govern
+ClickHouse tables**. The ClickHouse configuration now rejects these controls instead
+of reporting that an unenforced setting protects the logs. Reading and exporting
+logs remain available. Cold-archive verification checks existing objects; an empty
+archive does not establish that logs were archived.
+
+New installations preserve events and rollups without automatic TTL deletion until
+ClickHouse archival and hold enforcement are implemented. This increases storage
+usage over time; monitor capacity and plan a data lifecycle before production use.
+
+Existing volumes keep their old schema when containers or the installer are updated.
+Before relying on preservation, inspect `SHOW CREATE TABLE dsse.events` and
+`SHOW CREATE TABLE dsse.events_rollup_5m` using the deployment's authenticated
+ClickHouse connection. Earlier standard schemas expire events after 30 days and
+rollups after 400 days, independently of Console settings. For each table that still
+has that TTL, apply the corresponding statement in
+[`deploy/clickhouse-preserve-logs.sql`](../deploy/clickhouse-preserve-logs.sql), then
+check the schema again. Adapt database/table names for a customized deployment.
+Do not run `REMOVE TTL` on a table with no TTL; ClickHouse rejects it. These changes
+preserve remaining records; they cannot recover records already deleted. Other
+external cleanup jobs are outside these controls.
+
 ## What the records contain
 
 | Record | Typical use and potentially identifying context |

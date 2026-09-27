@@ -642,6 +642,14 @@ Credential schema migrations 048, 049 and 051 carry TOTP replay counters, revisi
 
 Administrator migration checks now include live shared authority, legacy principal IDs and credential-table purge after migration 051. See [administrator credential upgrade](admin-credential-upgrade.md) before changing a multi-control-plane deployment; all credential writers must move together.
 
+### Retention, legal holds and tenant erasure
+
+Retention and legal-hold edits now refresh shared state before saving and keep failed preservation requests effective locally. Pruning rechecks the saved policy inside the deletion transaction. Tenant erasure records a durable in-progress marker, checks protection between destructive steps, and retains its delivery markers after a partial failure. File erasure finishes its protection guard before reporting completion. Shared archival advances the chain and deletes exactly the archived hot rows in one SQL transaction; object-storage uncertainty stops further archival for reconciliation.
+
+Only explicitly installed version 3 protection snapshots pause deletion after restart or leadership change for reconciliation. Default and version 2 deployments continue with their confirmed protection checks. Read [deletion safety recovery](deletion-safety-recovery.md), [tenant erasure recovery](tenant-erasure-recovery.md), and [archive recovery](archive-recovery.md) before enabling deletion on an upgraded deployment. Ordinary configuration editing remains available. This integration is not a deployment or release acceptance.
+
+Retention migration review corrected two operational regressions before publication: normal restarts do not impose manual deletion permits (explicit v3 recovery policies retain their gate), and each transaction handles at most 1000 rows; a sweep repeats transactions for up to two minutes per stream. Old and new hold writers must be upgraded together; see the erasure recovery and archive preflight guides. Failed protective saves are unconfirmed and require reconciliation before restart.
+
 ### Console identity and account forms
 
 People, device, identity-provider, access-approval, organization and enrollment screens retain the intended tenant and form state across asynchronous reads and failed writes. API token creation uses the server role catalog and its default role, sends the roles array, and shows only the returned one-time raw token. Profile and device-package forms validate the required deployment inputs before generating output. Existing risk warnings remain visible.

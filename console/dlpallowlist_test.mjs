@@ -25,14 +25,14 @@ test('allowlist save keeps input and inline failure for retry and coalesces repe
  const modal=f.modals.at(-1),save=modal.footer.find(b=>b.text==='Add'),alert=modal.body.find(n=>n.role==='alert');
  let resolve;f.context.apiFetch=async(_method,_path,body)=>{if(_method==='GET')return {ok:true,status:200,body:{tenant_id:'tenant'}};f.writes.push(body);return await new Promise(r=>resolve=r)};
  const first=save.onClick();assert.equal(save.disabled,true);await save.onClick();await tick();assert.equal(f.writes.length,1);
- resolve({ok:false,status:500,body:{error:'saving could not be confirmed'}});await first;
- assert.equal(modal.closed,false);assert.equal(save.disabled,false);assert.equal(f.fields.value.value,'SYNTHETIC-ONLY');assert.equal(alert.textContent,'saving could not be confirmed');assert.equal(alert.style.display,'');assert.equal(alert.scrolled,true);assert.equal(f.toasts.length,0);
+ resolve({ok:false,status:400,body:{error:'invalid input'}});await first;
+ assert.equal(modal.closed,false);assert.equal(save.disabled,false);assert.equal(f.fields.value.value,'SYNTHETIC-ONLY');assert.equal(alert.textContent,'invalid input');assert.equal(alert.style.display,'');assert.equal(alert.scrolled,true);assert.equal(f.toasts.length,0);
  f.context.apiFetch=async(_method,_path,body)=>{if(_method==='GET')return {ok:true,status:200,body:{tenant_id:'tenant'}};f.writes.push(body);return {ok:true,status:200,body:{tenant_id:'tenant',values:body.values}}};await save.onClick();
  assert.equal(modal.closed,true);assert.equal(f.writes.length,2);assert.equal(alert.style.display,'none');assert.equal(f.toasts.at(-1)[1],'ok');
 });
 test('remove failure retains the old list for the next edit and uses the error notice',async()=>{
  const f=await fixture(['SYNTHETIC-ONLY']);
- f.context.apiFetch=async(_method,_path,body)=>{if(_method==='GET')return {ok:true,status:200,body:{tenant_id:'tenant'}};f.writes.push(body);return {ok:false,status:500,body:{error:'save failed'}}};
+ f.context.apiFetch=async(_method,_path,body)=>{if(_method==='GET')return {ok:true,status:200,body:{tenant_id:'tenant'}};f.writes.push(body);return {ok:false,status:403,body:{error:'save failed'}}};
  await f.buttons.find(b=>b.text==='Remove').onClick();assert.equal(f.writes.length,1);assert.equal(f.toasts.at(-1)[1],'err');assert.equal(f.toasts.at(-1)[0],'save failed');
  f.buttons.find(b=>b.text==='+ Add value').onClick();f.fields.value.value='NEW';
  await f.modals.at(-1).footer.find(b=>b.text==='Add').onClick();assert.deepEqual(Array.from(f.writes.at(-1).values),['SYNTHETIC-ONLY','NEW']);

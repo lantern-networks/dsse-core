@@ -40,3 +40,14 @@ test('a detached editor cannot send, and an old completion cannot show success i
  const f=fixture('values');await f.render();f.buttons.find(b=>b.text===f.def.add).onClick();f.fields.value.value='NEW';const save=f.modals.at(-1).footer.find(b=>b.text==='Add');f.host.isConnected=false;await save.onClick();assert.equal(f.writes.length,0);
  f.host.isConnected=true;let resolve;f.context.apiFetch=async(method,path,body)=>{if(method==='GET')return organization;f.writes.push(body);return new Promise(r=>resolve=r)};const task=save.onClick();await new Promise(r=>setImmediate(r));f.host.isConnected=false;resolve(response('values',['BLUEFIN','NEW']));await task;assert.equal(f.toasts.length,0);assert.equal(f.writes.length,1);
 });
+
+for (const status of [0,409,500,502,504]) test(`unconfirmed HTTP ${status} prevents a second write until reload`, async()=>{
+ const f=fixture('values');await f.render();f.buttons.find(b=>b.text===f.def.add).onClick();f.fields.value.value='NEW';const save=f.modals.at(-1).footer.find(b=>b.text==='Add');
+ f.context.apiFetch=async(method,path,body)=>{if(method==='GET')return organization;f.writes.push(body);return {ok:false,status,body:status===502?'Bad Gateway':{error:'unconfirmed'}}};
+ await save.onClick();await save.onClick();assert.equal(f.writes.length,1);assert.equal(f.fields.value.value,'NEW');assert.equal(f.modals.at(-1).closed,false);assert.equal(f.states.at(-1).state,'error');
+ f.context.apiFetch=async(method,path,body)=>path==='/admin/tenant'?organization:response('values',['BLUEFIN','NEW']);
+ await f.states.at(-1).retry.onClick();assert.ok(f.buttons.some(b=>b.text===f.def.add));
+});
+test('organization permission failure identifies the missing scope',()=>{
+ const f=fixture('values');assert.throws(()=>f.context.dlpLibraryTenant({ok:false,status:403,body:{error:'forbidden'}}),/admin.tenant.read/);
+});

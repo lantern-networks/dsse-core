@@ -8,6 +8,7 @@ function dlpLibraryInvalid() { return bl({en:"Could not load this list correctly
 function dlpLibraryOrganizationChanged() { return bl({en:"The organization changed or is unavailable. Reload before editing.",ja:"組織が変わったか、確認できません。編集前に一覧を再読込してください。"}); }
 function dlpLibraryListChanged() { return bl({en:"The list or organization changed. Close the editor and reload before editing.",ja:"一覧または組織が変わりました。編集画面を閉じて一覧を再読込してください。"}); }
 function dlpLibraryTenant(response) {
+  if (response?.status === 403) throw new Error(bl({en:"This screen requires permission to read the organization (admin.tenant.read).",ja:"この画面には組織情報の参照権限（admin.tenant.read）が必要です。"}));
   if (!response?.ok || response.status !== 200 || !dlpLibraryObject(response.body) ||
       typeof response.body.tenant_id !== "string" || !response.body.tenant_id.trim()) throw new Error(dlpLibraryOrganizationChanged());
   return response.body.tenant_id;
@@ -87,7 +88,12 @@ function dlpLibraryView(content, section, key, endpoint, onLoaded) {
       let response;
       try { response = await apiFetch(method, path, body); }
       catch (_) { loaded = false; error(dlpLibraryUnconfirmed()); throw new Error(dlpLibraryUnconfirmed()); }
-      if (!response?.ok) throw new Error(response?.body?.error || "HTTP " + response?.status);
+      if (!response?.ok) {
+        if (!response?.status || response.status >= 500 || response.status === 409 || !dlpLibraryObject(response.body)) {
+          loaded = false; revision++; error(dlpLibraryUnconfirmed()); throw new Error(dlpLibraryUnconfirmed());
+        }
+        throw new Error(response.body.error || "HTTP " + response.status);
+      }
       let rows;
       try {
         if (!active(stamp)) throw new Error("obsolete response");

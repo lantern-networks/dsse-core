@@ -32,6 +32,7 @@ function dlpFindingsObject(v) { return v !== null && typeof v === "object" && !A
 function dlpFindingsInvalid() { return bl({en:"Could not load DLP findings correctly. Retry to confirm the results.",ja:"DLP検出を正しく読み込めません。再試行して結果を確認してください。"}); }
 function dlpFindingsSelection() { return typeof operateTenant === "undefined" ? "" : (operateTenant || ""); }
 function dlpFindingsTenant(response) {
+  if (response?.status === 403) throw new Error(bl({en:"This screen requires permission to read the organization (admin.tenant.read).",ja:"この画面には組織情報の参照権限（admin.tenant.read）が必要です。"}));
   if (!response?.ok || response.status !== 200 || !dlpFindingsObject(response.body) ||
       typeof response.body.tenant_id !== "string" || !response.body.tenant_id.trim()) throw new Error(dlpFindingsInvalid());
   return response.body.tenant_id;

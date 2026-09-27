@@ -691,3 +691,5 @@ Regional searches and export previews report whether the number of excluded reco
 Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.
 
 AI service usage now verifies organization, requested period, coverage and totals before showing a report. Unavailable or inconsistent responses show Retry rather than zero usage; stale responses after a tenant or period change are ignored. Deploy the Console with its matching CP version: an older CP without the report tenant field is shown as unavailable, not as zero usage.
+
+For the AI usage Console, API tokens need both `admin.ai.read` and `admin.tenant.read` so the displayed report can be verified against its organization. Standard administrative session roles already include both permissions.

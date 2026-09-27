@@ -9,7 +9,7 @@ import (
 func TestUnavailableInternalCANeverPublishesEmptyComplete(t *testing.T) {
 	s := internalca.NewUnavailableStore("unavailable")
 	section := internalCABundleSection(s)
-	if section == nil || section.Complete {
+	if section != nil {
 		t.Fatal("unavailable authority published deletion")
 	}
 }

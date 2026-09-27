@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/logs"
 )
 
@@ -21,12 +20,8 @@ func TestAdminErrorEnvelopeAndStatusConsistency(t *testing.T) {
 	adminAuth, rawTokensByRole := adminRBACMatrixAuthStore(t)
 	rawScopeDeniedToken := "raw-scope-denied"
 	adminErrorEnvelopeAddScopedToken(t, adminAuth, rawScopeDeniedToken)
-	handler := newServerWithConfig(serverConfig{
-		Evaluator: testEvaluator(),
-		Writer:    writer,
-		Registry:  connector.NewRegistry(),
-		AdminAuth: adminAuth,
-	})
+	defer writer.Close()
+	handler := newServerWithConfig(adminRBACMatrixServerConfig(writer, adminAuth))
 
 	t.Run("rbac denied admin endpoints use the shared envelope", func(t *testing.T) {
 		routes := mustAdminEndpointRBACMatrixRoutes(t)
@@ -130,7 +125,7 @@ func TestAdminErrorEnvelopeAndStatusConsistency(t *testing.T) {
 
 func adminErrorEnvelopeDeniedRole(permission string) (string, bool) {
 	for _, role := range adminAPITokenAssignableRoles {
-		if !adminPermissionAllowed([]string{role}, permission) {
+		if !adminPermissionAllowedAny([]string{role}, permission) {
 			return role, true
 		}
 	}

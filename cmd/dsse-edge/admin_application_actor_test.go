@@ -86,3 +86,12 @@ func TestApplicationAuditDoesNotInventActor(t *testing.T) {
 		}
 	}
 }
+
+func TestApplicationAuditNoInventedActor(t *testing.T) {
+	for _, r := range []*http.Request{nil, httptest.NewRequest("POST", "/admin/applications", nil), adminRequestBy(" ")} {
+		a := applicationAuditWithActor(r, model.AuditLog{TenantID: "target"})
+		if a.ActorUserID != nil || a.TenantID != "target" {
+			t.Fatal("invented actor or changed tenant")
+		}
+	}
+}

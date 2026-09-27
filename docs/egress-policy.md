@@ -38,8 +38,19 @@ the effective list and a real decision instead of assuming deletion means deny.
 
 An unresolved source does not become Any. A destination that resolves to nothing
 is shown as **matches nothing** and cannot enforce a deny for that destination.
-Repair the catalog reference. A named service resolving to no ports currently
-falls back to port 443 in the egress compiler; it is not equivalent to Any.
+Repair the catalog reference. An unavailable or invalid named service is shown
+as **service unavailable**. Its access rule matches no traffic: it cannot grant
+access, deny traffic, or require authentication until the service is repaired.
+It does not fall back to HTTPS. Other matching rules and the default still apply.
+
+Named services retain each TCP/UDP and port combination. For example, TCP/22 +
+UDP/443 does not authorize TCP/443 or UDP/22. **Any** service (no service selected)
+intentionally omits both restrictions. Service writes and snapshot loading
+normalize protocol case and surrounding whitespace, and reject protocols other
+than TCP/UDP or ports outside 1–65535. Invalid persisted service definitions
+must be repaired before the catalog can load; loading does not rewrite the file.
+The inspection host compiler requires the named service to contain
+TCP/443. An unresolved service adds neither an inspection target nor a bypass.
 
 Egress compiles person and IdP-group selectors into user identity conditions and
 device selectors into device conditions. When different source selector kinds
@@ -82,13 +93,31 @@ Allow does not require leaving content uninspected. Authenticate does not itself
 enable DLP. Deny does not forward traffic, and the rule validator rejects
 Deny combined with inspection bypass.
 
-**Current authored inspection selection is destination-host based.** The bypass
-compiler collects active bypass destinations into the engine's host set; it does
-not apply the rule's source, service, risk condition, or access priority to that
-selection. Do not promise a bypass only for one person or one source device because
-the access rule names them. Inspect rules do not cancel a separately selected
-host bypass merely by having a higher access priority. Review other device-profile,
-static, and approved certificate-pinning exclusions as well.
+**Authored TLS inspection preserves tenant and device source scope.** Any-source
+rules contribute shared host patterns; a catalog device or device group contributes
+patterns only for its resolved device identities. The TLS selector uses the
+transport-authenticated tenant and device identity, never a self-reported OS user.
+An empty or unresolved source does not become Any. Both inspect and bypass host
+selection require Service=Any or a service containing TCP/443; SSH, UDP-only and
+unresolved named services do not change TCP/443 inspection.
+
+Person, IdP-group and agent source selectors require identity context that is not
+available to this pre-TLS selector. They do not create shared or device inspection
+exceptions; the Console shows that limitation. Their separate access-policy
+conditions still apply. If a rule mixes device and identity selectors, only the
+resolved device branch contributes to TLS selection.
+
+Risk conditions and authored access priority are not yet evaluated by this host
+projection. Inspect rules do not cancel a separate matching bypass merely by
+having higher access priority. Any destination is not currently expanded by this
+inspection projection. Review device-profile, static and approved certificate-pin
+exclusions as well; these controls are separate from source-scoped authored rules.
+
+Inspection Settings and the bypass-hosts API list shared host patterns, with the
+posture response flagging additional device-scoped rules. A destination-only
+Policy decision check reports **Depends on the device** when a device rule can
+change the inspection result. Confirm from included and excluded source devices;
+a destination-only preview cannot supply an authenticated source identity.
 
 A bypassed encrypted connection does not expose its plaintext to HTTP DLP.
 Protocols such as SSH are not converted into inspectable HTTP by choosing Inspect.
@@ -102,6 +131,203 @@ detectors and the match action, and attach it to an inspected Internet Access ru
 Use synthetic data for blocked and allowed upload tests. Account restrictions for
 supported SaaS services are a separate feature in
 [SaaS tenant restriction](saas-tenant-restriction.md).
+
+## Built-in bypass overrides
+
+In **Built-in Bypass List**, **Force-inspect** and **Disable** remove an entry's
+curated bypass for the selected organization. **Restore default** removes that
+override. These controls change the catalog's contribution; they do not override
+other bypass rules or force inspection when the deployment posture excludes a host.
+Test new connections and check the effective inspection selection.
+
+With override persistence configured, changes are saved before the live selection
+is rebuilt. A storage failure returns an error, leaves the current live selection
+in place, and records the administration request as failed. Repair storage, reload
+the page and retry the intended change. An error can occur after storage was
+written, so restarting is not a substitute for a successful retry. Without
+persistence, overrides last only for the running process.
+
+The common administration audit records the actor, organization, request path and
+result. It does not currently retain the override's previous/new mode or reason.
+For a successful retry, verify the saved override and the effective selection in
+addition to the audit result. Signed catalog feed updates are a separate operation.
+
+### Restoring override snapshots
+
+A configured override snapshot must be an object mapping organization IDs to entry
+IDs. Each record must have the matching entry ID and an exact `force_inspect` or
+`disabled` mode. Organization and entry keys cannot be blank or contain surrounding
+whitespace. Restoration checks the complete snapshot before changing live state or
+its persistence writer. Duplicate keys, unknown or alternate-case fields, null
+containers or fields, malformed values and trailing JSON are rejected.
+
+`reason` and `updated_at` remain optional. A supplied nonempty timestamp must be
+valid RFC 3339; missing historical times are retained without inventing one. The
+Console can read such historical records, but a new override write must acknowledge
+its saved timestamp. Overrides for IDs absent from the current catalog are retained:
+they take effect if that ID returns in a subsequent feed. They are not corruption
+merely because the current catalog does not list the ID.
+
+Invalid configured data stops startup with `invalid catalog override snapshot`.
+Preserve the rejected file or database record and restore a complete known-good
+snapshot. Do not delete inspection overrides to make startup succeed. Rejected
+replacement leaves the live configuration and previous writer unchanged; later
+changes still save through that writer. Explicit `{}` removes all overrides from
+this store, restoring each catalog default where no other policy excludes it.
+An existing zero-byte file or JSON `null` is invalid. An absent snapshot retains
+initial/live state and attaches the writer, without persisting that state until
+the next confirmed change. Attachment alone is not a completed migration.
+
+Update readers and snapshot formats together; unsupported fields are rejected
+rather than silently removed on a later save. This validates record consistency,
+not who authored or moved a valid record between organizations, nor protection
+against replacement by a complete older valid snapshot. Verify distribution and
+effective inspection on the serving Edges separately.
+
+### Signed catalog updates
+
+Only the deployment operator, outside an entered customer organization, can apply
+or roll back the signed feed. Customer administrators can override entries in the
+current effective catalog, including entries supplied only by a feed. An override
+is keyed by entry ID: it has no effect while that ID is absent, and applies again
+if a later feed or rollback brings the ID back.
+
+Apply checks the configured trusted signing key, signature, checksum and expiry.
+A version must be newer than the currently applied version; use **Roll back** to
+select an available historical version. The history retains at most 20 applied
+records. A previously applied feed remains in use after expiry and is shown as
+stale; this is distinct from submitting a new expired feed, which is rejected.
+
+With a feed state path configured, apply and rollback save the catalog and history
+before changing the current selection. Saving uses staged replacement and flushes.
+A storage error leaves live state unchanged and permits retry, but the destination
+may already have been replaced before a flush error. Repair storage and retry the
+intended operation before restarting or changing the state path. Keep a backup
+for recovery. Mount the containing directory rather than relying on replacement of
+a bind-mounted file. Without a state path, updates are in memory only.
+
+This confirms a local update, not its delivery to other nodes. Check the effective
+catalog and inspection selection on every serving Edge. The common mutation audit
+records actor, organization, request path and result; it is not a feed-content diff.
+
+#### Confirming Console changes
+
+The Console verifies the catalog, feed status and authenticated organization before
+allowing changes. Missing or inconsistent responses are errors, not an empty
+catalog or proof that built-in defaults are active. A feed-status service error
+leaves its controls unavailable; independently verified tenant overrides remain
+usable. Feed changes affect the deployment and require operator authority;
+overrides affect the selected organization.
+
+Pending operations lock other changes and reload. If the response is lost or does
+not identify the requested override or signed feed, the Console keeps the input
+and asks you to reload and check saved state before retrying. The server may have
+completed the write and correctly recorded success even though the browser could
+not confirm it. Reload both the catalog and its feed history, and check Logs & Audit.
+
+Update the Console and serving APIs together. The Console uses `scoped=1` responses
+with `tenant_id`, `scope` and `data`, plus an `expected_tenant_id` precondition.
+Older API responses remain available to existing clients, but an older server
+without these context fields does not provide an editable view in the new Console.
+These checks bind the authenticated organization; they do not compare concurrent
+catalog revisions or provide a transaction across catalog and override stores.
+
+#### Restoring a signed catalog
+
+A configured feed snapshot is verified before its catalog, rollback history or
+persistence path is adopted. Every retained envelope must have a trusted signature
+and matching checksum, and each saved catalog, version and signer/timestamp field
+must match that envelope. The current record must match the last history record;
+repeated versions caused by explicit rollback are valid. Verification preserves
+signed JSON numbers and the normal formatted snapshot representation.
+
+Previously applied expired feeds remain available as last-known-good and for
+explicit rollback. Restoration checks their signature without requiring a new
+expiry window; this does not permit applying a new expired feed. Keep the public
+verification keys for retained history as well as the current feed. Removing a
+signer from the configured keyring makes a snapshot containing that signer's
+records invalid, including otherwise valid historical records.
+
+Invalid configured snapshots stop startup with `invalid catalog feed snapshot`.
+Preserve the file, restore a complete verified backup and the intended trusted-key
+configuration, and restart. Do not discard verification or silently replace a bad
+feed with defaults. During a rejected reload, the current catalog, history and
+writer remain unchanged. Attaching a missing file keeps live state but does not
+save it until a subsequent confirmed mutation. An existing empty file or JSON
+`null` is invalid. Deliberate `{}` or an object with a null current record and empty
+history selects the built-in catalog; tenant overrides remain separate.
+
+Feed admission and restoration reject duplicate JSON keys, unknown or
+alternate-case fields, nonpositive catalog versions and duplicate/blank entry IDs.
+Envelope metadata keys remain extensible. Update formats and binaries together;
+fields from an unsupported newer format are rejected rather than dropped. These
+checks establish signed-content integrity, not the authenticity of unsigned
+application timestamps, protection against replacement with a complete older
+valid snapshot, or the suitability of a trusted publisher's bypass patterns.
+
+
+## Save and verify inspection defaults
+
+**Inspection Settings** configures defaults for the whole deployment. Only the
+operator organization, outside a customer operation context, can change the mode,
+host allowlist, sign-in/AI presets and operating-system bypass switch. Customer
+administrators can view the defaults and manage their own Internet Access rules.
+An Edge that pulls configuration from a control plane rejects local writes.
+
+Select the required sign-in and AI presets, save the list, then choose the desired
+mode. Under **Inspect only what I list**, destinations absent from the allowlist
+are not decrypted. Removing a service bypass rule does not add that service to the
+allowlist or override other exclusions. **No service bypass** describes that
+service's rule state; it is not proof that traffic is being inspected.
+
+Deployment defaults and tenant exceptions have separate scopes. Authored
+inspection/bypass destinations and curated-catalog overrides apply to their owning
+tenant. The serving Edge selects a complete host set using the authenticated
+connection's tenant; updating another tenant does not replace that selection.
+Changing deployment mode rebuilds all tenant selections together. Deleting a last
+rule removes its contribution, including after restart or a rule-bundle refresh.
+
+Inspection Settings, Policy decision check and the bypass-host listing show the
+effective host selection for the current customer context. Their host lists do not
+include other customers' exceptions. The `scope=deployment` field describes the
+shared posture settings; `intercept_hosts` and `effective_bypass` describe that
+requesting tenant's local engine configuration. A missing tenant-specific entry
+uses deployment defaults; this fallback is not an authorization decision.
+
+Certificate-pinning failure counts, successful-handshake history and optional
+automatic bypasses are also isolated by connection tenant. Candidate proposals
+carry that tenant into review. Detection alone does not enable automatic bypass.
+Host selection still needs separate verification against source/service/risk
+conditions and the actual traffic path; it is not a full policy decision.
+
+Use DNS hostnames, `*.example.com`, `*` or IPv4 literals in the explicit list,
+without schemes, paths or ports. IPv6 literal patterns are not supported by the
+current selector; use a DNS hostname for that destination. Unknown preset names
+are rejected rather than silently removed. The remaining settings are preserved
+when you change one field.
+
+The server saves a candidate before adopting it in memory. If storage reports a
+failure, the previous live posture remains active and the Console keeps the draft.
+Restore storage, reload to check the current state, then retry. A lost or malformed
+response can follow a successful save; it does not prove that nothing was saved.
+An ambiguous storage commit or multiple independent writers requires separate
+reconciliation. The server refuses empty, incomplete or invalid stored posture
+snapshots during loading; restore or repair the authoritative snapshot rather than
+silently replacing it with defaults. Missing snapshots still use initialization
+settings. Preserve a backup before correcting older invalid data.
+
+A control plane without an interception engine shows saved defaults and marks
+live coverage unavailable. After saving, check configuration synchronization and
+the serving Edge: a successful control-plane response does not establish fleet
+convergence or actual DLP/tenant-restriction enforcement. Failed posture saves on
+an Edge keep that bundle generation pending for retry.
+
+In **Logs & Audit**, look for `admin_inspection_posture_changed` and the common
+`admin_config_change` event. The dedicated event contains the actor, tenant,
+deployment scope, requested mode, selection counts, a posture digest and
+`saved`/`persistence_unconfirmed` outcome. It excludes destination lists. Input and
+permission refusals appear in the common audit. These configuration records do not
+replace traffic logs or confirmation that the audit storage itself is healthy.
 
 ## Authenticate on different traffic paths
 
@@ -136,6 +362,27 @@ Console also displays other effective contributions. A saved rule is configurati
 evidence, and the application's allow/deny result plus logs is enforcement evidence.
 Use [Verification](verification.md) to record them separately.
 
+### Save failures and retries
+
+With persistence configured, an authored rule is published and recompiled only
+after its snapshot save succeeds. A failed create, edit, disable, or delete returns
+an error and keeps the previous live rule set. Restore storage and reload the list
+before retrying. A storage error can still follow an uncertain commit, so reconcile
+the saved state before restarting the process. In-memory stores provide no restart
+durability.
+
+If the response is lost or incomplete, do not assume that nothing was saved. The
+Console keeps the draft and its rule ID for a retry within the same editor. API
+clients should also reuse the same ID after checking the current rule. A new draft
+with another ID can create a duplicate. The Console refuses incomplete catalog
+responses and requires the current customer context before submitting a change.
+
+In **Logs & Audit**, the audit stream records `admin_authored_rule_changed` with
+the actor, customer, rule ID, operation, result, and a digest of the rule. Rule names
+and destination selectors are omitted. `saved` confirms the rule-store operation;
+`persistence_unconfirmed` requires reconciliation. Neither result proves that a
+remote Edge or an existing connection has adopted the change.
+
 Implementation references: [rule model](../policyrule/policyrule.go),
 [egress compilation](../policyrule/compile_egress.go),
 [inspection selection](../policyrule/compile.go), [Console editor](../console/rules.js),
@@ -143,3 +390,96 @@ Implementation references: [rule model](../policyrule/policyrule.go),
 [HTTP enforcement](../cmd/dsse-edge/swg_http_egress.go).
 
 For detector setup, action semantics, and file coverage, continue with [DLP](dlp.md).
+
+
+### Changes to groups, services and destinations
+
+Authored catalog writes are saved before the live catalog changes. If persistence
+is not confirmed, the API returns HTTP 500 and retains the previous live entries,
+aliases and generation. Restore storage, reload the list and retry. A transport
+error or lost response can follow a completed save; inspect the list before
+creating another entry. Enrolled-derived device entries have a separate inventory
+lifecycle and are not covered by the authored catalog persistence guarantee.
+
+Successful catalog API changes also rebuild the local compiled rules and TLS
+inspection selectors. Changing a destination address or deleting a referenced
+group no longer requires editing its rules to refresh that local projection. This
+is not confirmation that every independent Edge has applied the change. Catalog
+bundle reconciliation saves one complete candidate. If that save fails, dependent
+authored rules are not applied and the same bundle generation remains retryable.
+Catalog and rule storage are separate transactions; ambiguous commits, independent
+writers and complete fleet consistency still require deployment validation.
+
+Catalog mutations record `admin_asset_catalog_changed` with the accepted tenant,
+actor, asset kind/ID, operation and result. Upserts include a digest of the submitted
+or accepted record; names, addresses, members and storage errors are omitted. The
+common HTTP audit remains separate. Neither audit proves remote delivery.
+
+The Console’s **Policy decision check** destination preview evaluates TCP/443.
+It is not a simulation of every protocol, port, identity, or existing connection.
+
+
+### Candidate persistence and bypass registration
+
+Candidate creation, observation, review and materialization publish their candidate state only after the configured store confirms the save. If saving fails, candidate write endpoints return HTTP 500 before their dependent rule creation or runtime apply step. Reload the candidate list, restore storage availability, and retry. Approval alone does not bypass traffic.
+
+A manual bypass registration saves approval and materialization separately before writing its destination asset and Egress rule. These stores do not share an atomic transaction: an earlier confirmed step can remain after a later failure. Check both the candidate and its Egress rule, and the serving Edge's bypass state. A candidate status is not a receipt that every Edge has applied the bypass. The normal HTTP change audit records the request result; specialized candidate events describe candidate lifecycle and are not fleet enforcement evidence.
+
+An unconfirmed save retains the previous live candidate snapshot and prevents replacing or detaching its writer until a later save is confirmed. It can still have changed persistent storage (for example, replacement completed but the final flush failed); do not treat an error as proof that storage is unchanged or crash recovery will select the old snapshot. Tenant erasure reports candidate-store failure as incomplete. Without a configured persister, candidates remain memory-only. Candidate observations that fail to save are not retained by the store; observation delivery is not a guaranteed audit stream.
+
+
+A candidate with `status: materialized` records an adoption request. It is not proof of an active bypass: asset or rule saving can fail afterwards. Such failures return HTTP 500 with `partial: true`, the candidate ID/status and a `failed_stage` (`candidate_materialization`, `bypass_endpoint`, `bypass_rule` or `bypass_rule_removal`). Previously saved steps remain. Restore storage, reload, and repeat the operation. The direct cert-pin materialize endpoint accepts an already-materialized candidate for retry, but still requires the high-risk override when applicable and rejects a later rejected/suppressed candidate. Manual registration retains its stable candidate/rule IDs.
+
+If rule removal is unconfirmed, the existing bypass may remain active. Inspect the Internet Access rule and retry removal; a rejected candidate alone does not prove the rule was removed. A configuration-pulling Edge refuses a candidate review that would remove an existing cert-pin rule: perform that authored change at the control plane. Within one HTTP server, candidate administrative writes are serialized to prevent a review from overtaking an in-progress registration. This does not coordinate other nodes, the general rule editor or background delivery.
+
+Specialized bypass lifecycle audits identify the acting administrator and report `result: partial` with `failed_stage` when a later step fails. `candidate_saved`, `rule_operation` and `rule_state_confirmed` describe this operation's saved stages. `policy_materialized` indicates a confirmed bypass-rule write by this operation. `local_apply_requested` (also reflected in the legacy `runtime_hot_reload` field) means the local rebuild callback was invoked; it is not a fleet or traffic receipt. The common HTTP audit independently records the failed request. The Console labels candidate registration separately from the serving Edge's current bypass list and reloads both after adoption or a partial result.
+
+### Restart and historical pinned-site candidates
+
+Startup restores the saved authored rules; it does not regenerate a bypass from a `materialized` candidate. Deleting or disabling a cert-pin rule, or changing its inspection action, therefore remains effective after restart. A registration that saved its candidate or endpoint but failed to save its rule is not completed automatically by restarting. Candidate records remain visible in Sites to Bypass as history, but do not appear as additional active rules in Internet Access or as an inspection-policy source.
+
+This also applies when upgrading older installations that retained only materialized candidates without authored rules. Such a candidate cannot distinguish a legacy bypass from a deliberate deletion or an incomplete registration. Review the current Internet Access rules and the serving Edge's bypass list. If a bypass is still required, explicitly register the host again through Sites to Bypass at the deployment's configuration authority. This uses the normal storage checks, audit and distribution path. Existing authored rules are preserved; no candidate history or endpoint is deleted by this change.
+
+
+### Older SaaS Optimize selections
+
+The current runtime takes SaaS bypasses from tenant-authored Egress rules. The legacy deployment-wide `inspection_posture.bypass_groups` field is retained for review; startup neither converts it into tenant rules nor clears it. It does not override a disabled, deleted or inspection-enabled rule, and it is not an additional active rule in Internet Access.
+
+After updating an older installation, review Inspection Settings in each organization that needs a SaaS bypass. Use **Do not inspect it** to save that organization's rule, or edit the rule in Internet Access. Existing authored rules continue to apply. An older selection alone does not grant bypass. The deployment operator, outside a customer context and at the configuration authority, can use **Clear older selection** to remove the retained entry. This cleanup keeps authored rules unchanged; removing a service's current rule also leaves the older selection unchanged. Each action has its own saved outcome and audit.
+
+The posture API accepts removal or retention of existing legacy selections, but rejects additions with HTTP 409. Use authored rules for new bypasses. A failed cleanup retains the previous live posture and returns HTTP 500; restore storage and retry. No automatic migration writes occur on restart. Upgrade all participating nodes before relying on this behavior: older binaries may still convert retained selections on their own startup. Clearing all obsolete selections at the authority and confirming configuration delivery removes that legacy input. These steps do not prove fleet propagation or actual traffic inspection; verify the serving Edge separately.
+
+
+### Pinned-site list and operation confirmation
+
+Sites to Bypass requires an attributable response from both the candidate store and the serving Edge. Unavailable, malformed or mismatched responses are shown as errors, not empty lists. Reload before editing. A failed read discards the previous action list; filtering cannot bring stale actions back. Overlapping loads and organization changes cannot adopt an older response. While a write is pending, other changes from that view are disabled.
+
+The Console confirms the organization again before a write and sends an `expected_tenant_id` query precondition. The candidate list, review, materialize, manual registration and bypass-host endpoints reject a mismatch with HTTP 409. Existing callers may omit it and remain scoped by authentication. Candidate-list responses include `tenant_id`; bypass-host reads with `scoped=1` return `{tenant_id, hosts}` and refuse an unavailable interception engine. The unscoped bypass-host endpoint retains its legacy array contract. Update the Console and serving APIs together: an older response without this context is rejected by the newer view.
+
+A successful status alone is not confirmation. The Console checks the candidate owner, identity/status for review, and the normalized host plus materialized status for registration. If the response is missing, mismatched or lost, input is retained and changes remain disabled until reload. A request may already have saved successfully; its audit then correctly records success even though the browser could not confirm it. Check current rules and serving-Edge state before retrying.
+
+Detected observations and control-plane registrations have different identities. Adoption by host does not change an observation on another Edge; both records can appear when stores are colocated. Rejecting that observation does not revoke the separately authored registration. Remove or change the actual rule in Internet Access and verify delivery. Candidate records are not deduplicated or rewritten merely because their hostnames match.
+
+
+### Restoring candidate history safely
+
+A configured policy-candidate snapshot must be a complete JSON object mapping organization IDs to candidate IDs. Every candidate must belong to that organization and have the matching ID, supported source/type/action/status, valid observation counters/ports and valid timestamps. The loader checks the whole snapshot before replacing live state or its persistence writer. It rejects duplicate JSON keys, noncanonical field names, unknown fields, null containers, malformed data and mismatched identities. It does not silently skip a bad record or create an approval while restoring history. The retired `policy_learning` source and existing optional attribution fields remain supported.
+
+Invalid configured snapshots stop product startup with a generic candidate-snapshot error, without logging their saved contents. Preserve the file or database record, restore a known-good complete snapshot, and restart. Do not delete candidate history merely to start the service. A deliberately empty `{}` replaces the candidate list; it does not remove independently authored bypass rules. An absent snapshot is a first-boot condition. An existing zero-byte file or JSON `null` is invalid, not an empty list.
+
+When a running store rejects a replacement snapshot, it retains its current state and writer; later changes continue saving to the original destination. Changing a clean store to an absent persistence destination retains its current in-memory history and saves that complete history on the next mutation. That attachment alone is not a migration or durability acknowledgement. Unconfirmed earlier saves must be reconciled before replacing or detaching the writer.
+
+Update binaries and snapshot formats together. Unknown fields from a newer version are rejected rather than discarded during an older binary's next save. This validation checks snapshot integrity against candidate admission rules; it does not prove the authenticity of observation evidence, correlate Edge observations with control-plane registrations, or make candidate, asset and rule writes one transaction.
+
+
+### Exact destinations for pinned-site registration
+
+Sites to Bypass registers one exact DNS hostname. It rejects wildcards (including `*` and `*.example.com`), IP literals and prefixes, abbreviated numeric addresses, URLs and port suffixes. IDNA names are stored as lowercase ASCII names. A registration for `app.example.com` does not include its subdomains. Broader authored policies belong in Internet Access and must be reviewed as such.
+
+When a candidate has a named Host, that name remains the registration target. When Host is an IP address or absent, a valid named SNI is used instead. The candidate list returns this derived name as `registration_host`; the Console displays it and names it in the confirmation. That field is not stored in candidate snapshots. IP-only or malformed candidates have no hostname adoption button; identify the actual hostname before registering it. Update Console and serving APIs together.
+
+The direct materialize API retains explicit `allow_high_risk: true` support for a single IPv4-only candidate. IPv6-only candidates, including mapped IPv6 notation, are rejected before saving because the current inspection selector does not support IPv6 literal patterns; use an exact named target instead. An IPv6 Host with a valid named SNI can still register that name. It determines the risk from Host/SNI rather than trusting stored confidence, suggested-action or DNS-attribution labels. Such an override cannot enable wildcard, prefix or malformed targets. Manual hostname registration rejects raw IPs even if an override field is sent. Confirmation is checked before candidate or dependent state changes.
+
+Specialized lifecycle audits report `bypass_target_kind` (`hostname` or `ip`) and `high_risk_override_used` for a confirmed IP bypass-rule write, without copying the destination into the audit. Candidate/rule IDs and the current saved rules remain the correlation points. Local confirmation does not prove independent delivery or active-connection changes.
+
+Existing authored rules are retained on upgrade. Previously saved broad or IP-based bypasses are not automatically narrowed or revoked by the new registration checks. Review their scope in Internet Access, remove or correct unintended rules explicitly, and confirm delivery. Candidate history alone does not authorize a replacement rule or prove that an old rule has been removed.

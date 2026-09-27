@@ -27,6 +27,12 @@ cannot answer until a customer organization exists:
 one. Screens opened while it says that act on the operator's own organization, including
 **Device configuration**, which would then issue a profile that puts the device in the wrong place.
 
+For authenticated operator API writes, select the customer with `X-Operate-Tenant`.
+Any organization named in the path or request body must match that selection.
+Naming a customer without selecting it, or selecting a different customer, is refused.
+The selected customer's standing delegation and any required elevation must also be active.
+A customer's own administrator can continue to omit the header.
+
 ## 1. Create it — Tenants → + Add tenant
 
 Complete the tenant creation dialog:

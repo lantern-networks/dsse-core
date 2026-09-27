@@ -10,6 +10,8 @@ import (
 	"testing"
 )
 
+var edgeControlPlaneAdminPath = regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)(?:\?|")`)
+
 // The files that make up the Edge's machine path to its control plane. Named rather than discovered, because
 // the point of the gate is to notice when a FOURTH one appears.
 var edgeControlPlaneSyncFiles = []string{
@@ -32,14 +34,13 @@ func TestTheControlPlaneCredentialCoversExactlyTheCallsItMakes(t *testing.T) {
 		t.Skip("the admin handler is not a mux in this build")
 	}
 
-	adminPath := regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)(?:\?|")`)
 	called := map[string]bool{}
 	for _, name := range edgeControlPlaneSyncFiles {
 		raw, err := os.ReadFile(filepath.Join(".", name))
 		if err != nil {
 			t.Fatalf("read %s: %v — the machine path moved and this gate did not", name, err)
 		}
-		for _, match := range adminPath.FindAllStringSubmatch(string(raw), -1) {
+		for _, match := range edgeControlPlaneAdminPath.FindAllStringSubmatch(string(raw), -1) {
 			called[match[1]] = true
 		}
 	}
@@ -98,5 +99,19 @@ func TestTheControlPlaneCredentialCarriesOneWriteAndNoPlatformPowers(t *testing.
 	if writes != 1 {
 		t.Fatalf("the machine credential carries %d write scopes (%v); it reports enrolments and reads its "+
 			"own configuration, and every additional write is something a compromised Edge can do", writes, scopes)
+	}
+}
+
+func TestControlPlaneCredentialRouteDiscoveryIncludesQueryParameters(t *testing.T) {
+	const source = `"/admin/config-bundle" + "/admin/steer-exclusions?expected_tenant_id=" + tenant + "/admin/new-route?cursor=next"`
+	matches := edgeControlPlaneAdminPath.FindAllStringSubmatch(source, -1)
+	want := []string{"/admin/config-bundle", "/admin/steer-exclusions", "/admin/new-route"}
+	if len(matches) != len(want) {
+		t.Fatalf("found %d routes, want %d", len(matches), len(want))
+	}
+	for i, path := range want {
+		if matches[i][1] != path {
+			t.Fatalf("route %d = %q, want %q", i, matches[i][1], path)
+		}
 	}
 }

@@ -175,6 +175,63 @@ A bypassed destination is unsuitable for this check. These three comparisons do 
 prove all tenant isolation properties; also test that a different customer's identity
 cannot access this customer's resources.
 
+## Restore normal networking
+
+If the deployment is unavailable or the lab has been shut down, the installed agent
+can restore direct networking **without contacting the deployment**. Keep the agent
+installed until recovery has finished.
+
+Open **PowerShell as administrator**. Run each command separately: press Enter and
+wait for the `PS ...>` prompt before entering the next command. Do not type the prompt
+itself or join separate commands with a space.
+
+If steering must remain off after a restart, first disable its automatic startup:
+
+```powershell
+Set-Service -Name DsseSteer -StartupType Disabled
+```
+
+Then run the installed recovery command. Include the leading `&`; PowerShell otherwise
+interprets the quoted path as text instead of running it:
+
+```powershell
+& "$env:ProgramFiles\DSSE\dsse-steer.exe" --mode recover
+```
+
+For a temporary recovery, omit the startup change. The recovery command stops the
+agent and driver and attempts to restore the DNS, QUIC, WFP redirect, and connectivity
+probe settings changed by DSSE. It does not uninstall the package or revoke the device.
+Do not add `--recover-keep-services` when the intention is to stop steering.
+
+Check the complete output and exit status. `recover: done` is the completion message;
+`recover completed with ... problem(s)` means the reported failures still need attention.
+Confirm the services are stopped and retry a normal website with certificate verification
+enabled. A completion message alone is not proof that the local network is working.
+
+```powershell
+Get-Service DsseSteer,DsseWfp | Select-Object Name,Status
+```
+
+### If PowerShell refuses the command
+
+| Message or symptom | Meaning and action |
+|---|---|
+| `dsse-steer.exe` is not recognized | Use the full-path command above. In the installation folder, `.\dsse-steer.exe --mode recover` also works; a bare filename is not sufficient in PowerShell. |
+| `UnexpectedToken`, or a message that token `mode` cannot be used | The quoted executable path needs a leading `&`. DSSE has not started yet. |
+| `Set-Service` cannot accept argument `.\dsse-steer.exe` | Two commands were joined on one line. Execute each code block separately. |
+| `StartupType` cannot be converted | Use the exact spelling `Disabled`. |
+| Access is denied | Reopen PowerShell using **Run as administrator**. |
+| The full path does not exist | Check the installed service's executable path with the command below; do not guess a different build or reinstall while steering remains active. |
+
+```powershell
+Get-CimInstance Win32_Service -Filter "Name='DsseSteer'" | Select-Object PathName
+```
+
+`PathName` may include service arguments. Use its executable path with `--mode recover`,
+not the service's `--service-run` arguments. If recovery still fails, retain the exact
+command and error text for [troubleshooting](troubleshooting.md#reporting-an-unresolved-problem).
+Avoid resetting all Windows Firewall or adapter settings: those may belong to other software.
+
 ## Removing it
 
 From the folder holding the original MSI, with administrator privileges:

@@ -55,6 +55,13 @@ The full fleet verifier includes active probes and can exercise enrolment using 
 administrative credential. Treat it as a planned verification action and record it in
 the test timeline; it is not a passive monitoring command.
 
+## Upgrading persisted user risk
+
+Before upgrading a deployment that uses manual user risk, read
+[User risk state upgrades](user-risk-state-upgrade.md). User marks now include a tenant
+and a distinct entity type. The state format and the fast risk feed both change;
+all control planes and enforcing Edges must use the compatible revision.
+
 ## Change a policy or organization setting
 
 1. Confirm the Console's organization context and the administrator's delegation.

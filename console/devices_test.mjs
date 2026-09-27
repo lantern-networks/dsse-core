@@ -505,10 +505,10 @@ function answerBeforeRisk(path) {
 }
 test('risk HTTP, network and malformed reads stop the list instead of displaying Normal', async()=>{
  for(const reply of [{ok:false,status:401},{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{...riskReadAnswer(),tenant_id:'tenant-b'}},new Error('network')]){
- const f=fixture();f.invokeWith((method,path,body,plane)=>{
- assert.equal(method,'GET');if(!path.includes('/risk-signals'))return answerBeforeRisk(path);
- assert.equal(path,'/admin/risk-signals?expected_tenant_id=tenant-a');assert.equal(plane,'control');if(reply instanceof Error)throw reply;return reply;
- });await f.actualRenderList(f.host);assert.deepEqual(f.states.map(x=>x.state),['loading','error']);assert.match(f.states[1].message,/Risk status could not be read/);assert.equal(f.toasts.length,0);
+ const f=fixture();let observed;f.invokeWith((method,path,body,plane)=>{
+ if(!path.includes('/risk-signals'))return answerBeforeRisk(path);
+ observed={method,path,plane};if(reply instanceof Error)throw reply;return reply;
+ });await f.actualRenderList(f.host);assert.deepEqual(observed,{method:'GET',path:'/admin/risk-signals?expected_tenant_id=tenant-a',plane:'control'});assert.deepEqual(f.states.map(x=>x.state),['loading','error']);assert.match(f.states[1].message,/Risk status could not be read/);assert.equal(f.toasts.length,0);
  assert.ok(!f.calls.some(c=>c[1].includes('/device-groups')));
  }
 });

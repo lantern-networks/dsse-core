@@ -647,3 +647,5 @@ Administrator migration checks now include live shared authority, legacy princip
 People, device, identity-provider, access-approval, organization and enrollment screens retain the intended tenant and form state across asynchronous reads and failed writes. API token creation uses the server role catalog and its default role, sends the roles array, and shows only the returned one-time raw token. Profile and device-package forms validate the required deployment inputs before generating output. Existing risk warnings remain visible.
 
 The Console regression suite and synthetic browser checks cover these form contracts; they do not establish acceptance of real identity providers, signed installers or deployed CP/Edge communication.
+
+Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.

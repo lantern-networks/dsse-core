@@ -114,14 +114,11 @@ function fmtAgo(ts) {
 function shortApp(a) { a = String(a || ""); const parts = a.split(/[.\/\\:]/); return parts[parts.length - 1] || a; }
 function riskLabel(sev) { return sev === "critical" ? bl({ en: "Critical", ja: "重大" }) : sev === "high" ? bl({ en: "High", ja: "高" }) : sev === "medium" ? bl({ en: "Medium", ja: "中" }) : bl({ en: "Normal", ja: "通常" }); }
 function riskTone(sev) { return (sev === "high" || sev === "critical") ? "danger" : (sev === "medium" ? "warn" : "off"); }
-async function deviceRiskMarks() {
-  const r = await apiFetch("GET", "/admin/risk-signals");
+async function deviceRiskMarks(tenant) {
+  const r = await apiFetch("GET", "/admin/risk-signals?expected_tenant_id=" + encodeURIComponent(tenant), undefined, "control");
   if (r && !r.ok && r.status === 403) return null;
   if (!r || !r.ok) throw new Error("HTTP " + (r && r.status || "unknown"));
-  const marks = r.body && r.body.high_risk;
-  if (!marks || typeof marks !== "object" || Array.isArray(marks) ||
-      !Object.values(marks).every((severity) => ["medium", "high", "critical"].includes(severity))) throw new Error("Invalid risk response");
-  return marks;
+  return deviceRiskSnapshot(r.body, tenant);
 }
 function deviceEffectiveRiskWithoutOverlay(value) {
   return ["none", "medium", "high", "critical"].includes(value) ? value : "unknown";
@@ -449,7 +446,7 @@ async function renderList(host) {
   // an unknown overlay. Other failures remain errors rather than clearing risk.
   let riskMap, riskReadable = true;
   try {
-    riskMap = await deviceRiskMarks();
+    riskMap = await deviceRiskMarks(tenant);
     if (!current()) return;
     if (riskMap === null) {
       riskReadable = false;

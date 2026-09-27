@@ -14,20 +14,20 @@ function fixture(reply) {
 
 test('denied overlay read keeps explicit effective risk and unknown missing risk', async () => {
   const {context, calls} = fixture({ok: false, status: 403});
-  assert.equal(await context.deviceRiskMarks(), null);
-  assert.deepEqual(calls, [['GET', '/admin/risk-signals']]);
+  assert.equal(await context.deviceRiskMarks('tenant-a'), null);
+  assert.deepEqual(calls, [['GET', '/admin/risk-signals?expected_tenant_id=tenant-a', undefined, 'control']]);
   assert.equal(context.deviceEffectiveRiskWithoutOverlay('high'), 'high');
   assert.equal(context.deviceEffectiveRiskWithoutOverlay(undefined), 'unknown');
   assert.equal(context.deviceEffectiveRiskWithoutOverlay('garbled'), 'unknown');
 });
 
 test('other risk read failures do not masquerade as an empty overlay', async () => {
-  await assert.rejects(fixture({ok: false, status: 503}).context.deviceRiskMarks(), /HTTP 503/);
-  await assert.rejects(fixture({ok: true, body: {}}).context.deviceRiskMarks(), /Invalid risk response/);
-  await assert.rejects(fixture(Promise.reject(new Error('offline'))).context.deviceRiskMarks(), /offline/);
+  await assert.rejects(fixture({ok: false, status: 503}).context.deviceRiskMarks('tenant-a'), /HTTP 503/);
+  await assert.rejects(fixture({ok: true, body: {}}).context.deviceRiskMarks('tenant-a'), /Invalid device risk response/);
+  await assert.rejects(fixture(Promise.reject(new Error('offline'))).context.deviceRiskMarks('tenant-a'), /offline/);
 });
 
 test('a valid risk map remains available for permitted editors', async () => {
-  const marks = await fixture({ok: true, body: {high_risk: {device1: 'critical'}}}).context.deviceRiskMarks();
+  const marks = await fixture({ok: true, body: {entity_type:'device',tenant_id:'tenant-a',withheld_unattributable:0,high_risk: {device1: 'critical'}}}).context.deviceRiskMarks('tenant-a');
   assert.deepEqual({...marks}, {device1: 'critical'});
 });

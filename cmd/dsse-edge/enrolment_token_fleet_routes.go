@@ -46,6 +46,9 @@ func registerEnrolmentTokenFleetRoutes(mux *http.ServeMux,
 			// 200 with a reason, not an HTTP error: this is an ANSWER to a question, and the Edge has to be
 			// able to tell "no, because it is spent" from "the authority did not respond". An HTTP status
 			// cannot carry that difference without the Edge guessing.
+			if rec, ok := w.(*adminAuditStatusRecorder); ok {
+				rec.businessFailure = true
+			}
 			writeJSON(w, http.StatusOK, enrolmentTokenRefusal(err))
 			return
 		}
@@ -58,13 +61,16 @@ func registerEnrolmentTokenFleetRoutes(mux *http.ServeMux,
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		tok, err := tokens.Spend(req.ID, req.TenantID, req.DeviceID, time.Now().UTC())
+		tok, err := spendEnrolmentToken(r.Context(), tokens, req.ID, req.TenantID, req.DeviceID, time.Now().UTC())
 		if err != nil {
 			if logf != nil {
 				// The operator's copy of why. The Edge gets the reason and turns it into its own log line, but
 				// the authority is where a burst of refusals is worth seeing.
 				logf("enrolment_token_spend_refused id=%q tenant=%q device=%q reason=%q",
 					req.ID, req.TenantID, req.DeviceID, enrolmentTokenReason(err))
+			}
+			if rec, ok := w.(*adminAuditStatusRecorder); ok {
+				rec.businessFailure = true
 			}
 			writeJSON(w, http.StatusOK, enrolmentTokenRefusal(err))
 			return

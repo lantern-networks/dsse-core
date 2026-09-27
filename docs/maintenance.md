@@ -659,3 +659,7 @@ The Console regression suite and synthetic browser checks cover these form contr
 Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
+
+### Enrolment and inventory persistence
+
+Device enrolment reports, enrolment-token issuance/revocation, inventory edits and seat allocations retain the accepted control-plane leadership term until durable storage completes. A storage or leadership failure is retryable and is not acknowledged as a saved enrolment. Promotion reloads shared inventory and seat allocations before serving writes; standby inventory refreshes cannot overwrite a promoted writer. Token issue/spend/revoke responses and audit records distinguish confirmed persistence from uncertain results.

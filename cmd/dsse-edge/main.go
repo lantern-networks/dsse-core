@@ -6365,10 +6365,18 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			log.Fatalf("resolve organization domains store %q: %v", config.OrganizationDomainsStorePath, e)
 		} else if p != nil {
 			if lerr := organizationDomains.SetPersister(p); lerr != nil {
-				log.Printf("organization domains store: load failed (starting fresh): %v", lerr)
+				log.Fatalf("organization domains store: initial load failed: %v", lerr)
 			}
 			go func() {
 				for range time.Tick(30 * time.Second) {
+					if err := organizationDomains.RefreshShared(); err != nil {
+						log.Printf("organization domains store: refresh failed; keeping applied classification: %v", err)
+					}
+					if idp := theIdPRegistry.Load(); idp != nil {
+						if err := idp.RefreshShared(); err != nil {
+							log.Printf("identity domains refresh failed; keeping applied classification: %v", err)
+						}
+					}
 					if err := organizationDomains.PersistIfDirty(); err != nil {
 						log.Printf("organization domains store: persist failed: %v", err)
 					}

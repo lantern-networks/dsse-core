@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/idpregistry"
@@ -18,6 +19,7 @@ import (
 // IdP verified_domains it supersedes (which were buried in Sign-in Providers, labelled for identity matching, and
 // required an IdP to exist). Durable, per-tenant.
 type organizationDomainsStore struct {
+	applied        atomic.Pointer[organizationDomainsSnapshot]
 	mu             sync.RWMutex
 	byTenant       map[string][]string
 	persister      blobstore.Persister
@@ -43,8 +45,11 @@ func (s *organizationDomainsStore) Domains(tenantID string) []string {
 	if s == nil {
 		return nil
 	}
-	domains, _ := s.DomainsChecked(tenantID)
-	return domains
+	snapshot := s.applied.Load()
+	if snapshot == nil {
+		return nil
+	}
+	return append([]string(nil), snapshot.ByTenant[tenantID]...)
 }
 func (s *organizationDomainsStore) DomainsChecked(tenant string) ([]string, error) {
 	if err := s.RefreshShared(); err != nil {
@@ -83,6 +88,7 @@ func (s *organizationDomainsStore) SetDomains(tenantID string, domains []string)
 	}
 	s.pending[tenantID] = append([]string(nil), out...)
 	s.dirty = true
+	s.publishDomainsLocked()
 	s.mu.Unlock()
 	return out
 }
@@ -116,6 +122,7 @@ func (s *organizationDomainsStore) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	s.byTenant, s.persister, s.authorityKnown = next.ByTenant, p, true
+	s.publishDomainsLocked()
 	s.dirty = false
 	s.pending = nil
 	return nil
@@ -163,7 +170,7 @@ func (s *organizationDomainsStore) PersistIfDirty() error {
 	if !s.dirty || s.persister == nil {
 		return nil
 	}
-	if err := s.editDomainsLocked(context.Background(), s.pending); err != nil {
+	if err := s.editDomainsLocked(captureCPWriteLease(context.Background()), s.pending); err != nil {
 		return err
 	}
 	s.pending = nil
@@ -238,6 +245,7 @@ func (s *organizationDomainsStore) editDomainsLocked(ctx context.Context, edits 
 		return err
 	}
 	s.byTenant = next.ByTenant
+	s.publishDomainsLocked()
 	if s.persister != nil {
 		s.authorityKnown = true
 	}
@@ -269,6 +277,7 @@ func (s *organizationDomainsStore) RefreshShared() error {
 		return err
 	}
 	s.byTenant = next.ByTenant
+	s.publishDomainsLocked()
 	s.authorityKnown = true
 	return nil
 }
@@ -292,25 +301,23 @@ func corporateDomainsResolver(org *organizationDomainsStore, idp *idpregistry.St
 			}
 		}
 		if org != nil {
-			domains, err := org.DomainsChecked(tenantID)
-			if err != nil {
-				return nil
-			}
+			domains := org.Domains(tenantID)
 			for _, d := range domains {
 				add(d)
 			}
 		}
 		if idp != nil {
-			connections, _, err := idp.TenantSnapshot(tenantID)
-			if err != nil {
-				return nil
-			}
-			for _, c := range connections {
-				for _, d := range c.VerifiedDomains {
-					add(d)
-				}
+			for _, d := range idp.AppliedVerifiedDomains(tenantID) {
+				add(d)
 			}
 		}
 		return out
 	}
+}
+
+// Publish an immutable data-plane view only after an applied change. Readers do
+// not wait for a writer holding the store mutex across database I/O.
+func (s *organizationDomainsStore) publishDomainsLocked() {
+	snapshot := s.snapshotLocked()
+	s.applied.Store(&snapshot)
 }

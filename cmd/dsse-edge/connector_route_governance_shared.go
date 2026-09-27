@@ -27,9 +27,8 @@ func routeGovernanceWriteContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if _, ok := ctx.Value(cpWriteLeaseKey{}).(cpWriteLease); !ok {
-		ctx = captureCPWriteLease(ctx)
-	}
+	// Admin middleware carries its captured term. Connector observations are
+	// accepted by each regional node and do not author administrative routes.
 	return ctx
 }
 func routeState(g *connectorRouteGovernance) governancePersistState {

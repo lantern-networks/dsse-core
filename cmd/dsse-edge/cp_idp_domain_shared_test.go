@@ -182,6 +182,9 @@ func TestPostgresDomainFlushPreservesPeerAndFailedAttachment(t *testing.T) {
 	if err = a.PersistIfDirty(); err != nil {
 		t.Fatal(err)
 	}
+	if err := b.RefreshShared(); err != nil {
+		t.Fatal(err)
+	}
 	if got := b.Domains("own"); len(got) != 1 || got[0] != "pending.invalid" {
 		t.Fatal("read did not refresh")
 	}
@@ -200,6 +203,9 @@ func TestPostgresDomainFlushPreservesPeerAndFailedAttachment(t *testing.T) {
 	}
 	if _, err = a.SetDomainsDurable("own", []string{"accepted.invalid"}); err != nil {
 		t.Fatal("writer was replaced", err)
+	}
+	if err := b.RefreshShared(); err != nil {
+		t.Fatal(err)
 	}
 	if got := b.Domains("own"); len(got) != 1 || got[0] != "accepted.invalid" {
 		t.Fatal("accepted state absent")

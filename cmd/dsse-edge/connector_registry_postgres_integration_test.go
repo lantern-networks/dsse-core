@@ -236,6 +236,16 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 		LabMode:          boolPtr(false),
 	})
 
+	// Regional registration must work even while this node is not the CP leader.
+	blobDB, err := newCPStateBlobDB(dsn, "../../migrations", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { blobDB.Close() })
+	oldElector, oldRoutes := cpLeaderElectorInstance, connectorRouteGov
+	cpLeaderElectorInstance = &cpLeaderElector{db: db}
+	connectorRouteGov = newConnectorRouteGovernanceWithPersister("", true, &postgresBlobPersister{db: blobDB, key: "connector_route_governance"})
+	t.Cleanup(func() { cpLeaderElectorInstance, connectorRouteGov = oldElector, oldRoutes })
 	registerReq := httptest.NewRequest(http.MethodPost, "/connectors/register", strings.NewReader(`{
 		"id":"conn_pg_runtime_001",
 		"tenant_id":"tenant_lab_001",
@@ -255,6 +265,7 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 		t.Fatalf("register status = %d, want %d, body=%s", registerRec.Code, http.StatusCreated, registerRec.Body.String())
 	}
 
+	cpLeaderElectorInstance = oldElector
 	rotateReq := httptest.NewRequest(http.MethodPost, "/connectors/conn_pg_runtime_001/runtime-secret/rotate", strings.NewReader(`{"runtime_secret":"postgres-rotated-runtime-secret-001"}`))
 	rotateReq.Header.Set("authorization", "Bearer pg-admin-token")
 	rotateRec := httptest.NewRecorder()

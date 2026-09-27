@@ -702,3 +702,5 @@ Before updating an Edge that downloads steering exclusions, ensure its retrieval
 ### Connector management and organization-domain reconciliation
 
 Connector secret replacement confirms persistence at both administrative URLs; errors do not return a usable new secret. Registration and heartbeat keep their audit/report follow-up when route discovery alone fails. Organization domain updates preserve concurrent changes, refresh shared state and retain the request leadership term. Connector lists reject malformed responses and avoid applying responses after the selected organization changes. These changes retain existing browser acceptance evidence for unchanged controls; real connector reconnection remains a deployment check.
+
+Organization-domain storage must load successfully before startup. A malformed or unreadable configured file/database no longer falls back to volatile settings. Repair the configured store (valid empty form: `{"by_tenant":{}}`) rather than starting over existing data. Traffic classification uses the last applied domain snapshot while management reads report storage failures; shared peers refresh in the background.

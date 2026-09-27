@@ -641,3 +641,13 @@ Credential schema migrations 048, 049 and 051 carry TOTP replay counters, revisi
 
 
 Administrator migration checks now include live shared authority, legacy principal IDs and credential-table purge after migration 051. See [administrator credential upgrade](admin-credential-upgrade.md) before changing a multi-control-plane deployment; all credential writers must move together.
+
+### Console identity and account forms
+
+People, device, identity-provider, access-approval, organization and enrollment screens retain the intended tenant and form state across asynchronous reads and failed writes. API token creation uses the server role catalog and its default role, sends the roles array, and shows only the returned one-time raw token. Profile and device-package forms validate the required deployment inputs before generating output. Existing risk warnings remain visible.
+
+The Console regression suite and synthetic browser checks cover these form contracts; they do not establish acceptance of real identity providers, signed installers or deployed CP/Edge communication.
+
+Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
+
+Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.

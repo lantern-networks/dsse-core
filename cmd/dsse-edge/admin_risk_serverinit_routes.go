@@ -142,6 +142,9 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 	}))
 	// GET /admin/risk-signals: device marks by default, or typed, tenant-scoped user marks when requested.
 	mux.HandleFunc("GET /admin/risk-signals", adminEndpoint("admin.risk.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		snap := map[string]string{}
 		var users []revocation.UserRisk
 		if config.HighRiskOverlay != nil {
@@ -202,7 +205,9 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 			snap = mine
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"high_risk": snap,
+			"entity_type": "device",
+			"tenant_id":   adminTenantIDFromRequest(r),
+			"high_risk":   snap,
 			// Named rather than dropped, so a customer is never shown a smaller version of their own risk
 			// picture without being told a smaller version is what they are looking at.
 			"withheld_unattributable": withheld,

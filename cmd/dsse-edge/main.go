@@ -2732,11 +2732,9 @@ func main() {
 			client:       &http.Client{Timeout: 15 * time.Second},
 			outbox:       meshOutbox,
 		}
-		livenessRevocations.SetMeshReporter(meshSrc.pushFunc())
-		// Durable outbox: drive any pushes that were enqueued but not acked before a restart to completion.
-		if n := meshSrc.resumePendingDeliveries(); n > 0 {
-			log.Printf("cross-region revocation mesh: resuming %d pending push(es) from the durable outbox", n)
-		}
+		livenessRevocations.SetMeshReporterContext(meshSrc.pushContext)
+		go meshSrc.resumeConfigured(context.Background())
+
 		log.Printf("cross-region revocation mesh: origin region %q -> %d peer region CP(s)", *edgeRegionID, len(revocationMeshPeerList))
 	}
 	highRiskOverlay := revocation.NewHighRiskOverlay()

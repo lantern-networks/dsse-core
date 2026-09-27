@@ -660,6 +660,14 @@ Device admission responses now include the authenticated tenant and the effectiv
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
 
+### Cross-region revocation delivery
+
+Pending revocation deliveries preserve peer changes in shared storage and resume after control-plane promotion. Peer acceptance and durable queue cleanup are reported separately; an old delivery acknowledgement cannot erase a newer request for the same identity. Snapshot loading rejects unreadable state instead of silently treating it as an empty queue. Existing outbox entries retain startup compatibility.
+
+Revocation-mesh upgrades require all shared-outbox writers to move together; old writers replace the entire row and can lose peer updates. Existing file-backed queues still wait for election and resume on promotion. Peer URLs must be valid HTTP(S) base URLs without userinfo, query or fragment. An uncertain shared commit requires process recovery; retries for unreachable peers remain bounded and may need another promotion or restart.
+
+File-backed mesh pending entries are resent only when the node holding that file becomes leader again. Unconfirmed enqueue intent can still be lost on a term change, and synchronous queue writes can delay session closure on a slow database; these are unresolved delivery limitations, not guaranteed atomic admission/outbox delivery.
+
 ### Device and user risk persistence
 
 Risk edits report whether the requested state was applied and durably saved; failed protective saves remain visibly unconfirmed. Standby risk management does not serve stale authority, and promotion reloads shared device and user marks. Existing local snapshots retain their backend instead of being silently replaced by empty shared state. DLP-derived device risk records the actual application and persistence outcome separately from the original finding, and Edge synchronization retains marks on an unconfirmed empty feed. An authoritative CP feed still replaces the device map, including local DLP marks; separating those sources is not part of this integration.

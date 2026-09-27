@@ -71,9 +71,62 @@ test('history failure stays unavailable and Retry can recover to a verified empt
  unavailable=false;await states.at(-1).action.onClick();const host=f.modals[0].body[0];assert.ok(host.children.some(n=>String(n.text).includes('No previous versions')));
 });
 
-for(const path of ['/admin/tenant-cas','/admin/pki/operations','/admin/pki/paths','/admin/pki/trust-refusals','/admin/transport-trust-anchors','/admin/tenant-device-authority?readiness=1','/admin/tenant-transport-authority','/admin/tenant-interception-authority','/admin/transport-name-rename','/admin/interception-authority-rotation'])test('PKI map refuses missing dependency '+path,async()=>{
- const f=fixture(null),states=[];f.c.freshRender=()=>()=>true;f.c.uiState=(h,kind,message,action)=>states.push({kind,message,action});
- f.c.apiFetch=async(method,p)=>p===path?{ok:false,status:503,body:{error:'internal'}}:{ok:true,status:200,body:{has_authority:false,tenant_cas:[],paths:[],refusals:[],anchors:[],items:[]}};
- // The form fixture substitutes this function; restore the production loader.
- await f.c.originalLoadCertMap({});assert.equal(states.at(-1).kind,'error');assert.match(states.at(-1).message,/Required PKI information/);assert.equal(states.at(-1).action.label,'Retry');
+const dependencies = ['/admin/tenant-cas','/admin/pki/operations','/admin/pki/paths','/admin/pki/trust-refusals','/admin/transport-trust-anchors','/admin/interception-intermediate','/admin/tenant-device-authority?readiness=1','/admin/tenant-transport-authority','/admin/tenant-interception-authority','/admin/transport-name-rename','/admin/interception-authority-rotation'];
+const certificate = {id:'synthetic-node', role:'node', subject:'CN=fixture.example', not_after:'2027-01-01T00:00:00Z', sha256:'synthetic-fingerprint', active:true};
+const textOf = node => [node.textContent || '', ...(node.children || []).map(textOf)].join(' ');
+const buttonsOf = node => [...(node.tag === 'button' ? [node] : []), ...(node.children || []).flatMap(buttonsOf)];
+function inventoryFixture(language='en') {
+  const f=fixture(null,language); f.host=f.c.el('div'); f.states=[];
+  Object.defineProperty(f.host,'innerHTML',{set(){this.children=[]}});
+  f.c.freshRender=()=>()=>true;
+  f.c.uiState=(h,kind,message,action)=>{h.innerHTML='';f.states.push({kind,message,action})};
+  f.c.loadCertMap=f.c.originalLoadCertMap;
+  f.c.apiFetch=async(method,path,body,plane)=>{
+    f.calls.push({method,path,plane});
+    if(path===f.failedPath)return {ok:false,status:f.status || 403,body:{error:'internal detail'}};
+    if(path==='/admin/pki/certificates') {
+      if(plane===f.failedPlane)return {ok:false,status:403};
+      return {ok:true,body:f.inventory || {items:[certificate],measured_on:plane || 'edge'}};
+    }
+    return {ok:true,body:{has_authority:false,tenant_cas:[],paths:[],refusals:[],anchors:[]}};
+  };
+  f.failedPlane='neither'; return f;
+}
+for(const path of dependencies)for(const status of [403,503])test(`inventory remains readable when ${path} returns ${status}`,async()=>{
+  const f=inventoryFixture();f.failedPath=path;f.status=status;
+  await f.c.loadCertMap(f.host);
+  assert.match(textOf(f.host),/fixture.example/);assert.match(textOf(f.host),/2027-01-01/);
+  assert.match(textOf(f.host),/synthetic-fingerprint/);assert.match(textOf(f.host),/Changes are unavailable/);
+  assert.doesNotMatch(textOf(f.host),/internal detail/);
+  assert.deepEqual(buttonsOf(f.host).map(b=>b.textContent),['Retry']);
+  assert.ok(f.calls.every(c=>c.method==='GET'));
+});
+test('partial inventory distinguishes an unreadable node from an empty node (Japanese)',async()=>{
+  const f=inventoryFixture('ja');f.failedPath=dependencies[0];f.failedPlane='control';f.inventory={items:[]};
+  await f.c.loadCertMap(f.host);
+  assert.match(textOf(f.host),/一覧は空/);assert.match(textOf(f.host),/状態は不明/);
+  assert.equal(buttonsOf(f.host)[0].textContent,'再試行');
+});
+test('same responding node is shown only once',async()=>{
+ const f=inventoryFixture();f.failedPath=dependencies[0];f.inventory={items:[certificate],measured_on:'same-node'};
+ await f.c.loadCertMap(f.host);assert.equal(textOf(f.host).split('fixture.example').length-1,1);
+});
+test('retry recovers the full map after missing information becomes readable',async()=>{
+ const f=inventoryFixture();f.failedPath=dependencies[0];
+ await f.c.loadCertMap(f.host);const retry=buttonsOf(f.host)[0];
+ f.failedPath=null;f.inventory={items:[]};f.c.pkiDeploymentAct=()=>true;
+ await retry.onClick();assert.doesNotMatch(textOf(f.host),/Changes are unavailable|synthetic-fingerprint/);
+ assert.equal(f.states.at(-1).kind,'loading');assert.equal(buttonsOf(f.host).length,0);
+});
+test('missing or malformed certificate lists are never accepted as empty inventory',async()=>{
+ for(const body of [{},{items:{}},{items:[null]}]) {
+  const f=inventoryFixture();f.inventory=body;
+  await f.c.loadCertMap(f.host);assert.equal(f.states.at(-1).kind,'error');
+  assert.match(f.states.at(-1).message,/Invalid certificate list/);
+ }
+});
+test('certificate read denial does not assert that delegation is the only cause',async()=>{
+ const f=inventoryFixture();f.failedPath='/admin/pki/certificates';
+ await f.c.loadCertMap(f.host);assert.equal(f.states.at(-1).kind,'error');
+ assert.match(f.states.at(-1).message,/read permissions/);
 });

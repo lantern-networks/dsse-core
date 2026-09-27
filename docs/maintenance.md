@@ -660,6 +660,9 @@ Device admission responses now include the authenticated tenant and the effectiv
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
 
+### Incoming exception edits and audit attribution
+
+Partial incoming-exception updates preserve omitted restrictions and reject null or unknown fields. Storage failures keep the previous confirmed policy; successful changes and failures are attributed to the target tenant, including operator actions. Existing export checks continue to reject unsupported conditions instead of silently widening access.
 ### Cross-region revocation delivery
 
 Pending revocation deliveries preserve peer changes in shared storage and resume after control-plane promotion. Peer acceptance and durable queue cleanup are reported separately; an old delivery acknowledgement cannot erase a newer request for the same identity. Snapshot loading rejects unreadable state instead of silently treating it as an empty queue. Existing outbox entries retain startup compatibility.

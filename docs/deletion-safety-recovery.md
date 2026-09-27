@@ -7,7 +7,7 @@ orders after its existing signature, tenant-existence and self-tenant checks;
 it does not use a separate, non-authoritative Edge hold store.
 
 The additional process/term gate described below is enabled only when an operator
-has explicitly installed a version 3 legal-hold snapshot. Existing version 3
+has explicitly installed a version 3 legal-hold snapshot and restarted all CP readers/writers. Quiesce deletion before installing it; it is not a live toggle. An unreadable protection snapshot prevents startup rather than silently disabling an existing gate. Existing version 3
 snapshots retain their gate; they are never silently downgraded. In this mode,
 pruning and erasure pause after every restart/leader change, including a new
 process reading that snapshot. There is no Console authorization action.

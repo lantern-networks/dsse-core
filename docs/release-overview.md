@@ -101,3 +101,7 @@ exercise before being treated as proven; [Operations](operations.md) currently c
 preparation rather than a certified restore runbook.
 
 Report vulnerabilities privately as described in [SECURITY.md](../SECURITY.md).
+
+## Hold and archive upgrade requirement
+
+Stop all old hold/retention writers, including standby CPs, and upgrade them together before erasing tenant data with this version. Do not mix old and new writers. Erasure migrates hold storage to version 2; old binaries can misread it as an empty hold list. Rollback is prohibited until a coordinated maintenance procedure has verified compatible protection state, preserved every current hold and resolved every erasure marker. See [tenant erasure recovery](tenant-erasure-recovery.md) and [archive preflight](archive-recovery.md). Existing retention snapshots containing whitespace stream keys or days beyond 106751 require offline correction with all policy writers and deletion workers stopped; retain a backup and verify the intended protection before restart.

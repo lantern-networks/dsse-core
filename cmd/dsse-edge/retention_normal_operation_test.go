@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,19 +37,56 @@ func TestPostgresRetentionBacklogMakesBoundedProgress(t *testing.T) {
 			cfg.archive = arc
 		}
 		now := time.Now()
-		for _, want := range []int{1001, 1, 0} {
-			if archived {
-				archiveThenPruneStream(context.Background(), p.db, cfg, "tenant", "access", now.Add(-24*time.Hour), now)
-			} else {
-				deleteHotStreamOlderThan(context.Background(), p.db, cfg, "tenant", "access", now.Add(-24*time.Hour), now)
-			}
-			var n int
-			if err := p.db.QueryRow(`SELECT count(*) FROM hot_events`).Scan(&n); err != nil || n != want {
-				t.Fatalf("archive=%v remaining=%d want=%d err=%v", archived, n, want, err)
-			}
+
+		// A statement trigger rejects any transaction deleting more than one batch.
+		if _, err := p.db.Exec(`CREATE FUNCTION enforce_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF (SELECT count(*) FROM deleted_rows)>1000 THEN RAISE EXCEPTION 'oversized retention batch'; END IF; RETURN NULL; END $$; CREATE TRIGGER bounded_delete AFTER DELETE ON hot_events REFERENCING OLD TABLE AS deleted_rows FOR EACH STATEMENT EXECUTE FUNCTION enforce_batch()`); err != nil {
+			t.Fatal(err)
 		}
+		if archived {
+			archiveThenPruneStream(context.Background(), p.db, cfg, "tenant", "access", now.Add(-24*time.Hour), now)
+		} else {
+			deleteHotStreamOlderThan(context.Background(), p.db, cfg, "tenant", "access", now.Add(-24*time.Hour), now)
+		}
+		var n int
+		if err := p.db.QueryRow(`SELECT count(*) FROM hot_events`).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("archive=%v remaining=%d err=%v", archived, n, err)
+		}
+		if _, err := p.db.Exec(`DROP TRIGGER bounded_delete ON hot_events; DROP FUNCTION enforce_batch()`); err != nil {
+			t.Fatal(err)
+		}
+
 		if archived && len(arc.objs) != 3 {
 			t.Fatalf("archive segments=%d", len(arc.objs))
+		}
+	}
+}
+
+func TestPostgresRetentionBatchPlans(t *testing.T) {
+	p, _, _ := blobWriterPostgresFixture(t)
+	_, err := p.db.Exec(`CREATE TABLE hot_events(tenant_id text,stream text,event_id text,received_at timestamptz,payload bytea); CREATE INDEX hot_events_retention_idx ON hot_events(tenant_id,stream,received_at,event_id); INSERT INTO hot_events SELECT 'tenant','access',n::text,now()-interval '10 days',convert_to('{}','UTF8') FROM generate_series(1,100000) n; ANALYZE hot_events`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ sql, want string }{
+		{`SELECT event_id,payload FROM hot_events WHERE tenant_id='tenant' AND stream='access' AND received_at<now()-interval '1 day' ORDER BY received_at,event_id LIMIT 1000 FOR UPDATE`, "hot_events_retention_idx"},
+		{`DELETE FROM hot_events WHERE ctid=ANY(ARRAY(SELECT ctid FROM hot_events WHERE tenant_id='tenant' AND stream='access' AND received_at<now()-interval '1 day' LIMIT 1000))`, "Tid Scan"},
+	} {
+		rows, err := p.db.Query("EXPLAIN " + tc.sql)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := ""
+		for rows.Next() {
+			var line string
+			if err := rows.Scan(&line); err != nil {
+				t.Fatal(err)
+			}
+			plan += line + "\n"
+		}
+		rows.Close()
+		t.Log(plan)
+		if !strings.Contains(plan, tc.want) {
+			t.Fatal(fmt.Sprintf("expected %s", tc.want))
 		}
 	}
 }

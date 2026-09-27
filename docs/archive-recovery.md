@@ -121,7 +121,14 @@ new chain namespace only after reviewing its empty baseline and documenting how
 readers retain access to the preserved legacy history. This is an offline storage
 migration, not an automatic conversion or permission to delete old objects.
 
-Pruning and archiving process at most 1000 rows per stream per sweep. Subsequent
-sweeps continue the backlog, rechecking current protection each time. A failed
+Pruning and archiving process at most 1000 rows per transaction and repeat batches
+for up to two minutes per stream per sweep. Each batch rechecks protection. Subsequent sweeps continue any remaining backlog. A failed
 batch retains its hot rows. The request budget still bounds SQL and object I/O;
 a persistently slow storage service requires operational repair.
+
+There is no configurable archive prefix. A new archive namespace therefore means
+a separately configured bucket and a separately backed-up, reviewed empty chain
+state for that bucket, with all old writers stopped. Keep the old bucket and its
+chain state together for verification; never reset the live old chain in place.
+Non-audit retries in later sweeps may produce duplicate objects because the key
+also includes the sweep timestamp. Consumers must deduplicate by event identity.

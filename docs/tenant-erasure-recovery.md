@@ -138,3 +138,10 @@ is not covered by the file-erasure worker.
 A timed-out file worker may still hold the CP writer connection until its OS call
 returns. Loss of that SQL session can change leadership; it does not prove file
 deletion stopped. Inspect worker termination before offline recovery.
+
+Known delivery ordering limitation: the CP currently records a signed fleet erasure
+order after its first hold check but before acquiring the erasure marker. A later
+marker refusal does not withdraw an already recorded order. Edge delivery does
+not re-evaluate CP protection. Quiesce hold changes and reconcile unconfirmed
+protection before issuing fleet erasure; the per-store marker does not make order
+publication and protection acquisition atomic.

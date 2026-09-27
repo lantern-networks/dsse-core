@@ -45,7 +45,11 @@ func configureExistingDeletionSafety(h *legalHoldStore, r *retentionOverrideStor
 	}
 	h.mu.RLock()
 	explicit := h.snapshotVersion >= 3
+	loadErr := h.loadErr
 	h.mu.RUnlock()
+	if loadErr != nil {
+		return fmt.Errorf("load deletion protection before startup: %w", loadErr)
+	}
 	if !explicit {
 		return nil
 	}

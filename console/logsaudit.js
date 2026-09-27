@@ -654,7 +654,7 @@ async function laLegalHold(host) {
   host.appendChild(el("p", { class: "ui-view-desc", text: pending ? bl({ en: "Hold save unconfirmed. Logs are protected only in this process; restart or another node may lose this protection. Retry saving.", ja: "ホールドの保存は未確認です。このプロセス内のみログを保護します。再起動や別ノードでは保護されない場合があります。保存を再試行してください。" }) : bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));
   const btn = el("button", { class: "ui-btn ui-btn-sm " + (held ? "ui-btn-danger" : "") });
   btn.textContent = pending ? bl({ en: "Retry hold save", ja: "ホールド保存を再試行" }) : held ? bl({ en: "Release hold", ja: "ホールド解除" }) : bl({ en: "Place legal hold", ja: "リーガルホールドを設定" });
-  host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(pending ? bl({ en: "Save unconfirmed", ja: "保存未確認" }) : held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
+  host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(pending ? bl({ en: "Save unconfirmed", ja: "保存未確認" }) : held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), pending ? "warn" : held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
   btn.addEventListener("click", async () => {
     const ok = await uiConfirm({ title: held ? bl({ en: "Release the legal hold?", ja: "リーガルホールドを解除?" }) : bl({ en: "Place a legal hold?", ja: "リーガルホールドを設定?" }), body: held ? bl({ en: "Retention resumes — aged logs expire / tier to cold again per policy.", ja: "保持が再開し、古いログはポリシーに従い失効/cold 階層化されます。" }) : bl({ en: "ALL logs for this tenant will be preserved (no deletion, no tiering) until released.", ja: "このテナントの全ログが解除まで保持（削除も階層化もしない）されます。" }), confirmLabel: held ? bl({ en: "Release", ja: "解除" }) : bl({ en: "Place hold", ja: "設定" }), danger: !held });
     if (!ok || !current() || btn.disabled) return;
@@ -685,7 +685,7 @@ function laLogs(section) {
   if (laCanReadDeploymentAudit()) {
     const scope = uiField({ name: "audit_scope", label: bl({ en: "Audit scope", ja: "監査の範囲" }), type: "select", value: _laAuditScope,
       options: [{ value: "tenant", label: bl({ en: "Current organization", ja: "現在の組織" }) },
-                { value: "deployment", label: bl({ en: "Deployment operations", ja: "配備全体の操作" }) }] });
+                { value: "deployment", label: bl({ en: "Agent distribution catalog records", ja: "エージェント配布カタログの記録" }) }] });
     scope.el.style.marginBottom = "0";
     scope.el.querySelector("select").addEventListener("change", () => {
       _laAuditScope = scope.get(); _laFilters = {};

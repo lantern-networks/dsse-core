@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"os"
 	"os/exec"
@@ -307,5 +308,13 @@ func TestDeletionSafetyConfigurationAndFormat(t *testing.T) {
 		if _, err := decodeHoldSnapshot([]byte(raw), true); err == nil {
 			t.Fatal("accepted invalid permit", raw)
 		}
+	}
+}
+
+func TestDeletionSafetyStartupDoesNotIgnoreFailedLoad(t *testing.T) {
+	h := newLegalHoldStore(nil)
+	h.loadErr = fmt.Errorf("fixture load failed")
+	if configureExistingDeletionSafety(h, newRetentionOverrideStore(nil), true) == nil {
+		t.Fatal("unknown saved protection silently downgraded")
 	}
 }

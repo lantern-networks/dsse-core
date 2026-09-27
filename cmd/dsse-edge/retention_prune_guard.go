@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -150,13 +151,23 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 const retentionPruneBatchSize = 1000
 
 func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, table, where, tenant, stream string, cutoff, now time.Time) {
+	sweep, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	for sweep.Err() == nil {
+		if deleteRetentionBatch(sweep, db, cfg, table, where, tenant, stream, cutoff, now) < retentionPruneBatchSize {
+			return
+		}
+	}
+}
+
+func deleteRetentionBatch(ctx context.Context, db *sql.DB, cfg retentionConfig, table, where, tenant, stream string, cutoff, now time.Time) int64 {
 	ctx = retentionWriteContext(ctx)
 	ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
 	defer cancel()
 	unlock, err := lockPrunePolicy(ctx, cfg)
 	if err != nil {
 		logPruneFailure(table, err)
-		return
+		return 0
 	}
 	defer unlock()
 	budget := newCPStatementBudget(ctx)
@@ -164,35 +175,37 @@ func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, t
 	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, db, nil)
 	if err != nil {
 		logPruneFailure(table, err)
-		return
+		return 0
 	}
 	defer finish()
 	defer tx.Rollback()
 	cutoff, allowed, err := checkedPruneCutoffWithBudget(budget, tx, cfg, tenant, stream, cutoff, now)
 	if err != nil {
 		logPruneFailure(table, err)
-		return
+		return 0
 	}
 	if !allowed {
-		return
+		return 0
 	}
 	args := []any{tenant, cutoff}
 	if stream != "" {
 		args = append(args, stream)
 	}
-	result, err := budget.exec(tx, "DELETE FROM "+table+" WHERE ctid IN (SELECT ctid FROM "+table+" WHERE tenant_id=$1 AND "+where+" LIMIT 1000)", args...)
+	result, err := budget.exec(tx, "DELETE FROM "+table+" WHERE ctid = ANY (ARRAY(SELECT ctid FROM "+table+" WHERE tenant_id=$1 AND "+where+" LIMIT "+strconv.Itoa(retentionPruneBatchSize)+"))", args...)
 	if err != nil {
 		logPruneFailure(table, err)
-		return
+		return 0
 	}
 	if err = budget.commit(tx); err != nil {
 		logPruneFailure(table, err)
-		return
+		return 0
 	}
 	adoptPrunePolicy(cfg)
 	if n, _ := result.RowsAffected(); n > 0 {
 		logPruneDeleted(table, tenant, n, cutoff)
 	}
+	n, _ := result.RowsAffected()
+	return n
 }
 
 // Called under policy locks only after the initializing transaction commits.

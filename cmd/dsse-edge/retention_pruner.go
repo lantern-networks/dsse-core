@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -168,6 +169,16 @@ func logPruneDeleted(table, tenant string, n int64, cutoff time.Time) {
 }
 
 func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
+	sweep, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	for sweep.Err() == nil {
+		if archiveRetentionBatch(sweep, db, cfg, tenant, stream, cutoff, now) < retentionPruneBatchSize {
+			return
+		}
+	}
+}
+
+func archiveRetentionBatch(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) int {
 	ctx = retentionWriteContext(ctx)
 	// Share one request budget across SQL and object-store work. PostgreSQL
 	// expires data statements before the later client fallback can discard the
@@ -180,7 +191,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	unlockPolicy, err := lockPrunePolicy(archiveCtx, cfg)
 	if err != nil {
 		log.Printf("cold-archive policy wait: %v", err)
-		return
+		return 0
 	}
 	defer unlockPolicy()
 	chained := stream == "audit" && cfg.auditChain != nil
@@ -188,14 +199,14 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	if chained {
 		if err := cfg.auditChain.operationMu.LockContext(archiveCtx); err != nil {
 			log.Printf("cold-archive chain wait: %v", err)
-			return
+			return 0
 		}
 		defer cfg.auditChain.operationMu.Unlock()
 		var err error
 		shared, err = cfg.auditChain.beginSharedArchive(budget, db)
 		if err != nil {
 			log.Printf("cold-archive shared state: %v", err)
-			return
+			return 0
 		}
 		if shared != nil {
 			defer shared.close()
@@ -205,7 +216,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		}
 		if err := cfg.auditChain.Health(); err != nil {
 			log.Printf("cold-archive paused: %v", err)
-			return
+			return 0
 		}
 	}
 	var tx *sql.Tx
@@ -220,21 +231,21 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	}
 	if err != nil {
 		log.Printf("cold-archive begin: %v", err)
-		return
+		return 0
 	}
 	defer tx.Rollback()
 	cutoff, allowed, err := checkedPruneCutoffWithBudget(budget, tx, cfg, tenant, stream, cutoff, now)
 	if err != nil {
 		logPruneFailure("hot_events", err)
-		return
+		return 0
 	}
 	if !allowed {
-		return
+		return 0
 	}
-	rows, err := budget.query(tx, "SELECT event_id, payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at, event_id LIMIT 1000 FOR UPDATE", tenant, stream, cutoff)
+	rows, err := budget.query(tx, "SELECT event_id, payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at, event_id LIMIT "+strconv.Itoa(retentionPruneBatchSize)+" FOR UPDATE", tenant, stream, cutoff)
 	if err != nil {
 		log.Printf("cold-archive: read %s/%s: %v", tenant, stream, err)
-		return
+		return 0
 	}
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -247,7 +258,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		if err != nil {
 			rows.Close()
 			log.Printf("cold-archive chain: %v", err)
-			return
+			return 0
 		}
 		gz.Write(auditChainHeaderLine(chainSeq, prev))
 	}
@@ -259,7 +270,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		if err := rows.Scan(&eventID, &payload); err != nil {
 			rows.Close()
 			log.Printf("cold-archive scan: %v", err)
-			return
+			return 0
 		}
 		eventIDs = append(eventIDs, eventID)
 		gz.Write(bytes.TrimRight(payload, "\n"))
@@ -270,14 +281,14 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	closeErr := rows.Close()
 	if rowErr != nil || closeErr != nil {
 		log.Printf("cold-archive read incomplete: %v / %v", rowErr, closeErr)
-		return
+		return 0
 	}
 	if n == 0 {
-		return
+		return 0
 	}
 	if err := gz.Close(); err != nil {
 		log.Printf("cold-archive: gzip %s/%s: %v", tenant, stream, err)
-		return
+		return 0
 	}
 	// Consult the external archive only after the locked policy and hot-row
 	// selection establish that there is work to archive. Protected or empty
@@ -288,11 +299,11 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		objects, err := cfg.archive.List(archiveCtx, "hot_events/"+tenant+"/audit/", 0)
 		if err != nil {
 			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
-			return
+			return 0
 		}
 		if len(objects) != chainSeq {
 			log.Printf("cold-archive paused tenant=%q: archive count mismatch expected=%d actual=%d; reconcile archive objects and saved chain state", tenant, chainSeq, len(objects))
-			return
+			return 0
 		}
 	}
 	// Sequence and content hash prevent a delete retry from overwriting an earlier segment.
@@ -303,37 +314,37 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	}
 	if _, err := cfg.archive.Put(archiveCtx, key, bytes.NewReader(buf.Bytes()), int64(buf.Len()), opts); err != nil {
 		log.Printf("cold-archive: put %s FAILED — leaving %d row(s) in place for retry: %v", key, n, err)
-		return
+		return 0
 	}
 	if shared != nil {
 		shared.objectWritten = true
 	}
 	if err := archiveCtx.Err(); err != nil {
 		log.Printf("cold-archive: object written but request canceled; hot rows retained: %v", err)
-		return
+		return 0
 	}
 	// Advance the tamper-evident chain only AFTER the segment is durably written (its hash = the object bytes).
 	if chained {
 		if err := cfg.auditChain.Commit(tenant, chainSeq, hashObjectBytes(buf.Bytes())); err != nil {
 			log.Printf("cold-archive: %s retained in hot after state failure: %v", key, err)
-			return
+			return 0
 		}
 	}
 	if shared != nil {
 		if err := shared.stage(budget, cfg.auditChain.per); err != nil {
 			log.Printf("cold-archive: head update failed; hot rows retained: %v", err)
-			return
+			return 0
 		}
 	}
 	// Archived successfully → now safe to delete exactly this stream's aged rows.
 	res, err := budget.exec(tx, "DELETE FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND event_id = ANY($3)", tenant, stream, pq.Array(eventIDs))
 	if err != nil {
 		log.Printf("cold-archive: archived %s but delete failed; hot rows retained, reconcile before retry: %v", key, err)
-		return
+		return 0
 	}
 	if err := budget.commit(tx); err != nil {
 		log.Printf("cold-archive: archived %s but delete commit failed: %v", key, err)
-		return
+		return 0
 	}
 	adoptPrunePolicy(cfg)
 	if shared != nil {
@@ -345,6 +356,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		worm = fmt.Sprintf(" worm_until=%s", opts.RetainUntil.UTC().Format(time.RFC3339))
 	}
 	log.Printf("cold-archive: tiered %d row(s) %s/%s to %s (deleted %d from hot)%s", n, tenant, stream, key, deleted, worm)
+	return n
 }
 
 // pruneOlderThan deletes rows whose timeCol is < cutoff, optionally filtered by extraWhere. Best-effort:

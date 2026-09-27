@@ -663,6 +663,13 @@ Device admission reads require the active CP when leader election is enabled; ma
 ### Incoming exception edits and audit attribution
 
 Partial incoming-exception updates preserve omitted restrictions and reject null or unknown fields. Storage failures keep the previous confirmed policy; successful changes and failures are attributed to the target tenant, including operator actions. Existing export checks continue to reject unsupported conditions instead of silently widening access.
+### Cross-region revocation delivery
+
+Pending revocation deliveries preserve peer changes in shared storage and resume after control-plane promotion. Peer acceptance and durable queue cleanup are reported separately; an old delivery acknowledgement cannot erase a newer request for the same identity. Snapshot loading rejects unreadable state instead of silently treating it as an empty queue. Existing outbox entries retain startup compatibility.
+
+Revocation-mesh upgrades require all shared-outbox writers to move together; old writers replace the entire row and can lose peer updates. Existing file-backed queues still wait for election and resume on promotion. Peer URLs must be valid HTTP(S) base URLs without userinfo, query or fragment. An uncertain shared commit requires process recovery; retries for unreachable peers remain bounded and may need another promotion or restart.
+
+File-backed mesh pending entries are resent only when the node holding that file becomes leader again. Unconfirmed enqueue intent can still be lost on a term change, and synchronous queue writes can delay session closure on a slow database; these are unresolved delivery limitations, not guaranteed atomic admission/outbox delivery.
 
 ### Device and user risk persistence
 

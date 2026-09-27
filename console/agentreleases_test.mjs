@@ -378,3 +378,12 @@ for(const key of ['session','authority','token','selection','detached','deployme
  wait.resolve();await task;assert.equal(f.host.children.length,0);assert.equal(f.c.window._arLastPublished,undefined);
 });
 test('verified group hints and failures have distinct Japanese text',()=>{const f=fixture();f.c.bl=x=>x.ja;assert.match(f.c.arDeviceGroupsReadError(),/確認できません/);f.c.openAgentWavesForm({},schedule(),[]);assert.ok(f.nodes.some(n=>String(n.text).includes('取得した登録端末の一覧にはグループ所属がありません')))});
+
+for (const tenant of ['own','']) test('bearer or tenantless operator uses server deployment scope: '+tenant,async()=>{
+ const f=readFixture();f.c.answeringForTheDeployment=()=>false;
+ f.setAPI(async(m,p)=>{if(p==='/admin/agent-updates'){const r=catalogueResponse('deployment');r.body.request_tenant_id=tenant;return r}if(p==='/admin/agent-update-sign-floor')return floorResponse('deployment');const r=f.responses(p);if(p.startsWith('/admin/agent-rollout')||p==='/admin/enrolled-devices')r.body.tenant_id=tenant;return r});
+ await f.c.renderAgentReleaseList(f.host);
+ assert.ok(f.requests.some(r=>r[1]==='/admin/agent-update-sign-floor?expected_tenant_id=deployment'));
+ assert.ok(f.requests.some(r=>r[1]==='/admin/agent-rollout?expected_tenant_id='+tenant));
+ assert.equal(f.c.window._arCanSign,true);
+});

@@ -73,6 +73,9 @@ func TestAConnectorProgramWhoseBytesAreNotTheOnesDeclaredIsRefused(t *testing.T)
 	if derr != nil {
 		t.Fatal(derr)
 	}
+	if _, err := os.Stat(refusedDir); !os.IsNotExist(err) {
+		t.Fatal("rejected upload created a target directory")
+	}
 	if _, err := os.Stat(filepath.Join(refusedDir, connectorProgramBytesName)); err == nil {
 		t.Fatalf("a refused publish stored its bytes anyway")
 	}

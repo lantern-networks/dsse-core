@@ -88,6 +88,16 @@ func TestAgentReleaseReadsShareVerifiedPublicationScope(t *testing.T) {
 							t.Fatal("wrong signing floor", b)
 						}
 					} else {
+						wantTenant := tc.header
+						if wantTenant == "" {
+							wantTenant = "tenant_lab_001"
+							if tc.role == "other" {
+								wantTenant = "tenant_other"
+							}
+						}
+						if b["request_tenant_id"] != wantTenant {
+							t.Fatalf("request tenant=%v want %s", b["request_tenant_id"], wantTenant)
+						}
 						if b["schema_version"] != "admin_agent_updates.v1" {
 							t.Fatal("catalogue schema", b)
 						}

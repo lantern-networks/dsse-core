@@ -877,6 +877,7 @@ func (s *localAdminCredentialStore) authorityForPrincipal(ctx context.Context, p
 
 // Refresh a shared login record before validation, without retrying a mutation.
 // Retain local failed-login/replay restrictions when an earlier save failed.
+// A peer reset does not clear that uncertainty; a confirmed local save does.
 func (s *localAdminCredentialStore) refreshLoginCredentialLocked(email string) error {
 	p, ok := s.persistence.(interface {
 		LoadCredential(context.Context, string) (*localAdminCredential, error)
@@ -894,6 +895,7 @@ func (s *localAdminCredentialStore) refreshLoginCredentialLocked(email string) e
 	old := s.byEmail[key]
 	if next == nil {
 		delete(s.byEmail, key)
+		delete(s.pendingLoginRestriction, key)
 		s.publishAuthorityLocked()
 		return nil
 	}

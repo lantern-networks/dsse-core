@@ -571,6 +571,13 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 			if transportTrust == nil {
 				return
 			}
+			if config.TransportTrustSharedStore != nil && cpLeaderElectorInstance != nil && !cpLeaderElectorInstance.IsLeader() {
+				if err := transportTrust.RefreshShared(); err != nil {
+					log.Printf("standby transport trust refresh failed: %v", err)
+				}
+				return
+			}
+
 			// Ask, for each organization that is mid-rotation, whether its devices have arrived — this is the
 			// step that turns evidence into a closed overlap, and it must happen BEFORE the anchors are read.
 			for _, org := range transportTenantCertificates.TenantsWithPendingAuthority() {
@@ -654,6 +661,12 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 					"devices that adopt by serial will keep the previous answer", aerr)
 			} else if moved {
 				servePEMs, serveSerial = transportTrust.Current()
+			}
+
+			if d := config.TenantTrustDistributor; d != nil {
+				if err := d.refreshPublication(); err != nil {
+					log.Printf("tenant trust publication refresh failed: %v", err)
+				}
 			}
 
 		}

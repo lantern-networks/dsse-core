@@ -186,3 +186,24 @@ func TestCertificateCommitFailureRestoresBothFiles(t *testing.T) {
 		})
 	}
 }
+
+func TestCertificateReplacementWithoutRemoteHistory(t *testing.T) {
+	cp, kp, _, _ := rotationRecoveryFiles(t)
+	cert, key := rotationRecoveryPair(t, 2)
+	mux := http.NewServeMux()
+	registerCertsAdminRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h }, serverConfig{}, testEvaluator(), nil)
+	body, _ := json.Marshal(certVersionSnapshot{CertPEM: cert, KeyPEM: key})
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, httptest.NewRequest("PUT", "/admin/certs/node", bytes.NewReader(body)))
+	if w.Code != http.StatusOK {
+		t.Fatalf("standalone replacement status %d", w.Code)
+	}
+	pair, err := tls.LoadX509KeyPair(cp, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(pair.Certificate[0])
+	if leaf.SerialNumber.Int64() != 2 {
+		t.Fatal("replacement was not persisted")
+	}
+}

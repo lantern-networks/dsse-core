@@ -152,8 +152,8 @@ func TestInternalCAHTTPPersistenceAuditAndTenantBoundary(t *testing.T) {
 	h = newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, InternalCAs: unavailable})
 	call("GET", "/admin/internal-cas", "", "admin", 503)
 	section := internalCABundleSection(unavailable)
-	if section == nil || section.Complete {
-		t.Fatal("unavailable store published complete empty list")
+	if section != nil {
+		t.Fatal("unprovisioned optional store blocked configuration distribution")
 	}
 	sourced := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, InternalCAs: s, ConfigSourceURL: "https://source.invalid"})
 	h = sourced

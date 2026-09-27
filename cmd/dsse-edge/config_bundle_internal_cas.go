@@ -47,7 +47,9 @@ func internalCABundleSection(store organizationInternalCAPool) *internalCABundle
 		return nil
 	}
 	if concrete.Availability() != nil {
-		return &internalCABundle{Complete: false}
+		// An unprovisioned optional feature has no authoritative section.
+		// Do not block unrelated configuration or clear the Edge's existing trust.
+		return nil
 	}
 	return &internalCABundle{Authorities: concrete.ListAll(time.Now().UTC()), Complete: true}
 }

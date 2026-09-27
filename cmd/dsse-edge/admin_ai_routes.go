@@ -23,6 +23,9 @@ import (
 
 func registerAIOpsRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, policyStore policy.RuntimeStore, decisionStore *accessdecision.Store, adminHotStore hotstore.Store) {
 	mux.HandleFunc("GET /admin/ai-usage-report", adminEndpoint("admin.ai.read", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// AI Security Visibility: identify known generative-AI service usage from access logs,
 		// classify (approved|tolerated|prohibited via the SaaS catalog / built-in defaults), and report.
 		// tenant isolation: the access log is shared storage; the report MUST be scoped to the
@@ -53,6 +56,7 @@ func registerAIOpsRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Han
 				return
 			}
 			report := buildAIUsageReportFromInputs(aiUsageInputsFromGroups(grouped.Groups), catalog, now.Format(time.RFC3339))
+			report.TenantID = tenantID
 			report.Window = aiUsageWindow{Requested: requested, From: from.Format(time.RFC3339), To: to.Format(time.RFC3339)}
 			// tenant isolation on this path rests on the bound tenant_id in the statement's WHERE, where
 			// the row-loading path below ALSO re-filters in Go (accessRowsForTenant). The asymmetry is deliberate
@@ -97,6 +101,7 @@ func registerAIOpsRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			return
 		}
 		report := buildAIUsageReport(accessRowsForTenant(rows, tenantID), catalog, now.Format(time.RFC3339))
+		report.TenantID = tenantID
 		report.Window = aiUsageWindow{Requested: requested, From: from.Format(time.RFC3339), To: to.Format(time.RFC3339)}
 		// Truncated means the cap, not the window, decided where the data starts. Report the coverage actually
 		// achieved: a report that is silently three days when it says seven is the defect this replaces.

@@ -116,6 +116,9 @@ func (s *transportTrustStore) mutateSharedLocked(ctx context.Context, edit func(
 				return nil, err
 			}
 		}
+		if bytes.Equal(raw, memory.raw) {
+			return raw, nil
+		}
 		return mergeTransportTrustState(raw, accepted)
 	})
 	if err != nil {

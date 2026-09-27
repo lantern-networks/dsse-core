@@ -8,6 +8,7 @@ package main
 // parameters.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -49,10 +50,17 @@ func adminLogReadScope(w http.ResponseWriter, r *http.Request) (string, bool) {
 }
 
 func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, adminHotStore hotstore.Store, decisionStore *accessdecision.Store, coldArchive archive.ColdArchive, legalHold *legalHoldStore, retentionOverride *retentionOverrideStore) {
-	// ClickHouse expiry is controlled by its table schema. The PostgreSQL
-	// pruner cannot enforce these settings on the store serving these logs.
+	// Advertise retention only when the running worker can enforce it on the
+	// configured hot store, including migrated insertion receipts.
 	unsupportedRetention := func(w http.ResponseWriter) bool {
 		if _, clickhouse := adminHotStore.(*hotstore.ClickHouseStore); clickhouse {
+			if retentionOverride != nil && retentionOverride.clickhouse != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+				defer cancel()
+				if err := retentionOverride.clickhouse.ready(ctx); err == nil {
+					return false
+				}
+			}
 			writeError(w, http.StatusNotImplemented, fmt.Errorf("log retention and legal hold are not enforced for ClickHouse; stored settings do not protect its logs. Check the ClickHouse table expiry configuration"))
 			return true
 		}

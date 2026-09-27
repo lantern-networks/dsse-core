@@ -21,6 +21,7 @@ import (
 // means "keep that stream forever" (never prune). A stream with no override falls back to the flag default.
 
 type retentionOverrideStore struct {
+	clickhouse         *clickhouseRetentionLifecycle // wired once before serving requests
 	writeMu            cpWriterMutex
 	pendingVersion     map[string]uint64
 	nextPendingVersion uint64

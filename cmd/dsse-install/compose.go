@@ -1099,7 +1099,7 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
         until mc alias set local http://dsse-archive:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
           sleep 2
         done
-        mc mb --ignore-existing "local/$$DSSE_ARCHIVE_BUCKET"
+        mc mb --with-lock --ignore-existing "local/$$DSSE_ARCHIVE_BUCKET"
         mc version enable "local/$$DSSE_ARCHIVE_BUCKET"
         if [ -z "$$DSSE_ARCHIVE_PEER_ENDPOINT" ]; then
           echo "cold archive: no peer configured, so this region's record converges nowhere."
@@ -1109,7 +1109,7 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
           exit 0
         fi
         mc alias set peer "$$DSSE_ARCHIVE_PEER_ENDPOINT" "$${DSSE_ARCHIVE_PEER_USER:-$$MINIO_ROOT_USER}" "$${DSSE_ARCHIVE_PEER_PASSWORD:-$$MINIO_ROOT_PASSWORD}"
-        mc mb --ignore-existing "peer/$$DSSE_ARCHIVE_BUCKET"
+        mc mb --with-lock --ignore-existing "peer/$$DSSE_ARCHIVE_BUCKET"
         mc version enable "peer/$$DSSE_ARCHIVE_BUCKET"
         # ★ IDEMPOTENT. This runs on every start; a rule that already exists must not become a second rule.
         if mc replicate ls "local/$$DSSE_ARCHIVE_BUCKET" 2>/dev/null | grep -q "$$DSSE_ARCHIVE_PEER_ENDPOINT"; then

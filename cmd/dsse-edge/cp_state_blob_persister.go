@@ -113,6 +113,9 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	}
 	defer finish()
 	defer tx.Rollback()
+	if err := guardClickhouseRetentionPolicy(budget, tx, p.key); err != nil {
+		return err
+	}
 	inserted, err := budget.exec(tx, `INSERT INTO cp_state_blobs (store_key,payload,updated_at) VALUES ($1,'{}',now()) ON CONFLICT (store_key) DO NOTHING`, p.key)
 	if err != nil {
 		return err

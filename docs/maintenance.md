@@ -8,15 +8,15 @@ The target is the week of September 28–October 4, 2026, subject to the release
 below. This is a planning target, not an availability commitment. If it moves, this
 page will record the remaining blockers and revised outlook.
 
-## Log retention blocker
+## Log retention
 
-The standard ClickHouse deployment does not enforce Console retention overrides or
-legal holds, and the PostgreSQL archive worker does not archive its rows. These
-controls now report that limitation. New schemas preserve logs without automatic
-expiry; existing volumes require the [schema correction](audit-and-data.md#clickhouse-retention-limitation-and-upgrade).
-That correction prevents the old independent TTL deletion but does not implement
-ClickHouse archival or hold-aware retention. Completing that data lifecycle and
-checking storage capacity remain release work.
+The ClickHouse retention worker now archives and verifies expired raw events before
+removing them, honors saved retention periods and legal holds, and resumes interrupted
+batches from PostgreSQL. Existing volumes require the
+[schema upgrade](audit-and-data.md#clickhouse-retention-limitation-and-upgrade).
+Aggregate rollups remain preserved; their capacity and the cold archive's lifecycle
+remain deployment responsibilities. Multi-region and long-duration release checks
+are still outstanding.
 
 ## What is being maintained
 
@@ -59,7 +59,8 @@ written to the file, so an export capped by its row limit is marked as truncated
 An interrupted database response fails the export instead of treating a partial
 response as complete. Real ClickHouse checks covered capped and filtered exports
 and tenant isolation; export-worker tests checked the resulting job status.
-This does not complete ClickHouse archival or hold-aware retention.
+For large exports, narrow the time range where possible: counting all matches can
+scan more records than the output limit.
 
 Reapplying a carried node plan reuses valid existing certificates without requiring
 the issuing CA private key. Invalid or mismatched material is rejected before the

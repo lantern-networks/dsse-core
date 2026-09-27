@@ -57,11 +57,14 @@ func TestTheGeneratedControlPlaneNamesEveryStoreItMustShare(t *testing.T) {
 		"agent-updates-store":                 "the releases this deployment publishes",
 		"agent-rollout-store":                 "what each organization is told to run",
 		"steer-exclusion-store":               "the apps an operator excluded from steering",
+		"audit-chain-store":                   "the archive chain sequence across CP restarts",
+		"legal-hold-store":                    "tenant preservation across CP restarts",
+		"retention-override-store":            "saved retention settings across CP restarts",
 		"first-party-store":                   "first-party administrator accounts",
 		"seat-allocation-store":               "how many devices each organization may enrol",
 	}
 	for flag, why := range mustShare {
-		if !strings.Contains(cp, "-"+flag+"=postgres") {
+		if !strings.Contains(cp, "-"+flag+"=postgres") && !strings.Contains(cp, "-"+flag+"=\"postgres+") {
 			t.Errorf("the generated control plane does not set -%s=postgres — %s would live on whichever node "+
 				"served the write, and the Console reads whichever node answers", flag, why)
 		}

@@ -6,28 +6,63 @@ See [Operations](operations.md) for state and backup preparation.
 
 ## ClickHouse retention limitation and upgrade
 
-The standard deployment stores logs in ClickHouse. Console retention overrides and
-legal holds are implemented by the PostgreSQL retention worker and **do not govern
-ClickHouse tables**. The ClickHouse configuration now rejects these controls instead
-of reporting that an unenforced setting protects the logs. Reading and exporting
-logs remain available. Cold-archive verification checks existing objects; an empty
-archive does not establish that logs were archived.
+The standard deployment stores logs in ClickHouse. The control-plane retention worker
+now applies the saved per-stream periods and tenant legal holds to the raw event
+store. Expired rows are copied to the configured archive, read back and compared,
+then deleted by immutable insertion receipts. The existing audit-chain verification
+API checks the archived audit segments. A saved zero-day override keeps a stream in
+hot storage indefinitely; a legal hold preserves the tenant's hot rows until released.
 
-New installations preserve events and rollups without automatic TTL deletion until
-ClickHouse archival and hold enforcement are implemented. This increases storage
-usage over time; monitor capacity and plan a data lifecycle before production use.
+New archive buckets are created with object locking enabled, as required by the
+default audit retention period. Existing non-locking buckets are not converted by
+`mc mb --ignore-existing`. Before enabling archival, provision a compatible locking
+bucket and migrate/verify any existing archive history; preserve original objects
+and chain state. Do not disable audit object retention to hide a write failure.
+See [MinIO object locking](https://min.io/docs/minio/windows/administration/object-management/object-retention.html).
 
-Existing volumes keep their old schema when containers or the installer are updated.
-Before relying on preservation, inspect `SHOW CREATE TABLE dsse.events` and
-`SHOW CREATE TABLE dsse.events_rollup_5m` using the deployment's authenticated
-ClickHouse connection. Earlier standard schemas expire events after 30 days and
-rollups after 400 days, independently of Console settings. For each table that still
-has that TTL, apply the corresponding statement in
-[`deploy/clickhouse-preserve-logs.sql`](../deploy/clickhouse-preserve-logs.sql), then
-check the schema again. Adapt database/table names for a customized deployment.
-Do not run `REMOVE TTL` on a table with no TTL; ClickHouse rejects it. These changes
-preserve remaining records; they cannot recover records already deleted. Other
-external cleanup jobs are outside these controls.
+A PostgreSQL journal records an admitted batch and its protection fence. Restarted
+workers resume that batch. A hold or retention change during a pending batch returns
+an error instead of falsely reporting protection; retry after completion. An archive
+failure preserves hot data and the pending journal. Repair archive availability and
+let the worker retry; do not delete the journal/fence or regenerate receipt IDs.
+
+The generated CP startup script stores audit-chain state in PostgreSQL and imports
+its former `audit_chain.json` once, together with `legal_holds.json` and
+`retention_overrides.json`. Existing startup scripts need these flags during migration:
+
+```sh
+-audit-chain-store="postgres+import:$DSSE_CP_STATE_DIR/audit_chain.json"
+-legal-hold-store="postgres+import:$DSSE_CP_STATE_DIR/legal_holds.json"
+-retention-override-store="postgres+import:$DSSE_CP_STATE_DIR/retention_overrides.json"
+```
+
+After verifying the shared state, use `postgres` for all three flags. Reconcile any
+conflicting per-node chain histories before starting multiple CPs; the importer
+never overwrites an existing shared history with a local file.
+
+Existing volumes retain their schema when the image is updated. Upgrade all CP
+readers/writers together with retention stopped; do not run mixed versions of this
+worker. Inspect `SHOW CREATE TABLE dsse.events` and `dsse.events_rollup_5m`. For each
+old table with a TTL, apply its statement from
+[`clickhouse-preserve-logs.sql`](../deploy/clickhouse-preserve-logs.sql).
+Do not run `REMOVE TTL` against tables without TTL. External cleanup jobs must also
+be stopped; they are outside the legal-hold controls.
+
+For an events table without `retention_id`, apply
+[`clickhouse-retention-receipts.sql`](../deploy/clickhouse-retention-receipts.sql)
+once and wait for materialization to finish before restarting retention. If the
+column already exists after an interrupted upgrade, inspect `system.mutations` and
+finish the outstanding materialization while workers remain stopped. **Never
+rematerialize existing receipts during normal operation**: pending batches refer to
+those identities. Adapt database/table names for customized installations. The API
+refuses retention operations until the required schema, archive and shared policy
+stores are configured. New installations include this schema.
+
+This worker archives and expires **raw events**. Aggregate rollups remain preserved
+without an independent TTL; cold objects, backups and exported files have their own
+lifecycle. Monitor their capacity separately. Schema corrections cannot recover data
+already deleted. An empty archive or a successful settings save alone does not prove
+that archival has run; inspect a completed batch and verify its archived contents.
 
 ## What the records contain
 
@@ -129,12 +164,11 @@ Generated configuration, runtime overrides, and storage settings can change them
 | `-audit-cold-retention` | 8,760 hours of requested object retention after archival, when configured |
 
 The pruner starts where PostgreSQL is configured and performs work on the control-plane
-leader. Deletion starts paused after every process start or leadership change,
-including first installation. Reconcile unconfirmed protection requests and authorize
-the current process/term using [deletion safety recovery](deletion-safety-recovery.md)
-before pruning or tenant erasure can resume. This restriction prevents a successor
-from losing the previous process's failed hold/indefinite-retention requests; it does
-not pause reads or saving protective settings. Setup failure is logged and startup
+leader. Normal restarts reuse confirmed protection settings. Only installations
+that explicitly enabled version 3 reconciliation mode require process/term
+authorization after restart; see [deletion safety recovery](deletion-safety-recovery.md).
+Before restarting after a failed protective save, reconcile that unconfirmed request;
+process-local pending intent is not a durable saved hold. Setup failure is logged and startup
 can continue without pruning. Hot-event
 retention precedence is **Console override, then per-stream startup override, then global
 default**. Zero keeps that stream indefinitely. Clearing a Console override restores the

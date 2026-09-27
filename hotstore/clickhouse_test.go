@@ -148,7 +148,7 @@ func TestClickHouseStoreIngestIdempotent(t *testing.T) {
 	store := NewClickHouseStore(endpoint, user, pass, "dsse", "events_ckdedup")
 
 	// The dedup window setting is what makes insert_deduplication_token take effect.
-	ddl := `CREATE TABLE IF NOT EXISTS dsse.events_ckdedup (event_id String, tenant_id LowCardinality(String), ts DateTime64(3), stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), application_id String, user_id String, device_id String, destination String, identifier_types Array(String), instance_class LowCardinality(String), rule_id String, raw String) ENGINE = MergeTree PARTITION BY (tenant_id, toYYYYMMDD(ts)) ORDER BY (tenant_id, ts, event_id) SETTINGS non_replicated_deduplication_window = 1000`
+	ddl := `CREATE TABLE IF NOT EXISTS dsse.events_ckdedup (event_id String, retention_id UUID DEFAULT generateUUIDv4(), tenant_id LowCardinality(String), ts DateTime64(3), stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), application_id String, user_id String, device_id String, destination String, identifier_types Array(String), instance_class LowCardinality(String), rule_id String, raw String) ENGINE = MergeTree PARTITION BY (tenant_id, toYYYYMMDD(ts)) ORDER BY (tenant_id, ts, event_id) SETTINGS non_replicated_deduplication_window = 1000`
 	if _, err := store.exec(ctx, ddl, nil); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -167,7 +167,7 @@ func TestClickHouseStoreIngestIdempotent(t *testing.T) {
 		}
 	}
 	// Two keyless records with DISTINCT content must both survive (different destinations → different blocks). A
-	// keyless record falls back to ClickHouse's default block-content-hash dedup, which only collapses byte-identical
+	// keyless record uses a content-derived token, which only collapses byte-identical
 	// re-ships (still replay-safe) — genuinely-distinct events differ in content and are not collapsed.
 	for i, dest := range []string{"a.example", "b.example"} {
 		if err := store.Ingest(ctx, "inspection_events", map[string]any{"tenant_id": "acme", "timestamp": "2026-07-16T03:01:00Z", "finding_type": "dlp_match", "metadata": map[string]any{"dlp_destination": dest}}); err != nil {
@@ -215,7 +215,7 @@ func TestClickHouseStoreIntegration(t *testing.T) {
 	ctx := context.Background()
 	store := NewClickHouseStore(endpoint, user, pass, "dsse", "events_cktest")
 
-	ddl := `CREATE TABLE IF NOT EXISTS dsse.events_cktest (event_id String, tenant_id LowCardinality(String), ts DateTime64(3), stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), application_id String, user_id String, device_id String, destination String, identifier_types Array(String), instance_class LowCardinality(String), rule_id String, raw String) ENGINE = MergeTree PARTITION BY (tenant_id, toYYYYMMDD(ts)) ORDER BY (tenant_id, ts, event_id)`
+	ddl := `CREATE TABLE IF NOT EXISTS dsse.events_cktest (event_id String, retention_id UUID DEFAULT generateUUIDv4(), tenant_id LowCardinality(String), ts DateTime64(3), stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), application_id String, user_id String, device_id String, destination String, identifier_types Array(String), instance_class LowCardinality(String), rule_id String, raw String) ENGINE = MergeTree PARTITION BY (tenant_id, toYYYYMMDD(ts)) ORDER BY (tenant_id, ts, event_id)`
 	if _, err := store.exec(ctx, ddl, nil); err != nil {
 		t.Fatalf("create table: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestClickHouseStoreTrends(t *testing.T) {
 	ctx := context.Background()
 	store := NewClickHouseStore(endpoint, user, pass, "dsse", "events_trendtest")
 
-	base := `CREATE TABLE IF NOT EXISTS dsse.events_trendtest (event_id String, tenant_id LowCardinality(String), ts DateTime64(3), stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), application_id String, user_id String, device_id String, destination String, identifier_types Array(String), instance_class LowCardinality(String), rule_id String, raw String) ENGINE = MergeTree PARTITION BY (tenant_id, toYYYYMMDD(ts)) ORDER BY (tenant_id, ts, event_id)`
+	base := `CREATE TABLE IF NOT EXISTS dsse.events_trendtest (event_id String, retention_id UUID DEFAULT generateUUIDv4(), tenant_id LowCardinality(String), ts DateTime64(3), stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), application_id String, user_id String, device_id String, destination String, identifier_types Array(String), instance_class LowCardinality(String), rule_id String, raw String) ENGINE = MergeTree PARTITION BY (tenant_id, toYYYYMMDD(ts)) ORDER BY (tenant_id, ts, event_id)`
 	rollup := `CREATE TABLE IF NOT EXISTS dsse.events_trendtest_rollup_5m (tenant_id LowCardinality(String), bucket DateTime, stream LowCardinality(String), finding_type LowCardinality(String), action LowCardinality(String), events SimpleAggregateFunction(sum, UInt64), users AggregateFunction(uniq, String), destinations AggregateFunction(uniq, String), devices AggregateFunction(uniq, String)) ENGINE = AggregatingMergeTree PARTITION BY (tenant_id, toYYYYMMDD(bucket)) ORDER BY (tenant_id, bucket, stream, finding_type, action)`
 	mv := `CREATE MATERIALIZED VIEW IF NOT EXISTS dsse.events_trendtest_mv TO dsse.events_trendtest_rollup_5m AS SELECT tenant_id, toStartOfFiveMinutes(ts) AS bucket, stream, finding_type, action, toUInt64(count()) AS events, uniqState(user_id) AS users, uniqState(destination) AS destinations, uniqState(device_id) AS devices FROM dsse.events_trendtest GROUP BY tenant_id, bucket, stream, finding_type, action`
 	for _, ddl := range []string{base, rollup, mv} {

@@ -327,7 +327,9 @@ exec "$DSSE_EDGE_BINARY" -control-plane \
   -hot-store-clickhouse-user=dsse -hot-store-clickhouse-password="$CLICKHOUSE_PASSWORD" \
   -cold-archive-endpoint="$DSSE_ARCHIVE_ENDPOINT" -cold-archive-bucket="$DSSE_ARCHIVE_BUCKET" \
   -cold-archive-access-key="$MINIO_ROOT_USER" -cold-archive-secret-key="$MINIO_ROOT_PASSWORD" \
-  -audit-chain-store="$DSSE_CP_STATE_DIR/audit_chain.json" \
+  -audit-chain-store="postgres+import:$DSSE_CP_STATE_DIR/audit_chain.json" \
+  -legal-hold-store="postgres+import:$DSSE_CP_STATE_DIR/legal_holds.json" \
+  -retention-override-store="postgres+import:$DSSE_CP_STATE_DIR/retention_overrides.json" \
   -audit-ingest-receiver-token="$AUDIT_INGEST_TOKEN" \
   -audit-ingest-client-ca="$here/management-ca.crt" \
   -audit-ingest-authority="$here/audit-ingest-authority.json" \

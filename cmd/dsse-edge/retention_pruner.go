@@ -23,6 +23,7 @@ import (
 // publishing outbox rows are NEVER pruned (only published + dead, which are terminal).
 
 type retentionConfig struct {
+	clickhouse *clickhouseRetentionLifecycle
 	// sweepLimit bounds admission of new batches; an admitted batch keeps its own I/O budget.
 	sweepLimit      time.Duration
 	interval        time.Duration
@@ -119,7 +120,13 @@ func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
 	}
 	now := time.Now()
 	if cfg.hotEvents > 0 || len(cfg.perStream) > 0 || cfg.override != nil {
-		pruneHotEventsPerStream(ctx, db, cfg, now)
+		if cfg.clickhouse != nil {
+			if err := cfg.clickhouse.sweep(ctx, now); err != nil {
+				log.Printf("ClickHouse retention paused: %v", err)
+			}
+		} else {
+			pruneHotEventsPerStream(ctx, db, cfg, now)
+		}
 	}
 	for _, tbl := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		if cfg.outboxPublished > 0 {

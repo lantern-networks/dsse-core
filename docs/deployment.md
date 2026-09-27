@@ -108,6 +108,24 @@ dsse-install -plan "$DSSE_PLAN" -dir "$DSSE_DIR" -order > install-order.txt
 Set `DSSE_DIR` to the founding region's directory if you changed the example region name.
 Review the order and assign the required host permissions before executing it.
 
+### Reapply a plan to an existing machine
+
+To refresh an existing machine's generated configuration, specify that machine:
+
+```sh
+dsse-install -plan "$DSSE_PLAN" -dir "$DSSE_DIR" -machine node-b
+```
+
+A carried node does not hold the consensus-store CA private key. Reapplying its
+plan reuses its existing member certificate and key only when the pair is valid,
+trusted by its store CA, and matches the planned member name and peer address.
+An Edge-only machine does not require store-member material. If a state-bearing
+node needs a new certificate, re-pack that machine on the issuing host and
+replace its material through your maintenance procedure; do not copy the CA
+private key onto it. A certificate preflight failure leaves `deployment.env`
+unchanged. This is not a transaction across every generated file, and generation
+does not restart running services.
+
 ## 4. Mint once and configure name resolution
 
 Run the first printed command **on the founding node**, using your operator organization name:

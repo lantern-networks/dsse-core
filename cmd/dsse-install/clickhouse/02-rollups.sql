@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS dsse.events_rollup_5m
 )
 ENGINE = AggregatingMergeTree
 PARTITION BY (tenant_id, toYYYYMMDD(bucket))
-ORDER BY (tenant_id, bucket, stream, finding_type, action)
-TTL toDateTime(bucket) + INTERVAL 400 DAY DELETE;
+ORDER BY (tenant_id, bucket, stream, finding_type, action);
+-- Preserve rollups too until ClickHouse retention respects holds and archive completion.
 
 CREATE MATERIALIZED VIEW IF NOT EXISTS dsse.events_rollup_5m_mv TO dsse.events_rollup_5m AS
 SELECT

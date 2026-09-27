@@ -23,6 +23,7 @@ package main
 import (
 	"crypto/ecdsa"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -241,4 +242,75 @@ func storeMemberMaterialFor(dir string, values map[string]string, now time.Time,
 		return nil, nil, ierr
 	}
 	return certPEM(c), keyPEM(k), nil
+}
+
+// Reapplying a plan on a carried node must not require the CA private key,
+// which deliberately stays on the issuing host. Reuse only a valid matching pair.
+func storeMemberForPlanApply(dir string, values map[string]string, now time.Time) ([]byte, []byte, error) {
+	if err := validateExistingStoreMember(dir, values, now); err == nil {
+		return nil, nil, nil // Keep the original files and their permissions unchanged.
+	}
+	cert, key, err := storeMemberMaterialFor(dir, values, now, storeMemberYears)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot apply plan with the existing store member certificate; re-pack this machine on the issuing host and install its replacement material before applying the plan: %w", err)
+	}
+	return cert, key, nil
+}
+
+func validateExistingStoreMember(dir string, values map[string]string, now time.Time) error {
+	certPEMBytes, err := os.ReadFile(filepath.Join(dir, storeMemberFile))
+	if err != nil {
+		return err
+	}
+	keyPEMBytes, err := os.ReadFile(filepath.Join(dir, storeMemberKeyFile))
+	if err != nil {
+		return err
+	}
+	pair, err := tls.X509KeyPair(certPEMBytes, keyPEMBytes)
+	if err != nil {
+		return err
+	}
+	cert, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return err
+	}
+	name := strings.TrimSpace(values["DSSE_ETCD_A_NAME"])
+	if name == "" {
+		name = "dsse-store-a"
+	}
+	reachable := strings.TrimSpace(values["DSSE_ETCD_A_PEER_ADVERTISE"])
+	if u, err := url.Parse(reachable); err == nil && u.Hostname() != "" {
+		reachable = u.Hostname()
+	}
+	if reachable == "" {
+		reachable = name
+	}
+	if cert.IsCA || cert.Subject.CommonName != name {
+		return fmt.Errorf("store member identity differs from plan")
+	}
+	for _, want := range storeMemberSANs(reachable, name) {
+		found := false
+		for _, got := range cert.DNSNames {
+			if got == want {
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("store member names differ from plan")
+		}
+	}
+	caBytes, err := os.ReadFile(filepath.Join(dir, storeCAFile))
+	if err != nil {
+		return err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caBytes) {
+		return fmt.Errorf("invalid store CA certificate")
+	}
+	for _, usage := range []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth} {
+		if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, CurrentTime: now, KeyUsages: []x509.ExtKeyUsage{usage}}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

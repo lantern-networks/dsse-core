@@ -150,7 +150,7 @@ function retentionHarness(api) {
 }
 
 test('unavailable retention never masquerades as defaults or offers mutation controls',async()=>{
- for(const response of [{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{overrides_days:null}},{ok:true,body:{overrides_days:{audit:-1}}},new Error('offline')]){
+ for(const response of [{ok:false,status:501,body:{error:'log retention and legal hold are not enforced for ClickHouse'}},{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{overrides_days:null}},{ok:true,body:{overrides_days:{audit:-1}}},new Error('offline')]){
   const h=retentionHarness(async()=>{if(response instanceof Error)throw response;return response;});
   await h.render();assert.equal(h.buttons.length,0);assert.equal(h.states[0][1],'error');assert.equal(typeof h.states[0][3].onClick,'function');
  }

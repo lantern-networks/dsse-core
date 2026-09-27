@@ -49,20 +49,24 @@ func applyPlanTo(plan *Plan, dir string, founding PlanRegion, machine PlanMachin
 	if rerr != nil {
 		return rerr
 	}
-	if werr := os.WriteFile(path, []byte(PlanEnvironmentFor(string(body), values)), 0o600); werr != nil {
-		return werr
-	}
 	// ★ AND THIS MACHINE'S MEMBER MATERIAL, if the deployment's store spans regions. Nothing writes it at
 	// minting time because minting does not know which region this machine is.
-	if cert, key, serr := storeMemberMaterialFor(dir, values, time.Now().UTC(), storeMemberYears); serr != nil {
-		return serr
-	} else if cert != nil {
-		if werr := os.WriteFile(filepath.Join(dir, storeMemberFile), cert, 0o644); werr != nil {
-			return werr
+	if plan.shapeOf(founding, machine).holds.holdsState() {
+		cert, key, serr := storeMemberForPlanApply(dir, values, time.Now().UTC())
+		if serr != nil {
+			return serr
 		}
-		if werr := os.WriteFile(filepath.Join(dir, storeMemberKeyFile), key, 0o600); werr != nil {
-			return werr
+		if cert != nil {
+			if werr := os.WriteFile(filepath.Join(dir, storeMemberFile), cert, 0o644); werr != nil {
+				return werr
+			}
+			if werr := os.WriteFile(filepath.Join(dir, storeMemberKeyFile), key, 0o600); werr != nil {
+				return werr
+			}
 		}
+	}
+	if werr := os.WriteFile(path, []byte(PlanEnvironmentFor(string(body), values)), 0o600); werr != nil {
+		return werr
 	}
 	// ★★★ AND WHAT THIS MACHINE RUNS (2026-08-28, measured by shipping the minted directory to the machine the
 	// plan says it is). The founding install renders the shape it has always rendered — a region that holds

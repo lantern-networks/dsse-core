@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS dsse.events
 ENGINE = MergeTree
 PARTITION BY (tenant_id, edge_region_id, toYYYYMMDD(ts))
 ORDER BY (tenant_id, edge_region_id, ts, event_id)
-TTL toDateTime(ts) + INTERVAL 30 DAY DELETE
+-- Preserve events: the PostgreSQL retention worker does not archive or hold ClickHouse rows.
 -- ★ SINGLE-ROW INSERTS ARE IDEMPOTENT BY TOKEN. The Edge ships records with a retain-and-replay spool, so the
 -- same record arrives more than once whenever the control plane was briefly away. The ingest path sets the
 -- insert deduplication token to stream+event_id; without this window the retries double-count, and a report

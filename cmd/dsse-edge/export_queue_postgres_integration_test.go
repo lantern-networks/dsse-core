@@ -498,7 +498,7 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskE2E(t *testing.T) {
 	}
 }
 
-func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t *testing.T) {
+func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectWorkerAuditJSONLE2E(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
 	if dsn == "" {
 		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
@@ -569,8 +569,10 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 	if err != nil {
 		t.Fatalf("ReadJSONL returned error: %v", err)
 	}
-	if len(auditRows) != 0 {
-		t.Fatalf("audit rows = %#v, want no direct JSONL audit writes", auditRows)
+	// The worker switch covers its own enqueue audits. Middleware still
+	// records the authenticated HTTP operation and mirrors it to the outbox.
+	if len(auditRows) != 1 || auditRows[0]["event_type"] != "admin_config_change" {
+		t.Fatalf("audit rows = %#v, want only the common HTTP audit", auditRows)
 	}
 }
 

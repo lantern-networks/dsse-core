@@ -16,6 +16,11 @@ import (
 // has to travel. This is the whole claim: an order in a SIGNED bundle erases the tenant on the receiving node.
 func TestACarriedErasureOrderErasesTheTenantOnThisNode(t *testing.T) {
 	targets, dir := purgeTargetsForTest(t, "tenant_edge")
+	// An Edge-local guard cannot override the signed authoritative CP order.
+	targets.legalHold = newLegalHoldStore(nil)
+	if err := configureDeletionSafety(targets.legalHold, newRetentionOverrideStore(nil), false); err != nil {
+		t.Fatal(err)
+	}
 	payload := signedPayloadWithPurgeOrder("tenant_gone")
 
 	applyCarriedTenantPurges(context.Background(), targets, payload, "node", time.Now())

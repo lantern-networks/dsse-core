@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"fmt"
 	"log"
 	"sort"
 	"sync"
@@ -24,9 +25,19 @@ type legalHoldRecord struct {
 }
 
 type legalHoldStore struct {
-	mu        sync.RWMutex
-	held      map[string]legalHoldRecord // tenant_id -> record
-	persister blobstore.Persister
+	erasures           map[string]tenantErasureFence
+	snapshotVersion    int
+	deletionPermit     *deletionSafetyPermit
+	deletionGuard      *deletionSafetyGuard
+	writeMu            cpWriterMutex
+	pendingVersion     map[string]uint64
+	nextPendingVersion uint64
+	sharedKnown        bool
+	mu                 sync.RWMutex
+	held               map[string]legalHoldRecord // confirmed tenant_id -> record
+	pending            map[string]bool            // failed hold additions; local only, never snapshot-saved
+	persister          blobstore.Persister
+	loadErr            error
 }
 
 func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
@@ -36,59 +47,97 @@ func newLegalHoldStore(p blobstore.Persister) *legalHoldStore {
 	}
 	data, err := p.Load()
 	if err != nil {
+		s.loadErr = err
 		log.Printf("legal-hold store load: %v", err)
 		return s
 	}
 	if len(data) == 0 {
 		return s
 	}
-	var records []legalHoldRecord
-	if err := json.Unmarshal(data, &records); err != nil {
+	s.sharedKnown = true
+	snapshot, err := decodeHoldSnapshot(data, false)
+	if err != nil {
+		s.loadErr = err
 		log.Printf("legal-hold store parse: %v", err)
 		return s
 	}
-	for _, r := range records {
-		if r.TenantID != "" {
-			s.held[r.TenantID] = r
-		}
-	}
+	s.held, s.erasures, s.snapshotVersion = snapshot.held(), snapshot.Erasures, snapshot.Version
+	s.deletionPermit = snapshot.DeletionPermit
 	if len(s.held) > 0 {
 		log.Printf("legal-hold store loaded: %d tenant(s) under hold", len(s.held))
 	}
 	return s
 }
 
-// IsHeld reports whether a tenant's logs are under legal hold (the retention pruner must skip it).
+// IsHeld is a conservative deletion guard: accepted/pending holds, erasure fences
+// and unavailable state all stop retention. Admin status distinguishes these.
 func (s *legalHoldStore) IsHeld(tenantID string) bool {
+	return s.IsHeldContext(context.Background(), tenantID)
+}
+
+func (s *legalHoldStore) IsHeldContext(ctx context.Context, tenantID string) bool {
 	if s == nil {
 		return false
 	}
+	if err := s.refreshSharedContext(ctx); err != nil {
+		return true
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return true
+	}
 	_, ok := s.held[tenantID]
-	return ok
+	return ok || s.pending[tenantID] || s.erasures[tenantID].ID != ""
 }
 
 // Set places or releases a legal hold on a tenant and persists the change.
-func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) {
-	if s == nil || tenantID == "" {
-		return
+// Caller holds writeMu. Keep confirmed state readable while Save is blocked;
+// only publish a detached candidate after persistence succeeds.
+func (s *legalHoldStore) setLocal(tenantID, heldBy, reason string, active bool, now time.Time) error {
+	s.mu.RLock()
+	if s.loadErr != nil {
+		s.mu.RUnlock()
+		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
 	}
-	s.mu.Lock()
+	if _, busy := s.erasures[tenantID]; busy {
+		s.mu.RUnlock()
+		return errTenantErasureInProgress
+	}
+	candidate := make(map[string]legalHoldRecord, len(s.held)+1)
+	for k, v := range s.held {
+		candidate[k] = v
+	}
+	version := s.pendingVersion[tenantID]
+	fences, snapshotVersion, permit := s.erasures, s.snapshotVersion, s.deletionPermit
+	s.mu.RUnlock()
 	if active {
-		if _, exists := s.held[tenantID]; !exists {
-			s.held[tenantID] = legalHoldRecord{TenantID: tenantID, HeldSince: now.UTC().Format(time.RFC3339), HeldBy: heldBy, Reason: reason}
+		if _, exists := candidate[tenantID]; !exists {
+			candidate[tenantID] = legalHoldRecord{TenantID: tenantID, HeldSince: now.UTC().Format(time.RFC3339), HeldBy: heldBy, Reason: reason}
 		}
 	} else {
-		delete(s.held, tenantID)
+		delete(candidate, tenantID)
 	}
-	s.persistLocked()
+	// writeMu prevents concurrent confirmed policy/erasure mutations.
+	raw, err := encodeHoldSnapshot(candidate, fences, snapshotVersion, permit)
+	if err == nil && s.persister != nil {
+		err = s.persister.Save(raw)
+	}
+	if err != nil {
+		if active {
+			s.rememberPendingHold(tenantID)
+		}
+		return fmt.Errorf("persist legal hold: %w", err)
+	}
+	s.mu.Lock()
+	s.held = candidate
+	if s.pendingVersion[tenantID] == version {
+		delete(s.pending, tenantID)
+		delete(s.pendingVersion, tenantID)
+	}
 	s.mu.Unlock()
-	if active {
-		log.Printf("legal_hold_set tenant=%s held=true by=%q", tenantID, heldBy)
-	} else {
-		log.Printf("legal_hold_set tenant=%s held=false", tenantID)
-	}
+	log.Printf("legal_hold_set tenant=%s held=%t by=%q", tenantID, active, heldBy)
+	return nil
 }
 
 // List returns the current holds, sorted by tenant id.
@@ -106,21 +155,36 @@ func (s *legalHoldStore) List() []legalHoldRecord {
 	return out
 }
 
-func (s *legalHoldStore) persistLocked() {
-	if s.persister == nil {
-		return
+// An unavailable snapshot cannot authorize deletion or be overwritten with partial state.
+func (s *legalHoldStore) Health() error {
+	return s.HealthContext(context.Background())
+}
+
+func (s *legalHoldStore) HealthContext(ctx context.Context) error {
+	if s == nil {
+		return nil
 	}
-	records := make([]legalHoldRecord, 0, len(s.held))
-	for _, r := range s.held {
-		records = append(records, r)
+	if err := s.refreshSharedContext(ctx); err != nil {
+		return err
 	}
-	sort.Slice(records, func(i, j int) bool { return records[i].TenantID < records[j].TenantID })
-	data, err := json.Marshal(records)
-	if err != nil {
-		log.Printf("legal-hold persist marshal: %v", err)
-		return
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.loadErr != nil {
+		return fmt.Errorf("legal hold state is unavailable; restore storage and restart")
 	}
-	if err := s.persister.Save(data); err != nil {
-		log.Printf("legal-hold persist save: %v", err)
+	return nil
+}
+
+func (s *legalHoldStore) Set(tenantID, heldBy, reason string, active bool, now time.Time) error {
+	return s.SetContext(context.Background(), tenantID, heldBy, reason, active, now)
+}
+
+// Pending reports process-local protection whose durable save is unconfirmed.
+func (s *legalHoldStore) Pending(tenant string) bool {
+	if s == nil {
+		return false
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.pending[tenant]
 }

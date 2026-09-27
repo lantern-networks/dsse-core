@@ -123,7 +123,7 @@ func TestPostgresManagedIdentityAndCredentialPurge(t *testing.T) {
 		t.Fatal(err)
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		row := purgeTenantRows(ctx, db, "admin_local_credentials", cred.TenantID)
+		row := purgeTenantRows(ctx, db, "admin_local_credentials", cred.TenantID, nil)
 		if row.Error != "" {
 			t.Fatalf("purge attempt %d: %s", attempt, row.Error)
 		}

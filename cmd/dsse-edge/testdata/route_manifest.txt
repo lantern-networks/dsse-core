@@ -63,6 +63,7 @@ GET /admin/audit-outbox/dead
 GET /admin/audit-outbox/dead/{outbox_id}
 GET /admin/audit-outbox/health
 GET /admin/audit-outbox/stats
+GET /admin/audit-writer/health
 GET /admin/auth/health
 GET /admin/break-glass-token
 GET /admin/catalog-groups

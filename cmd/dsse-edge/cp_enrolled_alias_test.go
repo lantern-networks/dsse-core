@@ -99,7 +99,7 @@ func TestPostgresEnrolledAliasPeerAndAcceptedTerm(t *testing.T) {
 		t.Fatal("response timeout")
 	}
 	after, _ := p.Load()
-	if rec.Code != 500 || !bytes.Equal(before, after) {
+	if rec.Code != http.StatusServiceUnavailable || !bytes.Equal(before, after) {
 		t.Fatalf("stale rename accepted: %d %s", rec.Code, rec.Body)
 	}
 	ep.Alias = "fresh-request"

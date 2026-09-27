@@ -104,7 +104,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		e.TenantID = tenantForWrite
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := store.UpsertEndpoint(e)
+		stored, err := store.UpsertEndpointContext(r.Context(), e)
 		item := stored
 		if err != nil {
 			item = e
@@ -124,10 +124,10 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		ok, err := store.DeleteEndpoint(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteEndpointContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "endpoint", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
-			writeAssetError(w, err, http.StatusInternalServerError) // durability unconfirmed — admin must know
+			writeAssetError(w, err, http.StatusBadRequest) // persistence errors are classified separately
 			return
 		}
 		if !ok {
@@ -164,7 +164,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		g.TenantID = tenantForWrite
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := store.UpsertGroup(g)
+		stored, err := store.UpsertGroupContext(r.Context(), g)
 		item := stored
 		if err != nil {
 			item = g
@@ -191,7 +191,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		ok, err := store.DeleteGroup(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteGroupContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "group", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeAssetError(w, err, http.StatusInternalServerError)
@@ -231,7 +231,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		svc.TenantID = tenantForWrite
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		stored, err := store.UpsertService(svc)
+		stored, err := store.UpsertServiceContext(r.Context(), svc)
 		item := stored
 		if err != nil {
 			item = svc
@@ -251,7 +251,7 @@ func registerAssetCatalogAdmin(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		mutationMu.Lock()
 		defer mutationMu.Unlock()
-		ok, err := store.DeleteService(adminTenantIDFromRequest(r), r.PathValue("id"))
+		ok, err := store.DeleteServiceContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("id"))
 		record(r, "service", r.PathValue("id"), "delete", nil, err, ok)
 		if err != nil {
 			writeAssetError(w, err, http.StatusInternalServerError)

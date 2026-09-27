@@ -80,6 +80,13 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 
+		if result.regionCoverage != nil {
+			w.Header().Set("X-DSSE-Region-Coverage", result.regionCoverage.Status)
+			w.Header().Set("X-DSSE-Region-Notice", "Records without a region are excluded")
+			if result.regionCoverage.UnknownRegionCount != nil {
+				w.Header().Set("X-DSSE-Unknown-Region-Count", fmt.Sprint(*result.regionCoverage.UnknownRegionCount))
+			}
+		}
 		writeAdminPreviewJSONL(w, http.StatusOK, result.rows, result.limit)
 	}))
 	// Legal hold (litigation / e-discovery): freeze retention for the tenant so ALL its logs are preserved.

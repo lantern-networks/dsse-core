@@ -54,6 +54,16 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+Reapplying a carried node plan reuses valid existing certificates without requiring
+the issuing CA private key. Invalid or mismatched material is rejected before the
+node environment is rewritten. Installer verification reports skipped checks
+separately from successful checks.
+
+An explicit **Any destination** rule applies its HTTPS inspection choice while
+preserving tenant and source-device scope. Local single-node checks covered real
+HTTP allow/deny changes, HTTPS inspection/bypass changes, enable/disable/delete,
+traffic after an Edge restart, and associated audit records. These checks do not
+replace the multi-region and real OS acceptance below.
 
 API-token creation and rotation preserve the one-time secret when a pending
 response arrives after closing the form or navigating to another view, provided
@@ -62,17 +72,16 @@ security context suppresses the secret and explains that the operation may have
 completed, with instructions to check and revoke or rotate it. Closing or
 reloading the browser page itself is not covered by this behavior.
 
-Operator elevation requests awaiting approval now show a pending message and do
+Operator elevation requests awaiting approval show a pending message and do
 not retry the original change. The distribution overview distinguishes unreadable
 customers from confirmed empty release lists. Certificate inventory remains
 readable when supporting status requests fail, while actions requiring that
 missing information stay unavailable.
 
 These Console changes have local browser checks using synthetic API responses
-and regression coverage. Representative local administration checks are complete
-for the recorded scope; deployed fleet behavior, real OS installers, external
-integrations and the release checks below remain outstanding.
-
+and regression coverage for the interactions described above. Deployed fleet
+behavior, real OS installers, external integrations and the release checks below
+remain outstanding.
 
 Configuration receivers now leave a generation unacknowledged when saving People,
 non-human identities, Sites, or device-CA changes fails. Polling retries the same

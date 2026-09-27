@@ -667,6 +667,9 @@ Device enrolment reports, enrolment-token issuance/revocation, inventory edits a
 Enrolment-report authorization now uses the Edge-to-tenant authority map as well as the verified client identity. Before upgrading a multi-tenant or operator-anchored Edge deployment, configure `-audit-ingest-authority` to cover each enrolling Edge and every tenant it serves. Missing mappings return 403 and keep reports queued; devices absent from CP inventory may lose admission on the next bundle refresh. Without a map, only a certificate resolved to the requested tenant is accepted. Startup warns when the CP report endpoint has no mapping; the warning cannot establish completeness of a configured map.
 
 Inventory/seat reload failure prevents promotion; recover shared storage and restart an inventory process whose initial empty snapshot load failed. Route `/enroll` to the active CP. If token consumption commits but acknowledgement is lost, enrolment may require a new token after checking the existing device record; do not assume an uncertain response means the token was unused.
+### Incoming exception edits and audit attribution
+
+Partial incoming-exception updates preserve omitted restrictions and reject null or unknown fields. Storage failures keep the previous confirmed policy; successful changes and failures are attributed to the target tenant, including operator actions. Existing export checks continue to reject unsupported conditions instead of silently widening access.
 ### Cross-region revocation delivery
 
 Pending revocation deliveries preserve peer changes in shared storage and resume after control-plane promotion. Peer acceptance and durable queue cleanup are reported separately; an old delivery acknowledgement cannot erase a newer request for the same identity. Snapshot loading rejects unreadable state instead of silently treating it as an empty queue. Existing outbox entries retain startup compatibility.

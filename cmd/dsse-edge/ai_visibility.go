@@ -200,6 +200,8 @@ type aiUsageCoverage struct {
 type aiUsageReport struct {
 	SchemaVersion string `json:"schema_version"`
 	GeneratedAt   string `json:"generated_at"`
+	// Set by the handler from the authenticated context, never from log input.
+	TenantID string `json:"tenant_id"`
 	// Window / Coverage are set by the handler after aggregation (this file's builder is pure over rows and has
 	// no knowledge of the query that selected them). Zero on a report built directly in a test.
 	Window             aiUsageWindow          `json:"window"`

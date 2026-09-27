@@ -321,10 +321,8 @@ func (s *ClickHouseStore) IngestBatch(ctx context.Context, records []IngestRecor
 			// the stream names and the count — and the next batch with the same shape produces the SAME token,
 			// which ClickHouse then drops as a replay. Silently, and in the mirror an operator reads.
 			//
-			// The single-row path already gets this right and says why: "a record with no event_id gets no
-			// token, so it falls back to ClickHouse's default block-content-hash dedup" — a byte-identical
-			// re-ship still collapses, and genuinely distinct events differ in content and are kept. The batch
-			// path is held to the same rule: one keyless record and the whole batch relies on content.
+			// Keyless batches use a content token computed before ClickHouse generates
+			// random retention receipts. Replaying identical input still deduplicates.
 			keyless = true
 		}
 		sum.Write([]byte(record.Stream + "\x00" + eventID + "\x00"))
@@ -339,6 +337,9 @@ func (s *ClickHouseStore) IngestBatch(ctx context.Context, records []IngestRecor
 	}
 	if !keyless {
 		settings["insert_deduplication_token"] = "batch:" + hex.EncodeToString(sum.Sum(nil))[:32]
+	} else {
+		content := sha256.Sum256([]byte(body.String()))
+		settings["insert_deduplication_token"] = "content:" + hex.EncodeToString(content[:])
 	}
 	_, err := s.execWithSettings(ctx, body.String(), nil, settings)
 	return err
@@ -354,10 +355,8 @@ func (s *ClickHouseStore) IngestAt(ctx context.Context, stream string, row map[s
 	// "replay after recovery does not duplicate". Each single-row INSERT carries an insert_deduplication_token
 	// keyed like the Postgres hot store's PK (stream + event_id); ClickHouse drops a re-insert whose token it has
 	// seen within the table's non_replicated_deduplication_window — no duplicate row is ever stored, and queries
-	// need no FINAL. A record with no event_id gets no token, so it falls back to ClickHouse's default
-	// block-content-hash dedup: a byte-identical re-ship still collapses (replay-safe), while genuinely-distinct
-	// events differ in content and are kept. In the target design every event carries a ULID, so the keyless path
-	// is only a safety fallback.
+	// need no FINAL. Keyless records use a content hash before the server generates
+	// the random retention receipt; distinct payloads retain distinct tokens.
 	// ★ ASYNC INSERT, BECAUSE ONE ROW PER INSERT IS THE ONE THING CLICKHOUSE CANNOT TAKE (2026-08-12, measured
 	// on the reference lab).
 	//
@@ -388,6 +387,9 @@ func (s *ClickHouseStore) IngestAt(ctx context.Context, stream string, row map[s
 	}
 	if token := insertDedupToken(stream, eventID); token != "" {
 		settings["insert_deduplication_token"] = token
+	} else {
+		content := sha256.Sum256(payload)
+		settings["insert_deduplication_token"] = "content:" + hex.EncodeToString(content[:])
 	}
 	_, err = s.execWithSettings(ctx, "INSERT INTO "+s.qualified()+" FORMAT JSONEachRow\n"+string(payload), nil, settings)
 	return err
@@ -395,8 +397,7 @@ func (s *ClickHouseStore) IngestAt(ctx context.Context, stream string, row map[s
 
 // insertDedupToken builds the ClickHouse insert-deduplication token for a record — scoped to (stream, event_id) so
 // it mirrors the Postgres hot store's (tenant, stream, event_id) idempotency key (tenant is already the partition
-// key). Empty when event_id is absent, so keyless records fall back to a plain insert instead of all collapsing to
-// one. The 0x1f unit separator cannot appear in either field.
+// key). Empty when event_id is absent; the caller then hashes the payload. The 0x1f unit separator cannot appear in either field.
 func insertDedupToken(stream, eventID string) string {
 	if strings.TrimSpace(eventID) == "" {
 		return ""

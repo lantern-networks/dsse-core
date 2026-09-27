@@ -3014,12 +3014,17 @@ func main() {
 			outboxPublished: *outboxPublishedRetention, outboxDead: *outboxDeadRetention,
 			archive: coldArchive, auditColdRetain: *auditColdRetention,
 			perStream: parseRetentionOverrides(*hotEventsRetentionOverrides), legalHold: legalHold, auditChain: auditChain, override: retentionOverride}
+		if hot, ok := adminHotStore.(*hotstore.ClickHouseStore); ok {
+			lifecycle := &clickhouseRetentionLifecycle{db: cpStateBlobDB, hot: hot, cfg: rcfg}
+			rcfg.clickhouse = lifecycle
+		}
 		if rcfg.enabled() {
 			closePruner, perr := startRetentionPruner(context.Background(), dsn, rcfg)
 			if perr != nil {
 				log.Printf("retention pruner setup failed (continuing without it): %v", perr)
 			} else {
 				defer closePruner()
+				retentionOverride.clickhouse = rcfg.clickhouse
 			}
 		}
 	}

@@ -398,11 +398,8 @@ func TestAnUnwritableSpoolIsReported(t *testing.T) {
 	}
 }
 
-// ★ A TOKEN OVER NOTHING IS A TOKEN TWO DIFFERENT BATCHES SHARE (2026-08-13). The batch token hashes
-// (stream, event_id) pairs, so records with no event id make it a function of the stream names and the count:
-// the next batch of the same shape gets the SAME token and ClickHouse drops it as a replay. The single-row
-// path already omits the token in that case and says why; this holds the batch path to the same rule.
-func TestABatchWithNoEventIDsCarriesNoDeduplicationToken(t *testing.T) {
+// Random server retention receipts must not change keyless retry identity.
+func TestKeylessBatchContentTokensPreserveDistinctRecordsAndRetries(t *testing.T) {
 	var got []map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := map[string]string{}
@@ -416,8 +413,8 @@ func TestABatchWithNoEventIDsCarriesNoDeduplicationToken(t *testing.T) {
 	store := NewClickHouseStore(srv.URL, "dsse", "events", "", "")
 
 	// Two DIFFERENT batches, same shape, no event ids: distinguishable only by content.
-	first := []IngestRecord{{Stream: "audit_logs", Row: map[string]any{"msg": "one"}}}
-	second := []IngestRecord{{Stream: "audit_logs", Row: map[string]any{"msg": "two"}}}
+	first := []IngestRecord{{Stream: "audit_logs", Row: map[string]any{"msg": "one"}, ReceivedAt: time.Unix(1700000000, 0)}}
+	second := []IngestRecord{{Stream: "audit_logs", Row: map[string]any{"msg": "two"}, ReceivedAt: time.Unix(1700000000, 0)}}
 	if err := store.IngestBatch(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
@@ -425,14 +422,15 @@ func TestABatchWithNoEventIDsCarriesNoDeduplicationToken(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("expected two inserts, saw %d", len(got))
+	if err := store.IngestBatch(context.Background(), first); err != nil {
+		t.Fatal(err)
 	}
-	for i, q := range got {
-		if tok, ok := q["insert_deduplication_token"]; ok {
-			t.Fatalf("insert %d carried a token (%q) although its records have no event id — the next batch of "+
-				"the same shape would hash identically and be dropped as a replay", i, tok)
-		}
+	if len(got) != 3 {
+		t.Fatalf("expected three inserts, saw %d", len(got))
+	}
+	token := func(i int) string { return got[i]["insert_deduplication_token"] }
+	if token(0) == "" || token(0) == token(1) || token(0) != token(2) {
+		t.Fatal("content tokens must distinguish different events and preserve retry identity")
 	}
 }
 

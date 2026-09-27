@@ -669,3 +669,5 @@ Risk backend upgrades must explicitly reconcile every CP onto the same reviewed 
 ### Regional log searches and exports
 
 Regional searches and export previews report whether the number of excluded records without region attribution is known. Downloaded regional exports carry the same limitation in gzip metadata; an unavailable count is never reported as zero. The count is a separate live query, not an export snapshot. Export jobs return detached metadata and check cancellation before the final object is committed, including small exports.
+
+Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.

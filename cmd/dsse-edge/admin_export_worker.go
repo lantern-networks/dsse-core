@@ -1740,9 +1740,7 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 				writeError(w, http.StatusServiceUnavailable, errDownloadStoreUnavailable)
 				return
 			}
-			status := http.StatusBadRequest
-			if errors.Is(err, errDownloadNotLeader) { status = http.StatusConflict } else if errors.Is(err, errDownloadStoreUnavailable) { status = http.StatusServiceUnavailable }
-			writeError(w, status, err)
+			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDownloadAuditLog("admin_export_url_issued", token, evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())

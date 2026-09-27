@@ -690,6 +690,8 @@ Regional searches and export previews report whether the number of excluded reco
 
 Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.
 
+Certificate administration now confirms shared saves before reporting success and retains the request leadership term through trust withdrawal. Startup recovers an interrupted certificate/key pair installation. Internal-CA updates invalidate outbound TLS transports using the certificate material itself; incomplete CA sections retain the previous trust configuration and are retried. Inspection-posture edits refresh the shared authority before changing controls and record results without destination lists. Manual key-health checks do not count as scheduled slow-signing intervals. These changes do not replace the release deployment and rotation acceptance checks.
+
 ### Steering exclusions and boundary administration
 
 Steering exclusions now keep saved state on failed writes, attribute audit and version history to the target organization, and validate tenant/schema on CP feeds before replacing an Edge cache. VLAN edits preserve unrelated records and distinguish rejected input from unconfirmed storage; auditors remain read-only. East-west and SaaS restriction reads report unavailable shared storage instead of presenting stale authority. Candidate publication errors retain retryable storage failures. Update CP before Edges that require the validated exclusion feed.

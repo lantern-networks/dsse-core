@@ -1,10 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -35,9 +37,9 @@ type organizationInternalCAPool interface {
 	Revision(tenantID string) uint64
 }
 
-// perOrganizationUpstreamTransports caches one transport per (base, organization, revision-of-that
-// organization's list). Keying on the revision is what makes an authority pasted in the Console take effect on
-// the next request instead of the next restart, and a deleted one stop being trusted immediately.
+// perOrganizationUpstreamTransports caches the exact material snapshot used to build the pool.
+// Reading a revision separately can associate old material with a newer revision after a concurrent
+// deletion. Material identity also separates stores whose local revision counters happen to match.
 var perOrganizationUpstreamTransports sync.Map
 
 // upstreamTransportTrustingTheOrganizationsPrivateAssets returns base unchanged when the organization vouches
@@ -53,7 +55,7 @@ func upstreamTransportTrustingTheOrganizationsPrivateAssets(base http.RoundTripp
 	if len(pem) == 0 {
 		return base
 	}
-	cacheKey := fmt.Sprintf("%p|%s|%d", base, tenantID, anchors.Revision(tenantID))
+	cacheKey := fmt.Sprintf("%p|%s|%x", base, tenantID, sha256.Sum256([]byte(strings.Join(pem, "\x00"))))
 	if cached, ok := perOrganizationUpstreamTransports.Load(cacheKey); ok {
 		return cached.(http.RoundTripper)
 	}

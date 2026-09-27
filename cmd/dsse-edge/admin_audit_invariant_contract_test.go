@@ -16,6 +16,8 @@ import (
 	"github.com/lantern-networks/dsse-core/assetcatalog"
 	endpointinventory "github.com/lantern-networks/dsse-core/endpointinventory"
 	humanidentity "github.com/lantern-networks/dsse-core/humanidentity"
+	"github.com/lantern-networks/dsse-core/inspectionposture"
+	"github.com/lantern-networks/dsse-core/internalca"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
 	"github.com/lantern-networks/dsse-core/policyrule"
 	toolcallaudit "github.com/lantern-networks/dsse-core/toolcallaudit"
@@ -58,6 +60,11 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 		name  string
 		audit model.AuditLog
 	}{
+		{
+			name:  "inspectionPostureAuditLog",
+			audit: inspectionPostureAuditLog(httptest.NewRequest("POST", "/admin/inspection-posture", nil), inspectionposture.Posture{}, inspectionposture.Posture{Mode: "bypass_default", DecryptAllowlistHosts: []string{rawDestination}}, "success", evaluator, now),
+		},
+		{name: "internalAuthorityAuditLog", audit: internalAuthorityAuditLog(httptest.NewRequest("POST", "/admin/internal-cas", nil), internalca.Authority{ID: auditID, TenantID: "tenant_audit_cp0020", CertificatePEM: rawMetadataValue}, "upsert", "success", evaluator, now)},
 		{
 			name:  "adminIdPChangeAuditLog",
 			audit: adminIdPChangeAuditLog(httptest.NewRequest("POST", "/admin/idp-connections", nil), "tenant_audit_cp0020", auditID, "upserted", evaluator, now),
@@ -618,6 +625,8 @@ func mustAuditEmitterFunctionNames(t *testing.T) []string {
 
 func coveredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
+		"inspectionPostureAuditLog":          true,
+		"internalAuthorityAuditLog":          true,
 		"adminHumanApprovalMutationAuditLog": true,
 		"adminAccessGrantRevocationAuditLog": true,
 		"adminAgentToolAuditLog":             true,

@@ -38,7 +38,7 @@ func TestInternalCAInvalidSnapshotRemainsRetryable(t *testing.T) {
 	}
 }
 
-func TestIncompleteInternalCAKeepsLocalWithoutRejectingBundle(t *testing.T) {
+func TestIncompleteInternalCAKeepsLocalAndRequestsRetry(t *testing.T) {
 	s, err := internalca.NewStore(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -49,8 +49,8 @@ func TestIncompleteInternalCAKeepsLocalWithoutRejectingBundle(t *testing.T) {
 	}
 	generation := s.ConfigGeneration()
 	src := configBundleSource{}
-	if _, err = src.apply(configBundlePayload{InternalCAs: &internalCABundle{Complete: false}}, configApplyTargets{internalCAs: s}); err != nil {
-		t.Fatal(err)
+	if _, err = src.apply(configBundlePayload{InternalCAs: &internalCABundle{Complete: false}}, configApplyTargets{internalCAs: s}); err == nil {
+		t.Fatal("incomplete authority must remain retryable")
 	}
 	if s.ConfigGeneration() != generation || len(s.AnchorsPEM("t", time.Now())) != 1 {
 		t.Fatal("incomplete snapshot changed local trust")

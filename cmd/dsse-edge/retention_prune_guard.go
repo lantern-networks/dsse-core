@@ -147,6 +147,8 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 
 // Both delete-only hot pruning and terminal-outbox cleanup share the term
 // fence and hold lock. Outbox retention uses its own TTL, not hot overrides.
+const retentionPruneBatchSize = 1000
+
 func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, table, where, tenant, stream string, cutoff, now time.Time) {
 	ctx = retentionWriteContext(ctx)
 	ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
@@ -178,7 +180,7 @@ func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, t
 	if stream != "" {
 		args = append(args, stream)
 	}
-	result, err := budget.exec(tx, "DELETE FROM "+table+" WHERE tenant_id=$1 AND "+where, args...)
+	result, err := budget.exec(tx, "DELETE FROM "+table+" WHERE ctid IN (SELECT ctid FROM "+table+" WHERE tenant_id=$1 AND "+where+" LIMIT 1000)", args...)
 	if err != nil {
 		logPruneFailure(table, err)
 		return

@@ -1,10 +1,22 @@
-# Deletion after restart or leadership change
+# Explicit deletion reconciliation mode
 
-Retention pruning and tenant erasure start paused after **every process start
-or control-plane leadership change**, including the first installation. Reads
-and saving protective settings remain available. This prevents an unsuccessful
-hold or indefinite-retention request, retained only in the previous process,
-from being forgotten when a successor starts deleting logs.
+Normal installations use confirmed holds, retention policies and durable erasure
+markers on each deletion transaction. They do not require manual authorization
+after a normal restart or leader change. Edge applies authenticated CP erasure
+orders after its existing signature, tenant-existence and self-tenant checks;
+it does not use a separate, non-authoritative Edge hold store.
+
+The additional process/term gate described below is enabled only when an operator
+has explicitly installed a version 3 legal-hold snapshot. Existing version 3
+snapshots retain their gate; they are never silently downgraded. In this mode,
+pruning and erasure pause after every restart/leader change, including a new
+process reading that snapshot. There is no Console authorization action.
+
+A failed protective save is unconfirmed. Pending requests protect data in the
+current process, but default mode cannot reconstruct an intent that never reached
+storage after that process exits. Before restarting after such a failure, stop
+destructive workers, reconcile the failed requests and verify the saved policy.
+Do not treat a failed save as a durable fleet-wide hold.
 
 The `legal_hold` snapshot carries a version 3 `deletion_permit` naming one
 process and one leader term. The running process generates a new random identity
@@ -15,7 +27,7 @@ clear this restriction. The permit does not override holds, pending local
 requests, retention settings, or interrupted-erasure markers.
 
 Upgrade **all** readers and writers of this authority before using version 3.
-Earlier readers reject it; do not strip the permit or downgrade its version.
+Earlier readers can treat this object as an empty hold list. Rolling back or mixing old writers is unsafe; do not strip the permit or downgrade its version.
 Ordinary hold changes and erasure-marker changes preserve the permit. A CP using
 PostgreSQL must keep both hold and retention stores on that same shared
 authority. Explicit file overrides on that CP leave deletion paused. Separate
@@ -101,7 +113,7 @@ keep the affected writer isolated and stop the process before attempting offline
 reconciliation. Do not edit its files or start a replacement on the same paths
 while the old process may still write. Confirm that the old process has exited;
 if it cannot be stopped, repair or isolate the underlying storage/host and keep
-deletion paused. After restart, the process/term authorization procedure above
+deletion paused. In explicit version 3 mode, after restart the process/term authorization procedure above
 still applies. Pending intent itself is not reconstructed from the timed-out
 request. File erasure-marker saves and filesystem deletion have separate
 ownership boundaries; this five-second protection-setting response contract

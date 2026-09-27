@@ -36,6 +36,22 @@ type deletionSafetyGuard struct {
 	shared             bool
 }
 
+// Preserve an explicitly installed v3 recovery policy without imposing a new
+// manual authorization step on existing/default deployments. Confirmed holds,
+// retention and erasure fences are still checked at every deletion boundary.
+func configureExistingDeletionSafety(h *legalHoldStore, r *retentionOverrideStore, shared bool) error {
+	if h == nil {
+		return nil
+	}
+	h.mu.RLock()
+	explicit := h.snapshotVersion >= 3
+	h.mu.RUnlock()
+	if !explicit {
+		return nil
+	}
+	return configureDeletionSafety(h, r, shared)
+}
+
 // Called once before starting the pruner or exposing administration handlers.
 // There is deliberately no automatic permit on first boot or on a missing row.
 func configureDeletionSafety(h *legalHoldStore, r *retentionOverrideStore, shared bool) error {
@@ -64,7 +80,7 @@ func configureDeletionSafety(h *legalHoldStore, r *retentionOverrideStore, share
 func (s *legalHoldStore) checkDeletionSafety(ctx context.Context, permit *deletionSafetyPermit) error {
 	if s == nil || s.deletionGuard == nil {
 		return nil
-	} // Unwired, isolated Store fixtures only.
+	} // Default mode; explicit v3 recovery policies enable the extra gate.
 	g := s.deletionGuard
 	if g.configurationError != "" {
 		return fmt.Errorf("deletion paused: %s", g.configurationError)

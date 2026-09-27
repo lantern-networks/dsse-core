@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -230,7 +231,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 	if !allowed {
 		return
 	}
-	rows, err := budget.query(tx, "SELECT event_id, payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at, event_id FOR UPDATE", tenant, stream, cutoff)
+	rows, err := budget.query(tx, "SELECT event_id, payload FROM hot_events WHERE tenant_id = $1 AND stream = $2 AND received_at < $3 ORDER BY received_at, event_id LIMIT 1000 FOR UPDATE", tenant, stream, cutoff)
 	if err != nil {
 		log.Printf("cold-archive: read %s/%s: %v", tenant, stream, err)
 		return
@@ -295,7 +296,7 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 		}
 	}
 	// Sequence and content hash prevent a delete retry from overwriting an earlier segment.
-	key := fmt.Sprintf("hot_events/%s/%s/%s-%020d-%s.ndjson.gz", tenant, stream, now.UTC().Format("2006-01-02T150405"), chainSeq, hashObjectBytes(buf.Bytes()))
+	key := fmt.Sprintf("hot_events/%s/%s/%s-%020d-%s-%s.ndjson.gz", tenant, stream, now.UTC().Format("2006-01-02T150405"), chainSeq, hashObjectBytes(buf.Bytes()), hashArchiveEventIDs(eventIDs))
 	opts := archive.PutOptions{ContentType: "application/gzip"}
 	if stream == "audit" && cfg.auditColdRetain > 0 {
 		opts.RetainUntil = now.Add(cfg.auditColdRetain) // WORM: audit segments are tamper-proof for the retention window
@@ -405,4 +406,10 @@ func parseRetentionOverrides(spec string) map[string]time.Duration {
 		out[stream] = d
 	}
 	return out
+}
+
+// Distinguish equal-content non-audit batches without making retry keys random.
+func hashArchiveEventIDs(ids []string) string {
+	raw, _ := json.Marshal(ids)
+	return hashObjectBytes(raw)
 }

@@ -2991,7 +2991,7 @@ func main() {
 	auditChain := newAuditChainStore(mustCPStateBlobPersister(*auditChainStorePath, "audit_chain"))
 	// Admin-configurable per-stream retention (Console), shared by the pruner (reads it) and the admin API.
 	retentionOverride := newRetentionOverrideStore(mustCPStateBlobPersister(*retentionOverrideStorePath, "retention_override"))
-	if err := configureDeletionSafety(legalHold, retentionOverride, strings.TrimSpace(*postgresDSN) != ""); err != nil {
+	if err := configureExistingDeletionSafety(legalHold, retentionOverride, strings.TrimSpace(*postgresDSN) != ""); err != nil {
 		log.Fatalf("configure deletion safety: %v", err)
 	}
 

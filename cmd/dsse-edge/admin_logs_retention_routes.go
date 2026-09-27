@@ -8,6 +8,7 @@ package main
 // parameters.
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -103,7 +104,11 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 	writeHoldStatus := func(w http.ResponseWriter, r *http.Request) {
 		rows, held, pending, err := legalHold.adminStatus(r.Context(), adminTenantIDFromRequest(r))
 		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, err)
+			status := http.StatusServiceUnavailable
+			if errors.Is(err, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r, rows), "tenant_held": held, "pending_local_hold": pending})
@@ -129,6 +134,10 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			return
 		}
 		if err := legalHold.SetContext(r.Context(), tenantID, adminPrincipalIDFromRequest(r), strings.TrimSpace(req.Reason), req.Active, time.Now()); err != nil {
+			if errors.Is(err, errTenantErasureInProgress) {
+				writeError(w, http.StatusConflict, err)
+				return
+			}
 			logErrorf("legal hold update failed: %v", err)
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("legal hold update could not be saved"))
 			return

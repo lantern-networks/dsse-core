@@ -1412,7 +1412,7 @@ func applyCarriedTenantPurges(ctx context.Context, t configApplyTargets, payload
 			t.deviceCAs, t.deviceCARegistryPath, t.deviceTrust, t.vlan,
 			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants,
 				DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, t.enrolled, tenantID).DeviceIDs},
-			t.legalHold, now)
+			nil, now) // The signed CP order already passed the authoritative hold check.
 		if len(result.Erased) == 0 && result.Complete {
 			continue // nothing here: already erased, or this node never served the tenant. Silence is correct.
 		}

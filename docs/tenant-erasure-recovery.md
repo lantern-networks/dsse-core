@@ -37,14 +37,18 @@ An erasure without a deletion permit uses version 2:
 
 The existing hold array is still readable before migration. Version 2 remains
 version 2 after the last erasure marker is removed. Upgrade every reader/writer
-of that authority before performing erasure. Older array-only readers reject
-version 2; do not convert it back, remove unknown fields, or restore a stale
-snapshot to permit an old binary to run.
+of that authority before performing erasure. Older array-only readers can silently load an empty hold list. Stop all readers
+and writers, including standby CPs, and upgrade them together before the first
+erasure with this version. Do not perform a rolling upgrade with old writers.
+Rollback requires a coordinated maintenance window and a verified compatible
+backup or explicitly reviewed conversion preserving every hold and resolving
+every erasure marker. Never strip fields or restore stale protection state just
+to make an old binary start.
 
-Production deletion now also requires the version 3 process/term permit in
+Only an explicitly configured version 3 snapshot also requires the process/term permit in
 [deletion-safety-recovery.md](deletion-safety-recovery.md). Version 3 remains
 version 3 when erasure markers change. Recovering a marker never renews that
-permit; a restarted process must be reconciled separately before deletion.
+permit; a restarted process in explicit version 3 mode must be reconciled separately before deletion.
 
 ## Offline recovery
 
@@ -95,7 +99,7 @@ WHERE state.store_key = 'legal_hold'
    hashes, operator, reason and resource reconciliation. This is an offline
    maintenance action, not an AdminConsole audit event.
 5. Restart current-version writers and inspect the footprint. If preservation is
-   now required, save and verify a hold before enabling deletion again. Reconcile
+   now required, save and verify a hold before enabling deletion again. For explicit version 3 mode, reconcile
    the new process/term under the deletion-safety procedure before retrying. Otherwise
    retry the existing erasure operation, inspect its partial/full result and
    remaining footprint, and verify fleet delivery markers. Retrying does not
@@ -130,3 +134,7 @@ retry under the recovery procedure above.
 These are caller budgets, not operating-system cancellation guarantees or an
 end-to-end deadline for every store in a purge. The standalone footprint endpoint
 is not covered by the file-erasure worker.
+
+A timed-out file worker may still hold the CP writer connection until its OS call
+returns. Loss of that SQL session can change leadership; it does not prove file
+deletion stopped. Inspect worker termination before offline recovery.

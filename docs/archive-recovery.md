@@ -108,3 +108,20 @@ deletion of records whose commit outcome was uncertain.
 Real object-store permissions, versioning, WORM behavior and recovery across a
 regional outage must be exercised on the deployment. Local adapters cannot
 establish those properties.
+
+## Upgrade preflight
+
+Before enabling this version's archive worker, stop competing archive writers and
+compare each tenant's saved chain with the complete object listing and verified
+compressed hashes. Archives created before hash chaining, or objects whose head
+was not saved by an older writer, need explicit reconciliation before upgrade.
+Do not count legacy objects as verified chain segments or infer a head from their
+number. Preserve legacy archives in a separately inventoried namespace; enable a
+new chain namespace only after reviewing its empty baseline and documenting how
+readers retain access to the preserved legacy history. This is an offline storage
+migration, not an automatic conversion or permission to delete old objects.
+
+Pruning and archiving process at most 1000 rows per stream per sweep. Subsequent
+sweeps continue the backlog, rechecking current protection each time. A failed
+batch retains its hot rows. The request budget still bounds SQL and object I/O;
+a persistently slow storage service requires operational repair.

@@ -250,9 +250,10 @@ type serverConfig struct {
 	// /admin/inspection-posture). SetInspectionPosture persists it and re-applies the engine's intercept + bypass
 	// sets. nil = no interception engine wired (read reports the default posture; write is rejected).
 	InspectionPosture func() inspectionposture.Posture
-	// SetInspectionPosture applies + persists the posture. A non-nil error means the posture IS live in the
-	// engine but was not persisted (it would revert on restart) — handlers surface it to the admin.
-	SetInspectionPosture func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error)
+	// SetInspectionPosture saves before applying; failures retain the previous live state.
+	SetInspectionPosture     func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error)
+	UpdateInspectionPosture  func(context.Context, func(inspectionposture.Posture) (inspectionposture.Posture, error), string) (inspectionposture.Posture, inspectionposture.Posture, error)
+	RefreshInspectionPosture func() error
 	// InspectionPostureGeneration is the posture store's contribution to the config bundle's aggregate
 	// generation. Without it a posture change alters the bundle's contents and not its version, so no Edge
 	// re-pulls — see config_bundle_inspection_posture.go.
@@ -1430,6 +1431,7 @@ func main() {
 	// Log the build identity FIRST. Every other startup line is easier to interpret when the log says which
 	// binary produced it, and an incident starts with "what is running?".
 	log.Printf("starting %s", versionString())
+	recoverConfiguredCertificatePairs([2]string{*mainTLSCert, *mainTLSKey}, [2]string{*transportTLSCert, *transportTLSKey})
 	log.Print(applyCPUHeadroom(*cpuHeadroomCoresFlag))
 	log.Print(setConnectorMTLSPresentationRelaxed(*connectorMTLSNotRequiredFlag, *devMode))
 	applyAIUsageReportFlags()
@@ -2471,6 +2473,7 @@ func main() {
 		log.Printf("migrated %d legacy SaaS Optimize bypass group(s) to authored Egress rules", n)
 	}
 	applyInspectionPosture(pb.TenantID)
+	postureAdmin := newInspectionPostureAdmin(postureStore, applyInspectionPosture)
 	policyStore := policy.NewStore(policies)
 	// Restore Admin-API runtime toggles persisted across restarts before serving, so a restart keeps
 	// tenant-restriction status / east-west config without manual re-apply.
@@ -4364,6 +4367,7 @@ func main() {
 		// fact, and an Edge acts on it. See refreshedRowLocked.
 		tenantTransportAuthorityStoreValue = newTenantTransportAuthorityWithReload(seed, persister.Save,
 			persister.Load, time.Now)
+		tenantTransportAuthorityStoreValue.persistContext = func(ctx context.Context, raw []byte) error { return saveAuthorityContext(ctx, persister, raw) }
 		// What the published agent configuration names as the organization's transport server name. A control
 		// plane serves no organization's certificate itself, so the authority's record is the only source it
 		// has — see agentConfigOrganization.
@@ -4404,6 +4408,7 @@ func main() {
 		// receive the write hands its Edges no interception tier for an organization that has one.
 		tenantInterceptionAuthorityValue = newTenantInterceptionAuthorityWithReload(seed, persister.Save,
 			persister.Load, time.Now)
+		tenantInterceptionAuthorityValue.persistContext = func(ctx context.Context, raw []byte) error { return saveAuthorityContext(ctx, persister, raw) }
 		log.Printf("tenant interception authorities loaded: %d organization(s) have delegated interception to "+
 			"this control plane", len(tenantInterceptionAuthorityValue.Organizations()))
 	}
@@ -4558,13 +4563,10 @@ func main() {
 		InspectionPosture:              func() inspectionposture.Posture { return postureStore.Get() },
 		// So a posture change moves the config bundle's VERSION and not only its contents — without this the
 		// section below would be published in every bundle and applied by nobody.
-		InspectionPostureGeneration: postureStore.ConfigGeneration,
-		SetInspectionPosture: func(p inspectionposture.Posture, tenantID string) (inspectionposture.Posture, error) {
-			updated, err := postureStore.SetReceived(p)
-			// Refresh enforcement from the actual live store, including after a rejected save.
-			applyInspectionPosture(tenantID)
-			return updated, err
-		},
+		InspectionPostureGeneration:  postureStore.ConfigGeneration,
+		SetInspectionPosture:         postureAdmin.set,
+		UpdateInspectionPosture:      postureAdmin.update,
+		RefreshInspectionPosture:     postureAdmin.refresh,
 		AssetStore:                   assetStore,
 		RuleStore:                    ruleStore,
 		TenantModelStore:             tenantModelStore,
@@ -5590,7 +5592,17 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerConnectorReportRoute(mux, registry, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)
 	registerTenantTransportAuthorityAdminRoute(mux, adminEndpoint, config.TenantTransportAuthority)
-	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore, newPKITransitionAdmission(config))
+	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore,
+		func(r *http.Request, tenant, action string, row *storedTenantInterceptionIssuer) {
+			root, _ := summarizeCertificatePEM(row.RootPEM)
+			issuer, _ := summarizeCertificatePEM(row.IssuingCertPEM)
+			entry := pkiMaterialAuditLog(tenant, action, "tenant_interception_authority", tenant,
+				"Interception authority saved; a staged replacement is not yet signing.",
+				map[string]any{"root_sha256": root.SHA256, "issuing_sha256": issuer.SHA256,
+					"staged": action == "interception_authority_staged"},
+				principalIDForAudit(r), sourceIPFromRequest(r), evaluator)
+			_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, entry, time.Now())
+		}, newPKITransitionAdmission(config))
 	registerTenantDeviceAuthorityAdminRoute(mux, adminEndpoint, config.TenantDeviceAuthority,
 		strings.TrimSpace(config.ConfigSourceURL), config.TenantModelStore, newPKITransitionAdmission(config))
 	// ★ And the READS for those two tiers, which did not exist until 2026-08-22: every act had a door and
@@ -6184,7 +6196,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// Run the check, then re-assess so the caller gets the whole page rather than one field they have to
 		// merge themselves.
 		if config.KeyCustodyMonitor != nil {
-			config.KeyCustodyMonitor.Check()
+			config.KeyCustodyMonitor.CheckNow()
 		}
 		return assessPKIReadinessNow()
 	}, config.EnrolledLedger, adminEndpoint)
@@ -6209,6 +6221,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			filedUnder := operatorTenantConfigured()
 			if filedUnder == "" {
 				filedUnder = evaluator.PolicyBundle.TenantID
+			}
+			if metadata["durable"] == false && config.Writer != nil {
+				entry := pkiMaterialAuditLog(filedUnder, action, "transport_trust_certificate", targetID, reason, metadata, principalIDForAudit(r), sourceIPFromRequest(r), evaluator)
+				result := "error"
+				entry.Result = &result
+				_ = appendAdminAudit(r.Context(), config.Writer, config.AdminAuditOutbox, entry, time.Now())
+				return
 			}
 			recordPKIMaterialChange(config.Writer, r, evaluator, filedUnder, action,
 				"transport_trust_certificate", targetID, reason, metadata)

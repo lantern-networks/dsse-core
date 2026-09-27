@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -47,7 +48,8 @@ import (
 // populated-by: assertion — reloaded from that blob at start-up. Nothing is inferred from what an Edge asks
 // for: a request for an organization with no imported authority is refused, never answered by creating one.
 type tenantInterceptionAuthority struct {
-	snapshot []byte
+	persistContext func(context.Context, []byte) error
+	snapshot       []byte
 
 	mu      sync.Mutex
 	issuers map[string]*storedTenantInterceptionIssuer
@@ -490,23 +492,41 @@ func (a *tenantInterceptionAuthority) CountForTenant(tenant string) int {
 }
 
 func (a *tenantInterceptionAuthority) RemoveTenant(tenant string) int {
+	n, _ := a.RemoveTenantChecked(tenant)
+	return n
+}
+
+func (a *tenantInterceptionAuthority) RemoveTenantChecked(tenant string) (int, error) {
+	return a.RemoveTenantContext(context.Background(), tenant)
+}
+
+func (a *tenantInterceptionAuthority) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if a == nil {
-		return 0
+		return 0, nil
 	}
 	key := strings.ToLower(strings.TrimSpace(tenant))
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
-		return 0
+		return 0, err
 	}
 	if _, ok := a.issuers[key]; !ok {
-		return 0
+		return 0, nil
 	}
 	delete(a.issuers, key)
-	if err := a.saveLocked(); err != nil {
-		return 0
+	// Bind the existing save/rollback path to this request, under the authority mutex.
+	oldPersist := a.persist
+	if a.persistContext != nil {
+		a.persist = func(raw []byte) error { return a.persistContext(ctx, raw) }
 	}
-	return 1
+	defer func() { a.persist = oldPersist }()
+	if err := a.saveLocked(); err != nil {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // registerTenantInterceptionAuthorityFlag declares where a control plane keeps the authorities organizations

@@ -721,3 +721,10 @@ Startup restores tenant and license authority before serving, and CP promotion r
 A receiving Edge must not also open the shared CP authority database. Before upgrading an Edge that combines `-postgres-dsn` with `-config-source-url` or `-config-source-endpoints`, keep shared authoring services on the CP, configure a local `-state-dir` for the Edge, remove its shared database option and any explicit PostgreSQL configuration-store overrides, and confirm that the CP contains the intended settings. Preserve old local snapshots for recovery and verify the first configuration pull before returning the node to service. The new binary rejects the incompatible combination before opening the database. Legacy SaaS bypass selections are retained for inspection but no longer recreate deleted rules at startup; author required bypass rules on the CP before upgrading.
 
 Break-glass approval consumption is saved before session creation, so one approval cannot issue twice. A crash after reservation can consume an approval without delivering a session; an administrator must use a new approved request. Observation delivery follows CP endpoint changes and drains queued records to its configured spool on shutdown.
+
+
+### Administrative screen reconciliation
+
+Catalog group members resolve their returned IDs to endpoint names, service forms reject incomplete or out-of-range port rows, and managed application/certificate-pinning endpoints direct edits to their owning screens. DNS reachability includes inherited Site routes and reports unavailable information instead of an empty result.
+
+Inspection, steering exclusions, internal CAs and predefined catalogs validate the returned organization and saved result, retain input after an unconfirmed write, and require a reload where the saved state is uncertain. PKI reads report unavailable required information, certificate history can be retried, and staging a replacement interception CA remains reachable after the first CA is installed. The screen distinguishes staging from promotion. Effective-policy previews use TCP/443 and saved authored rules, rather than treating historical approvals as active bypass rules.

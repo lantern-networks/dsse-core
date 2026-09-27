@@ -170,6 +170,10 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
 			return
 		}
+		if c, found, err := concrete.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id")); err == nil && found && c.Source == policycandidate.SourceCertPinningDetection && (assetStore == nil || ruleStore == nil) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("bypass rule storage is unavailable"))
+			return
+		}
 		materialized, found, err := concrete.Materialize(r.Context(), adminTenantIDFromRequest(r), r.PathValue("candidate_id"), materializeReq.AllowHighRisk, now)
 		if err != nil {
 			writePolicyCandidateError(w, err)

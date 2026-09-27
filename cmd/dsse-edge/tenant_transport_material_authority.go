@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -50,7 +51,8 @@ import (
 // and only mints one for an organization it finds none for. Nothing here is rebuilt from what Edges happen to
 // ask for; a request for an unknown organization is refused rather than answered by creating something.
 type tenantTransportAuthority struct {
-	snapshot []byte
+	persistContext func(context.Context, []byte) error
+	snapshot       []byte
 
 	mu  sync.Mutex
 	cas map[string]*storedTenantTransportCA
@@ -769,27 +771,41 @@ func (a *tenantTransportAuthority) CountForTenant(tenant string) int {
 }
 
 func (a *tenantTransportAuthority) RemoveTenant(tenant string) int {
-	// Nil-safe: the footprint helper evaluates every store's count in one call, so a node that holds no
-	// authorities must answer rather than crash.
+	n, _ := a.RemoveTenantChecked(tenant)
+	return n
+}
+
+func (a *tenantTransportAuthority) RemoveTenantChecked(tenant string) (int, error) {
+	return a.RemoveTenantContext(context.Background(), tenant)
+}
+
+func (a *tenantTransportAuthority) RemoveTenantContext(ctx context.Context, tenant string) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if a == nil {
-		return 0
+		return 0, nil
 	}
 	key := strings.ToLower(strings.TrimSpace(tenant))
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
-		return 0
+		return 0, err
 	}
 	if _, ok := a.cas[key]; !ok {
-		return 0
+		return 0, nil
 	}
 	delete(a.cas, key)
-	if err := a.saveLocked(); err != nil {
-		// Put it back rather than report a removal that did not survive: an erasure that says "done" over a
-		// row still on disk is the failure this whole family is about.
-		return 0
+	// Bind the existing save/rollback path to this request, under the authority mutex.
+	oldPersist := a.persist
+	if a.persistContext != nil {
+		a.persist = func(raw []byte) error { return a.persistContext(ctx, raw) }
 	}
-	return 1
+	defer func() { a.persist = oldPersist }()
+	if err := a.saveLocked(); err != nil {
+		return 0, err
+	}
+	return 1, nil
 }
 
 // registerTenantTransportMaterialFlags declares the three flags this mechanism needs.

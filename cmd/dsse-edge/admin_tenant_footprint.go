@@ -520,13 +520,15 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		}
 	}
 	if e.TenantTransportAuthorities != nil {
-		add("tenant_transport_authorities", e.TenantTransportAuthorities.RemoveTenant(tenantID))
+		eraseChecked("tenant_transport_authorities", func(tenant string) (int, error) { return e.TenantTransportAuthorities.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.TenantInterceptionAuthorities != nil {
-		add("tenant_interception_authorities", e.TenantInterceptionAuthorities.RemoveTenant(tenantID))
+		eraseChecked("tenant_interception_authorities", func(tenant string) (int, error) {
+			return e.TenantInterceptionAuthorities.RemoveTenantContext(ctx, tenant)
+		})
 	}
 	if e.TenantTrustDistributions != nil {
-		n, err := e.TenantTrustDistributions.RemoveTenant(tenantID)
+		n, err := e.TenantTrustDistributions.RemoveTenantContext(ctx, tenantID)
 		if err != nil {
 			result.Failures = append(result.Failures, "tenant_trust_distributions: "+err.Error())
 		} else {

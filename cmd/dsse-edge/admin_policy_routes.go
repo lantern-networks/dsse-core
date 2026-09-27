@@ -199,6 +199,9 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if configBundleRefusedOnAStandby(w) {
 			return
 		}
+		if !refreshInspectionPosture(w, config) {
+			return
+		}
 		if assetStore != nil {
 			if err := assetStore.RefreshShared(); err != nil {
 				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("asset catalog cannot be refreshed"))

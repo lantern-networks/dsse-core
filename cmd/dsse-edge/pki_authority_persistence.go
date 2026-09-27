@@ -19,16 +19,22 @@ var errAuthorityConflict = errors.New("authority changed on another control plan
 // payload means the row did not exist. Comparing payload bytes also works with existing
 // installations, without treating a process-local generation as a database revision.
 func (p postgresBlobPersister) CompareAndSwap(expected, next []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+	return p.CompareAndSwapContext(context.Background(), expected, next)
+}
+func (p postgresBlobPersister) CompareAndSwapContext(ctx context.Context, expected, next []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
 	defer cancel()
+	tx, unlock, err := beginCPWriteTransaction(ctx, p.db)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	defer tx.Rollback()
 	var result sql.Result
-	var err error
 	if expected == nil {
-		result, err = p.db.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key, payload, updated_at)
-   VALUES ($1,$2,now()) ON CONFLICT (store_key) DO NOTHING`, p.key, next)
+		result, err = tx.ExecContext(ctx, `INSERT INTO cp_state_blobs (store_key, payload, updated_at) VALUES ($1,$2,now()) ON CONFLICT (store_key) DO NOTHING`, p.key, next)
 	} else {
-		result, err = p.db.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$3, updated_at=now()
-   WHERE store_key=$1 AND payload=$2`, p.key, expected, next)
+		result, err = tx.ExecContext(ctx, `UPDATE cp_state_blobs SET payload=$3, updated_at=now() WHERE store_key=$1 AND payload=$2`, p.key, expected, next)
 	}
 	if err != nil {
 		return fmt.Errorf("persist authority %q: %w", p.key, err)
@@ -40,7 +46,7 @@ func (p postgresBlobPersister) CompareAndSwap(expected, next []byte) error {
 	if n != 1 {
 		return errAuthorityConflict
 	}
-	return nil
+	return tx.Commit()
 }
 
 type authorityCASBackend interface {
@@ -73,12 +79,23 @@ func (p *authorityCASPersister) Load() ([]byte, error) {
 }
 
 func (p *authorityCASPersister) Save(next []byte) error {
+	return p.SaveContext(context.Background(), next)
+}
+func (p *authorityCASPersister) SaveContext(ctx context.Context, next []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.loaded {
 		return errors.New("authority must be read successfully before it is changed")
 	}
-	if err := p.backend.CompareAndSwap(p.expected, next); err != nil {
+	var err error
+	if backend, ok := p.backend.(interface {
+		CompareAndSwapContext(context.Context, []byte, []byte) error
+	}); ok {
+		err = backend.CompareAndSwapContext(ctx, p.expected, next)
+	} else if err = ctx.Err(); err == nil {
+		err = p.backend.CompareAndSwap(p.expected, next)
+	}
+	if err != nil {
 		p.loaded = false
 		return err
 	}
@@ -246,4 +263,22 @@ func (p validatedAuthorityPersister) Load() ([]byte, error) {
 func validateAuthorityRows[T any](raw []byte, key func(*T) string) error {
 	_, _, err := readAuthoritySnapshot(func() ([]byte, error) { return raw, nil }, key, nil)
 	return err
+}
+
+func saveAuthorityContext(ctx context.Context, p blobstore.Persister, raw []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if contextual, ok := p.(interface {
+		SaveContext(context.Context, []byte) error
+	}); ok {
+		return contextual.SaveContext(ctx, raw)
+	}
+	return p.Save(raw)
+}
+func (p validatedAuthorityPersister) SaveContext(ctx context.Context, raw []byte) error {
+	if err := p.validate(raw); err != nil {
+		return err
+	}
+	return saveAuthorityContext(ctx, p.Persister, raw)
 }

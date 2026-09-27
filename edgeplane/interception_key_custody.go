@@ -296,14 +296,22 @@ func (m *KeyCustodyMonitor) Start() {
 	}()
 }
 
-func (m *KeyCustodyMonitor) Check() {
+// CheckNow runs the functional check on request (an administrator's "check signing now", which read-only roles
+// may use). It refreshes the reported health, and a key it finds unable to sign drains the node as a scheduled
+// check would. It does not advance or reset the consecutive-slow count: that count is measured in scheduled
+// intervals, so three clicks during one slow patch must not do what ninety seconds of sustained slowness does.
+func (m *KeyCustodyMonitor) CheckNow() { m.check(false) }
+
+func (m *KeyCustodyMonitor) Check() { m.check(true) }
+
+func (m *KeyCustodyMonitor) check(scheduled bool) {
 	h := CheckKeyCustodyHealth(m.provider(), time.Now)
 	m.mu.Lock()
 	prev := m.last
 	prevSlow := m.consecutiveSlow
-	if h.Healthy && h.latency > keyCustodySlowSignThreshold {
+	if scheduled && h.Healthy && h.latency > keyCustodySlowSignThreshold {
 		m.consecutiveSlow++
-	} else {
+	} else if scheduled {
 		m.consecutiveSlow = 0
 	}
 	slowNow := m.consecutiveSlow

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/assetcatalog"
@@ -278,11 +279,15 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 	// decrypt allowlist (explicit hosts + SaaS auth-group presets), and the curated known-bypass list. The
 	// "make the hidden default visible and editable" of docs/invisible_effective_configuration.md.
 	mux.HandleFunc("GET /admin/inspection-posture", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config, adminTenantIDFromRequest(r)))
+		if !refreshCatalogOverrides(w, config) {
+			return
+		}
+		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 	// Change the inspection posture (partial update — only provided fields change). bypass_default decrypts ONLY
 	// the allowlist and raw-forwards the rest (still steered + policy-gated); keep a SaaS auth group selected to
 	// keep tenant restriction working. Persisted; the engine's intercept + bypass sets are re-applied instantly.
+	var postureWriteMu sync.Mutex
 	mux.HandleFunc("POST /admin/inspection-posture", adminEndpoint("admin.policy.write", func(w http.ResponseWriter, r *http.Request) {
 		// ★★★ AND AN EDGE THAT PULLS ITS CONFIG IS NOT AN AUTHOR OF IT (2026-08-23). The posture now travels in
 		// the config bundle, so a change written here would be overwritten by the next poll — silently, and only
@@ -291,8 +296,12 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 		if configWriteRejectedWhenSourced(w, config.ConfigSourceURL, "inspection posture") {
 			return
 		}
+		if !inspectionPostureMayWrite(r) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("only the deployment operator, outside a customer context, may change deployment inspection defaults"))
+			return
+		}
 		if config.SetInspectionPosture == nil || config.InspectionPosture == nil {
-			writeError(w, http.StatusConflict, fmt.Errorf("inspection posture is not configurable on this edge (no interception engine wired)"))
+			writeError(w, http.StatusConflict, fmt.Errorf("inspection posture storage is not configured on this server"))
 			return
 		}
 		var body struct {
@@ -306,39 +315,79 @@ func registerEffectivePolicyRoutes(mux *http.ServeMux, adminEndpoint func(string
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode posture request: %w", err))
 			return
 		}
-		before := config.InspectionPosture()
-		next := before
-		if body.Mode != nil {
-			next.Mode = strings.TrimSpace(*body.Mode)
+		postureWriteMu.Lock()
+		defer postureWriteMu.Unlock()
+		var validationErr error
+		patch := func(before inspectionposture.Posture) (inspectionposture.Posture, error) {
+			next := before
+			if body.Mode != nil {
+				next.Mode = strings.TrimSpace(*body.Mode)
+			}
+			if body.DecryptAllowlistHosts != nil {
+				next.DecryptAllowlistHosts = *body.DecryptAllowlistHosts
+			}
+			if body.DecryptAllowlistGroups != nil {
+				next.DecryptAllowlistGroups = *body.DecryptAllowlistGroups
+			}
+			if body.BypassGroups != nil {
+				next.BypassGroups = *body.BypassGroups
+			}
+			if body.KnownBypassEnabled != nil {
+				next.KnownBypassEnabled = *body.KnownBypassEnabled
+			}
+			next, validationErr = inspectionposture.ValidateEdit(before, next)
+			if validationErr != nil {
+				return next, validationErr
+			}
+			for _, name := range next.BypassGroups {
+				if !stringInSetFold(name, before.BypassGroups) {
+					validationErr = errLegacyPostureSelection
+					return next, validationErr
+				}
+			}
+			return next, nil
 		}
-		if body.DecryptAllowlistHosts != nil {
-			next.DecryptAllowlistHosts = *body.DecryptAllowlistHosts
+		var before, next inspectionposture.Posture
+		var err error
+		if config.UpdateInspectionPosture != nil {
+			before, next, err = config.UpdateInspectionPosture(r.Context(), patch, adminTenantIDFromRequest(r))
+		} else {
+			// Compatibility for local, non-shared adapters.
+			before = config.InspectionPosture()
+			next, err = patch(before)
+			if err == nil {
+				_, err = config.SetInspectionPosture(next, adminTenantIDFromRequest(r))
+			}
 		}
-		if body.DecryptAllowlistGroups != nil {
-			next.DecryptAllowlistGroups = *body.DecryptAllowlistGroups
-		}
-		if body.BypassGroups != nil {
-			next.BypassGroups = *body.BypassGroups
-		}
-		if body.KnownBypassEnabled != nil {
-			next.KnownBypassEnabled = *body.KnownBypassEnabled
-		}
-		if next.Mode != inspectionposture.ModeDecryptAll && next.Mode != inspectionposture.ModeBypassDefault {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("mode must be %q or %q", inspectionposture.ModeDecryptAll, inspectionposture.ModeBypassDefault))
+		if validationErr != nil {
+			status := http.StatusBadRequest
+			if errors.Is(validationErr, errLegacyPostureSelection) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, validationErr)
 			return
 		}
-		if _, err := inspectionposture.ValidateEdit(before, next); err != nil {
-			writeError(w, http.StatusBadRequest, err)
+
+		result := "saved"
+		if err != nil {
+			result = "persistence_unconfirmed"
+		}
+		now := time.Now().UTC()
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, inspectionPostureAuditLog(r, before, next, result, evaluator, now), now)
+		if err != nil {
+			if errors.Is(err, inspectionposture.ErrPersistence) {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Storage did not confirm the inspection change. The previous live settings remain active. Restore storage and retry."))
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("Inspection settings could not be updated. Reload and retry."))
+			}
 			return
 		}
-		if _, err := config.SetInspectionPosture(next, adminTenantIDFromRequest(r)); err != nil {
-			writeError(w, http.StatusInternalServerError, err) // applied in memory but not persisted — would revert on restart
-			return
-		}
-		writeJSON(w, http.StatusOK, inspectionPostureSnapshot(config, adminTenantIDFromRequest(r)))
+		writeJSON(w, http.StatusOK, inspectionPostureForRequest(config, r))
 	}))
 
 	// Predefined pinned-bypass catalog: the curated set of well-known un-interceptable services (no-decrypt
 	// keep-steer by default). A tenant admin can override an individual entry (force_inspect / disabled), which
 	// is finer-grained than the all-or-nothing known-bypass toggle on the inspection posture.
 }
+
+var errLegacyPostureSelection = errors.New("Legacy bypass selections can only be removed. Create a tenant Egress bypass rule through Inspection Settings or Internet Access.")

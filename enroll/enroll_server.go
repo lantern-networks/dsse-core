@@ -1,6 +1,7 @@
 package enroll
 
 import (
+	"context"
 	"crypto/x509/pkix"
 	"encoding/json"
 	"errors"
@@ -89,8 +90,10 @@ type Issuer struct {
 	// worse than a refusal.
 	SignerFor func(tenantID string) *deviceca.Signer
 	Assign    Assigner
-	CertTTL   time.Duration
-	Record    RecordFunc // optional
+	// AssignContext takes precedence when a request must carry cancellation or authority fencing.
+	AssignContext func(context.Context, Request) (tenant, group, reason string, ok bool)
+	CertTTL       time.Duration
+	Record        RecordFunc // optional
 	// RecordWithMachine takes precedence over Record when set. See RecordWithMachineFunc.
 	RecordWithMachine RecordWithMachineFunc
 	Logf              func(string, ...interface{}) // optional
@@ -121,7 +124,13 @@ func (i Issuer) Handler() http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, Response{Error: "device_id and csr required"})
 			return
 		}
-		tenant, group, reason, ok := i.Assign(req)
+		var tenant, group, reason string
+		var ok bool
+		if i.AssignContext != nil {
+			tenant, group, reason, ok = i.AssignContext(r.Context(), req)
+		} else {
+			tenant, group, reason, ok = i.Assign(req)
+		}
 		if !ok {
 			if reason == "" {
 				reason = "not eligible"

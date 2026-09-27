@@ -3999,44 +3999,9 @@ func main() {
 	// migrated onto shared state.
 	if storeBackend(*enrolledInventoryStore) == "postgres" {
 		go func(l *enrolledinventory.Ledger) {
-			// ★★★ AND THE LAST READ IT DOES IS THE ONE ON PROMOTION (2026-08-25, measured).
-			//
-			// The loop below stops re-reading the moment this node becomes the leader, which is correct —
-			// from then on it is the author. But the snapshot it becomes the author OF is whatever it last
-			// read, up to one interval old. Measured on the generated deployment while a device was being
-			// enrolled: the leader named 1 and the standby named 0, and the check said what that costs — an
-			// Edge that receives a roster missing a device stops admitting it.
-			//
-			// So the transition is where the read belongs: one final reload at the instant of promotion,
-			// before this node starts answering as the authority. Fifteen seconds of staleness is not much
-			// until it is the fifteen seconds containing somebody's enrolment.
-			wasLeader := cpLeaderElectorInstance != nil && cpLeaderElectorInstance.IsLeader()
 			for range time.Tick(15 * time.Second) {
-				nowLeader := cpLeaderElectorInstance != nil && cpLeaderElectorInstance.IsLeader()
-				if nowLeader {
-					if wasLeader {
-						continue
-					}
-					// Just promoted: read once more, as the standby, before acting as the leader.
-					wasLeader = true
-					if changed, rerr := l.ReloadFromStore(); rerr != nil {
-						log.Printf("enrolled_inventory: this node was PROMOTED and could not re-read the "+
-							"fleet's roster (%v) — it is now the authority for a roster it knows is older "+
-							"than the one it is replacing", rerr)
-					} else if changed {
-						log.Printf("enrolled_inventory: took up the leader's roster at promotion")
-					}
-					continue
-				}
-				wasLeader = false
-				changed, rerr := l.ReloadFromStore()
-				if rerr != nil {
-					log.Printf("enrolled_inventory: this standby could not re-read the fleet's roster (%v) — it "+
-						"is serving an older one, and a failover would hand the deployment that", rerr)
-					continue
-				}
-				if changed {
-					log.Printf("enrolled_inventory: this standby took up the roster the leader authored")
+				if _, err := cpLeaderElectorInstance.refreshStandbyInventory(l); err != nil {
+					log.Printf("enrolled_inventory: standby refresh unavailable; promotion requires a successful retry")
 				}
 			}
 		}(enrolledLedger)
@@ -4800,6 +4765,8 @@ func main() {
 		log.Printf("vendor licence: NONE in force — enrolment is held until a licence is applied")
 	}
 	configureAdmissionPromotion(cpLeaderElectorInstance, *admissionRevocationStore, livenessRevocations)
+	configureInventoryPromotion(cpLeaderElectorInstance, *enrolledInventoryStore, enrolledLedger)
+	configureSeatPromotion(cpLeaderElectorInstance, *seatAllocationStore, seatAllocations)
 	configureRiskPromotion(cpLeaderElectorInstance, *highRiskStore, highRiskOverlay)
 	configureLicensePromotion(cpLeaderElectorInstance, *licenseStorePath, vendorLicenceStore, enrolmentLicensingGate, licenseAcceptedKeys, strings.TrimSpace(*licenseMSSPID))
 	cpLeaderElectorInstance.Start()
@@ -5606,7 +5573,19 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		config.LabMode != nil && *config.LabMode, config.TenantTrustDistributor)
 	// The machine door for "a device enrolled here", on the same identified channel as the material above.
 	registerEnrolmentReportRoute(mux, config.EnrolledLedger, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
-		config.LabMode != nil && *config.LabMode)
+		config.LabMode != nil && *config.LabMode,
+		func(r *http.Request, shipper auditIngestShipper, entry enrolledinventory.Entry, reportErr error) {
+			record := enrolledInventoryAuditLog(entry.TenantID, "enrolment_report", entry, evaluator, sourceIPFromRequest(r))
+			record.ActorNHIID = &shipper.Identity
+			reason := "Issued device enrolment report saved by the control plane."
+			if reportErr != nil {
+				result := "error"
+				record.Result = &result
+				reason = "Enrolment report was refused or saving could not be confirmed."
+			}
+			record.Reason = &reason
+			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, record, time.Now().UTC())
+		})
 	// The other half of the same sentence, for connectors — see connector_cp_report.go.
 	registerConnectorReportRoute(mux, registry, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)
@@ -9324,7 +9303,7 @@ func adminAgentAccessDecisionSummary(writer *logs.Writer, tenantID string) (map[
 	}, nil
 }
 
-func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query hotstore.SearchQuery, objectStore adminExportObjectStore, filename string, onRow func(rowsExported int) error) (string, hotstore.ExportResult, error) {
+func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query hotstore.SearchQuery, objectStore adminExportObjectStore, filename string, onRow func(rowsExported int, final bool) error) (string, hotstore.ExportResult, error) {
 	if store == nil {
 		return "", hotstore.ExportResult{}, fmt.Errorf("hot store is not configured")
 	}
@@ -9375,6 +9354,13 @@ func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query ho
 				if err := ctx.Err(); err != nil {
 					return nil, false, err
 				}
+				// Check terminal state before committing the generated file, even
+				// when fewer than 1,000 rows followed the last progress update.
+				if onRow != nil {
+					if err := onRow(rowsWritten, true); err != nil {
+						return nil, false, err
+					}
+				}
 				return nil, false, nil
 			}
 			if next.err != nil {
@@ -9384,7 +9370,7 @@ func writeHotStoreExportRows(ctx context.Context, store hotstore.Store, query ho
 			if onRow != nil {
 				// Alpha workers treat adminExportJobStoppedError from progress writes
 				// as an external stop signal, then re-read job state before cleanup.
-				if err := onRow(rowsWritten); err != nil {
+				if err := onRow(rowsWritten, false); err != nil {
 					return nil, false, err
 				}
 			}

@@ -660,6 +660,13 @@ Device admission responses now include the authenticated tenant and the effectiv
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
 
+### Enrolment and inventory persistence
+
+Device enrolment reports, enrolment-token issuance/revocation, inventory edits and seat allocations retain the accepted control-plane leadership term until durable storage completes. A storage or leadership failure is retryable and is not acknowledged as a saved enrolment. Promotion reloads shared inventory and seat allocations before serving writes; standby inventory refreshes cannot overwrite a promoted writer. Token issue/spend/revoke responses and audit records distinguish confirmed persistence from uncertain results.
+
+Enrolment-report authorization now uses the Edge-to-tenant authority map as well as the verified client identity. Before upgrading a multi-tenant or operator-anchored Edge deployment, configure `-audit-ingest-authority` to cover each enrolling Edge and every tenant it serves. Missing mappings return 403 and keep reports queued; devices absent from CP inventory may lose admission on the next bundle refresh. Without a map, only a certificate resolved to the requested tenant is accepted. Startup warns when the CP report endpoint has no mapping; the warning cannot establish completeness of a configured map.
+
+Inventory/seat reload failure prevents promotion; recover shared storage and restart an inventory process whose initial empty snapshot load failed. Route `/enroll` to the active CP. If token consumption commits but acknowledgement is lost, enrolment may require a new token after checking the existing device record; do not assume an uncertain response means the token was unused.
 ### Incoming exception edits and audit attribution
 
 Partial incoming-exception updates preserve omitted restrictions and reject null or unknown fields. Storage failures keep the previous confirmed policy; successful changes and failures are attributed to the target tenant, including operator actions. Existing export checks continue to reject unsupported conditions instead of silently widening access.
@@ -676,5 +683,11 @@ File-backed mesh pending entries are resent only when the node holding that file
 Risk edits report whether the requested state was applied and durably saved; failed protective saves remain visibly unconfirmed. Standby risk management does not serve stale authority, and promotion reloads shared device and user marks. Existing local snapshots retain their backend instead of being silently replaced by empty shared state. DLP-derived device risk records the actual application and persistence outcome separately from the original finding, and Edge synchronization retains marks on an unconfirmed empty feed. An authoritative CP feed still replaces the device map, including local DLP marks; separating those sources is not part of this integration.
 
 Risk backend upgrades must explicitly reconcile every CP onto the same reviewed backend before enabling HA. Existing files are not implicitly imported; use the documented `-high-risk-store=postgres+import:` procedure with writers stopped. Existing empty/unreadable local paths (also for admission and policy stores) are retained for checked loading instead of silently selecting an empty shared backend; repair those paths or explicitly configure the intended backend before upgrade.
+
+### Regional log searches and exports
+
+Regional searches and export previews report whether the number of excluded records without region attribution is known. Downloaded regional exports carry the same limitation in gzip metadata; an unavailable count is never reported as zero. The count is a separate live query, not an export snapshot. Export jobs return detached metadata and check cancellation before the final object is committed, including small exports.
+
+Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.
 
 Certificate administration now confirms shared saves before reporting success and retains the request leadership term through trust withdrawal. Startup recovers an interrupted certificate/key pair installation. Internal-CA updates invalidate outbound TLS transports using the certificate material itself; incomplete CA sections retain the previous trust configuration and are retried. Inspection-posture edits refresh the shared authority before changing controls and record results without destination lists. Manual key-health checks do not count as scheduled slow-signing intervals. These changes do not replace the release deployment and rotation acceptance checks.

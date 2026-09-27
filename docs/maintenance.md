@@ -45,6 +45,30 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 ## Focused fixes in this tree
 
 
+Configuration receivers now leave a generation unacknowledged when saving People,
+non-human identities, Sites, or device-CA changes fails. Polling retries the same
+generation after storage recovers, including a CA update already applied in memory.
+
+Revoking a delegated grant on an Edge now reports the revocation to the control
+plane over the existing machine connection. Success requires the CP to confirm
+storage and its audit record; other Edges receive the revoked grant through their
+normal configuration polling. If confirmation is unavailable, the API returns 503
+with `local_revoked: true` and `control_plane: "unconfirmed"`. Local denial remains
+in effect. A node-local `-delegated-grant-store` file retains the revocation across
+restart; memory-only storage cannot provide that guarantee. Pending reports retry
+every 30 seconds. Upgrade the CP before Edges and configure the existing
+`-audit-ingest-authority` Edge-to-tenant map (or the single-tenant CA binding).
+The reporting endpoint only revokes grants already held by the CP; an absent grant,
+unavailable CP, or missing machine identity remains unconfirmed rather than being
+reported as a fleet-wide success.
+
+PostgreSQL CI now includes all tests whose names contain `Postgres`, with the three
+DSN variables used by the integration fixtures. This includes legacy user-risk
+upgrade/restart tests and previously omitted shared-store tests. Local automated
+HTTP, storage, restart, and configuration-polling checks cover these fixes;
+deployed-fleet and GUI acceptance remain separate release checks.
+
+
 Delegated-access grant creation and editing now wait for confirmed storage;
 organization-scoped IDs prevent another organization's same-ID grant from being
 overwritten. Shared-store reads and edits use the latest saved grants. Revocation

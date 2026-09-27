@@ -139,7 +139,11 @@ func TestPostgresDLPSharedPeerAndAcceptedTerm(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			if rr.Code != 500 || !bytes.Equal(before, after) {
+			wantStatus := http.StatusInternalServerError
+			if c.name == "policies" {
+				wantStatus = http.StatusServiceUnavailable
+			}
+			if rr.Code != wantStatus || !bytes.Equal(before, after) {
 				t.Fatalf("old term accepted: %d %s", rr.Code, rr.Body)
 			}
 			if fresh := request("POST", "/admin/dlp-"+c.name, c.body); fresh.Code != 200 {

@@ -60,7 +60,7 @@ func TestAnEdgeAdoptsTheControlPlanesDeviceCAs(t *testing.T) {
 	if section == nil || !section.Complete {
 		t.Fatal("a control plane holding a registry published no complete section")
 	}
-	added, removed := applyDeviceCABundleSection(edge, section, nil, nil)
+	added, removed, _ := applyDeviceCABundleSection(edge, section, nil, nil)
 	if added != 1 {
 		t.Fatalf("added=%d, want 1: a device CA registered on the control plane never reached the Edge", added)
 	}
@@ -79,7 +79,7 @@ func TestARetiredDeviceCAIsRemovedWhereTheSectionNamesTheOrganization(t *testing
 	cp := registryWith(t, map[string][][]byte{"tenant_a": {caA1}})
 	edge := registryWith(t, map[string][][]byte{"tenant_a": {caA1, caA2}})
 
-	_, removed := applyDeviceCABundleSection(edge, deviceCABundleSection(cp, nil), nil, nil)
+	_, removed, _ := applyDeviceCABundleSection(edge, deviceCABundleSection(cp, nil), nil, nil)
 	if removed != 1 {
 		t.Fatalf("removed=%d, want 1: a CA retired on the control plane still admits that organization here", removed)
 	}
@@ -100,7 +100,7 @@ func TestTheLastDeviceCAOfAnOrganizationIsNotRemovedByABundle(t *testing.T) {
 
 	section := deviceCABundleSection(cp, nil)
 	section.Tenants = append(section.Tenants, "tenant_a") // the control plane speaks for it, and holds none
-	_, removed := applyDeviceCABundleSection(edge, section, nil, nil)
+	_, removed, _ := applyDeviceCABundleSection(edge, section, nil, nil)
 
 	if removed != 0 {
 		t.Fatalf("removed=%d: the organization's last CA was withdrawn by a config poll — every one of its "+
@@ -134,7 +134,7 @@ func TestAnEmptyOrIncompleteDeviceCASectionRemovesNothing(t *testing.T) {
 		{"absent", nil},
 	} {
 		edge := registryWith(t, map[string][][]byte{"tenant_a": {caA1, caA2}})
-		if _, removed := applyDeviceCABundleSection(edge, tc.section, nil, nil); removed != 0 {
+		if _, removed, _ := applyDeviceCABundleSection(edge, tc.section, nil, nil); removed != 0 {
 			t.Fatalf("%s: removed %d — the fleet would stop admitting devices", tc.name, removed)
 		}
 		if got := edge.Registrations()["tenant_a"]; got != 2 {

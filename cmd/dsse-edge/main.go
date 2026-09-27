@@ -600,7 +600,8 @@ type serverConfig struct {
 	// ConfigBundleSource (nil unless -config-source-url is set) is the puller; its poll loop is launched inside
 	// newServerWithConfig so a pull can apply policies + tenant-config (policy.Store) AND the DNS policy
 	// (the separate dnsresolver.Resolver store) together.
-	ConfigBundleSource *configBundleSource
+	ConfigBundleSource          *configBundleSource
+	DelegatedRevocationReporter *delegatedRevocationReporter
 	// FleetConfigStatus is the control plane's record of what each Edge reports it is running. nil on an Edge
 	// (it reports, it does not aggregate).
 	FleetConfigStatus *fleetConfigStatusStore
@@ -3209,6 +3210,7 @@ func main() {
 	// the control plane. nil = no -config-source-url, i.e. no CP→Edge sync configured at all.
 	var revocationSyncState *revocationSyncStatus
 	var sharedRevocationSource *revocationSource
+	var delegatedRevocations *delegatedRevocationReporter
 	var configBundlePuller *configBundleSource // launched inside newServerWithConfig, where the DNS resolver exists too
 	// enrolmentCPReport tells the control plane about enrolments completed HERE. Constructed only when this
 	// Edge follows a control plane, because that is exactly when the omission bites: the config bundle
@@ -3376,6 +3378,7 @@ func main() {
 		// about it by being told, with the same durable outbox so a control plane that is briefly away costs
 		// a retry rather than a connector.
 		if machineURL != "" && machineClient != nil {
+			delegatedRevocations = &delegatedRevocationReporter{url: strings.TrimSuffix(strings.TrimRight(machineURL, "/"), "/enrolment-report") + "/delegated-grant-revocations", client: machineClient, logf: log.Printf}
 			connectorCPReport = &connectorCPReporter{
 				url:        strings.TrimSuffix(strings.TrimRight(machineURL, "/"), "/enrolment-report") + "/connector-report",
 				client:     machineClient,
@@ -4627,6 +4630,7 @@ func main() {
 		ConfigSyncStatus:                   configSyncStatus,
 		RevocationSyncStatus:               revocationSyncState,
 		ConfigSourceURL:                    strings.TrimSpace(*configSourceURL),
+		DelegatedRevocationReporter:        delegatedRevocations,
 		SteerExclusionSourceURL:            strings.TrimSpace(*steerExclusionSourceURL),
 		ConfigBundleSource:                 configBundlePuller,
 		FleetConfigStatus:                  fleetConfigStatus,
@@ -5112,6 +5116,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// completes it and an ephemeral grant (E3) is issued against it to release the flow.
 	eastWestAuthChallenges := eastwest.NewAuthChallengeStore()
 	delegatedGrants := config.DelegatedGrants
+	if config.DelegatedRevocationReporter != nil && strings.TrimSpace(config.ConfigSourceURL) != "" {
+		go config.DelegatedRevocationReporter.reconcile(context.Background(), delegatedGrants, 30*time.Second)
+	}
 	nonHumanIdentities := config.NonHumanIdentities
 	decisionStore := config.DecisionStore
 	inspectionEvents := config.InspectionEvents
@@ -6385,6 +6392,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox)
 	// ★ AND THE AUTHORITY RECEIVES WHAT THE FLEET MINTED. Registered only on a node that does not pull its
 	// own configuration — the same rule the connector report states. See grant_cp_report.go.
+	registerDelegatedRevocationReport(mux, delegatedGrants, tcaReg, strings.TrimSpace(config.ConfigSourceURL), config.LabMode != nil && *config.LabMode, writer)
 	registerGrantReportRoute(mux, grantStore, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)
 	if strings.TrimSpace(config.ClientlessBaseURL) != "" {
@@ -7451,6 +7459,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if err := writer.Append("audit.log.jsonl", delegatedAccessGrantAuditLog("delegated_access_grant_revoked", grant, evaluator, now)); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		if strings.TrimSpace(config.ConfigSourceURL) != "" {
+			if err := config.DelegatedRevocationReporter.report(r.Context(), grant); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "revoked on this Edge; control-plane confirmation is pending", "local_revoked": true, "control_plane": "unconfirmed"})
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, grant)
 	})

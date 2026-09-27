@@ -959,7 +959,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		} else {
 			for _, identity := range payload.NHI.Identities {
 				if _, err := t.nhi.Upsert(context.Background(), identity, s.tenantID, now); err != nil {
-					log.Printf("config-bundle sync: skipping invalid non-human identity %q from the control plane: %v", identity.ID, err)
+					if errors.Is(err, nhi.ErrPersistence) {
+						criticalErr = errors.Join(criticalErr, fmt.Errorf("non-human identity %q: %w", identity.ID, err))
+					} else {
+						log.Printf("config-bundle sync: skipping invalid non-human identity %q from the control plane: %v", identity.ID, err)
+					}
 				}
 			}
 		}
@@ -985,7 +989,11 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 				// had re-stamped instead of refusing, one Edge would have merged every customer's directory
 				// into one. The empty tenant here means "the record says which organization it belongs to".
 				if _, err := t.humanIdentities.Upsert(context.Background(), identity, "", now); err != nil {
-					log.Printf("config-bundle sync: skipping invalid directory identity %q from the control plane: %v", identity.ID, err)
+					if errors.Is(err, humanidentity.ErrDirectoryPersistence) {
+						criticalErr = errors.Join(criticalErr, fmt.Errorf("directory identity %q: %w", identity.ID, err))
+					} else {
+						log.Printf("config-bundle sync: skipping invalid directory identity %q from the control plane: %v", identity.ID, err)
+					}
 					continue
 				}
 				applied++
@@ -1058,9 +1066,12 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 		}
 	}
 	if payload.DeviceCAs != nil && t.deviceCAs != nil {
-		added, removed := applyDeviceCABundleSection(t.deviceCAs, payload.DeviceCAs, func(reg *tenantca.TenantCARegistry) error {
+		added, removed, caErr := applyDeviceCABundleSection(t.deviceCAs, payload.DeviceCAs, func(reg *tenantca.TenantCARegistry) error {
 			return persistTenantCARegistry(reg, t.deviceCARegistryPath)
 		}, log.Printf)
+		if caErr != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("device authorities: %w", caErr))
+		}
 		// ★★★ AND THE LISTENER IS TOLD (2026-08-24). Adopting a device CA into the registry made this Edge able
 		// to IDENTIFY an organization's devices and did nothing about whether it would verify one at the
 		// handshake: the client-CA pool was built at start-up and never touched again on this path. An
@@ -1090,12 +1101,9 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// organizations the section names rather than upserting — an operator deleting a Site in the Console and
 	// the Edge going on honouring its bootstrap secret is the half of the defect that is hardest to see.
 	if payload.Sites != nil && t.sites != nil {
-		if len(payload.Sites.Sites) == 0 {
-			if local, err := t.sites.List(context.Background(), ""); err == nil && len(local) > 0 {
-				log.Printf("config-bundle sync: control plane sent an EMPTY Site catalog while this Edge has %d — keeping local (lockout-safe).", len(local))
-			}
+		if _, _, err := applySiteBundleSection(context.Background(), t.sites, payload.Sites, time.Now().UTC(), log.Printf); err != nil {
+			criticalErr = errors.Join(criticalErr, fmt.Errorf("site catalog: %w", err))
 		}
-		applySiteBundleSection(context.Background(), t.sites, payload.Sites, time.Now().UTC(), log.Printf)
 	}
 	if payload.RegionEndpoints != nil {
 		applyRegionEndpointBundleSection(payload.RegionEndpoints, log.Printf)

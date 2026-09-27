@@ -36,7 +36,7 @@ func TestDeletingAnOrganizationErasesTheRulesItAuthored(t *testing.T) {
 		t.Fatalf("the footprint must COUNT the authored rules, or completeness is measured over a set that excludes them: %+v", before)
 	}
 
-	result := purgeAdminTenantData(context.Background(), "node", "tenant_going", nil, nil, nil, nil, rules, nil, "", nil, nil, adminTenantExtraStores{}, now)
+	result := purgeAdminTenantData(context.Background(), "node", "tenant_going", nil, nil, nil, nil, rules, nil, "", nil, nil, adminTenantExtraStores{}, nil, now)
 	if len(result.Failures) != 0 {
 		t.Fatalf("purge failures: %+v", result.Failures)
 	}

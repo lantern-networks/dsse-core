@@ -310,7 +310,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// traffic at all is what creating one MEANS. A flag here would only be a way to create an organization
 		// that does not work.
 		if action == "create" && ruleStore != nil {
-			if _, rerr := ruleStore.Upsert(startingPostureRule(saved.TenantID)); rerr != nil {
+			if _, rerr := ruleStore.UpsertContext(r.Context(), startingPostureRule(saved.TenantID)); rerr != nil {
 				answer.StartingPostureNote = "this organization was created and carries no traffic yet: " + rerr.Error()
 				logWarnf("tenant_created_without_starting_posture tenant=%q: %v", saved.TenantID, rerr)
 			} else {
@@ -350,7 +350,16 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// removes the row that says whose data this is; a preservation order that permits that is not a
 		// preservation order. Refusing is the fail-safe direction — a hold that is genuinely finished is lifted
 		// deliberately, and that lifting is itself on the record.
-		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
+		_, held, _, protectionErr := config.LegalHold.adminStatus(r.Context(), tenantID)
+		if protectionErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(protectionErr, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, protectionErr)
+			return
+		}
+		if held {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so it cannot be deleted; lift the hold first "+
 					"(DELETE /admin/legal-hold)", tenantID))
@@ -361,7 +370,6 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
 			return
 		}
-		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now), now)
 		cascade := cascadeTenantDeletion(r.Context(), config.LocalCredentials, adminAuth, config.EnrolledLedger, tenantID, now)
 
 		// ★★★ RECORDS MAY WAIT FOR THE PURGE; A LIVE CERTIFICATE AUTHORITY MAY NOT (2026-08-21, measured).
@@ -402,6 +410,26 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		remaining := countAdminTenantFootprint(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore, config.TenantCARegistry, namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "delete", evaluator, now)
+		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		cascadeComplete := true
+		for key, value := range cascade {
+			if strings.HasSuffix(key, "_error") {
+				cascadeComplete = false
+			}
+			if key == "sessions_revoked" {
+				if _, ok := value.(int); !ok {
+					cascadeComplete = false
+				}
+			}
+		}
+		outcome := "success"
+		if !cascadeComplete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["cascade_complete"] = cascadeComplete
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		body := map[string]any{
 			"tenant_id": tenantID,
 			"deleted":   true,
@@ -491,10 +519,19 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// a hold is for. Nothing about an operator being authorised to erase makes the hold irrelevant: the
 		// hold is what says this particular organization must not be erased YET, and it is released by lifting
 		// it, deliberately and on the record.
-		if config.LegalHold != nil && config.LegalHold.IsHeld(tenantID) {
+		_, held, _, protectionErr := config.LegalHold.adminStatus(r.Context(), tenantID)
+		if protectionErr != nil {
+			status := http.StatusServiceUnavailable
+			if errors.Is(protectionErr, errTenantErasureInProgress) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, protectionErr)
+			return
+		}
+		if held {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"organization %q is under a legal hold, so its data must be preserved and cannot be erased; "+
-					"lift the hold first (DELETE /admin/legal-hold) — that is a decision with its own record", tenantID))
+					"resolve the hold through POST /admin/legal-hold first — that is a decision with its own record", tenantID))
 			return
 		}
 		var db *sql.DB
@@ -534,7 +571,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		result := purgeAdminTenantData(r.Context(), adminFootprintNodeName(configSourceURL), tenantID,
 			db, writer, config.LocalCredentials, config.EnrolledLedger, ruleStore,
 			config.TenantCARegistry, strings.TrimSpace(config.TenantCARegistryPath),
-			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), now)
+			trustAnchorStoreOrNil(deviceClientCAs), namedNetworks, tenantExtraStoresFor(extraStores, config.EnrolledLedger, tenantID), config.LegalHold, now)
 		// Recorded in the OPERATOR's audit, not the customer's.
 		//
 		// ★ AND THAT DISTINCTION IS LOAD-BEARING, WHICH THIS CODE LEARNED THE HARD WAY (2026-08-15). The audit
@@ -548,6 +585,17 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// was authorised and carried out must not live inside the thing that was erased.
 		auditRecord := adminTenantModelLifecycleAuditLogFor(r, adminTenantModel{TenantID: tenantID}, "purge", evaluator, now)
 		auditRecord.TenantID = adminTenantIDFromRequest(r)
+		outcome := "success"
+		if !result.Complete {
+			outcome = "partial"
+		}
+		auditRecord.Result = &outcome
+		auditRecord.Metadata["complete"] = result.Complete
+		auditRecord.Metadata["remaining_records"] = result.Remaining.Total
+		auditRecord.Metadata["failure_count"] = len(result.Failures)
+		if result.ArtifactCleanup != nil {
+			auditRecord.Metadata["artifact_cleanup"] = result.ArtifactCleanup
+		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, auditRecord, now)
 		writeJSON(w, http.StatusOK, result)
 	}))
@@ -579,7 +627,7 @@ func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentia
 	if credentials != nil {
 		removed, err := credentials.DeleteAllForTenant(tenantID)
 		if err != nil {
-			result["administrators_error"] = "removal could not be confirmed"
+			result["administrators_error"] = "credential deletion incomplete: storage unavailable"
 		}
 		if len(removed) > 0 {
 			result["administrators"] = removed
@@ -587,9 +635,12 @@ func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentia
 		}
 	}
 	if ledger != nil {
-		if removed := ledger.RemoveTenant(tenantID); len(removed) > 0 {
-			result["enrolled_identities"] = len(removed)
-			log.Printf("tenant %q deleted: removed %d enrolled identity/identities from the ledger", tenantID, len(removed))
+		if n, err := ledger.RetireTenantContext(ctx, tenantID, now.UTC().Format(time.RFC3339)); err != nil {
+			result["enrolled_identities_error"] = "identity retirement saving could not be confirmed"
+		} else if n > 0 {
+			result["enrolled_identities"] = n
+			result["identity_records_retained_for_purge"] = n
+			log.Printf("tenant %q deleted: retired %d identities; ownership retained for erasure", tenantID, n)
 		}
 	}
 	revoker, ok := adminAuth.(interface {
@@ -612,108 +663,6 @@ func cascadeTenantDeletion(ctx context.Context, credentials *localAdminCredentia
 		log.Printf("tenant %q deleted: revoked %d session(s) and %d API token(s)", tenantID, sessions, tokens)
 	}
 	return result
-}
-
-// bodyNamesOperatorEnvelope reports which envelope fields the request body actually CARRIED. The struct decode
-// cannot answer this — an absent operator_managed and a present false are the same bool — so the raw body is
-// read a second time as a map. Cheap, and the alternative (pointer fields on the model) would put "was it
-// sent?" into every other place the model is used.
-func bodyNamesOperatorEnvelope(raw []byte) map[string]bool {
-	named := map[string]bool{}
-	var probe map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &probe); err != nil {
-		return named
-	}
-	for _, key := range []string{"operator_managed", "operator_elevations", "operator_elevation_requires_approval",
-		"operator_delegation_changed_at", "operator_delegation_changed_by"} {
-		if _, present := probe[key]; present {
-			named[key] = true
-		}
-	}
-	return named
-}
-
-// preserveOperatorEnvelopeOnUpsert copies the stored envelope back onto an incoming record for every envelope
-// field the body did not name. A body that DOES name one is honoured — an operator restoring a full record
-// from a backup must be able to, and the whole point is that omission stops meaning erasure.
-func preserveOperatorEnvelopeOnUpsert(ctx context.Context, store adminTenantModelAdminStore, incoming adminTenantModel, named map[string]bool) adminTenantModel {
-	if store == nil {
-		return incoming
-	}
-	if len(named) == 5 {
-		return incoming // the body carried the whole envelope
-	}
-	existing, err := store.Get(ctx, strings.TrimSpace(incoming.TenantID))
-	if err != nil {
-		// Unreadable registry: do not invent an envelope, and do not erase one either — the incoming record is
-		// what the caller asked for, and a failure here must not be the thing that revokes a delegation.
-		return incoming
-	}
-	if !named["operator_managed"] {
-		incoming.OperatorManaged = existing.OperatorManaged
-	}
-	if !named["operator_elevations"] {
-		incoming.OperatorElevations = existing.OperatorElevations
-	}
-	if !named["operator_elevation_requires_approval"] {
-		incoming.OperatorElevationRequiresApproval = existing.OperatorElevationRequiresApproval
-	}
-	if !named["operator_delegation_changed_at"] {
-		incoming.OperatorDelegationChangedAt = existing.OperatorDelegationChangedAt
-	}
-	if !named["operator_delegation_changed_by"] {
-		incoming.OperatorDelegationChangedBy = existing.OperatorDelegationChangedBy
-	}
-	return incoming
-}
-
-// adminTenantCreateAnswer is the created organization plus what else the creation did. Embedded so every field
-// an existing caller already reads is exactly where it was.
-type adminTenantCreateAnswer struct {
-	adminTenantModel
-	// TransportServerName is the name this organization's devices will be told to send, when one was created
-	// with it. Empty means it is served the deployment's shared certificate.
-	TransportServerName string `json:"transport_server_name,omitempty"`
-	// TransportAuthorityNote says why there is none, when one was asked for and could not be made. The
-	// organization still exists — refusing the creation over this would leave the operator with neither.
-	TransportAuthorityNote string `json:"transport_authority_note,omitempty"`
-	// StartingPosture is what this organization carries from the moment it exists.
-	StartingPosture string `json:"starting_posture,omitempty"`
-	// StartingPostureNote says why it has none. An organization without one carries nothing at all, so this
-	// is the field that says "created, and it does not work yet".
-	StartingPostureNote string `json:"starting_posture_note,omitempty"`
-}
-
-// startingPostureRule is what a new organization carries from the moment it exists: everything allowed and
-// inspected — the sentence its own Internet Access screen opens with, and the posture the deployment's own
-// organization has had since it was installed.
-//
-// ★ ONE RULE, AT THE PRIORITY THE RULE EDITOR OFFERS BY DEFAULT, so anything the customer adds to narrow it
-// sits naturally above or below and the screen reads the way it reads for every other rule.
-func startingPostureRule(tenantID string) policyrule.Rule {
-	return policyrule.Rule{
-		TenantID:    tenantID,
-		Plane:       policyrule.PlaneEgress,
-		Priority:    100,
-		Name:        "Everything, allowed and inspected — the rule to narrow first",
-		Source:      []string{"*"},
-		Destination: []string{"*"},
-		Action:      policyrule.Action{Access: policyrule.AccessAllow, Inspection: policyrule.InspectionInspect},
-		Status:      policyrule.StatusActive,
-	}
-}
-
-// adminTenantBodyAsksForTransportAuthority reads the one optional field, from the RAW body rather than from a
-// decoded struct: adminTenantModel is a whole-record upsert and adding a field to it would make every
-// read/modify/write round-trip carry an instruction.
-func adminTenantBodyAsksForTransportAuthority(raw []byte) bool {
-	var body struct {
-		TransportAuthority *bool `json:"transport_authority"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil || body.TransportAuthority == nil {
-		return false
-	}
-	return *body.TransportAuthority
 }
 
 var errTenantEnvelopeEdit = errors.New("operator delegation and elevation fields must be changed through the operator-access routes")
@@ -766,4 +715,53 @@ func writeTenantSettingsEditError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant settings could not be read; no changes were saved"))
+}
+
+// adminTenantCreateAnswer is the created organization plus what else the creation did. Embedded so every field
+// an existing caller already reads is exactly where it was.
+type adminTenantCreateAnswer struct {
+	adminTenantModel
+	// TransportServerName is the name this organization's devices will be told to send, when one was created
+	// with it. Empty means it is served the deployment's shared certificate.
+	TransportServerName string `json:"transport_server_name,omitempty"`
+	// TransportAuthorityNote says why there is none, when one was asked for and could not be made. The
+	// organization still exists — refusing the creation over this would leave the operator with neither.
+	TransportAuthorityNote string `json:"transport_authority_note,omitempty"`
+	// StartingPosture is what this organization carries from the moment it exists.
+	StartingPosture string `json:"starting_posture,omitempty"`
+	// StartingPostureNote says why it has none. An organization without one carries nothing at all, so this
+	// is the field that says "created, and it does not work yet".
+	StartingPostureNote string `json:"starting_posture_note,omitempty"`
+}
+
+// startingPostureRule is what a new organization carries from the moment it exists: everything allowed and
+// inspected — the sentence its own Internet Access screen opens with, and the posture the deployment's own
+// organization has had since it was installed.
+//
+// ★ ONE RULE, AT THE PRIORITY THE RULE EDITOR OFFERS BY DEFAULT, so anything the customer adds to narrow it
+// sits naturally above or below and the screen reads the way it reads for every other rule.
+func startingPostureRule(tenantID string) policyrule.Rule {
+	return policyrule.Rule{
+		TenantID:    tenantID,
+		Plane:       policyrule.PlaneEgress,
+		Priority:    100,
+		Name:        "Everything, allowed and inspected — the rule to narrow first",
+		Source:      []string{"*"},
+		Destination: []string{"*"},
+		Action:      policyrule.Action{Access: policyrule.AccessAllow, Inspection: policyrule.InspectionInspect},
+		Status:      policyrule.StatusActive,
+	}
+}
+
+// adminTenantBodyAsksForTransportAuthority reads the one optional field, from the RAW body rather than from a
+// decoded struct: adminTenantModel is a whole-record upsert and adding a field to it would make every
+// read/modify/write round-trip carry an instruction.
+func adminTenantBodyAsksForTransportAuthority(raw []byte) bool {
+	var body struct {
+		TransportAuthority *bool `json:"transport_authority"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil || body.TransportAuthority == nil {
+		return false
+	}
+	return *body.TransportAuthority
 }

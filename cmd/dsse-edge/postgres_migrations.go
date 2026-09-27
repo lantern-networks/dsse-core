@@ -130,6 +130,7 @@ func postgresHotStoreMigrationVersions() []string {
 	return []string{
 		postgresMigrationHotEvents,
 		postgresMigrationHotEventsText,
+		"052",
 	}
 }
 

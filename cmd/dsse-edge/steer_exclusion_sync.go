@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -71,8 +72,11 @@ func buildSteerExclusionSourceClient(caFile string) (*http.Client, error) {
 // fetchAndReplace pulls the tenant's steer exclusions from the control plane and replaces the local cache.
 // Returns the count applied. On any error it returns the error WITHOUT touching the store (fail-safe).
 func (s steerExclusionSource) fetchAndReplace(ctx context.Context, store *steerexclusion.Store) (int, error) {
-	url := strings.TrimRight(s.url, "/") + "/admin/steer-exclusions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if s.tenantID == "" || strings.TrimSpace(s.tenantID) != s.tenantID {
+		return 0, fmt.Errorf("steer-exclusion source tenant is required")
+	}
+	endpoint := strings.TrimRight(s.url, "/") + "/admin/steer-exclusions?expected_tenant_id=" + url.QueryEscape(s.tenantID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -82,21 +86,31 @@ func (s steerExclusionSource) fetchAndReplace(ctx context.Context, store *steere
 		return 0, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	const limit = 4 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return 0, fmt.Errorf("read steer exclusions: %w", err)
+	}
+	if len(body) > limit {
+		return 0, fmt.Errorf("steer-exclusion response exceeds size limit")
+	}
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("control plane returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return 0, fmt.Errorf("control plane returned %d", resp.StatusCode)
 	}
 	var payload struct {
+		SchemaVersion   string                  `json:"schema_version"`
+		TenantID        string                  `json:"tenant_id"`
 		SteerExclusions []steerexclusion.Policy `json:"steer_exclusions"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return 0, fmt.Errorf("decode steer exclusions: %w", err)
 	}
-	// Bind every policy to the Edge's tenant so a misconfigured source can't inject another tenant's set.
-	for i := range payload.SteerExclusions {
-		payload.SteerExclusions[i].TenantID = s.tenantID
+	if payload.SchemaVersion != steerexclusion.ListSchema || payload.TenantID != s.tenantID {
+		return 0, fmt.Errorf("steer-exclusion response schema or tenant mismatch")
 	}
-	store.ReplaceTenant(s.tenantID, payload.SteerExclusions)
+	if err := store.ReplaceTenantChecked(s.tenantID, payload.SteerExclusions); err != nil {
+		return 0, fmt.Errorf("replace steer exclusions: %w", err)
+	}
 	return len(payload.SteerExclusions), nil
 }
 

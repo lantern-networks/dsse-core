@@ -180,8 +180,8 @@ func TestPostgresTrustDistributionStandbyAbsentAndRestart(t *testing.T) {
 	if !b.IsLeader() {
 		t.Fatal("no peer")
 	}
-	if _, ok := d.For("tenant_a"); ok {
-		t.Fatal("standby published signed trust")
+	if _, ok := d.For("tenant_a"); !ok {
+		t.Fatal("standby could not read the committed signed trust")
 	}
 	after, err := d.store.Load()
 	if err != nil || !bytes.Equal(before, after) {

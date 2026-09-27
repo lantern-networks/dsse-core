@@ -547,7 +547,20 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		eraseChecked("agent_rollout_plans", func(tenant string) (int, error) { return e.AgentRolloutPlans.RemoveTenantContext(ctx, tenant) })
 	}
 	if e.PublishedAgentUpdates != nil {
-		add("published_agent_releases", e.PublishedAgentUpdates.RemoveTenant(tenantID))
+		n, cleanup, err := e.PublishedAgentUpdates.removeTenantWithCleanupContext(ctx, tenantID)
+		result.ArtifactCleanup = cleanup
+		add("published_agent_releases", n)
+		if err != nil {
+			failure := "published_agent_releases: erasure saving could not be confirmed"
+			if cleanup["manifests"] == "absence_confirmed" {
+				location := "local"
+				if cleanup["shared"] == "unconfirmed" {
+					location = "shared"
+				}
+				failure = "published_agent_releases: manifests are absent; " + location + " artifact cleanup is unconfirmed; repair storage and retry erasure"
+			}
+			result.Failures = append(result.Failures, failure)
+		}
 	}
 }
 

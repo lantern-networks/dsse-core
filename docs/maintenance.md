@@ -663,3 +663,5 @@ Device admission reads require the active CP when leader election is enabled; ma
 ### Cross-region revocation delivery
 
 Pending revocation deliveries preserve peer changes in shared storage and resume after control-plane promotion. Peer acceptance and durable queue cleanup are reported separately; an old delivery acknowledgement cannot erase a newer request for the same identity. Snapshot loading rejects unreadable state instead of silently treating it as an empty queue. Existing outbox entries retain startup compatibility.
+
+Revocation-mesh upgrades require all shared-outbox writers to move together; old writers replace the entire row and can lose peer updates. Existing file-backed queues still wait for election and resume on promotion. Peer URLs must be valid HTTP(S) base URLs without userinfo, query or fragment. An uncertain shared commit requires process recovery; retries for unreachable peers remain bounded and may need another promotion or restart.

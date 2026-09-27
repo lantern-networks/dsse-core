@@ -48,3 +48,14 @@ func (s revocationMeshSource) resumeOnLeadership(ctx context.Context) {
 		}
 	}
 }
+
+// Every elected CP must wait for leadership, including one retaining a local file.
+func (s revocationMeshSource) resumeConfigured(ctx context.Context) {
+	if cpLeaderElectorInstance != nil {
+		s.resumeOnLeadership(ctx)
+		return
+	}
+	if n := s.resumePendingDeliveries(); n > 0 {
+		log.Printf("cross-region revocation mesh: resuming %d pending deliveries", n)
+	}
+}

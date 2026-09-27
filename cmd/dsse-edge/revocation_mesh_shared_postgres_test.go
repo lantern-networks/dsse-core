@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -169,4 +170,37 @@ func TestPostgresMeshSharedLifecycleAndPromotion(t *testing.T) {
 	if _, err = overlay.RevokeCheckedContext(req, "ctx-device", "block"); err != nil || received != req {
 		t.Fatal("request context lost", err)
 	}
+}
+
+func TestPostgresMeshFileQueueResumesAfterElection(t *testing.T) {
+	_, leader, _ := blobWriterPostgresFixture(t)
+	file := blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "mesh.json")}
+	o, err := newRevocationMeshOutbox(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int64
+	sink := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1) }))
+	defer sink.Close()
+	entry := meshOutboxEntry("queued")
+	entry.URL = sink.URL
+	if _, _, err = o.enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := newRevocationMeshOutbox(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := revocationMeshSource{outbox: fresh, client: sink.Client()}
+	leader.release()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); source.resumeConfigured(ctx) }()
+	defer func() { cancel(); <-done }()
+	time.Sleep(50 * time.Millisecond)
+	if requests.Load() != 0 {
+		t.Fatal("standby delivered file queue")
+	}
+	leader.tick()
+	waitUntil(t, 6*time.Second, func() bool { return requests.Load() == 1 && len(meshOutboxLoaded(t, file)) == 0 }, "file queue election resume")
 }

@@ -105,6 +105,7 @@ const (
 )
 
 type serverConfig struct {
+	StandbyAudit *adminStandbyAudit
 	// ===================================================================================
 	// DEPLOYMENT CONFIGURATION — flag-parsed values (addresses, paths, tokens, durations, toggles).
 	// ===================================================================================
@@ -4570,7 +4571,11 @@ func main() {
 	if storeBackend(*transportAnchorAckStorePath) == "postgres" {
 		transportAnchorAckShared = mustCPStateBlobPersister(*transportAnchorAckStorePath, "transport_anchor_acks")
 	}
+	standbyAudit := newAdminStandbyAudit(writer, evaluator)
+	stopStandbyAudit := standbyAudit.start()
+	defer stopStandbyAudit()
 	mux := newServerWithConfig(serverConfig{
+		StandbyAudit:                   standbyAudit,
 		DNSConntrack:                   edgeDNSConntrack,
 		VLANObjectStorePath:            strings.TrimSpace(*vlanObjectStorePath),
 		PeerEdges:                      meshPeerEdges,
@@ -5349,7 +5354,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return false, false
 			}
 			return counts.Principals > 0, true
-		})
+		}, config.LocalCredentials, config.StandbyAudit)
 	mux := http.NewServeMux()
 	configSyncStatus := config.ConfigSyncStatus                  // Phase 1 config-bundle puller status (nil = authoritative-local)
 	revocationSyncState := config.RevocationSyncStatus           // Phase 3 fast revocation puller status (nil = no CP sync)
@@ -6419,7 +6424,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		log.Fatalf("load grant store: %v", err)
 	}
 	theGrantStore.Store(grantStore)
-	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator.PolicyBundle.TenantID)
+	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox)
 	// ★ AND THE AUTHORITY RECEIVES WHAT THE FLEET MINTED. Registered only on a node that does not pull its
 	// own configuration — the same rule the connector report states. See grant_cp_report.go.
 	registerGrantReportRoute(mux, grantStore, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
@@ -7398,6 +7403,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, trustedKeyring)
 	})
 	mux.HandleFunc("POST /human-approvals/events", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -7417,7 +7423,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				return
 			}
 		}
-		stored, err := humanApprovals.Upsert(event)
+		stored, err := humanApprovals.UpsertContext(r.Context(), event)
 		if err != nil {
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
@@ -7450,6 +7456,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, event)
 	})
 	mux.HandleFunc("POST /delegated-grants", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
@@ -7467,7 +7474,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, nhi.StatusForReferenceError(err), err)
 			return
 		}
-		stored, err := delegatedGrants.Upsert(grant)
+		stored, err := delegatedGrants.UpsertContext(r.Context(), grant)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
@@ -7496,6 +7503,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, grant)
 	})
 	mux.HandleFunc("POST /delegated-grants/{grant_id}/revoke", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}

@@ -130,8 +130,8 @@ func TestAdminHumanApprovalEventAPIUpsertListDetailAndRevoke(t *testing.T) {
 		t.Fatalf("outbox inserted audits = %#v, want human approval upsert/revoke", outbox.insertedAudits)
 	}
 	for _, audit := range outbox.insertedAudits {
-		if audit.SourceIP != nil || audit.ActorUserID != nil {
-			t.Fatalf("human approval audit included raw source/user fields: %#v", audit)
+		if audit.SourceIP != nil || audit.ActorNHIID != nil || audit.ActorUserID == nil || *audit.ActorUserID == "approver_lab_001" || *audit.ActorUserID == "user_lab_001" {
+			t.Fatalf("human approval audit must name the administrator without copying the approval subject/source: %#v", audit)
 		}
 		if audit.Metadata["human_approval_metadata_recorded_scope"] != "none" || audit.Metadata["notification_sent"] != false || audit.Metadata["runtime_hot_reload"] != false {
 			t.Fatalf("human approval audit metadata = %#v, want non-secret admin boundary", audit.Metadata)

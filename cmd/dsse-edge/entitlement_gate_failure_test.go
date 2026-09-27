@@ -47,7 +47,7 @@ func TestDLPAuthorityFailureStopsEveryGatedMutation(t *testing.T) {
 			}
 			defer writer.Close()
 			mux := http.NewServeMux()
-			registerDLPRoutes(mux, newAdminEndpointMiddleware(testEvaluator(), writer, nil, auth, "", true, nil, nil), testEvaluator(), nil, rt.rules, rt.allowlist, rt.policyObjects, rt.fingerprints, rt.classifiers, rt.entitlements, nil, "")
+			registerDLPRoutes(mux, newAdminEndpointMiddleware(testEvaluator(), writer, nil, auth, "", true, nil, nil, nil), testEvaluator(), nil, rt.rules, rt.allowlist, rt.policyObjects, rt.fingerprints, rt.classifiers, rt.entitlements, nil, "")
 			snapshot := func() string {
 				b, err := json.Marshal([]any{rt.rules.RulesForTenant(tenant), rt.allowlist.ValuesForTenant(tenant), rt.policyObjects.List(tenant), rt.fingerprints.DatasetsForTenant(tenant), rt.classifiers.SpecsForTenant(tenant)})
 				if err != nil {

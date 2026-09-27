@@ -634,3 +634,10 @@ Targeted startup, license, entitlement, cancellation and write-fencing regressio
 An unreadable configured license or entitlement snapshot stops startup instead of silently starting with empty authority. A license serial that cannot be restored prevents every CP using that shared authority from advertising leadership; this affects leader-only management and audit intake. First distinguish storage connectivity failure from invalid stored data. If restoration is needed, use a verified authoritative snapshot at or above the last accepted license serial before retrying startup/promotion. Never reset the accepted serial to bypass this check. Write-term fencing here covers administrative blob UpdateContext calls; remaining background/runtime integrations follow separately.
 
 
+### Administrator identity and authorization reconciliation
+Administrator credential writes retain acknowledged state when persistence fails. Current stored roles and account status are checked for managed sessions; API token changes report save failures. Download bearers are consumed only after a confirmed shared write. Cross-organization writes retain explicit target checks, and failed authorization changes produce audit failures rather than success events.
+
+Credential schema migrations 048, 049 and 051 carry TOTP replay counters, revision checks and writer protocol coordination. File and database regression tests are separate from Console GUI and deployed-fleet acceptance.
+
+
+Administrator migration checks now include live shared authority, legacy principal IDs and credential-table purge after migration 051. See [administrator credential upgrade](admin-credential-upgrade.md) before changing a multi-control-plane deployment; all credential writers must move together.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -21,11 +22,15 @@ import (
 type postgresCredentialPersistence struct{ db *sql.DB }
 
 func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdminCredential, error) {
+	return p.loadCredentials(ctx, "")
+}
+
+func (p postgresCredentialPersistence) loadCredentials(ctx context.Context, suffix string, args ...any) ([]*localAdminCredential, error) {
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
 		       recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
-		       activation_expires_at, created_at, updated_at
-		FROM admin_local_credentials`)
+		       activation_expires_at, created_at, updated_at, last_totp_counter, revision
+		FROM admin_local_credentials`+suffix, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -37,11 +42,15 @@ func (p postgresCredentialPersistence) LoadAll(ctx context.Context) ([]*localAdm
 		var lockedUntil, activationExpiresAt sql.NullTime
 		if err := rows.Scan(&c.Email, &c.PrincipalID, &c.TenantID, &rolesJSON, &c.Status, &c.PasswordHash,
 			&c.TOTPSecret, &c.TOTPEnrolled, &recoveryJSON, &c.FailedAttempts, &lockedUntil,
-			&c.ActivationTokenHash, &activationExpiresAt, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			&c.ActivationTokenHash, &activationExpiresAt, &c.CreatedAt, &c.UpdatedAt, &c.LastTOTPCounter, &c.Revision); err != nil {
 			return nil, err
 		}
-		_ = json.Unmarshal(rolesJSON, &c.Roles)
-		_ = json.Unmarshal(recoveryJSON, &c.RecoveryCodeHashes)
+		if err := json.Unmarshal(rolesJSON, &c.Roles); err != nil {
+			return nil, fmt.Errorf("decode administrator roles: %w", err)
+		}
+		if err := json.Unmarshal(recoveryJSON, &c.RecoveryCodeHashes); err != nil {
+			return nil, fmt.Errorf("decode administrator recovery hashes: %w", err)
+		}
 		// Unseal the at-rest TOTP secret (no-op when stored as plaintext / no KEK). Fail-closed: a sealed
 		// secret with no KEK aborts the load rather than silently dropping every operator's 2FA.
 		if c.TOTPSecret, err = unsealTOTPSecretFromStore(c.TOTPSecret); err != nil {
@@ -73,32 +82,78 @@ func (p postgresCredentialPersistence) Upsert(ctx context.Context, c *localAdmin
 	if err != nil {
 		return err
 	}
-	_, err = p.db.ExecContext(ctx, `
-		INSERT INTO admin_local_credentials (
-			email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
-			recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
-			activation_expires_at, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-		ON CONFLICT (email) DO UPDATE SET
-			principal_id=EXCLUDED.principal_id, tenant_id=EXCLUDED.tenant_id, roles=EXCLUDED.roles,
-			status=EXCLUDED.status, password_hash=EXCLUDED.password_hash, totp_secret=EXCLUDED.totp_secret,
-			totp_enrolled=EXCLUDED.totp_enrolled, recovery_code_hashes=EXCLUDED.recovery_code_hashes,
-			failed_attempts=EXCLUDED.failed_attempts, locked_until=EXCLUDED.locked_until,
-			activation_token_hash=EXCLUDED.activation_token_hash,
-			activation_expires_at=EXCLUDED.activation_expires_at, updated_at=EXCLUDED.updated_at`,
-		c.Email, c.PrincipalID, c.TenantID, roles, c.Status, c.PasswordHash, sealedTOTP, c.TOTPEnrolled,
+	args := []any{c.Email, c.PrincipalID, c.TenantID, roles, c.Status, c.PasswordHash, sealedTOTP, c.TOTPEnrolled,
 		recovery, c.FailedAttempts, nullTime(c.LockedUntil), c.ActivationTokenHash,
-		nullTime(c.ActivationExpiresAt), c.CreatedAt, c.UpdatedAt)
+		nullTime(c.ActivationExpiresAt), c.CreatedAt, c.UpdatedAt, c.LastTOTPCounter}
+	query := `INSERT INTO admin_local_credentials (
+ email, principal_id, tenant_id, roles, status, password_hash, totp_secret, totp_enrolled,
+ recovery_code_hashes, failed_attempts, locked_until, activation_token_hash,
+ activation_expires_at, created_at, updated_at, last_totp_counter)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+ ON CONFLICT (email) DO NOTHING RETURNING revision`
+	if c.Revision != 0 {
+		args = append(args, c.Revision)
+		query = `UPDATE admin_local_credentials SET
+ principal_id=$2, tenant_id=$3, roles=$4, status=$5, password_hash=$6, totp_secret=$7,
+ totp_enrolled=$8, recovery_code_hashes=$9, failed_attempts=$10, locked_until=$11,
+ activation_token_hash=$12, activation_expires_at=$13, created_at=$14, updated_at=$15,
+ last_totp_counter=$16, revision=nextval('admin_local_credentials_revision_seq')
+ WHERE email=$1 AND tenant_id=$3 AND revision=$17 RETURNING revision`
+	}
+	tx, err := p.beginCredentialWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var revision int64
+	err = tx.QueryRowContext(ctx, query, args...).Scan(&revision)
+	if err == sql.ErrNoRows {
+		return errCredentialConflict
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err == nil {
+		c.Revision = revision
+	}
 	return err
 }
 
 // Delete removes a credential durably. The (email, tenant_id) predicate keeps the delete tenant-scoped so an
 // account can never be removed across tenants even though email is the table's primary key.
-func (p postgresCredentialPersistence) Delete(ctx context.Context, tenantID, email string) error {
-	_, err := p.db.ExecContext(ctx,
-		`DELETE FROM admin_local_credentials WHERE email=$1 AND tenant_id=$2`,
-		credentialEmailKey(email), tenantID)
-	return err
+func (p postgresCredentialPersistence) Delete(ctx context.Context, tenantID, email string, revision int64) error {
+	if revision <= 0 {
+		return errCredentialConflict
+	}
+	tx, err := p.beginCredentialWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var deleted int64
+	err = tx.QueryRowContext(ctx,
+		`DELETE FROM admin_local_credentials WHERE email=$1 AND tenant_id=$2 AND revision=$3 RETURNING revision`,
+		credentialEmailKey(email), tenantID, revision).Scan(&deleted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return errCredentialConflict
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// Transaction-local state cannot authorize a later borrower of this pooled connection.
+func (p postgresCredentialPersistence) beginCredentialWrite(ctx context.Context) (*sql.Tx, error) {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, `SET LOCAL dsse.credential_write_protocol = '1'`); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
 }
 
 func nullTime(t time.Time) sql.NullTime {
@@ -132,7 +187,7 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 				db.Close()
 				return nil, nil, fmt.Errorf("load local-credential migrations: %w", err)
 			}
-			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials)
+			migrations, err = selectPostgresComponentMigrations(migrations, "admin local credentials", postgresMigrationLocalCredentials, postgresMigrationCredentialTOTP, postgresMigrationCredentialRevision, postgresMigrationCredentialWriterProtocol)
 			if err != nil {
 				db.Close()
 				return nil, nil, err
@@ -158,4 +213,46 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 		}
 		return newFileCredentialPersistence(path), func() error { return nil }, nil
 	}
+}
+
+func (p postgresCredentialPersistence) LoadCredential(ctx context.Context, email string) (*localAdminCredential, error) {
+	rows, err := p.loadCredentials(ctx, " WHERE lower(btrim(email))=$1", email)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	if len(rows) != 1 {
+		return nil, fmt.Errorf("ambiguous administrator credential")
+	}
+	return rows[0], nil
+}
+
+func (p postgresCredentialPersistence) LookupAuthority(ctx context.Context, tenant, principal, email string) (credentialAuthorityRecord, bool, error) {
+	rows, err := p.db.QueryContext(ctx, `SELECT email,status,roles FROM admin_local_credentials
+ WHERE tenant_id=$1 AND (principal_id=$2 OR ($3<>'' AND lower(btrim(email))=$3)) LIMIT 2`, tenant, principal, email)
+	if err != nil {
+		return credentialAuthorityRecord{}, false, err
+	}
+	defer rows.Close()
+	var record credentialAuthorityRecord
+	count := 0
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&record.Email, &record.Status, &raw); err != nil {
+			return credentialAuthorityRecord{}, false, err
+		}
+		if err := json.Unmarshal(raw, &record.Roles); err != nil {
+			return credentialAuthorityRecord{}, false, err
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		return credentialAuthorityRecord{}, false, err
+	}
+	if count > 1 {
+		return credentialAuthorityRecord{}, false, fmt.Errorf("ambiguous administrator authority")
+	}
+	return record, count == 1, nil
 }

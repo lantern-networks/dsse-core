@@ -98,6 +98,7 @@ func TestOneCustomerMayNotNameAnother(t *testing.T) {
 		roles := []string{"admin"}
 		if operator {
 			roles = append(roles, "super_admin")
+			r.Header.Set("X-Operate-Tenant", "tenant_northwind")
 		}
 		return r.WithContext(context.WithValue(r.Context(), adminIdentityContextKey{},
 			adminIdentity{PrincipalID: "adm", TenantID: tenant, Roles: roles, AuthMethod: "admin_session"}))

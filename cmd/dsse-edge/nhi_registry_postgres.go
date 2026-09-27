@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -29,7 +30,7 @@ var _ nhi.RuntimeStore = postgresNonHumanIdentityStore{}
 
 func (store postgresNonHumanIdentityStore) Upsert(ctx context.Context, identity model.NonHumanIdentity, tenantID string, now time.Time) (model.NonHumanIdentity, error) {
 	if store.DB == nil {
-		return model.NonHumanIdentity{}, fmt.Errorf("postgres non-human identity db is not configured")
+		return model.NonHumanIdentity{}, nhi.ErrPersistence
 	}
 	normalized, err := nhi.Normalize(identity, tenantID, now)
 	if err != nil {
@@ -40,7 +41,8 @@ func (store postgresNonHumanIdentityStore) Upsert(ctx context.Context, identity 
 		return model.NonHumanIdentity{}, err
 	}
 	if _, err := store.DB.ExecContext(ctx, statement.SQL, statement.Args...); err != nil {
-		return model.NonHumanIdentity{}, fmt.Errorf("upsert non-human identity: %w", err)
+		log.Printf("upsert non-human identity: %v", err)
+		return model.NonHumanIdentity{}, nhi.ErrPersistence
 	}
 	if store.gen != nil {
 		atomic.AddUint64(store.gen, 1)

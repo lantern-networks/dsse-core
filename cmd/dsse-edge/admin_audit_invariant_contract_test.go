@@ -20,6 +20,7 @@ import (
 	"github.com/lantern-networks/dsse-core/policyrule"
 	toolcallaudit "github.com/lantern-networks/dsse-core/toolcallaudit"
 
+	"github.com/lantern-networks/dsse-core/grantstore"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
@@ -472,6 +473,31 @@ func TestControlPlaneAuditEmittersNonSecretInvariant(t *testing.T) {
 				Metadata:               map[string]any{"safe_label": rawMetadataValue},
 			}, evaluator, now),
 		},
+		{
+			name:  "adminAccessGrantRevocationAuditLog",
+			audit: adminAccessGrantRevocationAuditLog(httptest.NewRequest("POST", "/admin/grants/target/revoke", nil), grantstore.Grant{GrantID: rawTokenAudience, TenantID: "tenant_audit_cp0020", UserID: rawSubject, UserEmail: rawMetadataValue, DeviceID: rawDestination, Scope: rawPayloadRef}, evaluator, now, true),
+		},
+		{
+			name: "adminHumanApprovalMutationAuditLog",
+			audit: adminHumanApprovalMutationAuditLog(httptest.NewRequest("POST", "/admin/human-approval-events/target/revoke", nil), "admin_human_approval_event_upserted", adminHumanApprovalEvent{
+				ID:                     auditID,
+				TenantID:               "tenant_audit_cp0020",
+				ApproverUserID:         &rawActorUserID,
+				SubjectUserID:          &rawSubject,
+				ActorNHIID:             &rawActorNHIID,
+				DelegatedAccessGrantID: &rawMetadataValue,
+				AgentTaskSessionID:     &rawSession,
+				ApplicationID:          &rawDestination,
+				Audience:               &rawTokenAudience,
+				Resource:               &rawPayloadRef,
+				ActionType:             &actionType,
+				TaskID:                 &rawMetadataValue,
+				RunID:                  &rawMetadataValue,
+				RequestedScopes:        []string{rawTokenAudience},
+				ReasonCode:             &rawMetadataValue,
+				ApprovalResult:         "approved",
+			}, evaluator, now, true),
+		},
 	}
 
 	for _, tc := range audits {
@@ -592,32 +618,34 @@ func mustAuditEmitterFunctionNames(t *testing.T) []string {
 
 func coveredAuditEmitterInvariantFunctions() map[string]bool {
 	return map[string]bool{
-		"adminAgentToolAuditLog":            true,
-		"adminApplicationCatalogAuditLog":   true,
-		"adminApplicationDeleteAuditLog":    true,
-		"adminApplicationPublishAuditLog":   true,
-		"authoredRuleAuditLog":              true,
-		"assetCatalogAuditLog":              true,
-		"adminConnectorManagementAuditLog":  true,
-		"adminDelegatedAccessGrantAuditLog": true,
-		"adminEndpointInventoryAuditLog":    true,
-		"adminHumanApprovalEventAuditLog":   true,
-		"adminIdPChangeAuditLog":            true,
-		"adminPolicyMutationAuditLog":       true,
-		"adminPolicyAuditLog":               true,
-		"adminPolicyCandidateAuditLog":      true,
-		"adminSiteAuditLog":                 true,
-		"adminTenantModelAuditLog":          true,
-		"adminTenantModelLifecycleAuditLog": true,
-		"adminToolCallEventAuditLog":        true,
-		"delegatedAccessGrantAuditLog":      true,
-		"humanApprovalEventAuditLog":        true,
-		"humanIdentityAuditLog":             true,
-		"humanIdentityImportAuditLog":       true,
-		"humanIdentitySourcePolicyAuditLog": true,
-		"inspectionEventAuditLog":           true,
-		"nonHumanIdentityAuditLog":          true,
-		"toolCallEventAuditLog":             true,
+		"adminHumanApprovalMutationAuditLog": true,
+		"adminAccessGrantRevocationAuditLog": true,
+		"adminAgentToolAuditLog":             true,
+		"adminApplicationCatalogAuditLog":    true,
+		"adminApplicationDeleteAuditLog":     true,
+		"adminApplicationPublishAuditLog":    true,
+		"authoredRuleAuditLog":               true,
+		"assetCatalogAuditLog":               true,
+		"adminConnectorManagementAuditLog":   true,
+		"adminDelegatedAccessGrantAuditLog":  true,
+		"adminEndpointInventoryAuditLog":     true,
+		"adminHumanApprovalEventAuditLog":    true,
+		"adminIdPChangeAuditLog":             true,
+		"adminPolicyMutationAuditLog":        true,
+		"adminPolicyAuditLog":                true,
+		"adminPolicyCandidateAuditLog":       true,
+		"adminSiteAuditLog":                  true,
+		"adminTenantModelAuditLog":           true,
+		"adminTenantModelLifecycleAuditLog":  true,
+		"adminToolCallEventAuditLog":         true,
+		"delegatedAccessGrantAuditLog":       true,
+		"humanApprovalEventAuditLog":         true,
+		"humanIdentityAuditLog":              true,
+		"humanIdentityImportAuditLog":        true,
+		"humanIdentitySourcePolicyAuditLog":  true,
+		"inspectionEventAuditLog":            true,
+		"nonHumanIdentityAuditLog":           true,
+		"toolCallEventAuditLog":              true,
 	}
 }
 

@@ -23,6 +23,9 @@ import (
 
 func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, policyStore policy.RuntimeStore, eastWestAuthChallenges *eastwest.AuthChallengeStore, cpVersions *cpConfigVersionClient, eastWestObserveStore *eastwestobserve.Store, configSourceURL string, refreshObservationRules func(http.ResponseWriter) bool) {
 	mux.HandleFunc("GET /admin/east-west", adminEndpoint("admin.eastwest.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
 		writeJSON(w, http.StatusOK, eastwest.AdminStatus(policyStore, adminTenantIDFromRequest(r)))
 	}))
 	// S1 (Observe): the lateral-flow inventory + convergence readiness. Read-only; recording happens on the
@@ -31,6 +34,10 @@ func registerEastWestRoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		if refreshObservationRules != nil && !refreshObservationRules(w) {
 			return
 		}
+		if !refreshRuntimeManagement(w, policyStore) {
+			return
+		}
+
 		tenant := adminTenantIDFromRequest(r)
 		var obs []eastwestobserve.FlowObservation
 		if eastWestObserveStore != nil {

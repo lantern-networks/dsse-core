@@ -26,7 +26,7 @@ func TestSteerExclusionSourceFetchAndReplace(t *testing.T) {
 			http.Error(w, "no auth", http.StatusUnauthorized)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"steer_exclusions": []map[string]any{{
+		json.NewEncoder(w).Encode(map[string]any{"schema_version": steerexclusion.ListSchema, "tenant_id": "t1", "steer_exclusions": []map[string]any{{
 			"id": "sx_cp_1", "tenant_id": "t1", "scope_type": "device", "scope_id": "dev-1",
 			"excluded_app_signing_ids": []string{"corpvpn.exe"}, "status": "active",
 		}}})

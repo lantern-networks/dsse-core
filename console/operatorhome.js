@@ -199,7 +199,7 @@ async function renderOperatorDistribution(host) {
     el("tbody", {}, rows),
   ]));
 
-  let published = 0, withSomething = 0, undelegated = 0;
+  let published = 0, withSomething = 0, undelegated = 0, unreadable = 0;
   for (const t of tenants) {
     const row = host.querySelector('[data-op-dist="' + String(t.tenant_id).replace(/"/g, '\\"') + '"]');
     if (!row) continue;
@@ -214,8 +214,9 @@ async function renderOperatorDistribution(host) {
         undelegated += 1;
       } else {
         note = "HTTP " + r.status;
+        unreadable += 1;
       }
-    } catch (e) { note = bl({ en: "unreadable", ja: "読めません" }); }
+    } catch (e) { note = bl({ en: "unreadable", ja: "読めません" }); unreadable += 1; }
     if (!current()) return;
     const cells = row.querySelectorAll("td");
     cells[1].innerHTML = ""; cells[2].innerHTML = "";
@@ -236,8 +237,9 @@ async function renderOperatorDistribution(host) {
   summary.replaceChild(el("span", {}, [
     uiBadge(bl({ en: "Published: ", ja: "公開中: " }) + published, published ? "ok" : "off"),
     undelegated ? uiBadge(bl({ en: "Not delegated: ", ja: "委任なし: " }) + undelegated, "off") : el("span", {}),
+    unreadable ? uiBadge(bl({ en: "Unreadable: ", ja: "読取不能: " }) + unreadable, "warn") : el("span", {}),
   ]), summary.firstChild);
-  if (!published && withSomething === 0 && undelegated < tenants.length) {
+  if (!published && withSomething === 0 && undelegated === 0 && unreadable === 0) {
     host.appendChild(el("p", { class: "ui-view-desc", text: bl({
       en: "No tenant has a published release, so no endpoint can update itself.",
       ja: "どのテナントにも公開中のリリースがないため、端末は自分を更新できません。" }) }));

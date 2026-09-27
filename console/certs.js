@@ -430,6 +430,9 @@ async function loadCertMap(host) {
     try {
       const r = await apiFetch("GET", "/admin/pki/certificates", undefined, node.plane);
       if (!r.ok) return { node, error: "HTTP " + r.status, status: r.status };
+      if (!r.body || !Array.isArray(r.body.items) || r.body.items.some((item) => !item || typeof item !== "object" || Array.isArray(item))) {
+        return { node, error: bl({ en: "Invalid certificate list", ja: "証明書一覧の形式が不正です" }) };
+      }
       // ★★★ THE LABEL COMES FROM WHAT ANSWERED, NOT FROM WHERE WE ASKED (2026-09-05, measured). This screen
       // asks two addresses and calls one "Enforcement Edge"; on a deployment whose console front door
       // proxies both to the same node, it received the control plane's certificates twice and labelled half
@@ -446,14 +449,12 @@ async function loadCertMap(host) {
   await extras;
   if (results.every((x) => x.error)) {
     if (!current()) return;
-    // ★★ THE CHECKLIST SENDS PEOPLE HERE (2026-08-17, walked as the operator from a half-built organization's
-    // setup list). "Device identity — not set: this organization's devices are not accepted. Open certificates"
-    // landed on a screen whose entire content was "HTTP 403 / HTTP 403". The reason is real and knowable — the
-    // organization has not delegated its management, so nothing here is readable — and a status code is not it.
+    // A refusal can mean a missing read scope, expired sign-in, or missing delegation.
+    // Do not diagnose delegation from the HTTP status alone.
     const refused = results.every((x) => x.status === 403 || x.status === 401);
     uiState(host, "error", refused
-      ? bl({ en: "This tenant's certificates are not readable here. It has not delegated its management, so nothing on this screen can be shown or changed until it does.",
-             ja: "このテナントの証明書はここでは取得できません。運営に管理を委任していないため、この画面は表示も変更もできません。" })
+      ? bl({ en: "You cannot read this tenant's certificates. Check your sign-in, certificate read permissions, and the tenant's management delegation.",
+             ja: "このテナントの証明書を取得する権限がありません。ログイン状態、証明書の閲覧権限、テナントの管理委任を確認してください。" })
       : results.map((x) => x.error).join(" / "), {
       label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadCertMap(host),
     });
@@ -462,8 +463,7 @@ async function loadCertMap(host) {
 
   if (!current()) return;
   if (failedReads.size) {
-    uiState(host, "error", bl({ en: "Required PKI information could not be read. Retry before changing certificates.", ja: "必要なPKI情報を取得できません。証明書を変更する前に再試行してください。" }),
-      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadCertMap(host) });
+    renderPartialCertList(host, results);
     return;
   }
   host.innerHTML = "";
@@ -604,6 +604,43 @@ async function loadCertMap(host) {
       ]);
     }))));
   }
+}
+
+// Inventory is independently readable. Missing authority/adoption information must not hide it,
+// or enable controls that would infer "no authority" or "safe to retire" from missing evidence.
+function renderPartialCertList(host, results) {
+  host.innerHTML = "";
+  host.appendChild(el("p", { class: "ui-state ui-state-error", role: "status", text: bl({
+    en: "Some certificate information could not be read. Available certificates are listed below. Changes are unavailable until the missing information can be read.",
+    ja: "証明書の補助情報を取得できませんでした。取得できた証明書を表示します。不足する情報を取得できるまで変更操作は利用できません。" }) }));
+  host.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadCertMap(host) }));
+  const seen = new Set();
+  results.forEach(({ node, items, error, measuredOn, label }) => {
+    if (measuredOn && seen.has(measuredOn)) return;
+    if (measuredOn) seen.add(measuredOn);
+    host.appendChild(el("h3", { class: "ui-view-title", text: bl(label || node.label) }));
+    if (error) {
+      host.appendChild(el("p", { class: "ui-view-desc", text: bl({
+        en: "This node's certificates could not be read. Their state is unknown.",
+        ja: "このノードの証明書を取得できません。状態は不明です。" }) }));
+      return;
+    }
+    if (!items.length) {
+      host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "This node reported no certificates.", ja: "このノードが返した証明書一覧は空です。" }) }));
+      return;
+    }
+    const headers = [{ en: "Certificate", ja: "証明書" }, { en: "Name", ja: "名前" },
+      { en: "Expires", ja: "有効期限" }, { en: "SHA-256 fingerprint", ja: "SHA-256 指紋" }];
+    host.appendChild(el("table", { class: "ui-table" }, [
+      el("thead", {}, el("tr", {}, headers.map((h) => el("th", { text: bl(h) })))),
+      el("tbody", {}, items.map((item) => el("tr", {}, [
+        el("td", { text: _PKIMAP_ROLES[item.role] ? bl(_PKIMAP_ROLES[item.role].title) : item.role || "—" }),
+        el("td", { text: item.subject || item.id || "—" }),
+        el("td", { text: item.not_after || "—" }),
+        el("td", { style: "overflow-wrap:anywhere", text: item.sha256 || "—" }),
+      ]))),
+    ]));
+  });
 }
 
 // One certificate, one card: identity line, where-used line, contents, actions.

@@ -537,6 +537,7 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 		ExportObjectStore: objectStore,
 		HotStore:          hotstore.NewJSONLStore(writer, adminLogStreamFilenameMap()),
 		AdminExportJobs:   postgresJobStore,
+		AdminAuditOutbox:  postgresAdminAuditOutboxReader{DB: db},
 		AdminExportWorker: postgresQueueAdminExportWorker{
 			Queue:                   postgresExportTaskQueueAdapter{DB: postgresExportTaskSQLDB{DB: db}},
 			DB:                      db,
@@ -561,8 +562,8 @@ func TestAdminExportJobAPIEnqueuesPostgresQueueTaskWithoutDirectAuditJSONLE2E(t 
 	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 1 {
 		t.Fatalf("active queue rows = %d, want 1", count)
 	}
-	if count := countPostgresAdminAuditOutboxRows(t, ctx, db, "tenant_lab_001"); count != 2 {
-		t.Fatalf("admin audit outbox rows = %d, want 2", count)
+	if count := countPostgresAdminAuditOutboxRows(t, ctx, db, "tenant_lab_001"); count != 3 {
+		t.Fatalf("admin audit outbox rows = %d, want 3", count)
 	}
 	auditRows, err := writer.ReadJSONL("audit.log.jsonl")
 	if err != nil {

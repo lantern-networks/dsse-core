@@ -16,9 +16,9 @@ import (
 // Opt-in real PostgreSQL check. A private schema keeps this test away from a
 // caller's existing admin_runtime_state row even when a test DB is reused.
 func TestIncomingPostgresUnrelatedControlPlaneWriteKeepsConfirmedRule(t *testing.T) {
-	dsn := os.Getenv("DSSE_TEST_POSTGRES_DSN")
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
 	if dsn == "" {
-		t.Skip("set DSSE_TEST_POSTGRES_DSN for a real PostgreSQL check")
+		t.Skip("set POSTGRES_QUEUE_E2E_DSN for a real PostgreSQL check")
 	}
 	u, err := url.Parse(dsn)
 	if err != nil || u.Scheme == "" {

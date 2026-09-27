@@ -222,13 +222,18 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWriter returned error: %v", err)
 	}
+	auth := newAdminAuthStore()
+	auth.UpsertPrincipal(adminPrincipal{ID: "pg_admin", TenantID: "tenant_lab_001", Status: "active", IDPID: "test-fixture", Roles: []string{"admin"}})
+	auth.UpsertAPIToken(adminAPIToken{ID: "pg-test-token", TenantID: "tenant_lab_001", TokenHash: adminTokenHash("pg-admin-token"), Roles: []string{"admin"}, Scopes: []string{"*"}, CreatedByAdminPrincipalID: "pg_admin", Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)})
+	tenantCAs, connectorTLS := postgresTestConnectorIdentity(t, "tenant_lab_001", "conn_pg_runtime_001")
 	handler := newServerWithConfig(serverConfig{
-		Evaluator:       testEvaluator(),
-		Writer:          writer,
-		Registry:        store,
-		ConnectorSecret: defaultConnectorSecret,
-		AdminToken:      "legacy-admin-token",
-		LabMode:         boolPtr(false),
+		Evaluator:        testEvaluator(),
+		Writer:           writer,
+		Registry:         store,
+		ConnectorSecret:  defaultConnectorSecret,
+		AdminAuth:        auth,
+		TenantCARegistry: tenantCAs,
+		LabMode:          boolPtr(false),
 	})
 
 	registerReq := httptest.NewRequest(http.MethodPost, "/connectors/register", strings.NewReader(`{
@@ -251,7 +256,7 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 	}
 
 	rotateReq := httptest.NewRequest(http.MethodPost, "/connectors/conn_pg_runtime_001/runtime-secret/rotate", strings.NewReader(`{"runtime_secret":"postgres-rotated-runtime-secret-001"}`))
-	rotateReq.Header.Set("authorization", "Bearer legacy-admin-token")
+	rotateReq.Header.Set("authorization", "Bearer pg-admin-token")
 	rotateRec := httptest.NewRecorder()
 	handler.ServeHTTP(rotateRec, rotateReq)
 	if rotateRec.Code != http.StatusOK {
@@ -261,15 +266,17 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 	// Simulate an Edge process restart by constructing a new handler over the
 	// same PostgreSQL-backed registry. The rotated runtime secret must survive.
 	restarted := newServerWithConfig(serverConfig{
-		Evaluator:       testEvaluator(),
-		Writer:          writer,
-		Registry:        postgresConnectorRegistryStore{DB: db},
-		ConnectorSecret: defaultConnectorSecret,
-		AdminToken:      "legacy-admin-token",
-		LabMode:         boolPtr(false),
+		Evaluator:        testEvaluator(),
+		Writer:           writer,
+		Registry:         postgresConnectorRegistryStore{DB: db},
+		ConnectorSecret:  defaultConnectorSecret,
+		AdminAuth:        auth,
+		TenantCARegistry: tenantCAs,
+		LabMode:          boolPtr(false),
 	})
 	heartbeatBody := `{"tenant_id":"tenant_lab_001","status":"healthy","policy_bundle_id":"pb_lab_20260525_001","policy_bundle_version":"2026.05.25.001"}`
 	oldHeartbeatReq := httptest.NewRequest(http.MethodPost, "/connectors/conn_pg_runtime_001/heartbeat", strings.NewReader(heartbeatBody))
+	oldHeartbeatReq.TLS = connectorTLS
 	oldHeartbeatReq.Header.Set(connectorSecretHeader, defaultConnectorSecret)
 	oldHeartbeatRec := httptest.NewRecorder()
 	restarted.ServeHTTP(oldHeartbeatRec, oldHeartbeatReq)
@@ -277,6 +284,7 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 		t.Fatalf("old secret heartbeat status = %d, want %d", oldHeartbeatRec.Code, http.StatusUnauthorized)
 	}
 	heartbeatReq := httptest.NewRequest(http.MethodPost, "/connectors/conn_pg_runtime_001/heartbeat", strings.NewReader(heartbeatBody))
+	heartbeatReq.TLS = connectorTLS
 	heartbeatReq.Header.Set(connectorSecretHeader, "postgres-rotated-runtime-secret-001")
 	heartbeatRec := httptest.NewRecorder()
 	restarted.ServeHTTP(heartbeatRec, heartbeatReq)
@@ -285,7 +293,7 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 	}
 
 	listReq := httptest.NewRequest(http.MethodGet, "/connectors", nil)
-	listReq.Header.Set("authorization", "Bearer legacy-admin-token")
+	listReq.Header.Set("authorization", "Bearer pg-admin-token")
 	listRec := httptest.NewRecorder()
 	restarted.ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK {
@@ -299,7 +307,7 @@ func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {
 		t.Fatalf("connectors = %#v, want 1", connectors)
 	}
 	metadata := connectors[0].Metadata
-	if metadata["runtime_secret_configured"] != true || metadata["runtime_secret_rotated_by"] != "admin_legacy_token" {
+	if metadata["runtime_secret_configured"] != true || metadata["runtime_secret_rotated_by"] != "pg_admin" {
 		t.Fatalf("public connector metadata = %#v, want configured rotation metadata", metadata)
 	}
 	if _, ok := metadata["runtime_secret_hash"]; ok {

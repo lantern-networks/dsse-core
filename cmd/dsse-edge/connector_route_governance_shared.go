@@ -27,6 +27,9 @@ func routeGovernanceWriteContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if _, ok := ctx.Value(cpWriteLeaseKey{}).(cpWriteLease); !ok {
+		ctx = captureCPWriteLease(ctx)
+	}
 	return ctx
 }
 func routeState(g *connectorRouteGovernance) governancePersistState {

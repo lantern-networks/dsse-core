@@ -54,13 +54,23 @@ long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
 
+ClickHouse log exports report all matching records separately from the number
+written to the file, so an export capped by its row limit is marked as truncated.
+An interrupted database response fails the export instead of treating a partial
+response as complete. Real ClickHouse checks covered capped and filtered exports
+and tenant isolation; export-worker tests checked the resulting job status.
+This does not complete ClickHouse archival or hold-aware retention.
+
 Reapplying a carried node plan reuses valid existing certificates without requiring
 the issuing CA private key. Invalid or mismatched material is rejected before the
 node environment is rewritten. Installer verification reports skipped checks
 separately from successful checks.
 
 An explicit **Any destination** rule applies its HTTPS inspection choice while
-preserving tenant and source-device scope. Local single-node checks covered real
+preserving tenant and source-device scope. Before upgrading, review existing
+Any-destination inspect and bypass rules: previously ineffective rules now apply.
+In particular, an Any-source/Any-destination bypass rule disables HTTPS inspection
+for its tenant. Local single-node checks covered real
 HTTP allow/deny changes, HTTPS inspection/bypass changes, enable/disable/delete,
 traffic after an Edge restart, and associated audit records. These checks do not
 replace the multi-region and real OS acceptance below.

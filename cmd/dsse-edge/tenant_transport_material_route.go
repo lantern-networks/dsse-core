@@ -940,6 +940,9 @@ func registerEnrolmentReportRoute(mux *http.ServeMux, ledger *enrolledinventory.
 	if strings.TrimSpace(configSourceURL) != "" {
 		return
 	}
+	if !devMode && (auditIngestAuthorityMap == nil || len(auditIngestAuthorityMap.byEdge) == 0) {
+		log.Printf("WARNING enrolment-report: no Edge-to-tenant authority mapping is configured. Operator-anchored Edge reports will be refused; configure -audit-ingest-authority for every enrolling Edge and tenant before upgrading. Unreported devices may lose admission on the next configuration refresh. Tenant-CA identities remain limited to their own tenant.")
+	}
 	mux.HandleFunc("POST /enrolment-report", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))
 		shipper, verified := auditIngestShipperFrom(r, tenantCARegistry)

@@ -941,7 +941,7 @@ func registerEnrolmentReportRoute(mux *http.ServeMux, ledger *enrolledinventory.
 		return
 	}
 	if !devMode && (auditIngestAuthorityMap == nil || len(auditIngestAuthorityMap.byEdge) == 0) {
-		log.Printf("WARNING enrolment-report: no Edge-to-tenant authority mapping is configured. Operator-anchored Edge reports will be refused; configure -audit-ingest-authority for every enrolling Edge and tenant before upgrading. Unreported devices may lose admission on the next configuration refresh. Tenant-CA identities remain limited to their own tenant.")
+		log.Printf("WARNING enrolment-report: no Edge-to-tenant authority mapping is configured. Operator-anchored Edge reports will be refused; configure -audit-ingest-authority for every enrolling Edge and tenant before upgrading. Unreported devices may lose admission on the next configuration refresh. Without a mapping file, Tenant-CA identities are limited to their own tenant; an explicitly empty map refuses every report.")
 	}
 	mux.HandleFunc("POST /enrolment-report", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))

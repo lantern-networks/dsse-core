@@ -85,9 +85,12 @@ fallback is not a prerequisite you can rely on. See [Building the package](macos
 
 ## Container network conflicts
 
-The generated network defaults to IPv4 `10.77.0.0/16` and an IPv6 ULA range. If another
-network on the same host overlaps, change the related values together in `deployment.env`
-before first startup, for example:
+The generated network defaults to IPv4 `10.77.0.0/16` and an IPv6 ULA range. The
+ULA is internal container addressing, **not** proof of outbound IPv6. Select and
+verify the [deployment address-family mode](deployment.md#choose-ipv4-only-or-dual-stack-before-enrolling-devices)
+before installing endpoint agents. If another network on the same host overlaps,
+change the related values together in `deployment.env` before first startup, for
+example:
 
 ```sh
 DSSE_SUBNET=10.78.0.0/16

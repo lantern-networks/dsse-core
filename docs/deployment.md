@@ -41,6 +41,45 @@ Before starting, prepare:
 - A package-signing identity and signed Windows/macOS installers if endpoints will join.
   These are separate from the deployment's TLS authorities; see [Building](building.md).
 
+### Choose IPv4-only or dual-stack before enrolling devices
+
+Choose one mode for **every Edge region** and check it before installing agents. This
+procedure supports dual-stack or IPv4-only deployments; it does not establish an
+IPv6-only installation. The generated Docker network has an IPv6 ULA, but that
+alone does **not** give an Edge
+outbound IPv6 Internet access. Endpoint capture includes IPv6 TCP. An IPv4-only Edge
+reports that it cannot carry IPv6 and the Windows agent closes those captured flows;
+some browsers do not recover by trying IPv4, even when the site has an A record.
+Therefore an IPv4-only deployment is not an automatic, transparent fallback for a
+dual-stack endpoint.
+
+| Mode | Prepare before installing endpoints | Acceptance check |
+|---|---|---|
+| Dual-stack (use when endpoints have IPv6) | Give every Edge host working outbound IPv4 and a global IPv6 address, a `::/0` route, and firewall egress. Carry IPv6 from its container through host forwarding/NAT as needed; the container may use ULA. Keep regional transport names reachable by the address families actually used by endpoints; they need not have AAAA records merely because Edge egress is dual-stack. | Every Edge's `/healthz` reports `egress_address_family.ipv4=true` and `ipv6=true`; `dsse-install -verify` carries its IPv6-only test flow. Then test a real IPv6-only destination and a dual-stack page with an enrolled endpoint and TLS verification. |
+| IPv4-only (step back when outbound IPv6 cannot be supplied) | Give every Edge working outbound IPv4. Before enabling DSSE on a device, use the [Windows](windows-agent.md#ipv4-only-deployment) or [macOS](macos-agent.md#ipv4-only-deployment) IPv4-only endpoint procedure. Keep transport/recovery DNS and peer addresses reachable over IPv4. | Every Edge reports `ipv4=true`, `ipv6=false`. The verifier's IPv6-only destination is explicitly unavailable; it is **not** an IPv6 pass. With the agent active, verify ordinary dual-stack sites in the actual browser, allowed HTTPS, denied traffic, and audit. |
+
+For a dual-stack AWS VPC, associate IPv6 ranges with the VPC and each subnet, assign
+IPv6 to each Edge instance, route `::/0` to the Internet gateway for a public subnet
+or an egress-only Internet gateway for a private subnet, and allow required IPv6
+**outbound** traffic in security groups and any custom network ACL. Do not add public
+IPv6 inbound rules merely to enable egress. Check the host **and Edge container** for
+an actual outbound IPv6 connection; a global address or Docker ULA alone is not a
+reachability test. See [AWS's IPv6 VPC procedure](https://docs.aws.amazon.com/vpc/latest/userguide/vpc-migrate-ipv6-add.html).
+
+After starting each region, first confirm outbound IPv4 and IPv6 on its host with
+`curl -4 --fail https://example.com/` and `curl -6 --fail https://ipv6.google.com/`.
+Then run the printed fleet `dsse-install -verify` command in step 7: it checks each
+Edge's measured family and sends a real flow through DSSE to an IPv6-only origin.
+The host probes alone cannot establish container or DSSE reachability. If any
+Edge reports `ipv6=false` or the DSSE flow fails, fix that region's address,
+route, forwarding/NAT, or egress firewall before enrolling devices.
+
+Do not publish an AAAA record for a regional front door until that address accepts
+the intended TLS connection. Do not turn on fail-open, exempt IPv6 from steering, or
+disable certificate checks to make a page load. If endpoint and Edge address families
+do not match, correct the network mode and repeat the endpoint check before counting
+the installation as successful.
+
 Disk and memory needs depend on traffic, audit retention, and database workload. No
 production sizing is claimed here. Monitor disk use for Postgres, ClickHouse, MinIO, and
 Edge audit spools during the lab; do not treat an empty-stack startup as a capacity test.
@@ -252,6 +291,9 @@ Success requires **zero failed checks** and review of every **could not be answe
 `n/a` result. Check counts vary with the installed resources. A fresh deployment has no
 customer organization, so device enrolment cannot yet be proved. A single-machine plan
 also reports its lack of redundancy as the selected shape; that is not a failover test.
+For IPv4-only mode, record the verifier's IPv6-only flow as an expected limitation,
+not a successful IPv6 test. For dual-stack mode, that flow and every Edge's measured
+IPv6 egress must succeed before enrolling devices.
 
 After these infrastructure checks, follow [First use](after-verify.md). Installation is
 complete only after a customer endpoint has enrolled, passed its verifier, and exercised

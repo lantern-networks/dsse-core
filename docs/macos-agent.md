@@ -26,6 +26,38 @@ Apple describes the deployment controls under
 Plan approval before a remote installation. Do not disable OS security protections to
 replace a missing provisioning profile or approval.
 
+### IPv4-only deployment
+
+Read the operator's [address-family choice](deployment.md#choose-ipv4-only-or-dual-stack-before-enrolling-devices)
+before installing. For a dual-stack deployment, leave IPv6 on the active network
+service set to Automatic and verify real IPv6 traffic through DSSE. If every Edge is
+IPv4-only, use an IPv4-only network service for this lab device **before** enabling
+the Network Extension. At the local console, identify the active service and turn
+off IPv6 on that service:
+
+```sh
+networksetup -listallnetworkservices
+sudo networksetup -setv6off 'Wi-Fi' # replace Wi-Fi with the active service name
+```
+
+Alternatively, in System Settings → Network → the active service → Details → TCP/IP,
+select **Link-local only** for IPv6 if that is the available restricted mode.
+[Apple's TCP/IP settings guide](https://support.apple.com/guide/mac-help/mh14129/mac)
+describes that setting; it does not provide Internet IPv6. Verify the result
+rather than assuming every macOS version offers the same options.
+
+Before enabling DSSE, check that `curl -4 --fail https://example.com/` works
+and `curl -6 --connect-timeout 5 https://ipv6.google.com/` cannot reach the
+IPv6-only site. Check for another active service or tunnel with an IPv6 Internet
+route if it can. Then install and verify DSSE below. Test an actual dual-stack
+browser page with embedded content, allowed
+HTTPS, denied traffic, and audit; an IPv4-only Edge cannot reach IPv6-only sites.
+Changing an active service can disconnect remote access. Restore normal IPv6 when
+the deployment has dual-stack egress with
+`sudo networksetup -setv6automatic 'Wi-Fi'` (substitute the same service name).
+Do not bypass the extension's steering or disable TLS verification to work around
+an address-family mismatch.
+
 ## Obtain and verify the setup files
 
 The PKG is a generic product package shared by independently operated deployments and
@@ -122,6 +154,9 @@ Review every failure and unanswered check. Confirm actual steering and inspectio
 certificate acceptance, the intended organization in the Console, and recent device
 reports. Test an allowed application and a deliberately denied destination. Browser
 success alone cannot establish that traffic passed through DSSE.
+For dual-stack deployments, include a real IPv6-only destination and a dual-stack
+page with embedded content. For IPv4-only deployments, apply the procedure above
+and check the actual browser's IPv4 fallback.
 
 The installation-time `install_state.json` can contain a pending approval recorded before
 activation completed. Use current `systemextensionsctl` output and the runtime verifier

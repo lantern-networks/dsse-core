@@ -112,3 +112,22 @@ test('a late rotation response is not disclosed after switching tenants',async()
  f.c.operateTenant='tenant-b';f.response.resolve({ok:true,body:{raw_token:'synthetic-secret'}});await task;
  assert.equal(f.calls.length,1);assert.equal(f.secrets.length,0);assert.match(f.notices.at(-1)[0],/changed/);
 });
+
+for(const change of ['close','navigation','detached'])test(`creation still shows its one-time secret after ${change} while the security context is unchanged`,async()=>{
+ const f=createFixture(),response=deferred();let renders=0;f.c.renderApiTokensView=()=>renders++;
+ await f.c.openTokenForm(f.host);f.c.apiFetch=()=>response.promise;const task=f.submit();
+ if(change==='close')f.modals[0].close();else changeContext[change](f);
+ response.resolve({ok:true,body:{raw_token:'synthetic-secret'}});await task;
+ assert.equal(f.secrets.length,1);assert.equal(renders,change==='close'?1:0);
+});
+test('rotation still delivers the replacement secret after leaving its list',async()=>{
+ const f=actionFixture(),host={isConnected:true};let renders=0;f.c.renderTokList=()=>renders++;
+ f.confirm.resolve(true);const task=f.c.rotateToken('id',host);await new Promise(setImmediate);
+ host.isConnected=false;f.response.resolve({ok:true,body:{raw_token:'synthetic-secret'}});await task;
+ assert.equal(f.secrets.length,1);assert.equal(renders,0);
+});
+for(const name of ['tenant','session','connection','credential'])test(`creation explains recovery without disclosure when ${name} changes after sending`,async()=>{
+ const f=createFixture(),response=deferred();await f.c.openTokenForm(f.host);f.c.apiFetch=()=>response.promise;
+ const task=f.submit();changeContext[name](f);response.resolve({ok:true,body:{raw_token:'synthetic-secret'}});await task;
+ assert.equal(f.secrets.length,0);assert.match(f.notices.at(-1)[0],/may have completed/);assert.match(f.notices.at(-1)[0],/revoke or rotate/);
+});

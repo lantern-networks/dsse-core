@@ -18,14 +18,19 @@ async function withTokenAction(id, action) {
 }
 
 // apiFetch reads the current tenant and connection at send time. A dialog must retain its opening context.
-function tokenActionContext(host, watchContents = false) {
+function tokenActionContext(host, watchContents = false, requireConnected = true) {
   const context = () => [typeof idpSession === "undefined" ? null : idpSession,
     typeof operateTenant === "undefined" ? "" : operateTenant,
     typeof baseForPlane === "function" ? baseForPlane(_TOK_PLANE) : "",
     typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "",
     watchContents ? host.__tokenView : null, watchContents ? host.firstChild : null];
   const opened = context();
-  return () => host.isConnected !== false && context().every((value, i) => value === opened[i]);
+  return () => (!requireConnected || host.isConnected !== false) && context().every((value, i) => value === opened[i]);
+}
+
+function tokenResultContextChanged() {
+  uiToast(bl({ en: "The login, tenant, or connection changed. Token creation or rotation may have completed. Return to the original context, check the token list, and revoke or rotate the token if needed; its secret cannot be retrieved again.",
+    ja: "ログイン、テナント、または接続先が変わりました。トークンの作成・更新は完了している可能性があります。元の対象に戻って一覧を確認し、必要なら失効または再更新してください。秘密値は再取得できません。" }), "err");
 }
 
 function tokenContextChanged() {
@@ -102,6 +107,8 @@ async function loadRoleOptions() {
 
 async function openTokenForm(content) {
   const current = tokenActionContext(content, true);
+  // A submitted secret belongs to the login/tenant/connection, not to the lifetime of its form.
+  const sameRecipient = tokenActionContext(content, false, false);
   let closed = false;
   let options;
   try { options = await loadRoleOptions(); }
@@ -118,12 +125,11 @@ async function openTokenForm(content) {
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/api-tokens", { name: nameF.get(), roles: [roleF.get()] }, _TOK_PLANE);
-      if (closed) return;
-      if (!current()) { tokenContextChanged(); return; }
+      if (!sameRecipient()) { tokenResultContextChanged(); return; }
       if (!r.ok) { submit.disabled = false; const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); nameF.setError(msg); uiToast(msg, "err"); return; }
       m.close();
       showSecretOnce(r.body, bl({ en: "Token created", ja: "トークンを作成しました" }));
-      renderApiTokensView(content);
+      if (current()) renderApiTokensView(content);
     } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
   });
   nameF.focus();
@@ -141,14 +147,15 @@ function showSecretOnce(body, title) {
 async function rotateToken(id, host) {
   return withTokenAction(id, async () => {
     const current = tokenActionContext(host);
+    const sameRecipient = tokenActionContext(host, false, false);
     const ok = await uiConfirm({ title: bl({ en: "Rotate this token?", ja: "このトークンを更新?" }), body: bl({ en: "Issues a new secret and invalidates the old one. Anything using the old secret stops working until updated.", ja: "新しいシークレットを発行し旧シークレットを無効化します。旧シークレットを使う処理は更新まで動かなくなります。" }), confirmLabel: bl({ en: "Rotate", ja: "更新" }), danger: true });
     if (!ok) return;
     if (!current()) { tokenContextChanged(); return; }
     let r; try { r = await apiFetch("POST", "/admin/api-tokens/" + encodeURIComponent(id) + "/rotate", {}, _TOK_PLANE); } catch (e) { uiToast(bl({en:"Rotation could not be confirmed. Reload the list before retrying.",ja:"更新結果を確認できませんでした。一覧を再読込してから再操作してください。"}),"err"); return; }
-    if (!current()) { tokenContextChanged(); return; }
+    if (!sameRecipient()) { tokenResultContextChanged(); return; }
     if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
     showSecretOnce(r.body, bl({ en: "Token rotated", ja: "トークンを更新しました" }));
-    renderTokList(host);
+    if (current()) renderTokList(host);
   });
 }
 

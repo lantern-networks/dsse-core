@@ -752,7 +752,18 @@ async function offerOperatorElevation(need, plane) {
     uiToast(bl({ en: "Not granted", ja: "受け取れません" }) + ": " + ((r.body && r.body.error) || ("HTTP " + r.status)), "err");
     return false;
   }
-  const until = r.body && r.body.elevation && r.body.elevation.expires_at;
+  const elevation = r.body && r.body.elevation;
+  if (elevation && (r.body.state === "pending_approval" || (elevation.approval_required && !elevation.approved_at))) {
+    uiToast(bl({ en: "Request submitted. Wait for the organization's approval, then repeat the original operation.",
+      ja: "申請を受け付けました。組織の承認後に、元の操作をもう一度実行してください。" }), "info");
+    return false;
+  }
+  if (!elevation || r.body.state !== "active") {
+    uiToast(bl({ en: "Active access could not be confirmed. Check Operator access before trying again.",
+      ja: "作業権限が有効であることを確認できません。運営のアクセス画面で状態を確認してください。" }), "err");
+    return false;
+  }
+  const until = elevation.expires_at;
   uiToast(bl({
     en: "You have time inside " + org + (until ? " until " + new Date(until).toLocaleTimeString() : "") + ".",
     ja: org + " の中で作業できます" + (until ? "（" + new Date(until).toLocaleTimeString() + "まで）" : "") + "。" }), "ok");

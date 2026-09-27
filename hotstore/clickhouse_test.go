@@ -275,6 +275,28 @@ func TestClickHouseStoreIntegration(t *testing.T) {
 	if err != nil || exp.RowsExported != 3 || exported != 3 {
 		t.Fatalf("export: rows=%d exported=%d err=%v, want 3", exp.RowsExported, exported, err)
 	}
+
+	// A capped export must retain the total before LIMIT, including filtering.
+	for _, tc := range []struct {
+		tenant, finding string
+		total           int
+	}{
+		{"acme", "", 3}, {"acme", "dlp_match", 2}, {"other", "", 0},
+	} {
+		yielded := 0
+		filters := map[string]string{}
+		if tc.finding != "" {
+			filters["finding_type"] = tc.finding
+		}
+		result, err := store.ExportRows(ctx, SearchQuery{TenantID: tc.tenant, Stream: "inspection_events", Filters: filters, Limit: 1}, func(map[string]any) error { yielded++; return nil })
+		wantRows := 1
+		if tc.total == 0 {
+			wantRows = 0
+		}
+		if err != nil || result.TotalMatches != tc.total || result.RowsExported != wantRows || yielded != wantRows {
+			t.Fatalf("limited export %v: result=%+v yielded=%d err=%v", tc, result, yielded, err)
+		}
+	}
 }
 
 // TestClickHouseStoreTrends drives the full ingest-time rollup path — base table + AggregatingMergeTree rollup + the

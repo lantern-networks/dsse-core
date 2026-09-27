@@ -98,7 +98,10 @@ func (s *ClickHouseStore) execWithSettings(ctx context.Context, sql string, para
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read clickhouse response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("clickhouse http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
@@ -201,11 +204,11 @@ func (s *ClickHouseStore) ExportRows(ctx context.Context, query SearchQuery, yie
 	}
 	params = cloneParams(params)
 	params["lim"] = strconv.Itoa(limit)
-	body, err := s.exec(ctx, "SELECT raw FROM "+s.qualified()+" WHERE "+where+" ORDER BY ts DESC LIMIT {lim:UInt64} FORMAT JSONEachRow", params)
+	body, err := s.exec(ctx, "SELECT raw, count() OVER () AS total_matches FROM "+s.qualified()+" WHERE "+where+" ORDER BY ts DESC, event_id DESC LIMIT {lim:UInt64} FORMAT JSONEachRow", params)
 	if err != nil {
 		return ExportResult{}, err
 	}
-	rows, err := parseClickHouseRawRows(body)
+	rows, totalMatches, err := parseClickHouseExportRows(body)
 	if err != nil {
 		return ExportResult{}, err
 	}
@@ -223,8 +226,8 @@ func (s *ClickHouseStore) ExportRows(ctx context.Context, query SearchQuery, yie
 		Limit:        query.Limit,
 		Filters:      filters,
 		Query:        strings.ToLower(strings.TrimSpace(query.Text)),
-		TotalScanned: exported,
-		TotalMatches: exported,
+		TotalScanned: totalMatches,
+		TotalMatches: totalMatches,
 		RowsExported: exported,
 	}, nil
 }

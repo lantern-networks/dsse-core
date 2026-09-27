@@ -23,7 +23,7 @@ func meshLeaseCurrent(ctx context.Context) bool {
 	return lease.epoch != 0 && lease.elector.IsLeader() && lease.elector.leaderSince.Load() == lease.epoch
 }
 
-// Startup happens before election. Reload the shared queue on each new term,
+// Startup happens before election. Resume the configured queue on each new term,
 // including promotion of an already-running standby. Failed reads retry without
 // consuming the term. Workers keep that term through every retry and ACK.
 func (s revocationMeshSource) resumeOnLeadership(ctx context.Context) {

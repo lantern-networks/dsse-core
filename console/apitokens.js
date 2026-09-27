@@ -7,8 +7,34 @@
 
 const _TOK_PLANE = "control";
 let _tokSearch = "";
+// Shared across list reloads: allow only one confirmation/request for the same token at a time.
+const _tokPendingActions = new Set();
+
+async function withTokenAction(id, action) {
+  if (_tokPendingActions.has(id)) return;
+  _tokPendingActions.add(id);
+  try { return await action(); }
+  finally { _tokPendingActions.delete(id); }
+}
+
+// apiFetch reads the current tenant and connection at send time. A dialog must retain its opening context.
+function tokenActionContext(host, watchContents = false) {
+  const context = () => [typeof idpSession === "undefined" ? null : idpSession,
+    typeof operateTenant === "undefined" ? "" : operateTenant,
+    typeof baseForPlane === "function" ? baseForPlane(_TOK_PLANE) : "",
+    typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "",
+    watchContents ? host.__tokenView : null, watchContents ? host.firstChild : null];
+  const opened = context();
+  return () => host.isConnected !== false && context().every((value, i) => value === opened[i]);
+}
+
+function tokenContextChanged() {
+  uiToast(bl({ en: "The page, tenant, or connection changed. Reopen the token list to check the result before continuing.",
+    ja: "画面、テナント、または接続先が変わりました。トークン一覧を開き直し、状態を確認してから操作してください。" }), "err");
+}
 
 function renderApiTokensView(content) {
+  content.__tokenView = (content.__tokenView || 0) + 1;
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
@@ -75,18 +101,25 @@ async function loadRoleOptions() {
 }
 
 async function openTokenForm(content) {
+  const current = tokenActionContext(content, true);
+  let closed = false;
   let options;
   try { options = await loadRoleOptions(); }
   catch (e) { uiToast(bl({en:"Could not load token roles. Try again.",ja:"トークンのロールを取得できませんでした。再試行してください。"}),"err"); return; }
+  if (!current()) { tokenContextChanged(); return; }
   const nameF = uiField({ name: "name", label: bl({ en: "Token name", ja: "トークン名" }), required: true, placeholder: bl({ en: "e.g. ci-pipeline", ja: "例: ci-pipeline" }) });
   const roleF = uiField({ name: "role", label: bl({ en: "Role", ja: "ロール" }), type: "select", value: options[0].value, options, hint: bl({ en: "What this token is allowed to do.", ja: "このトークンに許可する操作の範囲。" }) });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Create token", ja: "トークン作成" }) });
-  const m = uiModal({ title: bl({ en: "Create an API token", ja: "API トークンを作成" }), body: [nameF.el, roleF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
+  const m = uiModal({ title: bl({ en: "Create an API token", ja: "API トークンを作成" }), body: [nameF.el, roleF.el], footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit], onClose: () => { closed = true; } });
   submit.addEventListener("click", async () => {
-    if (submit.disabled || !nameF.validate()) return;
+    if (closed || submit.disabled) return;
+    if (!current()) { tokenContextChanged(); return; }
+    if (!nameF.validate()) return;
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/api-tokens", { name: nameF.get(), roles: [roleF.get()] }, _TOK_PLANE);
+      if (closed) return;
+      if (!current()) { tokenContextChanged(); return; }
       if (!r.ok) { submit.disabled = false; const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); nameF.setError(msg); uiToast(msg, "err"); return; }
       m.close();
       showSecretOnce(r.body, bl({ en: "Token created", ja: "トークンを作成しました" }));
@@ -106,19 +139,29 @@ function showSecretOnce(body, title) {
 }
 
 async function rotateToken(id, host) {
-  const ok = await uiConfirm({ title: bl({ en: "Rotate this token?", ja: "このトークンを更新?" }), body: bl({ en: "Issues a new secret and invalidates the old one. Anything using the old secret stops working until updated.", ja: "新しいシークレットを発行し旧シークレットを無効化します。旧シークレットを使う処理は更新まで動かなくなります。" }), confirmLabel: bl({ en: "Rotate", ja: "更新" }), danger: true });
-  if (!ok) return;
-  let r; try { r = await apiFetch("POST", "/admin/api-tokens/" + encodeURIComponent(id) + "/rotate", {}, _TOK_PLANE); } catch (e) { uiToast(bl({en:"Rotation could not be confirmed. Reload the list before retrying.",ja:"更新結果を確認できませんでした。一覧を再読込してから再操作してください。"}),"err"); return; }
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  showSecretOnce(r.body, bl({ en: "Token rotated", ja: "トークンを更新しました" }));
-  renderTokList(host);
+  return withTokenAction(id, async () => {
+    const current = tokenActionContext(host);
+    const ok = await uiConfirm({ title: bl({ en: "Rotate this token?", ja: "このトークンを更新?" }), body: bl({ en: "Issues a new secret and invalidates the old one. Anything using the old secret stops working until updated.", ja: "新しいシークレットを発行し旧シークレットを無効化します。旧シークレットを使う処理は更新まで動かなくなります。" }), confirmLabel: bl({ en: "Rotate", ja: "更新" }), danger: true });
+    if (!ok) return;
+    if (!current()) { tokenContextChanged(); return; }
+    let r; try { r = await apiFetch("POST", "/admin/api-tokens/" + encodeURIComponent(id) + "/rotate", {}, _TOK_PLANE); } catch (e) { uiToast(bl({en:"Rotation could not be confirmed. Reload the list before retrying.",ja:"更新結果を確認できませんでした。一覧を再読込してから再操作してください。"}),"err"); return; }
+    if (!current()) { tokenContextChanged(); return; }
+    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+    showSecretOnce(r.body, bl({ en: "Token rotated", ja: "トークンを更新しました" }));
+    renderTokList(host);
+  });
 }
 
 async function revokeToken(id, name, host) {
-  const ok = await uiConfirm({ title: bl({ en: "Revoke this token?", ja: "このトークンを失効?" }), body: bl({ en: "\"" + (name || id) + "\" stops working immediately and cannot be restored.", ja: "「" + (name || id) + "」は即座に使えなくなり、復元できません。" }), confirmLabel: bl({ en: "Revoke", ja: "失効" }), danger: true });
-  if (!ok) return;
-  let r; try { r = await apiFetch("POST", "/admin/api-tokens/" + encodeURIComponent(id) + "/revoke", {}, _TOK_PLANE); } catch (e) { uiToast(bl({en:"Revocation could not be confirmed. Reload the list before retrying.",ja:"失効結果を確認できませんでした。一覧を再読込してから再操作してください。"}),"err"); return; }
-  if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
-  uiToast(bl({ en: "Token revoked.", ja: "トークンを失効しました。" }), "ok");
-  renderTokList(host);
+  return withTokenAction(id, async () => {
+    const current = tokenActionContext(host);
+    const ok = await uiConfirm({ title: bl({ en: "Revoke this token?", ja: "このトークンを失効?" }), body: bl({ en: "\"" + (name || id) + "\" stops working immediately and cannot be restored.", ja: "「" + (name || id) + "」は即座に使えなくなり、復元できません。" }), confirmLabel: bl({ en: "Revoke", ja: "失効" }), danger: true });
+    if (!ok) return;
+    if (!current()) { tokenContextChanged(); return; }
+    let r; try { r = await apiFetch("POST", "/admin/api-tokens/" + encodeURIComponent(id) + "/revoke", {}, _TOK_PLANE); } catch (e) { uiToast(bl({en:"Revocation could not be confirmed. Reload the list before retrying.",ja:"失効結果を確認できませんでした。一覧を再読込してから再操作してください。"}),"err"); return; }
+    if (!current()) { tokenContextChanged(); return; }
+    if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
+    uiToast(bl({ en: "Token revoked.", ja: "トークンを失効しました。" }), "ok");
+    renderTokList(host);
+  });
 }

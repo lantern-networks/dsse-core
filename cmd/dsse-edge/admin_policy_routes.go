@@ -202,11 +202,30 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if !refreshInspectionPosture(w, config) {
 			return
 		}
-		if assetStore != nil {
-			if err := assetStore.RefreshShared(); err != nil {
-				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("asset catalog cannot be refreshed"))
-				return
-			}
+		if !refreshAuthoredStores(w, ruleStore, assetStore) {
+			return
+		}
+		if !refreshVLANStore(w, vlanBoundary) {
+			return
+		}
+		if err := theIdPRegistry.Load().RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("configuration authority cannot be refreshed"))
+			return
+		}
+		if err := delegatedGrants.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("configuration authority cannot be refreshed"))
+			return
+		}
+		if err := transportTrust.RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("configuration authority cannot be refreshed"))
+			return
+		}
+		if err := theGrantStore.Load().RefreshShared(); err != nil {
+			writeError(w, http.StatusServiceUnavailable, errors.New("configuration authority cannot be refreshed"))
+			return
+		}
+		if !refreshDLPStores(w, config.DLPDistribution) {
+			return
 		}
 		if err := refreshManagedTenantRestrictions(policyStore); err != nil {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("SaaS configuration cannot be refreshed: %w", err))

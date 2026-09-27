@@ -43,8 +43,9 @@ func TestStateDirDefaultsCoverEveryConfigStoreInTheDurabilityContract(t *testing
 	// "policy_rules" and "asset-catalog-store" to "asset_catalog", so a name-derived rule would need a table of
 	// exceptions and would silently accept a new store that invented a third convention.
 	entry := regexp.MustCompile(`\{flag: "([a-z0-9-]+)", value: \*([A-Za-z0-9_]+)[^}]*class: storeClassConfig`)
-	// The defaulting block: *VAR = durableStorePath(*stateDir, *VAR, "...").
-	defaulted := regexp.MustCompile(`\*([A-Za-z0-9_]+) = durableStorePath\(\*stateDir,`)
+	// Both author defaults and role-aware receiver caches honor state-dir.
+	// Their path behavior is covered by TestBundleReceiverRejectsExplicitSharedAuthority.
+	defaulted := regexp.MustCompile(`\*([A-Za-z0-9_]+) = (?:durableStorePath|configBundleStorePath)\(\*stateDir,`)
 
 	covered := map[string]bool{}
 	for _, m := range defaulted.FindAllStringSubmatch(text, -1) {

@@ -15,6 +15,7 @@ import (
 	"github.com/lantern-networks/dsse-core/edgeplane"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/policy"
+	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
 func publishedAppForDistribution(tenant, destination string) appcatalog.Entry {
@@ -47,7 +48,7 @@ func TestApplicationBundleSignedFleetPublicationAndDeletion(t *testing.T) {
 	defer server.Close()
 	source := configBundleSource{url: server.URL, client: server.Client(), token: "token-operator", tenantID: "operator", verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
 	edge := appcatalog.NewStore()
-	targets := configApplyTargets{applications: edge, policyStore: policy.NewStore(nil), dlp: dlpStoresForTest("applications")}
+	targets := configApplyTargets{rules: policyrule.NewStore(), applications: edge, policyStore: policy.NewStore(nil), dlp: dlpStoresForTest("applications")}
 	fetch := func() configBundlePayload {
 		t.Helper()
 		bundle, err := source.fetch(context.Background())

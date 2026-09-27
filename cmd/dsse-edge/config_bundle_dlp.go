@@ -217,3 +217,15 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	s.fingerprints.generation++
 	return nil
 }
+
+func (s *dlpConfigStores) RefreshShared() error {
+	if !s.ready() {
+		return nil
+	}
+	for _, store := range []interface{ RefreshShared() error }{s.policies, s.classifiers, s.fingerprints, s.allowlist} {
+		if err := store.RefreshShared(); err != nil {
+			return err
+		}
+	}
+	return nil
+}

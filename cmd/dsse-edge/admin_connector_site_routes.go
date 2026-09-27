@@ -25,7 +25,7 @@ import (
 func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, config serverConfig, evaluator decision.Evaluator, writer *logs.Writer, registry connectorRegistryStore, tunnelManager *tunnel.Manager, siteStore adminSiteStore, vlanBoundary *vlan.Store, domainEventOutbox domainEventOutboxWriter, adminAuditOutbox adminAuditOutboxDeadReader, applicationCatalogStore appcatalog.RuntimeStore, tenantModelStore adminTenantModelRuntimeStore, configSourceURL string, connectorTunnelStatus func(string) *bool, connectorDeclaredRoutes func(ctx context.Context, tenant, connectorID string) (cidrs, fqdns []string, found bool)) {
 	mux.HandleFunc("GET /admin/connectors/{connector_id}/routes", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
 		if err := connectorRouteGov.RefreshShared(); err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
+			writeError(w, http.StatusServiceUnavailable, errors.New("Could not read network bindings."))
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
@@ -38,6 +38,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "routes": connectorRouteGov.Routes(tenant, cid, declared, declaredFQDNs)})
 	}))
 	mux.HandleFunc("POST /admin/connectors/{connector_id}/routes", adminEndpoint("admin.connectors.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		if configWriteRejectedWhenSourced(w, configSourceURL, "connector routes") {
 			return
 		}
@@ -96,6 +97,11 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				}
 			}
 			if isNetwork && action == "add" {
+				// Decide existence and ownership from shared authority, not this process's
+				// cache: a Network another control plane just created must be bindable here.
+				if !refreshVLANStore(w, vlanBoundary) {
+					return
+				}
 				if o, ok := vlanBoundary.GetObject(req.NetworkID); !namedNetworkVisibleToTenant(o, ok, tenant) {
 					writeError(w, http.StatusBadRequest, fmt.Errorf("network_id %q is not a known Named Network", req.NetworkID))
 					return
@@ -119,22 +125,20 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 				bindingErr = connectorRouteGov.RemoveAuthoredContext(r.Context(), tenant, cid, req.CIDR)
 			}
 		}
-		if action == "add" || action == "remove" {
-			now := time.Now().UTC()
-			result := "success"
-			if bindingErr != nil {
-				result = "error"
-			}
-			audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: cid, TenantID: tenant}, r, evaluator, now)
-			audit.ActorUserID = auditActorPrincipal(r)
-			kind := "route_binding"
-			audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
-			audit.Metadata = map[string]any{"network_id": req.NetworkID, "fqdn": req.FQDN, "cidr": req.CIDR, "operation": action}
-			_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
-			if bindingErr != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("Could not save network binding."))
-				return
-			}
+		now := time.Now().UTC()
+		result := "success"
+		if bindingErr != nil {
+			result = "error"
+		}
+		audit := adminSiteAuditLog("admin_route_binding_changed", adminSiteModel{SiteID: cid, TenantID: tenant}, r, evaluator, now)
+		kind := "route_binding"
+		audit.TargetType, audit.Action, audit.Result = &kind, &action, &result
+		audit.Metadata = map[string]any{"network_id": req.NetworkID, "fqdn": req.FQDN, "cidr": req.CIDR, "operation": action}
+		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, audit, now)
+		if bindingErr != nil {
+			log.Printf("admin network binding: %v", bindingErr)
+			writeError(w, http.StatusInternalServerError, errors.New("Could not save network binding."))
+			return
 		}
 		declared, declaredFQDNs, _ := connectorDeclaredRoutes(r.Context(), tenant, cid)
 		writeJSON(w, http.StatusOK, map[string]any{"connector_id": cid, "routes": connectorRouteGov.Routes(tenant, cid, declared, declaredFQDNs)})
@@ -184,6 +188,10 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		now := time.Now()
 		result, found, err := adminConnectorRotateRuntimeSecret(r.Context(), registry, adminTenantIDFromRequest(r), r.PathValue("connector_id"), request, now, connectorTunnelStatus)
 		if err != nil {
+			if errors.Is(err, connector.ErrRegistryPersistence) {
+				writeError(w, http.StatusServiceUnavailable, errors.New("Connector secret change could not be confirmed in storage. Reload before retrying."))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -393,7 +401,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 	// CIDR, a hostname (FQDN), or a Named-Network reference. Keyed by the site (connector group), never per-connector.
 	mux.HandleFunc("GET /admin/sites/{site_id}/networks", adminEndpoint("admin.connectors.read", func(w http.ResponseWriter, r *http.Request) {
 		if err := connectorRouteGov.RefreshShared(); err != nil {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("route governance cannot be read"))
+			writeError(w, http.StatusServiceUnavailable, errors.New("Could not read network bindings."))
 			return
 		}
 		tenant := adminTenantIDFromRequest(r)
@@ -409,6 +417,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		writeJSON(w, http.StatusOK, map[string]any{"site_id": siteID, "networks": rows})
 	}))
 	mux.HandleFunc("POST /admin/sites/{site_id}/networks", adminEndpoint("admin.connectors.write", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(routeGovernanceWriteContext(r.Context()))
 		if configWriteRejectedWhenSourced(w, configSourceURL, "site networks") {
 			return
 		}
@@ -458,6 +467,9 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 			}
 		}
 		if req.NetworkID != "" && action == "add" {
+			if !refreshVLANStore(w, vlanBoundary) {
+				return
+			}
 			if o, ok := vlanBoundary.GetObject(req.NetworkID); !namedNetworkVisibleToTenant(o, ok, tenant) {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("network_id %q is not a known Network", req.NetworkID))
 				return
@@ -643,3 +655,5 @@ func namedNetworkVisibleToTenant(o model.VLANObject, ok bool, tenant string) boo
 	owner := strings.TrimSpace(o.TenantID)
 	return owner == "" || strings.TrimSpace(tenant) == "" || strings.EqualFold(owner, strings.TrimSpace(tenant))
 }
+
+// Keep storage paths and internal error details out of the administrative response.

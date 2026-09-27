@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,28 +15,6 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 )
-
-func readConnectorManagementAudits(t *testing.T, writer *logs.Writer) []model.AuditLog {
-	t.Helper()
-	f, err := os.Open(filepath.Join(writer.Dir(), "audit.log.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	var rows []model.AuditLog
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		var row model.AuditLog
-		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
-			t.Fatal(err)
-		}
-		rows = append(rows, row)
-	}
-	if err := scanner.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return rows
-}
 
 type connectorManagementTestPersister struct {
 	blobstore.FilePersister
@@ -95,6 +71,18 @@ func TestConnectorManagementSaveFailureAndAuditActor(t *testing.T) {
 				h.ServeHTTP(r, req)
 				return r
 			}
+			for _, path := range []string{"/admin/connectors/managed/runtime-secret/rotate", "/connectors/managed/runtime-secret/rotate"} {
+				p.fail = true
+				failed := request("POST", path, `{"runtime_secret":"rotation-private-secret-0001"}`)
+				if failed.Code != 503 || strings.Contains(failed.Body.String(), "private save") || strings.Contains(failed.Body.String(), "rotation-private-secret") {
+					t.Fatalf("rotation failure path=%s status=%d body=%s", path, failed.Code, failed.Body)
+				}
+				p.fail = false
+				saved := request("POST", path, `{"runtime_secret":"rotation-private-secret-0001"}`)
+				if saved.Code != 200 {
+					t.Fatalf("rotation status=%d", saved.Code)
+				}
+			}
 			p.fail = true
 			r := request("POST", "/admin/connectors/managed/name", `{"name":"Changed"}`)
 			if r.Code != 503 || strings.Contains(r.Body.String(), "private save") {
@@ -122,11 +110,11 @@ func TestConnectorManagementSaveFailureAndAuditActor(t *testing.T) {
 			if r.Code != 200 {
 				t.Fatal(r.Code)
 			}
-			rows := readConnectorManagementAudits(t, writer)
+			rows := readTransportAudits(t, writer)
 			domains, commonErrors := 0, 0
 			for _, a := range rows {
 				raw, _ := json.Marshal(a)
-				for _, bad := range []string{"private save diagnostic", "private-test-token", "connector-csrf", "forged-actor"} {
+				for _, bad := range []string{"private save diagnostic", "private-test-token", "connector-csrf", "forged-actor", "rotation-private-secret-0001"} {
 					if strings.Contains(string(raw), bad) {
 						t.Fatal("audit leaked private input")
 					}
@@ -142,7 +130,7 @@ func TestConnectorManagementSaveFailureAndAuditActor(t *testing.T) {
 					t.Fatalf("incorrect audit: %+v", a)
 				}
 			}
-			if domains != 3 || commonErrors != 2 {
+			if domains != 4 || commonErrors != 4 {
 				t.Fatalf("domains=%d commonErrors=%d rows=%d", domains, commonErrors, len(rows))
 			}
 		})

@@ -18,6 +18,7 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/policy"
+	"github.com/lantern-networks/dsse-core/policyrule"
 )
 
 // Use the installer's actual role/scope shape through authentication, the signed
@@ -74,7 +75,7 @@ func TestConfigBundleFleetTokenReceivesCustomerDLP(t *testing.T) {
 			continue
 		}
 		receiving := dlpStoresForTest("edge-salt")
-		if _, err := src.apply(bundle, configApplyTargets{applications: appcatalog.NewStore(), policyStore: policy.NewStore(nil), dlp: receiving}); err != nil {
+		if _, err := src.apply(bundle, configApplyTargets{rules: policyrule.NewStore(), applications: appcatalog.NewStore(), policyStore: policy.NewStore(nil), dlp: receiving}); err != nil {
 			t.Fatal(err)
 		}
 		cfg, _ := newDLPTestConfig(t)

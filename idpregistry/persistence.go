@@ -51,6 +51,7 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	s.connections, s.defaults, s.persister, s.authorityKnown = snap.Connections, snap.Defaults, p, true
+	s.publishDomainsLocked()
 	return nil
 }
 

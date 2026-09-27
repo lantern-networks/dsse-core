@@ -1,18 +1,15 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/logs"
-	"github.com/lantern-networks/dsse-core/model"
 )
 
 func TestSiteLifecycleAuditsUseAuthenticatedActor(t *testing.T) {
@@ -72,7 +69,7 @@ func TestSiteLifecycleAuditsUseAuthenticatedActor(t *testing.T) {
 			if rec := request("DELETE", "/admin/sites/actor-site", ""); rec.Code != 200 {
 				t.Fatalf("delete %d %s", rec.Code, rec.Body.String())
 			}
-			rows := readSiteActorAudits(t, writer)
+			rows := readTransportAudits(t, writer)
 			domains := 0
 			actions := map[string]int{}
 			for _, a := range rows {
@@ -128,26 +125,4 @@ func TestSiteLifecycleAuditDoesNotInventAnActor(t *testing.T) {
 	if stringPtrValue(a.ActorUserID) != "operator" || a.TenantID != "target" {
 		t.Fatal("request actor changed the target tenant")
 	}
-}
-
-func readSiteActorAudits(t *testing.T, writer *logs.Writer) []model.AuditLog {
-	t.Helper()
-	file, err := os.Open(filepath.Join(writer.Dir(), "audit.log.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	var rows []model.AuditLog
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		var row model.AuditLog
-		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
-			t.Fatal(err)
-		}
-		rows = append(rows, row)
-	}
-	if err := scanner.Err(); err != nil {
-		t.Fatal(err)
-	}
-	return rows
 }

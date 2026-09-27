@@ -702,8 +702,22 @@ Steering exclusions now keep saved state on failed writes, attribute audit and v
 
 Before updating an Edge that downloads steering exclusions, ensure its retrieval token belongs to the same tenant as its configuration bundle. An operator token or a token from another tenant now receives a tenant-mismatch response; the Edge retains its cached exclusions but cannot receive subsequent updates. Update the CP first, then update Edges after checking this token-to-tenant mapping.
 
+### Connector management and organization-domain reconciliation
+
+Connector secret replacement confirms persistence at both administrative URLs; errors do not return a usable new secret. Registration and heartbeat keep their audit/report follow-up when route discovery alone fails. Organization domain updates preserve concurrent changes, refresh shared state and retain the request leadership term. Connector lists reject malformed responses and avoid applying responses after the selected organization changes. These changes retain existing browser acceptance evidence for unchanged controls; real connector reconnection remains a deployment check.
+
+Organization-domain storage must load successfully before startup. A malformed or unreadable configured file/database no longer falls back to volatile settings. Repair the configured store (valid empty form: `{"by_tenant":{}}`) rather than starting over existing data. Traffic classification uses the last applied domain snapshot while management reads report storage failures; shared peers refresh in the background.
 ### DLP library editing and findings
 
 DLP identifiers, fingerprint sets and allowlisted samples keep editors open after an unconfirmed save and verify the returned saved values. Duplicate submissions and responses from a previous organization/view cannot replace the current list. Invalid list responses remain retryable errors instead of appearing as an empty library. Numeric identifiers ignore grouping and email values ignore case; other allowlist values match exactly. Findings retain the matching request context when loading details. Existing real-browser save/reload/audit evidence is reused for unchanged retained controls; this is not a new production traffic acceptance claim.
 
 DLP library editors and findings require `admin.tenant.read` in addition to their DLP scopes when using API tokens. Console session roles already include this permission. An uncertain save (including a server or gateway failure) keeps the input but requires reloading the confirmed list before another edit. Allowlist reads and writes both use the control plane so an Edge's older delivered copy cannot overwrite a confirmed edit.
+
+
+### Startup and received configuration reconciliation
+
+Startup restores tenant and license authority before serving, and CP promotion refreshes and recompiles the latest authored settings before becoming available. A malformed existing tenant registry is an error requiring repair, rather than a fresh installation. Runtime settings received from the CP use node-local caches, and required-section failures keep the same configuration generation eligible for retry. This is not an atomic transaction across all sections: controls already applied stay in force while failed sections retry.
+
+A receiving Edge must not also open the shared CP authority database. Before upgrading an Edge that combines `-postgres-dsn` with `-config-source-url` or `-config-source-endpoints`, keep shared authoring services on the CP, configure a local `-state-dir` for the Edge, remove its shared database option and any explicit PostgreSQL configuration-store overrides, and confirm that the CP contains the intended settings. Preserve old local snapshots for recovery and verify the first configuration pull before returning the node to service. The new binary rejects the incompatible combination before opening the database. Legacy SaaS bypass selections are retained for inspection but no longer recreate deleted rules at startup; author required bypass rules on the CP before upgrading.
+
+Break-glass approval consumption is saved before session creation, so one approval cannot issue twice. A crash after reservation can consume an approval without delivering a session; an administrator must use a new approved request. Observation delivery follows CP endpoint changes and drains queued records to its configured spool on shutdown.

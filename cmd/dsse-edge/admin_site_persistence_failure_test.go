@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"github.com/lantern-networks/dsse-core/logs"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -21,27 +22,27 @@ func TestAdminSitePersistenceFailurePreservesCommittedGeneration(t *testing.T) {
 				path := filepath.Join(dir, "private-sites.json")
 				store := newDurableAdminSiteStore(path)
 				now := time.Now().UTC()
-				tenant := "tenant_site_fixture"
+				tenant := testEvaluator().PolicyBundle.TenantID
+				creds := newLocalAdminCredentialStore("DSSE")
+				seedActiveAdminAccount(t, creds, "review@example.test", tenant, "reviewer", []string{"admin", "super_admin"}, now)
 				auth := newAdminAuthStore()
-				auth.UpsertPrincipal(adminPrincipal{ID: "site-admin", TenantID: tenant, Roles: []string{"admin"}, Status: "active"})
-				auth.UpsertAPIToken(adminAPIToken{ID: "site-admin", TenantID: tenant, TokenHash: adminTokenHash("synthetic-site-store-token"),
-					Roles: []string{"admin"}, Scopes: []string{"admin.connectors.read", "admin.connectors.write"},
-					CreatedByAdminPrincipalID: "site-admin", Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)})
+				auth.UpsertPrincipal(principalFromCredential(creds.byEmail["review@example.test"], now))
+				auth.UpsertSession(adminSession{ID: "review-session", TenantID: tenant, AdminPrincipalID: "reviewer", Roles: []string{"admin", "super_admin"}, Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), Metadata: map[string]any{adminCSRFTokenKey: "review-csrf"}})
 				writer, err := logs.NewWriter(filepath.Join(dir, "logs"))
 				if err != nil {
 					t.Fatal(err)
 				}
-				handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: auth, SiteStore: store, Writer: writer,
-					ConnectorEnrollmentEdgeURL: "https://edge.example.test", ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ntest-anchor\n-----END CERTIFICATE-----\n"})
+				handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: auth, LocalCredentials: creds, SiteStore: store, Writer: writer, ConnectorEnrollmentEdgeURL: "https://edge.example.test", ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ntest-anchor\n-----END CERTIFICATE-----\n"})
 				request := func(method, route, body string) *httptest.ResponseRecorder {
 					req := httptest.NewRequest(method, route, strings.NewReader(body))
-					req.Header.Set("Authorization", "Bearer synthetic-site-store-token")
+					req.AddCookie(&http.Cookie{Name: "admin_session", Value: "review-session"})
+					req.Header.Set("X-CSRF-Token", "review-csrf")
 					rec := httptest.NewRecorder()
 					handler.ServeHTTP(rec, req)
 					return rec
 				}
 				if rec := request("POST", "/admin/sites", `{"site_id":"saved-site","name":"Saved","expected_connector_count":2}`); rec.Code != 200 {
-					t.Fatalf("seed status %d", rec.Code)
+					t.Fatalf("seed %d: %s", rec.Code, rec.Body.String())
 				}
 				// Seed an existing command so a failed rotation must retain the previous credential.
 				if _, _, err := adminSiteEnrollmentCommandIssue(context.Background(), store, tenant, "saved-site", enrollmentTokenParams{EdgeURL: "https://edge.example.test"}, now); err != nil {
@@ -78,7 +79,7 @@ func TestAdminSitePersistenceFailurePreservesCommittedGeneration(t *testing.T) {
 					rec = request("POST", "/admin/sites/saved-site/enrollment-command", `{}`)
 				}
 				if rec.Code != 500 {
-					t.Fatalf("failed write status %d, want 500", rec.Code)
+					t.Fatalf("failed write status %d body %s", rec.Code, rec.Body.String())
 				}
 				if strings.Contains(rec.Body.String(), dir) || strings.Contains(rec.Body.String(), "bootstrap_secret") || strings.Contains(rec.Body.String(), "sha256:") {
 					t.Fatal("response leaked private state")
@@ -126,7 +127,7 @@ func TestAdminSitePersistenceFailurePreservesCommittedGeneration(t *testing.T) {
 					if row["event_type"] != "admin_config_change" {
 						continue
 					}
-					if row["actor_user_id"] != "site-admin" || row["tenant_id"] != tenant {
+					if row["actor_user_id"] != "reviewer" || row["tenant_id"] != tenant {
 						t.Fatal("wrong audit attribution")
 					}
 					switch row["result"] {

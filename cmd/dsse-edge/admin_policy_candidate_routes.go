@@ -329,7 +329,11 @@ func registerPolicyCandidateRoutes(mux *http.ServeMux, adminEndpoint func(string
 		tenantID := adminTenantIDFromRequest(r)
 		discovered, err := refreshConnectorDiscoveredCandidates(r.Context(), registry, applicationCatalogStore, concrete, tenantID, now)
 		if err != nil {
-			writePolicyCandidateError(w, err)
+			if errors.Is(err, policycandidate.ErrPersistence) || errors.Is(err, policycandidate.ErrUnavailable) || errors.Is(err, policycandidate.ErrReconciliationRequired) {
+				writePolicyCandidateError(w, err)
+			} else {
+				writeError(w, http.StatusInternalServerError, fmt.Errorf("connector discovery is temporarily unavailable"))
+			}
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{

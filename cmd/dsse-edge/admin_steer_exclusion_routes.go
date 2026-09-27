@@ -122,6 +122,9 @@ func registerSteerExclusionRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		writeJSON(w, http.StatusOK, map[string]any{"versions": versions})
 	}))
 	mux.HandleFunc("POST /admin/steer-exclusions/{id}/rollback", adminEndpoint("admin.steering.write", func(w http.ResponseWriter, r *http.Request) {
+		if !pinnedTenantContextMatches(w, r) {
+			return
+		}
 		// Same reason as the create/delete routes: a rollback applied here is erased by the next CP poll.
 		if configWriteRejectedWhenSourced(w, config.SteerExclusionSourceURL, "steer exclusions") {
 			return

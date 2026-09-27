@@ -677,3 +677,5 @@ Risk backend upgrades must explicitly reconcile every CP onto the same reviewed 
 ### Steering exclusions and boundary administration
 
 Steering exclusions now keep saved state on failed writes, attribute audit and version history to the target organization, and validate tenant/schema on CP feeds before replacing an Edge cache. VLAN edits preserve unrelated records and distinguish rejected input from unconfirmed storage; auditors remain read-only. East-west and SaaS restriction reads report unavailable shared storage instead of presenting stale authority. Candidate publication errors retain retryable storage failures. Update CP before Edges that require the validated exclusion feed.
+
+Before updating an Edge that downloads steering exclusions, ensure its retrieval token belongs to the same tenant as its configuration bundle. An operator token or a token from another tenant now receives a tenant-mismatch response; the Edge retains its cached exclusions but cannot receive subsequent updates. Update the CP first, then update Edges after checking this token-to-tenant mapping.

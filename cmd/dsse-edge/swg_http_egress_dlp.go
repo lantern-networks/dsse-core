@@ -573,8 +573,27 @@ func appendEdgeSWGHTTPEgressDLPMatch(ctx context.Context, config edgeSWGHTTPEgre
 	// (enough distinct types + concentration + burst), and existing risk-based policy then acts.
 	if config.DLPDeviceRisk != nil && len(deviceRiskConditions) > 0 {
 		rec := dlpDetectionRecord{types: types, destination: destination, instanceClass: instanceClass}
-		if sev := config.DLPDeviceRisk.Record(derefStringPtr(dec.DeviceID), rec, deviceRiskConditions, now); sev != "" {
-			log.Printf("dlp_device_risk_tripped device=%s severity=%s (composite DLP condition satisfied)", derefStringPtr(dec.DeviceID), sev)
+		outcome := config.DLPDeviceRisk.Record(derefStringPtr(dec.DeviceID), rec, deviceRiskConditions, now)
+		if outcome.ConditionSeverity != "" {
+			result := "success"
+			eventSeverity := "info"
+			if !outcome.Applied {
+				result, eventSeverity = "error", "high"
+			} else if outcome.Err != nil || outcome.Persistence == "volatile" || outcome.Persistence == "saved_non_atomic" {
+				result, eventSeverity = "partial", "warning"
+			}
+			log.Printf("dlp_device_risk device=%s condition_severity=%s applied=%t applied_severity=%s changed=%t persistence=%s result=%s",
+				derefStringPtr(dec.DeviceID), outcome.ConditionSeverity, outcome.Applied, outcome.AutomaticRiskResult.Severity, outcome.Changed, outcome.Persistence, result)
+			// Keep the original detection separate and recorded first. A failed risk
+			// save must neither erase that finding nor count it twice in DLP Findings.
+			riskMetadata := map[string]any{
+				"dlp_event_version": "s2.v1", "dlp_metadata_scope": "non_secret",
+				"dlp_rule_id": ruleID, "dlp_destination": destination,
+				"condition_severity": outcome.ConditionSeverity, "applied": outcome.Applied,
+				"applied_severity": outcome.AutomaticRiskResult.Severity, "changed": outcome.Changed,
+				"persistence": outcome.Persistence, "result": result,
+			}
+			emitEdgeSWGHTTPEgressDLPEvent(ctx, config, dec, "dlp_device_risk", eventSeverity, riskMetadata, now)
 		}
 	}
 }

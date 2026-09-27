@@ -101,6 +101,9 @@ func (o *HighRiskOverlay) restoreSnapshotLocked(p blobstore.Persister, refresh b
 		o.mu.Unlock()
 		return ErrRiskUnavailable
 	}
+	if refresh {
+		o.mergeAutomaticPending(&f)
+	}
 	o.mu.Lock()
 	if !maps.Equal(o.devices, f.Devices) || !reflect.DeepEqual(o.users, f.Users) || o.legacy != legacy || !maps.Equal(o.legacyUnattributed, f.LegacyUnattributed) {
 		o.generation.Add(1)
@@ -108,8 +111,10 @@ func (o *HighRiskOverlay) restoreSnapshotLocked(p blobstore.Persister, refresh b
 	o.devices, o.users, o.legacy = f.Devices, f.Users, legacy
 	o.legacyUnattributed = f.LegacyUnattributed
 	o.persister, o.loadErr = p, nil
-	o.riskSavePending = false
-	o.automaticPending = nil
+	if !refresh {
+		o.automaticPending = nil
+	}
+	o.riskSavePending = len(o.automaticPending) > 0
 	o.rebuildUserIndexLocked()
 	o.mu.Unlock()
 	log.Printf("high_risk_overlay load: restored %d device and %d user risk marks", len(o.devices), len(o.users))

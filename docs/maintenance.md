@@ -1,6 +1,6 @@
 # Maintenance and 0.3.1 progress
 
-Updated: 2026-09-26. Lantern DSSE is actively maintained by Lantern Networks, Inc.
+Updated: 2026-09-27. Lantern DSSE is actively maintained by Lantern Networks, Inc.
 The latest published version is [0.3.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.0-experimental), released on September 11.
 **0.3.1 is in development and has not been released.**
 
@@ -43,6 +43,25 @@ control-plane/Edge operation, external identity-provider interoperability, or
 long-duration reliability. Test counts are not a release-readiness percentage.
 
 ## Focused fixes in this tree
+
+
+API-token creation and rotation preserve the one-time secret when a pending
+response arrives after closing the form or navigating to another view, provided
+the authenticated identity, tenant and connection remain unchanged. A changed
+security context suppresses the secret and explains that the operation may have
+completed, with instructions to check and revoke or rotate it. Closing or
+reloading the browser page itself is not covered by this behavior.
+
+Operator elevation requests awaiting approval now show a pending message and do
+not retry the original change. The distribution overview distinguishes unreadable
+customers from confirmed empty release lists. Certificate inventory remains
+readable when supporting status requests fail, while actions requiring that
+missing information stay unavailable.
+
+These Console changes have local browser checks using synthetic API responses
+and regression coverage. Representative local administration checks are complete
+for the recorded scope; deployed fleet behavior, real OS installers, external
+integrations and the release checks below remain outstanding.
 
 
 Configuration receivers now leave a generation unacknowledged when saving People,

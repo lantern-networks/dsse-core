@@ -28,6 +28,37 @@ function dlpActionBadge(action) {
   return uiBadge(action || "—", "off");
 }
 
+function dlpFindingsObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
+function dlpFindingsInvalid() { return bl({en:"Could not load DLP findings correctly. Retry to confirm the results.",ja:"DLP検出を正しく読み込めません。再試行して結果を確認してください。"}); }
+function dlpFindingsSelection() { return typeof operateTenant === "undefined" ? "" : (operateTenant || ""); }
+function dlpFindingsTenant(response) {
+  if (!response?.ok || response.status !== 200 || !dlpFindingsObject(response.body) ||
+      typeof response.body.tenant_id !== "string" || !response.body.tenant_id.trim()) throw new Error(dlpFindingsInvalid());
+  return response.body.tenant_id;
+}
+function dlpFindingsBody(response, tenant) {
+  const body = response?.body, count = v => Number.isSafeInteger(v) && v >= 0;
+  if (dlpFindingsTenant(response) !== tenant || body.schema_version !== "admin_dlp_findings.v1" ||
+      body.no_secret_attestation !== true || !Array.isArray(body.findings) || !dlpFindingsObject(body.summary)) throw new Error(dlpFindingsInvalid());
+  const sum = body.summary;
+  if (!count(sum.total) || !count(sum.returned) || !count(sum.blocked) || sum.returned !== body.findings.length ||
+      sum.returned > sum.total || sum.blocked > sum.total) throw new Error(dlpFindingsInvalid());
+  for (const key of ["by_identifier", "by_action", "by_destination"]) {
+    if (!dlpFindingsObject(sum[key]) || Object.values(sum[key]).some(v => !count(v) || v > sum.total)) throw new Error(dlpFindingsInvalid());
+  }
+  const seen = new Set();
+  for (const row of body.findings) {
+    if (!dlpFindingsObject(row) || typeof row.id !== "string" || !row.id || seen.has(row.id) ||
+        typeof row.timestamp !== "string" || !Number.isFinite(Date.parse(row.timestamp)) || typeof row.action !== "string" ||
+        (row.identifier_types !== null && (!Array.isArray(row.identifier_types) || row.identifier_types.some(id => typeof id !== "string" || !id)))) throw new Error(dlpFindingsInvalid());
+    seen.add(row.id);
+    for (const key of ["destination", "source_app", "user_id", "device_id", "corporate_user", "account", "source_ip", "instance_class", "rule_id"]) {
+      if (row[key] !== undefined && typeof row[key] !== "string") throw new Error(dlpFindingsInvalid());
+    }
+  }
+  return body;
+}
+
 async function renderDLPFindingsView(content) {
   content.innerHTML = "";
   content.appendChild(el("div", { class: "ui-view-head" }, el("div", {}, [
@@ -39,45 +70,54 @@ async function renderDLPFindingsView(content) {
   ])));
   const section = el("div", {});
   content.appendChild(section);
-  let _filter = "";       // identifier filter
-  let _policyNames = null; // DLP policy id -> human name (the finding stores the policy id in rule_id)
+  let _filter = "";
+  const fresh = freshRender(content);
+  const current = () => fresh() && content.isConnected !== false && section.isConnected !== false;
 
-  // ensurePolicyNames resolves a finding's rule_id (a DLP policy object id) to the operator-facing policy
-  // NAME. Cached for the view lifetime; falls back to the raw id when the policy was since deleted or the
-  // lookup fails (the id is non-secret, so a fallback leaks nothing).
-  async function ensurePolicyNames() {
-    if (_policyNames) return _policyNames;
-    const map = {};
+  // A missing/deleted policy name may fall back to its recorded ID. Findings
+  // themselves must be valid even when this optional name lookup is unavailable.
+  async function policyNames(tenant) {
+    const names = Object.create(null);
     try {
       const r = await apiFetch("GET", "/admin/dlp-policies");
-      if (r.ok && r.body && Array.isArray(r.body.policies)) {
-        r.body.policies.forEach((p) => { if (p && p.id) map[p.id] = p.name || p.id; });
+      if (r.ok && Array.isArray(r.body?.policies)) {
+        for (const p of r.body.policies) {
+          if (p && p.tenant_id === tenant && typeof p.id === "string" && typeof p.name === "string") names[p.id] = p.name || p.id;
+        }
       }
-    } catch (e) { /* fall back to the raw id */ }
-    _policyNames = map;
-    return map;
+    } catch (_) { /* The recorded policy ID remains available. */ }
+    return names;
   }
 
   async function load() {
+    if (!current()) return;
+    const latest = freshRender(section), selected = dlpFindingsSelection();
+    const active = () => current() && latest();
     uiState(section, "loading");
-    let body;
-    const qs = [];
-    if (_filter) qs.push("identifier=" + encodeURIComponent(_filter));
-    // Read findings from the CONTROL plane (the aggregated, fleet-wide, restart-safe hot store) — not a single
-    // Edge's in-memory cache (event_log_design.md, S2). Policy names are still resolved on the Edge, where
-    // policies are configured.
-    try { const r = await apiFetch("GET", "/admin/dlp-findings" + (qs.length ? "?" + qs.join("&") : ""), undefined, "control"); if (!r.ok) throw new Error("HTTP " + r.status); body = r.body || {}; }
-    catch (e) { uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
+    const suffix = _filter ? "?identifier=" + encodeURIComponent(_filter) : "";
+    let body, names;
+    try {
+      const [response, organization] = await Promise.all([
+        apiFetch("GET", "/admin/dlp-findings" + suffix, undefined, "control"), apiFetch("GET", "/admin/tenant"),
+      ]);
+      if (!active()) return;
+      const tenant = dlpFindingsTenant(organization);
+      if (selected !== dlpFindingsSelection() || (selected && selected !== tenant)) throw new Error(dlpFindingsInvalid());
+      body = dlpFindingsBody(response, tenant);
+      names = body.findings.length ? await policyNames(tenant) : Object.create(null);
+      if (!active()) return;
+      if (selected !== dlpFindingsSelection()) throw new Error(dlpFindingsInvalid());
+    } catch (e) {
+      if (active()) uiState(section, "error", dlpFindingsInvalid(), {label:bl({en:"Retry",ja:"再試行"}),onClick:load});
+      return;
+    }
     section.innerHTML = "";
-    const sum = body.summary || {};
-    const findings = body.findings || [];
-    const byId = sum.by_identifier || {};
-    const matchTotal = Object.values(byId).reduce((a, b) => a + b, 0);
+    const sum = body.summary, findings = body.findings, byId = sum.by_identifier;
 
-    // Summary line: matches + blocked + per-identifier chips (clickable to filter).
+    // Counts are events, not occurrences or the sum of overlapping identifier types.
     const chips = [el("span", { class: "ui-view-desc", text: bl({
-      en: (matchTotal) + " matches · " + (sum.blocked || 0) + " blocked · ",
-      ja: "検出 " + (matchTotal) + " 件 · 遮断 " + (sum.blocked || 0) + " 件 · ",
+      en: sum.total + " events · " + sum.blocked + " blocked · Showing " + sum.returned + " · ",
+      ja: "検出イベント " + sum.total + " 件 · 遮断 " + sum.blocked + " 件 · 表示 " + sum.returned + " 件 · ",
     }) })];
     const allChip = el("button", { class: "ui-btn ui-btn-sm" + (_filter ? "" : " ui-btn-primary"), text: bl({ en: "All", ja: "すべて" }), onClick: () => { _filter = ""; load(); } });
     chips.push(allChip);
@@ -93,7 +133,6 @@ async function renderDLPFindingsView(content) {
       return;
     }
 
-    const policyNames = await ensurePolicyNames();
     section.appendChild(simpleTable(
       [bl({ en: "Time", ja: "時刻" }), bl({ en: "Identifiers", ja: "識別子" }), bl({ en: "Action", ja: "アクション" }), bl({ en: "Application", ja: "アプリ" }), bl({ en: "User", ja: "ユーザー" }), bl({ en: "Device", ja: "デバイス" }), bl({ en: "Destination", ja: "宛先" })],
       findings.map((f) => {
@@ -110,7 +149,7 @@ async function renderDLPFindingsView(content) {
         // Action + the catching DLP policy, shown by NAME (rule_id holds the policy id; hover reveals the id).
         const actionCell = el("div", {}, [
           el("div", {}, dlpActionBadge(f.action)),
-          f.rule_id ? el("div", { class: "ui-view-desc", style: "font-size:0.85em", title: f.rule_id, text: bl({ en: "policy: ", ja: "ポリシー: " }) + (policyNames[f.rule_id] || f.rule_id) }) : null,
+          f.rule_id ? el("div", { class: "ui-view-desc", style: "font-size:0.85em", title: f.rule_id, text: bl({ en: "policy: ", ja: "ポリシー: " }) + (names[f.rule_id] || f.rule_id) }) : null,
         ]);
         return [
           el("span", { class: "ui-view-desc", text: f.timestamp ? window.dsseFormatTime(f.timestamp) : "—" }),
@@ -124,5 +163,5 @@ async function renderDLPFindingsView(content) {
       })
     ));
   }
-  load();
+  return load();
 }

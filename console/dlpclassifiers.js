@@ -36,19 +36,16 @@ async function renderDLPClassifiersView(content, opts) {
 
   let _specs = []; // the current authored set (source of truth for the atomic POST)
 
-  async function load() {
-    uiState(section, "loading");
-    try { const r = await apiFetch("GET", "/admin/dlp-classifiers"); if (!r.ok) throw new Error("HTTP " + r.status); _specs = (r.body && r.body.classifiers) || []; }
-    catch (e) { uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: load }); return; }
-    render();
-  }
+  const library = dlpLibraryView(content, section, "classifiers", "/admin/dlp-classifiers", rows => { _specs = rows; render(); });
+  async function load() { return library.load(); }
 
   // save POSTs the whole set atomically; on a 400 (a bad classifier) it surfaces the server message and keeps the
   // editor open so nothing is half-applied.
-  async function save(nextSpecs, okMsg) {
-    const r = await apiFetch("POST", "/admin/dlp-classifiers", { classifiers: nextSpecs });
-    if (!r.ok) { throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status)); }
-    _specs = (r.body && r.body.classifiers) || nextSpecs;
+  async function save(nextSpecs, okMsg, stamp) {
+    const rows = await library.write("POST", "/admin/dlp-classifiers", {classifiers:nextSpecs}, stamp,
+      actual => dlpLibrarySameClassifiers(actual, nextSpecs));
+    if (!library.current()) return;
+    _specs = rows;
     uiToast(okMsg || bl({ en: "Saved", ja: "保存しました" }), "ok");
     render();
   }
@@ -82,7 +79,7 @@ async function renderDLPClassifiersView(content, opts) {
   }
 
   async function remove(i) {
-    const c = _specs[i];
+    const c = _specs[i], stamp = library.stamp();
     const ok = await uiConfirm({
       title: bl({ en: "Delete identifier?", ja: "識別子を削除?" }),
       body: bl({ en: 'Stop detecting "' + c.name + '". Any DLP rule that governs it will no longer match it.', ja: '「' + c.name + '」の検出を停止します。これを対象とする DLP ルールは一致しなくなります。' }),
@@ -90,12 +87,13 @@ async function renderDLPClassifiersView(content, opts) {
     });
     if (!ok) return;
     const next = _specs.filter((_, idx) => idx !== i);
-    try { await save(next, bl({ en: "Identifier deleted", ja: "識別子を削除しました" })); }
-    catch (e) { uiToast(String(e.message || e), "danger"); }
+    try { await save(next, bl({ en: "Identifier deleted", ja: "識別子を削除しました" }), stamp); }
+    catch (e) { if (library.current()) uiToast(String(e.message || e), "err"); }
   }
 
   // openEditor(index|null): add (null) or edit an existing classifier. Builds the whole next-set on save and POSTs.
   function openEditor(index) {
+    const stamp = library.stamp();
     const editing = index != null ? _specs[index] : null;
     const nameF = uiField({
       name: "name", label: bl({ en: "Name", ja: "名前" }), required: true, value: editing ? editing.name : "",
@@ -156,18 +154,22 @@ async function renderDLPClassifiersView(content, opts) {
       } catch (e) { previewOut.textContent = bl({ en: "Pattern not valid yet: " + e.message, ja: "パターンが未完成: " + e.message }); }
     }
 
+    const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }), onClick: onSave });
+    const saveError = el("div", { class: "ui-state ui-state-error", role: "alert", style: "display:none" });
     const modal = uiModal({
       title: editing ? bl({ en: "Edit identifier", ja: "識別子を編集" }) : bl({ en: "Add custom identifier", ja: "カスタム識別子を追加" }),
-      body: [nameF.el, descF.el, kindF.el, regexWrap, keywordWrap, sampleF.el, previewOut],
+      body: [nameF.el, descF.el, kindF.el, regexWrap, keywordWrap, sampleF.el, previewOut, saveError],
       footer: [
         el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => modal.close() }),
-        el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Save", ja: "保存" }), onClick: onSave }),
+        submit,
       ],
     });
     syncKind();
     nameF.focus();
 
     async function onSave() {
+      if (submit.disabled) return;
+      saveError.style.display = "none";
       if (!nameF.validate()) { nameF.focus(); return; }
       const kind = kindF.get();
       const spec = { name: nameF.get(), description: descF.get(), kind };
@@ -186,10 +188,16 @@ async function renderDLPClassifiersView(content, opts) {
       if (dupe) { nameF.setError(bl({ en: "An identifier with this name already exists.", ja: "同じ名前の識別子が既に存在します。" })); return; }
       const next = _specs.slice();
       if (index != null) next[index] = spec; else next.push(spec);
-      try { await save(next, editing ? bl({ en: "Identifier updated", ja: "識別子を更新しました" }) : bl({ en: "Identifier added", ja: "識別子を追加しました" })); modal.close(); }
-      catch (e) { uiToast(String(e.message || e), "danger"); }
+      submit.disabled = true;
+      try { await save(next, editing ? bl({ en: "Identifier updated", ja: "識別子を更新しました" }) : bl({ en: "Identifier added", ja: "識別子を追加しました" }), stamp); if (library.current()) modal.close(); }
+      catch (e) {
+        if (!library.current()) return;
+        saveError.textContent = String(e.message || e);
+        saveError.style.display = "";
+        saveError.scrollIntoView({ block: "nearest" });
+      } finally { submit.disabled = false; }
     }
   }
 
-  load();
+  return load();
 }

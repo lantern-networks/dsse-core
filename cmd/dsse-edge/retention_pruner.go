@@ -23,6 +23,8 @@ import (
 // publishing outbox rows are NEVER pruned (only published + dead, which are terminal).
 
 type retentionConfig struct {
+	// sweepLimit bounds admission of new batches; an admitted batch keeps its own I/O budget.
+	sweepLimit      time.Duration
 	interval        time.Duration
 	hotEvents       time.Duration // move/delete hot_events older than this (0 = keep)
 	outboxPublished time.Duration // delete published outbox rows older than this (0 = keep)
@@ -46,6 +48,13 @@ type retentionConfig struct {
 	// override, when set, holds admin-configured per-stream retention (Console) that takes precedence over the
 	// startup-flag defaults, so retention is tunable without a redeploy. nil = flags only.
 	override *retentionOverrideStore
+}
+
+func (c retentionConfig) sweepBudget() time.Duration {
+	if c.sweepLimit > 0 {
+		return c.sweepLimit
+	}
+	return 2 * time.Minute
 }
 
 func (c retentionConfig) enabled() bool {
@@ -169,10 +178,9 @@ func logPruneDeleted(table, tenant string, n int64, cutoff time.Time) {
 }
 
 func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
-	sweep, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	for sweep.Err() == nil {
-		if archiveRetentionBatch(sweep, db, cfg, tenant, stream, cutoff, now) < retentionPruneBatchSize {
+	deadline := time.Now().Add(cfg.sweepBudget())
+	for ctx.Err() == nil && time.Now().Before(deadline) {
+		if archiveRetentionBatch(ctx, db, cfg, tenant, stream, cutoff, now) < retentionPruneBatchSize {
 			return
 		}
 	}

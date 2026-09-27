@@ -90,3 +90,37 @@ func TestPostgresRetentionBatchPlans(t *testing.T) {
 		}
 	}
 }
+
+// Reaching the sweep deadline must not cancel an already written audit object
+// before its SQL chain head and hot-row deletion are committed.
+func TestPostgresAuditRetentionFinishesBatchBeyondSweepBudget(t *testing.T) {
+	p, _, _ := blobWriterPostgresFixture(t)
+	p.key = "audit_chain"
+	if _, err := p.db.Exec(`CREATE TABLE hot_events(tenant_id text,stream text,event_id text,received_at timestamptz,payload bytea); INSERT INTO hot_events SELECT 'tenant','audit',n::text,now()-interval '10 days',convert_to('{}','UTF8') FROM generate_series(1,1001) n`); err != nil {
+		t.Fatal(err)
+	}
+	chain := newAuditChainStore(p)
+	arc := &archiveWriteProbe{fakeArchive: fakeArchive{objs: map[string][]byte{}}}
+	arc.putHook = func() { time.Sleep(250 * time.Millisecond) }
+	cfg := retentionConfig{archive: arc, auditChain: chain, sweepLimit: 100 * time.Millisecond}
+	now := time.Now()
+	archiveThenPruneStream(context.Background(), p.db, cfg, "tenant", "audit", now.Add(-time.Hour), now)
+	if err := chain.Health(); err != nil {
+		t.Fatal(err)
+	}
+	var remaining int
+	if err := p.db.QueryRow(`SELECT count(*) FROM hot_events`).Scan(&remaining); err != nil || remaining != 1 {
+		t.Fatalf("remaining=%d err=%v", remaining, err)
+	}
+	if arc.puts != 1 {
+		t.Fatalf("puts=%d", arc.puts)
+	}
+	seq, _, err := newAuditChainStore(p).Next("tenant")
+	if err != nil || seq != 1 {
+		t.Fatalf("seq=%d err=%v", seq, err)
+	}
+	verified, err := verifyAuditChain(context.Background(), arc, "tenant")
+	if err != nil || !verified.OK || verified.Segments != 1 {
+		t.Fatalf("chain=%+v err=%v", verified, err)
+	}
+}

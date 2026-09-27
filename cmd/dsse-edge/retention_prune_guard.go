@@ -151,10 +151,9 @@ func checkedPruneCutoffWithBudget(budget *cpStatementBudget, tx *sql.Tx, cfg ret
 const retentionPruneBatchSize = 1000
 
 func deleteRetentionRows(ctx context.Context, db *sql.DB, cfg retentionConfig, table, where, tenant, stream string, cutoff, now time.Time) {
-	sweep, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	for sweep.Err() == nil {
-		if deleteRetentionBatch(sweep, db, cfg, table, where, tenant, stream, cutoff, now) < retentionPruneBatchSize {
+	deadline := time.Now().Add(cfg.sweepBudget())
+	for ctx.Err() == nil && time.Now().Before(deadline) {
+		if deleteRetentionBatch(ctx, db, cfg, table, where, tenant, stream, cutoff, now) < retentionPruneBatchSize {
 			return
 		}
 	}

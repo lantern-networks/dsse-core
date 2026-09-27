@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -26,6 +27,7 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 		return
 	}
 	mux.HandleFunc("POST /grant-report", func(w http.ResponseWriter, r *http.Request) {
+		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if _, verified := auditIngestShipperFrom(r, tenantCARegistry); !verified && !devMode {
 			writeError(w, http.StatusForbidden, fmt.Errorf("grant-report: this request presents no Edge "+
 				"certificate, so these grants could not be attributed to a node"))
@@ -34,22 +36,34 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 		var body struct {
 			Grants []grantstore.Grant `json:"grants"`
 		}
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&body); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("grant-report: %w", err))
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10))
+		if err := decoder.Decode(&body); err != nil || body.Grants == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid grant report"))
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); err != io.EOF {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid grant report"))
 			return
 		}
 		added, updated, err := grants.MergeCheckedContext(r.Context(), body.Grants, time.Now().UTC())
 		if err != nil {
-			status := http.StatusServiceUnavailable
-			if errors.Is(err, grantstore.ErrConflict) || errors.Is(err, grantstore.ErrInvalidGrant) {
+			status := http.StatusBadRequest
+			if errors.Is(err, grantstore.ErrConflict) {
 				status = http.StatusConflict
 			}
-			writeError(w, status, fmt.Errorf("grant-report could not confirm the update"))
+			if errors.Is(err, grantstore.ErrPersistence) {
+				status = http.StatusServiceUnavailable
+			}
+			log.Printf("grant_report_rejected status=%d added=%d updated=%d", status, added, updated)
+			result := map[string]any{"error": "grant-report could not confirm the update", "added": added, "updated": updated, "changed": added > 0 || updated > 0}
+			if errors.Is(err, grantstore.ErrPersistence) {
+				result["persistence"] = "unconfirmed"
+			}
+			writeJSON(w, status, result)
 			return
 		}
-		if added > 0 {
-			log.Printf("grant_report_recorded added=%d updated=%d — the authority now holds them, so every "+
-				"Edge learns of them and a revocation reaches all of them", added, updated)
+		if added > 0 || updated > 0 {
+			log.Printf("grant_report_recorded added=%d updated=%d", added, updated)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"added": added, "updated": updated})
 	})

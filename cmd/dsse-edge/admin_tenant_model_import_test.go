@@ -47,7 +47,7 @@ func TestTheTenantCatalogIsCarriedIntoPostgresWithItsTombstones(t *testing.T) {
 			"DROP TABLE IF EXISTS admin_tenant_model_deletions",
 			"DROP TABLE IF EXISTS admin_tenant_model_purge_orders",
 			// A brand-new database has no ledger yet, and a fixture reset must not fail for being first.
-			"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041'); END IF; END $$",
+			"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041','044'); END IF; END $$",
 		} {
 			_, _ = db.ExecContext(context.Background(), stmt)
 		}
@@ -58,7 +58,7 @@ func TestTheTenantCatalogIsCarriedIntoPostgresWithItsTombstones(t *testing.T) {
 		"DROP TABLE IF EXISTS admin_tenant_model_deletions",
 		"DROP TABLE IF EXISTS admin_tenant_model_purge_orders",
 		// A brand-new database has no ledger yet, and a fixture reset must not fail for being first.
-		"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041'); END IF; END $$",
+		"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041','044'); END IF; END $$",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("reset the fixture (%s): %v", stmt, err)
@@ -155,7 +155,7 @@ func TestTheTenantCatalogIsCarriedIntoPostgresWithItsTombstones(t *testing.T) {
 		"DROP TABLE IF EXISTS admin_tenant_model_deletions",
 		"DROP TABLE IF EXISTS admin_tenant_model_purge_orders",
 		// A brand-new database has no ledger yet, and a fixture reset must not fail for being first.
-		"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041'); END IF; END $$",
+		"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041','044'); END IF; END $$",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("reset for the fill case: %v", err)
@@ -233,7 +233,7 @@ func TestTheTenantCatalogIsCarriedIntoPostgresWithItsTombstones(t *testing.T) {
 		"DROP TABLE IF EXISTS admin_tenant_model_deletions",
 		"DROP TABLE IF EXISTS admin_tenant_model_purge_orders",
 		// A brand-new database has no ledger yet, and a fixture reset must not fail for being first.
-		"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041'); END IF; END $$",
+		"DO $$ BEGIN IF to_regclass('schema_migrations') IS NOT NULL THEN DELETE FROM schema_migrations WHERE version IN ('023','024','038','039','040','041','044'); END IF; END $$",
 	} {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			t.Fatalf("reset for the control: %v", err)

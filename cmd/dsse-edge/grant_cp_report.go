@@ -52,7 +52,14 @@ func (g *grantCPReporter) report(ctx context.Context) {
 	}
 	now := time.Now().UTC()
 	live := make([]grantstore.Grant, 0)
-	for _, gr := range store.ListAll() {
+	rows, err := store.ListAllChecked()
+	if err != nil {
+		if g.logf != nil {
+			g.logf("grant_report_deferred: authority unavailable")
+		}
+		return
+	}
+	for _, gr := range rows {
 		if exp, err := time.Parse(time.RFC3339, gr.ExpiresAt); err == nil && !now.Before(exp) {
 			continue
 		}

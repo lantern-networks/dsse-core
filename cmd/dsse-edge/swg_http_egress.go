@@ -283,7 +283,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	if decision.IsDefaultDeny(dec) {
 		at := time.Now().UTC()
 		if cs, ok := config.PolicyCandidateStore.(*policycandidate.Store); ok {
-			_, _ = cs.ObserveUnmatchedFlow(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "", at)
+			_, _ = cs.ObserveUnmatchedFlow(candidateWriteContext(r.Context()), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "", at)
 		}
 		reportCandidate(policycandidate.ReportUnmatchedFlow, req.TenantID, req.FQDN, req.SNI, "", req.DestinationPort, "", at)
 	}
@@ -509,7 +509,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 		if swgEgressIsUnrecognizedName(err) {
 			at := time.Now().UTC()
 			if cs, ok := config.PolicyCandidateStore.(*policycandidate.Store); ok {
-				_, _ = cs.ObserveCertPinFailure(r.Context(), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "egress_tls_unrecognized_name", at)
+				_, _ = cs.ObserveCertPinFailure(candidateWriteContext(r.Context()), req.TenantID, req.FQDN, req.SNI, req.DestinationPort, "egress_tls_unrecognized_name", at)
 			}
 			reportCandidate(policycandidate.ReportCertPinFailure, req.TenantID, req.FQDN, req.SNI, "", req.DestinationPort, "egress_tls_unrecognized_name", at)
 		}

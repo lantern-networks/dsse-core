@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/grantstore"
@@ -30,7 +31,8 @@ func grantBundleSection(store *grantstore.Store) *grantBundle {
 	if store == nil {
 		return nil
 	}
-	return &grantBundle{Grants: store.ListAll(), Complete: true}
+	rows, err := store.ListAllChecked()
+	return &grantBundle{Grants: rows, Complete: err == nil}
 }
 
 // applyGrantBundleSection folds the authority's set into this Edge's. Returns what changed.
@@ -43,8 +45,11 @@ func applyGrantBundleSection(store *grantstore.Store, section *grantBundle, now 
 }
 
 func applyGrantBundleSectionChecked(store *grantstore.Store, section *grantBundle, now time.Time) (int, int, error) {
-	if store == nil || section == nil || !section.Complete {
+	if section == nil {
 		return 0, 0, nil
+	}
+	if store == nil || !section.Complete {
+		return 0, 0, fmt.Errorf("access grant bundle is unavailable or incomplete")
 	}
 	return store.MergeChecked(section.Grants, now)
 }

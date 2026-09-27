@@ -212,3 +212,29 @@ func TestBothSpoolsReleaseTheirHandleOnStop(t *testing.T) {
 			"be neither rotated nor removed")
 	}
 }
+
+// A record handed to the hook just before stop is in the spool afterwards. The reports an Edge writes on SIGTERM
+// (observation_report.go) arrive exactly then. This states the contract; it also held before stop drained the
+// channel, because run absorbs the channel at the top of each loop and the only losing window (a record and stop
+// both arriving between that absorb and the next select) cannot be forced from a test.
+func TestRecordsHandedOverBeforeStopAreSpooled(t *testing.T) {
+	for i := 0; i < 30; i++ {
+		spoolPath := filepath.Join(t.TempDir(), "spool.ndjson")
+		s, err := newRemoteAuditShipper("", "", "", []string{"audit.log.jsonl"}, 8, spoolPath, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		hook := s.hook()
+		_ = hook("audit.log.jsonl", []byte(`{"event":"first"}`))
+		// No control plane: the first record fails and the shipper waits to retry.
+		deadline := time.Now().Add(2 * time.Second)
+		for s.health(time.Now())["failing_since"] == nil && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		_ = hook("audit.log.jsonl", []byte(`{"event":"last"}`))
+		s.stop()
+		if _, replay, err := readReplayFor(t, spoolPath); err != nil || len(replay) != 2 {
+			t.Fatalf("attempt %d: spool holds %d record(s) after stop (%v)", i, len(replay), err)
+		}
+	}
+}

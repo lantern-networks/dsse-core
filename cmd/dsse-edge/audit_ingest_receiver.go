@@ -126,11 +126,7 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 		// durable copy, so a report is acknowledged only once it has committed, and it is not also written to
 		// this node's logs.
 		if isObservationReportStream(stream) {
-			if !cpLeaderElectorInstance.IsLeader() {
-				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observation report requires current control-plane leader"))
-				return
-			}
-			status, rerr := applyObservationReport(r.Context(), reports, stream, shipper.Identity, body)
+			status, rerr := applyObservationReport(captureCPWriteLease(r.Context()), reports, stream, shipper.Identity, body)
 			if rerr != nil {
 				writeError(w, status, rerr)
 				return

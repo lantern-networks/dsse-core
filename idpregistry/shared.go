@@ -50,6 +50,7 @@ func (s *Store) publishLocked(next persistedRegistry) {
 		s.generation++
 	}
 	s.connections, s.defaults = next.Connections, next.Defaults
+	s.publishDomainsLocked()
 }
 
 // edit applies the existing validation to an isolated candidate built from the locked shared row.

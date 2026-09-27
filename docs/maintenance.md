@@ -702,6 +702,11 @@ Steering exclusions now keep saved state on failed writes, attribute audit and v
 
 Before updating an Edge that downloads steering exclusions, ensure its retrieval token belongs to the same tenant as its configuration bundle. An operator token or a token from another tenant now receives a tenant-mismatch response; the Edge retains its cached exclusions but cannot receive subsequent updates. Update the CP first, then update Edges after checking this token-to-tenant mapping.
 
+### Connector management and organization-domain reconciliation
+
+Connector secret replacement confirms persistence at both administrative URLs; errors do not return a usable new secret. Registration and heartbeat keep their audit/report follow-up when route discovery alone fails. Organization domain updates preserve concurrent changes, refresh shared state and retain the request leadership term. Connector lists reject malformed responses and avoid applying responses after the selected organization changes. These changes retain existing browser acceptance evidence for unchanged controls; real connector reconnection remains a deployment check.
+
+Organization-domain storage must load successfully before startup. A malformed or unreadable configured file/database no longer falls back to volatile settings. Repair the configured store (valid empty form: `{"by_tenant":{}}`) rather than starting over existing data. Traffic classification uses the last applied domain snapshot while management reads report storage failures; shared peers refresh in the background.
 ### DLP library editing and findings
 
 DLP identifiers, fingerprint sets and allowlisted samples keep editors open after an unconfirmed save and verify the returned saved values. Duplicate submissions and responses from a previous organization/view cannot replace the current list. Invalid list responses remain retryable errors instead of appearing as an empty library. Numeric identifiers ignore grouping and email values ignore case; other allowlist values match exactly. Findings retain the matching request context when loading details. Existing real-browser save/reload/audit evidence is reused for unchanged retained controls; this is not a new production traffic acceptance claim.

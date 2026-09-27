@@ -651,3 +651,7 @@ The Console regression suite and synthetic browser checks cover these form contr
 Device admission responses now include the authenticated tenant and the effective restore result required by the Console. Device risk reads use the control-plane route and validate its tenant; a denied risk permission still permits the inventory's explicit risk display. Manual person creation is create-only in both file and PostgreSQL directories, so a concurrent existing identity is not overwritten.
 
 Device admission reads require the active CP when leader election is enabled; management routing to a standby returns a retryable conflict rather than a stale admission snapshot.
+
+### Cross-region revocation delivery
+
+Pending revocation deliveries preserve peer changes in shared storage and resume after control-plane promotion. Peer acceptance and durable queue cleanup are reported separately; an old delivery acknowledgement cannot erase a newer request for the same identity. Snapshot loading rejects unreadable state instead of silently treating it as an empty queue. Existing outbox entries retain startup compatibility.

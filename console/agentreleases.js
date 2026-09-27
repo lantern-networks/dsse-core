@@ -553,15 +553,14 @@ async function renderAgentReleaseList(host) {
   window._arReleaseReadContext = null;
   let catalogue, signing = null, rolloutTenant;
   try {
-    const organization = await apiFetch("GET", "/admin/tenant", undefined, _AR_PLANE);
+    // The authenticated server resolves bearer, break-glass and session scope.
+    // Subsequent requests are pinned to this response, not a browser-side role guess.
+    const updates = await apiFetch("GET", "/admin/agent-updates", undefined, _AR_PLANE);
     if (!current()) return;
-    const tenant = organization?.body?.tenant_id;
-    if (!organization?.ok || organization.status !== 200 || !arReadObject(organization.body) ||
-        typeof tenant !== "string" || tenant.trim() !== tenant || (selection && selection !== tenant)) throw new Error();
+    const scope = updates?.body?.tenant_id, tenant = updates?.body?.request_tenant_id;
+    if (typeof scope !== "string" || scope.trim() !== scope || typeof tenant !== "string" || tenant.trim() !== tenant ||
+        (selection && (selection !== tenant || selection !== scope)) || (scope !== "deployment" && scope !== tenant)) throw new Error();
     rolloutTenant = tenant;
-    const scope = deployment ? "deployment" : tenant;
-    const updates = await apiFetch("GET", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(scope), undefined, _AR_PLANE);
-    if (!current()) return;
     catalogue = arCatalogueBody(updates, scope);
     try {
       const floor = await apiFetch("GET", "/admin/agent-update-sign-floor?expected_tenant_id=" + encodeURIComponent(scope), undefined, _AR_PLANE);

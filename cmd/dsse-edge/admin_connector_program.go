@@ -175,6 +175,11 @@ func listConnectorPrograms(root, tenantID string) ([]connectorProgramListing, er
 			}
 			path := filepath.Join(dir, e.Name())
 			raw, err := os.ReadFile(filepath.Join(path, connectorProgramMetaName))
+			if os.IsNotExist(err) {
+				if _, bytesErr := os.Stat(filepath.Join(path, connectorProgramBytesName)); os.IsNotExist(bytesErr) {
+					continue // An abandoned upload with neither file never published a program.
+				}
+			}
 			if err != nil {
 				return err
 			}
@@ -277,10 +282,6 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			writeError(w, http.StatusPreconditionFailed, derr)
 			return
 		}
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
 		// ★ READ IT, THEN WRITE IT ONCE. Staging a temporary file here by hand — create, write, flush, close,
 		// chmod, replace — is durablefile.Write spelled out again, and every copy of that sequence is
 		// individually reasonable right up to the day one of them misses a platform fix. The cap below is
@@ -305,6 +306,10 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		if !strings.EqualFold(got, declared) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("these bytes are not the ones declared: got %d "+
 				"bytes sha256:%s, the request declares sha256:%s", written, got, declared))
+			return
+		}
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		if err := durablefile.Write(filepath.Join(dir, connectorProgramBytesName), body, 0o640); err != nil {
@@ -365,6 +370,10 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		tenantID := adminTenantIDFromRequest(r)
 		if strings.TrimSpace(tenantID) == "" {
 			writeError(w, http.StatusForbidden, fmt.Errorf("this request names no organization"))
+			return
+		}
+		if _, err := listConnectorPrograms(root, tenantID); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("connector programs cannot be verified"))
 			return
 		}
 		dir, meta, source, ok := resolveConnectorProgram(root, tenantID, target)

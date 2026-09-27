@@ -1219,10 +1219,11 @@ func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(str
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"schema_version": "admin_agent_updates.v1",
-			"tenant_id":      tenantID,
-			"envelopes":      active,
-			"pending":        pending,
+			"schema_version":    "admin_agent_updates.v1",
+			"tenant_id":         tenantID,
+			"envelopes":         active,
+			"pending":           pending,
+			"request_tenant_id": adminTenantIDFromRequest(r),
 		})
 	}))
 	// ★ ONE PUBLISH PATH, TWO DOORS INTO IT (2026-08-13). PUT takes an envelope signed somewhere else; POST

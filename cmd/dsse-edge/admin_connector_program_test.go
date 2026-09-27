@@ -64,6 +64,11 @@ func TestAConnectorProgramWhoseBytesAreNotTheOnesDeclaredIsRefused(t *testing.T)
 	// ★ THE PATH COMES FROM THE CODE UNDER TEST, NOT FROM A COPY OF IT. Written by hand, this looked at
 	// root/t1/… while the store had moved to root/tenants/t1/… — a check that passed because it was looking
 	// somewhere nothing is ever written. A negative assertion needs to be aimed at the real place.
+	listed := httptest.NewRecorder()
+	mux.ServeHTTP(listed, httptest.NewRequest("GET", "/admin/connector-programs", nil))
+	if listed.Code != 200 {
+		t.Fatalf("failed upload broke catalogue: %d", listed.Code)
+	}
 	refusedDir, derr := connectorProgramDir(root, "t1", "linux-arm64")
 	if derr != nil {
 		t.Fatal(derr)
@@ -449,7 +454,7 @@ func TestConnectorProgramCatalogueRefusesIncompleteStorage(t *testing.T) {
 }
 
 func TestConnectorProgramCatalogueDistinguishesMissingAndUnavailableRoots(t *testing.T) {
-	for _, kind := range []string{"fresh", "missing", "unconfigured", "root-file", "deployment-file", "deployment-corrupt"} {
+	for _, kind := range []string{"fresh", "missing", "unconfigured", "root-file", "deployment-file", "deployment-empty", "deployment-corrupt"} {
 		t.Run(kind, func(t *testing.T) {
 			root := t.TempDir()
 			code := 200
@@ -470,11 +475,16 @@ func TestConnectorProgramCatalogueDistinguishesMissingAndUnavailableRoots(t *tes
 					t.Fatal(err)
 				}
 				code = 503
-			case "deployment-corrupt":
+			case "deployment-empty", "deployment-corrupt":
 				if err := os.MkdirAll(filepath.Join(root, "deployment", "linux-amd64"), 0700); err != nil {
 					t.Fatal(err)
 				}
-				code = 503
+				if kind == "deployment-corrupt" {
+					if err := os.WriteFile(filepath.Join(root, "deployment", "linux-amd64", connectorProgramBytesName), []byte("incomplete"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					code = 503
+				}
 			}
 			rr := httptest.NewRecorder()
 			connectorProgramTestMux(root, false, "t1").ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/admin/connector-programs", nil))
@@ -491,5 +501,24 @@ func TestConnectorProgramCatalogueDistinguishesMissingAndUnavailableRoots(t *tes
 				}
 			}
 		})
+	}
+}
+
+func TestConnectorProgramDownloadRefusesIncompleteTenantOverride(t *testing.T) {
+	root := t.TempDir()
+	dir, err := connectorProgramDir(root, "t1", "linux-amd64")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, connectorProgramBytesName), []byte("unfinished"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	connectorProgramTestMux(root, false, "t1").ServeHTTP(rr, httptest.NewRequest("GET", "/admin/connector-program?platform=linux&arch=amd64", nil))
+	if rr.Code != 503 {
+		t.Fatalf("incomplete override status=%d", rr.Code)
 	}
 }

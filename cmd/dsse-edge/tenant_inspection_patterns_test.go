@@ -113,6 +113,42 @@ func TestTenantInspectionProductWritesAndReadViews(t *testing.T) {
 	}
 }
 
+func TestChromeAccountManagerDefaultBypassAndTenantOverride(t *testing.T) {
+	e := edgeplane.NewNetworkExtensionLabTLSInterceptionMatchOnly([]string{"*"})
+	o := knownbypass.NewOverrideStore()
+	apply := newTenantInspectionApplier(e, inspectionposture.NewStore(), policyrule.NewStore(),
+		assetcatalog.NewStore(), o, func() []knownbypass.Group { return knownbypass.Catalog().Entries }, []string{"*"}, nil)
+	const host = "oauthaccountmanager.googleapis.com"
+	check := func(inspectA bool) {
+		t.Helper()
+		for _, tenant := range []string{"a", "b", "new-tenant"} {
+			want := tenant == "a" && inspectA
+			if got := e.Matches(edgeplane.NetworkExtensionRuntimeCopyTCPRoute{TenantID: tenant, Host: host, Port: 443}); got != want {
+				t.Errorf("tenant %s: inspect account manager = %v, want %v", tenant, got, want)
+			}
+			for _, inspected := range []string{"accounts.google.com", "accounts.youtube.com", "mail.google.com", "oauth2.googleapis.com", "www.googleapis.com", "sub." + host} {
+				if !e.Matches(edgeplane.NetworkExtensionRuntimeCopyTCPRoute{TenantID: tenant, Host: inspected, Port: 443}) {
+					t.Errorf("tenant %s: neighboring host %s lost inspection", tenant, inspected)
+				}
+			}
+		}
+	}
+	apply("a")
+	check(false)
+	for _, mode := range []string{knownbypass.OverrideForceInspect, knownbypass.OverrideDisabled} {
+		if _, err := o.Set("a", knownbypass.Override{EntryID: "google_chrome_account_manager", Mode: mode}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		apply("a")
+		check(true)
+	}
+	if cleared, err := o.Clear("a", "google_chrome_account_manager"); err != nil || !cleared {
+		t.Fatalf("restore default: cleared=%v err=%v", cleared, err)
+	}
+	apply("a")
+	check(false)
+}
+
 func TestTenantInspectionDefaultsAndCatalogOverridesRefreshTogether(t *testing.T) {
 	e := edgeplane.NewNetworkExtensionLabTLSInterceptionMatchOnly(nil)
 	p := inspectionposture.NewStore()

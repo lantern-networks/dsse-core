@@ -29,6 +29,7 @@ func TestDefaultBypassCatalogActuallyMatchesTheHostsItNames(t *testing.T) {
 		{"mask.icloud.com", "iCloud Private Relay ingress"},
 		{"gateway.push.apple.com", "APNs"},
 		{"ocsp.apple.com", "Apple OCSP"},
+		{"oauthaccountmanager.googleapis.com", "Chrome profile verification and Gmail compatibility"},
 	} {
 		if !networkExtensionLabTLSHostMatchesAnyPattern(tc.host, hosts) {
 			t.Errorf("the default bypass catalog does not match %q (%s) — it would be decrypted, and a pinned "+
@@ -38,7 +39,11 @@ func TestDefaultBypassCatalogActuallyMatchesTheHostsItNames(t *testing.T) {
 
 	// The converse, so this test cannot pass by the catalog turning into a wildcard: a tenant-restriction
 	// interception target must still be decrypted.
-	for _, host := range []string{"accounts.google.com", "login.microsoftonline.com"} {
+	for _, host := range []string{
+		"accounts.google.com", "accounts.youtube.com", "mail.google.com", "login.microsoftonline.com",
+		"oauth2.googleapis.com", "www.googleapis.com", "www.google.com",
+		"sub.oauthaccountmanager.googleapis.com", "oauthaccountmanager.googleapis.com.example.test",
+	} {
 		if networkExtensionLabTLSHostMatchesAnyPattern(host, hosts) {
 			t.Errorf("%q is bypassed by the default catalog, which would disable tenant restriction on it", host)
 		}

@@ -134,6 +134,19 @@ supported SaaS services are a separate feature in
 
 ## Built-in bypass overrides
 
+Built-in catalog version 7 adds one exact-host compatibility bypass for
+`oauthaccountmanager.googleapis.com` (entry `google_chrome_account_manager`). It
+keeps Chrome profile verification and Gmail sign-in working in environments where
+inspection of this authentication endpoint causes repeated verification. Steering
+and access policy still apply; TLS content inspection does not apply to that host.
+Google sign-in pages, Gmail and other Google API hosts remain eligible for inspection.
+
+This is a deployment default, not an endpoint installation option. Update the
+control plane and serving Edges to a version containing this catalog and confirm
+the effective catalog on each Edge. Explicit tenant overrides, disabling the built-in
+bypass list, and a separately applied signed catalog keep their existing precedence;
+an applied signed catalog must include the entry to supply the same default.
+
 In **Built-in Bypass List**, **Force-inspect** and **Disable** remove an entry's
 curated bypass for the selected organization. **Restore default** removes that
 override. These controls change the catalog's contribution; they do not override

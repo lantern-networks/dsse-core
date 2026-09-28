@@ -8,8 +8,8 @@
 // pinning, OS trust/update, certificate-validation endpoints), plus the GitHub developer platform as a
 // curated compatibility bypass (its asset CDN is a genuinely pinned apex; the rest is bypassed alongside so
 // the platform works end to end — the entry is overridable per tenant for anyone who needs to inspect it).
-// It intentionally does NOT include Google Workspace or Microsoft 365, which an edge typically intercepts
-// for tenant restriction; bypassing those would defeat that control. Region-specific pinned apps (e.g.
+// Google Chrome's OAuth account manager has one exact-host compatibility exception. Google Workspace
+// sign-in pages and Microsoft 365 remain inspected for tenant restriction. Region-specific pinned apps (e.g.
 // banking) are left to per-deployment configuration or to the cert-pinning detection workflow.
 //
 // This is the predefined-catalog OBJECT: a versioned set of entries carrying vendor/category/risk metadata,
@@ -21,7 +21,7 @@ import "strings"
 
 // CatalogVersion is the monotonic version of the built-in default catalog. It bumps when the default entry set
 // changes so a tenant can tell which curated baseline is in effect (a signed feed will carry its own version).
-const CatalogVersion = 6
+const CatalogVersion = 7
 
 // Override modes for a predefined catalog entry. The default (no override) is no-decrypt keep-steer.
 const (
@@ -331,6 +331,19 @@ var Groups = []Group{
 			"*.dl.delivery.mp.microsoft.com",
 			"*.update.microsoft.com",
 			"*.windowsupdate.com",
+		},
+	},
+	{
+		ID:       "google_chrome_account_manager",
+		Name:     "google_chrome_account_manager",
+		Vendor:   "Google",
+		Category: "authentication",
+		Risk:     "medium",
+		Description: "Chrome OAuth account manager compatibility. Interception caused repeated browser profile " +
+			"verification and Gmail sign-in failures; bypassing this exact host restored both. " +
+			"Google sign-in pages, Gmail and other Google APIs remain eligible for inspection.",
+		Patterns: []string{
+			"oauthaccountmanager.googleapis.com",
 		},
 	},
 	{

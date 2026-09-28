@@ -85,6 +85,28 @@ On the connector host, using its actual state directory:
 sudo dsse-connector-install --verify --state-dir /var/lib/dsse-connector
 ```
 
+### Browser sign-in works only without TLS inspection
+
+Test browser profile sign-in or sync separately from a website login. A successful
+anonymous HTTPS probe, a loaded account page, or a policy `allow` record does not
+establish that browser reauthentication succeeded. Have the account owner perform
+authentication and report only the outcome; do not collect cookies, credentials,
+authentication URLs, or challenge contents.
+
+Keep the device, browser profile, and egress fixed when comparing inspection with
+TLS passthrough. Use temporary, exact-host exceptions in the affected tenant, verify
+the actual certificate issuer, and restore inspection for hosts that do not need
+an exception. Do not exclude an entire provider domain merely because its sign-in
+flow uses several hosts. Record each change and whether the original failure returns
+when an exception is removed. An already authenticated session surviving a browser
+restart does not prove that a new authentication or token renewal will work.
+
+Keep only exceptions supported by the comparison, and retest the affected operation
+after a forwarding fix before restoring inspection. Passthrough preserves end-to-end
+TLS but prevents content inspection and SaaS restriction-header injection on that
+host. Verify that other sites remain inspected; a successful passthrough comparison
+alone does not establish the cause of the interception failure.
+
 ## Updates and removal
 
 An update offered in the Console may not have run on the endpoint. Compare the running

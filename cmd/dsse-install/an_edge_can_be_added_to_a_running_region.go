@@ -180,7 +180,7 @@ func addAnEdgeToARunningRegion(dir, planPath, machineName string) error {
 		fmt.Sprintf("dsse-install -plan <plan> -dir %s -carry %s.tar.gz -machine %s", dir, machineName, machineName))
 	next(fmt.Sprintf("On %s — it needs the product image too: the archive carries configuration and\n"+
 		"   material, NOT the image this region already runs.", machineName),
-		fmt.Sprintf("tar xzf %s.tar.gz -C /opt/dsse/%s", machineName, region.ID),
+		fmt.Sprintf("tar xzpf %s.tar.gz -C /opt/dsse/%s", machineName, region.ID),
 		"docker compose --env-file deployment.env up -d")
 	if !unchanged {
 		next("Reload this region's door. This replaces no container and drops no established connection:",

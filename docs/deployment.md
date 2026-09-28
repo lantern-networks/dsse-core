@@ -266,7 +266,10 @@ from `install-order.txt` in order. The installer prints the exact membership com
    with `-plan ... -carry <machine>.tar.gz -machine <machine>`.
 2. Copy that archive to the named host. Adapt the printed `scp` destination to your SSH
    user and key. Both service images must already be loaded there.
-3. On that host, extract into the printed directory and start its generated Compose project.
+3. On that host, extract into the printed directory with `tar xzpf` and start its generated
+   Compose project. The `p` preserves the archive's file permissions under a private
+   `umask`: public HAProxy configuration and the store CA must remain readable to their
+   non-owner container processes; private keys remain private.
 4. Once the learner has caught up, run the printed promotion command on the founding node.
    A refusal because it is still catching up means wait and retry that promotion.
 5. Repeat for the third region. Confirm three voting members in three failure domains.

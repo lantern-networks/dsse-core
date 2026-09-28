@@ -47,7 +47,6 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 		{
 			Machine: minting.Name,
 			// ★★★ IT SAYS WHERE TO RUN IT FROM (2026-09-02, found by walking this on a live deployment).
-			// Every step for a JOINING machine begins `tar xzf … && cd /opt/dsse/<region> && docker compose`
 			// and every step for the founding one did not — compose reads deployment.env and the compose
 			// file from the working directory, so these worked only for a reader who had inferred the cd.
 			Do:    fmt.Sprintf("cd %s && docker compose -p dsse --env-file deployment.env up -d", dir),
@@ -164,9 +163,11 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 				},
 				PlanStep{
 					Machine: m.Name,
-					Do:      fmt.Sprintf("mkdir -p /opt/dsse/%s && tar xzf %s.tar.gz -C /opt/dsse/%s && cd /opt/dsse/%s && docker compose -p dsse-%s --env-file deployment.env up -d", r.ID, m.Name, r.ID, r.ID, r.ID),
-					Needs:   needs,
-					Why:     why,
+					// Preserve archive modes under umask 077: HAProxy and Patroni need their public
+					// configs and store CA readable to non-owner container processes.
+					Do:    fmt.Sprintf("mkdir -p /opt/dsse/%s && tar xzpf %s.tar.gz -C /opt/dsse/%s && cd /opt/dsse/%s && docker compose -p dsse-%s --env-file deployment.env up -d", r.ID, m.Name, r.ID, r.ID, r.ID),
+					Needs: needs,
+					Why:   why,
 				})
 			if joinsTheStore(p, r, m) {
 				steps = append(steps, PlanStep{

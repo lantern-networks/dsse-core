@@ -25,10 +25,10 @@ See the [threat model](docs/threat-model.md) and each platform's limitations.
 
 ## Maintenance status
 
-Development of 0.3.1 is focused on everyday reliability. See
-[maintenance and 0.3.1 progress](docs/maintenance.md) for implemented fixes,
-remaining release checks and the target week. Development changes are not yet
-part of the published 0.3.0 experimental release.
+[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) was released on September 29, 2026.
+It focuses on everyday reliability, regional installation, and endpoint compatibility.
+See the release notes for signed downloads, upgrade guidance and verification scope,
+and [maintenance and release history](docs/maintenance.md) for individual fixes and remaining checks.
 
 ## Why we built it
 

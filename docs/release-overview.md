@@ -1,10 +1,12 @@
 # Release overview and known limitations
 
-**Status: experimental. Documentation review date: 2026-09-11.**
-This page describes the source tree's evaluation scope. It does not declare a release
-tag, certify production readiness, or report a completed endurance run. Architecture,
-defaults, APIs, and the limitations below may change; use the docs from the revision
-you build. The [documentation index](README.md) provides the full reading path.
+**Status: experimental.** The latest published version is
+[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) (September 29, 2026).
+Its notes and manifest identify the source, signed packages, upgrade guidance and
+verification scope. The historical evaluation and implementation notes below were
+reviewed on September 11; they do not certify production readiness or replace the
+release-specific evidence. Use the documentation from the revision you build.
+The [documentation index](README.md) provides the full reading path.
 
 ## Evaluation scope
 

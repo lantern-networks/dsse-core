@@ -1,12 +1,10 @@
-# Maintenance and 0.3.1 progress
+# Maintenance and release history
 
 Updated: 2026-09-29. Lantern DSSE is actively maintained by Lantern Networks, Inc.
-The latest published version is [0.3.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.0-experimental), released on September 11.
-**0.3.1 is in development and has not been released.**
-
-The target is the week of September 28–October 4, 2026, subject to the release checks
-below. This is a planning target, not an availability commitment. If it moves, this
-page will record the remaining blockers and revised outlook.
+The latest published version is [0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental), released on September 29.
+The release notes provide signed endpoint downloads, upgrade guidance, exact artifact
+identities and the verified scope. This maintenance record retains the evidence and
+limits of individual changes; publication does not turn an unperformed check into a pass.
 
 ## Log retention
 
@@ -23,12 +21,12 @@ below.
 The current priority is reliability in everyday administration: creating, editing,
 removing and enabling records; preserving saved settings; enforcing permissions;
 propagating changes; and recording audit events. New features are outside the
-0.3.1 stabilization scope.
+maintenance scope.
 
 The areas below have been checked in the
 [development PR](https://github.com/lantern-networks/dsse-core/pull/1).
-Some focused fixes have also reached public main, as noted below. None of these
-changes is included in the published 0.3.0 release:
+Focused fixes were integrated into public main before 0.3.1. References below to
+changes absent from 0.3.0 are historical comparisons, not a claim that 0.3.1 is unreleased:
 
 | Area | Change | Evidence available so far |
 |---|---|---|
@@ -510,32 +508,31 @@ passed to the rule editor; they do not cover its complete save flow or deployed
 traffic. A batch is not a transaction across all rules and destinations. Review
 partial results and current state before retrying after an unconfirmed save.
 
-## What still blocks 0.3.1
+## 0.3.1 verification scope and follow-up
 
-- Finish outstanding everyday-operation checks and fix reproduced defects with
-  material effects on access, saved data or audit records. Reuse existing evidence
-  while reconciling remaining checks and reviewing independent fixes for integration.
-- Resolve or explicitly assess remaining persistence and restart limitations;
-  postponing an investigation does not turn it into a passed check.
-- Install from the public instructions and verify real allowed and denied traffic,
-  control-plane/Edge propagation, regional failure, PKI rotation and sustained
-  operation in the planned deployment of three DSSE regions, one node each, on
-  separate hosts in independent failure domains (separate availability zones qualify).
-  DSSE region IDs and cloud-provider regions are separate topology dimensions.
-- Complete the applicable release checks, signed-artifact verification and
-  release notes, including known limitations and upgrade guidance.
+The [0.3.1 experimental release](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) includes the independently reviewed maintenance
+fixes, candidate CI results, and signed generic macOS and Windows packages. Applicable
+upgrade procedures and exact source/artifact correspondence are in its notes and manifest.
 
-A September 28–29 candidate evaluation used three DSSE regions with one node each
-on separate hosts in three availability zones across two cloud-provider regions,
-with two independent tenant/device and
-Connector lanes. Allowed and denied traffic, service-level regional failover, and
-natural Edge leaf renewal were observed over a 16-hour common window. Results are
-still being assessed and are not presented as an error-free endurance result.
-Final signed 0.3.1 endpoint packages and the remaining release checks above are
-still required before publication.
+A September 28–29 evaluation used three DSSE Regions with one node each on separate
+hosts in three availability zones across two cloud-provider regions. DSSE region IDs
+and cloud-provider regions are separate topology dimensions. Two tenant/device and
+Connector lanes covered allowed and denied traffic, service-level failover, and two
+natural Edge leaf renewals over a 16-hour common window. Communication after the prior
+leaf certificates expired was also confirmed. This is not an error-free endurance
+certification or a whole-AZ outage test.
 
-The latest release remains experimental. Merging a fix does not certify production
-readiness or make an unreleased build a supported release.
+Final package signatures, payloads and Go binary vulnerability scans were verified.
+The endpoint functional source is unchanged from the deployed candidates, but the
+version and patched build toolchain differ; installation and upgrade of the rebuilt
+0.3.1 packages were not repeated. The release does not claim same-socket preservation,
+all CA-tier or endpoint-identity renewals, or full-fleet backup restoration. Follow the
+platform acceptance checks in the intended deployment.
+
+Continue focused investigation of reproducible defects affecting access, saved data
+or audit records. Reuse applicable evidence, keep outstanding persistence and recovery
+checks explicit, and record verified results for later releases. The product remains
+experimental; publication does not certify production readiness.
 
 ## How changes reach users
 

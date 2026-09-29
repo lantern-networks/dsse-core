@@ -3,8 +3,10 @@
 Updated: 2026-09-29. Lantern DSSE is actively maintained by Lantern Networks, Inc.
 The latest published version is [0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental), released on September 29.
 The release notes provide signed endpoint downloads, upgrade guidance, exact artifact
-identities and the verified scope. This maintenance record retains the evidence and
-limits of individual changes; publication does not turn an unperformed check into a pass.
+identities and the verified scope. The changes below are included in 0.3.1.
+Per-change evidence describes what was checked during development; remaining deployment validation is follow-up work,
+not a pending publication step. The [release verification summary](#031-verification-scope-and-follow-up)
+records the completed evaluation and its scope.
 
 ## Log retention
 
@@ -13,20 +15,20 @@ removing them, honors saved retention periods and legal holds, and resumes inter
 batches from PostgreSQL. Existing volumes require the
 [schema upgrade](audit-and-data.md#clickhouse-retention-limitation-and-upgrade).
 Aggregate rollups remain preserved; their capacity and the cold archive's lifecycle
-remain deployment responsibilities. A candidate regional evaluation is summarized
+remain deployment responsibilities. The 0.3.1 regional evaluation is summarized
 below.
 
-## What is being maintained
+## Maintenance delivered in 0.3.1
 
-The current priority is reliability in everyday administration: creating, editing,
-removing and enabling records; preserving saved settings; enforcing permissions;
+This first maintenance release focuses on reliability in everyday administration:
+creating, editing, removing and enabling records; preserving saved settings; enforcing permissions;
 propagating changes; and recording audit events. New features are outside the
 maintenance scope.
 
-The areas below have been checked in the
-[development PR](https://github.com/lantern-networks/dsse-core/pull/1).
-Focused fixes were integrated into public main before 0.3.1. References below to
-changes absent from 0.3.0 are historical comparisons, not a claim that 0.3.1 is unreleased:
+The areas below were developed and checked through focused pull requests,
+integrated into public main, and shipped in 0.3.1. The original
+[development PR](https://github.com/lantern-networks/dsse-core/pull/1) is background
+history; the published release and its tagged source identify what shipped:
 
 | Area | Change | Evidence available so far |
 |---|---|---|
@@ -39,7 +41,7 @@ changes absent from 0.3.0 are historical comparisons, not a claim that 0.3.1 is 
 | Incoming export compatibility | Reject activation of conditions the current Windows export cannot represent; refuse unsafe legacy exports while keeping disablement available | Authenticated registration/reactivation and saved-state checks, admin/device export checks, local browser refusal and corrected SMB save with audit comparison; Windows firewall execution remains unverified |
 | Embedded evaluator configuration | Explicit false and empty tenant settings override a caller-supplied evaluator configuration | Regression tests with caller-supplied settings; the shipped executable does not populate these startup fields, so this is not a reproduced ordinary-operation defect |
 | Incoming connection saves | Report storage failures for default changes and exception creation, edits and deletion; retain the current live setting until storage confirms the change | Four product HTTP failure/retry regressions and stored-state reload; local browser toggle failure/retry and audit comparison; shared-document regression preserving other settings. Windows application and real multi-region deployment remain separate checks. |
-| Incoming connection exceptions | Preserve port, disabled state, approval/session limits and exact expiry during owner edits; show verified defaults and permission-appropriate controls; select explicit TCP ports | Local browser owner edit, reader reload and failed-read recovery; saved-state and audit comparison; editor and TCP export regression tests. Windows application and incoming persistence-failure handling remain separate release checks. |
+| Incoming connection exceptions | Preserve port, disabled state, approval/session limits and exact expiry during owner edits; show verified defaults and permission-appropriate controls; select explicit TCP ports | Local browser owner edit, reader reload and failed-read recovery; saved-state and audit comparison; editor and TCP export regression tests. Windows application and incoming persistence-failure handling remain separate deployment checks. |
 | People | Retrieve the full directory for search; protect existing synchronized records during manual creation | Local browser operations, saved-state and audit comparisons, regression tests; PostgreSQL checked separately for creation protection |
 | Directory updates | Preserve user-risk association after subject or email changes | Local browser risk changes, import and decision API checks, saved-state and audit comparisons; separate PostgreSQL regression |
 | DLP and access rules | Preserve existing settings and references during ordinary edits; restore permitted read-only DLP listing | Local browser checks, saved-state and audit comparisons, automated regressions |
@@ -50,7 +52,7 @@ Local browser checks and separate database tests do not establish independent
 control-plane/Edge operation, external identity-provider interoperability, or
 long-duration reliability. Test counts are not a release-readiness percentage.
 
-## Focused fixes in this tree
+## Focused fixes included in 0.3.1
 
 ClickHouse log exports report all matching records separately from the number
 written to the file, so an export capped by its row limit is marked as truncated.
@@ -89,8 +91,9 @@ missing information stay unavailable.
 
 These Console changes have local browser checks using synthetic API responses
 and regression coverage for the interactions described above. Deployed fleet
-behavior, real OS installers, external integrations and the release checks below
-remain outstanding.
+validation of these individual Console operations and external integrations
+remains follow-up work. Release-level deployment and package verification are
+recorded in the [0.3.1 summary](#031-verification-scope-and-follow-up).
 
 Configuration receivers now leave a generation unacknowledged when saving People,
 non-human identities, Sites, or device-CA changes fails. Polling retries the same
@@ -113,7 +116,7 @@ PostgreSQL CI now includes all tests whose names contain `Postgres`, with the th
 DSN variables used by the integration fixtures. This includes legacy user-risk
 upgrade/restart tests and previously omitted shared-store tests. Local automated
 HTTP, storage, restart, and configuration-polling checks cover these fixes;
-deployed-fleet and GUI acceptance remain separate release checks.
+deployed-fleet and GUI acceptance remain separate deployment checks.
 
 
 Delegated-access grant creation and editing now wait for confirmed storage;
@@ -140,7 +143,7 @@ Tests cover PostgreSQL peer registration/edit/revocation and saved-state reload,
 HTTP permissions and audits, signed distribution, receiver save retry, and
 revoked-access denial. Full Go tests, focused race checks and vet pass locally.
 These are automated HTTP/storage checks, not new GUI or deployed-fleet acceptance.
-This change awaits premerge review with its preceding dependencies.
+This change and its dependencies are included in 0.3.1.
 
 
 Policy administration now distinguishes a saved server-side change from an
@@ -152,8 +155,8 @@ HTTP tests cover saved-state reload, failed publication and recovery, including
 partially written files from the real local publisher. Two PostgreSQL-backed
 handlers exercise edit, disable/re-enable, deletion and peer readback. Publication
 success is not an acknowledgment from a running device; deployed acceptance remains
-outstanding. This candidate also includes the policy persistence dependency from
-PR82, which still requires premerge review.
+follow-up work. The policy persistence dependency from
+[PR #82](https://github.com/lantern-networks/dsse-core/pull/82) is also included in 0.3.1.
 
 
 Authored rule creation, editing and deletion now report unconfirmed storage without
@@ -175,7 +178,7 @@ does not inherit the requester's operator identity. Product HTTP tests exercise
 worker completion, opposite-role cancellations, spoofed metadata and delegation
 revocation. A local browser cancellation matched the customer job and audit trail.
 
-- SaaS tenant restriction saves distinguish unavailable storage (503) from invalid input (400), without returning storage details. Failed saves keep the previous setting; retry after recovery persists the edit. A local browser exercised failure and retry with audit checks. Separate CP/Edge process tests cover four providers through create, edit, disable and re-enable, signed polling and local HTTPS header capture. External provider sign-in and deployed TLS interception remain release checks.
+- SaaS tenant restriction saves distinguish unavailable storage (503) from invalid input (400), without returning storage details. Failed saves keep the previous setting; retry after recovery persists the edit. A local browser exercised failure and retry with audit checks. Separate CP/Edge process tests cover four providers through create, edit, disable and re-enable, signed polling and local HTTPS header capture. External provider sign-in and deployed TLS interception remain deployment checks.
 
 Log exports now include the full selected local calendar days, including the
 last nanosecond of the end date. The Console offers the supported NDJSON format,
@@ -273,7 +276,7 @@ a retryable storage error without an internal path; a successful retry can be
 read from a fresh store. Six focused persistence cases and product HTTP/audit
 checks cover this boundary. This change has no new browser
 acceptance for these six operations, and independent deployment propagation
-remains a release check.
+remains a deployment check.
 
 DNS Filtering now rejects incomplete redirect and conditional-forwarding rows
 before saving. Previously, clearing either required field and applying the form
@@ -281,8 +284,8 @@ silently removed that rule. Complete the row or use its Remove button to delete 
 Corrected saves, reloads, explicit removal, preserved settings and audit records
 were checked in a local browser against the server and file store. Six focused
 regressions cover the form behavior, and Console tests now run in CI.
-This fix is not included in the published 0.3.0 release; independent
-control-plane/Edge traffic and the release checks below remain outstanding.
+This fix is included in 0.3.1. Independent control-plane/Edge validation
+for these DNS editing operations remains follow-up work.
 
 Invitation message and link copying now waits for the clipboard operation before
 showing success. If the browser refuses the copy, the handover dialog explains
@@ -290,7 +293,7 @@ how to select and copy the message manually. This affects both administrator and
 operator invitations; it does not issue a new invitation or change its validity.
 Four regressions check asynchronous success and rejection for both buttons, and
 browser-enforced clipboard denial was checked with a synthetic invitation.
-This fix is also not included in the published 0.3.0 release.
+This fix is included in 0.3.1.
 
 In Sites, connector routes now offer hostname and Named Network bindings in line
 with the existing administration API. A subnet entered directly is retained with
@@ -301,7 +304,7 @@ connector covered add, reload, removal, stored routes and audit records against
 the development server. The public server's rejection contract was checked
 separately; public-server storage and audit were checked in the focused save
 failure work below. Real connector traffic and independent control-plane/Edge propagation
-remain release checks. This correction is not in the published 0.3.0 release.
+remain deployment checks. This correction is included in 0.3.1.
 
 If a connector's route list cannot be loaded, Sites now shows a Retry state
 instead of an empty route list and hides binding controls until the read succeeds.
@@ -318,7 +321,7 @@ public-server regressions cover add and remove with file and shared-store write
 failures, then a successful retry and reload. A synthetic browser session
 confirmed the Sites failure, retry, reload and matching raw audit records using
 the public server. Independent control-plane/Edge propagation and production
-storage remain release checks. This fix is not in the published 0.3.0 release.
+storage remain deployment checks. This fix is included in 0.3.1.
 
 The file-backed Site catalogue now reports a storage failure for creation,
 editing, deletion and enrollment-command rotation, without changing the live
@@ -330,8 +333,8 @@ control-plane and Edge process check covers ordinary Site creation, editing and
 last-record deletion through signed bundle polling, administrative readback,
 file reload and three control-plane mutation audits. Earlier browser evidence
 for Site operations is reused; this check adds no new GUI acceptance. Deployed
-fleet propagation, shared PostgreSQL and real connector traffic remain release
-checks. This fix is not in the published 0.3.0 release.
+fleet propagation, shared PostgreSQL and real connector traffic remain deployment
+checks. This fix is included in 0.3.1.
 
 Ordinary DLP Policy edits now keep existing settings that the editor does not
 show, including disabled status, thresholds, metadata and additional device-risk
@@ -342,7 +345,7 @@ is unavailable. Twenty-eight focused Console regressions pass. A separate headed
 browser check against a local public-server synthetic fixture edited a policy,
 reloaded it, compared saved fields and the raw audit record, and confirmed that
 an auditor can list but cannot edit it. Production persistence and real
-control-plane/Edge traffic remain release checks. This fix is not in 0.3.0.
+control-plane/Edge traffic remain deployment checks. This fix is included in 0.3.1.
 
 Internet Access rule edits now retain a saved DLP policy reference while the
 policy list loads or is unavailable, including a reference to a deleted policy.
@@ -351,8 +354,8 @@ editing, disable/enable, reload, saved state and audit against the development
 server. A separate headed browser check against a local public-server synthetic
 fixture confirmed that a deleted policy reference survives a name-only edit and
 reload, that selecting None removes it, and that both saves match raw audit
-records. Independent CP/Edge traffic remains a release check. This fix is not
-in 0.3.0.
+records. Independent CP/Edge traffic remains a deployment check. This fix is included
+in 0.3.1.
 
 The admin audit now names mutations of `/admin/rules` as access-rule changes.
 That endpoint serves both connector and Internet Access rules, so the former
@@ -369,7 +372,7 @@ mark, changed it to Critical, and showed Critical again after reloading the
 People page; the saved file and audit record agreed. Focused tests cover tenant
 and device ID collisions, permissions, save failures, legacy-state migration,
 the CP-to-Edge HTTP feed, and tenant erasure. Independent deployed CP/Edge
-traffic and multi-CP shared-state operation remain release checks.
+traffic and multi-CP shared-state operation remain deployment checks.
 
 Older saved risk marks may have only a raw ID, with no reliable person/device or
 tenant owner. During upgrade they stay active by raw ID across tenants; the
@@ -385,7 +388,7 @@ typed person or device mark in this release. If a replacement typed mark is
 needed, create and verify it before discarding the old mark; otherwise risk
 enforcement may weaken during the transition. The U-1 compatibility change is
 tracked in [PR #53](https://github.com/lantern-networks/dsse-core/pull/53)
-and is not part of 0.3.0.
+and is included in 0.3.1.
 
 Devices readers whose risk overlay request is denied can still see the permitted
 device list. The page shows a server-provided effective risk when present, says
@@ -415,8 +418,8 @@ operation and saved result. Deployed fleet communication remains unverified.
 | [Application rule-destination save result](https://github.com/lantern-networks/dsse-core/pull/24) | When a separate rule-destination save fails after an application change, publish, unpublish and delete now return a partial error with a partial audit instead of success. HTTP regressions checked all three, and a synthetic browser showed the publication warning and explicit retry. | The two stores are not atomic. Failed unpublish/delete retry is covered separately below; independent CP/Edge operation remains unchecked. |
 | [Application destination retry](https://github.com/lantern-networks/dsse-core/pull/26) | A refused destination save keeps the previous in-memory endpoint so unpublish or delete can be retried. HTTP regressions reloaded both stores and checked the durable endpoint, partial and success audits; local catalog-snapshot tests cover adding and removing the destination on an Edge. Application-owned destinations cannot be changed through ordinary endpoint controls, and a synthetic browser shows where to manage them. | Cross-store atomicity, ambiguous shared-store responses, multi-CP convergence and independent deployed CP/Edge communication remain unchecked. |
 | Shared application destinations | Concurrent control-plane writers now serialize updates to the shared asset catalogue, and fleet generation reads refresh from committed storage. Local shared-store and product HTTP tests cover non-erasing edits, refused saves, latest reads and bundle generation. | This is not cross-store atomicity or deployed CP/Edge acceptance. A separate-process PostgreSQL test is conditional on a test database; current public CI does not supply one. |
-| Application destination name edits and distribution | Renaming a published application now updates the existing rule-destination alias while preserving its address, ID, ownership, tags and references. Focused product HTTP tests cover saved readback, refused saves and retry, ownership checks, audit and local CP-to-Edge bundle application. A separate-process local check exercises application destination changes through signed polling. | Existing browser evidence is reused, with no new GUI acceptance on this revision. Shared PostgreSQL, deployed CP/Edge traffic and cross-store atomicity remain release checks. |
-| [Networks read-only controls](https://github.com/lantern-networks/dsse-core/pull/28) | Administrators with only network read permission can view the catalog without Add or Delete controls. Focused Console tests, a product HTTP authorization check and a headed browser with synthetic sessions covered reader and editor views. | Independent deployed CP/Edge behavior remains a release check. |
+| Application destination name edits and distribution | Renaming a published application now updates the existing rule-destination alias while preserving its address, ID, ownership, tags and references. Focused product HTTP tests cover saved readback, refused saves and retry, ownership checks, audit and local CP-to-Edge bundle application. A separate-process local check exercises application destination changes through signed polling. | Existing browser evidence is reused, with no new GUI acceptance on this revision. Shared PostgreSQL, deployed CP/Edge traffic and cross-store atomicity remain deployment checks. |
+| [Networks read-only controls](https://github.com/lantern-networks/dsse-core/pull/28) | Administrators with only network read permission can view the catalog without Add or Delete controls. Focused Console tests, a product HTTP authorization check and a headed browser with synthetic sessions covered reader and editor views. | Independent deployed CP/Edge behavior remains a deployment check. |
 | [Networks membership reads](https://github.com/lantern-networks/dsse-core/pull/30) | If a site's bindings cannot be read, the catalog shows Retry instead of claiming a network is unused or offering Delete. Focused regressions and a headed browser with a synthetic failed read and recovery covered the display; earlier local server checks covered ordinary binding saves and audit records. | The read and later Delete are not atomic, and independent deployed CP/Edge traffic remains unchecked. |
 | [Sites network editing](https://github.com/lantern-networks/dsse-core/pull/31) | Failed bindings, catalog or connector reads block edits and offer Retry; an in-flight save blocks duplicate submissions and retains input on failure. Nine regressions and a headed browser on the public candidate covered a failed read and recovery without writes; earlier development-server checks covered saved state and audit. | Connector-route panels are a separate boundary. Independent deployed CP/Edge traffic remains unchecked. |
 | [Site HA settings](https://github.com/lantern-networks/dsse-core/pull/32) | An ordinary Site edit retains its hidden routing namespace and HA policy. HA targets accept decimal non-negative whole numbers or blank; values such as `1.5` are rejected without saving. Focused regressions and a headed browser on the public candidate checked invalid input, a normal edit and reload; earlier local server evidence covered saved state and audit. | Product-server persistence for this exact public candidate and independent deployed CP/Edge behavior remain unchecked. |
@@ -450,7 +453,7 @@ they do not establish deployed fleet traffic acceptance. Deployment-wide posture
 controls and complete rule-priority/risk evaluation remain
 separate work; this change does not claim those gates are complete.
 
-## Observation delivery and candidate management (under review)
+## Observation delivery and candidate management
 
 Edges report observed lateral flows and policy candidates to the control plane on
 an independent delivery queue. The Console reads these inventories and sends
@@ -487,7 +490,7 @@ backup are lost and pending Edge reports need operator reconciliation. This is n
 a transparent rollback. Resume report intake only after every shared-store writer
 runs the new version.
 
-## Adopting observed flows (under review)
+## Adopting observed flows
 
 A batch that fails while creating destinations or rules now identifies the confirmed
 rules, failed observation and remaining observations. Confirmed rules are compiled
@@ -511,7 +514,8 @@ partial results and current state before retrying after an unconfirmed save.
 ## 0.3.1 verification scope and follow-up
 
 The [0.3.1 experimental release](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) includes the independently reviewed maintenance
-fixes, candidate CI results, and signed generic macOS and Windows packages. Applicable
+fixes and signed generic macOS and Windows packages. The release-candidate
+[CI checks passed](https://github.com/lantern-networks/dsse-core/actions/runs/36523518835). Applicable
 upgrade procedures and exact source/artifact correspondence are in its notes and manifest.
 
 A September 28–29 evaluation used three DSSE Regions with one node each on separate
@@ -536,19 +540,17 @@ experimental; publication does not certify production readiness.
 
 ## How changes reach users
 
-We will integrate focused, independently reviewable fixes as they meet their own
-review and verification requirements. A documentation change or a verified isolated
-fix need not wait for every deployment test for the next release. The accumulated
-development PR remains visible while its dependencies and integration path are
-reviewed; it is not approval to merge the entire batch at once.
+The fixes on this page shipped in 0.3.1. Future changes continue through focused,
+independently reviewable pull requests with their own verification requirements.
+Integration into main and publication of a subsequent release are separate steps.
 
 Each fix should describe the user-visible problem, the resulting behavior, relevant
 checks and remaining limits. Related changes may be grouped when they must ship
 together. The [contribution guide](../CONTRIBUTING.md#integration-and-release-checks)
 explains the distinction between integration and release checks.
 
-This page will be updated when a meaningful fix is integrated, the next blocker
-changes, or the target week changes. Published versions and delivered fixes are
+This page records delivered changes and is updated when further fixes or
+validation results are available. Published versions and delivered fixes are
 recorded in [Releases](https://github.com/lantern-networks/dsse-core/releases).
 Report ordinary reproducible bugs through [Issues](https://github.com/lantern-networks/dsse-core/issues);
 report vulnerabilities privately according to the [security policy](../SECURITY.md).
@@ -563,14 +565,14 @@ such a record before enabling it; no automatic broadening of its rules is made.
 Upgrade note: older API clients could store exception statuses other than `active` or `disabled` (for example `inactive`). Review and correct those records before upgrading; the current export rejects an unknown status instead of silently skipping it. Old Console-created records used the supported default status.
 
 
-Pending route-distribution reconciliation: shared route edits preserve other CPs' committed decisions. Administrative reads and bundle publication refresh that shared state. A committed complete empty snapshot carries organization-wide route deletion to updated Edges; legacy omitted or empty sections retain their previous behavior. Receiver persistence failure prevents acknowledgment of the bundle so it can be retried. HTTP, real PostgreSQL peer CRUD, save-failure/retry and file-restart checks cover this change; deployed traffic and release acceptance remain pending. Older Edge versions do not understand the complete-empty marker, so all receivers must be updated before relying on organization-wide empty-set propagation. Leader-transition transaction fencing remains outside this change.
+Route-distribution reconciliation in 0.3.1: shared route edits preserve other CPs' committed decisions. Administrative reads and bundle publication refresh that shared state. A committed complete empty snapshot carries organization-wide route deletion to updated Edges; legacy omitted or empty sections retain their previous behavior. Receiver persistence failure prevents acknowledgment of the bundle so it can be retried. HTTP, real PostgreSQL peer CRUD, save-failure/retry and file-restart checks cover this change. Deployed-traffic validation for these route edits remains follow-up work. Older Edge versions do not understand the complete-empty marker, so all receivers must be updated before relying on organization-wide empty-set propagation. Leader-transition transaction fencing remains outside this change.
 
 Pulling Edges use a node-local route cache even when another subsystem uses PostgreSQL. Configure `-connector-route-governance-store` with a per-node file path for restart persistence; an unset path uses an in-memory cache populated by the first pull. An explicit PostgreSQL route store is rejected for a pulling Edge to avoid writing received data back into CP authority. Control planes retain shared PostgreSQL route storage.
 
 
-Pending DLP allowlist reconciliation: administrative writes require an explicit values array, confirm storage before changing live suppression, and preserve peers' committed tenant lists in shared PostgreSQL. Allowlist edits and clears now advance configuration generation and travel with signed DLP definitions. Updated receivers persist exceptions before applying them and retry failed saves at the same generation. Tenant-scoped readers receive only their own values; fleet readers retain the existing operator authorization requirement. Literal identifiers match exactly, numeric grouping and email case remain supported, and digits embedded in an unrelated identifier no longer authorize numeric findings.
+DLP allowlist reconciliation in 0.3.1: administrative writes require an explicit values array, confirm storage before changing live suppression, and preserve peers' committed tenant lists in shared PostgreSQL. Allowlist edits and clears now advance configuration generation and travel with signed DLP definitions. Updated receivers persist exceptions before applying them and retry failed saves at the same generation. Tenant-scoped readers receive only their own values; fleet readers retain the existing operator authorization requirement. Literal identifiers match exactly, numeric grouping and email case remain supported, and digits embedded in an unrelated identifier no longer authorize numeric findings.
 
-DLP receiver libraries use node-local caches rather than CP authority even when another subsystem uses PostgreSQL. Explicit PostgreSQL library storage is rejected for pulling Edges; configure per-node files when restart persistence is required. Unset paths use memory. Older publishers omit allowlists and retain the receiver's previous list; explicit empty maps from updated publishers clear it. Older receivers ignore the new allowlist section, so update receiving Edges before relying on distributed exceptions. Invalid saved allowlist data now stops startup instead of silently starting with an empty list. Signed HTTP publication, receiver upload inspection, save/retry/restart, PostgreSQL peers and audit attribution are checked; deployed fleet traffic, remaining non-allowlist DLP shared-store reconciliation and release acceptance are still pending.
+DLP receiver libraries use node-local caches rather than CP authority even when another subsystem uses PostgreSQL. Explicit PostgreSQL library storage is rejected for pulling Edges; configure per-node files when restart persistence is required. Unset paths use memory. Older publishers omit allowlists and retain the receiver's previous list; explicit empty maps from updated publishers clear it. Older receivers ignore the new allowlist section, so update receiving Edges before relying on distributed exceptions. Invalid saved allowlist data now stops startup instead of silently starting with an empty list. Signed HTTP publication, receiver upload inspection, save/retry/restart, PostgreSQL peers and audit attribution are checked; deployed-fleet traffic for these allowlist operations remains follow-up work. The detector and policy reconciliation delivered alongside this change is described below.
 
 ### DLP detector definitions and exact-match datasets
 
@@ -578,9 +580,9 @@ Custom classifier edits and dataset creation/replacement/deletion now confirm co
 
 Shared PostgreSQL updates preserve other organizations and datasets, and reads/config publication refresh the shared definitions. Received classifiers and datasets are saved before the Edge acknowledges their generation. Dataset snapshots retain the source salt so matching survives an Edge restart; source dataset values are not stored or returned by the administration API.
 
-Validation covers administrative CRUD, peer reads with PostgreSQL, read-only permissions, audit attribution, signed publication and received scanning, failed-save retry, and startup/reload. No new deployed-fleet or GUI acceptance is claimed. These changes depend on the preceding allowlist/distribution work and require review before integration.
+Validation covers administrative CRUD, peer reads with PostgreSQL, read-only permissions, audit attribution, signed publication and received scanning, failed-save retry, and startup/reload. No new deployed-fleet or GUI acceptance is claimed. These changes shipped in 0.3.1 together with the preceding allowlist/distribution work.
 
-Compatibility: legacy dataset snapshots without a version continue to use the configured startup salt. Newly saved version-1 snapshots include the adopted salt; older binaries do not understand that salt contract, so rolling back a receiver with a different local salt is not supported without restoring its matching prior configuration. Invalid saved classifier or dataset snapshots stop startup with a generic error instead of silently dropping detection. Separate library files are not an atomic multi-file transaction; a failed update can leave partially written files, and must be retried before claiming completion. Policy-object persistence, leader-transition write fencing, and release deployment checks remain separate work.
+Compatibility: legacy dataset snapshots without a version continue to use the configured startup salt. Newly saved version-1 snapshots include the adopted salt; older binaries do not understand that salt contract, so rolling back a receiver with a different local salt is not supported without restoring its matching prior configuration. Invalid saved classifier or dataset snapshots stop startup with a generic error instead of silently dropping detection. Separate library files are not an atomic multi-file transaction; a failed update can leave partially written files, and must be retried before claiming completion. Policy-object persistence is covered by the following change. Leader-transition write fencing and deployment validation of these detector operations remain follow-up work.
 
 ### DLP policy save, peer reads and distribution
 
@@ -588,7 +590,7 @@ Named DLP policies now confirm configured storage for creation, editing, enable/
 
 Shared PostgreSQL edits preserve policies from other CPs and organizations. Lists and bundle publication refresh policy state, and policy validation refreshes the referenced detector libraries. Received policy snapshots are saved before the Edge acknowledges the distribution update. Mutable metadata and identifier slices cannot change stored policy through a caller's copy.
 
-Validation covers PostgreSQL peer CRUD and status changes, permission/organization guards, attributed audits, signed fetch and reference-only upload decisions, save failure/retry, restore and production startup. Inline fallback behavior for an unresolved/disabled policy reference is unchanged. Saved snapshots are validated as a whole; malformed data stops startup without rewriting it or logging its contents. Separate DLP library files are still not an atomic transaction. This change depends on the preceding detector-library work and requires premerge review; deployed-fleet and release checks remain outstanding.
+Validation covers PostgreSQL peer CRUD and status changes, permission/organization guards, attributed audits, signed fetch and reference-only upload decisions, save failure/retry, restore and production startup. Inline fallback behavior for an unresolved/disabled policy reference is unchanged. Saved snapshots are validated as a whole; malformed data stops startup without rewriting it or logging its contents. Separate DLP library files are still not an atomic transaction. This change shipped in 0.3.1 with the preceding detector-library work; deployed-fleet validation of these policy operations remains follow-up work.
 
 ### Inspection source compatibility
 
@@ -618,7 +620,7 @@ Identity provider creation, editing, default selection and deletion now confirm 
 
 Receiving Edges save a complete registry before acknowledging the bundle; failed saves and incomplete snapshots remain retryable. Defaults and deletions survive reload. Pulling Edges use a node-local IdP cache even when another subsystem uses PostgreSQL: configure a per-node `-idp-connection-store` file for restart persistence. An unset path uses memory; explicit PostgreSQL storage for a pulling Edge is rejected to avoid writing received data into CP authority.
 
-Validation covers PostgreSQL peer CRUD/default selection, authenticated permissions and audits, signed publication, blank-secret preservation, failed-save retry, reload and copy isolation. Existing complete JSON snapshots remain supported; incomplete or inconsistent saved registries are rejected at startup. A file replacement with unconfirmed final durability returns an error; reload before retrying because disk may already contain the replacement. This change requires premerge review. Interactive IdP login, deployed fleet and release acceptance remain outstanding; no new GUI acceptance is claimed.
+Validation covers PostgreSQL peer CRUD/default selection, authenticated permissions and audits, signed publication, blank-secret preservation, failed-save retry, reload and copy isolation. Existing complete JSON snapshots remain supported; incomplete or inconsistent saved registries are rejected at startup. A file replacement with unconfirmed final durability returns an error; reload before retrying because disk may already contain the replacement. This change is included in 0.3.1. Interactive IdP login and deployed-fleet validation of these registry operations remain follow-up work; no new GUI acceptance is claimed.
 
 ### Inspection catalog persistence reconciliation
 
@@ -710,7 +712,7 @@ Validation includes five isolated installer-adoption cases, shell syntax checks,
 ### Licensing and control-plane write authority
 License application and feature entitlement edits now acknowledge confirmed storage, preserve the shared serial floor, and refuse writes from an expired leadership term. Startup restores license authority before starting leadership election; promotion refreshes the license before advertising leadership. DLP configuration writes stop when entitlement authority cannot be read.
 
-Targeted startup, license, entitlement, cancellation and write-fencing regression tests cover these changes. GUI and multi-region deployment acceptance remain separate release checks.
+Targeted startup, license, entitlement, cancellation and write-fencing regression tests cover these changes. GUI and multi-region deployment acceptance remain separate deployment checks.
 
 An unreadable configured license or entitlement snapshot stops startup instead of silently starting with empty authority. A license serial that cannot be restored prevents every CP using that shared authority from advertising leadership; this affects leader-only management and audit intake. First distinguish storage connectivity failure from invalid stored data. If restoration is needed, use a verified authoritative snapshot at or above the last accepted license serial before retrying startup/promotion. Never reset the accepted serial to bypass this check. Write-term fencing here covers administrative blob UpdateContext calls; remaining background/runtime integrations follow separately.
 
@@ -727,7 +729,7 @@ Administrator migration checks now include live shared authority, legacy princip
 
 Retention and legal-hold edits now refresh shared state before saving and keep failed preservation requests effective locally. Pruning rechecks the saved policy inside the deletion transaction. Tenant erasure records a durable in-progress marker, checks protection between destructive steps, and retains its delivery markers after a partial failure. File erasure finishes its protection guard before reporting completion. Shared archival advances the chain and deletes exactly the archived hot rows in one SQL transaction; object-storage uncertainty stops further archival for reconciliation.
 
-Only explicitly installed version 3 protection snapshots pause deletion after restart or leadership change for reconciliation. Default and version 2 deployments continue with their confirmed protection checks. Read [deletion safety recovery](deletion-safety-recovery.md), [tenant erasure recovery](tenant-erasure-recovery.md), and [archive recovery](archive-recovery.md) before enabling deletion on an upgraded deployment. Ordinary configuration editing remains available. This integration is not a deployment or release acceptance.
+Only explicitly installed version 3 protection snapshots pause deletion after restart or leadership change for reconciliation. Default and version 2 deployments continue with their confirmed protection checks. Read [deletion safety recovery](deletion-safety-recovery.md), [tenant erasure recovery](tenant-erasure-recovery.md), and [archive recovery](archive-recovery.md) before enabling deletion on an upgraded deployment. Ordinary configuration editing remains available. These checks do not establish deployment-specific recovery acceptance.
 
 Retention migration review corrected two operational regressions before publication: normal restarts do not impose manual deletion permits (explicit v3 recovery policies retain their gate), and each transaction handles at most 1000 rows; a sweep repeats transactions for up to two minutes per stream. Old and new hold writers must be upgraded together; see the erasure recovery and archive preflight guides. Failed protective saves are unconfirmed and require reconciliation before restart.
 
@@ -771,7 +773,7 @@ Regional searches and export previews report whether the number of excluded reco
 
 Export creation for an unknown stream now returns 404 consistently with searches. Cancellation can still race after final progress confirmation and before completion; this integration does not make object creation and job cancellation atomic.
 
-Certificate administration now confirms shared saves before reporting success and retains the request leadership term through trust withdrawal. Startup recovers an interrupted certificate/key pair installation. Internal-CA updates invalidate outbound TLS transports using the certificate material itself; incomplete CA sections retain the previous trust configuration and are retried. Inspection-posture edits refresh the shared authority before changing controls and record results without destination lists. Manual key-health checks do not count as scheduled slow-signing intervals. These changes do not replace the release deployment and rotation acceptance checks.
+Certificate administration now confirms shared saves before reporting success and retains the request leadership term through trust withdrawal. Startup recovers an interrupted certificate/key pair installation. Internal-CA updates invalidate outbound TLS transports using the certificate material itself; incomplete CA sections retain the previous trust configuration and are retried. Inspection-posture edits refresh the shared authority before changing controls and record results without destination lists. Manual key-health checks do not count as scheduled slow-signing intervals. These checks do not establish deployment-specific CA rotation acceptance.
 
 PKI upgrade compatibility: CPs and standalone Edges without a remote certificate-history service can still replace certificates; configured history must confirm its save first. An unprovisioned optional internal-CA store omits its bundle section, preserving existing Edge trust without blocking other configuration. Explicit incomplete sections still require retry. Shared trust reads on standby CPs consume the signed committed revision; only the current leader authors revisions. Interrupted file-backed device-CA removals require [offline reconciliation](ca-withdrawal-recovery.md) before restarting. Certificate pair recovery and replacement use owner-only files; deployments sharing those files with a different process must provide an explicit controlled copy/access arrangement. Duplicate pre-change history entries are retained intentionally so the first replacement can be rolled back. Fleet-wide internal-CA listing requires a configured operator organization; tenant-scoped listing remains available.
 AI service usage now verifies organization, requested period, coverage and totals before showing a report. Unavailable or inconsistent responses show Retry rather than zero usage; stale responses after a tenant or period change are ignored. Deploy the Console with its matching CP version: an older CP without the report tenant field is shown as unavailable, not as zero usage.

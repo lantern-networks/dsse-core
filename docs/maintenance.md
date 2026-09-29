@@ -519,13 +519,15 @@ partial results and current state before retrying after an unconfirmed save.
   postponing an investigation does not turn it into a passed check.
 - Install from the public instructions and verify real allowed and denied traffic,
   control-plane/Edge propagation, regional failure, PKI rotation and sustained
-  operation in the planned deployment of three DSSE regions with one node each.
+  operation in the planned deployment of three DSSE regions, one node each, on
+  separate hosts in independent failure domains (separate availability zones qualify).
   DSSE region IDs and cloud-provider regions are separate topology dimensions.
 - Complete the applicable release checks, signed-artifact verification and
   release notes, including known limitations and upgrade guidance.
 
-A September 28–29 candidate evaluation used three DSSE regions with one node each,
-spread across two cloud-provider regions, with two independent tenant/device and
+A September 28–29 candidate evaluation used three DSSE regions with one node each
+on separate hosts in three availability zones across two cloud-provider regions,
+with two independent tenant/device and
 Connector lanes. Allowed and denied traffic, service-level regional failover, and
 natural Edge leaf renewal were observed over a 16-hour common window. Results are
 still being assessed and are not presented as an error-free endurance result.

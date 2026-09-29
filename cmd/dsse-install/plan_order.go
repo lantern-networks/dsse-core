@@ -47,8 +47,9 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 		{
 			Machine: minting.Name,
 			// ★★★ IT SAYS WHERE TO RUN IT FROM (2026-09-02, found by walking this on a live deployment).
-			// and every step for the founding one did not — compose reads deployment.env and the compose
-			// file from the working directory, so these worked only for a reader who had inferred the cd.
+			// Joining-machine steps extract with tar xzpf and enter the deployment directory.
+			// The founding machine must enter its deployment directory too: compose reads
+			// deployment.env and the compose file from the working directory.
 			Do:    fmt.Sprintf("cd %s && docker compose -p dsse --env-file deployment.env up -d", dir),
 			Needs: "the directory above, on this machine",
 			Why:   "Every other machine is packed from a deployment that is running, and joins one that answers.",

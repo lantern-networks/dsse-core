@@ -138,7 +138,10 @@ Built-in catalog version 7 adds one exact-host compatibility bypass for
 `oauthaccountmanager.googleapis.com` (entry `google_chrome_account_manager`). It
 keeps Chrome profile verification and Gmail sign-in working in environments where
 inspection of this authentication endpoint causes repeated verification. Steering
-and access policy still apply; TLS content inspection does not apply to that host.
+and access policy still apply. TLS content inspection and SaaS tenant-restriction
+header injection do not apply to that host, including requests that refresh a
+Chrome account's tokens. Review this exception against the organization's account
+restrictions when deploying the default catalog.
 Google sign-in pages, Gmail and other Google API hosts remain eligible for inspection.
 
 This is a deployment default, not an endpoint installation option. Update the

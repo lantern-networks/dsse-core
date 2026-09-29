@@ -339,9 +339,10 @@ var Groups = []Group{
 		Vendor:   "Google",
 		Category: "authentication",
 		Risk:     "medium",
-		Description: "Chrome OAuth account manager compatibility. Interception caused repeated browser profile " +
-			"verification and Gmail sign-in failures; bypassing this exact host restored both. " +
-			"Google sign-in pages, Gmail and other Google APIs remain eligible for inspection.",
+		Description: "Chrome OAuth account manager compatibility. Repeated browser profile verification and " +
+			"Gmail sign-in failures were observed with inspection in an evaluated deployment; an exact-host " +
+			"bypass restored both. TLS content inspection and SaaS tenant-restriction header injection do not " +
+			"apply to this host. Google sign-in pages, Gmail and other Google APIs remain eligible for inspection.",
 		Patterns: []string{
 			"oauthaccountmanager.googleapis.com",
 		},

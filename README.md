@@ -23,12 +23,13 @@ A successful installation check is not evidence of long-duration reliability or 
 security audit. It has not been independently run at length by anyone who did not write it.
 See the [threat model](docs/threat-model.md) and each platform's limitations.
 
-## Maintenance status
+## Latest release — 0.3.1 experimental
 
 [0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) was released on September 29, 2026.
-It focuses on everyday reliability, regional installation, and endpoint compatibility.
+This is the first maintenance release following 0.3.0, focused on everyday reliability,
+regional installation, and endpoint compatibility.
 See the release notes for signed downloads, upgrade guidance and verification scope,
-and [maintenance and release history](docs/maintenance.md) for individual fixes and remaining checks.
+and [maintenance and release history](docs/maintenance.md) for delivered fixes and follow-up validation.
 
 ## Why we built it
 

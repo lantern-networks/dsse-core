@@ -3,9 +3,9 @@
 **Status: experimental.** The latest published version is
 [0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) (September 29, 2026).
 Its notes and manifest identify the source, signed packages, upgrade guidance and
-verification scope. The historical evaluation and implementation notes below were
-reviewed on September 11; they do not certify production readiness or replace the
-release-specific evidence. Use the documentation from the revision you build.
+verification scope. This is the first maintenance release after 0.3.0.
+The evaluation records below identify their release and dates; use the documentation
+from the revision you build.
 The [documentation index](README.md) provides the full reading path.
 
 ## Evaluation scope
@@ -60,12 +60,34 @@ These are documented constraints, not a complete security audit or vulnerability
 
 ## Release evidence
 
+### 0.3.1 — September 29, 2026
+
+The published release includes signed generic macOS and Windows packages, checksums,
+a source SBOM and a source/artifact manifest. Release CI, package signatures and
+binary vulnerability checks passed.
+
+The September 28–29 candidate evaluation used three DSSE Regions—Tokyo East, Tokyo
+West and Osaka—with two tenants, macOS and Windows endpoints, and two Connectors.
+It covered allowed and denied traffic, planned Edge-service failover, a 16-hour
+common observation window, two natural Edge leaf renewals, and communication after
+the preceding leaf certificates expired. DSSE Regions and cloud-provider regions
+are separate topology dimensions.
+
+See the [0.3.1 verification summary](maintenance.md#031-verification-scope-and-follow-up)
+and [release notes](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental)
+for the scope and follow-up work, including the distinction between deployed
+candidate evidence and final-package checks.
+
+### Checking published artifacts
+
 The [Experimental release notes](https://github.com/lantern-networks/dsse-core/releases)
 record the exact tag, source revision, downloadable packages, signatures, checksums,
 validation scope, and implementation limits. Use those artifact identities when
 reproducing a result; installation success alone does not establish recovery.
 
-The three-region evaluation collected two overlapping observation windows of approximately
+### 0.3.0 — historical evaluation
+
+The three-region evaluation for 0.3.0 collected two overlapping observation windows of approximately
 30 hours each, from September 9–10 and September 9–11, 2026 (UTC). Each window recorded
 21,588 successful fresh TLS checks across two tenants and three regions, with five distinct
 server certificates observed per region/tenant lane. The server-certificate lifetime was
@@ -78,6 +100,8 @@ short deployment checks. Their results must not be described as another complete
 30-hour run. This includes Connector backend-refusal isolation, recovery on the main
 agent port, recovery names in Console-issued profiles, and Windows identity selection
 when changing organizations.
+
+### Evidence references for operators
 
 | Evidence | Where to check |
 |---|---|

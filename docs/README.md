@@ -5,6 +5,14 @@ These guides cover the source in this repository. Commands run from the reposito
 unless a guide changes directory explicitly. Replace example names, addresses, and paths
 with values from your deployment. Use the documentation from the revision you build.
 
+## Current release
+
+[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental)
+was published on September 29, 2026 as the first maintenance release after 0.3.0.
+Its release notes provide signed macOS and Windows downloads, upgrade instructions,
+and verification scope. [Maintenance history](maintenance.md) describes the fixes
+included in this version.
+
 ## Choose a starting point
 
 | Your task | Reading order |

@@ -22,6 +22,60 @@ supplied to the build; cross-compiling the Go services alone is insufficient. Se
 [Packaging](../clients/windows-wfp/packaging/README.md) and
 [Driver build](../clients/windows-wfp/driver/BUILD.md).
 
+### IPv4-only deployment
+
+Read the operator's [address-family choice](deployment.md#choose-ipv4-only-or-dual-stack-before-enrolling-devices)
+before installing. If every Edge has outbound IPv6, leave the device's normal IPv6
+configuration in place. If every Edge is IPv4-only, configure this lab device to
+prefer IPv4 **before** starting the DSSE service. Windows normally prefers IPv6;
+Microsoft [recommends IPv4 preference over disabling IPv6](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/configure-ipv6-in-windows).
+
+On the device, record any existing `DisabledComponents` value. In an elevated
+PowerShell window, back up the registry key, set decimal `32` (`0x20`), and restart Windows:
+
+```powershell
+$key = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters'
+Get-ItemProperty -Path $key -Name DisabledComponents -ErrorAction SilentlyContinue |
+  Select-Object DisabledComponents
+reg export 'HKLM\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters' .\tcpip6-parameters-before.reg
+New-ItemProperty -Path $key -Name DisabledComponents -PropertyType DWord -Value 32 -Force
+```
+
+After restart, confirm the device prefers an IPv4 answer for a dual-stack name
+(for example, `ping example.com`), then install and verify DSSE below. **Preference
+is not a guarantee** that every application will avoid IPv6. With steering active,
+test an actual browser page with embedded content, allowed HTTPS, denied traffic,
+and the corresponding audit. If the browser still opens IPv6 flows and fails, do
+not count this as a working installation. Supply IPv6 egress to every Edge, or use
+an explicitly IPv4-only managed network/adapter for an isolated lab and verify it
+again. Microsoft cautions that unbinding IPv6 can affect Windows components; do
+not apply it fleet-wide as a silent installer default. A change to the active
+adapter can disconnect a remote session.
+
+If this lab requires the adapter option, perform it **at the local console** on
+the intended physical adapter only, with administrator privileges. Record its
+name from `Get-NetAdapter` first; replace `Wi-Fi` below with that exact name:
+
+```powershell
+Get-NetAdapter | Select-Object Name,Status
+Disable-NetAdapterBinding -Name 'Wi-Fi' -ComponentID ms_tcpip6
+Get-NetAdapterBinding -Name 'Wi-Fi' -ComponentID ms_tcpip6
+Get-NetRoute -AddressFamily IPv6 -DestinationPrefix '::/0' -ErrorAction SilentlyContinue
+```
+
+There should be no remaining IPv6 Internet route through another active adapter
+or tunnel. Before installing DSSE, `curl.exe -4 --fail https://example.com/`
+must work; `curl.exe -6 --connect-timeout 5 https://ipv6.google.com/`
+must not reach the IPv6-only site in this explicitly IPv4-only lab setup.
+These network checks do not replace the post-install browser and audit checks.
+
+To restore the adapter after moving to a dual-stack deployment, run
+`Enable-NetAdapterBinding -Name 'Wi-Fi' -ComponentID ms_tcpip6` at the local
+console. Restore the recorded `DisabledComponents` value (remove the property if
+it was absent), then restart. Do not change the system's IPv6 loopback or turn
+off DSSE capture to make an IPv4-only test pass. IPv6-only destinations remain
+unavailable in IPv4-only mode.
+
 ## What a device is placed by
 
 The MSI is a generic product package shared by independently operated deployments and
@@ -129,6 +183,9 @@ Read all failed and `n/a` checks. Confirm recent heartbeats, active forwarding, 
 customer organization in the Console, and an actual allowed HTTPS request with TLS
 verification. Exercise a denied destination and check the recorded decision too.
 A running driver and `enforcement=healthy` do not prove application TLS works.
+For dual-stack deployments, also open an IPv6-only destination and a dual-stack
+page with embedded content in the real browser. For IPv4-only deployments, apply
+the procedure above and verify that the browser actually falls back to IPv4.
 
 Useful log: `C:\Program Files\DSSE\dsse-steer.log`. Representative messages include
 `heartbeat sent`, `enforcement=healthy`, and `steer_mux_forwarded`. Check timestamps;

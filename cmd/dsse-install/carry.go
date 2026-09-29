@@ -266,7 +266,7 @@ func reportCarry(dest, dir string, carried, withheld []string) {
 		fmt.Printf("  and any re-issue all happen there.\n\n")
 	}
 	fmt.Printf("  On the receiving machine:\n\n")
-	fmt.Printf("    mkdir -p /opt/dsse/<region> && tar -xzf %s -C /opt/dsse/<region>\n", filepath.Base(dest))
+	fmt.Printf("    mkdir -p /opt/dsse/<region> && tar -xzpf %s -C /opt/dsse/<region>\n", filepath.Base(dest))
 	fmt.Printf("    dsse-install -dir /opt/dsse/<region> -region <region-name> [-holds-state|-with-standby-control-plane]\n\n")
 	fmt.Printf("  ★ Or, for a machine that runs ONE component of a region this deployment already has, untar it\n")
 	fmt.Printf("  and start only that component's services — the directory is the same on every machine of a\n")

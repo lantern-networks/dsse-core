@@ -29,3 +29,20 @@ func TestEveryPrintedComposeStepSaysWhereItRuns(t *testing.T) {
 			"already inferred the directory:\n  %s\n  (on %s)", step.Do, step.Machine)
 	}
 }
+
+func TestJoiningStepsPreserveCarriedFileModes(t *testing.T) {
+	p := planOfThree(t)
+	joinSteps := 0
+	for _, step := range p.InstallOrder("/opt/dsse", "/tmp/plan.json") {
+		if !strings.Contains(step.Do, "tar ") {
+			continue
+		}
+		joinSteps++
+		if !strings.Contains(step.Do, "tar xzpf ") {
+			t.Errorf("joining step must preserve the archive's public config and CA modes under umask 077: %s", step.Do)
+		}
+	}
+	if joinSteps != 2 {
+		t.Fatalf("expected two joining steps, got %d", joinSteps)
+	}
+}

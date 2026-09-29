@@ -43,13 +43,14 @@ type verifyResult struct {
 // persistedState is the part of connector-state.json this walk reads. The connector owns this file; the field
 // names here are its own (see cmd/dsse-connector/enrollment.go).
 type persistedState struct {
-	EdgeURL       string `json:"edge_url"`
-	TenantID      string `json:"tenant_id"`
-	Site          string `json:"site"`
-	ConnectorID   string `json:"connector_id"`
-	Region        string `json:"region"`
-	EdgeCAPath    string `json:"edge_ca_path"`
-	EdgeEndpoints string `json:"edge_endpoints"`
+	EdgeURL        string `json:"edge_url"`
+	TenantID       string `json:"tenant_id"`
+	Site           string `json:"site"`
+	ConnectorID    string `json:"connector_id"`
+	Region         string `json:"region"`
+	EdgeCAPath     string `json:"edge_ca_path"`
+	EdgeServerName string `json:"edge_server_name"`
+	EdgeEndpoints  string `json:"edge_endpoints"`
 	// RuntimeSecret is what the connector presents to the doors on every later request. It is read here so
 	// this walk can ask a door the question the connector asks it, rather than a weaker one. See askDoor.
 	RuntimeSecret string `json:"runtime_secret"`
@@ -264,7 +265,7 @@ func verifyDoorsAnswer(stateDir string, st persistedState, doors []door) []verif
 	}
 	answered, notes := 0, []string{}
 	for _, d := range doors {
-		if err := askDoor(d, anchors, identity, st.ConnectorID, st.RuntimeSecret); err != nil {
+		if err := askDoor(d, anchors, identity, st.ConnectorID, st.RuntimeSecret, st.EdgeServerName); err != nil {
 			notes = append(notes, fmt.Sprintf("%s DID NOT answer for this connector (%v)", d.display(), err))
 			continue
 		}
@@ -322,7 +323,7 @@ func verifySurvivesAReboot(stateDir, binary, serviceName string) []verifyResult 
 // The status is reported rather than swallowed, because the two failures are different and an operator acts on
 // them differently: a transport error is a door that is not there, and an HTTP status is a door that is there
 // and will not carry this connector — which is what a region whose Edges have not heard of it looks like.
-func askDoor(d door, anchors *x509.CertPool, identity tls.Certificate, connectorID, runtimeSecret string) error {
+func askDoor(d door, anchors *x509.CertPool, identity tls.Certificate, connectorID, runtimeSecret, serverName string) error {
 	base, err := d.baseURL()
 	if err != nil {
 		return err
@@ -339,6 +340,8 @@ func askDoor(d door, anchors *x509.CertPool, identity tls.Certificate, connector
 		Timeout: 8 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
+				// Regional addresses select a machine; the persisted organization name selects its TLS identity.
+				ServerName:   strings.TrimSpace(serverName),
 				RootCAs:      anchors,
 				Certificates: []tls.Certificate{identity},
 				MinVersion:   tls.VersionTLS12,

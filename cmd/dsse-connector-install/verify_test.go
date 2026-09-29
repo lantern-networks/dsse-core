@@ -307,3 +307,51 @@ func TestNoServiceMeansItDoesNotComeBack(t *testing.T) {
 		t.Fatalf("a missing program passed: %+v", missing)
 	}
 }
+
+// A customer connector dials regional addresses but authenticates its own SNI name.
+func TestVerifyUsesPersistedOrganizationTLSName(t *testing.T) {
+	ca := newTestCA(t, "organization transport CA")
+	foreign := newTestCA(t, "other organization")
+	now := time.Now()
+	cert, key := ca.issue(t, "customer.example", now.Add(-time.Hour), now.Add(time.Hour), "customer.example")
+	pair, err := tls.X509KeyPair(cert, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AppendCertsFromPEM(ca.pem)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{pair}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: roots})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS.ServerName != "customer.example" || r.Header.Get("x-connector-secret") != "test-secret" {
+			w.WriteHeader(403)
+			return
+		}
+		w.WriteHeader(200)
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	defer srv.Close()
+	crt, ckey := ca.issue(t, "conn-test", now.Add(-time.Hour), now.Add(time.Hour))
+	for _, tc := range []struct {
+		name, sni string
+		anchor    []byte
+		want      bool
+	}{
+		{"customer name", "customer.example", ca.pem, true},
+		{"missing name", "", ca.pem, false},
+		{"wrong name", "other.example", ca.pem, false},
+		{"wrong trust", "customer.example", foreign.pem, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st := persistedState{ConnectorID: "conn-test", TenantID: "customer", EdgeServerName: tc.sni, EdgeEndpoints: "region=https://" + ln.Addr().String(), RuntimeSecret: "test-secret"}
+			anEnrolledConnector(t, dir, st, crt, ckey, ca.pem, tc.anchor)
+			r := mustCheck(t, verifyConnector(dir, "/bin/true", "dsse-connector", now), "each door answers this connector")
+			if r.ok != tc.want {
+				t.Fatalf("got %+v, want pass=%v", r, tc.want)
+			}
+		})
+	}
+}

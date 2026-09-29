@@ -1,6 +1,6 @@
 # Maintenance and 0.3.1 progress
 
-Updated: 2026-09-27. Lantern DSSE is actively maintained by Lantern Networks, Inc.
+Updated: 2026-09-29. Lantern DSSE is actively maintained by Lantern Networks, Inc.
 The latest published version is [0.3.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.0-experimental), released on September 11.
 **0.3.1 is in development and has not been released.**
 
@@ -15,8 +15,8 @@ removing them, honors saved retention periods and legal holds, and resumes inter
 batches from PostgreSQL. Existing volumes require the
 [schema upgrade](audit-and-data.md#clickhouse-retention-limitation-and-upgrade).
 Aggregate rollups remain preserved; their capacity and the cold archive's lifecycle
-remain deployment responsibilities. Multi-region and long-duration release checks
-are still outstanding.
+remain deployment responsibilities. A candidate regional evaluation is summarized
+below.
 
 ## What is being maintained
 
@@ -519,9 +519,20 @@ partial results and current state before retrying after an unconfirmed save.
   postponing an investigation does not turn it into a passed check.
 - Install from the public instructions and verify real allowed and denied traffic,
   control-plane/Edge propagation, regional failure, PKI rotation and sustained
-  operation in the planned three-region, one-node-per-region deployment.
+  operation in the planned deployment of three DSSE regions, one node each, on
+  separate hosts in independent failure domains (separate availability zones qualify).
+  DSSE region IDs and cloud-provider regions are separate topology dimensions.
 - Complete the applicable release checks, signed-artifact verification and
   release notes, including known limitations and upgrade guidance.
+
+A September 28–29 candidate evaluation used three DSSE regions with one node each
+on separate hosts in three availability zones across two cloud-provider regions,
+with two independent tenant/device and
+Connector lanes. Allowed and denied traffic, service-level regional failover, and
+natural Edge leaf renewal were observed over a 16-hour common window. Results are
+still being assessed and are not presented as an error-free endurance result.
+Final signed 0.3.1 endpoint packages and the remaining release checks above are
+still required before publication.
 
 The latest release remains experimental. Merging a fix does not certify production
 readiness or make an unreleased build a supported release.

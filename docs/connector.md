@@ -214,13 +214,16 @@ and upgrade requirements across server and endpoint paths.
 
 ## Region failover
 
-If a connector loses its tunnel, it tries the other configured regions and reports the
-lost endpoint, retry target, and new tunnel in its log. Recovery time depends on detection,
-network conditions, and the other regions' health; no fixed failover latency is promised.
-A one-region deployment has no alternative endpoint.
+If a connector loses its tunnel, it tries the other configured entrances and reports the
+lost endpoint, retry target, and new tunnel in its log. It moves only to entrances it is
+allowed to use: in three Regions, another Region's entrance; in one Region with three
+nodes, another of that Region's three entrances. A deployment with a single entrance (a single machine, or one
+CP with dedicated Edges) has no alternative endpoint. Recovery time depends on detection,
+network conditions, and the other entrances' health; no fixed failover latency is promised,
+and established connections are not carried over.
 
 Test from an enrolled device that the private application remains reachable after the
-selected region becomes unavailable. A new tunnel log alone does not prove the application's
+selected entrance or region becomes unavailable. A new tunnel log alone does not prove the application's
 path or policy. Restore the region and check connectivity again.
 
 ## What the deployment can then say about it

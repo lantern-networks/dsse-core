@@ -1,9 +1,11 @@
 # Upstream TLS compatibility
 
 For inspected HTTPS, the Edge establishes its own TLS connection to the destination.
-By default, that connection offers the same cipher suites as Chrome, so a site that
-opens in Chrome also opens through DSSE. An organization can choose a stricter
-profile instead.
+By default, that connection offers the same TLS 1.2 cipher suites as Chrome, so a
+site that failed only because it accepts nothing but static RSA key exchange now
+opens. Other differences between Chrome and the Edge can still make a site fail; see
+[When a browser works](#when-a-browser-works-but-dsse-reports-a-handshake-failure).
+An organization can choose a stricter profile instead.
 
 In Console, select the organization and open **Web & Traffic → Inspection Settings**.
 The **Origin TLS compatibility** setting belongs to the selected organization;
@@ -34,8 +36,9 @@ HTTP/2 combination is not repaired by replaying the request over another protoco
 
 Static RSA key exchange has no forward secrecy: if a server that uses it has its
 private key compromised later, previously recorded sessions with that server can
-be decrypted. A server that also supports ECDHE is not affected in practice, because
-servers choose ECDHE when the client offers it. Choose **Strict** when the
+be decrypted. The Edge lists ECDHE suites ahead of static RSA, and most servers that
+support ECDHE select it, but the server makes the choice: a server configured to prefer
+static RSA uses it, and that connection has no forward secrecy. Choose **Strict** when the
 organization prefers refusing such servers to reaching them. The Edge records each
 use of a static RSA suite so operators can identify these origins.
 

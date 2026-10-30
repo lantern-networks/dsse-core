@@ -332,6 +332,14 @@ Run the post-uninstall check from the repository root:
 .\clients\windows-wfp\packaging\verify-windows-install.ps1 -AfterUninstall
 ```
 
+Uninstall deliberately keeps a copy of the verified signed install profile at
+`%ProgramData%\DSSE\install-profile.json`, with `profile_signing_key.txt`, the
+adopted trust anchors and the device identity under `enroll\`, so that reinstalling
+for the same organization restores its configuration: a later MSI installation reads
+that copy when it is given no new profile. The post-uninstall check reports these
+files. They name the deployment the PC belonged to. Before installing for another deployment or organization, or when
+the PC leaves DSSE, remove them after confirming they are the old deployment's.
+
 Review remaining certificates and identity files. Remove obsolete certificates by their
 verified fingerprint, never by subject name: two deployments can use the same name with
 different keys. Preserve certificates independently installed by the administrator if

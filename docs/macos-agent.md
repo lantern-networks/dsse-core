@@ -263,6 +263,14 @@ deactivate the extension. If that fails, it stops before deleting the app needed
 recovery. Resolve approval or a pending OS restart and retry; do not manually delete the
 app while its proxy configuration remains active.
 
+The uninstaller removes the app and its extension but leaves the deployment
+configuration in `/Library/Application Support/Dsse`, including the signed
+`install_profile.json`, `agent_config.json`, `enrolment_token.txt` and
+`profile_signing_key.txt`, and the package receipt stays registered with `pkgutil`.
+These name the deployment the Mac belonged to. Before installing for another
+deployment or organization, or when the Mac leaves DSSE, remove them after confirming
+they are the old deployment's.
+
 After removal, check extension state and restored connectivity. Review trust-store and
 identity remnants, particularly on a Mac that has used several deployments. The current
 `interception-root.pem` identifies the current certificate, not every previously installed

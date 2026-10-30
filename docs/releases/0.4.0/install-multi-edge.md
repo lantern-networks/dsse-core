@@ -98,6 +98,50 @@ Replace the sample `service_image` and `console_image` local tags with the
 published digests, or with images you built, and set `image_revision` to match. The release image gate checks
 both completed supported plans against every scanned built image.
 
+### Using the published images
+
+To install the released images, put these values in the plan before generating
+the deployment directory. They are the images the release acceptance ran:
+
+```json
+"image_revision": "source-768a8c72fb96156d00d2e78d6a0f3903b506f59c988e5692c2e951efd6ddd6f8",
+"service_image": "ghcr.io/lantern-networks/dsse-service@sha256:9d7d0f62365c59398dc3ea83ef09aab67e1650cd22a395d197047ff9cb6a5118",
+"console_image": "ghcr.io/lantern-networks/dsse-console@sha256:bd729ef7776cb38c53d149dcf69e8471c95a580e9213cbce0ed6f6f0268a9c97",
+"data_layer": {
+  "etcd_image": "ghcr.io/lantern-networks/dsse-etcd@sha256:0c85129c93c3dcd0bb4d00c44c8cb7db749c256f36d39fbcf323b9bfaab0c24f",
+  "postgres_image": "ghcr.io/lantern-networks/dsse-postgres@sha256:7b6559a1ffd064428cd11b5e3a041fa1ad97d433e0f77f1718f70ede00b11396",
+  "postgres_tools_image": "ghcr.io/lantern-networks/dsse-postgres-tools@sha256:2285f9b3ca3b949b9113fd8564715777466c1d9d1ee21690ccb29667df5dfc74",
+  "postgres_major": 18
+}
+```
+
+The installer does not pull images; `-preflight` refuses an image that is not
+already on the host. On each host, once its deployment directory
+exists (the founder's generated directory, or an unpacked carry) and before
+`-preflight` or `-start-node`, pull exactly the images that host's generated
+Compose file uses. No registry sign-in is needed:
+
+```sh
+cd <deployment-directory>
+docker compose --env-file deployment.env config --images
+docker compose --env-file deployment.env pull
+```
+
+In three Regions a CP+HAProxy host lists seven images: the five above and the
+HAProxy and ClickHouse images the installer pins. A dedicated Edge host lists only
+`dsse-service`. Then check what was pulled:
+
+```sh
+docker image inspect --format '{{json .RepoDigests}} {{index .Config.Labels "org.opencontainers.image.revision"}}' \
+  ghcr.io/lantern-networks/dsse-service@sha256:9d7d0f62365c59398dc3ea83ef09aab67e1650cd22a395d197047ff9cb6a5118
+```
+
+The digest must be the one in the plan, the [release README](README.md#server-container-images)
+and `release-manifest.json`, and the revision label must equal `image_revision`.
+`-preflight` repeats the label check and also checks each image's OS and
+architecture and the service binary's own revision. To check the images'
+source, see [Checking the images yourself](README.md#checking-the-images-yourself).
+
 For deployment-certificate Online revocation, declare `deployment_crl_origins`
 **before minting** the authority. Supply one to eight distinct, publicly reachable
 plain HTTP origins without credentials, paths, queries or fragments, for example

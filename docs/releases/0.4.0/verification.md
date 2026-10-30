@@ -44,6 +44,22 @@ configured.
   completed Keycloak sign-in in Chrome, and resumed with HTTP `200` without a
   retry. An SSH session to a management host excluded by the signed profile
   connected after capture started.
+- Over 80 minutes, with the macOS agent connected throughout and the Windows
+  agent for the last 33, the number of open endpoint flows on each Region A Edge
+  stayed between 7 and 143 and fell back after each burst of use. Of 2,774 flows,
+  the idle safety net closed 1,251. On the previous candidate, without the safety
+  net, the count passed 1,200 and grew by about 70 every three minutes. In five
+  samples over 20 minutes the Windows agent's handle count read 604, 589, 772, 589
+  and 587, and no capture connection stayed in `CloseWait` from one sample to the
+  next; on the previous candidate it rose from 1,679 to 2,207.
+- Each agent's regular stop restored ordinary networking. On macOS the package
+  uninstaller exited 0, the extension was removed, and ordinary HTTPS over IPv4
+  and IPv6 and the physical exit were verified. On Windows the signed recovery
+  exited 0, no DSSE WFP filter remained, and ordinary HTTPS over IPv4 and IPv6
+  returned `200`. The MSI then uninstalled with exit 0 on the first attempt and left
+  no installation directory. As designed, both agents keep the previous
+  deployment's signed profile and identity material after removal; see
+  [Windows agent](../../windows-agent.md) and [macOS agent](../../macos-agent.md).
 
 - `govulncheck` on the release source reports no vulnerability reachable from
   DSSE code. Two advisories, GO-2026-6866 and GO-2026-6860, affect
@@ -111,10 +127,9 @@ deciding where to deploy 0.4.0.
 |---|---|
 | Tenant isolation | Regression coverage of deployment-only distribution APIs and tenant APIs; upgrades and data migration from any existing 0.3.1 installation require separate acceptance |
 | Audit storage | Accept local-only mode with durable hot-store capacity, backup and restore evidence. Verify scoped, audited manual hot-log deletion with preview, legal-hold refusal and confirmed completion on PostgreSQL and ClickHouse. If external S3 is selected, verify CP-scoped credentials, real Put/Get, outage retention and replay, and an operator-visible failure/backlog/recovery alert through the signed webhook and Console; S3 itself is not a prerequisite for local-only installation |
-| Final image installation | After both supported plans select the final scanned digests for all five built image roles, freshly generate the one-Region and three-Region installations on real Linux hosts. Verify three-member synchronous PostgreSQL replication, primary failover and rejoin, etcd quorum, ClickHouse, CP startup without S3, and backup/restore using the final images. Earlier MinIO-era AWS trials and two-member local HA tests do not satisfy this gate |
+| Final image installation | The three-Region installation above ran the final images with three-member synchronous PostgreSQL replication, etcd quorum, ClickHouse and CP startup without S3. Still required with the same images: a fresh one-Region installation on real Linux hosts, PostgreSQL primary failover and rejoin, and backup/restore. Earlier MinIO-era AWS trials and two-member local HA tests do not satisfy this gate |
 | Dependency security | Current blocking source/binary checks for shipped components, including the S3 client library, plus the [image inventory and per-image scanner](../../../scripts/scan_release_images.py) for shipped third-party bases and built images selected by both plans. The scanner also requires a CycloneDX inventory for each built image and rejects unresolved local Go module identities such as `pkg:golang/..`. No missing digest, image role, component identity or high/critical finding may be reported as approved |
-| macOS package | Exact PKG hash, Developer ID signatures, accepted notarization/staple, fresh installation, steering and normal-network recovery |
-| Windows package | Exact MSI/payload hashes, EV signatures/timestamps, Microsoft driver validation, fresh installation, updater publisher argument validation and WFP recovery |
+| Windows package | Updater publisher argument validation with the released MSI. Fresh installation, payload hashes, signatures, the Microsoft-signed driver, WFP recovery and uninstall are measured above |
 | Generic packaging | No baked tenant/deployment inputs; same signed package verified with separately supplied independent deployment inputs |
 | Admin Console | With the final Console and server images on a real deployment, review every tenant-administrator and operator page against actual API responses, including populated and empty states, API failure and session expiry. Verify device identity, OS, last report and certificate details against enrolled endpoints; exercise create/save/read-back/cancel/delete only in a dedicated test tenant and confirm cross-tenant and role restrictions. Local synthetic-data screenshots and navigation checks do not satisfy this gate |
 | Authority failure | Full Connector/held-flow test with a slow synchronous database replica; distinguish database write delay from an unreachable Region |

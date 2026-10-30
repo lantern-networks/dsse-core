@@ -46,19 +46,52 @@ the release image scan with no blocking high or critical finding.
 
 | Plan setting | Image |
 |---|---|
-| `service_image` | `ghcr.io/lantern-networks/dsse-service@sha256:6a799afd89182a73e12566954730a0a561fc871c97ce95f3e1002eee7cb8c228` |
-| `console_image` | `ghcr.io/lantern-networks/dsse-console@sha256:a5eb525e0af1b345e514d99b46bda0ad10777285b20cac4cf1d90f1c140a217f` |
-| `data_layer.etcd_image` | `ghcr.io/lantern-networks/dsse-etcd@sha256:46c7e4608e1b3e08e29cb4d57230c19144170318d17ca7ddd708ba749c572984` |
-| `data_layer.postgres_image` | `ghcr.io/lantern-networks/dsse-postgres@sha256:e835b85c2125e6fe04134d13094065398dfa39e27a34d4d0de55008a5cafd18a` |
-| `data_layer.postgres_tools_image` | `ghcr.io/lantern-networks/dsse-postgres-tools@sha256:48a9b7badd6045c24230be413653a108e8d568cafb990358ea286dc5f6773d13` |
+| `service_image` | `ghcr.io/lantern-networks/dsse-service@sha256:9d7d0f62365c59398dc3ea83ef09aab67e1650cd22a395d197047ff9cb6a5118` |
+| `console_image` | `ghcr.io/lantern-networks/dsse-console@sha256:bd729ef7776cb38c53d149dcf69e8471c95a580e9213cbce0ed6f6f0268a9c97` |
+| `data_layer.etcd_image` | `ghcr.io/lantern-networks/dsse-etcd@sha256:0c85129c93c3dcd0bb4d00c44c8cb7db749c256f36d39fbcf323b9bfaab0c24f` |
+| `data_layer.postgres_image` | `ghcr.io/lantern-networks/dsse-postgres@sha256:7b6559a1ffd064428cd11b5e3a041fa1ad97d433e0f77f1718f70ede00b11396` |
+| `data_layer.postgres_tools_image` | `ghcr.io/lantern-networks/dsse-postgres-tools@sha256:2285f9b3ca3b949b9113fd8564715777466c1d9d1ee21690ccb29667df5dfc74` |
 
 The `0.4.0` tag names the same images; use the digests in a plan. The service and
 Console images carry the label `org.opencontainers.image.revision` set to
-`source-facfca560389c3221d1ee454ed14f12f63531986afef096761eaf4f1851b12b0`, and
+`source-768a8c72fb96156d00d2e78d6a0f3903b506f59c988e5692c2e951efd6ddd6f8`, and
 setup preflight refuses them unless the plan's `image_revision` has that value.
 Set `data_layer.postgres_major` to `18`. HAProxy and ClickHouse are used from
 their upstream images at the digests the installer pins. See [Building](../../building.md)
 for the plan settings and for building the same images from source instead.
+
+To install with these images, follow
+[Using the published images](install-multi-edge.md#using-the-published-images).
+
+### Checking the images yourself
+
+You can check the images with this repository and the registry alone:
+
+- **Digest.** `docker pull` by the digests above, or `docker buildx imagetools
+  inspect`, needs no sign-in. A digest names exactly one image.
+- **Source.** The service and Console images carry the revision label
+  `source-768a8c72…`. That is the content identity of the public commit
+  `1c4becfbdd235b40cc98ad22b4a161b292aff8fc`, which you can check from a clone:
+
+  ```sh
+  mkdir /tmp/dsse-images-source
+  git archive 1c4becfbdd235b40cc98ad22b4a161b292aff8fc | tar -x -C /tmp/dsse-images-source
+  cd /tmp/dsse-images-source
+  go run ./scripts/verify_source_content_id.go -root . \
+    -expected source-768a8c72fb96156d00d2e78d6a0f3903b506f59c988e5692c2e951efd6ddd6f8
+  ```
+
+  `git diff 1c4becfbdd235b40cc98ad22b4a161b292aff8fc v0.4.0-experimental` shows that the release tag
+  adds documentation only. The Windows MSI and macOS PKG were built from the
+  earlier public commits `526c57fc7519dc8068d2cddb272b9552ffc2da42` and `214a524a641a16f4da4dd8ee6eacbcfc757c6a4d`; their content
+  identities are in `release-manifest.json`, and the same check applies.
+- **Vulnerabilities.** Scan the same digests with your own scanner, for example
+  `trivy image --platform linux/amd64 <image>@sha256:<digest>`. The release
+  gate found no blocking high or critical finding.
+
+The images are not bit-for-bit reproducible: the service binaries embed their
+build time. Rebuilding from the same commit gives equivalent images with
+different digests.
 
 `dsse-postgres` is built from Zalando Spilo on Ubuntu 22.04 with PostgreSQL 18.6,
 Patroni 4.1.5 and WAL-G built from source. It contains third-party software under

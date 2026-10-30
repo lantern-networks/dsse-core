@@ -310,6 +310,9 @@ func TestPostgresAuthRollingNativeProcesses(t *testing.T) {
 	}
 	runtime := &authRolloutRuntime{authority: authority}
 	completeRollout(t, runtime, m)
+	// Each process re-reads the rollout state at most every authRolloutDecisionPoll,
+	// so another process sees completion within that bound, not at the same instant.
+	time.Sleep(authRolloutDecisionPoll + 100*time.Millisecond)
 	for _, c := range children {
 		probe(c, "evidence-device", true)
 		probe(c, "legacy-device", false)

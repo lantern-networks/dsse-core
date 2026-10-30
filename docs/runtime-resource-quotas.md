@@ -26,7 +26,6 @@ accepted, instead of selecting a hidden default or crashing on the first flow.
 | `DSSE_TCP_STREAM_IDLE_TIMEOUT_SECONDS` | Edge stream sender | Idle time per Connector TCP flow |
 | `DSSE_NE_MAX_SESSIONS` | Edge runtime-copy session API | Active sessions per runtime-copy handler |
 | `DSSE_NE_SESSION_IDLE_TIMEOUT_SECONDS` | Edge runtime-copy session API | Idle time per session |
-| `DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS` | Edge raw runtime-copy tunnel | Idle time with no traffic in either direction |
 | `DSSE_SWG_MAX_CONNECTIONS_PER_HOST` | Edge HTTP egress | Active connections per destination host in each transport |
 | `DSSE_HTTP2_MAX_CONCURRENT_STREAMS` | Edge, interception, broker | Streams per accepted HTTP/2 connection |
 | `DSSE_HTTP_IDLE_TIMEOUT_SECONDS` | Edge, Console, interception | Idle established HTTP connection time |
@@ -54,6 +53,23 @@ The Connector's private health endpoint reports `tcp_admission.active` and
 parallel opens cannot overbook it. Rejection preserves existing connections.
 Failed dials, closed streams, and lost transports release reservations and
 underlying sockets. Each process has its own budget; this is not a fleet quota.
+
+## Resource protection defaults
+
+These settings bound resources that would otherwise leak. They are on when unset.
+
+| Setting | Applies to | Default and meaning |
+| --- | --- | --- |
+| `DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS` | Edge endpoint flows (macOS and Windows agents) | 180 seconds. A flow with no traffic in either direction for this long is closed. One direction staying quiet while the other carries data is not idle. |
+
+The Windows agent does not tell the Edge when an application closes a connection,
+and macOS flows were also observed to stay open, so a flow the application abandoned
+stays open until the destination closes it, and many destinations never do. Without this bound, open flows accumulate on every Edge and
+endpoint for as long as the agent runs. A connection that is idle in both directions
+for longer than the setting is closed, for example an interactive SSH session without
+keepalives; enable the client's keepalive or set a longer value. A positive value
+replaces the default. An explicit `0` disables the bound and accepts that
+accumulation.
 
 ## Security admission is separate
 

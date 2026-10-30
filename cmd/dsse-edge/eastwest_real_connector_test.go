@@ -73,10 +73,17 @@ func startEastWestTrafficConnector(t *testing.T, ctx context.Context, binary, di
 		t.Fatal(err)
 	}
 	labMode := true
-	edge := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(), LabMode: &labMode,
+	// The Edge must name itself as the Connector's door. Since the Connector began
+	// following its profile, an authoritative empty door list means "withdrawn":
+	// it registers, then closes its tunnel. A deployment names its door through
+	// ConnectorEnrollmentEdgeURL, so the fixture does too.
+	edge := httptest.NewUnstartedServer(nil)
+	edge.Config.Handler = newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(), LabMode: &labMode,
 		OperatorTenantID: processDistributionTenant, AdminAuth: processDistributionAuth(), PolicyStore: policies, ConfigSourceURL: cpURL,
 		ApplicationCatalogStore: apps, TunnelManager: manager, Writer: writer, ConnectorSecret: "synthetic-eastwest-traffic",
-		RouteProfiles: map[string]edgeplane.ApplicationRouteProfile{"wiki": {Destination: host, DestinationPort: port, Protocol: "tcp", ServiceFamily: "ssh", DestinationRole: "ssh_server", ApplicationSensitivity: "low"}}}))
+		ConnectorEnrollmentEdgeURL: "http://" + edge.Listener.Addr().String(),
+		RouteProfiles:              map[string]edgeplane.ApplicationRouteProfile{"wiki": {Destination: host, DestinationPort: port, Protocol: "tcp", ServiceFamily: "ssh", DestinationRole: "ssh_server", ApplicationSensitivity: "low"}}})
+	edge.Start()
 	routes, _ := json.Marshal(map[string]any{"applications": []map[string]any{{"application_id": "wiki", "fqdn": host, "destination_port": port}}})
 	routePath := filepath.Join(dir, "connector-routes.json")
 	if err := os.WriteFile(routePath, routes, 0600); err != nil {
@@ -100,7 +107,13 @@ func startEastWestTrafficConnector(t *testing.T, ctx context.Context, binary, di
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("Connector tunnel startup timeout")
+			// Show what the Connector said: a bare timeout gave no way to tell a refused
+			// registration from a tunnel that never opened.
+			raw, _ := os.ReadFile(filepath.Join(dir, "connector-traffic.log"))
+			if len(raw) > 4096 {
+				raw = raw[len(raw)-4096:]
+			}
+			t.Fatalf("Connector tunnel startup timeout; Connector output:\n%s", raw)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

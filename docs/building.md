@@ -54,8 +54,10 @@ retain the local tags above; `image_revision` is required by setup preflight.
 The final image gate compares both completed supported installation plans with
 the exact five scanned image digests; local tags are not release evidence.
 
-For a private PostgreSQL 18 candidate install, the plan must select one
-immutable data-layer cohort before `-preflight` or `-start-node`:
+Every PostgreSQL 18 installation plan must select one immutable data-layer
+cohort before `-preflight` or `-start-node`. Use the images published with the
+release (see the [0.4.0 release README](releases/0.4.0/README.md#server-container-images))
+or images you built:
 
 ```json
 "data_layer": {
@@ -76,8 +78,8 @@ Preflight refuses a plan that omits `data_layer`. Generated Compose also refuses
 to interpolate its etcd, Spilo, and PostgreSQL tools services without explicit
 image references; it has no legacy fallback for these images. Use `-preflight`
 and `-start-node` to check the actual image contents before starting services.
-The final scanned public image defaults and a fresh Linux installation remain
-release conditions.
+The published 0.4.0 images were installed fresh on Linux hosts in a three-Region
+layout; see the release acceptance record for what that installation covered.
 
 For nodes with the same architecture, build once and copy both first-party images:
 

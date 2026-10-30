@@ -83,9 +83,10 @@ actual failure domains. Each Node holds `["control-plane", "edges"]`; there is
 one DSSE Region and one founding Region. The sample uses Region `kiri` and
 Nodes `node-a`, `node-b`, `node-c`.
 
-Before final release image digests are finalized, a private candidate plan must set
-`data_layer` with immutable `etcd_image`, `postgres_image`, and
-`postgres_tools_image` references plus `postgres_major: 18`. Use the same
+Every plan must set `data_layer` with immutable `etcd_image`, `postgres_image`,
+and `postgres_tools_image` references plus `postgres_major: 18`. The 0.4.0
+release publishes these images; their digests are listed in the
+[release README](README.md#server-container-images). Use the same
 reviewed cohort on every machine and make the images available to each Linux
 host. The sample plans omit this candidate-specific field: add it before
 `-preflight` or `-start-node`. The installer carries these values; setup
@@ -93,8 +94,8 @@ preflight refuses an omitted cohort and checks the actual PostgreSQL binary
 major before startup. Generated Compose also requires explicit data-layer image
 references and has no legacy fallback. Use `-preflight` and `-start-node` to
 verify the actual images before starting services. See [Building](../../building.md).
-For release acceptance, replace the sample `service_image` and `console_image`
-local tags with the exact reviewed digests as well. The release image gate checks
+Replace the sample `service_image` and `console_image` local tags with the
+published digests, or with images you built, and set `image_revision` to match. The release image gate checks
 both completed supported plans against every scanned built image.
 
 For deployment-certificate Online revocation, declare `deployment_crl_origins`

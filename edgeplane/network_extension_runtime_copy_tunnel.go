@@ -38,13 +38,31 @@ import (
 
 const NetworkExtensionRuntimeCopyTunnelPath = "/network-extension/runtime-copy/tunnel"
 
-// An optional operator idle quota, measured across both directions. Unset/0
-// leaves responsive, idle sessions open. Peer EOF/RST and failed liveness checks
-// remain separate cleanup conditions; there is no count-driven default reaper.
+// The idle safety net: a flow with no bytes in EITHER direction for this long is
+// torn down. One direction going quiet while the other still carries is not idle.
+//
+// It is resource protection, not a performance quota. The Windows agent does not
+// tell the Edge when its application closes a connection (its mux has no
+// half-close frame), and macOS flows were observed to stay open as well, so a
+// flow the application abandoned stays open until the destination closes it, and
+// many destinations never do. Without this bound the
+// flows pile up on every Edge and endpoint without limit: on 2026-10-30, with the
+// default unset, two Edges held about 1,200 open flows from two endpoints after
+// 90 minutes and gained about 70 more every 3 minutes, while the Windows agent
+// accumulated CLOSE_WAIT sockets. The 2026-10-18 change that made performance
+// quotas opt-in had removed this default by classifying it as one.
+//
+// 180 s is the value it had before that change: generous enough that SSE and
+// long-poll normally carry something inside it. A connection that is idle in both
+// directions for longer (an interactive SSH session without keepalives) is closed.
+// DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS sets another value; an explicit 0 disables
+// the safety net and accepts the unbounded growth described above.
+const networkExtensionRuntimeCopyTunnelDefaultIdle = 180 * time.Second
+
 var networkExtensionRuntimeCopyTunnelIdleTimeout = resolveNetworkExtensionRuntimeCopyTunnelIdleTimeout()
 
 func resolveNetworkExtensionRuntimeCopyTunnelIdleTimeout() time.Duration {
-	return runtimequota.Seconds("DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS")
+	return runtimequota.SecondsDefault("DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS", networkExtensionRuntimeCopyTunnelDefaultIdle)
 }
 
 const (

@@ -132,7 +132,9 @@ a digest to check on arrival.
 
 **A deployment seeds one program from its own image — its own architecture, and no other.** Build the Edge
 images on arm64 machines and the deployment offers an arm64 connector; a branch office running x86 has
-nothing it can run, and **Add connector** says so and names who fixes it. Build the other and add it:
+nothing it can run, and **Add connector** says so and names who fixes it. A deployment running the published
+0.4.0 images (linux/amd64) offers an amd64 connector, so an arm64 site needs `GOARCH=arm64` below. Build the
+other and add it:
 
 ```sh
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o out/dsse-connector         ./cmd/dsse-connector

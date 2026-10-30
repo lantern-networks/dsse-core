@@ -10,15 +10,16 @@ reference for a future supported upgrade and is not part of 0.4.0 acceptance.
 Use the [three-entrance installation guide](install-multi-edge.md) for the
 complete host-by-host workflow. The checklist below also applies to upgrade planning.
 The one-Region shared pool and three-Region regional pools have different
-routing contracts. The three-Region generator now passes local regional-backend
-tests, but acceptance of the exact binaries with real endpoints is still open.
+routing contracts. Both were installed from the released images with real
+endpoints; [Acceptance and limitations](verification.md) lists what remains open.
 
 1. Read the release manifest and the open acceptance items. Verify source
    and package checksums, platform signatures, notarization or Microsoft driver
    signature as applicable. Use source and tools from the same release.
-2. Build the services and operator tools using [Building](../../building.md).
+2. Build the operator tools using [Building](../../building.md). Use the
+   [published images](install-multi-edge.md#using-the-published-images) or build them.
    Choose the [three-region dedicated-node plan](../../plans/three-regions-multi-edge.json)
-   or [one-region multi-Edge evaluation](../../one-region-multi-edge.md). Supply your
+   or the [one-Region three-node plan](../../plans/one-region-three-independent-entries.json). Supply your
    own failure domains, network addresses and signing identities.
    Choose local-only audit retention or an optional external S3 archive. For the
    latter, provision the private bucket and CP credentials before startup as

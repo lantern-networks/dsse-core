@@ -1,15 +1,13 @@
 # Release overview and known limitations
 
 **Status: experimental.** The latest published version is
-[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) (September 29, 2026).
-Its notes and manifest identify the source, signed packages, upgrade guidance and
-verification scope. This is the first maintenance release after 0.3.0.
+[0.4.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.0-experimental) (October 30, 2026).
+Its notes and `release-manifest.json` identify the source, signed packages, server
+images and checksums. The [0.4.0 documentation](releases/0.4.0/README.md) records what
+was measured, the known issue and the acceptance items that remain open.
 The evaluation records below identify their release and dates; use the documentation
 from the revision you build.
 The [documentation index](README.md) provides the full reading path.
-Development source is now versioned 0.4.0; the [distribution review](releases/0.4.0/README.md)
-records its proposed assets, migration requirements and unresolved publication gates.
-This does not change the identity or qualification of the published 0.3.1 artifacts.
 
 ## Evaluation scope
 
@@ -35,7 +33,7 @@ No tested minimum OS-version matrix or performance capacity is established by th
 - TLS inspection does not enable DLP by itself. Attach a DLP policy; Observe and Warn
   permit matching uploads. Uninspectable-file blocking is off by default.
 - Standard upstream HTTP/TLS uses Go. The experimental browser-faithful broker is
-  not packaged or qualified for the proposed 0.4.0 distribution.
+  not packaged or qualified for the 0.4.0 release.
 - Generated PKI uses software-held key material. PKCS#11/HSM integration exists, but
   SoftHSM is not part of the default generated deployment.
 
@@ -62,6 +60,24 @@ condition: [IdP](idp.md), [Egress](egress-policy.md), [East-West and OOB](east-w
 These are documented constraints, not a complete security audit or vulnerability inventory.
 
 ## Release evidence
+
+### 0.4.0 — October 30, 2026
+
+The release includes signed generic macOS and Windows packages, the source and
+English documentation archives, a source SBOM, a source/artifact manifest and five
+server container images. Each artifact's source is a public commit whose content
+identity the artifact carries; see
+[Checking the images yourself](releases/0.4.0/README.md#checking-the-images-yourself).
+Release CI and the image vulnerability gate passed.
+
+A fresh three-Region installation from the released installer and images ran on
+Linux hosts with two organizations, two Connectors and real macOS and Windows
+endpoints. Fleet verification, default-browser sign-in with resumption of held
+native requests, and each agent's regular stop and uninstall were measured. The
+[acceptance record](releases/0.4.0/verification.md) lists the results, the known
+issue that the audit hot store is not replicated between control planes, and the
+items that remain open, including a one-Region installation from the released
+images, database failover and backup/restore.
 
 ### 0.3.1 — September 29, 2026
 

@@ -60,6 +60,15 @@ configured.
   no installation directory. As designed, both agents keep the previous
   deployment's signed profile and identity material after removal; see
   [Windows agent](../../windows-agent.md) and [macOS agent](../../macos-agent.md).
+- A one-Region installation with three combined nodes was then built on three new
+  Linux hosts in three availability zones using only the published guides, this
+  repository and the published images and packages, with no registry sign-in.
+  Fleet verification passed 61 checks with 3 not checked. An administrator signed
+  in to the Console, created an organization and its two authorities, and installed
+  the published macOS package from the Console's setup archive; the profile verified
+  against its pin, the endpoint enrolled into that organization, and the on-machine
+  verifier reported it steering, with inspected HTTPS trusted. The guides were
+  corrected where this walk found gaps.
 
 - `govulncheck` on the release source reports no vulnerability reachable from
   DSSE code. Two advisories, GO-2026-6866 and GO-2026-6860, affect
@@ -127,7 +136,7 @@ deciding where to deploy 0.4.0.
 |---|---|
 | Tenant isolation | Regression coverage of deployment-only distribution APIs and tenant APIs; upgrades and data migration from any existing 0.3.1 installation require separate acceptance |
 | Audit storage | Accept local-only mode with durable hot-store capacity, backup and restore evidence. Verify scoped, audited manual hot-log deletion with preview, legal-hold refusal and confirmed completion on PostgreSQL and ClickHouse. If external S3 is selected, verify CP-scoped credentials, real Put/Get, outage retention and replay, and an operator-visible failure/backlog/recovery alert through the signed webhook and Console; S3 itself is not a prerequisite for local-only installation |
-| Final image installation | The three-Region installation above ran the final images with three-member synchronous PostgreSQL replication, etcd quorum, ClickHouse and CP startup without S3. Still required with the same images: a fresh one-Region installation on real Linux hosts, PostgreSQL primary failover and rejoin, and backup/restore. Earlier MinIO-era AWS trials and two-member local HA tests do not satisfy this gate |
+| Final image installation | The three-Region and one-Region installations above ran the final images with three-member synchronous PostgreSQL replication, etcd quorum, ClickHouse and CP startup without S3. Still required with the same images: PostgreSQL primary failover and rejoin, and backup/restore. Earlier MinIO-era AWS trials and two-member local HA tests do not satisfy this gate |
 | Dependency security | Current blocking source/binary checks for shipped components, including the S3 client library, plus the [image inventory and per-image scanner](../../../scripts/scan_release_images.py) for shipped third-party bases and built images selected by both plans. The scanner also requires a CycloneDX inventory for each built image and rejects unresolved local Go module identities such as `pkg:golang/..`. No missing digest, image role, component identity or high/critical finding may be reported as approved |
 | Windows package | Updater publisher argument validation with the released MSI. Fresh installation, payload hashes, signatures, the Microsoft-signed driver, WFP recovery and uninstall are measured above |
 | Generic packaging | No baked tenant/deployment inputs; same signed package verified with separately supplied independent deployment inputs |

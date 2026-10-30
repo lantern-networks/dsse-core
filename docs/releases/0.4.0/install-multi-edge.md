@@ -501,9 +501,9 @@ Unperformed browser, endpoint and failure acceptance is explicitly `n/a`, never
 PASS; it remains mandatory before device admission. Review every
 `n/a` even when the measured server checks exit 0.
 
-On a CP-only verifier host, an approved private browser CA must be trusted by the
-host's normal CA store (one approved CA per file on Ubuntu's
-`/usr/local/share/ca-certificates/`, followed by `sudo update-ca-certificates`).
+On a CP-only verifier host, pass an approved private browser CA with
+`-portal-ca`, as described above. Adding it to the host's CA store is not required;
+do that only if your organization wants that host to trust the CA generally.
 This is public trust material only; never copy an Edge private key to the CP.
 Edge/combined hosts also use the explicit trust saved by certificate import.
 

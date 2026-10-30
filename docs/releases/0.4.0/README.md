@@ -102,8 +102,10 @@ You can check the images with this repository and the registry alone:
   gate found no blocking high or critical finding.
 
 The images are not bit-for-bit reproducible: the service binaries embed their
-build time. Rebuilding from the same commit gives equivalent images with
-different digests.
+build time, and the builds install the OS package updates current at build time.
+A rebuild from the same commit has a different digest and can contain different
+OS packages. It is not the verified release image: generate its inventory and
+scan it before use.
 
 `dsse-postgres` is built from Zalando Spilo on Ubuntu 22.04 with PostgreSQL 18.6,
 Patroni 4.1.5 and WAL-G built from source. It contains third-party software under

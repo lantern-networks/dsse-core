@@ -3,9 +3,12 @@
 Updated for the 0.4.0 release (October 30, 2026). The published server images are
 linux/amd64; their digests and scan result are in the
 [0.4.0 release README](releases/0.4.0/README.md#server-container-images).
-Release builds use fixed
-versions, rather than resolving a new dependency at every build. The Go module
-manifests and native archive checksums are the authoritative build inputs.
+Release builds fix the source, Go modules, base images and native archives,
+rather than resolving them at every build. The Go module manifests and native
+archive checksums are the authoritative build inputs. The image builds also apply
+the current OS package updates (`apk upgrade`, and `apt-get` in the Spilo build),
+so a later rebuild can contain different OS packages. The published digests
+identify the verified images; a rebuilt image needs its own inventory and scan.
 
 | Component | Selected version | Source |
 |---|---|---|

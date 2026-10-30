@@ -34,7 +34,10 @@ secret is not displayed again; it does not mean Edges never possess it.
 2. Identify the deployed step-up portal base URL (`-clientless-base-url`). Register
    its exact callback, `<portal-base-url>/clientless/auth/callback`, in the IdP's
    OIDC application. Use the deployed HTTPS name and port, not an address copied
-   from a different region or an older example.
+   from a different region or an older example. A deployment with three entrances
+   has three Portal names: register the callback for each of them, or sign-in fails
+   only after a device moves to another entrance. See the
+   [installation guide](releases/0.4.0/install-multi-edge.md).
 3. Configure the IdP application to return the claims needed below and an ID token
    signed with RS256. Match its client authentication settings to the DSSE token
    exchange: DSSE submits `client_id`, a configured `client_secret`, and the PKCE
@@ -110,6 +113,16 @@ There are two independent HTTPS paths:
 - Every serving Edge must reach and trust the IdP's discovery, token, and JWKS
   endpoints. A private `ca_pem` on the connection configures these server-side
   calls; it does not install that CA into the user's browser.
+
+When the IdP's certificate is issued by a private CA and the organization inspects
+the browser's HTTPS to it, there is a third TLS connection: the Edge connects to the
+IdP on the browser's behalf. That connection trusts the public roots plus the
+organization's **Network & Apps → Internal site certificates**, not the connection's
+`ca_pem`. Add the IdP's issuing CA there as well (see
+[Trusting certificates for internal sites](pki.md#trusting-certificates-for-internal-sites)),
+wait for the change to reach the serving Edges, and test sign-in from an enrolled
+device's browser. A Console **Test** and a browser outside DSSE do not exercise this
+connection. An IdP with a publicly trusted certificate needs no such entry.
 
 The portal needs its own trusted certificate. In a generated deployment,
 `clientless/tls.crt` and `clientless/tls.key` supply that certificate when present.

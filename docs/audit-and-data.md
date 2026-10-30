@@ -47,11 +47,13 @@ failure preserves hot data and the pending journal. If no archive is configured,
 worker leaves aged hot rows in the local persistent database instead of deleting them.
 This is a supported local-only storage mode: budget disk capacity and backups for
 retained history. It does not provide S3 Object Lock or archived-chain verification.
-When an archive is configured but unavailable, local retention is a temporary buffer;
-monitor database capacity and the age of pending batches with operator-provided
-database/log monitoring. DSSE does not yet expose a complete archive backlog and
-last-success view in Console/API; this remains an acceptance gap for archive-enabled
-deployments. Repair archive availability and let the
+When an archive is configured but unavailable, local retention is a temporary buffer.
+The operator-only `GET /admin/archive-health` and the Console retention view show the
+latest failure class, rows due for archival and the oldest due time, alert-delivery
+backlog, and the last successful alert webhook delivery; see [Operations](operations.md).
+That last success is the webhook's, not the last successful S3 write. Monitor database
+capacity as well. A real S3 outage and recovery has not passed acceptance for this
+release. Repair archive availability and let the
 worker retry; do not delete the journal/fence or regenerate receipt IDs.
 
 ### Legacy installation reference

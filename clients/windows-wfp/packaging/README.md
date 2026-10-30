@@ -5,7 +5,7 @@ use the [Windows agent guide](../../../docs/windows-agent.md). This page is for 
 
 ## Prerequisites
 
-- Windows, Go 1.25 or newer, PowerShell, and a .NET SDK.
+- Windows, Go 1.27.3 (the release toolchain; `go.mod` requires at least 1.26.9 and selects 1.27.3 when the `go` command may download toolchains), PowerShell, and a .NET SDK.
 - WiX 7.0.0 (`dotnet tool install --global wix --version 7.0.0`) and the Windows SDK signing tools. The build scripts pass `-acceptEula wix7` to the WiX CLI. Review the [OSMF terms](https://docs.firegiant.com/wix/osmf/) before building; confirm the applicable revenue condition as part of release operations.
 - A driver matching the target architecture and accepted by the target's Windows security policy.
 - Your own signing identity for a distributed MSI. The `test` backend is for development only.

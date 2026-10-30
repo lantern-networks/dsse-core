@@ -49,8 +49,11 @@ This is a supported local-only storage mode: budget disk capacity and backups fo
 retained history. It does not provide S3 Object Lock or archived-chain verification.
 When an archive is configured but unavailable, local retention is a temporary buffer.
 The operator-only `GET /admin/archive-health` and the Console retention view show the
-latest failure class, rows due for archival and the oldest due time, alert-delivery
-backlog, and the last successful alert webhook delivery; see [Operations](operations.md).
+latest failure class, the number of rows due for archival, the alert-delivery backlog,
+and the last successful alert webhook delivery; see [Operations](operations.md). The
+Console also shows when the oldest of those rows was received (`oldest_at`); the API
+additionally returns when it became due for archival (`oldest_due_at`), which is later
+by the stream's retention period.
 That last success is the webhook's, not the last successful S3 write. Monitor database
 capacity as well. A real S3 outage and recovery has not passed acceptance for this
 release. Repair archive availability and let the

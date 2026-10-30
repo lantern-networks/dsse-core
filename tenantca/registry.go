@@ -1,6 +1,7 @@
 package tenantca
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
@@ -197,32 +198,37 @@ func ParseCACertsPEM(pemBytes []byte) ([]*x509.Certificate, error) {
 	return out, nil
 }
 
-// TenantForVerifiedChains resolves the owning tenant from mTLS-verified chains: the chain's trust anchor
-// (last element) is a registered Tenant CA → its tenant. Returns ("", false) when no chain anchors to a
-// registered tenant CA. Because the tenant is derived from the actual issuing CA, a cert from tenant A's
-// CA can never resolve to tenant B (cross-tenant admission is structurally impossible).
+// TenantForVerifiedChains resolves the owning tenant from mTLS-verified chains.
+// Every registered CA in every verified chain must name the same tenant; a
+// different owner on an intermediate or root makes the identity ambiguous.
+// Returns ("", false) when no registered CA is present or ownership conflicts.
 func (r *TenantCARegistry) TenantForVerifiedChains(chains [][]*x509.Certificate) (string, bool) {
 	if r == nil {
 		return "", false
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	resolved := ""
 	for _, chain := range chains {
 		if len(chain) == 0 {
 			continue
 		}
-		anchor := chain[len(chain)-1]
-		if tid, ok := r.byAnchorKey[CAAnchorKey(anchor)]; ok {
-			return tid, true
-		}
-		// Also tolerate registries that registered an intermediate present mid-chain.
 		for _, c := range chain {
+			if c == nil {
+				return "", false
+			}
 			if tid, ok := r.byAnchorKey[CAAnchorKey(c)]; ok {
-				return tid, true
+				// A verified chain may contain both a registered intermediate
+				// and a registered root. If different organizations claim them,
+				// neither one is an unambiguous device identity.
+				if resolved != "" && resolved != tid {
+					return "", false
+				}
+				resolved = tid
 			}
 		}
 	}
-	return "", false
+	return resolved, resolved != ""
 }
 
 // Register adds (or re-points) a tenant's CA at RUNTIME and returns the anchors it added.
@@ -255,7 +261,7 @@ func (r *TenantCARegistry) Register(tenantID string, pemBytes []byte) ([]*x509.C
 		if _, pending := r.pendingWithdrawals[CAAnchorKey(c)]; pending {
 			return nil, fmt.Errorf("CA withdrawal is pending; finish saving the withdrawal before registering it again")
 		}
-		if owner, ok := r.byAnchorKey[CAAnchorKey(c)]; ok && !strings.EqualFold(owner, tenantID) {
+		if owner, ok := r.byAnchorKey[CAAnchorKey(c)]; ok && owner != tenantID {
 			return nil, fmt.Errorf("that CA already identifies tenant %q; a CA cannot be moved to another "+
 				"organization, because every device already holding a certificate under it would move with it", owner)
 		}
@@ -295,14 +301,14 @@ func (r *TenantCARegistry) Withdraw(tenantID string) int {
 	kept := make([]*x509.Certificate, 0, len(r.anchors))
 	for _, c := range r.anchors {
 		key := CAAnchorKey(c)
-		if strings.EqualFold(r.byAnchorKey[key], tenantID) {
+		if r.byAnchorKey[key] == tenantID {
 			delete(r.byAnchorKey, key)
 			removed++
 			continue
 		}
 		kept = append(kept, c)
 	}
-	delete(r.materialManaged, strings.ToLower(tenantID))
+	delete(r.materialManaged, tenantID)
 	r.anchors = kept
 	// The pool cannot have a certificate removed, so it is rebuilt from what remains. A withdrawn CA that
 	// stayed trusted would keep admitting the devices this call exists to stop admitting.
@@ -447,6 +453,47 @@ func (r *TenantCARegistry) Adopt(data []byte) (int, error) {
 	return r.adoptExcept(data, nil)
 }
 
+// parseSharedAnchors checks the whole remotely supplied admission set before a
+// caller changes its live registry. Remote material-managed ownership is local
+// state and is deliberately not adopted from this document.
+func parseSharedAnchors(data []byte) ([]AnchorRegistration, error) {
+	var doc TenantCARegistryFile
+	if err := json.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.PendingWithdrawals) != 0 {
+		return nil, ErrPendingWithdrawal
+	}
+	if doc.Tenants == nil {
+		return nil, fmt.Errorf("shared tenant CA snapshot has no tenants array")
+	}
+	checked := NewTenantCARegistry()
+	for i, entry := range doc.Tenants {
+		if strings.TrimSpace(entry.CAPEM) == "" {
+			return nil, fmt.Errorf("shared tenant CA snapshot entry %d has no inline ca_pem", i)
+		}
+		// A shared snapshot is emitted as certificate-only PEM. ParseCACertsPEM
+		// intentionally finds certificates in a mixed local file, but accepting
+		// a valid certificate followed by broken or secret material here would
+		// silently turn a damaged authoritative row into a partial one.
+		rest := bytes.TrimSpace([]byte(entry.CAPEM))
+		for len(rest) > 0 {
+			if !bytes.HasPrefix(rest, []byte("-----BEGIN CERTIFICATE-----")) {
+				return nil, fmt.Errorf("shared tenant CA snapshot entry %d contains non-certificate PEM material", i)
+			}
+			block, tail := pem.Decode(rest)
+			if block == nil || block.Type != "CERTIFICATE" {
+				return nil, fmt.Errorf("shared tenant CA snapshot entry %d contains malformed certificate PEM", i)
+			}
+			rest = bytes.TrimSpace(tail)
+		}
+		if _, err := checked.Register(entry.TenantID, []byte(entry.CAPEM)); err != nil {
+			return nil, fmt.Errorf("shared tenant CA snapshot entry %d: %w", i, err)
+		}
+	}
+	return checked.AnchorsByTenant(), nil
+}
+
 func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, error) {
 	if r == nil {
 		return 0, fmt.Errorf("tenant CA registry is not configured")
@@ -454,12 +501,9 @@ func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, e
 	if len(data) == 0 {
 		return 0, nil
 	}
-	var doc TenantCARegistryFile
-	if err := json.Unmarshal(data, &doc); err != nil {
+	anchors, err := parseSharedAnchors(data)
+	if err != nil {
 		return 0, err
-	}
-	if len(doc.PendingWithdrawals) != 0 {
-		return 0, ErrPendingWithdrawal
 	}
 	skip := map[string]bool{}
 	for _, h := range skipSHA256 {
@@ -467,29 +511,34 @@ func (r *TenantCARegistry) adoptExcept(data []byte, skipSHA256 []string) (int, e
 			skip[h] = true
 		}
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, anchor := range anchors {
+		key := CAAnchorKey(anchor.Cert)
+		if owner, known := r.byAnchorKey[key]; known && owner != anchor.TenantID {
+			return 0, fmt.Errorf("shared tenant CA snapshot assigns an existing CA of tenant %q to tenant %q", owner, anchor.TenantID)
+		}
+	}
+	if r.byAnchorKey == nil {
+		r.byAnchorKey = map[string]string{}
+	}
+	if r.Pool == nil {
+		r.Pool = x509.NewCertPool()
+	}
 	added := 0
-	for _, e := range doc.Tenants {
-		tenantID := strings.TrimSpace(e.TenantID)
-		if tenantID == "" || strings.TrimSpace(e.CAPEM) == "" {
-			continue
+	for _, anchor := range anchors {
+		key := CAAnchorKey(anchor.Cert)
+		if skip[key] || r.pendingWithdrawals[key] != "" || r.byAnchorKey[key] != "" {
+			continue // a locally withdrawn anchor must not be restored from a stale shared view
 		}
-		certs, err := ParseCACertsPEM([]byte(e.CAPEM))
-		if err != nil || len(certs) == 0 {
-			continue
-		}
-		if sum := sha256.Sum256(certs[0].Raw); skip[hex.EncodeToString(sum[:])] {
-			continue // this node has just withdrawn it; the shared view is behind, not right
-		}
-		r.mu.RLock()
-		_, pending := r.pendingWithdrawals[CAAnchorKey(certs[0])]
-		_, known := r.byAnchorKey[CAAnchorKey(certs[0])]
-		r.mu.RUnlock()
-		if known || pending {
-			continue
-		}
-		if _, rerr := r.Register(tenantID, []byte(e.CAPEM)); rerr == nil {
-			added++
-		}
+		r.byAnchorKey[key] = anchor.TenantID
+		r.anchors = append(r.anchors, anchor.Cert)
+		r.Pool.AddCert(anchor.Cert)
+		added++
+	}
+	if added > 0 {
+		r.TenantCount = r.tenantCountLocked()
+		r.generation += uint64(added)
 	}
 	return added, nil
 }
@@ -555,50 +604,58 @@ func (r *TenantCARegistry) Reconcile(data []byte) (added, removed int, err error
 	if len(data) == 0 {
 		return 0, 0, nil
 	}
-	var doc TenantCARegistryFile
-	if err := json.Unmarshal(data, &doc); err != nil {
+	anchors, err := parseSharedAnchors(data)
+	if err != nil {
 		return 0, 0, err
 	}
-	if len(doc.PendingWithdrawals) != 0 {
-		return 0, 0, ErrPendingWithdrawal
-	}
-	fleet := map[string]bool{}
-	for _, e := range doc.Tenants {
-		certs, perr := ParseCACertsPEM([]byte(e.CAPEM))
-		if perr != nil || len(certs) == 0 {
-			continue
-		}
-		sum := sha256.Sum256(certs[0].Raw)
-		fleet[hex.EncodeToString(sum[:])] = true
+	fleet := map[string]string{}
+	for _, anchor := range anchors {
+		fleet[CAAnchorKey(anchor.Cert)] = anchor.TenantID
 	}
 	if len(fleet) == 0 {
-		// An empty or unparsable shared view is not an instruction to forget everything.
+		// An explicitly empty shared view is not an instruction to forget everything.
 		return 0, 0, nil
 	}
-	type gone struct {
-		tenant string
-		sha    string
-	}
-	drop := []gone{}
-	r.mu.RLock()
-	for _, c := range r.anchors {
-		sum := sha256.Sum256(c.Raw)
-		h := hex.EncodeToString(sum[:])
-		if !fleet[h] {
-			drop = append(drop, gone{tenant: r.byAnchorKey[CAAnchorKey(c)], sha: h})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for key, tenant := range fleet {
+		if owner, known := r.byAnchorKey[key]; known && owner != tenant {
+			return 0, 0, fmt.Errorf("shared tenant CA snapshot assigns an existing CA of tenant %q to tenant %q", owner, tenant)
 		}
 	}
-	r.mu.RUnlock()
-	for _, g := range drop {
-		if g.tenant == "" {
+	kept := make([]*x509.Certificate, 0, len(anchors))
+	for _, cert := range r.anchors {
+		key := CAAnchorKey(cert)
+		if _, present := fleet[key]; !present {
+			delete(r.byAnchorKey, key)
+			removed++
 			continue
 		}
-		if ok, _ := r.WithdrawAnchor(g.tenant, g.sha); ok {
-			removed++
-		}
+		kept = append(kept, cert)
 	}
-	added, err = r.Adopt(data)
-	return added, removed, err
+	for _, anchor := range anchors {
+		key := CAAnchorKey(anchor.Cert)
+		if r.byAnchorKey[key] != "" || r.pendingWithdrawals[key] != "" {
+			continue
+		}
+		if r.byAnchorKey == nil {
+			r.byAnchorKey = map[string]string{}
+		}
+		r.byAnchorKey[key] = anchor.TenantID
+		kept = append(kept, anchor.Cert)
+		added++
+	}
+	if added+removed > 0 {
+		pool := x509.NewCertPool()
+		for _, cert := range kept {
+			pool.AddCert(cert)
+		}
+		r.Pool = pool
+		r.anchors = kept
+		r.TenantCount = r.tenantCountLocked()
+		r.generation += uint64(added + removed)
+	}
+	return added, removed, nil
 }
 
 // ReconcileFrom is Reconcile against a shared backend.
@@ -715,7 +772,7 @@ func (r *TenantCARegistry) WithdrawAnchor(tenantID, sha256Hex string) (removed b
 	kept := make([]*x509.Certificate, 0, len(r.anchors))
 	for _, c := range r.anchors {
 		key := CAAnchorKey(c)
-		if strings.EqualFold(r.byAnchorKey[key], tenantID) && strings.EqualFold(key, want) {
+		if r.byAnchorKey[key] == tenantID && strings.EqualFold(key, want) {
 			delete(r.byAnchorKey, key)
 			removed = true
 			continue
@@ -733,7 +790,7 @@ func (r *TenantCARegistry) WithdrawAnchor(tenantID, sha256Hex string) (removed b
 	r.TenantCount = r.tenantCountLocked()
 	r.generation++
 	for _, owner := range r.byAnchorKey {
-		if strings.EqualFold(owner, tenantID) {
+		if owner == tenantID {
 			remaining++
 		}
 	}

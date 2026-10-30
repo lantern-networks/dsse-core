@@ -29,6 +29,13 @@ public protocol DsseRuntimeCopyTunnelStream: AnyObject, Sendable {
     func send(_ data: Data, completion: @escaping @Sendable (Error?) -> Void)
     func receive(completion: @escaping @Sendable (Data?, Error?) -> Void)
     func close()
+    // Only an authenticated STEPUP frame may suspend ordinary idle cleanup.
+    // Implementations must bound this state to the Portal request lifetime.
+    var authenticationWaitPending: Bool { get }
+}
+
+extension DsseRuntimeCopyTunnelStream {
+    public var authenticationWaitPending: Bool { false }
 }
 
 // Opens the tunnel for a flow given its routing metadata.
@@ -172,6 +179,18 @@ public final class DsseRuntimeCopyTunnel: DsseRuntimeCopyTunnelStream, @unchecke
         return Data(lines.joined(separator: "\r\n").utf8)
     }
 
+    // Parse only the protocol and the first status token. A response such as
+    // "HTTP/1.1 502 Retry after 200 seconds" must not open a tunnel.
+    static func handshakeStatusCode(_ header: Data) -> Int? {
+        guard let firstLine = String(data: header, encoding: .utf8)?
+            .split(separator: "\r\n", omittingEmptySubsequences: true).first else { return nil }
+        let parts = firstLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 2, parts[0] == "HTTP/1.1" || parts[0] == "HTTP/1.0",
+              parts[1].utf8.count == 3,
+              parts[1].utf8.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
+        return Int(parts[1])
+    }
+
     // Reads the HTTP response headers, verifies a 2xx status, and buffers any
     // bytes that arrive after the header terminator as the first tunnel payload.
     private func readHandshakeResponse(
@@ -182,12 +201,10 @@ public final class DsseRuntimeCopyTunnel: DsseRuntimeCopyTunnelStream, @unchecke
         if let range = accumulated.range(of: terminator) {
             let header = accumulated.subdata(in: accumulated.startIndex..<range.lowerBound)
             let leftover = accumulated.subdata(in: range.upperBound..<accumulated.endIndex)
-            guard let statusLine = String(data: header, encoding: .utf8)?
-                .split(separator: "\r\n", omittingEmptySubsequences: true).first,
-                  statusLine.contains(" 200 ") || statusLine.hasSuffix(" 200") else {
-                let firstLine = String(data: header, encoding: .utf8)?
-                    .split(separator: "\r\n", omittingEmptySubsequences: true).first.map(String.init) ?? "unparseable"
-                dsseRuntimeLog("runtime_copy_tunnel handshake_failed reason=non_200_status status_line=\(firstLine)")
+            guard Self.handshakeStatusCode(header) == 200 else {
+                // A peer controls the status line; it may echo request data. Log only a bounded numeric code.
+                let code = Self.handshakeStatusCode(header).map(String.init) ?? "unknown"
+                dsseRuntimeLog("runtime_copy_tunnel handshake_failed reason=non_200_status status_code=\(code)")
                 completion(.failure(DsseRuntimeCopyTunnelError.handshakeFailed("non_200_status")))
                 return
             }
@@ -205,7 +222,7 @@ public final class DsseRuntimeCopyTunnel: DsseRuntimeCopyTunnelStream, @unchecke
         connection.receive(minimumIncompleteLength: 1, maximumLength: 8 * 1024) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             if let error {
-                dsseRuntimeLog("runtime_copy_tunnel handshake_failed reason=transport_error error=\(error)")
+                dsseRuntimeLog("runtime_copy_tunnel handshake_failed reason=transport_error category=\(providerNonsecretNetworkFailureCategory(String(describing: error)))")
                 completion(.failure(DsseRuntimeCopyTunnelError.handshakeFailed("\(error)")))
                 return
             }
@@ -320,7 +337,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
            let parsed = TimeInterval(raw) {
             return parsed
         }
-        return 120
+        return DssePerformanceLimits.current.idleTimeoutSeconds
     }
 
     // LOAD-AWARE idle reaping (the robustness cure): each live flow parks a dedicated pump thread; a browser's
@@ -335,7 +352,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
     }
     static var highLoadIdleReapThreshold: TimeInterval {
         if let raw = ProcessInfo.processInfo.environment["DSSE_NE_HIGH_LOAD_IDLE_REAP_SECONDS"], let n = TimeInterval(raw) { return n }
-        return 20
+        return 0
     }
 
     // Grace after the upstream (request) direction half-closes, for the downstream (response) direction to drain
@@ -408,7 +425,16 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
         timer.resume()
     }
 
-    private func reapIfIdle() {
+    private func deferIdleCloseForAuthentication() -> Bool {
+        guard tunnel.authenticationWaitPending else { return false }
+        // Waiting for a human is activity, even without application bytes. Keep
+        // the normal idle budget after completion instead of closing immediately.
+        touchActivity()
+        return true
+    }
+
+    func reapIfIdle() {
+        if deferIdleCloseForAuthentication() { return }
         lock.lock()
         if finished {
             lock.unlock()
@@ -419,7 +445,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
         // Load-aware: under a high concurrent-flow count reap idle flows sooner to bound the per-idle-flow thread
         // accumulation; at normal load keep the full window so keep-alive reuse / SSE heartbeats are not broken.
         var threshold = idleReapThreshold
-        if liveGuard.activeCount >= Self.highLoadFlowWatermark {
+        if Self.highLoadIdleReapThreshold > 0 && liveGuard.activeCount >= Self.highLoadFlowWatermark {
             threshold = min(idleReapThreshold, Self.highLoadIdleReapThreshold)
         }
         if idleFor >= threshold {
@@ -469,6 +495,10 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
         let grace = max(1.0, DsseLiveRuntimeCopyTunnelLoop.upstreamEOFDrainGrace)
         idleReapQueue.asyncAfter(deadline: .now() + grace) { [weak self] in
             guard let self, !self.isFinished else { return }
+            if self.deferIdleCloseForAuthentication() {
+                self.scheduleUpstreamEOFDrainFinish()
+                return
+            }
             self.lock.lock()
             let idleFor = Date().timeIntervalSince(self.lastActivityAt)
             self.lock.unlock()
@@ -513,7 +543,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
         while true {
             let (data, readError) = blockingFlowRead()
             if let readError {
-                dsseFlowDiagLogger.error("leg=flow_read fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) err=\(String(describing: readError), privacy: .public)")
+                dsseFlowDiagLogger.error("leg=flow_read fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) category=\(providerNonsecretNetworkFailureCategory(String(describing: readError)), privacy: .public)")
                 handleUpstreamEnd("readerr:\(readError)")
                 return
             }
@@ -556,7 +586,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
             lock.lock(); bytesUp += data.count; lock.unlock()
             emitProgress(.upstreamReadCompleted(bytes: data.count))
             if let sendError = blockingTunnelSend(data) {
-                dsseFlowDiagLogger.error("leg=tunnel_send fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) err=\(String(describing: sendError), privacy: .public)")
+                dsseFlowDiagLogger.error("leg=tunnel_send fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) category=\(providerNonsecretNetworkFailureCategory(String(describing: sendError)), privacy: .public)")
                 finishReason("up_senderr:\(sendError)")
                 finish(.failure(sendError))
                 return
@@ -570,7 +600,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
         while true {
             let (data, receiveError) = blockingTunnelReceive()
             if let receiveError {
-                dsseFlowDiagLogger.error("leg=tunnel_receive fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) err=\(String(describing: receiveError), privacy: .public)")
+                dsseFlowDiagLogger.error("leg=tunnel_receive fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) category=\(providerNonsecretNetworkFailureCategory(String(describing: receiveError)), privacy: .public)")
                 finishReason("down_recverr:\(receiveError)")
                 finish(.failure(receiveError))
                 return
@@ -587,7 +617,7 @@ final class DsseLiveRuntimeCopyTunnelLoop: @unchecked Sendable {
             lock.lock(); bytesDown += data.count; lock.unlock()
             emitProgress(.downstreamWriteStarted)
             if let writeError = blockingFlowWrite(data) {
-                dsseFlowDiagLogger.error("leg=flow_write fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) err=\(String(describing: writeError), privacy: .public)")
+                dsseFlowDiagLogger.error("leg=flow_write fail req=\(self.requestID, privacy: .public) up=\(self.bytesUp) down=\(self.bytesDown) category=\(providerNonsecretNetworkFailureCategory(String(describing: writeError)), privacy: .public)")
                 finishReason("down_writeerr:\(writeError)")
                 finish(.failure(writeError))
                 return

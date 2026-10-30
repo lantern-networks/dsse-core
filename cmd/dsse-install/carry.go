@@ -92,6 +92,14 @@ func carryDeploymentFor(dir, dest string, shape machineShape, region string, pla
 	// ★ AND WHAT THIS PROGRAM READS ON THAT MACHINE. See installerReadsFromDeploymentDir: without root.crt a
 	// carried machine reads as an EMPTY directory, and -region refuses it as the second deployment it is not.
 	for _, f := range installerReadsFromDeploymentDir {
+		// Legacy deployments created without -plan have no install-plan.json.
+		// Carry it when present, but do not turn that optional input into a
+		// requirement for the older, plan-free installation path.
+		if f == installPlanFile {
+			if _, statErr := os.Lstat(filepath.Join(dir, f)); os.IsNotExist(statErr) {
+				continue
+			}
+		}
 		needed[f] = true
 	}
 
@@ -100,6 +108,12 @@ func carryDeploymentFor(dir, dest string, shape machineShape, region string, pla
 		return nil, nil, oerr
 	}
 	defer out.Close()
+	defer func() {
+		if err != nil {
+			_ = out.Close()
+			_ = os.Remove(dest)
+		}
+	}()
 	gz := gzip.NewWriter(out)
 	tw := tar.NewWriter(gz)
 
@@ -121,7 +135,32 @@ func carryDeploymentFor(dir, dest string, shape machineShape, region string, pla
 		}
 	}
 
+	if len(planValues) > 0 && shape.holds.holdsState() {
+		material, err := runtimeTransportMaterialFor(dir, planValues, time.Now().UTC())
+		if err != nil {
+			return nil, nil, err
+		}
+		for name, body := range material {
+			replaced[name] = string(body)
+		}
+	}
+
+	if _, e := os.Stat(filepath.Join(dir, authCensusFile)); e == nil && planValues["DSSE_NODE_NAME"] != "" {
+		for _, role := range []string{"cp", "edge"} {
+			if (role == "cp" && !shape.holdsAControlPlane()) || (role == "edge" && !shape.runsEdges()) {
+				continue
+			}
+			material, err := authRolloutMaterialFor(dir, planValues["DSSE_NODE_NAME"], role)
+			if err != nil {
+				return nil, nil, err
+			}
+			for name, body := range material {
+				replaced[name] = string(body)
+			}
+		}
+	}
 	carried, withheld = []string{}, []string{}
+	seen := map[string]bool{}
 	walkErr := filepath.WalkDir(dir, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			return werr
@@ -156,6 +195,7 @@ func carryDeploymentFor(dir, dest string, shape machineShape, region string, pla
 		// exists to end.
 		if d.IsDir() {
 			if underNeeded(needed, rel) || leadsToNeeded(needed, rel) {
+				seen[filepath.ToSlash(rel)] = true
 				return writeTarDir(tw, d, rel)
 			}
 			return filepath.SkipDir
@@ -169,7 +209,7 @@ func carryDeploymentFor(dir, dest string, shape machineShape, region string, pla
 			return ierr
 		}
 		if !info.Mode().IsRegular() {
-			return nil
+			return fmt.Errorf("required carry material %s is not a regular file", rel)
 		}
 		content, has := replaced[filepath.ToSlash(rel)]
 		var data []byte
@@ -195,15 +235,24 @@ func carryDeploymentFor(dir, dest string, shape machineShape, region string, pla
 			return err
 		}
 		carried = append(carried, filepath.ToSlash(rel))
+		seen[filepath.ToSlash(rel)] = true
 		return nil
 	})
 	if walkErr != nil {
 		return nil, nil, walkErr
 	}
+	for name := range needed {
+		if !seen[filepath.ToSlash(name)] {
+			return nil, nil, fmt.Errorf("required carry material %s is missing", name)
+		}
+	}
 	if cerr := tw.Close(); cerr != nil {
 		return nil, nil, cerr
 	}
 	if cerr := gz.Close(); cerr != nil {
+		return nil, nil, cerr
+	}
+	if cerr := out.Close(); cerr != nil {
 		return nil, nil, cerr
 	}
 	// The credentials that were dropped OUT OF deployment.env are withheld too, and they are the ones that

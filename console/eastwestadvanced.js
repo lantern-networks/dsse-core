@@ -90,7 +90,17 @@ async function adoptFlowIntoRule(o, section) {
     //    editable object. Dedup by address. When creating a NEW one, let the operator NAME it (default = the
     //    address). Track whether WE created it, so canceling the editor can undo it — nothing left behind unless
     //    a rule is actually saved.
-    let endpointId = "", createdEndpoint = false;
+    let endpointId = "", createdEndpoint = false, cleanupStarted = false;
+    async function cleanupCreatedEndpoint() {
+      if (!createdEndpoint || cleanupStarted) return;
+      cleanupStarted = true;
+      try {
+        const r = await apiFetch("DELETE", "/admin/assets/endpoints/" + encodeURIComponent(endpointId));
+        if (!r || !r.ok || !r.body || r.body.status !== "deleted" || r.body.id !== endpointId) throw new Error("unconfirmed");
+      } catch (_) {
+        uiToast(bl({ en: "Could not confirm removal of the new destination endpoint. Check the endpoint catalog before adopting again.", ja: "新しい宛先エンドポイントの削除を確認できません。再度ルール化する前にエンドポイント一覧を確認してください。" }), "err");
+      }
+    }
     const eps = await loadList("/admin/assets/endpoints");
     const existingEp = (eps || []).find((e) => e.kind === "network" && (e.address || "").toLowerCase() === (o.destination || "").toLowerCase());
     if (existingEp) endpointId = existingEp.id;
@@ -118,6 +128,6 @@ async function adoptFlowIntoRule(o, section) {
       action: { access: "allow", inspection: "inspect" },
       stage: "enforce",
       direction: "outbound",
-    }, () => { if (createdEndpoint) apiFetch("DELETE", "/admin/assets/endpoints/" + encodeURIComponent(endpointId)).catch(() => {}); });
+    }, cleanupCreatedEndpoint);
   } catch (e) { uiToast(String(e), "err"); }
 }

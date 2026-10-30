@@ -47,19 +47,20 @@ var OnPersistError func(error)
 func (store *Store) SetPersister(p blobstore.Persister) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.persister = p
 	if p == nil {
+		store.persister = nil
 		return nil
 	}
 	data, err := p.Load()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if data == nil {
+		store.persister = p
 		return nil
 	}
-	var snap registryPersistSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	snap, err := decodeRegistrySnapshot(data)
+	if err != nil {
 		return err
 	}
 	fresh := make(map[string]model.NonHumanIdentity, len(snap.Identities))
@@ -76,6 +77,7 @@ func (store *Store) SetPersister(p blobstore.Persister) error {
 		fresh[key] = identity
 	}
 	store.identities = fresh
+	store.persister = p
 	return nil
 }
 
@@ -180,7 +182,7 @@ func (store *Store) Upsert(_ context.Context, identity model.NonHumanIdentity, t
 	}
 	store.identities = candidate
 	store.generation++
-	return normalized, nil
+	return copyIdentity(normalized), nil
 }
 
 // ConfigGeneration returns the monotonic NHI-registry config version (bumped on each Upsert). A config-bundle
@@ -197,7 +199,7 @@ func (store *Store) List(_ context.Context, tenantID string) ([]model.NonHumanId
 	items := []model.NonHumanIdentity{}
 	for _, identity := range store.identities {
 		if identity.TenantID == tenantID {
-			items = append(items, identity)
+			items = append(items, copyIdentity(identity))
 		}
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -402,6 +404,7 @@ func StatusForReferenceError(err error) int {
 }
 
 func Normalize(identity model.NonHumanIdentity, tenantID string, _ time.Time) (model.NonHumanIdentity, error) {
+	identity = copyIdentity(identity)
 	identity.ID = strings.TrimSpace(identity.ID)
 	identity.TenantID = strings.TrimSpace(identity.TenantID)
 	if identity.ID == "" {

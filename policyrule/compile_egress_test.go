@@ -43,7 +43,7 @@ func TestCompileEgressPolicies(t *testing.T) {
 	}
 	rules := []Rule{
 		{ID: "r1", Plane: PlaneEgress, Status: StatusActive, Priority: 10, Source: []string{"grp-macs"}, Destination: []string{"ep-bad"}, Action: Action{Access: AccessDeny, Inspection: InspectionInspect}},
-		{ID: "r2", Plane: PlaneEgress, Status: StatusActive, Priority: 20, Source: []string{"grp-macs"}, Destination: []string{"ep-bad"}, Action: Action{Access: AccessAuthenticate, RequiredIdPID: "idp_okta", MinACR: "phr", RequiredAMR: []string{"fido"}, MaxAgeSeconds: 900}},
+		{ID: "r2", Plane: PlaneEgress, Status: StatusActive, Priority: 20, Source: []string{"grp-macs"}, Destination: []string{"ep-bad"}, Action: Action{Access: AccessAuthenticate, RequiredIdPID: "idp_okta", MinACR: "phr", RequiredAMR: []string{"fido"}, MaxAgeSeconds: authMaxAgeForTest(900), GrantTTLSeconds: 300}},
 		{ID: "r3", Plane: PlaneEastWest, Direction: DirectionOutbound, Status: StatusActive, Source: []string{"grp-macs"}, Destination: []string{"ep-bad"}, Action: Action{Access: AccessAllow}}, // wrong plane -> skipped
 	}
 	got := CompileEgressPolicies("acme", rules, resolver)
@@ -64,7 +64,7 @@ func TestCompileEgressPolicies(t *testing.T) {
 		}
 		if p.Action.Decision == "require_reauthentication" && p.Conditions["sni"] == "evil.example.com" {
 			authSni = true
-			if p.Metadata["required_idp_id"] != "idp_okta" || p.Metadata["min_acr"] != "phr" || p.Metadata["required_amr"] != "fido" || p.Metadata["max_age_seconds"] != 900 {
+			if p.Metadata["required_idp_id"] != "idp_okta" || p.Metadata["min_acr"] != "phr" || p.Metadata["required_amr"] != "fido" || p.Metadata["max_age_seconds"] != 900 || p.Metadata["grant_ttl_seconds"] != 300 {
 				t.Fatalf("authenticate metadata = %#v, want idp_okta/phr/fido/900", p.Metadata)
 			}
 		}

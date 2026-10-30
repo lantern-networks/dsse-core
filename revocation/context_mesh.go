@@ -39,16 +39,10 @@ func (a *AdmissionRevocations) receiveMeshContext(ctx context.Context, identity,
 			if err != nil {
 				return nil, err
 			}
-		} else if a.generation.Load() != 0 && !a.meshInitialPending {
+		} else if a.generation.Load() != 0 && !a.meshInitialPending && !a.originInitialPending {
 			return nil, ErrAdmissionLoad
 		}
-		// Received mesh blocks are monotonic; keep locally retained deliveries
-		// whose earlier shared commit was unconfirmed. Origin blocks stay latest-row owned.
-		for key, value := range a.meshReceived {
-			if _, ok := candidate.MeshReceived[key]; !ok {
-				candidate.MeshReceived[key] = value
-			}
-		}
+		a.mergePendingAdmissionBlocks(&candidate)
 		initial = raw == nil
 		candidate.MeshReceived[id] = reason
 		edited = true
@@ -66,9 +60,18 @@ func (a *AdmissionRevocations) receiveMeshContext(ctx context.Context, identity,
 			a.generation.Add(1)
 		}
 		a.revoked, a.meshReceived = candidate.Revoked, candidate.MeshReceived
+		a.originPending = nil
+		a.originInitialPending = false
+		a.meshPending = nil
 	} else if changed {
 		a.meshReceived[id] = reason
 		a.generation.Add(1)
+	}
+	if err != nil && edited {
+		if a.meshPending == nil {
+			a.meshPending = map[string]string{}
+		}
+		a.meshPending[id] = reason
 	}
 	onRevoked := a.onRevoked
 	a.mu.Unlock()

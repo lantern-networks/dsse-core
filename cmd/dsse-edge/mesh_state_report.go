@@ -32,8 +32,10 @@ var (
 // list — "none" is the answer that has to be sayable.
 func setMeshState(peerRegions []string, eligibleHosts int, live func(region string) bool) {
 	regions := make([]string, 0, len(peerRegions))
+	seen := map[string]bool{}
 	for _, r := range peerRegions {
-		if r = strings.ToLower(strings.TrimSpace(r)); r != "" {
+		if r = strings.ToLower(strings.TrimSpace(r)); r != "" && !seen[r] {
+			seen[r] = true
 			regions = append(regions, r)
 		}
 	}

@@ -29,8 +29,6 @@
 const _ENROL_PLANE = "control";
 let _enrolSearch = "";
 let _enrolMaxLifetimeHours = 720;
-// principal id -> email, for tokens issued before the approver's name was recorded with them.
-let _enrolAdminLabels = {};
 
 // Who approved this device, in a form a person can act on.
 //
@@ -121,8 +119,9 @@ function enrolTimeLeft(expiresAt) {
 async function renderEnrolTokenList(host) {
   uiState(host, "loading");
   const current = freshRender(host);
-  // Fetched alongside the tokens so a name can be shown for approvals recorded before the label was stored.
-  _enrolAdminLabels = await loadAdminLabels();
+  // Keep the fallback name lookup with this render. An older tenant's slow admin response must not
+  // replace a newer tenant's names while its token list is still in flight.
+  const adminLabels = await loadAdminLabels();
   let body;
   try {
     const r = await apiFetch("GET", "/admin/enrolment-tokens", undefined, _ENROL_PLANE);
@@ -219,7 +218,7 @@ async function renderEnrolTokenList(host) {
         t.group ? el("div", { class: "ui-view-desc", text: bl({ en: "group " + t.group, ja: "グループ " + t.group }) }) : el("span", {})]),
       el("td", {}, uiBadge(state.label, state.tone)),
       el("td", {}, outcome),
-      el("td", { class: "ui-view-desc", text: approvedByLabel(t, _enrolAdminLabels) }),
+      el("td", { class: "ui-view-desc", text: approvedByLabel(t, adminLabels) }),
       el("td", { class: "ui-row-actions" }, actions),
     ]);
   });

@@ -84,8 +84,11 @@ func TestAnAllocationMayBeReducedBelowCurrentUse(t *testing.T) {
 func TestSeatsAreFreedByRemovingATenant(t *testing.T) {
 	s := NewStore()
 	s.Allocate(strictPool(1000), "tenant_a", 700, "adm_alice", "", now)
-	if !s.Remove("TENANT_A") {
-		t.Fatalf("removal must not be case-sensitive")
+	if s.Remove("TENANT_A") {
+		t.Fatal("a case-distinct tenant must not remove this allocation")
+	}
+	if !s.Remove(" tenant_a ") {
+		t.Fatalf("removal must match the exact trimmed tenant")
 	}
 	if s.Allocated() != 0 {
 		t.Fatalf("removing a tenant returns its seats: allocated %d", s.Allocated())

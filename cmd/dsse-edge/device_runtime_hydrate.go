@@ -144,6 +144,8 @@ func (s *endpointRuntimeStore) seedFromHistory(rows []map[string]any) int {
 				}
 			}
 		}
+		e.authAccounts = parseObservedAuthAccountRows(row["auth_accounts"])
+		e.authAccountOrder = parseObservedAuthAccountOrder(row["auth_account_order"], e.authAccounts)
 		if v, ok := row["disk_encryption_enabled"].(bool); ok {
 			e.posture.DiskEncryptionEnabled = &v
 		}

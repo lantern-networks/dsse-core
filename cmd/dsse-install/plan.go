@@ -20,9 +20,11 @@ package main
 // deployment does.
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -30,6 +32,15 @@ import (
 
 // Plan is the whole deployment, as decided before it exists.
 type Plan struct {
+	// DeploymentCRLOrigins are independent, unauthenticated HTTP origins that
+	// publish this deployment's signed CRLs. The issuer host must serve each
+	// origin before endpoint enrollment; omitted origins retain legacy material
+	// and fail the online-revocation release gate.
+	DeploymentCRLOrigins []string `json:"deployment_crl_origins,omitempty"`
+	// Profile selects a topology whose placement cannot be inferred from the number of regions.
+	// An absent profile retains the meaning of existing plans.
+	Profile            string `json:"profile,omitempty"`
+	SharedEntryMachine string `json:"shared_entry_machine,omitempty"`
 	// Deployment is the name everything hangs off: the planes, the per-region names, the node wildcard.
 	Deployment string `json:"deployment"`
 	// Names are any other names this deployment answers on. The first entry of the certificate is Deployment.
@@ -37,6 +48,16 @@ type Plan struct {
 	// Publisher is the signing identity that builds the agent packages this deployment's devices install.
 	// Without it the configuration this deployment publishes is one the endpoint installer refuses.
 	Publisher string `json:"agent_publisher,omitempty"`
+	// Images are operator inputs; omission retains the documented local build tags.
+	ServiceImage string `json:"service_image,omitempty"`
+	ConsoleImage string `json:"console_image,omitempty"`
+	// DataLayer selects one reviewed cohort for offline candidate installs.
+	// Omission retains the generated defaults until the public images are released.
+	DataLayer *PlanDataLayer `json:"data_layer,omitempty"`
+	Archive   *PlanArchive   `json:"archive,omitempty"`
+	// ImageRevision identifies the reviewed source used for both first-party images.
+	// Setup preflight requires it; generating an offline plan does not start services.
+	ImageRevision string `json:"image_revision,omitempty"`
 	// Mesh is whether the Edges of this deployment relay flows to each other's regions. A pointer, because
 	// the three states are different: absent means "this deployment did not say", true and false mean it did.
 	//
@@ -60,6 +81,38 @@ type Plan struct {
 	// A single-region deployment has nobody to relay to and gets no peers either way.
 	Mesh    *bool        `json:"mesh,omitempty"`
 	Regions []PlanRegion `json:"regions"`
+}
+
+// PlanDataLayer keeps the database image and its actual PostgreSQL major together.
+// All three immutable images must be supplied, so carried nodes cannot silently
+// mix the candidate database with the old init helper or consensus store.
+type PlanDataLayer struct {
+	EtcdImage          string `json:"etcd_image"`
+	PostgresImage      string `json:"postgres_image"`
+	PostgresToolsImage string `json:"postgres_tools_image"`
+	PostgresMajor      int    `json:"postgres_major"`
+}
+
+func immutableImageRef(ref string) bool {
+	if strings.TrimSpace(ref) != ref || strings.ContainsAny(ref, " \t\r\n") {
+		return false
+	}
+	name, digest, ok := strings.Cut(ref, "@sha256:")
+	if !ok || name == "" || len(digest) != 64 || strings.Contains(name, "@") {
+		return false
+	}
+	_, err := hex.DecodeString(digest)
+	return err == nil
+}
+
+// PlanArchive names storage operated outside DSSE. It contains no secret: static
+// credentials are entered once in the private deployment.env before carrying CPs.
+type PlanArchive struct {
+	Endpoint   string `json:"endpoint"` // TLS endpoint, host:port
+	Bucket     string `json:"bucket"`
+	Region     string `json:"region,omitempty"`
+	AuthMode   string `json:"auth_mode"`   // static or iam
+	WebhookURL string `json:"webhook_url"` // HTTPS receiver; signing secret stays in deployment.env
 }
 
 // HasMesh is whether this deployment relays between its regions: what it said, or — when it said nothing —
@@ -102,6 +155,9 @@ func (p *Plan) MeshPeersFor(region string) string {
 // PlanRegion is one site.
 type PlanRegion struct {
 	ID string `json:"id"`
+	// Entry is an optional legacy external TCP entry. Without it, the three Node doors are
+	// independent agent endpoints; the installer does not provision a load balancer.
+	Entry *PlanEntry `json:"entry,omitempty"`
 	// Founding marks the region whose machine MINTS the deployment. Exactly one, and it is where the
 	// consensus store lives; every other region joins it.
 	Founding bool `json:"founding,omitempty"`
@@ -111,9 +167,22 @@ type PlanRegion struct {
 	Machines   []PlanMachine `json:"machines"`
 }
 
+type PlanEntry struct {
+	Mode              string   `json:"mode"`
+	Targets           []string `json:"targets"`
+	PreservesClientIP bool     `json:"preserves_client_ip"`
+}
+
 // PlanMachine is one host, and what it runs.
 type PlanMachine struct {
 	Name string `json:"name"`
+	// Portal is the public, node-specific TLS name for OIDC start and callback.
+	// Unlike the shared region entry, it must reach this Node's own Edge.
+	// Dedicated multi-edge profiles instead derive one common Portal per Region;
+	// an explicit value in that profile must equal the derived shared name.
+	Portal string `json:"portal,omitempty"`
+	// FailureDomain identifies an independently failing place, not a DSSE Region.
+	FailureDomain string `json:"failure_domain,omitempty"`
 	// Holds is what this machine runs: "control-plane", "edges", or both.
 	//
 	// ★★★ ONE MACHINE MAY HOLD BOTH, AND THE SMALLEST REDUNDANT DEPLOYMENT REQUIRES IT (2026-08-31). This was
@@ -129,8 +198,8 @@ type PlanMachine struct {
 	//
 	// A bare string is still accepted, so plans written before this keep working and keep their meaning.
 	Holds heldComponents `json:"holds"`
-	// Addresses are the host addresses its front doors bind, in order. A doorway is a PAIR and every mouth is
-	// 443, so two addresses are needed — a host has one 443 per address.
+	// Addresses are the host addresses its front door binds, in order. A Node
+	// needs at least one address; one TCP doorway carries the planes by SNI.
 	Addresses []string `json:"addresses"`
 	// Reachable is the name the OTHER regions reach this machine by, and it is what TLS verifies.
 	Reachable string `json:"reachable,omitempty"`
@@ -173,6 +242,40 @@ func LoadPlan(path string) (*Plan, error) {
 // Validate refuses what cannot work, naming what to fix. Every rule here is a failure this deployment has
 // actually had.
 func (p *Plan) Validate() error {
+	if d := p.DataLayer; d != nil {
+		if d.PostgresMajor != 18 {
+			return fmt.Errorf("data_layer postgres_major must be 18 for this release candidate")
+		}
+		for _, image := range [][2]string{
+			{"etcd_image", d.EtcdImage}, {"postgres_image", d.PostgresImage},
+			{"postgres_tools_image", d.PostgresToolsImage},
+		} {
+			if !immutableImageRef(image[1]) {
+				return fmt.Errorf("data_layer %s must be an immutable image@sha256: reference", image[0])
+			}
+		}
+	}
+	if a := p.Archive; a != nil {
+		if strings.TrimSpace(a.Endpoint) == "" || strings.TrimSpace(a.Bucket) == "" {
+			return fmt.Errorf("archive requires an external endpoint and bucket")
+		}
+		if strings.Contains(a.Endpoint, "://") {
+			return fmt.Errorf("archive endpoint must be a host:port, with TLS implicit")
+		}
+		if _, _, err := net.SplitHostPort(a.Endpoint); err != nil {
+			return fmt.Errorf("archive endpoint must be a host:port: %w", err)
+		}
+		if a.AuthMode != "static" && a.AuthMode != "iam" {
+			return fmt.Errorf("archive auth_mode must be static or iam")
+		}
+		webhook, err := url.Parse(a.WebhookURL)
+		if err != nil || webhook.Scheme != "https" || webhook.Hostname() == "" || webhook.User != nil || webhook.Fragment != "" || webhook.RawQuery != "" {
+			return fmt.Errorf("archive webhook_url must be an HTTPS URL without credentials, query, or fragment")
+		}
+	}
+	if p.Profile != "" && p.Profile != "one-region-three-nodes" && p.Profile != "three-regions-multi-edge" && !p.oneRegionMultiEdge() {
+		return fmt.Errorf("unknown deployment profile %q", p.Profile)
+	}
 	if strings.TrimSpace(p.Deployment) == "" {
 		return fmt.Errorf("the plan names no deployment — it is what every plane name and every per-region name hangs off")
 	}
@@ -183,9 +286,18 @@ func (p *Plan) Validate() error {
 	if len(p.Regions) == 0 {
 		return fmt.Errorf("the plan names no regions")
 	}
+	if p.SharedEntryMachine != "" {
+		_, entry, found := p.find(p.SharedEntryMachine)
+		if !declaredNodeMapProfile(p.Profile) || !found || !entry.Holds.has("control-plane") {
+			return fmt.Errorf("shared_entry_machine must name a declared CP/L4 entrance")
+		}
+	}
 	founding, seenRegion, seenMachine, seenAddress := 0, map[string]bool{}, map[string]bool{}, map[string]string{}
 	for _, r := range p.Regions {
 		id := strings.ToLower(strings.TrimSpace(r.ID))
+		if !p.oneRegionThreeNodes() && r.Entry != nil {
+			return fmt.Errorf("region %q declares an entry but no supported topology profile uses it", id)
+		}
 		if id == "" {
 			return fmt.Errorf("a region has no id — it is the name devices use to CHOOSE a region and the name every record from it carries")
 		}
@@ -286,7 +398,182 @@ func (p *Plan) Validate() error {
 			"joins it — a second one mints a second anchor, and a device that MOVES between them meets an "+
 			"issuer it has never heard of", founding)
 	}
+	if p.oneRegionThreeNodes() {
+		if len(p.Regions) != 1 || len(p.Regions[0].Machines) != 3 {
+			return fmt.Errorf("profile one-region-three-nodes requires exactly one DSSE region with three machines")
+		}
+		if !validPlanDNSName(p.Deployment) || !validPlanDNSLabel(p.Regions[0].ID) {
+			return fmt.Errorf("profile one-region-three-nodes requires DNS-safe deployment and region names")
+		}
+		domains := map[string]bool{}
+		portals := map[string]bool{}
+		peerNames := map[string]bool{}
+		adminNames := map[string]bool{}
+		for _, target := range p.nodeAdminTargets() {
+			name := target.Label + ".admin." + strings.ToLower(strings.TrimSpace(p.Deployment))
+			if adminNames[name] {
+				return fmt.Errorf("two machines generate the same admin name %q", name)
+			}
+			adminNames[name] = true
+		}
+		for _, alias := range p.Names {
+			if adminNames[strings.ToLower(strings.TrimSpace(alias))] {
+				return fmt.Errorf("deployment alias shadows an owned admin name")
+			}
+		}
+		nodeAddressOwners := map[string]string{}
+		for _, m := range p.Regions[0].Machines {
+			if adminNames[strings.ToLower(strings.TrimSpace(m.Reachable))] {
+				return fmt.Errorf("machine %q reachable name shadows an owned admin name", m.Name)
+			}
+			peer := strings.ToLower(strings.TrimSpace(m.Reachable))
+			if peerNames[peer] {
+				return fmt.Errorf("two machines share reachable name %q", peer)
+			}
+			peerNames[peer] = true
+		}
+		entry := p.Regions[0].Entry
+		targets := map[string]bool{}
+		if entry != nil {
+			if entry.Mode != "tcp-pass-through" || !entry.PreservesClientIP || len(entry.Targets) != 3 {
+				return fmt.Errorf("profile one-region-three-nodes entry must be TCP pass-through with three targets and preserved client IP")
+			}
+			for _, target := range entry.Targets {
+				target = strings.ToLower(strings.TrimSpace(target))
+				if targets[target] {
+					return fmt.Errorf("entry target %q is duplicated", target)
+				}
+				targets[target] = true
+			}
+		}
+		for _, m := range p.Regions[0].Machines {
+			portal := strings.ToLower(strings.TrimSpace(m.Portal))
+			if adminNames[portal] {
+				return fmt.Errorf("machine %q portal shadows an owned admin name", m.Name)
+			}
+			for _, component := range []string{"edge-a", "control-plane-a"} {
+				label := nodeAdminLabel(p.Regions[0].ID, m.Name, component)
+				if !validPlanDNSLabel(label) || !validPlanDNSName(label+".admin."+p.Deployment) {
+					return fmt.Errorf("machine %q generates an invalid admin name %q; shorten the region or machine name", m.Name, label)
+				}
+			}
+			if !validPlanDNSName(portal) || portals[portal] {
+				return fmt.Errorf("machine %q needs a distinct DNS-safe portal name for its own Edge", m.Name)
+			}
+			if peerNames[portal] {
+				return fmt.Errorf("machine %q portal name must differ from every peer-reachable name", m.Name)
+			}
+			portals[portal] = true
+			for _, plane := range p.PlaneNamesFor(p.Regions[0].ID) {
+				if strings.EqualFold(portal, plane) {
+					return fmt.Errorf("machine %q portal name cannot equal a shared region plane", m.Name)
+				}
+			}
+			if !validPlanDNSLabel(m.Name) || !validPlanDNSName(m.Reachable) {
+				return fmt.Errorf("machine %q needs DNS-safe name and reachable TLS name", m.Name)
+			}
+			if entry != nil && !targets[strings.ToLower(strings.TrimSpace(m.Name))] {
+				return fmt.Errorf("entry omits machine %q", m.Name)
+			}
+			if !m.Holds.has("control-plane") || !m.Holds.has("edges") {
+				return fmt.Errorf("machine %q must hold both control-plane and edges in profile one-region-three-nodes", m.Name)
+			}
+			if len(m.Addresses) == 0 || net.ParseIP(strings.TrimSpace(m.Addresses[0])).To4() == nil ||
+				net.ParseIP(strings.TrimSpace(m.ReachableAddress)).To4() == nil {
+				return fmt.Errorf("machine %q needs IPv4 local and reachable peer addresses; IPv6-only peer wiring is not yet supported", m.Name)
+			}
+			local, reachable := strings.TrimSpace(m.Addresses[0]), strings.TrimSpace(m.ReachableAddress)
+			for _, address := range []string{local, reachable} {
+				if owner := nodeAddressOwners[address]; owner != "" && owner != m.Name {
+					return fmt.Errorf("machine %q must have distinct local and peer-reachable Node addresses", m.Name)
+				}
+				nodeAddressOwners[address] = m.Name
+			}
+			d := strings.ToLower(strings.TrimSpace(m.FailureDomain))
+			if d == "" || domains[d] {
+				return fmt.Errorf("machine %q needs a distinct failure_domain", m.Name)
+			}
+			domains[d] = true
+		}
+	}
+	if p.oneRegionMultiEdge() {
+		if err := p.validateOneRegionMultiEdge(); err != nil {
+			return err
+		}
+	}
+	if p.threeRegionsMultiEdge() {
+		if err := p.validateThreeRegionNames(); err != nil {
+			return err
+		}
+		if len(p.Regions) != 3 {
+			return fmt.Errorf("profile three-regions-multi-edge requires exactly three DSSE regions")
+		}
+		for _, r := range p.Regions {
+			if !r.HoldsState {
+				return fmt.Errorf("region %q must hold a consensus vote and database member on its control-plane node", r.ID)
+			}
+			controlPlanes, edges := 0, 0
+			domains := map[string]bool{}
+			for _, m := range r.Machines {
+				domain := strings.ToLower(strings.TrimSpace(m.FailureDomain))
+				if domain == "" || domains[domain] {
+					return fmt.Errorf("machine %q needs a distinct failure_domain within region %q", m.Name, r.ID)
+				}
+				domains[domain] = true
+				switch {
+				case m.Holds.has("control-plane") && !m.Holds.has("edges"):
+					controlPlanes++
+				case m.Holds.has("edges") && !m.Holds.has("control-plane"):
+					edges++
+				default:
+					return fmt.Errorf("machine %q must be either the dedicated control-plane/L4 door or a dedicated Edge", m.Name)
+				}
+			}
+			if controlPlanes != 1 || edges < 2 {
+				return fmt.Errorf("region %q needs exactly one control-plane/L4 door and at least two dedicated Edge nodes; got %d and %d", r.ID, controlPlanes, edges)
+			}
+		}
+	}
 	return nil
+}
+
+func (p *Plan) oneRegionThreeNodes() bool   { return p.Profile == "one-region-three-nodes" }
+func (p *Plan) threeRegionsMultiEdge() bool { return p.Profile == "three-regions-multi-edge" }
+
+func validPlanDNSName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if !validPlanDNSLabel(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func validPlanDNSLabel(label string) bool {
+	if len(label) == 0 || len(label) > 63 {
+		return false
+	}
+	for i, c := range label {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' {
+			continue
+		}
+		if c == '-' && i > 0 && i < len(label)-1 {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func storeMemberNameForMachine(m PlanMachine) string {
+	return "dsse-store-" + strings.ToLower(strings.TrimSpace(m.Name))
+}
+
+func storeMemberPeerURLForMachine(m PlanMachine) string {
+	return fmt.Sprintf("https://%s:%d", m.reachableName(), planEtcdPeerPortA)
 }
 
 // ---- what the plan means -----------------------------------------------------
@@ -304,9 +591,15 @@ func (p *Plan) PlaneNamesFor(region string) map[string]string {
 	return out
 }
 
-// CertificateNames is every name this deployment's leaves must carry.
+// CertificateNames is every name the deployment transport leaf must carry.
+// A three-Region browser Portal uses a separate Region-scoped leaf instead.
 func (p *Plan) CertificateNames() []string {
 	names := []string{p.Deployment}
+	if declaredNodeMapProfile(p.Profile) {
+		for _, target := range p.nodeAdminTargets() {
+			names = append(names, target.Label+".admin."+p.Deployment)
+		}
+	}
 	names = append(names, p.Names...)
 	for _, r := range p.Regions {
 		for _, n := range p.PlaneNamesFor(r.ID) {
@@ -316,18 +609,57 @@ func (p *Plan) CertificateNames() []string {
 	for _, m := range p.machines() {
 		if m.Reachable != "" {
 			names = append(names, m.Reachable)
+			if p.oneRegionThreeNodes() {
+				names = append(names, "agents."+strings.ToLower(strings.TrimSpace(m.Reachable)))
+			}
+		}
+		// The 3-Region profile serves each browser Portal through a separate,
+		// Region-scoped leaf. Its transport fallback must not authenticate a
+		// Portal name, including one owned by a different Region.
+		if m.Portal != "" && p.Profile != "three-regions-multi-edge" {
+			names = append(names, m.Portal)
+		}
+		if p.dedicatedMultiEdge() && p.Profile != "three-regions-multi-edge" && m.Holds.has("edges") {
+			names = append(names, p.edgePortalName(m))
 		}
 	}
 	return dedupeSorted(names, p.Deployment)
 }
 
-// RegionEndpoints is the map every Edge in every region is handed, identically: one entry per region, each
-// naming that region's AGENT plane, which is where a device goes.
+// BrowserPortalNames are served with a separate browser certificate. A management
+// leaf must not also cover these names: an HTTP/2 browser may otherwise reuse an
+// existing Console TLS connection for a Portal request on the same entry IP.
+func (p *Plan) BrowserPortalNames() []string {
+	names := []string{}
+	for _, m := range p.machines() {
+		if m.Portal != "" {
+			names = append(names, m.Portal)
+		}
+		if p.dedicatedMultiEdge() && m.Holds.has("edges") {
+			names = append(names, p.edgePortalName(m))
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	return dedupeSorted(names, names[0])
+}
+
+// RegionEndpoints is the same signed-catalog source on every Edge. In the 1x3 profile each
+// Node has its own DNS name (agents.<node-reachable-name>) and public address supplied by
+// the operator's DNS/hosts; the TLS name is on the deployment certificate. All three doors
+// route that SNI to the same Edge fleet. Older one-door-per-region plans are unchanged.
 func (p *Plan) RegionEndpoints() string {
 	entries := []string{}
 	for _, r := range p.Regions {
 		id := strings.ToLower(strings.TrimSpace(r.ID))
-		entries = append(entries, id+"=https://"+p.PlaneNamesFor(id)["agents"])
+		if p.oneRegionThreeNodes() {
+			for _, m := range r.Machines {
+				entries = append(entries, id+"=https://agents."+strings.ToLower(strings.TrimSpace(m.Reachable)))
+			}
+		} else {
+			entries = append(entries, id+"=https://"+p.PlaneNamesFor(id)["agents"])
+		}
 	}
 	sort.Strings(entries)
 	return strings.Join(entries, ";")

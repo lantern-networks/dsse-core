@@ -51,6 +51,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="dsse_wfp.h" />
+    <ClInclude Include="captive_deadline.h" />
+    <ClInclude Include="captive_admission.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

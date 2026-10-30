@@ -77,7 +77,8 @@ func TestARestorationIsJudgedAgainstWhatTheDisarmTookDown(t *testing.T) {
 			"the safe default: never assume nothing was taken down"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p := &Platform{disarmObserved: tc.observed, armedBeforeDisarm: tc.wasArmed}
+			p := &Platform{disarmObserved: tc.observed, preDisarmKnown: tc.observed,
+				armedBeforeDisarm: tc.wasArmed}
 			if got := p.restorationIsTheServiceComingBack(); got != tc.serviceOK {
 				t.Fatalf("restorationIsTheServiceComingBack() = %v, want %v — %s", got, tc.serviceOK, tc.why)
 			}

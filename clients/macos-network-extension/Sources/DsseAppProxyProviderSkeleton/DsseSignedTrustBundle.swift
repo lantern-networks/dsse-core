@@ -177,6 +177,8 @@ public enum DsseSignedTrustBundle {
         guard sigVerified else { return nil }
         guard let body = try? JSONDecoder().decode(DsseTrustBundleBody.self, from: payload),
               body.schemaVersion == payloadSchemaVersion,
+              let tenantID = body.tenantID, !tenantID.isEmpty,
+              tenantID == tenantID.trimmingCharacters(in: .whitespacesAndNewlines),
               let serial = body.serial, serial > 0,
               serial > lastAcceptedSerial,
               let pem = body.transportCAPEM,
@@ -200,7 +202,7 @@ public enum DsseSignedTrustBundle {
             },
             renewalRecoveryEndpoint: (body.renewalRecoveryEndpoint ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
             serial: serial,
-            tenantID: body.tenantID ?? "",
+            tenantID: tenantID,
             // Lower-cased because an SNI is compared case-insensitively and the Edge announces it that way;
             // a device that sent a differently-cased name would ask for a certificate that exists under
             // another spelling.

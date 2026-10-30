@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -51,6 +52,30 @@ type operatorElevation struct {
 	ApprovalRequired bool    `json:"approval_required"`
 	ApprovedAt       *string `json:"approved_at,omitempty"`
 	ApprovedBy       *string `json:"approved_by,omitempty"`
+}
+
+type operatorMutationRefusal struct {
+	status int
+	err    error
+}
+
+func (e operatorMutationRefusal) Error() string { return e.err.Error() }
+
+func operatorRefuse(status int, err error) error {
+	return operatorMutationRefusal{status: status, err: err}
+}
+
+func writeOperatorMutationError(w http.ResponseWriter, tenantID string, err error) {
+	if errors.Is(err, errAdminTenantModelMissing) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("organization %q does not exist", tenantID))
+		return
+	}
+	var refused operatorMutationRefusal
+	if errors.As(err, &refused) {
+		writeError(w, refused.status, refused.err)
+		return
+	}
+	writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
 }
 
 // finished reports whether this elevation is over — ended by hand, or lapsed by the clock.
@@ -105,6 +130,8 @@ func (e operatorElevation) state(now time.Time) string {
 	switch {
 	case e.EndedAt != nil:
 		return "ended"
+	case e.finished(now):
+		return "expired"
 	case e.ApprovalRequired && e.ApprovedAt == nil:
 		return "pending_approval"
 	case e.active(now):
@@ -119,7 +146,7 @@ func (e operatorElevation) state(now time.Time) string {
 func operatorHasActiveElevation(tenant adminTenantModel, principalID string, now time.Time) bool {
 	principalID = strings.TrimSpace(principalID)
 	for _, elevation := range tenant.OperatorElevations {
-		if !strings.EqualFold(strings.TrimSpace(elevation.GrantedTo), principalID) {
+		if strings.TrimSpace(elevation.GrantedTo) != principalID {
 			continue
 		}
 		if elevation.active(now) {
@@ -159,13 +186,12 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		}
 		return tenant, strings.TrimSpace(tenant.TenantID) != "", nil
 	}
-	save := func(ctx context.Context, tenant adminTenantModel) error {
-		store, ok := tenantModelStore.(adminTenantModelAdminStore)
+	mutate := func(ctx context.Context, tenantID string, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+		store, ok := tenantModelStore.(adminTenantModelConditionalStore)
 		if !ok {
-			return fmt.Errorf("this node cannot author organization records")
+			return adminTenantModel{}, fmt.Errorf("this node cannot atomically author organization records")
 		}
-		_, err := store.Put(ctx, tenant, time.Now())
-		return err
+		return store.MutateExisting(ctx, tenantID, time.Now(), edit)
 	}
 	audit := func(r *http.Request, tenant adminTenantModel, action string) {
 		now := time.Now()
@@ -229,34 +255,37 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		// Who is writing this: the organization itself, or an operator reaching in from outside it. The rest of
 		// this handler turns on that difference, and it is the same question adminTenantPKITargetAllowed asks.
 		identity, _ := adminIdentityFromRequest(r)
-		callerIsOperator := !strings.EqualFold(strings.TrimSpace(identity.TenantID), strings.TrimSpace(target))
-		if body.Managed != nil {
-			if err := delegationReopenRefusal(tenant, callerIsOperator, *body.Managed); err != nil {
-				writeError(w, http.StatusForbidden, err)
-				return
-			}
-			applyDelegationChangeBy(&tenant, *body.Managed, strings.TrimSpace(identity.PrincipalID),
-				time.Now().UTC().Format(time.RFC3339), !callerIsOperator)
-		}
+		callerIsOperator := strings.TrimSpace(identity.TenantID) != strings.TrimSpace(target)
 		wantApproval := body.ElevationNeedsApproval
 		if wantApproval == nil {
 			wantApproval = body.DeprecatedRequireApprove
 		}
-		if wantApproval != nil {
-			// ★ AND THE OPERATOR MAY NOT LOWER THE BAR THE CUSTOMER SET. Clearing this flag is the same act as
-			// reopening the delegation, one field over: the organization said "an elevation over me needs my
-			// administrator's approval", and the party the approval protects it from must not be able to switch
-			// it off. Raising it is allowed from either side — nobody needs protecting from more approval.
-			if callerIsOperator && tenant.OperatorElevationRequiresApproval && !*wantApproval {
-				writeError(w, http.StatusForbidden, fmt.Errorf(
-					"%q requires its own administrator to approve an elevation, and an operator cannot remove "+
-						"that requirement — it exists to be applied to you. %q can remove it", target, target))
-				return
+		// Re-evaluate both guards and apply the change to the latest row inside
+		// the store's write fence. The earlier load is only a fast response path;
+		// a customer can withdraw between that read and this mutation.
+		tenant, err = mutate(r.Context(), target, func(latest adminTenantModel) (adminTenantModel, error) {
+			if latest.IsOperator {
+				return latest, operatorRefuse(http.StatusConflict, fmt.Errorf("the operator's own organization does not delegate to itself"))
 			}
-			tenant.OperatorElevationRequiresApproval = *wantApproval
-		}
-		if err := save(r.Context(), tenant); err != nil {
-			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
+			if body.Managed != nil {
+				if err := delegationReopenRefusal(latest, callerIsOperator, *body.Managed); err != nil {
+					return latest, operatorRefuse(http.StatusForbidden, err)
+				}
+				applyDelegationChangeBy(&latest, *body.Managed, strings.TrimSpace(identity.PrincipalID),
+					time.Now().UTC().Format(time.RFC3339), !callerIsOperator)
+			}
+			if wantApproval != nil {
+				if callerIsOperator && latest.OperatorElevationRequiresApproval && !*wantApproval {
+					return latest, operatorRefuse(http.StatusForbidden, fmt.Errorf(
+						"%q requires its own administrator to approve an elevation, and an operator cannot remove "+
+							"that requirement — it exists to be applied to you. %q can remove it", target, target))
+				}
+				latest.OperatorElevationRequiresApproval = *wantApproval
+			}
+			return latest, nil
+		})
+		if err != nil {
+			writeOperatorMutationError(w, target, err)
 			return
 		}
 		audit(r, tenant, "operator_delegation_changed")
@@ -289,7 +318,7 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		}
 		identity, _ := adminIdentityFromRequest(r)
 		target, ok := resolveTarget(r)
-		if !ok || target == "" || strings.EqualFold(target, strings.TrimSpace(identity.TenantID)) {
+		if !ok || target == "" || target == strings.TrimSpace(identity.TenantID) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf(
 				"name the organization to be elevated over with X-Operate-Tenant; an elevation over your own "+
 					"organization is not a thing that exists"))
@@ -332,9 +361,17 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			ExpiresAt:        now.Add(time.Duration(body.Minutes) * time.Minute).Format(time.RFC3339),
 			ApprovalRequired: tenant.OperatorElevationRequiresApproval,
 		}
-		tenant.OperatorElevations = appendOperatorElevation(tenant.OperatorElevations, elevation)
-		if err := save(r.Context(), tenant); err != nil {
-			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
+		tenant, err = mutate(r.Context(), target, func(latest adminTenantModel) (adminTenantModel, error) {
+			if !latest.OperatorManaged {
+				return latest, operatorRefuse(http.StatusConflict, fmt.Errorf(
+					"%q has withdrawn its management delegation; an elevation cannot replace it", target))
+			}
+			elevation.ApprovalRequired = latest.OperatorElevationRequiresApproval
+			latest.OperatorElevations = appendOperatorElevation(latest.OperatorElevations, elevation)
+			return latest, nil
+		})
+		if err != nil {
+			writeOperatorMutationError(w, target, err)
 			return
 		}
 		audit(r, tenant, "operator_elevation_granted")
@@ -363,41 +400,34 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 			return
 		}
 		identity, _ := adminIdentityFromRequest(r)
-		tenant, found, err := load(r.Context(), target)
-		if err != nil || !found {
-			writeError(w, http.StatusNotFound, fmt.Errorf("organization %q does not exist", target))
-			return
-		}
 		id := strings.TrimSpace(r.PathValue("id"))
 		now := time.Now().UTC()
-		changed, known := false, false
-		for i, elevation := range tenant.OperatorElevations {
-			if !strings.EqualFold(elevation.ID, id) {
-				continue
+		tenant, err := mutate(r.Context(), target, func(latest adminTenantModel) (adminTenantModel, error) {
+			changed, known := false, false
+			for i, elevation := range latest.OperatorElevations {
+				if !strings.EqualFold(elevation.ID, id) {
+					continue
+				}
+				known = true
+				if elevation.finished(now) {
+					continue
+				}
+				ended, by := now.Format(time.RFC3339), adminActorLabel(identity)
+				latest.OperatorElevations[i].EndedAt = &ended
+				latest.OperatorElevations[i].EndedBy = &by
+				changed = true
 			}
-			known = true
-			if elevation.finished(now) {
-				continue
+			if !changed {
+				if known {
+					return latest, operatorRefuse(http.StatusConflict, fmt.Errorf(
+						"elevation %q over %q is already over — an elevation that has ended or lapsed cannot be ended again", id, target))
+				}
+				return latest, operatorRefuse(http.StatusNotFound, fmt.Errorf("%q is not an open elevation over %q", id, target))
 			}
-			ended, by := now.Format(time.RFC3339), adminActorLabel(identity)
-			tenant.OperatorElevations[i].EndedAt = &ended
-			tenant.OperatorElevations[i].EndedBy = &by
-			changed = true
-		}
-		if !changed {
-			if known {
-				// It exists and is over. Saying so is different from saying it is not there, and stops a caller
-				// concluding the id was wrong.
-				writeError(w, http.StatusConflict, fmt.Errorf(
-					"elevation %q over %q is already over — an elevation that has ended or lapsed cannot be ended again", id, target))
-				return
-			}
-			writeError(w, http.StatusNotFound, fmt.Errorf(
-				"%q is not an open elevation over %q", id, target))
-			return
-		}
-		if err := save(r.Context(), tenant); err != nil {
-			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
+			return latest, nil
+		})
+		if err != nil {
+			writeOperatorMutationError(w, target, err)
 			return
 		}
 		audit(r, tenant, "operator_elevation_ended")
@@ -421,41 +451,35 @@ func registerOperatorAccessRoutes(mux *http.ServeMux, adminEndpoint func(string,
 		// Deliberately the identity's OWN tenant, not the operate-within target: this is the organization
 		// speaking for itself, and reading the header here would let an operator approve on its behalf.
 		target := strings.TrimSpace(identity.TenantID)
-		tenant, found, err := load(r.Context(), target)
-		if err != nil || !found {
-			writeError(w, http.StatusNotFound, fmt.Errorf("organization %q does not exist", target))
-			return
-		}
 		id := strings.TrimSpace(r.PathValue("id"))
 		now := time.Now().UTC()
-		approved, knownElevation := false, false
-		for i, elevation := range tenant.OperatorElevations {
-			if !strings.EqualFold(elevation.ID, id) {
-				continue
+		tenant, err := mutate(r.Context(), target, func(latest adminTenantModel) (adminTenantModel, error) {
+			approved, knownElevation := false, false
+			for i, elevation := range latest.OperatorElevations {
+				if !strings.EqualFold(elevation.ID, id) {
+					continue
+				}
+				knownElevation = true
+				if elevation.finished(now) || elevation.ApprovedAt != nil {
+					continue
+				}
+				at, by := now.Format(time.RFC3339), adminActorLabel(identity)
+				latest.OperatorElevations[i].ApprovedAt = &at
+				latest.OperatorElevations[i].ApprovedBy = &by
+				approved = true
 			}
-			knownElevation = true
-			// Approval is only meaningful while the window is still open: an approval stamped after the
-			// elevation lapsed says somebody allowed access that had already gone away.
-			if elevation.finished(now) || elevation.ApprovedAt != nil {
-				continue
+			if !approved {
+				if knownElevation {
+					return latest, operatorRefuse(http.StatusConflict, fmt.Errorf(
+						"elevation %q is not waiting for approval — it has already been approved, ended, or lapsed", id))
+				}
+				return latest, operatorRefuse(http.StatusNotFound, fmt.Errorf(
+					"%q is not an elevation over your organization that is waiting for approval", id))
 			}
-			at, by := now.Format(time.RFC3339), adminActorLabel(identity)
-			tenant.OperatorElevations[i].ApprovedAt = &at
-			tenant.OperatorElevations[i].ApprovedBy = &by
-			approved = true
-		}
-		if !approved {
-			if knownElevation {
-				writeError(w, http.StatusConflict, fmt.Errorf(
-					"elevation %q is not waiting for approval — it has already been approved, ended, or lapsed", id))
-				return
-			}
-			writeError(w, http.StatusNotFound, fmt.Errorf(
-				"%q is not an elevation over your organization that is waiting for approval", id))
-			return
-		}
-		if err := save(r.Context(), tenant); err != nil {
-			writeAdminTenantSaveError(w, http.StatusInternalServerError, err)
+			return latest, nil
+		})
+		if err != nil {
+			writeOperatorMutationError(w, target, err)
 			return
 		}
 		audit(r, tenant, "operator_elevation_approved")

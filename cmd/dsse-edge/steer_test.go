@@ -110,8 +110,12 @@ func TestSteerEgressForwardWithoutInterceptionDialsAuthority(t *testing.T) {
 	_ = ln.Close() // now nothing is listening on closedAuthority
 	_, serverSide := net.Pipe()
 	defer serverSide.Close()
-	err = steerEgressForward(context.Background(), serverSide, closedAuthority, edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: "127.0.0.1", Port: 0}, nil)
+	upstreamReady := false
+	err = steerEgressForward(context.Background(), serverSide, closedAuthority, edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: "127.0.0.1", Port: 0}, nil, func() { upstreamReady = true })
 	if err == nil {
 		t.Fatal("steerEgressForward to a closed authority returned nil, want dial failure error")
+	}
+	if upstreamReady {
+		t.Fatal("reported resumed before establishing upstream")
 	}
 }

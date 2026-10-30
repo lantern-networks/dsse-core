@@ -1,3 +1,5 @@
+import { encodeQR } from "./vendor/qr.js";
+
 "use strict";
 
 // ---------------------------------------------------------------------------
@@ -131,14 +133,14 @@ function wireActivation() {
       document.getElementById("activate-otpauth").textContent = j.otpauth_uri;
       document.getElementById("activate-secret").textContent = j.secret || "";
       document.getElementById("activate-2fa").style.display = "";
-      // Render a scannable QR from the otpauth URI (vendored qrcode.min.js, fully offline — no external call).
+      // Render the locally vendored SVG QR; the SVG renderer emits only numeric geometry, not the secret text.
       const qrEl = document.getElementById("activate-qr");
       if (qrEl) {
         qrEl.innerHTML = "";
-        if (window.QRCode) {
-          new QRCode(qrEl, { text: j.otpauth_uri, width: 220, height: 220, correctLevel: QRCode.CorrectLevel.M });
-        } else {
-          qrEl.style.display = "none"; // lib missing → fall back to the manual secret below
+        try {
+          qrEl.innerHTML = encodeQR(j.otpauth_uri, "svg", { ecc: "medium" });
+        } catch (_) {
+          qrEl.style.display = "none"; // fall back to the manual secret below
         }
       }
       setActivation("ok", t("enroll2fa"));

@@ -203,9 +203,12 @@ func buildWFPInboundPolicy(exp *serverInitiatedExport, deviceGroup string, resol
 	return p, errs
 }
 
-// inboundPolicyAllows mirrors the driver's DsseInboundClassify match (pure; for unit tests). srcIP is the
-// initiating server. Returns true if an allow rule matches (=> kernel PERMIT), false => default-deny BLOCK.
+// inboundPolicyAllows mirrors the driver's DsseInboundClassify disposition (pure; for unit tests). srcIP is
+// the initiating server. DefaultDeny=0 permits unmatched flows; DefaultDeny=1 needs a matching allow rule.
 func inboundPolicyAllows(p *wfpInboundPolicy, srcIP net.IP, localPort uint16, proto uint16) bool {
+	if p.DefaultDeny == 0 {
+		return true // the driver leaves unmatched inbound flows to the system firewall
+	}
 	var family uint32
 	var src [16]byte
 	if v4 := srcIP.To4(); v4 != nil {

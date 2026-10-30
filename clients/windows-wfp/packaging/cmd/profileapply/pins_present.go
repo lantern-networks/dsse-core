@@ -216,6 +216,43 @@ func pinsInArgs(service string, args []string) pinSet {
 	return out
 }
 
+// legacyPublisherForCapture recognizes the exact ImagePath corruption produced when the WiX preprocessor
+// expanded &quot; inside UpdaterArgs. Those entities reached Windows literally, so a subject with spaces became
+// several argv entries. Only pre-upgrade capture uses this recovery: it preserves the intended publisher in
+// the protected store while a corrected MSI replaces the service. Any ambiguous shape remains a hard failure.
+func legacyPublisherForCapture(args []string) (string, bool) {
+	const marker = "&quot;"
+	index := -1
+	for i, arg := range args {
+		name, _, joined := splitFlag(arg)
+		if name == "--update-publisher" || name == "-update-publisher" {
+			if index >= 0 || joined { // A duplicate or joined value makes this recovery ambiguous.
+				return "", false
+			}
+			index = i
+		}
+	}
+	if index < 0 || index+1 >= len(args) || !strings.HasPrefix(args[index+1], marker) {
+		return "", false
+	}
+	var fragments []string
+	for _, arg := range args[index+1:] {
+		if strings.HasPrefix(arg, "-") {
+			return "", false
+		}
+		fragments = append(fragments, arg)
+		if strings.HasSuffix(arg, marker) {
+			candidate := strings.Join(fragments, " ")
+			candidate = strings.TrimPrefix(strings.TrimSuffix(candidate, marker), marker)
+			if strings.Contains(candidate, marker) || validatePublisher(candidate) != nil {
+				return "", false
+			}
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
 func splitFlag(a string) (name, value string, joined bool) {
 	if i := strings.Index(a, "="); i >= 0 {
 		return a[:i], a[i+1:], true

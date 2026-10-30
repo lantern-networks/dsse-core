@@ -63,7 +63,7 @@ func decodeCandidateSnapshot(data []byte) (map[string]map[string]Candidate, erro
 				return nil, errInvalidSnapshot
 			}
 			// Previous API writers accepted free-form review reasons and timestamps.
-			// Keep that history; only new writes must meet the evidence contract.
+			// Keep that history; only new writes must pass current evidence validation.
 			if err := validateCandidateEvidence(c); err != nil {
 				log.Printf("policy candidate: retained legacy evidence for tenant %q candidate %q", tenant, id)
 			}

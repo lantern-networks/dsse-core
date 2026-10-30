@@ -260,7 +260,7 @@ func (l *Ledger) CountAdmitted(tenantID string) int {
 		if !e.Enabled {
 			continue
 		}
-		if want == "" || strings.EqualFold(strings.TrimSpace(e.TenantID), want) {
+		if want == "" || sameGroupTenant(strings.TrimSpace(e.TenantID), want) {
 			n++
 		}
 	}
@@ -520,7 +520,7 @@ func (l *Ledger) WouldRefuseEnrolment(id, tenantID, machineRef string) error {
 		return ErrIdentityDisabled
 	}
 	owner := strings.TrimSpace(e.TenantID)
-	if owner != "" && strings.TrimSpace(tenantID) != "" && !strings.EqualFold(owner, strings.TrimSpace(tenantID)) {
+	if owner != "" && strings.TrimSpace(tenantID) != "" && !sameGroupTenant(owner, strings.TrimSpace(tenantID)) {
 		return ErrIdentityOwnedByAnotherTenant
 	}
 	if strings.TrimSpace(e.DeviceEnrolledAt) != "" {
@@ -551,7 +551,7 @@ func (l *Ledger) EnrollDeviceForTenantWithMachine(id, tenantID, group, note, now
 			return Entry{}, MachineRefConflict{}, ErrIdentityDisabled
 		}
 		owner := strings.TrimSpace(e.TenantID)
-		if owner != "" && strings.TrimSpace(tenantID) != "" && !strings.EqualFold(owner, strings.TrimSpace(tenantID)) {
+		if owner != "" && strings.TrimSpace(tenantID) != "" && !sameGroupTenant(owner, strings.TrimSpace(tenantID)) {
 			return Entry{}, MachineRefConflict{}, ErrIdentityOwnedByAnotherTenant
 		}
 		// ★ AND THE SAME-TENANT CASE IS THE ONE THAT WAS LEFT (2026-08-12, twentieth review). Refusing only
@@ -665,7 +665,7 @@ func (l *Ledger) recordEnrolmentReport(id, tenantID, group, note, machineRef, no
 		if !e.Enabled {
 			return Entry{}, ErrIdentityDisabled
 		}
-		if owner := strings.TrimSpace(e.TenantID); owner != "" && !strings.EqualFold(owner, strings.TrimSpace(tenantID)) {
+		if owner := strings.TrimSpace(e.TenantID); owner != "" && !sameGroupTenant(owner, strings.TrimSpace(tenantID)) {
 			return Entry{}, ErrIdentityOwnedByAnotherTenant
 		}
 	}
@@ -724,7 +724,7 @@ func (l *Ledger) EnrollGroupForTenant(id, claimant, assignTo, group, note, now s
 		switch {
 		case owner == "" && !adoptUnassigned:
 			return Entry{}, ErrIdentityUnassigned
-		case owner != "" && !strings.EqualFold(owner, strings.TrimSpace(claimant)):
+		case owner != "" && !sameGroupTenant(owner, strings.TrimSpace(claimant)):
 			return Entry{}, ErrIdentityOwnedByAnotherTenant
 		}
 	}
@@ -765,7 +765,7 @@ func (l *Ledger) AllowReenrolment(id, callerTenant, now string) (Entry, Entry, e
 	}
 	if strings.TrimSpace(callerTenant) != "" {
 		owner := strings.TrimSpace(e.TenantID)
-		if owner == "" || !strings.EqualFold(owner, strings.TrimSpace(callerTenant)) {
+		if owner == "" || !sameGroupTenant(owner, strings.TrimSpace(callerTenant)) {
 			return Entry{}, Entry{}, ErrIdentityOwnedByAnotherTenant
 		}
 	}
@@ -1089,7 +1089,7 @@ func (l *Ledger) setEnabledForTenant(id, tenant string, enabled bool, now string
 	// ★ A TOMBSTONE IS NOT A DEVICE TO RE-ENABLE. Removal is deliberate, and the way back is enrolling again
 	// — which is its own decision, with its own credential and its own record. Letting "enable" resurrect a
 	// removal would make the tombstone a suggestion.
-	if !ok || e.isTombstone() || (strings.TrimSpace(tenant) != "" && !strings.EqualFold(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenant))) {
+	if !ok || e.isTombstone() || (strings.TrimSpace(tenant) != "" && !sameGroupTenant(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenant))) {
 		return Entry{}, false, nil
 	}
 	before := e
@@ -1233,7 +1233,7 @@ func (l *Ledger) RemoveTenantChecked(tenantID string) ([]string, error) {
 	l.mu.Lock()
 	removed := map[string]Entry{}
 	for k, entry := range l.entries {
-		if strings.EqualFold(strings.TrimSpace(entry.TenantID), tenantID) {
+		if sameGroupTenant(strings.TrimSpace(entry.TenantID), tenantID) {
 			removed[k] = entry
 		}
 	}

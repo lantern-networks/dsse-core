@@ -48,6 +48,16 @@ func TestClickHouseRetentionReceiptsIntegration(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("batch=%v err=%v", rows, err)
 	}
+	candidates, err := s.RetentionCandidates(ctx, "a", "audit", time.Now(), "", "", 100)
+	if err != nil || len(candidates) != 1 || candidates[0].ID != rows[0].ID {
+		t.Fatalf("manual candidates=%v err=%v", candidates, err)
+	}
+	if n, err := s.RetentionExistingCount(ctx, "a", "audit", []string{rows[0].ID}); err != nil || n != 1 {
+		t.Fatalf("existing receipt count=%d err=%v", n, err)
+	}
+	if n, oldest, err := s.RetentionBacklog(ctx, "a", "audit", time.Now()); err != nil || n != 1 || oldest == nil {
+		t.Fatalf("archive backlog=%d oldest=%v err=%v", n, oldest, err)
+	}
 	if !strings.HasSuffix(rows[0].Timestamp, ".123") {
 		t.Fatal("timestamp precision lost", rows[0].Timestamp)
 	}
@@ -57,6 +67,9 @@ func TestClickHouseRetentionReceiptsIntegration(t *testing.T) {
 	}
 	if err = s.DeleteRetentionBatch(ctx, "a", "audit", []string{rows[0].ID}); err != nil {
 		t.Fatal(err)
+	}
+	if n, err := s.RetentionExistingCount(ctx, "a", "audit", []string{rows[0].ID}); err != nil || n != 0 {
+		t.Fatalf("deleted receipt still present count=%d err=%v", n, err)
 	}
 	// The same producer ID may arrive again, but it has a new insertion receipt.
 	run("INSERT INTO " + s.qualified() + " (event_id,tenant_id,stream,ts,raw) VALUES ('same-event','a','audit','2020-01-01 00:00:00.123','{}')")

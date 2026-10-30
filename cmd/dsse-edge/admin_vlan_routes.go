@@ -171,10 +171,10 @@ func vlanOwnerForWrite(r *http.Request, targetTenant string) func(string) bool {
 	tenant, operator := adminVLANCallerTenant(r)
 	return func(owner string) bool {
 		owner = strings.TrimSpace(owner)
-		if !operator && (owner == "" || !strings.EqualFold(owner, tenant)) {
+		if !operator && (owner == "" || owner != strings.TrimSpace(tenant)) {
 			return false
 		}
-		return targetTenant == "" || owner == "" || strings.EqualFold(owner, targetTenant)
+		return targetTenant == "" || owner == "" || owner == strings.TrimSpace(targetTenant)
 	}
 }
 

@@ -369,7 +369,13 @@ func buildSecureTransportTLSConfig(cfg secureTransportConfig) (*tls.Config, erro
 	// the handshake before any data plane — the absolute no-cross-tenant-mixing invariant is enforced here.
 	tenantBindingActive := cfg.TenantCARegistry != nil && strings.TrimSpace(cfg.ExpectedTenantID) != ""
 	revocations := cfg.AdmissionRevocations
-	if tenantBindingActive || cfg.RequireEnrolledIdentity || revocations != nil {
+	// A known-owner check is additive when lab transport explicitly permits an optional client
+	// certificate. It can inspect a presented identity without turning anonymous bootstrap into
+	// mandatory mTLS. Every existing tenant/enrolment/revocation gate still rejects no certificate.
+	ownerCheckOnly := cfg.TenantCARegistry != nil && cfg.EnrolledLedger != nil &&
+		!cfg.RequireClientCert && !tenantBindingActive && !cfg.RequireEnrolledIdentity && revocations == nil
+	if tenantBindingActive || cfg.RequireEnrolledIdentity || revocations != nil ||
+		(cfg.TenantCARegistry != nil && cfg.EnrolledLedger != nil) {
 		reg := cfg.TenantCARegistry
 		expectedTenant := strings.TrimSpace(cfg.ExpectedTenantID)
 		enrolled := cfg.EnrolledIdentities
@@ -377,6 +383,9 @@ func buildSecureTransportTLSConfig(cfg secureTransportConfig) (*tls.Config, erro
 		requireEnrolled := cfg.RequireEnrolledIdentity
 		tlsCfg.VerifyConnection = func(cs tls.ConnectionState) error {
 			if len(cs.PeerCertificates) == 0 {
+				if ownerCheckOnly {
+					return nil
+				}
 				log.Printf("transport_admission_denied reason=no_client_cert")
 				return fmt.Errorf("transport admission: no client certificate")
 			}
@@ -421,11 +430,41 @@ func buildSecureTransportTLSConfig(cfg secureTransportConfig) (*tls.Config, erro
 					return fmt.Errorf("transport admission: identity %q is not enrolled", id)
 				}
 			}
+			id := transportIdentityFromLeaf(cs.PeerCertificates[0])
+			if err := knownEnrolledOwnerMatchesCertificateTenant(cs.VerifiedChains, id, reg, ledger); err != nil {
+				log.Printf("transport_admission_denied reason=tenant_owner_mismatch identity=%q", id)
+				return fmt.Errorf("transport admission: %w", err)
+			}
 			return nil
 		}
 	}
 
 	return tlsCfg, nil
+}
+
+// A globally enrolled identity has one tenant owner. A multi-tenant transport also verifies certificates
+// from other tenants, so a matching CN alone must not let a second tenant present that enrolled name.
+// Unknown identities are handled by each door's existing policy (strict on (T), temporarily tolerated on
+// the main agent door while inventory replication catches up). Unassigned legacy entries have no owner to
+// compare; the device-facing enrolment path assigns them before issuing a certificate.
+func knownEnrolledOwnerMatchesCertificateTenant(chains [][]*x509.Certificate, id string,
+	reg *tenantca.TenantCARegistry, ledger *enrolledinventory.Ledger) error {
+	if reg == nil || ledger == nil {
+		return nil
+	}
+	entry, known := ledger.EntryFor(id)
+	if !known {
+		return nil
+	}
+	owner := strings.TrimSpace(entry.TenantID)
+	if owner == "" {
+		return nil
+	}
+	certTenant, resolved := reg.TenantForVerifiedChains(chains)
+	if !resolved || certTenant != owner {
+		return fmt.Errorf("known enrolled identity %q is not certified for its owning tenant", id)
+	}
+	return nil
 }
 
 // attachConnRegistryTracking layers connection tracking onto tlsCfg so a live (T) connection is registered
@@ -444,6 +483,9 @@ func attachConnRegistryTracking(tlsCfg *tls.Config, reg *transportConnRegistry) 
 	baseVerify := base.VerifyConnection
 	out := base.Clone()
 	out.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		if portal := browserPortalConfigFor(base, hello); portal != nil {
+			return portal, nil
+		}
 		// ★ the enrolment fold step 3: the expired-certificate recovery path, when the handshake asks for it by name. It
 		// needs RequireAnyClientCert, which the main configuration must never have — so it is a separate
 		// configuration returned for that name only, and this returns BEFORE anything below runs. Nil for
@@ -746,7 +788,9 @@ func connectorMTLSIdentityBound(r *http.Request, connectorID string) (bound bool
 	if !verified || strings.TrimSpace(id) == "" {
 		return false, "", false
 	}
-	return strings.EqualFold(strings.TrimSpace(id), strings.TrimSpace(connectorID)), id, true
+	// Connector IDs are exact registry keys. Case folding would let a cert for
+	// one registered connector authenticate a distinct case-only ID.
+	return strings.TrimSpace(id) == strings.TrimSpace(connectorID), id, true
 }
 
 // enrichDecisionRequestWithTransportIdentity binds a verified mTLS device identity into the decision

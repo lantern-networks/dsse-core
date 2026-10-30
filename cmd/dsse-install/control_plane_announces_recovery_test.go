@@ -13,6 +13,15 @@ func TestInstalledControlPlaneReceivesRecoveryName(t *testing.T) {
 	if err := run(dir, "dsse.example", "Test Deployment", 10, false); err != nil {
 		t.Fatal(err)
 	}
+	f, err := os.OpenFile(filepath.Join(dir, "deployment.env"), os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString("\nDSSE_ARCHIVE_ENDPOINT='archive.example.test:443'\nDSSE_ARCHIVE_BUCKET='fixture'\nDSSE_ARCHIVE_AUTH_MODE='static'\nDSSE_ARCHIVE_ACCESS_KEY='fixture'\nDSSE_ARCHIVE_SECRET_KEY='fixture'\nDSSE_ARCHIVE_WEBHOOK_URL='https://alerts.example.test/dsse'\n")
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	binary := filepath.Join(dir, "capture-arguments")
 	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0700); err != nil {
 		t.Fatal(err)

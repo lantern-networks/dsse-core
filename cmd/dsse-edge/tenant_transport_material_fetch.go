@@ -32,7 +32,7 @@ import (
 // currently serving and when that runs out. A restart drops them all, and the start-up fetch runs with
 // known_generation=0, so the control plane sends everything and they are rebuilt from the certificates that
 // arrive. Until that first fetch succeeds the deadline is simply unknown, which the loop already treats as
-// "ask at the ordinary one-minute cadence" rather than as "nothing expires". Nothing an operator reads is
+// "ask again within ten seconds" rather than as "nothing expires". Nothing an operator reads is
 // served from here; the certificates themselves are held by transportTenantCertificates, which declares its
 // own durability.
 //
@@ -43,9 +43,10 @@ import (
 // under it is still the one on the wire.
 type tenantTransportMaterialFetcher struct {
 	trustDistributions *tenantTrustDistributionCache
-	// installedTenants is how many organizations the LAST fetch actually carried. It exists because a control
-	// plane that is still assembling answers 200 with an empty set, which is indistinguishable from "this
-	// deployment has no organizations" unless somebody counts.
+	// installedTenants counts distinct organizations successfully installed from
+	// any tier in the last full fetch. Shared transport needs no tenant-specific
+	// transport leaf; its identity/interception material still establishes that the
+	// control plane has supplied organizations, rather than an empty startup view.
 	installedTenants atomic.Int64
 	// lastAnswer is the set of organizations the control plane's last SUCCESSFUL, non-empty answer named —
 	// what it handed over plus what it refused by name. nil until one arrives, and never replaced by an empty
@@ -96,7 +97,10 @@ type tenantTransportMaterialFetcher struct {
 	generation uint64
 	// loadInterception hands the per-Edge interception tier to the engine. Nil on a node that does not
 	// intercept, which is a legitimate deployment and not an error.
-	loadInterception func(tenantInterceptionMaterial) error
+	loadInterception       func(tenantInterceptionMaterial) error
+	publishInterceptionCRL func(string) error
+	crlTenants             map[string]bool
+	crlPublishedAt         map[string]time.Time
 	// afterInstall runs once material has landed, so anything DERIVED from it can be rebuilt. The agent
 	// configuration is the measured case — see the note where this is called.
 	afterInstall func(transport, interception, deviceIdentity int)
@@ -192,6 +196,17 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 		}
 	}
 	if out.Unchanged {
+		for tenant := range f.crlTenants {
+			if f.publishInterceptionCRL != nil {
+				if time.Since(f.crlPublishedAt[tenant]) < 2*time.Minute {
+					continue
+				}
+				if err := f.publishInterceptionCRL(tenant); err != nil {
+					return f.expiry, fmt.Errorf("publish inspection leaf CRL for %q: %w", tenant, err)
+				}
+				f.crlPublishedAt[tenant] = time.Now()
+			}
+		}
 		if f.trustDistributions != nil {
 			if err := f.trustDistributions.Adopt(out.TrustBundles); err != nil {
 				return f.expiry, err
@@ -225,12 +240,18 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 	}
 	soonest := time.Time{}
 	installed := 0
+	installedOrganizations := map[string]bool{}
+	noteInstalled := func(tenant string) {
+		if tenant = strings.TrimSpace(tenant); tenant != "" {
+			installedOrganizations[tenant] = true
+		}
+	}
 	unresolved := 0
 	// Which authorities this response carried for each organization, so an authority it NO LONGER carries can
 	// be recognised as withdrawn rather than merely absent from a partial answer. See the withdrawal below.
 	carried := map[string]map[string]bool{}
 	for _, mat := range out.Materials {
-		tenant := strings.ToLower(strings.TrimSpace(mat.TenantID))
+		tenant := strings.TrimSpace(mat.TenantID)
 		if carried[tenant] == nil {
 			carried[tenant] = map[string]bool{}
 		}
@@ -255,6 +276,7 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 			continue
 		}
 		installed++
+		noteInstalled(mat.TenantID)
 		// ★ NOTHING IS BOOKED HERE FOR TRANSPORT. The install folds the lease into the effective deadline it
 		// records beside the certificate, so the deadline moves when the certificate moves — through a
 		// promotion, a withdrawal, or a replacement — instead of being a second copy that a transition can
@@ -283,6 +305,8 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 	// it down would leave an organization's signing material on a machine that may be gone in an hour, which is
 	// the thing this whole shape exists to avoid. LoadOfflineTenantIntermediate takes PEMs and persists nothing.
 	intercepted := 0
+	crlTenants := map[string]bool{}
+	crlPublishedAt := map[string]time.Time{}
 	for _, mat := range out.Interception {
 		if f.loadInterception == nil {
 			break
@@ -293,8 +317,22 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 			unresolved++
 			continue
 		}
+		if f.publishInterceptionCRL != nil {
+			if err := f.publishInterceptionCRL(mat.TenantID); err != nil {
+				f.log("tenant_interception_material for %q has no published leaf CRL (%v)", mat.TenantID, err)
+				unresolved++
+				continue
+			}
+			crlTenants[mat.TenantID] = true
+			crlPublishedAt[mat.TenantID] = time.Now()
+		}
 		intercepted++
+		noteInstalled(mat.TenantID)
 		f.recordHeld("interception", mat.TenantID, f.deadlineOf(mat.ChainPEM, mat.NotAfter))
+	}
+	if f.publishInterceptionCRL != nil {
+		f.crlTenants = crlTenants
+		f.crlPublishedAt = crlPublishedAt
 	}
 	// ★ THE AUTHORITY THIS NODE ENROLS AN ORGANIZATION'S DEVICES UNDER (2026-08-21). Same rule as the
 	// interception tier: it is short-lived, re-fetched, and never written to this node's disk. An Edge that
@@ -312,6 +350,7 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 			continue
 		}
 		enrolling++
+		noteInstalled(mat.TenantID)
 		f.recordHeld("device", mat.TenantID, f.deadlineOf(mat.CACertPEM, mat.NotAfter))
 	}
 	// ★★★ AN ORGANIZATION THE CONTROL PLANE NO LONGER KNOWS IS RETIRED IN TWO PHASES (2026-08-21, after doing
@@ -335,18 +374,13 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 	// not hand over material this time — transient, and keeping what we hold is exactly right. Absent from
 	// BOTH lists means it has no idea who that is. Only that starts a retirement. And an answer carrying no
 	// material at all starts nothing: a fetch that came back empty is not evidence that the fleet is empty.
-	if len(out.Materials) > 0 {
+	// Refusals are diagnostic prose, not a complete tenant membership list. A
+	// partial answer cannot prove an absent tenant was deleted, including when
+	// its identifier does not use the historical tenant_ prefix.
+	if len(out.Materials) > 0 && len(out.Refused) == 0 && unresolved == 0 {
 		known := map[string]bool{}
 		for _, mat := range out.Materials {
-			known[strings.ToLower(strings.TrimSpace(mat.TenantID))] = true
-		}
-		for _, reason := range out.Refused {
-			for _, field := range strings.Fields(reason) {
-				field = strings.Trim(strings.ToLower(field), ":\"")
-				if strings.HasPrefix(field, "tenant_") {
-					known[field] = true
-				}
-			}
+			known[strings.TrimSpace(mat.TenantID)] = true
 		}
 		// Remembered for the start-up promise guard, which asks the same question this loop asks — is this
 		// organization still one of the deployment's? — about names rather than about certificates.
@@ -382,7 +416,7 @@ func (f *tenantTransportMaterialFetcher) FetchOnce() (time.Time, error) {
 	// replace this round and is therefore still serving under the old certificate. See recordHeld.
 	soonest = f.heldDeadline()
 	f.noteDeadlineChanged()
-	f.installedTenants.Store(int64(installed))
+	f.installedTenants.Store(int64(len(installedOrganizations)))
 	f.log("tenant_edge_material installed: transport for %d organization(s), interception for %d, device "+
 		"identity for %d; soonest expiry %s", installed, intercepted, enrolling, soonestString(soonest))
 	// ★★★ AND WHATEVER WAS WRITTEN BEFORE THIS ARRIVED IS NOW WRONG (2026-08-22, measured to the second).
@@ -509,14 +543,14 @@ func (f *tenantTransportMaterialFetcher) recordHeld(purpose, tenant string, unti
 	if f.held == nil {
 		f.held = map[string]time.Time{}
 	}
-	f.held[purpose+"|"+strings.ToLower(strings.TrimSpace(tenant))] = until
+	f.held[purpose+"|"+strings.TrimSpace(tenant)] = until
 }
 
 func (f *tenantTransportMaterialFetcher) forgetHeld(tenant string) {
 	if f == nil {
 		return
 	}
-	suffix := "|" + strings.ToLower(strings.TrimSpace(tenant))
+	suffix := "|" + strings.TrimSpace(tenant)
 	f.heldMu.Lock()
 	defer f.heldMu.Unlock()
 	for k := range f.held {
@@ -543,7 +577,7 @@ func (f *tenantTransportMaterialFetcher) withdrawAuthoritiesTheControlPlaneNoLon
 	}
 	carried := map[string]map[string]bool{}
 	for _, mat := range materials {
-		tenant := strings.ToLower(strings.TrimSpace(mat.TenantID))
+		tenant := strings.TrimSpace(mat.TenantID)
 		if carried[tenant] == nil {
 			carried[tenant] = map[string]bool{}
 		}
@@ -707,10 +741,8 @@ func (f *tenantTransportMaterialFetcher) Start() {
 			// eight hours on a twelve-hour lifetime — which is also how long a rotation performed on the
 			// control plane took to reach this node. It now asks every minute and is told "unchanged" almost
 			// every time; material is minted only when the answer is different.
-			wait := time.Minute
-			switch {
-			case err != nil:
-				wait = f.backoffAfterFailure(time.Now(), 10*time.Minute)
+			wait := f.nextFetchWait(time.Now(), err)
+			if err != nil {
 				f.reportFetchFailure(err, wait)
 			}
 			// ★★★ AND HOLDING NOTHING IS NOT A REASON TO WAIT (2026-08-28, measured while setting a deployment
@@ -1058,6 +1090,20 @@ func warnIfNodeIdentityIsEnding(pair *tls.Certificate, lastWarned *atomic.Int64,
 	return true
 }
 
+// An empty deployment must recover promptly when its first organization's material appears,
+// including after an unavailable control plane. Ten seconds bounds the retry delay without a hot loop.
+const tenantMaterialBootstrapInterval = 10 * time.Second
+
+func (f *tenantTransportMaterialFetcher) nextFetchWait(now time.Time, err error) time.Duration {
+	if err != nil {
+		return f.backoffAfterFailure(now, tenantMaterialBootstrapInterval)
+	}
+	if f != nil && f.expiry.IsZero() {
+		return tenantMaterialBootstrapInterval
+	}
+	return time.Minute
+}
+
 // backoffAfterFailure is how long to wait after a refresh failed. It is the ordinary back-off, EXCEPT that it
 // never outlives the material this node is holding.
 //
@@ -1084,9 +1130,14 @@ func warnIfNodeIdentityIsEnding(pair *tls.Certificate, lastWarned *atomic.Int64,
 // node from spinning. If those attempts all fail the material really is gone, and reportFetchFailure's
 // expiry branch does what it says: leave, so the door routes around this node instead of into it.
 func (f *tenantTransportMaterialFetcher) backoffAfterFailure(now time.Time, ordinary time.Duration) time.Duration {
-	if f == nil || f.expiry.IsZero() {
-		// Holding nothing has no life to be shorter than; the fleet guard is what judges such a node.
+	if f == nil {
 		return ordinary
+	}
+	if f.expiry.IsZero() {
+		if ordinary < tenantMaterialBootstrapInterval {
+			return ordinary
+		}
+		return tenantMaterialBootstrapInterval
 	}
 	remaining := f.expiry.Sub(now)
 	if remaining <= 0 {
@@ -1192,5 +1243,5 @@ func (f *tenantTransportMaterialFetcher) OrganizationIsGone(tenant string) bool 
 	if answer == nil || len(*answer) == 0 {
 		return false
 	}
-	return !(*answer)[strings.ToLower(strings.TrimSpace(tenant))]
+	return !(*answer)[strings.TrimSpace(tenant)]
 }

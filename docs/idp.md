@@ -120,6 +120,33 @@ a working Console connection test does not prove every Edge has applied them.
 **Test** checks connectivity and metadata/JWKS consistency. It does not complete
 an authorization-code exchange, verify a client secret, or demonstrate MFA.
 
+## Browser access to a published private application
+
+The optional `/clientless/apps/{application_id}` route requires explicit
+`-clientless-access` enablement, an active verified IdP session cookie, and an
+active, published private application in that session's tenant. High-sensitivity
+applications require a managed device and cannot use this reduced-trust route.
+This feature is separate from the standard-browser step-up ceremony used by
+endpoint agents.
+
+The application relay uses the verified caller's tenant to select its Connector
+and policy. URL parameters cannot assert a user, group, device posture, delegated
+identity, or a different tenant. Query and header values do not replace the
+clientless browser's session cookie. A catalog read failure stops the request;
+it does not select a legacy destination instead.
+
+Direct `/apps/{application_id}` requests carrying a human session also require a
+verified mTLS endpoint registered in the same tenant. A session already bound to
+a device must match that device. A Connector certificate or a device identifier
+stored in an IdP session is not proof of a managed endpoint. Administrators can
+still author an explicit policy for anonymous access to a non-high-sensitivity
+application; such requests have no verified user or managed-device identity.
+These routes always require the current application policy to permit access.
+An inventory read failure is different from an unregistered device: access
+evaluation stops instead of dropping device risk or posture conditions. The
+Console's risk API likewise returns an error instead of reporting an empty risk
+value.
+
 ## Authentication strength and current limits
 
 An Authenticate action and a phishing-resistant authentication requirement are
@@ -128,28 +155,35 @@ corresponding signed claim; the browser opening or returning is insufficient.
 
 | Setting | Current interpretation |
 |---|---|
-| `required_idp_id` | Selects the provider requested by the step-up URL |
+| `required_idp_id` | Selects the requested provider and restricts grant reuse to that provider |
 | `min_acr` | Exact expected assurance value, not a numeric ordering of arbitrary ACR strings |
 | `acr_claim` | Claim to read; a required value can match a scalar or an element of an array |
-| `required_amr` | Authored required methods; the token validator can check all supplied values, but the shared flow path has the limitation below |
-| `max_age_seconds` | Authored freshness requirement; not a guarantee that the shared broker forces a fresh IdP authentication |
+| `required_amr` | Every required method must be present in the verified token and reusable grant |
+| `max_age_seconds` | Limits verified IdP `auth_time`; zero is restricted to one pending native request |
+| `grant_ttl_seconds` | Caps grant issuance and reuse from issuance time; separate from IdP authentication age |
 
-**The shared federated flow gate currently checks a live tenant grant, compatible
-device binding, and the required ACR. It does not check the grant's provider ID,
-AMR, authentication age, or destination scope.** The step-up URL/start path does not
-carry the rule's AMR and freshness requirements through to validation. An unbound
-grant can also satisfy the gate's device check. Do not describe this path as strict
-per-user, per-device, per-destination authorization with every form field enforced.
+The shared federated gate checks tenant, exact device binding, provider/issuer
+identity and configuration, destination scope, assurance, required methods,
+authentication freshness, revocation and the current grant-lifetime cap. When
+[device-user authentication](device-user-authentication.md) is activated, the OS
+principal, login incarnation and administrator-assigned IdP subject must match too.
+An unbound grant cannot release a device-bound flow. Signed start links preserve
+these requirements through authorization and callback; incomplete, duplicated or
+tampered parameters are rejected before an IdP redirect.
 
-The broker requests `acr_values`; it does not implement provider-specific claims
-challenges or a `max_age`/`prompt` freshness round-trip here. Provider labels and
-the Console's strength presets do not overcome these limits. Check the actual
-claims and negative cases on the exact deployed path before relying on assurance.
+The broker requests `acr_values` and the authored `max_age` with OIDC authorization
+code plus PKCE, and validates the resulting signed claims. It does not implement
+provider-specific claims challenges. Test actual claims and negative cases with
+the chosen provider; provider labels and Console presets are not evidence that an
+IdP performed a requested factor.
 
-Pending browser authentication state is process-local and expires after ten
-minutes. A restart or a callback reaching a different process can require a fresh
-attempt. The broker's federated grant has a default lifetime of eight hours;
-this is distinct from the East-West challenge/grant API's lifetimes.
+Signed native requests have a bounded authentication window. With the configured
+shared deployment key and activated ceremony-recovery capability, encrypted
+browser-bound state can finish on another current Portal process behind the same
+origin. Anonymous clientless starts remain process-local. The federated grant's
+configured default is eight hours; positive rule and tenant ceilings can shorten
+it. See [grant lifetime and freshness](device-user-authentication.md#grant-lifetime-and-idp-authentication-freshness)
+and the [rolling-upgrade requirements](authentication-rolling-upgrades.md).
 
 ## Review and revoke access approvals
 
@@ -165,6 +199,68 @@ The page lists and revokes approvals; it has no manual creation or editing form.
 **Revoke** asks for confirmation. Cancel sends no revocation request. The API
 checks the exact tenant and grant together before applying the denial. Repeated
 requests while a confirmation or write is pending are suppressed in the page.
+
+Administrator revocation requires a new identity verification, rather than only
+invalidating one cookie. DSSE persists a `reauthenticate_after` boundary for the
+affected identity, device/account and resource. Older IdP SSO evidence cannot
+mint or authorize a replacement approval, even under a different approval ID or
+OS login session. New approvals must contain a verified `auth_time` strictly
+later than that boundary. Token issuance and approval issuance times do not
+substitute for authentication time. The boundary has no automatic expiry: IdP
+SSO lifetimes are not bounded by the approval lifetime. Expired duplicate or
+subsumed fences are compacted after the 15-minute replay
+retention period. At more than 4096 distinct effective selectors in a tenant,
+boundaries are consolidated to one **stricter tenant-wide boundary** at the latest
+cutoff. Revocation is never rejected because that threshold was reached. Other
+users, devices and resources in the same tenant may also need fresh identity
+verification; the API returns `reauthentication_scope: tenant` and the Console
+shows a warning. Existing denials are never weakened. Live and recent grant IDs
+remain as replay tombstones until their own expiry plus retention; this threshold
+bounds effective selectors, not those temporary tombstone rows. The wider
+boundary survives restart and distribution. Tenant data erasure removes its
+boundaries along with its other authentication data. Authorization uses an index
+by tenant and user; an unidentified subject is conservatively matched within its
+own tenant.
+
+The Portal requests suitable authentication freshness from the IdP and checks
+the returned signed evidence. IdPs that cannot request or prove that freshness
+fail closed; do not interpret an account-selection screen or a successful redirect
+as a fresh identity verification. Google account reauthentication is not claimed
+as supported by the existing direct-provider integration.
+
+After the new verification, an ordinary reusable approval may be issued under
+the current policy. This does not turn the approval into a one-request grant.
+Natural expiration and consumption of a one-request grant do not create an
+administrator revocation boundary. Deny policies and device/account revocations
+still apply after a new sign-in.
+
+In a distributed deployment, update the CPs before Edges: the Portal checks the
+CP's authenticated management authority before sign-in and commits approvals
+there before publishing them locally once `revocation-reauthentication-v1` is
+activated. No local-only approval is issued when that authority is unavailable;
+already valid approvals may still authorize under current policy. A deployment
+with one CP therefore cannot issue new approvals while that CP is unavailable.
+Before activation, Edges retain local issuance and reporting for compatibility
+with old CPs, and the administrative API still revokes the selected approval.
+Its response explicitly sets `fresh_identity_required: false`, and the Console
+warns that existing IdP SSO may authorize a replacement. Activation does not
+silently add freshness boundaries to earlier ordinary revocations. All expected
+CP/Edge processes must report and activate the capability for the stronger
+operation. Do not reintroduce an older serving binary after activation.
+
+Authorization misses use a separate, signed `/admin/authentication-grants`
+management snapshot, rather than refetching the complete configuration. Both
+this endpoint and `/admin/config-bundle` require an operator identity or an
+operator-organization Edge API token with `admin.policy.read`; customer policy
+readers cannot download them. These responses contain bearer grants and, for
+the full configuration, IdP client secrets. They are available directly over the
+trusted management channel and are never proxied by the browser-facing Console.
+Tenant administrators use the scoped resource APIs instead. A
+content version avoids transferring unchanged grants. Each signed response
+includes a fresh read nonce and is checked against the existing pinned signing
+keys. Concurrent misses do not wait behind another refresh; the Edge admits at
+most one refresh per second. Old CPs without this endpoint continue using
+ordinary periodic distribution, without unsigned or full-bundle fallback here.
 
 If storage fails, the API returns HTTP 500 with `status: partial`, `applied: true`
 and `persistence: unconfirmed`. The grant remains revoked in this server's memory,
@@ -274,3 +370,43 @@ Implementation references: [registry](../idpregistry/idpregistry.go),
 [broker](../cmd/dsse-edge/clientless_broker.go),
 [flow gate](../cmd/dsse-edge/federated_auth_gate.go), and
 [registry distribution](../cmd/dsse-edge/config_bundle_idp_connections.go).
+
+## Rolling grant-storage compatibility (development)
+
+The shared PostgreSQL authority now keeps `grants` as the map understood by the
+released 0.3.1 writer. New evidence is stored separately in `grants_evidence_v1`;
+both keys are updated in one transaction. Backups must include both keys.
+Request-bound grants are absent from the legacy key and legacy bundle field.
+They travel in `protected_grants` and use the versioned `/grant-report-v2` report
+endpoint, so an older CP cannot silently acknowledge them after dropping their
+requirements. Unknown required features deny only the affected grant; unknown
+JSON fields are retained.
+
+This storage change alone does **not** establish rolling-upgrade readiness.
+Authoritative membership and capability tracking for every CP and Edge, the
+mixed-version acceptance phase for legacy evidence, and authenticated native
+traffic across actual process replacement remain required. The current gate
+still refuses grants without provider evidence. Do not claim that an already
+authenticated legacy user avoids reauthentication during upgrade yet. A fleet
+view containing only nodes that recently reported is insufficient to conclude
+that all older nodes have been upgraded.
+
+Draining prevents new authentication starts and waits. It does not revoke an
+already issued grant or immediately cancel an existing callback. Request-bound
+grants expire no later than their original ceremony deadline; retries do not
+extend that deadline. Expired protected rows are removed after a ten-minute
+grace. The rolling authority conservatively retains ordinary legacy rows until
+a complete-fleet cutover can be established. Local caches prune expired rows.
+
+### Grant visibility between Edges
+
+A successful Portal callback reports the saved grant to the control plane before
+returning its completion page, with a three-second publication bound. The periodic
+report remains a retry path when the authority is unavailable. Before starting
+another authentication ceremony after a local authorization miss, an Edge makes
+a bounded read of the authority's signed configuration and imports only its grant
+evidence. Concurrent misses are coalesced and reads are limited to once per second
+per Edge. Invalid, unsigned or incomplete evidence cannot authorize traffic.
+Device, OS session, destination, assurance and current policy lifetime checks still
+apply after import. This avoids waiting for the normal report and configuration
+poll intervals when a user's next connection reaches a different Edge.

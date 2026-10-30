@@ -8,11 +8,12 @@ import "flag"
 // publicly trusted certificate. The DSSE hop in between is a browser-facing page like any other, so its
 // certificate is provided for it rather than minted from a CA that exists to do something else. See
 // the_step_up_portal_is_a_browser_facing_page.go for the two alternatives that were measured and rejected.
-func stepUpPortalCertificateFlags() (cert, key *string) {
+func stepUpPortalCertificateFlags() (cert, key, ca *string) {
 	return flag.String("clientless-tls-cert", "",
 			"certificate presented at the step-up portal's own name (the host in -clientless-base-url). A "+
 				"browser is sent here to authenticate, so this is the operator's certificate for a name they "+
 				"hold — publicly trusted in production. Empty = the agent plane's certificate, which a browser "+
 				"has no reason to trust."),
-		flag.String("clientless-tls-key", "", "private key for -clientless-tls-cert.")
+		flag.String("clientless-tls-key", "", "private key for -clientless-tls-cert."),
+		flag.String("clientless-tls-ca", "", "optional PEM CA file used only to validate this Edge's Portal certificate; does not add trust for upstream applications or identity providers")
 }

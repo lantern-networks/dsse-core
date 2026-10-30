@@ -5,9 +5,7 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
-	"syscall"
 
 	"github.com/lantern-networks/dsse-core/clients/windows-wfp/winbin"
 )
@@ -23,10 +21,14 @@ const warnToastScript = `$ErrorActionPreference='SilentlyContinue';` +
 	`$n.BalloonTipText='__DSSE_DEST__ (__DSSE_SVC__) への接続は監視されています。まもなく認証が必要になります。';` +
 	`$n.Visible=$true;$n.ShowBalloonTip(8000);Start-Sleep -Seconds 9;$n.Dispose()`
 
-// defaultWarnLauncher shows the passive Warn notice as a tray balloon in the logged-in user's console session
-// (the agent runs as a session-0 service, so it bridges via launchInActiveSession — the same path the step-up
-// toast uses). Best-effort and non-fatal: it never holds or opens anything.
-func defaultWarnLauncher(dest, service string) {
+// defaultWarnLauncher shows the passive Warn notice only in the originating flow owner's session.
+// A different user may own the active console by the time the Edge sends WARN, so there is no active-console
+// or session-0 fallback. Best-effort and non-fatal: it never holds or opens anything.
+func defaultWarnLauncher(dest, service string, owner stepUpOwner) {
+	if !warnOwnerStillCurrent(owner, captureStepUpOwner) {
+		fmt.Fprintln(os.Stderr, "steer warn: originating user session unavailable")
+		return
+	}
 	script := strings.ReplaceAll(warnToastScript, "__DSSE_DEST__", sanitizeResource(dest))
 	script = strings.ReplaceAll(script, "__DSSE_SVC__", sanitizeResource(service))
 	// Resolved from the system directory for both forms — see package winbin. The string form runs in the
@@ -37,10 +39,7 @@ func defaultWarnLauncher(dest, service string) {
 		return
 	}
 	cmd := fmt.Sprintf(`"%s" -NoProfile -NonInteractive -WindowStyle Hidden -Command "%s"`, ps, script)
-	if err := launchInActiveSession(cmd); err != nil {
-		// session-0 fallback (foreground test); harmless if it shows nowhere.
-		c := exec.Command(ps, "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script)
-		c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		_ = c.Start()
+	if err := launchInSession(cmd, uintptr(owner.Session), owner.SID, owner.LogonID); err != nil {
+		fmt.Fprintln(os.Stderr, "steer warn: originating user session unavailable")
 	}
 }

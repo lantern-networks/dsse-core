@@ -90,7 +90,7 @@ func DerivePostureTrustLevel(signals *model.DevicePostureSignals, policy Posture
 func osVersionAtLeast(got, want string) bool {
 	g := parseVersion(got)
 	w := parseVersion(want)
-	if len(g) == 0 {
+	if len(g) == 0 || len(w) == 0 {
 		return false
 	}
 	for i := 0; i < len(g) || i < len(w); i++ {
@@ -117,8 +117,8 @@ func parseVersion(v string) []int {
 	out := make([]int, 0, len(parts))
 	for _, p := range parts {
 		n, err := strconv.Atoi(strings.TrimSpace(p))
-		if err != nil {
-			break
+		if err != nil || n < 0 {
+			return nil
 		}
 		out = append(out, n)
 	}

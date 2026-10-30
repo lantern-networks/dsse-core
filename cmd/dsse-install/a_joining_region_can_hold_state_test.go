@@ -33,7 +33,7 @@ func TestAJoiningRegionCanHoldState(t *testing.T) {
 	// first survives a process crash and not the machine; the member that matters is the one in the next
 	// region, which the database door already names.
 	for _, want := range []string{"dsse-postgres-a", "dsse-control-plane-a",
-		"dsse-clickhouse", "dsse-archive", "dsse-console"} {
+		"dsse-clickhouse", "dsse-console"} {
 		if !has(want) {
 			t.Fatalf("a state-bearing joining region must run %s — without it there is nothing here to promote, "+
 				"or its history is written in another region", want)

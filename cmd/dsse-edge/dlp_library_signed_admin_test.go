@@ -54,7 +54,7 @@ func TestLibrarySignedAdminCRUDAndAudit(t *testing.T) {
 	send("customer", "POST", "/admin/dlp-classifiers", `{"classifiers":[],"expected_tenant_id":"other"}`, 409)
 	send("customer", "DELETE", "/admin/dlp-fingerprints?name=employees&expected_tenant_id=other", "", 409)
 	send("operator", "POST", "/admin/dlp-classifiers", `{"classifiers":[{"name":"foreign_id","kind":"keyword","keywords":["FOREIGN"]}]}`, 200)
-	src := configBundleSource{url: server.URL, client: server.Client(), token: "token-customer", tenantID: "customer", verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
+	src := configBundleSource{url: server.URL, client: server.Client(), token: "token-operator", tenantID: "operator", verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
 	before, err := src.fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -71,6 +71,9 @@ func TestLibrarySignedAdminCRUDAndAudit(t *testing.T) {
 			send("customer", "DELETE", "/admin/dlp-fingerprints?name=employees", "", 200)
 		}
 		got := send("reader", "GET", "/admin/dlp-classifiers", "", 200)
+		if strings.Contains(got, "FOREIGN") {
+			t.Fatal("customer scoped classifier API disclosed foreign definition")
+		}
 		if value != "" && !strings.Contains(got, value) {
 			t.Fatal("saved classifier missing")
 		}
@@ -85,8 +88,8 @@ func TestLibrarySignedAdminCRUDAndAudit(t *testing.T) {
 		if bundle.Generation <= before.Generation || bundle.DLP == nil {
 			t.Fatal("edit did not advance distributed generation")
 		}
-		if _, ok := bundle.DLP.Classifiers["operator"]; ok {
-			t.Fatal("foreign definition exposed")
+		if _, ok := bundle.DLP.Classifiers["operator"]; !ok {
+			t.Fatal("operator fleet read lost another tenant definition")
 		}
 		if err := edge.Apply(bundle.DLP); err != nil {
 			t.Fatal(err)

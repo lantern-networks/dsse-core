@@ -2,8 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	dnsresolver "github.com/lantern-networks/dsse-core/dnsresolver"
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // The DNS policy an operator authored, kept across restarts.
@@ -31,34 +32,41 @@ type dnsPolicyStore struct {
 	path     string
 	mu       sync.Mutex
 	authored bool
+	write    func(string, []byte, os.FileMode) error
 }
 
 func newDNSPolicyStore(path string) *dnsPolicyStore {
 	return &dnsPolicyStore{path: strings.TrimSpace(path)}
 }
 
-// load returns the stored policy, or ok=false when there is nothing stored yet. A CORRUPT store returns
-// ok=false as well: falling back to the boot environment is recoverable, whereas refusing to start over an
-// unreadable DNS file would take the datapath down for a resolvable problem.
-func (s *dnsPolicyStore) load() (dnsresolver.PolicyDTO, bool) {
+// load distinguishes first boot from unreadable or invalid operator state.
+// Existing state must never be replaced with a seed just because it cannot be read.
+func (s *dnsPolicyStore) load() (dnsresolver.PolicyDTO, bool, error) {
 	if s == nil || s.path == "" {
-		return dnsresolver.PolicyDTO{}, false
+		return dnsresolver.PolicyDTO{}, false, nil
 	}
 	raw, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return dnsresolver.PolicyDTO{}, false, nil
+	}
 	if err != nil {
-		return dnsresolver.PolicyDTO{}, false
+		return dnsresolver.PolicyDTO{}, false, fmt.Errorf("read DNS policy: %w", err)
 	}
 	var record struct {
 		dnsresolver.PolicyDTO
 		Authored bool `json:"admin_authored,omitempty"`
 	}
-	if err := json.Unmarshal(raw, &record); err != nil {
-		log.Printf("dns policy store: %s is unreadable (%v) — starting from the boot configuration instead", s.path, err)
-		return dnsresolver.PolicyDTO{}, false
+	if strings.TrimSpace(string(raw)) == "null" {
+		return dnsresolver.PolicyDTO{}, false, fmt.Errorf("DNS policy must be an object")
 	}
-	_, validationErr := dnsresolver.PolicyFromDTO(record.PolicyDTO)
-	s.authored = record.Authored && validationErr == nil
-	return record.PolicyDTO, true
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return dnsresolver.PolicyDTO{}, false, fmt.Errorf("decode DNS policy: %w", err)
+	}
+	if _, err := dnsresolver.PolicyFromDTO(record.PolicyDTO); err != nil {
+		return dnsresolver.PolicyDTO{}, false, fmt.Errorf("invalid stored DNS policy: %w", err)
+	}
+	s.authored = record.Authored
+	return record.PolicyDTO, true, nil
 }
 
 // save writes atomically: a temp file and a rename, so a crash mid-write leaves the previous policy rather
@@ -81,39 +89,36 @@ func (s *dnsPolicyStore) saveSnapshot(dto dnsresolver.PolicyDTO, authored bool) 
 			return fmt.Errorf("create dns policy store directory: %w", err)
 		}
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("write dns policy: %w", err)
+	write := s.write
+	if write == nil {
+		write = durablefile.Write
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("commit dns policy: %w", err)
-	}
-	return nil
+	return write(s.path, raw, 0o600)
 }
 
 // restoreDNSPolicy applies the stored policy over the one built from the environment, and seeds the store when
 // there is nothing in it yet. Returns a line describing what happened, for the startup log — a restart that
 // silently changes which names resolve is exactly what this is meant to stop being possible.
-func restoreDNSPolicy(store *dnsPolicyStore, resolver *dnsresolver.Resolver) string {
+func restoreDNSPolicy(store *dnsPolicyStore, resolver *dnsresolver.Resolver) (string, error) {
 	if store == nil || store.path == "" || resolver == nil {
-		return ""
+		return "", nil
 	}
-	if dto, ok := store.load(); ok {
+	dto, ok, err := store.load()
+	if err != nil {
+		return "", err
+	}
+	if ok {
 		policy, err := dnsresolver.PolicyFromDTO(dto)
 		if err != nil {
-			log.Printf("dns policy store: stored policy is invalid (%v) — keeping the boot configuration", err)
-			return ""
+			return "", err
 		}
 		resolver.SetPolicy(policy)
-		return fmt.Sprintf("dns policy: restored from %s (%s)", store.path, policy.Summary())
+		return fmt.Sprintf("dns policy: restored from %s (%s)", store.path, policy.Summary()), nil
 	}
-	// Nothing stored: seed from what the deployment booted with, so the first admin write is an edit rather
-	// than a creation, and so the file exists to be inspected.
 	if err := store.save(dnsresolver.PolicyToDTO(resolver.CurrentPolicy())); err != nil {
-		log.Printf("dns policy store: could not seed %s: %v", store.path, err)
-		return ""
+		return "", fmt.Errorf("seed DNS policy: %w", err)
 	}
-	return fmt.Sprintf("dns policy: seeded %s from the boot configuration (%s)", store.path, resolver.CurrentPolicy().Summary())
+	return fmt.Sprintf("dns policy: seeded %s from the boot configuration (%s)", store.path, resolver.CurrentPolicy().Summary()), nil
 }
 
 // DNS-policy admin routes (read + durable write-through to the resolver), moved verbatim
@@ -150,6 +155,10 @@ func registerDNSPolicyRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		edgeDNSPolicyStore.mu.Lock()
 		defer edgeDNSPolicyStore.mu.Unlock()
 		if err := edgeDNSPolicyStore.saveSnapshot(dnsresolver.PolicyToDTO(policy), true); err != nil {
+			if errors.Is(err, durablefile.ErrReplacedNotFlushed) {
+				edgeDNSPolicyStore.authored = true
+				edgeDNSResolver.SetPolicy(policy)
+			}
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("DNS policy could not be saved; reload and retry"))
 			return
 		}

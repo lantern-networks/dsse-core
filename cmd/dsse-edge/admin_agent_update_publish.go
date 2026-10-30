@@ -48,8 +48,8 @@ import (
 // run code moves here: what moves is the answer to "which signed document is current", which is exactly the
 // thing that must not differ between two nodes.
 
-// maxPublishedSetBytes and maxPublishedTargets bound what a control plane may hand an Edge. A fleet publishes
-// one release per platform/arch; anything approaching these is not a release set.
+// maxPublishedSetBytes and maxPublishedTargets bound a compromised control plane's distribution response.
+// Multiple tenant canaries may legitimately share one platform/arch and remain distinct in this response.
 const (
 	maxPublishedSetBytes = 4 << 20 // 4 MiB of JSON envelopes
 	maxPublishedTargets  = 64
@@ -141,7 +141,7 @@ func (s *publishedAgentUpdateStore) WithArtifactShelf(shelf *agentUpdateArtifact
 // on disk either, so the two cannot disagree about what exists.
 func artifactBlobKey(tenantID, platform, arch, version string) string {
 	name := artifactFileName(platform, arch, version)
-	t := strings.ToLower(strings.TrimSpace(tenantID))
+	t := strings.TrimSpace(tenantID)
 	if name == "" || t == "" || strings.ContainsAny(t, `/\`) || strings.Contains(t, "..") {
 		return ""
 	}
@@ -149,7 +149,13 @@ func artifactBlobKey(tenantID, platform, arch, version string) string {
 }
 
 func artifactBlobKeyPrefix(tenantID string) string {
-	return "agent_update_artifact|" + strings.ToLower(strings.TrimSpace(tenantID)) + "|"
+	return "agent_update_artifact|" + artifactTenantComponent(tenantID) + "|"
+}
+
+// Encode the exact tenant bytes using one case-insensitive-filesystem-safe component. Even on the default
+// macOS filesystem, distinct tenant IDs such as Acme and acme must not share local or shared release bytes.
+func artifactTenantComponent(tenantID string) string {
+	return "t-" + hex.EncodeToString([]byte(strings.TrimSpace(tenantID)))
 }
 
 func (s *publishedAgentUpdateStore) shelfFor(tenantID, platform, arch, version string) blobstore.Persister {
@@ -179,6 +185,47 @@ func (s *publishedAgentUpdateStore) shelveArtifact(path, tenantID, platform, arc
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
+	}
+	return blob.Save(data)
+}
+
+// Startup migration may race a live upload for the same release slot. Only
+// the upload may replace an existing nonempty shelf row; the seed fills only
+// an absent or empty row.
+func (s *publishedAgentUpdateStore) seedArtifactIfAbsent(path, tenantID, platform, arch, version string) (bool, error) {
+	blob := s.shelfFor(tenantID, platform, arch, version)
+	if blob == nil {
+		return false, nil
+	}
+	seed, ok := blob.(interface {
+		seedArtifactIfAbsent([]byte) (bool, error)
+	})
+	if !ok {
+		return false, fmt.Errorf("the shared artifact shelf cannot seed atomically")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	return seed.seedArtifactIfAbsent(data)
+}
+
+// A live upload may spend time reading and hashing its request body. Preserve
+// the request's original CP term when placing its bytes on the shared shelf;
+// verified startup seeding uses a separate, insert-only path above.
+func (s *publishedAgentUpdateStore) shelveArtifactContext(ctx context.Context, path, tenantID, platform, arch, version string) error {
+	blob := s.shelfFor(tenantID, platform, arch, version)
+	if blob == nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if contextual, ok := blob.(interface {
+		saveArtifactContext(context.Context, []byte) error
+	}); ok {
+		return contextual.saveArtifactContext(ctx, data)
 	}
 	return blob.Save(data)
 }
@@ -229,10 +276,14 @@ func (s *publishedAgentUpdateStore) SeedShelfFromDisk(dir string, trustedKeys []
 		if path == "" || !artifactBytesMatch(path, m) {
 			continue
 		}
-		if serr := s.shelveArtifact(path, tenant, m.Platform, m.Arch, m.Version); serr != nil {
+		inserted, serr := s.seedArtifactIfAbsent(path, tenant, m.Platform, m.Arch, m.Version)
+		if serr != nil {
 			log.Printf("agent_update_artifact_seed_failed tenant=%s target=%s/%s version=%s err=%v", tenant,
 				m.Platform, m.Arch, m.Version, serr)
 			continue
+		}
+		if !inserted {
+			continue // A concurrent upload or another seed already filled this row.
 		}
 		log.Printf("agent_update_artifact_seeded tenant=%s target=%s/%s version=%s — this node held the bytes "+
 			"and the deployment's shelf did not, so every control plane can serve it now", tenant, m.Platform,
@@ -355,8 +406,23 @@ func agentUpdateReadContextMatches(w http.ResponseWriter, r *http.Request, scope
 	return true
 }
 
+func agentUpdateDistributionAllowed(r *http.Request, operatorTenantID string) bool {
+	identity, ok := adminIdentityFromRequest(r)
+	if !ok || identity.AuthMethod != "admin_api_token" ||
+		!adminPermissionAllowed(identity.Roles, "admin.agent_updates.distribution.read") ||
+		!adminScopeAllowed(identity, "admin.agent_updates.distribution.read") ||
+		strings.TrimSpace(r.Header.Get("X-Operate-Tenant")) != "" {
+		return false
+	}
+	operatorTenantID = strings.TrimSpace(operatorTenantID)
+	if operatorTenantID == "" {
+		return strings.TrimSpace(identity.TenantID) == "" && operatorTenantlessMode.Load()
+	}
+	return strings.TrimSpace(identity.TenantID) == operatorTenantID
+}
+
 func tenantTargetKey(tenantID, platform, arch string) string {
-	return strings.ToLower(strings.TrimSpace(tenantID)) + "|" + updateTargetKey(platform, arch)
+	return strings.TrimSpace(tenantID) + "|" + updateTargetKey(platform, arch)
 }
 
 func newPublishedAgentUpdateStore() *publishedAgentUpdateStore {
@@ -587,7 +653,7 @@ func copyEnvelopes(in map[string]agentpolicy.Envelope) map[string]agentpolicy.En
 }
 
 func scopedTo(all map[string]agentpolicy.Envelope, tenantID string) map[string]agentpolicy.Envelope {
-	prefix := strings.ToLower(strings.TrimSpace(tenantID)) + "|"
+	prefix := strings.TrimSpace(tenantID) + "|"
 	out := map[string]agentpolicy.Envelope{}
 	for k, v := range all {
 		if strings.HasPrefix(k, prefix) {
@@ -630,7 +696,7 @@ func (s *publishedAgentUpdateStore) ForTenant(tenantID string) map[string]agentp
 	if s == nil {
 		return nil
 	}
-	prefix := strings.ToLower(strings.TrimSpace(tenantID)) + "|"
+	prefix := strings.TrimSpace(tenantID) + "|"
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := map[string]agentpolicy.Envelope{}
@@ -642,7 +708,7 @@ func (s *publishedAgentUpdateStore) ForTenant(tenantID string) map[string]agentp
 	// Before this, an organization saw only what somebody had written into IT, which on a deployment with more
 	// than one customer meant nothing at all.
 	cataloguePrefix := agentUpdateCatalogueScope + "|"
-	if !strings.EqualFold(strings.TrimSpace(tenantID), agentUpdateCatalogueScope) {
+	if strings.TrimSpace(tenantID) != agentUpdateCatalogueScope {
 		for k, v := range s.envelopes {
 			if strings.HasPrefix(k, cataloguePrefix) {
 				out[strings.TrimPrefix(k, cataloguePrefix)] = v
@@ -773,17 +839,17 @@ func (s *publishedAgentUpdateStore) removeTenantWithCleanupContext(ctx context.C
 // component. Same refusals as artifactStorePath, which is the only other thing that builds this path.
 func tenantArtifactDir(dir, tenantID string) string {
 	d := strings.TrimSpace(dir)
-	t := strings.ToLower(strings.TrimSpace(tenantID))
+	t := strings.TrimSpace(tenantID)
 	if d == "" || t == "" || strings.ContainsAny(t, `/\`) || strings.Contains(t, "..") {
 		return ""
 	}
-	return filepath.Join(d, t)
+	return filepath.Join(d, artifactTenantComponent(t))
 }
 
 // tenantShelfPrefix is the key prefix of one organization's own shelf, or "" for anything that is not one —
 // including the deployment's catalogue, which no tenant erasure may touch.
 func tenantShelfPrefix(tenantID string) string {
-	t := strings.ToLower(strings.TrimSpace(tenantID))
+	t := strings.TrimSpace(tenantID)
 	if t == "" || t == agentUpdateCatalogueScope {
 		return ""
 	}
@@ -837,11 +903,22 @@ func artifactStorePath(dir, tenantID, platform, arch, version string) string {
 	if name == "" {
 		return ""
 	}
-	t := strings.ToLower(strings.TrimSpace(tenantID))
+	t := strings.TrimSpace(tenantID)
 	if t == "" || strings.ContainsAny(t, `/\`) || strings.Contains(t, "..") {
 		return ""
 	}
-	return filepath.Join(dir, t, name)
+	return filepath.Join(dir, artifactTenantComponent(t), name)
+}
+
+func edgeArtifactPathForPublication(dir string, u publishedUpdate) string {
+	if strings.TrimSpace(u.TenantID) != "" {
+		return artifactStorePath(dir, u.TenantID, u.Manifest.Platform, u.Manifest.Arch, u.Manifest.Version)
+	}
+	name := artifactFileName(u.Manifest.Platform, u.Manifest.Arch, u.Manifest.Version)
+	if name == "" || strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	return filepath.Join(dir, name) // read-only pre-tenant publication
 }
 
 // artifactReadPath is where a target's bytes are FOUND, which is not always where new ones are written.
@@ -866,7 +943,7 @@ func artifactReadPath(dir, tenantID, platform, arch, version string) string {
 	// organization is offered was published once, by the operator, and its bytes live on that shelf. Without
 	// this the manifest resolves and the download 404s, which is the exact shape the pending/active split
 	// exists to prevent.
-	if !strings.EqualFold(strings.TrimSpace(tenantID), agentUpdateCatalogueScope) {
+	if strings.TrimSpace(tenantID) != agentUpdateCatalogueScope {
 		if p := artifactStorePath(dir, agentUpdateCatalogueScope, platform, arch, version); p != "" {
 			if _, err := os.Stat(p); err == nil {
 				return p
@@ -923,7 +1000,7 @@ func artifactBytesMatch(path string, m agentupdate.Manifest) bool {
 // discovered by every device in the fleet, one at a time.
 func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
 	store *publishedAgentUpdateStore, trustedKeys []string, dir string, isEnforcingEdge bool, writer *logs.Writer,
-	evaluator decision.Evaluator, deviceFacing *publishedUpdates) {
+	evaluator decision.Evaluator, deviceFacing *publishedUpdates, operatorTenantID string) {
 	mux.HandleFunc("PUT /admin/agent-update-artifact", adminEndpoint("admin.platform.write", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(publicationWriteContext(r.Context()))
 		tenantID := agentUpdatePublishScope(r)
@@ -1052,7 +1129,7 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		// the node serving this upload make that a promise the other node cannot keep — a device is answered
 		// 404 by whichever one the front door picked. So a shelving failure fails the REQUEST: the manifest
 		// stays pending, the operator is told exactly what happened, and retrying the upload is the whole fix.
-		if serr := store.shelveArtifact(path, tenantID, m.Platform, m.Arch, m.Version); serr != nil {
+		if serr := store.shelveArtifactContext(r.Context(), path, tenantID, m.Platform, m.Arch, m.Version); serr != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("these bytes are on this control plane and "+
 				"could NOT be put on the deployment's shared shelf (%w), so another control plane would answer "+
 				"404 for them: the release is NOT activated. Upload it again", serr))
@@ -1143,7 +1220,20 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		// The catalogue explicitly asks for its publication view; the request never
 		// supplies a tenant to read outside verified identity/operator context.
 		tenantID := adminTenantIDFromRequest(r)
+		distributionRead := false
+		if values, present := r.URL.Query()["distribution_tenant_id"]; present {
+			if len(values) != 1 || !agentUpdateDistributionAllowed(r, operatorTenantID) {
+				writeError(w, http.StatusForbidden, fmt.Errorf("only the deployment fleet credential may read release distribution artifacts"))
+				return
+			}
+			tenantID = values[0]
+			distributionRead = true
+		}
 		if views, present := r.URL.Query()["artifact_scope"]; present {
+			if distributionRead {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("artifact_scope cannot accompany distribution_tenant_id"))
+				return
+			}
 			if len(views) != 1 || (views[0] != "tenant" && views[0] != "publication") {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("artifact_scope must be tenant or publication"))
 				return
@@ -1157,7 +1247,22 @@ func registerAgentUpdateArtifactAdminRoutes(mux *http.ServeMux, adminEndpoint fu
 		}
 		platform := strings.TrimSpace(r.URL.Query().Get("platform"))
 		arch := strings.TrimSpace(r.URL.Query().Get("arch"))
-		active, _, err := store.PublicationFor(r.Context(), tenantID)
+		var active map[string]agentpolicy.Envelope
+		var err error
+		if distributionRead {
+			var raw map[string]agentpolicy.Envelope
+			raw, err = store.DistributionSnapshot(r.Context())
+			active = map[string]agentpolicy.Envelope{}
+			key := updateTargetKey(platform, arch)
+			if tenantID != "" {
+				key = tenantTargetKey(tenantID, platform, arch)
+			}
+			if env, found := raw[key]; found {
+				active[updateTargetKey(platform, arch)] = env
+			}
+		} else {
+			active, _, err = store.PublicationFor(r.Context(), tenantID)
+		}
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
@@ -1204,7 +1309,23 @@ func actorOf(r *http.Request) adminIdentity {
 func registerAgentUpdatePublishRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc,
 	store *publishedAgentUpdateStore, trustedKeys []string, isEnforcingEdge bool, writer *logs.Writer,
 	evaluator decision.Evaluator, artifactDir string, deviceFacing *publishedUpdates,
-	signer *agentpolicy.Signer, ratchet *agentUpdateSignRatchet) {
+	signer *agentpolicy.Signer, ratchet *agentUpdateSignRatchet, operatorTenantID string) {
+	// The fleet pull receives every organization's release and therefore needs a dedicated API-token scope.
+	// A tenant's normal read credential, or a customer who minted a token with the same scopes, cannot turn
+	// its own tenant view into the full distribution set.
+	mux.HandleFunc("GET /admin/agent-updates/distribution", adminEndpoint("admin.agent_updates.distribution.read", func(w http.ResponseWriter, r *http.Request) {
+		if !agentUpdateDistributionAllowed(r, operatorTenantID) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("only the deployment fleet credential may read release distribution"))
+			return
+		}
+		active, err := store.DistributionSnapshot(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"schema_version": "agent_update_distribution.v2",
+			"tenant_id": agentUpdateCatalogueScope, "envelopes": active})
+	}))
 	mux.HandleFunc("GET /admin/agent-updates", adminEndpoint("admin.agents.read", func(w http.ResponseWriter, r *http.Request) {
 		// the operator standing outside an organization is looking at the catalogue — see agentUpdateCatalogueScope.
 		tenantID := agentUpdatePublishScope(r)
@@ -1461,16 +1582,12 @@ type agentUpdateSource struct {
 	artifactDir string
 	interval    time.Duration
 	client      *http.Client
-	// tenantID is the enforcement tenant of THIS edge, checked against the tenant the control plane says it
-	// answered for — the same rule the halt lane already applies, and for the same reason: an edge pointed at
-	// the wrong control plane, or holding a token scoped to another tenant, must not hand ANOTHER TENANT'S
-	// BUILD to its own devices. That is the one mistake in this file that ends with the wrong code running on
-	// somebody's machines.
-	tenantID string
+	// The response is the deployment-wide distribution, authorized by a dedicated fleet credential.
+	// Per-device selection is deferred until the verified Tenant CA is known at the serving Edge.
 }
 
 func (s agentUpdateSource) fetch(ctx context.Context, now time.Time) (map[string]publishedUpdate, error) {
-	url := strings.TrimRight(s.url, "/") + "/admin/agent-updates"
+	url := strings.TrimRight(s.url, "/") + "/admin/agent-updates/distribution"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -1489,6 +1606,7 @@ func (s agentUpdateSource) fetch(ctx context.Context, now time.Time) (map[string
 	// answering a gigabyte of JSON, or ten thousand envelopes, to an Edge that decodes without a limit. The
 	// cap is generous for a fleet's worth of platforms and nowhere near a memory problem.
 	var body struct {
+		Schema    string                          `json:"schema_version"`
 		TenantID  string                          `json:"tenant_id"`
 		Envelopes map[string]agentpolicy.Envelope `json:"envelopes"`
 	}
@@ -1500,11 +1618,8 @@ func (s agentUpdateSource) fetch(ctx context.Context, now time.Time) (map[string
 	// serves EVERY organization on this deployment, and the versions the operator publishes for all of them
 	// arrive under the catalogue's name — so refusing it left every Edge carrying only its own enforcement
 	// tenant's set, which on a deployment with customers is how no customer's device could be updated at all.
-	answered := strings.TrimSpace(body.TenantID)
-	if want := strings.TrimSpace(s.tenantID); want != "" && !strings.EqualFold(answered, want) &&
-		!strings.EqualFold(answered, agentUpdateCatalogueScope) {
-		return nil, fmt.Errorf("the control plane answered for tenant %q and this edge enforces %q — refusing to "+
-			"offer another tenant's release to these devices", body.TenantID, want)
+	if body.Schema != "agent_update_distribution.v2" || body.TenantID != agentUpdateCatalogueScope {
+		return nil, fmt.Errorf("the control plane did not answer for the deployment tenant release distribution")
 	}
 	if len(body.Envelopes) > maxPublishedTargets {
 		return nil, fmt.Errorf("the control plane answered with %d targets (limit %d): refusing to adopt a set "+
@@ -1520,8 +1635,11 @@ func (s agentUpdateSource) fetch(ctx context.Context, now time.Time) (map[string
 		if oerr != nil {
 			return nil, fmt.Errorf("the control plane published %s and this edge will not relay it: %w", key, oerr)
 		}
-		out[updateTargetKey(m.Platform, m.Arch)] = publishedUpdate{Manifest: m, Envelope: env,
-			Source: "control plane"}
+		scope, valid := publicationScopeForTarget(key, updateTargetKey(m.Platform, m.Arch))
+		if !valid {
+			return nil, fmt.Errorf("the control plane returned a release under an invalid distribution key %q", key)
+		}
+		out[key] = publishedUpdate{Manifest: m, Envelope: env, Source: "control plane", TenantID: scope}
 	}
 	return out, nil
 }
@@ -1558,7 +1676,10 @@ func (s agentUpdateSource) serveable(ctx context.Context, set, before map[string
 		// case on a build box and the normal case after a re-sign; the old check was os.Stat. Adopting on the
 		// name alone means the device-facing route serves a digest mismatch and every endpoint refuses to stage
 		// — the fleet stops updating and the reason is on a machine nobody is looking at.
-		local := filepath.Join(s.artifactDir, name)
+		local := edgeArtifactPathForPublication(s.artifactDir, u)
+		if local == "" {
+			continue
+		}
 		if artifactBytesMatch(local, u.Manifest) {
 			out[key] = u
 			continue
@@ -1569,7 +1690,7 @@ func (s agentUpdateSource) serveable(ctx context.Context, set, before map[string
 				key, u.Manifest.Version)
 			_ = os.Remove(local)
 		}
-		if ferr := s.fetchArtifact(ctx, u.Manifest); ferr != nil {
+		if ferr := s.fetchArtifact(ctx, u); ferr != nil {
 			if prev, had := before[key]; had {
 				out[key] = prev
 				log.Printf("agent-update sync: ★ %s publishes %s and its artifact is neither here nor "+
@@ -1649,14 +1770,18 @@ func (s agentUpdateSource) run(ctx context.Context, published *publishedUpdates)
 // Verified against the manifest BEFORE the file appears under its real name: the device-facing route re-checks
 // the digest anyway, and this keeps a failed or truncated transfer from ever occupying the path that route
 // serves from — the same temp-then-rename rule endpoint staging uses, for the same reason.
-func (s agentUpdateSource) fetchArtifact(ctx context.Context, m agentupdate.Manifest) error {
+func (s agentUpdateSource) fetchArtifact(ctx context.Context, u publishedUpdate) error {
+	m := u.Manifest
 	name := artifactFileName(m.Platform, m.Arch, m.Version)
 	if name == "" || strings.TrimSpace(s.artifactDir) == "" {
 		return fmt.Errorf("no artifact directory on this edge")
 	}
-	url := fmt.Sprintf("%s/admin/agent-update-artifact?platform=%s&arch=%s",
+	fetchURL := fmt.Sprintf("%s/admin/agent-update-artifact?platform=%s&arch=%s",
 		strings.TrimRight(s.url, "/"), m.Platform, m.Arch)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	query := "&distribution_tenant_id=" + url.QueryEscape(u.TenantID) +
+		"&expected_manifest_sha256=" + url.QueryEscape(u.Envelope.PayloadSHA256)
+	fetchURL += query
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 	if err != nil {
 		return err
 	}
@@ -1670,14 +1795,18 @@ func (s agentUpdateSource) fetchArtifact(ctx context.Context, m agentupdate.Mani
 		return fmt.Errorf("control plane answered HTTP %d%s", resp.StatusCode,
 			agentupdate.DescribeHTTPErrorBody(resp.Body))
 	}
-	if err := os.MkdirAll(s.artifactDir, 0o750); err != nil {
+	path := edgeArtifactPathForPublication(s.artifactDir, u)
+	if path == "" {
+		return fmt.Errorf("the published manifest has no safe artifact path")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
 	// durable-write: staged — the artifact is streamed and hashed as it arrives (io.Copy through a MultiWriter
 	// into sha256), so there is no []byte to hand durablefile.Write: holding a whole package in memory to
 	// satisfy the shared writer would trade a real memory bound for a stylistic one. The REPLACE half still
 	// goes through the package, which is the half that is platform-specific.
-	tmp, err := os.CreateTemp(s.artifactDir, ".artifact-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".artifact-*")
 	if err != nil {
 		return err
 	}
@@ -1698,7 +1827,7 @@ func (s agentUpdateSource) fetchArtifact(ctx context.Context, m agentupdate.Mani
 	}
 	tmp.Close()
 	_ = os.Chmod(tmpName, 0o640)
-	return os.Rename(tmpName, filepath.Join(s.artifactDir, name))
+	return os.Rename(tmpName, path)
 }
 
 // buildAgentUpdateSourceClient trusts the control plane's CA, like the other CP→Edge syncs.
@@ -1746,13 +1875,8 @@ func buildAgentUpdateSourceClient(caFile string) (*http.Client, error) {
 	}, nil
 }
 
-// refreshDeviceFacingPublished rebuilds the set GET /steer/agent-update-manifest answers from, out of what the
-// admin store holds as ACTIVE for this tenant.
-//
-// Merged into the existing set rather than replacing it: this index is keyed by platform/arch with no tenant,
-// so a second tenant's targets would otherwise disappear when the first publishes. That the index cannot tell
-// two tenants' releases apart is a real limit and it is older than this function — recorded here because this
-// is where a reader will next stand in front of it.
+// refreshDeviceFacingPublished rebuilds the complete verified device-facing distribution from the active
+// admin store. Replacing it atomically preserves simultaneous tenant canaries and removes withdrawals.
 func refreshDeviceFacingPublished(deviceFacing *publishedUpdates, store *publishedAgentUpdateStore,
 	tenantID string, trustedKeys []string) {
 	// ★ A NIL DEVICE-FACING SET IS NOT A REASON TO GO QUIET (2026-08-13, thirtieth review #12). A publish that
@@ -1772,12 +1896,14 @@ func refreshDeviceFacingPublished(deviceFacing *publishedUpdates, store *publish
 	if store == nil {
 		return
 	}
-	next := map[string]publishedUpdate{}
-	for target, entry := range deviceFacing.targets() {
-		next[target] = entry
+	active, readErr := store.DistributionSnapshot(context.Background())
+	if readErr != nil {
+		log.Printf("agent-update publish: distribution read failed (%v); keeping the last device-facing set", readErr)
+		return
 	}
+	next := make(map[string]publishedUpdate, len(active))
 	now := time.Now().UTC()
-	for target, env := range store.ForTenant(tenantID) {
+	for target, env := range active {
 		m, err := agentupdate.Open(env, trustedKeys, now)
 		if err != nil {
 			// Refusing to serve what this process cannot verify is the same rule the loader applies at boot.
@@ -1785,11 +1911,27 @@ func refreshDeviceFacingPublished(deviceFacing *publishedUpdates, store *publish
 				"are NOT offered it", target, err)
 			continue
 		}
+		scope, valid := publicationScopeForTarget(target, updateTargetKey(m.Platform, m.Arch))
+		if !valid {
+			log.Printf("agent-update publish: invalid distribution key %q; retaining previous device-facing set", target)
+			return
+		}
 		next[target] = publishedUpdate{Manifest: m, Envelope: env, Source: "published via the admin API",
-			TenantID: tenantID}
+			TenantID: scope}
 	}
 	deviceFacing.replace(next)
 	log.Printf("agent-update publish: the device-facing set now offers %d target(s)", len(next))
+}
+
+func publicationScopeForTarget(key, target string) (string, bool) {
+	if key == target {
+		return "", true // explicit pre-tenant publication
+	}
+	i := strings.LastIndexByte(key, '|')
+	if i <= 0 || key[i+1:] != target || strings.TrimSpace(key[:i]) != key[:i] {
+		return "", false
+	}
+	return key[:i], true
 }
 
 // decodeLimitedJSONBodyStrict additionally REFUSES a field the target type does not have.

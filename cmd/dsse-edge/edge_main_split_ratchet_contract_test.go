@@ -19,7 +19,7 @@ import (
 const (
 	mainGoRouteRegistrationBaseline = 57
 	mainGoFlagDefinitionBaseline    = 303
-	mainGoFuncDeclBaseline          = 113
+	mainGoFuncDeclBaseline          = 112
 	mainGoTypeSpecBaseline          = 5
 )
 

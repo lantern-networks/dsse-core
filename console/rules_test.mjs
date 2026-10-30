@@ -59,3 +59,55 @@ test('cert-pin summary only represents unmodified unrestricted allow/bypass rule
   {...r,id:'ordinary-rule'}, {...r,plane:'eastwest'},
  ]) assert.equal(context.isCertPinSummaryRule(changed),false,JSON.stringify(changed));
 });
+
+test('identity directory groups named like Object properties remain selectable',()=>{
+ const tree=context.identityTreeFromDirectory([
+  {department:'__proto__',subject:'alice',display_name:'Alice'},
+  {department:'constructor',subject:'bob',display_name:'Bob'},
+  {department:'Finance',subject:'cara',display_name:'Cara'},
+ ]);
+ assert.deepEqual(JSON.parse(JSON.stringify(tree)),[
+  {group:'Finance',people:[{id:'cara',label:'Cara'}]},
+  {group:'__proto__',people:[{id:'alice',label:'Alice'}]},
+  {group:'constructor',people:[{id:'bob',label:'Bob'}]},
+ ]);
+ assert.equal(vm.runInContext('({}).alice',context),undefined);
+});
+
+test('an IdP group named __proto__ starts collapsed and can be expanded',()=>{
+ const make=(tag,attrs={},children=[])=>{
+  const node={tag,className:attrs.class||'',style:{},children:[],value:attrs.value||'',checked:false,
+   textContent:attrs.text||'',events:{},classList:{add(){},toggle(){}},
+   appendChild(child){this.children.push(child);return child},
+   addEventListener(name,fn){this.events[name]=fn}};
+  for(const child of (Array.isArray(children)?children:[children])) if(child) node.appendChild(child);
+  return node;
+ };
+ const c=vm.createContext({bl:b=>b.en,el:make,uiBadge:(label)=>make('span',{text:label})});
+ vm.runInContext(readFileSync(new URL('./rules.js',import.meta.url),'utf8'),c);
+ const picker=c.subjectPicker('Source',[],{identityGroups:true,idpTree:[{group:'__proto__',people:[{id:'alice',label:'Alice'}]}]});
+ const find=(node,cls)=>{
+  if(node.className.split(' ').includes(cls)) return node;
+  for(const child of node.children){const found=find(child,cls);if(found)return found}
+  return null;
+ };
+ const person=find(picker.el,'subject-idp-person');
+ const expand=find(picker.el,'subject-idp-expand');
+ assert.equal(person.style.display,'none');
+ expand.events.click();
+ assert.equal(person.style.display,'');
+});
+
+test('max sign-in age keeps omitted, one-request, and exact positive seconds distinct',()=>{
+ assert.equal(context.maxAgeMinutesFromAction({}), '');
+ assert.equal(context.maxAgeMinutesFromAction({max_age_seconds:0}), '0');
+ assert.equal(context.maxAgeMinutesFromAction({max_age_seconds:90}), '1.5');
+ assert.equal(context.parseMaxAgeMinutes(''), null);
+ assert.equal(context.parseMaxAgeMinutes('0'), 0);
+ assert.equal(context.parseMaxAgeMinutes('1.5'), 90);
+ assert.equal(context.parseMaxAgeMinutes(context.maxAgeMinutesFromAction({max_age_seconds:1})), 1);
+ assert.equal(context.parseMaxAgeMinutes(context.maxAgeMinutesFromAction({max_age_seconds:Number.MAX_SAFE_INTEGER}), Number.MAX_SAFE_INTEGER), Number.MAX_SAFE_INTEGER);
+ for(const bad of ['-1','NaN','Infinity','1e3','0.01','1.01','0.000000000001','9007199254740991']) {
+  assert.throws(()=>context.parseMaxAgeMinutes(bad), undefined, bad);
+ }
+});

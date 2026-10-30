@@ -23,22 +23,22 @@ func TestTheAnnouncedOverlapSurvivesAFileReplacementAndRestart(t *testing.T) {
 	const newRoot = "2222222222222222222222222222222222222222222222222222222222222222"
 
 	// The node comes up on the old material and announces it.
-	if retiring := recordAnnouncedRoot(dir, tenant, oldRoot); len(retiring) != 0 {
+	if retiring, err := recordAnnouncedRoot(dir, tenant, oldRoot); err != nil || len(retiring) != 0 {
 		t.Fatalf("a first load has nothing to retire, got %v", retiring)
 	}
 
 	// The operator replaces the files and recreates the node. THIS is the case the in-memory version could not
 	// see: a different process, different material, and no certificate for what came before.
-	retiring := recordAnnouncedRoot(dir, tenant, newRoot)
-	if len(retiring) != 1 || retiring[0] != oldRoot {
+	retiring, err := recordAnnouncedRoot(dir, tenant, newRoot)
+	if err != nil || len(retiring) != 1 || retiring[0] != oldRoot {
 		t.Fatalf("★ the previous root is not being announced after a file replacement and restart: %v — a "+
 			"device that had not adopted the new root loses every site at that moment, and the overlap that "+
 			"was supposed to protect it is not running", retiring)
 	}
 
 	// ★ AND IT SURVIVES THE NEXT RESTART TOO, or the overlap lasts exactly one boot.
-	again := recordAnnouncedRoot(dir, tenant, newRoot)
-	if len(again) != 1 || again[0] != oldRoot {
+	again, err := recordAnnouncedRoot(dir, tenant, newRoot)
+	if err != nil || len(again) != 1 || again[0] != oldRoot {
 		t.Fatalf("the overlap did not survive a second start-up: %v", again)
 	}
 
@@ -47,7 +47,7 @@ func TestTheAnnouncedOverlapSurvivesAFileReplacementAndRestart(t *testing.T) {
 	if err := forgetRetiringRoot(dir, tenant, oldRoot); err != nil {
 		t.Fatalf("withdraw: %v", err)
 	}
-	if after := recordAnnouncedRoot(dir, tenant, newRoot); len(after) != 0 {
+	if after, err := recordAnnouncedRoot(dir, tenant, newRoot); err != nil || len(after) != 0 {
 		t.Fatalf("a withdrawn root came back after a restart: %v", after)
 	}
 
@@ -61,7 +61,7 @@ func TestTheAnnouncedOverlapSurvivesAFileReplacementAndRestart(t *testing.T) {
 	}
 
 	// ★ A NODE WITH NO DIRECTORY RECORDS NOTHING rather than panicking — an in-memory deployment still runs.
-	if got := recordAnnouncedRoot("", tenant, newRoot); got != nil {
+	if got, err := recordAnnouncedRoot("", tenant, newRoot); err != nil || got != nil {
 		t.Fatalf("a node with nowhere to write returned %v instead of nothing", got)
 	}
 }

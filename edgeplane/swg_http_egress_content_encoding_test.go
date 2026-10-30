@@ -2,7 +2,9 @@ package edgeplane
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
+	"compress/zlib"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +13,115 @@ import (
 
 	"github.com/andybalholm/brotli"
 )
+
+type closeTrackingBody struct {
+	io.Reader
+	closed bool
+}
+
+func (b *closeTrackingBody) Close() error { b.closed = true; return nil }
+
+func TestReconcileRawAndWrappedDeflate(t *testing.T) {
+	const payload = `{"raw":"deflate body"}`
+	for _, raw := range []bool{false, true} {
+		t.Run(map[bool]string{false: "zlib", true: "raw"}[raw], func(t *testing.T) {
+			var buf bytes.Buffer
+			var writer io.WriteCloser
+			if raw {
+				writer, _ = flate.NewWriter(&buf, flate.DefaultCompression)
+			} else {
+				writer = zlib.NewWriter(&buf)
+			}
+			if _, err := writer.Write([]byte(payload)); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			resp := makeResp("deflate", buf.Bytes())
+			original := &closeTrackingBody{Reader: resp.Body}
+			resp.Body = original
+			ReconcileSWGEgressContentEncoding(reqWithAE("identity"), resp)
+			decoded, err := io.ReadAll(resp.Body)
+			if err != nil || string(decoded) != payload {
+				t.Fatalf("decoded=%q err=%v", decoded, err)
+			}
+			if resp.Header.Get("Content-Encoding") != "" {
+				t.Fatal("encoding was not stripped")
+			}
+			if err := resp.Body.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !original.closed {
+				t.Fatal("decoded body Close did not close upstream response")
+			}
+		})
+	}
+}
+
+func TestReconcileFailedDecoderHeaderPreservesAndClosesUpstream(t *testing.T) {
+	compressed := []byte("not a gzip stream")
+	resp := makeResp("gzip", compressed)
+	original := &closeTrackingBody{Reader: resp.Body}
+	resp.Body = original
+	ReconcileSWGEgressContentEncoding(reqWithAE("identity"), resp)
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		t.Fatal("invalid gzip header must not be stripped")
+	}
+	got, err := io.ReadAll(resp.Body)
+	if err != nil || !bytes.Equal(got, compressed) {
+		t.Fatalf("failed header consumed upstream body: %q %v", got, err)
+	}
+	if err := resp.Body.Close(); err != nil || !original.closed {
+		t.Fatalf("upstream not closed after header failure: %v", err)
+	}
+}
+
+func TestDecoderHeaderCaptureStopsBeforeStreamingResponse(t *testing.T) {
+	// A compressed response much larger than the decoder header must not be
+	// copied into the temporary replay buffer after the header is accepted.
+	payload := make([]byte, 512*1024)
+	var state uint32 = 0x12345678
+	for i := range payload {
+		state ^= state << 13
+		state ^= state >> 17
+		state ^= state << 5
+		payload[i] = byte(state)
+	}
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var recorder *headerCaptureReader
+	decoded, ok := decoderInit(io.NopCloser(bytes.NewReader(compressed.Bytes())), func(r io.Reader) (io.ReadCloser, error) {
+		var valid bool
+		recorder, valid = r.(*headerCaptureReader)
+		if !valid {
+			t.Fatalf("decoder source %T does not support stopping header capture", r)
+		}
+		return gzip.NewReader(r)
+	})
+	if !ok || recorder == nil {
+		t.Fatal("gzip decoder did not initialize")
+	}
+	if recorder.recording || recorder.consumed.Len() != 0 {
+		t.Fatal("header capture was not discarded after initialization")
+	}
+	got, err := io.ReadAll(decoded)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("streamed response mismatch: bytes=%d err=%v", len(got), err)
+	}
+	if recorder.consumed.Len() != 0 {
+		t.Fatalf("header capture grew during streaming: %d bytes", recorder.consumed.Len())
+	}
+	if err := decoded.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func brotliBytes(t *testing.T, s string) []byte {
 	t.Helper()

@@ -863,8 +863,14 @@ public final class DssePinnedURLSessionDelegate: NSObject, URLSessionDelegate, U
                 completionHandler(.cancelAuthenticationChallenge, nil)
                 return
             }
-            SecTrustSetAnchorCertificates(trust, pinned as CFArray)
-            SecTrustSetAnchorCertificatesOnly(trust, true)
+            guard SecTrustSetAnchorCertificates(trust, pinned as CFArray) == errSecSuccess,
+                  SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else {
+                Self.sayItRefused(chain: [], host: challenge.protectionSpace.host,
+                                  reason: "pinned transport CA could not be applied to the trust evaluation",
+                                  channel: channel)
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
             var evalError: CFError?
             if SecTrustEvaluateWithError(trust, &evalError) {
                 completionHandler(.useCredential, URLCredential(trust: trust))
@@ -1134,8 +1140,12 @@ public enum DsseTransportTLS {
             let trust = sec_trust_copy_ref(secTrust).takeRetainedValue()
             // Anchor evaluation to the pinned CAs only — ALL of them, so a device mid-rotation accepts the
             // Edge under either the outgoing or the incoming CA.
-            SecTrustSetAnchorCertificates(trust, pinned as CFArray)
-            SecTrustSetAnchorCertificatesOnly(trust, true)
+            guard SecTrustSetAnchorCertificates(trust, pinned as CFArray) == errSecSuccess,
+                  SecTrustSetAnchorCertificatesOnly(trust, true) == errSecSuccess else {
+                dsseRuntimeLog("transport_trust REFUSED reason=pinned_anchor_setup_failed")
+                complete(false)
+                return
+            }
             var error: CFError?
             let ok = SecTrustEvaluateWithError(trust, &error)
             if !ok {

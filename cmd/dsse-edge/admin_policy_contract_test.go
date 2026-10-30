@@ -13,10 +13,41 @@ import (
 	"github.com/lantern-networks/dsse-core/policy"
 
 	"github.com/lantern-networks/dsse-core/connector"
+	"github.com/lantern-networks/dsse-core/idpregistry"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/steering"
 )
+
+func TestAdminPolicyRejectsWebRequestBoundAuthenticationOnSaveAndActivation(t *testing.T) {
+	previous := theIdPRegistry.Load()
+	t.Cleanup(func() { theIdPRegistry.Store(previous) })
+	registry := idpregistry.NewStore()
+	if _, err := registry.Upsert(idpFixture("tenant_lab_001", "corp")); err != nil {
+		t.Fatal(err)
+	}
+	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: newAdminAuthStore()})
+	theIdPRegistry.Store(registry)
+	post := func(body string, want int) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/admin/policies", strings.NewReader(body))
+		req.Header.Set("content-type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Fatalf("save status=%d want=%d body=%s", rec.Code, want, rec.Body.String())
+		}
+	}
+	base := `{"id":"pol_one_request","name":"One request","conditions":{"service_family":"https"},"action":{"decision":"require_reauthentication"},"metadata":{"required_idp_id":"corp","max_age_seconds":0},"status":"active"}`
+	post(base, http.StatusUnprocessableEntity)
+	post(strings.Replace(base, `"active"`, `"draft"`, 1), http.StatusOK)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/admin/policies/pol_one_request/status", strings.NewReader(`{"status":"active"}`))
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("activation status=%d want=422 body=%s", rec.Code, rec.Body.String())
+	}
+}
 
 func TestAdminPolicyOpenAPIContract(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("..", "..", "openapi", "admin_api.yaml"))
@@ -252,7 +283,7 @@ func TestAdminPolicyAPIUpsertPublishesDefaultTunnelNetworkExtensionSnapshot(t *t
 	}
 
 	var rules steering.NetworkExtensionRules
-	rulesBody, err := os.ReadFile(filepath.Join(outputDir, networkExtensionSnapshotRulesRef))
+	rulesBody, err := os.ReadFile(filepath.Join(outputDir, "tenants", "74656e616e745f6c61625f303031", networkExtensionSnapshotRulesRef))
 	if err != nil {
 		t.Fatalf("read rules snapshot: %v", err)
 	}
@@ -271,7 +302,7 @@ func TestAdminPolicyAPIUpsertPublishesDefaultTunnelNetworkExtensionSnapshot(t *t
 	}
 
 	var agentConfig map[string]any
-	agentBody, err := os.ReadFile(filepath.Join(outputDir, networkExtensionSnapshotAgentConfigRef))
+	agentBody, err := os.ReadFile(filepath.Join(outputDir, "tenants", "74656e616e745f6c61625f303031", networkExtensionSnapshotAgentConfigRef))
 	if err != nil {
 		t.Fatalf("read agent config snapshot: %v", err)
 	}
@@ -313,7 +344,7 @@ func TestAdminPolicyAPIUpsertPublishesDefaultTunnelNetworkExtensionSnapshot(t *t
 	if _, leaked := agentConfig["header_value"]; leaked {
 		t.Fatalf("agent config leaked header value material: %#v", agentConfig)
 	}
-	if _, err := os.Stat(filepath.Join(outputDir, networkExtensionSnapshotRuntimeDiagnosticRef)); err != nil {
+	if _, err := os.Stat(filepath.Join(outputDir, "tenants", "74656e616e745f6c61625f303031", networkExtensionSnapshotRuntimeDiagnosticRef)); err != nil {
 		t.Fatalf("runtime diagnostic placeholder missing: %v", err)
 	}
 }

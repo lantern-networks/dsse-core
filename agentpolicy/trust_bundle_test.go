@@ -98,6 +98,26 @@ func TestTrustBundleRoundTrips(t *testing.T) {
 	}
 }
 
+func TestTrustBundleRequiresExplicitTenant(t *testing.T) {
+	s := testSigner(t)
+	ca := testCAPEM(t, "DSSE Transport CA")
+	for _, tenant := range []string{"", " ", "tenant-a "} {
+		payload := TrustBundlePayload{SchemaVersion: TrustBundleSchema, TenantID: tenant, Serial: 1, TransportCAPEM: ca}
+		if _, err := s.SignTrustBundlePayload(payload, time.Now()); err == nil {
+			t.Fatalf("signed a trust bundle with ambiguous tenant %q", tenant)
+		}
+		// A previously signed or directly constructed envelope must also fail at
+		// the verifier, before any endpoint can adopt its transport anchors.
+		env, err := s.Sign(payload, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := VerifyTrustBundle(env, s.PublicKeyHex(), 0); err == nil {
+			t.Fatalf("verified a trust bundle with ambiguous tenant %q", tenant)
+		}
+	}
+}
+
 // The attack the serial exists for. Whoever can serve an unauthenticated document can serve an OLD one, so a
 // bundle from before a compromised CA was withdrawn must not be accepted again.
 func TestTrustBundleRefusesReplayOfAnOlderSerial(t *testing.T) {

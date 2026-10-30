@@ -64,6 +64,7 @@ func TestBuildPostgresExportTaskLeaseStatementUsesSkipLockedAndTenantScope(t *te
 		"UPDATE export_worker_tasks",
 		"tenant_id = $1",
 		"status = 'queued'",
+		"status = 'running' AND lease_expires_at <= $4",
 		"retry_not_before IS NULL OR retry_not_before <= $4",
 		"FOR UPDATE SKIP LOCKED LIMIT 1",
 		"RETURNING payload",
@@ -91,11 +92,11 @@ func TestBuildPostgresExportTaskLifecycleStatementsScopeTenant(t *testing.T) {
 		wants     []string
 	}{
 		"complete": {
-			statement: must(buildPostgresExportTaskCompleteStatement("tenant_lab_001", "task_001")),
-			wants:     []string{"DELETE FROM export_worker_tasks", "tenant_id = $1", "task_id = $2"},
+			statement: must(buildPostgresExportTaskCompleteStatement("tenant_lab_001", "task_001", "lease_001")),
+			wants:     []string{"DELETE FROM export_worker_tasks", "tenant_id = $1", "task_id = $2", "lease_owner = $3"},
 		},
 		"release": {
-			statement: must(buildPostgresExportTaskReleaseStatement("tenant_lab_001", "task_001", now)),
+			statement: must(buildPostgresExportTaskReleaseStatement("tenant_lab_001", "task_001", "lease_001", now)),
 			wants:     []string{"status = 'queued'", "lease_owner = NULL", "status = 'running'", "RETURNING payload"},
 		},
 		"extend": {
@@ -103,12 +104,12 @@ func TestBuildPostgresExportTaskLifecycleStatementsScopeTenant(t *testing.T) {
 			wants:     []string{"lease_expires_at = $4", "lease_owner = $3", "status = 'running'", "RETURNING payload"},
 		},
 		"retry": {
-			statement: must(buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", now, 30)),
-			wants:     []string{"attempt = attempt + 1", "retry_not_before = $3", "{lease_expires_at}", "{metadata,retry_not_before}", "{metadata,retry_scheduled_at}", "{metadata,retry_backoff_seconds}", "attempt + 1 < max_attempts", "RETURNING payload"},
+			statement: must(buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", "lease_001", now, 30)),
+			wants:     []string{"attempt = attempt + 1", "retry_not_before = $4", "lease_owner = $3", "{lease_expires_at}", "{metadata,retry_not_before}", "{metadata,retry_scheduled_at}", "{metadata,retry_backoff_seconds}", "attempt + 1 < max_attempts", "RETURNING payload"},
 		},
 		"dead letter": {
-			statement: must(buildPostgresExportTaskDeadLetterStatement("tenant_lab_001", "task_001", now, "")),
-			wants:     []string{"WITH moved AS", "DELETE FROM export_worker_tasks", "export_worker_task_dead_letters", "attempt + 1 >= max_attempts", "RETURNING payload"},
+			statement: must(buildPostgresExportTaskDeadLetterStatement("tenant_lab_001", "task_001", "lease_001", now, "")),
+			wants:     []string{"WITH moved AS", "DELETE FROM export_worker_tasks", "export_worker_task_dead_letters", "lease_owner = $3", "attempt + 1 >= max_attempts", "RETURNING payload"},
 		},
 	}
 	for name, tc := range cases {
@@ -139,10 +140,10 @@ func TestBuildPostgresExportTaskStatementsRejectInvalidInputs(t *testing.T) {
 	if _, err := buildPostgresExportTaskLeaseStatement("tenant_lab_001", "worker_tokyo_001", now, 0); err == nil {
 		t.Fatalf("lease accepted zero duration")
 	}
-	if _, err := buildPostgresExportTaskCompleteStatement("tenant_lab_001", ""); err == nil {
+	if _, err := buildPostgresExportTaskCompleteStatement("tenant_lab_001", "", "lease_001"); err == nil {
 		t.Fatalf("complete accepted empty task id")
 	}
-	if _, err := buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", now, -1); err == nil {
+	if _, err := buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", "lease_001", now, -1); err == nil {
 		t.Fatalf("retry accepted negative backoff")
 	}
 }
@@ -150,7 +151,7 @@ func TestBuildPostgresExportTaskStatementsRejectInvalidInputs(t *testing.T) {
 func TestBuildPostgresExportTaskRetryStatementRecordsLocalRetryMetadataShape(t *testing.T) {
 	now := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
 
-	statement, err := buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", now, 120)
+	statement, err := buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", "lease_001", now, 120)
 	if err != nil {
 		t.Fatalf("buildPostgresExportTaskRetryStatement returned error: %v", err)
 	}
@@ -166,8 +167,8 @@ func TestBuildPostgresExportTaskRetryStatementRecordsLocalRetryMetadataShape(t *
 			t.Fatalf("SQL = %s, want %s", statement.SQL, want)
 		}
 	}
-	if len(statement.Args) != 5 || statement.Args[4] != 120 {
-		t.Fatalf("args = %#v, want backoff seconds as fifth arg", statement.Args)
+	if len(statement.Args) != 6 || statement.Args[5] != 120 {
+		t.Fatalf("args = %#v, want backoff seconds as sixth arg", statement.Args)
 	}
 }
 
@@ -247,13 +248,10 @@ func TestPostgresExportTaskQueueAdapterLeaseHydratesReturnedPayload(t *testing.T
 	}
 }
 
-func TestPostgresExportTaskQueueAdapterRetryFallsThroughToDeadLetter(t *testing.T) {
-	adapter, document, payload := newPostgresExportTaskQueueAdapterFixture(t)
+func TestPostgresExportTaskQueueAdapterRetryLeavesExhaustedLeaseForAtomicDeadLetter(t *testing.T) {
+	adapter, document, _ := newPostgresExportTaskQueueAdapterFixture(t)
 	db := &recordingPostgresExportTaskDB{
-		rows: []postgresExportTaskRow{
-			fakePostgresExportTaskRow{err: sql.ErrNoRows},
-			fakePostgresExportTaskRow{payload: payload},
-		},
+		rows: []postgresExportTaskRow{fakePostgresExportTaskRow{err: sql.ErrNoRows}},
 	}
 	adapter.DB = db
 	now := time.Date(2026, 5, 23, 1, 10, 0, 0, time.UTC)
@@ -263,13 +261,28 @@ func TestPostgresExportTaskQueueAdapterRetryFallsThroughToDeadLetter(t *testing.
 		t.Fatalf("Retry returned error: %v", err)
 	}
 	if queued {
-		t.Fatalf("Retry returned queued=true, want dead letter path")
+		t.Fatalf("Retry returned queued=true, want exhausted lease retained for atomic dead letter")
 	}
-	if item.Document.ID != document.ID {
-		t.Fatalf("dead letter item = %#v", item)
+	if item.Document.ID != "" {
+		t.Fatalf("Retry returned a moved dead letter item = %#v", item)
 	}
-	if len(db.queries) != 2 || !strings.Contains(db.queries[0].SQL, "attempt + 1 < max_attempts") || !strings.Contains(db.queries[1].SQL, "export_worker_task_dead_letters") {
-		t.Fatalf("queries = %#v, want retry then dead letter", db.queries)
+	if len(db.queries) != 1 || !strings.Contains(db.queries[0].SQL, "attempt + 1 < max_attempts") {
+		t.Fatalf("queries = %#v, want one fenced retry only", db.queries)
+	}
+}
+
+func TestPostgresExportTaskFinishedAtStartsRetryBackoffAfterSlowFailure(t *testing.T) {
+	claimAt := time.Date(2026, 5, 23, 1, 0, 0, 0, time.UTC)
+	wallStartedAt := time.Date(2026, 10, 23, 5, 0, 0, 0, time.UTC)
+	finishedAt := postgresExportTaskFinishedAt(claimAt, wallStartedAt, wallStartedAt.Add(40*time.Second))
+	statement, err := buildPostgresExportTaskRetryStatement("tenant_lab_001", "task_001", "lease_001", finishedAt, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := statement.Args[3].(time.Time)
+	want := claimAt.Add(70 * time.Second)
+	if !got.Equal(want) {
+		t.Fatalf("retry_not_before=%s, want end of 40s processing plus 30s backoff=%s", got, want)
 	}
 }
 
@@ -432,8 +445,13 @@ func (db *recordingPostgresExportTaskDB) ExecContext(ctx context.Context, query 
 		return nil, err
 	}
 	db.execs = append(db.execs, postgresExportTaskQueueStatement{SQL: query, Args: append([]any(nil), args...)})
-	return nil, db.execErr
+	return fakePostgresExportTaskResult(1), db.execErr
 }
+
+type fakePostgresExportTaskResult int64
+
+func (result fakePostgresExportTaskResult) LastInsertId() (int64, error) { return 0, nil }
+func (result fakePostgresExportTaskResult) RowsAffected() (int64, error) { return int64(result), nil }
 
 func (db *recordingPostgresExportTaskDB) QueryRowContext(ctx context.Context, query string, args ...any) postgresExportTaskRow {
 	db.mu.Lock()

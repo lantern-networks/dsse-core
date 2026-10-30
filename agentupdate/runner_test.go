@@ -149,6 +149,12 @@ func TestAnUnconfirmedDisarmStopsTheUpdate(t *testing.T) {
 	if !strings.Contains(out.Reason, "refusing every connection") {
 		t.Errorf("the reason must name the consequence, got %q", out.Reason)
 	}
+	if !strings.Contains(out.Reason, "already have been cleared") || !strings.Contains(j.LastFailureReason, "steering may already have been cleared") {
+		t.Fatalf("an unconfirmed disarm must preserve the possible unprotected state in outcome and journal: %q / %q", out.Reason, j.LastFailureReason)
+	}
+	if strings.Contains(strings.Join(p.calls, ","), "rearm") {
+		t.Fatal("a failed disarm is not proof that restarting a possibly broken driver is safe")
+	}
 }
 
 // A fail-closed endpoint must not have its steering taken down by the updater: that would break the posture
@@ -846,13 +852,13 @@ func TestASteeringRestorationThatFailsIsReportedAsAnEmergency(t *testing.T) {
 
 	j := NewJournal()
 	out, _ := Run(j, goodManifest(), runCfg(), p, func(*Journal) error { return nil }, jNow)
-	if !strings.Contains(out.Reason, "STEERING WAS TAKEN DOWN") || !strings.Contains(out.Reason, "control OFF") {
+	if !strings.Contains(out.Reason, "STEERING WAS TAKEN DOWN") || !strings.Contains(out.Reason, "may be unprotected or blocked") {
 		t.Fatalf("an unprotected endpoint must be named as one, got %q", out.Reason)
 	}
 	// ★ And it outlives the process: the journal is what a later reader has. This assertion is the reason
 	// LastFailureReason exists — the account used to be discarded until the THIRD failure, because only the
 	// poison ceiling wrote a reason down, and the first failure is the one that leaves a box unprotected.
-	if !strings.Contains(j.LastFailureReason, "could NOT be restored") {
+	if !strings.Contains(j.LastFailureReason, "could NOT be confirmed") {
 		t.Errorf("the journal must carry why this device is unprotected, got %q", j.LastFailureReason)
 	}
 }
@@ -952,14 +958,40 @@ func TestAFailedRearmReachesTheCallerNotJustTheJournal(t *testing.T) {
 	if err == nil {
 		t.Fatal("this must be an error")
 	}
-	if !strings.Contains(err.Error(), "COULD NOT BE RESTORED") {
+	if !strings.Contains(err.Error(), "RESTORATION COULD NOT BE CONFIRMED") {
 		t.Fatalf("★ the error names only the lesser problem: %v", err)
 	}
 	if !strings.Contains(err.Error(), "could not be recorded either") {
 		t.Errorf("the failed journal write is part of the state and must survive too: %v", err)
 	}
-	if out.Action != ActionRefused || !strings.Contains(out.Reason, "control OFF") {
+	if out.Action != ActionRefused || !strings.Contains(out.Reason, "may be unprotected or blocked") {
 		t.Errorf("the outcome must say it as well: %s / %s", out.Action, out.Reason)
+	}
+}
+
+func TestFailedLaunchRearmAndJournalSaveAllReachCaller(t *testing.T) {
+	p := readyPlatform()
+	launchErr := errors.New("launcher refused the package")
+	rearmErr := errors.New("driver state could not be read")
+	saveErr := errors.New("journal storage is unavailable")
+	p.execErr, p.rearmErr = launchErr, rearmErr
+	writes := 0
+	save := func(*Journal) error {
+		writes++
+		if writes == 5 { // begin, snapshotted, disarmed, executing, then failed-launch result
+			return saveErr
+		}
+		return nil
+	}
+	out, err := Run(NewJournal(), goodManifest(), runCfg(), p, save, jNow)
+	if !errors.Is(err, saveErr) || !errors.Is(err, launchErr) || !errors.Is(err, rearmErr) {
+		t.Fatalf("caller lost one of the three failures: %v", err)
+	}
+	if out.Action != ActionRefused || !strings.Contains(out.Reason, "may be unprotected or blocked") {
+		t.Fatalf("protection state uncertainty was hidden: %+v", out)
+	}
+	if got := strings.Join(p.calls, ","); !strings.Contains(got, "disarm,execute,rearm") {
+		t.Fatalf("wrong action order: %q", got)
 	}
 }
 

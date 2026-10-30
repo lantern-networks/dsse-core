@@ -101,6 +101,10 @@ func verifyTheEdgesEnforceWhatWasAuthored(client *http.Client, cpAdmin string, e
 	case len(unreachable) == len(edgeAdmins):
 		return []verifyResult{{name: name, note: "no Edge could be asked what it signs under: " +
 			strings.Join(unreachable, ", ")}}
+	case len(unreachable) > 0:
+		return []verifyResult{{name: name, note: fmt.Sprintf(
+			"%d Edge(s) could not be asked what they sign under, so the fleet was not fully measured — and NOT measured on: %s",
+			len(unreachable), strings.Join(unreachable, ", "))}}
 	default:
 		return []verifyResult{{ok: true, name: name, note: fmt.Sprintf(
 			"every Edge that answered signs each organization under its own authority; %d organization(s) "+
@@ -127,28 +131,32 @@ func organizationsWithTheirOwnInterceptionAuthority(client *http.Client, cpAdmin
 		return nil, fmt.Errorf("HTTP %d: %s", status, firstLineOf(body))
 	}
 	var listing struct {
-		Tenants []struct {
+		Tenants *[]struct {
 			TenantID    string `json:"tenant_id"`
 			DisplayName string `json:"display_name"`
 		} `json:"tenants"`
 	}
-	if jerr := json.Unmarshal(body, &listing); jerr != nil {
-		return nil, jerr
+	if jerr := json.Unmarshal(body, &listing); jerr != nil || listing.Tenants == nil {
+		return nil, fmt.Errorf("the deployment-wide tenant list is missing or invalid: %v", jerr)
 	}
 	owed := []string{}
-	for _, t := range listing.Tenants {
+	for _, t := range *listing.Tenants {
 		id := strings.TrimSpace(t.TenantID)
 		if id == "" {
-			continue
+			return nil, fmt.Errorf("the deployment-wide tenant list contains an unnamed organization")
 		}
 		astatus, abody, aerr := getAsOrganization(client, cpAdmin+"/admin/tenant-interception-authority", adminToken, id)
 		if aerr != nil || astatus != http.StatusOK {
-			continue
+			return nil, fmt.Errorf("authority for %s was not measured: HTTP %d %v", id, astatus, aerr)
 		}
 		var answer struct {
-			HasAuthority bool `json:"has_authority"`
+			TenantID     string `json:"tenant_id"`
+			HasAuthority *bool  `json:"has_authority"`
 		}
-		if jerr := json.Unmarshal(abody, &answer); jerr == nil && answer.HasAuthority {
+		if jerr := json.Unmarshal(abody, &answer); jerr != nil || answer.HasAuthority == nil || answer.TenantID != id {
+			return nil, fmt.Errorf("authority response for %s was missing, invalid or belonged to another organization", id)
+		}
+		if *answer.HasAuthority {
 			label := strings.TrimSpace(t.DisplayName)
 			if label == "" || label == id {
 				label = id

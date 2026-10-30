@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,6 +57,29 @@ func writeSelfSigned(t *testing.T, dir, name string) (certPath, keyPath string) 
 		t.Fatalf("write key: %v", err)
 	}
 	return certPath, keyPath
+}
+
+func TestPinnedConnectorHTTPRejectsPlaintextRedirectBeforeSendingSecret(t *testing.T) {
+	var plaintextRequests atomic.Int32
+	plaintext := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		plaintextRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer plaintext.Close()
+	tlsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", plaintext.URL+"/connectors/id/heartbeat")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer tlsServer.Close()
+	anchors := x509.NewCertPool()
+	anchors.AddCert(tlsServer.Certificate())
+	client := newConnectorEdgeHTTPClient(&tls.Config{RootCAs: anchors})
+	if err := postJSON(client, tlsServer.URL+"/connectors/id/heartbeat", map[string]string{"status": "healthy"}, "test-secret"); err == nil {
+		t.Fatal("expected plaintext redirect to be rejected")
+	}
+	if plaintextRequests.Load() != 0 {
+		t.Fatal("connector secret was sent over plaintext redirect")
+	}
 }
 
 func TestBuildConnectorTLSConfig(t *testing.T) {

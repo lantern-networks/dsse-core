@@ -2,11 +2,8 @@
 
 // winnet_api_livecheck_windows_test.go — LIVE, opt-in checks that the in-process Win32 DNS API primitives work
 // on the real box, and CRUCIALLY that they work from SESSION 0 (where powershell.exe/netsh.exe failed with
-// 0xC0000142). These are gated behind env vars so `go test` never mutates a developer's DNS by accident; the
-// compiled test binary (`go test -c`) is run once interactively and once as a SYSTEM scheduled task (session 0)
-// to prove the session-0 fix. Read-only check: DSSE_WINNET_SELFTEST=1. Reversible write round-trip:
-// DSSE_WINNET_WRITETEST=1 (sets the egress IPv4 iface static to its current servers, verifies, then resets it to
-// automatic/DHCP — a no-op on a DHCP box, restoring the original state).
+// 0xC0000142). Read-only checks require explicit opt-in. The write check requires DSSE_WINNET_WRITETEST=1 and
+// an API-confirmed automatic-DNS interface; a static-DNS interface must never be reset to DHCP by a test.
 package main
 
 import (
@@ -14,19 +11,21 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unsafe"
 )
 
-// Session-0 probe: fixed trigger/result paths so the compiled test binary can be driven by a SYSTEM scheduled
-// task (session 0) with no shell to pass env vars or redirect stdout — the point is to prove the in-process API
-// works where powershell.exe/netsh.exe/cmd.exe fail to even launch (0xC0000142).
+// Session-0 probe result path. Both the environment opt-in and trigger are required so a stale trigger file
+// cannot make an ordinary go test touch the machine.
 const (
 	s0TriggerPath = `C:\Windows\Temp\dsse_winnet_s0.trigger`
 	s0ResultPath  = `C:\Windows\Temp\dsse_winnet_s0.result`
 )
 
-// TestWinnetSession0 runs the read + reversible write checks and writes a PASS/FAIL report to a fixed file, so a
-// session-0 SYSTEM task can prove the API works there. Skipped unless the trigger file exists.
+// TestWinnetSession0 reads DNS without changing it and writes a report for a separately invoked SYSTEM task.
 func TestWinnetSession0(t *testing.T) {
+	if os.Getenv("DSSE_WINNET_S0_SELFTEST") != "1" {
+		t.Skip("set DSSE_WINNET_S0_SELFTEST=1 for the session-0 read-only probe")
+	}
 	if _, err := os.Stat(s0TriggerPath); err != nil {
 		t.Skip("session-0 trigger file absent; skipping")
 	}
@@ -45,28 +44,47 @@ func TestWinnetSession0(t *testing.T) {
 		fmt.Fprintf(&b, "  iface=%s fam=%s egress=%v servers=%s\n", e.IfIndex, e.Family, e.Egress, e.Servers)
 	}
 
-	// reversible write round-trip on the egress IPv4 iface (static-set same servers -> verify -> reset to DHCP)
-	var target ifaceDNS
-	for _, s := range state {
-		if s.Family == "IPv4" && s.Egress && s.Servers != "" && !strings.Contains(s.Servers, "127.0.0.1") {
-			target = s
-			break
-		}
-	}
-	if target.IfIndex != "" {
-		idx := idxU32(target.IfIndex)
-		if err := setInterfaceDNS(idx, "IPv4", target.Servers); err != nil {
-			fmt.Fprintf(&b, "FAIL setInterfaceDNS(static): %v\n", err)
-		} else if err := setInterfaceDNS(idx, "IPv4", ""); err != nil {
-			fmt.Fprintf(&b, "FAIL setInterfaceDNS(reset): %v\n", err)
-		} else {
-			flushDNSCache()
-			fmt.Fprintf(&b, "PASS write round-trip on iface %s (static-set + reset-to-DHCP, no child process)\n", target.IfIndex)
-		}
-	} else {
-		fmt.Fprintf(&b, "SKIP write round-trip: no egress IPv4 iface with real servers\n")
-	}
 	_ = os.WriteFile(s0ResultPath, []byte(b.String()), 0o600)
+}
+
+// GetInterfaceDnsSettings distinguishes an automatic DNS interface from one with an authored static server.
+// enumInterfaceDNS reports only effective servers, which cannot make this distinction. Treat any uncertainty
+// or profile-specific server as static and leave it untouched.
+func automaticIPv4DNS(ifIndex uint32) (bool, error) {
+	guid, err := interfaceGUID(ifIndex)
+	if err != nil {
+		return false, err
+	}
+	settings := dnsInterfaceSettings{Version: dnsInterfaceSettingsVersion1}
+	get := iphlpapi.NewProc("GetInterfaceDnsSettings")
+	if r, _, _ := get.Call(uintptr(unsafe.Pointer(&guid)), uintptr(unsafe.Pointer(&settings))); r != 0 {
+		return false, fmt.Errorf("GetInterfaceDnsSettings(if=%d): status %d", ifIndex, r)
+	}
+	defer iphlpapi.NewProc("FreeInterfaceDnsSettings").Call(uintptr(unsafe.Pointer(&settings)))
+	return dnsSettingsAreAutomatic(settings), nil
+}
+
+func dnsSettingsAreAutomatic(settings dnsInterfaceSettings) bool {
+	const dnsSettingProfileNameServer = 0x0200
+	return settings.Flags&(dnsSettingNameServer|dnsSettingProfileNameServer) == 0 &&
+		settings.NameServer == nil && settings.ProfileNameServer == nil
+}
+
+func TestWinnetWriteProbeRequiresAutomaticDNS(t *testing.T) {
+	static := uint16('1')
+	for _, settings := range []dnsInterfaceSettings{
+		{Flags: dnsSettingNameServer},
+		{Flags: 0x0200},
+		{NameServer: &static},
+		{ProfileNameServer: &static},
+	} {
+		if dnsSettingsAreAutomatic(settings) {
+			t.Fatal("static or profile DNS was classified as automatic")
+		}
+	}
+	if !dnsSettingsAreAutomatic(dnsInterfaceSettings{}) {
+		t.Fatal("no authored DNS servers must be classified as automatic")
+	}
 }
 
 func TestWinnetEnumReadOnly(t *testing.T) {
@@ -112,8 +130,26 @@ func TestWinnetWriteRoundTrip(t *testing.T) {
 	}
 	idx := idxU32(target.IfIndex)
 	orig := target.Servers
+	automatic, err := automaticIPv4DNS(idx)
+	if err != nil {
+		t.Fatalf("cannot prove the interface uses automatic DNS: %v", err)
+	}
+	if !automatic {
+		t.Skip("interface has static or profile DNS; the test must not reset it to DHCP")
+	}
 	t.Logf("round-trip target iface=%s orig_servers=%s", target.IfIndex, orig)
 
+	// Register recovery before the write; even an API error could follow a partial change.
+	t.Cleanup(func() {
+		if err := setInterfaceDNS(idx, "IPv4", ""); err != nil {
+			t.Errorf("restore automatic DNS failed: %v", err)
+			return
+		}
+		flushDNSCache()
+		if restored, err := automaticIPv4DNS(idx); err != nil || !restored {
+			t.Errorf("automatic DNS restore not verified: restored=%t error=%v", restored, err)
+		}
+	})
 	// 1. WRITE: set static to the same servers (exercises SetInterfaceDnsSettings + GUID conversion).
 	if err := setInterfaceDNS(idx, "IPv4", orig); err != nil {
 		t.Fatalf("setInterfaceDNS(static) failed: %v", err)
@@ -129,10 +165,5 @@ func TestWinnetWriteRoundTrip(t *testing.T) {
 	if normalizeServers(gotServers) != normalizeServers(orig) {
 		t.Fatalf("after static set, servers=%q want %q", gotServers, orig)
 	}
-	// 3. RESET to automatic (DHCP) — restores the original state on a DHCP box.
-	if err := setInterfaceDNS(idx, "IPv4", ""); err != nil {
-		t.Fatalf("setInterfaceDNS(reset) failed: %v", err)
-	}
-	flushDNSCache()
-	t.Logf("RESULT write round-trip ok on iface %s: static-set + verify + reset-to-DHCP all succeeded (no child process)", target.IfIndex)
+	t.Logf("RESULT write verified on iface %s; cleanup will restore automatic DNS", target.IfIndex)
 }

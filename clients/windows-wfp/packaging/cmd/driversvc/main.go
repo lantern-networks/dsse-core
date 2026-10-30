@@ -16,6 +16,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -61,7 +62,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "driversvc: uninstall %s: %v\n", n, err)
 			os.Exit(1)
 		}
-		fmt.Printf("driversvc: %s stopped + deleted\n", n)
+		fmt.Printf("driversvc: %s stopped; service absence confirmed\n", n)
 	case *status:
 		st, err := doStatus(m, n, *sysPath)
 		if err != nil {
@@ -123,7 +124,12 @@ func doInstall(m *mgr.Mgr, name, sysPath string) error {
 		// dynamic unload. The new bytes are on disk and the OLD code is in the kernel: a pending reboot, not a
 		// success. Record it and say so; do NOT delete/recreate, which would fail anyway and leave the box
 		// without a driver service.
-		if st, qerr := s.Query(); qerr == nil && st.State != svc.Stopped {
+		st, qerr := s.Query()
+		if qerr != nil {
+			s.Close()
+			return fmt.Errorf("verify old driver stopped before replacement: %w", qerr)
+		}
+		if st.State != svc.Stopped {
 			s.Close()
 			recordPendingReboot(name, digest)
 			fmt.Println(DescribeInstallOutcome(name, digest, true, &PendingReboot{Digest: digest}))
@@ -197,18 +203,61 @@ func startDriver(s *mgr.Service) error {
 func doUninstall(m *mgr.Mgr, name string) error {
 	s, err := m.OpenService(name)
 	if err != nil {
-		return nil // already absent — uninstall is idempotent
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return nil // already absent — uninstall is idempotent
+		}
+		return fmt.Errorf("open driver service for removal: %w", err)
 	}
-	defer s.Close()
-	stopServiceIfRunning(s)
-	if err := s.Delete(); err != nil {
-		return fmt.Errorf("delete: %w", err)
+	err = func() error {
+		defer s.Close()
+		if err := confirmStoppedBeforeDelete(func() (uint32, error) {
+			st, err := s.Query()
+			return uint32(st.State), err
+		}, func() error {
+			_, err := s.Control(svc.Stop)
+			if err == windows.ERROR_SERVICE_NOT_ACTIVE {
+				return nil
+			}
+			return err
+		}, func() error {
+			return waitState(s, svc.Stopped, 15*time.Second)
+		}, uint32(svc.Stopped), uint32(svc.StopPending)); err != nil {
+			return err
+		}
+		if err := s.Delete(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+			return fmt.Errorf("delete: %w", err)
+		}
+		return nil
+	}()
+	if err != nil {
+		return err
 	}
-	return nil
+	// Close our handle before probing: SCM only completes deletion after all
+	// handles close. A delete request alone must not be an MSI success.
+	deadline := time.Now().Add(15 * time.Second)
+	return confirmDriverAbsent(func() (bool, error) {
+		probe, err := m.OpenService(name)
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return true, nil
+		}
+		if err == nil {
+			probe.Close()
+		} else if !errors.Is(err, windows.ERROR_SERVICE_MARKED_FOR_DELETE) {
+			return false, err
+		}
+		return false, nil
+	}, func() bool {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+		return true
+	})
 }
 
-// stopServiceIfRunning best-effort stops a service and waits for it to reach Stopped (bounded). Used before a
-// delete/replace so the driver image is unloaded first.
+// stopServiceIfRunning best-effort stops a service and waits for it to reach Stopped (bounded). Used only by
+// install/replace, which separately queries the final state and reports pending reboot when unloading fails.
+// Uninstall uses confirmStoppedBeforeDelete and refuses to report a stopped driver without that proof.
 func stopServiceIfRunning(s *mgr.Service) {
 	if st, err := s.Query(); err == nil && st.State != svc.Stopped {
 		if _, cerr := s.Control(svc.Stop); cerr == nil || cerr == windows.ERROR_SERVICE_NOT_ACTIVE {
@@ -236,7 +285,10 @@ func sameDriverImage(current, want string) bool {
 func doStatus(m *mgr.Mgr, name, sysPath string) (string, error) {
 	s, err := m.OpenService(name)
 	if err != nil {
-		return fmt.Sprintf("%s: absent", name), nil
+		if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+			return fmt.Sprintf("%s: absent", name), nil
+		}
+		return "", fmt.Errorf("open driver service for status: %w", err)
 	}
 	defer s.Close()
 	st, err := s.Query()

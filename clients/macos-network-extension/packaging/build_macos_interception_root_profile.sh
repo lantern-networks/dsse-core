@@ -79,7 +79,9 @@ try:
 except Exception:
     sys.exit("build_macos_interception_root_profile: the Edge did not answer with JSON:\n  " + raw[:400])
 
-rows = [r for r in (doc.get("per_tenant_issuers") or []) if r.get("tenant", "").lower() == tenant.lower()]
+rows = [r for r in (doc.get("per_tenant_issuers") or []) if r.get("tenant") == tenant]
+if len(rows) > 1:
+    sys.exit("build_macos_interception_root_profile: duplicate issuer records for %r" % tenant)
 scope = (doc.get("signing_scope") or {})
 shared = ""
 

@@ -26,12 +26,12 @@ type Group struct {
 // folds the SPELLING VARIANTS free-form entry produced (finance / Finance / "finance ").
 func NormalizeGroupName(name string) string { return strings.ToLower(strings.TrimSpace(name)) }
 
-// sameGroupTenant reports whether two tenant ids denote the same tenant scope (trim + casefold). Used to scope
+// sameGroupTenant reports whether two tenant ids denote the same tenant scope (trim, case-sensitive identity). Used to scope
 // the name-uniqueness invariant and the risk-floor lookup PER TENANT: multi-tenancy is a system premise, so two
 // DIFFERENT tenants may each own a group named "finance" without colliding, and a device's floor must resolve
 // within its OWN tenant (never another tenant's same-named group). Empty == empty (the unscoped/legacy case).
 func sameGroupTenant(a, b string) bool {
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+	return strings.TrimSpace(a) == strings.TrimSpace(b)
 }
 
 func newGroupID() (string, error) {

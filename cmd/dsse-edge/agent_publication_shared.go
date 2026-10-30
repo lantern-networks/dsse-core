@@ -133,3 +133,36 @@ func (s *publishedAgentUpdateStore) PublicationFor(ctx context.Context, tenant s
 	candidate.legacy = s.legacy
 	return candidate.ForTenant(tenant), scopedTo(s.pending, tenant), nil
 }
+
+// DistributionSnapshot is the operator-authorized CP→Edge input. It contains the raw active tenant scopes,
+// including the catalogue and the read-only pre-tenant fallback. A failed shared read never turns a partially
+// cached answer into an authoritative distribution set.
+func (s *publishedAgentUpdateStore) DistributionSnapshot(ctx context.Context) (map[string]agentpolicy.Envelope, error) {
+	if s == nil {
+		return map[string]agentpolicy.Envelope{}, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if _, shared := s.blob.(interface {
+		UpdateContext(context.Context, func([]byte) ([]byte, error)) error
+	}); shared {
+		raw, err := s.blob.Load()
+		if err != nil {
+			return nil, err
+		}
+		candidate, err := decodeSharedPublication(raw, s.sharedKnown)
+		if err != nil {
+			return nil, err
+		}
+		s.envelopes, s.pending, s.legacy = candidate.envelopes, candidate.pending, candidate.legacy
+		s.sharedKnown = s.sharedKnown || len(raw) > 0
+	}
+	out := copyEnvelopes(s.legacy)
+	for key, env := range s.envelopes {
+		out[key] = env
+	}
+	return out, nil
+}

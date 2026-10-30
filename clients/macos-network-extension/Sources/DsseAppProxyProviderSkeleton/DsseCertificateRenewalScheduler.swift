@@ -39,10 +39,12 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
     // Where the verified agent policy is cached, so the renewal decision can read the operator's cutoff from
     // the same signed document the steering path already trusts.
     private let agentPolicySignedPath: String?
+    private let expectedDeviceIdentity: String?
 
     public init(configDirectory: URL, contract: DsseTransportContract,
                 agentPolicyPinnedPublicKeyHex: String = "", trustBundleURL: URL? = nil,
                 agentPolicySignedPath: String? = nil,
+                expectedDeviceIdentity: String? = nil,
                 onAnchorsAdopted: (() -> Void)? = nil,
                 log: @escaping (String) -> Void) {
         self.configDirectory = configDirectory
@@ -50,6 +52,7 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
         self.agentPolicyPinnedPublicKeyHex = agentPolicyPinnedPublicKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
         self.trustBundleURL = trustBundleURL
         self.agentPolicySignedPath = agentPolicySignedPath
+        self.expectedDeviceIdentity = expectedDeviceIdentity
         self.onAnchorsAdopted = onAnchorsAdopted
         self.log = log
     }
@@ -66,7 +69,9 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
             return nil
         }
         return DsseSignedAgentPolicy.verifiedRenewCertificatesIssuedBefore(
-            signedPath: path, pinnedPublicKeyHex: agentPolicyPinnedPublicKeyHex)
+            signedPath: path, pinnedPublicKeyHex: agentPolicyPinnedPublicKeyHex,
+            expectedDeviceIdentity: expectedDeviceIdentity,
+            expectedTenantID: DsseAdoptedTenantScope.tenantInForce(configDirectory: configDirectory))
     }
 
     // Six hours is ample for the 60-day certificates /enroll issues today, whose retry budget is 20 days.
@@ -393,7 +398,7 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
         } catch {
             // Loud but not fatal. With the retry budget this is an alert; only a renewal path that stays
             // broken for weeks becomes an outage, and that is what the day count is for.
-            log("certificate_renewal FAILED identity=\(commonName) days_remaining=\(daysRemaining) error=\(error) " +
+            log("certificate_renewal FAILED identity=\(commonName) days_remaining=\(daysRemaining) error=\(providerNonsecretErrorDetail(error)) " +
                 "— the existing certificate is still in use and renewal will be retried in \(Int(next))s")
         }
         return next
@@ -471,6 +476,10 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
     func recoverTrustAnchorsIfNeeded() {
         guard !agentPolicyPinnedPublicKeyHex.isEmpty else {
             log("trust_anchor_recovery disabled (no pinned agent-policy key in the agent config)")
+            return
+        }
+        guard DsseAdoptedTenantScope.tenantInForce(configDirectory: configDirectory) != nil else {
+            log("trust_anchor_recovery disabled (no tenant in the verified install profile)")
             return
         }
         guard let url = contract.transportTLSURL?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -594,7 +603,7 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
                                                  log: log)
             log("certificate_renewal RECOVERED identity=\(commonName) — steering can resume with the new certificate")
         } catch {
-            log("certificate_renewal RECOVERY FAILED identity=\(commonName) error=\(error) — the device still " +
+            log("certificate_renewal RECOVERY FAILED identity=\(commonName) error=\(providerNonsecretErrorDetail(error)) — the device still " +
                 "cannot renew itself; it will retry")
         }
     }
@@ -604,11 +613,18 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
     // It deliberately does NOT use /enroll/renew: proving a certificate against the one endpoint that just
     // issued it would show little. Any HTTP answer is enough — the question is whether the mTLS handshake
     // completes, not what the endpoint says.
+    static func probeTransportSecurity(like security: DsseTransportSecurity,
+                                       candidate: SecIdentity?) -> DsseTransportSecurity {
+        DsseTransportSecurity(host: security.host, port: security.port,
+                              mtlsRequired: true,
+                              pinnedCACertificates: security.pinnedCACertificates,
+                              clientIdentity: candidate)
+    }
+
     private func handshakeSucceeds(with candidate: SecIdentity, like security: DsseTransportSecurity) -> Bool {
-        let probeSecurity = DsseTransportSecurity(host: security.host, port: security.port,
-                                                  mtlsRequired: true,
-                                                  pinnedCACertificate: security.pinnedCACertificate,
-                                                  clientIdentity: candidate)
+        // The Edge may already present the incoming CA during an overlap. The probe must trust exactly the
+        // same complete bundle as the live transport, or it rejects a valid renewed client identity.
+        let probeSecurity = Self.probeTransportSecurity(like: security, candidate: candidate)
         // ★★★ BY NAME, AND WITH THE CANDIDATE (2026-08-22, measured — this probe was failing on the SERVER's
         // certificate and reporting it as "the renewed identity could not complete an mTLS handshake", which
         // is a sentence about the wrong end of the connection).
@@ -633,7 +649,7 @@ public final class DsseCertificateRenewalScheduler: @unchecked Sendable {
             return true
         } catch {
             log("certificate_renewal probe FAILED name=\(name.isEmpty ? "(by address)" : name) " +
-                "transport_error=\(error.localizedDescription)")
+                "transport_error=\(providerNonsecretErrorDetail(error))")
             return false
         }
     }

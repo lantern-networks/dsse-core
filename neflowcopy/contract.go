@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"github.com/lantern-networks/dsse-core/tunnel"
 )
 
@@ -42,10 +43,10 @@ type Contract struct {
 func DefaultLimits() Limits {
 	return Limits{
 		ConnectTimeoutMillis:        int((5 * time.Second) / time.Millisecond),
-		MaxConnectionLifetimeMillis: int((5 * time.Minute) / time.Millisecond),
-		IdleTimeoutMillis:           int((30 * time.Second) / time.Millisecond),
-		ByteCap:                     64 << 20,
-		ConcurrentConnectionCap:     32,
+		MaxConnectionLifetimeMillis: int(runtimequota.Seconds("DSSE_TCP_STREAM_MAX_LIFETIME_SECONDS") / time.Millisecond),
+		IdleTimeoutMillis:           int(runtimequota.Seconds("DSSE_TCP_STREAM_IDLE_TIMEOUT_SECONDS") / time.Millisecond),
+		ByteCap:                     runtimequota.Bytes("DSSE_TCP_STREAM_MAX_BYTES"),
+		ConcurrentConnectionCap:     tunnel.LegacyTCPConcurrentConnectionCap,
 	}
 }
 

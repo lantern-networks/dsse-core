@@ -99,7 +99,7 @@ func (c *agentRolloutCache) setForTenant(tenantID string, p agentrollout.AgentRo
 	if c.plans == nil {
 		c.plans = map[string]agentrollout.AgentRolloutPlan{}
 	}
-	if key := strings.ToLower(strings.TrimSpace(tenantID)); key != "" {
+	if key := strings.TrimSpace(tenantID); key != "" {
 		c.plans[key] = p
 	}
 }
@@ -110,15 +110,14 @@ func (c *agentRolloutCache) setAll(plans map[string]agentrollout.AgentRolloutPla
 	defer c.mu.Unlock()
 	next := make(map[string]agentrollout.AgentRolloutPlan, len(plans))
 	for k, v := range plans {
-		if key := strings.ToLower(strings.TrimSpace(k)); key != "" {
+		if key := strings.TrimSpace(k); key != "" {
 			next[key] = v
 		}
 	}
 	c.plans, c.fetched, c.lastErr = next, true, ""
 	c.tenantID = strings.TrimSpace(own)
-	if p, ok := next[strings.ToLower(strings.TrimSpace(own))]; ok {
-		c.plan = p
-	}
+	// A complete snapshot removing this tenant must also remove its old plan.
+	c.plan = next[c.tenantID]
 }
 
 // planFor answers one organization's plan, and whether this Edge has been told anything about it. The second
@@ -132,18 +131,16 @@ func (c *agentRolloutCache) planFor(tenantID string) (agentrollout.AgentRolloutP
 	if !c.fetched {
 		return agentrollout.AgentRolloutPlan{}, false
 	}
-	key := strings.ToLower(strings.TrimSpace(tenantID))
+	key := strings.TrimSpace(tenantID)
 	if key == "" {
 		return c.plan, true
 	}
 	if p, ok := c.plans[key]; ok {
 		return p, true
 	}
-	// The single-plan answer an older control plane gives: it is this Edge's own organization's and nobody
-	// else's, which is exactly what the caller must not spread around.
-	if strings.EqualFold(key, strings.TrimSpace(c.tenantID)) {
-		return c.plan, true
-	}
+	// setForTenant also puts the older control plane's single-plan answer in
+	// plans. A missing entry in a complete snapshot is unknown, never a reason
+	// to reuse an earlier single-plan answer.
 	return agentrollout.AgentRolloutPlan{}, false
 }
 
@@ -221,7 +218,7 @@ func (s agentRolloutSource) fetch(ctx context.Context) (agentrollout.AgentRollou
 	if derr := json.NewDecoder(resp.Body).Decode(&body); derr != nil {
 		return agentrollout.AgentRolloutPlan{}, fmt.Errorf("decode the rollout plan: %w", derr)
 	}
-	if want := strings.TrimSpace(s.tenantID); want != "" && !strings.EqualFold(strings.TrimSpace(body.TenantID), want) {
+	if want := strings.TrimSpace(s.tenantID); want != "" && strings.TrimSpace(body.TenantID) != want {
 		return agentrollout.AgentRolloutPlan{}, fmt.Errorf("the control plane answered for tenant %q and this edge "+
 			"enforces %q — refusing to apply another tenant's halt (or its release) to these devices",
 			body.TenantID, want)
@@ -246,7 +243,7 @@ func (s agentRolloutSource) run(ctx context.Context, cache *agentRolloutCache) {
 		if all, served, aerr := s.fetchAll(ctx); aerr == nil && served {
 			prevAll, hadAll, _ := cache.Get()
 			cache.setAll(all, s.tenantID)
-			own := all[strings.ToLower(strings.TrimSpace(s.tenantID))]
+			own := all[strings.TrimSpace(s.tenantID)]
 			switch {
 			case first:
 				first = false

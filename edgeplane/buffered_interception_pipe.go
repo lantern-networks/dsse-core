@@ -18,20 +18,31 @@ func (bufferedPipeTimeoutError) Error() string {
 func (bufferedPipeTimeoutError) Timeout() bool   { return true }
 func (bufferedPipeTimeoutError) Temporary() bool { return true }
 
+type bufferedPipeWriteTimeoutError struct{}
+
+func (bufferedPipeWriteTimeoutError) Error() string {
+	return "buffered interception pipe: write deadline exceeded"
+}
+func (bufferedPipeWriteTimeoutError) Timeout() bool   { return true }
+func (bufferedPipeWriteTimeoutError) Temporary() bool { return true }
+
 // BufferedPipeHalf is a bounded in-memory byte buffer with blocking Read/Write for ONE direction.
 type BufferedPipeHalf struct {
-	mu           sync.Mutex
-	cond         *sync.Cond
-	buf          []byte
-	closed       bool
-	cap          int
-	totalWritten int64
+	mu             sync.Mutex
+	cond           *sync.Cond
+	buf            []byte
+	closed         bool
+	cap            int
+	rejectOverflow bool // authentication waits must not block unrelated mux flows
+	totalWritten   int64
 	// readDeadline, when non-zero, bounds a blocking Read: a timer broadcasts the cond at the deadline so a Read
 	// waiting on an empty buffer wakes and returns bufferedPipeTimeoutError instead of blocking forever. The
 	// runtime-copy session pump relies on this to time-slice a TLS handshake's flights (drain what the server
 	// produced, return it so the client can send the next flight); a raw net.Pipe honors deadlines, this must too.
-	readDeadline  time.Time
-	deadlineTimer *time.Timer
+	readDeadline       time.Time
+	readDeadlineTimer  *time.Timer
+	writeDeadline      time.Time
+	writeDeadlineTimer *time.Timer
 }
 
 func NewBufferedPipeHalf(capBytes int) *BufferedPipeHalf {
@@ -46,10 +57,11 @@ func (h *BufferedPipeHalf) setReadDeadline(t time.Time) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.readDeadline = t
-	if h.deadlineTimer != nil {
-		h.deadlineTimer.Stop()
-		h.deadlineTimer = nil
+	if h.readDeadlineTimer != nil {
+		h.readDeadlineTimer.Stop()
+		h.readDeadlineTimer = nil
 	}
+	h.cond.Broadcast()
 	if t.IsZero() {
 		return
 	}
@@ -58,23 +70,69 @@ func (h *BufferedPipeHalf) setReadDeadline(t time.Time) {
 		h.cond.Broadcast()
 		return
 	}
-	h.deadlineTimer = time.AfterFunc(d, func() {
+	h.readDeadlineTimer = time.AfterFunc(d, func() {
 		h.mu.Lock()
 		h.cond.Broadcast()
 		h.mu.Unlock()
 	})
 }
 
+// setWriteDeadline also wakes a Write blocked behind a full buffer.
+func (h *BufferedPipeHalf) setWriteDeadline(t time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.writeDeadline = t
+	if h.writeDeadlineTimer != nil {
+		h.writeDeadlineTimer.Stop()
+		h.writeDeadlineTimer = nil
+	}
+	h.cond.Broadcast()
+	if t.IsZero() {
+		return
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return
+	}
+	h.writeDeadlineTimer = time.AfterFunc(d, func() {
+		h.mu.Lock()
+		h.cond.Broadcast()
+		h.mu.Unlock()
+	})
+}
+
+func (h *BufferedPipeHalf) writeTimedOut() bool {
+	return !h.writeDeadline.IsZero() && !time.Now().Before(h.writeDeadline)
+}
+
 func (h *BufferedPipeHalf) Write(p []byte) (int, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.rejectOverflow && len(p) > h.cap-len(h.buf) {
+		h.closed = true
+		h.buf = nil
+		h.cond.Broadcast()
+		return 0, io.ErrShortBuffer
+	}
 	written := 0
 	for len(p) > 0 {
 		for len(h.buf) >= h.cap && !h.closed {
+			if h.rejectOverflow {
+				h.closed = true
+				h.buf = nil
+				h.cond.Broadcast()
+				return written, io.ErrShortBuffer
+			}
+			if h.writeTimedOut() {
+				return written, bufferedPipeWriteTimeoutError{}
+			}
 			h.cond.Wait()
 		}
 		if h.closed {
 			return written, io.ErrClosedPipe
+		}
+		if h.writeTimedOut() {
+			return written, bufferedPipeWriteTimeoutError{}
 		}
 		space := h.cap - len(h.buf)
 		n := len(p)
@@ -88,6 +146,31 @@ func (h *BufferedPipeHalf) Write(p []byte) (int, error) {
 		h.cond.Broadcast()
 	}
 	return written, nil
+}
+
+// setAuthLimit is used only while no upstream connection exists. Overflow
+// terminates this flow; it must never stall the shared demultiplexer.
+func (h *BufferedPipeHalf) setAuthLimit(limit int, holding bool) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || limit <= 0 {
+		return false
+	}
+	h.cap, h.rejectOverflow = limit, holding
+	if len(h.buf) > limit {
+		h.closed = true
+		h.buf = nil
+		h.cond.Broadcast()
+		return false
+	}
+	if holding {
+		// Release a pre-existing large backing allocation.
+		copyBuffer := make([]byte, len(h.buf), limit)
+		copy(copyBuffer, h.buf)
+		h.buf = copyBuffer
+	}
+	h.cond.Broadcast()
+	return true
 }
 
 func (h *BufferedPipeHalf) Read(p []byte) (int, error) {
@@ -111,6 +194,14 @@ func (h *BufferedPipeHalf) Read(p []byte) (int, error) {
 func (h *BufferedPipeHalf) Close() {
 	h.mu.Lock()
 	h.closed = true
+	if h.readDeadlineTimer != nil {
+		h.readDeadlineTimer.Stop()
+		h.readDeadlineTimer = nil
+	}
+	if h.writeDeadlineTimer != nil {
+		h.writeDeadlineTimer.Stop()
+		h.writeDeadlineTimer = nil
+	}
 	h.cond.Broadcast()
 	h.mu.Unlock()
 }
@@ -155,14 +246,20 @@ func (c *bufferedPipeConn) CloseWrite() error {
 func (c *bufferedPipeConn) LocalAddr() net.Addr  { return bufferedPipeAddr{} }
 func (c *bufferedPipeConn) RemoteAddr() net.Addr { return bufferedPipeAddr{} }
 
-// SetReadDeadline / SetDeadline bound this end's blocking Read (which reads readHalf). The write half is
-// buffered (a Write only blocks when the buffer is full), so a write deadline is a no-op today.
-func (c *bufferedPipeConn) SetDeadline(t time.Time) error { c.readHalf.setReadDeadline(t); return nil }
+// Both reads and writes can block: writes wait when the bounded peer buffer is full.
+func (c *bufferedPipeConn) SetDeadline(t time.Time) error {
+	c.readHalf.setReadDeadline(t)
+	c.writeHalf.setWriteDeadline(t)
+	return nil
+}
 func (c *bufferedPipeConn) SetReadDeadline(t time.Time) error {
 	c.readHalf.setReadDeadline(t)
 	return nil
 }
-func (c *bufferedPipeConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *bufferedPipeConn) SetWriteDeadline(t time.Time) error {
+	c.writeHalf.setWriteDeadline(t)
+	return nil
+}
 
 // NewBufferedInterceptionPipe is a drop-in for net.Pipe() with an internal per-direction buffer: a Write
 // returns as soon as the bytes are buffered (up to capBytes) instead of blocking until the peer Reads.

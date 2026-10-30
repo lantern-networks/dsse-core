@@ -14,6 +14,29 @@ const (
 	publisher = "subject:Aoba Networks"
 )
 
+func TestLegacyWiXPublisherCapturePreservesOnlyUnambiguousRequirement(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"split subject", []string{"--service-run", "--update-publisher", "&quot;subject:Aoba", "Networks,", "Inc.&quot;"}, "subject:Aoba Networks, Inc."},
+		{"subject with spaces", []string{"--service-run", "--update-publisher", "&quot;subject:Aoba", "Networks,&quot;"}, "subject:Aoba Networks,"},
+		{"thumbprint", []string{"--update-publisher", "&quot;thumbprint:" + keyA + "&quot;"}, "thumbprint:" + keyA},
+		{"missing terminator", []string{"--update-publisher", "&quot;subject:Aoba", "Networks"}, ""},
+		{"intervening flag", []string{"--update-publisher", "&quot;subject:Aoba", "--plan-pin", keyA}, ""},
+		{"duplicate publisher", []string{"--update-publisher", "&quot;subject:Aoba&quot;", "--update-publisher", "&quot;subject:Other&quot;"}, ""},
+		{"joined publisher", []string{"--update-publisher=&quot;subject:Aoba&quot;", "&quot;subject:Other&quot;"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := legacyPublisherForCapture(tc.args)
+			if got != tc.want || ok != (tc.want != "") {
+				t.Fatalf("legacy capture got (%q, %t), want (%q, %t)", got, ok, tc.want, tc.want != "")
+			}
+		})
+	}
+}
+
 func storedEverything() pinSet {
 	return pinSet{
 		"Steer_ConfigPin":      keyA,

@@ -322,9 +322,10 @@ func TestTrustRecoveryRefusesReplayedBundle(t *testing.T) {
 	if second.code != "unrecovered" {
 		t.Fatalf("second feed of the same bundle: outcome = %q, want unrecovered (replay must be refused)", second.code)
 	}
-	// The serial must survive even losing the anchors file — otherwise deleting one file re-opens the replay.
-	if err := os.Remove(filepath.Join(dir, adoptedAnchorsFile)); err != nil {
-		t.Fatal(err)
+	// New adoptions keep the CA and serial in one record. No separately writable
+	// anchor file may be needed to retain the replay floor.
+	if _, err := os.Stat(filepath.Join(dir, adoptedAnchorsFile)); !os.IsNotExist(err) {
+		t.Fatal("new adoption unexpectedly published a separate anchor file")
 	}
 	if got := lastAcceptedTrustSerial(dir); got != 1 {
 		t.Fatalf("serial after losing the anchors file = %d, want 1 (replay window re-opened)", got)
@@ -361,6 +362,30 @@ func TestTrustRecoveryIgnoresUnpinnedSignature(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, adoptedPointerFile)); !os.IsNotExist(err) {
 		t.Fatalf("an unverified bundle was persisted")
+	}
+}
+
+func TestTrustRecoveryRefusesMissingOrDifferentSignedTenantBeforeChangingAnchors(t *testing.T) {
+	ca := newTestCA(t, "current-ca")
+	for _, tenant := range []string{"", "tenant_other", "Tenant_Expected"} {
+		t.Run("offered="+tenant, func(t *testing.T) {
+			dir := t.TempDir()
+			tc := &transportConfig{enabled: true, liveTrust: &atomic.Pointer[trustMaterial]{}}
+			out, ok := adoptVerifiedBundle(tc, trustRecoveryConfig{
+				stateDir: dir, tenantID: "tenant_expected",
+			}, agentpolicy.TrustBundlePayload{
+				TenantID: tenant, Serial: 1, TransportCAPEM: string(ca.pem),
+			}, time.Second)
+			if ok || out.code != "refused_other_organization" {
+				t.Fatalf("outcome=%q accepted=%v, want tenant refusal", out.code, ok)
+			}
+			if _, err := os.Stat(filepath.Join(dir, adoptedPointerFile)); !os.IsNotExist(err) {
+				t.Fatal("foreign or unnamed tenant bundle was persisted")
+			}
+			if len(tc.currentTrustAnchors()) != 0 {
+				t.Fatal("foreign or unnamed tenant bundle changed live trust")
+			}
+		})
 	}
 }
 

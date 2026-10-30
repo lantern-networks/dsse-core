@@ -35,6 +35,7 @@ test('tenant settings can be retried after an unconfirmed save', async () => {
     },
     ensureSignedIn: async () => true,
   });
+  vm.runInContext(readFileSync(new URL('./tenant_fleet_settings.js', import.meta.url), 'utf8'), context);
   vm.runInContext(readFileSync(new URL('./tenantsettings.js', import.meta.url), 'utf8'), context);
   await context.loadTenantSettings(root, root);
   const name = fields[0];

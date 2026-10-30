@@ -1,17 +1,23 @@
 package edgeplane
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // Moving interception under a central (MSSP) root WITHOUT taking the signing key out of its token.
@@ -103,21 +109,54 @@ func InterceptionIntermediateCSR(interception *NetworkExtensionLabTLSInterceptio
 //
 // The caller applies interceptionRootSwitchGate first: this function changes the anchor, and an anchor an
 // endpoint does not hold breaks every site on it at once.
-// reparentedRootFileName / reparentedIntermediateFileName are where a completed re-parent is persisted so it
-// SURVIVES A RESTART. Without this the adopt was in-memory only, and the first redeploy silently dropped the
-// Edge back to its self-signed interception root — the posture reported as migrated had rolled back
-// (docs/pki_hierarchy_gap_2026_08_01.ja.md). Certificates only; the signing key is and stays in the token.
+// The root and intermediate are committed in ONE durable snapshot. The older two-file format remains
+// recognizable at boot solely to report DEGRADED instead of silently treating a previous adoption as day 0.
+// Certificates only; the signing key is and stays in the token.
 const (
+	reparentedSnapshotFileName     = "interception_reparent_pair.json"
 	reparentedRootFileName         = "interception_reparent_root.pem"
 	reparentedIntermediateFileName = "interception_reparent_intermediate.pem"
 )
 
+type persistedReparentPair struct {
+	Version         int    `json:"version"`
+	RootPEM         []byte `json:"root_pem"`
+	IntermediatePEM []byte `json:"intermediate_pem"`
+}
+
+type preparedReparentPair struct {
+	root     *x509.Certificate
+	inter    *x509.Certificate
+	provider InterceptionRootProvider
+	signer   crypto.Signer
+}
+
+type reparentSnapshotIO struct {
+	write   func(string, []byte, os.FileMode) error
+	syncDir func(string) error
+}
+
+var productionReparentSnapshotIO = reparentSnapshotIO{write: durablefile.Write, syncDir: durablefile.SyncDir}
+
 // AdoptReparentedIntermediate installs the re-parented certificate and, when persistDir is set, writes the
 // root+intermediate there so a restart can restore this exact posture rather than reverting to self-signed.
 func AdoptReparentedIntermediate(interception *NetworkExtensionLabTLSInterception, rootPEM, intermediatePEM []byte, persistDir string) error {
+	return adoptReparentedIntermediateWithIO(interception, rootPEM, intermediatePEM, persistDir, productionReparentSnapshotIO)
+}
+
+func adoptReparentedIntermediateWithIO(interception *NetworkExtensionLabTLSInterception, rootPEM, intermediatePEM []byte, persistDir string, io reparentSnapshotIO) error {
+	if interception == nil {
+		return fmt.Errorf("interception is not enabled on this edge")
+	}
+	interception.reparentMu.Lock()
+	defer interception.reparentMu.Unlock()
+	// The public API receives caller-owned slices. Freeze the validated bytes before persistence so a
+	// concurrent caller mutation cannot turn the committed pair into something other than what was checked.
+	rootPEM, intermediatePEM = bytes.Clone(rootPEM), bytes.Clone(intermediatePEM)
 	// PERSIST-THEN-SWITCH. Validate the pair without mutating anything, make it durable, and only
 	// then make it live — so the durable and live states can never diverge on a mid-adopt failure.
-	if _, _, err := validateReparentPair(interception, rootPEM, intermediatePEM); err != nil {
+	prepared, err := validateReparentPair(interception, rootPEM, intermediatePEM)
+	if err != nil {
 		return err
 	}
 	// A live trust change that cannot survive a restart is REFUSED, not silently accepted: a warn-and-succeed
@@ -126,70 +165,60 @@ func AdoptReparentedIntermediate(interception *NetworkExtensionLabTLSInterceptio
 	if strings.TrimSpace(persistDir) == "" {
 		return fmt.Errorf("interception reparent requires -interception-reparent-state-dir: refusing a live trust change that cannot survive a restart")
 	}
-	// Persist BEFORE switching live. Both certificates are written to temp files and then renamed into place, so
-	// a failure here leaves the live state untouched — nothing has changed yet, and there is nothing to unwind.
-	if err := persistReparentAtomically(persistDir, rootPEM, intermediatePEM); err != nil {
+	// One durable replacement commits the pair. An ordinary write error leaves the previous snapshot/live
+	// state intact. ErrReplacedNotFlushed is different: the new snapshot is already visible on disk.
+	err = persistReparentAtomicallyWithIO(persistDir, rootPEM, intermediatePEM, io)
+	if err != nil && !errors.Is(err, durablefile.ErrReplacedNotFlushed) {
 		return fmt.Errorf("persist re-parent (live state untouched): %w", err)
 	}
-	// Persistence succeeded, so a crash during the live switch below restores exactly this posture at boot.
-	return installReparentedIntermediate(interception, rootPEM, intermediatePEM)
-}
-
-// persistReparentAtomically writes the root+intermediate durably as a pair: both to temp files first (so a
-// failure leaves the existing pair untouched), then renamed into place back to back. Each rename is atomic; the
-// tiny window where only the root is renamed is caught on restore, which re-validates that the pair chains
-// before trusting it (ReapplyPersistedReparent), so a half-applied pair falls back rather than being served.
-func persistReparentAtomically(dir string, rootPEM, intermediatePEM []byte) error {
-	rootTmp, err := writeReparentTemp(dir, rootPEM)
+	if errors.Is(err, durablefile.ErrReplacedNotFlushed) {
+		// Do not leave a visible NEW snapshot with the OLD live issuer. Retry the directory flush and verify
+		// that the exact candidate remains installed before adopting it. If persistence is still uncertain,
+		// serve the candidate but report DEGRADED rather than claiming a durable migration.
+		path := filepath.Join(persistDir, reparentedSnapshotFileName)
+		want, marshalErr := marshalReparentPair(rootPEM, intermediatePEM)
+		got, readErr := os.ReadFile(path)
+		if marshalErr != nil || readErr != nil || !bytes.Equal(got, want) {
+			interception.setReparentRestoreFailed("re-parent snapshot state uncertain after replacement")
+			return fmt.Errorf("persist re-parent replaced snapshot but could not verify its visible contents: %w", err)
+		}
+		if syncErr := io.syncDir(persistDir); syncErr == nil {
+			err = nil
+		}
+	}
+	// Prepared before the write, so the live switch cannot fail after the snapshot has committed.
+	exportErr := applyReparentedIntermediate(interception, prepared)
+	if exportErr != nil {
+		interception.setReparentRestoreFailed("active interception anchor export did not commit")
+		return fmt.Errorf("re-parent is live and durable, but active anchor export failed: %w", exportErr)
+	}
 	if err != nil {
-		return err
+		interception.setReparentRestoreFailed("re-parent snapshot durability not confirmed after replacement")
+		return fmt.Errorf("re-parent is live and visible on disk, but snapshot durability is not confirmed: %w", err)
 	}
-	interTmp, err := writeReparentTemp(dir, intermediatePEM)
-	if err != nil {
-		_ = os.Remove(rootTmp)
-		return err
-	}
-	if err := os.Rename(rootTmp, filepath.Join(dir, reparentedRootFileName)); err != nil {
-		_ = os.Remove(rootTmp)
-		_ = os.Remove(interTmp)
-		return err
-	}
-	if err := os.Rename(interTmp, filepath.Join(dir, reparentedIntermediateFileName)); err != nil {
-		_ = os.Remove(interTmp)
-		return err
-	}
+	interception.setReparentRestoreFailed("")
 	return nil
 }
 
-// writeReparentTemp writes data to a fsync'd temp file in dir and returns its path, or cleans up and errors.
-func writeReparentTemp(dir string, data []byte) (string, error) {
-	f, err := os.CreateTemp(dir, ".reparent-*.tmp")
+func marshalReparentPair(rootPEM, intermediatePEM []byte) ([]byte, error) {
+	return json.Marshal(persistedReparentPair{Version: 1, RootPEM: rootPEM, IntermediatePEM: intermediatePEM})
+}
+
+func persistReparentAtomicallyWithIO(dir string, rootPEM, intermediatePEM []byte, io reparentSnapshotIO) error {
+	data, err := marshalReparentPair(rootPEM, intermediatePEM)
 	if err != nil {
-		return "", err
+		return err
 	}
-	name := f.Name()
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(name)
-		return "", err
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(name)
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(name)
-		return "", err
-	}
-	return name, nil
+	return io.write(filepath.Join(dir, reparentedSnapshotFileName), data, 0600)
 }
 
 // ReapplyPersistedReparent restores a re-parent recorded by a previous adopt. Called at boot, AFTER the HSM
 // provider is built (its token key is what the persisted intermediate was issued for) and before any traffic
-// is served. It runs the same validation installReparentedIntermediate does — a persisted pair that no longer
-// matches the token key, or fails to chain, is ignored with a loud line rather than trusted, so a device
-// falls back to its provisioned self-signed root instead of presenting a chain it cannot sign under.
+// is served. It runs the same validation the live adoption does. An unreadable
+// or invalid persisted pair marks the engine DEGRADED; startup must refuse to
+// serve instead of falling back to the original root. If the snapshot is
+// missing, startup's public-export check still refuses to roll back an anchor
+// that devices have already received.
 //
 // No gate here: boot is restoring a decision an operator already made through the gated adopt, not making a
 // new one. Absent files are the ordinary case (never re-parented) and say nothing.
@@ -197,23 +226,42 @@ func ReapplyPersistedReparent(interception *NetworkExtensionLabTLSInterception, 
 	if interception == nil || strings.TrimSpace(persistDir) == "" {
 		return
 	}
-	rootPEM, rerr := os.ReadFile(filepath.Join(persistDir, reparentedRootFileName))
-	interPEM, ierr := os.ReadFile(filepath.Join(persistDir, reparentedIntermediateFileName))
-	if os.IsNotExist(rerr) || os.IsNotExist(ierr) {
-		return // never re-parented, or only half-written — the day-0 self-signed root stands
-	}
-	// From here the files EXIST: a re-parent WAS adopted, so a failure to restore it is not the day-0 case — it
-	// is "the operator meant the MSSP root and we are serving the self-signed one". Record that so it shows as
-	// degraded/not-ready rather than being a silent revert.
-	if rerr != nil || ierr != nil {
-		reason := fmt.Sprintf("persisted re-parent unreadable (root=%v inter=%v)", rerr, ierr)
-		log.Printf("network_extension_lab_tls progress=interception_reparent_restore_skipped reason=unreadable root=%v inter=%v — serving self-signed; marking DEGRADED", rerr, ierr)
+	interception.reparentMu.Lock()
+	defer interception.reparentMu.Unlock()
+	data, readErr := os.ReadFile(filepath.Join(persistDir, reparentedSnapshotFileName))
+	if os.IsNotExist(readErr) {
+		// Legacy two-file state is never silently accepted as day 0. There are no existing users to
+		// migrate; an operator must explicitly adopt the pair into the atomic format after validation.
+		_, rootErr := os.Stat(filepath.Join(persistDir, reparentedRootFileName))
+		_, interErr := os.Stat(filepath.Join(persistDir, reparentedIntermediateFileName))
+		if os.IsNotExist(rootErr) && os.IsNotExist(interErr) {
+			return // never re-parented
+		}
+		const reason = "legacy or incomplete persisted re-parent pair requires explicit re-adoption"
+		log.Printf("network_extension_lab_tls progress=interception_reparent_restore_skipped reason=%q — marking DEGRADED", reason)
 		interception.setReparentRestoreFailed(reason)
 		return
 	}
-	if err := installReparentedIntermediate(interception, rootPEM, interPEM); err != nil {
+	if readErr != nil {
+		interception.setReparentRestoreFailed("persisted re-parent snapshot is unreadable")
+		log.Printf("network_extension_lab_tls progress=interception_reparent_restore_skipped reason=unreadable — marking DEGRADED")
+		return
+	}
+	var pair persistedReparentPair
+	if err := json.Unmarshal(data, &pair); err != nil || pair.Version != 1 || len(pair.RootPEM) == 0 || len(pair.IntermediatePEM) == 0 {
+		interception.setReparentRestoreFailed("persisted re-parent snapshot is malformed")
+		log.Printf("network_extension_lab_tls progress=interception_reparent_restore_skipped reason=malformed — marking DEGRADED")
+		return
+	}
+	prepared, err := validateReparentPair(interception, pair.RootPEM, pair.IntermediatePEM)
+	if err != nil {
 		log.Printf("network_extension_lab_tls progress=interception_reparent_restore_skipped reason=%q — serving self-signed; marking DEGRADED", err.Error())
 		interception.setReparentRestoreFailed(fmt.Sprintf("persisted re-parent failed validation: %v", err))
+		return
+	}
+	if err := applyReparentedIntermediate(interception, prepared); err != nil {
+		interception.setReparentRestoreFailed("active interception anchor export did not commit during restore")
+		log.Printf("network_extension_lab_tls progress=interception_reparent_restored_anchor_export_failed err=%v — marking DEGRADED", err)
 		return
 	}
 	interception.setReparentRestoreFailed("") // restored cleanly — clear any prior degraded flag
@@ -223,26 +271,26 @@ func ReapplyPersistedReparent(interception *NetworkExtensionLabTLSInterception, 
 // validateReparentPair checks a root+intermediate pair WITHOUT mutating any live or durable state, returning
 // the parsed certificates so a caller can persist or apply them. Extracting validation is what lets adopt
 // persist before it switches and reject a bad pair before touching anything.
-func validateReparentPair(interception *NetworkExtensionLabTLSInterception, rootPEM, intermediatePEM []byte) (*x509.Certificate, *x509.Certificate, error) {
+func validateReparentPair(interception *NetworkExtensionLabTLSInterception, rootPEM, intermediatePEM []byte) (*preparedReparentPair, error) {
 	if interception == nil {
-		return nil, nil, fmt.Errorf("interception is not enabled on this edge")
+		return nil, fmt.Errorf("interception is not enabled on this edge")
 	}
 	root, err := ParseInterceptionCertPEM(rootPEM)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse root certificate: %w", err)
+		return nil, fmt.Errorf("parse root certificate: %w", err)
 	}
 	inter, err := ParseInterceptionCertPEM(intermediatePEM)
 	if err != nil {
-		return nil, nil, fmt.Errorf("parse intermediate certificate: %w", err)
+		return nil, fmt.Errorf("parse intermediate certificate: %w", err)
 	}
 	if !root.IsCA {
-		return nil, nil, fmt.Errorf("the supplied root is not a CA")
+		return nil, fmt.Errorf("the supplied root is not a CA")
 	}
 	if !inter.IsCA {
-		return nil, nil, fmt.Errorf("the supplied intermediate is not a CA, so it cannot issue the per-site leaves interception mints")
+		return nil, fmt.Errorf("the supplied intermediate is not a CA, so it cannot issue the per-site leaves interception mints")
 	}
 	if err := inter.CheckSignatureFrom(root); err != nil {
-		return nil, nil, fmt.Errorf("the intermediate is not signed by the supplied root: %w", err)
+		return nil, fmt.Errorf("the intermediate is not signed by the supplied root: %w", err)
 	}
 	// The intermediate must be able to ISSUE. CheckSignatureFrom(root) validates the ROOT's certSign, not the
 	// intermediate's — and IsCA (basicConstraints CA:TRUE) does not imply keyCertSign. An intermediate minted
@@ -252,11 +300,11 @@ func validateReparentPair(interception *NetworkExtensionLabTLSInterception, root
 	// keyUsage is asserted it must include certSign; an absent keyUsage places no restriction, as the verifiers
 	// themselves read it.
 	if inter.KeyUsage != 0 && inter.KeyUsage&x509.KeyUsageCertSign == 0 {
-		return nil, nil, fmt.Errorf("the intermediate's keyUsage does not include certSign, so endpoints will reject every leaf it issues")
+		return nil, fmt.Errorf("the intermediate's keyUsage does not include certSign, so endpoints will reject every leaf it issues")
 	}
 	now := interception.now().UTC()
 	if now.Before(inter.NotBefore) || now.After(inter.NotAfter) {
-		return nil, nil, fmt.Errorf("the intermediate is not currently valid (%s..%s)",
+		return nil, fmt.Errorf("the intermediate is not currently valid (%s..%s)",
 			inter.NotBefore.Format(time.RFC3339), inter.NotAfter.Format(time.RFC3339))
 	}
 	// The root is the anchor endpoints pin; an expired or not-yet-valid root fails SecTrustEvaluate on the whole
@@ -264,37 +312,34 @@ func validateReparentPair(interception *NetworkExtensionLabTLSInterception, root
 	// otherwise an expiring root passes adopt while healthy and then, re-installed by ReapplyPersistedReparent
 	// after a restart past its notAfter, breaks every site instead of falling back to the self-signed root.
 	if now.Before(root.NotBefore) || now.After(root.NotAfter) {
-		return nil, nil, fmt.Errorf("the supplied root is not currently valid (%s..%s)",
+		return nil, fmt.Errorf("the supplied root is not currently valid (%s..%s)",
 			root.NotBefore.Format(time.RFC3339), root.NotAfter.Format(time.RFC3339))
 	}
 	provider := interception.rootRegistry.DefaultProvider()
 	if provider == nil {
-		return nil, nil, fmt.Errorf("no interception signing provider is configured")
+		return nil, fmt.Errorf("no interception signing provider is configured")
 	}
 	signer := provider.Signer()
 	if signer == nil {
-		return nil, nil, fmt.Errorf("the interception signing key is not available")
+		return nil, fmt.Errorf("the interception signing key is not available")
 	}
 	// The certificate must belong to the key this Edge signs with. Without this check an operator could adopt
 	// any CA certificate at all and the Edge would present a chain it cannot sign under.
 	if err := VerifySignerMatchesCert(signer, inter); err != nil {
-		return nil, nil, fmt.Errorf("the intermediate was not issued for this Edge's signing key — the key stays in its token and only its certificate changes: %w", err)
+		return nil, fmt.Errorf("the intermediate was not issued for this Edge's signing key — the key stays in its token and only its certificate changes: %w", err)
 	}
-	return root, inter, nil
+	return &preparedReparentPair{root: root, inter: inter, provider: provider, signer: signer}, nil
 }
 
-// installReparentedIntermediate validates the pair and, if good, swaps it into the LIVE interception state.
-// Callers that also need durability (adopt) persist first; this is the live half alone, and is what boot's
-// ReapplyPersistedReparent runs to restore an already-adopted decision.
-func installReparentedIntermediate(interception *NetworkExtensionLabTLSInterception, rootPEM, intermediatePEM []byte) error {
-	root, inter, err := validateReparentPair(interception, rootPEM, intermediatePEM)
-	if err != nil {
-		return err
-	}
-	provider := interception.rootRegistry.DefaultProvider()
+// applyReparentedIntermediate cannot fail to select a signer after persistence.
+// The separate public export can fail; callers must surface that degraded
+// distribution state while keeping the durable snapshot and live issuer aligned.
+func applyReparentedIntermediate(interception *NetworkExtensionLabTLSInterception, prepared *preparedReparentPair) error {
+	root, inter, provider := prepared.root, prepared.inter, prepared.provider
 	issuer := &InterceptionIssuer{
+		trustAnchor: root, // The anchor is omitted from the wire chain, but its expiry still bounds leaf issuance.
 		signingCert: inter,
-		signer:      provider.Signer(),
+		signer:      prepared.signer,
 		// [intermediate, root]: endpoints pin the root and receive the path to it. The root is included
 		// because a device that has just adopted it may not have it indexed for path building yet.
 		// See loadOfflineInterceptionIssuer: intermediates are presented, the anchor is not.
@@ -315,21 +360,13 @@ func installReparentedIntermediate(interception *NetworkExtensionLabTLSIntercept
 	outPath := interception.rootCACertOutPath
 	interception.mu.Unlock()
 
-	// ★ AND THE FILE DEVICES ARE TOLD TO INSTALL FROM (2026-08-16). That file exists for exactly one purpose —
-	// "this is the root to put in a machine's trust store" — and it was written once at startup and never
-	// again. Measured on the reference lab AFTER its root was re-parented to the MSSP root: the Edge served
-	// 36973669… and the distribution file still held 5a74ac31…. An operator following the deployment's own
-	// procedure installs a root that verifies nothing, every HTTPS site fails on that machine, and the file
-	// that told them to do it looks perfectly valid.
-	//
-	// A failure to rewrite is NOT fatal: the re-parent itself has already succeeded and is live, and undoing
-	// it here would trade a stale file for a broken deployment. It is loud instead, because the next person to
-	// read that file is about to trust it.
+	// The public export is deliberately separate from the signer pair. Once the
+	// snapshot commits, a failed export cannot roll back the live trust change;
+	// callers report DEGRADED and a boot replay will retry the export.
 	if strings.TrimSpace(outPath) != "" {
 		if err := WriteNetworkExtensionLabTLSRootCertificatePEM(outPath, anchorPEM); err != nil {
-			log.Printf("network_extension_lab_tls WARNING interception_root_anchor_file_stale path=%q err=%v — the "+
-				"re-parent is LIVE but the file devices are told to install still holds the previous root; anyone "+
-				"who distributes it will break every HTTPS site on that machine", outPath, err)
+			log.Printf("network_extension_lab_tls WARNING interception_root_anchor_file_stale path=%q err=%v — the re-parent is LIVE but the separate export did not commit", outPath, err)
+			return err
 		} else {
 			log.Printf("network_extension_lab_tls progress=interception_root_anchor_file_rewritten path=%q root_cn=%q",
 				outPath, root.Subject.CommonName)

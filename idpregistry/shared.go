@@ -33,6 +33,14 @@ func decodeRegistry(raw []byte) (persistedRegistry, error) {
 	}
 	for tenant, rows := range next.Connections {
 		for id, c := range rows {
+			if err := validateDeviceUserBindings(c.DeviceUserBindings); err != nil {
+				return next, err
+			}
+			for _, b := range c.DeviceUserBindings {
+				if !ValidOSSession(b.Revision) {
+					return next, fmt.Errorf("device user assignment revision is missing")
+				}
+			}
 			if c.TenantID != tenant || c.IdPID != id || tenant == "" || id == "" {
 				return next, fmt.Errorf("identity provider key mismatch")
 			}
@@ -189,6 +197,7 @@ func (s *Store) TenantSnapshot(tenant string) ([]Connection, string, error) {
 	rows := make([]Connection, 0, len(s.connections[tenant]))
 	for _, c := range s.connections[tenant] {
 		c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+		c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 		rows = append(rows, c)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].IdPID < rows[j].IdPID })

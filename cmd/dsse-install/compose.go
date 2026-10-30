@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -184,6 +185,9 @@ func rewriteComposeFileFor(dir string, shape machineShape) error {
 }
 
 func composeFileFor(dir string, shape machineShape, rewrite bool) error {
+	if err := writeHAProxyResourceEntrypoint(dir, rewrite); err != nil {
+		return err
+	}
 	path := filepath.Join(dir, "docker-compose.yml")
 	if _, err := os.Stat(path); err == nil && !rewrite {
 		stateBearingRegion := shape.holds == regionShapeStateBearing
@@ -235,6 +239,54 @@ func composeFileTo(dir, path string, shape machineShape) error {
 			stateBearing = composeStandbyControlPlane
 		}
 	}
+	cpPorts := "expose: [\"9443\"]"
+	if declaredNodeMapProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) {
+		// The three doorway instances probe each Node's own CP. Publish these
+		// listeners only on that Node's private address; other profiles keep the
+		// existing container-only admin listener.
+		cpPorts = `ports:
+      - "${DSSE_CP_A_BIND:?set DSSE_CP_A_BIND to the Node private address}${DSSE_CP_A_ADMIN_PORT:-19543}:9443"
+      - "${DSSE_CP_A_BIND:?set DSSE_CP_A_BIND to the Node private address}${DSSE_CP_A_DATA_PORT:-19545}:8443"`
+	}
+	stateBearing = strings.ReplaceAll(stateBearing, cpPortsPlaceholder, cpPorts)
+	quorumMounts := ""
+	if threeVoterProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) {
+		quorumMounts = `      # Dedicated DCS consumer; no Patroni/member key or CA signing key.
+      - "./store-ca.pem:/deployment/store-ca.pem:ro"
+      - "./cp-quorum.pem:/deployment/cp-quorum.pem:ro"
+      - "./cp-quorum-key.pem:/deployment/cp-quorum-key.pem:ro"`
+	}
+	stateBearing = strings.ReplaceAll(stateBearing, "__CP_QUORUM_MOUNTS__", quorumMounts)
+	if threeVoterProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) && shape.holdsAControlPlane() {
+		stateBearing += composeCPUnavailable
+	}
+	consolePorts := "expose: [\"8443\"]"
+	if declaredNodeMapProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) {
+		consolePorts = `ports:
+      - "${DSSE_CONSOLE_BIND:?set DSSE_CONSOLE_BIND to the Node private address}${DSSE_CONSOLE_PORT:-19544}:8443"`
+	}
+	cpOwned = strings.ReplaceAll(cpOwned, consolePortsPlaceholder, consolePorts)
+	consoleCert := filepath.Join(dir, "console-server.crt")
+	consoleKey := filepath.Join(dir, "console-server.key")
+	certInfo, certErr := os.Stat(consoleCert)
+	keyInfo, keyErr := os.Stat(consoleKey)
+	if certErr == nil && keyErr == nil && !certInfo.IsDir() && !keyInfo.IsDir() {
+		// Fresh installs present a server-only Console identity. Existing installs
+		// keep the management leaf until an explicit certificate rotation.
+		cpOwned = strings.Replace(cpOwned, "${DSSE_CONSOLE_TLS_CERT:-/deployment/management.crt}",
+			"${DSSE_CONSOLE_TLS_CERT:-/deployment/console-server.crt}", 1)
+		cpOwned = strings.Replace(cpOwned, "${DSSE_CONSOLE_TLS_KEY:-/deployment/management.key}",
+			"${DSSE_CONSOLE_TLS_KEY:-/deployment/console-server.key}", 1)
+		cpOwned = strings.Replace(cpOwned, "      - \"./console:/deployment/console:ro\"",
+			"      - \"./console-server.crt:/deployment/console-server.crt:ro\"\n"+
+				"      - \"./console-server.key:/deployment/console-server.key:ro\"\n"+
+				"      - \"./console:/deployment/console:ro\"", 1)
+	} else if !(os.IsNotExist(certErr) && os.IsNotExist(keyErr)) {
+		return fmt.Errorf("Console server certificate pair is incomplete")
+	}
+	if cpOwned != "" && readDeploymentEnv(dir)["DSSE_ARCHIVE_WEBHOOK_URL"] != "" {
+		cpOwned += composeArchiveAlertPublisher
+	}
 	// ★★★ THE DOORWAY WAITS FOR THE EDGES ONLY WHEN THEY ARE IN THIS FILE. Naming a service compose does not
 	// define makes the whole project invalid; naming one that IS defined but belongs on another machine starts
 	// it here, which is the co-location this whole exercise exists to end.
@@ -253,7 +305,7 @@ func composeFileTo(dir, path string, shape machineShape) error {
 
 	// ★ AND THE VOLUMES GO WITH THEM. Declaring storage for a database this region does not run says the
 	// region holds state, in the one file somebody reads to find out what it holds.
-	stateVolumes := "  pg-a:\n  clickhouse-data:\n  archive-data:\n  cp-a-state:\n  store-a-state:\n"
+	stateVolumes := "  postgres-tls:\n  pg-a:\n  clickhouse-data:\n  cp-a-state:\n  store-a-state:\n"
 	if shape.holds == regionShapeStandbyCP {
 		// The standby's own state directory, and nothing else. It starts empty, which is what makes it warm
 		// rather than a second, emptier deployment — see the note on the state-bearing pair.
@@ -294,8 +346,21 @@ func composeFileTo(dir, path string, shape machineShape) error {
 	}
 	// ★ A MACHINE BEHIND THE DOOR RENDERS NO DOOR. Its Edge publishes its own ports and the region's doorway,
 	// on another machine, names it in DSSE_EDGE_BACKENDS.
+	edgePorts := edgePortsFor(shape)
+	if declaredNodeMapProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) && shape.runsEdges() {
+		// Peer doorways and Edge mesh links require both listeners. Bind to
+		// the Node's private address, never a second public entry path.
+		edgePorts = `    ports:
+      - "${DSSE_EDGE_BIND:?set DSSE_EDGE_BIND to the Node private address}${DSSE_EDGE_AGENT_PORT:-8443}:8443"
+      - "${DSSE_EDGE_BIND:?set DSSE_EDGE_BIND to the Node private address}${DSSE_EDGE_ADMIN_PORT:-9443}:9443"
+`
+	}
 	edgeBlock := strings.Replace(composeEdgeFleetWith(edgeDependsOnCP, adminDefault, dataDefault),
-		edgePortsPlaceholder, edgePortsFor(shape), 1)
+		edgePortsPlaceholder, edgePorts, 1)
+	if declaredNodeMapProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) && shape.runsEdges() {
+		// Allow the 10s drain and bounded 15s HTTP shutdown before SIGKILL.
+		edgeBlock = strings.Replace(edgeBlock, "    restart: unless-stopped\n", "    restart: unless-stopped\n    stop_grace_period: 30s\n", 1)
+	}
 	if !shape.behindDoorway {
 		edgeBlock = composeRegionDoorwayWith(edgeDependsOnCP) + "\n" + edgeBlock
 	}
@@ -412,7 +477,12 @@ networks:
 	// ★ EVERY MEMBER OF THE DEPLOYMENT'S DATABASE, so libpq can find the primary itself. See
 	// the_client_finds_the_primary.go for the door this replaces.
 	body = strings.ReplaceAll(body, databaseHostsPlaceholder, databaseHostList(dir))
-	return os.WriteFile(path, []byte(boundEveryServicesLog(body)), 0o644)
+	var err error
+	body, err = composeWithPlanNameResolution(body, readDeploymentEnv(dir))
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, []byte(boundEveryServicesLog(composeAuthRollout(body, dir))), 0o644)
 }
 
 // composeBodyFor renders a machine's compose WITHOUT writing it.
@@ -455,7 +525,9 @@ func composeFileName() string { return "docker-compose.yml" }
 // compose refuses a file naming a service it does not define — "depends on undefined service" — so the
 // dependency travels with the block that provides it.
 const (
-	cpDependsPlaceholder = "__CP_DEPENDS_ON_DB_INIT__"
+	cpDependsPlaceholder    = "__CP_DEPENDS_ON_DB_INIT__"
+	cpPortsPlaceholder      = "__CP_A_PORTS__"
+	consolePortsPlaceholder = "__CONSOLE_PORTS__"
 	// ★★★ AND THE PAIR IS RETRIED, for the same reason dsse-postgres-init is. This process FATALS when its
 	// database cannot be opened — deliberately: a control plane answering from a store it could not read
 	// would be worse. But "starts once, fails, stays dead" turns a database that is thirty seconds late into
@@ -591,9 +663,8 @@ const composeConsensusStore = `  # ★★★ THE CONNECTION TO IT IS ENCRYPTED, 
   # network in the clear, and nothing says so. What catches it is not a warning: a real Postgres image refuses
   # an unencrypted connection by default and the control plane does not start.
   #
-  # ★ sslmode=require ENCRYPTS AND DOES NOT AUTHENTICATE. It stops a passive reader on the network and does
-  # not stop an active one that can answer as the database. Verifying the database's certificate against this
-  # deployment's own anchor is the next step and needs the cluster to present one this deployment issued.
+  # Database clients verify the dedicated database CA and the dialled server name.
+  # Server and Patroni client keys are copied into a private volume owned by the image's postgres UID.
   # ★★★ THE DEPLOYMENT'S DATABASE, AND WHY IT IS SIX CONTAINERS. A control plane OWNS its Postgres, so an
   # authority that is not a single point of failure means a DATABASE that is not one — two control-plane
   # processes in front of one database are one control plane with two front ends, and the leadership advisory
@@ -611,7 +682,7 @@ const composeConsensusStore = `  # ★★★ THE CONNECTION TO IT IS ENCRYPTED, 
   # ★ IT BELONGS TO THE CONTROL PLANE, and is not a service beside it. Nothing else in this deployment may
   # connect to it — an Edge holds no database, which is what lets a fleet grow and shrink without a migration.
   dsse-store-a: &dsse-store
-    image: ${DSSE_ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.15}
+    image: ${DSSE_ETCD_IMAGE:?declare the reviewed etcd image in data_layer}
     # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
     # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
     # restart. A node brought back then serves its door with its Edge and nothing behind it, and the fleet
@@ -687,7 +758,7 @@ const composeConsensusStore = `  # ★★★ THE CONNECTION TO IT IS ENCRYPTED, 
       # containers brings the cluster back as ONE member while the others refuse to start with
       # "member count is unequal", and they stay that way.
       #
-      # Every other stateful service here has a named volume — pg-a, clickhouse-data, archive-data,
+      # Every other stateful service here has a named volume — pg-a and clickhouse-data,
       # cp-a-state, edge-a-state. This one had three read-only certificates and nothing else, so etcd's data
       # directory lived inside the container. Recreating it — which this installer's own procedures ask for,
       # to close the break-glass credential, to pick up a new build, to add a machine — DESTROYED the
@@ -750,8 +821,13 @@ const composeConsensusStore = `  # ★★★ THE CONNECTION TO IT IS ENCRYPTED, 
 // ★ AND WAITING FOR IT WAS NEVER THE MECHANISM ANYWAY. The members find the store through DSSE_ETCD_HOSTS,
 // which a joining region MUST set to the deployment's; depends_on only orders start-up on one machine.
 func composeDatabaseWith(storeDependency string) string {
-	return `  dsse-postgres-a: &dsse-postgres
-    image: ${DSSE_POSTGRES_IMAGE:-ghcr.io/zalando/spilo-16:3.2-p2}` + storeDependency + `
+	dependency := "\n    depends_on:\n      dsse-postgres-tls-init: { condition: service_completed_successfully }"
+	if storeDependency != "" {
+		dependency += "\n      dsse-store-a: { condition: service_started }"
+	}
+	return composePostgresTLSInit + `  dsse-postgres-a: &dsse-postgres
+    restart: unless-stopped
+    image: ${DSSE_POSTGRES_IMAGE:?declare the reviewed Spilo image in data_layer}` + dependency + `
     environment: &dsse-postgres-env
       SCOPE: dsse
       # ★★★ AND ITS NAME IN THE CLUSTER, WHICH TWO REGIONS WOULD OTHERWISE SHARE. Every region is
@@ -765,7 +841,7 @@ func composeDatabaseWith(storeDependency string) string {
       # a member in an unknown state). The image writes Patroni's configuration itself; what it merges over
       # its own answer is SPILO_CONFIGURATION, below.
       PATRONI_NAME: ${DSSE_PG_A_NAME:-dsse-postgres-a}
-      PGVERSION: "16"
+      PGVERSION: 18
       # ★★★ WHERE THE CONSENSUS IS, WHICH IS NOT ALWAYS HERE. A region that joins the deployment
       # runs Patroni members against the deployment's ONE consensus store, whose members live one per region —
       # so this has to be answerable from outside. The default names the local three, which is right for the
@@ -782,6 +858,8 @@ func composeDatabaseWith(storeDependency string) string {
       ETCD3_CACERT: ${DSSE_ETCD_CLIENT_CACERT:-}
       ETCD3_CERT: ${DSSE_ETCD_CLIENT_CERT:-}
       ETCD3_KEY: ${DSSE_ETCD_CLIENT_KEY:-}
+      SSL_CERTIFICATE_FILE: /run/dsse-postgres-tls/database-server.pem
+      SSL_PRIVATE_KEY_FILE: /run/dsse-postgres-tls/database-server-key.pem
       PGPASSWORD_SUPERUSER: ${PG_SUPERUSER_PASSWORD:?PG_SUPERUSER_PASSWORD is in deployment.env — pass --env-file deployment.env}
       PGPASSWORD_ADMIN: ${PG_SUPERUSER_PASSWORD}
       PGPASSWORD_STANDBY: ${PG_SUPERUSER_PASSWORD}
@@ -799,7 +877,7 @@ func composeDatabaseWith(storeDependency string) string {
       # Patroni's configuration file itself and writes connect_address from the container's own IP, so
       # PATRONI_POSTGRESQL_CONNECT_ADDRESS arrived in the environment, was visible in the process env, and
       # appeared nowhere in /home/postgres/postgres.yml. What the image merges over its own answer is this.
-      SPILO_CONFIGURATION: '{name: "${DSSE_PG_A_NAME:-dsse-postgres-a}", postgresql: {connect_address: "${DSSE_PG_A_ADVERTISE:-dsse-postgres-a:5432}"}, restapi: {connect_address: "${DSSE_PG_A_API_ADVERTISE:-dsse-postgres-a:8008}"}}'
+      SPILO_CONFIGURATION: '{name: "${DSSE_PG_A_NAME:-dsse-postgres-a}", postgresql: {connect_address: "${DSSE_PG_A_ADVERTISE:-dsse-postgres-a:5432}", authentication: {replication: {sslmode: verify-full, sslrootcert: /run/dsse-postgres-tls/database-ca.pem}, superuser: {sslmode: verify-full, sslrootcert: /run/dsse-postgres-tls/database-ca.pem}}}, restapi: {connect_address: "${DSSE_PG_A_API_ADVERTISE:-dsse-postgres-a:8008}"}}'
     # ★★★ AND REACHABLE, WHICH IS A SEPARATE ACT FROM BEING ADVERTISED. A member that announces an address
     # nothing listens on is the same outage with a better error message. Loopback by default, like every other
     # published port here: widening it should reach the deployment's other regions and nothing else, because a
@@ -809,10 +887,9 @@ func composeDatabaseWith(storeDependency string) string {
       - "${DSSE_PG_A_API_PUBLISH:-127.0.0.1:18008}:8008"
 ` + composeAuthorityAliases + `    volumes:
       - "pg-a:/home/postgres/pgdata"
-      # ★ WHAT PATRONI VERIFIES THE STORE AGAINST, and the identity it presents when the store asks for one.
+      - "postgres-tls:/run/dsse-postgres-tls:ro"
+      # Patroni uses its dedicated consumer key from the protected postgres-tls volume.
       - "./store-ca.pem:/deployment/store-ca.pem:ro"
-      - "./store-member.pem:/deployment/store-member.pem:ro"
-      - "./store-member-key.pem:/deployment/store-member-key.pem:ro"
   # ★★★ ONE DATABASE MEMBER PER MACHINE. A Patroni pair sharing a host survives a process crash and not the
   # host, and this deployment replicates ACROSS machines — the database door below already names the members
   # in the other regions — so the member that matters is the one on the next machine, not one beside this.
@@ -844,7 +921,8 @@ const composeDatabaseDoor = `  # ★★★ THIS DOOR IS HOW A CLIENT REACHES THE
   # clients are lib/pq, which supports ONE host and reads a comma-separated list as a single hostname to
   # resolve. So the door stays, and the reason it stays is written here.
   postgres:
-    image: ${DSSE_HAPROXY_IMAGE:-haproxy:2.9-alpine}
+    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:251da69821897ec8c4819f12b1babbc4b71f562943addc9b9eb14bb6ece40dc6}
+    entrypoint: ["/bin/sh", "/usr/local/bin/dsse-haproxy-resources"]
     # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
     # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
     # restart. A node brought back then serves its door with its Edge and nothing behind it, and the fleet
@@ -858,10 +936,12 @@ const composeDatabaseDoor = `  # ★★★ THIS DOOR IS HOW A CLIENT REACHES THE
     # haproxy reserves file descriptors for maxconn across every proxy in the file, and asks the kernel for
     # them at start-up. A default Linux host allows far fewer, so it exits — and the region's doorway is the
     # one service whose absence looks like the whole deployment being down.
-    ulimits:
-      nofile: { soft: 200000, hard: 200000 }
+    # Inherit the platform's descriptor resources. The generated HAProxy config
+    # does not request a DSSE-authored connection quota; operators may supply
+    # their chosen ulimits through a Compose override.
     depends_on: [dsse-postgres-a]
     volumes:
+      - "./haproxy-resource-entrypoint.sh:/usr/local/bin/dsse-haproxy-resources:ro"
       - "./haproxy-postgres.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"
     # ★★★ NOT PUBLISHED UNLESS THE DEPLOYMENT NEEDS IT TO BE. The default binds to loopback, which reaches
     # exactly one machine: the one already running the database. Widening it is an explicit act —
@@ -877,11 +957,15 @@ const composeDatabaseInit = `  # ★ THE DEPLOYMENT'S OWN ROLE AND DATABASE, cre
   # restarted until it succeeds, because the cluster is still electing when compose first starts it — and an
   # init that runs once, fails, and is never retried is how a deployment comes up with no database to use.
   dsse-postgres-init:
-    image: ${DSSE_PSQL_IMAGE:-postgres:16-alpine}
+    image: ${DSSE_PSQL_IMAGE:?declare the reviewed PostgreSQL tools image in data_layer}
     depends_on: [dsse-postgres-a]
     restart: on-failure
     environment:
       PGPASSWORD: ${PG_SUPERUSER_PASSWORD}
+      PGSSLMODE: verify-full
+      PGSSLROOTCERT: /deployment/database-ca.pem
+    volumes:
+      - "./database-ca.pem:/deployment/database-ca.pem:ro"
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -895,6 +979,18 @@ const composeDatabaseInit = `  # ★ THE DEPLOYMENT'S OWN ROLE AND DATABASE, cre
         echo "the deployment's database and role exist"
 `
 
+const composeCPUnavailable = `  # Passive 503 responder, reachable only inside this Node's Compose network.
+  # It is not a CP candidate and never reads credentials, state or CA signing keys.
+  dsse-cp-unavailable:
+    image: ${DSSE_IMAGE:?set DSSE_IMAGE to the DSSE image this deployment runs}
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/dsse-edge", "-cp-unavailable-listen=0.0.0.0:9443", "-tls-cert=/deployment/management.crt", "-tls-key=/deployment/management.key"]
+    volumes:
+      - "./management.crt:/deployment/management.crt:ro"
+      - "./management.key:/deployment/management.key:ro"
+
+`
+
 const composeControlPlanePair = `  dsse-control-plane-a:
     image: ${DSSE_IMAGE:?set DSSE_IMAGE to the DSSE image this deployment runs}
     # ★★★ NAMED HERE ONLY WHEN IT EXISTS. A joining region runs no database initialisation — the
@@ -906,24 +1002,29 @@ const composeControlPlanePair = `  dsse-control-plane-a:
       DSSE_EDGE_BINARY: ${DSSE_BINARY:-/usr/local/bin/dsse-edge}
       # ★ THE CLIENT FINDS THE PRIMARY. DSSE_PG_HOSTS lists every member of the deployment's cluster and
       # target_session_attrs=read-write picks the one that can be written to — no proxy in between.
-      DSSE_POSTGRES_DSN: postgres://dsse:${PG_PASSWORD}@${DSSE_PG_HOST:-postgres:5432}/dsse?sslmode=require
+      DSSE_POSTGRES_DSN: postgres://dsse:${PG_PASSWORD}@${DSSE_PG_HOST:-postgres:5432}/dsse?sslmode=verify-full&sslrootcert=/deployment/database-ca.pem
       DSSE_MIGRATION_DIR: ${DSSE_MIGRATION_DIR:-/app/migrations}
       DSSE_CP_STATE_DIR: /var/lib/dsse
       # Which machine this is. Screens that report a per-node answer name the node that produced it, so a
       # reader can go and ask that node; without this a control plane cannot say who it is.
       DSSE_NODE_NAME: ${DSSE_NODE_NAME:-}
+      DSSE_STEP_UP_PORTAL_CERTIFICATE: ${DSSE_STEP_UP_PORTAL_CERTIFICATE:-deployment}
       DSSE_NODE_ADDRESS: ${DSSE_NODE_ADDRESS:-}
       DSSE_EDGE_REGION: ${DSSE_EDGE_REGION:-}
       DSSE_CLICKHOUSE_ENDPOINT: ${DSSE_CLICKHOUSE_ENDPOINT:-http://dsse-clickhouse:8123}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
-      DSSE_ARCHIVE_ENDPOINT: ${DSSE_ARCHIVE_ENDPOINT:-dsse-archive:9000}
-      DSSE_ARCHIVE_BUCKET: ${DSSE_ARCHIVE_BUCKET:-dsse-audit-archive}
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dsse-archive}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      DSSE_ARCHIVE_ENDPOINT: ${DSSE_ARCHIVE_ENDPOINT:-}
+      DSSE_ARCHIVE_BUCKET: ${DSSE_ARCHIVE_BUCKET:-}
+      DSSE_ARCHIVE_REGION: ${DSSE_ARCHIVE_REGION:-}
+      DSSE_ARCHIVE_AUTH_MODE: ${DSSE_ARCHIVE_AUTH_MODE:-}
+      DSSE_ARCHIVE_ACCESS_KEY: ${DSSE_ARCHIVE_ACCESS_KEY:-}
+      DSSE_ARCHIVE_SECRET_KEY: ${DSSE_ARCHIVE_SECRET_KEY:-}
     volumes:
       # ★★★ WHAT THIS NODE READS, AND NOTHING ELSE. See the note on the Edge above: the whole-directory mount
       # this replaces handed the deployment's root CA key to every service that had one.
       - "./start-control-plane.sh:/deployment/start-control-plane.sh:ro"
+      - "./database-ca.pem:/deployment/database-ca.pem:ro"
+__CP_QUORUM_MOUNTS__
       - "./deployment.env:/deployment/deployment.env:ro"
       - "./policy.json:/deployment/policy.json:ro"
       - "./policy-egress.json:/deployment/policy-egress.json:ro"
@@ -941,7 +1042,7 @@ const composeControlPlanePair = `  dsse-control-plane-a:
       - "./agent-update-signing.pub:/deployment/agent-update-signing.pub:ro"
       - "./runtime:/deployment/runtime"
       - "cp-a-state:/var/lib/dsse"
-    # ★★★ ITS OWN ADMIN PORT IS NOT PUBLISHED, AND THE NODE IS STILL ASKABLE (measured: this was
+    # ★★★ Ordinarily its own admin port is not published, and the Node is still askable (measured: this was
     # listening on 0.0.0.0:19543 beside a door on 10.22.1.200:443).
     #
     # It was published because some questions are about a NODE and cannot be asked through a front door that
@@ -951,15 +1052,12 @@ const composeControlPlanePair = `  dsse-control-plane-a:
     # one node. -verify asks exactly those names, through 443, and the peer doors in every other region reach
     # this region on 443 too. Nothing was dialling this port.
     #
-    # ★ AND A MACHINE THAT RUNS A CONTROL PLANE ALWAYS RENDERS A DOORWAY — behindDoorway is Edges with no
-    # control plane — so this is unconditional, unlike the Edge's ports, which a machine behind the door
-    # still needs.
-    expose: ["9443"]
-    # ★ NOT PUBLISHED DIRECTLY. Everything reaches the control plane through the front door, which routes to
-    # whichever node is the leader; publishing one node's own port would hand somebody an address that is
-    # right only until a failover. The published ports are on the front door, and THEY are the one thing a
-    # host gets a say in — another process may already hold 8443, which is not a reason to edit a generated
-    # file.
+    # The one-region-three-nodes profile is different: its peer doorways must
+    # probe this CP directly, so it publishes admin/data only on the Node's
+    # plan address. Other profiles keep the container-only admin listener.
+    __CP_A_PORTS__
+    # The direct ports are private peer transport only. Clients still use the
+    # single region front door, which chooses the leader and preserves their TLS.
     # ★★★ entrypoint, NOT command (found by running it). A DSSE image's entrypoint IS the binary,
     # so a command: is appended to it as an ARGUMENT: the script never runs, the binary starts with its own
     # defaults, and what comes out is "REFUSING TO START: this Edge has no control plane" — from the control
@@ -1004,6 +1102,26 @@ const composeJoiningRegionNote = `  # ★★★ THIS REGION HOLDS NO STATE, AND 
 
 `
 
+// Archive alerts are deployment-scoped. Every state-bearing CP machine may run
+// a publisher; PostgreSQL outbox leases prevent duplicate delivery.
+const composeArchiveAlertPublisher = `  dsse-archive-alert-publisher:
+    image: ${DSSE_IMAGE:?set DSSE_IMAGE to the DSSE image this deployment runs}
+    restart: unless-stopped
+    depends_on:
+      dsse-control-plane-a: { condition: service_started }
+    environment:
+      DSSE_EDGE_BINARY: ${DSSE_BINARY:-/usr/local/bin/dsse-edge}
+      DSSE_POSTGRES_DSN: postgres://dsse:${PG_PASSWORD}@${DSSE_PG_HOST:-postgres:5432}/dsse?sslmode=verify-full&sslrootcert=/deployment/database-ca.pem
+      DSSE_NODE_NAME: ${DSSE_NODE_NAME:?set the CP machine name}
+      DSSE_ARCHIVE_WEBHOOK_URL: ${DSSE_ARCHIVE_WEBHOOK_URL:?set the HTTPS archive alert receiver}
+      DSSE_ARCHIVE_WEBHOOK_SIGNING_SECRET: ${DSSE_ARCHIVE_WEBHOOK_SIGNING_SECRET:?set the private signing secret}
+    volumes:
+      - "./start-archive-alert-publisher.sh:/deployment/start-archive-alert-publisher.sh:ro"
+      - "./database-ca.pem:/deployment/database-ca.pem:ro"
+    entrypoint: ["/deployment/start-archive-alert-publisher.sh"]
+
+`
+
 // composeControlPlaneOwnedWith renders what the control plane OWNS — its hot store, its archive and the
 // Console. adminUpstream is where the Console reaches the deployment's authority.
 func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
@@ -1018,7 +1136,7 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
   # is in /docker-entrypoint-initdb.d on FIRST boot only — so a schema change is a migration and not an edit,
   # and the deployment says so by shipping the files rather than by hiding them in an image.
   dsse-clickhouse:
-    image: ${DSSE_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:24-alpine}
+    image: ${DSSE_CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8.30.8-alpine@sha256:2ad322429c7965bde31e3a6389daa2df62db7e1898b1b91d50eb3a7bad716f1f}
     # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
     # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
     # restart. A node brought back then serves its door with its Edge and nothing behind it, and the fleet
@@ -1039,87 +1157,8 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
 
-  # ★★★ THE COLD ARCHIVE. Long-term retention is not the same question as "what happened last week": a hot
-  # store answers a screen and an archive answers an auditor, and one of them has to survive a retention
-  # policy the other cannot. Object storage the deployment runs itself, because the list of things outside a
-  # deployment is short — an identity provider and a customer's own interception root — and a
-  # hyperscaler is not on it.
-  dsse-archive:
-    image: ${DSSE_MINIO_IMAGE:-minio/minio:latest}
-    # ★ A REGION THAT REBOOTS MUST COME BACK. Without a policy Docker starts nothing when the daemon does, and
-    # "on-failure" declines a container that was stopped cleanly — which is every container on a planned
-    # restart. A node brought back then serves its door with its Edge and nothing behind it, and the fleet
-    # view reads that Edge and calls the region current.
-    restart: unless-stopped
-    command: server /data --console-address ":9001"
-    # ★ AND THE ARCHIVE, likewise: a standby elsewhere keeps the same history, in the same place.
-    ports: ["${DSSE_ARCHIVE_PUBLISH:-127.0.0.1:19000}:9000"]
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dsse-archive}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD - the cold archive cannot be reached without it}
-      # ★ THE IMAGE BAKES IN MINIO_ROOT_USER_FILE, a Docker-secrets pattern. With no such file present it
-      # silently falls back to minioadmin:minioadmin — a deployment whose archive has the default password and
-      # says nothing. Overriding the phantom *_FILE variables to empty is what makes the credentials above the
-      # ones that are used.
-      MINIO_ROOT_USER_FILE: ""
-      MINIO_ROOT_PASSWORD_FILE: ""
-      MINIO_ACCESS_KEY_FILE: ""
-      MINIO_SECRET_KEY_FILE: ""
-    volumes: ["archive-data:/data"]
-
-  # ★★★ WHERE THE HISTORY CONVERGES. Three layers, three treatments: the
-  # database replicates with automatic promotion, the HOT store is deliberately not replicated — that is the
-  # one-sided window, and it is cheaper than writing a region's logs across an ocean — and the cold archive is
-  # where both regions end up holding the same record.
-  #
-  # ★★ ASYNCHRONOUS AND AUTOMATIC. Asynchronous is fine here; automatic is what matters, and bucket
-  # replication is both by nature. A replication an operator runs periodically is not an answer.
-  #
-  # ★ VERSIONING FIRST, OR THE RULE CANNOT EXIST. MinIO refuses to configure replication on a bucket without
-  # it, and the refusal is easy to miss in a start-up log — so it is turned on here whether or not a peer is
-  # ever configured, and the deployment does not depend on somebody remembering the order.
-  dsse-archive-init:
-    image: ${DSSE_MC_IMAGE:-minio/mc:latest}
-    depends_on: [dsse-archive]
-    restart: on-failure
-    entrypoint: ["sh", "-c"]
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dsse-archive}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
-      DSSE_ARCHIVE_BUCKET: ${DSSE_ARCHIVE_BUCKET:-dsse-audit-archive}
-      # ★ THE OTHER REGION'S ARCHIVE, when there is one. Empty means this deployment has one region holding
-      # state and there is nowhere to converge to — which is a fact about the deployment, not a failure, so
-      # it is said and not treated as an error.
-      DSSE_ARCHIVE_PEER_ENDPOINT: ${DSSE_ARCHIVE_PEER_ENDPOINT:-}
-      DSSE_ARCHIVE_PEER_USER: ${DSSE_ARCHIVE_PEER_USER:-}
-      DSSE_ARCHIVE_PEER_PASSWORD: ${DSSE_ARCHIVE_PEER_PASSWORD:-}
-    command:
-      - |
-        set -e
-        until mc alias set local http://dsse-archive:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
-          sleep 2
-        done
-        mc mb --with-lock --ignore-existing "local/$$DSSE_ARCHIVE_BUCKET"
-        mc version enable "local/$$DSSE_ARCHIVE_BUCKET"
-        if [ -z "$$DSSE_ARCHIVE_PEER_ENDPOINT" ]; then
-          echo "cold archive: no peer configured, so this region's record converges nowhere."
-          echo "  That is correct for a deployment with one state-bearing region. Set DSSE_ARCHIVE_PEER_ENDPOINT"
-          echo "  (and _USER/_PASSWORD) on both regions to make the two archives converge, asynchronously and"
-          echo "  without anybody running anything."
-          exit 0
-        fi
-        mc alias set peer "$$DSSE_ARCHIVE_PEER_ENDPOINT" "$${DSSE_ARCHIVE_PEER_USER:-$$MINIO_ROOT_USER}" "$${DSSE_ARCHIVE_PEER_PASSWORD:-$$MINIO_ROOT_PASSWORD}"
-        mc mb --with-lock --ignore-existing "peer/$$DSSE_ARCHIVE_BUCKET"
-        mc version enable "peer/$$DSSE_ARCHIVE_BUCKET"
-        # ★ IDEMPOTENT. This runs on every start; a rule that already exists must not become a second rule.
-        if mc replicate ls "local/$$DSSE_ARCHIVE_BUCKET" 2>/dev/null | grep -q "$$DSSE_ARCHIVE_PEER_ENDPOINT"; then
-          echo "cold archive: replication to $$DSSE_ARCHIVE_PEER_ENDPOINT is already configured"
-        else
-          mc replicate add "local/$$DSSE_ARCHIVE_BUCKET" \
-            --remote-bucket "$$DSSE_ARCHIVE_PEER_ENDPOINT/$$DSSE_ARCHIVE_BUCKET" \
-            --priority 1
-          echo "cold archive: replicating to $$DSSE_ARCHIVE_PEER_ENDPOINT — asynchronous, and nobody has to run it"
-        fi
+  # The cold archive is an operator-managed external S3 service. DSSE runs
+  # no object-storage server, bucket initializer or replication controller.
 
   # ★★★ THE FOURTH STEP OF THE INSTALL ORDER, AND IT WAS NOT HERE. The order is Postgres, the
   # anchor, the control plane, the CONSOLE, then the Edges — and everything this installer generated skipped
@@ -1205,6 +1244,9 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
       CONTROL_API_UPSTREAM: ${DSSE_CONTROL_API_UPSTREAM:-` + adminUpstream + `}
       AUTH_API_UPSTREAM: ${DSSE_AUTH_API_UPSTREAM:-` + adminUpstream + `}
       ADMIN_SESSION_VALIDATE_CA: /deployment/deployment-anchor.pem
+      DSSE_CONSOLE_LOCAL_CP_LEADER_URL: ${DSSE_CONSOLE_LOCAL_CP_LEADER_URL:-}
+      DSSE_CONSOLE_LOCAL_CP_LEADER_NAME: ${DSSE_CONSOLE_LOCAL_CP_LEADER_NAME:-}
+      DSSE_CONSOLE_LEADER_ROUTING: ${DSSE_CONSOLE_LEADER_ROUTING:-}
     volumes:
       # ★★★ THE CONSOLE READS THREE FILES, and it was given the whole deployment directory to serve a web
       # interface — read-only, which does nothing about the fact that the deployment's root CA private key was
@@ -1215,7 +1257,7 @@ func composeControlPlaneOwnedWith(adminUpstream, edgeUpstream string) string {
       # ★ WHERE THE OPERATOR PUTS THE CONSOLE'S OWN CERTIFICATE. A directory rather than two files, because a
       # bind mount of a file that does not exist creates a directory in its place. Usually empty.
       - "./console:/deployment/console:ro"
-    expose: ["8443"]
+    __CONSOLE_PORTS__
 `
 }
 
@@ -1315,20 +1357,24 @@ const composeStandbyControlPlane = `  # ★ A WARM CONTROL PLANE, AND NO STATE. 
       # Which machine this is. Screens that report a per-node answer name the node that produced it, so a
       # reader can go and ask that node; without this a control plane cannot say who it is.
       DSSE_NODE_NAME: ${DSSE_NODE_NAME:-}
+      DSSE_STEP_UP_PORTAL_CERTIFICATE: ${DSSE_STEP_UP_PORTAL_CERTIFICATE:-deployment}
       DSSE_NODE_ADDRESS: ${DSSE_NODE_ADDRESS:-}
       DSSE_EDGE_REGION: ${DSSE_EDGE_REGION:-}
       # The deployment's hot store and archive, which live with the state. This node writes to them across
       # regions when it holds leadership.
       DSSE_CLICKHOUSE_ENDPOINT: ${DSSE_CLICKHOUSE_ENDPOINT:?set DSSE_CLICKHOUSE_ENDPOINT to the deployment's hot store}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD}
-      DSSE_ARCHIVE_ENDPOINT: ${DSSE_ARCHIVE_ENDPOINT:?set DSSE_ARCHIVE_ENDPOINT to the deployment's archive}
-      DSSE_ARCHIVE_BUCKET: ${DSSE_ARCHIVE_BUCKET:-dsse-audit-archive}
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-dsse-archive}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD}
+      DSSE_ARCHIVE_ENDPOINT: ${DSSE_ARCHIVE_ENDPOINT:-}
+      DSSE_ARCHIVE_BUCKET: ${DSSE_ARCHIVE_BUCKET:-}
+      DSSE_ARCHIVE_REGION: ${DSSE_ARCHIVE_REGION:-}
+      DSSE_ARCHIVE_AUTH_MODE: ${DSSE_ARCHIVE_AUTH_MODE:-}
+      DSSE_ARCHIVE_ACCESS_KEY: ${DSSE_ARCHIVE_ACCESS_KEY:-}
+      DSSE_ARCHIVE_SECRET_KEY: ${DSSE_ARCHIVE_SECRET_KEY:-}
     volumes:
       # ★★★ WHAT THIS NODE READS, AND NOTHING ELSE. See the note on the Edge above: the whole-directory mount
       # this replaces handed the deployment's root CA key to every service that had one.
       - "./start-control-plane.sh:/deployment/start-control-plane.sh:ro"
+      - "./database-ca.pem:/deployment/database-ca.pem:ro"
       - "./deployment.env:/deployment/deployment.env:ro"
       - "./policy.json:/deployment/policy.json:ro"
       - "./policy-egress.json:/deployment/policy-egress.json:ro"
@@ -1393,7 +1439,8 @@ func composeRegionDoorwayWith(edgeDependsOnCP string) string {
     # containers were generated with no restart policy at all, so "temporarily unable" and "permanently
     # broken" had the same outcome. The control planes had this line; the Edges did not.
     restart: unless-stopped
-    image: ${DSSE_HAPROXY_IMAGE:-haproxy:2.9-alpine}
+    image: ${DSSE_HAPROXY_IMAGE:-haproxy:3.4.7-alpine3.24@sha256:251da69821897ec8c4819f12b1babbc4b71f562943addc9b9eb14bb6ece40dc6}
+    entrypoint: ["/bin/sh", "/usr/local/bin/dsse-haproxy-resources"]
     # ★★★ THE FRONT DOOR COULD NOT START ON AN ORDINARY HOST (measured the first time this
     # deployment ran with one component per machine):
     #
@@ -1403,14 +1450,14 @@ func composeRegionDoorwayWith(edgeDependsOnCP string) string {
     # them at start-up. A default Linux host allows far fewer, so it exits — and the region's doorway is the
     # one service whose absence looks like the whole deployment being down.
     #
-    # ★ IT NEVER APPEARED ON THE DEVELOPMENT MACHINE. Docker Desktop and colima hand containers a very large
-    # descriptor limit, so the same file started there every time. The limit is declared here rather than left
-    # to whatever the host happens to allow, because "it works on the machine it was written on" is exactly
-    # what a one-host lab certifies.
-    ulimits:
-      nofile: { soft: 200000, hard: 200000 }
+    # Inherit the platform's descriptor resources. The generated HAProxy config
+    # does not request a DSSE-authored connection quota; operators may supply
+    # their chosen ulimits through a Compose override.
     depends_on:__DOORWAY_DEPENDS__
-    volumes: ["./haproxy-edge.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"]
+    volumes:
+      - "./haproxy-resource-entrypoint.sh:/usr/local/bin/dsse-haproxy-resources:ro"
+      - "./haproxy-edge.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro"
+      - "./deployment-anchor.pem:/deployment/deployment-anchor.pem:ro"
     # ★★★ A FIXED ADDRESS, BECAUSE THE EDGES ARE TOLD TO BELIEVE IT AND NOTHING ELSE. This container states
     # each device's original address in a PROXY protocol header, and an Edge that believed such a header from
     # anyone would let any peer choose its own source address — and with it every decision keyed on the
@@ -1429,7 +1476,12 @@ func composeRegionDoorwayWith(edgeDependsOnCP string) string {
     # so on one machine the pair could only ever be 18443 and 18444, which is the substitution this whole
     # arrangement exists to end. DSSE_REGION_BIND_A/B name the host address each door listens on, so both can
     # be 443. Empty by default, which is every interface and exactly what a one-host rendering had.
-    ports: ["${DSSE_REGION_BIND_A:-}${DSSE_REGION_PORT:-18443}:443"]
+    # CRL status is signed DER on a separate HTTP-only listener. Loopback by
+    # default: the operator exposes the chosen public CDP origin through their
+    # own single-IP frontend (or explicitly sets DSSE_CRL_PUBLISH_BIND).
+    ports:
+      - "${DSSE_REGION_BIND_A:-}${DSSE_REGION_PORT:-18443}:443"
+      - "${DSSE_CRL_PUBLISH_BIND:-127.0.0.1:18080}:8088"
   # ★★★ ONE DOOR PER REGION. A second haproxy beside this one — the same image and the same configuration
   # file, bound to a second address, both on 443 — lets a region survive losing a door. It does; but a device
   # whose door stops answering already FAILS OVER TO ANOTHER REGION, which is measured and takes about thirty
@@ -1523,6 +1575,7 @@ func composeEdgeFleetWith(edgeDependsOnCP string, adminDefault, dataDefault stri
     depends_on:` + edgeDependsOnCP + `
     environment:
       DSSE_EDGE_BINARY: ${DSSE_BINARY:-/usr/local/bin/dsse-edge}
+      DSSE_STEER_MUX_ONLY: ${DSSE_STEER_MUX_ONLY:-false}
       # ★★★ THE DEPLOYMENT'S CONTROL PLANE, WHICH IS NOT ALWAYS IN THIS REGION. Where state lives, this
       # resolves to the local front door; in a region that holds none it names the deployment's, across
       # regions. An Edge takes configuration from whichever node currently holds leadership, and there is one
@@ -1553,6 +1606,7 @@ func composeEdgeFleetWith(edgeDependsOnCP string, adminDefault, dataDefault stri
       # machine is behind?" is not answerable from anything on screen. The plan holds the name the operator
       # wrote; this is how it reaches the process that reports it.
       DSSE_NODE_NAME: ${DSSE_NODE_NAME:-}
+      DSSE_STEP_UP_PORTAL_CERTIFICATE: ${DSSE_STEP_UP_PORTAL_CERTIFICATE:-deployment}
       DSSE_NODE_ADDRESS: ${DSSE_NODE_ADDRESS:-}
       # ★★★ THE OTHER EDGE OF THIS REGION, BY NAME (measured on a site with a connector pair).
       #
@@ -1744,12 +1798,23 @@ func deploymentHostFor(dir string) string {
 // — which is the failure the note on adminUpstreamFor exists to prevent.
 func consoleEdgeUpstreamFor(dir string, shape machineShape) string {
 	if p := planeNamesFor(deploymentHostFor(dir)); p.Split && strings.TrimSpace(p.BareHost) != "" {
+		machine := readDeploymentEnv(dir)["DSSE_NODE_NAME"]
+		regionalEdge := ""
 		for _, n := range perNodeAdminTargets(dir) {
 			// The edges come first out of perNodeAdminTargets, but ordering is not the contract — the compose
 			// service name is.
-			if strings.Contains(n.host, "edge") {
+			if n.role == "edge" && n.machine == machine || n.role == "" && strings.Contains(n.host, "edge") {
 				return "https://" + n.node + ".admin." + strings.TrimSpace(p.BareHost)
 			}
+			// A dedicated CP has no local Edge service. Declared plan targets
+			// are restricted to this Region and already have authenticated
+			// per-node routes and Console DNS aliases through its front door.
+			if n.role == "edge" && regionalEdge == "" {
+				regionalEdge = "https://" + n.node + ".admin." + strings.TrimSpace(p.BareHost)
+			}
+		}
+		if !shape.edges && regionalEdge != "" {
+			return regionalEdge
 		}
 	}
 	// A deployment that answers on an address rather than on names reaches the Edge beside it directly, the

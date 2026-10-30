@@ -27,7 +27,7 @@ BEGIN
     END IF;
     FOR previous_row IN SELECT value FROM jsonb_array_elements(before_doc) LOOP
       SELECT value INTO candidate_row FROM jsonb_array_elements(after_doc)
-        WHERE lower(value->>'tenant_id') = lower(previous_row->>'tenant_id');
+        WHERE value->>'tenant_id' = previous_row->>'tenant_id';
       -- A missing organization was erased. A surviving organization must retain
       -- every retired fingerprint, even when a different organization was edited.
       IF FOUND AND NOT (COALESCE(candidate_row->'retired_anchor_sha256', '[]'::jsonb)

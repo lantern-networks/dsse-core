@@ -60,7 +60,7 @@ func TestStandbyWriteAuditDoesNotAuthenticateReadBodyOrMirror(t *testing.T) {
 			cancel()
 			rec := httptest.NewRecorder()
 			mw(permission, func(http.ResponseWriter, *http.Request) { t.Fatal("refused handler called") })(rec, r.WithContext(ctx))
-			if rec.Code != 409 {
+			if rec.Code != 503 || rec.Header().Get("Retry-After") != "1" {
 				t.Fatalf("refusal changed: %d %s", rec.Code, rec.Body)
 			}
 			rows := readTransportAudits(t, w)
@@ -101,7 +101,7 @@ func TestStandbyWriteAuditActualRoutePreservesStateAndResumes(t *testing.T) {
 	oldRisk, oldRuntime := risk.Snapshot(), runtime.List()
 	for _, bearer := range []string{transportAuditBearer, transportAuditReadBearer, "invalid"} {
 		r := deviceRiskRequest(h, `{"entity_type":"device","entity_id":"owned-device","severity":"critical","evidence_ref":"private-body"}`, bearer)
-		if r.Code != 409 {
+		if r.Code != 503 || r.Header().Get("Retry-After") != "1" {
 			t.Fatalf("standby %d %s", r.Code, r.Body)
 		}
 	}
@@ -160,7 +160,7 @@ func TestStandbyWriteAuditStorageFailureKeepsRefusal(t *testing.T) {
 			r.Header.Set("Authorization", "Bearer private-token")
 			rec := httptest.NewRecorder()
 			mw("admin.policy.write", func(http.ResponseWriter, *http.Request) { t.Fatal("handler called") })(rec, r)
-			if rec.Code != 409 {
+			if rec.Code != 503 || rec.Header().Get("Retry-After") != "1" {
 				t.Fatalf("audit failure opened request: %d", rec.Code)
 			}
 			if !strings.Contains(captured.String(), "admin_audit_write_failed") || !strings.Contains(captured.String(), "admin_write_refused_on_standby") || strings.Contains(captured.String(), "private-") {
@@ -189,7 +189,7 @@ func TestStandbyWriteAuditConcurrentRefusals(t *testing.T) {
 			defer wg.Done()
 			rec := httptest.NewRecorder()
 			h(rec, httptest.NewRequest("PUT", "/admin/policy", nil))
-			if rec.Code != 409 {
+			if rec.Code != 503 || rec.Header().Get("Retry-After") != "1" {
 				t.Errorf("status %d", rec.Code)
 			}
 		}()

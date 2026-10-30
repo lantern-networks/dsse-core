@@ -48,6 +48,11 @@ function laWhen(row) {
   return window.dsseFormatTime ? window.dsseFormatTime(w) : new Date(w).toLocaleString();
 }
 function laDash(s) { return (s === "" || s == null) ? "—" : s; }
+function laDisplayTimestamp(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "—";
+  return typeof window !== "undefined" && window.dsseFormatTime ? window.dsseFormatTime(value) : date.toLocaleString();
+}
 
 // Decision → colour. allow=green, deny=red, any challenge/step-up=amber, bypass=grey.
 function laDecisionBadge(dec) {
@@ -507,7 +512,121 @@ async function laVolume(section) {
   const rcHost = el("div", { style: "margin-top:18px" });
   section.appendChild(rcHost);
   laRetentionConfig(rcHost);
+  const deleteHost = el("div", { style: "margin-top:18px" });
+  section.appendChild(deleteHost);
+  laManualHotLogDelete(deleteHost);
+  if (typeof answeringForTheDeployment === "function" && answeringForTheDeployment()) {
+    const healthHost = el("div", { style: "margin-top:18px" });
+    section.appendChild(healthHost);
+    laArchiveHealth(healthHost);
+  }
   await laVolumeEstimate(estimateHost);
+}
+
+async function laArchiveHealth(host) {
+  const current = freshRender(host);
+  uiState(host, "loading");
+  let body;
+  try {
+    const response = await apiFetch("GET", "/admin/archive-health", undefined, "control");
+    if (!response.ok || !response.body) throw new Error((response.body && response.body.error) || "Archive status is unavailable");
+    body = response.body;
+  } catch (e) {
+    if (current()) uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laArchiveHealth(host) });
+    return;
+  }
+  if (!current()) return;
+  host.innerHTML = "";
+  host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "External archive health", ja: "外部アーカイブの状態" }) }));
+  if (!body.archive_enabled) {
+    host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "No external archive is configured.", ja: "外部アーカイブは設定されていません。" }) }));
+    return;
+  }
+  const state = body.state || {};
+  const status = state.status === "ok" ? bl({ en: "Healthy", ja: "正常" }) : state.status === "degraded" ? bl({ en: "Attention required", ja: "要対応" }) : bl({ en: "Not checked yet", ja: "未確認" });
+  const reason = { put_failed: bl({en:"Write failed",ja:"書込み失敗"}), get_failed: bl({en:"Read failed",ja:"読取り失敗"}), list_failed: bl({en:"Connection, credentials or bucket check failed",ja:"接続・認証情報・バケット確認に失敗"}), backlog_query_failed: bl({en:"Backlog check failed",ja:"滞留の確認に失敗"}), backlog_stale: bl({en:"Archival backlog is overdue",ja:"退避待ちが長時間滞留"}) }[state.reason] || "";
+  host.appendChild(el("p", { class: "ui-view-desc", text: status + (reason ? " — " + reason : "") }));
+  if (Number.isSafeInteger(state.backlog) && state.backlog > 0) {
+    host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Rows due for archival: ", ja: "退避期限を過ぎた行: " }) + state.backlog.toLocaleString() + (state.oldest_at ? bl({ en: "; oldest row ", ja: "、最古の行 " }) + laDisplayTimestamp(state.oldest_at) : "") }));
+  }
+  if (Array.isArray(state.pending) && state.pending.length) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Alert events awaiting delivery: ", ja: "通知待ちイベント: " }) + state.pending.length }));
+  const delivery = body.delivery || {};
+  if (Number.isSafeInteger(delivery.pending_count)) host.appendChild(el("p", { class:"ui-view-desc", text:bl({en:"Webhook deliveries waiting: ",ja:"Webhook送信待ち: "}) + delivery.pending_count }));
+  if (Number.isSafeInteger(delivery.dead_count) && delivery.dead_count > 0) host.appendChild(el("p", { class:"ui-view-desc", text:bl({en:"Webhook deliveries needing intervention: ",ja:"要対応のWebhook送信: "}) + delivery.dead_count }));
+  if (delivery.last_success_at) host.appendChild(el("p", { class:"ui-view-desc", text:bl({en:"Last webhook delivery: ",ja:"最後のWebhook送信成功: "}) + laDisplayTimestamp(delivery.last_success_at) }));
+  if (!body.webhook_configured) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Signed webhook delivery has not been verified or needs attention.", ja: "署名付きWebhookの送信は未確認か、対応が必要です。" }) }));
+  if (state.checked_at) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Last checked: ", ja: "最終確認: " }) + laDisplayTimestamp(state.checked_at) }));
+}
+
+// Manual removal is a two-step operation scoped to the organization in use.
+function laManualHotLogDelete(host) {
+  host.innerHTML = "";
+  host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Manual hot-log deletion", ja: "ローカルログの手動削除" }) }));
+  host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Permanently remove only a selected tenant and stream before a UTC time. Archived S3 objects are untouched. Rows not yet archived will be lost. Legal holds block deletion.", ja: "指定テナント・ストリームのUTC日時より古いローカルログだけを完全削除します。S3の退避済みオブジェクトは削除しません。未退避の行は失われます。リーガルホールド中は削除できません。" }) }));
+  const stream = uiField({ name: "stream", label: bl({ en: "Stream", ja: "ストリーム" }), type: "select", value: "access", options: _LA_STREAMS.map(s => ({ value:s.id, label:bl(s.label) })) });
+  const before = uiField({ name: "before", label: bl({ en: "Delete before this date (UTC)", ja: "この日より前を削除（UTC）" }), type: "date", value: "" });
+  const preview = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Preview rows", ja: "対象行を確認" }) });
+  const confirm = el("button", { class:"ui-btn ui-btn-danger ui-btn-sm", text:bl({en:"Confirm permanent deletion",ja:"完全削除を確認して実行"}) });
+  confirm.disabled = true;
+  const status = el("p", { class: "ui-view-desc" });
+  const history = el("div", { class: "ui-view-desc" });
+  host.appendChild(el("div", { style: "display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end" }, [stream.el, before.el, preview, confirm]));
+  host.appendChild(status);
+  host.appendChild(history);
+  let activeJob = null;
+  const displayStatus = s => ({ previewing:bl({en:"Preparing",ja:"準備中"}), preview_ready:bl({en:"Ready to confirm",ja:"確認待ち"}), queued:bl({en:"Queued",ja:"削除待ち"}), running:bl({en:"Deleting",ja:"削除中"}), completed:bl({en:"Completed",ja:"完了"}), failed:bl({en:"Failed",ja:"失敗"}), stale:bl({en:"Preview expired",ja:"対象が変わりました"}) })[s] || bl({en:"Unknown",ja:"不明"});
+  const displayJobStatus = j => j?.status === "running" && j?.failure_code === "mutation_retrying"
+    ? bl({en:"Deletion requires operator attention (ClickHouse is retrying)",ja:"運営者の対応が必要です（ClickHouseが削除を再試行中）"})
+    : displayStatus(j?.status);
+  const refreshHistory = async () => {
+    const response = await apiFetch("GET", "/admin/manual-hot-log-delete", undefined, _LA_PLANE);
+    if (!response.ok) { history.textContent = bl({en:"Deletion history is unavailable.",ja:"削除履歴を取得できません。"}); return; }
+    const jobs = Array.isArray(response.body?.jobs) ? response.body.jobs : [];
+    history.textContent = jobs.length ? bl({en:"Recent deletions: ",ja:"最近の削除: "}) + jobs.slice(0, 10).map(j => {
+      const label = (_LA_STREAMS.find(s => s.id === j.stream) || {label:{en:j.stream,ja:j.stream}}).label;
+      return `${bl(label)} ${displayJobStatus(j)} — ${bl({en:"Confirmed absent",ja:"削除済みを確認"})} ${j.confirmed_absent_count} / ${bl({en:"Selected",ja:"対象"})} ${j.preview_count}`;
+    }).join(" · ") : bl({en:"No deletion history.",ja:"削除履歴はありません。"});
+  };
+  refreshHistory();
+  preview.addEventListener("click", async () => {
+    const streamID = String(stream.get() || "").trim(), day = String(before.get() || "").trim();
+    if (!/^\d{4}-\d\d-\d\d$/.test(day) || !Number.isFinite(Date.parse(day + "T00:00:00Z"))) { uiToast(bl({ en:"Select a valid UTC date.", ja:"有効なUTC日付を選択してください。" }), "err"); return; }
+    const cutoff = day + "T00:00:00Z";
+    preview.disabled = true; confirm.disabled = true; activeJob = null;
+    try {
+      const selected = typeof operateTenant === "string" && operateTenant ? operateTenant : (await apiFetch("GET", "/admin/tenant", undefined, _LA_PLANE)).body?.tenant_id;
+      const tenantID = String(selected || "").trim();
+      if (!tenantID) throw new Error(bl({en:"Select an organization first.",ja:"先に組織を選択してください。"}));
+      const response = await apiFetch("POST", "/admin/manual-hot-log-delete/preview", {tenant_id:tenantID,stream:streamID,before:cutoff}, _LA_PLANE);
+      if (!response.ok || !response.body?.job) throw new Error(response.body?.error || "Preview failed");
+      const job = response.body.job;
+      activeJob = job;
+      status.textContent = bl({ en:`Frozen preview: ${job.preview_count} row(s). No rows deleted.`, ja:`確定した対象: ${job.preview_count}行。まだ削除していません。` });
+      confirm.disabled = false;
+    } catch (e) { uiToast(String(e), "err"); }
+    finally { preview.disabled = false; }
+  });
+  confirm.addEventListener("click", async () => {
+        const job = activeJob;
+        if (!job) return;
+        const message = bl({en:`Permanently remove ${job.preview_count} previewed hot row(s) for the current organization before the selected date? Unarchived rows will be lost. S3 archives are untouched.`,ja:`現在の組織について、選択した日より古い対象${job.preview_count}行を完全削除しますか。未退避の行は失われます。S3退避済みデータは残ります。`});
+        if (!await uiConfirm({title:bl({en:"Delete frozen hot logs?",ja:"対象のローカルログを削除しますか？"}),body:message,confirmLabel:bl({en:"Permanently delete",ja:"完全削除"}),danger:true})) return;
+        confirm.disabled = true;
+        try {
+          const result = await apiFetch("POST", `/admin/manual-hot-log-delete/${encodeURIComponent(job.job_id)}/confirm`, {preview_digest:job.preview_digest,confirm:true}, _LA_PLANE);
+          if (!result.ok) throw new Error(result.body?.error || "Confirmation failed");
+          status.textContent = bl({en:"Deletion queued; checking progress…",ja:"削除を受け付けました。進捗を確認中…"});
+          const refresh = async () => {
+            const check = await apiFetch("GET", `/admin/manual-hot-log-delete/${encodeURIComponent(job.job_id)}`, undefined, _LA_PLANE);
+            if (!check.ok) { status.textContent = bl({en:"Progress unavailable; refresh this page to check recent deletions.",ja:"進捗を取得できません。ページを再読込みして最近の削除を確認してください。"}); return; }
+            const j = check.body;
+            status.textContent = bl({en:`${displayJobStatus(j)}: ${j.confirmed_absent_count}/${j.preview_count} previewed rows confirmed absent.`,ja:`${displayJobStatus(j)}: 対象${j.preview_count}行中${j.confirmed_absent_count}行の不在を確認。`});
+            if (j.status === "queued" || j.status === "running") setTimeout(refresh, 5000);
+            else refreshHistory();
+          };
+          await refresh();
+        } catch (e) { confirm.disabled = false; uiToast(String(e), "err"); }
+  });
 }
 
 // A failed volume estimate must not hide independent retention and audit controls.
@@ -551,15 +670,16 @@ async function laVolumeEstimate(section) {
   }
 }
 
-// Admin-configurable per-stream retention (days) — overrides the built-in defaults at runtime, no redeploy.
+// Retention days apply only when an external archive can receive the aged rows.
 async function laRetentionConfig(host) {
   const current = freshRender(host);
-  let ov, pending = [];
+  let ov, pending = [], archiveEnabled;
   try {
     const r = await apiFetch("GET", "/admin/retention-config", undefined, _LA_PLANE);
     ov = r.body && r.body.overrides_days;
     pending = (r.body && r.body.pending_local_forever) || [];
-    if (!r.ok || !ov || typeof ov !== "object" || Array.isArray(ov) ||
+    archiveEnabled = r.body && r.body.archive_enabled;
+    if (!r.ok || typeof archiveEnabled !== "boolean" || !ov || typeof ov !== "object" || Array.isArray(ov) ||
         Object.values(ov).some(v => !Number.isSafeInteger(v) || v < 0 || v > 106751)) {
       throw new Error((r.body && r.body.error) || "Retention settings are unavailable");
     }
@@ -570,6 +690,30 @@ async function laRetentionConfig(host) {
   if (!current()) return;
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Retention (per stream)", ja: "保持（ストリーム別）" }) }));
+  if (!archiveEnabled) {
+    host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "No external archive is configured. Local hot events are not deleted when a retention period passes. Retention days cannot be set in this mode; monitor and back up the local store.", ja: "外部アーカイブは設定されていません。この構成では保持期間が過ぎてもローカルのログを削除しません。保持日数は設定できません。ローカルストアの容量を監視し、バックアップしてください。" }) }));
+    if (Object.keys(ov).length) {
+      host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Previously saved retention overrides are inactive now. Clear them before configuring an external archive if they should not take effect later.", ja: "以前保存した保持日数の設定は現在無効です。後で外部アーカイブを設定する際に適用させない場合は、ここで取り消してください。" }) }));
+      const saved = Object.keys(ov).sort();
+      const streamF = uiField({ name: "s", label: bl({ en: "Saved stream", ja: "保存済みストリーム" }), type: "select", value: saved[0], options: saved.map(s => ({ value: s, label: s })) });
+      const clear = el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Clear saved override", ja: "保存済み設定を取り消す" }) });
+      host.appendChild(el("div", { style: "display:flex;gap:10px;align-items:flex-end" }, [streamF.el, clear]));
+      clear.addEventListener("click", async () => {
+        if (!current() || clear.disabled) return;
+        clear.disabled = true;
+        try {
+          const r = await apiFetch("POST", "/admin/retention-config", {stream:streamF.get(),clear:true}, _LA_PLANE);
+          if (!r.ok) throw new Error((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status));
+          if (current()) uiToast(bl({ en: "Saved override cleared.", ja: "保存済み設定を取り消しました。" }), "ok");
+        } catch (e) {
+          if (current()) uiToast(String(e), "err");
+        } finally {
+          if (current()) await laRetentionConfig(host);
+        }
+      });
+    }
+    return;
+  }
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Override how long each stream is kept in hot storage (days) — no redeploy. 0 = keep forever; unset = the built-in default (audit/approvals/grants 365d, others 30d).", ja: "各ストリームの短期保持日数を上書き（再デプロイ不要）。0=無期限、未設定=組込既定（audit/承認/grant は365日、他は30日）。" }) }));
   if (pending.length) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Keep-forever save unconfirmed for: " + pending.join(", ") + ". Protection is local to this process; retry saving. Saved settings are shown below.", ja: "無期限保持の保存未確認: " + pending.join(", ") + "。保護はこのプロセス内のみです。保存を再試行してください。下記は保存済み設定です。" }) }));
   const keys = Object.keys(ov).sort();
@@ -637,12 +781,13 @@ function laAuditChain(host) {
 // Legal hold: freeze retention for THIS tenant (litigation / e-discovery). While held, no log is deleted/tiered.
 async function laLegalHold(host) {
   const current = freshRender(host);
-  let held, pending;
+  let held, pending, archiveEnabled;
   try {
     const r = await apiFetch("GET", "/admin/legal-hold", undefined, _LA_PLANE);
-    if (!r.ok || !r.body || typeof r.body.tenant_held !== "boolean") throw new Error((r.body && r.body.error) || "Legal hold status is unavailable");
+    if (!r.ok || !r.body || typeof r.body.tenant_held !== "boolean" || typeof r.body.archive_enabled !== "boolean") throw new Error((r.body && r.body.error) || "Legal hold status is unavailable");
     pending = r.body.pending_local_hold === true;
     held = r.body.tenant_held && !pending;
+    archiveEnabled = r.body.archive_enabled;
   } catch (e) {
     if (!current()) return;
     uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => laLegalHold(host) });
@@ -652,11 +797,12 @@ async function laLegalHold(host) {
   host.innerHTML = "";
   host.appendChild(el("h3", { class: "ui-field-label", text: bl({ en: "Legal hold", ja: "リーガルホールド" }) }));
   host.appendChild(el("p", { class: "ui-view-desc", text: pending ? bl({ en: "Hold save unconfirmed. Logs are protected only in this process; restart or another node may lose this protection. Retry saving.", ja: "ホールドの保存は未確認です。このプロセス内のみログを保護します。再起動や別ノードでは保護されない場合があります。保存を再試行してください。" }) : bl({ en: "While ON, ALL logs for this tenant are preserved (retention frozen) for litigation / e-discovery, until released. Survives a restart.", ja: "オンの間、このテナントの全ログを保持（保持凍結）── 訴訟・e-discovery 用、解除まで削除されません。再起動しても維持。" }) }));
+  if (!archiveEnabled) host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "No external archive is configured. Local logs remain stored regardless of legal-hold state.", ja: "外部アーカイブは未設定です。リーガルホールドの状態にかかわらず、ローカルのログは保持されます。" }) }));
   const btn = el("button", { class: "ui-btn ui-btn-sm " + (held ? "ui-btn-danger" : "") });
   btn.textContent = pending ? bl({ en: "Retry hold save", ja: "ホールド保存を再試行" }) : held ? bl({ en: "Release hold", ja: "ホールド解除" }) : bl({ en: "Place legal hold", ja: "リーガルホールドを設定" });
   host.appendChild(el("div", { class: "ui-toolbar", style: "align-items:center" }, [el("span", { style: "font-weight:600" }, [bl({ en: "Status: ", ja: "状態: " }), uiBadge(pending ? bl({ en: "Save unconfirmed", ja: "保存未確認" }) : held ? bl({ en: "Held", ja: "保持中" }) : bl({ en: "Off", ja: "オフ" }), pending ? "warn" : held ? "danger" : "off")]), el("span", { class: "ui-spacer" }), btn]));
   btn.addEventListener("click", async () => {
-    const ok = await uiConfirm({ title: held ? bl({ en: "Release the legal hold?", ja: "リーガルホールドを解除?" }) : bl({ en: "Place a legal hold?", ja: "リーガルホールドを設定?" }), body: held ? bl({ en: "Retention resumes — aged logs expire / tier to cold again per policy.", ja: "保持が再開し、古いログはポリシーに従い失効/cold 階層化されます。" }) : bl({ en: "ALL logs for this tenant will be preserved (no deletion, no tiering) until released.", ja: "このテナントの全ログが解除まで保持（削除も階層化もしない）されます。" }), confirmLabel: held ? bl({ en: "Release", ja: "解除" }) : bl({ en: "Place hold", ja: "設定" }), danger: !held });
+    const ok = await uiConfirm({ title: held ? bl({ en: "Release the legal hold?", ja: "リーガルホールドを解除?" }) : bl({ en: "Place a legal hold?", ja: "リーガルホールドを設定?" }), body: held ? (archiveEnabled ? bl({ en: "Retention resumes — aged logs expire / tier to cold again per policy.", ja: "保持が再開し、古いログはポリシーに従い失効/cold 階層化されます。" }) : bl({ en: "The hold will be released. Local logs remain stored because no external archive is configured.", ja: "ホールドを解除します。外部アーカイブが未設定のため、ローカルのログは引き続き保持されます。" })) : bl({ en: "ALL logs for this tenant will be preserved (no deletion, no tiering) until released.", ja: "このテナントの全ログが解除まで保持（削除も階層化もしない）されます。" }), confirmLabel: held ? bl({ en: "Release", ja: "解除" }) : bl({ en: "Place hold", ja: "設定" }), danger: !held });
     if (!ok || !current() || btn.disabled) return;
     btn.disabled = true;
     try {
@@ -848,7 +994,7 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
   if (_laCursor) footer.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Load older", ja: "さらに古いものを読み込む" }), onClick: () => laLoadStream(host, filterHost, summaryHost, true) }));
   else footer.appendChild(el("span", { class: "ui-view-desc", text: deploymentAudit
     ? bl({ en: "— end of matches in this server's hot audit log", ja: "— このサーバーで検索できる監査記録の末尾" })
-    : bl({ en: "— end of matches (older data past retention is in cold archive; use Exports)", ja: "— 一致の末尾（保持期間を過ぎた古いデータはコールドアーカイブ。エクスポートを利用）" }) }));
+    : bl({ en: "— end of matches", ja: "— 一致の末尾" }) }));
   host.appendChild(footer);
 }
 

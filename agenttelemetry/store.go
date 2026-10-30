@@ -89,7 +89,7 @@ func agentUpdateEventKey(event model.AgentUpdateEvent) string {
 	if id == "" {
 		return ""
 	}
-	return strings.ToLower(strings.TrimSpace(event.TenantID)) + "\x00" +
+	return strings.TrimSpace(event.TenantID) + "\x00" +
 		strings.ToLower(strings.TrimSpace(event.DeviceID)) + "\x00" + id
 }
 
@@ -162,7 +162,7 @@ func (store *Store) LatestUpdateByDevice(_ context.Context, tenantID string) (ma
 	defer store.mu.RUnlock()
 	latest := map[string]model.AgentUpdateEvent{}
 	for _, event := range store.updates {
-		if !strings.EqualFold(strings.TrimSpace(event.TenantID), strings.TrimSpace(tenantID)) {
+		if !sameTenant(event.TenantID, tenantID) {
 			continue
 		}
 		device := strings.TrimSpace(event.DeviceID)
@@ -213,10 +213,8 @@ func (store *Store) UpdateSummary(_ context.Context, tenantID string) (map[strin
 	defer store.mu.RUnlock()
 	events := make([]model.AgentUpdateEvent, 0, len(store.updates))
 	for _, event := range store.updates {
-		// ★ MATCHED THE WAY EVERYTHING ELSE HERE MATCHES (2026-08-13, twenty-ninth review). RecordUpdate and
-		// LatestUpdateByDevice trim and fold case; the summaries compared exactly — so a tenant id differing
-		// only in case or whitespace put devices in the drill-down and left the summary at total:0, which is a
-		// symptom this product has chased before.
+		// Tenant IDs are exact after surrounding whitespace is removed. Case-distinct organizations must not
+		// share a summary, even when their devices and event IDs happen to have the same spelling.
 		if sameTenant(event.TenantID, tenantID) {
 			events = append(events, event)
 		}
@@ -346,7 +344,7 @@ func intMetadataValue(metadata map[string]any, key string, fallback int) int {
 
 // sameTenant is the one tenant comparison this package uses, so a summary and a drill-down cannot disagree.
 func sameTenant(a, b string) bool {
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+	return strings.TrimSpace(a) == strings.TrimSpace(b)
 }
 
 // recordedAfter reports whether a is strictly later than b, as instants. Equal instants answer false, which

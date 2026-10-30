@@ -43,11 +43,11 @@ type certAdmissionInput struct {
 	// DialNames are the hosts agents actually connect to (region endpoints, the published transport URL).
 	DialNames []string
 	// AdoptedByEveryDevicePEM is the subset of the distribution that EVERY enrolled device is reported to
-	// hold, and NotYetAdoptedBy names the devices holding the rest back. Empty means adoption cannot be
-	// measured here, in which case the distribution check above stands alone and says so by staying silent
-	// rather than inventing certainty.
+	// hold. AdoptionMeasured distinguishes a known fleet that has adopted zero roots from a fleet with no
+	// measurement source. Only the latter uses the distribution check alone.
 	AdoptedByEveryDevicePEM []string
 	NotYetAdoptedBy         []string
+	AdoptionMeasured        bool
 }
 
 // verifyCertificateWouldBeAcceptedByDevices returns nil when a device would accept this certificate, or an
@@ -101,15 +101,16 @@ func verifyCertificateWouldBeAcceptedByDevices(in certAdmissionInput) error {
 	// same shape of failure as the outage, arriving on the next handshake rather than immediately. So the
 	// path is re-checked against the certificates devices are actually REPORTED to hold; a certificate
 	// that survives only on the newest one is refused, naming the devices it would strand (review R8①).
-	if len(in.AdoptedByEveryDevicePEM) > 0 {
+	if in.AdoptionMeasured || len(in.AdoptedByEveryDevicePEM) > 0 {
 		adopted := x509.NewCertPool()
-		if adopted.AppendCertsFromPEM([]byte(strings.Join(in.AdoptedByEveryDevicePEM, "\n"))) {
-			if _, err := in.Leaf.Verify(x509.VerifyOptions{
-				Roots: adopted, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-			}); err != nil {
-				return fmt.Errorf("only a certificate the fleet has NOT finished adopting can verify this one — %s would be stranded at their next handshake; wait for adoption to complete, then replace",
-					strings.Join(in.NotYetAdoptedBy, ", "))
-			}
+		if !adopted.AppendCertsFromPEM([]byte(strings.Join(in.AdoptedByEveryDevicePEM, "\n"))) {
+			return fmt.Errorf("no certificate is confirmed adopted by every enrolled device — wait for adoption to complete, then replace")
+		}
+		if _, err := in.Leaf.Verify(x509.VerifyOptions{
+			Roots: adopted, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}); err != nil {
+			return fmt.Errorf("only a certificate the fleet has NOT finished adopting can verify this one — %s would be stranded at their next handshake; wait for adoption to complete, then replace",
+				strings.Join(in.NotYetAdoptedBy, ", "))
 		}
 	}
 	return nil
@@ -196,11 +197,11 @@ func guardServedCertificateChange(config serverConfig, name, certPEM string) err
 		return nil
 	}
 	trustedPEM, _ := currentTrustAnchors(config)
-	adoptedPEM, notYet := fullyAdoptedTrust(config)
+	adoptedPEM, notYet, measured := fullyAdoptedTrust(config)
 	if err := verifyCertificateWouldBeAcceptedByDevices(certAdmissionInput{
 		Leaf: candidate[0], Chain: candidate[1:], TrustedPEM: trustedPEM,
 		DialNames:               transportDialNames(config, config.RegionEndpointURLs),
-		AdoptedByEveryDevicePEM: adoptedPEM, NotYetAdoptedBy: notYet,
+		AdoptedByEveryDevicePEM: adoptedPEM, NotYetAdoptedBy: notYet, AdoptionMeasured: measured,
 	}); err != nil {
 		return fmt.Errorf("devices would refuse this certificate: %w", err)
 	}
@@ -254,18 +255,18 @@ func regionEndpointHostsFrom(spec string) []string {
 // fullyAdoptedTrust splits the distribution into the certificates EVERY enrolled device is reported to
 // hold, and the devices that are holding the rest back. Returns nothing when adoption cannot be measured
 // — a node with no telemetry has no business claiming a certificate is safe to switch to.
-func fullyAdoptedTrust(config serverConfig) (adopted []string, notYet []string) {
+func fullyAdoptedTrust(config serverConfig) (adopted []string, notYet []string, measured bool) {
 	if config.ObservedExclusions == nil {
-		return nil, nil
+		return nil, nil, false
 	}
 	pems, _ := currentTrustAnchors(config)
 	certs := parseAllCerts([]byte(pems))
 	if len(certs) == 0 {
-		return nil, nil
+		return nil, nil, false
 	}
 	known := enabledEnrolledIdentities(config)
 	if len(known) == 0 {
-		return nil, nil
+		return nil, nil, false
 	}
 	pending := map[string]bool{}
 	for _, c := range certs {
@@ -283,5 +284,5 @@ func fullyAdoptedTrust(config serverConfig) (adopted []string, notYet []string) 
 		notYet = append(notYet, id)
 	}
 	sort.Strings(notYet)
-	return adopted, notYet
+	return adopted, notYet, true
 }

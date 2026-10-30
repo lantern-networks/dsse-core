@@ -31,6 +31,8 @@ public final class DsseAgentPolicyPoller: @unchecked Sendable {
     private let serverName: () -> String
     private let url: URL
     private let pinnedPublicKeyHex: String
+    private let currentDeviceIdentity: () -> String?
+    private let currentTenantID: () -> String?
     /// Additional policy-signing keys this device has adopted from a verified trust bundle. Resolved fresh on
     /// every poll rather than captured once: adopting a bundle is what puts a key here, and a poller holding
     /// the set it was born with would never see the key that arrives afterwards — the same start-up-capture
@@ -108,13 +110,20 @@ public final class DsseAgentPolicyPoller: @unchecked Sendable {
     // had already stopped requiring a pin, but this refused to construct, so the caller's guard failed anyway
     // and blamed the transport in its log. A poller with no pin is a legitimate object — it reports, and it
     // verifies nothing (fetchVerifiedExclusions still yields nil, because an empty pin cannot verify anything).
-    public init?(security: DsseTransportSecurity, pinnedPublicKeyHex: String, cachePath: String?,
+    public init?(security: DsseTransportSecurity, configDirectory: URL,
+                 pinnedPublicKeyHex: String, cachePath: String?,
                  acceptedKeys: @escaping () -> [String] = { [] }) {
         let keyHex = pinnedPublicKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = Self.agentPolicyURL(security: security) else { return nil }
         self.session = DsseTransportTLS.makePinnedURLSession(security: security, channel: "agent-policy")
         self.url = url
         self.pinnedPublicKeyHex = keyHex
+        // The (T) transport may present a renewed identity after startup. Bind each response to the
+        // identity in force when it is checked, not to the constructor's certificate snapshot.
+        self.currentDeviceIdentity = {
+            DsseDeviceHeartbeat.deviceIdentity(from: DsseLiveClientIdentity.current() ?? security.clientIdentity)
+        }
+        self.currentTenantID = { DsseAdoptedTenantScope.tenantInForce(configDirectory: configDirectory) }
         self.acceptedKeys = acceptedKeys
         self.cachePath = cachePath
         self.namedTransport = security
@@ -125,10 +134,14 @@ public final class DsseAgentPolicyPoller: @unchecked Sendable {
 
     // Test/seam initializer: inject the session + URL directly.
     public init(session: URLSession, url: URL, pinnedPublicKeyHex: String, cachePath: String? = nil,
+                expectedDeviceIdentity: String? = nil,
+                expectedTenantID: String? = nil,
                 acceptedKeys: @escaping () -> [String] = { [] }) {
         self.session = session
         self.url = url
         self.pinnedPublicKeyHex = pinnedPublicKeyHex.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.currentDeviceIdentity = { expectedDeviceIdentity }
+        self.currentTenantID = { expectedTenantID }
         self.acceptedKeys = acceptedKeys
         self.cachePath = cachePath
         self.namedTransport = nil
@@ -175,8 +188,10 @@ public final class DsseAgentPolicyPoller: @unchecked Sendable {
                 }
                 guard let excluded = DsseSignedAgentPolicy.verifiedServerExclusions(
                           envelopeData: answer.body, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                          expectedDeviceIdentity: currentDeviceIdentity(),
+                          expectedTenantID: currentTenantID(),
                           alsoAccept: acceptedKeys()) else {
-                    noteFetchOutcome(failure: "signature NOT verified against pin \(pinnedPublicKeyHex.prefix(12))… (+\(acceptedKeys().count) adopted key(s)) — admin exclusions authored for this device are NOT being applied")
+                    noteFetchOutcome(failure: "signature NOT verified against pin \(pinnedPublicKeyHex.prefix(12))… (+\(acceptedKeys().count) adopted key(s)) OR device identity mismatch — admin exclusions authored for this device are NOT being applied")
                     completion(nil); return
                 }
                 noteFetchOutcome(failure: nil)
@@ -208,8 +223,10 @@ public final class DsseAgentPolicyPoller: @unchecked Sendable {
             }
             guard let excluded = DsseSignedAgentPolicy.verifiedServerExclusions(
                       envelopeData: data, pinnedPublicKeyHex: self.pinnedPublicKeyHex,
+                      expectedDeviceIdentity: self.currentDeviceIdentity(),
+                      expectedTenantID: self.currentTenantID(),
                       alsoAccept: self.acceptedKeys()) else {
-                self.noteFetchOutcome(failure: "signature NOT verified against pin \(self.pinnedPublicKeyHex.prefix(12))… (+\(self.acceptedKeys().count) adopted key(s)) — admin exclusions authored for this device are NOT being applied")
+                self.noteFetchOutcome(failure: "signature NOT verified against pin \(self.pinnedPublicKeyHex.prefix(12))… (+\(self.acceptedKeys().count) adopted key(s)) OR device identity mismatch — admin exclusions authored for this device are NOT being applied")
                 completion(nil); return
             }
             self.noteFetchOutcome(failure: nil)

@@ -124,6 +124,7 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 		// the re-applicable snapshot; a rollback re-POSTs a prior version's request.
 		shipConfigVersionToCP(r, cpVersions, configversion.ResourceTenantRestriction, adminTenantIDFromRequest(r),
 			configversion.ActionUpsert, "tenant-restriction update", req)
+		resp.Status = resp.Status.ForTenant(callerTenant, isOperator)
 		writeJSON(w, http.StatusOK, resp)
 	}))
 	// S6: tenant-restriction history + rollback (Edge-side resource versioned via the control plane).
@@ -188,6 +189,7 @@ func registerSWGTenantRestrictionRoutes(mux *http.ServeMux, adminEndpoint func(s
 		}
 		shipConfigVersionToCP(r, cpVersions, configversion.ResourceTenantRestriction, adminTenantIDFromRequest(r),
 			configversion.ActionRollback, fmt.Sprintf("rolled back to version %d", body.VersionNo), req)
+		resp.Status = resp.Status.ForTenant(callerTenant, isOperator)
 		writeJSON(w, http.StatusOK, map[string]any{"rolled_back_to": body.VersionNo, "tenant_restriction": resp})
 	}))
 }

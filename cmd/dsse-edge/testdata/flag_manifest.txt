@@ -76,18 +76,26 @@ audit-publisher-webhook-signing-secret	String	""
 audit-publisher-webhook-timeout	Duration	10 * time.Second
 audit-publisher-webhook-token	String	""
 audit-publisher-webhook-url	String	""
+auth-rollout-ca	String	""
+auth-rollout-census	String	""
+auth-rollout-client-cert	String	""
+auth-rollout-client-key	String	""
+auth-rollout-report-url	String	""
 break-glass-store	String	""
 bundle	String	"../samples/phase1/policy_bundle_standard.json"
 clientless-access	Bool	false
 clientless-base-url	String	""
+clientless-tls-ca	String	""
 clientless-tls-cert	String	""
 clientless-tls-key	String	""
 cold-archive-access-key	String	""
+cold-archive-alert-after	Duration	2 * time.Hour
+cold-archive-auth-mode	String	"static"
 cold-archive-bucket	String	""
 cold-archive-endpoint	String	""
 cold-archive-region	String	""
 cold-archive-secret-key	String	""
-cold-archive-use-ssl	Bool	false
+cold-archive-use-ssl	Bool	true
 config-source-ca	String	""
 config-source-data-endpoints	String	""
 config-source-endpoints	String	""
@@ -107,6 +115,7 @@ connector-routes-cp-configured	Bool	true
 connector-runtime-secret-required	Bool	false
 connector-secret	String	defaultConnectorSecret
 control-plane	Bool	false
+cp-unavailable-listen	String	""
 cpu-headroom-cores	Int	-1
 default-bypass-list	Bool	true
 delegated-grant-store	String	""
@@ -127,6 +136,9 @@ dlp-classifier-store	String	""
 dlp-fingerprint-store	String	""
 dlp-policy-object-store	String	""
 dlp-requires-license	Bool	false
+dlp-retention-per-stream-bytes	Int64	64 << 20
+dlp-retention-process-bytes	Int64	512 << 20
+dlp-rule-store	String	""
 dns-policy-store	String	""
 domain-event-outbox	String	"disabled"
 domain-event-outbox-postgres-dsn	String	""
@@ -140,7 +152,7 @@ domain-event-publisher-poll-interval	Duration	250 * time.Millisecond
 domain-event-publisher-postgres-dsn	String	""
 domain-event-publisher-retry-delay	Duration	30 * time.Second
 domain-event-publisher-webhook-signing-key-id	String	""
-domain-event-publisher-webhook-signing-secret	String	""
+domain-event-publisher-webhook-signing-secret	String	os.Getenv("DSSE_DOMAIN_EVENT_PUBLISHER_WEBHOOK_SIGNING_SECRET")
 domain-event-publisher-webhook-timeout	Duration	10 * time.Second
 domain-event-publisher-webhook-token	String	""
 domain-event-publisher-webhook-url	String	""
@@ -165,6 +177,7 @@ enrolment-token-max-lifetime	Duration	30 * 24 * time.Hour
 enrolment-token-max-outstanding	Int	200
 enrolment-token-store	String	""
 entitlement-store	String	""
+entrance-portal-origins	String	os.Getenv("DSSE_ENTRANCE_PORTAL_ORIGINS")
 first-party-accounts	Bool	false
 first-party-issuer	String	"Lantern DSSE"
 first-party-store	String	"memory"
@@ -184,6 +197,7 @@ human-approval-store	String	""
 identity-directory-postgres-dsn	String	""
 identity-directory-store	String	"memory"
 idp-connection-store	String	""
+inspection-crl-listen	String	""
 inspection-events-store	String	""
 inspection-posture-store	String	""
 interception-anchor-cert	String	""
@@ -231,6 +245,7 @@ mint-operator-credential-ttl	Duration	time.Hour
 mode	String	"edge"
 network-extension-config-publish-dir	String	""
 network-extension-default-passthrough-domains-enabled	Bool	true
+network-extension-exact-https-passthrough-endpoints-json	String	""
 network-extension-passthrough-domains	String	""
 network-extension-renewal-recovery-endpoint	String	""
 network-extension-runtime-copy-downstream-passthrough-default-tunnel	Bool	false
@@ -310,6 +325,7 @@ steer-fail-open-cooldown-ms	Int	0
 steer-fail-open-mode	String	"off"
 steer-region-failover	Bool	false
 step-up-binding-secret	String	""
+step-up-portal-origins	String	""
 strip-alt-svc	Bool	true
 swg-egress-browser-mimic	Bool	false
 swg-mac-ca-trust-observed	Bool	false

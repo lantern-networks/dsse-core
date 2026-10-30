@@ -75,6 +75,54 @@ func SameDriverImagePath(current, want string) bool {
 	return norm(current) == norm(want)
 }
 
+// confirmStoppedBeforeDelete is the uninstall-only gate before deleting a driver service. SCM can accept a
+// delete while the driver is still running, leaving it marked for deletion rather than stopped. The install
+// path deliberately has a different contract: it records a pending reboot when a live image cannot be
+// unloaded. Keep the state transition here so refusal and timeout can be exercised without a Windows host.
+func confirmStoppedBeforeDelete(query func() (uint32, error), stop func() error, wait func() error,
+	stopped, stopPending uint32) error {
+	state, err := query()
+	if err != nil {
+		return fmt.Errorf("query driver before removal: %w", err)
+	}
+	if state == stopped {
+		return nil
+	}
+	if state != stopPending {
+		if err := stop(); err != nil {
+			return fmt.Errorf("stop driver before removal: %w", err)
+		}
+	}
+	if err := wait(); err != nil {
+		return fmt.Errorf("confirm driver stopped before removal: %w", err)
+	}
+	state, err = query()
+	if err != nil {
+		return fmt.Errorf("query driver after stop: %w", err)
+	}
+	if state != stopped {
+		return fmt.Errorf("driver is still running (state %d) after stop confirmation", state)
+	}
+	return nil
+}
+
+// probe returns true only for SCM's service-does-not-exist result. Marked for
+// deletion is pending, not absence; denied/query errors remain failures.
+func confirmDriverAbsent(probe func() (bool, error), wait func() bool) error {
+	for {
+		absent, err := probe()
+		if err != nil {
+			return fmt.Errorf("confirm driver absent: %w", err)
+		}
+		if absent {
+			return nil
+		}
+		if !wait() {
+			return fmt.Errorf("driver service deletion is still pending; removal incomplete, retry after handles close or reboot")
+		}
+	}
+}
+
 // PendingReboot describes an image that is on disk but not in the kernel: the driver could not be stopped, so
 // the bytes were replaced while the old code kept running.
 type PendingReboot struct {

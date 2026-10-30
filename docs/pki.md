@@ -18,7 +18,8 @@ for every deployment service, and trusting an Edge server does not identify a de
 | Customer transport CA | Customer-facing Edge server identity | That customer's agents and connectors |
 | Customer device CA | Enrolled device/client identity | Edge admission and renewal handlers |
 | Customer inspection CA hierarchy | Certificates for inspected HTTPS destinations | Endpoint OS and application trust stores |
-| Consensus Store CA | Store member TLS identities | Consensus store members |
+| Consensus Store CA | Store member and dedicated Patroni client TLS identities | Store members and authenticated client endpoints |
+| Database CA | PostgreSQL server identities | Control plane, database initialiser and Patroni/libpq clients |
 | Configuration/profile/policy signing key | Authentic configuration and trust distribution | DSSE components with the signing public key pinned |
 | Agent update signing key | Authentic update manifests | Endpoint update verifier |
 
@@ -41,6 +42,8 @@ flowchart TD
     M --> ML[Management service certificates]
     T --> TL[Node and bootstrap transport certificates]
     S[Separate Consensus Store CA] --> SL[Store member certificates]
+    S --> SC[Dedicated Patroni client certificates]
+    B[Separate Database CA] --> BL[Database server certificates]
 ```
 
 Customer authorities managed by the control plane have a different shape. The
@@ -73,7 +76,8 @@ authority stores. Those stores contain private-key material, not just certificat
 | Material | Current custody and boundary |
 |---|---|
 | Deployment root, Management CA, Transport CA, and installer signing keys | Installer `authority/` directory; excluded from generated runtime mounts and machine carry packages |
-| Consensus Store CA key | Installer `authority/`; member certificates and keys travel to store nodes |
+| Consensus Store CA key | Installer `authority/`; member material travels to store nodes, dedicated client material to database nodes |
+| Database CA key | Installer `authority/`; only node-specific server certificate/key and public CA travel to runtime nodes |
 | Shared Device and Interception CA keys | Runtime file-based signing paths remain in the generated deployment |
 | Customer transport CA key | Control-plane durable authority store; Edge receives server certificate and private key |
 | Managed customer device CA key | Control-plane durable store **and the CA private key delivered to Edge** for enrolment signing |
@@ -127,11 +131,38 @@ certificate cannot extend an expired parent's validity.
 | Enrolled device certificate | 60 days (`-enroll-cert-ttl`) | Windows/macOS agents renew at two-thirds of actual certificate lifetime |
 | Installer-managed enrolled connector identity | Enrolment certificate lifetime | Connector renews at two-thirds; operator-supplied certificate files are not automatically enrolled into this loop |
 | Installer-issued node/service leaf certificates | One year | Operator reissues and applies replacement; no general automatic reissuance loop |
-| Store member certificates | Five years | Operator replacement |
+| Store member certificates | Five years, bounded by issuer expiry | Operator replacement |
+| Patroni client and database server certificates | One year, bounded by issuer expiry | Operator reissues and re-packs the node |
 | Deployment/bootstrap CAs and Store CA | Installer `-years`, default ten years | Operator lifecycle management |
 | Managed customer transport CA | Ten years | Operator-driven CA rotation |
 | Managed customer device CA | Five years | Operator-driven CA rotation |
 | Managed customer inspection root / issuing CA | Five / two years | Operator-driven authority renewal or replacement |
+
+The optional file-backed interception root used by the lab TLS path has a
+365-day certificate. In its final seven days, the Edge warns and continues to
+use the same persisted certificate and key. At expiry, startup refuses that
+root and leaves both files unchanged. It does **not** automatically create and
+activate a replacement: devices must receive and confirm the incoming trust
+anchor before an operator changes the signing root. The seven-day warning is
+not a completed rotation or proof of endpoint adoption.
+
+The optional file-backed Edge root now has one private, mode-0600 atomic
+certificate/key snapshot as its authority. Its historical PEM certificate and
+key files are compatibility views; the loader checks and repairs them under a
+process-shared lock after an interrupted write. If the snapshot is malformed,
+the Edge refuses to mint a replacement root. A valid legacy two-file pair is
+migrated without changing its certificate or key. Do not read the compatibility
+views independently while an Edge is starting; use the supported loader.
+
+The active public trust anchor has a different file: for a file-backed root at
+`root.pem`, distribute `root.active-anchor.pem`. After a gated re-parent, the
+signer still loads from its private snapshot while that certificate-only export
+and the authenticated admin/install-bundle responses name the new anchor. An
+export failure is reported as degraded and retried from the durable re-parent
+record on restart; never distribute the signer certificate path as the active
+anchor after re-parenting. Startup replays the re-parent record before it
+publishes the active export: constructing the signer alone must not overwrite a
+previously adopted public anchor during that interval.
 
 Edge material is obtained over authenticated TLS using the node's client identity
 and authorization credential at `/tenant-edge-material`. The refresh loop normally
@@ -152,6 +183,36 @@ The previous identity can remain as a fallback, so both current and fallback
 certificates matter when retiring a CA. An operator can request earlier renewal
 through the signed renewal cutoff (`/admin/device-certificates/renew-all`). This
 requests client work; it is not proof that every device has already renewed.
+
+New Windows trust-bundle adoptions store the public transport CA set, replay serial
+and associated metadata together in `trust_anchor_pointer.json`. Older split-file
+records remain readable with their fingerprint checks. A failed write does not
+activate a partial CA set. If replacement is visible but durable storage cannot
+be confirmed, the agent aligns live trust with that verified record and reports
+`adopted_unconfirmed`; it does not report a completed durable adoption. Investigate
+the storage failure before treating the rotation as safely persisted.
+
+An enrolled Connector commits renewal with a recoverable certificate/key update.
+New TLS connections, including connections to another region, load the committed
+identity without a process restart. Existing TLS connections retain the identity
+used in their original handshake. Explicitly supplied certificate/key flags remain
+operator-managed, even if their paths match the managed state directory. Manual and
+periodic renewal use the current authorized Edge door and stop when all data doors
+are withdrawn. The check interval scales with the certificate's lifetime, dividing
+its final third into twelve intervals and applying the existing Windows schedule's
+15-second minimum and six-hour maximum interval. The interval is recalculated
+after renewal, so a shorter replacement lifetime does not inherit a six-hour wait.
+This bounds renewal request frequency; it does not guarantee renewal during an
+outage or for a lifetime too short for the retry interval and TLS round trip.
+
+Inspection-root announcement withdrawal is recorded before it is reported as
+successful. A durable withdrawal record prevents an old retiring PEM file from
+restoring that announcement at restart. Unreadable or malformed announcement state
+is preserved and blocks replacement until repaired; it is not treated as empty.
+Withdrawing an announcement is distinct from revoking a compromised authority.
+Revocation also covers retiring roots retained only as fingerprints after a
+restart. Those fingerprints are excluded from subsequent device-facing
+announcements, including after a replacement authority is loaded.
 
 ## CA rotation and retirement
 
@@ -182,9 +243,70 @@ the client. Offline or stale reports are unresolved evidence, not successful ado
 
 ## Expiry, revocation, and recovery
 
+For managed inspection, the current lifetime bounds are:
+
+| Inspection tier | Current bound | What the bound means |
+|---|---|---|
+| Destination leaf | 30-day maximum, capped by the earliest expiry in its issuer chain | A leaf under a newly issued 12-hour Edge intermediate lasts at most that intermediate's remaining lifetime |
+| Per-Edge intermediate | 12-hour default material TTL | Limits the validity of material delivered to one Edge; configured TTLs can differ, and parent expiry limits chain validity |
+| Customer issuing CA | Two years for the managed minting path | Signs per-Edge intermediates; its key remains with the control plane |
+| Customer inspection root | Five years for the managed minting path | Endpoint trust anchor; retiring it requires endpoint trust removal |
+
+These bounds limit exposure; expiry is not immediate administrative revocation.
+Stopping leaf minting does not invalidate certificates already issued. An empty
+signed CRL cannot replace the deployment's authority-revocation state or prove
+that an origin certificate is unrevoked. Short lifetimes also do not supply the
+status information a strict client requires. Retain those distinctions when
+evaluating the compatibility remedy below. Imported authorities and other signing
+paths can have different lifetimes; inspect the actual chain.
+
 Normal admission requires a valid, enrolled, non-revoked identity. Expiry and an
 explicit administrative revocation are different conditions. DSSE uses admission
-and revocation state; do not assume universal browser CRL/OCSP enforcement.
+and revocation state. Those deployment identity checks do not determine whether
+an external website's certificate has been revoked.
+
+**Upstream certificate revocation is not currently enforced by DSSE's inspection
+path.** Origin chain, hostname, and validity verification remain separate from
+OCSP/CRL status checking. The Go inspection path can fetch a missing public
+CA Issuers intermediate and still verifies the chain against existing roots;
+the optional egress broker has its own AIA issuer fetching. Both are chain
+construction, not revocation enforcement. Interception replaces the origin's
+certificate with an inspection certificate, so the endpoint cannot apply its
+original certificate's revocation check to that replacement. Known responder
+bypasses alone do not restore that check for an intercepted site.
+
+The development candidate adds a small signed-CRL route for newly issued,
+CRL-enabled tenant authorities. The offline root signs its own seven-day CRL;
+the control plane signs and stores a five-minute issuing CRL with every known
+revoked Edge delegation; each Edge signs a five-minute CRL for its own leaf
+issuer and publishes it through its authenticated control channel. A separate
+read-only HTTP listener returns only the stored DER at the exact certificate
+distribution URL. Inspection leaves advertise that URL only after publication
+has been acknowledged; an expired publication prevents cached or new leaf use.
+The root key stays offline. Existing roots with no CDP cannot be retrofitted;
+adoption requires a new authority and endpoint trust transition.
+
+A controlled deployment passed strict Windows .NET/Schannel Online revocation
+for ordinary intercepted HTTPS, with the inspection chain and all three public
+CDP responses checked. All three Portal certificates also passed strict Online
+validation before agent startup. These checks establish the CRL path for that
+deployment; failure and recovery scenarios require separate acceptance.
+The published endpoint must be reachable from clients without DSSE interception,
+and the operator must refresh the offline root CRL before its seven-day expiry. The installer binds
+the HTTP CRL doorway to loopback by default. For an operator-managed single-IP
+frontend, bind `DSSE_CRL_PUBLISH_BIND` to each Node's reachable private address
+and port, then forward the public HTTP origin there. Do not bind Docker to a
+movable VIP on standby Nodes. The URL embedded by `dsse-inspection-pki -crl-base`
+must exactly match that origin. Do not disable client revocation checks, and do
+not confuse inspection-leaf status with the origin certificate's status.
+
+A deployment CRL would not check public-origin certificates or remove an
+inspection root from an endpoint's trust store. Retirement therefore requires
+endpoint trust cleanup. Retain the root's SHA-1 and SHA-256 fingerprints and
+compare the exact certificate before removal; names alone are insufficient.
+See the [macOS removal procedure](macos-agent.md#removing-it)
+and [Windows removal procedure](windows-agent.md#removing-it) for current cleanup
+steps and remaining limitations.
 
 An optional renewal recovery route can accept an expired identity solely for
 renewal within its configured grace window (default 30 days), while checking its
@@ -380,3 +502,49 @@ reassign a CA just to make startup pass. Restore a consistent registry through
 the deployment's controlled maintenance procedure, then verify the owning tenant
 before serving devices. This check does not persist an interrupted withdrawal's
 pending receipt; the separate recovery procedure above still applies.
+
+## Installer database and consensus transport
+
+New installer output uses a dedicated database CA. The generated control-plane
+DSN and database initialiser use `verify-full`, with `database-ca.pem`; Patroni's
+superuser and replication clients use the same mode. Database certificates contain
+DNS and IP SANs derived from each node's advertised database address and published
+member address, plus the cluster's local database-door aliases. These aliases
+identify a member of this deployment's database trust domain; they do not identify
+which node the primary is. Independently supplied standby DSNs still need operator
+validation; the generated placeholder also requests `verify-full`.
+
+For plans whose consensus traffic crosses machines, etcd's client endpoint requires
+a certificate from the Store CA. Patroni presents a separate client-only certificate
+and key, not the etcd member key. This authenticates TLS peers; it does not enable
+etcd application RBAC. The local single-host legacy store remains on its existing
+HTTP configuration.
+
+An init service, using the same Spilo image as the database, discovers the actual
+`postgres` UID/GID and installs client/server keys with mode 0600 in a mode 0700
+private volume. The database mounts that volume read-only. Source host keys retain
+0600 permissions, and CA private keys stay in `authority/`, excluded from runtime
+mounts and carry archives. The installer refuses to reapply damaged, expired or
+wrong-node runtime material on a carried node without its issuing authority; re-pack
+on the issuing host. A valid carried node can reapply without either CA private key.
+
+This changes newly generated output; it is not an automatic migration of an existing
+running database. Older directories lacking the Database CA need an explicit
+issuer-host preparation and coordinated distribution of the public trust and new
+node certificates before requiring verified client connections. Do not overwrite
+existing deployment/customer authorities, reinitialise PostgreSQL data, or copy CA
+private keys to runtime nodes. Refresh the private volume with the init service when
+replacing leaf material, then restart its consumers. Plan the rolling sequence and
+verify cluster replication and primary failover before declaring a migrated cluster
+accepted.
+
+The one-region-three-nodes verifier requires live authenticated health from every
+configured etcd endpoint and a TLS rejection without a client certificate. It also
+connects through the published database door with `verify-full` and checks
+`pg_stat_ssl`. Missing credentials, unreachable peers or configuration text alone
+cannot pass these checks. Host-side probes complement the actual-image UID and
+cross-node replication tests; they do not substitute for them. The public browser
+certificate and real step-up ceremony gates remain independent.
+
+Patroni's supported authentication fields are documented in its
+[YAML configuration reference](https://patroni.readthedocs.io/en/latest/yaml_configuration.html).

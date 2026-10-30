@@ -151,3 +151,33 @@ func TestResolutionDoesNotRewriteWhatTheClientAskedFor(t *testing.T) {
 		t.Fatalf("DestinationResolvedIP = %q, want the resolved address", got.DestinationResolvedIP)
 	}
 }
+
+func TestCachedDNSAnswersAreClassifiedAgainstCurrentTenantNetworks(t *testing.T) {
+	calls := 0
+	withResolver(t, func(context.Context, string) ([]net.IP, error) {
+		calls++
+		return []net.IP{net.ParseIP("8.8.8.8"), net.ParseIP("1.1.1.1")}, nil
+	})
+	now := time.Now()
+	first := lateralReq("shared.example")
+	first.TenantID = "tenant-a"
+	got := resolveDestinationForLocality(context.Background(), first, decision.InternalNetworks{}, now)
+	if got.DestinationResolvedIP != "8.8.8.8" {
+		t.Fatal("unexpected initial DNS choice")
+	}
+	// The same cached DNS response serves another tenant whose declared internal
+	// network includes the second answer. A cached policy decision is not portable.
+	second := lateralReq("shared.example")
+	second.TenantID = "tenant-b"
+	networks := decision.InternalNetworks{CIDRs: []string{"1.1.1.1/32"}}
+	got = resolveDestinationForLocality(context.Background(), second, networks, now)
+	if got.DestinationResolvedIP != "1.1.1.1" || !decision.IsEastWestFlow(got, networks) {
+		t.Fatalf("cached choice bypassed current tenant's internal network: %s", got.DestinationResolvedIP)
+	}
+	// A policy change for the original tenant must also take effect without waiting
+	// for DNS expiry; tenant-only cache keys would not solve this case.
+	got = resolveDestinationForLocality(context.Background(), first, networks, now)
+	if got.DestinationResolvedIP != "1.1.1.1" || calls != 1 {
+		t.Fatalf("policy change not applied to cached DNS answers: ip=%s lookups=%d", got.DestinationResolvedIP, calls)
+	}
+}

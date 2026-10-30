@@ -218,7 +218,7 @@ func keptForTenant(ledger *enrolledinventory.Ledger, tenant string, kept []strin
 		if t == "" {
 			t = tenant // an identity with no organization is the node's own, as everywhere else
 		}
-		if strings.EqualFold(t, tenant) {
+		if t == strings.TrimSpace(tenant) {
 			out = append(out, id)
 		}
 	}

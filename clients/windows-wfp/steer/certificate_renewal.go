@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,6 +24,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // certificate_renewal.go — automated device-certificate renewal for the Windows agent.
@@ -66,6 +69,8 @@ const (
 	renewalAttemptsPerBudget = 12
 	renewalPointerFile       = "device_identity_pointer.json"
 )
+
+var errRenewalPointerCommitUncertain = errors.New("renewal pointer commit durability is unconfirmed")
 
 // renewalCheckInterval derives how often to look from the certificate's own lifetime.
 //
@@ -516,6 +521,10 @@ func runRenewalCheck(tc *transportConfig, identityDir, recoveryHostPort string, 
 			time.Since(leaf.NotAfter).Round(time.Hour), where)
 		// Ask the recovery listener; prove the answer on the NORMAL transport, where the device has to work.
 		if err := renewAndInstall(&recovery, tc, identityDir, leaf.Subject.CommonName); err != nil {
+			if errors.Is(err, errRenewalPointerCommitUncertain) {
+				log.Printf("certificate_renewal RECOVERY COMMIT UNCERTAIN identity=%q error=%v — both generations retained; inspect the identity pointer before removing either", leaf.Subject.CommonName, err)
+				return next
+			}
 			log.Printf("certificate_renewal RECOVERY FAILED identity=%q expired_ago=%s error=%v — retrying in %s",
 				leaf.Subject.CommonName, time.Since(leaf.NotAfter).Round(time.Hour), err, next)
 			return next
@@ -541,6 +550,10 @@ func runRenewalCheck(tc *transportConfig, identityDir, recoveryHostPort string, 
 	}
 
 	if err := renewAndInstall(tc, tc, identityDir, leaf.Subject.CommonName); err != nil {
+		if errors.Is(err, errRenewalPointerCommitUncertain) {
+			log.Printf("certificate_renewal COMMIT UNCERTAIN identity=%q error=%v — both generations retained; inspect the identity pointer before removing either", leaf.Subject.CommonName, err)
+			return next
+		}
 		// Loud but not fatal. The retry budget is what makes this an alert; only a path that stays broken for
 		// weeks becomes an outage, and the day count says how much room is left.
 		log.Printf("certificate_renewal FAILED identity=%q days_remaining=%d error=%v — the existing certificate is still in use and renewal will be retried in %s",
@@ -605,14 +618,17 @@ func renewAndInstall(requestTC, probeTC *transportConfig, identityDir, commonNam
 	newKeyPath := ""
 	if !dk.hardware {
 		newKeyPath = filepath.Join(dir, "device-"+name[:16]+".key")
-		if err := os.WriteFile(newKeyPath, dk.keyPEM, 0o600); err != nil {
+		if err := durablefile.Write(newKeyPath, dk.keyPEM, 0o600); err != nil {
+			os.Remove(newKeyPath) // no pointer can name it yet, including after a post-rename flush error
+			rollbackDeviceKey(dk)
 			return fmt.Errorf("write renewed key: %w", err)
 		}
 	}
-	if err := os.WriteFile(newCertPath, []byte(certPEM), 0o644); err != nil {
+	if err := durablefile.Write(newCertPath, []byte(certPEM), 0o644); err != nil {
 		if newKeyPath != "" {
 			os.Remove(newKeyPath)
 		}
+		os.Remove(newCertPath) // no pointer can name the new certificate yet
 		rollbackDeviceKey(dk)
 		return fmt.Errorf("write renewed certificate: %w", err)
 	}
@@ -655,6 +671,16 @@ func renewAndInstall(requestTC, probeTC *transportConfig, identityDir, commonNam
 		}
 	}
 	if err := writeIdentityPointer(dir, pointer); err != nil {
+		// A Unix directory flush can fail AFTER the pointer replacement. At that point the pointer may already
+		// name these files; deleting the key or TPM container would strand the identity a restart reads.
+		// Windows' durable replacement is one operation and does not return this ambiguity.
+		if visible, mayBePublished := classifyIdentityPointerWrite(dir, pointer, err); mayBePublished {
+			if visible {
+				probeTC.setClientCert(&candidate)
+				return fmt.Errorf("renewed identity is active but pointer durability is unconfirmed; keeping its material and previous identity: %w", errors.Join(errRenewalPointerCommitUncertain, err))
+			}
+			return fmt.Errorf("renewal pointer replacement may have happened but readback did not match; keeping new material for recovery: %w", errors.Join(errRenewalPointerCommitUncertain, err))
+		}
 		if newKeyPath != "" {
 			os.Remove(newKeyPath)
 		}
@@ -907,11 +933,29 @@ func writeIdentityPointer(dir string, pointer deviceIdentityPointer) error {
 	if err != nil {
 		return err
 	}
-	// Written via a temporary file and renamed: a torn pointer would leave the agent unable to decide which
-	// identity is current, which is worse than not having renewed at all.
-	tmp := filepath.Join(dir, renewalPointerFile+".tmp")
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return err
+	// Unique staging, flushed bytes and durable replacement. A fixed .tmp lets a second writer overwrite the
+	// first writer's staging file; plain Rename also gives no write-through guarantee on Windows.
+	return durablefile.Write(filepath.Join(dir, renewalPointerFile), raw, 0o644)
+}
+
+// identityPointerReadbackMatches is used only for a post-replacement flush failure. A matching visible
+// pointer means the running transport can safely adopt the proven candidate, but its persistence across a
+// crash remains uncertain. The caller preserves BOTH new material and the previous identity in that case.
+func identityPointerReadbackMatches(dir string, pointer deviceIdentityPointer) bool {
+	want, err := json.MarshalIndent(pointer, "", "  ")
+	if err != nil {
+		return false
 	}
-	return os.Rename(tmp, filepath.Join(dir, renewalPointerFile))
+	got, err := os.ReadFile(filepath.Join(dir, renewalPointerFile))
+	return err == nil && bytes.Equal(got, want)
+}
+
+// classifyIdentityPointerWrite separates a failed STAGING/replace from a replacement whose directory flush
+// failed after publication. In the latter case material must be retained even if readback is unavailable or
+// another writer changed the pointer: publication may already have occurred.
+func classifyIdentityPointerWrite(dir string, pointer deviceIdentityPointer, writeErr error) (visible, mayBePublished bool) {
+	if !errors.Is(writeErr, durablefile.ErrReplacedNotFlushed) {
+		return false, false
+	}
+	return identityPointerReadbackMatches(dir, pointer), true
 }

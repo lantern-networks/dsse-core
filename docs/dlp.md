@@ -35,6 +35,15 @@ The browser's regex preview uses JavaScript and is only a convenience. Test the 
 classifier through the Edge. Pattern or checksum matches do not establish that a number
 was issued, that a credential is live, or that all sensitive information was found.
 
+Custom regex classifiers must have a finite maximum match of at most 512 UTF-8 bytes.
+The server rejects unbounded repetition (`*`, `+`, `{n,}`), longer bounded matches,
+and text, line, or word-boundary assertions such as `^`, `$`, `\A`, `\z`, `\b`, and
+`\B`. A streaming scan advances its window through the upload; accepting those
+patterns would silently miss an overlong secret or reinterpret an internal window
+boundary as the start or end of the upload. This is a detection correctness limit,
+not a traffic throughput quota. Use bounded expressions or keyword classifiers,
+and verify a matching upload through the Edge before enabling Block or Authenticate.
+
 EDM values reach the administration service in plaintext during submission; the dataset
 store retains tenant-salted hashes rather than the source values. Protect the upload,
 hashing configuration, stored hashes, and backups. Hashing is not a promise of anonymity.
@@ -210,13 +219,25 @@ The DLP `authenticate` response does not itself start the East-West OOB ceremony
 promise automatic replay of the upload. See [East-West step-up](east-west-policy.md)
 for that separate workflow.
 
-The default instance scope is **any**. **Corporate** and **personal** scopes classify the
-account email available in the egress decision against the organization's IdP verified
-domains. Without an account signal or configured domains, the class is unknown and
-neither scoped rule applies. Keep an `any` rule when unknown accounts must remain covered;
-a destination hostname alone does not establish its signed-in account.
+The default instance scope is **any**. **Corporate** and **personal** scopes can exclude an
+account only when its destination-bound identity has been independently verified. An
+unknown account matches **both** scopes, including when tokens or organization domains
+are missing. This retains the configured inspection and action; unknown identity alone
+does not block an upload whose content does not trigger the rule.
+
+The current SWG extracts account hints from request Bearer tokens and cookies for
+visibility, without verifying the SaaS signature, issuer, audience or destination binding.
+It therefore treats the destination account as unknown for DLP: corporate and personal
+rules both apply to their matched destinations. A configured company domain, authenticated
+DSSE tenant/user/device, or a destination hostname does not prove the receiving SaaS
+account. Verified corporate-account exemptions are not currently implemented. Account
+hints in decision metadata carry `ai_identity_trust=unverified_request_hint`; DLP events
+carry `dlp_account_trust` and the findings API returns `account_trust` with the same value.
+Historical account hints are also unverified. None is verified account evidence.
 
 Optional composite DLP conditions can raise device risk after a pattern of detections.
+Their personal/outside destination filter also includes unverified accounts; the configured
+count, diversity, destination and time-window requirements still apply.
 Subsequent risk-based access policy determines the consequence; recording risk does not
 by itself mean every future connection is blocked.
 
@@ -227,11 +248,59 @@ The guard withholds the detection window, but earlier cleared bytes may already 
 reached the destination. A blocked streaming request is not an atomic rollback of the
 whole upload; confirm receiver-side behavior for the application you intend to protect.
 
+Streaming guards have enabled-by-default protection for undecided body retention:
+
+| Edge startup setting | Default | Scope |
+|---|---:|---|
+| `-dlp-retention-per-stream-bytes` | 67108864 (64 MiB) | One guarded upload |
+| `-dlp-retention-process-bytes` | 536870912 (512 MiB) | All guarded uploads in one Edge process, across tenants and ingress paths |
+
+`0` selects the corresponding protected default; it does not disable protection.
+Negative values, a per-upload value below 512 KiB, or a process value smaller than
+the per-upload value are rejected at startup. These are resource protections, not
+limits on total transferred bytes, connection count, bandwidth, or session lifetime.
+A long upload whose undecided portion stays small can exceed 64 MiB in total.
+The defaults allow a substantial unresolved value while bounding one upload's
+resource consumption and the combined impact of concurrent uploads. Administrators
+can adjust both to the capacity and concurrency of each Edge node.
+
+Each active guard reserves 512 KiB for bounded body working buffers, in addition to
+the actual encrypted spill bytes. Every spill frame includes its header and
+authentication tag: 40 bytes beyond its plaintext payload. Consumed frames remain
+charged until in-place compaction and truncation succeed. Allocation is reserved
+before writing; an upload that cannot obtain its reservation is refused before its
+undecided bytes are forwarded. Other uploads can continue within their reservations.
+These amounts do not bound classifier metadata, the process's total memory usage,
+the Observe scanner, or Office/PDF/multipart extraction described below.
+
+Normal EOF, detection refusal, resource refusal, source errors, and explicit Close
+release the guard's buffers and confirmed reclaimed spill bytes. Callers that stop
+reading early must close the body; the Edge handler owns that cleanup. Spill files
+are unlinked before storing data on Linux/macOS, and use OS delete-on-close on
+Windows, so abrupt process exit does not leave body files. Windows may leave an
+empty private temporary directory after abrupt exit. No named-file fallback is
+used when these protections are unavailable. If file reclamation cannot be confirmed,
+the reservation stays charged and appears as unreleased bytes; it is not made
+available to other uploads.
+
+The effective settings are logged at startup. Deployment operators with fleet
+configuration read access can inspect `GET /admin/dlp-retention-status` for the
+effective limits, reserved bytes, active guards, and unreleased bytes on that Edge
+process. These settings are not tenant DLP rules.
+
+Resource refusal records `dlp_inspection_resource_exhausted`, without claiming a
+secret was detected or requesting another identity check. If response headers have
+not yet been sent, the Edge returns 403 with an inspection-resource explanation.
+An upstream service can send an early response while an upload is still in progress;
+if the resource limit is reached later, the guard still stops undecided bytes and
+records the refusal, but cannot replace response headers already sent to the client.
+
 Recognized Office Open XML, PDF, and multipart uploads use bounded buffering and text
 extraction. This is not OCR or complete inspection of arbitrary archives, binary formats,
 embedded objects, or every part of an encrypted document. Extraction and size limits
-can leave content unexamined. Multipart extraction can skip unsupported or failed parts
-while inspecting other parts, so a partly inspected upload is not proof of full coverage.
+can leave content unexamined. Malformed multipart data, failed extraction of a recognized
+part, and extraction-budget exhaustion are reported as inspection failures. Unsupported
+binary parts can still be skipped, so inspecting other parts is not proof of full coverage.
 
 The default `-dlp-block-uninspectable-files=false` forwards oversized buffered files and
 files whose extraction fails, with service-log warnings. Setting it to `true` blocks

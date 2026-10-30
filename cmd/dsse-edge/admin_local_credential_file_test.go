@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -154,6 +155,42 @@ func TestLocalCredentialFilePersistenceEmptyAndParse(t *testing.T) {
 	}
 	if _, err := newFileCredentialPersistence(corruptPath).LoadAll(ctx); err == nil {
 		t.Fatalf("corrupt snapshot must fail closed, got nil error")
+	}
+}
+
+func TestLocalCredentialFilePersistenceRejectsNullAndDuplicateAccounts(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "creds.json")
+	store := newFileCredentialPersistence(path)
+	if err := store.Upsert(ctx, newTestFileCredential()); err != nil {
+		t.Fatal(err)
+	}
+	first, err := credentialToPersisted(newTestFileCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.Email = " ADMIN@example.com "
+	second.TenantID = "another_tenant"
+	duplicate, err := json.Marshal([]persistedCredential{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sample := range []struct {
+		name string
+		data []byte
+	}{{"null", []byte("null")}, {"duplicate", duplicate}} {
+		t.Run(sample.name, func(t *testing.T) {
+			if err := os.WriteFile(path, sample.data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.LoadAll(ctx); err == nil {
+				t.Fatal("invalid credential snapshot accepted as an empty or ambiguous account set")
+			}
+			if len(store.byEmail) != 1 {
+				t.Fatal("failed reload discarded the last confirmed credentials")
+			}
+		})
 	}
 }
 

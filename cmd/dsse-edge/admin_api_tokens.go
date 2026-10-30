@@ -252,7 +252,10 @@ func publicAdminAPITokens(tokens []adminAPIToken) []adminAPITokenResponse {
 
 const defaultAdminAPITokenRole = "auditor"
 
-var adminAPITokenAssignableRoles = []string{"admin", "tenant_admin", "analyst", "approver", "auditor", "super_admin"}
+// Advertise only roles the token validator can issue and RBAC can authorize.
+// tenant_admin is not a defined role; listing it made the Console offer a
+// credential that POST /admin/api-tokens always rejects.
+var adminAPITokenAssignableRoles = []string{"admin", "analyst", "approver", "auditor", "super_admin"}
 
 func adminAPITokenCreateAuthAllowed(identity adminIdentity) bool {
 	return identity.AuthMethod != "admin_api_token"

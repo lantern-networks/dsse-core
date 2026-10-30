@@ -26,7 +26,7 @@ func TestDeviceGroupVisibleToTenant(t *testing.T) {
 		want         bool
 	}{
 		{"same tenant is visible", "acme", "acme", true},
-		{"case-insensitive tenant match", "ACME", "acme", true},
+		{"case-distinct tenant is isolated", "ACME", "acme", false},
 		{"different non-empty tenants are isolated", "acme", "globex", false},
 		// The boundary this test exists for, and the one it used to assert the opposite of.
 		{"an object in NO tenant belongs to no tenant's admin", "", "acme", false},

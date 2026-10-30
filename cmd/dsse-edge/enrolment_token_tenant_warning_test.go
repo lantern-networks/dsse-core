@@ -35,9 +35,9 @@ func TestATokenForAnOrganizationThisNodeDoesNotEnrolForSaysSo(t *testing.T) {
 	if w := enrolmentTokenTenantWarning("tenant_reference_lab", "tenant_reference_lab", true, false); w != "" {
 		t.Fatalf("a usable token must not be warned about: %q", w)
 	}
-	// Case-insensitively, like every other tenant comparison on this path.
-	if w := enrolmentTokenTenantWarning("Tenant_Reference_Lab", "tenant_reference_lab", true, false); w != "" {
-		t.Fatalf("tenant comparison must be case-insensitive here as it is in the token store: %q", w)
+	// Tenant IDs are opaque and case-distinct. This token cannot be used under the node's tenant.
+	if w := enrolmentTokenTenantWarning("Tenant_Reference_Lab", "tenant_reference_lab", true, false); w == "" {
+		t.Fatal("case-distinct tenant must be warned about before handing out an unusable token")
 	}
 	// And an unknown node tenant is not an excuse to invent a warning.
 	if w := enrolmentTokenTenantWarning("tenant_northwind", "", true, false); w != "" {
@@ -92,9 +92,9 @@ func TestTheDeploymentIsAskedWhereverThisNodeRoleKeepsTheAnswer(t *testing.T) {
 		t.Error("a control plane holding this organization's device authority answered that it cannot issue " +
 			"for it — which is the screen telling a customer their working token is refused")
 	}
-	// Case-insensitively, like every other tenant comparison on this path.
-	if !nodeIssuesDeviceIdentitiesFor(cp, "Tenant_Kaede") {
-		t.Error("tenant comparison must be case-insensitive here as it is in the token store")
+	// Tenant IDs are opaque: a case-distinct organization has no such authority.
+	if nodeIssuesDeviceIdentitiesFor(cp, "Tenant_Kaede") {
+		t.Error("another organization's authority was offered through a case alias")
 	}
 	// And somebody else's organization is still somebody else's.
 	if nodeIssuesDeviceIdentitiesFor(cp, "tenant_northwind") {

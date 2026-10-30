@@ -45,7 +45,9 @@ func TestDecryptAllEndToEnd(t *testing.T) {
 		t.Fatal("interception CA PEM not usable")
 	}
 	c, s := net.Pipe()
-	go eng.Intercept(s, interception.Route{Host: "intercept.test", Port: 443})
+	done := make(chan struct{})
+	go func() { eng.Intercept(s, interception.Route{Host: "intercept.test", Port: 443}); close(done) }()
+	defer c.Close()
 
 	tc := tls.Client(c, &tls.Config{RootCAs: pool, ServerName: "intercept.test"})
 	_ = tc.SetDeadline(time.Now().Add(10 * time.Second))
@@ -53,6 +55,11 @@ func TestDecryptAllEndToEnd(t *testing.T) {
 		t.Fatalf("inner TLS write: %v", err)
 	}
 	data, _ := io.ReadAll(tc)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("interception handler did not return after HTTP/1 connection closed")
+	}
 	if !strings.Contains(string(data), "ORIGIN-DECRYPTED-OK") {
 		t.Fatalf("decrypted forwarded response missing origin body; got %q", string(data))
 	}

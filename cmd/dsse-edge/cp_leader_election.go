@@ -52,6 +52,9 @@ type cpLeaderElector struct {
 	// Installed before Start. It refreshes shared revocation state while the
 	// advisory lock is held but /leader and administrative writes remain closed.
 	prepareLeadership func() error
+	// Installed before Start for the three-node topology. Every admitted write
+	// asks the DCS for current consensus; a still-live PG session is insufficient.
+	quorumCheck func(context.Context) error
 	// Serialize standby refreshes with the entire promotion, including publication.
 	stateRefreshMu sync.Mutex
 }
@@ -62,7 +65,7 @@ func newCPLeaderElector(dsn string) (*cpLeaderElector, error) {
 	if dsn == "" {
 		return nil, nil
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return nil, err
 	}

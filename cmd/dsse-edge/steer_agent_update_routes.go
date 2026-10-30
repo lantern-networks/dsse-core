@@ -52,8 +52,8 @@ type publishedUpdate struct {
 	Manifest agentupdate.Manifest
 	Envelope agentpolicy.Envelope
 	Source   string // the file it came from, so a wrong publication is traceable to a path
-	// TenantID is whose release this is, and it exists because the ARTIFACT is stored per tenant while this
-	// index is keyed only by platform/arch.
+	// TenantID is the exact publication scope. It selects the corresponding artifact shelf after the
+	// device's verified Tenant CA chooses its own canary or the deployment catalogue.
 	//
 	// ★ THE DEVICE ROUTE OPENED A FLAT PATH AND THE UPLOAD WROTE A TENANT ONE (2026-08-13, twenty-eighth
 	// review). Publishing succeeded, activation succeeded, every screen said active — and every device staging
@@ -62,7 +62,8 @@ type publishedUpdate struct {
 	TenantID string
 }
 
-// publishedUpdates indexes them by the only two things a device can be handed the wrong build for.
+// publishedUpdates indexes releases by tenant and target, with the pre-tenant flat key retained as a
+// read-only fallback. A device must resolve its tenant before selecting a release.
 // restart-durability: cp_durable — on an enforcing edge this is a CACHE of the control plane's published set
 // and is refilled by the first pull after a restart (agent_update_source). Where no control plane is
 // configured it is rebuilt from the local manifest directory at startup, which is the deployment that has no
@@ -81,7 +82,7 @@ type publishedUpdates struct {
 	// with nothing comparing them. That is the per-edge authored-rules defect, on the document that decides
 	// which code runs on every managed machine.
 	mu       sync.RWMutex
-	byTarget map[string]publishedUpdate // "platform/arch"
+	byTarget map[string]publishedUpdate // "tenant|platform/arch", plus catalogue and legacy target keys
 }
 
 // replace swaps the whole published set atomically. A partial set is never visible: the caller builds the new
@@ -191,6 +192,32 @@ func (p *publishedUpdates) forTarget(platform, arch string) (publishedUpdate, bo
 	return u, ok
 }
 
+// forTenantTarget resolves a device's own publication before the deployment catalogue and the
+// pre-tenant fallback. The caller must derive tenant from the verified transport, never a query.
+func (p *publishedUpdates) forTenantTarget(tenant, platform, arch string) (publishedUpdate, bool) {
+	if p == nil {
+		return publishedUpdate{}, false
+	}
+	target := updateTargetKey(platform, arch)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	for _, key := range []string{tenantTargetKey(tenant, platform, arch),
+		tenantTargetKey(agentUpdateCatalogueScope, platform, arch), target} {
+		if u, ok := p.byTarget[key]; ok {
+			return u, true
+		}
+	}
+	return publishedUpdate{}, false
+}
+
+func deviceUpdateTenantForRequest(r *http.Request, config serverConfig) (string, bool) {
+	if config.TenantCARegistry != nil {
+		return transportTenantFromRequest(r, config.TenantCARegistry)
+	}
+	// A deployment without a Tenant CA registry is the existing single-tenant installation.
+	return strings.TrimSpace(config.Evaluator.PolicyBundle.TenantID), true
+}
+
 // registerSteerAgentUpdateRoutes serves the device-facing update manifest.
 func registerSteerAgentUpdateRoutes(mux *http.ServeMux, config serverConfig) {
 	// GET /steer/agent-update-manifest?platform=windows&arch=amd64
@@ -217,7 +244,12 @@ func registerSteerAgentUpdateRoutes(mux *http.ServeMux, config serverConfig) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("platform and arch query parameters are required"))
 			return
 		}
-		u, ok := config.PublishedUpdates.forTarget(platform, arch)
+		tenant, bound := deviceUpdateTenantForRequest(r, config)
+		if !bound {
+			writeError(w, http.StatusForbidden, fmt.Errorf("the verified device certificate has no registered tenant CA"))
+			return
+		}
+		u, ok := config.PublishedUpdates.forTenantTarget(tenant, platform, arch)
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("no agent update is published for %s/%s", platform, arch))
 			return
@@ -238,10 +270,7 @@ func registerSteerAgentUpdateRoutes(mux *http.ServeMux, config serverConfig) {
 		// was found answering the bundle tenant's freeze to every fleet on the box; the same mistake here would
 		// apply the operator's pin to a customer's devices. No organization resolved means no pin applied, and
 		// the catalogue's current release is served exactly as before.
-		planTenant := ""
-		if bound, terr := authoritativeTenantForRequest(r, "", config.TenantCARegistry); terr == nil {
-			planTenant = strings.TrimSpace(bound)
-		}
+		planTenant := tenant
 		// ★★ THIS EDGE HOLDS ONE VERSION PER TARGET, and that is why a pin can only ever HOLD a fleet here, not
 		// move it backwards. The catalogue keeps the release it currently distributes; going back to a version
 		// this deployment no longer publishes would need the Edge to hold more than one, which it does not, and

@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/model"
@@ -41,6 +42,33 @@ func TestSSHToAPrivateHostIsStillLateralMovement(t *testing.T) {
 	e := Evaluator{EastWestEnabled: true}
 	if !e.isEastWestFlow(labSSH()) {
 		t.Fatal("ssh to a private address must stay on the east-west plane")
+	}
+}
+
+func TestGovernedConnectorCustomTCPUsesConnectorAccess(t *testing.T) {
+	req := model.DecisionRequest{Destination: "10.200.0.10", DestinationPort: 18082,
+		Protocol: "tcp", ConnectorRouteVerified: true}
+	if !IsEastWestFlow(req, InternalNetworks{}) {
+		t.Fatal("a governed Connector route on a custom TCP port belongs to Connector Access")
+	}
+	req.ConnectorRouteVerified = false
+	if IsEastWestFlow(req, InternalNetworks{}) {
+		t.Fatal("an unverified Connector claim must not change policy plane")
+	}
+	req.ConnectorRouteVerified = true
+	req.Destination = "93.184.215.14"
+	if !IsEastWestFlow(req, InternalNetworks{}) {
+		t.Fatal("a verified Connector route must use Connector Access even for public address space")
+	}
+}
+
+func TestClientCannotClaimVerifiedConnectorRoute(t *testing.T) {
+	var req model.DecisionRequest
+	if err := json.Unmarshal([]byte(`{"destination":"10.200.0.10","protocol":"tcp","destination_port":18082,"connector_id":"claimed","ConnectorRouteVerified":true}`), &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.ConnectorRouteVerified || IsEastWestFlow(req, InternalNetworks{}) {
+		t.Fatal("client JSON must not change policy plane")
 	}
 }
 

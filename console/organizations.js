@@ -106,7 +106,7 @@ async function renderOrgList(host) {
     el("td", {}, uiBadge(t2.status || "active", orgStatusKind(t2.status))),
     el("td", { text: t2.plan || "—" }),
     el("td", { text: t2.home_region || "—" }),
-    el("td", { class: "ui-view-desc", text: (t2.allowed_regions || []).join(", ") || "—" }),
+    el("td", { class: "ui-view-desc" }, [el("span", {text: (t2.allowed_regions || []).join(", ") || "—"}), t2.shared_fleet_warning ? el("div", {role: "status", text: sharedFleetTenantWarning(t2)}) : null].filter(Boolean)),
     // ★ THE COLUMN THAT ANSWERS "DOES IT ACTUALLY WORK". A registry row is the entrance, not the finish, and
     // this list used to show only the row: name, status, plan, regions — every one of which is true of an
     // organization that enforces nothing. Filled in per row after the table is drawn, because it asks both
@@ -145,14 +145,15 @@ function openOrgForm(content, existing) {
   const regionsF = uiField({ name: "regions", label: bl({ en: "Allowed regions (optional)", ja: "許可リージョン(任意)" }), value: existing ? (existing.allowed_regions || []).join(", ") : "", placeholder: "region-a, region-b", hint: bl({ en: "Comma-separated.", ja: "カンマ区切り。" }) });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: existing ? bl({ en: "Save changes", ja: "保存" }) : bl({ en: "Add tenant", ja: "テナントを追加" }) });
   const m = uiModal({ title: existing ? bl({ en: "Edit tenant", ja: "テナントを編集" }) : bl({ en: "Add a tenant", ja: "テナントを追加" }),
-    body: [idF.el, nameF.el, statusF.el, planF.el, homeF.el, regionsF.el],
+    body: [idF.el, nameF.el, statusF.el, planF.el, homeF.el, regionsF.el, existing?.shared_fleet_warning ? el("p", {role: "status", text: sharedFleetTenantWarning(existing)}) : null].filter(Boolean),
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
     if (!idF.validate() || !nameF.validate()) return;
     submit.disabled = true;
     const regions = regionsF.get().split(",").map((s) => s.trim()).filter(Boolean);
     try {
-      const r = await apiFetch("POST", "/admin/tenants", { tenant_id: idF.get(), display_name: nameF.get(), status: statusF.get(), plan: planF.get(), home_region: homeF.get(), allowed_regions: regions });
+      const r = await saveTenantWithFleetConfirmation("/admin/tenants", { tenant_id: idF.get(), display_name: nameF.get(), status: statusF.get(), plan: planF.get(), home_region: homeF.get(), allowed_regions: regions });
+      if (r.cancelled) {submit.disabled = false; return;}
       if (!r.ok) { submit.disabled = false; const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status); idF.setError(msg); uiToast(msg, "err"); return; }
       m.close(); uiToast(existing ? bl({ en: "Tenant saved.", ja: "テナントを保存しました。" }) : bl({ en: "Tenant added.", ja: "テナントを追加しました。" }), "ok");
       renderOrganizationsView(content);

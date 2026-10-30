@@ -34,6 +34,9 @@ type Store struct {
 	// Edge restart/recreate instead of being wiped (they used to be in-memory only, so the Networks catalog went
 	// empty on every rebuild). Nil = in-memory only.
 	persister blobstore.Persister
+	// A failed file save may have replaced the file before durability could be
+	// confirmed. A later no-op must still confirm the accepted live snapshot.
+	persistenceDirty bool
 }
 
 // vlanPersistSnapshot is the on-disk shape: the full object + policy sets.
@@ -66,6 +69,7 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	defer s.mu.Unlock()
 	if p == nil {
 		s.persister = nil
+		s.persistenceDirty = false
 		return nil
 	}
 	data, err := p.Load()
@@ -80,6 +84,7 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		s.adoptLocked(snap)
 	}
 	s.persister = p
+	s.persistenceDirty = false
 	return nil
 }
 
@@ -102,9 +107,11 @@ func (s *Store) saveCandidateLocked(objects map[string]model.VLANObject, policie
 		err = s.persister.Save(data)
 	}
 	if err != nil && !(errors.Is(err, blobstore.ErrSavedWithoutAtomicity) && !errors.Is(err, blobstore.ErrDurabilityUnconfirmed)) {
+		s.persistenceDirty = true
 		s.reportPersistError(err)
 		return fmt.Errorf("%w: %v", ErrPersistence, err)
 	}
+	s.persistenceDirty = false
 	return nil
 }
 
@@ -360,12 +367,12 @@ func (s *Store) CountForTenant(tenantID string) (objects int, policies int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, o := range s.objects {
-		if strings.EqualFold(strings.TrimSpace(o.TenantID), tenantID) {
+		if strings.TrimSpace(o.TenantID) == tenantID {
 			objects++
 		}
 	}
 	for _, p := range s.policies {
-		if strings.EqualFold(strings.TrimSpace(p.TenantID), tenantID) {
+		if strings.TrimSpace(p.TenantID) == tenantID {
 			policies++
 		}
 	}
@@ -399,13 +406,13 @@ func (s *Store) RemoveTenantContext(ctx context.Context, tenantID string) (objec
 	defer s.mu.Unlock()
 	err = s.mutateLocked(ctx, func(snap *vlanPersistSnapshot) error {
 		for id, o := range snap.Objects {
-			if strings.EqualFold(strings.TrimSpace(o.TenantID), tenantID) {
+			if strings.TrimSpace(o.TenantID) == tenantID {
 				delete(snap.Objects, id)
 				objects++
 			}
 		}
 		for id, p := range snap.Policies {
-			if strings.EqualFold(strings.TrimSpace(p.TenantID), tenantID) {
+			if strings.TrimSpace(p.TenantID) == tenantID {
 				delete(snap.Policies, id)
 				policies++
 			}

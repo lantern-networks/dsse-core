@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -72,7 +73,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 	// question this whole area exists to make answerable — an Edge could read as current against one and
 	// lagging against the other, and neither reader would know a rival definition existed.
 	applicationState := &applicationBundleState{}
-	baseBundleGeneration := func() (uint64, string) {
+	baseBundleGeneration := func(ctx context.Context) (uint64, string, error) {
 		var connectorGen, nhiGen, delegatedGrantGen, ruleGen uint64
 		// Asked for by the METHOD, not by the store's type. See postgresConnectorRegistryStore.ConfigGeneration:
 		// this term was read from the in-memory registry by concrete type, so it went silently to zero the
@@ -171,11 +172,21 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// contributed 0 in silence — see adminSiteStore.ConfigGeneration.
 		var siteGen uint64
 		if config.SiteStore != nil {
-			siteGen = config.SiteStore.ConfigGeneration()
+			if checked, ok := config.SiteStore.(interface {
+				ConfigGenerationChecked(context.Context) (uint64, error)
+			}); ok {
+				var err error
+				siteGen, err = checked.ConfigGenerationChecked(ctx)
+				if err != nil {
+					return 0, "", fmt.Errorf("site configuration generation unavailable: %w", err)
+				}
+			} else {
+				siteGen = config.SiteStore.ConfigGeneration()
+			}
 		}
 		return policyStore.ConfigGeneration() + edgeDNSResolver.ConfigGeneration() + config.EnrolledLedger.ConfigGeneration() +
 			vlanBoundary.ConfigGeneration() + connectorGen + connectorRouteGov.ConfigGeneration() + nhiGen + delegatedGrantGen + ruleGen +
-			tenantGen + directoryGen + siteGen + postureGen + deviceCAGen + transportTrustGen + regionGen + licenceGen + config.DLPDistribution.Generation(), configBundleEpoch
+			tenantGen + directoryGen + siteGen + postureGen + deviceCAGen + transportTrustGen + regionGen + licenceGen + config.DLPDistribution.Generation(), configBundleEpoch, nil
 	}
 	bundleGeneration = func() (uint64, string, error) {
 		if assetStore != nil {
@@ -189,11 +200,22 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		if err != nil {
 			return 0, "", err
 		}
-		base, epoch := baseBundleGeneration()
+		base, epoch, err := baseBundleGeneration(ctx)
+		if err != nil {
+			return 0, "", err
+		}
 		return base + catalogGeneration, epoch, nil
 	}
+	registerGrantBundlePages(mux, adminEndpoint, theGrantStore.Load, config.AgentPolicySigner, configBundleEpoch, config.OperatorTenantID, edgeIsControlPlane)
 
 	mux.HandleFunc("GET /admin/config-bundle", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeFleetConfigurationRead(w, r, config.OperatorTenantID) {
+			return
+		}
+		if protocol := r.URL.Query().Get("grant_pages"); protocol != "" && protocol != grantPageProtocol {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("unsupported grant page protocol"))
+			return
+		}
 		// ★★★ NOT FROM A STANDBY. See the_bundle_is_the_leaders_instruction.go: measured with two Edges of one
 		// region applying generations 13 and 8 while both polled in the same second.
 		if configBundleRefusedOnAStandby(w) {
@@ -220,7 +242,8 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusServiceUnavailable, errors.New("configuration authority cannot be refreshed"))
 			return
 		}
-		if err := theGrantStore.Load().RefreshShared(); err != nil {
+		grantGenerationBefore, err := theGrantStore.Load().SnapshotGenerationChecked()
+		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, errors.New("configuration authority cannot be refreshed"))
 			return
 		}
@@ -253,6 +276,23 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			return
 		}
 		tenantID := adminTenantIDFromRequest(r)
+		// Capture the aggregate before reading any section. Taking it only after
+		// tenant/directory reads could label an older snapshot with a newer
+		// generation if a write races the bundle assembly.
+		baseGenerationBefore, _, err := baseBundleGeneration(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("configuration generation cannot be read; retry"))
+			return
+		}
+		// An Edge only applies a newer bundle generation. If a catalog read
+		// fails, publishing that generation with missing tenants or identities
+		// can leave the omitted records absent until some unrelated change.
+		bundleTenants, err := listBundleTenantModels(r.Context(), tenantModelStore)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant catalog cannot be read; retry"))
+			return
+		}
+		directoryTenants := directoryBundleTenantsFromModels(tenantID, bundleTenants)
 		// The runtime policy store can change while a bundle is assembled. If its
 		// generation changes between reading the posture and assigning the bundle
 		// generation, an Edge can accept an intermediate east-west mode under the
@@ -279,7 +319,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			// DNS resolver + Enrolled Inventory ledger + VLAN boundary store + connector catalog. All counters
 			// are monotonic, so the sum is monotonic and advances on ANY distributed-config change, triggering
 			// an Edge re-pull.
-			Generation:   generationOnly(baseBundleGeneration) + catalogGeneration,
+			Generation:   baseGenerationBefore + catalogGeneration,
 			Epoch:        configBundleEpoch,
 			Policies:     policyStore.Snapshot(tenantID),
 			TenantConfig: &tenantConfig,
@@ -324,23 +364,37 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// The tenant model, with the control plane as the authority. Served only when this node can actually
 		// enumerate tenants — a narrow store would otherwise publish an empty set, which the receiving side
 		// correctly refuses to act on but which is still a bundle claiming something it does not know.
-		if adminStore, ok := tenantModelStore.(adminTenantModelAdminStore); ok {
-			if tenants, err := adminStore.List(r.Context()); err == nil {
-				section := &tenantModelBundle{Tenants: tenants}
-				// Carry the deletions and the standing erasure orders. Without the deletions a delete on the
-				// control plane reached no Edge at all, because the section UPSERTs and nothing in it can express
-				// "this one is gone"; without the orders a node that has not yet erased a terminated tenant is
-				// never told, since the order is the only thing that ever tells it.
-				//
-				// ★ ONE ASSERTION FOR BOTH, AND IT IS REPORTED WHEN IT FAILS (2026-08-18). These were two separate
-				// anonymous-interface assertions, and the Postgres backend satisfied the second one never — so a
-				// production control plane published a bundle whose erasure orders were silently always empty.
-				if carrier, ok := tenantModelFleetCarrier(adminStore); ok {
-					section.Deleted = carrier.DeletedTenants()
-					section.PurgeOrders = carrier.PurgeOrders()
-				}
-				bundle.Tenants = section
+		if adminStore, ok := tenantModelStore.(adminTenantModelAdminStore); ok && adminStore != nil {
+			section := &tenantModelBundle{Tenants: bundleTenants}
+			// Carry the deletions and the standing erasure orders. Without the deletions a delete on the
+			// control plane reached no Edge at all, because the section UPSERTs and nothing in it can express
+			// "this one is gone"; without the orders a node that has not yet erased a terminated tenant is
+			// never told, since the order is the only thing that ever tells it.
+			//
+			// ★ ONE ASSERTION FOR BOTH, AND IT IS REPORTED WHEN IT FAILS (2026-08-18). These were two separate
+			// anonymous-interface assertions, and the Postgres backend satisfied the second one never — so a
+			// production control plane published a bundle whose erasure orders were silently always empty.
+			carrier, ok := tenantModelFleetCarrier(adminStore)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant fleet history is unavailable; retry"))
+				return
 			}
+			reader, ok := carrier.(adminTenantModelFleetReader)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant fleet history cannot be read; retry"))
+				return
+			}
+			section.Deleted, err = reader.DeletedTenantsChecked(r.Context())
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant deletion history cannot be read; retry"))
+				return
+			}
+			section.PurgeOrders, err = reader.PurgeOrdersChecked(r.Context())
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant erasure orders cannot be read; retry"))
+				return
+			}
+			bundle.Tenants = section
 		}
 		if vlanBoundary != nil {
 			// Complete only when this node's own store is DURABLE: an in-memory control plane that has just
@@ -376,9 +430,12 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// agent governance authored on the control plane reaches enforcing Edges. Present-but-empty stays lockout-
 		// safe on the Edge (apply keeps a non-empty local set). Guarded for nil stores.
 		if nonHumanIdentities != nil {
-			if identities, err := nonHumanIdentities.List(r.Context(), tenantID); err == nil {
-				bundle.NHI = &nonHumanIdentityBundle{Identities: identities}
+			identities, err := nonHumanIdentities.List(r.Context(), tenantID)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("non-human identity registry cannot be read; retry"))
+				return
 			}
+			bundle.NHI = &nonHumanIdentityBundle{Identities: identities}
 		}
 		// The people DIRECTORY, for the tenant this bundle is for. Measured absent before this existed: the
 		// control plane held 90 identities for the lab tenant and both enforcing Edges held zero, so every
@@ -391,13 +448,19 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// the caller's identity and a tenant_id parameter is ignored — so distribution is not disclosure.
 		if carrier, ok := humanIdentityDirectoryCarrier(humanIdentities); ok {
 			section := &humanIdentityBundle{Identities: []model.HumanIdentity{}}
-			for _, directoryTenant := range directoryBundleTenants(r.Context(), tenantModelStore, tenantID) {
-				if identities, err := carrier.List(r.Context(), directoryTenant); err == nil {
-					section.Identities = append(section.Identities, identities...)
+			for _, directoryTenant := range directoryTenants {
+				identities, err := carrier.List(r.Context(), directoryTenant)
+				if err != nil {
+					writeError(w, http.StatusServiceUnavailable, fmt.Errorf("people directory cannot be read; retry"))
+					return
 				}
-				if policies, err := carrier.ListSourcePolicies(r.Context(), directoryTenant); err == nil {
-					section.SourcePolicies = append(section.SourcePolicies, policies...)
+				section.Identities = append(section.Identities, identities...)
+				policies, err := carrier.ListSourcePolicies(r.Context(), directoryTenant)
+				if err != nil {
+					writeError(w, http.StatusServiceUnavailable, fmt.Errorf("directory source policies cannot be read; retry"))
+					return
 				}
+				section.SourcePolicies = append(section.SourcePolicies, policies...)
 			}
 			bundle.HumanIdentities = section
 		}
@@ -446,8 +509,20 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("identity provider settings changed or could not be read; retry"))
 				return
 			}
-			// What the fleet has already approved out of band. See config_bundle_grants.go.
-			bundle.Grants = grantBundleSection(theGrantStore.Load())
+			// A current Edge asks for bounded, signed pages. Keep the inline section for
+			// older Edges and unsigned development deployments.
+			if r.URL.Query().Get("grant_pages") == grantPageProtocol && config.AgentPolicySigner != nil {
+				bundle.GrantPages = &grantBundleReference{Protocol: grantPageProtocol, Epoch: configBundleEpoch, Generation: grantGenerationBefore}
+			} else {
+				bundle.Grants = grantBundleSection(theGrantStore.Load())
+			}
+			var rolloutErr error
+			bundle.AuthRollout, rolloutErr = theAuthRollout.Load().distribution(time.Now())
+			if rolloutErr != nil {
+				log.Printf("authentication_rollout_distribution status=unavailable")
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("authentication rollout cannot be read; retry"))
+				return
+			}
 		}
 		bundle.RegionEndpoints = regionEndpointBundleSection(edgeIsControlPlane, regionMap.Catalog())
 		bundle.InspectionPosture = inspectionPostureBundleSection(config.InspectionPosture)
@@ -455,8 +530,7 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// this it went no further than the node it was applied to, and an Edge given vendor keys refused every
 		// enrolment in the deployment.
 		bundle.Licence = licenceBundleSection(config.VendorLicense)
-		bundle.Sites = siteBundleSection(r.Context(), config.SiteStore,
-			directoryBundleTenants(r.Context(), tenantModelStore, tenantID))
+		bundle.Sites = siteBundleSection(r.Context(), config.SiteStore, directoryTenants)
 		// ★ Served for EVERY tenant, not the requesting one. The rest of this bundle is tenant-scoped because
 		// each Edge pulls on behalf of the tenant it enforces; rules are not, because the fleet requirement is
 		// that all Edges hold the same authored configuration for all tenants. A tenant-scoped rule section
@@ -473,6 +547,17 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		// SIGN the bundle with the shared agent-policy Ed25519 key so a PULLING Edge can verify it and reject a
 		// tampered/forged config (a compromised CP or stolen bearer token must not push arbitrary policy). An Edge
 		// that pins the key requires this signature (fail-closed). No signer configured = serve unsigned (lab).
+		// Grants have an independently versioned, immutable response stream. A
+		// login racing this configuration snapshot must not block policy delivery.
+		baseGenerationAfter, _, err := baseBundleGeneration(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("configuration generation cannot be read; retry"))
+			return
+		}
+		if baseGenerationAfter != baseGenerationBefore {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("configuration changed while preparing the bundle; retry"))
+			return
+		}
 		if config.AgentPolicySigner != nil {
 			env, serr := config.AgentPolicySigner.Sign(bundle, time.Now())
 			if serr != nil {
@@ -526,6 +611,24 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusConflict, fmt.Errorf("policy status toggle is not supported on this edge"))
 			return
 		}
+		if status == "active" {
+			candidate, exists, err := policyStore.Get(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"))
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
+				return
+			}
+			if exists && candidate.Action.Decision == "require_reauthentication" {
+				if err := validateAuthPolicyRequirements(theIdPRegistry.Load(), adminTenantIDFromRequest(r), candidate.Metadata); err != nil {
+					writeError(w, http.StatusUnprocessableEntity, err)
+					return
+				}
+				candidate.Status = "active"
+				if err := validateRequestBoundPolicyTransport(candidate); err != nil {
+					writeError(w, http.StatusUnprocessableEntity, err)
+					return
+				}
+			}
+		}
 		found, err := concrete.SetPolicyStatusContext(r.Context(), adminTenantIDFromRequest(r), r.PathValue("policy_id"), status)
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, policystore.ErrPolicyPersistence)
@@ -555,6 +658,16 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		}
 		now := time.Now()
 		tenantID := adminTenantIDFromRequest(r)
+		if policy.Status != "disabled" && policy.Action.Decision == "require_reauthentication" {
+			if err := validateAuthPolicyRequirements(theIdPRegistry.Load(), tenantID, policy.Metadata); err != nil {
+				writeError(w, http.StatusUnprocessableEntity, err)
+				return
+			}
+			if err := validateRequestBoundPolicyTransport(policy); err != nil {
+				writeError(w, http.StatusUnprocessableEntity, err)
+				return
+			}
+		}
 		created, err := policyStore.Upsert(r.Context(), policy, tenantID, now)
 		if err != nil {
 			if errors.Is(err, policystore.ErrPolicyPersistence) {
@@ -604,11 +717,4 @@ func registerPolicyAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		})
 	}))
 	return bundleGeneration
-}
-
-// generationOnly drops the epoch from the shared generation function, for the one caller that only needs the
-// number. Named rather than inlined so the shared function keeps a single call shape.
-func generationOnly(f func() (uint64, string)) uint64 {
-	g, _ := f()
-	return g
 }

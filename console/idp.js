@@ -16,12 +16,18 @@ let _idpSearch = "";
 
 function idpObject(v) { return v !== null && typeof v === "object" && !Array.isArray(v); }
 function idpText(v) { return typeof v === "string" && v.trim() !== ""; }
+function idpBindingRows(c) { return (c?.device_user_bindings || []).map(b => ({device_id:b.device_id,os_principal:b.os_principal,subject:b.subject})); }
+function idpObservedTime(value) { try { return value ? window.dsseFormatTime(value) : ""; } catch (_) { return ""; } }
+function idpBindingKey(b) { return [b.device_id,b.os_principal,b.subject].join("\u0000"); }
+function idpBindingsEqual(a,b) { return JSON.stringify(a.map(idpBindingKey).sort()) === JSON.stringify(b.map(idpBindingKey).sort()); }
 function idpConnection(c) {
   return idpObject(c) && ["idp_id", "tenant_id", "issuer", "authorization_endpoint", "client_id"].every(k => idpText(c[k])) &&
     /^[A-Za-z0-9_-]+$/.test(c.idp_id) && ["oidc","entra","google","okta"].includes(c.type) &&
     ["email_domain","google_hd"].includes(c.domain_mode) && !c.client_secret &&
     ["display_name","jwks_uri","token_endpoint","groups_claim","acr_claim","amr_claim","hosted_domain_claim","ca_pem"].every(k => c[k] == null || typeof c[k] === "string") &&
-    (c.use_pkce == null || typeof c.use_pkce === "boolean") && (c.verified_domains == null || (Array.isArray(c.verified_domains) && c.verified_domains.every(idpText)));
+    (c.use_pkce == null || typeof c.use_pkce === "boolean") && (c.verified_domains == null || (Array.isArray(c.verified_domains) && c.verified_domains.every(idpText))) &&
+    (c.device_user_bindings == null || (Array.isArray(c.device_user_bindings) && c.device_user_bindings.every(b => idpObject(b) &&
+      ["device_id","os_principal","subject"].every(k => idpText(b[k])) && /^[0-9a-f]{64}$/.test(b.revision))));
 }
 function idpError(r) { return r?.body?.error || r?.body?.message || ("HTTP " + (r?.status || "unknown")); }
 function idpUncertain() { return bl({en:"The provider change could not be confirmed and may already be applied. Reload before retrying.",ja:"プロバイダの変更結果を確認できません。反映済みの可能性があるため、再読込してから再試行してください。"}); }
@@ -37,12 +43,39 @@ async function idpGet(path) {
   if (!r.ok) throw new Error(idpError(r));
   return r.body;
 }
-function idpConfirmConnection(r, expected) {
+// Candidate lists are hints for an explicit administrator decision. The
+// directory source must match this provider; an email match or first login is
+// never enough to assert that its subject is the provider's OIDC sub.
+async function idpAssignmentCandidates(tenant, provider) {
+  const observed = await idpGet("/admin/auth-observed-accounts");
+  if (!idpObject(observed) || observed.tenant_id !== tenant || !Array.isArray(observed.accounts)) throw new Error("Invalid observed accounts");
+  const accounts = observed.accounts.filter(a => idpObject(a) && idpText(a.device_id) && idpText(a.display_name) &&
+    typeof a.os_principal === "string" && /^(windows:S-1-[0-9-]+|macos:[0-9a-f-]{36})$/.test(a.os_principal));
+  const people = [], seen = new Set();
+  let cursor = "";
+  for (let page = 0; page < 100; page++) {
+    const path = "/admin/human-identities?source=" + encodeURIComponent(provider) + "&status=active" +
+      (cursor ? "&cursor=" + encodeURIComponent(cursor) : "");
+    const body = await idpGet(path);
+    if (!idpObject(body) || body.tenant_id !== tenant || !Array.isArray(body.identities)) throw new Error("Invalid identity directory");
+    for (const person of body.identities) {
+      if (!idpObject(person) || person.tenant_id !== tenant || person.source !== provider || person.status !== "active" || !idpText(person.subject)) throw new Error("Invalid identity directory");
+      people.push(person);
+    }
+    if (body.next_cursor == null || body.next_cursor === "") return {accounts, people, fleetWide:observed.fleet_wide === true};
+    if (typeof body.next_cursor !== "string" || seen.has(body.next_cursor)) throw new Error("Invalid identity directory cursor");
+    cursor = body.next_cursor;
+    seen.add(cursor);
+  }
+  throw new Error("Identity directory has too many pages");
+}
+function idpConfirmConnection(r, expected, expectedBindings = []) {
   if (!r?.ok) throw new Error(idpError(r));
   const c = r.body;
   const keys = ["idp_id","tenant_id","type","display_name","issuer","authorization_endpoint","token_endpoint","jwks_uri","client_id","domain_mode","acr_claim","amr_claim","groups_claim","hosted_domain_claim","ca_pem"];
   if (!idpConnection(c) || keys.some(k => (c[k] || "") !== (expected[k] || "")) || !!c.use_pkce !== !!expected.use_pkce ||
-      JSON.stringify(c.verified_domains || []) !== JSON.stringify(expected.verified_domains || [])) throw new Error(idpUncertain());
+      JSON.stringify(c.verified_domains || []) !== JSON.stringify(expected.verified_domains || []) ||
+      !idpBindingsEqual(idpBindingRows(c), expectedBindings)) throw new Error(idpUncertain());
 }
 
 function idpTypeLabel(t) {
@@ -118,6 +151,7 @@ async function renderIdPList(host) {
     const isDefault = c.idp_id === defaultID;
     const nameCell = [el("strong", { text: c.display_name || c.idp_id }), el("div", { class: "ui-view-desc" }, el("code", { text: c.idp_id }))];
     if (isDefault) nameCell.splice(1, 0, document.createTextNode(" "), uiBadge(bl({ en: "Default", ja: "既定" }), "ok"));
+    if (c.device_user_bindings?.length) nameCell.push(el("div",{class:"ui-view-desc",text:c.device_user_bindings.length+bl({en:" device users assigned",ja:" 件の端末利用者を割当"})}));
     const actions = [];
     if (!isDefault) actions.push(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Set default", ja: "既定にする" }), disabled:content.__idpPending ? true : null, onClick: () => setIdpDefault(c, host) }), document.createTextNode(" "));
     actions.push(
@@ -252,6 +286,63 @@ function openIdpForm(content, existing) {
     hint: bl({ en: "Only for a provider inside your own network. Paste the certificate of whoever issues its TLS certificate. Blank means it is one the public internet already trusts, which is the case for Entra, Okta and Google.",
                ja: "社内にあるプロバイダのときだけ。その TLS 証明書を発行している側の証明書を貼ってください。空欄なら、インターネットが既に信頼している発行元だという意味です(Entra・Okta・Google はこちら)。" }) });
 
+  // These are explicit operator assignments. The browser's first sign-in,
+  // email address and endpoint display name must never become an assignment.
+  const bindingsHost = el("div", {});
+  const guidedHost = el("div", {});
+  const bindingRows = [];
+  const addBindingRow = (binding = {}) => {
+    const device = uiField({name:"binding-device",label:bl({en:"Device ID",ja:"端末ID"}),required:true,value:binding.device_id || ""});
+    const principal = uiField({name:"binding-principal",label:bl({en:"OS account ID",ja:"OSアカウントID"}),required:true,value:binding.os_principal || "",placeholder:"windows:S-1-5-21-… / macos:xxxxxxxx-…"});
+    const subject = uiField({name:"binding-subject",label:bl({en:"OIDC subject (sub)",ja:"OIDC subject (sub)"}),required:true,value:binding.subject || ""});
+    const row = {device,principal,subject,provider:binding.provider_id || ""};
+    const remove = el("button",{class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Remove assignment",ja:"割当を削除"}),onClick:()=>{
+      const index = bindingRows.indexOf(row);
+      if (index >= 0) bindingRows.splice(index,1);
+      bindingsHost.removeChild(item);
+    }});
+    const item = el("div",{class:"ui-card"},[device.el,principal.el,subject.el,remove]);
+    bindingRows.push(row);
+    bindingsHost.appendChild(item);
+  };
+  (existing?.device_user_bindings || []).forEach(addBindingRow);
+  const addBinding = el("button",{class:"ui-btn ui-btn-sm",text:bl({en:"Advanced: enter verified IDs",ja:"詳細: 確認済みIDを入力"}),onClick:()=>addBindingRow()});
+  let guidedPending = false;
+  const guidedButton = el("button",{class:"ui-btn ui-btn-sm",text:bl({en:"+ Choose observed account and IdP user",ja:"+ 観測した端末アカウントとIdP利用者を選択"}),onClick:async()=>{
+    if (guidedPending || pending || closed) return;
+    const provider = idF.get();
+    if (!provider) { guidedHost.textContent = bl({en:"Enter the provider ID first.",ja:"先にプロバイダIDを入力してください。"}); return; }
+    guidedPending = true;
+    guidedButton.disabled = true;
+    guidedHost.textContent = bl({en:"Loading candidates…",ja:"候補を読み込み中…"});
+    try {
+      const {accounts,people,fleetWide} = await idpAssignmentCandidates(tenant, provider);
+      if (closed) return;
+      if (idF.get() !== provider) { guidedHost.textContent = bl({en:"Provider ID changed. Load the candidates again.",ja:"プロバイダIDが変わりました。候補を読み直してください。"}); return; }
+      guidedHost.textContent = "";
+      if (!accounts.length || !people.length) {
+        guidedHost.textContent = bl({en:"No observed account or active user from this provider is available. Import its directory under the provider ID, or use the advanced verified-ID form.",ja:"観測した端末アカウント、またはこのプロバイダから取り込んだ有効な利用者がありません。プロバイダIDをsourceとして名簿を取り込むか、詳細入力を使ってください。"});
+        return;
+      }
+      const deviceChoice = uiField({name:"observed-account",label:bl({en:"Observed device account",ja:"観測した端末アカウント"}),type:"select",options:accounts.map((a,i)=>({value:String(i),label:a.display_name+" · "+a.device_id+(idpObservedTime(a.observed_at) ? " · "+idpObservedTime(a.observed_at) : "")}))});
+      const personChoice = uiField({name:"directory-person",label:bl({en:"IdP directory user",ja:"IdP名簿の利用者"}),type:"select",options:people.map((p,i)=>({value:String(i),label:(p.display_name || p.email || p.subject)+" · "+p.source}))});
+      const choose = el("button",{class:"ui-btn ui-btn-sm ui-btn-primary",text:bl({en:"Add selected assignment",ja:"選択した割当を追加"}),onClick:()=>{
+        if (pending || closed || idF.get() !== provider) return;
+        const account = accounts[Number(deviceChoice.get())], person = people[Number(personChoice.get())];
+        if (!account || !person) return;
+        addBindingRow({device_id:account.device_id,os_principal:account.os_principal,subject:person.subject,provider_id:provider});
+        guidedHost.textContent = "";
+      }});
+      guidedHost.appendChild(el("div",{class:"ui-card"},[
+        el("p",{class:"ui-view-desc",text:bl({en:"Review both identities before assigning. Observed names do not prove that they are the same person.",ja:"割当前に両者を照合してください。観測した名前だけでは同一人物の証明になりません。"})}),
+        !fleetWide ? el("p",{class:"ui-view-desc",text:bl({en:"Only local device observations are currently available.",ja:"現在はこのノードの端末観測のみ表示しています。"})}) : null,
+        deviceChoice.el,personChoice.el,choose,
+      ]));
+    } catch (_) {
+      if (!closed) guidedHost.textContent = bl({en:"Candidate lists are unavailable. No assignment was made.",ja:"候補を取得できませんでした。割当は行っていません。"});
+    } finally { guidedPending = false; guidedButton.disabled = false; }
+  }});
+
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: existing ? bl({ en: "Save changes", ja: "変更を保存" }) : bl({ en: "Add provider", ja: "プロバイダを追加" }) });
   const error = el("div", {class:"ui-field-error-msg",role:"alert",style:"display:block;white-space:pre-wrap"});
   let pending = false, closed = false, completed = false;
@@ -262,7 +353,9 @@ function openIdpForm(content, existing) {
     body: [
       idF.el, nameF.el, typeF.el, issuerF.el, authzF.el, tokenF.el, jwksF.el, clientF.el, secretF.el, domainsF.el, domainModeF.el, pkceF.el,
       el("p", { class: "ui-view-desc", text: bl({ en: "Advanced claim mapping", ja: "詳細: クレームマッピング" }) }),
-      acrF.el, amrF.el, groupsF.el, hdF.el, caF.el, error,
+      acrF.el, amrF.el, groupsF.el, hdF.el, caF.el,
+      el("p", { class: "ui-view-desc", text: bl({en:"Device users are assigned to an exact OIDC sub. Use the endpoint's OS UUID or SID, never an email or display name. Removing an assignment invalidates its previous approvals.",ja:"端末利用者を正確なOIDC subに割り当てます。OSのUUIDまたはSIDを使い、メールアドレスや表示名は使わないでください。割当を削除すると以前の承認は無効になります。"}) }),
+      bindingsHost, guidedButton, guidedHost, addBinding, error,
     ],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
@@ -270,6 +363,17 @@ function openIdpForm(content, existing) {
     if (pending || closed || content.__idpPending) return;
     if (![idF,issuerF,authzF,clientF].map(f => f.validate()).every(Boolean)) return;
     error.textContent = "";
+    if (!bindingRows.every(row => [row.device,row.principal,row.subject].map(f => f.validate()).every(Boolean))) return;
+    if (bindingRows.some(row => row.provider && row.provider !== idF.get())) {
+      error.textContent = bl({en:"Provider ID changed after an assignment was selected. Remove that assignment and choose again.",ja:"割当の選択後にプロバイダIDが変わりました。その割当を削除して選び直してください。"});
+      return;
+    }
+    const bindings = bindingRows.map(row => ({device_id:row.device.get(),os_principal:row.principal.get(),subject:row.subject.get()}));
+    const keys = bindings.map(b => b.device_id + "\u0000" + b.os_principal);
+    if (new Set(keys).size !== keys.length || bindings.some(b => !/^(windows:S-1-[0-9-]+|macos:[0-9a-f-]{36})$/.test(b.os_principal))) {
+      error.textContent = bl({en:"Each device and OS account must be unique. Use the exact Windows SID or macOS account UUID.",ja:"端末とOSアカウントの組は一意にしてください。正確なWindows SIDまたはmacOSアカウントUUIDを使ってください。"});
+      return;
+    }
     const body = {
       tenant_id: tenant,
       idp_id: idF.get(),
@@ -290,13 +394,15 @@ function openIdpForm(content, existing) {
       ca_pem: caF.get(),
     };
     if (secretF.get()) body.client_secret = secretF.get();
+    const originalBindings = idpBindingRows(existing);
+    if (!idpBindingsEqual(bindings, originalBindings)) body.device_user_bindings = bindings;
     const controls = m.el.querySelectorAll("input,select,textarea,button");
     pending = true; content.__idpPending = true; controls.forEach(c => { c.disabled = true; });
     try {
       let r;
       try { r = await apiFetch("POST", "/admin/idp-connections", body, "control"); }
       catch (_) { throw new Error(idpUncertain()); }
-      idpConfirmConnection(r, body);
+      idpConfirmConnection(r, body, bindings);
       completed = true; idpNotice(content, "");
       if (!closed) { m.close(); uiToast(existing ? bl({en:"Provider saved.",ja:"プロバイダを保存しました。"}) : bl({en:"Provider added.",ja:"プロバイダを追加しました。"}), "ok"); }
     } catch (e) { const message = e.message || String(e); idpNotice(content, message); if (!closed) error.textContent = message; }

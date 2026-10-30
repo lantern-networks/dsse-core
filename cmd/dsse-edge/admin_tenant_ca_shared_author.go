@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -76,7 +75,7 @@ func sharedTenantCAWrite(w http.ResponseWriter, r *http.Request, reg *tenantca.T
 		case "tenant_ca_anchor_withdraw":
 			exists := false
 			for _, f := range candidate.Facts(time.Now()) {
-				if strings.EqualFold(f.TenantID, tenant) {
+				if f.TenantID == tenant {
 					if f.SHA256 == fingerprint {
 						exists = true
 					} else {

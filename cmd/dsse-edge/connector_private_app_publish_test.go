@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,44 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 )
+
+type unreadableRouteCatalog struct{ appcatalog.RuntimeStore }
+
+func (unreadableRouteCatalog) ListAll(context.Context, string, appcatalog.ListAllOptions) ([]appcatalog.Entry, error) {
+	return nil, errors.New("injected catalog read failure")
+}
+
+func TestPrivateApplicationRouteRefusesCatalogReadFailure(t *testing.T) {
+	const tenant = "tenant_lab_001"
+	registry := connector.NewRegistry()
+	if _, err := registry.Register(model.ConnectorRegistration{
+		ID: "conn-route-failure", TenantID: tenant, ConnectorGroupID: "site",
+		ApplicationIDs: []string{"wiki"}, PrivateBaseURL: "http://connector.invalid", Status: "registered",
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	store := appcatalog.NewStore()
+	if _, err := store.Upsert(context.Background(), appcatalog.Entry{
+		TenantID: tenant, ApplicationID: "wiki", ApplicationType: "private_app", Status: "active",
+		Published: true, Destination: "wiki.example.test", DestinationPort: 443, PublishProtocol: "web",
+	}, tenant, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newServerWithConfig(serverConfig{
+		Evaluator: testEvaluator(), Writer: writer, Registry: registry,
+		ApplicationCatalogStore: unreadableRouteCatalog{RuntimeStore: store},
+		RouteProfiles:           map[string]edgeplane.ApplicationRouteProfile{"wiki": {Destination: "startup.example.test"}},
+	})
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/apps/wiki?connector_id=conn-route-failure", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("catalog read failure restored startup route: status=%d", rec.Code)
+	}
+}
 
 // TestRouteProfilesWithPublishedCatalogMergeAndFallback covers the runtime publish->route merge (Slice 2):
 // a PUBLISHED catalog entry contributes a route, an UN-published entry does not (lab invariant), the merge is
@@ -69,7 +108,10 @@ func TestRouteProfilesWithPublishedCatalogMergeAndFallback(t *testing.T) {
 		"app_file_route_001": {Destination: "file.internal.example.com", DestinationPort: 22, Protocol: "tcp", ServiceFamily: "ssh"},
 	}
 
-	merged := edgeplane.RouteProfilesWithPublishedCatalog(base, store, "tenant_a")
+	merged, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, base, store, "tenant_a")
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// File route survives as the fallback.
 	fileRoute, ok := merged["app_file_route_001"]
@@ -96,11 +138,16 @@ func TestRouteProfilesWithPublishedCatalogMergeAndFallback(t *testing.T) {
 	// No published apps for a tenant -> base returned unchanged (byte-for-byte same map: lab invariant).
 	baseForB := map[string]edgeplane.ApplicationRouteProfile{"only": {Destination: "x"}}
 	emptyStore := appcatalog.NewStore()
-	if got := edgeplane.RouteProfilesWithPublishedCatalog(baseForB, emptyStore, "tenant_a"); len(got) != 1 || got["only"].Destination != "x" {
+	got, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, baseForB, emptyStore, "tenant_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got["only"].Destination != "x" {
 		t.Fatalf("empty-catalog merge altered base: %#v", got)
 	}
-	// Nil store / empty tenant -> base unchanged (fail-closed to startup routes).
-	if got := edgeplane.RouteProfilesWithPublishedCatalog(base, nil, "tenant_a"); len(got) != 1 {
+	// No catalog configured -> existing startup routes remain available.
+	got, err = edgeplane.RouteProfilesWithPublishedCatalog(ctx, base, nil, "tenant_a")
+	if err != nil || len(got) != 1 {
 		t.Fatalf("nil store should return base unchanged: %#v", got)
 	}
 }

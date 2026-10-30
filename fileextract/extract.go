@@ -2,11 +2,17 @@ package fileextract
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"strings"
 )
+
+// ErrExtractionLimit means only a prefix could be inspected. Callers must apply
+// their uninspectable-file policy, rather than treating that prefix as a clean file.
+var ErrExtractionLimit = errors.New("file text extraction exceeds inspection budget")
 
 // Extract returns the scannable plain text of an upload body for DLP inspection, and whether it inspected
 // anything. For multipart/form-data it walks the parts — extracting recognized file parts (Office now, PDF via
@@ -42,44 +48,55 @@ func Extract(contentType string, body []byte) (text string, inspected bool, err 
 // parts and plain form fields are included verbatim, binary parts are skipped.
 func extractMultipart(body []byte, boundary string) (string, bool, error) {
 	if strings.TrimSpace(boundary) == "" {
-		return "", false, nil
+		return "", false, errors.New("multipart boundary is missing")
 	}
 	mr := multipart.NewReader(bytes.NewReader(body), boundary)
 	var sb strings.Builder
 	inspected := false
 	for {
-		if sb.Len() >= DefaultMaxExtractedBytes {
+		p, err := mr.NextPart()
+		if err == io.EOF {
 			break
 		}
-		p, err := mr.NextPart()
 		if err != nil {
-			break // EOF or malformed — take what we have
+			return "", inspected, errors.New("malformed multipart upload")
 		}
-		partCT := p.Header.Get("Content-Type")
-		filename := p.FileName()
-		data, _ := io.ReadAll(io.LimitReader(p, DefaultMaxExtractedBytes))
-		p.Close()
+		partCT, filename := p.Header.Get("Content-Type"), p.FileName()
+		data, err := io.ReadAll(io.LimitReader(p, DefaultMaxExtractedBytes+1))
+		// Do not drain an over-budget part: the whole buffered upload is rejected
+		// for inspection, and no partially inspected text is called successful.
+		if err != nil {
+			return "", inspected, errors.New("cannot read multipart member")
+		}
+		if len(data) > DefaultMaxExtractedBytes {
+			return "", inspected, ErrExtractionLimit
+		}
+		if err := p.Close(); err != nil {
+			return "", inspected, errors.New("cannot close multipart member")
+		}
+		var text string
 		switch {
 		case IsOOXML(filename, partCT):
-			if t, e := ExtractOOXMLText(data); e == nil && t != "" {
-				sb.WriteString(t)
-				sb.WriteByte('\n')
-				inspected = true
-			}
+			text, err = ExtractOOXMLText(data)
 		case IsPDF(filename, partCT):
-			if t, e := ExtractPDFText(data); e == nil && t != "" {
-				sb.WriteString(t)
-				sb.WriteByte('\n')
-				inspected = true
-			}
+			text, err = ExtractPDFText(data)
 		case partCT == "" || isTextLike(strings.ToLower(firstToken(partCT))):
-			// a text part or a plain form field (form fields carry no Content-Type) → scannable text
-			sb.Write(data)
-			sb.WriteByte('\n')
-			inspected = true
+			text = string(data)
 		default:
-			// binary non-file part → skip
+			continue // non-text binary formats remain outside extraction support
 		}
+		if err != nil {
+			return "", inspected, fmt.Errorf("multipart member could not be inspected: %w", err)
+		}
+		inspected = true
+		if len(text) == 0 {
+			continue
+		}
+		if len(text)+1 > DefaultMaxExtractedBytes-sb.Len() {
+			return "", inspected, ErrExtractionLimit
+		}
+		sb.WriteString(text)
+		sb.WriteByte('\n')
 	}
 	return sb.String(), inspected, nil
 }

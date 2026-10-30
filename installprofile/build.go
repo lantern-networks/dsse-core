@@ -119,16 +119,20 @@ func Build(o Options, issued time.Time) InstallProfile {
 		// stays empty — a deployment that has not been given one of them says so by absence rather than by a
 		// blank that reads as configured.
 		Deployment: DeploymentSpec{
-			AnchorPEM:                   o.Deployment.AnchorPEM,
-			TransportAnchorsPEM:         o.Deployment.TransportAnchorsPEM,
-			DeviceCAPinSHA256:           strings.TrimSpace(o.Deployment.DeviceCAPinSHA256),
-			InterceptionRootPEM:         o.Deployment.InterceptionRootPEM,
-			InterceptionRootIsOwn:       o.Deployment.InterceptionRootIsOwn,
-			AgentPolicySigningPublicKey: strings.TrimSpace(o.Deployment.AgentPolicySigningPublicKey),
-			UpdateSigningKeys:           o.Deployment.UpdateSigningKeys,
-			UpdatePublisherTeamID:       strings.TrimSpace(o.Deployment.UpdatePublisherTeamID),
-			SteerExclusions:             o.Deployment.SteerExclusions,
-			PassthroughDomains:          o.Deployment.PassthroughDomains,
+			AnchorPEM:                          o.Deployment.AnchorPEM,
+			TransportAnchorsPEM:                o.Deployment.TransportAnchorsPEM,
+			StepUpPortalCertificateIsOperators: o.Deployment.StepUpPortalCertificateIsOperators,
+			StepUpPortalAnchorPEM:              o.Deployment.StepUpPortalAnchorPEM,
+			DeviceCAPinSHA256:                  strings.TrimSpace(o.Deployment.DeviceCAPinSHA256),
+			InterceptionRootPEM:                o.Deployment.InterceptionRootPEM,
+			InterceptionRootIsOwn:              o.Deployment.InterceptionRootIsOwn,
+			AgentPolicySigningPublicKey:        strings.TrimSpace(o.Deployment.AgentPolicySigningPublicKey),
+			UpdateSigningKeys:                  o.Deployment.UpdateSigningKeys,
+			UpdatePublisherTeamID:              strings.TrimSpace(o.Deployment.UpdatePublisherTeamID),
+			SteerExclusions:                    o.Deployment.SteerExclusions,
+			PassthroughDomains:                 o.Deployment.PassthroughDomains,
+			ExactHTTPSPassthroughEndpoints:     append([]ExactHTTPSPassthroughEndpoint{}, o.Deployment.ExactHTTPSPassthroughEndpoints...),
+			StepUpPortalOrigins:                append([]string(nil), o.Deployment.StepUpPortalOrigins...),
 		},
 	}
 }

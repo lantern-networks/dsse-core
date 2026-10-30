@@ -56,10 +56,11 @@ final class DsseSignedTrustBundleTests: XCTestCase {
     }
 
     private func signedBundle(_ key: Curve25519.Signing.PrivateKey, serial: Int64,
-                              policyKeys: [String], caPEM: String) throws -> Data {
+                              policyKeys: [String], caPEM: String,
+                              tenantID: String = "tenant_example") throws -> Data {
         let payloadObj: [String: Any] = [
             "schema_version": "dsse.trust-bundle.v1",
-            "tenant_id": "tenant_example",
+            "tenant_id": tenantID,
             "serial": serial,
             "transport_ca_pem": caPEM,
             "renewal_recovery_endpoint": "203.0.113.10:18545",
@@ -102,6 +103,23 @@ final class DsseSignedTrustBundleTests: XCTestCase {
             envelopeData: data, pinnedPublicKeyHex: pin, lastAcceptedSerial: 0))
         XCTAssertEqual(bundle.agentPolicyPublicKeys, [ed, ecdsa],
                        "both the Ed25519 pin and the ECDSA next-key must survive; the three malformed entries must not")
+    }
+
+    func testTrustBundleRequiresOneNonemptyTenantAndMatchesInstalledScope() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let pin = key.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        let ca = try liveTransportCAPEM()
+        for invalid in ["", " tenant_example ", "tenant_example\n"] {
+            let raw = try signedBundle(key, serial: 43, policyKeys: [], caPEM: ca, tenantID: invalid)
+            XCTAssertNil(DsseSignedTrustBundle.verified(
+                envelopeData: raw, pinnedPublicKeyHex: pin, lastAcceptedSerial: 0))
+        }
+        let valid = try signedBundle(key, serial: 44, policyKeys: [], caPEM: ca)
+        let bundle = try XCTUnwrap(DsseSignedTrustBundle.verified(
+            envelopeData: valid, pinnedPublicKeyHex: pin, lastAcceptedSerial: 0))
+        XCTAssertTrue(DsseTrustAnchorRecovery.bundleMatchesTenant(bundle, expectedTenant: "tenant_example"))
+        XCTAssertFalse(DsseTrustAnchorRecovery.bundleMatchesTenant(bundle, expectedTenant: "tenant_other"))
+        XCTAssertFalse(DsseTrustAnchorRecovery.bundleMatchesTenant(bundle, expectedTenant: ""))
     }
 
     private func ecdsaSignedBundle(_ key: P256.Signing.PrivateKey, serial: Int64, caPEM: String) throws -> Data {

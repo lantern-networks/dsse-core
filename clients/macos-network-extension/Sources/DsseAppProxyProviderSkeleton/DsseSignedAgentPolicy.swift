@@ -60,15 +60,20 @@ public enum DsseSignedAgentPolicy {
 
     // verifiedServerExclusions returns the server-issued excluded signing identifiers ONLY when the file at
     // signedPath is a signed envelope that verifies against pinnedPublicKeyHex. Any failure (missing file,
-    // bad checksum, bad signature, wrong type) returns nil — the caller then keeps the previous behavior.
+    // bad checksum, bad signature, wrong type, or policy for another certificate device) returns nil — the
+    // caller then keeps the previous behavior. A deployment key signs many devices' policies.
     // Fail-closed against tampering: an edited payload or a forged signature does not pass.
     public static func verifiedServerExclusions(signedPath: String, pinnedPublicKeyHex: String,
+                                               expectedDeviceIdentity: String? = nil,
+                                               expectedTenantID: String? = nil,
                                                alsoAccept: [String] = []) -> [String]? {
         let path = signedPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             return nil
         }
-        return verifiedServerExclusions(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept)
+        return verifiedServerExclusions(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                        expectedDeviceIdentity: expectedDeviceIdentity,
+                                        expectedTenantID: expectedTenantID, alsoAccept: alsoAccept)
     }
 
     // verifiedServerExclusions(envelopeData:) is the same verification over IN-MEMORY envelope bytes — used
@@ -76,8 +81,12 @@ public enum DsseSignedAgentPolicy {
     // human/script provisions a file; the NE fetches + verifies + applies + caches on its own). Fail-closed:
     // any checksum/signature/type/parse failure returns nil and the caller keeps the previous set.
     public static func verifiedServerExclusions(envelopeData: Data, pinnedPublicKeyHex: String,
+                                               expectedDeviceIdentity: String? = nil,
+                                               expectedTenantID: String? = nil,
                                                alsoAccept: [String] = []) -> [String]? {
-        guard let parsed = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept) else {
+        guard let parsed = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                           expectedDeviceIdentity: expectedDeviceIdentity,
+                                           expectedTenantID: expectedTenantID, alsoAccept: alsoAccept) else {
             return nil
         }
         return parsed.excludedAppSigningIdentifiers ?? []
@@ -87,12 +96,34 @@ public enum DsseSignedAgentPolicy {
     // Two readers now need the payload, and two copies of a signature check is one copy too many — the second
     // is where the weaker version ends up.
     private static func verifiedPayload(envelopeData: Data, pinnedPublicKeyHex: String,
+                                        expectedDeviceIdentity: String?,
+                                        expectedTenantID: String?,
+                                        diagnosticTenantRead: Bool = false,
                                         alsoAccept: [String] = []) -> DsseSignedAgentPolicyPayload? {
         guard let raw = verifiedPayloadBytes(envelopeData: envelopeData, expectedType: envelopeType,
                                              pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept) else {
             return nil
         }
-        return try? JSONDecoder().decode(DsseSignedAgentPolicyPayload.self, from: raw)
+        guard let parsed = try? JSONDecoder().decode(DsseSignedAgentPolicyPayload.self, from: raw),
+              let expected = expectedDeviceIdentity?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !expected.isEmpty,
+              let issuedFor = parsed.deviceIdentity?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !issuedFor.isEmpty, issuedFor == expected else {
+            // The deployment signing key signs many devices' policies. A valid signature alone does not
+            // authorize applying one device's cached or fetched policy to another device.
+            return nil
+        }
+        // The signing key spans tenants. CN equality alone cannot authorize an enforcement document:
+        // a cached policy for the same name under an old tenant must not survive reprovisioning.
+        // Only the dedicated mismatch diagnostic may read the signed tenant before comparing it to the
+        // signed install profile; it never applies exclusions, roots or renewal instructions.
+        if !diagnosticTenantRead {
+            guard let expectedTenant = expectedTenantID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !expectedTenant.isEmpty,
+                  let issuedTenant = parsed.tenantID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !issuedTenant.isEmpty, issuedTenant == expectedTenant else { return nil }
+        }
+        return parsed
     }
 
     // verifiedPayloadBytes is the crypto, with the document KIND as a required argument.
@@ -180,15 +211,23 @@ public enum DsseSignedAgentPolicy {
     /// certificates this agent goes looking for, and an agent that reports finding an attacker's root would
     /// be handing the Edge a reason to switch onto it.
     public static func verifiedInterceptionRoots(signedPath: String, pinnedPublicKeyHex: String,
+                                                expectedDeviceIdentity: String? = nil,
+                                                expectedTenantID: String? = nil,
                                                 alsoAccept: [String] = []) -> [String] {
         let path = signedPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, let data = FileManager.default.contents(atPath: path) else { return [] }
-        return verifiedInterceptionRoots(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept)
+        return verifiedInterceptionRoots(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                         expectedDeviceIdentity: expectedDeviceIdentity,
+                                         expectedTenantID: expectedTenantID, alsoAccept: alsoAccept)
     }
 
     public static func verifiedInterceptionRoots(envelopeData: Data, pinnedPublicKeyHex: String,
+                                                expectedDeviceIdentity: String? = nil,
+                                                expectedTenantID: String? = nil,
                                                 alsoAccept: [String] = []) -> [String] {
-        guard let payload = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept) else {
+        guard let payload = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                            expectedDeviceIdentity: expectedDeviceIdentity,
+                                            expectedTenantID: expectedTenantID, alsoAccept: alsoAccept) else {
             return []
         }
         return (payload.interceptionRootSHA256 ?? [])
@@ -210,15 +249,21 @@ public enum DsseSignedAgentPolicy {
     ///
     /// nil for absent, unparseable or unverified — all three are "not answered", never "wrong".
     public static func verifiedDeploymentTenant(signedPath: String, pinnedPublicKeyHex: String,
+                                                expectedDeviceIdentity: String? = nil,
                                                 alsoAccept: [String] = []) -> String? {
         let path = signedPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, let data = FileManager.default.contents(atPath: path) else { return nil }
-        return verifiedDeploymentTenant(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept)
+        return verifiedDeploymentTenant(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                        expectedDeviceIdentity: expectedDeviceIdentity, alsoAccept: alsoAccept)
     }
 
     public static func verifiedDeploymentTenant(envelopeData: Data, pinnedPublicKeyHex: String,
+                                                expectedDeviceIdentity: String? = nil,
                                                 alsoAccept: [String] = []) -> String? {
-        guard let payload = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept),
+        guard let payload = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                            expectedDeviceIdentity: expectedDeviceIdentity,
+                                            expectedTenantID: nil, diagnosticTenantRead: true,
+                                            alsoAccept: alsoAccept),
               let tid = payload.tenantID?.trimmingCharacters(in: .whitespacesAndNewlines), !tid.isEmpty else {
             return nil
         }
@@ -226,8 +271,12 @@ public enum DsseSignedAgentPolicy {
     }
 
     public static func verifiedRenewCertificatesIssuedBefore(envelopeData: Data, pinnedPublicKeyHex: String,
+                                                            expectedDeviceIdentity: String? = nil,
+                                                            expectedTenantID: String? = nil,
                                                             alsoAccept: [String] = []) -> Date? {
-        guard let payload = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept),
+        guard let payload = verifiedPayload(envelopeData: envelopeData, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                            expectedDeviceIdentity: expectedDeviceIdentity,
+                                            expectedTenantID: expectedTenantID, alsoAccept: alsoAccept),
               let raw = payload.renewCertificatesIssuedBefore?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
             return nil
@@ -238,10 +287,14 @@ public enum DsseSignedAgentPolicy {
     }
 
     public static func verifiedRenewCertificatesIssuedBefore(signedPath: String, pinnedPublicKeyHex: String,
+                                                            expectedDeviceIdentity: String? = nil,
+                                                            expectedTenantID: String? = nil,
                                                             alsoAccept: [String] = []) -> Date? {
         let path = signedPath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !path.isEmpty, let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
-        return verifiedRenewCertificatesIssuedBefore(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex, alsoAccept: alsoAccept)
+        return verifiedRenewCertificatesIssuedBefore(envelopeData: data, pinnedPublicKeyHex: pinnedPublicKeyHex,
+                                                    expectedDeviceIdentity: expectedDeviceIdentity,
+                                                    expectedTenantID: expectedTenantID, alsoAccept: alsoAccept)
     }
 
     private static func hexToData(_ hex: String) -> Data? {

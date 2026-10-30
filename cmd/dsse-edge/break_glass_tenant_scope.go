@@ -44,7 +44,7 @@ func breakGlassRequestVisibleTo(item breakGlassAccessRequest, r *http.Request, n
 	if owner == "" {
 		return true // unattributed: a single-tenant deployment's own
 	}
-	return strings.EqualFold(owner, breakGlassCallerTenant(r, nodeTenant))
+	return owner == breakGlassCallerTenant(r, nodeTenant)
 }
 
 // breakGlassEventsForCaller narrows the export to the caller's own organization. The export is the record of
@@ -57,7 +57,7 @@ func breakGlassEventsForCaller(events []map[string]any, r *http.Request, nodeTen
 	out := make([]map[string]any, 0, len(events))
 	for _, e := range events {
 		owner := strings.TrimSpace(stringValue(e["tenant_id"]))
-		if owner != "" && !strings.EqualFold(owner, caller) {
+		if owner != "" && owner != caller {
 			continue
 		}
 		out = append(out, e)

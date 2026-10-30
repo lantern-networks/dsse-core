@@ -116,7 +116,12 @@ func steerInterceptionUpstream(ctx context.Context, clientConn net.Conn, route e
 // interception engine (InterceptAll); without one it transparently forwards to the original destination
 // (the prior /steer policy-enforcing forward proxy). Both paths use the full-duplex tunnel bridge so
 // long-lived / bidirectional flows are preserved. The client conn must already have received CONNECT 200.
-func steerEgressForward(ctx context.Context, clientConn net.Conn, authority string, route edgeplane.NetworkExtensionRuntimeCopyTCPRoute, interceptionDialer edgeplane.NetworkExtensionRuntimeCopyTCPDialer) error {
+func steerEgressForward(ctx context.Context, clientConn net.Conn, authority string, route edgeplane.NetworkExtensionRuntimeCopyTCPRoute, interceptionDialer edgeplane.NetworkExtensionRuntimeCopyTCPDialer, onUpstreamReady ...func()) error {
+	upstreamReady := func() {
+		if len(onUpstreamReady) > 0 && onUpstreamReady[0] != nil {
+			onUpstreamReady[0]()
+		}
+	}
 	// Interactive East-West families (ssh/rdp/…) get an UNLIMITED full-duplex idle window (idle=0) plus a finite
 	// half-close linger: a live session at a prompt is never reaped, but an abandoned (half-closed) flow still is.
 	// Everything else (browsing https/http) keeps the default idle + /8 linger, so idle connections are reclaimed.
@@ -137,6 +142,7 @@ func steerEgressForward(ctx context.Context, clientConn net.Conn, authority stri
 		if err != nil {
 			return err
 		}
+		upstreamReady()
 		bridge(cc, upstreamConn)
 		return nil
 	}
@@ -144,6 +150,7 @@ func steerEgressForward(ctx context.Context, clientConn net.Conn, authority stri
 	if err != nil {
 		return fmt.Errorf("steer upstream dial failed: %w", err)
 	}
+	upstreamReady()
 	bridge(clientConn, upstream)
 	return nil
 }

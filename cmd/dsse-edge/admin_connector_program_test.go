@@ -45,6 +45,36 @@ func sha256Of(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func TestConnectorProgramHyphenatedPlatformKeepsItsMetadataAndListing(t *testing.T) {
+	mux := connectorProgramTestMux(t.TempDir(), false, "tenant-one")
+	body := []byte("fixture connector program")
+	put := publishConnectorProgram(t, mux, "linux-musl", "arm64", body, sha256Of(body))
+	if put.Code != http.StatusOK {
+		t.Fatalf("publish hyphenated target: %d %s", put.Code, put.Body.String())
+	}
+	var published connectorProgramMeta
+	if err := json.Unmarshal(put.Body.Bytes(), &published); err != nil {
+		t.Fatal(err)
+	}
+	if published.Platform != "linux-musl" || published.Arch != "arm64" {
+		t.Fatalf("published target metadata = %q/%q", published.Platform, published.Arch)
+	}
+	listed := httptest.NewRecorder()
+	mux.ServeHTTP(listed, httptest.NewRequest(http.MethodGet, "/admin/connector-programs", nil))
+	if listed.Code != http.StatusOK {
+		t.Fatalf("list hyphenated target: %d %s", listed.Code, listed.Body.String())
+	}
+	var response struct {
+		Programs []connectorProgramListing `json:"programs"`
+	}
+	if err := json.Unmarshal(listed.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Programs) != 1 || response.Programs[0].Platform != "linux-musl" || response.Programs[0].Arch != "arm64" {
+		t.Fatalf("listed hyphenated target count=%d metadata=%#v", len(response.Programs), response.Programs)
+	}
+}
+
 // ★★★ BYTES THAT ARE NOT THE ONES DECLARED ARE REFUSED, AND NOTHING IS STORED. A truncated upload that lands
 // anyway is downloaded by a customer and run on a machine inside their network. The control runs first: the
 // same publish with the right digest must succeed, or the refusal below proves only that the test is broken.

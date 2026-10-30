@@ -29,6 +29,7 @@ import (
 
 	"github.com/lantern-networks/dsse-core/agentstatus"
 	"github.com/lantern-networks/dsse-core/agenttuning"
+	"github.com/lantern-networks/dsse-core/authportal"
 	"github.com/lantern-networks/dsse-core/clients/windows-wfp/configstore"
 	"github.com/lantern-networks/dsse-core/clients/windows-wfp/updateplatform"
 	"github.com/lantern-networks/dsse-core/installprofile"
@@ -50,7 +51,7 @@ func main() {
 	applicationID := flag.String("application-id", "", "edge application id for CONNECT /apps/{id} (required for redirect)")
 	connectorID := flag.String("connector-id", "conn_lab_001", "edge connector id")
 	sessionID := flag.String("session-id", "", "session id forwarded to edge")
-	maxFlows := flag.Int("max-flows", 5, "stop after steering this many flows (redirect mode)")
+	maxFlows := flag.Int("max-flows", 0, "optional stop after this many flows in targeted redirect mode; 0 = no flow-count limit")
 	timeout := flag.Duration("timeout", 2*time.Minute, "maximum run duration")
 	omitAuthority := flag.Bool("omit-connect-authority", false, "omit x-dsse-connect-authority so the edge falls back to the request host (rarely what you want for a routed app)")
 	connectAuthority := flag.String("connect-authority", "", "explicit host:port to send as x-dsse-connect-authority instead of the recovered orig dst; set this to the app route destination (e.g. dummy-ssh.local:22) for FQDN-routed apps")
@@ -135,10 +136,11 @@ func main() {
 	ackFailOpen := flag.Bool("acknowledge-fail-open", false, "acknowledge the stabilization-only fail-open posture. REQUIRED to enable --fail-open, which disables zero-trust enforcement on an Edge outage. Without it the agent refuses --fail-open, so production is structurally fail-closed.")
 
 	// Captive-portal bootstrap. ALWAYS ON — there is no enable flag; the trigger discipline (disarm to the native
-	// network ONLY on netchange + Edge-unreachable + captive POSITIVELY detected) makes it safe as a standard
-	// behavior. These two are TUNING only (per-tenant configurable later via signed policy / Admin Console); the
+	// network ONLY on netchange + Edge-unreachable + captive POSITIVELY detected) limits when it is entered.
+	// A kernel ALE deadline refuses new direct flows even when local rearm fails. These two are TUNING only
+	// (per-tenant configurable later via signed policy / Admin Console); the
 	// defaults are the product defaults.
-	captiveTimeout := flag.Duration("captive-timeout", 180*time.Second, "captive-portal bootstrap TUNING: T_max — the bounded window during which steering is disarmed to the native network so the OS captive sign-in can complete. On timeout with the Edge still unreachable, re-arm fail-closed (DARK). The feature itself is always on.")
+	captiveTimeout := flag.Duration("captive-timeout", 180*time.Second, "captive-portal bootstrap TUNING: T_max — kernel-enforced deadline for new direct connections during OS captive sign-in. Rearm starts before this deadline; established connections are not forcibly cut: failed WFP/DNS/QUIC rearm is reported and retried, and DARK is reported only after complete rearm. The feature itself is always on.")
 	captiveProbeInterval := flag.Duration("captive-probe-interval", 3*time.Second, "captive-portal bootstrap TUNING: how often to re-probe the Edge during the window; the first success re-arms steer-all immediately.")
 
 	// L1 signed install profile (roadmap M0/M1): instead of passing posture knobs as loose flags, the agent can
@@ -280,6 +282,7 @@ func main() {
 	profileVMEgress := vmEgressFromProfile("", false)
 	// profilePassthrough are the deployment-authored names that bypass steering entirely (its own Console).
 	var profilePassthrough []string
+	var profileAuthOrigins []string
 	var profileOrganization installprofile.OrganizationSpec
 	// authoredBypass are the never-steer identifiers the signed profile carries, kept as a LIST so a comma
 	// inside one of them survives (mergeIdentifiers). Empty when no profile named any.
@@ -456,6 +459,7 @@ func main() {
 		// no reference to this field at all until 2026-08-31, so a steered administrator got 502 from the
 		// Console of the deployment they were steering, while macOS got 200 from the same profile.
 		profilePassthrough = prof.Deployment.PassthroughDomains
+		profileAuthOrigins = append([]string(nil), prof.Deployment.StepUpPortalOrigins...)
 		// The names this organization presents, stated at install time. This is the ONLY source that exists
 		// before the device has ever been told anything — the trust bundle announces them, and the bundle
 		// arrives after enrolment, which was the thing that needed a name to send. An announcement still
@@ -1060,7 +1064,7 @@ func main() {
 
 	// W-3 test affordance: delete ONE of the driver's WFP filters to simulate an admin "partial tamper"
 	// (driver stays loaded but a filter is removed). The next heartbeat then reports enforcement UNHEALTHY
-	// (wfp-filters-incomplete). Reverse with `sc stop/start DsseWfp` (DriverEntry re-adds all six).
+	// (wfp-filters-incomplete). Reverse with `sc stop/start DsseWfp` (DriverEntry re-adds all required filters).
 	if *mode == "wfp-tamper" {
 		name, err := deleteFirstDsseFilter()
 		if err != nil {
@@ -1238,10 +1242,8 @@ func main() {
 	// noticed by nobody.
 	capCfg.dests = newLiveDests(capCfg.bypassDests)
 	if transport.enabled {
-		if ap, e := netip.ParseAddrPort(transport.host); e == nil {
-			capCfg.dests.setEdge(ap)
-		} else if ap, ok := resolveAddrPort(transport.host); ok {
-			capCfg.dests.setEdge(ap)
+		if addrs := resolveBypassDestinations(transport.host, net.LookupIP); len(addrs) > 0 {
+			capCfg.dests.setEdges(addrs)
 		} else {
 			fmt.Fprintf(os.Stderr, "steer: WARNING the (T) transport host %q could not be resolved to a "+
 				"destination bypass yet; the tunnel is protected only by the AppID self-exclusion until the "+
@@ -1312,9 +1314,12 @@ func main() {
 			var mgr *resolverManager
 			var dnsProxyInst *dnsProxy
 			var disarmed atomic.Bool
+			// A native-network claim is not verified when any teardown step fails.
+			var disarmCleanupFailed atomic.Bool
 			// captiveActive reflects whether the captive bootstrap window is currently open, so the tray status
 			// (M2b) shows CaptiveOnboarding rather than a plain fail-open Disarmed.
 			var captiveActive atomic.Bool
+			var captiveRearmFailed atomic.Bool
 			// captiveTrigger nudges the captive-portal bootstrap controller to re-evaluate posture (fired at
 			// startup and on every network change). Buffered/coalesced so a roam's event burst evaluates once.
 			captiveTrigger := make(chan struct{}, 1)
@@ -1337,6 +1342,9 @@ func main() {
 				transport.pins = &atomic.Pointer[[]string]{}
 				if addrs, perr := resolveEdgeEndpoints(transport, true, nil); perr == nil {
 					transport.pins.Store(&addrs)
+					if bypass, ok := parsePinnedEdgeDestinations(addrs); ok {
+						capCfg.dests.setEdges(bypass)
+					}
 					fmt.Printf("steer: Edge %s pinned -> %v (dial by IP, verify by name; no DNS-on-tunnel dependency)\n", transport.serverName, addrs)
 				} else {
 					fmt.Fprintf(os.Stderr, "steer: WARNING could not pre-resolve Edge %s: %v (the refresh loop will retry)\n", transport.serverName, perr)
@@ -1348,22 +1356,22 @@ func main() {
 						return mgr.upstreams()
 					}
 					return nil
-				}, 60*time.Second, func(first string) {
+				}, 60*time.Second, func(addrs []string) {
 					// Fill (or correct) the destination loop guard from whatever the refresher just resolved.
 					// setEdge is a no-op when the address has not moved, so the ordinary sixty-second success
 					// is silent; the line below is printed only when the rule set actually changes.
-					ap, ok := resolveAddrPort(first)
+					bypass, ok := parsePinnedEdgeDestinations(addrs)
 					if !ok || capCfg.dests == nil {
 						return
 					}
 					had := capCfg.dests.hasEdge()
-					if !capCfg.dests.setEdge(ap) {
+					if !capCfg.dests.setEdges(bypass) {
 						return
 					}
 					if had {
-						fmt.Printf("steer: Edge destination bypass MOVED to %v (the loop guard follows the pin)\n", ap)
+						fmt.Printf("steer: Edge destination bypass candidates MOVED to %v (backend application is logged separately)\n", bypass)
 					} else {
-						fmt.Printf("steer: Edge destination bypass FILLED IN at %v — it was missing since arm time, and the tunnel had been relying on the AppID self-exclusion alone\n", ap)
+						fmt.Printf("steer: Edge destination bypass candidates FILLED IN at %v — backend application is logged separately\n", bypass)
 					}
 				})
 			}
@@ -1373,6 +1381,10 @@ func main() {
 				// within a couple of flows instead of lingering on the dead control plane.
 				health = newEdgeHealth(2, *failOpenCooldown)
 				fmt.Printf("steer: FAIL-OPEN posture enabled — Edge outage: DNS forwards upstream + TCP goes direct; a SUSTAINED outage (>%s, e.g. an interface dropped and the OS hasn't failed over) self-disarms to the native network and re-arms on recovery.\n", *failOpenDisarmAfter)
+			}
+			var muxTransportFailure chan struct{}
+			if *regionFailoverOn && *steerMux {
+				muxTransportFailure = make(chan struct{}, 1)
 			}
 			edgeCfg := edgeConfig{
 				edgeURL:          strings.TrimRight(*edgeURL, "/"),
@@ -1387,6 +1399,7 @@ func main() {
 				muxFlowsPerConn:  *steerMuxFlowsPerConn,
 				muxMaxConns:      *steerMuxMaxConns,
 				transport:        transport,
+				transportFailure: muxTransportFailure,
 				failOpen:         *failOpen,
 				health:           health,
 				answerNCSI:       *answerNCSI,
@@ -1409,7 +1422,13 @@ func main() {
 			// the flow is simply denied. The (T) transport must be on for the step-up loop to bind a grant to
 			// this device (the browser flow rides the same tunnel), but the prompt itself is harmless without it.
 			if *stepUpPortal {
-				edgeCfg.stepUp = newStepUpCoordinator(*stepUpCoalesce, defaultStepUpLauncher, log.Printf)
+				edgeCfg.stepUp = newStepUpCoordinator(*stepUpCoalesce, nil, log.Printf)
+				edgeCfg.stepUp.launchForOwner = defaultStepUpLauncherForOwner
+				edgeCfg.stepUp.resultForOwner = showStepUpResultForOwner
+				edgeCfg.stepUp.validate = func(raw string) bool {
+					_, err := authportal.ValidateStart(raw, profileAuthOrigins, time.Now())
+					return err == nil
+				}
 				fmt.Printf("steer: agent-mediated step-up enabled (coalesce=%s)\n", *stepUpCoalesce)
 			}
 			// Warn-stage (S3) passive notice: on a steer-mux WARN frame, show a "this connection is monitored"
@@ -1638,7 +1657,11 @@ func main() {
 					fmt.Fprintf(os.Stderr, "block-quic: %v\n", err)
 				} else {
 					fmt.Println("steer: QUIC blocked (UDP:443 outbound) -> browsers fall back to intercepted TCP immediately")
-					defer removeQUICBlock()
+					defer func() {
+						if err := removeQUICBlock(); err != nil {
+							fmt.Fprintf(os.Stderr, "block-quic: cleanup not verified: %v\n", err)
+						}
+					}()
 				}
 			}
 			// NCSI active-probe suppression: under steer-all the OS connectivity active test is genuinely
@@ -1671,7 +1694,10 @@ func main() {
 				mgr = newResolverManager(bound)
 				upstream, rerr := mgr.start()
 				if rerr != nil {
-					fmt.Fprintf(os.Stderr, "dns_resolver: %v (DNS left on the system resolver — it would leak)\n", rerr)
+					if err := mgr.restoreToAutomatic(); err != nil {
+						fmt.Fprintf(os.Stderr, "dns_resolver: native DNS recovery is unverified: %v\n", err)
+					}
+					return fmt.Errorf("DNS takeover failed; steering not started: %w", rerr)
 				} else {
 					defer mgr.restore()
 					// fail-open: teach the proxy the real upstream resolver(s) to forward to during an Edge outage.
@@ -1746,47 +1772,88 @@ func main() {
 				edgeURLForProbe := strings.TrimRight(*edgeURL, "/")
 				onDisarm = func() {
 					fmt.Println("steer_disarm: REMOVING steering (stop WFP redirect, reset DNS to automatic, unblock QUIC) so the box uses its NATIVE network. Will re-arm on recovery.")
+					disarmFailed := false
 					if useWFP {
 						// Verified, not best-effort. This runs when the box is ALREADY in trouble (a sustained
 						// Edge outage, or a captive portal), so it is the worst possible moment to believe a
 						// disarm that did not happen: the operator would read "steer_disarm: REMOVING steering"
 						// and conclude the box is on its native network while it is refusing every connection.
-						if v := removePolicyVerified(); !v.Verified {
-							fmt.Printf("disarm: WARNING the WFP redirect is NOT confirmed cleared: %s\n", v.Reason)
+						if err := activeWFPPolicy.suspend(func() error {
+							v := removeRedirectPolicyVerified()
+							if !v.Verified {
+								return fmt.Errorf("%s", v.Reason)
+							}
+							return nil
+						}); err != nil {
+							fmt.Printf("disarm: WARNING the WFP redirect is NOT confirmed cleared: %v\n", err)
+							disarmFailed = true
 						}
 					}
 					if mgr != nil {
 						// Reset to AUTOMATIC (DHCP), not the captured static servers: disarm may be due to a Wi-Fi
 						// roam to a different network where the old servers are unreachable. Automatic = the new
 						// network's DHCP resolver, which is what actually recovers the box.
-						mgr.restoreToAutomatic()
+						if err := mgr.restoreToAutomatic(); err != nil {
+							fmt.Fprintf(os.Stderr, "disarm: native DNS recovery is unverified: %v\n", err)
+							disarmFailed = true
+						}
 					}
 					if *blockQUIC {
-						removeQUICBlock()
+						if err := removeQUICBlock(); err != nil {
+							fmt.Fprintf(os.Stderr, "disarm: QUIC block removal not verified: %v\n", err)
+							disarmFailed = true
+						}
 					}
+					disarmCleanupFailed.Store(disarmFailed)
 					disarmed.Store(true)
 				}
 				onRearm = func() {
-					fmt.Println("steer_rearm: re-applying steering (WFP redirect, DNS takeover, QUIC block).")
-					if useWFP {
-						if err := pushPolicy(capCfg); err != nil {
-							fmt.Printf("rearm: pushPolicy: %v\n", err)
-						}
-					}
-					if mgr != nil {
-						if _, err := mgr.converge(); err != nil {
-							fmt.Printf("rearm: converge: %v\n", err)
-						}
-						// Refresh the fail-open upstream from the (possibly NEW) network's DNS that converge just
-						// re-captured, so a subsequent outage forwards to a reachable resolver, not the old one.
-						if dnsProxyInst != nil {
-							dnsProxyInst.setFallback(mgr.upstreams())
-						}
-					}
+					fmt.Println("steer_rearm: re-applying steering (QUIC block, DNS takeover, WFP redirect).")
+					var addQUIC func() error
+					var removeQUIC func() error
 					if *blockQUIC {
-						addQUICBlock()
+						if useWFP {
+							// The driver's ALE QUIC gate refuses new UDP/443
+							// while preserving established native flows. A
+							// blanket Firewall rule would cut those at rearm.
+							addQUIC, removeQUIC = removeQUICBlock, removeQUICBlock
+						} else {
+							addQUIC, removeQUIC = addQUICBlock, removeQUICBlock
+						}
+					}
+					var convergeDNS func() error
+					var restoreDNS func() error
+					if mgr != nil {
+						convergeDNS = func() error {
+							_, err := mgr.converge()
+							return err
+						}
+						restoreDNS = mgr.restoreToAutomatic
+					}
+					var resumeWFP func() error
+					var clearWFP func() error
+					if useWFP {
+						resumeWFP = activeWFPPolicy.resume
+						clearWFP = func() error {
+							return activeWFPPolicy.suspend(func() error {
+								v := removeRedirectPolicyVerified()
+								if !v.Verified {
+									return fmt.Errorf("WFP rollback CLEAR unverified: %s", v.Reason)
+								}
+								return nil
+							})
+						}
+					}
+					if err := rearmSteering(addQUIC, removeQUIC, convergeDNS, restoreDNS, resumeWFP, clearWFP); err != nil {
+						fmt.Printf("rearm: steering remains disarmed; retry required: %v\n", err)
+						return
+					}
+					// A later fail-open fallback must use the newly captured network's upstream resolvers.
+					if mgr != nil && dnsProxyInst != nil {
+						dnsProxyInst.setFallback(mgr.upstreams())
 					}
 					disarmed.Store(false)
+					disarmCleanupFailed.Store(false)
 				}
 
 				// Fail-open recovery + self-disarm monitor. While the Edge is reachable it does nothing; once
@@ -1825,13 +1892,59 @@ func main() {
 					var captiveTimeoutSec, captiveProbeSec atomic.Int64
 					captiveTimeoutSec.Store(floorSec(*captiveTimeout))
 					captiveProbeSec.Store(floorSec(*captiveProbeInterval))
+					inheritedRearmComplete := false
 					capDeps := captiveDeps{
 						probeEdge: func() bool { return probeEdge(transport, edgeURLForProbe) },
 						detectCaptive: func() captiveVerdict {
 							return detectCaptive(defaultCaptiveProbeHostsWindows, newCaptiveProbe(mgr.upstreams))
 						},
-						disarm: onDisarm,
-						rearm:  onRearm,
+						disarm:      onDisarm,
+						armDeadline: activeWFPPolicy.armCaptive,
+						recoverDeadline: func() bool {
+							select {
+							case <-capStop:
+								return false
+							default:
+							}
+							state, err := readDriverState()
+							if err != nil {
+								captiveRearmFailed.Store(true)
+								return false
+							}
+							if !state.CaptiveActive {
+								inheritedRearmComplete = false
+								captiveRearmFailed.Store(false)
+								return true
+							}
+							if !inheritedRearmComplete {
+								disarmed.Store(true)
+								onRearm()
+								inheritedRearmComplete = !disarmed.Load()
+							}
+							ok := inheritedRearmComplete
+							select {
+							case <-capStop:
+								return false
+							default:
+							}
+							if ok {
+								ok = activeWFPPolicy.finishCaptive() == nil
+							}
+							captiveRearmFailed.Store(!ok)
+							return ok
+						},
+						rearm: func() bool {
+							disarmed.Store(true)
+							onRearm()
+							ok := !disarmed.Load()
+							captiveRearmFailed.Store(!ok)
+							return ok
+						},
+						finishDeadline: func() error {
+							err := activeWFPPolicy.finishCaptive()
+							captiveRearmFailed.Store(err != nil)
+							return err
+						},
 						osCaptiveDetect: func(on bool) {
 							// Only meaningful when we suppress the OS active probe under steer-all. Entering the
 							// window RESTORES it so Windows runs captive detection + shows the native sign-in; on
@@ -1863,14 +1976,15 @@ func main() {
 					// L3 live tuning (M5): pull the signed tuning policy over (T) and apply captive timing centrally
 					// without a restart. Gated on the signed-policy pin + transport (same trust as steer-exclusions);
 					// a bad/absent bundle keeps the current settings.
-					if strings.TrimSpace(*agentPolicyPin) != "" && transport.enabled {
+					if strings.TrimSpace(*agentPolicyPin) != "" && transport.enabled && strings.TrimSpace(profTenant) != "" {
 						base := strings.TrimSpace(*agentPolicyURL)
 						if base == "" {
 							base = "https://" + transport.host
 						}
 						tuner := agenttuning.Syncer{
-							URL:    strings.TrimRight(base, "/") + "/steer/agent-tuning",
-							PinHex: strings.TrimSpace(*agentPolicyPin),
+							URL:      strings.TrimRight(base, "/") + "/steer/agent-tuning",
+							PinHex:   strings.TrimSpace(*agentPolicyPin),
+							TenantID: strings.TrimSpace(profTenant),
 							// Same accepted-key set as every other signed-policy path here, read fresh per fetch so
 							// an adoption that happens while this Syncer is running is picked up.
 							Keys: func() []string {
@@ -1938,6 +2052,9 @@ func main() {
 									lastProbe = time.Now()
 								}
 								p := deriveProtection(disarmed.Load(), captiveActive.Load(), edgeOK)
+								if captiveRearmFailed.Load() || disarmCleanupFailed.Load() {
+									p = agentstatus.Error
+								}
 								holder.Set(func(s *agentstatus.Status) {
 									s.Protection, s.EdgeReachable, s.UpdatedUnix = p, edgeOK, time.Now().Unix()
 								})
@@ -1997,11 +2114,11 @@ func main() {
 						if capCfg.dests == nil || len(addrs) == 0 {
 							return
 						}
-						ap, ok := resolveAddrPort(addrs[0])
-						if !ok || !capCfg.dests.setEdge(ap) {
+						bypass, ok := parsePinnedEdgeDestinations(addrs)
+						if !ok || !capCfg.dests.setEdges(bypass) {
 							return
 						}
-						fmt.Printf("steer: Edge destination bypass follows the region -> %v\n", ap)
+						fmt.Printf("steer: Edge destination bypass follows the region -> %v\n", bypass)
 					},
 				}
 				rf := newRegionFailover(
@@ -2025,11 +2142,12 @@ func main() {
 						// Phase 4: recovering to a healthy region re-arms from terminal fail-open back to in-boundary
 						// steering (edge-triggered on the fail-closed -> connected transition). This is the auto-recovery
 						// path — only an explicit STOP is terminal.
-						connectedOK: func(ep regionfailover.RegionEndpoint) {
+						connectedOK: func(ep regionfailover.RegionEndpoint) bool {
 							if onRearm != nil && disarmed.Load() {
 								fmt.Println("region_failover: a region recovered — re-arming from terminal fail-open back to in-boundary steering")
 								onRearm()
 							}
+							return !disarmed.Load()
 						},
 					},
 					regionFailoverOptions{
@@ -2054,7 +2172,7 @@ func main() {
 				if stop != nil {
 					go func() { <-stop; rfCancel() }()
 				}
-				go rf.run(rfCtx, nil, nil)
+				go rf.run(rfCtx, muxTransportFailure, nil)
 				// ★★★ AND THEN SAY WHICH REGION IT IS ACTUALLY ON (2026-08-30).
 				//
 				// The banner below names home= from the profile. nearest-healthy decides where this device
@@ -2122,7 +2240,6 @@ func main() {
 			// Which optional companions actually made it onto this machine. The branded step-up window was
 			// implemented, wired, and installed nowhere — and because its absence only degrades a feature at
 			// the moment it is used, it went unnoticed. Report it at startup instead.
-			reportCompanions()
 
 			// Wire the capture backend to the edge-steering layer via the SteeringCapture interface; the
 			// factory lets the supervisor recreate the backend after a failure (durable operation).
@@ -2189,64 +2306,6 @@ func splitCSV(s string) []string {
 	for _, f := range strings.Split(s, ",") {
 		if f = strings.TrimSpace(f); f != "" {
 			out = append(out, f)
-		}
-	}
-	return out
-}
-
-// resolveAddrPort turns a "host:port" (host may be an IPv4 literal or a name) into an IPv4 AddrPort.
-func resolveAddrPort(hostPort string) (netip.AddrPort, bool) {
-	trimmed := strings.TrimSpace(hostPort)
-	host, portStr, err := net.SplitHostPort(trimmed)
-	if err != nil {
-		// No port given: treat the whole token as an IP/host and bypass ALL ports to it
-		// (port 0 = wildcard). This is how a "whole-host" exception (e.g. a domain controller,
-		// whose dynamic RPC uses ephemeral ports) is expressed; the driver/windivert side match
-		// port 0 against any connection port.
-		return resolveHostWildcard(trimmed)
-	}
-	var port int
-	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil || port < 1 || port > 65535 {
-		return netip.AddrPort{}, false
-	}
-	if a, err := netip.ParseAddr(host); err == nil && a.Is4() {
-		return netip.AddrPortFrom(a, uint16(port)), true
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return netip.AddrPort{}, false
-	}
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			return netip.AddrPortFrom(netip.AddrFrom4([4]byte{v4[0], v4[1], v4[2], v4[3]}), uint16(port)), true
-		}
-	}
-	return netip.AddrPort{}, false
-}
-
-// resolveHostWildcard resolves a bare IP/host (no port) to an IPv4 AddrPort with port 0, meaning "bypass
-// every port to this destination". Used for whole-host exceptions like a domain controller.
-func resolveHostWildcard(host string) (netip.AddrPort, bool) {
-	if a, err := netip.ParseAddr(host); err == nil && a.Is4() {
-		return netip.AddrPortFrom(a, 0), true
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return netip.AddrPort{}, false
-	}
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			return netip.AddrPortFrom(netip.AddrFrom4([4]byte{v4[0], v4[1], v4[2], v4[3]}), 0), true
-		}
-	}
-	return netip.AddrPort{}, false
-}
-
-func parseAddrPorts(hostPorts []string) []netip.AddrPort {
-	var out []netip.AddrPort
-	for _, hp := range hostPorts {
-		if ap, ok := resolveAddrPort(hp); ok {
-			out = append(out, ap)
 		}
 	}
 	return out

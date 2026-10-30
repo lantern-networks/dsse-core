@@ -46,3 +46,22 @@ func TestAuthenticationMaxAgeRequiresReauth(t *testing.T) {
 		t.Fatalf("no max-age policy should allow regardless of auth_time, got %q", d.Decision)
 	}
 }
+
+func TestReauthenticationActionPreservesZeroAndMethodList(t *testing.T) {
+	p := model.Policy{Metadata: map[string]any{"max_age_seconds": 0, "required_amr": []string{"pwd", "otp"}}}
+	actions := actionsForPolicyDecision("require_reauthentication", model.DecisionRequest{}, p)
+	if len(actions) != 1 {
+		t.Fatal(actions)
+	}
+	if age, present := actions[0].Metadata["max_age_seconds"]; !present || age != 0 {
+		t.Fatal("explicit fresh-authentication request disappeared")
+	}
+	methods, ok := actions[0].Metadata["required_amr"].([]string)
+	if !ok || len(methods) != 2 {
+		t.Fatal("method requirements disappeared")
+	}
+	p.Metadata["max_age_seconds"] = -1
+	if actionsForPolicyDecision("require_reauthentication", model.DecisionRequest{}, p)[0].Metadata["max_age_seconds"] != -1 {
+		t.Fatal("invalid requirement silently omitted")
+	}
+}

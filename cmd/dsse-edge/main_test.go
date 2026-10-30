@@ -9,6 +9,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1185,6 +1187,37 @@ func TestRuntimeHumanIdentitySourceDueAndImportRequireConnectorAuth(t *testing.T
 	}
 	if !found {
 		t.Fatalf("runtime import audit not found in %#v", audits)
+	}
+}
+
+func TestCPBoundRuntimeHumanIdentityImportRequiresDirectoryReportChannel(t *testing.T) {
+	relaxConnectorMTLSPresentationForTest(t)
+	store := humanidentity.NewHumanIdentityDirectoryStore()
+	if _, err := humanidentity.HumanIdentityDirectoryUpsertSourcePolicy(context.Background(), store, "tenant_lab_001", humanidentity.HumanIdentitySourcePolicy{
+		Source: "scim_runtime", ConnectorType: "scim", Enabled: true,
+		Metadata: map[string]any{"connector_id": "conn_runtime_scim"},
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	handler := newServerWithConfig(serverConfig{
+		Evaluator: testEvaluator(), HumanIdentities: store, ConnectorSecret: "tenant-runtime-secret",
+		ConfigSourceURL: "https://cp.invalid", LabMode: boolPtr(false),
+	})
+	req := httptest.NewRequest(http.MethodPost, "/identity-sources/import", strings.NewReader(`{
+		"source":"scim_runtime", "import_run_id":"human_import_no_report_001",
+		"identities":[{"id":"human_no_report_001","subject":"sub_human_no_report_001","status":"active"}]
+	}`))
+	req.Header.Set("content-type", "application/json")
+	req.Header.Set(connectorSecretHeader, "tenant-runtime-secret")
+	req.Header.Set(connectorIDHeader, "conn_runtime_scim")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("CP-bound import without report channel status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	identities, err := humanidentity.HumanIdentityDirectoryList(context.Background(), store, "tenant_lab_001", time.Now(), humanidentity.HumanIdentityDirectoryListOptions{})
+	if err != nil || identities.Count != 0 {
+		t.Fatalf("CP-bound import changed local directory before a durable report channel: count=%d err=%v", identities.Count, err)
 	}
 }
 
@@ -2867,6 +2900,7 @@ func TestConnectorRoutingSupportsSSHApplication(t *testing.T) {
 	}
 
 	proxyReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_ssh?connector_id=conn_lab_001&service_family=https&destination_port=443&destination=dummy-private-app.local", nil)
+	proxyReq.TLS = managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_ssh_001")
 	proxyRec := httptest.NewRecorder()
 	handler.ServeHTTP(proxyRec, proxyReq)
 	if proxyRec.Code != http.StatusOK {
@@ -2988,6 +3022,7 @@ func TestConnectorRoutingReturnsDecisionForSSHReauthentication(t *testing.T) {
 
 	proxyReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_ssh?connector_id=conn_lab_001", nil)
 	proxyReq.AddCookie(&http.Cookie{Name: "session_id", Value: "sess_ssh_stale_001"})
+	proxyReq.TLS = managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_lab_001")
 	proxyRec := httptest.NewRecorder()
 	handler.ServeHTTP(proxyRec, proxyReq)
 	if proxyRec.Code != http.StatusUnauthorized {
@@ -3129,8 +3164,10 @@ func TestEdgeConnectPolicyDecisionTakeoverBlocksDeniedBeforeTCPOpenAndAllowsOpen
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_policy_001")
 
 	denyReq := httptest.NewRequest(http.MethodConnect, "/apps/app_denied_https?connector_id=conn_lab_001", nil)
+	denyReq.TLS = managedTLS
 	denyReq.Header.Set(edgeplane.ConnectAuthorityHeader, "denied-route.internal:8443")
 	denyRec := httptest.NewRecorder()
 	handler.ServeHTTP(denyRec, denyReq)
@@ -3160,6 +3197,7 @@ func TestEdgeConnectPolicyDecisionTakeoverBlocksDeniedBeforeTCPOpenAndAllowsOpen
 	}
 
 	allowReq := httptest.NewRequest(http.MethodConnect, "/apps/app_allowed_https?connector_id=conn_lab_001", nil)
+	allowReq.TLS = managedTLS
 	allowReq.Header.Set(edgeplane.ConnectAuthorityHeader, "allowed-route.internal:8443")
 	allowDone := make(chan *httptest.ResponseRecorder, 1)
 	go func() {
@@ -3168,9 +3206,15 @@ func TestEdgeConnectPolicyDecisionTakeoverBlocksDeniedBeforeTCPOpenAndAllowsOpen
 		allowDone <- allowRec
 	}()
 
+	if err := serverRaw.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline for allowed tcp_open returned error: %v", err)
+	}
 	var openFrame tunnel.Frame
 	if err := serverTunnelConn.ReadJSON(&openFrame); err != nil {
 		t.Fatalf("ReadJSON allowed tcp_open returned error: %v", err)
+	}
+	if err := serverRaw.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear allowed tcp_open deadline returned error: %v", err)
 	}
 	if openFrame.Type != tunnel.FrameTCPOpen || openFrame.ApplicationID != "app_allowed_https" || openFrame.Host != "allowed-route.internal" || openFrame.Port != 8443 || openFrame.TunnelID != "tun_lab_001" {
 		t.Fatalf("openFrame = %+v, want allowed route tcp_open", openFrame)
@@ -3181,9 +3225,15 @@ func TestEdgeConnectPolicyDecisionTakeoverBlocksDeniedBeforeTCPOpenAndAllowsOpen
 	if err := serverTunnelConn.WriteJSON(tunnel.Frame{Type: tunnel.FrameTCPOpenResult, RequestID: openFrame.RequestID}); err != nil {
 		t.Fatalf("WriteJSON tcp_open_result returned error: %v", err)
 	}
+	if err := serverRaw.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline for post-open tcp_close returned error: %v", err)
+	}
 	var closeFrame tunnel.Frame
 	if err := serverTunnelConn.ReadJSON(&closeFrame); err != nil {
 		t.Fatalf("ReadJSON post-open tcp_close returned error: %v", err)
+	}
+	if err := serverRaw.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear post-open tcp_close deadline returned error: %v", err)
 	}
 	if closeFrame.Type != tunnel.FrameTCPClose || closeFrame.RequestID != openFrame.RequestID || closeFrame.Direction != tunnel.TCPDirectionLocal || closeFrame.CloseReason != tunnel.TCPCloseReasonError {
 		t.Fatalf("closeFrame = %+v, want local error close after hijack limitation", closeFrame)
@@ -3325,8 +3375,10 @@ func TestPhase3PolicyDrivenDefaultDenyInProcessAllowsTunnelAndClosesDefaultDeny(
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_phase3_001")
 
 	denyReq := httptest.NewRequest(http.MethodConnect, "/apps/app_phase3_default_deny_https?connector_id=conn_lab_phase3", nil)
+	denyReq.TLS = managedTLS
 	denyReq.Header.Set(edgeplane.ConnectAuthorityHeader, "phase3-default-deny.internal:8443")
 	denyRec := httptest.NewRecorder()
 	handler.ServeHTTP(denyRec, denyReq)
@@ -3356,6 +3408,7 @@ func TestPhase3PolicyDrivenDefaultDenyInProcessAllowsTunnelAndClosesDefaultDeny(
 	}
 
 	allowReq := httptest.NewRequest(http.MethodConnect, "/apps/app_phase3_allow_https?connector_id=conn_lab_phase3", nil)
+	allowReq.TLS = managedTLS
 	allowReq.Header.Set(edgeplane.ConnectAuthorityHeader, "phase3-allow.internal:8443")
 	allowWriter := newHijackableCONNECTResponseWriter()
 	defer allowWriter.close()
@@ -3365,9 +3418,15 @@ func TestPhase3PolicyDrivenDefaultDenyInProcessAllowsTunnelAndClosesDefaultDeny(
 		allowDone <- struct{}{}
 	}()
 
+	if err := serverRaw.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline for allowed tcp_open returned error: %v", err)
+	}
 	var openFrame tunnel.Frame
 	if err := serverTunnelConn.ReadJSON(&openFrame); err != nil {
 		t.Fatalf("ReadJSON allowed tcp_open returned error: %v", err)
+	}
+	if err := serverRaw.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear allowed tcp_open deadline returned error: %v", err)
 	}
 	if openFrame.Type != tunnel.FrameTCPOpen || openFrame.ApplicationID != "app_phase3_allow_https" || openFrame.Host != "phase3-allow.internal" || openFrame.Port != 8443 || openFrame.TunnelID != "tun_lab_phase3" {
 		t.Fatalf("openFrame = %+v, want Phase3 allowed route tcp_open", openFrame)
@@ -3381,6 +3440,9 @@ func TestPhase3PolicyDrivenDefaultDenyInProcessAllowsTunnelAndClosesDefaultDeny(
 	connectResponse := readCONNECTResponse(t, allowWriter.clientConn)
 	if !strings.Contains(connectResponse, "200 Connection Established") {
 		t.Fatalf("CONNECT response = %q, want 200 Connection Established", connectResponse)
+	}
+	if err := serverRaw.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline for allowed TCP data returned error: %v", err)
 	}
 
 	clientPayload := []byte("phase3-allow-client-bytes")
@@ -3604,6 +3666,7 @@ func TestEdgeConnectClientSuppliedNHIContextIgnoredBeforeTCPOpen(t *testing.T) {
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_nhi_context_001")
 
 	query := url.Values{}
 	query.Set("connector_id", "conn_lab_001")
@@ -3619,6 +3682,7 @@ func TestEdgeConnectClientSuppliedNHIContextIgnoredBeforeTCPOpen(t *testing.T) {
 	query.Set("mcp_token_passthrough_policy", "blocked")
 	query.Set("runtime_environment_id", "runtime_managed_cloud_lab_001")
 	denyReq := httptest.NewRequest(http.MethodConnect, "/apps/app_nhi_blocked_https?"+query.Encode(), nil)
+	denyReq.TLS = managedTLS
 	denyReq.Header.Set(edgeplane.ConnectAuthorityHeader, "nhi-blocked-route.internal:8443")
 	denyRec := httptest.NewRecorder()
 	handler.ServeHTTP(denyRec, denyReq)
@@ -3793,6 +3857,7 @@ func TestEdgeConnectClientSuppliedHumanContextCannotSatisfySessionPolicyBeforeTC
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_human_context_001")
 
 	query := url.Values{}
 	query.Set("connector_id", "conn_lab_001")
@@ -3804,6 +3869,7 @@ func TestEdgeConnectClientSuppliedHumanContextCannotSatisfySessionPolicyBeforeTC
 	query.Set("device_id", "dev_evil_001")
 	query.Set("device_trust_level", "trusted")
 	denyReq := httptest.NewRequest(http.MethodConnect, "/apps/app_human_mfa_group_https?"+query.Encode(), nil)
+	denyReq.TLS = managedTLS
 	denyReq.Header.Set(edgeplane.ConnectAuthorityHeader, "human-mfa-group-route.internal:8443")
 	denyRec := httptest.NewRecorder()
 	handler.ServeHTTP(denyRec, denyReq)
@@ -3820,13 +3886,16 @@ func TestEdgeConnectClientSuppliedHumanContextCannotSatisfySessionPolicyBeforeTC
 	if stringSliceContains(deniedDecision.ReasonCodes, "policy_matched") || !stringSliceContains(deniedDecision.ReasonCodes, "no_policy_match") {
 		t.Fatalf("denied decision = %#v, want query human context ignored before policy match", deniedDecision)
 	}
-	if deniedDecision.ActorType != "human" || deniedDecision.UserID != nil || deniedDecision.SubjectUserID != nil || deniedDecision.SessionID != nil || deniedDecision.DeviceID != nil {
-		t.Fatalf("denied decision identity = %#v, want no client-supplied human/session/device identity", deniedDecision)
+	if deniedDecision.ActorType != "human" || deniedDecision.UserID != nil || deniedDecision.SubjectUserID != nil || deniedDecision.SessionID != nil || deniedDecision.DeviceID == nil || *deniedDecision.DeviceID != "dev_human_context_001" {
+		t.Fatalf("denied decision identity = %#v, want only certificate-backed device identity", deniedDecision)
 	}
-	for _, forbidden := range []string{"mfa_state", "acr", "subject_user_id", "device_trust_level"} {
+	for _, forbidden := range []string{"mfa_state", "acr", "subject_user_id"} {
 		if _, ok := deniedDecision.Metadata[forbidden]; ok {
 			t.Fatalf("denied metadata = %#v, want no client-supplied %s", deniedDecision.Metadata, forbidden)
 		}
+	}
+	if deniedDecision.Metadata["device_trust_level"] == "trusted" {
+		t.Fatalf("denied metadata = %#v, want no query-supplied trust level", deniedDecision.Metadata)
 	}
 
 	if err := serverRaw.SetReadDeadline(time.Now().Add(75 * time.Millisecond)); err != nil {
@@ -3848,17 +3917,20 @@ func TestEdgeConnectClientSuppliedHumanContextCannotSatisfySessionPolicyBeforeTC
 	if err != nil {
 		t.Fatalf("read access log: %v", err)
 	}
-	if len(accessRows) != 1 || accessRows[0]["decision"] != "deny" || accessRows[0]["actor_type"] != "human" || accessRows[0]["user_id"] != nil || accessRows[0]["subject_user_id"] != nil || accessRows[0]["session_id"] != nil || accessRows[0]["device_id"] != nil {
+	if len(accessRows) != 1 || accessRows[0]["decision"] != "deny" || accessRows[0]["actor_type"] != "human" || accessRows[0]["user_id"] != nil || accessRows[0]["subject_user_id"] != nil || accessRows[0]["session_id"] != nil || accessRows[0]["device_id"] != "dev_human_context_001" {
 		t.Fatalf("access rows = %#v, want spoofed human context ignored in CONNECT deny", accessRows)
 	}
 	accessMetadata, ok := accessRows[0]["metadata"].(map[string]any)
 	if !ok {
 		t.Fatalf("access metadata = %#v, want metadata map", accessRows[0]["metadata"])
 	}
-	for _, forbidden := range []string{"mfa_state", "acr", "subject_user_id", "device_trust_level"} {
+	for _, forbidden := range []string{"mfa_state", "acr", "subject_user_id"} {
 		if _, ok := accessMetadata[forbidden]; ok {
 			t.Fatalf("access metadata = %#v, want no client-supplied %s", accessMetadata, forbidden)
 		}
+	}
+	if accessMetadata["device_trust_level"] == "trusted" {
+		t.Fatalf("access metadata = %#v, want no query-supplied trust level", accessMetadata)
 	}
 
 	traceRows, err := writer.ReadJSONL("access.log.jsonl")
@@ -3884,10 +3956,13 @@ func TestEdgeConnectClientSuppliedHumanContextCannotSatisfySessionPolicyBeforeTC
 	if !ok || traceMetadata["actor_type"] != "human" {
 		t.Fatalf("trace metadata = %#v, want human actor only", traceRows[0]["metadata"])
 	}
-	for _, forbidden := range []string{"mfa_state", "acr", "subject_user_id", "device_trust_level"} {
+	for _, forbidden := range []string{"mfa_state", "acr", "subject_user_id"} {
 		if _, ok := traceMetadata[forbidden]; ok {
 			t.Fatalf("trace metadata = %#v, want no client-supplied %s", traceMetadata, forbidden)
 		}
+	}
+	if traceMetadata["device_trust_level"] == "trusted" {
+		t.Fatalf("trace metadata = %#v, want no query-supplied trust level", traceMetadata)
 	}
 
 	connectorRows, err := writer.ReadJSONL("connector.log.jsonl")
@@ -4026,6 +4101,7 @@ func TestEdgeConnectSessionCannotUpgradeHumanGroupMFAFromQueryBeforeTCPOpen(t *t
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_session_limited_001")
 
 	query := url.Values{}
 	query.Set("connector_id", "conn_lab_001")
@@ -4037,6 +4113,7 @@ func TestEdgeConnectSessionCannotUpgradeHumanGroupMFAFromQueryBeforeTCPOpen(t *t
 	query.Set("device_id", "dev_evil_001")
 	query.Set("device_trust_level", "trusted")
 	denyReq := httptest.NewRequest(http.MethodConnect, "/apps/app_session_strict_group_https?"+query.Encode(), nil)
+	denyReq.TLS = managedTLS
 	denyReq.Header.Set(edgeplane.ConnectAuthorityHeader, "session-strict-group-route.internal:8443")
 	denyReq.AddCookie(&http.Cookie{Name: "session_id", Value: "sess_connect_limited_human_001"})
 	denyRec := httptest.NewRecorder()
@@ -4293,6 +4370,7 @@ func TestEdgeConnectSessionIdentityAllowsWhileIgnoringClientSuppliedNHIContext(t
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_session_001")
 
 	query := url.Values{}
 	query.Set("connector_id", "conn_lab_001")
@@ -4309,6 +4387,7 @@ func TestEdgeConnectSessionIdentityAllowsWhileIgnoringClientSuppliedNHIContext(t
 	query.Set("mcp_token_passthrough_policy", "blocked")
 	query.Set("runtime_environment_id", "runtime_managed_cloud_lab_001")
 	allowReq := httptest.NewRequest(http.MethodConnect, "/apps/app_session_human_https?"+query.Encode(), nil)
+	allowReq.TLS = managedTLS
 	allowReq.Header.Set(edgeplane.ConnectAuthorityHeader, "session-human-route.internal:8443")
 	allowReq.AddCookie(&http.Cookie{Name: "session_id", Value: "sess_connect_human_001"})
 	allowDone := make(chan *httptest.ResponseRecorder, 1)
@@ -4318,9 +4397,15 @@ func TestEdgeConnectSessionIdentityAllowsWhileIgnoringClientSuppliedNHIContext(t
 		allowDone <- allowRec
 	}()
 
+	if err := serverRaw.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline for session tcp_open returned error: %v", err)
+	}
 	var openFrame tunnel.Frame
 	if err := serverTunnelConn.ReadJSON(&openFrame); err != nil {
 		t.Fatalf("ReadJSON allowed tcp_open returned error: %v", err)
+	}
+	if err := serverRaw.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear session tcp_open deadline returned error: %v", err)
 	}
 	if openFrame.Type != tunnel.FrameTCPOpen || openFrame.ApplicationID != "app_session_human_https" || openFrame.Host != "session-human-route.internal" || openFrame.Port != 8443 {
 		t.Fatalf("openFrame = %+v, want session human route tcp_open", openFrame)
@@ -4328,9 +4413,15 @@ func TestEdgeConnectSessionIdentityAllowsWhileIgnoringClientSuppliedNHIContext(t
 	if err := serverTunnelConn.WriteJSON(tunnel.Frame{Type: tunnel.FrameTCPOpenResult, RequestID: openFrame.RequestID}); err != nil {
 		t.Fatalf("WriteJSON tcp_open_result returned error: %v", err)
 	}
+	if err := serverRaw.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline for session tcp_close returned error: %v", err)
+	}
 	var closeFrame tunnel.Frame
 	if err := serverTunnelConn.ReadJSON(&closeFrame); err != nil {
 		t.Fatalf("ReadJSON post-open tcp_close returned error: %v", err)
+	}
+	if err := serverRaw.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("clear session tcp_close deadline returned error: %v", err)
 	}
 	if closeFrame.Type != tunnel.FrameTCPClose || closeFrame.RequestID != openFrame.RequestID || closeFrame.Direction != tunnel.TCPDirectionLocal || closeFrame.CloseReason != tunnel.TCPCloseReasonError {
 		t.Fatalf("closeFrame = %+v, want local error close after no-hijack test harness", closeFrame)
@@ -4987,6 +5078,7 @@ func TestConnectorRoutingSupportsDatabaseApplication(t *testing.T) {
 	}
 
 	proxyReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_postgres?connector_id=conn_lab_001", nil)
+	proxyReq.TLS = managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_database_001")
 	proxyRec := httptest.NewRecorder()
 	handler.ServeHTTP(proxyRec, proxyReq)
 	if proxyRec.Code != http.StatusOK {
@@ -5056,6 +5148,7 @@ func TestConnectorRoutingSupportsRDPApplication(t *testing.T) {
 	}
 
 	proxyReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_rdp?connector_id=conn_lab_001", nil)
+	proxyReq.TLS = managedApplicationTestTLS(t, handler, "tenant_lab_001", "dev_rdp_001")
 	proxyRec := httptest.NewRecorder()
 	handler.ServeHTTP(proxyRec, proxyReq)
 	if proxyRec.Code != http.StatusOK {
@@ -5108,7 +5201,7 @@ func TestConnectorRoutingUsesSessionCookie(t *testing.T) {
 		}, nil
 	})}, defaultConnectorSecret, tunnel.NewManager(), store, oidcConfig{})
 
-	createReq := httptest.NewRequest(http.MethodPost, "/auth/events", strings.NewReader(`{
+	createReq := httptest.NewRequest(http.MethodPost, "/auth/events", strings.NewReader(fmt.Sprintf(`{
 		"id":"auth_cookie_001",
 		"tenant_id":"tenant_lab_001",
 		"user_id":"user_cookie_001",
@@ -5120,12 +5213,12 @@ func TestConnectorRoutingUsesSessionCookie(t *testing.T) {
 		"acr":"urn:mfa:fresh",
 		"mfa_state":"fresh",
 		"auth_time":"2026-05-22T00:00:00Z",
-		"expires_at":"2026-05-22T01:00:00Z",
+		"expires_at":"%s",
 		"device_id":"dev_cookie_001",
 		"result":"success",
 		"timestamp":"2026-05-22T00:00:00Z",
 		"metadata":{}
-	}`))
+	}`, time.Now().UTC().Add(time.Hour).Format(time.RFC3339))))
 	createRec := httptest.NewRecorder()
 	handler.ServeHTTP(createRec, createReq)
 	if createRec.Code != http.StatusCreated {
@@ -5150,9 +5243,23 @@ func TestConnectorRoutingUsesSessionCookie(t *testing.T) {
 	if registerRec.Code != http.StatusCreated {
 		t.Fatalf("register status = %d, want %d, body=%s", registerRec.Code, http.StatusCreated, registerRec.Body.String())
 	}
+	deviceReq := httptest.NewRequest(http.MethodPost, "/devices/register", strings.NewReader(`{"id":"dev_cookie_001","tenant_id":"tenant_lab_001","user_id":"user_cookie_001"}`))
+	deviceRec := httptest.NewRecorder()
+	handler.ServeHTTP(deviceRec, deviceReq)
+	if deviceRec.Code != http.StatusCreated {
+		t.Fatalf("device register status = %d, want 201", deviceRec.Code)
+	}
+	ca := makeTestCA(t, t.TempDir(), "cookie-device", 193)
+	pool := x509.NewCertPool()
+	pool.AddCert(ca.cert)
+	chains := leafSignedBy(t, ca, "dev_cookie_001", pool)
+	if len(chains) == 0 {
+		t.Fatal("device chain did not verify")
+	}
 
 	proxyReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_https?connector_id=conn_lab_001", nil)
 	proxyReq.AddCookie(&http.Cookie{Name: "session_id", Value: "sess_cookie_001"})
+	proxyReq.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{chains[0][0]}, VerifiedChains: chains}
 	proxyRec := httptest.NewRecorder()
 	handler.ServeHTTP(proxyRec, proxyReq)
 	if proxyRec.Code != http.StatusOK {

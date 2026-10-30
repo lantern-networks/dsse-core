@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 
@@ -33,7 +32,7 @@ func setupEdgeNonHumanIdentityStore(ctx context.Context, config edgeNonHumanIden
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("nhi-registry-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

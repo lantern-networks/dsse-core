@@ -100,11 +100,18 @@ func recordNonHumanIdentityRuntimeUse(ctx context.Context, store nhi.RuntimeStor
 }
 
 func enrichDecisionRequestWithSession(req model.DecisionRequest, sessionStore *sessionstore.Store) model.DecisionRequest {
-	if req.SessionID == "" {
+	if req.SessionID == "" || sessionStore == nil {
 		return req
 	}
-	session, ok := sessionStore.Get(req.SessionID)
-	if !ok || session.Status != "active" {
+	session, ok := sessionStore.GetActiveAt(req.SessionID, time.Now())
+	if !ok {
+		return req
+	}
+	// The request's tenant may already come from its application route or
+	// transport. Never combine that tenant with identity/MFA from a foreign
+	// session. When the request has no tenant, the caller still verifies the
+	// session-derived tenant against the transport before authorization.
+	if tenant := strings.TrimSpace(req.TenantID); tenant != "" && tenant != strings.TrimSpace(session.TenantID) {
 		return req
 	}
 	req.TenantID = valueOrDefault(req.TenantID, session.TenantID)
@@ -132,7 +139,17 @@ func enrichDecisionRequestWithSession(req model.DecisionRequest, sessionStore *s
 	return req
 }
 
+// This compatibility form is used with nil stores and in-memory/test snapshots.
+// Authorization paths backed by a fallible inventory must use the checked form.
 func enrichDecisionRequestWithDeviceRisk(req model.DecisionRequest, deviceStore deviceRuntimeStore, highRisk *revocation.HighRiskOverlay) model.DecisionRequest {
+	req, _ = enrichDecisionRequestWithDeviceRiskChecked(req, deviceStore, highRisk)
+	return req
+}
+
+// Authorization callers must distinguish an absent device from an inventory
+// read failure. A missing device retains the existing policy semantics; an
+// unreadable inventory cannot silently strip risk conditions from a decision.
+func enrichDecisionRequestWithDeviceRiskChecked(req model.DecisionRequest, deviceStore deviceRuntimeStore, highRisk *revocation.HighRiskOverlay) (model.DecisionRequest, error) {
 	// Phase 3 shared high-risk overlay: a device marked high-risk on the control plane is treated
 	// high-risk by EVERY node — even one whose local device store never saw it. Consulted BEFORE the device
 	// lookup so it bites regardless of local registration (reconnect-elsewhere can't dodge a high-risk mark).
@@ -158,24 +175,44 @@ func enrichDecisionRequestWithDeviceRisk(req model.DecisionRequest, deviceStore 
 		}
 	}
 	if deviceStore == nil || req.DeviceID == "" {
-		return req
+		return req, nil
 	}
 	var dev model.Device
 	var ok bool
 	if req.TenantID != "" {
 		var err error
 		dev, ok, err = deviceForTenant(deviceStore, req.TenantID, req.DeviceID)
-		if err != nil || !ok {
-			return req
+		if err != nil {
+			return req, fmt.Errorf("read device risk inventory: %w", err)
+		}
+		if !ok {
+			return req, nil
 		}
 	} else {
-		dev, ok = deviceStore.Get(req.DeviceID)
+		if checked, available := deviceStore.(interface {
+			GetChecked(string) (model.Device, bool, error)
+		}); available {
+			var err error
+			dev, ok, err = checked.GetChecked(req.DeviceID)
+			if err != nil {
+				return req, fmt.Errorf("read device risk inventory: %w", err)
+			}
+		} else {
+			// The in-memory inventory has no I/O failure mode. Its legacy
+			// unscoped lookup is retained for single-tenant requests that do
+			// not know the device's tenant until after this read.
+			dev, ok = deviceStore.Get(req.DeviceID)
+		}
 		if !ok {
-			return req
+			return req, nil
 		}
 		req.TenantID = valueOrDefault(req.TenantID, dev.TenantID)
 	}
 
+	return enrichDecisionRequestWithDeviceRecord(req, dev), nil
+}
+
+func enrichDecisionRequestWithDeviceRecord(req model.DecisionRequest, dev model.Device) model.DecisionRequest {
 	req.DeviceTrustLevel = valueOrDefault(req.DeviceTrustLevel, dev.DeviceTrustLevel)
 	req.RiskStateID = valueOrDefault(req.RiskStateID, stringMetadata(dev.Metadata, "risk_state_id"))
 	req.RiskStateSeverity = valueOrDefault(req.RiskStateSeverity, stringMetadata(dev.Metadata, "risk_state_severity"))
@@ -194,9 +231,17 @@ func enrichDecisionRequestWithDeviceRisk(req model.DecisionRequest, deviceStore 
 // model): a member device's effective risk_state_severity becomes max(its resolved severity, its group's floor).
 // The floor is CONDITION-ONLY — it raises risk_state_severity so risk-gated POLICIES react (including on the
 // re-evaluation of existing sessions), but it does NOT set AdminHighRisk and does NOT trigger revocation. All
-// enforcement is explicit policy .
+// enforcement is explicit policy. The unchecked form is retained for nil
+// inventory and already-verified device snapshots; fallible runtime reads use
+// enrichDecisionRequestWithRiskChecked so policy never sees erased risk state.
 func enrichDecisionRequestWithRisk(req model.DecisionRequest, deviceStore deviceRuntimeStore, highRisk *revocation.HighRiskOverlay, ledger *enrolledinventory.Ledger) model.DecisionRequest {
-	req = enrichDecisionRequestWithDeviceRisk(req, deviceStore, highRisk)
+	req, _ = enrichDecisionRequestWithRiskChecked(req, deviceStore, highRisk, ledger)
+	return req
+}
+
+func enrichDecisionRequestWithRiskChecked(req model.DecisionRequest, deviceStore deviceRuntimeStore, highRisk *revocation.HighRiskOverlay, ledger *enrolledinventory.Ledger) (model.DecisionRequest, error) {
+	var err error
+	req, err = enrichDecisionRequestWithDeviceRiskChecked(req, deviceStore, highRisk)
 	if ledger != nil && req.DeviceID != "" {
 		// Floor resolved WITHIN the device's own tenant (GroupRiskForDevice keys on the entry's TenantID), so a
 		// device never inherits another tenant's same-named group floor (multi-tenant premise).
@@ -204,5 +249,5 @@ func enrichDecisionRequestWithRisk(req model.DecisionRequest, deviceStore device
 			req.RiskStateSeverity = maxRiskSeverity(req.RiskStateSeverity, floor)
 		}
 	}
-	return req
+	return req, err
 }

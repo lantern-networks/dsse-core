@@ -134,12 +134,12 @@ func publishedAppCountForSite(ctx context.Context, catalog appcatalog.RuntimeSto
 	if catalog == nil || siteID == "" || siteID == adminSiteUngroupedID {
 		return 0
 	}
-	resp, err := catalog.List(ctx, strings.TrimSpace(tenantID), appcatalog.ListOptions{Limit: 1000})
+	entries, err := catalog.ListAll(ctx, strings.TrimSpace(tenantID), appcatalog.ListAllOptions{})
 	if err != nil {
 		return 0
 	}
 	count := 0
-	for _, entry := range resp.Applications {
+	for _, entry := range entries {
 		if entry.Published && strings.TrimSpace(entry.ConnectorGroupID) == siteID {
 			count++
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/authrollout"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/logs"
@@ -21,7 +22,7 @@ import (
 // (adminTenantIDFromRequest) and never a startup-fixed value — LIST returns only the caller's grants, and REVOKE
 // verifies the target grant belongs to the caller's tenant before revoking (otherwise a grant id alone would be a
 // cross-tenant IDOR: any admin could revoke any tenant's grant). Fail closed when no tenant resolves.
-func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *grantstore.Store, evaluator decision.Evaluator, writer *logs.Writer, outbox adminAuditOutboxDeadReader) {
+func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, store *grantstore.Store, evaluator decision.Evaluator, writer *logs.Writer, outbox adminAuditOutboxDeadReader, rollout *authRolloutRuntime, configSourceURL string) {
 	mux.HandleFunc("GET /admin/grants", adminEndpoint("admin.grants.read", func(w http.ResponseWriter, r *http.Request) {
 		callerTenant := strings.TrimSpace(adminTenantIDFromRequest(r))
 		if callerTenant == "" {
@@ -42,7 +43,19 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 			return
 		}
 		id := r.PathValue("id")
-		grant, found, err := store.RevokeForTenantContext(r.Context(), callerTenant, id)
+		if strings.TrimSpace(configSourceURL) != "" {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("send revocation to the control-plane authority; this Edge cannot confirm an authoritative revocation"))
+			return
+		}
+		strong := rollout.featureEnabled(authrollout.RevocationReauthenticationFeature)
+		var grant grantstore.Grant
+		var found bool
+		var err error
+		if strong {
+			grant, found, err = store.RequireReauthenticationForTenantContext(r.Context(), callerTenant, id, time.Now().UTC())
+		} else {
+			grant, found, err = store.RevokeForTenantContext(r.Context(), callerTenant, id)
+		}
 		if err != nil && !found {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
@@ -57,15 +70,26 @@ func registerGrantsAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Han
 		if nonAtomic {
 			audit.Metadata["persistence"] = "saved_non_atomic"
 		}
+		scope := store.ReauthenticationScope(grant)
+		if scope == "tenant" {
+			audit.Metadata["reauthentication_scope"] = scope
+		}
 		_ = appendAdminAudit(r.Context(), writer, outbox, audit, now)
 		if err != nil && !nonAtomic {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"status": "partial", "applied": true, "tenant_id": grant.TenantID, "grant_id": grant.GrantID, "audit_ref": accessGrantAuditReference(grant.GrantID), "persistence": "unconfirmed",
+				"status": "partial", "applied": true, "tenant_id": grant.TenantID, "grant_id": grant.GrantID, "audit_ref": accessGrantAuditReference(grant.GrantID), "persistence": "unconfirmed", "reauthenticate_after": grant.ReauthenticateAfter, "fresh_identity_required": grant.ReauthenticateAfter != "", "reauthentication_scope": scope,
 				"error": "Access was revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",
 			})
 			return
 		}
-		result := map[string]string{"status": "revoked", "grant_id": grant.GrantID, "tenant_id": grant.TenantID, "audit_ref": accessGrantAuditReference(grant.GrantID)}
+		result := map[string]any{"status": "revoked", "grant_id": grant.GrantID, "tenant_id": grant.TenantID, "audit_ref": accessGrantAuditReference(grant.GrantID), "reauthenticate_after": grant.ReauthenticateAfter, "fresh_identity_required": grant.ReauthenticateAfter != ""}
+		result["reauthentication_scope"] = scope
+		if scope == "tenant" {
+			result["warning"] = "Revocation boundaries were consolidated for this tenant. Other approvals in this tenant may also require fresh identity verification."
+		}
+		if grant.ReauthenticateAfter == "" {
+			result["warning"] = "Approval revoked. Fresh identity verification is not enforced until revocation reauthentication is activated on all authentication nodes."
+		}
 		if nonAtomic {
 			result["persistence"] = "saved_non_atomic"
 		}

@@ -71,10 +71,10 @@ func siteBundleSection(ctx context.Context, store adminSiteStore, tenants []stri
 	seen := map[string]bool{}
 	for _, tenant := range tenants {
 		tenant = strings.TrimSpace(tenant)
-		if tenant == "" || seen[strings.ToLower(tenant)] {
+		if tenant == "" || seen[tenant] {
 			continue
 		}
-		seen[strings.ToLower(tenant)] = true
+		seen[tenant] = true
 		sites, err := store.List(ctx, tenant)
 		if err != nil {
 			// One organization's store failing must not publish a section that LOOKS complete without them —
@@ -130,12 +130,12 @@ func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *
 	// The organizations this catalogue speaks for — including any it says has NO Sites, which is the whole
 	// point of carrying them separately.
 	for _, tenant := range section.Tenants {
-		if t := strings.ToLower(strings.TrimSpace(tenant)); t != "" {
+		if t := strings.TrimSpace(tenant); t != "" {
 			tenants[t] = true
 		}
 	}
 	for _, site := range section.Sites {
-		tenant := strings.ToLower(strings.TrimSpace(site.TenantID))
+		tenant := strings.TrimSpace(site.TenantID)
 		id := strings.TrimSpace(site.SiteID)
 		if tenant == "" || id == "" {
 			continue
@@ -154,7 +154,7 @@ func applySiteBundleSection(ctx context.Context, store adminSiteStore, section *
 			continue
 		}
 		for _, site := range local {
-			key := strings.ToLower(strings.TrimSpace(site.TenantID)) + "\x00" + strings.TrimSpace(site.SiteID)
+			key := strings.TrimSpace(site.TenantID) + "\x00" + strings.TrimSpace(site.SiteID)
 			if _, keep := wanted[key]; keep {
 				continue
 			}

@@ -10,9 +10,13 @@ import (
 	"github.com/lantern-networks/dsse-core/enrolltoken"
 )
 
+const enrolRateLimitBurst = 20 // The public bootstrap's inherited abuse-protection default.
+
 // The bootstrap endpoint is public and unauthenticated by construction, so the limit has to actually bite —
 // but on the ATTEMPT, before any of the work an attacker is trying to cause.
 func TestEnrolIsRateLimitedPerSource(t *testing.T) {
+	t.Setenv("DSSE_ENROL_REQUESTS_PER_SECOND", "")
+	t.Setenv("DSSE_ENROL_BURST", "")
 	mux, _, _ := newTokenEnrolTestMux(t)
 
 	limited := 0
@@ -28,6 +32,29 @@ func TestEnrolIsRateLimitedPerSource(t *testing.T) {
 	// device anyone tries to enrol.
 	if code, _ := enrolPost(t, mux, "probe", "not-a-real-token"); code != http.StatusTooManyRequests {
 		t.Fatalf("once the bucket is empty it stays empty until it refills, got %d", code)
+	}
+}
+
+func TestEnrolRateCanOnlyBeDisabledByExplicitOperatorChoice(t *testing.T) {
+	t.Setenv("DSSE_ENROL_REQUESTS_PER_SECOND", "0")
+	t.Setenv("DSSE_ENROL_BURST", "")
+	mux, _, _ := newTokenEnrolTestMux(t)
+	for i := 0; i < 100; i++ {
+		if code, _ := enrolPost(t, mux, "probe", "invalid-token"); code == http.StatusTooManyRequests {
+			t.Fatal("explicit operator opt-out was ignored")
+		}
+	}
+}
+
+func TestEnrolRateUsesTheExplicitPositiveOperatorBudget(t *testing.T) {
+	t.Setenv("DSSE_ENROL_REQUESTS_PER_SECOND", "2")
+	t.Setenv("DSSE_ENROL_BURST", "3")
+	mux, _, _ := newTokenEnrolTestMux(t)
+	for i := 0; i < 4; i++ {
+		code, _ := enrolPost(t, mux, "probe", "invalid-token")
+		if (code == http.StatusTooManyRequests) != (i == 3) {
+			t.Fatalf("explicit three-request burst was not enforced on request %d", i)
+		}
 	}
 }
 
@@ -55,6 +82,8 @@ func TestTheBurstCoversARealisticKittingBatch(t *testing.T) {
 // unauthenticated surface, and throttling it would turn a fleet-wide renewal window into a fleet-wide expiry.
 // This asserts the ROUTE is separate — a shared limiter would be the mistake.
 func TestRenewalIsNotBehindTheEnrolmentLimiter(t *testing.T) {
+	t.Setenv("DSSE_ENROL_REQUESTS_PER_SECOND", "5")
+	t.Setenv("DSSE_ENROL_BURST", "20")
 	mux, _, _ := newTokenEnrolTestMux(t)
 	for i := 0; i < enrolRateLimitBurst+5; i++ {
 		enrolPost(t, mux, "probe", "not-a-real-token")

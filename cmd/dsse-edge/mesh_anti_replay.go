@@ -91,7 +91,9 @@ func verifyMeshAntiReplay(h http.Header, secret string, body []byte, guard *mesh
 	}
 	reqTime := time.Unix(tsec, 0)
 	age := now.Sub(reqTime)
-	if age < -meshAntiReplayWindow || age > meshAntiReplayWindow {
+	// Cache entries expire at timestamp+window. That instant must also be
+	// outside the acceptance window, or eviction makes the same nonce fresh.
+	if age < -meshAntiReplayWindow || age >= meshAntiReplayWindow {
 		return fmt.Errorf("mesh request timestamp outside freshness window")
 	}
 	want := meshRequestSignature(secret, ts, nonce, body)

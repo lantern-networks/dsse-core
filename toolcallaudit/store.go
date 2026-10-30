@@ -18,9 +18,13 @@ type RuntimeStore interface {
 }
 
 type Store struct {
-	mu     sync.RWMutex
-	events map[string]Event
+	mu sync.RWMutex
+	// Event IDs are unique only within a tenant. A tenant must not replace another tenant's audit event
+	// by submitting the same ID.
+	events map[eventStoreKey]Event
 }
+
+type eventStoreKey struct{ tenantID, eventID string }
 
 type ListOptions struct {
 	ToolID     string
@@ -72,7 +76,7 @@ type Event struct {
 
 func NewStore() *Store {
 	return &Store{
-		events: map[string]Event{},
+		events: map[eventStoreKey]Event{},
 	}
 }
 
@@ -140,7 +144,7 @@ func (s *Store) Get(_ context.Context, tenantID, eventID string) (Event, bool, e
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	event, ok := s.events[eventID]
+	event, ok := s.events[eventStoreKey{tenantID, eventID}]
 	if !ok || event.TenantID != tenantID {
 		return Event{}, false, nil
 	}
@@ -165,7 +169,7 @@ func (s *Store) Upsert(_ context.Context, event model.ToolCallEvent, tenantID st
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.events[adminEvent.ID] = adminEvent
+	s.events[eventStoreKey{adminEvent.TenantID, adminEvent.ID}] = adminEvent
 	return adminEvent, nil
 }
 

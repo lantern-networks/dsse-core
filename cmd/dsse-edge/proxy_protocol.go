@@ -54,17 +54,24 @@ func newProxyProtocolListener(ln net.Listener, trusted []*net.IPNet) net.Listene
 }
 
 func (l *proxyProtocolListener) Accept() (net.Conn, error) {
-	conn, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if !l.trustedRemote(conn.RemoteAddr()) {
+			// An untrusted peer's PROXY header remains ordinary payload: it cannot
+			// choose a source address and will fail the TLS handshake.
+			return conn, nil
+		}
+		wrapped, err := proxyProtocolConn(conn)
+		if err == nil {
+			return wrapped, nil
+		}
+		// A malformed connection is not a listener failure. Returning its parse
+		// error makes http.Server.Serve close the entire agent-facing listener.
+		_ = conn.Close()
 	}
-	if !l.trustedRemote(conn.RemoteAddr()) {
-		// Not the front door: the connection is whatever it is, and any PROXY header in it is just bytes that
-		// will fail to be a TLS ClientHello — which is the correct outcome for someone trying to declare an
-		// address they were not asked for.
-		return conn, nil
-	}
-	return proxyProtocolConn(conn)
 }
 
 func (l *proxyProtocolListener) trustedRemote(addr net.Addr) bool {
@@ -95,7 +102,9 @@ func proxyProtocolConn(conn net.Conn) (net.Conn, error) {
 		_ = conn.SetReadDeadline(time.Time{})
 		return &bufferedConn{Conn: conn, r: r}, nil
 	}
-	line, err := r.ReadString('\n')
+	// ReadString grows until a newline. ReadSlice bounds parsing to the v1
+	// header buffer and rejects a peer that fills it without terminating.
+	line, err := r.ReadSlice('\n')
 	_ = conn.SetReadDeadline(time.Time{})
 	if err != nil || len(line) > proxyProtocolV1MaxLine {
 		// A trusted peer that begins a header and does not finish one is a fault worth failing on: continuing
@@ -103,7 +112,7 @@ func proxyProtocolConn(conn net.Conn) (net.Conn, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("proxy protocol: malformed header from %s", conn.RemoteAddr())
 	}
-	declared := parseProxyProtocolV1(strings.TrimRight(line, "\r\n"))
+	declared := parseProxyProtocolV1(strings.TrimRight(string(line), "\r\n"))
 	if declared == nil {
 		// "PROXY UNKNOWN" is the front door saying it does not know either. The connection is served; the
 		// address stays the front door's, which is honest rather than invented.

@@ -205,11 +205,7 @@ func (e *enrolmentCPReporter) queue(rep enrolmentReport, cause error) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(e.outboxPath), 0o700); err != nil && e.logf != nil {
-		e.logf("enrolment_report_outbox: cannot create %s: %v", filepath.Dir(e.outboxPath), err)
-	}
-	f, err := os.OpenFile(e.outboxPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
+	if err := appendCPReportOutbox(e.outboxPath, line); err != nil {
 		if e.logf != nil {
 			e.logf("★ enrolment_report_lost identity=%q tenant=%q error=%q outbox_error=%q — the report could "+
 				"not be delivered NOR queued; this device will be dropped from admission at the next bundle",
@@ -217,15 +213,6 @@ func (e *enrolmentCPReporter) queue(rep enrolmentReport, cause error) {
 		}
 		return
 	}
-	defer f.Close()
-	if _, err := f.Write(append(line, '\n')); err != nil {
-		if e.logf != nil {
-			e.logf("★ enrolment_report_lost identity=%q write_error=%q", rep.Identity, err.Error())
-		}
-		return
-	}
-	// Sync, because the case this exists for is the Edge being restarted while the CP is down.
-	_ = f.Sync()
 	if e.logf != nil {
 		e.logf("enrolment_report_queued identity=%q tenant=%q error=%q — queued for retry; until it is "+
 			"delivered the control plane does not know this device exists", rep.Identity, rep.TenantID, cause.Error())
@@ -260,9 +247,16 @@ func (e *enrolmentCPReporter) drainOnce(ctx context.Context) {
 
 	f, err := os.Open(e.outboxPath)
 	if err != nil {
-		return // no outbox = nothing pending
+		if !os.IsNotExist(err) && e.logf != nil {
+			e.logf("enrolment_report_outbox_read_failed: %v — replay stopped; original outbox preserved", err)
+		}
+		return
 	}
-	var pending []enrolmentReport
+	type queued struct {
+		line []byte
+		rep  enrolmentReport
+	}
+	var pending []queued
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -271,20 +265,34 @@ func (e *enrolmentCPReporter) drainOnce(ctx context.Context) {
 			continue
 		}
 		var rep enrolmentReport
-		if err := json.Unmarshal([]byte(line), &rep); err != nil {
-			continue // an unparseable line is dropped rather than retried for ever
+		if err := decodeCPReportObject([]byte(line), &rep); err != nil {
+			f.Close()
+			if e.logf != nil {
+				e.logf("enrolment_report_outbox_unreadable: %v — replay stopped; original outbox preserved", err)
+			}
+			return
 		}
-		pending = append(pending, rep)
+		pending = append(pending, queued{line: []byte(line), rep: rep})
 	}
+	scanErr := scanner.Err()
 	f.Close()
+	if scanErr != nil {
+		if e.logf != nil {
+			e.logf("enrolment_report_outbox_unreadable: %v — replay stopped; original outbox preserved", scanErr)
+		}
+		return
+	}
 	if len(pending) == 0 {
-		_ = os.Remove(e.outboxPath)
+		if err := replaceCPReportOutbox(e.outboxPath, nil); err != nil && e.logf != nil {
+			e.logf("enrolment_report_outbox_rewrite_failed: %v", err)
+		}
 		return
 	}
 
-	var stillPending []enrolmentReport
+	var stillPending [][]byte
 	delivered := 0
-	for _, rep := range pending {
+	for _, item := range pending {
+		rep := item.rep
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := e.post(cctx, rep)
 		cancel()
@@ -299,25 +307,19 @@ func (e *enrolmentCPReporter) drainOnce(ctx context.Context) {
 					"administrator must resolve this on the control plane", rep.Identity, rep.TenantID, err.Error())
 			}
 		default:
-			stillPending = append(stillPending, rep)
+			stillPending = append(stillPending, item.line)
 		}
 	}
 
-	if len(stillPending) == 0 {
-		_ = os.Remove(e.outboxPath)
-	} else {
-		var buf bytes.Buffer
-		for _, rep := range stillPending {
-			line, err := json.Marshal(rep)
-			if err != nil {
-				continue
-			}
-			buf.Write(append(line, '\n'))
+	var remaining []byte
+	if len(stillPending) > 0 {
+		remaining = append(bytes.Join(stillPending, []byte("\n")), '\n')
+	}
+	if err := replaceCPReportOutbox(e.outboxPath, remaining); err != nil {
+		if e.logf != nil {
+			e.logf("enrolment_report_outbox_rewrite_failed: %v — original outbox retained or durability unconfirmed", err)
 		}
-		tmp := e.outboxPath + ".tmp"
-		if err := os.WriteFile(tmp, buf.Bytes(), 0o600); err == nil {
-			_ = os.Rename(tmp, e.outboxPath)
-		}
+		return
 	}
 	if e.logf != nil && (delivered > 0 || len(stillPending) > 0) {
 		e.logf("enrolment_report_outbox: delivered=%d still_pending=%d", delivered, len(stillPending))

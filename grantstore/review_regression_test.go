@@ -3,16 +3,17 @@ package grantstore
 import (
 	"encoding/json"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type countedShared struct {
 	grantSharedFixture
-	loads int
+	loads atomic.Int64
 }
 
-func (p *countedShared) Load() ([]byte, error) { p.loads++; return p.grantSharedFixture.Load() }
+func (p *countedShared) Load() ([]byte, error) { p.loads.Add(1); return p.grantSharedFixture.Load() }
 func TestAuthorizationReadsBoundSharedLoads(t *testing.T) {
 	p := &countedShared{}
 	s := NewStore()
@@ -21,7 +22,7 @@ func TestAuthorizationReadsBoundSharedLoads(t *testing.T) {
 	}
 	now := time.Now()
 	s.Mint(grantFixture("one", now), time.Hour, now)
-	p.loads = 0
+	p.loads.Store(0)
 	for i := 0; i < 100; i++ {
 		if !s.ValidForAuthorization("one", now) {
 			t.Fatal("missing grant")
@@ -30,16 +31,59 @@ func TestAuthorizationReadsBoundSharedLoads(t *testing.T) {
 			t.Fatal("missing list")
 		}
 	}
-	if p.loads != 1 {
-		t.Fatalf("loads=%d", p.loads)
+	if p.loads.Load() != 0 {
+		t.Fatalf("a confirmed local commit triggered redundant I/O: loads=%d", p.loads.Load())
 	}
+	p.mu.Lock()
 	p.loadFail = true
+	p.mu.Unlock()
+	s.mu.Lock()
 	s.readRefreshAt = time.Time{}
+	s.mu.Unlock()
 	if s.ValidForAuthorization("one", now) {
 		t.Fatal("failed refresh allowed cached grant")
 	}
-	if p.loads != 2 {
-		t.Fatal("refresh not attempted")
+	until := time.Now().Add(time.Second)
+	for p.loads.Load() == 0 && time.Now().Before(until) {
+		time.Sleep(time.Millisecond)
+	}
+	if p.loads.Load() != 1 {
+		t.Fatal("single background refresh not attempted")
+	}
+	s.readRefreshMu.Lock()
+	running := s.readRefreshRunning
+	s.readRefreshMu.Unlock()
+	for running && time.Now().Before(until) {
+		time.Sleep(time.Millisecond)
+		s.readRefreshMu.Lock()
+		running = s.readRefreshRunning
+		s.readRefreshMu.Unlock()
+	}
+	if s.ValidForAuthorization("one", now) {
+		t.Fatal("failed refresh allowed cached grant")
+	}
+}
+
+func TestCheckedAuthorizationReadSeparatesEmptyFromUnavailable(t *testing.T) {
+	p := &grantSharedFixture{}
+	s := NewStore()
+	if err := s.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := s.ListForAuthorizationChecked("tenant"); err != nil || len(rows) != 0 {
+		t.Fatalf("fresh empty authority: rows=%d err=%v", len(rows), err)
+	}
+	p.mu.Lock()
+	p.loadFail = true
+	p.mu.Unlock()
+	s.mu.Lock()
+	s.readRefreshAt = time.Time{}
+	s.mu.Unlock()
+	if rows, err := s.ListForAuthorizationChecked("tenant"); !errors.Is(err, ErrPersistence) || len(rows) != 0 {
+		t.Fatalf("unavailable authority: rows=%d err=%v", len(rows), err)
+	}
+	if fresh, err := s.AuthorizationFreshChecked(Grant{}, "app:22"); fresh || !errors.Is(err, ErrPersistence) {
+		t.Fatalf("unavailable freshness: fresh=%v err=%v", fresh, err)
 	}
 }
 func TestConflictDoesNotBlockOtherGrantRevocation(t *testing.T) {

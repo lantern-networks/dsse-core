@@ -3,7 +3,7 @@
 # Curated: Japanese EC/finance/portal (the release-critical interop targets) + global representatives
 # spanning CDNs, SaaS auth, and multi-domain login/checkout flows.
 
-# --- 国内 EC / 決済 (multi-domain checkout — the reported failure class) ---
+# --- Japanese retail / payments (multi-domain checkout — the reported failure class) ---
 www.amazon.co.jp
 www.rakuten.co.jp
 www.yahoo.co.jp
@@ -16,13 +16,13 @@ www.uniqlo.com
 store.shopping.yahoo.co.jp
 paypay.ne.jp
 
-# --- 国内 ポータル / メディア / 交通 ---
+# --- Japanese portals / media / transport ---
 news.yahoo.co.jp
 www.nicovideo.jp
 www.jreast.co.jp
 www.japanpost.jp
 
-# --- 国内 金融 (TLS strict, sometimes pinning-adjacent) ---
+# --- Japanese finance (TLS strict, sometimes pinning-adjacent) ---
 www.smbc.co.jp
 www.mufg.jp
 www.rakuten-bank.co.jp
@@ -35,7 +35,7 @@ www.salesforce.com
 slack.com
 www.dropbox.com
 
-# --- グローバル 代表 (CDN / 大規模) ---
+# --- Global representatives (CDN / large-scale) ---
 www.google.com
 www.cloudflare.com
 www.youtube.com

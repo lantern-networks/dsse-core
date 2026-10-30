@@ -19,7 +19,7 @@ private func providerRuntimeLog(_ message: String) {
 // The same runtime log, reachable from the files that hold the two facts an operator needs when a device
 // stops trusting its Edge: why the trust evaluation refused, and why a tunnel handshake failed. Both were
 // computed and discarded until 2026-07-31, when their absence turned two datapath incidents into an hour
-// each of guessing. Non-secret by construction — reasons, counts and status lines, never key material.
+// each of guessing. Callers must pass fixed diagnostic categories or other reviewed non-secret fields.
 func dsseRuntimeLog(_ message: String) {
     providerRuntimeLog(message)
 }
@@ -42,8 +42,7 @@ func providerNonsecretErrorDetail(_ error: Error) -> String {
     // requestFailed — Swift numbers cases carrying payloads before those that do not). An operator, and the
     // person debugging it, spent a round trip on a number that pointed at the wrong failure.
     //
-    // The enrolment errors carry their reason as text, and it is diagnostic status — an HTTP status, a TLS
-    // failure, a URLError description. Never key material, so it is safe to log and useless to withhold.
+    // Enrolment errors can carry response text, so keep their case and bounded status but not the payload.
     if let detail = providerNonsecretEnrolmentErrorDetail(error) {
         return "\(base) \(detail)"
     }
@@ -64,7 +63,14 @@ func providerNonsecretErrorDetail(_ error: Error) -> String {
     // of them it is; ask it. Same defect as cff1980b, one layer further in — that fixed the caller that logs
     // the round trip, and left the formatter every other caller goes through.
     if let single = error as? DsseSingleRequestError {
-        return "\(base) \(single.description)"
+        switch single {
+        case .badEndpoint:
+            return "\(base) request_error=bad_endpoint"
+        case .transport(let reason):
+            return "\(base) transport: \(providerNonsecretNetworkFailureCategory(reason))"
+        case .unusable:
+            return "\(base) request_error=response_unusable"
+        }
     }
     // ★★★ AND A LIST OF KNOWN TYPES IS THE WRONG SHAPE FOR THIS (2026-08-30, the third time in two days).
     //
@@ -78,16 +84,44 @@ func providerNonsecretErrorDetail(_ error: Error) -> String {
     // nothing else to report with. Maintaining the list is the defect; every future error type joins it by
     // being forgotten.
     //
-    // A Swift enum with associated values carries its reason in String(describing:) whether or not anyone
-    // remembered it here. That is diagnostic text — a status, a keychain OSStatus, a TLS failure — never key
-    // material, exactly as the named cases above already are. So the fallback names the case and its payload,
-    // and a type that is added later is legible on the day it first fails rather than on the day someone
-    // notices this function does not know it.
-    let described = String(describing: error)
-    if described != base, !described.isEmpty {
-        return "\(base) detail=\(described)"
+    // Associated error strings are not inherently non-secret: a server refusal can carry arbitrary response
+    // text, including an echoed credential. Name known cases without their payload; never print an unknown
+    // error's String(describing:) to a public runtime log.
+    if let renewal = error as? DsseCertificateRenewalError {
+        switch renewal {
+        case .notDue: return "\(base) renewal_error=not_due"
+        case .noTransportSecurity: return "\(base) renewal_error=no_transport_security"
+        case .keyGenerationFailed: return "\(base) renewal_error=key_generation_failed"
+        case .csrEncodingFailed: return "\(base) renewal_error=csr_encoding_failed"
+        case .requestFailed(let reason):
+            return "\(base) renewal_error=request_failed network_reason=\(providerNonsecretNetworkFailureCategory(reason))"
+        case .serverRefused(let status, _):
+            return "\(base) renewal_error=server_refused status=\(status)"
+        case .responseUnusable: return "\(base) renewal_error=response_unusable"
+        }
+    }
+    if let store = error as? DsseRenewedIdentityStoreError {
+        switch store {
+        case .keyStoreFailed(let status): return "\(base) identity_store_error=key_store_failed os_status=\(status)"
+        case .certificateStoreFailed(let status): return "\(base) identity_store_error=certificate_store_failed os_status=\(status)"
+        case .identityNotResolvable: return "\(base) identity_store_error=identity_not_resolvable"
+        case .probeRejectedNewIdentity: return "\(base) identity_store_error=probe_rejected_new_identity"
+        case .pointerWriteFailed: return "\(base) identity_store_error=pointer_write_failed"
+        }
     }
     return base
+}
+
+// A network error's free-form text may include the URL supplied by the caller. Retain only diagnostic classes.
+func providerNonsecretNetworkFailureCategory(_ reason: String) -> String {
+    let lower = reason.lowercased()
+    if lower.contains("timed out") || lower.contains("timeout") { return "timeout" }
+    if lower.contains("refused") { return "refused" }
+    if lower.contains("could not connect") || lower.contains("connection failed") { return "connection_failed" }
+    if lower.contains("certificate") || lower.contains("trust") || lower.contains("tls") { return "tls" }
+    if lower.contains("closed") || lower.contains("cancelled") || lower.contains("canceled") { return "closed" }
+    if lower.contains("resolve") || lower.contains("dns") || lower.contains("host not found") { return "name_resolution" }
+    return "other"
 }
 
 // The runtime-copy driver failure, named rather than numbered. See the note in providerNonsecretErrorDetail.
@@ -127,23 +161,22 @@ func providerNonsecretRuntimeCopyErrorDetail(_ error: Error) -> String? {
 func providerNonsecretEnrolmentErrorDetail(_ error: Error) -> String? {
     guard let e = error as? DsseDeviceEnrolmentError else { return nil }
     switch e {
-    case .notConfigured(let why):
-        return "enrolment_error=not_configured detail=\(why)"
+    case .notConfigured:
+        return "enrolment_error=not_configured"
     case .unpinnedTransport:
         return "enrolment_error=unpinned_transport — the configuration names neither an enrol CA nor a device-CA pin, so the endpoint that issues this device's identity could not be authenticated"
     case .requestFailed(let why):
-        return "enrolment_error=request_failed detail=\(why)"
-    case .serverRefused(let status, let message):
-        return "enrolment_error=server_refused status=\(status) detail=\(message)"
-    case .responseUnusable(let why):
-        return "enrolment_error=response_unusable detail=\(why)"
+        return "enrolment_error=request_failed network_reason=\(providerNonsecretNetworkFailureCategory(why))"
+    case .serverRefused(let status, _):
+        return "enrolment_error=server_refused status=\(status)"
+    case .responseUnusable:
+        return "enrolment_error=response_unusable"
     case .caPinMismatch(let expected, let got):
         return "enrolment_error=ca_pin_mismatch expected=\(expected) got=\(got)"
     }
 }
 
-// TLS/transport failure reasons — "certificate required", "bad certificate", a connect errno. These are
-// diagnostic status text, never key material, so they are safe to log and useless to withhold.
+// TLS/transport errors can include peer-controlled text; expose fixed categories only.
 private func providerNonsecretTunnelErrorDetail(_ error: Error) -> String? {
     guard let tunnelError = error as? DsseRuntimeCopyTunnelError else { return nil }
     switch tunnelError {
@@ -158,14 +191,11 @@ private func providerNonsecretTunnelErrorDetail(_ error: Error) -> String? {
     }
 }
 
-// Keep the reason a single log token: one line, bounded length, no whitespace to break key=value parsing.
+// Tunnel errors can contain arbitrary peer/OS text. Only the fixed handshake codes and diagnostic classes
+// belong in the public runtime log.
 private func providerNonsecretReasonToken(_ reason: String) -> String {
-    let collapsed = reason
-        .replacingOccurrences(of: "\n", with: " ")
-        .split(separator: " ", omittingEmptySubsequences: true)
-        .joined(separator: "_")
-    if collapsed.isEmpty { return "none" }
-    return String(collapsed.prefix(160))
+    if ["non_200_status", "header_too_large", "closed_before_headers"].contains(reason) { return reason }
+    return providerNonsecretNetworkFailureCategory(reason)
 }
 
 private func providerRuntimeProgressCategory(_ progress: DsseLiveRuntimeCopyProgress) -> String {
@@ -253,6 +283,14 @@ struct DsseRuntimeCopyPassthroughDecision: Equatable, Sendable {
 struct DsseTransparentPassthroughDecision: Equatable, Sendable {
     let category: String
     let shouldPassThrough: Bool
+}
+
+// Unlike the older domain-wide bypass, this rule requires the original name
+// supplied by NEAppProxyFlow, the actual resolved destination, and TCP/443.
+// An address-only flow has no trustworthy hostname and therefore stays steered.
+struct DsseExactHTTPSPassthroughEndpoint: Equatable, Sendable {
+    let hostname: String
+    let addresses: Set<String>
 }
 
 struct DsseRuntimeCopyDownstreamPassthroughPolicy: Equatable, Sendable {
@@ -487,26 +525,18 @@ struct DsseSelfExclusionPolicy: Equatable, Sendable {
            teamIdentifiers.contains(team) {
             return true
         }
-        // subject:<value> matches the signer's organization. Windows certs carry it as Subject O= (exact);
-        // Apple Developer ID certs have NO O= field — the org is embedded in the leaf Common Name, e.g.
-        // "Developer ID Application: Google LLC (EQHXZ8M8AV)". So on macOS we match a configured subject value
-        // if it equals the O= (when present) OR is contained in the leaf CN (case-insensitive). This makes one
-        // `subject:Google LLC` entry work on both platforms despite the different PKI field layout.
-        for wanted in subjectOrganizations {
-            if let organization = signerIdentity.subjectOrganization?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased(),
-               !organization.isEmpty,
-               organization == wanted {
-                return true
-            }
-            if let commonName = signerIdentity.subjectCommonName?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased(),
-               !commonName.isEmpty,
-               commonName.contains(wanted) {
-                return true
-            }
+        // subject:<value> matches an exact publisher organization. Apple Developer ID Application leaves O=
+        // empty and carries the organization in a structured CN. Substring matching allowed an unrelated
+        // signed publisher such as "NotGoogle LLC" to satisfy "subject:Google LLC" and bypass steering.
+        let organization = signerIdentity.subjectOrganization?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let organization, !organization.isEmpty {
+            if subjectOrganizations.contains(organization) { return true }
+        } else if let commonName = signerIdentity.subjectCommonName,
+                  let publisher = Self.developerIDApplicationPublisher(
+                    commonName: commonName, teamIdentifier: signerIdentity.teamIdentifier),
+                  subjectOrganizations.contains(publisher) {
+            return true
         }
         if let thumb = signerIdentity.leafSha256.map(Self.normalizeThumbprint),
            !thumb.isEmpty,
@@ -514,6 +544,20 @@ struct DsseSelfExclusionPolicy: Equatable, Sendable {
             return true
         }
         return false
+    }
+
+    private static func developerIDApplicationPublisher(commonName: String, teamIdentifier: String?) -> String? {
+        let prefix = "Developer ID Application: "
+        guard let team = teamIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines), !team.isEmpty else {
+            return nil
+        }
+        let name = commonName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = " (\(team))"
+        guard name.hasPrefix(prefix), name.hasSuffix(suffix),
+              name.count > prefix.count + suffix.count else { return nil }
+        let publisher = String(name.dropFirst(prefix.count).dropLast(suffix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return publisher.isEmpty ? nil : publisher
     }
 }
 
@@ -523,8 +567,8 @@ struct DsseSelfExclusionPolicy: Equatable, Sendable {
 struct DsseSourceAppSignerIdentity: Equatable, Sendable {
     let teamIdentifier: String?
     let subjectOrganization: String?
-    // Leaf Common Name — Apple Developer ID certs carry the org here (no O= field), so subject: matching
-    // falls back to a case-insensitive "contains" against this. nil when undetermined.
+    // Leaf Common Name — Apple Developer ID Application certs carry the publisher here (no O= field).
+    // subject: matching parses the exact publisher and verifies the CN's Team ID against the resolved signer.
     let subjectCommonName: String?
     let leafSha256: String?
 
@@ -550,6 +594,19 @@ private struct DsseTransparentPassthroughAgentConfig: Decodable {
     enum CodingKeys: String, CodingKey {
         case passthroughDomains = "network_extension_passthrough_domains"
         case defaultPassthroughDomainsEnabled = "network_extension_default_passthrough_domains_enabled"
+    }
+}
+
+private struct DsseExactHTTPSPassthroughAgentConfig: Decodable {
+    struct Endpoint: Decodable {
+        let hostname: String
+        let addresses: [String]
+    }
+
+    let endpoints: [Endpoint]?
+
+    enum CodingKeys: String, CodingKey {
+        case endpoints = "network_extension_exact_https_passthrough_endpoints"
     }
 }
 
@@ -1201,6 +1258,17 @@ struct DsseProviderFlowAuthorityObservation {
     let input: ProviderFlowAuthorityInput
     let endpointSourceGate: String
     let portSourceGate: String
+    // The original name and the dialed address are separate facts. The policy
+    // authority normally prefers the former; exact IdP bypass must check both.
+    let resolvedRemoteAddress: String?
+
+    init(input: ProviderFlowAuthorityInput, endpointSourceGate: String,
+         portSourceGate: String, resolvedRemoteAddress: String? = nil) {
+        self.input = input
+        self.endpointSourceGate = endpointSourceGate
+        self.portSourceGate = portSourceGate
+        self.resolvedRemoteAddress = resolvedRemoteAddress
+    }
 }
 
 private struct DsseProviderFlowPortObservation {
@@ -1726,10 +1794,10 @@ private enum FlowCopyGuardSkeletonContract {
     static let status = "guard_enforced_local_compile_test_reviewed"
     static let implementation = "live_runtime_copy_guard_enforced_local_compile_test"
     static let maxConnectTimeoutMillis = 30_000
-    static let maxConnectionLifetimeMillis = 3_600_000
-    static let maxByteCapBytes: Int64 = 1_073_741_824
-    static let maxIdleTimeoutMillis = 300_000
-    static let maxConcurrentConnections = 1_024
+    static let maxConnectionLifetimeMillis = 0
+    static let maxByteCapBytes: Int64 = 0
+    static let maxIdleTimeoutMillis = 0
+    static let maxConcurrentConnections = 0
     static let backpressureQueueCapacity = 16
     static let backpressureStrategy = "bounded_stream_channel_fail_closed_on_overflow"
     static let tenantScopeSource = "agent_config_and_signed_rules_manifest"
@@ -1755,9 +1823,9 @@ private enum FlowCopyGuardSkeletonContract {
             connectionRegistryRequired: true,
             connectionRegistryStatus: status,
             connectionRegistrySkeleton: ConnectionRegistryCompileSkeletonContract.make(),
-            byteCapRequired: true,
+            byteCapRequired: false,
             maxByteCapBytes: maxByteCapBytes,
-            idleTimeoutRequired: true,
+            idleTimeoutRequired: false,
             maxIdleTimeoutMillis: maxIdleTimeoutMillis,
             closeCleanupRequired: true,
             closeCleanupStatus: status,
@@ -1811,15 +1879,15 @@ private enum ConnectionRegistryCompileSkeletonContract {
             tenantScopeRequiredBeforeOpen: true,
             requestIDUniquenessRequired: true,
             duplicateOpenAction: "deny_closed",
-            concurrentCapRequired: true,
+            concurrentCapRequired: false,
             maxConcurrentConnections: FlowCopyGuardSkeletonContract.maxConcurrentConnections,
             connectTimeoutRequired: true,
             maxConnectTimeoutMillis: FlowCopyGuardSkeletonContract.maxConnectTimeoutMillis,
-            maxConnectionLifetimeRequired: true,
+            maxConnectionLifetimeRequired: false,
             maxConnectionLifetimeMillis: FlowCopyGuardSkeletonContract.maxConnectionLifetimeMillis,
-            byteCapRequired: true,
+            byteCapRequired: false,
             maxByteCapBytes: FlowCopyGuardSkeletonContract.maxByteCapBytes,
-            idleTimeoutRequired: true,
+            idleTimeoutRequired: false,
             maxIdleTimeoutMillis: FlowCopyGuardSkeletonContract.maxIdleTimeoutMillis,
             closeCleanupRequired: true,
             closeMetricsRequired: true,
@@ -1987,19 +2055,68 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         get { runtimeCopyTransportLock.lock(); defer { runtimeCopyTransportLock.unlock() }; return _regionEgressDeniedAdmission }
         set { runtimeCopyTransportLock.lock(); _regionEgressDeniedAdmission = newValue; runtimeCopyTransportLock.unlock() }
     }
-    // Read/write the (blocked, admissionDenied) PAIR under ONE lock acquisition so handleNewFlow never observes a
-    // torn state (blocked=true with a stale admissionDenied=false), which would let a revocation fail-open in the
-    // set gap. Writers must set both together; the reader reads both together.
-    private func setRegionEgress(blocked: Bool, admissionDenied: Bool) {
+    // A selected region is not usable until its transport has actually been built. Keep this under the same
+    // lock as the transport and egress decision: a failed rebuild must neither reuse the old region nor take
+    // the LAB direct-egress fallback. The controller retries on its next (even unchanged) decision.
+    private var _regionTransportReady = true
+    private var _appliedRegionTransportEndpoint: String?
+    // A stopped or re-armed controller must not publish a late decision into this provider.
+    private var _regionControllerEpoch = 0
+    private func nextRegionControllerEpoch() {
         runtimeCopyTransportLock.lock()
+        _regionControllerEpoch += 1
+        runtimeCopyTransportLock.unlock()
+    }
+    private func regionControllerEpoch() -> Int {
+        runtimeCopyTransportLock.lock()
+        defer { runtimeCopyTransportLock.unlock() }
+        return _regionControllerEpoch
+    }
+    private func isCurrentRegionControllerEpoch(_ epoch: Int) -> Bool {
+        runtimeCopyTransportLock.lock()
+        defer { runtimeCopyTransportLock.unlock() }
+        return _regionControllerEpoch == epoch
+    }
+    // Read/write the egress state under ONE lock acquisition so a revocation cannot fail-open in a set gap.
+    @discardableResult
+    private func setRegionEgress(blocked: Bool, admissionDenied: Bool, epoch: Int) -> Bool {
+        runtimeCopyTransportLock.lock()
+        guard _regionControllerEpoch == epoch else { runtimeCopyTransportLock.unlock(); return false }
         _regionEgressBlocked = blocked
         _regionEgressDeniedAdmission = admissionDenied
         runtimeCopyTransportLock.unlock()
+        return true
     }
-    private func regionEgressState() -> (blocked: Bool, admissionDenied: Bool) {
+    private func blockRegionTransportTransition(epoch: Int) -> Bool {
+        runtimeCopyTransportLock.lock()
+        guard _regionControllerEpoch == epoch else { runtimeCopyTransportLock.unlock(); return false }
+        _regionEgressBlocked = true
+        _regionEgressDeniedAdmission = false
+        _regionTransportReady = false
+        runtimeCopyTransportLock.unlock()
+        return true
+    }
+    private func activateRegionTransport(_ transport: any DsseLocalRuntimeCopyTransport,
+                                         endpoint: String, epoch: Int) -> Bool {
+        runtimeCopyTransportLock.lock()
+        guard _regionControllerEpoch == epoch else { runtimeCopyTransportLock.unlock(); return false }
+        _runtimeCopyTransport = transport
+        _appliedRegionTransportEndpoint = endpoint
+        _regionTransportReady = true
+        _regionEgressBlocked = false
+        _regionEgressDeniedAdmission = false
+        runtimeCopyTransportLock.unlock()
+        return true
+    }
+    private func regionTransportApplication() -> (endpoint: String?, ready: Bool) {
         runtimeCopyTransportLock.lock()
         defer { runtimeCopyTransportLock.unlock() }
-        return (_regionEgressBlocked, _regionEgressDeniedAdmission)
+        return (_appliedRegionTransportEndpoint, _regionTransportReady)
+    }
+    private func regionFlowSnapshot() -> (blocked: Bool, admissionDenied: Bool, transportReady: Bool, transport: any DsseLocalRuntimeCopyTransport) {
+        runtimeCopyTransportLock.lock()
+        defer { runtimeCopyTransportLock.unlock() }
+        return (_regionEgressBlocked, _regionEgressDeniedAdmission, _regionTransportReady, _runtimeCopyTransport)
     }
     private var runtimeCopyEvidenceWriter: (any DsseLocalRuntimeCopyEvidenceWriting)?
     private var runtimeDiagnosticWriter: DsseProviderRuntimeDiagnosticWriter?
@@ -2016,6 +2133,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
     // the decision said nothing because it only spoke when it matched. Naming a destination has to mean
     // the destination, whichever half of it the client hands over.
     private var transparentPassthroughAddresses: Set<String> = []
+    private var exactHTTPSPassthroughEndpoints: [DsseExactHTTPSPassthroughEndpoint] = []
     // Read on the flow queue, written by the refresh below on a background queue — the same reason
     // runtimeCopyTransport is behind a lock. A torn read here decides whether a flow is steered.
     private let transparentPassthroughLock = NSLock()
@@ -2069,6 +2187,14 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
 
     public override func startProxy(options: [String: Any]? = nil, completionHandler: @escaping (Error?) -> Void) {
         providerRuntimeLog("startProxy entered")
+        runtimeCopyTransportLock.lock()
+        _regionControllerEpoch += 1
+        _appliedRegionTransportEndpoint = nil
+        _regionTransportReady = true
+        _regionEgressBlocked = false
+        _regionEgressDeniedAdmission = false
+        _startupEnforcementBlocked = false
+        runtimeCopyTransportLock.unlock()
         runtimeCopyPassthroughEndpoint = nil
         runtimeCopyDownstreamPassthroughPolicy = nil
         guard let agentConfigPath = Self.agentConfigPath(from: options) else {
@@ -2090,6 +2216,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             )
             transparentPassthroughDomains = Self.transparentPassthroughDomains(agentConfigPath: validatedAgentConfigPath)
             transparentPassthroughAddresses = Self.addressesFor(domains: transparentPassthroughDomains)
+            exactHTTPSPassthroughEndpoints = Self.exactHTTPSPassthroughEndpoints(agentConfigPath: validatedAgentConfigPath)
             startTransparentPassthroughRefresh(agentConfigPath: validatedAgentConfigPath)
             selfExclusionPolicy = Self.selfExclusionPolicy(agentConfigPath: validatedAgentConfigPath)
             observeOnlyPassthroughAll = Self.observeOnlyPassthroughAll(agentConfigPath: validatedAgentConfigPath)
@@ -2119,6 +2246,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             // one line to grep. What was loaded, and what it resolved to, is the evidence that the
             // authored list can actually fire; the count is the only proof this repository accepts.
             providerRuntimeLog("startProxy transparent_passthrough domain_count=\(transparentPassthroughDomains.count) address_count=\(transparentPassthroughAddresses.count) domains=\(transparentPassthroughDomains.joined(separator: ","))")
+            providerRuntimeLog("startProxy exact_https_passthrough endpoint_count=\(exactHTTPSPassthroughEndpoints.count)")
             logFailOpenPosture(failOpenPosture)
             armIdentityDependentSubsystems(agentConfigPath: validatedAgentConfigPath,
                                            installProfile: installProfile,
@@ -2210,6 +2338,17 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
 
     public override func stopProxy(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         providerRuntimeLog("stopProxy reason=\(reason.rawValue)")
+        // Invalidate controller callbacks before asking the controller to stop asynchronously. A callback
+        // already in progress may finish later; the epoch check below prevents it from restoring steering.
+        runtimeCopyTransportLock.lock()
+        _regionControllerEpoch += 1
+        _runtimeCopyTransport = DsseDeviceValidationPendingRuntimeCopyTransport()
+        _appliedRegionTransportEndpoint = nil
+        _regionTransportReady = false
+        _regionEgressBlocked = true
+        _regionEgressDeniedAdmission = false
+        _startupEnforcementBlocked = true
+        runtimeCopyTransportLock.unlock()
         updateCourier?.stop()
         updateCourier = nil
         deviceHeartbeat?.stop()
@@ -2229,6 +2368,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         transparentPassthroughRefreshGeneration += 1
         transparentPassthroughDomains = Self.defaultTransparentPassthroughDomains
         transparentPassthroughAddresses = []
+        exactHTTPSPassthroughEndpoints = []
         transparentPassthroughLock.unlock()
         agentPolicyPoller?.stop()
         agentPolicyPoller = nil
@@ -2324,7 +2464,17 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         transparentPassthroughLock.lock()
         let passthroughDomainsNow = transparentPassthroughDomains
         let passthroughAddressesNow = transparentPassthroughAddresses
+        let exactHTTPSEndpointsNow = exactHTTPSPassthroughEndpoints
         transparentPassthroughLock.unlock()
+        let exactHTTPSDecision = Self.exactHTTPSPassthroughDecision(
+            input: input,
+            resolvedRemoteAddress: authorityObservation.resolvedRemoteAddress,
+            endpoints: exactHTTPSEndpointsNow
+        )
+        if exactHTTPSDecision.shouldPassThrough {
+            providerRuntimeLog("handleNewFlow pass_through=exact_https_endpoint category=\(exactHTTPSDecision.category)")
+            return false
+        }
         let transparentPassthroughDecision = Self.transparentPassthroughDomainDecision(
             input: input,
             domains: passthroughDomainsNow,
@@ -2338,7 +2488,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         // Preserve the configured exclusions above so an administrator can repair it.
         if startupEnforcementBlocked {
             providerRuntimeLog("handleNewFlow deny_closed=startup_enrolment_failed")
-            Self.dropFlowForcingQUICFallback(flow)
+            Self.closeFlowWithoutCopy(flow)
             return true
         }
         // QUIC (UDP/443) cannot be intercepted, so steer-target flows are dropped to force a fallback
@@ -2346,7 +2496,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         // passthrough flows already returned above, so any UDP/443 reaching here is a steer target.
         if ProviderQUICFallbackPolicy.shouldDropForcingTCPFallback(transport: input.transport, remotePort: input.remotePort) {
             providerRuntimeLog("handleNewFlow quic_drop=udp_443_forcing_tcp_fallback")
-            Self.dropFlowForcingQUICFallback(flow)
+            Self.closeFlowWithoutCopy(flow)
             return true
         }
         let interceptAllowlistDecision = Self.interceptAllowlistDecision(
@@ -2409,9 +2559,10 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         } catch {
             providerRuntimeLog("handleNewFlow runtime_diagnostic_write_failed=\(providerNonsecretErrorDetail(error))")
         }
-        let egress = regionEgressState() // read (blocked, admissionDenied) as ONE atomic pair (no fail-open TOCTOU)
+        let egress = regionFlowSnapshot() // decision and transport from the same region-transition snapshot
         let regionAction: RegionEgressAction = report.acceptFlow
-            ? Self.regionEgressAction(blocked: egress.blocked, admissionDenied: egress.admissionDenied, failOpenArmed: failOpenArmed)
+            ? Self.regionEgressAction(blocked: egress.blocked, admissionDenied: egress.admissionDenied,
+                                      transportReady: egress.transportReady, failOpenArmed: failOpenArmed)
             : .proceed
         if regionAction == .declineDirect {
             // LAB fail-open (ARMED = enable key AND acknowledgment) applies ONLY to a REACHABILITY block —
@@ -2429,14 +2580,15 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             // NOT egress an otherwise-accepted flow. Take it over and close it rather than letting it leave the
             // residency boundary / evade a kill-switch. Note when a revocation OVERRODE an armed lab fail-open —
             // that is the kill-switch correctly refusing to be bypassed (a security-relevant event to surface).
-            providerRuntimeLog("handleNewFlow region_failover_egress_blocked=true admission_denied=\(egress.admissionDenied) fail_open_armed=\(failOpenArmed) decision=deny_closed\(egress.admissionDenied && failOpenArmed ? " (revocation overrides armed fail-open — kill-switch not bypassed)" : "") (no healthy allowed region or device admission denied)")
-            Self.dropFlowForcingQUICFallback(flow)
+            providerRuntimeLog("handleNewFlow region_failover_egress_blocked=true admission_denied=\(egress.admissionDenied) transport_ready=\(egress.transportReady) fail_open_armed=\(failOpenArmed) decision=deny_closed\(egress.admissionDenied && failOpenArmed ? " (revocation overrides armed fail-open — kill-switch not bypassed)" : "")")
+            Self.closeFlowWithoutCopy(flow)
         } else if report.acceptFlow, let tcpFlow = flow as? NEAppProxyTCPFlow {
             startLiveRuntimeCopy(
                 tcpFlow: tcpFlow,
                 providerResult: evaluation.providerResult,
                 destination: evaluation.extraction.providerFlowRequest,
-                report: report
+                report: report,
+                transport: egress.transport
             )
         } else {
             let auditEvidence = Self.policyDrivenHandleNewFlowAuditEvidence(report: report)
@@ -2453,8 +2605,12 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                     providerRuntimeLog("handleNewFlow policy_driven_protection_audit_write_failed=\(providerNonsecretErrorDetail(error))")
                 }
             }
+            // A transparent proxy returning false tells macOS to send the flow directly. A policy denial
+            // (or an accepted rule without a usable TCP flow) must instead retain and close the flow. The
+            // report's acceptFlow flag describes the policy/copy path, not this NE API's return contract.
+            Self.closeFlowWithoutCopy(flow)
         }
-        return report.acceptFlow
+        return true
     }
 
     public var currentLifecycleState: ProviderLifecycleState? {
@@ -2552,9 +2708,9 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
     }
 
 
-    // Drop by closing both directions without opening the flow. The app's QUIC (UDP) send fails and HTTPS
-    // falls back to TCP/TLS. The post-fallback TCP/443 becomes a steer+interception target.
-    private static func dropFlowForcingQUICFallback(_ flow: NEAppProxyFlow) {
+    // Retain and close both directions without opening the flow. For QUIC this prompts TCP/TLS fallback;
+    // for a policy denial it prevents NETransparentProxyProvider's false return from sending traffic direct.
+    private static func closeFlowWithoutCopy(_ flow: NEAppProxyFlow) {
         flow.closeReadWithError(nil)
         flow.closeWriteWithError(nil)
     }
@@ -2644,6 +2800,71 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         let configuredDomains = config?.passthroughDomains ?? []
         return normalizedTransparentPassthroughDomains(
             (includeDefaults ? defaultTransparentPassthroughDomains : []) + configuredDomains
+        )
+    }
+
+    // This explicit root-owned setting is for a dedicated HTTPS authority such
+    // as an external IdP. DNS is checked against the administrator's pinned
+    // address set at load and every refresh. A name-only, IP-only, changed-DNS,
+    // or non-443 flow cannot use it. A shared-IP virtual host is unsuitable:
+    // NEAppProxyFlow does not expose the TLS ClientHello at this admission step.
+    static func exactHTTPSPassthroughEndpoints(agentConfigPath: String) -> [DsseExactHTTPSPassthroughEndpoint] {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: agentConfigPath)),
+              let config = try? JSONDecoder().decode(DsseExactHTTPSPassthroughAgentConfig.self, from: data),
+              let configured = config.endpoints else { return [] }
+        var result: [DsseExactHTTPSPassthroughEndpoint] = []
+        var seenHosts: Set<String> = []
+        for item in configured {
+            guard let hostname = normalizeHost(item.hostname),
+                  hostname == item.hostname,
+                  !seenHosts.contains(hostname),
+                  !item.addresses.isEmpty else { return [] }
+            let normalized = item.addresses.compactMap(canonicalNumericAddress)
+            let addresses = Set(normalized)
+            guard normalized.count == item.addresses.count,
+                  addresses.count == normalized.count,
+                  addresses == addressesFor(domains: [hostname]) else { return [] }
+            seenHosts.insert(hostname)
+            result.append(DsseExactHTTPSPassthroughEndpoint(hostname: hostname, addresses: addresses))
+        }
+        return result
+    }
+
+    // AI_NUMERICHOST prevents this validator from turning an alleged address
+    // into another DNS query. getnameinfo canonicalizes equivalent IPv6 forms.
+    static func canonicalNumericAddress(_ value: String) -> String? {
+        let numeric = value.hasPrefix("[") && value.hasSuffix("]")
+            ? String(value.dropFirst().dropLast()) : value
+        guard !numeric.isEmpty, !numeric.contains("%") else { return nil }
+        var hints = addrinfo(ai_flags: AI_NUMERICHOST, ai_family: AF_UNSPEC,
+                             ai_socktype: SOCK_STREAM, ai_protocol: 0, ai_addrlen: 0,
+                             ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(numeric, nil, &hints, &result) == 0, let address = result else { return nil }
+        defer { freeaddrinfo(address) }
+        var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        guard getnameinfo(address.pointee.ai_addr, address.pointee.ai_addrlen,
+                          &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 else { return nil }
+        return String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self).lowercased()
+    }
+
+    static func exactHTTPSPassthroughDecision(
+        input: ProviderFlowAuthorityInput,
+        resolvedRemoteAddress: String?,
+        endpoints: [DsseExactHTTPSPassthroughEndpoint]
+    ) -> DsseTransparentPassthroughDecision {
+        guard input.transport == .tcp, input.remotePort == 443 else {
+            return DsseTransparentPassthroughDecision(category: "not_https_tcp", shouldPassThrough: false)
+        }
+        guard let hostname = normalizeHost(input.remoteHost),
+              let resolvedRemoteAddress,
+              let address = canonicalNumericAddress(resolvedRemoteAddress) else {
+            return DsseTransparentPassthroughDecision(category: "missing_named_address_pair", shouldPassThrough: false)
+        }
+        let matched = endpoints.contains { $0.hostname == hostname && $0.addresses.contains(address) }
+        return DsseTransparentPassthroughDecision(
+            category: matched ? "matched_exact_https_endpoint" : "not_matched",
+            shouldPassThrough: matched
         )
     }
 
@@ -2857,6 +3078,8 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                     signedPath: signedPath,
                     pinnedPublicKeyHex: exclCfg.agentPolicyPinnedPublicKey?
                         .trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+                    expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from: security?.clientIdentity),
+                    expectedTenantID: DsseAdoptedTenantScope.tenantInForce(configDirectory: configDir),
                     alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir))
             }
             return fromPolicy.isEmpty
@@ -2912,6 +3135,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                signedPath: signedPath,
                pinnedPublicKeyHex: exclCfg.agentPolicyPinnedPublicKey?
                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
+               expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from: security?.clientIdentity),
                alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir)) {
             identityBelongsHere = (says == want)
             providerRuntimeLog("startProxy deployment_says_this_device_is=\(says) profile_says=\(want)")
@@ -3043,6 +3267,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
     private func armIdentityDependentSubsystems(agentConfigPath: String,
                                                 installProfile: DsseInstallProfile?,
                                                 phase: String) {
+        nextRegionControllerEpoch()
         certificateRenewalScheduler?.stop()
         certificateRenewalScheduler = nil
         agentPolicyPoller?.stop()
@@ -3115,6 +3340,9 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             configDirectory: configDir, contract: contract,
             agentPolicyPinnedPublicKeyHex: policyPin,
             agentPolicySignedPath: policySignedPath,
+            expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from:
+                DsseTransportSecurityResolver.resolve(contract: contract, configDirectory: configDir,
+                                                      agentConfigPath: agentConfigPath)?.clientIdentity),
             onAnchorsAdopted: { [weak self] in
                 // Same live-rebuild path region failover uses: resolve again (now reading the adopted anchors)
                 // and swap the transport so NEW flows use it. Without this the device adopts correct anchors
@@ -3164,17 +3392,21 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                 guard stillOurs else { return }
                 let domains = Self.transparentPassthroughDomains(agentConfigPath: agentConfigPath)
                 let addresses = Self.addressesFor(domains: domains)
+                let exactEndpoints = Self.exactHTTPSPassthroughEndpoints(agentConfigPath: agentConfigPath)
                 self.transparentPassthroughLock.lock()
                 let changed = domains != self.transparentPassthroughDomains
                     || addresses != self.transparentPassthroughAddresses
+                    || exactEndpoints != self.exactHTTPSPassthroughEndpoints
                 if changed {
                     self.transparentPassthroughDomains = domains
                     self.transparentPassthroughAddresses = addresses
+                    self.exactHTTPSPassthroughEndpoints = exactEndpoints
                 }
                 self.transparentPassthroughLock.unlock()
                 if changed {
                     providerRuntimeLog("transparent_passthrough refreshed domain_count=\(domains.count) "
-                        + "address_count=\(addresses.count) domains=\(domains.joined(separator: ","))")
+                        + "address_count=\(addresses.count) exact_https_count=\(exactEndpoints.count) "
+                        + "domains=\(domains.joined(separator: ","))")
                 }
                 schedule()
             }
@@ -3221,6 +3453,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
               let security = DsseTransportSecurityResolver.resolve(contract: contract, configDirectory: configDir, agentConfigPath: agentConfigPath),
               let poller = DsseAgentPolicyPoller(
                 security: security,
+                configDirectory: configDir,
                 pinnedPublicKeyHex: exclCfg.agentPolicyPinnedPublicKey?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
                 cachePath: exclCfg.resolvedAgentPolicySignedPath(configDirectory: configDir),
                 acceptedKeys: { DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir) }) else {
@@ -3345,6 +3578,8 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                         let fromPolicy = DsseSignedAgentPolicy.verifiedInterceptionRoots(
                             signedPath: exclCfg.resolvedAgentPolicySignedPath(configDirectory: configDir),
                             pinnedPublicKeyHex: pin,
+                            expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from: live.clientIdentity),
+                            expectedTenantID: DsseAdoptedTenantScope.tenantInForce(configDirectory: configDir),
                             alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir))
                         let fromBundle = DsseAdoptedTrustAnchorStore
                             .advertisedInterceptionRoots(configDirectory: configDir)
@@ -3383,6 +3618,8 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             if case let signedPath = exclCfg.resolvedAgentPolicySignedPath(configDirectory: configDir),
                DsseSignedAgentPolicy.verifiedRenewCertificatesIssuedBefore(
                    signedPath: signedPath, pinnedPublicKeyHex: pin,
+                   expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from: live.clientIdentity),
+                   expectedTenantID: DsseAdoptedTenantScope.tenantInForce(configDirectory: configDir),
                    alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir)) != nil {
                 self.certificateRenewalScheduler?.checkSoon(reason: "operator_requested_renewal_in_policy")
             }
@@ -3420,6 +3657,8 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                         let fromPolicy = DsseSignedAgentPolicy.verifiedInterceptionRoots(
                             signedPath: exclCfg.resolvedAgentPolicySignedPath(configDirectory: configDir),
                             pinnedPublicKeyHex: pin,
+                            expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from: live.clientIdentity),
+                            expectedTenantID: DsseAdoptedTenantScope.tenantInForce(configDirectory: configDir),
                             alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir))
                         let fromBundle = DsseAdoptedTrustAnchorStore
                             .advertisedInterceptionRoots(configDirectory: configDir)
@@ -3453,8 +3692,11 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
     // so, whether fail-open is armed (direct/disarmed) or not (deny-closed/dark) — mirroring handleNewFlow.
     private func steerStateForTelemetry() -> (posture: String, failOpenConfigured: Bool, regionFailoverEnabled: Bool, activeRegion: String) {
         let armed = failOpenArmed
-        let posture: String
-        if regionEgressBlocked { posture = armed ? "disarmed" : "dark" } else { posture = "steering" }
+        let egress = regionFlowSnapshot()
+        let posture = Self.regionSteerPosture(blocked: egress.blocked,
+                                              admissionDenied: egress.admissionDenied,
+                                              transportReady: egress.transportReady,
+                                              failOpenArmed: armed)
         return (posture: posture,
                 failOpenConfigured: armed,
                 regionFailoverEnabled: regionController != nil,
@@ -3467,10 +3709,41 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
     // so a kill-switch can never be bypassed via fail-open. Mirrors the Windows agent, where terminal fail-open
     // engages on failClosed (exhaustion) but never on surfaceDenied (admission).
     enum RegionEgressAction: Equatable { case proceed, denyClosed, declineDirect }
-    static func regionEgressAction(blocked: Bool, admissionDenied: Bool, failOpenArmed: Bool) -> RegionEgressAction {
+    static func regionSteerPosture(blocked: Bool, admissionDenied: Bool, transportReady: Bool,
+                                   failOpenArmed: Bool) -> String {
+        switch regionEgressAction(blocked: blocked, admissionDenied: admissionDenied,
+                                  transportReady: transportReady, failOpenArmed: failOpenArmed) {
+        case .proceed: return "steering"
+        case .declineDirect: return "disarmed"
+        case .denyClosed: return "dark"
+        }
+    }
+    static func regionEgressAction(blocked: Bool, admissionDenied: Bool, transportReady: Bool = true,
+                                   failOpenArmed: Bool) -> RegionEgressAction {
+        if !transportReady { return .denyClosed }
         guard blocked else { return .proceed }
         if failOpenArmed && !admissionDenied { return .declineDirect }
         return .denyClosed
+    }
+
+    // The controller's changed flag is not enough: after a failed rebuild its next probe reports the same
+    // selected region. Keep retrying until the transport is published, and never unblock the old transport.
+    static func activateConnectedRegion<Transport>(
+        current: DsseRegionEndpoint?, changed: Bool, appliedEndpoint: String?, transportReady: Bool,
+        block: () -> Bool, build: (URL) -> Transport?,
+        activate: (Transport, String, URL) -> Bool, unblock: () -> Bool
+    ) -> Bool {
+        guard let current else { _ = block(); return false }
+        guard changed || !transportReady || appliedEndpoint != current.endpoint else {
+            return unblock()
+        }
+        guard block() else { return false }
+        guard let endpointURL = URL(string: current.endpoint),
+              endpointURL.scheme?.lowercased() == "https",
+              endpointURL.host?.isEmpty == false,
+              endpointURL.user == nil, endpointURL.password == nil,
+              let transport = build(endpointURL) else { return false }
+        return activate(transport, current.endpoint, endpointURL)
     }
 
     // startRegionFailoverController wires the client-side region failover (multi-region G): the NE pulls the
@@ -3482,6 +3755,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
     // (region_failover state/current/changed/transport_rebuilt/egress_blocked). Disabled when no pin / no (T).
     private func startRegionFailoverController(agentConfigPath: String,
                                                installProfile: DsseInstallProfile?) {
+        let epoch = regionControllerEpoch()
         let configDir = URL(fileURLWithPath: agentConfigPath).deletingLastPathComponent()
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: agentConfigPath)),
               let exclCfg = try? JSONDecoder().decode(DsseSelfExclusionAgentConfig.self, from: data),
@@ -3547,31 +3821,38 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             onDecision: { [weak self] (dec: DsseRegionDecision, changed: Bool) in
                 let failover = dec.failoverSet.map { $0.region }.joined(separator: ",")
                 providerRuntimeLog("region_failover state=\(dec.state.rawValue) current=\(dec.current?.region ?? "-") changed=\(changed) failover_set=[\(failover)] reason=\(dec.reason)")
-                guard let self else { return }
+                guard let self, self.isCurrentRegionControllerEpoch(epoch) else { return }
                 switch dec.state {
                 case .connected:
-                    // A healthy allowed region is selected. Clear any prior fail-closed block, and on an actual
-                    // region change rebuild the runtime-copy transport so NEW flows steer through it.
-                    self.setRegionEgress(blocked: false, admissionDenied: false)
-                    guard changed, let current = dec.current else { return }
-                    guard let endpointURL = URL(string: current.endpoint),
-                          let rebuilt = DsseLocalRuntimeCopyTransportFactory.makeForRegionEndpoint(
-                              agentConfigPath: agentConfigPath, endpoint: endpointURL) else {
-                        providerRuntimeLog("region_failover transport_rebuild_skipped region=\(current.region) endpoint=\(current.endpoint) (could not build (T) transport)")
-                        return
+                    let applied = self.regionTransportApplication()
+                    let ready = Self.activateConnectedRegion(
+                        current: dec.current, changed: changed, appliedEndpoint: applied.endpoint,
+                        transportReady: applied.ready,
+                        block: { self.blockRegionTransportTransition(epoch: epoch) },
+                        build: { DsseLocalRuntimeCopyTransportFactory.makeForRegionEndpoint(
+                            agentConfigPath: agentConfigPath, endpoint: $0) },
+                        activate: { rebuilt, endpoint, endpointURL in
+                            guard self.activateRegionTransport(rebuilt, endpoint: endpoint, epoch: epoch) else {
+                                return false
+                            }
+                            poller.selectEndpoint(endpointURL)
+                            self.deviceHeartbeat?.selectEndpoint(endpointURL)
+                            self.updateCourier?.selectEndpoint(endpointURL)
+                            providerRuntimeLog("region_failover transport_rebuilt region=\(dec.current?.region ?? "-") endpoint=\(endpoint)")
+                            return true
+                        },
+                        unblock: { self.setRegionEgress(blocked: false, admissionDenied: false, epoch: epoch) })
+                    if !ready {
+                        providerRuntimeLog("region_failover transport_rebuild_failed region=\(dec.current?.region ?? "-") decision=deny_closed_retry_next_probe")
                     }
-                    self.runtimeCopyTransport = rebuilt
-                    poller.selectEndpoint(endpointURL)
-                    self.deviceHeartbeat?.selectEndpoint(endpointURL)
-                    self.updateCourier?.selectEndpoint(endpointURL)
-                    providerRuntimeLog("region_failover transport_rebuilt region=\(current.region) endpoint=\(current.endpoint)")
                 case .failClosed, .denied:
                     // No healthy allowed region, or device admission denied: deny new flows (fail-closed). Failover
                     // is for region health only — never to leave the residency boundary or evade a kill-switch.
                     // Set blocked + the CAUSE together (one lock) so fail-open can never observe a torn state and
                     // bypass a revocation: .denied (admission) must always deny_close; only .failClosed
                     // (reachability) is eligible for LAB fail-open direct-egress.
-                    self.setRegionEgress(blocked: true, admissionDenied: dec.state == .denied)
+                    guard self.setRegionEgress(blocked: true, admissionDenied: dec.state == .denied,
+                                               epoch: epoch) else { return }
                     providerRuntimeLog("region_failover egress_blocked=true state=\(dec.state.rawValue) admission_denied=\(dec.state == .denied) reason=\(dec.reason)")
                 }
             })
@@ -3615,11 +3896,17 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             // Edge signed with the ECDSA key the device adopted, the first (pre-poll) server exclusion set failed
             // to verify and fell back to empty until the async poller caught up.
             let configDir = URL(fileURLWithPath: agentConfigPath).deletingLastPathComponent()
+            let contract = (try? Data(contentsOf: URL(fileURLWithPath: agentConfigPath)))
+                .flatMap { transportContract(agentConfigPath: agentConfigPath, data: $0) }
+            let currentIdentity = DsseTransportSecurityResolver.resolve(
+                contract: contract, configDirectory: configDir, agentConfigPath: agentConfigPath)?.clientIdentity
             guard let config,
                   case let signedPath = config.resolvedAgentPolicySignedPath(configDirectory: configDir),
                   let pinnedKey = config.agentPolicyPinnedPublicKey,
                   let verified = DsseSignedAgentPolicy.verifiedServerExclusions(
                       signedPath: signedPath, pinnedPublicKeyHex: pinnedKey,
+                      expectedDeviceIdentity: DsseDeviceHeartbeat.deviceIdentity(from: currentIdentity),
+                      expectedTenantID: DsseAdoptedTenantScope.tenantInForce(configDirectory: configDir),
                       alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDir)
                   )
             else { return [] }
@@ -3910,6 +4197,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         lifecycleState: ProviderLifecycleState?,
         destination: ProviderFlowRequest? = nil,
         osUser: String? = nil,
+ authOwner: DsseAuthOwner? = nil,
         sourceApp: String? = nil,
         driver: DsseLocalRuntimeCopyDriver = DsseLocalRuntimeCopyDriver(),
         transport: any DsseLocalRuntimeCopyTransport,
@@ -3924,6 +4212,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             lifecycleState: lifecycleState,
             destination: destination,
             osUser: osUser,
+ authOwner: authOwner,
             sourceApp: sourceApp
         ) else {
             let failure: Result<DsseLocalRuntimeCopyResult, Error> = .failure(DsseLocalRuntimeCopyDriverError.missingTenantScope)
@@ -4445,7 +4734,8 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         tcpFlow: NEAppProxyTCPFlow,
         providerResult: ProviderFlowResult,
         destination: ProviderFlowRequest?,
-        report: DsseHandleNewFlowContractReport
+        report: DsseHandleNewFlowContractReport,
+        transport: any DsseLocalRuntimeCopyTransport
     ) {
         let diagnosticWriter = runtimeDiagnosticWriter
         let policyAuditWriter = policyDrivenAuditEvidenceWriter
@@ -4455,9 +4745,10 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             lifecycleState: lifecycleManager.state,
             destination: destination,
             osUser: Self.sourceAppOSUser(from: tcpFlow),
+ authOwner: DsseAuthOwner.fromAuditToken(tcpFlow.metaData.sourceAppAuditToken),
             sourceApp: Self.sourceAppSigningIdentifier(from: tcpFlow),
             driver: runtimeCopyDriver,
-            transport: runtimeCopyTransport,
+            transport: transport,
             // Fail-open: when it is ARMED (enable key AND acknowledgment), a flow the Edge cannot carry
             // falls back to a direct connection instead of deny_closed. Same armed posture as the region fast-path;
             // production leaves it false and stays fail-closed.
@@ -4513,6 +4804,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
         lifecycleState: ProviderLifecycleState?,
         destination: ProviderFlowRequest? = nil,
         osUser: String? = nil,
+ authOwner: DsseAuthOwner? = nil,
         sourceApp: String? = nil
     ) -> DsseLocalRuntimeCopyMetadata? {
         guard HandleNewFlowTakeoverContract.matchedTunnel(providerResult) else {
@@ -4531,6 +4823,7 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
             destinationHost: normalizedRuntimeCopyDestinationHost(destination?.host),
             destinationPort: normalizedRuntimeCopyDestinationPort(destination?.port),
             osUser: osUser,
+ authOwner: authOwner,
             sourceApp: sourceApp
         )
     }
@@ -4612,7 +4905,8 @@ public final class DsseAppProxyProvider: NETransparentProxyProvider {
                 sourceBundleID: endpointObservation.input.sourceBundleID
             ),
             endpointSourceGate: "flow_remote_named_authority_preferred",
-            portSourceGate: endpointObservation.portSourceGate
+            portSourceGate: endpointObservation.portSourceGate,
+            resolvedRemoteAddress: canonicalNumericAddress(endpointObservation.input.remoteHost)
         )
     }
 

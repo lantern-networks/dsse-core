@@ -290,6 +290,7 @@ func TestNetworkExtensionRuntimeCopyTunnelIdleTimeoutDoesNotCutActiveFlow(t *tes
 }
 
 func TestNetworkExtensionRuntimeCopyTunnelHalfCloseStalledReverseReapsFast(t *testing.T) {
+	t.Setenv("DSSE_NE_ABANDONED_HALF_CLOSE_LINGER_MILLISECONDS", "25")
 	// LEAK REGRESSION: a flow whose one direction half-closes WITHOUT HAVING SENT ANYTHING, and whose surviving
 	// direction then STALLS, must be reaped on the SHORT half-close linger — not held for the full idle window.
 	// This is the ABANDONED-client shape (Happy-Eyeballs race loser, connection-pool miss, closed tab) — measured

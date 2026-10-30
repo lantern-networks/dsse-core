@@ -296,6 +296,28 @@ func TestAPlanFromAnotherTenantCannotOpenAWave(t *testing.T) {
 	}
 }
 
+func TestCaseDistinctTenantPlanCannotOpenWaveOrAdvanceReplayFloor(t *testing.T) {
+	now := time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC)
+	plan := RolloutPlan{
+		EligibleSince: "2026-10-22T00:00:00Z", TargetVersion: "0.4.0",
+		GeneratedAt: now.Format(time.RFC3339), TenantID: "Tenant-A",
+	}
+	path := planFile(t, plan)
+	other := RolloutExpectation{Version: "0.4.0", MaxAge: DefaultPlanMaxAge, TenantID: "tenant-a"}
+	r, err := LoadRollout(path, nil, now, other)
+	if err != nil {
+		t.Fatalf("LoadRollout: %v", err)
+	}
+	if !r.EligibleSince.IsZero() || r.WaveWithheld == "" || !r.PlanGeneratedAt.IsZero() {
+		t.Fatalf("case-distinct tenant's plan changed this device's rollout state: %+v", r)
+	}
+	other.TenantID = "Tenant-A"
+	r, err = LoadRollout(path, nil, now, other)
+	if err != nil || r.EligibleSince.IsZero() || r.PlanGeneratedAt.IsZero() {
+		t.Fatalf("exact tenant's plan should open its wave: %+v (%v)", r, err)
+	}
+}
+
 // ★ ONE MISDELIVERED PLAN WAS A PERMANENT FREEZE (2026-08-13, twenty-ninth review). The replay floor is a
 // one-way ratchet, and it moved for any plan that parsed — including one addressed to another device. A
 // correctly signed, newer plan meant for somebody else raised this device's floor above its own plan, and

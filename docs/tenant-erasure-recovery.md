@@ -5,6 +5,38 @@ pools. It is not one transaction and does not roll back data already removed.
 The result reports partial failures and the remaining footprint. Fleet delivery
 markers are retained when preceding erasure or completion recording fails.
 
+## Fleet completion evidence
+
+The control plane retains each reporting Edge's last tenant-erasure result in
+the `fleet_tenant_erasure` store. With `-postgres-dsn`, it uses the shared
+`cp_state_blobs` row, including after leadership changes. A single CP without
+PostgreSQL uses `<state-dir>/fleet_tenant_erasure.json`. A production CP requires
+one of these durable backends; an explicitly selected development mode may use
+memory and does not provide restart durability.
+
+This evidence is separate from current fleet liveness. Restarting the CP does
+not make an offline Edge appear online, and an offline Edge's nonzero remaining
+count still prevents erasure completion. A report is acknowledged only after
+its evidence is saved. Unavailable, corrupt or unexpectedly missing evidence,
+or a pending unconfirmed save, makes the completion endpoint return HTTP 503
+instead of certifying erasure. Retrying a report preserves other nodes' evidence.
+
+The record retains tenant ID, reporting node identity, remaining count and
+observation time, not tenant payload or DLP configuration. It must survive the
+tenant purge so it can establish whether that purge finished. Do not delete or
+reset it to clear a stale result. A node that never reported is not represented;
+this is evidence from reporting participants, not a complete infrastructure
+census. Replaced node identities do not automatically clear the old node's data.
+Decommissioning or loss of an unresponsive node requires reconciliation of its
+storage rather than an assumption that silence proves erasure.
+
+Protect this authoritative record with the CP storage and backup policy. If the
+whole record is deleted while every CP is stopped, a new process cannot
+distinguish that loss from first initialization. A restore must retain the
+erasure evidence; an empty or older restored database is not proof of erasure.
+
+## Protection marker
+
 Before touching a store, the erasing node saves an operation ID, node name and
 start time in the `legal_hold` snapshot. This orders erasure against hold changes:
 

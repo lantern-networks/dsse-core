@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -220,9 +221,11 @@ func startCertPinMain(t *testing.T, dir string, sourced bool, extraArgs ...strin
 	for deadline := time.Now().Add(12 * time.Second); time.Now().Before(deadline); time.Sleep(30 * time.Millisecond) {
 		resp, e := client.Get(base + "/healthz")
 		if e == nil {
-			io.Copy(io.Discard, resp.Body)
+			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if resp.StatusCode == 200 {
+			// A puller with an intentionally unreachable CP has started, but
+			// correctly refuses data-plane readiness until its first bundle.
+			if resp.StatusCode == 200 || (sourced && resp.StatusCode == http.StatusServiceUnavailable && strings.Contains(string(body), "awaiting_initial_config_bundle")) {
 				return base, stop
 			}
 		}

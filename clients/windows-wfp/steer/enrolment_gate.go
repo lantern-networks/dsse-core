@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // enrolment_gate.go — what the agent does when it starts and finds it has no device identity. The Windows
@@ -118,7 +120,10 @@ func (c enrolmentConfig) hasPinnedBootstrap() bool {
 func loadEnrolmentConfig(path string) (enrolmentConfig, bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return enrolmentConfig{}, false, nil
+		if os.IsNotExist(err) {
+			return enrolmentConfig{}, false, nil
+		}
+		return enrolmentConfig{}, false, fmt.Errorf("enrolment config %q is present but unreadable: %w", path, err)
 	}
 	var c enrolmentConfig
 	if err := json.Unmarshal(raw, &c); err != nil {
@@ -143,11 +148,7 @@ func markEnrolmentTokenSpent(path string) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return durablefile.Write(path, raw, 0o600)
 }
 
 // identityServesThisOrganization reports whether a device identity found on disk can be used HERE.
@@ -173,5 +174,5 @@ func identityServesThisOrganization(identityTenant, profileTenant string) bool {
 	if a == "" || b == "" {
 		return true
 	}
-	return strings.EqualFold(a, b)
+	return a == b
 }

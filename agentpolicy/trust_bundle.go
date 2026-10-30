@@ -263,6 +263,9 @@ func VerifyTrustBundleWithKeys(env Envelope, pubKeyHexes []string, lastAcceptedS
 	if p.SchemaVersion != TrustBundleSchema {
 		return TrustBundlePayload{}, fmt.Errorf("payload is %q, not a trust bundle (%s)", p.SchemaVersion, TrustBundleSchema)
 	}
+	if p.TenantID == "" || p.TenantID != strings.TrimSpace(p.TenantID) {
+		return TrustBundlePayload{}, fmt.Errorf("trust bundle must name one tenant")
+	}
 	if p.Serial <= 0 {
 		return TrustBundlePayload{}, fmt.Errorf("trust bundle has no serial; rollback could not be detected")
 	}
@@ -315,6 +318,36 @@ func FetchVerifiedTrustBundleForName(ctx context.Context, client *http.Client, b
 	return VerifyTrustBundleWithKeys(env, pubKeyHexes, lastAcceptedSerial)
 }
 
+// FetchVerifiedTrustBundleForOrganization selects the organization already named by a
+// verified installation profile. Shared-transport organizations have no dedicated
+// server name, so a name alone cannot identify their recovery distribution. The
+// selector is public addressing, not authorization; the signature, schema, serial
+// floor, and organization are all checked before any payload is returned.
+func FetchVerifiedTrustBundleForOrganization(ctx context.Context, client *http.Client, baseURL, tenantID, serverName string,
+	pubKeyHexes []string, lastAcceptedSerial int64) (TrustBundlePayload, error) {
+	tenant := strings.TrimSpace(tenantID)
+	if tenant == "" {
+		return TrustBundlePayload{}, fmt.Errorf("trust bundle: an expected organization is required")
+	}
+	query := url.Values{"tenant": []string{tenant}}
+	if name := strings.TrimSpace(serverName); name != "" {
+		query.Set("server_name", name)
+	}
+	target := strings.TrimRight(baseURL, "/") + trustBundlePath + "?" + query.Encode()
+	var env Envelope
+	if err := getJSON(ctx, client, target, &env); err != nil {
+		return TrustBundlePayload{}, err
+	}
+	payload, err := VerifyTrustBundleWithKeys(env, pubKeyHexes, lastAcceptedSerial)
+	if err != nil {
+		return TrustBundlePayload{}, err
+	}
+	if strings.TrimSpace(payload.TenantID) != tenant {
+		return TrustBundlePayload{}, fmt.Errorf("trust bundle: the signed distribution belongs to a different organization")
+	}
+	return payload, nil
+}
+
 // SignTrustBundle builds the signed envelope the Edge serves. Serial must advance on every issue; the caller
 // owns that counter because it is what devices use to reject replays.
 // SignTrustBundle signs the bundle without naming interception roots. Kept so existing callers and the OSS
@@ -360,6 +393,9 @@ func (s *Signer) SignTrustBundleWithKeyring(tenantID string, serial int64, trans
 func (s *Signer) SignTrustBundlePayload(p TrustBundlePayload, now time.Time) (Envelope, error) {
 	if p.Serial <= 0 {
 		return Envelope{}, fmt.Errorf("trust bundle serial must be positive")
+	}
+	if p.TenantID == "" || p.TenantID != strings.TrimSpace(p.TenantID) {
+		return Envelope{}, fmt.Errorf("trust bundle must name one tenant")
 	}
 	if strings.TrimSpace(p.SchemaVersion) == "" {
 		p.SchemaVersion = TrustBundleSchema

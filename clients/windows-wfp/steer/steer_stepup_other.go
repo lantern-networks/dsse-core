@@ -8,5 +8,5 @@ import "fmt"
 // keeps `go build ./...` and the pure stepUpCoordinator tests green on Mac/CI, and logs so a mis-target on a
 // non-Windows host is visible rather than silent.
 func defaultStepUpLauncher(resource, portalURL string) {
-	fmt.Printf("steer_stepup (no-op on non-windows) resource=%s url=%s\n", resource, portalURL)
+	fmt.Printf("steer_stepup (no-op on non-windows)\n")
 }

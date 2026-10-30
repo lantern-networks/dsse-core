@@ -68,6 +68,7 @@ func TestRegistryHeartbeatRefreshesReachableRoutes(t *testing.T) {
 	}, now); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
+	registeredGeneration := registry.ConfigGeneration()
 
 	// Heartbeat WITH routes -> registered set refreshed.
 	conn, err := registry.Heartbeat(model.ConnectorHeartbeat{
@@ -80,6 +81,10 @@ func TestRegistryHeartbeatRefreshesReachableRoutes(t *testing.T) {
 	if len(conn.ReachableRoutes.CIDRs) != 2 {
 		t.Fatalf("heartbeat with routes must refresh the registered set, got %v", conn.ReachableRoutes.CIDRs)
 	}
+	if got := registry.ConfigGeneration(); got != registeredGeneration+1 {
+		t.Fatalf("route and status change must bump catalog generation once, got %d", got)
+	}
+	changedGeneration := registry.ConfigGeneration()
 
 	// Heartbeat WITHOUT routes (nil) -> registered set unchanged (not wiped).
 	conn, err = registry.Heartbeat(model.ConnectorHeartbeat{
@@ -90,6 +95,19 @@ func TestRegistryHeartbeatRefreshesReachableRoutes(t *testing.T) {
 	}
 	if len(conn.ReachableRoutes.CIDRs) != 2 {
 		t.Fatalf("a heartbeat omitting routes must leave the registered set unchanged, got %v", conn.ReachableRoutes.CIDRs)
+	}
+	if got := registry.ConfigGeneration(); got != changedGeneration {
+		t.Fatalf("steady heartbeat must not bump catalog generation, got %d", got)
+	}
+	conn, err = registry.Heartbeat(model.ConnectorHeartbeat{
+		ID: "conn_lab_001", TenantID: "tenant_lab_001", Status: "healthy",
+		ReachableRoutes: &model.ConnectorReachableRoutes{CIDRs: []string{"10.2.0.0/24"}},
+	}, now.Add(3*time.Minute))
+	if err != nil {
+		t.Fatalf("same-status route heartbeat: %v", err)
+	}
+	if got := registry.ConfigGeneration(); got != changedGeneration+1 {
+		t.Fatalf("same-status route change must trigger catalog re-pull, got %d", got)
 	}
 }
 

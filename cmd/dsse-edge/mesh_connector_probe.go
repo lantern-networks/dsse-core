@@ -29,7 +29,10 @@ func meshConnectorProber(registry connectorRegistryStore, tunnels *tunnel.Manage
 		ctx, cancel := context.WithTimeout(ctx, time.Duration(tunnel.ProbeTimeoutMillisOrDefault(frame.ConnectTimeoutMillis))*time.Millisecond)
 		defer cancel()
 		if residency != nil {
-			allowed := residency(tenant)
+			allowed, err := residency(tenant)
+			if err != nil {
+				return tunnel.Frame{}, fmt.Errorf("mesh diagnostic tenant residency lookup failed")
+			}
 			if len(allowed) > 0 && !edgeplane.ContainsRegionFold(allowed, region) {
 				return tunnel.Frame{}, fmt.Errorf("mesh diagnostic region is outside the tenant residency boundary")
 			}

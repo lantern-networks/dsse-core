@@ -282,7 +282,7 @@ func TestConnectorEgressDialContextMeshRelaysViaPeerEdge(t *testing.T) {
 		return nopConn{}, nil
 	}
 	dial := edgeplane.ConnectorEgressDialContext(base, connectorDestinationResolver(reg), tunnel.NewManager(), "tenant-a", "jp-tokyo",
-		edgeplane.ResidencyResolver(func(string) []string { return []string{"jp-tokyo", "jp-osaka"} }),
+		edgeplane.ResidencyResolver(func(string) ([]string, error) { return []string{"jp-tokyo", "jp-osaka"}, nil }),
 		stubPeerEdges{region: "jp-osaka", session: session},
 		func(string) bool { return true })
 

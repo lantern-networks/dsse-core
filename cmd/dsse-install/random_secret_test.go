@@ -15,7 +15,10 @@ import (
 // something and still costs nothing.
 func TestAMintedSecretNeverLooksLikeAnOption(t *testing.T) {
 	for i := 0; i < 10000; i++ {
-		s := randomSecret()
+		s, err := randomSecret()
+		if err != nil {
+			t.Fatal(err)
+		}
 		if strings.HasPrefix(s, "-") {
 			t.Fatalf("draw %d minted %q, which every argv in this deployment will read as a flag", i, s)
 		}

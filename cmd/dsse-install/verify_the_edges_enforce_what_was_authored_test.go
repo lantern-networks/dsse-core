@@ -107,7 +107,36 @@ func TestAnUnreachableEdgeIsNamedRatherThanCountedAsPassing(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("expected one answer, got %d", len(got))
 	}
+	if got[0].ok {
+		t.Fatalf("an unmeasured Edge was reported as passing: %+v", got)
+	}
 	if !strings.Contains(got[0].note, "NOT measured on") || !strings.Contains(got[0].note, dead.URL) {
 		t.Errorf("an Edge that never answered is not named in the result: %s", got[0].note)
+	}
+}
+
+func TestTenantAuthorityReadFailureCannotBeReportedAsNoCustomerPKI(t *testing.T) {
+	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/tenants":
+			_, _ = w.Write([]byte(`{"tenants":[{"tenant_id":"tenant-a"},{"tenant_id":"tenant-b"}]}`))
+		case "/admin/tenant-interception-authority":
+			if r.Header.Get("X-Operate-Tenant") == "tenant-b" {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = w.Write([]byte(`{"tenant_id":"tenant-a","has_authority":false}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer cp.Close()
+	edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"signing_scope":{"per_tenant_signing":true}}`))
+	}))
+	defer edge.Close()
+	got := verifyTheEdgesEnforceWhatWasAuthored(cp.Client(), cp.URL, []string{edge.URL}, "test-token")
+	if len(got) != 1 || got[0].ok || !strings.Contains(got[0].note, "tenant-b") {
+		t.Fatalf("unreadable tenant authority was reported as none: %+v", got)
 	}
 }

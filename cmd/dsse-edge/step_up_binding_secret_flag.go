@@ -14,5 +14,5 @@ func stepUpBindingSecretFlag() *string {
 		"deployment-wide secret the step-up start URL is signed with (it covers the device AND the "+
 			"organization the held flow belonged to). MUST be the same on every Edge: the Edge that issues a "+
 			"step-up URL is rarely the one the region's front door hands it to. Empty = a per-process key, "+
-			"which loses the device binding the moment a ceremony crosses a node.")
+			"which causes signed ceremonies crossing nodes to be rejected.")
 }

@@ -7,127 +7,93 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
+	devicestore "github.com/lantern-networks/dsse-core/device"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
 const postgresDeviceInventoryTimeout = 15 * time.Second
 
 type postgresDeviceInventoryStore struct {
-	DB *sql.DB
+	DB            *sql.DB
+	policyMu      sync.RWMutex
+	posturePolicy *devicestore.PosturePolicy
 }
 
 var _ deviceRuntimeStore = (*postgresDeviceInventoryStore)(nil)
 var _ deviceTenantReader = (*postgresDeviceInventoryStore)(nil)
 var _ deviceTenantGetter = (*postgresDeviceInventoryStore)(nil)
+var _ posturePolicyConfigurableStore = (*postgresDeviceInventoryStore)(nil)
+var _ riskSignalDeviceApplier = (*postgresDeviceInventoryStore)(nil)
+
+// The Edge environment is the policy authority. PostgreSQL keeps each device's
+// last derived verdict; new posture reports apply the current ruleset.
+func (store *postgresDeviceInventoryStore) SetPosturePolicy(policy devicestore.PosturePolicy) error {
+	store.policyMu.Lock()
+	defer store.policyMu.Unlock()
+	store.posturePolicy = &policy
+	return nil
+}
+
+func (store *postgresDeviceInventoryStore) effectivePosturePolicy() devicestore.PosturePolicy {
+	store.policyMu.RLock()
+	defer store.policyMu.RUnlock()
+	if store.posturePolicy == nil {
+		return devicestore.DefaultPosturePolicy()
+	}
+	return *store.posturePolicy
+}
 
 func (store *postgresDeviceInventoryStore) Register(device model.Device, policyBundle model.PolicyBundle, now time.Time) (model.Device, error) {
-	if policyBundle.TenantID != "" && device.TenantID != policyBundle.TenantID {
-		return device, fmt.Errorf("device tenant_id %s does not match policy bundle tenant_id %s", device.TenantID, policyBundle.TenantID)
-	}
-	if device.DeviceTrustLevel == "" {
-		device.DeviceTrustLevel = "unknown"
-	}
-	if device.PolicyBundleID == "" {
-		device.PolicyBundleID = policyBundle.ID
-	}
-	if device.PolicyBundleVersion == "" {
-		device.PolicyBundleVersion = policyBundle.Version
-	}
-	if device.Status == "" {
-		device.Status = "registered"
-	}
-	// ★ A DEVICE RE-REGISTERING MUST NOT UNDO AN OPERATOR (2026-08-13, twenty-eighth review). This defaults an
-	// absent status to "registered" and the upsert wrote it over whatever was there — so a machine an operator
-	// had REVOKED could call POST /devices/register with its own transport certificate and clear the
-	// revocation, silently and indistinguishably from a first registration. The device drives this call; the
-	// revocation is the operator's. The conflict clause below keeps 'revoked' whatever the device says, and
-	// un-revoking stays what it always was: an administrator's action on the admin route.
-	if device.RegisteredAt == "" {
-		device.RegisteredAt = now.UTC().Format(time.RFC3339)
-	}
-	if device.LastSeenAt == "" {
-		device.LastSeenAt = device.RegisteredAt
-	}
-	if device.Metadata == nil {
-		device.Metadata = map[string]any{}
-	}
-	if err := store.upsert(context.Background(), device, now); err != nil {
-		return model.Device{}, err
-	}
-	return normalizePostgresDeviceForStorage(device)
+	device.ID = strings.TrimSpace(device.ID)
+	device.TenantID = strings.TrimSpace(device.TenantID)
+	result, err := store.mutateDevice(device.ID, now, func(previous *model.Device) (postgresDeviceMutation, error) {
+		updated, err := devicestore.FoldRegistration(previous, device, policyBundle, store.effectivePosturePolicy(), now)
+		return postgresDeviceMutation{device: updated, write: true}, err
+	})
+	return result.device, err
 }
 
 func (store *postgresDeviceInventoryStore) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.PolicyBundle, now time.Time) (model.Device, error) {
-	if heartbeat.ID == "" {
-		return model.Device{}, fmt.Errorf("device id is required")
-	}
-	device, ok, err := store.getByID(context.Background(), heartbeat.ID)
-	if err != nil {
-		return model.Device{}, err
-	}
-	if !ok {
-		return model.Device{}, fmt.Errorf("device %s is absent", heartbeat.ID)
-	}
-	if heartbeat.TenantID != "" && heartbeat.TenantID != device.TenantID {
-		return model.Device{}, fmt.Errorf("device tenant_id %s does not match registered tenant_id %s", heartbeat.TenantID, device.TenantID)
-	}
-	if policyBundle.TenantID != "" && device.TenantID != policyBundle.TenantID {
-		return model.Device{}, fmt.Errorf("device tenant_id %s does not match policy bundle tenant_id %s", device.TenantID, policyBundle.TenantID)
-	}
-	if heartbeat.AgentVersion != "" {
-		device.AgentVersion = heartbeat.AgentVersion
-	}
-	if heartbeat.DeviceTrustLevel != "" {
-		device.DeviceTrustLevel = heartbeat.DeviceTrustLevel
-	}
-	if heartbeat.PolicyBundleID != "" {
-		device.PolicyBundleID = heartbeat.PolicyBundleID
-	}
-	if heartbeat.PolicyBundleVersion != "" {
-		device.PolicyBundleVersion = heartbeat.PolicyBundleVersion
-	}
-	if device.PolicyBundleID == "" {
-		device.PolicyBundleID = policyBundle.ID
-	}
-	if device.PolicyBundleVersion == "" {
-		device.PolicyBundleVersion = policyBundle.Version
-	}
-	// Same rule as Register: a heartbeat is the DEVICE talking, and it must not clear a revocation. The upsert
-	// keeps 'revoked' regardless of what is set here; this is the in-memory half so the value this process
-	// returns agrees with the row it wrote.
-	if strings.EqualFold(strings.TrimSpace(device.Status), "revoked") {
-		// leave it
-	} else if heartbeat.Status != "" {
-		device.Status = heartbeat.Status
-	} else {
-		device.Status = "healthy"
-	}
-	if heartbeat.Timestamp != "" {
-		device.LastSeenAt = heartbeat.Timestamp
-	} else {
-		device.LastSeenAt = now.UTC().Format(time.RFC3339)
-	}
-	if device.Metadata == nil {
-		device.Metadata = map[string]any{}
-	}
-	for key, value := range heartbeat.Metadata {
-		device.Metadata[key] = value
-	}
-	if err := store.upsert(context.Background(), device, now); err != nil {
-		return model.Device{}, err
-	}
-	return normalizePostgresDeviceForStorage(device)
+	heartbeat.ID = strings.TrimSpace(heartbeat.ID)
+	heartbeat.TenantID = strings.TrimSpace(heartbeat.TenantID)
+	result, err := store.mutateDevice(heartbeat.ID, now, func(previous *model.Device) (postgresDeviceMutation, error) {
+		if previous == nil {
+			return postgresDeviceMutation{}, fmt.Errorf("device %s is absent", heartbeat.ID)
+		}
+		updated, err := devicestore.FoldHeartbeat(*previous, heartbeat, policyBundle, store.effectivePosturePolicy(), now)
+		return postgresDeviceMutation{device: updated, write: true}, err
+	})
+	return result.device, err
+}
+
+func (store *postgresDeviceInventoryStore) ApplyRiskSignal(deviceID string, signal model.RiskSignal, now time.Time) (model.Device, bool, bool, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	result, err := store.mutateDevice(deviceID, now, func(previous *model.Device) (postgresDeviceMutation, error) {
+		if previous == nil {
+			return postgresDeviceMutation{}, nil
+		}
+		updated, high, err := devicestore.FoldRiskSignal(*previous, signal, now)
+		return postgresDeviceMutation{device: updated, write: true, high: high}, err
+	})
+	return result.device, result.write, result.high, err
 }
 
 func (store *postgresDeviceInventoryStore) Get(id string) (model.Device, bool) {
-	device, ok, err := store.getByID(context.Background(), id)
+	device, ok, err := store.GetChecked(id)
 	if err != nil {
 		log.Printf("postgres device inventory get failed: %v", err)
 		return model.Device{}, false
 	}
 	return device, ok
+}
+
+// GetChecked preserves read failures for authorization callers that cannot
+// infer a tenant before looking up a device in a legacy single-tenant flow.
+func (store *postgresDeviceInventoryStore) GetChecked(id string) (model.Device, bool, error) {
+	return store.getByID(context.Background(), id)
 }
 
 func (store *postgresDeviceInventoryStore) GetByTenant(tenantID, deviceID string) (model.Device, bool, error) {
@@ -167,24 +133,81 @@ func (store *postgresDeviceInventoryStore) ListByTenant(tenantID string) ([]mode
 	return store.list(context.Background(), tenantID)
 }
 
-func (store *postgresDeviceInventoryStore) upsert(ctx context.Context, device model.Device, now time.Time) error {
-	ctx, cancel := context.WithTimeout(ctx, postgresDeviceInventoryTimeout)
-	defer cancel()
-	statement, err := buildPostgresDeviceInventoryUpsertStatement(device, now)
-	if err != nil {
-		return err
-	}
+type postgresDeviceMutation struct {
+	device model.Device
+	write  bool
+	high   bool
+}
+
+// mutateDevice serializes every writer for a device ID, including the first
+// registration when no row exists yet. The transaction row lock alone cannot
+// protect an absent row from a concurrent registration/risk update. All domain
+// changes are calculated from the locked record and committed with its payload.
+func (store *postgresDeviceInventoryStore) mutateDevice(deviceID string, now time.Time, fold func(*model.Device) (postgresDeviceMutation, error)) (postgresDeviceMutation, error) {
 	if store == nil || store.DB == nil {
-		return fmt.Errorf("postgres device inventory db is not configured")
+		return postgresDeviceMutation{}, fmt.Errorf("postgres device inventory db is not configured")
 	}
-	result, err := store.DB.ExecContext(ctx, statement.SQL, statement.Args...)
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return postgresDeviceMutation{}, fmt.Errorf("device_id is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), postgresDeviceInventoryTimeout)
+	defer cancel()
+	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return postgresDeviceMutation{}, err
 	}
-	if rowsAffected, err := result.RowsAffected(); err == nil && rowsAffected == 0 {
-		return fmt.Errorf("device inventory upsert affected 0 rows for device_id %s", device.ID)
+	defer tx.Rollback()
+
+	// A transaction-scoped advisory lock covers the no-row case. A hash
+	// collision only serializes unrelated IDs; it cannot join their records.
+	var lockResult any
+	if err := tx.QueryRowContext(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", deviceID).Scan(&lockResult); err != nil {
+		return postgresDeviceMutation{}, err
 	}
-	return nil
+	var previous *model.Device
+	var rowTenant string
+	var payload []byte
+	err = tx.QueryRowContext(ctx, "SELECT tenant_id, payload FROM device_inventory WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&rowTenant, &payload)
+	if err != nil && err != sql.ErrNoRows {
+		return postgresDeviceMutation{}, err
+	}
+	if err == nil {
+		prior, err := decodePostgresDeviceInventoryPayload(payload)
+		if err != nil {
+			return postgresDeviceMutation{}, err
+		}
+		if prior.ID != deviceID || prior.TenantID != rowTenant {
+			return postgresDeviceMutation{}, fmt.Errorf("device inventory row and payload identity disagree")
+		}
+		previous = &prior
+	}
+	result, err := fold(previous)
+	if err != nil || !result.write {
+		return result, err
+	}
+	statement, err := buildPostgresDeviceInventoryUpsertStatement(result.device, now)
+	if err != nil {
+		return postgresDeviceMutation{}, err
+	}
+	if err := tx.QueryRowContext(ctx, statement.SQL, statement.Args...).Scan(&payload); err != nil {
+		if err == sql.ErrNoRows {
+			return postgresDeviceMutation{}, fmt.Errorf("device %s belongs to another tenant", deviceID)
+		}
+		return postgresDeviceMutation{}, err
+	}
+	persisted, err := decodePostgresDeviceInventoryPayload(payload)
+	if err != nil {
+		return postgresDeviceMutation{}, err
+	}
+	if persisted.ID != deviceID || persisted.TenantID != result.device.TenantID {
+		return postgresDeviceMutation{}, fmt.Errorf("device inventory write returned another identity")
+	}
+	if err := tx.Commit(); err != nil {
+		return postgresDeviceMutation{}, err
+	}
+	result.device = persisted
+	return result, nil
 }
 
 func (store *postgresDeviceInventoryStore) getByID(ctx context.Context, id string) (model.Device, bool, error) {
@@ -301,7 +324,7 @@ func buildPostgresDeviceInventoryUpsertStatement(device model.Device, now time.T
 		SQL: strings.Join([]string{
 			"INSERT INTO device_inventory (device_id, tenant_id, user_id, hostname, os, os_version, agent_version, device_trust_level, policy_bundle_id, policy_bundle_version, status, registered_at, last_seen_at, metadata, payload, created_at, updated_at)",
 			"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::timestamptz, $13::timestamptz, $14::jsonb, $15::jsonb, $16, $16)",
-			"ON CONFLICT (device_id) DO UPDATE SET user_id = EXCLUDED.user_id, hostname = EXCLUDED.hostname, os = EXCLUDED.os, os_version = EXCLUDED.os_version, agent_version = EXCLUDED.agent_version, device_trust_level = EXCLUDED.device_trust_level, policy_bundle_id = EXCLUDED.policy_bundle_id, policy_bundle_version = EXCLUDED.policy_bundle_version, status = CASE WHEN device_inventory.status = 'revoked' THEN device_inventory.status ELSE EXCLUDED.status END, registered_at = EXCLUDED.registered_at, last_seen_at = EXCLUDED.last_seen_at, metadata = EXCLUDED.metadata, payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at WHERE device_inventory.tenant_id = EXCLUDED.tenant_id",
+			"ON CONFLICT (device_id) DO UPDATE SET user_id = EXCLUDED.user_id, hostname = EXCLUDED.hostname, os = EXCLUDED.os, os_version = EXCLUDED.os_version, agent_version = EXCLUDED.agent_version, device_trust_level = EXCLUDED.device_trust_level, policy_bundle_id = EXCLUDED.policy_bundle_id, policy_bundle_version = EXCLUDED.policy_bundle_version, status = CASE WHEN device_inventory.status = 'revoked' THEN device_inventory.status ELSE EXCLUDED.status END, registered_at = EXCLUDED.registered_at, last_seen_at = EXCLUDED.last_seen_at, metadata = EXCLUDED.metadata, payload = CASE WHEN device_inventory.status = 'revoked' THEN jsonb_set(EXCLUDED.payload, '{status}', to_jsonb(device_inventory.status), true) ELSE EXCLUDED.payload END, updated_at = EXCLUDED.updated_at WHERE device_inventory.tenant_id = EXCLUDED.tenant_id RETURNING payload",
 		}, " "),
 		Args: []any{
 			normalized.ID,

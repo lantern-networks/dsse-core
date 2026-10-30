@@ -28,16 +28,12 @@ const (
 func TestSWGEdgeSWGProductionProcessStatusSmoke(t *testing.T) {
 	postgresDSN := strings.TrimSpace(os.Getenv(sWGEdgeRuntimeProductionProcessStatusSmokeDSNEnv))
 	if postgresDSN == "" {
-		t.Skipf("%s is required for production-mode cmd/edge process status smoke", sWGEdgeRuntimeProductionProcessStatusSmokeDSNEnv)
+		t.Skipf("%s is required for production-mode cmd/dsse-edge process status smoke", sWGEdgeRuntimeProductionProcessStatusSmokeDSNEnv)
 	}
 
 	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatalf("resolve module root: %v", err)
-	}
-	repoRoot, err := filepath.Abs(filepath.Join(moduleRoot, ".."))
-	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
 	}
 
 	workDir := t.TempDir()
@@ -45,13 +41,13 @@ func TestSWGEdgeSWGProductionProcessStatusSmoke(t *testing.T) {
 
 	binaryPath := filepath.Join(workDir, "edge-process-status-smoke")
 	build := exec.Command("go", "build", "-o", binaryPath, ".")
-	build.Dir = filepath.Join(moduleRoot, "cmd", "edge")
+	build.Dir = filepath.Join(moduleRoot, "cmd", "dsse-edge")
 	build.Env = os.Environ()
 	build.Stdout = io.Discard
 	var buildErr bytes.Buffer
 	build.Stderr = &buildErr
 	if err := build.Run(); err != nil {
-		t.Fatalf("build cmd/edge failed: %v; stderr redacted=%s", err, m1600RedactedLine(buildErr.String()))
+		t.Fatalf("build cmd/dsse-edge failed: %v; stderr redacted=%s", err, m1600RedactedLine(buildErr.String()))
 	}
 
 	listen := m1600FreeListenAddress(t)
@@ -68,7 +64,7 @@ func TestSWGEdgeSWGProductionProcessStatusSmoke(t *testing.T) {
 		"-listen", listen,
 		"-policy", strings.Join(policyPaths, ","),
 		"-bundle", bundlePath,
-		"-schema-dir", filepath.Join(repoRoot, "schemas"),
+		"-schema-dir", filepath.Join(moduleRoot, "schemas"),
 		"-migration-dir", filepath.Join(moduleRoot, "migrations"),
 		"-log-dir", logDir,
 		"-lab-mode=false",
@@ -85,7 +81,7 @@ func TestSWGEdgeSWGProductionProcessStatusSmoke(t *testing.T) {
 	var processErr bytes.Buffer
 	cmd.Stderr = &processErr
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start cmd/edge process: %v", err)
+		t.Fatalf("start cmd/dsse-edge process: %v", err)
 	}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
@@ -269,7 +265,7 @@ func m1600WaitForHealthz(t *testing.T, client *http.Client, baseURL string, wait
 		select {
 		case err := <-waitCh:
 			waitCh <- err
-			t.Fatalf("cmd/edge exited before /healthz became ready: %v; stderr redacted=%s", err, m1600RedactedLine(processErr.String()))
+			t.Fatalf("cmd/dsse-edge exited before /healthz became ready: %v; stderr redacted=%s", err, m1600RedactedLine(processErr.String()))
 		default:
 		}
 		health, err := m1600FetchJSON(client, baseURL+"/healthz", "")
@@ -288,7 +284,7 @@ func m1600GetJSON(t *testing.T, client *http.Client, url, connectorAuthValue str
 	select {
 	case err := <-waitCh:
 		waitCh <- err
-		t.Fatalf("cmd/edge exited before status readback: %v; stderr redacted=%s", err, m1600RedactedLine(processErr.String()))
+		t.Fatalf("cmd/dsse-edge exited before status readback: %v; stderr redacted=%s", err, m1600RedactedLine(processErr.String()))
 	default:
 	}
 	result, err := m1600FetchJSON(client, url, connectorAuthValue)

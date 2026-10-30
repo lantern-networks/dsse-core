@@ -128,6 +128,37 @@ requires a separately configured broker and `EGRESS_BROKER_URL`; failures in tha
 path do not silently fall back to Go. The broker guide covers integration, native build
 requirements, and the separate embedded-engine build. Browser compatibility still needs testing.
 
+### Certificate revocation limits
+
+**DSSE does not currently enforce the origin certificate's OCSP or CRL status on
+intercepted traffic.** The standard Go upstream path verifies the origin's chain,
+hostname, and validity, but does not add revocation checks. The standard Go
+inspection path and optional broker can fetch missing CA Issuers intermediates
+to construct a trusted chain; that does not establish
+revocation enforcement. Do not treat a successful intercepted HTTPS request as
+proof that the origin certificate has not been revoked.
+
+The endpoint sees an inspection certificate instead of the origin's certificate,
+so its validation of that inspection certificate cannot verify the origin's
+revocation status. Legacy inspection authorities lack CRL distribution points;
+the development candidate adds signed distribution for newly issued authorities,
+pending strict-client validation. Bypassing a
+known certificate-validation responder preserves that responder's connection,
+but does not restore verification of the original certificate on an intercepted
+site. Customer overrides can change the effective bypass set.
+
+Strict-client compatibility remains unverified. The signed-CRL candidate must be
+tested with client revocation checks enabled, including every link of the chain
+and status fetching after expiry or failover. The readiness report retains
+`attention`. The candidate does not establish origin certificate status.
+
+Deployment identity revocation uses admission state and signed configuration
+distribution. It is a separate check from public-origin certificate revocation.
+Publishing a deployment CRL does not fill the upstream gap. The choice of upstream revocation enforcement, including
+the policy when status cannot be obtained, remains an open product decision.
+See [PKI revocation and recovery](pki.md#expiry-revocation-and-recovery) for these
+boundaries and the endpoint trust-removal guides.
+
 ## Config distribution (control plane)
 
 The control plane is the config authority: administrators author through its admin API, and it serves the

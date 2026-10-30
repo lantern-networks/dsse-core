@@ -39,6 +39,16 @@ test('valid results use the control plane, verified tenant and directory; explic
   const d=report();d.services=[];d.by_activity=[];for(const k of ['total_ai_accesses','total_ai_sessions','total_ai_messages','total_bytes_sent','total_bytes_received'])d[k]=0;
   assert.equal(f.ctx.aiUsageBody(ok(d),'own','7d').services.length,0);
 });
+test('an unverified account hint cannot impersonate a logged-in directory user',async()=>{
+  const f=fixture(),normal=f.ctx.apiFetch,d=report();
+  Object.assign(d.by_activity[0],{identity:'alice',identity_type:'user',corporate_user:'',ai_account:'alice',ai_name:'alice'});
+  f.ctx.apiFetch=(m,p,b,plane)=>p.startsWith('/admin/ai-usage-report')?ok(d):normal(m,p,b,plane);
+  await f.ctx.loadAiUsage(f.host);
+  assert.equal(f.tables.length,2);
+  assert.equal(f.tables[1].rows[0][0].props.text,'—');
+  assert.doesNotMatch(JSON.stringify(f.tables),/Alice Example|Engineering/);
+  assert.ok(f.tables[1].headers.includes('AI name hint'));
+});
 test('service bucket union is not the sum of users; aggregate and shortened coverage are accepted',()=>{
   const f=fixture(),d=report();d.by_activity[0].accesses=1;d.by_activity[0].bytes_sent=50;d.by_activity[0].bytes_received=100;
   d.by_activity.push({...d.by_activity[0],identity:'bob',messages:0});

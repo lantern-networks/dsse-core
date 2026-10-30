@@ -90,7 +90,13 @@ public enum DsseInstallProfileApplication {
                  "downgrade, and stripping the stamp is the same downgrade")
             return nil
         }
-        recordApplied(issuedAt: profile.issuedAt, configDirectory: configDirectory)
+        do {
+            try recordApplied(issuedAt: profile.issuedAt, configDirectory: configDirectory)
+        } catch {
+            log?("install_profile REFUSED=stamp_write — the applied profile's anti-rollback floor could not " +
+                 "be persisted; keeping the existing configuration (\(error))")
+            return nil
+        }
         log?("install_profile applied path=\(path) tenant=\(profile.tenantID) issued_at=\(profile.issuedAt ?? "-") " +
              "transport_url=\(profile.transportURL) endpoints=\(profile.transportEndpoints?.count ?? 0) " +
              "posture=\(profile.posture ?? "-") ack_failopen=\(profile.ackFailOpen.map(String.init) ?? "-")")
@@ -137,16 +143,19 @@ public enum DsseInstallProfileApplication {
     public static func regionSeed(profile: DsseInstallProfile?) -> [DsseRegionEndpoint] {
         guard let entries = profile?.transportEndpoints, !entries.isEmpty else { return [] }
         var seeded: [DsseRegionEndpoint] = []
-        for (index, entry) in entries.enumerated() {
+        var regionRanks: [String: Int] = [:]
+        for entry in entries {
             // "region-a=https://…" — the format the deployment's own DSSE_REGION_ENDPOINTS uses.
             let parts = entry.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2 else { continue }
             let region = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
             let endpoint = parts[1].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !region.isEmpty, !endpoint.isEmpty else { continue }
-            // Earlier in the list is preferred. The poller's ranking uses a HIGHER number as more preferred,
-            // so the order is inverted here rather than at the call site.
-            seeded.append(DsseRegionEndpoint(region: region, endpoint: endpoint, priority: entries.count - index))
+            // Earlier REGIONS are preferred. Doors in the same region share one tier so their measured RTT,
+            // rather than their position in the profile, chooses the first healthy door.
+            let rank = regionRanks[region] ?? (entries.count - regionRanks.count)
+            regionRanks[region] = rank
+            seeded.append(DsseRegionEndpoint(region: region, endpoint: endpoint, priority: rank))
         }
         return seeded
     }
@@ -186,13 +195,13 @@ public enum DsseInstallProfileApplication {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    static func recordApplied(issuedAt: String?, configDirectory: URL) {
+    static func recordApplied(issuedAt: String?, configDirectory: URL) throws {
         guard let issuedAt = issuedAt?.trimmingCharacters(in: .whitespacesAndNewlines), !issuedAt.isEmpty else {
             // An unstamped profile is applied but records nothing: writing an empty stamp would make every
             // later profile look like a rollback.
             return
         }
-        guard let data = try? JSONEncoder().encode(AppliedStamp(issuedAt: issuedAt)) else { return }
-        try? data.write(to: configDirectory.appendingPathComponent(appliedStampFileName), options: .atomic)
+        let data = try JSONEncoder().encode(AppliedStamp(issuedAt: issuedAt))
+        try data.write(to: configDirectory.appendingPathComponent(appliedStampFileName), options: .atomic)
     }
 }

@@ -80,7 +80,7 @@ func TestValidateConnectorTCPDialRequestDeniesMismatchedRoute(t *testing.T) {
 
 func TestValidateConnectorTCPDialRequestRejectsInvalidOpenFrame(t *testing.T) {
 	frame := validConnectorTCPOpenFrame()
-	frame.ByteCap = 0
+	frame.ByteCap = -1
 	err := validateConnectorTCPDialRequest(frame, []connectorTCPRoute{{
 		ApplicationID: "app_dummy_https",
 		Host:          "dummy-private-app.local",
@@ -412,24 +412,6 @@ func TestHandleTunnelTCPOpenConnectionRejectsRegistryConflictBeforeDial(t *testi
 		t.Fatal("duplicate connection was closed even though it should not be dialed")
 	}
 
-	capFrame := openFrame
-	capFrame.RequestID = "req_tcp_concurrent_cap_reject"
-	capFrame.ConcurrentConnectionCap = 1
-	capConn := newRecordingTCPConnection("")
-	dialer.conn = capConn
-	capResponse, capHandler := handleTunnelTCPOpenConnection(context.Background(), capFrame, allowedConnectorTCPRoutes(), dialer, registry, now.Add(2*time.Second))
-	if capHandler != nil {
-		t.Fatalf("concurrent cap handler = %v, want nil", capHandler)
-	}
-	if capResponse.Type != tunnel.FrameTCPOpenResult || !strings.Contains(capResponse.Error, "concurrent connection cap") {
-		t.Fatalf("concurrent cap response = %+v, want cap rejection", capResponse)
-	}
-	if len(dialer.routes) != 1 {
-		t.Fatalf("dialer routes = %+v, want concurrent cap rejected before extra dial", dialer.routes)
-	}
-	if capConn.closed {
-		t.Fatal("concurrent cap connection was closed even though it should not be dialed")
-	}
 	if got := registry.Count(); got != 1 {
 		t.Fatalf("registry Count = %d, want original open connection preserved", got)
 	}
@@ -1446,15 +1428,29 @@ func TestHandleConnectorTunnelConnDispatchesRuntimeTCPFrames(t *testing.T) {
 func TestHandleConnectorTunnelConnPumpsDownstreamTCPFrames(t *testing.T) {
 	tcpConn := newRecordingTCPConnection("private-response")
 	dispatcher := newConnectorTunnelTCPDispatcher(allowedConnectorTCPRoutes(), &recordingTCPConnectionDialer{conn: tcpConn}, fixedConnectorTestNow())
+	transportClosed := make(chan struct{})
 	fakeTunnel := &recordingTunnelJSONConn{
-		reads:   []tunnel.Frame{validConnectorTCPOpenFrame()},
-		writeCh: make(chan tunnel.Frame, 4),
+		reads:         []tunnel.Frame{validConnectorTCPOpenFrame()},
+		writeCh:       make(chan tunnel.Frame, 4),
+		beforeReadEOF: transportClosed,
 	}
-
-	err := handleConnectorTunnelConn(context.Background(), fakeTunnel, "http://127.0.0.1:1", dispatcher)
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("handleConnectorTunnelConn err = %v, want EOF after scripted frames", err)
-	}
+	// A live tunnel can deliver downstream frames. Once it ends, its backend
+	// sockets must be closed instead of continuing to use a dead transport.
+	done := make(chan error, 1)
+	go func() {
+		done <- handleConnectorTunnelConn(context.Background(), fakeTunnel, "http://127.0.0.1:1", dispatcher)
+	}()
+	defer func() {
+		close(transportClosed)
+		select {
+		case err := <-done:
+			if !errors.Is(err, io.EOF) {
+				t.Errorf("handleConnectorTunnelConn err = %v, want EOF", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("tunnel did not stop")
+		}
+	}()
 
 	openResult := waitForTunnelWrite(t, fakeTunnel.writeCh)
 	if openResult.Type != tunnel.FrameTCPOpenResult || openResult.Error != "" {
@@ -2652,14 +2648,18 @@ func (conn *readErrorTCPConnection) Closed() bool {
 }
 
 type recordingTunnelJSONConn struct {
-	mu      sync.Mutex
-	reads   []tunnel.Frame
-	writes  []tunnel.Frame
-	writeCh chan tunnel.Frame
+	mu            sync.Mutex
+	reads         []tunnel.Frame
+	writes        []tunnel.Frame
+	writeCh       chan tunnel.Frame
+	beforeReadEOF <-chan struct{}
 }
 
 func (conn *recordingTunnelJSONConn) ReadJSON(value any) error {
 	if len(conn.reads) == 0 {
+		if conn.beforeReadEOF != nil {
+			<-conn.beforeReadEOF
+		}
 		return io.EOF
 	}
 	frame := conn.reads[0]

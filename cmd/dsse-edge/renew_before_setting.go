@@ -2,12 +2,16 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
+	"github.com/lantern-networks/dsse-core/internal/strictjson"
 )
 
 // "Renew every certificate issued before this moment."
@@ -27,9 +31,10 @@ import (
 // polled. The alternative, the trust bundle, is signed once at startup against a serial that comes from a
 // flag, so it cannot carry anything that changes at runtime.
 type renewBeforeSetting struct {
-	mu   sync.RWMutex
-	at   time.Time
-	path string
+	mu    sync.RWMutex
+	at    time.Time
+	path  string
+	write func(string, []byte, os.FileMode) error
 }
 
 type renewBeforeState struct {
@@ -39,31 +44,49 @@ type renewBeforeState struct {
 
 const renewBeforeSchemaVersion = "admin_renew_before.v1"
 
-func newRenewBeforeSetting(path string) *renewBeforeSetting {
-	s := &renewBeforeSetting{path: strings.TrimSpace(path)}
-	s.load()
-	return s
+func newRenewBeforeSetting(path string) (*renewBeforeSetting, error) {
+	s := &renewBeforeSetting{path: strings.TrimSpace(path), write: durablefile.Write}
+	if err := s.load(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
-func (s *renewBeforeSetting) load() {
+func (s *renewBeforeSetting) load() error {
 	if s == nil || s.path == "" {
-		return
+		return nil
 	}
 	raw, err := os.ReadFile(s.path)
+	if os.IsNotExist(err) {
+		return nil
+	}
 	if err != nil {
-		return
+		return fmt.Errorf("read renewal declaration: %w", err)
+	}
+	if err := strictjson.RejectDuplicateKeys(raw); err != nil {
+		return fmt.Errorf("invalid renewal declaration: %w", err)
+	}
+	if err := strictjson.RejectUnknownFields(raw, renewBeforeState{}); err != nil {
+		return fmt.Errorf("invalid renewal declaration: %w", err)
 	}
 	var state renewBeforeState
-	if err := json.Unmarshal(raw, &state); err != nil || strings.TrimSpace(state.At) == "" {
-		return
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return fmt.Errorf("decode renewal declaration: %w", err)
 	}
-	at, err := time.Parse(time.RFC3339, state.At)
-	if err != nil {
-		return
+	if state.SchemaVersion != renewBeforeSchemaVersion {
+		return fmt.Errorf("unsupported renewal declaration schema")
+	}
+	var at time.Time
+	if state.At != "" {
+		at, err = time.Parse(time.RFC3339Nano, state.At)
+		if err != nil || at.IsZero() {
+			return fmt.Errorf("invalid renewal declaration cutoff")
+		}
 	}
 	s.mu.Lock()
 	s.at = at
 	s.mu.Unlock()
+	return nil
 }
 
 // Set records the cutoff. Durable, because a restart that forgot it would silently stop a fleet-wide renewal
@@ -73,22 +96,8 @@ func (s *renewBeforeSetting) Set(at time.Time) error {
 		return fmt.Errorf("renew-before setting is not configured")
 	}
 	s.mu.Lock()
-	s.at = at.UTC()
-	path := s.path
-	s.mu.Unlock()
-	if path == "" {
-		return nil
-	}
-	raw, err := json.Marshal(renewBeforeState{SchemaVersion: renewBeforeSchemaVersion, At: at.UTC().Format(time.RFC3339)})
-	if err != nil {
-		return err
-	}
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-	}
-	return os.WriteFile(path, raw, 0o600)
+	defer s.mu.Unlock()
+	return s.replaceLocked(at.UTC())
 }
 
 // Clear stops asking. Renewals already performed are not undone — there is nothing to undo, since a renewed
@@ -98,16 +107,39 @@ func (s *renewBeforeSetting) Clear() error {
 		return nil
 	}
 	s.mu.Lock()
-	s.at = time.Time{}
-	path := s.path
-	s.mu.Unlock()
-	if path == "" {
-		return nil
+	defer s.mu.Unlock()
+	// Persist an empty declaration atomically, so clearing has the same
+	// durability and failure semantics as setting a cutoff.
+	return s.replaceLocked(time.Time{})
+}
+
+func (s *renewBeforeSetting) replaceLocked(at time.Time) error {
+	var err error
+	if s.path != "" {
+		state := renewBeforeState{SchemaVersion: renewBeforeSchemaVersion}
+		if !at.IsZero() {
+			state.At = at.Format(time.RFC3339Nano)
+		}
+		raw, marshalErr := json.Marshal(state)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
+			return err
+		}
+		write := s.write
+		if write == nil {
+			write = durablefile.Write
+		}
+		err = write(s.path, raw, 0o600)
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return err
+	// A staging/replacement failure leaves the live declaration unchanged.
+	// A post-rename flush error is different: the new file is already visible.
+	// Match that file while returning the durability error to the caller.
+	if err == nil || errors.Is(err, durablefile.ErrReplacedNotFlushed) {
+		s.at = at
 	}
-	return nil
+	return err
 }
 
 func (s *renewBeforeSetting) At() (time.Time, bool) {

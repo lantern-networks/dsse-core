@@ -377,8 +377,8 @@ func TestAStrangersSerialDoesNotGateThisOrganizationsDistribution(t *testing.T) 
 	if got := trustSerialFloor(dir, "tenant_default"); got != 3 {
 		t.Fatalf("floor = %d for this device's OWN previous distribution — replay protection must be unchanged", got)
 	}
-	if got := trustSerialFloor(dir, "TENANT_DEFAULT"); got != 3 {
-		t.Fatalf("floor = %d — the organization id is an identifier, not a case-sensitive secret", got)
+	if got := trustSerialFloor(dir, "TENANT_DEFAULT"); got != 0 {
+		t.Fatalf("floor = %d — case-distinct tenant identifiers must not share a replay floor", got)
 	}
 }
 

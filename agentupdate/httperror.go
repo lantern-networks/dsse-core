@@ -73,3 +73,9 @@ func DescribeHTTPErrorBody(r io.Reader) string {
 // A HINT, NEVER AN AUTHORITY. The digest in the signed manifest is what decides whether bytes may run, and
 // nothing here changes that: a lying header produces the same refusal, with a sentence that mentions the lie.
 const ArtifactVersionHeader = "X-Dsse-Agent-Update-Version"
+
+// ArtifactSHA256Header carries the Edge's digest after it verified the served
+// artifact against the published manifest. The courier uses it only to decide
+// whether a staged file can be reused; the updater independently verifies the
+// signed manifest and staged bytes before running any installer.
+const ArtifactSHA256Header = "X-Dsse-Agent-Update-SHA256"

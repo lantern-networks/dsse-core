@@ -182,21 +182,34 @@ func envList(dir, key string) []string {
 // deployment came up with the fix applied to every door a device does not use. See
 // TestEveryResolvedBackendPrefersIPv4, which now spans both generators for exactly that reason.
 func edgeFleetServers(backends []string) string {
+	return edgeFleetServersWithTLS(backends, "")
+}
+
+func edgeFleetServersWithTLS(backends []string, checkName string) string {
+	return edgeFleetServersOnMachine(backends, checkName, true)
+}
+
+func edgeFleetServersOnMachine(backends []string, checkName string, hasLocalEdge bool) string {
+	checkTLS := "check check-ssl verify none"
+	if checkName != "" {
+		checkTLS = fmt.Sprintf("check check-ssl check-sni %s verify required ca-file /deployment/deployment-anchor.pem verifyhost %s", checkName, checkName)
+	}
 	if len(backends) == 0 {
+		if !hasLocalEdge {
+			return ""
+		}
 		// ★ ONE EDGE ON THIS MACHINE. A second Edge for this region lives on ANOTHER machine and is named in
 		// DSSE_EDGE_BACKENDS, which is the branch below — that is what makes a region's Edges redundant.
-		return "    server edge-a dsse-edge-a:8443 check check-ssl verify none port 9443 send-proxy resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
+		return "    server edge-a dsse-edge-a:8443 " + checkTLS + " port 9443 send-proxy resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
 	}
 	var b strings.Builder
 	for i, e := range backends {
 		// The health check is on the admin port while traffic goes to the agent one: health is a property of
 		// the node, and asking the port that carries traffic would call a busy Edge unhealthy.
-		host := e
-		if h, _, ok := strings.Cut(e, ":"); ok {
-			host = h
-		}
-		fmt.Fprintf(&b, "    server edge-%d %s check check-ssl verify none port 9443 send-proxy addr %s "+
-			"resolvers containers init-addr last,libc,none resolve-prefer ipv4\n", i+1, e, host)
+		// Use the server's resolved address for both listeners. An explicit check `addr` with the
+		// same DNS name is resolved only at startup and can keep checking a removed container's IP.
+		fmt.Fprintf(&b, "    server edge-%d %s %s port 9443 send-proxy "+
+			"resolvers containers init-addr last,libc,none resolve-prefer ipv4\n", i+1, e, checkTLS)
 	}
 	return b.String()
 }

@@ -116,7 +116,8 @@ type wfpCapture struct {
 	// ownerHandle is held open for exactly as long as this capture is accepting redirected connections. Its
 	// close — whether from Close() below or from the OS reaping handles when this process dies however it
 	// dies — is what tells the driver the listener behind the redirect is gone. See armPolicyOwner.
-	ownerHandle syscall.Handle
+	ownerHandle      syscall.Handle
+	policyGeneration uint64
 }
 
 func (c *wfpCapture) Backend() string           { return "wfp" }
@@ -151,8 +152,14 @@ func (c *wfpCapture) Close() error {
 		// Clear the policy and CHECK it cleared. This used to be a bare best-effort removePolicy() whose
 		// result was discarded — and a disarm that silently failed is not a smaller problem than no disarm at
 		// all, it is the same black hole with a log line saying everything is fine.
-		if v := removePolicyVerified(); !v.Verified {
-			fmt.Printf("steer_disarm: WARNING the WFP redirect may still be armed after shutdown: %s\n", v.Reason)
+		if err := activeWFPPolicy.end(c.policyGeneration, func() error {
+			v := removePolicyVerified()
+			if !v.Verified {
+				return fmt.Errorf("%s", v.Reason)
+			}
+			return nil
+		}); err != nil {
+			fmt.Printf("steer_disarm: WARNING the WFP redirect may still be armed after shutdown: %v\n", err)
 		}
 		// Release ownership last, so the state read above still saw an owner and the driver's own
 		// close-handler has nothing left to do. On any path that is NOT a clean shutdown this line never
@@ -165,8 +172,9 @@ func (c *wfpCapture) Close() error {
 	return nil
 }
 
-// newWFPCapture pushes the bypass policy to the kernel driver, opens the local proxy listeners, and starts
-// accepting redirected flows. It fails cleanly if the driver device is absent (P2/P3 not yet deployed).
+// newWFPCapture opens the local proxy listeners, publishes the complete bypass
+// policy to the kernel driver, and starts accepting redirected flows. It fails
+// cleanly if the driver device is absent (P2/P3 not yet deployed).
 func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 	if !cfg.steerAll {
 		return nil, fmt.Errorf("wfp backend currently supports --steer-all only")
@@ -177,12 +185,6 @@ func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 	if cfg.verifiedExactApps == nil {
 		cfg.verifiedExactApps = &atomic.Pointer[[]string]{}
 	}
-	// Hand the driver the connect-time policy: the local proxy port to redirect to, the never-redirect app
-	// image substrings and destination exclusions. Under WFP the owner is known at classify time, so the
-	// bypass is race-free and fail-CLOSED is safe (unknown owner cannot happen mid-connect).
-	if err := pushPolicy(cfg); err != nil {
-		return nil, fmt.Errorf("wfp: push policy to driver (is the callout driver installed/loaded?): %w", err)
-	}
 	ln4, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(int(cfg.localPort))))
 	if err != nil {
 		return nil, fmt.Errorf("wfp: listen 127.0.0.1:%d: %w", cfg.localPort, err)
@@ -191,13 +193,28 @@ func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 	if l6, err6 := net.Listen("tcp", net.JoinHostPort("::1", strconv.Itoa(int(cfg.localPort)))); err6 == nil {
 		ln6 = l6
 	}
+	// Open the listener before publishing the redirect. If binding fails, no
+	// connection can be sent to a port without a receiver. Under WFP the owner is
+	// known at classify time, so the bypass is race-free at connect time.
+	policyGeneration, policyApplied, err := activeWFPPolicy.begin(func() error { return writeWFPPolicy(cfg) })
+	if err != nil {
+		ln4.Close()
+		if ln6 != nil {
+			ln6.Close()
+		}
+		return nil, fmt.Errorf("wfp: push policy to driver (is the callout driver installed/loaded?): %w", err)
+	}
 	c := &wfpCapture{
-		cfg:         cfg,
-		ln4:         ln4,
-		ln6:         ln6,
-		flows:       make(chan SteeredFlow),
-		done:        make(chan struct{}),
-		ownerHandle: syscall.InvalidHandle,
+		cfg:              cfg,
+		ln4:              ln4,
+		ln6:              ln6,
+		flows:            make(chan SteeredFlow),
+		done:             make(chan struct{}),
+		ownerHandle:      syscall.InvalidHandle,
+		policyGeneration: policyGeneration,
+	}
+	if !policyApplied {
+		fmt.Println("steer_capture: WFP capture prepared while intentionally disarmed; redirect policy waits for explicit rearm")
 	}
 	// Claim ownership of the redirect policy now that the listeners behind it exist. Deliberately AFTER the
 	// listeners: the handle's meaning is "someone is accepting redirected connections", and arming it before
@@ -215,11 +232,16 @@ func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 			"`dsse-steer --mode recover` runs. Is the loaded driver older than DSSE_OWNER_ARM?\n", err)
 	} else {
 		c.ownerHandle = h
+		activeWFPPolicy.bindDeadline(c.policyGeneration,
+			func(timeout time.Duration) (uint64, time.Duration, error) {
+				return armCaptiveDeadline(h, timeout, cfg.dests.captiveEdges())
+			},
+			func(generation uint64) error { return finishCaptiveDeadline(h, generation) })
 		fmt.Printf("steer_capture: WFP policy ownership claimed disarm_on_agent_exit=%t (posture: %s)\n",
 			cfg.disarmOnAgentExit, wfpstate.PostureLabel(cfg.disarmOnAgentExit))
 	}
-	fmt.Printf("steer_capture backend=wfp target=ALL-outbound-tcp -> loopback:%d (v6=%t) bypass_apps=%v bypass_dests=%v (connect-time classify; race-free)\n",
-		cfg.localPort, ln6 != nil, cfg.bypassApps, cfg.effectiveDests())
+	fmt.Printf("steer_capture backend=wfp armed=%t target=ALL-outbound-tcp -> loopback:%d (v6=%t) bypass_apps=%v bypass_dests=%v (connect-time classify; race-free)\n",
+		policyApplied, cfg.localPort, ln6 != nil, cfg.bypassApps, cfg.effectiveDests())
 	// Signature-based exclusions (subject:/thumbprint:/publisher:/signed:) cannot be evaluated in-kernel (the
 	// callout matches image paths only, no Authenticode). They are NOT pushed as substrings (which would never
 	// match). Instead the exact-app resolver below verifies them in userspace and pushes the VERIFIED processes'
@@ -236,7 +258,7 @@ func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 	// supervisor-recreated capture re-pushes the latest set on its next apply.
 	if cfg.exclusions != nil {
 		cfg.exclusions.register(func([]string) {
-			if err := pushPolicy(cfg); err != nil {
+			if _, err := activeWFPPolicy.update(c.policyGeneration, func() error { return writeWFPPolicy(cfg) }); err != nil {
 				fmt.Fprintf(os.Stderr, "wfp: re-push signed exclusions to driver: %v\n", err)
 			}
 		})
@@ -247,11 +269,14 @@ func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 	// since the previous one armed.
 	if cfg.dests != nil {
 		cfg.dests.register(func(now []netip.AddrPort) {
-			if err := pushPolicy(cfg); err != nil {
+			applied, err := activeWFPPolicy.update(c.policyGeneration, func() error { return writeWFPPolicy(cfg) })
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "wfp: re-push destination bypasses to driver: %v\n", err)
 				return
 			}
-			fmt.Printf("steer_capture: destination bypasses updated -> %v\n", now)
+			if applied {
+				fmt.Printf("steer_capture: destination bypasses updated -> %v\n", now)
+			}
 		})
 	}
 
@@ -266,7 +291,10 @@ func newWFPCapture(cfg captureConfig) (*wfpCapture, error) {
 			}
 			return signatureRules(eff)
 		}
-		go runExactAppResolver(c.done, cfg, effectiveRules, exactAppResolveEvery, exactAppReverifyEvery)
+		go runExactAppResolver(c.done, cfg, effectiveRules, exactAppResolveEvery, exactAppReverifyEvery,
+			func() (bool, error) {
+				return activeWFPPolicy.update(c.policyGeneration, func() error { return writeWFPPolicy(cfg) })
+			})
 	}
 	c.wg.Add(1)
 	go c.acceptLoop(ln4)

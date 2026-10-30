@@ -68,12 +68,19 @@ func watchForHome(ctx context.Context, doors *connectorEndpoints, attachments *c
 			continue
 		}
 		answered = 0
-		log.Printf("connector: %s%s has answered %d checks in a row — going back to it. Everything behind this "+
-			"connector is briefly unreachable while the tunnels move, which is the cost of returning to the "+
-			"door the operator put first", home, regionSuffix(region), connectorHomeStableChecks)
-		doors.resetToPreferred()
-		if letGo := attachments.letGoOfEverything(); len(letGo) > 0 {
-			log.Printf("connector let go of %v so its workers re-dial at %s%s", letGo, home, regionSuffix(region))
+		crossRegion := doors.resetToPreferred()
+		if !crossRegion {
+			log.Printf("connector: %s%s has answered %d checks in a row — returning to the preferred entry without closing healthy tunnels in this DSSE Region",
+				home, regionSuffix(region), connectorHomeStableChecks)
+		} else {
+			log.Printf("connector: %s%s has answered %d checks in a row — going back to it. Everything behind this "+
+				"connector is briefly unreachable while the tunnels move, which is the cost of returning to the "+
+				"door the operator put first", home, regionSuffix(region), connectorHomeStableChecks)
+		}
+		if crossRegion {
+			if letGo := attachments.letGoOfEverything(); len(letGo) > 0 {
+				log.Printf("connector let go of %v so its workers re-dial at %s%s", letGo, home, regionSuffix(region))
+			}
 		}
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -74,6 +75,8 @@ type adminExportQueuedTask struct {
 	Document adminExportWorkerTaskDocument
 	Task     adminExportTask
 	Job      adminExportJob
+	// LeaseToken is ephemeral. It is never serialized into the queue payload.
+	LeaseToken string
 }
 
 type localAdminExportTaskQueue struct {
@@ -1261,7 +1264,7 @@ func runAdminExportJob(ctx context.Context, writer *logs.Writer, adminAuditOutbo
 		}
 		return adminExportJob{}, fmt.Errorf("hot store is not configured")
 	}
-	objectRef, err := adminExportObjectRef(job)
+	objectRef, err := adminExportObjectRefForRuntime(job, store)
 	if err != nil {
 		failed, markErr := store.MarkFailed(job.ID, "invalid_object_ref", now)
 		if markErr == nil {
@@ -1269,7 +1272,7 @@ func runAdminExportJob(ctx context.Context, writer *logs.Writer, adminAuditOutbo
 		}
 		return adminExportJob{}, err
 	}
-	localFilename, err := adminExportLocalFilename(job)
+	localFilename, err := adminExportLocalFilenameForRuntime(job, store)
 	if err != nil {
 		failed, markErr := store.MarkFailed(job.ID, "invalid_local_filename", now)
 		if markErr == nil {
@@ -1353,6 +1356,66 @@ func adminExportObjectRef(job adminExportJob) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s%s.%s.gz", prefix, job.ID, job.Format), nil
+}
+
+func adminExportArtifactAttemptSuffix(store adminExportJobRuntimeStore) string {
+	postgresStore, ok := store.(postgresAdminExportJobStore)
+	if !ok || postgresStore.LeaseToken == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(postgresStore.LeaseToken))
+	return fmt.Sprintf("-attempt-%x", digest)
+}
+
+func adminExportObjectRefForRuntime(job adminExportJob, store adminExportJobRuntimeStore) (string, error) {
+	ref, err := adminExportObjectRef(job)
+	if err != nil {
+		return "", err
+	}
+	suffix := adminExportArtifactAttemptSuffix(store)
+	if suffix == "" {
+		return ref, nil
+	}
+	return strings.TrimSuffix(ref, "."+job.Format+".gz") + suffix + "." + job.Format + ".gz", nil
+}
+
+func adminExportLocalFilenameForRuntime(job adminExportJob, store adminExportJobRuntimeStore) (string, error) {
+	name, err := adminExportLocalFilename(job)
+	if err != nil {
+		return "", err
+	}
+	suffix := adminExportArtifactAttemptSuffix(store)
+	if suffix == "" {
+		return name, nil
+	}
+	return strings.TrimSuffix(name, "."+job.Format+".gz") + suffix + "." + job.Format + ".gz", nil
+}
+
+func adminExportCompletedLocalFilename(job adminExportJob) (string, error) {
+	legacy, err := adminExportLocalFilename(job)
+	if err != nil || job.ObjectRef == nil {
+		return legacy, err
+	}
+	prefix, err := adminExportObjectRefPrefix(job)
+	if err != nil {
+		return "", err
+	}
+	stem := job.ID + "-attempt-"
+	ending := "." + job.Format + ".gz"
+	ref := *job.ObjectRef
+	if !strings.HasPrefix(ref, prefix+stem) || !strings.HasSuffix(ref, ending) {
+		return legacy, nil
+	}
+	hexDigest := strings.TrimSuffix(strings.TrimPrefix(ref, prefix+stem), ending)
+	if len(hexDigest) != 64 {
+		return legacy, nil
+	}
+	for _, r := range hexDigest {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return legacy, nil
+		}
+	}
+	return filepath.Join(filepath.Dir(legacy), stem+hexDigest+ending), nil
 }
 
 func adminExportObjectRefPrefix(job adminExportJob) (string, error) {
@@ -1460,7 +1523,7 @@ func createAdminExportDownloadURL(r *http.Request, store *adminDownloadTokenStor
 	if job.Status != "completed" {
 		return adminDownloadURLResponse{}, adminDownloadToken{}, fmt.Errorf("export job %s is not completed", job.ID)
 	}
-	localFilename, err := adminExportLocalFilename(job)
+	localFilename, err := adminExportCompletedLocalFilename(job)
 	if err != nil {
 		return adminDownloadURLResponse{}, adminDownloadToken{}, err
 	}
@@ -1733,7 +1796,8 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 		response, token, err := createAdminExportDownloadURL(r, adminDownloadTokens, exportObjectStore, job, adminPrincipalIDFromRequest(r), time.Now())
 		if err != nil {
 			if errors.Is(err, errDownloadNotLeader) {
-				writeError(w, http.StatusConflict, errDownloadNotLeader)
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusServiceUnavailable, errDownloadNotLeader)
 				return
 			}
 			if errors.Is(err, errDownloadStoreUnavailable) {
@@ -1741,11 +1805,6 @@ func registerExportJobRoutes(mux *http.ServeMux, adminEndpoint func(string, http
 				return
 			}
 			status := http.StatusBadRequest
-			if errors.Is(err, errDownloadNotLeader) {
-				status = http.StatusConflict
-			} else if errors.Is(err, errDownloadStoreUnavailable) {
-				status = http.StatusServiceUnavailable
-			}
 			writeError(w, status, err)
 			return
 		}

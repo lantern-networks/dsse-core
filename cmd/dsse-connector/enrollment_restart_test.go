@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -92,6 +93,25 @@ func TestATokenForAnotherSiteStillEnrols(t *testing.T) {
 	}
 }
 
+func TestACaseDistinctTenantTokenDoesNotReuseOldConnectorIdentity(t *testing.T) {
+	dir := t.TempDir()
+	tok := connectorEnrollmentToken{V: 1, EdgeURL: "https://agents.example:443", TenantID: "TenantA",
+		Site: "site-b", Bootstrap: "first"}
+	f, _, _, _, oldID, _, _, _, _ := flagsFor()
+	if first, err := resolveConnectorEnrollment(dir, tokenFor(t, tok), f); err != nil || !first {
+		t.Fatalf("initial enrolment: first=%v err=%v", first, err)
+	}
+	previous := *oldID
+	tok.TenantID = "tenanta"
+	tok.Bootstrap = "second"
+	f2, _, tenant, _, newID, _, _, _, _ := flagsFor()
+	first, err := resolveConnectorEnrollment(dir, tokenFor(t, tok), f2)
+	if err != nil || !first || *newID == previous || *tenant != "tenanta" {
+		t.Fatalf("case-distinct tenant retained old identity: first=%v tenant=%q same_id=%v err=%v",
+			first, *tenant, *newID == previous, err)
+	}
+}
+
 // The guard: with no state at all a token still enrols, so the checks above are about a RESTART and not about
 // the token being ignored.
 func TestAFirstRunStillEnrols(t *testing.T) {
@@ -104,5 +124,43 @@ func TestAFirstRunStillEnrols(t *testing.T) {
 		V: 1, EdgeURL: "https://agents.example:443", TenantID: "tenant_a", Site: "site-b", Bootstrap: "b"}), f)
 	if err != nil || !first || *id == "" {
 		t.Fatalf("a first run did not enrol: firstRun=%v id=%q err=%v", first, *id, err)
+	}
+}
+
+func TestInterruptedBootstrapResumesWithoutTokenAndErasesAfterRegistration(t *testing.T) {
+	dir := t.TempDir()
+	tok := connectorEnrollmentToken{V: 1, EdgeURL: "https://agents.example:443", TenantID: "tenant_a", Site: "site-a", Bootstrap: "synthetic-bootstrap"}
+	f, _, _, _, id, _, bootstrap, _, _ := flagsFor()
+	if _, err := resolveConnectorEnrollment(dir, tokenFor(t, tok), f); err != nil {
+		t.Fatal(err)
+	}
+	initialID := *id
+	f2, _, _, _, id2, _, bootstrap2, _, _ := flagsFor()
+	if _, err := resolveConnectorEnrollment(dir, "", f2); err != nil {
+		t.Fatal(err)
+	}
+	if *id2 != initialID || *bootstrap2 != *bootstrap {
+		t.Fatal("interrupted first run lost its ID or issuance credential")
+	}
+	st, _, err := loadConnectorState(filepath.Join(dir, "connector-state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.PendingBootstrap == "" {
+		t.Fatal("pending issuance cannot resume")
+	}
+	if err := completeConnectorBootstrap(dir); err != nil {
+		t.Fatal(err)
+	}
+	f3, _, _, _, id3, _, bootstrap3, _, _ := flagsFor()
+	if _, err := resolveConnectorEnrollment(dir, "", f3); err != nil {
+		t.Fatal(err)
+	}
+	if *id3 != initialID || *bootstrap3 != "" {
+		t.Fatal("completed bootstrap was retained or identity changed")
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "connector-state.json"))
+	if strings.Contains(string(b), tok.Bootstrap) {
+		t.Fatal("bootstrap secret still on disk after acknowledgement")
 	}
 }

@@ -809,7 +809,7 @@ func pkiCertificateItemsForTenant(items []pkiCertificateItem, callerTenant strin
 			continue
 		}
 		owner := pkiItemTenant(item)
-		if owner != "" && !strings.EqualFold(owner, callerTenant) {
+		if owner != "" && owner != strings.TrimSpace(callerTenant) {
 			continue
 		}
 		// ★★ A DEVICE-TRUST CA ALWAYS BELONGS TO SOMEBODY, SO "NO OWNER" IS NOT "EVERYBODY'S" (2026-08-18).
@@ -841,6 +841,7 @@ func pkiCertificateItemsForTenant(items []pkiCertificateItem, callerTenant strin
 		// customer administrator: mac-dev-1, win-dev-1, conn-lab-1.
 		if visibleDevice != nil {
 			item.TrustedBy = keepVisibleDevices(item.TrustedBy, visibleDevice)
+			item.NotHolding = keepVisibleDevices(item.NotHolding, visibleDevice)
 			item.NotReporting = keepVisibleDevices(item.NotReporting, visibleDevice)
 			// The adoption report and the retire gate name machines too. The gate's PARAMS are what the Console
 			// renders into its refusal sentence, so leaving them would print another organization's device in a

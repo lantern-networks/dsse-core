@@ -81,8 +81,9 @@ func (s *Store) mutateLocked(ctx context.Context, edit func(*vlanPersistSnapshot
 		if err = edit(&next); err != nil {
 			return err
 		}
-		// No-op file deletion need not create a new file or fail on a read-only volume.
-		if reflect.DeepEqual(next.Objects, s.objects) && reflect.DeepEqual(next.Policies, s.policies) {
+		// A genuine no-op need not create a file. After an unconfirmed write,
+		// however, absence in memory does not prove absence on disk.
+		if !s.persistenceDirty && reflect.DeepEqual(next.Objects, s.objects) && reflect.DeepEqual(next.Policies, s.policies) {
 			return nil
 		}
 		err = s.saveCandidateLocked(next.Objects, next.Policies)

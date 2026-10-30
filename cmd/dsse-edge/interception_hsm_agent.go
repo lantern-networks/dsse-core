@@ -125,17 +125,18 @@ func (s *hsmAgentSigner) SignCert(template, issuer *x509.Certificate, leafPub cr
 		ips = append(ips, ip.String())
 	}
 	body, err := json.Marshal(map[string]any{
-		"key_id":              s.keyID,
-		"purpose":             purpose,
-		"issuer_der":          base64.StdEncoding.EncodeToString(issuer.Raw),
-		"leaf_public_key_der": base64.StdEncoding.EncodeToString(leafPubDER),
-		"serial":              template.SerialNumber.String(),
-		"common_name":         template.Subject.CommonName,
-		"organization":        template.Subject.Organization,
-		"dns_names":           template.DNSNames,
-		"ip_addresses":        ips,
-		"not_before":          template.NotBefore.UTC().Format(time.RFC3339),
-		"not_after":           template.NotAfter.UTC().Format(time.RFC3339),
+		"key_id":                  s.keyID,
+		"purpose":                 purpose,
+		"issuer_der":              base64.StdEncoding.EncodeToString(issuer.Raw),
+		"leaf_public_key_der":     base64.StdEncoding.EncodeToString(leafPubDER),
+		"serial":                  template.SerialNumber.String(),
+		"common_name":             template.Subject.CommonName,
+		"organization":            template.Subject.Organization,
+		"dns_names":               template.DNSNames,
+		"ip_addresses":            ips,
+		"crl_distribution_points": template.CRLDistributionPoints,
+		"not_before":              template.NotBefore.UTC().Format(time.RFC3339),
+		"not_after":               template.NotAfter.UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		return nil, err

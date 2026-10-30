@@ -20,9 +20,9 @@ func TestPostgresDLPSharedPeerAndAcceptedTerm(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	keys := map[string]string{"allowlist": "dlp_allowlist", "classifiers": "dlp_classifiers", "fingerprints": "dlp_fingerprints", "policies": "dlp_policy_objects"}
+	keys := map[string]string{"rules": "dlp_rules", "allowlist": "dlp_allowlist", "classifiers": "dlp_classifiers", "fingerprints": "dlp_fingerprints", "policies": "dlp_policy_objects"}
 	// Same isolated database contract as the other CP acceptance suites.
-	for _, key := range append([]string{"entitlements"}, keys["allowlist"], keys["classifiers"], keys["fingerprints"], keys["policies"]) {
+	for _, key := range append([]string{"entitlements"}, keys["rules"], keys["allowlist"], keys["classifiers"], keys["fingerprints"], keys["policies"]) {
 		p := postgresBlobPersister{db: db, key: key}
 		saved, e := p.Load()
 		if e != nil {
@@ -80,7 +80,7 @@ func TestPostgresDLPSharedPeerAndAcceptedTerm(t *testing.T) {
 	oldDB, oldE := cpStateBlobDB, cpLeaderElectorInstance
 	cpStateBlobDB = db
 	defer func() { cpStateBlobDB, cpLeaderElectorInstance = oldDB, oldE }()
-	config := serverConfig{Evaluator: testEvaluator(), Writer: w, AdminAuth: auth, OperatorTenantID: tenant, EntitlementStorePath: "postgres", DLPAllowlistStorePath: "postgres", DLPClassifierStorePath: "postgres", DLPFingerprintStorePath: "postgres", DLPPolicyObjectStorePath: "postgres"}
+	config := serverConfig{Evaluator: testEvaluator(), Writer: w, AdminAuth: auth, OperatorTenantID: tenant, EntitlementStorePath: "postgres", DLPRuleStorePath: "postgres", DLPAllowlistStorePath: "postgres", DLPClassifierStorePath: "postgres", DLPFingerprintStorePath: "postgres", DLPPolicyObjectStorePath: "postgres"}
 	h := newServerWithConfig(config)
 	cpLeaderElectorInstance = a
 	a.tick()

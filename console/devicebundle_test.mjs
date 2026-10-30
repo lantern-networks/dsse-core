@@ -188,6 +188,26 @@ test('pending guard survives an externally reenabled button without duplicate is
   assert.equal(f.downloads[1].name, 'dsse-device-setup-windows-amd64.zip');
 });
 
+test('bundle does not mint a token for a different operator selection than its profile', async () => {
+  const f = fixture();
+  f.context.operateTenant = 'another-tenant';
+  await f.context.downloadDeviceBundle(envelope, 'fixture-group', 'darwin', 'arm64', f.button, 'fixture-tenant');
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.blobs.length, 0);
+  assert.ok(f.notices.some(notice => notice.kind === 'err'));
+});
+
+test('changing operator selection while downloading installer prevents token issuance', async () => {
+  const f = fixture(); let finish;
+  f.context.fetch = (...args) => { f.calls.push(['GET', ...args]); return new Promise(resolve => { finish = resolve; }); };
+  const pending = f.context.downloadDeviceBundle(envelope, 'fixture-group', 'darwin', 'arm64', f.button, 'fixture-tenant');
+  f.context.operateTenant = 'another-tenant';
+  finish(response()); await pending;
+  assert.deepEqual(f.calls.map(call => call[0]), ['GET']);
+  assert.equal(f.blobs.length, 0);
+  assert.ok(f.notices.some(notice => notice.kind === 'err'));
+});
+
 test('all supported platforms produce exact ZIP contents and fetch the installer before one token', async () => {
   for (const platform of ['darwin', 'windows']) for (const arch of ['arm64', 'amd64']) {
     const f = fixture(); await f.send(platform, arch);

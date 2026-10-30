@@ -56,7 +56,7 @@ func TestNoScreenDerivesAnOrganizationIDFromItsDisplayName(t *testing.T) {
 	}
 	// The creation call specifically. Passing the ISSUED id around afterwards is how every later step names
 	// the new organization, and is exactly right — what must not happen is naming one on the way in.
-	if create := strings.Index(text, `apiFetch("POST", "/admin/tenants"`); create >= 0 {
+	if create := strings.Index(text, `saveTenantWithFleetConfirmation("/admin/tenants"`); create >= 0 {
 		body := text[create:]
 		if end := strings.Index(body, "});"); end > 0 {
 			body = body[:end]

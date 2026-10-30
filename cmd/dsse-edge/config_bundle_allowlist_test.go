@@ -209,12 +209,19 @@ func TestConfigBundleSignedAllowlistEditAndClear(t *testing.T) {
 		customer := src
 		customer.token = "token-customer"
 		customer.tenantID = "customer"
-		scoped, err := customer.fetch(context.Background())
+		if _, err := customer.fetch(context.Background()); err == nil {
+			t.Fatal("customer downloaded fleet exceptions")
+		}
+		ownRequest, _ := http.NewRequest("GET", server.URL+"/admin/dlp-allowlist", nil)
+		ownRequest.Header.Set("Authorization", "Bearer token-customer")
+		ownReply, err := server.Client().Do(ownRequest)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := scoped.DLP.Allowlists["foreign"]; ok {
-			t.Fatal("customer received foreign exception")
+		ownRaw, _ := io.ReadAll(ownReply.Body)
+		ownReply.Body.Close()
+		if ownReply.StatusCode != 200 || strings.Contains(string(ownRaw), "foreign@example.invalid") {
+			t.Fatal("tenant-scoped allowlist read lost isolation")
 		}
 		if _, err := src.apply(bundle, configApplyTargets{rules: policyrule.NewStore(), applications: appcatalog.NewStore(), policyStore: policy.NewStore(nil), dlp: edge}); err != nil {
 			t.Fatal(err)

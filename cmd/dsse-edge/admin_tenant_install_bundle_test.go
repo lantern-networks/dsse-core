@@ -112,6 +112,32 @@ func TestTheInstallBundleFlagsWhoseInterceptionRootItIs(t *testing.T) {
 	}
 }
 
+func TestInstallBundleDoesNotMixCaseDistinctInterceptionRoots(t *testing.T) {
+	declareOperatorTenantForTest(t, "tenant_operator_001")
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	interception, err := edgeplane.NewNetworkExtensionLabTLSInterception([]string{"*"}, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range []struct{ tenant, name string }{{"Acme", "Upper Acme"}, {"acme", "Lower Acme"}} {
+		root, intermediate, key := offlineTenantBundleForTest(t, entry.name, now)
+		if _, err := interception.LoadOfflineTenantIntermediate(entry.tenant, root, intermediate, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	handler := newServerWithConfig(serverConfig{
+		Evaluator: testEvaluator(), NetworkExtensionLabTLS: interception,
+		AgentPolicySigner: testAgentPolicySigner(t), AdminAuth: newAdminAuthStore(),
+		OperatorTenantID: "tenant_lab_001",
+	})
+	for _, entry := range []struct{ tenant, name string }{{"Acme", "Upper Acme"}, {"acme", "Lower Acme"}} {
+		_, body := installBundleAs(t, handler, "", entry.tenant)
+		if body["interception_root_is_own"] != true || !strings.Contains(body["interception_root_common_name"].(string), entry.name) {
+			t.Fatalf("tenant %q received the wrong interception root", entry.tenant)
+		}
+	}
+}
+
 // ★ AFTER A REVOCATION THE FALLBACK IS THE DEFECT (2026-08-16, found live on the reference lab). An
 // organization with no issuer of its own falls back to the node's anchor, because that is genuinely what
 // signs its traffic. A REVOKED organization has no issuer for the opposite reason: this node decided its
@@ -128,6 +154,7 @@ func TestARevokedOrganizationGetsNoInterceptionRootToEmbed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("interception: %v", err)
 	}
+	interception.SetOfflineTenantIntermediateDir(t.TempDir())
 	rootPEM, interPEM, keyPEM := offlineTenantBundleForTest(t, "Northwind", now)
 	if _, err := interception.LoadOfflineTenantIntermediate("tenant_northwind", rootPEM, interPEM, keyPEM); err != nil {
 		t.Fatalf("load issuer: %v", err)

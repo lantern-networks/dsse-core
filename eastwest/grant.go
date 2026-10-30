@@ -98,9 +98,10 @@ func grantResponseFrom(tenantID string, g decision.EastWestGrant) grantResponse 
 	}
 }
 
-// IssueGrantFromChallenge completes a pending challenge and issues an ephemeral grant bound to
-// its (identity x device x destination x protocol), hot-applied to the live decision path.
-func IssueGrantFromChallenge(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID string, now time.Time) (grantResponse, error) {
+// issueGrantFromChallenge is private to the authenticated ceremony. Possession
+// of a challenge ID is not authentication: the ID appears in the held flow's
+// response, so callers must first prove and bind the user in CompleteCeremony.
+func issueGrantFromChallenge(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID string, now time.Time) (grantResponse, error) {
 	grantStore, ok := policyStore.(grantStore)
 	if !ok {
 		return grantResponse{}, fmt.Errorf("policy store does not support east-west grants")
@@ -163,13 +164,16 @@ func IssueGrantDirect(policyStore policy.RuntimeStore, tenantID string, req Admi
 
 // CompleteCeremony is the E4 hook: after the out-of-band browser ceremony authenticates the user
 // (OIDC + MFA), this issues the ephemeral grant against the held challenge -- but only when the
-// authenticated identity matches the held flow's claimed subject (identity binding). The endpoint is
-// untrusted, so the grant is bound to who actually proved themselves in the browser, not to who the held
-// flow claimed to be.
-func CompleteCeremony(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID, authenticatedUserID string, now time.Time) (grantResponse, error) {
+// authenticated tenant and identity match the held flow (identity binding).
+// The endpoint is untrusted, so the grant is bound to who actually proved
+// themselves in the browser, not to who the held flow claimed to be.
+func CompleteCeremony(policyStore policy.RuntimeStore, challenges *AuthChallengeStore, challengeID, authenticatedTenantID, authenticatedUserID string, now time.Time) (grantResponse, error) {
 	challenge, ok := challenges.Get(challengeID)
 	if !ok || challenge.Status != "pending" {
 		return grantResponse{}, fmt.Errorf("challenge is not a pending challenge")
+	}
+	if strings.TrimSpace(authenticatedTenantID) == "" || challenge.TenantID != authenticatedTenantID {
+		return grantResponse{}, fmt.Errorf("authenticated tenant does not match the held flow")
 	}
 	// Identity binding (fail-open review #16): when the held flow CLAIMS a subject, the browser ceremony must have
 	// PROVEN that same subject. The previous `authenticatedUserID != ""` clause let an EMPTY authenticated identity
@@ -179,7 +183,7 @@ func CompleteCeremony(policyStore policy.RuntimeStore, challenges *AuthChallenge
 	if challenge.SubjectUserID != "" && challenge.SubjectUserID != authenticatedUserID {
 		return grantResponse{}, fmt.Errorf("authenticated identity does not match the held flow")
 	}
-	return IssueGrantFromChallenge(policyStore, challenges, challengeID, now)
+	return issueGrantFromChallenge(policyStore, challenges, challengeID, now)
 }
 
 type grantToucher interface {

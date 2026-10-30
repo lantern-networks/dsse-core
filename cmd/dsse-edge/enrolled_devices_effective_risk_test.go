@@ -18,13 +18,18 @@ import (
 func TestEnrolledDeviceEffectiveRiskReflectsDeviceMetadata(t *testing.T) {
 	now := time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC)
 	store := devicestore.NewStore()
-	// A device whose ONLY risk source is its device-store metadata (NOT the high-risk overlay, NOT a group floor).
+	// A device whose ONLY risk source is its authoritative device-store metadata
+	// (NOT the high-risk overlay, NOT a group floor).
 	if _, err := store.Register(model.Device{
 		ID:       "dev-meta",
 		TenantID: "t1",
-		Metadata: map[string]any{"risk_state_severity": "high"},
 	}, model.PolicyBundle{}, now); err != nil {
 		t.Fatalf("register dev-meta: %v", err)
+	}
+	if _, found, _, err := store.ApplyRiskSignal("dev-meta", model.RiskSignal{
+		EntityType: "device", EntityID: "dev-meta", Severity: "high", Source: "manual_high_risk",
+	}, now); err != nil || !found {
+		t.Fatalf("apply dev-meta risk: found=%t err=%v", found, err)
 	}
 	// A device with no risk at all — the control case an operator correctly reads as Normal.
 	if _, err := store.Register(model.Device{ID: "dev-clean", TenantID: "t1"}, model.PolicyBundle{}, now); err != nil {
@@ -56,11 +61,19 @@ func TestEnrolledDeviceEffectiveRiskReflectsDeviceMetadata(t *testing.T) {
 func TestEnrolledDeviceEffectiveRiskMaxesMetadataWithGroupFloor(t *testing.T) {
 	now := time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC)
 	store := devicestore.NewStore()
-	if _, err := store.Register(model.Device{ID: "d-mid", TenantID: "t1", Metadata: map[string]any{"risk_state_severity": "medium"}}, model.PolicyBundle{}, now); err != nil {
+	if _, err := store.Register(model.Device{ID: "d-mid", TenantID: "t1"}, model.PolicyBundle{}, now); err != nil {
 		t.Fatalf("register d-mid: %v", err)
 	}
-	if _, err := store.Register(model.Device{ID: "d-crit", TenantID: "t1", Metadata: map[string]any{"risk_state_severity": "critical"}}, model.PolicyBundle{}, now); err != nil {
+	if _, err := store.Register(model.Device{ID: "d-crit", TenantID: "t1"}, model.PolicyBundle{}, now); err != nil {
 		t.Fatalf("register d-crit: %v", err)
+	}
+	for _, signal := range []model.RiskSignal{
+		{EntityType: "device", EntityID: "d-mid", Severity: "medium", Source: "manual_high_risk"},
+		{EntityType: "device", EntityID: "d-crit", Severity: "critical", Source: "manual_high_risk"},
+	} {
+		if _, found, _, err := store.ApplyRiskSignal(signal.EntityID, signal, now); err != nil || !found {
+			t.Fatalf("apply %s risk: found=%t err=%v", signal.EntityID, found, err)
+		}
 	}
 
 	led := enrolledinventory.NewLedger()

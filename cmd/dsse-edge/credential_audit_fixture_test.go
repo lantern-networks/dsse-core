@@ -31,7 +31,7 @@ func assertStandbyAudit(t *testing.T, a model.AuditLog, permission string) {
 		stringPtrValue(a.Result) != "refused" || stringPtrValue(a.Reason) != "not_leader" || a.ID == "" || a.Timestamp == "" {
 		t.Fatalf("untruthful routing audit: %+v", a)
 	}
-	want := map[string]any{"audit_scope": "node", "authentication": "not_evaluated", "request_tenant": "not_evaluated", "required_permission": permission, "http_status": float64(409)}
+	want := map[string]any{"audit_scope": "node", "authentication": "not_evaluated", "request_tenant": "not_evaluated", "required_permission": permission, "http_status": float64(503), "retry_after_seconds": float64(1)}
 	metadata := make(map[string]any)
 	for k, v := range a.Metadata {
 		metadata[k] = v

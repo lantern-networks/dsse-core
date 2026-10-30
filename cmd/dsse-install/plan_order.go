@@ -15,6 +15,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 )
 
@@ -97,6 +98,36 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 				"returned 401\" and knew none of the connectors the other regions had registered.",
 		},
 	}
+	if declaredNodeMapProfile(p.Profile) {
+		steps[1].Do = fmt.Sprintf("dsse-install -start-node -dir %s -machine %s", dir, minting.Name)
+		steps[1].Needs = "the generated directory, the complete plan inputs, preloaded reviewed images, peer/entrance DNS and private routing; Edge hosts must first import their approved browser pair with -install-portal-certificate"
+		if p.Archive != nil {
+			steps[1].Needs += "; before startup and CP carry, provision the declared external S3 bucket and put dedicated archive credentials or workload-identity inputs in the founding CP's private deployment.env; run -preflight and verify a real archive write after startup"
+		} else {
+			steps[1].Needs += "; local-only audit retention is selected: provision persistent hot-store capacity and backups"
+		}
+		steps[1].Why = "The helper refuses to start services when local preflight fails. compose_started means containers started, not quorum, database synchronization or authentication readiness."
+		steps[2].Do = fmt.Sprintf("(umask 077; set -C; dsse-install -bootstrap-admin -dir %s -control-plane https://%s -admin-email <address> -admin-token-file %s > %s 2>&1)", dir, p.PlaneNamesFor(founding.ID)["admin"], privateTokenDestination(dir), filepath.Join(dir, "admin-credentials.txt"))
+		steps[2].Why += " Retain the private credentials output even on failure; the operator token is saved only on the issuer, never in a carry. An existing token file is not overwritten."
+	}
+	if p.dedicatedMultiEdge() {
+		steps[3].Do = fmt.Sprintf("cd %s && docker compose -p dsse --env-file deployment.env up -d --no-deps --force-recreate %s", dir, composeServiceList(controlPlaneNodeNames))
+		steps[3].Why = "Restart the founding CP after closing bootstrap credentials; this dedicated machine has no Edge service."
+	}
+	if p.oneRegionThreeNodes() {
+		steps[3].Do += fmt.Sprintf(" && cd %s && docker compose -p dsse --env-file deployment.env up -d --no-deps --force-recreate dsse-edge", dir)
+		steps[3].Why += " Recreate the local front door after its Edge: an existing HAProxy process may retain " +
+			"the former container address and keep the agent backend down after the Edge is replaced."
+		steps[1].Needs += "; each Node's agent and portal names resolve to that Node's own public entry address, " +
+			"every Node doorway routes each portal SNI across all three Edges, and each Node's " +
+			"clientless/tls.crt and tls.key contain a browser-trusted SAN pair for all three Portal names"
+		steps[1].Why += " In this profile, browser OIDC start and callback may reach different Edges; " +
+			"any of the three Node doors may receive a device, so all three Edges need the shared binding key, recovery capability and CP one-time result authority."
+	}
+
+	if threeVoterProfile(p.Profile) {
+		steps[3].Why += " After bootstrap closes, CP startup/writes remain fenced until all three planned voting store members join. A temporary unavailable/restarting CP is not permission to reopen bootstrap: continue the store joins below, then require CP readiness before authentication activation."
+	}
 
 	// ★ THE REST OF THE FOUNDING REGION, then each joining region: its control plane, then its Edges.
 	regions := []PlanRegion{founding}
@@ -105,12 +136,18 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 			regions = append(regions, r)
 		}
 	}
+	var deferredEdges []PlanStep
 	for _, r := range regions {
 		for _, m := range machinesInOrder(r) {
+			start := len(steps)
 			if r.Founding && m.Name == minting.Name {
 				continue // this directory IS that machine
 			}
 			needs, why := m.needsFor(r, founding, minting)
+			if threeVoterProfile(p.Profile) && m.Holds.has("control-plane") {
+				needs = "the founding store and database reachable from this host, its learner already admitted, and the named-admin bootstrap recorded in this carry; CP availability is not required until all three voters join"
+				why += " Preserve the closed-bootstrap marker and quorum fencing; do not wait for an unfenced CP or remint authorities to join this state member."
+			}
 			// ★★★ A JOINING STATE-BEARING REGION IS ADMITTED TO THE STORE BEFORE IT STARTS, AND AS A LEARNER
 			// (2026-08-31). Its machine renders one member of the deployment's one cluster, and a member that
 			// was never added is a process that starts, finds itself unknown, and never joins.
@@ -125,8 +162,8 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 				steps = append(steps, PlanStep{
 					Machine: minting.Name,
 					Do: fmt.Sprintf("%s member add %s --learner --peer-urls=%s",
-						storeExecPrefix(p, dir), storeMemberName(r.ID), p.storeMemberPeerURL(r)),
-					Needs: "the founding region's store answering",
+						storeExecPrefix(p, dir), p.storeMemberNameFor(r, m), p.storeMemberPeerURLFor(r, m)),
+					Needs: "the existing store cluster healthy; after promotion allow membership health to converge, check endpoint health --cluster and member list before the next add; on an unhealthy-cluster refusal inspect membership, wait and retry only if the intended peer was not added",
 					Why: "This region keeps a copy of the database, so it holds a member of the deployment's " +
 						"ONE consensus store. As a LEARNER it takes no part in the quorum: if the machine " +
 						"below never comes up, nothing that works today stops working.",
@@ -170,6 +207,24 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 					Needs: needs,
 					Why:   why,
 				})
+			if declaredNodeMapProfile(p.Profile) {
+				at := len(steps) - 1
+				steps[at].Do = fmt.Sprintf("mkdir -p /opt/dsse/%s && tar xzpf %s.tar.gz -C /opt/dsse/%s && dsse-install -start-node -dir /opt/dsse/%s -machine %s", r.ID, m.Name, r.ID, r.ID, m.Name)
+				if m.Holds.has("edges") {
+					switch p.Profile {
+					case "one-region-three-nodes":
+						steps[at].Needs += "; import this Edge's approved browser certificate with all three Portal names before startup"
+					case "three-regions-multi-edge":
+						steps[at].Needs += "; import this Edge's approved browser certificate for its own Region Portal name before startup"
+					default:
+						steps[at].Needs += "; import this Edge's approved browser certificate for its shared Region Portal name before startup"
+					}
+				} else {
+					steps[at].Needs += "; CP-only hosts receive no browser private key"
+				}
+				steps[at].Needs += "; local preflight must pass"
+				steps[at].Why += " The carried install-plan.json retains the complete plan. Fix preflight inputs and rerun -start-node without reminting or deleting state."
+			}
 			if joinsTheStore(p, r, m) {
 				steps = append(steps, PlanStep{
 					Machine: minting.Name,
@@ -177,7 +232,7 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 					// image has no shell, so `exec … sh -c` failed with "sh: executable file not found").
 					// The operator's own shell resolves $( ), which is where a shell certainly exists.
 					Do: fmt.Sprintf("%[1]s member promote $(%[1]s member list | awk -F', ' '$3==\"%[2]s\"{print $1}')",
-						storeExecPrefix(p, dir), storeMemberName(r.ID)),
+						storeExecPrefix(p, dir), p.storeMemberNameFor(r, m)),
 					Needs: "the machine above running, and its member caught up with the cluster",
 					Why: "Until this runs the member is a learner: it holds a copy and has no vote, so the " +
 						"deployment tolerates no more failures than it did before this region existed. ★ The " +
@@ -186,9 +241,34 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 						"ARRIVES WITH THE THIRD PROMOTION, not the second: two voting members cannot lose one.",
 				})
 			}
+			if p.threeRegionsMultiEdge() && !m.Holds.has("control-plane") {
+				deferredEdges = append(deferredEdges, steps[start:]...)
+				steps = steps[:start]
+			}
 		}
 	}
 
+	if threeVoterProfile(p.Profile) {
+		steps = append(steps, PlanStep{
+			Machine: minting.Name,
+			Do: fmt.Sprintf("cd %s && docker compose -p dsse --env-file deployment.env exec -T dsse-postgres-a "+
+				"patronictl -c /home/postgres/postgres.yml edit-config dsse "+
+				"--set synchronous_mode=true --set synchronous_mode_strict=true "+
+				"--set synchronous_node_count=1 --force", dir),
+			Needs: "both joining database members streaming and one eligible synchronous standby; confirm " +
+				"patronictl show-config and pg_stat_replication before admitting devices",
+			Why: "A bootstrapping single-member database must allow the administrator to create the deployment " +
+				"before joiners exist. After all three members join, strict synchronous mode prevents success " +
+				"on a lone database copy. Without this step the three-node profile is not ready.",
+		})
+	}
+	steps = append(steps, deferredEdges...)
+	if declaredNodeMapProfile(p.Profile) {
+		steps = append(steps, PlanStep{Machine: minting.Name,
+			Do:    fmt.Sprintf("dsse-install -activate-auth -dir %s -admin-token-file %s", dir, privateTokenDestination(dir)),
+			Needs: "all declared CPs and Edges running the reviewed build, three voters and strict database synchronization ready; private owned Edge admin routes reachable from the issuer",
+			Why:   "New shared-fleet authentication stays unavailable until the existing authority confirms all members and every declared Edge applies the complete enabled feature set. A timeout is not success: correct the named member and rerun; existing enabled features are retained. Device-user session binding requires separate assignment preparation."})
+	}
 	steps = append(steps, PlanStep{
 		Machine: minting.Name,
 		Do: fmt.Sprintf("dsse-install -verify -dir %s -control-plane https://%s -edge %s -edge-admin %s -control-plane-peers %s -admin-token <token>",
@@ -214,6 +294,20 @@ func (p *Plan) InstallOrder(dir, planPath string) []PlanStep {
 			"every Edge hand devices the same region map, does every node run the same build — and a " +
 			"deployment answering those from one node looks complete and is not.",
 	})
+	if declaredNodeMapProfile(p.Profile) {
+		steps[len(steps)-1].Do = strings.Replace(steps[len(steps)-1].Do, "-admin-token <token>", "-admin-token-file "+privateTokenDestination(dir), 1)
+	}
+	if len(p.DeploymentCRLOrigins) > 0 {
+		status := PlanStep{
+			Machine: minting.Name,
+			Do:      fmt.Sprintf("sudo %s/install-deployment-crl-services.sh", dir),
+			Needs:   "the reviewed dsse-deployment-crl host binary installed at /usr/local/bin; public HTTP origins in deployment_crl_origins routed to the keyless publisher's loopback 127.0.0.1:18081 before -start-node",
+			Why:     "The issuer's signed 24-hour CRLs must renew before expiry while the HTTP publisher has no signing keys. The next node's preflight retrieves every issuer-bound URL and rejects missing, stale, redirected or revoked status.",
+		}
+		steps[1].Needs += "; the signed deployment CRL publisher and its renewal timer active, with every declared public CDP reachable"
+		steps = append(steps[:1], append([]PlanStep{status}, steps[1:]...)...)
+	}
+
 	return steps
 }
 
@@ -274,6 +368,10 @@ func (p *Plan) verifyEdges() []string {
 	out := []string{}
 	for _, r := range p.Regions {
 		agents := p.PlaneNamesFor(r.ID)["agents"]
+		if p.dedicatedMultiEdge() {
+			out = append(out, "https://"+agents+"@"+p.fromFounding(r.controlPlane(), r, 0))
+			continue
+		}
 		for _, m := range r.Machines {
 			if !m.Holds.has("edges") {
 				continue
@@ -303,7 +401,15 @@ func (p *Plan) verifyEdgeAdmins() []string {
 			for _, node := range edgeNodeNames {
 				// ★ THE REGION IS PART OF THE NODE'S NAME: every region runs services of the same names, so
 				// without it two machines in two regions answer to one.
-				out = append(out, "https://"+r.ID+"-"+node+".admin."+p.Deployment+"@"+p.fromFounding(m, r, 0))
+				label := r.ID + "-" + node
+				if declaredNodeMapProfile(p.Profile) {
+					label = nodeAdminLabel(r.ID, m.Name, node)
+				}
+				owner := m
+				if p.dedicatedMultiEdge() {
+					owner = r.controlPlane()
+				}
+				out = append(out, "https://"+label+".admin."+p.Deployment+"@"+p.fromFounding(owner, r, 0))
 			}
 		}
 	}
@@ -313,9 +419,18 @@ func (p *Plan) verifyEdgeAdmins() []string {
 func (p *Plan) verifyControlPlanes() []string {
 	out := []string{}
 	for _, r := range p.Regions {
-		cp := r.controlPlane()
-		for _, node := range controlPlaneNodeNames {
-			out = append(out, "https://"+r.ID+"-"+node+".admin."+p.Deployment+"@"+p.fromFounding(cp, r, 0))
+		machines := []PlanMachine{r.controlPlane()}
+		if p.oneRegionThreeNodes() {
+			machines = r.Machines
+		}
+		for _, cp := range machines {
+			for _, node := range controlPlaneNodeNames {
+				label := r.ID + "-" + node
+				if declaredNodeMapProfile(p.Profile) {
+					label = nodeAdminLabel(r.ID, cp.Name, node)
+				}
+				out = append(out, "https://"+label+".admin."+p.Deployment+"@"+p.fromFounding(cp, r, 0))
+			}
 		}
 	}
 	return out
@@ -384,10 +499,10 @@ func wrapAt(text string, width int, indent string) string {
 // defaults to 127.0.0.1:2379 in PLAINTEXT, so with TLS on it fails with "error reading server preface: EOF" —
 // a message that names neither TLS nor the endpoint it used. And the loopback address cannot be verified
 // against a certificate issued for the member's NAME, so the endpoint has to be the name, at the published
-// port. No client certificate: the client endpoint asks for none.
+// port. Present the founding member certificate as an authenticated operator.
 func etcdctlAt(p *Plan) string {
 	founding := p.foundingRegion().controlPlane()
-	return fmt.Sprintf("etcdctl --endpoints=https://%s:%d --cacert=/deployment/store-ca.pem",
+	return fmt.Sprintf("etcdctl --endpoints=https://%s:%d --cacert=/deployment/store-ca.pem --cert=/deployment/store-member.pem --key=/deployment/store-member-key.pem",
 		founding.reachableName(), planEtcdPortA)
 }
 
@@ -401,5 +516,22 @@ func storeExecPrefix(p *Plan, dir string) string {
 }
 
 func joinsTheStore(p *Plan, r PlanRegion, m PlanMachine) bool {
+	if p.oneRegionThreeNodes() {
+		return m.Holds.has("control-plane") && m.Name != r.controlPlane().Name
+	}
 	return !r.Founding && r.HoldsState && m.Holds.has("control-plane") && len(p.stateBearingRegions()) > 1
+}
+
+func (p *Plan) storeMemberNameFor(r PlanRegion, m PlanMachine) string {
+	if p.oneRegionThreeNodes() {
+		return storeMemberNameForMachine(m)
+	}
+	return storeMemberName(r.ID)
+}
+
+func (p *Plan) storeMemberPeerURLFor(r PlanRegion, m PlanMachine) string {
+	if p.oneRegionThreeNodes() {
+		return storeMemberPeerURLForMachine(m)
+	}
+	return p.storeMemberPeerURL(r)
 }

@@ -7,6 +7,7 @@ function fixture() {
   let text=attrs.text||'';const listeners={};
   const n={tag,attrs,style:{},children:[],disabled:Object.hasOwn(attrs,"disabled") && attrs.disabled != null,value:attrs.value||'',
    appendChild(child){if(child!=null){if(typeof child!=='object')child=el('text',{text:String(child)});this.children.push(child)};return child},
+   removeChild(child){this.children.splice(this.children.indexOf(child),1);return child},
    addEventListener(event,fn){listeners[event]=fn},
    click(){return (listeners.click||attrs.onClick)?.()}, input(){return listeners.input?.()},
    getAttribute(name){return attrs[name]}, setAttribute(name,value){attrs[name]=value}, querySelector(selector){return this.querySelectorAll(selector)[0]||null},
@@ -51,6 +52,88 @@ test('form validates authorization endpoint and safe ID without posting',async()
 });
 test('form confirms tenant, type and all metadata, normalizing domains and omitting blank secret',async()=>{
  for(const type of ['oidc','google','entra','okta']){const f=fixture();f.mockRefresh();const m=f.form();f.fields.type.input.value=type;f.fields.domains.input.value='Example.test, example.test, OTHER.test';await button(m.el,'Add provider').click();assert.equal(m.closed,true);const c=f.calls[0];assert.equal(c.plane,'control');assert.equal(c.body.tenant_id,'tenant');assert.equal(c.body.type,type);assert.equal(c.body.client_secret,undefined);assert.deepEqual(Array.from(c.body.verified_domains),['example.test','other.test'])}
+});
+test('device user assignment is explicit, checked on readback and preserved on unrelated edits',async()=>{
+ const binding={device_id:'device-1',os_principal:'windows:S-1-5-21-100-200-300-1001',subject:'opaque-idp-sub',revision:'a'.repeat(64)};
+ const existing={...conn,device_user_bindings:[binding]};
+ const f=fixture();const m=f.form(existing);
+ f.invokeWith(async(method,path,body)=>reply({...body,device_user_bindings:[binding]}));
+ await button(m.el,'Save changes').click();
+ assert.equal(m.closed,true);
+ assert.equal(f.calls.find(c=>c.method==='POST').body.device_user_bindings,undefined);
+ const changed=fixture();const edit=changed.form(existing);
+ changed.fields['binding-subject'].input.value='different-sub';
+ changed.invokeWith(async(method,path,body)=>reply({...body,device_user_bindings:body.device_user_bindings.map(b=>({...b,revision:'b'.repeat(64)}))}));
+ await button(edit.el,'Save changes').click();
+ assert.equal(edit.closed,true);
+ assert.equal(changed.calls.find(c=>c.method==='POST').body.device_user_bindings[0].subject,'different-sub');
+ assert.equal(changed.calls.find(c=>c.method==='POST').body.device_user_bindings[0].revision,undefined);
+});
+test('device user assignment rejects duplicate and malformed OS identifiers before save',async()=>{
+ const f=fixture();const m=f.form();
+ button(m.el,'Advanced: enter verified IDs').click();
+ f.fields['binding-device'].input.value='device';
+ f.fields['binding-principal'].input.value='alice@example.com';
+ f.fields['binding-subject'].input.value='subject';
+ await button(m.el,'Add provider').click();
+ assert.equal(f.calls.length,0);
+ assert.match(error(m.el).textContent,/exact Windows SID/);
+});
+test('guided assignment requires observed OS identity and matching provider directory subject',async()=>{
+ const f=fixture(),m=f.form();
+ const principal='windows:S-1-5-21-100-200-300-1001';
+ f.invokeWith(async(method,path)=>{
+  if(path==='/admin/auth-observed-accounts')return reply({tenant_id:'tenant',fleet_wide:true,accounts:[{device_id:'device-1',os_principal:principal,display_name:'Alice'}]});
+  if(path.startsWith('/admin/human-identities?'))return reply({tenant_id:'tenant',identities:[{tenant_id:'tenant',source:'new',status:'active',subject:'oidc-sub-1',display_name:'Alice'}]});
+  throw Error('unexpected request');
+ });
+ await button(m.el,'+ Choose observed account and IdP user').click();
+ assert.equal(f.calls.filter(c=>c.method==='POST').length,0);
+ f.fields['observed-account'].input.value='0';f.fields['directory-person'].input.value='0';
+ button(m.el,'Add selected assignment').click();
+ assert.equal(f.fields['binding-device'].get(),'device-1');
+ assert.equal(f.fields['binding-principal'].get(),principal);
+ assert.equal(f.fields['binding-subject'].get(),'oidc-sub-1');
+});
+test('guided assignment fails closed on a foreign directory tenant',async()=>{
+ const f=fixture(),m=f.form();
+ f.invokeWith(async(method,path)=>reply(path==='/admin/auth-observed-accounts'
+  ?{tenant_id:'tenant',fleet_wide:true,accounts:[{device_id:'device-1',os_principal:'macos:00000000-0000-0000-0000-000000000001',display_name:'Alice'}]}
+  :{tenant_id:'other',identities:[{tenant_id:'other',source:'new',status:'active',subject:'oidc-sub-1'}]}));
+ await button(m.el,'+ Choose observed account and IdP user').click();
+ assert.match(m.el.textContent,/Candidate lists are unavailable/);
+ assert.equal(f.fields['binding-device'],undefined);
+});
+test('guided assignment rejects subjects from another provider source',async()=>{
+ const f=fixture(),m=f.form();
+ f.invokeWith(async(method,path)=>reply(path==='/admin/auth-observed-accounts'
+  ?{tenant_id:'tenant',fleet_wide:true,accounts:[{device_id:'device-1',os_principal:'macos:00000000-0000-0000-0000-000000000001',display_name:'Alice'}]}
+  :{tenant_id:'tenant',identities:[{tenant_id:'tenant',source:'other-idp',status:'active',subject:'oidc-sub-1'}]}));
+ await button(m.el,'+ Choose observed account and IdP user').click();
+ assert.match(m.el.textContent,/Candidate lists are unavailable/);
+ assert.equal(f.calls.filter(c=>c.method==='POST').length,0);
+});
+test('guided assignment cannot be saved under a different provider ID',async()=>{
+ const f=fixture(),m=f.form();
+ f.invokeWith(async(method,path)=>reply(path==='/admin/auth-observed-accounts'
+  ?{tenant_id:'tenant',fleet_wide:true,accounts:[{device_id:'device-1',os_principal:'macos:00000000-0000-0000-0000-000000000001',display_name:'Alice'}]}
+  :{tenant_id:'tenant',identities:[{tenant_id:'tenant',source:'new',status:'active',subject:'oidc-sub-1'}]}));
+ await button(m.el,'+ Choose observed account and IdP user').click();
+ f.fields['observed-account'].input.value='0';f.fields['directory-person'].input.value='0';
+ button(m.el,'Add selected assignment').click();
+ f.fields.id.input.value='different';
+ await button(m.el,'Add provider').click();
+ assert.match(error(m.el).textContent,/Provider ID changed/);
+ assert.equal(f.calls.filter(c=>c.method==='POST').length,0);
+});
+test('removing a device user requires an explicit empty assignment update',async()=>{
+ const binding={device_id:'device-1',os_principal:'macos:00000000-0000-0000-0000-000000000001',subject:'subject',revision:'a'.repeat(64)};
+ const f=fixture();const m=f.form({...conn,device_user_bindings:[binding]});
+ button(m.el,'Remove assignment').click();
+ f.invokeWith(async(method,path,body)=>reply({...body,device_user_bindings:[]}));
+ await button(m.el,'Save changes').click();
+ assert.equal(m.closed,true);
+ assert.equal(f.calls.find(c=>c.method==='POST').body.device_user_bindings.length,0);
 });
 test('form rejects failed, mismatched or leaked-secret replies and restores all controls',async()=>{
  for(const response of [{ok:false,status:500,body:{error:'save failed'}},new Error('offline'),reply({}),reply({...conn,idp_id:'wrong'}),reply({...conn,client_secret:'leaked'})]){const f=fixture();f.mockRefresh();const m=f.form();f.invokeWith(async()=>{if(response instanceof Error)throw response;return response});await button(m.el,'Add provider').click();assert.equal(m.closed,false);assert.ok(error(m.el).textContent);assert.equal(button(m.el,'Add provider').disabled,false);assert.equal(f.toasts.length,0);f.invokeWith(async(m,p,body)=>reply(body));await button(m.el,'Add provider').click();assert.equal(m.closed,true)}

@@ -10,7 +10,6 @@
 
 let assetsTab = "endpoints"; // "endpoints" | "groups" | "services"
 const _assetsFilter = { ep: "", epType: "all", grp: "", svc: "" }; // per-tab search/filter, kept across re-renders
-const _inspCache = {}; // address -> "inspect"|"bypass" so search-filtering does not re-query effective-policy
 
 function renderAssetsView(content) {
   content.innerHTML = "";
@@ -44,6 +43,12 @@ async function loadAssetsArr(path) {
   return r.body;
 }
 function platLabel(p) { return p === "macos" ? "macOS" : p === "windows" ? "Windows" : "—"; }
+function assetInspectionBadge(decision) {
+  if (decision === "bypass") return uiBadge(bl({ en: "Bypassed", ja: "バイパス" }), "warn");
+  if (decision === "inspect") return uiBadge(bl({ en: "Inspected", ja: "傍受" }), "ok");
+  if (decision === "depends_on_device") return uiBadge(bl({ en: "Depends on device", ja: "端末による" }), "off");
+  return uiBadge(bl({ en: "Unknown", ja: "不明" }), "off");
+}
 
 // ---- Devices & Servers (endpoints) ----------------------------------------
 
@@ -54,12 +59,16 @@ async function renderEndpointsSection(section) {
   try { eps = await loadAssetsArr("/admin/assets/endpoints"); }
   catch (e) { if (!current()) return; uiState(section, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderEndpointsSection(section) }); return; }
   eps = eps.filter((ep) => !ep.built_in);
+  // Reuse inspection results only while filtering this inventory view. A new
+  // inventory read must also re-read the effective policy: rules may have changed
+  // while the operator was on another page or before pressing Reload.
+  const inspCache = Object.create(null);
 
   if (!current()) return;
   section.innerHTML = "";
   const search = el("input", { class: "ui-input ui-search", type: "search", placeholder: bl({ en: "Search by name or address…", ja: "名前・アドレスで検索…" }) });
   search.value = _assetsFilter.ep;
-  const typeF = uiField({ name: "type", type: "select", value: _assetsFilter.epType, options: [
+  const typeF = uiField({ name: "type", label: bl({ en: "Type", ja: "種別" }), type: "select", value: _assetsFilter.epType, options: [
     { value: "all", label: bl({ en: "All types", ja: "全種別" }) },
     { value: "device", label: bl({ en: "Devices", ja: "デバイス" }) },
     { value: "server", label: bl({ en: "Servers", ja: "サーバ" }) },
@@ -91,15 +100,15 @@ async function renderEndpointsSection(section) {
       }
       const insCell = el("td", { text: "" });
       if (ep.kind === "network" && ep.address) {
-        const cached = _inspCache[ep.address];
-        const setBadge = (dec) => { insCell.innerHTML = ""; insCell.appendChild(uiBadge(dec === "bypass" ? bl({ en: "Bypassed", ja: "バイパス" }) : bl({ en: "Inspected", ja: "傍受" }), dec === "bypass" ? "warn" : "ok")); };
+        const cached = inspCache[ep.address];
+        const setBadge = (dec) => { insCell.innerHTML = ""; insCell.appendChild(assetInspectionBadge(dec)); };
         if (cached) setBadge(cached);
         else {
           insCell.textContent = "…";
           apiFetch("GET", "/admin/effective-policy?destination=" + encodeURIComponent(ep.address)).then((r) => {
             const ins = r && r.ok && r.body && r.body.inspection;
             if (!ins) { insCell.textContent = "—"; return; }
-            _inspCache[ep.address] = ins.decision; setBadge(ins.decision);
+            inspCache[ep.address] = ins.decision; setBadge(ins.decision);
           }).catch(() => { insCell.textContent = "—"; });
         }
       } else { insCell.textContent = "—"; }

@@ -13,11 +13,11 @@ func TestRenewBeforeCutoffSurvivesARestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "renew_before.json")
 	at := time.Date(2026, 7, 31, 4, 0, 0, 0, time.UTC)
 
-	if err := newRenewBeforeSetting(path).Set(at); err != nil {
+	if err := mustRenewBeforeSetting(t, path).Set(at); err != nil {
 		t.Fatalf("set: %v", err)
 	}
 
-	restarted := newRenewBeforeSetting(path)
+	restarted := mustRenewBeforeSetting(t, path)
 	got, ok := restarted.At()
 	if !ok {
 		t.Fatal("the cutoff did not survive — every device that had not yet checked in would never be told")
@@ -34,7 +34,7 @@ func TestRenewBeforeCutoffSurvivesARestart(t *testing.T) {
 // behaves exactly as it did before, so an empty rendering is what keeps the field out of the signed policy.
 func TestRenewBeforeIsAbsentUntilAskedAndAfterClearing(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "renew_before.json")
-	s := newRenewBeforeSetting(path)
+	s := mustRenewBeforeSetting(t, path)
 	if s.RFC3339() != "" {
 		t.Fatalf("a fresh setting must ask for nothing, got %q", s.RFC3339())
 	}
@@ -54,7 +54,7 @@ func TestRenewBeforeIsAbsentUntilAskedAndAfterClearing(t *testing.T) {
 	}
 	// Clearing must also survive a restart, or the request would come back from the dead and renew the fleet a
 	// second time.
-	if reloaded := newRenewBeforeSetting(path); reloaded.RFC3339() != "" {
+	if reloaded := mustRenewBeforeSetting(t, path); reloaded.RFC3339() != "" {
 		t.Fatalf("a cleared request returned after restart: %q", reloaded.RFC3339())
 	}
 }

@@ -35,6 +35,7 @@ import (
 	"golang.org/x/net/http2/h2c"
 
 	"github.com/lantern-networks/dsse-core/egress-broker/engine"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"github.com/lantern-networks/dsse-core/swg"
 )
 
@@ -46,6 +47,10 @@ func firstNonEmpty(a, b string) string {
 }
 
 func main() {
+	if err := runtimequota.ValidateEnvironment(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	// Check the address every transfer ACTUALLY connects to, before its request is sent. The Edge already
 	// pre-flights the destination hostname, but that resolution and this dial are two separate lookups, so a
 	// name can resolve to a public address when it is checked and an internal one when it is dialled. Every
@@ -72,10 +77,9 @@ func main() {
 	// Serve h2c so the Edge can stream the WS tunnel full-duplex (request body = client->origin, response body =
 	// origin->client concurrently) — Go's HTTP/1.1 client cannot do that. h2c.NewHandler also serves plain HTTP/1.1
 	// (the /v1/reoriginate + /healthz callers), so both work on one listener.
-	// High MaxConcurrentStreams: the Edge coalesces ALL decrypt-all egress onto ONE h2c connection to the broker,
-	// so under a heavy page (a scroll firing dozens of subresources + API POSTs) the default 250-stream cap would
-	// queue requests -> latency -> the browser cancels them (observed as "context canceled" -> broken infinite scroll).
-	h2s := &http2.Server{MaxConcurrentStreams: 10000}
+	// Preserve the previous finite stream fan-out while resource-exhaustion
+	// protection is reviewed. An explicit operator override remains available.
+	h2s := &http2.Server{MaxConcurrentStreams: runtimequota.HTTP2StreamsDefault("DSSE_HTTP2_MAX_CONCURRENT_STREAMS", 10000)}
 	srv := &http.Server{Addr: addr, Handler: h2c.NewHandler(mux, h2s)}
 
 	// Drain on SIGTERM instead of dying mid-request. Without this, `docker compose up -d` killed in-flight

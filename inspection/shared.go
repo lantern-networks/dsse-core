@@ -21,18 +21,7 @@ func decodeSharedSnapshot(raw []byte, known bool) (storeSnapshot, error) {
 	if len(raw) == 0 || json.Unmarshal(raw, &snap) != nil || snap.Events == nil {
 		return snap, fmt.Errorf("inspection shared snapshot unavailable")
 	}
-	seen := map[string]bool{}
-	for _, id := range snap.Order {
-		ev, ok := snap.Events[id]
-		if !ok || id == "" || ev.ID != id || ev.TenantID == "" || seen[id] {
-			return snap, fmt.Errorf("invalid inspection shared order")
-		}
-		seen[id] = true
-	}
-	if len(seen) != len(snap.Events) {
-		return snap, fmt.Errorf("incomplete inspection shared order")
-	}
-	return snap, nil
+	return canonicalizeSnapshot(snap)
 }
 
 // Pending IDs, not a stale full snapshot, are merged under the shared row lock.
@@ -75,8 +64,8 @@ func (s *Store) mergePendingLocked(next *storeSnapshot) error {
 			continue
 		}
 		if previous, exists := next.Events[id]; exists {
-			if previous.TenantID != ev.TenantID {
-				return fmt.Errorf("inspection event belongs to another tenant")
+			if previous.TenantID != ev.TenantID || previous.ID != ev.ID {
+				return fmt.Errorf("inspection event identity changed")
 			}
 		} else {
 			next.Order = append(next.Order, id)

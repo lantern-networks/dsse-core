@@ -32,7 +32,7 @@ func TestAnAuthorityThatDeniesLeadershipIsAskedAgainOnAFreshConnection(t *testin
 			})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"token": map[string]any{"secret": "s", "tenant_id": "t1"}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"token": map[string]any{"id": "approval-1", "secret": "s", "tenant_id": "t1"}})
 	}))
 	defer srv.Close()
 

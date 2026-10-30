@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -17,8 +18,19 @@ import (
 const loginChallengeTTL = 5 * time.Minute
 
 type loginChallenge struct {
-	email  string
-	expiry time.Time
+	email             string
+	credentialBinding string
+	expiry            time.Time
+}
+
+// Bind both factors to the same account enrollment. A password verified before
+// replacement must not authorize the new password/TOTP enrollment for that email.
+func loginCredentialBinding(cred *localAdminCredential) string {
+	if cred == nil {
+		return ""
+	}
+	data, _ := json.Marshal([]string{cred.Email, cred.TenantID, cred.PrincipalID, cred.PasswordHash, cred.TOTPSecret})
+	return adminTokenHash(string(data))
 }
 
 // loginChallengeStore holds the short-lived token issued after a correct password, redeemed by the TOTP step.
@@ -31,30 +43,38 @@ func newLoginChallengeStore() *loginChallengeStore {
 	return &loginChallengeStore{byToken: map[string]loginChallenge{}}
 }
 
-func (s *loginChallengeStore) Issue(email string, now time.Time) (string, error) {
+func (s *loginChallengeStore) Issue(cred *localAdminCredential, now time.Time) (string, error) {
+	if cred == nil || cred.Status != credentialStatusActive || cred.PasswordHash == "" || !cred.TOTPEnrolled {
+		return "", fmt.Errorf("invalid credentials")
+	}
 	token, err := randomToken(24)
 	if err != nil {
 		return "", err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.byToken[token] = loginChallenge{email: email, expiry: now.UTC().Add(loginChallengeTTL)}
+	for key, c := range s.byToken {
+		if !now.Before(c.expiry) {
+			delete(s.byToken, key)
+		}
+	}
+	s.byToken[token] = loginChallenge{email: cred.Email, credentialBinding: loginCredentialBinding(cred), expiry: now.UTC().Add(loginChallengeTTL)}
 	return token, nil
 }
 
-// Consume redeems a challenge token exactly once, returning the email it was issued for.
-func (s *loginChallengeStore) Consume(token string, now time.Time) (string, bool) {
+// Consume redeems a challenge token exactly once, returning its account binding.
+func (s *loginChallengeStore) Consume(token string, now time.Time) (loginChallenge, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c, ok := s.byToken[strings.TrimSpace(token)]
 	if !ok {
-		return "", false
+		return loginChallenge{}, false
 	}
 	delete(s.byToken, strings.TrimSpace(token))
-	if now.After(c.expiry) {
-		return "", false
+	if !now.Before(c.expiry) {
+		return loginChallenge{}, false
 	}
-	return c.email, true
+	return c, true
 }
 
 // activationLink builds the URL emailed to a newly invited admin (the Console activation page consumes the

@@ -71,6 +71,7 @@ async function loadTenantSettings(host, content) {
   if (!current()) return;
   host.innerHTML = "";
   const card = el("div", { class: "ui-card" });
+  if (tenant.shared_fleet_warning) card.appendChild(el("p", {role: "status", text: sharedFleetTenantWarning(tenant)}));
 
   const nameF = uiField({ name: "display_name", label: bl({ en: "Display name", ja: "表示名" }),
     value: tenant.display_name || "" });
@@ -124,7 +125,7 @@ async function loadTenantSettings(host, content) {
     const body = Object.assign({}, tenant, { display_name: nameF.get(), timezone: tzF.get() });
     let r;
     try {
-      r = await apiFetch("POST", "/admin/tenant", body, _TENANT_PLANE);
+      r = await saveTenantWithFleetConfirmation("/admin/tenant", body, _TENANT_PLANE);
     } catch (e) {
       // The request may have reached the authority even when its reply was lost.
       // Keep the edit and let the operator verify the saved value before retrying.
@@ -135,6 +136,7 @@ async function loadTenantSettings(host, content) {
     } finally {
       save.disabled = false;
     }
+    if (r.cancelled) return;
     if (!r.ok) {
       const msg = (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
       tzF.setError(msg);

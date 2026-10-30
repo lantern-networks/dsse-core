@@ -19,7 +19,51 @@ func (f *fakeRiskMarker) RaiseDeviceRisk(deviceID, severity string) (revocation.
 }
 
 func rec(types []string, dest, class string) dlpDetectionRecord {
-	return dlpDetectionRecord{types: types, destination: dest, instanceClass: class}
+	return dlpDetectionRecord{tenantID: "fixture", types: types, destination: dest, instanceClass: class}
+}
+
+func TestDeviceRiskRespectsConfiguredWindowLongerThanOneDay(t *testing.T) {
+	a := newDLPDeviceRiskAggregator(&fakeRiskMarker{})
+	conditions := []model.DLPDeviceRiskCondition{{MinCount: 2, MinDistinctTypes: 2, WindowSeconds: 48 * 60 * 60, Severity: "high"}}
+	base := time.Now()
+	a.Record("device", rec([]string{"email"}, "upload.invalid", ""), conditions, base)
+	result := a.Record("device", rec([]string{"credit_card"}, "upload.invalid", ""), conditions, base.Add(25*time.Hour))
+	if result.ConditionSeverity != "high" {
+		t.Fatalf("configured 48-hour window was silently shortened: %+v", result)
+	}
+}
+
+func TestDeviceRiskTenantReassignmentDoesNotReuseOldDetections(t *testing.T) {
+	a := newDLPDeviceRiskAggregator(&fakeRiskMarker{})
+	c := []model.DLPDeviceRiskCondition{{MinCount: 2, MinDistinctTypes: 2, WindowSeconds: 60, Severity: "high"}}
+	base := time.Now()
+	one := rec([]string{"email"}, "upload.invalid", "")
+	one.tenantID = "Acme"
+	a.Record("reused-device", one, c, base)
+	two := rec([]string{"credit_card"}, "upload.invalid", "")
+	two.tenantID = "acme"
+	if got := a.Record("reused-device", two, c, base.Add(time.Second)); got.ConditionSeverity != "" {
+		t.Fatalf("other tenant's old detection contributed to risk: %+v", got)
+	}
+	one.tenantID = " acme "
+	if got := a.Record("reused-device", one, c, base.Add(2*time.Second)); got.ConditionSeverity != "high" {
+		t.Fatalf("own tenant's detections should still aggregate: %+v", got)
+	}
+}
+
+func TestDeviceRiskShorterPolicyDoesNotDiscardLongWindowRecord(t *testing.T) {
+	a := newDLPDeviceRiskAggregator(&fakeRiskMarker{})
+	long := []model.DLPDeviceRiskCondition{{MinCount: 2, MinDistinctTypes: 2, WindowSeconds: 48 * 60 * 60, Severity: "high"}}
+	short := []model.DLPDeviceRiskCondition{{MinCount: 2, MinDistinctTypes: 2, WindowSeconds: 60, Severity: "high"}}
+	base := time.Now()
+	a.Record("device", rec([]string{"email"}, "upload.invalid", ""), long, base)
+	a.Record("device", rec([]string{"email"}, "upload.invalid", ""), short, base.Add(25*time.Hour))
+	if got := a.Record("device", rec([]string{"credit_card"}, "upload.invalid", ""), long, base.Add(26*time.Hour)); got.ConditionSeverity != "high" {
+		t.Fatalf("short policy discarded the other policy's observation: %+v", got)
+	}
+	if got := a.Record("device", rec([]string{"credit_card"}, "upload.invalid", ""), long, base.Add(75*time.Hour)); got.ConditionSeverity != "" {
+		t.Fatalf("expired history still contributed to risk: %+v", got)
+	}
 }
 
 // The operator's worked example: >=2 distinct types to the SAME destination >=10 times in 5 min -> high.
@@ -77,7 +121,7 @@ func TestDeviceRiskWindowBurst(t *testing.T) {
 	}
 }
 
-// destination_class=personal only counts detections to personal/outside-org destinations.
+// destination_class=personal counts personal/outside-org and unverified destinations.
 func TestDeviceRiskDestinationClass(t *testing.T) {
 	m := &fakeRiskMarker{}
 	a := newDLPDeviceRiskAggregator(m)
@@ -92,6 +136,19 @@ func TestDeviceRiskDestinationClass(t *testing.T) {
 	a.Record("d", rec([]string{"my_number"}, "gdrive-personal", "personal"), cond, base.Add(2*time.Second))
 	if sev := a.Record("d", rec([]string{"credit_card"}, "gdrive-personal", "personal"), cond, base.Add(3*time.Second)); sev.ConditionSeverity != "high" {
 		t.Fatalf("personal-instance diverse burst should trip, got %+v", sev)
+	}
+}
+
+func TestDeviceRiskUnknownDestinationRetainsPersonalCondition(t *testing.T) {
+	m := &fakeRiskMarker{}
+	a := newDLPDeviceRiskAggregator(m)
+	cond := []model.DLPDeviceRiskCondition{{MinCount: 2, MinDistinctTypes: 2, SameDestination: true, WindowSeconds: 300, DestinationClass: "personal", Severity: "high"}}
+	base := time.Unix(4_000_000, 0)
+	if result := a.Record("d", rec([]string{"my_number"}, "saas", ""), cond, base); result.ConditionSeverity != "" {
+		t.Fatal("unknown class must not bypass the other composite thresholds")
+	}
+	if result := a.Record("d", rec([]string{"credit_card"}, "saas", ""), cond, base.Add(time.Second)); result.ConditionSeverity != "high" {
+		t.Fatalf("unknown class must not suppress a matching personal-scoped burst: %+v", result)
 	}
 }
 

@@ -1,6 +1,7 @@
 package edgeplane
 
 import (
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -34,7 +35,8 @@ type tenantInterceptionRootRegistry struct {
 	region    string
 	now       func() time.Time
 	providers map[string]InterceptionRootProvider // (region\x00tenant) -> lazily-created provider (when perTenant)
-	// stateDir, when set, persists each per-tenant root to <stateDir>/<key>.pem (+ .key.pem) so a tenant's root
+	// stateDir, when set, persists each per-tenant root to one private pair snapshot
+	// with <stateDir>/<key>.pem (+ .key.pem) compatibility views, so a tenant's root
 	// SURVIVES a restart — without it the lazily-generated per-tenant roots regenerate on restart and every
 	// device that trusted the old one breaks. The default (primary) root persists separately via its own path.
 	stateDir string
@@ -159,20 +161,10 @@ func (r *tenantInterceptionRootRegistry) loadOrCreateLocked(key string) (Interce
 	}
 	if r.stateDir != "" {
 		path := filepath.Join(r.stateDir, sanitizeRootKey(key)+".pem")
-		material, reused, err := LoadNetworkExtensionLabTLSPersistentRootMaterial(path, r.now)
+		material, _, err := loadOrCreateInterceptionRootPair(path, r.now, rootScopeLabel(key))
 		if err != nil {
 			return nil, err
 		}
-		if material.Cert == nil {
-			material, err = GenerateNetworkExtensionLabTLSRootMaterialScoped(rootScopeLabel(key), r.now)
-			if err != nil {
-				return nil, err
-			}
-			if err := WriteNetworkExtensionLabTLSPersistentRootMaterial(path, material); err != nil {
-				return nil, err
-			}
-		}
-		_ = reused
 		p := NewFileInterceptionRootProvider(material)
 		r.providers[key] = p
 		return p, nil
@@ -283,20 +275,29 @@ func (r *tenantInterceptionRootRegistry) List() []PerTenantRootInfo {
 			if entry.IsDir() || !strings.HasSuffix(name, ".pem") || strings.HasSuffix(name, ".key.pem") {
 				continue
 			}
-			key := strings.TrimSuffix(name, ".pem")
-			if seen[key] {
+			fileKey := strings.TrimSuffix(name, ".pem")
+			if seen[fileKey] {
 				continue
+			}
+			key, ok := rootKeyFromFilename(fileKey)
+			if !ok {
+				log.Printf("interception root registry: ignoring unrecognized root filename %q", name)
+				continue
+			}
+			tenant, region := key, ""
+			if i := strings.IndexByte(key, 0); i >= 0 {
+				region, tenant = key[:i], key[i+1:]
 			}
 			material, _, lerr := LoadNetworkExtensionLabTLSPersistentRootMaterial(filepath.Join(r.stateDir, name), r.now)
 			if lerr != nil || material.Cert == nil {
 				log.Printf("interception root registry: %q is on disk but unreadable (%v) — reporting it so it is not "+
 					"mistaken for a tenant that has no root", name, lerr)
-				out = append(out, PerTenantRootInfo{Tenant: key, Key: key, Durable: true})
+				out = append(out, PerTenantRootInfo{Tenant: tenant, Region: region, Key: key, Durable: true})
 				continue
 			}
 			out = append(out, PerTenantRootInfo{
-				Tenant:  key,
-				Region:  r.region,
+				Tenant:  tenant,
+				Region:  region,
 				Key:     key,
 				CertPEM: string(NewFileInterceptionRootProvider(material).CertPEM()),
 				Durable: true,
@@ -307,22 +308,18 @@ func (r *tenantInterceptionRootRegistry) List() []PerTenantRootInfo {
 	return out
 }
 
-// sanitizeRootKey makes a (region\x00tenant) key safe as a filename.
+// sanitizeRootKey reversibly encodes the complete (region\x00tenant) key. Replacing
+// punctuation with '_' would map distinct valid tenant IDs to the same root file.
 func sanitizeRootKey(key string) string {
-	var b strings.Builder
-	for _, r := range key {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
+	return "root-" + hex.EncodeToString([]byte(key))
+}
+
+func rootKeyFromFilename(fileKey string) (string, bool) {
+	if !strings.HasPrefix(fileKey, "root-") {
+		return "", false
 	}
-	s := b.String()
-	if s == "" {
-		s = "tenant"
-	}
-	return s
+	decoded, err := hex.DecodeString(strings.TrimPrefix(fileKey, "root-"))
+	return string(decoded), err == nil && len(decoded) > 0
 }
 
 // Retire removes a PROVISIONED per-tenant root: the provider this process holds and the files that would

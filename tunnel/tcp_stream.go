@@ -19,14 +19,16 @@ type TCPFrameBufferPool struct {
 }
 
 type TCPStreamCopyPattern struct {
-	BufferPoolEnabled         bool  `json:"buffer_pool_enabled"`
-	FrameChunkBytes           int   `json:"frame_chunk_bytes"`
-	StreamChannelBufferFrames int   `json:"stream_channel_buffer_frames"`
-	MaxFramePayloadBytes      int   `json:"max_frame_payload_bytes"`
-	MaxConcurrentConnections  int   `json:"max_concurrent_connections"`
-	MaxByteCap                int64 `json:"max_byte_cap"`
-	ZeroCopyEnabled           bool  `json:"zero_copy_enabled"`
-	TuningPerformed           bool  `json:"tuning_performed"`
+	BufferPoolEnabled         bool `json:"buffer_pool_enabled"`
+	FrameChunkBytes           int  `json:"frame_chunk_bytes"`
+	StreamChannelBufferFrames int  `json:"stream_channel_buffer_frames"`
+	MaxFramePayloadBytes      int  `json:"max_frame_payload_bytes"`
+	// Zero means no implementation-imposed connection-count limit. A receiver
+	// may apply an explicit operator-configured budget across its sessions.
+	MaxConcurrentConnections int   `json:"max_concurrent_connections"`
+	MaxByteCap               int64 `json:"max_byte_cap"`
+	ZeroCopyEnabled          bool  `json:"zero_copy_enabled"`
+	TuningPerformed          bool  `json:"tuning_performed"`
 }
 
 func NewTCPFrameBufferPool(chunkSize int) (*TCPFrameBufferPool, error) {
@@ -58,8 +60,8 @@ func DefaultTCPStreamCopyPattern() TCPStreamCopyPattern {
 		FrameChunkBytes:           DefaultTCPDataFrameChunkBytes,
 		StreamChannelBufferFrames: DefaultTCPStreamChannelBufferFrames,
 		MaxFramePayloadBytes:      MaxTCPDataFramePayloadBytes,
-		MaxConcurrentConnections:  MaxTCPConcurrentConnections,
-		MaxByteCap:                MaxTCPByteCap,
+		MaxConcurrentConnections:  0,
+		MaxByteCap:                0,
 		ZeroCopyEnabled:           false,
 		TuningPerformed:           false,
 	}
@@ -78,11 +80,11 @@ func (pattern TCPStreamCopyPattern) Validate() error {
 	if pattern.MaxFramePayloadBytes != MaxTCPDataFramePayloadBytes {
 		return fmt.Errorf("max frame payload bytes must remain %d", MaxTCPDataFramePayloadBytes)
 	}
-	if pattern.MaxConcurrentConnections != MaxTCPConcurrentConnections {
-		return fmt.Errorf("max concurrent connections must remain %d", MaxTCPConcurrentConnections)
+	if pattern.MaxConcurrentConnections < 0 {
+		return fmt.Errorf("max concurrent connections cannot be negative; 0 means no connection-count limit")
 	}
-	if pattern.MaxByteCap != MaxTCPByteCap {
-		return fmt.Errorf("max byte cap must remain %d", MaxTCPByteCap)
+	if pattern.MaxByteCap < 0 {
+		return fmt.Errorf("max byte cap cannot be negative (0 = no byte quota)")
 	}
 	if pattern.ZeroCopyEnabled || pattern.TuningPerformed {
 		return fmt.Errorf("zero-copy and tuning are deferred until measured boundaries")

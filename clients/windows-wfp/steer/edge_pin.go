@@ -101,11 +101,11 @@ func resolveEdgeEndpoints(tc transportConfig, useSystem bool, directServers []st
 // refreshEdgePins periodically re-resolves the Edge hostname (via the direct resolver, since the system resolver
 // is the loopback proxy once takeover is active) and updates the shared pins — so a hostname Edge picks up
 // DNS-based failover / new IPs without a restart. upstreams() supplies the box's real resolvers to prefer.
-// onResolved, when non-nil, is called with the first pin on EVERY successful resolution, including the first
+// onResolved, when non-nil, is called with every pin on EVERY successful resolution, including the first
 // success after a failure at arm time. That is the point of it: the destination loop guard is built from
-// this address, and before the callback existed one failed lookup left the guard absent for the life of the
+// these addresses, and before the callback existed one failed lookup left the guard absent for the life of the
 // process while these pins quietly repaired themselves.
-func refreshEdgePins(stop <-chan struct{}, tc transportConfig, upstreams func() []string, interval time.Duration, onResolved func(string)) {
+func refreshEdgePins(stop <-chan struct{}, tc transportConfig, upstreams func() []string, interval time.Duration, onResolved func([]string)) {
 	if tc.pins == nil {
 		return
 	}
@@ -135,10 +135,32 @@ func refreshEdgePins(stop <-chan struct{}, tc transportConfig, upstreams func() 
 			// Told on EVERY success, not only on change: the guard may be missing while the address has
 			// not moved at all, which is exactly the arm-time-failure case. The receiver decides what is new.
 			if onResolved != nil && len(addrs) > 0 {
-				onResolved(addrs[0])
+				onResolved(addrs)
 			}
 		}
 	}
+}
+
+// parsePinnedEdgeDestinations accepts only the exact IP:port addresses that
+// the transport can dial. A malformed member must not publish a partial guard.
+func parsePinnedEdgeDestinations(addrs []string) ([]netip.AddrPort, bool) {
+	if len(addrs) == 0 {
+		return nil, false
+	}
+	out := make([]netip.AddrPort, 0, len(addrs))
+	seen := make(map[netip.AddrPort]bool, len(addrs))
+	for _, value := range addrs {
+		ap, err := netip.ParseAddrPort(value)
+		if err != nil || !ap.IsValid() || ap.Port() == 0 || ap.Addr().Zone() != "" {
+			return nil, false
+		}
+		ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+		if !seen[ap] {
+			seen[ap] = true
+			out = append(out, ap)
+		}
+	}
+	return out, len(out) > 0
 }
 
 func sameStrings(a, b []string) bool {

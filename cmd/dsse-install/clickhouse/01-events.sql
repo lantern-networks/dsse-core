@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS dsse.events
 (
     event_id         String,
     retention_id     UUID DEFAULT generateUUIDv4(),
+    -- A confirmed manual deletion freezes the rows visible at preview time.
+    -- Keep insertion time separate from the producer's event timestamp.
+    inserted_at      DateTime64(9, 'UTC') DEFAULT now64(9, 'UTC'),
     tenant_id        LowCardinality(String),
     -- ★★★ WHICH REGION IT CAME FROM, AS A COLUMN. With the region only inside the opaque `raw` JSON, a
     -- region's data cannot be SELECTED, RETAINED or DELETED without a full scan — which is the whole of what

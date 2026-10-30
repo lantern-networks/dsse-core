@@ -31,9 +31,9 @@ func TestTheAgentConfigStatesTheOrganization(t *testing.T) {
 		t.Fatalf("an enrolment name was offered with no transport name behind it: %#v", got)
 	}
 
-	// Case is normalised the way every other organization comparison in this tree does it.
-	if got := agentConfigOrganization("  Tenant_Mixed_Case  "); got["tenant_id"] != "tenant_mixed_case" {
-		t.Fatalf("the organization id was not normalised: %#v", got)
+	// Tenant IDs are case-sensitive; only surrounding whitespace is normalization.
+	if got := agentConfigOrganization("  Tenant_Mixed_Case  "); got["tenant_id"] != "Tenant_Mixed_Case" {
+		t.Fatalf("the organization id changed identity: %#v", got)
 	}
 }
 

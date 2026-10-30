@@ -44,7 +44,7 @@ func (r *TenantCARegistry) replaceTenantPersisted(tenantID string, pemBytes []by
 		return err
 	}
 	for _, cert := range certs {
-		if owner, ok := r.byAnchorKey[CAAnchorKey(cert)]; ok && !strings.EqualFold(owner, tenantID) {
+		if owner, ok := r.byAnchorKey[CAAnchorKey(cert)]; ok && owner != tenantID {
 			return fmt.Errorf("CA already identifies another organization")
 		}
 	}
@@ -53,7 +53,7 @@ func (r *TenantCARegistry) replaceTenantPersisted(tenantID string, pemBytes []by
 	for _, cert := range r.anchors {
 		key := CAAnchorKey(cert)
 		owner := r.byAnchorKey[key]
-		if strings.EqualFold(owner, tenantID) {
+		if owner == tenantID {
 			continue
 		}
 		owners[key] = owner
@@ -76,7 +76,7 @@ func (r *TenantCARegistry) replaceTenantPersisted(tenantID string, pemBytes []by
 		ownership[tenant] = owned
 	}
 	if managed {
-		ownership[strings.ToLower(tenantID)] = true
+		ownership[tenantID] = true
 	}
 	candidate := &TenantCARegistry{byAnchorKey: owners, anchors: kept, Pool: pool, materialManaged: ownership}
 	candidate.TenantCount = candidate.tenantCountLocked()

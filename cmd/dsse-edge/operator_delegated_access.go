@@ -53,7 +53,7 @@ func operatorDelegationForRequest(ctx context.Context, r *http.Request, identity
 	}
 	target, overridden := adminOperateTenant(r, identity)
 	target = strings.TrimSpace(target)
-	if !overridden || target == "" || strings.EqualFold(target, strings.TrimSpace(identity.TenantID)) {
+	if !overridden || target == "" || target == strings.TrimSpace(identity.TenantID) {
 		return verdict
 	}
 	verdict.Target = target
@@ -114,7 +114,7 @@ func operatorDelegationRecord(ctx context.Context, store adminTenantModelRuntime
 		return adminTenantModel{}, false, nil
 	}
 	for _, tenant := range tenants {
-		if strings.EqualFold(strings.TrimSpace(tenant.TenantID), target) {
+		if strings.TrimSpace(tenant.TenantID) == target {
 			return tenant, true, nil
 		}
 	}

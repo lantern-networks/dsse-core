@@ -73,14 +73,15 @@ function zipStored(entries) {
 
 // A 404 permits an installer-free bundle. Other failures must be resolved before minting a token.
 // The artifact endpoint can also return 404 for a missing published file, so do not assert "unpublished".
-async function dbFetchInstaller(platform, arch) {
+async function dbFetchInstaller(platform, arch, tenantSelection) {
   const base = baseForPlane(_PROFILE_PLANE);
   const token = localStorage.getItem("adminToken") || "";
   const signedIn = idpSession && idpSession.auth_method === "admin_session";
   const headers = {};
   if (!signedIn && token) headers["authorization"] = "Bearer " + token;
   if (signedIn && idpSession.csrf_token) headers["x-csrf-token"] = idpSession.csrf_token;
-  if (operateTenant) headers["x-operate-tenant"] = operateTenant;
+  const selectedTenant = tenantSelection === undefined ? operateTenant : tenantSelection;
+  if (selectedTenant) headers["x-operate-tenant"] = selectedTenant;
   const path = "/admin/agent-update-artifact?platform=" + encodeURIComponent(platform) +
     "&arch=" + encodeURIComponent(arch);
   const res = await fetch(base + path, { headers, credentials: "include", redirect: "error" });
@@ -126,8 +127,15 @@ function dbReadme(hasInstaller, installerName) {
 }
 
 // downloadDeviceBundle mints one approval and hands over the whole set as a single archive.
-async function downloadDeviceBundle(envelope, group, platform, arch, button) {
+async function downloadDeviceBundle(envelope, group, platform, arch, button, profileTenantSelection, profileContextCurrent) {
   if (button.__bundlePending) return;
+  const currentSelection = () => typeof operateTenant === "string" ? operateTenant : "";
+  const selectedTenant = profileTenantSelection === undefined ? currentSelection() : profileTenantSelection;
+  if (currentSelection() !== selectedTenant || (profileContextCurrent && !profileContextCurrent())) {
+    uiToast(bl({ en: "The selected organization changed. Make a new device configuration before downloading.",
+      ja: "操作中の組織が変わりました。新しい端末設定を作ってからダウンロードしてください。" }), "err");
+    return;
+  }
   const enc = new TextEncoder();
   const key = profileSigningKeyOf(envelope);
   if (!key) {
@@ -143,12 +151,18 @@ async function downloadDeviceBundle(envelope, group, platform, arch, button) {
   button.textContent = bl({ en: "Preparing…", ja: "準備中…" });
   try {
     // Resolve the artifact before creating a credential. Only 404 permits a bundle without an installer.
-    const installer = await dbFetchInstaller(platform, arch);
+    const installer = await dbFetchInstaller(platform, arch, selectedTenant);
+    if (currentSelection() !== selectedTenant || (profileContextCurrent && !profileContextCurrent())) {
+      uiToast(bl({ en: "The selected organization changed. No device approval was created.",
+        ja: "操作中の組織が変わりました。端末の承認は作成していません。" }), "err");
+      button.textContent = retryLabel;
+      return;
+    }
     issuancePending = true;
     const r = await apiFetch("POST", "/admin/enrolment-tokens", {
       label: group ? group : bl({ en: "Device configuration", ja: "端末の設定" }),
       group, expires_in_hours: 168, count: 1,
-    }, _PROFILE_PLANE);
+    }, _PROFILE_PLANE, undefined, selectedTenant || undefined);
     issuancePending = false;
     if (r.status === 409 && r.body && r.body.partial === true &&
         Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
@@ -164,7 +178,7 @@ async function downloadDeviceBundle(envelope, group, platform, arch, button) {
     const row = r.body.tokens[0];
     const secret = row.secret;
     // Keep the returned credential reachable even if ZIP construction or the browser download fails.
-    bundleApprovalFallback(button, secret, row.token.id);
+    bundleApprovalFallback(button, secret, row.token.id, selectedTenant);
     const installerName = "dsse-agent-" + platform + "-" + arch + (platform === "windows" ? ".msi" : ".pkg");
     const entries = [
       { name: "install_profile.json", bytes: enc.encode(JSON.stringify(envelope, null, 2) + "\n") },
@@ -201,7 +215,7 @@ async function downloadDeviceBundle(envelope, group, platform, arch, button) {
 }
 
 // Keep the returned approval available independently of the archive download.
-function bundleApprovalFallback(button, secret, tokenId) {
+function bundleApprovalFallback(button, secret, tokenId, tenantSelection) {
   const host = button.parentNode;
   if (!host) return;
   const previous = host.querySelector("[data-bundle-approval]");
@@ -233,7 +247,8 @@ function bundleApprovalFallback(button, secret, tokenId) {
                                      "一覧があります。" }), "err"); return; }
     revoke.disabled = true;
     try {
-      const r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(tokenId) + "/revoke", {}, _PROFILE_PLANE);
+      const r = await apiFetch("POST", "/admin/enrolment-tokens/" + encodeURIComponent(tokenId) + "/revoke", {},
+        _PROFILE_PLANE, undefined, tenantSelection || undefined);
       if (!r.ok) { uiToast((r.body && r.body.error) || ("HTTP " + r.status), "err"); return; }
       const token = r.body && r.body.token;
       if (!token || token.id !== tokenId || typeof token.revoked_at !== "string" || !token.revoked_at ||

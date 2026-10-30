@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/certreload"
+	"github.com/lantern-networks/dsse-core/durablefile"
 	"github.com/lantern-networks/dsse-core/enroll"
 )
 
@@ -70,6 +72,9 @@ func ensureConnectorIdentity(ctx context.Context, stateDir string, st connectorS
 	}
 	crt := filepath.Join(stateDir, connectorIdentityCertFile)
 	key := filepath.Join(stateDir, connectorIdentityKeyFile)
+	if err := certreload.RecoverPair(crt, key); err != nil {
+		return false, fmt.Errorf("recover connector identity: %w", err)
+	}
 	if fileExistsNonEmpty(crt) && fileExistsNonEmpty(key) {
 		// ★★★ AND IT HAS TO BE THIS CONNECTOR'S CERTIFICATE (2026-08-26, measured — the lab connector held one
 		// for a name it had stopped using and was refused by every Edge in the fleet, silently, for hours).
@@ -111,6 +116,9 @@ func ensureConnectorIdentity(ctx context.Context, stateDir string, st connectorS
 	// transport port BY the name in the ClientHello — a connection asking for the plain transport name is the
 	// transport plane, which is not the plane that issues identities. Empty keeps the dialled host, which is
 	// what a connector without an organization door has always sent.
+	if err := validateConnectorDoorURLs(parseConnectorEndpoints(st.EdgeURL), true); err != nil {
+		return false, fmt.Errorf("connector enrollment Edge URL: %w", err)
+	}
 	client, err := connectorEnrolmentClient(st.EdgeCAPath, connectorFirstNonEmpty(st.EdgeEnrolmentServerName, st.EdgeServerName))
 	if err != nil {
 		return false, err
@@ -196,13 +204,10 @@ func connectorEnrolmentClient(edgeCAPath, serverName string) (*http.Client, erro
 	if !pool.AppendCertsFromPEM(pem) {
 		return nil, fmt.Errorf("pinned Edge CA %s contains no certificate", edgeCAPath)
 	}
-	return &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12,
-				ServerName: strings.TrimSpace(serverName)},
-		},
-	}, nil
+	return newConnectorEdgeHTTPClient(&tls.Config{
+		RootCAs: pool, MinVersion: tls.VersionTLS12,
+		ServerName: strings.TrimSpace(serverName),
+	}), nil
 }
 
 func fileExistsNonEmpty(path string) bool {
@@ -220,13 +225,30 @@ func fileExistsNonEmpty(path string) bool {
 // on, so there is nothing to remember and no secret to keep: the connector proves it is the connector by being
 // the connector. A revoked one cannot renew, which is what keeps revocation terminal rather than a countdown.
 
-// connectorIdentityCheckEvery is how often the question is asked. Cheap — it reads one file — and the answer
-// changes once every few weeks, so this is about surviving a long-running process, not about speed.
-//
-// WHEN the answer becomes yes is enroll.RenewalDue's to say, not this file's: two thirds of the certificate's
-// OWN life. A fixed number of days here would agree with it on the 60-day certificates issued today and stop
-// renewing in time on any deployment that shortened them — which is precisely what -enroll-cert-ttl is for.
-const connectorIdentityCheckEvery = 6 * time.Hour
+// Match the existing Windows renewal schedule: divide the last third of the
+// certificate's lifetime into twelve check intervals, capped at six hours.
+// Request duration and failures reduce the actual number of attempts.
+// The fifteen-second retry floor bounds credential-maintenance request frequency;
+// it is not a connection or traffic quota. Extremely short lifetimes cannot be
+// guaranteed within this retry floor or a failed network round trip.
+const (
+	connectorIdentityCheckEvery = 6 * time.Hour
+	connectorIdentityCheckFloor = 15 * time.Second
+)
+
+func connectorIdentityCheckInterval(notBefore, notAfter time.Time) time.Duration {
+	if notAfter.IsZero() || !notAfter.After(notBefore) {
+		return connectorIdentityCheckEvery
+	}
+	interval := notAfter.Sub(notBefore) / 3 / 12
+	if interval > connectorIdentityCheckEvery {
+		return connectorIdentityCheckEvery
+	}
+	if interval < connectorIdentityCheckFloor {
+		return connectorIdentityCheckFloor
+	}
+	return interval
+}
 
 // How long a first run waits for its Site to reach the Edge it dials, and how often it asks. Longer than any
 // reasonable config-bundle poll and short enough that a genuinely wrong token is reported while the operator
@@ -237,26 +259,47 @@ const (
 )
 
 // renewConnectorIdentityLoop keeps the connector's certificate alive for as long as the process runs. It never
-// returns except on ctx cancellation; a failed renewal is logged and retried at the next tick, because there
-// are weeks of chances left and stopping the connector over one failed attempt would turn a transient Edge
-// outage into a Site outage.
-func renewConnectorIdentityLoop(ctx context.Context, stateDir string, st connectorState, edgeTLS *tls.Config,
+// returns except on ctx cancellation; a failed renewal is logged and retried
+// within the certificate's remaining lifetime. One failed request does not stop
+// existing tunnels or change the expiry checks on subsequent TLS handshakes.
+func renewConnectorIdentityLoop(ctx context.Context, stateDir string, st connectorState, edgeTLS *tls.Config, doors *connectorEndpoints,
 	logf func(string, ...interface{})) {
 	if strings.TrimSpace(stateDir) == "" || edgeTLS == nil {
 		return // an operator-supplied identity, or no state: renewal is theirs to run
 	}
-	ticker := time.NewTicker(connectorIdentityCheckEvery)
-	defer ticker.Stop()
 	for {
-		if err := renewConnectorIdentityIfDue(ctx, stateDir, st, edgeTLS, false, logf); err != nil && logf != nil {
+		if err := renewConnectorIdentityAtSelectedDoor(ctx, stateDir, st, edgeTLS, doors, false, logf); err != nil && logf != nil {
 			logf("connector identity renewal failed (will retry): %v", err)
 		}
+		// Read after the attempt: renewal may have changed the certificate lifetime.
+		next := connectorIdentityCheckFloor
+		if cert, err := connectorCertificateOnDisk(filepath.Join(stateDir, connectorIdentityCertFile)); err == nil {
+			next = connectorIdentityCheckInterval(cert.NotBefore, cert.NotAfter)
+		}
+		timer := time.NewTimer(next)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
+}
+
+// Manual and periodic renewal obey the same verified door decision. The
+// enrolment URL in st is historical and may no longer be an authorized door.
+func renewConnectorIdentityAtSelectedDoor(ctx context.Context, stateDir string, st connectorState,
+	edgeTLS *tls.Config, doors *connectorEndpoints, force bool, logf func(string, ...interface{})) error {
+	selected, dataCtx := doors.selectionForData()
+	if dataCtx == nil {
+		return fmt.Errorf("identity renewal is unavailable while all data doors are withdrawn")
+	}
+	st.EdgeURL = selected.url
+	attemptCtx, cancel := context.WithCancel(ctx)
+	stopOnWithdrawal := context.AfterFunc(dataCtx, cancel)
+	defer stopOnWithdrawal()
+	defer cancel()
+	return renewConnectorIdentityIfDue(attemptCtx, stateDir, st, edgeTLS, force, logf)
 }
 
 // renewConnectorIdentityIfDue renews when enroll.RenewalDue says so, and does nothing otherwise.
@@ -266,6 +309,12 @@ func renewConnectorIdentityLoop(ctx context.Context, stateDir string, st connect
 // cannot be run is a check nobody has run.
 func renewConnectorIdentityIfDue(ctx context.Context, stateDir string, st connectorState, edgeTLS *tls.Config,
 	force bool, logf func(string, ...interface{})) error {
+	if edgeTLS == nil {
+		return fmt.Errorf("connector identity renewal requires pinned transport TLS")
+	}
+	if err := validateConnectorDoorURLs(parseConnectorEndpoints(st.EdgeURL), true); err != nil {
+		return fmt.Errorf("connector identity renewal Edge URL: %w", err)
+	}
 	crt := filepath.Join(stateDir, connectorIdentityCertFile)
 	current, err := connectorCertificateOnDisk(crt)
 	if err != nil {
@@ -281,10 +330,7 @@ func renewConnectorIdentityIfDue(ctx context.Context, stateDir string, st connec
 	// The CURRENT certificate is what authenticates this, so the call goes out on the connector's own mTLS
 	// config — the same one its tunnel uses. The CSR proves possession of the NEW key and nothing else; the
 	// Edge takes the identity from the verified certificate, never from what is sent.
-	client := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: edgeTLS.Clone()},
-	}
+	client := newConnectorEdgeHTTPClient(edgeTLS.Clone())
 	endpoint := strings.TrimRight(strings.TrimSpace(st.EdgeURL), "/") + "/enroll/renew"
 	body := fmt.Sprintf(`{"csr_pem":%s}`, mustJSONString(string(csrPEM)))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(body))
@@ -319,16 +365,20 @@ func renewConnectorIdentityIfDue(ctx context.Context, stateDir string, st connec
 	if err := enroll.ValidateIssuedCert([]byte(out.CertPEM), []byte(out.CAPEM), keyPEM, ""); err != nil {
 		return fmt.Errorf("the renewed certificate did not verify, keeping the current one: %w", err)
 	}
-	// Written to temporary names and renamed, so a crash mid-write cannot leave a certificate that does not
-	// match the key beside it. The pair has to move together or not at all.
-	if err := writeThenRename(filepath.Join(stateDir, connectorIdentityKeyFile), keyPEM); err != nil {
-		return err
-	}
-	if err := writeThenRename(crt, []byte(out.CertPEM)); err != nil {
+	// Two renames alone are not an atomic pair update. Record the previous
+	// identity before touching either file; startup and TLS reload recover an
+	// interrupted update before using the pair.
+	keyPath := filepath.Join(stateDir, connectorIdentityKeyFile)
+	if err := certreload.WithPairUpdate(crt, keyPath, func() error {
+		if err := durablefile.Write(keyPath, keyPEM, 0o600); err != nil {
+			return err
+		}
+		return durablefile.Write(crt, []byte(out.CertPEM), 0o600)
+	}); err != nil {
 		return err
 	}
 	if logf != nil {
-		logf("connector identity renewed, valid until %s (restart to present it)", out.NotTo)
+		logf("connector identity renewed, valid until %s (used on the next TLS connection)", out.NotTo)
 	}
 	return nil
 }
@@ -350,15 +400,21 @@ func connectorCertificateOnDisk(path string) (*x509.Certificate, error) {
 	return cert, nil
 }
 
-func writeThenRename(path string, data []byte) error {
-	tmp := path + ".new"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", tmp, err)
+// Renewal writes only the identity owned by the enrolled state directory.
+// An operator-supplied identity must not trigger renewal of unrelated files that
+// happen to remain in that directory.
+func connectorUsesManagedIdentity(stateDir, certPath, keyPath string) bool {
+	if strings.TrimSpace(stateDir) == "" || strings.TrimSpace(certPath) == "" || strings.TrimSpace(keyPath) == "" {
+		return false
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("rename %s: %w", tmp, err)
+	for _, pair := range [][2]string{{certPath, filepath.Join(stateDir, connectorIdentityCertFile)}, {keyPath, filepath.Join(stateDir, connectorIdentityKeyFile)}} {
+		actual, aerr := filepath.Abs(pair[0])
+		managed, merr := filepath.Abs(pair[1])
+		if aerr != nil || merr != nil || actual != managed {
+			return false
+		}
 	}
-	return nil
+	return true
 }
 
 func mustJSONString(s string) string {

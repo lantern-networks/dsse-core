@@ -150,7 +150,7 @@ func newTenantDeviceAuthorityWithReload(seed []byte, persist func([]byte) error,
 				if row == nil || strings.TrimSpace(row.TenantID) == "" {
 					continue
 				}
-				a.cas[strings.ToLower(strings.TrimSpace(row.TenantID))] = row
+				a.cas[strings.TrimSpace(row.TenantID)] = row
 			}
 		}
 	}
@@ -191,7 +191,7 @@ func (a *tenantDeviceAuthority) Generation() uint64 {
 
 // EnsureCA creates this organization's device-identity authority if it has none, and is idempotent otherwise.
 func (a *tenantDeviceAuthority) EnsureCA(tenant, displayName string) (*storedTenantDeviceCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	if key == "" {
 		return nil, fmt.Errorf("an organization must be named")
 	}
@@ -226,7 +226,7 @@ func (a *tenantDeviceAuthority) EnsureCA(tenant, displayName string) (*storedTen
 // answering by minting an authority would mean the identity basis of a fleet came into existence because a
 // node asked a question.
 func (a *tenantDeviceAuthority) IssueFor(tenant string, ttl time.Duration) (tenantDeviceMaterial, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	row, ok, rerr := a.refreshedRowLocked(key)
@@ -342,7 +342,7 @@ func deviceCALabelFrom(caCertPEM, fallback string) string {
 // ★ ONE ROTATION AT A TIME. A second incoming authority would leave devices spread across three, and the
 // readiness question — "has everybody moved?" — would have no single answer to be measured against.
 func (a *tenantDeviceAuthority) RotateCA(tenant string) (*storedTenantDeviceCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -384,7 +384,7 @@ func (a *tenantDeviceAuthority) RotateCA(tenant string) (*storedTenantDeviceCA, 
 // or renewed during the overlap keeps working. Dropping the abandoned authority is a separate, later act,
 // gated on the same readiness answer as any other retirement — measured on what devices actually present.
 func (a *tenantDeviceAuthority) AbandonRotation(tenant string) (*storedTenantDeviceCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -424,7 +424,7 @@ func (a *tenantDeviceAuthority) AbandonRotation(tenant string) (*storedTenantDev
 // moved" from what each device actually presented at a handshake, and an operator reads that first. This is
 // the act; that is the evidence.
 func (a *tenantDeviceAuthority) RetirePrevious(tenant string) (*storedTenantDeviceCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -489,7 +489,7 @@ func (a *tenantDeviceAuthority) Row(tenant string) (storedTenantDeviceCA, bool) 
 	// The material paths already went through the shared store on a miss, with a comment saying exactly why —
 	// "a control plane that did not receive a write does not refuse an organization's enrolments as if it had
 	// none". The read that BUILDS THE PROFILE did not. Same rule, one call site over.
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
@@ -524,7 +524,7 @@ func (a *tenantDeviceAuthority) RemoveTenant(tenant string) int {
 	if a == nil {
 		return 0
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -806,5 +806,5 @@ func (a *tenantDeviceAuthority) refreshLocked() error {
 }
 
 func deviceAuthorityRowKey(row *storedTenantDeviceCA) string {
-	return strings.ToLower(strings.TrimSpace(row.TenantID))
+	return strings.TrimSpace(row.TenantID)
 }

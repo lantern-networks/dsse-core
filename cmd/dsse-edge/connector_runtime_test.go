@@ -101,18 +101,18 @@ func TestConnectorRegistrationHeartbeatAndRouting(t *testing.T) {
 		t.Fatalf("connector log = %s, want access_decision_id", string(connectorLog))
 	}
 
-	denyReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_https?connector_id=conn_lab_001&actor_nhi_id=nhi_missing_001", nil)
-	denyRec := httptest.NewRecorder()
-	handler.ServeHTTP(denyRec, denyReq)
-	if denyRec.Code != http.StatusForbidden {
-		t.Fatalf("deny status = %d, want %d, body=%s", denyRec.Code, http.StatusForbidden, denyRec.Body.String())
+	spoofReq := httptest.NewRequest(http.MethodGet, "/apps/app_dummy_https?connector_id=conn_lab_001&actor_nhi_id=nhi_missing_001", nil)
+	spoofRec := httptest.NewRecorder()
+	handler.ServeHTTP(spoofRec, spoofReq)
+	if spoofRec.Code != http.StatusOK {
+		t.Fatalf("spoofed-query status = %d, want %d, body=%s", spoofRec.Code, http.StatusOK, spoofRec.Body.String())
 	}
 	connectorLog, err = os.ReadFile(filepath.Join(logDir, "connector.log.jsonl"))
 	if err != nil {
-		t.Fatalf("read connector log after deny: %v", err)
+		t.Fatalf("read connector log after spoofed query: %v", err)
 	}
-	if !strings.Contains(string(connectorLog), "connector_route_denied") {
-		t.Fatalf("connector log = %s, want connector_route_denied", string(connectorLog))
+	if strings.Contains(string(connectorLog), "connector_route_denied") || strings.Contains(string(connectorLog), "nhi_missing_001") {
+		t.Fatalf("connector log = %s, want spoofed NHI query ignored", string(connectorLog))
 	}
 	domainEvents := domainOutbox.insertedEvents()
 	counts := map[string]int{}

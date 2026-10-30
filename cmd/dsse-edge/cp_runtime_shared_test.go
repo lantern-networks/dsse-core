@@ -89,6 +89,8 @@ func TestPostgresRuntimeWritersPeerTermReadBundlePromotion(t *testing.T) {
 	auth := newAdminAuthStore()
 	auth.UpsertPrincipal(adminPrincipal{ID: "runtime-admin", TenantID: tenant, Roles: []string{"admin"}, Status: "active"})
 	auth.UpsertSession(adminSession{ID: "runtime-session", TenantID: tenant, AdminPrincipalID: "runtime-admin", Roles: []string{"admin"}, Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339), Metadata: map[string]any{adminCSRFTokenKey: "runtime-csrf"}})
+	auth.UpsertPrincipal(adminPrincipal{ID: "runtime-operator", TenantID: tenant, Roles: []string{"admin", "super_admin"}, Status: "active"})
+	auth.UpsertSession(adminSession{ID: "runtime-operator-session", TenantID: tenant, AdminPrincipalID: "runtime-operator", Roles: []string{"admin", "super_admin"}, Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339), Metadata: map[string]any{adminCSRFTokenKey: "runtime-operator-csrf"}})
 	writer, err := logs.NewWriter(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -96,12 +98,17 @@ func TestPostgresRuntimeWritersPeerTermReadBundlePromotion(t *testing.T) {
 	defer writer.Close()
 	evaluator := testEvaluator()
 	evaluator.PolicyBundle.SWGTenantRestrictionRules = []model.SWGTenantRestrictionRule{{ID: "legacy-rule", TenantID: tenant, SaaSApplicationID: "legacy-app", Provider: "google_workspace", Status: "active"}}
-	h := newServerWithConfig(serverConfig{Writer: writer, Evaluator: evaluator, AdminAuth: auth, PolicyStore: a})
+	h := newServerWithConfig(serverConfig{Writer: writer, Evaluator: evaluator, AdminAuth: auth, PolicyStore: a, OperatorTenantID: tenant})
 	call := func(method, path, body string, want int) *httptest.ResponseRecorder {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.AddCookie(&http.Cookie{Name: "admin_session", Value: "runtime-session"})
-		r.Header.Set("X-CSRF-Token", "runtime-csrf")
+		if path == "/admin/config-bundle" {
+			r.AddCookie(&http.Cookie{Name: "admin_session", Value: "runtime-operator-session"})
+			r.Header.Set("X-CSRF-Token", "runtime-operator-csrf")
+		} else {
+			r.AddCookie(&http.Cookie{Name: "admin_session", Value: "runtime-session"})
+			r.Header.Set("X-CSRF-Token", "runtime-csrf")
+		}
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		if w.Code != want {

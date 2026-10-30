@@ -47,7 +47,7 @@ func (l *Ledger) SetEnabledContext(ctx context.Context, id, tenant string, enabl
 		var exists bool
 		entry, exists = candidate.Entries[key]
 		tenant = strings.TrimSpace(tenant)
-		if !exists || entry.isTombstone() || (tenant != "" && !strings.EqualFold(strings.TrimSpace(entry.TenantID), tenant)) {
+		if !exists || entry.isTombstone() || (tenant != "" && !sameGroupTenant(strings.TrimSpace(entry.TenantID), tenant)) {
 			absent = true
 			return nil, ErrIdentityNotFound
 		}

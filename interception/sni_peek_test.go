@@ -70,3 +70,15 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func TestPeekShortReadsReplayOnlyActualBytes(t *testing.T) {
+	for _, wire := range [][]byte{{}, {0x16, 0x03}, {0x16, 0x03, 0x03, 0, 8, 1, 2}} {
+		_, buffered, err := PeekClientHelloSNI(bytes.NewReader(wire))
+		if err == nil {
+			t.Fatal("truncated record accepted")
+		}
+		if !bytes.Equal(buffered, wire) {
+			t.Fatalf("replay appended unread bytes: wire=%x replay=%x", wire, buffered)
+		}
+	}
+}

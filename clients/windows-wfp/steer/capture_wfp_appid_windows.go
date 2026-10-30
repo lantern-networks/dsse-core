@@ -313,7 +313,8 @@ func signatureRules(effective []string) []string {
 // runExactAppResolver periodically resolves the verified exact-APP_ID bypass set and, when it changes, re-pushes
 // the kernel policy so signature exclusions take effect on the WFP backend. effectiveRules() returns the current
 // signature-form rules (recomputed each tick so a live exclusion-sync change is picked up). Stops with stop.
-func runExactAppResolver(stop <-chan struct{}, cfg captureConfig, effectiveRules func() []string, resolveEvery, reverifyEvery time.Duration) {
+func runExactAppResolver(stop <-chan struct{}, cfg captureConfig, effectiveRules func() []string, resolveEvery, reverifyEvery time.Duration,
+	writePolicy func() (bool, error)) {
 	if cfg.verifiedExactApps == nil {
 		return
 	}
@@ -339,16 +340,23 @@ func runExactAppResolver(stop <-chan struct{}, cfg captureConfig, effectiveRules
 		return r
 	}
 
+	pendingPublication := false
 	publish := func() {
 		next := store.list()
 		prev := cfg.verifiedExactApps.Load()
-		if prev != nil && sameStrings(*prev, next) {
+		if prev != nil && sameStrings(*prev, next) && !pendingPublication {
 			return
 		}
 		cfg.verifiedExactApps.Store(&next)
-		if err := pushPolicy(cfg); err != nil {
+		applied, err := writePolicy()
+		if err != nil {
+			pendingPublication = true
 			fmt.Fprintf(os.Stderr, "wfp: re-push verified exact-app bypass: %v\n", err)
 			return
+		}
+		pendingPublication = !applied
+		if !applied {
+			return // capture closed or intentionally disarmed; resume uses the latest table
 		}
 		fmt.Printf("steer_capture: verified exact-app bypass updated -> %d signature-verified app path(s) enforced on the WFP backend\n", len(next))
 	}

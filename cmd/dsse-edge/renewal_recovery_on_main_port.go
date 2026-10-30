@@ -167,6 +167,9 @@ func serveRecoveryIfNamed(w http.ResponseWriter, req *http.Request) bool {
 // on the admin or data-plane listeners would be widening it for no reason.
 func renewalRecoveryAwareHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if serveBrowserPortalIfNamed(w, r, next) {
+			return
+		}
 		if serveRecoveryIfNamed(w, r) {
 			return
 		}

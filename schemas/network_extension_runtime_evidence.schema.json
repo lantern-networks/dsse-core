@@ -47,6 +47,7 @@
       "enum": [
         "not_installed",
         "app_proxy_provider",
+        "transparent_proxy_provider",
         "packet_tunnel_provider"
       ]
     },

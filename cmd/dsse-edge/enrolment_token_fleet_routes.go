@@ -41,7 +41,7 @@ func registerEnrolmentTokenFleetRoutes(mux *http.ServeMux,
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		tok, err := tokens.Verify(req.Secret, req.TenantID, time.Now().UTC())
+		tok, err := verifyEnrolmentToken(r.Context(), tokens, req.Secret, req.TenantID, time.Now().UTC())
 		if err != nil {
 			// 200 with a reason, not an HTTP error: this is an ANSWER to a question, and the Edge has to be
 			// able to tell "no, because it is spent" from "the authority did not respond". An HTTP status

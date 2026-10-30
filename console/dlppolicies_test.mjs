@@ -19,7 +19,7 @@ function saveFixture(raw='12',types='2'){
  const fields={},writes=[],submit={disabled:false},saveError={style:{},scrollIntoView(){}};
  const field=(name,value)=>({get:()=>value,validate:()=>true,focus(){},setError:message=>fields[name]=message});
  const context=vm.createContext({bl:x=>x.en,missingIDs:[],submit,saveError,nameF:field('name','Observe'),idFields:[{id:'email',f:{get:()=>true}}],drEnableF:{get:()=>true},drCountF:field('count',raw),drTypesF:field('types',types),drSameF:{get:()=>true},drWinF:{get:()=> '300'},drClassF:{get:()=> 'any'},actionF:{get:()=> 'observe'},scopeF:{get:()=> 'any'},existing:null,m:{close(){}},render(){},uiToast(){},_policies:[],apiFetch:async(...args)=>{writes.push(args);return {ok:true,body:{policies:[]}}}});
- vm.runInContext(source.slice(source.indexOf('function dlpWholeCount'),source.indexOf('async function renderDLPPoliciesView')),context);
+ vm.runInContext(source,context);
  const start=source.indexOf('    async function onSave()');const end=source.indexOf('\n  }\n\n  async function remove',start);vm.runInContext(source.slice(start,end),context);
  return {context,writes,fields,submit,saveError};
 }

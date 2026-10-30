@@ -43,13 +43,16 @@ import (
 // renders, and nothing else. Keeping it narrow is deliberate — a projection that grows toward the full record
 // becomes a second copy of the log with different bugs.
 type fleetDeviceRecord struct {
-	TenantID      string
-	DeviceID      string
-	OS            string
-	LoggedInUsers []string
-	Edge          string
-	LastSteered   string
-	Timestamp     string
+	TenantID               string
+	DeviceID               string
+	OS                     string
+	AgentVersion           string
+	AgentVersionReportedAt string
+	LoggedInUsers          []string
+	AuthAccounts           map[string]string
+	Edge                   string
+	LastSteered            string
+	Timestamp              string
 	// SourceIP is the address the device reached its Edge from, carried for the same reason Posture is: the
 	// node answering a fleet-wide question is usually not the node the device is connected to.
 	SourceIP string
@@ -102,14 +105,17 @@ func (p *fleetDeviceProjection) Fold(row map[string]any) {
 		return
 	}
 	rec := fleetDeviceRecord{
-		TenantID:      strings.TrimSpace(stringFromRow(row, "tenant_id")),
-		DeviceID:      strings.TrimSpace(stringFromRow(row, "device_id")),
-		OS:            strings.TrimSpace(stringFromRow(row, "os")),
-		LoggedInUsers: stringsFromRow(row, "logged_in_users"),
-		Edge:          strings.TrimSpace(stringFromRow(row, "edge")),
-		SourceIP:      strings.TrimSpace(stringFromRow(row, "source_ip")),
-		LastSteered:   strings.TrimSpace(stringFromRow(row, "last_steered")),
-		Timestamp:     strings.TrimSpace(stringFromRow(row, "timestamp")),
+		TenantID:               strings.TrimSpace(stringFromRow(row, "tenant_id")),
+		DeviceID:               strings.TrimSpace(stringFromRow(row, "device_id")),
+		OS:                     strings.TrimSpace(stringFromRow(row, "os")),
+		AgentVersion:           strings.TrimSpace(stringFromRow(row, "agent_version")),
+		AgentVersionReportedAt: strings.TrimSpace(stringFromRow(row, "agent_version_reported_at")),
+		LoggedInUsers:          stringsFromRow(row, "logged_in_users"),
+		AuthAccounts:           parseObservedAuthAccountRows(row["auth_accounts"]),
+		Edge:                   strings.TrimSpace(stringFromRow(row, "edge")),
+		SourceIP:               strings.TrimSpace(stringFromRow(row, "source_ip")),
+		LastSteered:            strings.TrimSpace(stringFromRow(row, "last_steered")),
+		Timestamp:              strings.TrimSpace(stringFromRow(row, "timestamp")),
 		Posture: model.DevicePostureSignals{
 			DiskEncryptionEnabled:   boolPtrFromRow(row, "disk_encryption_enabled"),
 			FirewallEnabled:         boolPtrFromRow(row, "firewall_enabled"),
@@ -118,7 +124,8 @@ func (p *fleetDeviceProjection) Fold(row map[string]any) {
 			Source:                  strings.TrimSpace(stringFromRow(row, "posture_source")),
 		},
 	}
-	if rec.DeviceID == "" || rec.Timestamp == "" {
+	recordedAt, err := time.Parse(time.RFC3339Nano, rec.Timestamp)
+	if rec.DeviceID == "" || err != nil {
 		// A row with no device or no time is not a state of anything. Same rule as seedFromHistory.
 		return
 	}
@@ -129,8 +136,19 @@ func (p *fleetDeviceProjection) Fold(row map[string]any) {
 		devices = map[string]fleetDeviceRecord{}
 		p.byName[rec.TenantID] = devices
 	}
-	if existing, ok := devices[rec.DeviceID]; ok && existing.Timestamp >= rec.Timestamp {
-		return
+	if existing, ok := devices[rec.DeviceID]; ok {
+		// RFC3339 text is not time-ordered when fractional seconds or offsets
+		// differ. An invalid timestamp must not pin the projection forever.
+		existingAt, parseErr := time.Parse(time.RFC3339Nano, existing.Timestamp)
+		if parseErr == nil && !recordedAt.After(existingAt) {
+			return
+		}
+		// Older shipped rows did not carry a version. A newer posture or
+		// steering event must not erase a version reported by a heartbeat.
+		if rec.AgentVersion == "" {
+			rec.AgentVersion = existing.AgentVersion
+			rec.AgentVersionReportedAt = existing.AgentVersionReportedAt
+		}
 	}
 	devices[rec.DeviceID] = rec
 }

@@ -63,7 +63,45 @@ func TestTheStepUpPortalPresentsTheOperatorsCertificate(t *testing.T) {
 	stepUpPortalCert.Store(nil)
 }
 
-func writeSelfSignedFor(t *testing.T, host, certPath, keyPath string) {
+func TestRequiredStepUpPortalRefusesMissingUntrustedAndStaleMaterial(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "portal.crt"), filepath.Join(dir, "portal.key")
+	writeSelfSignedFor(t, "portal.example.test", certPath, keyPath)
+	t.Cleanup(func() { stepUpPortalCert.Store(nil) })
+	for _, paths := range [][2]string{{"", ""}, {filepath.Join(dir, "missing"), keyPath}, {certPath, keyPath}} {
+		configureStepUpPortalCertificateForProfile("https://portal.example.test", paths[0], paths[1], true)
+		sharedCalls := 0
+		selector := transportCertificateForClientHello(func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			sharedCalls++
+			return &tls.Certificate{}, nil
+		})
+		cert, err := selector(&tls.ClientHelloInfo{ServerName: "PORTAL.EXAMPLE.TEST"})
+		if err == nil || cert != nil || sharedCalls != 0 {
+			t.Fatalf("required portal silently fell back: %v %v %d", cert, err, sharedCalls)
+		}
+		if _, err := selector(&tls.ClientHelloInfo{ServerName: "agents.example.test"}); err != nil || sharedCalls != 1 {
+			t.Fatalf("portal failure disabled the adjacent agent plane: %v", err)
+		}
+	}
+	pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(pair.Certificate[0])
+	roots := x509.NewCertPool()
+	roots.AddCert(leaf)
+	if err := validateStepUpPortalCertificate("portal.example.test", &pair, roots, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateStepUpPortalCertificate("other.example.test", &pair, roots, time.Now()); err == nil {
+		t.Fatal("wrong portal name accepted")
+	}
+	if err := validateStepUpPortalCertificate("portal.example.test", &pair, roots, leaf.NotAfter.Add(time.Second)); err == nil {
+		t.Fatal("expired portal certificate accepted")
+	}
+}
+
+func writeSelfSignedFor(t *testing.T, host, certPath, keyPath string, additionalHosts ...string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -72,7 +110,7 @@ func writeSelfSignedFor(t *testing.T, host, certPath, keyPath string) {
 	tmpl := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: host},
-		DNSNames:     []string{host},
+		DNSNames:     append([]string{host}, additionalHosts...),
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 	}

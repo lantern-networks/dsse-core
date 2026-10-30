@@ -53,3 +53,30 @@ func TestConnectorForDestinationRouteLayer(t *testing.T) {
 		t.Fatal("unknown destination must fail-closed")
 	}
 }
+
+func TestConnectorCandidatesDoNotCrossOverlappingPrivateSiteNamespaces(t *testing.T) {
+	reg := connector.NewRegistry()
+	for _, item := range []struct{ id, namespace string }{
+		{"a-osaka", "osaka"}, {"b-osaka", "osaka"},
+		{"a-tokyo", "tokyo"}, {"b-tokyo", "tokyo"},
+	} {
+		_, err := reg.Register(model.ConnectorRegistration{
+			ID: item.id, TenantID: "tenant-a", Status: "active",
+			PrivateBaseURL: "https://internal.invalid",
+			ReachableRoutes: model.ConnectorReachableRoutes{
+				Namespace: item.namespace, CIDRs: []string{"10.0.0.0/8"},
+			},
+		}, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := connectorsForDestination(context.Background(), reg, "tenant-a", "10.1.2.3", "tokyo")
+	if err != nil || len(got) != 2 || got[0].ID != "a-tokyo" || got[1].ID != "b-tokyo" {
+		t.Fatalf("tokyo candidates=%v err=%v, want only tokyo HA pair", got, err)
+	}
+	got, err = connectorsForDestination(context.Background(), reg, "tenant-a", "10.1.2.3", "")
+	if err != nil || len(got) != 0 {
+		t.Fatalf("unscoped overlapping site candidates=%v err=%v, want none", got, err)
+	}
+}

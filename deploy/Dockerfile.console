@@ -8,16 +8,22 @@
 # session, validated server-side against the control plane — so the admin application is never handed to an
 # unauthenticated client. Set ADMIN_SESSION_VALIDATE_CA to the deployment anchor; without a validate URL the
 # gate DISABLES itself and says so in the log, which is a line worth reading on first start.
-FROM golang:1.27.1-alpine3.24@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY egress-broker/go.mod egress-broker/go.sum ./egress-broker/
-RUN go mod download
+RUN apk upgrade --no-cache && go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/dsse-console ./cmd/dsse-console
+RUN CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" go build -o /out/dsse-console ./cmd/dsse-console
 
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
-RUN apk add --no-cache ca-certificates
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+ARG DSSE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$DSSE_REVISION
+
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates
 COPY --from=build /out/dsse-console /usr/local/bin/dsse-console
 COPY --from=build /src/console /console
 ENTRYPOINT ["/usr/local/bin/dsse-console"]

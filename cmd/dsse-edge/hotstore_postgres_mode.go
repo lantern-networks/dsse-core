@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -171,7 +170,7 @@ func setupEdgeHotStore(ctx context.Context, config edgeHotStoreConfig) (hotstore
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("hot-store-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

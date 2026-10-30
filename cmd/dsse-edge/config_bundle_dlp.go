@@ -16,10 +16,21 @@ import (
 func configBundleFleetReader(r *http.Request, operator string) bool {
 	identity, ok := adminIdentityFromRequest(r)
 	return ok && strings.TrimSpace(operator) != "" &&
-		strings.EqualFold(strings.TrimSpace(identity.TenantID), strings.TrimSpace(operator)) &&
+		strings.TrimSpace(identity.TenantID) == strings.TrimSpace(operator) &&
 		identity.AuthMethod == "admin_api_token" &&
 		adminPermissionAllowed(identity.Roles, "admin.policy.read") &&
 		adminScopeAllowed(identity, "admin.policy.read")
+}
+
+// Fleet snapshots contain cross-tenant secrets and bearer grants. A customer's
+// policy-read permission is never permission to download the deployment.
+func authorizeFleetConfigurationRead(w http.ResponseWriter, r *http.Request, operator string) bool {
+	w.Header().Set("Cache-Control", "no-store")
+	if adminCallerIsOperator(r) || configBundleFleetReader(r, operator) {
+		return true
+	}
+	writeError(w, http.StatusForbidden, fmt.Errorf("fleet configuration requires an operator or operator Edge API token"))
+	return false
 }
 
 // Named policies are resolved at request time, so distributing only rule IDs
@@ -27,6 +38,9 @@ func configBundleFleetReader(r *http.Request, operator string) bool {
 // detector library together. EDM carries salted hashes, never source values;
 // allowlists carry the operator-declared known-safe values for local compilation.
 type dlpConfigBundle struct {
+	// Nil means an older publisher: retain locally accepted rules. An explicit
+	// empty map is the authority's complete rule set and clears old rules.
+	Rules       map[string][]model.DLPRule                  `json:"rules"`
 	Policies    map[string]map[string]model.DLPPolicyObject `json:"policies"`
 	Classifiers map[string][]dlp.ClassifierSpec             `json:"classifiers"`
 	Datasets    map[string]map[string][]string              `json:"datasets"`
@@ -35,6 +49,7 @@ type dlpConfigBundle struct {
 }
 
 type dlpConfigStores struct {
+	rules        *dlpRuleRuntimeStore
 	policies     *dlpPolicyObjectStore
 	classifiers  *dlpClassifierRuntimeStore
 	fingerprints *dlpFingerprintRuntimeStore
@@ -42,7 +57,7 @@ type dlpConfigStores struct {
 }
 
 func (s *dlpConfigStores) ready() bool {
-	return s != nil && s.policies != nil && s.classifiers != nil && s.fingerprints != nil && s.allowlist != nil
+	return s != nil && s.rules != nil && s.policies != nil && s.classifiers != nil && s.fingerprints != nil && s.allowlist != nil
 }
 func (s *dlpConfigStores) Generation() uint64 {
 	if !s.ready() {
@@ -56,7 +71,9 @@ func (s *dlpConfigStores) Generation() uint64 {
 	defer s.fingerprints.mu.RUnlock()
 	s.allowlist.mu.RLock()
 	defer s.allowlist.mu.RUnlock()
-	return s.policies.generation + s.classifiers.generation + s.fingerprints.generation + s.allowlist.generation
+	s.rules.mu.Lock()
+	defer s.rules.mu.Unlock()
+	return s.rules.generation + s.policies.generation + s.classifiers.generation + s.fingerprints.generation + s.allowlist.generation
 }
 func (s *dlpConfigStores) Snapshot() *dlpConfigBundle {
 	if !s.ready() {
@@ -70,7 +87,9 @@ func (s *dlpConfigStores) Snapshot() *dlpConfigBundle {
 	defer s.fingerprints.mu.RUnlock()
 	s.allowlist.mu.RLock()
 	defer s.allowlist.mu.RUnlock()
-	raw, err := json.Marshal(dlpConfigBundle{Policies: s.policies.byTenant, Classifiers: s.classifiers.specs, Datasets: s.fingerprints.datasets, Salt: s.fingerprints.salt, Allowlists: s.allowlist.values})
+	s.rules.mu.Lock()
+	defer s.rules.mu.Unlock()
+	raw, err := json.Marshal(dlpConfigBundle{Rules: s.rules.snapshotLocked().Rules, Policies: s.policies.byTenant, Classifiers: s.classifiers.specs, Datasets: s.fingerprints.datasets, Salt: s.fingerprints.salt, Allowlists: s.allowlist.values})
 	if err != nil {
 		panic(err)
 	} // Only concrete JSON data types, no custom marshalers.
@@ -86,6 +105,12 @@ func (b *dlpConfigBundle) ForTenant(tenant string) *dlpConfigBundle {
 		return nil
 	}
 	out := &dlpConfigBundle{Policies: map[string]map[string]model.DLPPolicyObject{}, Classifiers: map[string][]dlp.ClassifierSpec{}, Datasets: map[string]map[string][]string{}, Salt: b.Salt}
+	if b.Rules != nil {
+		out.Rules = map[string][]model.DLPRule{}
+		if rules, ok := b.Rules[tenant]; ok {
+			out.Rules[tenant] = cloneDLPRules(rules)
+		}
+	}
 	// A nil section came from an older publisher; an explicit empty map clears.
 	if b.Allowlists != nil {
 		out.Allowlists = map[string][]string{}
@@ -158,6 +183,16 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 			}
 		}
 	}
+	if next.Rules != nil {
+		if err := validateDLPRuleSnapshot(dlpRuleSnapshot{Rules: next.Rules}); err != nil {
+			return err
+		}
+		for tenant, rules := range next.Rules {
+			if err := validateDLPRules(rules, classifiers[tenant]); err != nil {
+				return fmt.Errorf("invalid DLP rules for tenant %s: %w", tenant, err)
+			}
+		}
+	}
 	allowlists := map[string][]string{}
 	for tenant, values := range next.Allowlists {
 		if strings.TrimSpace(tenant) == "" {
@@ -180,7 +215,9 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	defer s.fingerprints.mu.Unlock()
 	s.allowlist.mu.Lock()
 	defer s.allowlist.mu.Unlock()
-	if isDLPSharedPersister(s.policies.persister) || isDLPSharedPersister(s.classifiers.persister) || isDLPSharedPersister(s.fingerprints.persister) || isDLPSharedPersister(s.allowlist.persister) {
+	s.rules.mu.Lock()
+	defer s.rules.mu.Unlock()
+	if isDLPSharedPersister(s.rules.persister) || isDLPSharedPersister(s.policies.persister) || isDLPSharedPersister(s.classifiers.persister) || isDLPSharedPersister(s.fingerprints.persister) || isDLPSharedPersister(s.allowlist.persister) {
 		return fmt.Errorf("cannot apply an Edge DLP bundle to shared authority stores")
 	}
 	if err := s.policies.saveSnapshotLocked(dlpPolicyObjectSnapshot{ByTenant: next.Policies}); err != nil {
@@ -196,21 +233,34 @@ func (s *dlpConfigStores) Apply(b *dlpConfigBundle) error {
 	}
 	// Refuse the entire library before publication when its suppression rules
 	// cannot be saved. The polling caller retries the same generation.
+	var compiledAllowlists map[string]*dlp.Allowlist
 	if next.Allowlists != nil {
 		if err := s.allowlist.saveSnapshotLocked(allowlistStoreSnapshot{Values: allowlists}); err != nil {
 			return fmt.Errorf("save DLP allowlist: %w", err)
 		}
-		compiled := map[string]*dlp.Allowlist{}
+		compiledAllowlists = map[string]*dlp.Allowlist{}
 		for tenant, values := range allowlists {
-			compiled[tenant] = dlp.NewAllowlist(s.allowlist.salt+"\x00"+tenant, values)
+			compiledAllowlists[tenant] = dlp.NewAllowlist(s.allowlist.salt+"\x00"+tenant, values)
 		}
-		s.allowlist.values, s.allowlist.sets = allowlists, compiled
+	}
+	if next.Rules != nil {
+		if err := s.rules.saveSnapshotLocked(dlpRuleSnapshot{Rules: next.Rules}); err != nil {
+			return fmt.Errorf("save DLP rules: %w", err)
+		}
+	}
+	if next.Allowlists != nil {
+		s.allowlist.values, s.allowlist.sets = allowlists, compiledAllowlists
 		s.allowlist.dirty = false
 		s.allowlist.generation++
 	}
 	s.classifiers.specs, s.classifiers.sets = next.Classifiers, classifiers
 	s.fingerprints.datasets, s.fingerprints.sets, s.fingerprints.salt = next.Datasets, fingerprints, next.Salt
 	s.policies.byTenant = next.Policies
+	if next.Rules != nil {
+		s.rules.rules.Store(&next.Rules)
+		s.rules.dirty = false
+		s.rules.generation++
+	}
 	s.policies.dirty, s.classifiers.dirty, s.fingerprints.dirty = false, false, false
 	s.policies.generation++
 	s.classifiers.generation++
@@ -222,7 +272,7 @@ func (s *dlpConfigStores) RefreshShared() error {
 	if !s.ready() {
 		return nil
 	}
-	for _, store := range []interface{ RefreshShared() error }{s.policies, s.classifiers, s.fingerprints, s.allowlist} {
+	for _, store := range []interface{ RefreshShared() error }{s.rules, s.policies, s.classifiers, s.fingerprints, s.allowlist} {
 		if err := store.RefreshShared(); err != nil {
 			return err
 		}

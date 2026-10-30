@@ -467,10 +467,10 @@ final class DsseSystemExtensionRequestDelegate: NSObject, OSSystemExtensionReque
         log("System Extension request failed: \(error.localizedDescription)")
         log("failure detail domain=\(nsError.domain) code=\(nsError.code) uninstalling=\(isUninstalling)")
         if isUninstalling {
-            // Uninstall must not hang on a failed deactivation — the caller (the uninstaller script) still has
-            // to unload the LaunchAgent and delete files, and it reports the residue itself.
+            // The containing app is the only code that can retry deactivation. Return a failure to the
+            // uninstaller so it keeps the app installed instead of stranding the registered extension.
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(1)) {
-                NSApplication.shared.terminate(nil)
+                exit(4)
             }
             return
         }
@@ -551,6 +551,7 @@ if CommandLine.arguments.contains("--uninstall") {
         disableConfigurator.disable { error in
             log("disable completed error=\(error.map { nonsecretErrorDetail($0) } ?? "none")")
             DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) {
+                if error != nil { exit(5) }
                 NSApplication.shared.terminate(nil)
             }
         }
@@ -563,47 +564,65 @@ if CommandLine.arguments.contains("--uninstall") {
 }
 
 // Step-up hand-off: the NE provider (root, no window server) can't open a browser, so on an egress
-// authenticate/reauth flow (e.g. tcp/22) it drops the step-up portal URL in /tmp and fires this systemwide
-// Darwin notification. The agent app (user GUI session) opens it — the OOB browser step-up the operator expects.
+// authenticate/reauth flow, it writes a root-owned, user-readable session record.
+// This notification contains no URL; each GUI reads only its own validated records.
+private final class AuthHandoffDelivery: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "jp.co.lantern-networks.dsse.auth-ui-recovery")
+    private let admission = DispatchSemaphore(value: 1)
+    private var gate = DsseAuthUIReplayGate()
+    func replay() {
+        guard admission.wait(timeout: .now()) == .success else { return }
+        queue.async { [self] in
+            defer { admission.signal() }
+            for request in DsseAuthHandoff.pending() {
+                guard gate.admit(id: request.id, result: request.result, uptime: ProcessInfo.processInfo.systemUptime) else { continue }
+                if let result = request.result {
+                    StepUpStatusController.shared.presentAuthResult(id: request.id, result: result)
+                } else if let url = URL(string: request.url) {
+                    StepUpStatusController.shared.presentStepUp(url: url)
+                }
+            }
+        }
+    }
+}
+private let authHandoffDelivery = AuthHandoffDelivery()
+private func replayAuthHandoff() { authHandoffDelivery.replay() }
 CFNotificationCenterAddObserver(
     CFNotificationCenterGetDarwinNotifyCenter(),
     nil,
     { _, _, _, _, _ in
-        guard let raw = try? String(contentsOfFile: "/tmp/dsse_stepup_url", encoding: .utf8) else { return }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed) else { return }
-// ★★★ THE PRODUCT'S OWN NAMESPACE, NOT AN AUTHOR'S (2026-09-03, found while checking what publishing
-// dsse-core would actually publish). These Darwin notification names carried a personal
-// GitHub handle in shipped source, while the logger three lines away already used
-// jp.co.lantern-networks.dsse.agent. One product, two namespaces, one of them somebody's.
-//
-// They are a private contract between the extension and the app in this same package, tied to neither the
-// bundle identifier nor the signing identity, so renaming them changes nothing but the name — provided BOTH
-// sides move together, which is why they are defined once here and referenced.
-        // Task #7: surface a native notification + menu-bar indicator instead of silently opening a browser tab.
-        // The controller opens the portal on the user's click (or auto-opens as a fallback if notifications are
-        // unauthorized, so the ceremony never strands behind an invisible prompt).
-        log("stepup: surfacing notification + menu-bar for host=\(url.host ?? "?")")
-        StepUpStatusController.shared.presentStepUp(url: url)
+        replayAuthHandoff()
     },
     "jp.co.lantern-networks.dsse.stepup" as CFString,
     nil,
     .deliverImmediately)
+// Darwin notifications are not queued while the GUI is absent. The root NE's
+// session-bound records are the recovery source when the app is relaunched.
+replayAuthHandoff()
+// Recover a missed notification while the GUI remains running. Protected files,
+// signature/origin checks and OS-session binding remain the admission boundary.
+let authHandoffCatchUpTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { _ in
+    replayAuthHandoff()
+    replayWarnHandoff()
+}
 
 // Warn-stage hand-off (S3, learning lifecycle): a Warn-staged East-West rule ALLOWS the flow but the provider
-// drops a JSON notice in /tmp and fires this Darwin notification so the agent can surface a PASSIVE "this internal
-// connection is monitored; authentication will soon be required" message. Non-holding — nothing is opened or
-// blocked. The controller coalesces so the same resource is not re-announced repeatedly in one session.
+// writes a root-owned, originating-login-only notice and fires a payload-free Darwin notification. Non-holding —
+// nothing is opened or blocked. The controller coalesces the same resource within this login session.
+private func replayWarnHandoff() {
+    for notice in DsseAuthHandoff.pendingWarn() {
+        StepUpStatusController.shared.presentWarnNotice(destination: notice.destination, service: notice.service)
+    }
+}
 CFNotificationCenterAddObserver(
     CFNotificationCenterGetDarwinNotifyCenter(),
     nil,
     { _, _, _, _, _ in
-        guard let raw = try? String(contentsOfFile: "/tmp/dsse_warn_notice", encoding: .utf8) else { return }
-        log("warn: surfacing monitored-notice")
-        StepUpStatusController.shared.presentWarnNotice(json: raw)
+        replayWarnHandoff()
     },
     "jp.co.lantern-networks.dsse.warn" as CFString,
     nil,
     .deliverImmediately)
+replayWarnHandoff()
 
 app.run()

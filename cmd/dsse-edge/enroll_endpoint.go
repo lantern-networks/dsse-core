@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/lantern-networks/dsse-core/enroll"
 	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/enrolltoken"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 )
 
 // enroll_endpoint.go — the device-facing enrollment endpoint (roadmap M4c-wire). An UNENROLLED agent POSTs a
@@ -43,13 +45,6 @@ func cpAuthoritativeGroup(ledger *enrolledinventory.Ledger, identity string) str
 	g, _ := ledger.GroupFor(identity)
 	return strings.TrimSpace(g)
 }
-
-// Enrolment is a once-per-device event, so even a large kitting run is far below this. Chosen to bound the work
-// an unauthenticated caller can cause, not to make a 256-bit secret harder to guess.
-const (
-	enrolRateLimitPerSecond = 5
-	enrolRateLimitBurst     = 20
-)
 
 func registerEnrollEndpoint(mux *http.ServeMux, signer *deviceca.Signer, ledger *enrolledinventory.Ledger, eligibilityToken, tenant, defaultGroup string, certTTL time.Duration, logf func(string, ...interface{})) {
 	registerEnrollEndpointWithIdP(mux, signer, ledger, nil, nil, eligibilityToken, tenant, defaultGroup, certTTL, nil, nil, nil, nil, logf)
@@ -137,7 +132,7 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 	}
 	// Eligibility alone: may this caller enrol at all? Split out of Assign so the disabled-identity gate can
 	// run strictly after it — see refuseIfDisabled.
-	assignEligibility := func(req enroll.Request, pendingSpendOut *string) (t, g, reason string, ok bool) {
+	assignEligibility := func(ctx context.Context, req enroll.Request, pendingSpendOut *string) (t, g, reason string, ok bool) {
 		pendingSpend := ""
 		defer func() { *pendingSpendOut = pendingSpend }()
 		// A connector proving itself with its Site's bootstrap secret. Checked FIRST because its mode is its
@@ -148,8 +143,8 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 			// request BODY and no context, and widening that shared interface for one caller is worse than a
 			// deadline here. Bounded rather than Background so a wedged Site store cannot pin an enrolment
 			// goroutine open — the caller gets the ordinary refusal and retries.
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			issuedFor, allowed := connectorEnrolmentEligibility(ctx, siteStore, tenant, req, logf)
+			attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			issuedFor, allowed := connectorEnrolmentEligibility(attemptCtx, siteStore, tenant, req, logf)
 			cancel()
 			if !allowed {
 				// The same sentence every refusal on this endpoint gives. /enroll is unauthenticated, and an
@@ -173,7 +168,7 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 			// token's organization is AUTHORITATIVE and not client-claimed: the store bound it at issue and
 			// refuses to be read as any other, exactly like a device's organization coming from the CA that
 			// issued its certificate rather than from a field it sends.
-			tok, err := tokens.Verify(req.Eligibility.Token, "", time.Now().UTC())
+			tok, err := verifyEnrolmentToken(ctx, tokens, req.Eligibility.Token, "", time.Now().UTC())
 			if err == nil {
 				// Verified, NOT yet spent. The endpoint still has to refuse identities an admin disabled, and a
 				// token burned on an enrolment that is then refused leaves the admin re-issuing for a machine
@@ -200,7 +195,7 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 				// organization that runs its own PKI has no authority here on purpose and its devices are
 				// issued by the CA it holds — so the reason goes to the operator's log by name, while the
 				// caller keeps the one sentence every refusal gives.
-				if !strings.EqualFold(issuedFor, tenant) && tenantDeviceIdentity.For(issuedFor) == nil {
+				if issuedFor != strings.TrimSpace(tenant) && tenantDeviceIdentity.For(issuedFor) == nil {
 					if logf != nil {
 						logf("enroll_refused mode=token device=%q tenant=%q reason=%q", req.DeviceID, issuedFor,
 							"this node holds no device-identity authority for that organization: either the "+
@@ -273,15 +268,35 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 		Signer: signer,
 		// ★ THE AUTHORITY THAT ORGANIZATION'S DEVICES ARE ISSUED UNDER (2026-08-21). nil means this node holds
 		// none for them, and enroll refuses rather than signing under the node's own — see Issuer.SignerFor.
-		SignerFor:        tenantDeviceIdentity.For,
+		SignerFor: func(assignedTenant string) *deviceca.Signer {
+			if perTenant := tenantDeviceIdentity.For(assignedTenant); perTenant != nil {
+				return perTenant
+			}
+			// The node's original --device-ca-key still issues for its own
+			// configured tenant while managed material is being fetched. It
+			// must never become a fallback for a different organization.
+			if strings.TrimSpace(assignedTenant) == strings.TrimSpace(tenant) {
+				return signer
+			}
+			return nil
+		},
 		CertTTL:          certTTL,
 		Logf:             logf,
 		NowPolicyVersion: 1,
 		AssignContext: func(ctx context.Context, req enroll.Request) (t, g, reason string, ok bool) {
 			var spendTokenID string
-			t, g, reason, ok = assignEligibility(req, &spendTokenID)
+			t, g, reason, ok = assignEligibility(ctx, req, &spendTokenID)
 			if !ok {
 				return "", "", reason, false
+			}
+			// Eligibility selects the organization. The node's bootstrap tenant
+			// must not stand in for that organization's lifecycle decision.
+			if why, err := enrolmentLifecycleRefusal(ctx, tenantLifecycle, t, false); err != nil || why != "" {
+				lastEnrolmentAttribution.Delete(req.DeviceID)
+				if logf != nil {
+					logf("enroll_refused device=%q tenant=%q reason=%q lifecycle_unavailable=%t", req.DeviceID, t, why, err != nil)
+				}
+				return "", "", "enrolment is not available for this tenant", false
 			}
 			if why, disabled := refuseIfDisabled(req.DeviceID); disabled {
 				return "", "", why, false
@@ -383,35 +398,41 @@ func registerEnrollEndpointWithIdP(mux *http.ServeMux, signer *deviceca.Signer, 
 			return nil
 		},
 	}
-	// Per-source rate limit on the bootstrap endpoint. ON by default, unlike the optional admin-surface limiter,
-	// because /enroll is public, unauthenticated by construction, and parses attacker-supplied CSRs.
-	//
-	// It is NOT here to stop token guessing — the secret is 256 bits of randomness and guessing is not a threat
-	// model. It bounds what an unauthenticated caller can make this endpoint DO: parse, hash, and log, on a port
-	// facing the internet. So the limit is generous rather than tight, because the cost of being wrong in the
-	// other direction is real: fifty laptops being kitted behind one office NAT all enrol from one source IP, and
-	// a refusal there strands machines an operator has already approved.
+	// Public, unauthenticated bootstrap parses attacker-controlled CSRs. Preserve
+	// its source-IP abuse protection by default; it is not a data-plane quota.
+	// An operator may size it for a kitting NAT or explicitly disable it with 0.
 	//
 	// POST /enroll/renew is deliberately NOT rate-limited. It authenticates with the certificate being renewed,
 	// so it is not an unauthenticated surface — and throttling it would turn a fleet-wide renewal window into a
 	// fleet-wide expiry, which is an outage rather than a defence.
-	enrolLimiter := newTokenBucketLimiter(enrolRateLimitPerSecond, enrolRateLimitBurst)
+	var enrolLimiter *tokenBucketLimiter
+	rps, burst := float64(5), float64(20)
+	if strings.TrimSpace(os.Getenv("DSSE_ENROL_REQUESTS_PER_SECOND")) != "" {
+		rps = runtimequota.Rate("DSSE_ENROL_REQUESTS_PER_SECOND")
+		burst = rps
+		if burst < 1 {
+			burst = 1
+		}
+	}
+	if strings.TrimSpace(os.Getenv("DSSE_ENROL_BURST")) != "" {
+		burst = runtimequota.Rate("DSSE_ENROL_BURST")
+	}
+	if burst > 0 && burst < 1 {
+		panic("DSSE_ENROL_BURST must hold at least one request or be 0")
+	}
+	if rps > 0 {
+		if burst == 0 {
+			burst = rps
+			if burst < 1 {
+				burst = 1
+			}
+		}
+		enrolLimiter = newTokenBucketLimiter(rps, burst)
+	}
 	enrolHandler := iss.Handler()
 	mux.HandleFunc("POST /enroll", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))
-		// ★ A SUSPENDED ORGANIZATION TAKES NO NEW DEVICES (2026-08-18). Suspension freezes the administrative
-		// plane and stops NEW admission; the devices already enrolled keep being enforced, because a billing
-		// dispute must not take protection off a customer's laptops. Checked before the rate limiter so a frozen
-		// organization's kitting run is answered rather than throttled into a mystery.
-		if reason, refuse := adminTenantAdministrativelySuspended(r.Context(), tenantLifecycle, tenant); refuse {
-			if logf != nil {
-				logf("enroll_refused reason=tenant_suspended tenant=%q", tenant)
-			}
-			writeError(w, http.StatusConflict, fmt.Errorf(
-				"%s — it takes no new devices while suspended. The devices already enrolled are unaffected", reason))
-			return
-		}
-		if !enrolLimiter.allow(clientIPForRateLimit(r)) {
+		if enrolLimiter != nil && !enrolLimiter.allow(clientIPForRateLimit(r)) {
 			if logf != nil {
 				// The source, never the token. A burst from one address is worth seeing; it is either an attack
 				// or a kitting run that needs a higher limit, and both are the operator's call.
@@ -490,6 +511,9 @@ func enrolmentRefusalForTheInstaller(err error, conflict enrolledinventory.Machi
 func enrolmentAuthorityWasUnreachable(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, enrolltoken.ErrStateUnavailable) {
+		return true
 	}
 	e := strings.ToLower(err.Error())
 	for _, marker := range []string{

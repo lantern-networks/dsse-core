@@ -34,6 +34,7 @@ const (
 var authorityFiles = []string{
 	"root.key",
 	"management-ca.key",
+	"console-server-ca.key",
 	"transport-ca.key",
 	"bundle-signing.key",
 }

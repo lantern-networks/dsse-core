@@ -162,6 +162,9 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 	// DLP rules (the egress-rule option): read/hot-apply per-tenant model.DLPRules (selector + identifiers ->
 	// on_match). Overlaid onto the bundle so the evaluator surfaces a dlp_inspect directive per destination.
 	mux.HandleFunc("GET /admin/dlp-rules", adminEndpoint("admin.dlp.read", func(w http.ResponseWriter, r *http.Request) {
+		if !refreshDLPStores(w, dlpRuleStore) {
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"rules": dlpRuleStore.RulesForTenant(adminTenantIDFromRequest(r))})
 	}))
 	// DLP findings (VISIBILITY, V-slice): the operator-facing list of what DLP has DETECTED — the dlp_match
@@ -248,6 +251,13 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 				}
 			}
 			destination := stringMetadata(ev.Metadata, "dlp_destination")
+			account := stringMetadata(ev.Metadata, "dlp_account")
+			accountTrust := ""
+			if account != "" {
+				// Historical findings also came from unverified request hints. No serialized
+				// metadata flag establishes destination-bound account verification.
+				accountTrust = "unverified_request_hint"
+			}
 			row := map[string]any{
 				"id":               ev.ID,
 				"timestamp":        ev.Timestamp,
@@ -258,13 +268,14 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 				"findings":         ev.Metadata["dlp_findings"],
 				"destination":      destination,
 				// Source (who sent it): corporate identity, device, the OS/corporate user, originating app, the
-				// signed-in account, and source IP — whichever the flow carried (device-only steered flows have no
+				// unverified account hint, and source IP — whichever the flow carried (device-only steered flows have no
 				// corporate session, so user_id may be empty but source_app / source_ip / account still identify it).
 				"user_id":            derefStringPtr(ev.UserID),
 				"device_id":          derefStringPtr(ev.DeviceID),
 				"corporate_user":     stringMetadata(ev.Metadata, "dlp_corporate_user"),
 				"source_app":         stringMetadata(ev.Metadata, "dlp_source_app"),
-				"account":            stringMetadata(ev.Metadata, "dlp_account"),
+				"account":            account,
+				"account_trust":      accountTrust,
 				"source_ip":          stringMetadata(ev.Metadata, "dlp_source_ip"),
 				"application_id":     derefStringPtr(ev.ApplicationID),
 				"access_decision_id": derefStringPtr(ev.AccessDecisionID),
@@ -310,25 +321,41 @@ func registerDLPRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Handl
 			return
 		}
 		var body struct {
-			Rules []model.DLPRule `json:"rules"`
+			Rules            *[]model.DLPRule `json:"rules"`
+			ExpectedTenantID string           `json:"expected_tenant_id,omitempty"`
 		}
 		if err := decodeLimitedJSONBody(w, r, &body, maxEdgeRuntimeJSONBodyBytes); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode dlp rules: %w", err))
 			return
 		}
+		if body.Rules == nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("rules must be an array; use [] to clear"))
+			return
+		}
 		tenant := adminTenantIDFromRequest(r)
-		if err := validateDLPRules(body.Rules, dlpClassifierStore.ClassifierSetForTenant(tenant)); err != nil {
+		if body.ExpectedTenantID != "" && body.ExpectedTenantID != tenant {
+			writeError(w, http.StatusConflict, fmt.Errorf("the organization changed; reload the list before editing"))
+			return
+		}
+		if !refreshDLPStores(w, dlpClassifierStore, dlpRuleStore) {
+			return
+		}
+		if err := validateDLPRules(*body.Rules, dlpClassifierStore.ClassifierSetForTenant(tenant)); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		for i := range body.Rules {
-			body.Rules[i].TenantID = tenant // tenant is authoritative from the admin identity
-			if body.Rules[i].Status == "" {
-				body.Rules[i].Status = "active"
+		for i := range *body.Rules {
+			(*body.Rules)[i].TenantID = tenant // tenant is authoritative from the admin identity
+			if (*body.Rules)[i].Status == "" {
+				(*body.Rules)[i].Status = "active"
 			}
 		}
-		dlpRuleStore.SetRules(tenant, body.Rules)
-		logInfof("dlp_rules_applied_by_admin tenant=%s rules=%d", tenant, len(body.Rules))
+		if err := dlpRuleStore.SetRulesContext(r.Context(), tenant, *body.Rules); err != nil {
+			logInfof("dlp_rules_save_unconfirmed tenant=%s", tenant)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("saving DLP rules could not be confirmed; reload before retrying"))
+			return
+		}
+		logInfof("dlp_rules_applied_by_admin tenant=%s rules=%d", tenant, len(*body.Rules))
 		writeJSON(w, http.StatusOK, map[string]any{"rules": dlpRuleStore.RulesForTenant(tenant)})
 	}))
 	// DLP custom classifiers (slice C): read/hot-apply the operator-defined identifiers (regex + keyword

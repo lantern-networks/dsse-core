@@ -14,6 +14,37 @@ final class DsseRegionFailoverTests: XCTestCase {
         { ep in m[ep.region] ?? DsseRegionHealth(reachable: false, admitted: false, rttMillis: 0) }
     }
 
+    func testThreeDoorsInOneRegionFailOverAndDoNotFailBack() {
+        let doors = ["a", "b", "c"].map { DsseRegionEndpoint(region: "kiri", endpoint: "https://agents.node-\($0).example") }
+        let s = DsseRegionSelector(allowed: doors + [doors[0]], home: "kiri")
+        s.setUnhealthyStrikes(2)
+        var health = [doors[0].endpoint: up(1), doors[1].endpoint: up(2), doors[2].endpoint: up(3)]
+        let probe: (DsseRegionEndpoint) -> DsseRegionHealth = { health[$0.endpoint] ?? self.down() }
+        let initial = s.evaluate(probe: probe)
+        XCTAssertEqual(initial.current, doors[0])
+        XCTAssertEqual(initial.failoverSet, [doors[1], doors[2]]) // exact duplicate removed
+        health[doors[0].endpoint] = down()
+        XCTAssertTrue(s.evaluate(probe: probe).held)
+        XCTAssertEqual(s.evaluate(probe: probe).current, doors[1])
+        health[doors[0].endpoint] = up(1)
+        XCTAssertEqual(s.evaluate(probe: probe).current, doors[1])
+        s.updateList(allowed: [doors[0], doors[2]], home: "kiri")
+        XCTAssertEqual(s.currentRegion, "")
+        health[doors[0].endpoint] = down()
+        health[doors[2].endpoint] = down()
+        XCTAssertEqual(s.evaluate(probe: probe).state, .failClosed)
+    }
+
+    func testDeniedDoorCannotBeEvadedByAnotherDoor() {
+        let a = DsseRegionEndpoint(region: "kiri", endpoint: "https://a.example")
+        let b = DsseRegionEndpoint(region: "kiri", endpoint: "https://b.example")
+        let s = DsseRegionSelector(allowed: [a, b], home: "kiri")
+        s.setDenyOnAdmissionDeny(true)
+        s.setInstantRevokeOnAdmissionDeny(true)
+        let d = s.evaluate { $0.endpoint == a.endpoint ? self.deniedAdmit() : self.up(1) }
+        XCTAssertEqual(d.state, .denied)
+    }
+
     // Nearest-healthy among allowed: home=tokyo but osaka nearer -> land on osaka, not the home anchor.
     func testNearestHealthyAmongAllowedNotHome() {
         let s = DsseRegionSelector(allowed: [tok, osa, ish], home: "jp-tokyo")

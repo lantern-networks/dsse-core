@@ -79,15 +79,20 @@ type enrolmentTokenRemoteResponse struct {
 	UsedAt string `json:"used_at,omitempty"`
 }
 
-func (a *remoteEnrolmentTokenAuthority) call(path string, req enrolmentTokenRemoteRequest) (enrolltoken.Token, error) {
-	return a.callOnce(path, req, false)
+func (a *remoteEnrolmentTokenAuthority) call(parent context.Context, path string, req enrolmentTokenRemoteRequest) (enrolltoken.Token, error) {
+	// One budget covers both the first request and its leadership retry. The caller's cancellation
+	// remains authoritative, so an abandoned enrolment cannot leave a remote verify or spend running.
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	return a.callOnce(ctx, path, req, false)
 }
 
 // callOnce is one attempt. retried says this is already the second, so a node that still denies leadership is
 // reported rather than chased.
-func (a *remoteEnrolmentTokenAuthority) callOnce(path string, req enrolmentTokenRemoteRequest, retried bool) (enrolltoken.Token, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+func (a *remoteEnrolmentTokenAuthority) callOnce(ctx context.Context, path string, req enrolmentTokenRemoteRequest, retried bool) (enrolltoken.Token, error) {
+	if err := ctx.Err(); err != nil {
+		return enrolltoken.Token{}, err
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return enrolltoken.Token{}, err
@@ -118,13 +123,14 @@ func (a *remoteEnrolmentTokenAuthority) callOnce(path string, req enrolmentToken
 	// pool when its response body is finished with, and CloseIdleConnections closes only what is IDLE — so
 	// dropping the pool while this response was still open left the bad connection in place and the retry rode
 	// it straight back to the same node. The difference between this working and not.
-	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	const maxAuthorityResponseBytes = 1 << 20
+	raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAuthorityResponseBytes+1))
 	_ = resp.Body.Close()
+	if readErr != nil || len(raw) > maxAuthorityResponseBytes {
+		return enrolltoken.Token{}, fmt.Errorf("%w: incomplete enrolment-token authority response", enrolltoken.ErrStateUnavailable)
+	}
 	var out enrolmentTokenRemoteResponse
 	if err := json.Unmarshal(raw, &out); err != nil && resp.StatusCode < 300 {
-		if readErr != nil {
-			err = readErr
-		}
 		return enrolltoken.Token{}, fmt.Errorf("enrolment-token authority answered unreadably: %w", err)
 	}
 	if reason := strings.TrimSpace(out.Error); reason != "" {
@@ -142,12 +148,19 @@ func (a *remoteEnrolmentTokenAuthority) callOnce(path string, req enrolmentToken
 		// if the second attempt also says this, leadership is genuinely moving and the caller should be told.
 		if !retried && enrolmentAuthorityDeniedLeadership(reason) {
 			a.dropPooledConnections()
-			return a.callOnce(path, req, true)
+			return a.callOnce(ctx, path, req, true)
 		}
 		return enrolltoken.Token{}, enrolmentTokenSentinel(reason, out.UsedBy, out.UsedAt)
 	}
 	if resp.StatusCode >= 300 {
 		return enrolltoken.Token{}, fmt.Errorf("the enrolment-token authority refused: HTTP %d", resp.StatusCode)
+	}
+	// An empty success response otherwise becomes a verified token with no ID:
+	// enrollment falls back to the node tenant and skips the one-time spend.
+	if strings.TrimSpace(out.Token.ID) == "" || strings.TrimSpace(out.Token.TenantID) == "" ||
+		(req.ID != "" && out.Token.ID != strings.TrimSpace(req.ID)) ||
+		(req.TenantID != "" && out.Token.TenantID != strings.TrimSpace(req.TenantID)) {
+		return enrolltoken.Token{}, fmt.Errorf("%w: invalid enrolment-token authority identity", enrolltoken.ErrStateUnavailable)
 	}
 	return out.Token, nil
 }
@@ -172,6 +185,8 @@ func enrolmentTokenSentinel(reason, usedBy, usedAt string) error {
 		return enrolltoken.ErrTokenExpired
 	case "wrong_tenant":
 		return enrolltoken.ErrWrongTenant
+	case "state_unavailable":
+		return enrolltoken.ErrStateUnavailable
 	default:
 		return fmt.Errorf("enrolment token refused: %s", reason)
 	}
@@ -192,17 +207,27 @@ func enrolmentTokenReason(err error) string {
 		return "expired"
 	case errors.Is(err, enrolltoken.ErrWrongTenant):
 		return "wrong_tenant"
+	case errors.Is(err, enrolltoken.ErrStateUnavailable):
+		return "state_unavailable"
 	default:
 		return "refused"
 	}
 }
 
 func (a *remoteEnrolmentTokenAuthority) Verify(secret, tenantID string, _ time.Time) (enrolltoken.Token, error) {
-	return a.call("/admin/fleet/enrolment-token/verify", enrolmentTokenRemoteRequest{Secret: secret, TenantID: tenantID})
+	return a.VerifyContext(context.Background(), secret, tenantID, time.Time{})
+}
+
+func (a *remoteEnrolmentTokenAuthority) VerifyContext(ctx context.Context, secret, tenantID string, _ time.Time) (enrolltoken.Token, error) {
+	return a.call(ctx, "/admin/fleet/enrolment-token/verify", enrolmentTokenRemoteRequest{Secret: secret, TenantID: tenantID})
 }
 
 func (a *remoteEnrolmentTokenAuthority) Spend(id, tenantID, deviceID string, _ time.Time) (enrolltoken.Token, error) {
-	return a.call("/admin/fleet/enrolment-token/spend",
+	return a.SpendContext(context.Background(), id, tenantID, deviceID, time.Time{})
+}
+
+func (a *remoteEnrolmentTokenAuthority) SpendContext(ctx context.Context, id, tenantID, deviceID string, _ time.Time) (enrolltoken.Token, error) {
+	return a.call(ctx, "/admin/fleet/enrolment-token/spend",
 		enrolmentTokenRemoteRequest{ID: id, TenantID: tenantID, DeviceID: deviceID})
 }
 

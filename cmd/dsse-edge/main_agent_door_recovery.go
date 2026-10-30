@@ -11,6 +11,9 @@ func mainEdgeListenerClientTLSConfig(base *tls.Config, door string) *tls.Config 
 	out := base.Clone()
 	out.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 		if door == "agent-plane" {
+			if portal := browserPortalConfigFor(base, hello); portal != nil {
+				return portal, nil
+			}
 			if recovery := recoveryConfigFor(base, hello); recovery != nil {
 				return recovery, nil
 			}

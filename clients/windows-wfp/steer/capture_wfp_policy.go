@@ -10,10 +10,13 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/lantern-networks/dsse-core/clients/windows-wfp/wfpstate"
@@ -71,8 +74,10 @@ type wfpPolicy struct {
 	ExactApps [wfpMaxExactApps][wfpExactAppLen]uint16
 }
 
-// buildWFPPolicy serialises the capture config into the driver policy blob (pure; unit-tested).
-func buildWFPPolicy(cfg captureConfig) wfpPolicy {
+// buildWFPPolicy serialises the complete capture config into the fixed v2 driver
+// ABI. It must reject an unrepresentable policy before any IOCTL: silently
+// dropping a bypass would report a policy the kernel does not enforce.
+func buildWFPPolicy(cfg captureConfig) (wfpPolicy, error) {
 	var p wfpPolicy
 	p.Version = wfpPolicyVer
 	p.LocalPort = cfg.localPort
@@ -84,21 +89,18 @@ func buildWFPPolicy(cfg captureConfig) wfpPolicy {
 	if cfg.exclusions != nil {
 		apps = cfg.exclusions.effective()
 	}
-	// The agent's own image is ALWAYS bypassed (added first so it survives even a full 16-app list): a fail-open
+	// The agent's own image is ALWAYS bypassed (added first; an overfull list is rejected): a fail-open
 	// direct dial from the agent must not be redirected back into the terminator (infinite self-loop -> port
 	// exhaustion). Empty in unit tests, so buildWFPPolicy stays deterministic there.
 	if self := strings.ToLower(strings.TrimSpace(cfg.selfImage)); self != "" && !isSignatureRule(self) {
 		b := []byte(self)
 		if len(b) > wfpAppSubLen-1 {
-			b = b[:wfpAppSubLen-1]
+			return wfpPolicy{}, fmt.Errorf("WFP self-image bypass exceeds the v2 ABI path length")
 		}
 		copy(p.Apps[p.NumApps][:], b)
 		p.NumApps++
 	}
 	for _, sub := range apps {
-		if p.NumApps >= wfpMaxApps {
-			break
-		}
 		s := strings.ToLower(strings.TrimSpace(sub))
 		if s == "" {
 			continue
@@ -110,16 +112,27 @@ func buildWFPPolicy(cfg captureConfig) wfpPolicy {
 		if isSignatureRule(s) {
 			continue
 		}
+		if p.NumApps >= wfpMaxApps {
+			return wfpPolicy{}, fmt.Errorf("WFP app bypasses exceed the v2 ABI capacity of %d", wfpMaxApps)
+		}
 		b := []byte(s)
 		if len(b) > wfpAppSubLen-1 {
-			b = b[:wfpAppSubLen-1]
+			return wfpPolicy{}, fmt.Errorf("WFP app bypass exceeds the v2 ABI path length")
 		}
 		copy(p.Apps[p.NumApps][:], b) // NUL-terminated by zero-value remainder
 		p.NumApps++
 	}
+	seenDests := make(map[netip.AddrPort]bool)
 	for _, d := range cfg.effectiveDests() {
+		if !d.IsValid() {
+			return wfpPolicy{}, fmt.Errorf("WFP destination bypass is invalid")
+		}
+		if seenDests[d] {
+			continue
+		}
+		seenDests[d] = true
 		if p.NumDests >= wfpMaxDests {
-			break
+			return wfpPolicy{}, fmt.Errorf("WFP destination bypasses exceed the v2 ABI capacity of %d", wfpMaxDests)
 		}
 		var rule wfpDestRule
 		if d.Addr().Is4() {
@@ -142,18 +155,18 @@ func buildWFPPolicy(cfg captureConfig) wfpPolicy {
 		if ep := cfg.verifiedExactApps.Load(); ep != nil {
 			for _, ntPath := range *ep {
 				if p.NumExactApps >= wfpMaxExactApps {
-					break
+					return wfpPolicy{}, fmt.Errorf("WFP verified app bypasses exceed the v2 ABI capacity of %d", wfpMaxExactApps)
 				}
 				u16, err := syscall.UTF16FromString(ntPath)
 				if err != nil || len(u16) > wfpExactAppLen {
-					continue // contains a NUL, or too long to store WITH its terminator — skip (never truncate a path)
+					return wfpPolicy{}, fmt.Errorf("WFP verified app bypass cannot be represented by the v2 ABI")
 				}
 				copy(p.ExactApps[p.NumExactApps][:], u16) // u16 includes the NUL; the array remainder stays zero
 				p.NumExactApps++
 			}
 		}
 	}
-	return p
+	return p, nil
 }
 
 // CTL_CODE(DeviceType, Function, Method, Access) = (DeviceType<<16)|(Access<<14)|(Function<<2)|Method.
@@ -167,10 +180,16 @@ func wfpCtlCode(function uint32) uint32 {
 }
 
 var (
-	ioctlWFPSetPolicy   = wfpCtlCode(0x800)
-	ioctlWFPClearPolicy = wfpCtlCode(0x801)
-	ioctlWFPGetStats    = wfpCtlCode(0x802) // read-only; health probe (W-3) AND the arming-state read
-	ioctlWFPArmOwner    = wfpCtlCode(0x809) // nominate this handle as the redirect policy's owner
+	ioctlWFPSetPolicy      = wfpCtlCode(0x800)
+	ioctlWFPClearPolicy    = wfpCtlCode(0x801)
+	ioctlWFPGetStats       = wfpCtlCode(0x802) // read-only; health probe (W-3) AND the arming-state read
+	ioctlWFPArmCaptive     = wfpCtlCode(0x80A)
+	ioctlWFPFinishCaptive  = wfpCtlCode(0x80B)
+	ioctlWFPRecoverNetwork = wfpCtlCode(0x80C)
+	ioctlWFPArmOwner       = wfpCtlCode(0x809) // nominate this handle as the redirect policy's owner
+	// Every service-process SET/CLEAR must pass through this publication gate.
+	// The separate recovery command uses the raw CLEAR after the service stops.
+	activeWFPPolicy = &wfpPolicyPublication{}
 )
 
 // wfpOwnerArm mirrors DSSE_OWNER_ARM in driver/dsse_wfp.h.
@@ -246,7 +265,17 @@ func readDriverState() (wfpstate.State, error) {
 // the exact black hole the disarm exists to prevent — while the log line says it worked. Anything about to
 // hand the machine to an installer, or about to exit, should use this and report what came back.
 func removePolicyVerified() wfpstate.DisarmVerification {
-	err := removePolicy()
+	return verifyPolicyRemoval(removePolicy, false)
+}
+
+// Intentional captive disarm and failed-rearm rollback clear only redirection;
+// the independent deadline MUST remain active and is not an error here.
+func removeRedirectPolicyVerified() wfpstate.DisarmVerification {
+	return verifyPolicyRemoval(removePolicy, true)
+}
+
+func verifyPolicyRemoval(clear func() error, allowCaptive bool) wfpstate.DisarmVerification {
+	err := clear()
 	if err != nil && driverAbsent(err) {
 		// No driver, no redirect. Genuinely disarmed, not merely unverifiable.
 		return wfpstate.DisarmVerification{Verified: true}
@@ -255,7 +284,12 @@ func removePolicyVerified() wfpstate.DisarmVerification {
 	if rerr != nil && driverAbsent(rerr) {
 		return wfpstate.DisarmVerification{Verified: true}
 	}
+	observed := state
+	if allowCaptive {
+		state.CaptiveActive = false
+	}
 	v := wfpstate.VerifyDisarmed(state, rerr)
+	v.State = observed
 	if err != nil && !v.Verified {
 		// The clear returned an error AND the driver still will not confirm it is clear. Report both: "the
 		// IOCTL failed" and "the redirect is still in force" are different claims, and only the second one
@@ -273,10 +307,13 @@ func openWFPDevice() (syscall.Handle, error) {
 	return syscall.CreateFile(p, syscall.GENERIC_READ|syscall.GENERIC_WRITE, 0, nil, syscall.OPEN_EXISTING, 0, 0)
 }
 
-// pushPolicy sends the bypass/redirect policy to the kernel driver. Returns an error (device not found) if
-// the callout driver is not installed/loaded -- which is how the WFP backend fails cleanly pre-P3.
-func pushPolicy(cfg captureConfig) error {
-	pol := buildWFPPolicy(cfg)
+// writeWFPPolicy sends a complete bypass/redirect policy to the driver. Its
+// caller must hold activeWFPPolicy's publication lock across building and IOCTL.
+func writeWFPPolicy(cfg captureConfig) error {
+	pol, err := buildWFPPolicy(cfg)
+	if err != nil {
+		return err
+	}
 	h, err := openWFPDevice()
 	if err != nil {
 		return err
@@ -297,4 +334,121 @@ func removePolicy() error {
 	defer syscall.CloseHandle(h)
 	var ret uint32
 	return syscall.DeviceIoControl(h, ioctlWFPClearPolicy, nil, 0, nil, 0, &ret, nil)
+}
+
+// These packed 16-byte requests mirror the versioned driver ABI. The driver
+// fences ARM/FINISH to the open capture owner handle and a nonzero generation.
+type wfpCaptiveRequest struct {
+	Version  uint32
+	Reserved uint32
+	Value    uint64
+}
+
+type wfpCaptiveArm struct {
+	Version       uint32
+	Reserved      uint32
+	Duration100ns uint64
+	NumEdges      uint32
+	Reserved2     uint32
+	Edges         [wfpMaxDests]wfpDestRule
+}
+
+func armCaptiveDeadline(h syscall.Handle, timeout time.Duration, edges []netip.AddrPort) (uint64, time.Duration, error) {
+	if count, ok := dsseFiltersPresent(); !ok || count != len(dsseFilterNames) {
+		return 0, 0, fmt.Errorf("captive deadline requires all WFP admission/flow filters: filters=%d/%d enumeration_ok=%t", count, len(dsseFilterNames), ok)
+	}
+	if timeout <= 0 || len(edges) == 0 || len(edges) > wfpMaxDests {
+		return 0, 0, fmt.Errorf("captive deadline requires positive duration and representable verified Edge pins")
+	}
+	req := wfpCaptiveArm{Version: 2, Duration100ns: (uint64(timeout) + 99) / 100}
+	for _, d := range edges {
+		if !d.IsValid() || d.Port() == 0 {
+			return 0, 0, fmt.Errorf("invalid captive Edge pin")
+		}
+		rule := &req.Edges[req.NumEdges]
+		rule.Port = d.Port()
+		if d.Addr().Is4() {
+			rule.Family = afInet
+			a := d.Addr().As4()
+			copy(rule.Addr[:], a[:])
+		} else {
+			rule.Family = afInet6
+			rule.Addr = d.Addr().As16()
+		}
+		req.NumEdges++
+	}
+	var ack struct{ Generation, Remaining100ns uint64 }
+	var ret uint32
+	started := time.Now() // subtract IOCTL/readback latency, never renew the kernel deadline
+	if err := syscall.DeviceIoControl(h, ioctlWFPArmCaptive,
+		(*byte)(unsafe.Pointer(&req)), uint32(unsafe.Sizeof(req)),
+		(*byte)(unsafe.Pointer(&ack)), uint32(unsafe.Sizeof(ack)), &ret, nil); err != nil {
+		return 0, 0, err
+	}
+	if ret != 16 || ack.Generation == 0 || ack.Remaining100ns > uint64(timeout)/100+1 {
+		return 0, 0, fmt.Errorf("invalid captive arm acknowledgement")
+	}
+	state, err := readDriverState()
+	if err != nil {
+		return 0, 0, fmt.Errorf("captive deadline readback: %w", err)
+	}
+	if !state.CaptiveActive || state.CaptiveGeneration != ack.Generation {
+		return 0, 0, fmt.Errorf("captive deadline not confirmed active: %s", state)
+	}
+	remaining := time.Duration(ack.Remaining100ns)*100 - time.Since(started)
+	if remaining < 0 {
+		remaining = 0
+	}
+	return ack.Generation, remaining, nil
+}
+
+func finishCaptiveDeadline(h syscall.Handle, generation uint64) error {
+	// A restarted capture adopts the existing generation only after the caller
+	// completed local rearm. FINISH still checks this handle is the owner.
+	if generation == 0 {
+		state, err := readDriverState()
+		if err != nil {
+			return err
+		}
+		if !state.CaptiveActive {
+			return nil
+		}
+		generation = state.CaptiveGeneration
+	}
+	req := wfpCaptiveRequest{Version: 2, Value: generation}
+	var ret uint32
+	if err := syscall.DeviceIoControl(h, ioctlWFPFinishCaptive,
+		(*byte)(unsafe.Pointer(&req)), uint32(unsafe.Sizeof(req)), nil, 0, &ret, nil); err != nil {
+		return err
+	}
+	state, err := readDriverState()
+	if err != nil {
+		return err
+	}
+	if state.CaptiveActive || !state.Armed {
+		return fmt.Errorf("captive completion not confirmed: %s", state)
+	}
+	return nil
+}
+
+// Explicit elevated recovery, including the pre-update recovery command. A v3
+// driver cannot have a captive guard; only that positively identified legacy
+// driver uses CLEAR. An unknown or unreadable driver never gets a blind fallback.
+func recoverWFPNetworkVerified() wfpstate.DisarmVerification {
+	return verifyPolicyRemoval(func() error {
+		state, err := readDriverState()
+		if err != nil {
+			return err
+		}
+		if !state.CaptiveSupported {
+			return removePolicy()
+		}
+		h, err := openWFPDevice()
+		if err != nil {
+			return err
+		}
+		defer syscall.CloseHandle(h)
+		var ret uint32
+		return syscall.DeviceIoControl(h, ioctlWFPRecoverNetwork, nil, 0, nil, 0, &ret, nil)
+	}, false)
 }

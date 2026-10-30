@@ -53,9 +53,15 @@ The install enrols, obtains an identity of the connector's own from the deployme
   installed /etc/systemd/system/dsse-connector.service — this connector comes back after a reboot.
 ```
 
-**The settings file is a credential until the connector has run once.** It carries a one-time bootstrap
+**The settings file is a credential until the Edge acknowledges the connector registration.** It carries a one-time bootstrap
 secret; the identity that replaces it is minted on the machine and never travels. Carry the file once, over a
-channel you trust, and delete the copies it leaves behind.
+channel you trust, and delete the copies it leaves behind after successful registration.
+The connector retains a pending bootstrap credential in its private state file while
+identity issuance or first registration is incomplete. Restarting resumes with the
+same connector ID; it does not require deleting state or issuing another profile.
+After the Edge acknowledges registration, the pending credential is removed from
+state and later registration uses the runtime identity. Treat the state directory
+as secret throughout this process; it also holds the long-lived private identity.
 
 **The doors are why the shape matters.** On a three-region deployment the file names all three, tried in
 order, so a connector whose region goes keeps the estate behind it reachable. On a one-machine deployment it
@@ -172,6 +178,37 @@ What comes back names both, and says whether it actually carries traffic:
 A connector may also *report* subnets it can see. These reports are informational; the administration API
 does not accept adopting or holding self-reported routes. To configure a reported subnet, define it on the
 Networks page and bind that Named Network to the connector.
+
+## Concurrent TCP streams
+
+Updated Connectors and Edge relays have no implementation-imposed TCP connection
+count limit. The previous fixed 32-stream and 1024-stream bounds are removed from
+receiver admission. File descriptors, memory, backend capacity, and other OS
+resource limits still apply; this does not guarantee unlimited throughput.
+
+An operator may set `DSSE_CONNECTOR_MAX_TCP_CONNECTIONS` in the Connector service
+environment to a non-negative integer. Unset or `0` imposes no connection-count
+limit. A positive value applies to the entire Connector process, including
+pending dials, all Edge attachments, and the private TCP round-trip endpoint. It
+is not multiplied by the number of tunnels, Edges, users, or applications.
+Negative and malformed values prevent startup. Configure the service environment
+(for example, a systemd override or container environment) and restart the service
+to apply the chosen budget. This is a host-operator resource setting, not an
+Internet Access or Connector Access authorization rule or a Console setting.
+
+`GET /healthz` on the Connector's private listener reports `tcp_admission.active`
+and `tcp_admission.max_connections` (`0` means no configured count limit).
+Rejection at an explicitly configured budget preserves established connections.
+Closing a connection, failing a dial, or losing a tunnel releases its reservations.
+Each Connector process has its own budget; this is not a fleet-wide quota.
+
+The legacy `concurrent_connection_cap` frame field is retained as an
+interoperability hint for older receivers and is not an admission policy on
+updated receivers. Old Connector and Edge relay binaries still enforce their old
+limits: update both roles to remove these limits throughout the path. Route
+authorization, mTLS, explicit operator byte budgets, and payload frame sizes remain enforced.
+See [operator resource quotas](runtime-resource-quotas.md) for the full settings
+and upgrade requirements across server and endpoint paths.
 
 ## Region failover
 

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/logs"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 // ★★★ A CUSTOMER'S DASHBOARD CARRIED ANOTHER ORGANIZATION'S PEOPLE AND MACHINES (2026-08-16, found by
@@ -100,9 +101,22 @@ func TestTheStateAnswerDoesNotNameAnotherOrganizationsPolicyBundle(t *testing.T)
 	if unscoped["id"] != "bundle_cp_tenant_reference_lab" {
 		t.Fatalf("a single-tenant deployment lost its own bundle identity: %#v", unscoped)
 	}
-	// Case-insensitively, the way every other organization comparison in this tree works.
+	// Tenant IDs are case-sensitive: the case-distinct caller may not receive this identity.
 	if _, hidden := policyBundleFactsForTenant("Tenant_Reference_Lab", "b", "v", "active", "standard",
-		"tenant_reference_lab")["withheld"]; hidden {
-		t.Fatal("a case difference in the organization id was read as a different organization")
+		"tenant_reference_lab")["withheld"]; !hidden {
+		t.Fatal("a case-distinct organization received another organization's policy bundle")
+	}
+}
+
+func TestAdminStateTenantSelectorsKeepCaseDistinctOrganizationsSeparate(t *testing.T) {
+	type row struct{ tenant string }
+	rows := []row{{"Acme"}, {"acme"}}
+	if got := countByTenant(rows, "Acme", func(r row) string { return r.tenant }); got != 1 {
+		t.Fatalf("count crossed tenant boundary: %d", got)
+	}
+	policies := []model.Policy{{ID: "upper", TenantID: "Acme"}, {ID: "lower", TenantID: "acme"}, {ID: "global"}}
+	got := policiesForTenant(policies, "Acme")
+	if len(got) != 2 || got[0].ID != "upper" || got[1].ID != "global" {
+		t.Fatalf("another tenant's policy reached state/evaluator: %+v", got)
 	}
 }

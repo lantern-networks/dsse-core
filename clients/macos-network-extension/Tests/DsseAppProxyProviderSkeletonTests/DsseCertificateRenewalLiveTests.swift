@@ -180,7 +180,7 @@ final class DsseCertificateRenewalLiveTests: XCTestCase {
     static func handshakeSucceeds(with candidate: SecIdentity, like security: DsseTransportSecurity) -> Bool {
         let probeSecurity = DsseTransportSecurity(host: security.host, port: security.port,
                                                   mtlsRequired: true,
-                                                  pinnedCACertificate: security.pinnedCACertificate,
+                                                  pinnedCACertificates: security.pinnedCACertificates,
                                                   clientIdentity: candidate)
         var request = URLRequest(url: URL(string: "https://\(security.host):\(security.port)/healthz")!)
         request.timeoutInterval = 15

@@ -146,7 +146,7 @@ func TestPostgresEnrolmentIssueSpendRequestTermAndAudit(t *testing.T) {
 	}
 	spendBody := fmt.Sprintf(`{"id":%q,"tenant_id":%q,"device_id":"accepted-device"}`, issued.Token.ID, tenant)
 	failed = call("/admin/fleet/enrolment-token/spend", spendBody, true, 200)
-	if !strings.Contains(failed.Body.String(), `"error":"refused"`) || s.Outstanding(tenant, now) != 1 {
+	if !strings.Contains(failed.Body.String(), `"error":"state_unavailable"`) || s.Outstanding(tenant, now) != 1 {
 		t.Fatal("old spend accepted")
 	}
 	success = call("/admin/fleet/enrolment-token/spend", spendBody, false, 200)

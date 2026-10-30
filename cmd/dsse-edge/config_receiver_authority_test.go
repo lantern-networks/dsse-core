@@ -18,6 +18,8 @@ func TestConfigReceiverCannotOpenSharedAuthority(t *testing.T) {
 	}{
 		{"single CP", "postgres://user:secret@db/control", "https://cp", "", true},
 		{"failover only", "postgres://user:secret@db/control", "", "a=https://cp-a;b=https://cp-b", true},
+		{"malformed declared failover", "postgres://user:secret@db/control", "", "bad", true},
+		{"partly malformed declared failover", "postgres://user:secret@db/control", "", "a=https://cp-a;bad", true},
 		{"both sources", "postgres://user:secret@db/control", "https://cp", "a=https://cp", true},
 		{"local receiver", "", "https://cp", "", false},
 		{"local failover receiver", " ", "", "a=https://cp", false},
@@ -43,6 +45,7 @@ func TestConfigReceiverProductionStartupRejectsSharedAuthority(t *testing.T) {
 	}{
 		{"single CP", []string{"-config-source-url", "https://cp.invalid"}},
 		{"failover only", []string{"-config-source-endpoints", "a=https://cp.invalid"}},
+		{"malformed failover in CP role", []string{"-config-source-endpoints", "a=https://cp.invalid;bad", "-control-plane"}},
 		{"CP role cannot bypass", []string{"-config-source-url", "https://cp.invalid", "-control-plane"}},
 		{"local store cannot bypass", []string{"-config-source-url", "https://cp.invalid", "-policy-rule-store", "memory", "-no-control-plane"}},
 	} {

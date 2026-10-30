@@ -1,7 +1,6 @@
 package enrolledinventory
 
 import (
-	"encoding/json"
 	"fmt"
 	"sort"
 )
@@ -27,12 +26,9 @@ func (l *Ledger) ListForPKI() ([]Entry, error) {
 
 // DecodePKIPopulation validates a durable population read inside a PKI transaction.
 func DecodePKIPopulation(raw []byte) ([]Entry, error) {
-	var state stateFile
-	if err := json.Unmarshal(raw, &state); err != nil {
+	state, err := decodeInventorySnapshot(raw)
+	if err != nil {
 		return nil, fmt.Errorf("read PKI population: %w", err)
-	}
-	if state.Entries == nil {
-		return nil, fmt.Errorf("shared inventory has no complete entry set")
 	}
 	out := make([]Entry, 0, len(state.Entries))
 	for _, entry := range state.Entries {

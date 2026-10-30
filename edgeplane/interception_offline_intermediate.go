@@ -21,6 +21,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // staticInterceptionProvider is a generic InterceptionRootProvider backed by an in-memory cert + signer (RSA or
@@ -265,15 +267,32 @@ func (interception *NetworkExtensionLabTLSInterception) LoadOfflineTenantInterme
 	if err != nil {
 		return nil, err
 	}
+	issuer.requiresTenantLeafCRL = len(issuer.signingCert.CRLDistributionPoints) > 0
 	// ★ A REVOKED AUTHORITY DOES NOT COME BACK. Without this the revocation would remove the loaded issuer and
 	// nothing else: the next well-meaning load — a restore, a re-run of the onboarding call, an operator
 	// repeating a step — would install the compromised key again, and the log would say "loaded" like any
 	// other day.
 	interception.issuerMu.Lock()
+	if interception.revocationStoreUnreadableReason != "" {
+		interception.issuerMu.Unlock()
+		return nil, fmt.Errorf("interception revocation store is unavailable; refusing to load authority for %q", key)
+	}
+	if reason, quarantined := interception.revocationQuarantinedTenants[key]; quarantined {
+		interception.issuerMu.Unlock()
+		return nil, fmt.Errorf("interception revocation record for %q is unreadable (%s); repair it before loading any authority", key, reason)
+	}
 	if reason, dead := interception.revokedTenantRoots[interceptionCertSHA256Hex(root)]; dead {
 		interception.issuerMu.Unlock()
 		return nil, fmt.Errorf("this interception root was REVOKED on this node (%s) and cannot be loaded again; "+
 			"issue a new authority for %q rather than restoring the revoked one", reason, key)
+	}
+	// Commit the announcement decision before changing the active issuer. A
+	// corrupt or unwritable record must not be overwritten or reported as a
+	// successful rotation whose overlap disappears at the next restart.
+	retiringFingerprints, err := recordAnnouncedRootExcludingRevoked(interception.offlineTenantIntermediateDir, key, certFingerprintHex(root), interception.revokedTenantRoots)
+	if err != nil {
+		interception.issuerMu.Unlock()
+		return nil, err
 	}
 	if interception.offlineTenantIssuers == nil {
 		interception.offlineTenantIssuers = map[string]*InterceptionIssuer{}
@@ -321,14 +340,14 @@ func (interception *NetworkExtensionLabTLSInterception) LoadOfflineTenantInterme
 	}
 	interception.offlineTenantIssuers[key] = issuer
 	interception.offlineTenantRoots[key] = root
+	delete(interception.offlineTenantPersistedIssuers, key)
 
 	// ★★★ AND THE OVERLAP IS WRITTEN DOWN, so it outlives this process. The in-memory retiring set above only
 	// records a replacement that happens on a LIVE engine; the procedure operators actually use is to replace
 	// the files and recreate the node, and a restarted engine has no memory of what it was signing under
 	// before. Recording it on EVERY load is what makes that case work — see
 	// interception_announced_roots_survive_a_restart.go.
-	interception.offlineTenantRetiringFingerprints[key] = recordAnnouncedRoot(
-		interception.offlineTenantIntermediateDir, key, certFingerprintHex(root))
+	interception.offlineTenantRetiringFingerprints[key] = retiringFingerprints
 	// ★ THE KEY STAYS DEAD; THE ORGANIZATION RECOVERS (2026-08-16, found by the test written for it). A
 	// revocation leaves that organization fail-closed, and loading a REPLACEMENT is exactly what ends that
 	// state — the check above already refuses the revoked certificate itself, so anything reaching here is a
@@ -358,7 +377,10 @@ func (interception *NetworkExtensionLabTLSInterception) LoadOfflineTenantInterme
 				"authority aside)", key, err)
 		}
 	}
-	if err := interception.persistOfflineTenantIntermediate(key, rootCertPEM, interCertPEM, interKeyPEM); err != nil {
+	interception.issuerMu.Lock()
+	persistDir := interception.offlineTenantIntermediateDir
+	interception.issuerMu.Unlock()
+	if err := interception.persistOfflineTenantIntermediate(persistDir, key, rootCertPEM, interCertPEM, interKeyPEM); err != nil {
 		// Live but not durable. NOT a failure of the load — refusing here would leave the node signing under a
 		// bundle the caller was told had failed — but the caller must be able to see it, so the admin route
 		// reports durable=false rather than letting a restart quietly stop intercepting this organization.
@@ -373,6 +395,16 @@ func (interception *NetworkExtensionLabTLSInterception) LoadOfflineTenantInterme
 			log.Printf("network_extension_lab_tls WARNING offline_tenant_intermediate_not_durable tenant=%q err=%v "+
 				"(live now; a restart returns this organization to REFUSED until it is loaded again)", key, err)
 		}
+	} else {
+		interception.issuerMu.Lock()
+		if persistDir != "" && interception.offlineTenantIntermediateDir == persistDir &&
+			interception.offlineTenantIssuers[key] == issuer && interception.offlineTenantRoots[key] == root {
+			if interception.offlineTenantPersistedIssuers == nil {
+				interception.offlineTenantPersistedIssuers = map[string]bool{}
+			}
+			interception.offlineTenantPersistedIssuers[key] = true
+		}
+		interception.issuerMu.Unlock()
 	}
 	log.Printf("network_extension_lab_tls progress=offline_tenant_intermediate_loaded tenant=%q intermediate_cn=%q root_cn=%q not_after=%s",
 		key, issuer.signingCert.Subject.CommonName, root.Subject.CommonName, issuer.signingCert.NotAfter.Format(time.RFC3339))
@@ -398,21 +430,37 @@ func (interception *NetworkExtensionLabTLSInterception) SetOfflineTenantIntermed
 		return
 	}
 	interception.issuerMu.Lock()
-	interception.offlineTenantIntermediateDir = strings.TrimSpace(dir)
+	dir = strings.TrimSpace(dir)
+	if interception.offlineTenantIntermediateDir != dir {
+		interception.offlineTenantPersistedIssuers = nil
+	}
+	interception.offlineTenantIntermediateDir = dir
 	interception.issuerMu.Unlock()
 }
 
-func (interception *NetworkExtensionLabTLSInterception) persistOfflineTenantIntermediate(tenantKey string, rootPEM, interPEM, keyPEM []byte) error {
-	interception.issuerMu.Lock()
-	dir := interception.offlineTenantIntermediateDir
-	interception.issuerMu.Unlock()
+// Tenant IDs may contain ':' and '_', which sanitizeRootKey maps to the same
+// filename. Hex encodes the exact bytes using only lowercase ASCII; it also
+// keeps Acme and acme distinct on case-insensitive filesystems.
+func interceptionTenantFileKey(tenantID string) string {
+	return "tenant-" + hex.EncodeToString([]byte(strings.TrimSpace(tenantID)))
+}
+
+func interceptionTenantFromFileKey(key string) (string, bool) {
+	if !strings.HasPrefix(key, "tenant-") {
+		return "", false
+	}
+	raw, err := hex.DecodeString(strings.TrimPrefix(key, "tenant-"))
+	return string(raw), err == nil && len(raw) > 0
+}
+
+func (interception *NetworkExtensionLabTLSInterception) persistOfflineTenantIntermediate(dir, tenantKey string, rootPEM, interPEM, keyPEM []byte) error {
 	if dir == "" {
 		return fmt.Errorf("no -interception-offline-tenant-intermediate-dir is configured")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	safe := sanitizeRootKey(tenantKey)
+	safe := interceptionTenantFileKey(tenantKey)
 	sealedKey, err := maybeSealInterceptionKeyForDisk(keyPEM)
 	if err != nil {
 		return fmt.Errorf("seal intermediate key: %w", err)
@@ -452,8 +500,14 @@ func (interception *NetworkExtensionLabTLSInterception) LoadOfflineTenantInterme
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
+		interception.issuerMu.Lock()
+		interception.revocationStoreUnreadableReason = "revocation directory cannot be read"
+		interception.issuerMu.Unlock()
 		return 0, err
 	}
+	interception.issuerMu.Lock()
+	interception.revocationStoreUnreadableReason = ""
+	interception.issuerMu.Unlock()
 	// Revocations FIRST, so a bundle that survived on disk cannot be restored ahead of the record that says it
 	// is dead. Ordering is the whole difference between a revocation and a suggestion.
 	interception.restoreRevocations(dir, entries)
@@ -463,10 +517,21 @@ func (interception *NetworkExtensionLabTLSInterception) LoadOfflineTenantInterme
 		if entry.IsDir() || !strings.HasSuffix(name, ".root.pem") {
 			continue
 		}
-		tenant := strings.TrimSuffix(name, ".root.pem")
+		tenant, ok := interceptionTenantFromFileKey(strings.TrimSuffix(name, ".root.pem"))
+		if !ok {
+			continue
+		}
+		fileKey := interceptionTenantFileKey(tenant)
+		interception.issuerMu.Lock()
+		_, quarantined := interception.revocationQuarantinedTenants[normalizeInterceptionTenantKey(tenant)]
+		interception.issuerMu.Unlock()
+		if quarantined {
+			log.Printf("network_extension_lab_tls WARNING offline_tenant_intermediate_quarantined tenant=%q", tenant)
+			continue
+		}
 		rootPEM, rerr := os.ReadFile(filepath.Join(dir, name))
-		interPEM, ierr := os.ReadFile(filepath.Join(dir, tenant+".intermediate.pem"))
-		rawKey, kerr := os.ReadFile(filepath.Join(dir, tenant+".key.pem"))
+		interPEM, ierr := os.ReadFile(filepath.Join(dir, fileKey+".intermediate.pem"))
+		rawKey, kerr := os.ReadFile(filepath.Join(dir, fileKey+".key.pem"))
 		if rerr != nil || ierr != nil || kerr != nil {
 			log.Printf("network_extension_lab_tls WARNING offline_tenant_intermediate_incomplete tenant=%q root=%v intermediate=%v key=%v "+
 				"(this organization will NOT be intercepted until a complete bundle is loaded)", tenant, rerr, ierr, kerr)
@@ -575,7 +640,7 @@ func (interception *NetworkExtensionLabTLSInterception) ListOfflineTenantInterme
 			Tenant:          tenant,
 			IntermediateCN:  issuer.signingCert.Subject.CommonName,
 			IntermediateEnd: issuer.signingCert.NotAfter.UTC().Format(time.RFC3339),
-			Durable:         interception.offlineTenantIntermediateDir != "",
+			Durable:         interception.offlineTenantPersistedIssuers[tenant],
 		}
 		if root != nil {
 			row.RootCommonName = root.Subject.CommonName
@@ -683,7 +748,7 @@ func (interception *NetworkExtensionLabTLSInterception) InterceptionIntermediate
 	rootCert := interception.rootCert
 	interception.issuerMu.Unlock()
 
-	if primary != "" && strings.EqualFold(primary, strings.TrimSpace(tenantID)) && nodeIssuer != nil {
+	if primary != "" && primary == strings.TrimSpace(tenantID) && nodeIssuer != nil {
 		out["mode"] = "node_intermediate"
 		if rootCert != nil {
 			out["root_common_name"] = rootCert.Subject.CommonName
@@ -798,41 +863,46 @@ func NewNetworkExtensionLabTLSInterceptionOfflineIntermediate(hostPatterns []str
 	if err != nil {
 		return nil, fmt.Errorf("generate lab TLS leaf key: %w", err)
 	}
-	var sessionTicketKeys [][32]byte
-	var ticketKey [32]byte
-	if _, err := rand.Read(ticketKey[:]); err == nil {
-		sessionTicketKeys = [][32]byte{ticketKey}
+	sessionTicketSecret, fleetWide, err := newInterceptionTicketSecret()
+	if err != nil {
+		return nil, err
+	}
+	if fleetWide {
+		log.Printf("interception: session-ticket keys are FLEET-WIDE (derived, rotating every %s)", sessionTicketRotationPeriod)
+	} else {
+		log.Printf("interception: session-ticket keys are PER-PROCESS (no DSSE_INTERCEPTION_SESSION_TICKET_SECRET)")
 	}
 	rootPEMCopy := append([]byte(nil), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})...)
 	// The registry provider slot is filled with the intermediate (a valid provider); it is never used to mint
 	// leaves because offlineIssuer short-circuits issuerFor. The anchor surfaced to clients/admin is the ROOT.
 	interProvider := &staticInterceptionProvider{cert: issuer.signingCert, certPEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: issuer.signingCert.Raw}), signer: issuer.signer}
 	engine := &NetworkExtensionLabTLSInterception{
-		rootCert:           root,
-		rootRegistry:       NewTenantInterceptionRootRegistry(interProvider, now),
-		rootCertPEM:        rootPEMCopy,
-		leafKey:            leafKey,
-		sessionTicketKeys:  sessionTicketKeys,
-		hosts:              hosts,
-		leafCache:          map[string]tls.Certificate{},
-		interceptIssuers:   map[string]*InterceptionIssuer{},
-		offlineIssuer:      issuer,
-		now:                now,
-		pinDetectThreshold: 2,
-		pinnedHosts:        map[string]bool{},
-		handshakeFailures:  map[string]int{},
-		everSucceededHosts: map[string]bool{},
+		rootCert:            root,
+		rootRegistry:        NewTenantInterceptionRootRegistry(interProvider, now),
+		rootCertPEM:         rootPEMCopy,
+		leafKey:             leafKey,
+		sessionTicketSecret: sessionTicketSecret,
+		hosts:               hosts,
+		leafCache:           map[string]tls.Certificate{},
+		interceptIssuers:    map[string]*InterceptionIssuer{},
+		offlineIssuer:       issuer,
+		now:                 now,
+		pinDetectThreshold:  2,
+		pinnedHosts:         map[string]bool{},
+		handshakeFailures:   map[string]int{},
+		everSucceededHosts:  map[string]bool{},
 		// FAIL-SAFE DEFAULT OFF: auto-pin — a detection turning straight into a raw forward, and so into an
 		// escape from interception — is enabled only by the explicit opt-in of
 		// SetDynamicPinDetectionEnabled(true). Defaulting it to true would mean any path that does not call
 		// Set has auto-bypass silently on.
 		autoPinEnabled: false,
 	}
-	engine.rootCACertOutPath = strings.TrimSpace(rootCACertOut)
-	if engine.rootCACertOutPath != "" {
-		if err := WriteNetworkExtensionLabTLSRootCertificatePEM(engine.rootCACertOutPath, rootPEMCopy); err != nil {
-			return nil, fmt.Errorf("write interception root anchor: %w", err)
+	if strings.TrimSpace(rootCACertOut) != "" {
+		path, err := normalizeNetworkExtensionLabTLSRootCACertOutPath(rootCACertOut)
+		if err != nil {
+			return nil, err
 		}
+		engine.rootCACertOutPath = path // publish only after persisted re-parent replay
 	}
 	log.Printf("network_extension_lab_tls progress=offline_intermediate_loaded root_cn=%q intermediate_cn=%q name_constraints=%v", root.Subject.CommonName, issuer.signingCert.Subject.CommonName, issuer.signingCert.PermittedDNSDomains)
 	return engine, nil
@@ -939,8 +1009,8 @@ func (interception *NetworkExtensionLabTLSInterception) WithdrawRetiringTenantRo
 	}
 	key := normalizeInterceptionTenantKey(tenantID)
 	want := strings.ToLower(strings.TrimSpace(sha256Hex))
-	if key == "" || want == "" {
-		return false, fmt.Errorf("tenant and root fingerprint are both required")
+	if key == "" || !validInterceptionFingerprint(want) {
+		return false, fmt.Errorf("tenant and a SHA-256 root fingerprint are required")
 	}
 	interception.issuerMu.Lock()
 	defer interception.issuerMu.Unlock()
@@ -954,13 +1024,10 @@ func (interception *NetworkExtensionLabTLSInterception) WithdrawRetiringTenantRo
 	for _, r := range interception.offlineTenantRetiringRoots[key] {
 		if strings.EqualFold(interceptionCertSHA256Hex(r), want) {
 			removed = true
-			log.Printf("network_extension_lab_tls progress=offline_tenant_root_withdrawn tenant=%q cn=%q sha256=%s",
-				key, r.Subject.CommonName, want)
 			continue
 		}
 		kept = append(kept, r)
 	}
-	interception.offlineTenantRetiringRoots[key] = kept
 
 	// ★ AND A RETIREMENT THIS NODE KNOWS ONLY AS A FINGERPRINT (2026-08-21). A node that came up on already
 	// replaced material holds no certificate for what it was signing under before — only the durable record.
@@ -970,22 +1037,20 @@ func (interception *NetworkExtensionLabTLSInterception) WithdrawRetiringTenantRo
 	for _, fp := range interception.offlineTenantRetiringFingerprints[key] {
 		if strings.EqualFold(strings.TrimSpace(fp), want) {
 			removed = true
-			log.Printf("network_extension_lab_tls progress=offline_tenant_root_withdrawn tenant=%q sha256=%s "+
-				"(known from the durable record; this node holds no certificate for it)", key, want)
 			continue
 		}
 		fingerprintKept = append(fingerprintKept, fp)
 	}
-	interception.offlineTenantRetiringFingerprints[key] = fingerprintKept
-
 	if removed {
-		// Unlocked deliberately after the map edit: the file must go too, or the next restart announces a root
-		// an operator has just withdrawn.
-		go interception.forgetRetiringTenantRootByFingerprint(key, want)
+		// Persist a tombstone before publishing the smaller live set. It also
+		// prevents a stale retiring PEM from reviving this announcement.
 		if err := forgetRetiringRoot(interception.offlineTenantIntermediateDir, key, want); err != nil {
-			log.Printf("network_extension_lab_tls WARNING withdrawal_not_recorded tenant=%q sha256=%s err=%v — "+
-				"this node has stopped announcing it, and the next restart will announce it again", key, want, err)
+			return false, err
 		}
+		interception.offlineTenantRetiringRoots[key] = kept
+		interception.offlineTenantRetiringFingerprints[key] = fingerprintKept
+		removeRetiringTenantRootFile(interception.offlineTenantIntermediateDir, key, want)
+		log.Printf("network_extension_lab_tls progress=offline_tenant_root_withdrawn tenant=%q sha256=%s", key, want)
 	}
 	return removed, nil
 }
@@ -1000,7 +1065,7 @@ func interceptionCertSHA256Hex(cert *x509.Certificate) string {
 // fingerprint is in the NAME so withdrawing one is a single unlink and two operators cannot disagree about
 // which file is which root.
 func retiringRootFileName(tenantKey string, cert *x509.Certificate) string {
-	return sanitizeRootKey(tenantKey) + ".retiring-" + interceptionCertSHA256Hex(cert)[:16] + ".pem"
+	return interceptionTenantFileKey(tenantKey) + ".retiring-" + interceptionCertSHA256Hex(cert)[:16] + ".pem"
 }
 
 func (interception *NetworkExtensionLabTLSInterception) persistRetiringTenantRoot(tenantKey string, cert *x509.Certificate) error {
@@ -1020,11 +1085,20 @@ func (interception *NetworkExtensionLabTLSInterception) persistRetiringTenantRoo
 // restoreRetiringTenantRoots reads back the roots an organization is being moved off. Called from the same
 // boot path that restores the bundles, for the same reason.
 func (interception *NetworkExtensionLabTLSInterception) restoreRetiringTenantRoots(dir, tenantKey string) {
+	rec, err := readAnnouncedRoots(dir, tenantKey)
+	if err != nil {
+		log.Printf("network_extension_lab_tls retiring_root_restore_refused tenant=%q err=%v", tenantKey, err)
+		return
+	}
+	withdrawn := map[string]bool{}
+	for _, fp := range rec.WithdrawnSHA256 {
+		withdrawn[strings.ToLower(fp)] = true
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	prefix := sanitizeRootKey(tenantKey) + ".retiring-"
+	prefix := interceptionTenantFileKey(tenantKey) + ".retiring-"
 	for _, entry := range entries {
 		name := entry.Name()
 		if entry.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".pem") {
@@ -1047,6 +1121,9 @@ func (interception *NetworkExtensionLabTLSInterception) restoreRetiringTenantRoo
 		// declared compromised, listed beside its replacement. Checked here as well as at the source, because
 		// a file that predates the fix is exactly the case that matters.
 		fingerprint := interceptionCertSHA256Hex(cert)
+		if withdrawn[fingerprint] {
+			continue
+		}
 		interception.issuerMu.Lock()
 		reason, revoked := interception.revokedTenantRoots[fingerprint]
 		interception.issuerMu.Unlock()
@@ -1083,13 +1160,20 @@ func (interception *NetworkExtensionLabTLSInterception) forgetRetiringTenantRoot
 	interception.issuerMu.Lock()
 	dir := interception.offlineTenantIntermediateDir
 	interception.issuerMu.Unlock()
+	removeRetiringTenantRootFile(dir, tenantKey, sha256Hex)
+}
+
+func removeRetiringTenantRootFile(dir, tenantKey, sha256Hex string) {
 	if dir == "" {
 		return
 	}
-	name := sanitizeRootKey(tenantKey) + ".retiring-" + strings.ToLower(sha256Hex)[:16] + ".pem"
+	if !validInterceptionFingerprint(sha256Hex) {
+		return
+	}
+	name := interceptionTenantFileKey(tenantKey) + ".retiring-" + strings.ToLower(sha256Hex)[:16] + ".pem"
 	if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
 		log.Printf("network_extension_lab_tls WARNING offline_tenant_retiring_root_still_on_disk tenant=%q file=%q err=%v "+
-			"(withdrawn from this process; a restart would announce it again)", tenantKey, name, err)
+			"(durable withdrawal or revocation still prevents its announcement after restart)", tenantKey, name, err)
 	}
 }
 
@@ -1120,20 +1204,49 @@ func (interception *NetworkExtensionLabTLSInterception) RevokeTenantInterception
 			"deciding whether it may come back, and \"revoked\" alone does not answer that")
 	}
 	interception.issuerMu.Lock()
-	revoked := []string{}
+	revokedSet := map[string]bool{}
 	if current := interception.offlineTenantRoots[key]; current != nil {
-		revoked = append(revoked, interceptionCertSHA256Hex(current))
+		revokedSet[interceptionCertSHA256Hex(current)] = true
 	}
 	for _, retiring := range interception.offlineTenantRetiringRoots[key] {
-		revoked = append(revoked, interceptionCertSHA256Hex(retiring))
+		revokedSet[interceptionCertSHA256Hex(retiring)] = true
 	}
+	// A node restarted after replacement may only retain the old authority's
+	// fingerprint, not its certificate. It remains in the device-facing trust
+	// list and must be part of the durable revocation decision as well.
+	for _, fingerprint := range interception.offlineTenantRetiringFingerprints[key] {
+		fingerprint = strings.ToLower(strings.TrimSpace(fingerprint))
+		if !validInterceptionFingerprint(fingerprint) {
+			interception.issuerMu.Unlock()
+			return nil, fmt.Errorf("invalid retiring interception root fingerprint for %q", key)
+		}
+		revokedSet[fingerprint] = true
+	}
+	revoked := make([]string, 0, len(revokedSet))
+	for fingerprint := range revokedSet {
+		revoked = append(revoked, fingerprint)
+	}
+	sort.Strings(revoked)
 	if len(revoked) == 0 {
 		interception.issuerMu.Unlock()
 		return nil, fmt.Errorf("%q has no interception authority on this node to revoke", tenantID)
 	}
+	dir := interception.offlineTenantIntermediateDir
+	if dir == "" {
+		interception.issuerMu.Unlock()
+		return nil, fmt.Errorf("interception revocation for %q requires a durable tenant-intermediate directory", key)
+	}
+	// The administrative operation must not report success, or alter the live
+	// issuer, until its tombstone is durable. Holding issuerMu also prevents a
+	// simultaneous authority replacement from racing the recorded fingerprints.
+	if err := interception.persistRevocation(dir, key, revoked, reason); err != nil {
+		interception.issuerMu.Unlock()
+		return nil, fmt.Errorf("persist interception revocation for %q: %w", key, err)
+	}
 	delete(interception.offlineTenantIssuers, key)
 	delete(interception.offlineTenantRoots, key)
 	delete(interception.offlineTenantRetiringRoots, key)
+	delete(interception.offlineTenantRetiringFingerprints, key)
 	if interception.revokedTenantRoots == nil {
 		interception.revokedTenantRoots = map[string]string{}
 	}
@@ -1147,7 +1260,6 @@ func (interception *NetworkExtensionLabTLSInterception) RevokeTenantInterception
 		interception.revokedTenants = map[string]string{}
 	}
 	interception.revokedTenants[key] = reason
-	dir := interception.offlineTenantIntermediateDir
 	interception.issuerMu.Unlock()
 
 	// Leaves minted under the revoked authority must not be served again from cache.
@@ -1155,18 +1267,15 @@ func (interception *NetworkExtensionLabTLSInterception) RevokeTenantInterception
 	interception.leafCache = map[string]tls.Certificate{}
 	interception.mu.Unlock()
 
-	if dir != "" {
-		// The retiring roots are persisted one file each, separately from the bundle, and deleting the bundle
-		// left them behind — so a restart restored a revoked root and announced it to devices beside its
-		// replacement. Removed by fingerprint here as well as refused on restore: one stops it recurring, the
-		// other repairs a node that already has the file.
-		for _, fingerprint := range revoked {
-			interception.forgetRetiringTenantRootByFingerprint(key, fingerprint)
-		}
-		if err := interception.persistRevocation(dir, key, revoked, reason); err != nil {
-			log.Printf("network_extension_lab_tls ★ WARNING interception_revocation_not_durable tenant=%q err=%v — "+
-				"the authority is dead in THIS process only; a restart would load it again from disk. Remove the "+
-				"bundle files by hand before restarting.", key, err)
+	// The retiring roots are persisted separately from the bundle. Cleanup
+	// follows the tombstone; restore refuses a revoked root even if unlink fails.
+	for _, fingerprint := range revoked {
+		interception.forgetRetiringTenantRootByFingerprint(key, fingerprint)
+	}
+	safe := interceptionTenantFileKey(key)
+	for _, name := range []string{safe + ".root.pem", safe + ".intermediate.pem", safe + ".key.pem"} {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			log.Printf("network_extension_lab_tls WARNING revoked_bundle_cleanup_failed tenant=%q file=%q err=%v (durable revocation still blocks restore)", key, name, err)
 		}
 	}
 	log.Printf("network_extension_lab_tls ★ interception_authority_revoked tenant=%q roots=%v reason=%q — that "+
@@ -1176,7 +1285,9 @@ func (interception *NetworkExtensionLabTLSInterception) RevokeTenantInterception
 }
 
 // revocationFileName is where a tenant's revoked fingerprints live, beside the bundles they refer to.
-func revocationFileName(tenantKey string) string { return sanitizeRootKey(tenantKey) + ".revoked.json" }
+func revocationFileName(tenantKey string) string {
+	return interceptionTenantFileKey(tenantKey) + ".revoked.json"
+}
 
 type persistedRevocation struct {
 	Tenant  string            `json:"tenant"`
@@ -1193,11 +1304,17 @@ func (interception *NetworkExtensionLabTLSInterception) persistRevocation(dir, t
 	// or the earlier key becomes loadable again.
 	if raw, err := os.ReadFile(filepath.Join(dir, revocationFileName(tenantKey))); err == nil {
 		var existing persistedRevocation
-		if json.Unmarshal(raw, &existing) == nil {
-			for fingerprint, why := range existing.Revoked {
-				record.Revoked[fingerprint] = why
-			}
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			return fmt.Errorf("decode existing revocation: %w", err)
 		}
+		if err := validatePersistedRevocation(existing, tenantKey); err != nil {
+			return fmt.Errorf("validate existing revocation: %w", err)
+		}
+		for fingerprint, why := range existing.Revoked {
+			record.Revoked[fingerprint] = why
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read existing revocation: %w", err)
 	}
 	for _, fingerprint := range fingerprints {
 		record.Revoked[fingerprint] = reason
@@ -1206,14 +1323,17 @@ func (interception *NetworkExtensionLabTLSInterception) persistRevocation(dir, t
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, revocationFileName(tenantKey)), encoded, 0o600); err != nil {
-		return err
+	return durablefile.Write(filepath.Join(dir, revocationFileName(tenantKey)), encoded, 0o600)
+}
+
+func validatePersistedRevocation(record persistedRevocation, tenantKey string) error {
+	if record.Tenant != tenantKey || strings.TrimSpace(record.Reason) == "" || len(record.Revoked) == 0 {
+		return fmt.Errorf("tenant, reason, or revoked roots are invalid")
 	}
-	// And take the bundle out of the way, so a restore cannot walk the revoked key back in.
-	safe := sanitizeRootKey(tenantKey)
-	for _, name := range []string{safe + ".root.pem", safe + ".intermediate.pem", safe + ".key.pem"} {
-		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
-			return err
+	for fingerprint, reason := range record.Revoked {
+		decoded, err := hex.DecodeString(fingerprint)
+		if len(fingerprint) != 64 || len(decoded) != 32 || err != nil || strings.ToLower(fingerprint) != fingerprint || strings.TrimSpace(reason) == "" {
+			return fmt.Errorf("revoked root fingerprint or reason is invalid")
 		}
 	}
 	return nil
@@ -1252,17 +1372,30 @@ func (interception *NetworkExtensionLabTLSInterception) TenantInterceptionRevoke
 func (interception *NetworkExtensionLabTLSInterception) restoreRevocations(dir string, entries []os.DirEntry) {
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".revoked.json") {
+		if !strings.HasSuffix(name, ".revoked.json") {
+			continue
+		}
+		tenant, ok := interceptionTenantFromFileKey(strings.TrimSuffix(name, ".revoked.json"))
+		if !ok {
+			log.Printf("network_extension_lab_tls WARNING interception_revocation_bad_name file=%q", name)
+			continue
+		}
+		if entry.IsDir() {
+			interception.quarantineInterceptionRevocation(tenant, "revocation record is a directory")
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
+			interception.quarantineInterceptionRevocation(tenant, "revocation record cannot be read")
 			continue
 		}
 		var record persistedRevocation
 		if err := json.Unmarshal(raw, &record); err != nil {
-			log.Printf("network_extension_lab_tls ★ WARNING interception_revocation_unreadable file=%q err=%v — this "+
-				"node cannot tell which authorities were revoked, so it may load one that was", name, err)
+			interception.quarantineInterceptionRevocation(tenant, "revocation record is invalid JSON")
+			continue
+		}
+		if err := validatePersistedRevocation(record, tenant); err != nil {
+			interception.quarantineInterceptionRevocation(tenant, "revocation record has invalid fields")
 			continue
 		}
 		interception.issuerMu.Lock()
@@ -1275,13 +1408,35 @@ func (interception *NetworkExtensionLabTLSInterception) restoreRevocations(dir s
 		if interception.revokedTenants == nil {
 			interception.revokedTenants = map[string]string{}
 		}
-		if strings.TrimSpace(record.Tenant) != "" && len(record.Revoked) > 0 {
-			interception.revokedTenants[normalizeInterceptionTenantKey(record.Tenant)] = record.Reason
-		}
+		interception.revokedTenants[tenant] = record.Reason
 		interception.issuerMu.Unlock()
 		log.Printf("network_extension_lab_tls progress=interception_revocations_restored tenant=%q count=%d",
 			record.Tenant, len(record.Revoked))
 	}
+}
+
+// A damaged tombstone may be the only evidence that a key was compromised.
+// Refuse every authority for that tenant until the record is repaired; loading
+// a different root cannot prove the earlier revocations are still enforced.
+func (interception *NetworkExtensionLabTLSInterception) quarantineInterceptionRevocation(tenant, why string) {
+	key := normalizeInterceptionTenantKey(tenant)
+	interception.issuerMu.Lock()
+	if interception.revocationQuarantinedTenants == nil {
+		interception.revocationQuarantinedTenants = map[string]string{}
+	}
+	if interception.revokedTenants == nil {
+		interception.revokedTenants = map[string]string{}
+	}
+	interception.revocationQuarantinedTenants[key] = why
+	interception.revokedTenants[key] = why
+	delete(interception.offlineTenantIssuers, key)
+	delete(interception.offlineTenantRoots, key)
+	delete(interception.offlineTenantRetiringRoots, key)
+	interception.issuerMu.Unlock()
+	interception.mu.Lock()
+	interception.leafCache = map[string]tls.Certificate{}
+	interception.mu.Unlock()
+	log.Printf("network_extension_lab_tls WARNING interception_revocation_quarantined tenant=%q reason=%q (authority load refused)", key, why)
 }
 
 // parseInterceptionCertChainPEM reads one or more certificates, SIGNING TIER FIRST. The first is what mints
@@ -1418,7 +1573,7 @@ func (interception *NetworkExtensionLabTLSInterception) AnnounceTenantIntercepti
 	if interception == nil {
 		return nil, fmt.Errorf("interception not enabled")
 	}
-	key := strings.ToLower(strings.TrimSpace(tenantID))
+	key := normalizeInterceptionTenantKey(tenantID)
 	if key == "" {
 		return nil, fmt.Errorf("an organization must be named: a root announced to nobody is announced to everybody")
 	}
@@ -1429,8 +1584,17 @@ func (interception *NetworkExtensionLabTLSInterception) AnnounceTenantIntercepti
 	if !root.IsCA {
 		return nil, fmt.Errorf("that certificate is not a CA, so no device could ever chain to it")
 	}
-	interception.mu.Lock()
-	defer interception.mu.Unlock()
+	interception.issuerMu.Lock()
+	defer interception.issuerMu.Unlock()
+	if interception.revocationStoreUnreadableReason != "" {
+		return nil, fmt.Errorf("interception revocation store is unavailable; refusing to announce an authority for %q", key)
+	}
+	if _, quarantined := interception.revocationQuarantinedTenants[key]; quarantined {
+		return nil, fmt.Errorf("interception revocation record for %q is unreadable; refusing to announce an authority", key)
+	}
+	if _, revoked := interception.revokedTenantRoots[certFingerprintHex(root)]; revoked {
+		return nil, fmt.Errorf("this interception root was revoked and cannot be announced again for %q", key)
+	}
 	if current := interception.offlineTenantRoots[key]; current != nil && current.Equal(root) {
 		return nil, fmt.Errorf("this is already the root %q signs under, so there is nothing to announce", key)
 	}
@@ -1464,7 +1628,9 @@ func (interception *NetworkExtensionLabTLSInterception) OfflineTenantAnnouncedRo
 	if interception == nil {
 		return nil
 	}
-	key := strings.ToLower(strings.TrimSpace(tenantID))
+	key := normalizeInterceptionTenantKey(tenantID)
+	interception.issuerMu.Lock()
+	defer interception.issuerMu.Unlock()
 	seen := map[string]bool{}
 	out := []string{}
 	add := func(fp string) {
@@ -1472,16 +1638,23 @@ func (interception *NetworkExtensionLabTLSInterception) OfflineTenantAnnouncedRo
 		if fp == "" || seen[fp] {
 			return
 		}
+		if _, revoked := interception.revokedTenantRoots[fp]; revoked {
+			return
+		}
 		seen[fp] = true
 		out = append(out, fp)
 	}
-	for _, c := range interception.OfflineTenantAnnouncedRoots(tenantID) {
+	if current := interception.offlineTenantRoots[key]; current != nil {
+		add(certFingerprintHex(current))
+	}
+	for _, c := range interception.offlineTenantRetiringRoots[key] {
 		add(certFingerprintHex(c))
 	}
-	interception.mu.Lock()
+	for _, c := range interception.offlineTenantIncomingRoots[key] {
+		add(certFingerprintHex(c))
+	}
 	for _, fp := range interception.offlineTenantRetiringFingerprints[key] {
 		add(fp)
 	}
-	interception.mu.Unlock()
 	return out
 }

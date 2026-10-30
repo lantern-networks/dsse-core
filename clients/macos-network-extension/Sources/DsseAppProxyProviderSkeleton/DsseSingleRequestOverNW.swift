@@ -54,7 +54,7 @@ public enum DsseSingleRequestOverNW {
                                body: Data, security: DsseTransportSecurity, timeout: TimeInterval,
                                identityOverride: SecIdentity? = nil,
                                presentClientIdentity: Bool = true) throws -> Response {
-        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
+        guard port > 0, port <= Int(UInt16.max), let nwPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             throw DsseSingleRequestError.badEndpoint("port \(port)")
         }
         let parameters = DsseTransportTLS.makeTunnelParameters(security: security, serverNameOverride: serverName,
@@ -170,31 +170,92 @@ public enum DsseSingleRequestOverNW {
         guard parts.count >= 2, let status = Int(parts[1]) else {
             throw DsseSingleRequestError.unusable("no status in \"\(statusLine)\"")
         }
-        // Chunked bodies: the Edge answers these with Content-Length, but a proxy in between may not, and a
-        // silently-truncated JSON body would surface as "response carried no cert_pem" — a message that sends
-        // the reader to the server. Decoded here so the failure names the real thing.
-        if headerText.lowercased().contains("transfer-encoding: chunked") {
+        // A short response can still be valid JSON. Check the declared framing before a caller uses the body
+        // as a certificate, profile or policy; EOF alone does not prove that all declared bytes arrived.
+        var contentLength: Int?
+        var chunked = false
+        for line in headerText.components(separatedBy: "\r\n").dropFirst() {
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            let name = line[..<colon].lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            switch name {
+            case "content-length":
+                guard contentLength == nil, let length = Int(value), length >= 0 else {
+                    throw DsseSingleRequestError.unusable("invalid or duplicate content length")
+                }
+                contentLength = length
+            case "transfer-encoding":
+                guard !chunked, value.lowercased() == "chunked" else {
+                    throw DsseSingleRequestError.unusable("unsupported transfer encoding")
+                }
+                chunked = true
+            default:
+                break
+            }
+        }
+        guard !(chunked && contentLength != nil) else {
+            throw DsseSingleRequestError.unusable("conflicting response framing")
+        }
+        if chunked {
             return Response(status: status, body: try dechunk(body))
+        }
+        if let contentLength, body.count != contentLength {
+            throw DsseSingleRequestError.unusable("response body length does not match content length")
         }
         return Response(status: status, body: body)
     }
 
     static func dechunk(_ body: Data) throws -> Data {
+        let bytes = Array(body)
         var out = Data()
-        var rest = body
-        while true {
-            guard let lineEnd = rest.range(of: Data("\r\n".utf8)) else { break }
-            let sizeText = String(data: rest.subdata(in: rest.startIndex..<lineEnd.lowerBound), encoding: .utf8) ?? ""
-            let size = Int(sizeText.split(separator: ";").first.map(String.init) ?? "", radix: 16) ?? -1
-            if size < 0 { throw DsseSingleRequestError.unusable("bad chunk size \"\(sizeText)\"") }
-            if size == 0 { break }
-            let chunkStart = lineEnd.upperBound
-            let chunkEnd = rest.index(chunkStart, offsetBy: size, limitedBy: rest.endIndex) ?? rest.endIndex
-            out.append(rest.subdata(in: chunkStart..<chunkEnd))
-            let afterChunk = rest.index(chunkEnd, offsetBy: 2, limitedBy: rest.endIndex) ?? rest.endIndex
-            rest = rest.subdata(in: afterChunk..<rest.endIndex)
+        var cursor = 0
+        func lineEnd(from start: Int) -> Int? {
+            guard start < bytes.count else { return nil }
+            var i = start
+            while i + 1 < bytes.count {
+                if bytes[i] == 13 && bytes[i + 1] == 10 { return i }
+                i += 1
+            }
+            return nil
         }
-        return out
+        while true {
+            guard let end = lineEnd(from: cursor),
+                  let sizeLine = String(bytes: bytes[cursor..<end], encoding: .ascii) else {
+                throw DsseSingleRequestError.unusable("incomplete chunk size")
+            }
+            let token = String(sizeLine.prefix { $0 != ";" })
+            guard !token.isEmpty,
+                  token.utf8.allSatisfy({ byte in
+                      (48...57).contains(byte) || (65...70).contains(byte) || (97...102).contains(byte)
+                  }),
+                  let size = Int(token, radix: 16) else {
+                throw DsseSingleRequestError.unusable("invalid chunk size")
+            }
+            cursor = end + 2
+            if size == 0 {
+                // Zero-size chunk must be followed by complete trailers and a blank line. A connection that
+                // drops before that terminator has not delivered a complete HTTP response.
+                while let trailerEnd = lineEnd(from: cursor) {
+                    if trailerEnd == cursor {
+                        guard trailerEnd + 2 == bytes.count else {
+                            throw DsseSingleRequestError.unusable("bytes after chunk terminator")
+                        }
+                        return out
+                    }
+                    cursor = trailerEnd + 2
+                }
+                throw DsseSingleRequestError.unusable("incomplete chunk terminator")
+            }
+            guard size <= bytes.count - cursor else {
+                throw DsseSingleRequestError.unusable("truncated chunk data")
+            }
+            let chunkEnd = cursor + size
+            guard bytes.count - chunkEnd >= 2, bytes[chunkEnd] == 13, bytes[chunkEnd + 1] == 10 else {
+                throw DsseSingleRequestError.unusable("missing chunk data terminator")
+            }
+            out.append(contentsOf: bytes[cursor..<chunkEnd])
+            cursor = chunkEnd + 2
+        }
     }
 }
 

@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -394,29 +395,20 @@ func domainEventOutboxManifestFilename(objectFilename string) string {
 }
 
 func safeDomainEventOutboxObjectSegment(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "unknown"
+	// Preserve the existing path for ordinary IDs, including minted tenant IDs.
+	// Replacing punctuation with '_' merged valid tenant IDs such as A.B and
+	// A_B, and distinct outbox IDs such as x:y and x_y. A leading '~' cannot
+	// occur in the unchanged alphabet, so encoding the entire original byte
+	// string below is injective even when the original contains '~' itself.
+	plain := value != ""
+	for i := 0; i < len(value) && plain; i++ {
+		b := value[i]
+		plain = b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '-' || b == '_'
 	}
-	var builder strings.Builder
-	for _, r := range value {
-		switch {
-		case r >= 'a' && r <= 'z':
-			builder.WriteRune(r)
-		case r >= 'A' && r <= 'Z':
-			builder.WriteRune(r)
-		case r >= '0' && r <= '9':
-			builder.WriteRune(r)
-		case r == '-' || r == '_':
-			builder.WriteRune(r)
-		default:
-			builder.WriteByte('_')
-		}
+	if plain {
+		return value
 	}
-	if builder.Len() == 0 {
-		return "unknown"
-	}
-	return builder.String()
+	return "~" + base64.RawURLEncoding.EncodeToString([]byte(value))
 }
 
 type httpDomainEventOutboxDelivery struct {

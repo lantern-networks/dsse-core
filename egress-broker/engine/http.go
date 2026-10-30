@@ -44,7 +44,7 @@ static struct curl_slist* hc_slist_append(struct curl_slist *l, const char *s) {
 static void hc_slist_free(struct curl_slist *l) { curl_slist_free_all(l); }
 
 // --- curl_multi: single event loop multiplexing all transfers (h2 streams share one conn per host, like Chrome) ---
-static void* hc_multi_init(void) {
+static void* hc_multi_init(long connection_limit) {
 	CURLM *m = curl_multi_init();
 	if (m) {
 		// h2 stream multiplexing: curl reuses one connection per host and multiplexes streams onto it (Chrome-like)
@@ -54,16 +54,10 @@ static void* hc_multi_init(void) {
 		// failing dozens of streams at once. curl's default connection management already prefers multiplex + reuse
 		// and avoids the connection storm; the retry loop below handles GOAWAY recycles.
 		curl_multi_setopt(m, CURLMOPT_PIPELINING, (long)CURLPIPE_MULTIPLEX);
-		// LEAK FIX: 0 (unlimited) let curl's connection cache grow without bound, so idle upstream connections
-		// that the origin later closed (FIN) lingered in CLOSE_WAIT forever — curl only discards a dead cached
-		// connection when it REUSES that host, so conns to one-off hosts leaked (24 CLOSE_WAIT accumulated over a
-		// 3-day uptime; unbounded under diverse egress → FD/memory creep). A FINITE cap makes curl LRU-PRUNE the
-		// least-recently-used idle connection (including a dead CLOSE_WAIT one) whenever the cache is full, so the
-		// idle-conn set is bounded and dead conns are reaped. This is the TOTAL-connections cap; it does NOT
-		// reintroduce the per-host stall the comment above warns about (that was MAX_HOST_CONNECTIONS=1 — h2 still
-		// multiplexes many streams over one conn). Also bound the reuse cache directly and cap idle-conn age so a
-		// stale keepalive is not reused. 256 total is generous for h2-multiplexed egress; tune by real fleet load.
-		curl_multi_setopt(m, CURLMOPT_MAX_TOTAL_CONNECTIONS, 256L);
+		// Active connection admission is an explicit operator choice (0 disables).
+		// MAXCONNECTS below limits only unused connections retained for reuse;
+		// it does not queue or refuse active transfers.
+		curl_multi_setopt(m, CURLMOPT_MAX_TOTAL_CONNECTIONS, connection_limit);
 		curl_multi_setopt(m, CURLMOPT_MAXCONNECTS, 256L);
 	}
 	return m;
@@ -91,6 +85,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime"
 	"runtime/cgo"
 	"strconv"
 	"strings"
@@ -98,6 +93,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"golang.org/x/net/http/httpguts"
 )
 
@@ -145,7 +141,14 @@ type multiEngine struct {
 // but broke connection reuse (cold engines). Hashing by HOST gives each origin a STABLE engine — its connections
 // stay warm/reused on its own loop — while spreading DIFFERENT hosts (the page host vs the image CDN) across
 // separate loops/threads, so getAsins's host isn't stuck behind the CDN's image traffic.
-const numEngines = 8
+var numEngines = configuredEngineWorkers()
+
+func configuredEngineWorkers() int {
+	if n := runtimequota.Count("DSSE_EGRESS_ENGINE_WORKERS"); n > 0 {
+		return n
+	}
+	return runtime.GOMAXPROCS(0)
+}
 
 var (
 	enginesOnce sync.Once
@@ -157,7 +160,7 @@ func initEngines() {
 		engines = make([]*multiEngine, numEngines)
 		for i := range engines {
 			engines[i] = &multiEngine{
-				multi: unsafe.Pointer(C.hc_multi_init()),
+				multi: unsafe.Pointer(C.hc_multi_init(C.long(runtimequota.Count("DSSE_EGRESS_MAX_CONNECTIONS_PER_ENGINE")))),
 				prof:  impersonateTarget(),
 				live:  map[unsafe.Pointer]*xfer{},
 			}
@@ -174,7 +177,7 @@ func engineForHost(host string) *multiEngine {
 		h ^= uint32(host[i])
 		h *= 16777619
 	}
-	return engines[h%numEngines]
+	return engines[int(uint64(h)%uint64(numEngines))]
 }
 
 func (e *multiEngine) acquire() unsafe.Pointer {

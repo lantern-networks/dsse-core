@@ -135,6 +135,9 @@ func (s *Store) ApplyReport(ctx context.Context, tenantID, reporter string, seq 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.restoreErr != nil {
+		return false, s.restoreErr
+	}
 	if p, ok := s.persister.(sharedPersister); ok {
 		if s.sharedUncertain {
 			return false, fmt.Errorf("observation commit requires reconciliation")

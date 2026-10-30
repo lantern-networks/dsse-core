@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import DsseAppProxyProviderSkeleton
 
 // Cross-language verification: this envelope + public key were produced by the GO Edge signer
@@ -20,9 +21,105 @@ final class DsseSignedAgentPolicyTests: XCTestCase {
     func testGoSignedPolicyVerifiesInSwift() {
         let path = writeTemp(envelopeJSON)
         defer { try? FileManager.default.removeItem(atPath: path) }
-        let result = DsseSignedAgentPolicy.verifiedServerExclusions(signedPath: path, pinnedPublicKeyHex: pubKeyHex)
+        let result = DsseSignedAgentPolicy.verifiedServerExclusions(
+            signedPath: path, pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant_track_a_uc03a_lab")
         XCTAssertEqual(result, ["com.corp.vpnclient", "com.example.devtool"],
                        "the Go-signed server exclusion set must verify and parse in the NE")
+    }
+
+    func testDeviceScopedPolicyIsNotAcceptedWithoutADeviceOwner() {
+        let envelope = Data(envelopeJSON.utf8)
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pubKeyHex),
+            "a valid signature for mac-dev-1 alone cannot authorize an unidentified device")
+    }
+
+    func testSameDeviceNameCannotApplySignedPolicyWithoutTenantBinding() {
+        // A deployment key signs policies for many tenants. The same certificate CN can be presented
+        // under a different tenant authority after a legitimate reprovisioning, while this old policy
+        // remains cached. Device-name binding alone must not apply the old tenant's exclusions.
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: Data(envelopeJSON.utf8), pinnedPublicKeyHex: pubKeyHex,
+            expectedDeviceIdentity: "mac-dev-1"))
+    }
+
+    func testDeviceScopedPolicyRejectsAnotherDeviceAndAcceptsExactOwner() {
+        let envelope = Data(envelopeJSON.utf8)
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pubKeyHex,
+            expectedDeviceIdentity: "mac-dev-2"))
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pubKeyHex,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant_track_a_uc03a_lab"),
+            ["com.corp.vpnclient", "com.example.devtool"])
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pubKeyHex,
+            expectedDeviceIdentity: "MAC-DEV-1", expectedTenantID: "tenant_track_a_uc03a_lab"),
+            ["com.corp.vpnclient", "com.example.devtool"],
+            "the Edge canonicalizes certificate CNs by trimming and lowercasing")
+    }
+
+    func testEveryPolicyFieldRequiresTheCertificateDeviceIdentity() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let root = String(repeating: "a", count: 64)
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "device_identity": "mac-dev-1",
+            "tenant_id": "Tenant-Exact",
+            "excluded_app_signing_ids": ["com.example.policy"],
+            "interception_root_sha256": [root],
+            "renew_certificates_issued_before": "2026-10-23T00:00:00Z",
+        ])
+        let signature = try key.signature(for: payload).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        let envelope = try JSONSerialization.data(withJSONObject: [
+            "type": DsseSignedAgentPolicy.envelopeType,
+            "signing_key_id": "test",
+            "payload_sha256": SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined(),
+            "payload_b64": payload.base64EncodedString(),
+            "signature": "ed25519:" + signature,
+        ])
+        let pin = key.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "Tenant-Exact"), ["com.example.policy"])
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedInterceptionRoots(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "Tenant-Exact"), [root])
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedDeploymentTenant(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1"), "Tenant-Exact")
+        XCTAssertNotNil(DsseSignedAgentPolicy.verifiedRenewCertificatesIssuedBefore(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "Tenant-Exact"))
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-other"),
+            "a valid deployment signature and the same CN cannot transfer enforcement between tenants")
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedInterceptionRoots(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-other"), [])
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedRenewCertificatesIssuedBefore(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-other"))
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedDeploymentTenant(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-1"), "Tenant-Exact",
+            "startup must still read the signed old tenant for mismatch diagnosis, without applying it")
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-2"))
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedInterceptionRoots(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-2"), [])
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedDeploymentTenant(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-2"))
+        XCTAssertNil(DsseSignedAgentPolicy.verifiedRenewCertificatesIssuedBefore(
+            envelopeData: envelope, pinnedPublicKeyHex: pin,
+            expectedDeviceIdentity: "mac-dev-2"))
     }
 
     func testWrongPinnedKeyRejected() {
@@ -66,7 +163,9 @@ final class DsseSignedAgentPolicyTests: XCTestCase {
         let configPath = writeTemp(configJSON)
         defer { try? FileManager.default.removeItem(atPath: configPath) }
 
-        let policy = DsseAppProxyProvider.selfExclusionPolicy(agentConfigPath: configPath)
+        let policy = DsseAppProxyProvider.selfExclusionPolicy(
+            agentConfigPath: configPath,
+            serverExclusionsOverride: ["com.corp.vpnclient", "com.example.devtool"])
         XCTAssertTrue(policy.excludes(sourceAppSigningIdentifier: "limactl-loop-egress"),
                       "the local loop-prevention infra exclusion must survive a signed server policy")
         XCTAssertTrue(policy.excludes(sourceAppSigningIdentifier: "a.out"),

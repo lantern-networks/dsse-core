@@ -143,6 +143,11 @@ func verifyDeployment(dir, cpAdmin string, edgeAdmins []string, edgeTransport, a
 				adminBootstrappedMarker)
 			return out
 		}
+		if err != nil || (code != http.StatusUnauthorized && code != http.StatusForbidden) {
+			add("the break-glass credential is no longer accepted", false,
+				"GET /admin/config-bundle -> %d %v; only an explicit 401 or 403 proves refusal. A missing route, unavailable authority, or transport failure does not establish that the credential is disabled", code, err)
+			return out
+		}
 		add("the break-glass credential is no longer accepted", true,
 			"answered %d, and this deployment has a named administrator", code)
 	} else {
@@ -269,16 +274,17 @@ func verifyDeployment(dir, cpAdmin string, edgeAdmins []string, edgeTransport, a
 		// So it waits, bounded. Staying behind is the real defect and it still fails; catching up is what the
 		// deployment is supposed to do and it is given the time to.
 		edgeGen, edgeEpoch := edgeAppliedGeneration(client, edgeAdmin)
-		for waited := 0; edgeGen < cpGen && waited < generationCatchUpWait; waited += 5 {
+		for waited := 0; !edgeConfigurationCurrent(edgeGen, edgeEpoch, cpGen, cpEpoch) && waited < generationCatchUpWait; waited += 5 {
 			time.Sleep(5 * time.Second)
 			edgeGen, edgeEpoch = edgeAppliedGeneration(client, edgeAdmin)
 		}
 		switch {
-		case edgeEpoch != "" && cpEpoch != "" && edgeEpoch != cpEpoch:
-			add("the Edge holds the control plane's current configuration", true,
-				"not comparable yet: the control plane has restarted since this Edge last applied, and it "+
-					"re-baselines on the next poll")
-		case edgeGen >= cpGen:
+		case cpEpoch != "" && edgeEpoch != cpEpoch:
+			add("the Edge holds the control plane's current configuration", false,
+				"the control plane is publishing epoch %q but this Edge is still serving epoch %q after %ds. "+
+					"Its generation cannot be compared until it applies the new epoch",
+				cpEpoch, edgeEpoch, generationCatchUpWait)
+		case edgeConfigurationCurrent(edgeGen, edgeEpoch, cpGen, cpEpoch):
 			add("the Edge holds the control plane's current configuration", true,
 				"generation %d", edgeGen)
 		default:
@@ -443,7 +449,12 @@ func verifyEnrolment(client *http.Client, dir, cpAdmin string, edgeAdmins []stri
 	// identity claim is a ONE-TIME decision held by the control plane — which is the property being checked —
 	// so a fixed name works once and is refused for ever after with "this identity has already been enrolled
 	// by another issuer". A check that only passes the first time is a check people stop running.
-	deviceID := "dsse-install-verification-" + strings.ToLower(randomSecret()[:10])
+	deviceNonce, err := randomSecret()
+	if err != nil {
+		add("a device can enrol", false, "could not generate verification device ID: %v", err)
+		return out
+	}
+	deviceID := "dsse-install-verification-" + strings.ToLower(deviceNonce[:10])
 	keyPEM, csrPEM, err := generateVerificationCSR(deviceID)
 	if err != nil {
 		add("a device can enrol", false, "could not build a request: %v", err)
@@ -527,9 +538,9 @@ func verifyEnrolment(client *http.Client, dir, cpAdmin string, edgeAdmins []stri
 	}
 
 	// The same token, again. It must be refused, and refused by the AUTHORITY rather than by this node's memory.
-	code, _, _ = post(client, strings.TrimRight(edgeTransport, "/")+"/enroll", "", enrol)
-	add("the same enrolment token cannot be used twice", code != 200,
-		"the second use answered %d — one-time is decided in one place, or it means once per Edge", code)
+	code, _, err = post(client, strings.TrimRight(edgeTransport, "/")+"/enroll", "", enrol)
+	add("the same enrolment token cannot be used twice", tokenReuseWasRefused(code, err),
+		"the second use answered %d (%v) — expected an explicit 403 refusal from the Edge; a transport error or server failure does not prove one-time use", code, err)
 
 	// ★★★ AND THE ONE ACT AN OPERATOR PERFORMS TO STOP A MACHINE IS PERFORMED, AGAINST THE MACHINE. A screen
 	// that says "blocked" and a device that goes on steering are the same screen.
@@ -583,6 +594,10 @@ func verifyEnrolment(client *http.Client, dir, cpAdmin string, edgeAdmins []stri
 		}
 	}
 	return out
+}
+
+func tokenReuseWasRefused(code int, err error) bool {
+	return err == nil && code == http.StatusForbidden
 }
 
 // enrolledCertificatePEM pulls the issued certificate out of an enrolment answer. The field name is the one
@@ -920,7 +935,10 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 		// a_shape_cannot_fail_for_being_the_shape.go. It has one control plane, one copy of its state and one
 		// door because that is the shape it was installed in, and reporting that as a failure teaches an
 		// operator that a red -verify is normal.
-		if deploymentIsASingleMachine(dir) {
+		if readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"] == "one-region-multi-edge" {
+			results = append(results, verifyResult{name: "authority and doorway redundancy", skipped: true,
+				note: "one-region-multi-edge intentionally has a single CP/L4 host; only the Edge tier is redundant"})
+		} else if deploymentIsASingleMachine(dir) {
 			results = append(results,
 				verifyResult{name: "more than one control-plane process is running", ok: true,
 					note: singleMachineNote("control plane")},
@@ -929,7 +947,8 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 		} else {
 			results = append(results, verifyAuthorityIsNotASinglePoint(client, strings.TrimRight(cpAdmin, "/"),
 				strings.Split(cpPeers, ","))...)
-			results = append(results, verifyAuthorityStateIsRedundant(client, strings.TrimRight(cpAdmin, "/"))...)
+			results = append(results, verifyAuthorityStateForProfile(client, strings.TrimRight(cpAdmin, "/"),
+				threeVoterProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]))...)
 		}
 		// The peers are asked with the same credential the rest of the walk resolved: the flag when one was
 		// given, otherwise the deployment's own break-glass token, which is what a deployment that has not
@@ -957,11 +976,17 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 		results = append(results, verifyOneBuild(client,
 			append(append([]string{strings.TrimRight(cpAdmin, "/")}, strings.Split(cpPeers, ",")...), edgeAdmins...))...)
 		// A deployment of one machine has one door, for the same reason it has one control plane.
-		if deploymentIsASingleMachine(dir) {
+		if readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"] == "one-region-multi-edge" {
+			results = append(results, verifyFrontDoors(client, edgeDoors, 1)...)
+		} else if deploymentIsASingleMachine(dir) {
 			results = append(results, verifyResult{name: "the region's doorway is not a single point", ok: true,
 				note: singleMachineNote("doorway")})
 		} else {
-			results = append(results, verifyFrontDoorPair(client, edgeDoors)...)
+			requiredDoors := 2
+			if threeVoterProfile(readDeploymentEnv(dir)["DSSE_TOPOLOGY_PROFILE"]) {
+				requiredDoors = 3
+			}
+			results = append(results, verifyFrontDoors(client, edgeDoors, requiredDoors)...)
 		}
 		// ★★★ AND WHERE THE ANSWERS ABOVE CAME FROM. Half of this walk is about NODES, and a deployment
 		// presents no name that reaches one. See the_fleet_has_no_address.go.
@@ -972,6 +997,17 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 		// one, and it looks exactly like three from every other angle.
 		if storeEnv, eerr := readEnvFile(filepath.Join(dir, "deployment.env")); eerr == nil {
 			results = append(results, verifyTheStoreCanLoseAPlace(dir, storeEnv)...)
+			if storeEnv["DSSE_TOPOLOGY_PROFILE"] == "three-regions-multi-edge" {
+				results = append(results, verifyOneRegionThreeNodesSync(storeEnv), verifyStoreConsumerAuthentication(dir, storeEnv), verifyDatabaseIdentity(dir, storeEnv))
+				results = append(results, verifySharedFleetPortalEntrances(dir, storeEnv), unmeasuredSharedFleetAcceptance())
+			}
+			if storeEnv["DSSE_TOPOLOGY_PROFILE"] == "one-region-three-nodes" {
+				results = append(results, verifyNodeAdminOwners(client, storeEnv, planeNamesFor(deploymentHostFor(dir)).BareHost, edgeAdmins, cpPeers))
+				results = append(results, verifyOneRegionThreeNodesSync(storeEnv))
+				results = append(results, verifyOneRegionThreeNodesReadiness(dir, storeEnv)...)
+				results = append(results, verifyOneRegionThreeNodesPortalCertificate(dir, storeEnv))
+				results = append(results, unmeasuredSharedFleetAcceptance())
+			}
 		}
 	}
 
@@ -1095,6 +1131,13 @@ func edgeAppliedGeneration(client *http.Client, edgeAdmin string) (uint64, strin
 // is looking.
 const generationCatchUpWait = 60
 
+// A generation from an earlier control-plane run can be arbitrarily larger
+// than the current one. When the authority publishes an epoch, the Edge must
+// have applied that SAME epoch before its generation proves currency.
+func edgeConfigurationCurrent(edgeGen uint64, edgeEpoch string, cpGen uint64, cpEpoch string) bool {
+	return (cpEpoch == "" || edgeEpoch == cpEpoch) && edgeGen >= cpGen
+}
+
 // becomesTrueWithin waits for a condition a freshly started deployment reaches on its own — a first poll, a
 // first report — and returns what it finds at the deadline.
 //
@@ -1167,7 +1210,7 @@ func waitForTheControlPlaneToAnswer(client *http.Client, cpAdmin string, within 
 // moment when it can work: a token authored on the authority admits on the Edge, and the two are a poll
 // apart. Whether the enrolment then succeeds is the caller's question, asked once.
 func waitForEveryEdgeToCatchUp(client *http.Client, edgeAdmins []string, cpAdmin, token string, within time.Duration) {
-	want, _, ok := controlPlaneGeneration(client, strings.TrimRight(cpAdmin, "/"), "", token, true)
+	want, epoch, ok := controlPlaneGeneration(client, strings.TrimRight(cpAdmin, "/"), "", token, true)
 	if !ok {
 		return
 	}
@@ -1178,7 +1221,7 @@ func waitForEveryEdgeToCatchUp(client *http.Client, edgeAdmins []string, cpAdmin
 			if e = strings.TrimRight(strings.TrimSpace(e), "/"); e == "" {
 				continue
 			}
-			if applied, _ := edgeAppliedGeneration(client, e); applied < want {
+			if applied, appliedEpoch := edgeAppliedGeneration(client, e); !edgeConfigurationCurrent(applied, appliedEpoch, want, epoch) {
 				behind = true
 			}
 		}

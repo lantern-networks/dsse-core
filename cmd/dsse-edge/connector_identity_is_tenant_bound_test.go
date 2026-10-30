@@ -62,6 +62,25 @@ func TestAConnectorCertificateMustComeFromItsOwnOrganizationsCA(t *testing.T) {
 		t.Fatalf("a connector presenting a certificate from its OWN organization's CA was not bound "+
 			"(present=%v bound=%v)", present, bound)
 	}
+	if bound, _, present := connectorMTLSIdentityBoundToTenant(
+		connectorRequestPresenting(ownChains), "conn_lab_001", "TENANT_REFERENCE_LAB", reg); !present || bound {
+		t.Fatalf("case-distinct tenant identity was accepted: present=%v bound=%v", present, bound)
+	}
+	// On first registration no Edge has a registry row yet. The requested
+	// tenant still must match the one proven by the certificate's issuer.
+	otherTenant := httptest.NewRecorder()
+	if authorizeConnectorRegistrationRequest(otherTenant, connectorRequestPresenting(ownChains), "", nil,
+		"conn_lab_001", "tenant_northwind", reg) {
+		t.Fatal("tenant_reference_lab certificate registered a connector under tenant_northwind")
+	}
+	if otherTenant.Code != http.StatusUnauthorized {
+		t.Fatalf("cross-tenant registration status = %d, want 401", otherTenant.Code)
+	}
+	ownTenant := httptest.NewRecorder()
+	if !authorizeConnectorRegistrationRequest(ownTenant, connectorRequestPresenting(ownChains), "", nil,
+		"conn_lab_001", "tenant_reference_lab", reg) {
+		t.Fatalf("own-tenant connector registration was refused: %d", ownTenant.Code)
+	}
 
 	bound, certIdentity, present := connectorMTLSIdentityBoundToTenant(
 		connectorRequestPresenting(foreignChains), "conn_lab_001", "tenant_reference_lab", reg)

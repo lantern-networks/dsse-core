@@ -36,8 +36,9 @@ func adminStateCount(tenantID string, wholeNode func() int, own func() int) int 
 // countByTenant counts the records in a snapshot that belong to one organization.
 func countByTenant[T any](all []T, tenantID string, owner func(T) string) int {
 	n := 0
+	tenantID = strings.TrimSpace(tenantID)
 	for _, item := range all {
-		if strings.EqualFold(strings.TrimSpace(owner(item)), tenantID) {
+		if strings.TrimSpace(owner(item)) == tenantID {
 			n++
 		}
 	}
@@ -53,7 +54,7 @@ func policiesForTenant(policies []model.Policy, tenantID string) []model.Policy 
 	out := make([]model.Policy, 0, len(policies))
 	for _, p := range policies {
 		owner := strings.TrimSpace(p.TenantID)
-		if owner == "" || strings.EqualFold(owner, tenantID) {
+		if owner == "" || owner == strings.TrimSpace(tenantID) {
 			out = append(out, p)
 		}
 	}
@@ -79,7 +80,7 @@ func policiesForTenant(policies []model.Policy, tenantID string) []model.Policy 
 // that loses a key is a different kind of break for whatever reads it next.
 func policyBundleFactsForTenant(bundleTenantID, bundleID, version, status, bundleType, callerTenantID string) map[string]any {
 	caller := strings.TrimSpace(callerTenantID)
-	if caller == "" || strings.EqualFold(strings.TrimSpace(bundleTenantID), caller) {
+	if caller == "" || strings.TrimSpace(bundleTenantID) == caller {
 		return map[string]any{"id": bundleID, "version": version, "status": status, "type": bundleType}
 	}
 	return map[string]any{

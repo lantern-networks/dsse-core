@@ -11,7 +11,8 @@ import XCTest
 final class DsseAgentPolicyKeyringTests: XCTestCase {
 
     private func envelope(signedBy key: Curve25519.Signing.PrivateKey, excluding ids: [String]) throws -> Data {
-        let payload = try JSONSerialization.data(withJSONObject: ["excluded_app_signing_ids": ids])
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "device_identity": "mac-dev-1", "tenant_id": "tenant-a", "excluded_app_signing_ids": ids])
         let digest = SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined()
         let sig = try key.signature(for: payload)
         let env: [String: Any] = [
@@ -41,7 +42,8 @@ final class DsseAgentPolicyKeyringTests: XCTestCase {
         // Signed by the provisioned pin: accepted with or without a keyring, exactly as before.
         let byPin = try envelope(signedBy: provisioned, excluding: ["com.example.a"])
         XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
-            envelopeData: byPin, pinnedPublicKeyHex: hex(provisioned)), ["com.example.a"])
+            envelopeData: byPin, pinnedPublicKeyHex: hex(provisioned),
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-a"), ["com.example.a"])
 
         // Signed by the NEXT key: refused until this device has adopted it, accepted once it has. That gap is
         // the whole overlap — publish, wait for adoption, then start signing.
@@ -50,7 +52,9 @@ final class DsseAgentPolicyKeyringTests: XCTestCase {
             envelopeData: byNext, pinnedPublicKeyHex: hex(provisioned)),
             "a key this device has not adopted must not be accepted")
         XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
-            envelopeData: byNext, pinnedPublicKeyHex: hex(provisioned), alsoAccept: [hex(next)]),
+            envelopeData: byNext, pinnedPublicKeyHex: hex(provisioned),
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-a",
+            alsoAccept: [hex(next)]),
             ["com.example.b"])
 
         // And an unrelated key is refused however long the accepted list is.
@@ -67,6 +71,8 @@ final class DsseAgentPolicyKeyringTests: XCTestCase {
         // Junk in the accepted list must neither crash nor widen what is accepted.
         XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
             envelopeData: data, pinnedPublicKeyHex: hex(provisioned),
+            expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant-a",
             alsoAccept: ["", "zz", String(repeating: "q", count: 64)]), ["com.example.a"])
     }
 }

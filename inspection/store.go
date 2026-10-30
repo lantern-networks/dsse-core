@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ type Store struct {
 	dirty         bool
 	sharedKnown   bool
 	sharedPending map[string]bool
+	restoreErr    error // an unreadable source must never be overwritten by a later flush
 
 	// Append-only WAL mode (when the persister supports blobstore.AppendPersister). Under decrypt-all + log-all
 	// the store fills fast; re-marshaling the WHOLE snapshot every flush is O(n) memory + I/O and was the cause of
@@ -34,10 +37,11 @@ type Store struct {
 	// O(n) marshal is amortized to rare rotations, not every 30s. Durability of the record itself is off-Edge
 	// (logs.Writer + domain-event outbox); this file is only a hot-cache WAL so the DLP findings view survives a
 	// restart. Shared persisters merge pending IDs into the latest row; other non-append stores use snapshots.
-	appendP     blobstore.AppendPersister
-	pending     []model.InspectionEvent // events appended since the last flush (append mode only)
-	walBytes    int64                   // approximate current WAL size, to trigger compaction
-	maxWALBytes int64                   // compact when walBytes exceeds this (0 = derive from capacity)
+	appendP         blobstore.AppendPersister
+	pending         []model.InspectionEvent // events appended since the last flush (append mode only)
+	pendingOverflow bool                    // dropped buffer entries require a full live-set rewrite
+	walBytes        int64                   // approximate current WAL size, to trigger compaction
+	maxWALBytes     int64                   // compact when walBytes exceeds this (0 = derive from capacity)
 }
 
 // NewStore builds an inspection-event store with the given FIFO capacity. The bound is injected by
@@ -52,12 +56,55 @@ type storeSnapshot struct {
 	Order  []string                         `json:"order"`
 }
 
+// Event IDs are unique only inside a tenant. A length prefix makes the pair
+// unambiguous even if an ID contains a delimiter.
+func eventKey(tenantID, eventID string) string {
+	return strconv.Itoa(len(tenantID)) + ":" + tenantID + eventID
+}
+
+// Earlier snapshots used a bare event ID as their key. Re-key those rows on
+// load while refusing inconsistent identities and incomplete FIFO order.
+func canonicalizeSnapshot(snap storeSnapshot) (storeSnapshot, error) {
+	if snap.Events == nil {
+		return snap, fmt.Errorf("inspection snapshot has no events")
+	}
+	events := make(map[string]model.InspectionEvent, len(snap.Events))
+	keys := make(map[string]string, len(snap.Events))
+	for oldKey, event := range snap.Events {
+		key := eventKey(event.TenantID, event.ID)
+		if event.TenantID == "" || event.ID == "" || (oldKey != event.ID && oldKey != key) {
+			return snap, fmt.Errorf("inspection snapshot has invalid event identity")
+		}
+		if _, exists := events[key]; exists {
+			return snap, fmt.Errorf("inspection snapshot has duplicate event identity")
+		}
+		events[key] = event
+		keys[oldKey] = key
+	}
+	order := make([]string, 0, len(snap.Order))
+	seen := make(map[string]bool, len(snap.Order))
+	for _, oldKey := range snap.Order {
+		key, ok := keys[oldKey]
+		if !ok || seen[key] {
+			return snap, fmt.Errorf("inspection snapshot has invalid order")
+		}
+		order = append(order, key)
+		seen[key] = true
+	}
+	if len(order) != len(events) {
+		return snap, fmt.Errorf("inspection snapshot has incomplete order")
+	}
+	return storeSnapshot{Events: events, Order: order}, nil
+}
+
 // SetPersister attaches durable storage and REHYDRATES the events from it (so the DLP findings view survives a
 // restart), dropping any older than retention and re-applying the FIFO bound. Call once at startup. A load error
 // is returned but non-fatal. Pair with periodic PersistIfDirty().
 func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) error {
 	s.mu.Lock()
 	s.persister = p
+	s.appendP = nil
+	s.restoreErr = nil
 	s.retention = retention
 	if ap, ok := p.(blobstore.AppendPersister); ok {
 		s.appendP = ap
@@ -100,6 +147,11 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 		return nil
 	}
 	if err != nil || len(data) == 0 {
+		if err != nil {
+			s.mu.Lock()
+			s.restoreErr = err
+			s.mu.Unlock()
+		}
 		return err
 	}
 	s.mu.Lock()
@@ -109,12 +161,30 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 	// replay the WAL (last-write-wins by ID; a torn final line from an interrupted append is skipped). An existing
 	// snapshot file thus migrates seamlessly — it loads here and is rewritten as a compacted WAL on the next flush.
 	migratedFromSnapshot := false
-	if snap, ok := decodeSnapshot(data); ok {
+	if snap, isSnapshot, decodeErr := decodeSnapshot(data); isSnapshot {
+		if decodeErr != nil {
+			s.restoreErr = decodeErr
+			return decodeErr
+		}
 		s.events = snap.Events
 		s.order = snap.Order
 		migratedFromSnapshot = true
 	} else {
-		s.replayWALLocked(data)
+		tornTail, replayErr := s.replayWALLocked(data)
+		if replayErr != nil {
+			s.restoreErr = replayErr
+			return replayErr
+		}
+		if tornTail && s.appendP != nil {
+			// A later Append would join onto the torn JSON tail. Compact once
+			// before accepting new records, preserving all complete rows.
+			out := s.encodeWALLocked()
+			if err := s.appendP.Save(out); err != nil {
+				s.restoreErr = err
+				return err
+			}
+			s.walBytes = int64(len(out))
+		}
 	}
 	s.pruneLocked(time.Now())
 	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
@@ -124,6 +194,7 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 			// mixed snapshot-object + NDJSON file. One-time, at startup, under the lock.
 			out := s.encodeWALLocked()
 			if err := s.appendP.Save(out); err != nil {
+				s.restoreErr = err
 				return err
 			}
 			s.walBytes = int64(len(out))
@@ -165,6 +236,11 @@ func (s *Store) PersistIfDirty() error { return s.PersistIfDirtyContext(context.
 
 func (s *Store) PersistIfDirtyContext(ctx context.Context) error {
 	s.mu.Lock()
+	if s.restoreErr != nil {
+		err := s.restoreErr
+		s.mu.Unlock()
+		return fmt.Errorf("inspection restore failed; source preserved: %w", err)
+	}
 	if s.persister == nil || (!s.dirty && len(s.pending) == 0) {
 		s.mu.Unlock()
 		return nil
@@ -184,24 +260,27 @@ func (s *Store) PersistIfDirtyContext(ctx context.Context) error {
 		}
 		s.pending = s.pending[:0]
 		s.walBytes += int64(len(batch))
+		compactNeeded := s.pendingOverflow || s.walBytes > s.maxWALBytes
 		var compact []byte
-		if s.walBytes > s.maxWALBytes {
+		if compactNeeded {
 			// Rotation: prune + FIFO-bound, then rewrite the file to just the live set (which already includes the
 			// pending events — they were added to the map on Upsert — so the batch is subsumed and not appended).
 			s.pruneLocked(time.Now())
 			s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
 			compact = s.encodeWALLocked()
 		}
+		s.pendingOverflow = false
 		ap := s.appendP
 		s.dirty = false
 		s.mu.Unlock()
-		if compact != nil {
+		if compactNeeded {
 			if err := ap.Save(compact); err != nil { // atomic temp+rename replace
 				// The dirty flag was cleared optimistically (the write runs outside the lock). Re-mark dirty
-				// so the next flush retries — walBytes is still past the cap, so it re-compacts, which rebuilds
+				// so the next flush retries and re-compacts, which rebuilds
 				// the full live set (review #17: a swallowed/dropped failure silently lost the snapshot).
 				s.mu.Lock()
 				s.dirty = true
+				s.pendingOverflow = true
 				s.mu.Unlock()
 				return err
 			}
@@ -262,37 +341,52 @@ func (s *Store) encodeWALLocked() []byte {
 	return buf
 }
 
-// replayWALLocked rebuilds the map from an NDJSON WAL, last-write-wins by event ID. A line that fails to parse
-// (a torn final record from an interrupted append) is skipped, so recovery never fails on a partial tail.
-func (s *Store) replayWALLocked(data []byte) {
-	s.events = map[string]model.InspectionEvent{}
-	s.order = s.order[:0]
-	for _, line := range bytes.Split(data, []byte("\n")) {
+// replayWALLocked rebuilds the map from complete NDJSON rows. Only an
+// unterminated final row may be torn; a malformed complete row is an error.
+func (s *Store) replayWALLocked(data []byte) (bool, error) {
+	events := map[string]model.InspectionEvent{}
+	var order []string
+	lines := bytes.Split(data, []byte("\n"))
+	tornTail := false
+	for i, line := range lines {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var ev model.InspectionEvent
-		if err := json.Unmarshal(line, &ev); err != nil {
-			continue
+		if err := json.Unmarshal(line, &ev); err != nil || ev.ID == "" || ev.TenantID == "" {
+			if i == len(lines)-1 && !bytes.HasSuffix(data, []byte("\n")) && len(events) > 0 {
+				tornTail = true
+				continue
+			}
+			return false, fmt.Errorf("inspection WAL has invalid record")
 		}
-		if _, exists := s.events[ev.ID]; !exists {
-			s.order = append(s.order, ev.ID)
+		key := eventKey(ev.TenantID, ev.ID)
+		if _, exists := events[key]; !exists {
+			order = append(order, key)
 		}
-		s.events[ev.ID] = ev
+		events[key] = ev
 	}
+	s.events, s.order = events, order
+	return tornTail, nil
 }
 
-// decodeSnapshot reports whether data is the historical full-snapshot object (vs an NDJSON WAL). A WAL — even a
-// one-line one — unmarshals into an InspectionEvent, which has no "events" field, so snap.Events stays nil.
-func decodeSnapshot(data []byte) (storeSnapshot, bool) {
+// decodeSnapshot distinguishes the historical snapshot shape from NDJSON WAL.
+// A recognized but invalid snapshot is an error, never a reason to replay it
+// as an event line and later replace its original bytes.
+func decodeSnapshot(data []byte) (storeSnapshot, bool, error) {
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return storeSnapshot{}, false, nil
+	}
+	if _, exists := shape["events"]; !exists {
+		return storeSnapshot{}, false, nil
+	}
 	var snap storeSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
-		return storeSnapshot{}, false
+		return storeSnapshot{}, true, err
 	}
-	if snap.Events == nil {
-		return storeSnapshot{}, false
-	}
-	return snap, true
+	snap, err := canonicalizeSnapshot(snap)
+	return snap, true, err
 }
 
 // deriveMaxWALBytes bounds the WAL to a small multiple of the compacted live set so compaction stays rare while
@@ -312,24 +406,26 @@ func deriveMaxWALBytes(capacity int) int64 {
 func (s *Store) Upsert(event model.InspectionEvent) model.InspectionEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, exists := s.events[event.ID]; !exists {
-		s.order = append(s.order, event.ID)
+	key := eventKey(event.TenantID, event.ID)
+	if _, exists := s.events[key]; !exists {
+		s.order = append(s.order, key)
 	}
-	s.events[event.ID] = event
+	s.events[key] = event
 	if _, shared := s.persister.(sharedPersister); shared {
 		if s.sharedPending == nil {
 			s.sharedPending = map[string]bool{}
 		}
-		s.sharedPending[event.ID] = true
+		s.sharedPending[key] = true
 	}
 	s.order = evictFIFO(s.order, len(s.events), s.capacity, func(k string) { delete(s.events, k); delete(s.sharedPending, k) })
 	s.dirty = true
 	if s.appendP != nil {
-		// Buffer for the next append flush. Bounded: an event dropped from the buffer is still in the live map, so
-		// the next compaction persists it — this only bounds the between-flush memory, never loses a live event.
+		// Buffer for the next append flush. An overflow forces that flush to
+		// rewrite the live set; otherwise dropped entries would vanish on restart.
 		s.pending = append(s.pending, event)
 		const maxPending = 8192
 		if len(s.pending) > maxPending {
+			s.pendingOverflow = true
 			s.pending = append(s.pending[:0], s.pending[len(s.pending)-maxPending:]...)
 		}
 	}
@@ -339,8 +435,26 @@ func (s *Store) Upsert(event model.InspectionEvent) model.InspectionEvent {
 func (s *Store) Get(id string) (model.InspectionEvent, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	event, ok := s.events[id]
-	return event, ok
+	var found model.InspectionEvent
+	ok := false
+	for _, event := range s.events {
+		if event.ID != id {
+			continue
+		}
+		if ok {
+			return model.InspectionEvent{}, false // ambiguous; callers must supply the tenant
+		}
+		found, ok = event, true
+	}
+	return found, ok
+}
+
+// GetForTenant is the authorization-safe lookup for runtime and Admin paths.
+func (s *Store) GetForTenant(tenantID, id string) (model.InspectionEvent, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	event, ok := s.events[eventKey(tenantID, id)]
+	return event, ok && event.TenantID == tenantID && event.ID == id
 }
 
 func (s *Store) Count() int {

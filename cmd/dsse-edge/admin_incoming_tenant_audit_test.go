@@ -58,6 +58,38 @@ func TestIncomingOperatorBodyTargetOwnsItsAudit(t *testing.T) {
 	}
 }
 
+func TestIncomingCaseDistinctOperatorTargetKeepsAuditProvenance(t *testing.T) {
+	root := t.TempDir()
+	w, err := logs.NewWriter(filepath.Join(root, "logs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := newAdminAuthStore()
+	auth.UpsertPrincipal(adminPrincipal{ID: "operator-admin", TenantID: "Acme", Roles: []string{"owner"}, Status: "active"})
+	auth.UpsertAPIToken(adminAPIToken{ID: "operator-token", TokenHash: adminTokenHash("review-operator"), TenantID: "Acme", CreatedByAdminPrincipalID: "operator-admin", Roles: []string{"owner"}, Scopes: []string{"*"}, Status: "active", ExpiresAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})
+	h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), OperatorTenantID: "Acme", AdminAuth: auth, Writer: w, PolicyStore: policy.NewStore(nil)})
+	req := httptest.NewRequest("POST", "/admin/legacy-exceptions", bytes.NewReader([]byte(`{"id":"incoming","tenant_id":"acme","business_owner":"Customer owner","expires_at":"2027-01-01T00:00:00Z","mode":"allow"}`)))
+	req.Header.Set("Authorization", "Bearer review-operator")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Operate-Tenant", "acme")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+	if res.Code != 200 {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	for _, a := range incomingMutationAudits(t, root) {
+		if a["event_type"] != "admin_incoming_changed" {
+			continue
+		}
+		meta := a["metadata"].(map[string]any)
+		if a["tenant_id"] != "acme" || meta["operator_tenant_id"] != "Acme" || meta["target_tenant_id"] != "acme" {
+			t.Fatalf("case-distinct cross-tenant audit lost attribution: %#v", a)
+		}
+		return
+	}
+	t.Fatal("missing incoming mutation audit")
+}
+
 func incomingMutationAudits(t *testing.T, root string) []map[string]any {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(root, "logs", "audit.log.jsonl"))

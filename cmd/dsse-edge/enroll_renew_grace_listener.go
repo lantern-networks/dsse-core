@@ -269,7 +269,7 @@ func enrollRenewGraceVerify(cfg enrollRenewGraceConfig, pool *x509.CertPool) fun
 			log.Printf("enroll_renew_grace_denied reason=%q", err.Error())
 			return fmt.Errorf("renewal recovery: %w", err)
 		}
-		if namedOrganization != "" && !strings.EqualFold(renewTenantOf(cfg.Ledger, identity), namedOrganization) {
+		if namedOrganization != "" && renewTenantOf(cfg.Ledger, identity) != namedOrganization {
 			return fmt.Errorf("renewal recovery: enrolled identity does not belong to the named organization")
 		}
 		// Security-relevant on the happy path too: a device returning with a credential that has been dead

@@ -72,3 +72,22 @@ func TestBreakGlassExportCarriesOnlyTheCallersOrganization(t *testing.T) {
 		t.Fatalf("the operator must still export the whole deployment, got %d", len(all))
 	}
 }
+
+func TestBreakGlassCaseDistinctTenantsCannotSeeOrActOnEachOthersRequests(t *testing.T) {
+	declareOperatorTenantForTest(t, "operator")
+	r := bgRequestAs("Acme")
+	if breakGlassRequestVisibleTo(breakGlassAccessRequest{ID: "other", TenantID: "acme"}, r, "Acme") {
+		t.Fatal("a case-distinct tenant may approve or issue another tenant's emergency request")
+	}
+	if !breakGlassRequestVisibleTo(breakGlassAccessRequest{ID: "own", TenantID: "Acme"}, r, "Acme") {
+		t.Fatal("the owner's emergency request was hidden")
+	}
+	events := []map[string]any{
+		{"tenant_id": "Acme", "session_id": "own"},
+		{"tenant_id": "acme", "session_id": "other"},
+	}
+	got := breakGlassEventsForCaller(events, r, "Acme")
+	if len(got) != 1 || got[0]["session_id"] != "own" {
+		t.Fatalf("case-distinct tenant's emergency audit was exported: %+v", got)
+	}
+}

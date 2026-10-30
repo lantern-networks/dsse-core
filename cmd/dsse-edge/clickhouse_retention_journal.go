@@ -64,7 +64,7 @@ func decodeClickhouseRetentionBatch(raw []byte) (*clickhouseRetentionBatch, erro
 	if err := dec.Decode(&b); err != nil {
 		return nil, fmt.Errorf("invalid ClickHouse retention journal")
 	}
-	if dec.Decode(new(any)) != io.EOF || b.Version != 1 || len(b.ID) != 32 || len(b.Target) != 64 || b.Tenant == "" || b.Stream == "" || len(b.IDs) == 0 || len(b.IDs) > retentionPruneBatchSize || b.Hash != hashObjectBytes(b.Payload) || (b.Phase != "prepared" && b.Phase != "archived") {
+	if dec.Decode(new(any)) != io.EOF || b.Version != 1 || len(b.ID) != 32 || len(b.Target) != 64 || !validArchivePathComponent(b.Tenant) || !validArchivePathComponent(b.Stream) || len(b.IDs) == 0 || len(b.IDs) > retentionPruneBatchSize || b.Hash != hashObjectBytes(b.Payload) || (b.Phase != "prepared" && b.Phase != "archived") {
 		return nil, fmt.Errorf("invalid ClickHouse retention journal")
 	}
 	if _, err := hex.DecodeString(b.ID); err != nil {
@@ -169,6 +169,9 @@ func (c *clickhouseRetentionLifecycle) prepare(ctx context.Context, tenant, stre
 	if len(rows) == 0 {
 		return nil
 	}
+	if !validArchivePathComponent(tenant) || !validArchivePathComponent(stream) {
+		return fmt.Errorf("invalid tenant or stream archive key component")
+	}
 	return c.transaction(ctx, func(budget *cpStatementBudget, tx *sql.Tx, current *clickhouseRetentionBatch) (*clickhouseRetentionBatch, error) {
 		if current != nil {
 			return nil, fmt.Errorf("another log retention batch is pending")
@@ -260,12 +263,16 @@ func (c *clickhouseRetentionLifecycle) resume(ctx context.Context, b *clickhouse
 		return err
 	}
 	if b.Phase == "prepared" {
-		objects, err := c.cfg.archive.List(ctx, "hot_events/"+b.Tenant+"/"+b.Stream+"/", 0)
+		prefix := "hot_events/" + b.Tenant + "/" + b.Stream + "/"
+		objects, err := c.cfg.archive.List(ctx, prefix, 0)
 		if err != nil {
 			return err
 		}
 		exists := false
 		for _, obj := range objects {
+			if !strings.HasPrefix(obj.Key, prefix) {
+				return fmt.Errorf("archive listing escaped tenant scope")
+			}
 			if obj.Key == b.Key {
 				exists = true
 			}

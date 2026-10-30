@@ -13,30 +13,39 @@ jobs:
     name: Console regression tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
       - run: node --test console/*_test.mjs
 
+  release-image-scanner-tests:
+    name: Release image scanner regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test image inventory and scanner gate
+        working-directory: scripts
+        run: python3 -m unittest test_scan_release_images
+
   go:
     name: Go build + vet + test
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_HOST_AUTH_METHOD: trust
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and start patched PostgreSQL test image
+        run: |
+          docker build -f deploy/Dockerfile.postgres-tools -t dsse-postgres-tools:ci .
+          docker run --detach --name dsse-ci-postgres \
+            --env POSTGRES_HOST_AUTH_METHOD=trust \
+            --publish 127.0.0.1:5432:5432 dsse-postgres-tools:ci
+          for attempt in $(seq 1 30); do
+            if docker exec dsse-ci-postgres pg_isready -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs dsse-ci-postgres
+          exit 1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # ★ FROM go.mod, NOT A LITERAL. It said "1.22" while the module requires 1.25, so the very first
           # job on the public repo would have refused to build before running a single test — and a version
@@ -70,17 +79,50 @@ jobs:
           DSSE_TEST_POSTGRES_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
           ENROLMENT_TOKEN_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
         run: go test ./cmd/dsse-edge -run '^(Test.*Postgres|TestASecondEdgeSeesTheTokenAlreadySpent|TestPKIAdmissionUsesShared)' -count=1
+      - name: Start ClickHouse for irreversible deletion tests
+        run: |
+          docker run --detach --name dsse-ci-clickhouse \
+            --env CLICKHOUSE_PASSWORD=ci_manual_delete \
+            --env CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            --publish 127.0.0.1:58124:8123 \
+            clickhouse/clickhouse-server:26.8.30.8-alpine@sha256:2ad322429c7965bde31e3a6389daa2df62db7e1898b1b91d50eb3a7bad716f1f
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --user default:ci_manual_delete 'http://127.0.0.1:58124/?query=SELECT%201' >/dev/null; then exit 0; fi
+            sleep 1
+          done
+          docker logs dsse-ci-clickhouse
+          exit 1
+      - name: Manual deletion and cold-archive health against real stores
+        env:
+          POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
+          CLICKHOUSE_TEST_ENDPOINT: http://127.0.0.1:58124
+          CLICKHOUSE_TEST_USER: default
+          CLICKHOUSE_TEST_PASSWORD: ci_manual_delete
+        run: go test ./cmd/dsse-edge -run '^(TestManualHotLogDelete|TestColdArchiveHealth|TestColdArchiveDeliveryState)' -count=1 -v
+      - name: Generated archive alert publisher delivers over HTTPS
+        env:
+          POSTGRES_QUEUE_E2E_DSN: postgres://postgres@localhost:5432/postgres?sslmode=disable
+        run: go test ./cmd/dsse-install -run '^TestGeneratedArchiveAlertPublisherDeliversOverHTTPS$' -count=1
+      - name: Released grant writer and rolling PostgreSQL compatibility
+        env:
+          DSSE_ROLLING_TEST_DSN: postgres://postgres@localhost:5432/dsse_rolling?sslmode=disable
+        run: |
+          psql postgres://postgres@localhost:5432/postgres -v ON_ERROR_STOP=1 -c 'CREATE DATABASE dsse_rolling'
+          go test ./cmd/dsse-edge -run '^TestPostgres(RollingGrantReleasedWriter|AuthRolloutConcurrentCPsAndPromotion|AuthRollingNativeProcesses)$' -count=1
       - name: Connector access policy traffic
         run: |
           go build -o "$RUNNER_TEMP/dsse-connector" ./cmd/dsse-connector
           DSSE_TEST_CONNECTOR_BIN="$RUNNER_TEMP/dsse-connector" go test ./cmd/dsse-edge -run '^TestEastWestLifecycleThroughRealConnector$' -count=1
+      - name: Stop PostgreSQL test container
+        if: always()
+        run: docker rm --force dsse-ci-clickhouse dsse-ci-postgres || true
 
   macos:
     name: macOS network extension (swift build + test)
     # macos-15 ships Xcode 16 / Swift 6; the package declares swift-tools-version 6.0 (macos-14 has Swift 5.10).
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: swift build + test
         working-directory: clients/macos-network-extension
         run: |

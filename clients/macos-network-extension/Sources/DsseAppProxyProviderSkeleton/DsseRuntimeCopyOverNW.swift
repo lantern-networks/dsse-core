@@ -61,16 +61,15 @@ public final class DsseNWRuntimeCopyHTTPClient: DsseInstrumentedEdgeRuntimeCopyH
         } catch {
             // Named, for the same reason every other failure on this path is: a device that steers and cannot
             // deliver is fail-closed by accident, and the operator's only way in is this line.
-            // ★★ AND IT SAYS WHAT THE ERROR SAID (2026-08-29). Bridging a Swift enum to NSError and printing
-            // localizedDescription discards the associated value — every failure on this path read
+            // Bridging a Swift enum to NSError and printing localizedDescription discards the case — every
+            // failure on this path once read
             // "DsseSingleRequestError error 1 / The operation couldn't be completed", which is the same line
-            // for a refused connection, a timeout and an unparseable response. DsseSingleRequestError already
-            // spells out which one it is; this asks it rather than Foundation.
+            // for a refused connection, a timeout and an unparseable response. Preserve its reviewed category
+            // while withholding untrusted error text and URL query parameters from the public runtime log.
             let nsError = error as NSError
-            let reason = (error as? DsseSingleRequestError)?.description ?? nsError.localizedDescription
-            dsseRuntimeLog("edge_round_trip_failed transport=nw url=\(host)\(path) " +
+            dsseRuntimeLog("edge_round_trip_failed transport=nw url=\(host)\(url.path) " +
                            "server_name=\(serverName ?? DsseLiveTransportServerName.current()) " +
-                           "domain=\(nsError.domain) code=\(nsError.code) reason=\(reason)")
+                           "domain=\(nsError.domain) code=\(nsError.code) reason=\(providerNonsecretErrorDetail(error))")
             throw DsseLocalRuntimeCopyDriverError.edgeTransportRequestFailed
         }
     }

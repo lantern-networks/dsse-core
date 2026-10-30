@@ -41,6 +41,36 @@ func (b *memoryBlob) Save(data []byte) error {
 	return nil
 }
 
+func (b *memoryBlob) seedArtifactIfAbsent(data []byte) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.fail {
+		return false, errors.New("the shared store is unreachable")
+	}
+	if len(b.data) > 0 {
+		return false, nil
+	}
+	b.data = append([]byte(nil), data...)
+	return true, nil
+}
+
+// A live artifact upload can fill the shared row after the seed's initial
+// read. Startup seeding must never overwrite that newer release's bytes.
+type seedUploadRaceBlob struct {
+	memoryBlob
+	upload []byte
+	once   sync.Once
+}
+
+func (b *seedUploadRaceBlob) Load() ([]byte, error) {
+	b.once.Do(func() {
+		b.memoryBlob.mu.Lock()
+		b.memoryBlob.data = append([]byte(nil), b.upload...)
+		b.memoryBlob.mu.Unlock()
+	})
+	return nil, nil // The seed's stale absent observation.
+}
+
 // ★★★ THE PUBLISHED SET WAS PER NODE, IN AN HA PAIR (2026-08-28, measured on the two-region lab). region-a's
 // control plane held `deployment|darwin/arm64` and region-b's had no file at all: it never received the
 // publish, and it loads its own disk at start-up. The front door balances both, so an Edge polling every
@@ -247,6 +277,34 @@ func TestReleasesPublishedBeforeTheShelfExistedAreStillServable(t *testing.T) {
 	}
 	if string(got) != string(artifactBytesFor("0.2.4")) {
 		t.Fatalf("wrong bytes: %q", got)
+	}
+}
+
+func TestStartupArtifactSeedDoesNotOverwriteConcurrentUpload(t *testing.T) {
+	now := time.Now().UTC()
+	signer := updateSigner(t)
+	m, env := signedUpdate(t, signer, "0.2.4", now)
+	dir := t.TempDir()
+	path := artifactStorePath(dir, agentUpdateCatalogueScope, m.Platform, m.Arch, m.Version)
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, artifactBytesFor("0.2.4"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	newer := []byte("a newer, verified upload for the same release slot")
+	row := &seedUploadRaceBlob{upload: newer}
+	shelf := &agentUpdateArtifactShelf{open: func(string) blobstore.Persister { return row }}
+	store := newPublishedAgentUpdateStore().WithArtifactDir(dir).WithArtifactShelf(shelf)
+	store.envelopes[tenantTargetKey(agentUpdateCatalogueScope, m.Platform, m.Arch)] = env
+	if seeded := store.SeedShelfFromDisk(dir, []string{signer.PublicKeyHex()}, now); seeded != 0 {
+		t.Fatalf("stale startup seed reported %d writes after the upload won", seeded)
+	}
+	row.memoryBlob.mu.Lock()
+	got := append([]byte(nil), row.memoryBlob.data...)
+	row.memoryBlob.mu.Unlock()
+	if string(got) != string(newer) {
+		t.Fatalf("startup seed replaced the concurrent upload's bytes")
 	}
 }
 

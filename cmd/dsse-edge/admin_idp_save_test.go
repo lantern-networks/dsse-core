@@ -122,3 +122,12 @@ func TestAdminIdPAuditAttributionAndPrivacyInvariant(t *testing.T) {
 		}
 	}
 }
+
+func TestAdminIdPAuditKeepsCaseDistinctOperatorProvenance(t *testing.T) {
+	req := requestWithAdminIdentity(httptest.NewRequest(http.MethodPost, "/admin/idp-connections", nil),
+		adminIdentity{PrincipalID: "operator", TenantID: "Acme"})
+	audit := adminIdPChangeAuditLog(req, "acme", "idp", "upserted", testEvaluator(), time.Now())
+	if audit.Metadata["operator_principal_id"] != "operator" || audit.Metadata["operator_tenant_id"] != "Acme" {
+		t.Fatal("cross-tenant IdP change lost operator provenance for case-distinct tenants")
+	}
+}

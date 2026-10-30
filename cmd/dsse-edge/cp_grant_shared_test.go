@@ -128,8 +128,12 @@ func TestPostgresGrantPeerTermReportReadAndAudit(t *testing.T) {
 			t.Fatalf("report %d want %d %s", w.Code, want, w.Body)
 		}
 	}
-	if section := grantBundleSection(b); !section.Complete || len(section.Grants) != 3 {
-		t.Fatal("bundle missing peer")
+	if section := grantBundleSection(b); !section.Complete || len(section.Grants)+len(section.ProtectedGrants) != 3 || len(section.ProtectedGrants) != 1 || section.ProtectedGrants[0].GrantID != "own" {
+		protectedID := ""
+		if len(section.ProtectedGrants) > 0 {
+			protectedID = section.ProtectedGrants[0].GrantID
+		}
+		t.Fatalf("bundle missing peer or protected grant: complete=%t grants=%d protected=%d protected_id=%q", section.Complete, len(section.Grants), len(section.ProtectedGrants), protectedID)
 	}
 	if n, e := a.RemoveTenantContext(captureCPWriteLease(context.Background()), tenant); e != nil || n != 2 {
 		t.Fatal("erase", n, e)

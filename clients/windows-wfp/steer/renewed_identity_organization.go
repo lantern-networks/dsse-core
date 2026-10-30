@@ -25,7 +25,9 @@ func renewedIdentityBelongsToEnrollment(renewed *tls.Certificate, enrollmentPEM 
 	organization := func(c *x509.Certificate) string {
 		for _, value := range c.Subject.Organization {
 			if value = strings.TrimSpace(value); value != "" {
-				return strings.ToLower(value)
+				// Tenant IDs are opaque identifiers. Case folding can adopt a
+				// renewal pointer belonging to a different tenant.
+				return value
 			}
 		}
 		return ""

@@ -14,7 +14,7 @@ func (r *TenantCARegistry) MaterialManaged(tenant string) bool {
 	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.materialManaged[strings.ToLower(strings.TrimSpace(tenant))]
+	return r.materialManaged[strings.TrimSpace(tenant)]
 }
 
 func (r *TenantCARegistry) materialManagedTenantsLocked() []string {
@@ -33,7 +33,7 @@ func (r *TenantCARegistry) restoreMaterialOwnership(names []string) error {
 	defer r.mu.Unlock()
 	owned := make(map[string]bool, len(names))
 	for _, name := range names {
-		tenant := strings.ToLower(strings.TrimSpace(name))
+		tenant := strings.TrimSpace(name)
 		if tenant == "" {
 			return fmt.Errorf("empty material-managed tenant in CA registry")
 		}
@@ -41,7 +41,7 @@ func (r *TenantCARegistry) restoreMaterialOwnership(names []string) error {
 		// snapshots must not turn an unknown owner into an asserted owner.
 		found := false
 		for _, owner := range r.byAnchorKey {
-			if strings.EqualFold(owner, tenant) {
+			if owner == tenant {
 				found = true
 				break
 			}

@@ -247,8 +247,8 @@ func TestDomainEventOutboxObjectFilenameSanitizesPathSegments(t *testing.T) {
 	if strings.Contains(filename, "..") || strings.Contains(filename, ":") || strings.Contains(filename, "\\") {
 		t.Fatalf("filename = %q, want sanitized path segments", filename)
 	}
-	if !strings.HasPrefix(filename, "domain-events/__/evidence_______x/") {
-		t.Fatalf("filename = %q, want sanitized tenant and plane", filename)
+	if !strings.HasPrefix(filename, "domain-events/~Li4/~ZXZpZGVuY2UvLi4vLi4veA/") {
+		t.Fatalf("filename = %q, want separate encoded tenant and plane segments", filename)
 	}
 }
 
@@ -642,6 +642,7 @@ func TestDomainEventOutboxRuntimeBuildersCoverAllowedStreams(t *testing.T) {
 	add(domainEventOutboxEnvelopeFromAccessLog(model.AccessLog{ID: "alog_cov_001", TenantID: "tenant_lab_001", AccessDecisionID: "dec_cov_001", Decision: "allow", Timestamp: now.Format(time.RFC3339), Metadata: map[string]any{}}, now))
 	add(domainEventOutboxEnvelopeFromDecisionTrace(model.DecisionTrace{ID: "trace_cov_001", AccessDecisionID: "dec_cov_001", PolicyID: "pol_lab_001", PolicyBundleID: "pb_lab_001", CacheStatus: "miss", Timestamp: now.Format(time.RFC3339), Metadata: map[string]any{}}, "tenant_lab_001", now))
 	add(domainEventOutboxEnvelopeFromConnectorLog(map[string]any{"id": "connlog_cov_001", "tenant_id": "tenant_lab_001", "event_type": "connector_registered", "connector_id": "conn_lab_001", "timestamp": now.Format(time.RFC3339), "metadata": map[string]any{}}, now))
+	add(domainEventOutboxEnvelopeFromModel("cold_archive_health_events", "cold_archive_degraded", "cold_archive_cov_001", agentUpdateCatalogueScope, now.Format(time.RFC3339), coldArchiveHealthEvent{Sequence: 1, Type: "cold_archive_degraded", At: now, Reason: "put_failed", Backlog: 1}, now))
 	got := map[string]bool{}
 	for _, envelope := range envelopes {
 		got[envelope.Stream] = true
@@ -1069,7 +1070,8 @@ func TestPostgresDomainEventOutboxMigrationMatchesSchemaSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}
-	want := normalizePostgresExportTaskSQLContract(strings.Join(postgresDomainEventOutboxSchemaSQL(), "\n"))
+	// Migration 006 is immutable. Migration 054 extends its stream CHECK.
+	want := normalizePostgresExportTaskSQLContract(strings.ReplaceAll(strings.Join(postgresDomainEventOutboxSchemaSQL(), "\n"), ", 'cold_archive_health_events'", ""))
 	got := normalizePostgresExportTaskSQLContract(string(data))
 	if got != want {
 		t.Fatalf("migration drift:\nwant: %s\n got: %s", want, got)
@@ -1081,7 +1083,8 @@ func TestPostgresDomainEventOutboxStreamCheckMigrationMatchesSQL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read stream check migration: %v", err)
 	}
-	want := normalizePostgresExportTaskSQLContract(strings.Join(postgresDomainEventOutboxStreamCheckMigrationSQL(), "\n"))
+	// Migration 007 is immutable. Migration 054 extends its stream CHECK.
+	want := normalizePostgresExportTaskSQLContract(strings.ReplaceAll(strings.Join(postgresDomainEventOutboxStreamCheckMigrationSQL(), "\n"), ", 'cold_archive_health_events'", ""))
 	got := normalizePostgresExportTaskSQLContract(string(data))
 	if got != want {
 		t.Fatalf("stream check migration drift:\nwant: %s\n got: %s", want, got)

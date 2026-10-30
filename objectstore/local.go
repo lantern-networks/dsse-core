@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 type LocalStore struct {
@@ -60,16 +62,16 @@ func (s *LocalStore) WriteGzipJSONLStreamWithComment(filename, comment string, n
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("create object export dir: %w", err)
 	}
-	file, err := os.Create(path)
+	// Build beside the committed object. A failed source or disk write must
+	// never truncate the previous successful export/outbox delivery.
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return "", fmt.Errorf("create object export: %w", err)
 	}
-	committed := false
+	staged := file.Name()
 	defer func() {
 		_ = file.Close()
-		if !committed {
-			_ = os.Remove(path)
-		}
+		_ = os.Remove(staged)
 	}()
 
 	hash := sha256.New()
@@ -93,7 +95,15 @@ func (s *LocalStore) WriteGzipJSONLStreamWithComment(filename, comment string, n
 	if err := gzipWriter.Close(); err != nil {
 		return "", fmt.Errorf("close object export gzip: %w", err)
 	}
-	committed = true
+	if err := file.Sync(); err != nil {
+		return "", fmt.Errorf("flush generated object: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close generated object: %w", err)
+	}
+	if err := durablefile.Replace(staged, path); err != nil {
+		return "", fmt.Errorf("commit generated object: %w", err)
+	}
 
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/decision"
@@ -29,6 +31,54 @@ func TestDLPRuleRuntimeStoreHotSwap(t *testing.T) {
 	}
 	if len(s.RulesForTenant("t2")) != 1 {
 		t.Errorf("t2 disturbed")
+	}
+}
+
+func TestDLPRuleRuntimeStorePreservesConcurrentTenantWrites(t *testing.T) {
+	const writers = 96
+	s := newDLPRuleRuntimeStore()
+	start := make(chan struct{})
+	var done sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		done.Add(1)
+		go func(i int) {
+			defer done.Done()
+			<-start
+			tenant := "tenant-" + strconv.Itoa(i)
+			s.SetRules(tenant, []model.DLPRule{{ID: tenant}})
+		}(i)
+	}
+	close(start)
+	done.Wait()
+	for i := 0; i < writers; i++ {
+		tenant := "tenant-" + strconv.Itoa(i)
+		if rules := s.RulesForTenant(tenant); len(rules) != 1 || rules[0].ID != tenant {
+			t.Fatalf("concurrent write for %s lost: %+v", tenant, rules)
+		}
+	}
+}
+
+func TestDLPRuleRuntimeStoreOwnsInputAndReturnedNestedValues(t *testing.T) {
+	s := newDLPRuleRuntimeStore()
+	input := []model.DLPRule{{
+		ID: "original", Identifiers: []string{"my_number"},
+		Metadata: map[string]any{"nested": map[string]any{"labels": []any{"original"}}},
+	}}
+	s.SetRules("tenant", input)
+	input[0].ID = "input-mutated"
+	input[0].Identifiers[0] = "input-mutated"
+	input[0].Metadata["nested"].(map[string]any)["labels"].([]any)[0] = "input-mutated"
+
+	read := s.RulesForTenant("tenant")
+	if len(read) != 1 || read[0].ID != "original" || read[0].Identifiers[0] != "my_number" || read[0].Metadata["nested"].(map[string]any)["labels"].([]any)[0] != "original" {
+		t.Fatalf("input mutated live rules: %+v", read)
+	}
+	read[0].ID = "output-mutated"
+	read[0].Identifiers[0] = "output-mutated"
+	read[0].Metadata["nested"].(map[string]any)["labels"].([]any)[0] = "output-mutated"
+	read = s.RulesForTenant("tenant")
+	if len(read) != 1 || read[0].ID != "original" || read[0].Identifiers[0] != "my_number" || read[0].Metadata["nested"].(map[string]any)["labels"].([]any)[0] != "original" {
+		t.Fatalf("returned value mutated live rules: %+v", read)
 	}
 }
 

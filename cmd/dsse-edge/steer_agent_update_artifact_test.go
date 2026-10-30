@@ -212,6 +212,9 @@ func TestServedArtifactNamesItsVersion(t *testing.T) {
 		t.Errorf("%s = %q, want 9.9.9 — an endpoint cannot tell a stale manifest from a substitution without it",
 			agentupdate.ArtifactVersionHeader, got)
 	}
+	if got := rec.Header().Get(agentupdate.ArtifactSHA256Header); got != m.ArtifactSHA256 {
+		t.Errorf("%s = %q, want the digest verified before serving", agentupdate.ArtifactSHA256Header, got)
+	}
 }
 
 // ★ This route is unauthenticated by design, and it used to hash the whole artifact on EVERY request —

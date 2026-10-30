@@ -325,6 +325,10 @@ func ClassifyPostRecovery(after Observation) (PostRecoveryOutcome, string) {
 		return PostRecoveryStillBroken, "the resolver is still pointed at the dead agent: recovery ran and name " +
 			"resolution on this box is still broken"
 	}
+	if !after.DNSResidueKnown {
+		return PostRecoveryStillBroken, "the resolver's DSSE backup state could not be read after recovery, so " +
+			"name resolution cannot be confirmed restored"
+	}
 	return PostRecoveryCleared, "both residues are gone: the redirect is not armed and the resolver was restored"
 }
 

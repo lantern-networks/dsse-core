@@ -85,3 +85,28 @@ func SourceAppFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+// AuthOwner is the kernel-attributed OS principal and login incarnation, reported
+// by the privileged device agent over mTLS. Neither is read from HTTP headers.
+type AuthOwner struct{ Principal, Session string }
+type authOwnerContextKey struct{}
+
+func WithAuthOwner(ctx context.Context, owner AuthOwner) context.Context {
+	return context.WithValue(ctx, authOwnerContextKey{}, owner)
+}
+func AuthOwnerFromContext(ctx context.Context) AuthOwner {
+	o, _ := ctx.Value(authOwnerContextKey{}).(AuthOwner)
+	return o
+}
+
+// TransportServerName identifies the OUTER device-to-Edge TLS entrance. It is
+// set by the authenticated HTTP transport, never a header or application SNI.
+type transportServerNameContextKey struct{}
+
+func WithTransportServerName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, transportServerNameContextKey{}, strings.ToLower(strings.TrimSpace(name)))
+}
+func TransportServerNameFromContext(ctx context.Context) string {
+	name, _ := ctx.Value(transportServerNameContextKey{}).(string)
+	return name
+}

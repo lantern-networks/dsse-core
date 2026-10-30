@@ -186,3 +186,47 @@ func TestPostgresOutstandingCountsOnlyUnspentTokens(t *testing.T) {
 		t.Fatalf("expected only the waiting token in the window, got %+v", soon)
 	}
 }
+
+func TestPostgresEnrolmentTokensKeepCaseDistinctTenantsSeparate(t *testing.T) {
+	db := openEnrolmentTokenDB(t)
+	s := newPostgresEnrolmentTokenStore(db)
+	now := time.Now().UTC()
+	const own = "tenant_test_CaseA"
+	const other = "tenant_test_casea"
+	tok, secret, err := s.Issue(enrolltoken.DefaultPolicy(), other, "", "case boundary", "issuer", "", now.Add(time.Hour), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ListContext(t.Context(), own); err != nil || len(got) != 0 {
+		t.Fatalf("other organization's token listed: count=%d err=%v", len(got), err)
+	}
+	if got, err := s.OutstandingContext(t.Context(), own, now); err != nil || got != 0 {
+		t.Fatalf("other organization's token counted: %d %v", got, err)
+	}
+	if got := s.ExpiringWithin(own, 2*time.Hour, now); len(got) != 0 {
+		t.Fatalf("other organization's token appeared as expiring: %d", len(got))
+	}
+	if _, err := s.Verify(secret, own, now); !errors.Is(err, enrolltoken.ErrWrongTenant) {
+		t.Fatalf("other organization's token verified under case-distinct tenant: %v", err)
+	}
+	if _, ok, err := s.RevokeForTenantContext(t.Context(), own, tok.ID, "other admin", now); err != nil || ok {
+		t.Fatalf("other organization's token revoked: ok=%v err=%v", ok, err)
+	}
+	if _, err := s.SpendContext(t.Context(), tok.ID, own, "device", now); !errors.Is(err, enrolltoken.ErrWrongTenant) {
+		t.Fatalf("other organization's token spent under case-distinct tenant: %v", err)
+	}
+	if _, err := s.Verify(secret, other, now); err != nil {
+		t.Fatalf("other organization's token changed: %v", err)
+	}
+}
+
+func TestPostgresTokenUsabilityUsesExactTenantIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	tok := enrolltoken.Token{TenantID: "tenanta", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339)}
+	if err := enrolmentTokenUsability(tok, "TenantA", now); !errors.Is(err, enrolltoken.ErrWrongTenant) {
+		t.Fatalf("case-distinct tenant accepted: %v", err)
+	}
+	if err := enrolmentTokenUsability(tok, "tenanta", now); err != nil {
+		t.Fatalf("exact tenant refused: %v", err)
+	}
+}

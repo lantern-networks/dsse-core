@@ -4,10 +4,11 @@ The macOS agent uses a Network Extension to steer device traffic to DSSE. This g
 covers a fresh installation, local verification, trust troubleshooting, and removal.
 Use an isolated lab for this experimental release.
 
-For internal-access authentication, see the
-[Windows and macOS OOB windows](east-west-policy.md#windows-and-macos-authentication-windows).
+For internal-access authentication, see
+[Windows and macOS authentication](east-west-policy.md#windows-and-macos-authentication).
 The macOS resident agent presents notifications and a menu-bar entry that open
-its WKWebView authentication window; the Network Extension alone does not show it.
+the signed Portal link in the current user's default browser; the Network Extension
+alone does not show interactive UI.
 
 ## Prerequisites
 
@@ -332,3 +333,13 @@ Do not rely on a previously installed developer's app to supply profiles on a cl
 The build reports signature, notarization, and Gatekeeper checks. A development or
 unnotarized build is not a distributable release package. Verify the resulting package
 on a separate lab Mac before distributing it.
+
+### Tenant-scoped published snapshots
+
+When `-network-extension-config-publish-dir` is configured, the Edge writes each
+tenant's configuration and rules beneath
+`<directory>/tenants/<hex-encoded UTF-8 tenant ID>/`. Tenant IDs are case-sensitive
+after trimming surrounding whitespace. Shared root-level snapshot files are not
+published. Deployment tooling must select the authenticated tenant's directory;
+it must not fall back to another tenant's files when rules are unavailable.
+A failed policy read or incomplete policy listing stops publication.

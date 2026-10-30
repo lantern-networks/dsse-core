@@ -7,15 +7,18 @@ verification scope. This is the first maintenance release after 0.3.0.
 The evaluation records below identify their release and dates; use the documentation
 from the revision you build.
 The [documentation index](README.md) provides the full reading path.
+Development source is now versioned 0.4.0; the [distribution review](releases/0.4.0/README.md)
+records its proposed assets, migration requirements and unresolved publication gates.
+This does not change the identity or qualification of the published 0.3.1 artifacts.
 
 ## Evaluation scope
 
 | Area | Current documented path | What remains deployment-specific |
 |---|---|---|
 | Services | Self-hosted Linux / Docker Compose; control plane, Edge, and persistent state | Host sizing, network reachability, storage, recovery, and availability measurements |
-| Topology | Single-machine lab or three-region lab | Independent failure domains and tested quorum/failover; three names on one host give no regional redundancy |
-| Windows endpoint | Native agent installation and WebView2 OOB window | Actual OS/CPU, signed package and driver acceptance, WebView2 Runtime, IdP method |
-| macOS endpoint | Signed/notarized package, Network Extension, resident user agent and WKWebView OOB | Actual OS/CPU, signing entitlements, approvals, steering, IdP method |
+| Topology | Single-machine; one Region with three combined CP/L4/Edge Nodes and three entrances; three logical Regions with dedicated CP/L4 and Edge nodes. A separate single-entrance/two-Edge profile supports evaluation | Independent failure domains and tested quorum/failover; three names on one host give no regional redundancy |
+| Windows endpoint | Native agent installation and default-browser authentication | Actual OS/CPU, signed package and driver acceptance, IdP method |
+| macOS endpoint | Signed/notarized package, Network Extension, resident user agent and default-browser authentication | Actual OS/CPU, signing entitlements, approvals, steering, IdP method |
 | Private resources | Outbound Connector tunnels and East-West policy | Each application's protocol, DNS, routing, and allowed/denied behavior |
 | Internet access | Egress policy, TLS inspection, optional attached DLP | Client trust, application compatibility, bypasses, content coverage |
 
@@ -31,8 +34,8 @@ No tested minimum OS-version matrix or performance capacity is established by th
   Narrow it to your intended access. Connector access begins in **OBSERVE**.
 - TLS inspection does not enable DLP by itself. Attach a DLP policy; Observe and Warn
   permit matching uploads. Uninspectable-file blocking is off by default.
-- Standard upstream HTTP/TLS uses Go. Browser-faithful forwarding requires the optional
-  egress broker and its separate integration.
+- Standard upstream HTTP/TLS uses Go. The experimental browser-faithful broker is
+  not packaged or qualified for the proposed 0.4.0 distribution.
 - Generated PKI uses software-held key material. PKCS#11/HSM integration exists, but
   SoftHSM is not part of the default generated deployment.
 
@@ -44,11 +47,11 @@ These defaults are operational choices to review, not acceptance results. Detail
 | Area | Limit to account for |
 |---|---|
 | PKI | Short-lived material has renewal paths, but node/service certificates do not have automatic reissue. Review key custody, expiry, and operator-managed rotation separately |
-| IdP assurance | The shared broker's live-grant check does not enforce provider identity, AMR, age, or destination scope. OIDC request propagation does not provide all displayed assurance controls |
+| IdP assurance | Provider, AMR, age, and destination scope checks exist, but real Google, Okta, and Entra assurance flows still require validation; unsupported requirements must not be silently weakened |
 | Inspection bypass | Native TLS bypass host compilation does not preserve all source/service/risk constraints of a policy rule; it can exempt more traffic than the rule suggests |
 | East-West enforcement | Observe permits traffic; Partial permits unmatched traffic. A Warn rule permits even in Full. Outbound source compilation does not handle shared IdP selectors equivalently to device selectors |
-| OOB | Shared broker grants and the separate East-West challenge/grant API have different lifetimes and scope checks. Customer-tenant held-flow resume has a default-tenant lookup limitation; retry behavior must be tested |
-| OOB UI | Windows launcher fallback and macOS embedded-window behavior differ. A browser login test does not prove passkey or MFA success inside either WebView |
+| Authentication availability | Shared evidence-backed grants and cross-Edge ceremony recovery require complete capability activation. Store freshness, database latency and whole-snapshot contention remain release-review items; an unavailable store must not be mistaken for a normal missing grant |
+| Browser and native resume | Both agents open the default browser and the Portal confirms the destination. Keycloak Passkey acceptance on Mac does not certify every provider/platform. A completed sign-in does not by itself prove that a waiting application socket resumed |
 | DLP | Limited methods, formats, and extraction; streaming interruption can follow delivery of earlier bytes. No finding is not proof of complete inspection |
 | Audit and data | Finding writes can be best effort. Retention/hold settings do not cover all stores and copies; archive and object-lock behavior require operational verification |
 | Administration | Role, home organization, customer delegation, and selected elevation checks are distinct. Host-level recovery remains a separate privileged authority |
@@ -66,8 +69,8 @@ The published release includes signed generic macOS and Windows packages, checks
 a source SBOM and a source/artifact manifest. Release CI, package signatures and
 binary vulnerability checks passed.
 
-The September 28–29 candidate evaluation used three DSSE Regions—Tokyo East, Tokyo
-West and Osaka—with two tenants, macOS and Windows endpoints, and two Connectors.
+The 0.3.1 candidate evaluation used three logical DSSE Regions with two tenants,
+macOS and Windows endpoints, and two Connectors.
 It covered allowed and denied traffic, planned Edge-service failover, a 16-hour
 common observation window, two natural Edge leaf renewals, and communication after
 the preceding leaf certificates expired. DSSE Regions and cloud-provider regions
@@ -88,7 +91,7 @@ reproducing a result; installation success alone does not establish recovery.
 ### 0.3.0 — historical evaluation
 
 The three-region evaluation for 0.3.0 collected two overlapping observation windows of approximately
-30 hours each, from September 9–10 and September 9–11, 2026 (UTC). Each window recorded
+30 hours each. Each window recorded
 21,588 successful fresh TLS checks across two tenants and three regions, with five distinct
 server certificates observed per region/tenant lane. The server-certificate lifetime was
 12 hours. The windows overlap and are **not** a combined 60-hour test; they do not establish
@@ -119,6 +122,11 @@ traffic; see [macOS troubleshooting](macos-agent.md).
 The [verification guide](verification.md) describes how to record topology, effective
 lifetimes, start/end times, revisions, failures, and unrun cases. Keep deployment
 credentials, private keys, and raw operational logs outside public release assets.
+
+For a release that changes HTTPS inspection or egress, repeat the missing-intermediate
+chain checks for the default Go path and, when enabled, the optional broker path.
+Verify both implementations independently with an origin that omits an intermediate,
+and confirm strict certificate validation and successful requests after chain completion.
 
 An accelerated certificate test does not substitute for a full run at normal lifetimes.
 Successful startup or package installation does not establish enforcement, renewal,

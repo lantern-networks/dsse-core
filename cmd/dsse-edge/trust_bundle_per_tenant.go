@@ -264,7 +264,7 @@ func (b *perTenantTrustBundles) CatchUpWithTheFleet(tenant, announced string) {
 		}
 		for _, token := range strings.Split(announced, ",") {
 			name, fp, ok := strings.Cut(strings.TrimSpace(token), "=")
-			if ok && strings.EqualFold(strings.TrimSpace(name), tenant) &&
+			if ok && strings.TrimSpace(name) == tenant &&
 				strings.EqualFold(strings.TrimSpace(fp), fingerprint) {
 				return true
 			}
@@ -364,7 +364,7 @@ func interceptionRootFingerprintsForTenant(config serverConfig, tenant, nodeTena
 	// The question is not "is this the node's tenant" but "does this tenant have an issuer of its own". A
 	// deployment where nobody does still falls through to the node-wide answer, unchanged.
 	if config.NetworkExtensionLabTLS != nil && strings.TrimSpace(tenant) != "" &&
-		(!strings.EqualFold(strings.TrimSpace(tenant), strings.TrimSpace(nodeTenant)) ||
+		(strings.TrimSpace(tenant) != strings.TrimSpace(nodeTenant) ||
 			tenantHasItsOwnInterceptionIssuer(config, tenant)) {
 		// EVERY root this organization should be looking for: the one signing now, plus any it is being moved
 		// OFF and that has not been withdrawn yet.
@@ -396,7 +396,7 @@ func interceptionRootFingerprintsForTenant(config serverConfig, tenant, nodeTena
 		// — the same organization, two answers, one door apart. The node-local root is what a deployment has
 		// before it has an authority, and it must stop being the answer the moment it does.
 		for _, root := range config.NetworkExtensionLabTLS.ListTenantInterceptionRoots() {
-			if !strings.EqualFold(strings.TrimSpace(root.Tenant), strings.TrimSpace(tenant)) {
+			if strings.TrimSpace(root.Tenant) != strings.TrimSpace(tenant) {
 				continue
 			}
 			if tenantHasCentralInterceptionAuthority(config, tenant) {
@@ -407,7 +407,7 @@ func interceptionRootFingerprintsForTenant(config serverConfig, tenant, nodeTena
 			}
 		}
 		for _, issuer := range config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates() {
-			if !strings.EqualFold(strings.TrimSpace(issuer.Tenant), strings.TrimSpace(tenant)) {
+			if strings.TrimSpace(issuer.Tenant) != strings.TrimSpace(tenant) {
 				continue
 			}
 			// The issuer exists but its root could not be read. Returning the node-wide list here would tell
@@ -428,7 +428,7 @@ func tenantHasItsOwnInterceptionIssuer(config serverConfig, tenant string) bool 
 		return false
 	}
 	for _, issuer := range config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates() {
-		if strings.EqualFold(strings.TrimSpace(issuer.Tenant), strings.TrimSpace(tenant)) {
+		if strings.TrimSpace(issuer.Tenant) == strings.TrimSpace(tenant) {
 			return true
 		}
 	}
@@ -446,7 +446,7 @@ func tenantHasItsOwnInterceptionIssuer(config serverConfig, tenant string) bool 
 	// A device then reports interception_root_trust wanted=1 found=0 and never looks for the certificate that
 	// is actually signing its traffic. Every step that produced this answered 200.
 	for _, root := range config.NetworkExtensionLabTLS.ListTenantInterceptionRoots() {
-		if strings.EqualFold(strings.TrimSpace(root.Tenant), strings.TrimSpace(tenant)) {
+		if strings.TrimSpace(root.Tenant) == strings.TrimSpace(tenant) {
 			return true
 		}
 	}
@@ -487,7 +487,7 @@ func (b *perTenantTrustBundles) sharedAnchorMayBeWithdrawn(tenant string) bool {
 		if !e.Enabled || !e.IsEndpoint() {
 			continue
 		}
-		if t := strings.TrimSpace(e.TenantID); t != "" && !strings.EqualFold(t, tenant) {
+		if t := strings.TrimSpace(e.TenantID); t != "" && t != tenant {
 			continue
 		}
 		known = append(known, e.Identity)
@@ -602,7 +602,7 @@ func (b *perTenantTrustBundles) promotePendingIfAdopted(tenant string) bool {
 		if !e.Enabled || !e.IsEndpoint() {
 			continue
 		}
-		if t := strings.TrimSpace(e.TenantID); t != "" && !strings.EqualFold(t, tenant) {
+		if t := strings.TrimSpace(e.TenantID); t != "" && t != tenant {
 			continue
 		}
 		known = append(known, e.Identity)
@@ -693,7 +693,7 @@ func tenantHasCentralInterceptionAuthority(config serverConfig, tenant string) b
 		return false
 	}
 	for _, issuer := range config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates() {
-		if strings.EqualFold(strings.TrimSpace(issuer.Tenant), strings.TrimSpace(tenant)) {
+		if strings.TrimSpace(issuer.Tenant) == strings.TrimSpace(tenant) {
 			return true
 		}
 	}

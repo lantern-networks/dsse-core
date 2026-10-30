@@ -237,8 +237,8 @@ func cidrRelation(a, b *net.IPNet) string {
 	}
 }
 
-// ResolveConnectorsForHost is ResolveConnectorForHost returning EVERY connector that fronts the host, most
-// specific first and stable within a specificity.
+// ResolveConnectorsForHost is the unscoped form of ResolveConnectorsForDestination.
+// An IP covered equally by different namespaces is ambiguous and returns no candidates.
 //
 // ★★★ A SITE HOLDS MORE THAN ONE CONNECTOR ON PURPOSE (the operator's reminder, 2026-08-26). Route bindings
 // are authored on the SITE, so every connector in it fronts the same names — that is what makes the pair an HA
@@ -250,6 +250,13 @@ func cidrRelation(a, b *net.IPNet) string {
 // place that knows what it can actually reach — takes the first that answers. Order is unchanged for a site
 // with one connector, so a single-connector deployment behaves exactly as before.
 func ResolveConnectorsForHost(host string, connectors []model.ConnectorRegistration) []string {
+	return ResolveConnectorsForDestination(host, "", connectors)
+}
+
+// ResolveConnectorsForDestination returns the candidate members of a site's HA pair.
+// FQDNs are globally named; IP routes are restricted to the caller's namespace. Without
+// a namespace, equally specific coverage by different sites is ambiguous and denied.
+func ResolveConnectorsForDestination(host, namespace string, connectors []model.ConnectorRegistration) []string {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "" {
 		return nil
@@ -257,6 +264,7 @@ func ResolveConnectorsForHost(host string, connectors []model.ConnectorRegistrat
 	type match struct {
 		id  string
 		len int
+		ns  string
 	}
 	// ★★★ AND A SUBNET COUNTS, WHICH IS WHY AN HA PAIR HAD ONE MEMBER (2026-09-01, measured by stopping one
 	// connector of a pair and watching the whole site go dark).
@@ -273,10 +281,15 @@ func ResolveConnectorsForHost(host string, connectors []model.ConnectorRegistrat
 	address := net.ParseIP(host)
 	matches := make([]match, 0, len(connectors))
 	for _, c := range connectors {
+		if address != nil && namespace != "" && c.ReachableRoutes.Namespace != namespace {
+			continue
+		}
 		best := -1
-		for _, domain := range c.ReachableRoutes.FQDNDomains {
-			if n, ok := fqdnDomainMatchLen(host, domain); ok && n > best {
-				best = n
+		if address == nil {
+			for _, domain := range c.ReachableRoutes.FQDNDomains {
+				if n, ok := fqdnDomainMatchLen(host, domain); ok && n > best {
+					best = n
+				}
 			}
 		}
 		if address != nil {
@@ -291,7 +304,7 @@ func ResolveConnectorsForHost(host string, connectors []model.ConnectorRegistrat
 			}
 		}
 		if best >= 0 {
-			matches = append(matches, match{id: c.ID, len: best})
+			matches = append(matches, match{id: c.ID, len: best, ns: c.ReachableRoutes.Namespace})
 		}
 	}
 	sort.SliceStable(matches, func(i, j int) bool {
@@ -300,6 +313,19 @@ func ResolveConnectorsForHost(host string, connectors []model.ConnectorRegistrat
 		}
 		return matches[i].id < matches[j].id
 	})
+	if address != nil && namespace == "" && len(matches) > 0 {
+		// The unscoped route can choose a longest prefix, but it cannot choose a
+		// site among equally specific overlapping private networks.
+		bestNS := matches[0].ns
+		for _, m := range matches[1:] {
+			if m.len != matches[0].len {
+				break
+			}
+			if m.ns != bestNS {
+				return nil
+			}
+		}
+	}
 	out := make([]string, 0, len(matches))
 	for _, m := range matches {
 		out = append(out, m.id)

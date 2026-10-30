@@ -96,11 +96,11 @@ func refreshConnectorDiscoveredCandidates(ctx context.Context, registry connecto
 	}
 	var published []appcatalog.Entry
 	if catalog != nil {
-		resp, err := catalog.List(ctx, tenantID, appcatalog.ListOptions{ApplicationType: "private_app", Limit: 1000})
+		entries, err := catalog.ListAll(ctx, tenantID, appcatalog.ListAllOptions{ApplicationType: "private_app"})
 		if err != nil {
 			return nil, err
 		}
-		published = resp.Applications
+		published = entries
 	}
 	inputs := connectorDiscoveredCandidateInputs(connectors, published)
 	out := make([]policycandidate.Candidate, 0, len(inputs))

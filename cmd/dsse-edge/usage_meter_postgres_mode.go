@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -35,7 +34,7 @@ func setupEdgeUsageMeterStore(ctx context.Context, config edgeUsageMeterStoreCon
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("usage-meter-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

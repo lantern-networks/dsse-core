@@ -409,6 +409,18 @@ func TestDNSStillOrphanedAfterRecoveryIsAFailure(t *testing.T) {
 	}
 }
 
+func TestDNSUnknownAfterRecoveryIsNotCalledCleared(t *testing.T) {
+	o := recoveredBox()
+	o.DNSResidueKnown = false
+	got, why := ClassifyPostRecovery(o)
+	if got != PostRecoveryStillBroken {
+		t.Fatalf("got %s (%s), want still_broken when DNS recovery cannot be verified", got, why)
+	}
+	if !strings.Contains(strings.ToLower(why), "resolver") {
+		t.Fatalf("DNS uncertainty is missing from the result: %q", why)
+	}
+}
+
 // Unverifiable must not be reported as success. This is the direction the whole component leans.
 func TestAnUnreadableBoxAfterRecoveryIsNotCalledRecovered(t *testing.T) {
 	o := recoveredBox()

@@ -115,7 +115,7 @@ func (s *AuthChallengeStore) Complete(id string, now time.Time) (AuthChallenge, 
 	if !ok || c.Status != "pending" {
 		return AuthChallenge{}, false
 	}
-	if expiresAt, err := time.Parse(time.RFC3339, c.ExpiresAt); err == nil && now.After(expiresAt) {
+	if expiresAt, err := time.Parse(time.RFC3339, c.ExpiresAt); err != nil || !now.Before(expiresAt) {
 		return AuthChallenge{}, false
 	}
 	c.Status = "completed"
@@ -146,7 +146,7 @@ func (s *AuthChallengeStore) ListPending(tenantID string, now time.Time) []AuthC
 		if c.TenantID != tenantID || c.Status != "pending" {
 			continue
 		}
-		if expiresAt, err := time.Parse(time.RFC3339, c.ExpiresAt); err == nil && now.After(expiresAt) {
+		if expiresAt, err := time.Parse(time.RFC3339, c.ExpiresAt); err != nil || !now.Before(expiresAt) {
 			continue
 		}
 		out = append(out, c)

@@ -72,23 +72,12 @@ func TestEachStateBearingRegionNamesTheClusterAsItWillFindIt(t *testing.T) {
 		if env["DSSE_ETCD_PEER_CLIENT_CERT_AUTH"] != "true" {
 			t.Errorf("%s does not require a certificate from its peers", c.machine)
 		}
-		// ★★★ AND THE CLIENT ENDPOINT DELIBERATELY DOES NOT — A STATED GAP, PINNED SO IT STAYS VISIBLE
-		// (2026-08-31, measured: Patroni could not start).
-		//
-		// Every private key this deployment mounts is 0600, which works because every container reading one
-		// runs as root. The database image does not — Patroni is uid 101 — so the member key it was told to
-		// present was unreadable, and the symptom was a permission error wearing a network error's clothes.
-		//
-		// The right fix is per-consumer client material owned by the uid that reads it. Until then the client
-		// endpoint is encrypted and server-authenticated and asks for nothing, and this test says so out loud
-		// rather than letting the relaxation become invisible. If somebody turns it back on, they must also
-		// give Patroni a key it can read — and this failing is how they find out.
-		if env["DSSE_ETCD_CLIENT_CERT_AUTH"] != "false" {
-			t.Errorf("%s requires a client certificate: Patroni runs as uid 101 and cannot read a 0600 key, "+
-				"so this starts nothing. Give it material it can read before asking for one.", c.machine)
+		// Consumer keys are delivered through the postgres-owned private volume.
+		if env["DSSE_ETCD_CLIENT_CERT_AUTH"] != "true" {
+			t.Errorf("%s does not require authenticated consumers", c.machine)
 		}
-		if env["DSSE_ETCD_CLIENT_CERT"] != "" || env["DSSE_ETCD_CLIENT_KEY"] != "" {
-			t.Errorf("%s points Patroni at a certificate it is not asked for and cannot read", c.machine)
+		if env["DSSE_ETCD_CLIENT_CERT"] != "/run/dsse-postgres-tls/store-client.pem" || env["DSSE_ETCD_CLIENT_KEY"] != "/run/dsse-postgres-tls/store-client-key.pem" {
+			t.Errorf("%s does not point Patroni at its private consumer material", c.machine)
 		}
 		if env["DSSE_ETCD_CLIENT_CACERT"] == "" {
 			t.Errorf("%s does not verify the store it talks to: without the CA this is encryption to whoever "+

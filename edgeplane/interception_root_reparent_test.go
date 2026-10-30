@@ -402,6 +402,84 @@ func TestReparentPersistsAcrossARestart(t *testing.T) {
 	}
 }
 
+func TestReparentIssuerStopsWhenCentralAnchorExpires(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	clock := now
+	selfSigned, tokenKey := mintReparentCA(t, "Edge Interception Root", nil, nil)
+	interception := newTestInterceptionForReparent(t, selfSigned, tokenKey)
+	interception.now = func() time.Time { return clock }
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interception.leafKey = leafKey
+
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(201), Subject: pkix.Name{CommonName: "Short Central Root"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(2 * time.Minute),
+		KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	rootDER, err := x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, rootKey.Public(), rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := x509.ParseCertificate(rootDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(202), Subject: pkix.Name{CommonName: "Long Edge Issuer"},
+		NotBefore: now.Add(-time.Hour), NotAfter: now.Add(time.Hour),
+		KeyUsage: x509.KeyUsageCertSign, BasicConstraintsValid: true, IsCA: true,
+	}
+	interDER, err := x509.CreateCertificate(rand.Reader, interTemplate, root, tokenKey.Public(), rootKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AdoptReparentedIntermediate(interception,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: rootDER}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: interDER}), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	issuer := interception.offlineIssuer
+	if issuer == nil {
+		t.Fatal("adoption did not install an issuer")
+	}
+	if err := issuer.usableAt(now.Add(time.Minute)); err != nil {
+		t.Fatalf("issuer should be usable before the anchor expires: %v", err)
+	}
+	clock = now.Add(time.Minute)
+	if _, err := interception.leafCertificate("tenant", "site.example.com"); err != nil {
+		t.Fatalf("leaf should be issued before the anchor expires: %v", err)
+	}
+	if err := issuer.usableAt(now.Add(3 * time.Minute)); err == nil {
+		t.Fatal("expired central trust anchor must stop leaf issuance even if the intermediate remains valid")
+	}
+	clock = now.Add(3 * time.Minute)
+	if _, err := interception.leafCertificate("tenant", "site.example.com"); err == nil {
+		t.Fatal("cached leaf must not be served after its central trust anchor expires")
+	}
+}
+
+func TestReparentRestoreFlagsHalfMissingPersistedPair(t *testing.T) {
+	selfSigned, tokenKey := mintReparentCA(t, "Edge Interception Root", nil, nil)
+	dir := t.TempDir()
+	// A legacy two-file adoption may be half-written. The current writer never produces these files,
+	// but their presence must never be mistaken for a never-adopted node.
+	if err := os.WriteFile(filepath.Join(dir, reparentedRootFileName), []byte("old root"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	restarted := newTestInterceptionForReparent(t, selfSigned, tokenKey)
+	ReapplyPersistedReparent(restarted, dir)
+	if _, failed := restarted.InterceptionIntermediateStatus()["reparent_restore_failed"]; !failed {
+		t.Fatal("one missing file from an adopted pair must be visible as degraded, not mistaken for a never-reparented node")
+	}
+}
+
 // ★ THE FILE DEVICES ARE TOLD TO INSTALL FROM WENT STALE ON A RE-PARENT (2026-08-16). -...-root-ca-cert-out
 // exists for exactly one purpose: "this is the root to put in a machine's trust store". It was written once at
 // startup and never again, so the moment the anchor moved, that file went on naming the previous root.

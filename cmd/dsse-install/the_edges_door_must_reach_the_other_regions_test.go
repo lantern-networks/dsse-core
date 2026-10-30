@@ -94,6 +94,9 @@ func TestTheDoorwayCanReachEdgesOnOtherMachines(t *testing.T) {
 		t.Fatal("a compose service name survived beside the real hosts; the doorway would health-check a name " +
 			"that resolves nowhere and report the fleet as half down")
 	}
+	if strings.Contains(backendBlock(door, "edge_fleet"), "send-proxy addr ") {
+		t.Fatal("health checks pin the startup DNS address instead of following each server's resolved address")
+	}
 	// ★ send-proxy has to survive. Without it every device in the region arrives from the doorway's address:
 	// one rate-limit bucket for the fleet, and a device list saying every machine is in the same place.
 	if !strings.Contains(door, "send-proxy") {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	certreload "github.com/lantern-networks/dsse-core/certreload"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 )
 
 // Edge/Admin server hardening: bounded request-read timeouts (Slowloris defense) and an
@@ -47,7 +49,7 @@ func hardenedHTTPServer(addr, door string, handler http.Handler) *http.Server {
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: edgeReadHeaderTimeout,
-		IdleTimeout:       edgeIdleTimeout,
+		IdleTimeout:       runtimequota.SecondsDefault("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", edgeIdleTimeout),
 		// ReadTimeout / WriteTimeout deliberately unset (0): streaming tunnels must not be time-bounded.
 		// Filter net/http's own ErrorLog: its per-connection "TLS handshake error … EOF/reset" lines are
 		// benign client aborts (health probes, port scans, keep-alive closes) — pure Plane-A noise that
@@ -303,11 +305,12 @@ func installGracefulDrain(srv *http.Server, addr string, drainState *atomic.Bool
 // tokenBucketLimiter is a tiny self-contained per-client token-bucket rate limiter (no external dependency,
 // keeping the OSS dependency surface minimal). Keyed by client IP.
 type tokenBucketLimiter struct {
-	mu      sync.Mutex
-	buckets map[string]*tokenBucketState
-	rps     float64
-	burst   float64
-	now     func() time.Time
+	mu        sync.Mutex
+	nextSweep time.Time
+	buckets   map[string]*tokenBucketState
+	rps       float64
+	burst     float64
+	now       func() time.Time
 }
 
 type tokenBucketState struct {
@@ -336,6 +339,24 @@ func (l *tokenBucketLimiter) allow(key string) bool {
 	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if !now.Before(l.nextSweep) {
+		// A fully replenished idle bucket is equivalent to a new bucket.
+		// Reclaim only those keys; never reset an active caller's rate history.
+		for oldKey, old := range l.buckets {
+			if elapsed := now.Sub(old.lastSeen).Seconds(); elapsed > 0 && old.tokens+elapsed*l.rps >= l.burst {
+				delete(l.buckets, oldKey)
+			}
+		}
+		horizon := math.Ceil(l.burst / l.rps * float64(time.Second))
+		interval := time.Duration(math.MaxInt64)
+		if horizon < float64(math.MaxInt64) {
+			interval = time.Duration(horizon)
+		}
+		if interval <= 0 {
+			interval = time.Nanosecond
+		}
+		l.nextSweep = now.Add(interval)
+	}
 	b, ok := l.buckets[key]
 	if !ok {
 		l.buckets[key] = &tokenBucketState{tokens: l.burst - 1, lastSeen: now}
@@ -383,7 +404,7 @@ func adminSurfaceOnlyMiddleware(next http.Handler) http.Handler {
 		// each organization's short-lived server material from its control plane, over the connection it
 		// already authenticates on. Adding it here rather than to the admin surface keeps it out of the admin
 		// API — it is a machine route, not something an administrator calls.
-		if isAdminSurfacePath(r.URL.Path) || r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/leader" || r.URL.Path == "/audit-ingest" || r.URL.Path == "/tenant-edge-material" {
+		if isAdminSurfacePath(r.URL.Path) || r.URL.Path == "/healthz" || r.URL.Path == "/metrics" || r.URL.Path == "/leader" || r.URL.Path == "/audit-ingest" || r.URL.Path == "/auth-flow-results" || r.URL.Path == "/auth-flow-results/query" || r.URL.Path == "/fleet-capabilities/report" || r.URL.Path == "/tenant-edge-material" || r.URL.Path == "/tenant-inspection-crl" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -397,7 +418,7 @@ func dataPlaneOnlyMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// /metrics is management-only: 404 it on the data plane so decision counts are not exposed on the public
 		// data-plane port (it is served on the dedicated admin listener).
-		if isAdminSurfacePath(r.URL.Path) || r.URL.Path == "/metrics" {
+		if isAdminSurfacePath(r.URL.Path) || r.URL.Path == "/metrics" || r.URL.Path == "/auth-flow-results" || r.URL.Path == "/auth-flow-results/query" {
 			http.NotFound(w, r)
 			return
 		}

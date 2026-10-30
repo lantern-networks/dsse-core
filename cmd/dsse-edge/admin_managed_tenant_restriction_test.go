@@ -124,7 +124,7 @@ func TestManagedTenantRestrictionHTTPSHeadersAllProviders(t *testing.T) {
 			if err := store.SaveTenantRestriction("customer", provider.ID, patch); err != nil {
 				t.Fatal(err)
 			}
-			bundle := fixture.PolicyBundle
+			bundle := tenantRestrictionInspectionFixtureFor(fixture.PolicyBundle, "customer")
 			bundle.SaaSCatalog = nil
 			bundle.SWGTenantRestrictionRules = nil
 			bundle.SWGTLSBypassRules = nil
@@ -178,6 +178,26 @@ func TestManagedTenantRestrictionHTTPSHeadersAllProviders(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The source fixture belongs to tenant_swg_lab. Reusing its inspected-allow
+// policy for a different tenant requires that tenant's own inspection/trust
+// configuration too; cross-tenant inspection material must not be inherited.
+func tenantRestrictionInspectionFixtureFor(bundle model.PolicyBundle, tenant string) model.PolicyBundle {
+	bundle.TenantID = tenant
+	bundle.InspectionProfiles = append(bundle.InspectionProfiles[:0:0], bundle.InspectionProfiles...)
+	for i := range bundle.InspectionProfiles {
+		bundle.InspectionProfiles[i].TenantID = tenant
+	}
+	bundle.TrustProfiles = append(bundle.TrustProfiles[:0:0], bundle.TrustProfiles...)
+	for i := range bundle.TrustProfiles {
+		bundle.TrustProfiles[i].TenantID = tenant
+	}
+	bundle.TenantRootCAs = append(bundle.TenantRootCAs[:0:0], bundle.TenantRootCAs...)
+	for i := range bundle.TenantRootCAs {
+		bundle.TenantRootCAs[i].TenantID = tenant
+	}
+	return bundle
 }
 
 func TestManagedTenantRestrictionConfigSyncRejectsInvalidBeforeApply(t *testing.T) {

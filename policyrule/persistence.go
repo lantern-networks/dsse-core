@@ -106,6 +106,10 @@ func (s *Store) saveCandidateLocked(next map[string]map[string]Rule, seq int) er
 }
 
 func cloneRule(r Rule) Rule {
+	if r.Action.MaxAgeSeconds != nil {
+		age := *r.Action.MaxAgeSeconds
+		r.Action.MaxAgeSeconds = &age
+	}
 	r.Source = append([]string(nil), r.Source...)
 	r.Destination = append([]string(nil), r.Destination...)
 	r.AllowedToolIDs = append([]string(nil), r.AllowedToolIDs...)

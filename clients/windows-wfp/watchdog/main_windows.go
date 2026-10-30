@@ -271,11 +271,6 @@ func observe() Observation {
 	return o
 }
 
-// dnsResidueFileName is the agent's persisted pre-takeover resolver snapshot. Must match
-// resolverBackupPath() in steer/dns_resolver_windows.go — the agent writes it beside its own binary when it
-// points the resolver at itself, and deletes it once it has put the servers back.
-const dnsResidueFileName = "dsse_dns_resolver_backup.json"
-
 // dnsTakeoverResidue reports (residue, known): whether the agent left the resolver pointed at its dead
 // loopback proxy.
 //
@@ -289,26 +284,9 @@ const dnsResidueFileName = "dsse_dns_resolver_backup.json"
 // reported dns_residue_known=false on a genuinely orphaned box, so the decision degraded to report_only and
 // `cannot_recover` never fired.
 func dnsTakeoverResidue(dirs []string) (bool, bool) {
-	if len(dirs) == 0 {
-		return false, false
-	}
-	answered := false
-	for _, dir := range dirs {
-		path := filepath.Join(dir, dnsResidueFileName)
-		switch _, serr := os.Stat(path); {
-		case serr == nil:
-			return true, true
-		case os.IsNotExist(serr):
-			// A definite absence, including when the directory itself is gone: DSSE state cannot be in a place
-			// that does not exist.
-			answered = true
-		default:
-			// Present-but-unreadable is NOT "absent". Reporting it as absent is how a real residue becomes a
-			// confident "nothing to do".
-			fmt.Printf("dsse-watchdog: could not check the DNS takeover residue at %s: %v\n", path, serr)
-		}
-	}
-	return false, answered
+	return dnsTakeoverResidueWithStat(dirs, os.Stat, func(path string, err error) {
+		fmt.Printf("dsse-watchdog: could not check the DNS takeover residue at %s: %v\n", path, err)
+	})
 }
 
 // --- driver ---------------------------------------------------------------------------------------------

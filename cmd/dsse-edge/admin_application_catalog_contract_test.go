@@ -310,7 +310,10 @@ func TestRouteProfilesDropPublishedAppOnDelete(t *testing.T) {
 		t.Fatalf("publish upsert: %v", err)
 	}
 
-	merged := edgeplane.RouteProfilesWithPublishedCatalog(map[string]edgeplane.ApplicationRouteProfile{}, store, tenantID)
+	merged, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, map[string]edgeplane.ApplicationRouteProfile{}, store, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := merged["app_pub_001"]; !ok {
 		t.Fatalf("published app missing from route overlay: %#v", merged)
 	}
@@ -318,7 +321,10 @@ func TestRouteProfilesDropPublishedAppOnDelete(t *testing.T) {
 	if err := store.Delete(ctx, tenantID, "app_pub_001"); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	mergedAfter := edgeplane.RouteProfilesWithPublishedCatalog(map[string]edgeplane.ApplicationRouteProfile{}, store, tenantID)
+	mergedAfter, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, map[string]edgeplane.ApplicationRouteProfile{}, store, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, ok := mergedAfter["app_pub_001"]; ok {
 		t.Fatalf("deleted published app still in route overlay: %#v", mergedAfter)
 	}

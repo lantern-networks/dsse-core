@@ -66,6 +66,9 @@ func ValidateWithTrustedKeys(b model.PolicyBundle, now time.Time, trustedKeys ma
 }
 
 func validate(b model.PolicyBundle, now time.Time, trustedKeys map[string]ed25519.PublicKey, allowLabMock bool) error {
+	if !allowLabMock && len(trustedKeys) == 0 {
+		return fmt.Errorf("policy bundle trusted-key validation requires a non-empty keyring")
+	}
 	if b.ID == "" {
 		return fmt.Errorf("policy bundle id is required")
 	}
@@ -98,7 +101,7 @@ func validate(b model.PolicyBundle, now time.Time, trustedKeys map[string]ed2551
 			return fmt.Errorf("policy bundle mock signature is not accepted with trusted key validation")
 		}
 	} else {
-		if err := VerifySignatureWithTrustedKeys(b, trustedKeys); err != nil {
+		if err := verifySignature(b, trustedKeys); err != nil {
 			return err
 		}
 	}
@@ -119,7 +122,7 @@ func validate(b model.PolicyBundle, now time.Time, trustedKeys map[string]ed2551
 		if err != nil {
 			return fmt.Errorf("parse policy bundle expires_at: %w", err)
 		}
-		if now.After(expiresAt) {
+		if !now.Before(expiresAt) {
 			return fmt.Errorf("policy bundle %s expired at %s", b.ID, b.ExpiresAt)
 		}
 	}
@@ -128,10 +131,17 @@ func validate(b model.PolicyBundle, now time.Time, trustedKeys map[string]ed2551
 }
 
 func VerifySignature(b model.PolicyBundle) error {
-	return VerifySignatureWithTrustedKeys(b, nil)
+	return verifySignature(b, nil)
 }
 
 func VerifySignatureWithTrustedKeys(b model.PolicyBundle, trustedKeys map[string]ed25519.PublicKey) error {
+	if len(trustedKeys) == 0 {
+		return fmt.Errorf("policy bundle trusted-key verification requires a non-empty keyring")
+	}
+	return verifySignature(b, trustedKeys)
+}
+
+func verifySignature(b model.PolicyBundle, trustedKeys map[string]ed25519.PublicKey) error {
 	if !strings.HasPrefix(b.Signature, signedconfig.SignaturePrefix) {
 		return fmt.Errorf("policy bundle signature must use %s prefix", signedconfig.SignaturePrefix)
 	}

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
+	"github.com/lantern-networks/dsse-core/internal/strictjson"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
@@ -312,7 +313,7 @@ func NewHumanIdentityDirectoryStore(items ...model.HumanIdentity) *HumanIdentity
 	for _, item := range items {
 		normalized, err := NormalizeHumanIdentity(item, item.TenantID, now)
 		if err == nil {
-			store.users[HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)] = normalized
+			store.users[HumanIdentityDirectoryKey(normalized.TenantID, normalized.ID)] = cloneHumanIdentity(normalized)
 		}
 	}
 	return store
@@ -328,29 +329,83 @@ func NewHumanIdentityDirectoryStore(items ...model.HumanIdentity) *HumanIdentity
 func (store *HumanIdentityDirectoryStore) SetPersister(p blobstore.Persister) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	store.persister = p
 	if p == nil {
+		store.persister = nil
 		return nil
 	}
 	data, err := p.Load()
 	if err != nil {
 		return err
 	}
-	if len(data) == 0 {
+	if data == nil {
+		store.persister = p
 		return nil
+	}
+	if len(data) == 0 {
+		return fmt.Errorf("empty human identity directory snapshot")
+	}
+	if err := strictjson.RejectDuplicateKeys(data); err != nil {
+		return err
+	}
+	if err := strictjson.RejectUnknownFields(data, humanIdentityDirectorySnapshot{}); err != nil {
+		return err
+	}
+	var rawSnapshot struct {
+		Users          map[string]json.RawMessage `json:"users"`
+		SourceStates   map[string]json.RawMessage `json:"source_states"`
+		SourcePolicies map[string]json.RawMessage `json:"source_policies"`
+	}
+	if err := json.Unmarshal(data, &rawSnapshot); err != nil {
+		return err
+	}
+	for _, raw := range rawSnapshot.Users {
+		if err := strictjson.RejectUnknownFields(raw, model.HumanIdentity{}); err != nil {
+			return err
+		}
+	}
+	for _, raw := range rawSnapshot.SourceStates {
+		if err := strictjson.RejectUnknownFields(raw, HumanIdentitySourceState{}); err != nil {
+			return err
+		}
+	}
+	for _, raw := range rawSnapshot.SourcePolicies {
+		if err := strictjson.RejectUnknownFields(raw, HumanIdentitySourcePolicy{}); err != nil {
+			return err
+		}
 	}
 	var snap humanIdentityDirectorySnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	if snap.Users != nil {
-		store.users = snap.Users
+	if err := validateDirectorySnapshot(snap); err != nil {
+		return err
 	}
-	if snap.SourceStates != nil {
-		store.sourceStates = snap.SourceStates
+	store.users = snap.Users
+	store.sourceStates = snap.SourceStates
+	store.sourcePolicies = snap.SourcePolicies
+	store.persister = p
+	return nil
+}
+
+func validateDirectorySnapshot(snap humanIdentityDirectorySnapshot) error {
+	if snap.Users == nil || snap.SourceStates == nil || snap.SourcePolicies == nil {
+		return fmt.Errorf("incomplete human identity directory snapshot")
 	}
-	if snap.SourcePolicies != nil {
-		store.sourcePolicies = snap.SourcePolicies
+	for key, user := range snap.Users {
+		if user.TenantID == "" || user.ID == "" || user.Subject == "" || !HumanIdentityStatusAllowed(user.Status) ||
+			strings.ContainsRune(user.TenantID, 0) || strings.ContainsRune(user.ID, 0) || key != HumanIdentityDirectoryKey(user.TenantID, user.ID) {
+			return fmt.Errorf("invalid human identity directory entry")
+		}
+	}
+	for key, state := range snap.SourceStates {
+		if state.TenantID == "" || state.Source == "" || strings.ContainsRune(state.TenantID, 0) || strings.ContainsRune(state.Source, 0) || key != HumanIdentityDirectoryKey(state.TenantID, state.Source) {
+			return fmt.Errorf("invalid human identity source state entry")
+		}
+	}
+	for key, policy := range snap.SourcePolicies {
+		if policy.TenantID == "" || policy.Source == "" || strings.ContainsRune(policy.TenantID, 0) || strings.ContainsRune(policy.Source, 0) || key != HumanIdentityDirectoryKey(policy.TenantID, policy.Source) {
+			return fmt.Errorf("invalid human identity source policy entry")
+		}
 	}
 	return nil
 }
@@ -366,13 +421,17 @@ var ErrDirectoryPersistence = errors.New("human identity directory could not be 
 // in-place save is already committed; treating it as rejected would diverge memory
 // from disk. Stores without a persister remain intentionally in-memory.
 func (store *HumanIdentityDirectoryStore) saveSnapshotLocked(users map[string]model.HumanIdentity) error {
+	return store.saveSnapshotPartsLocked(users, store.sourceStates, store.sourcePolicies)
+}
+
+func (store *HumanIdentityDirectoryStore) saveSnapshotPartsLocked(users map[string]model.HumanIdentity, states map[string]HumanIdentitySourceState, policies map[string]HumanIdentitySourcePolicy) error {
 	if store.persister == nil {
 		return nil
 	}
 	data, err := json.Marshal(humanIdentityDirectorySnapshot{
 		Users:          users,
-		SourceStates:   store.sourceStates,
-		SourcePolicies: store.sourcePolicies,
+		SourceStates:   states,
+		SourcePolicies: policies,
 	})
 	if err != nil {
 		reportPersistError(fmt.Errorf("marshal human identity directory snapshot: %w", err))
@@ -416,13 +475,13 @@ func (store *HumanIdentityDirectoryStore) saveIdentity(user model.HumanIdentity,
 	for key, existing := range store.users {
 		candidate[key] = existing
 	}
-	candidate[key] = normalized
+	candidate[key] = cloneHumanIdentity(normalized)
 	if err := store.saveSnapshotLocked(candidate); err != nil {
 		return model.HumanIdentity{}, err
 	}
 	store.users = candidate
 	store.generation.Add(1)
-	return normalized, nil
+	return cloneHumanIdentity(normalized), nil
 }
 
 // ConfigGeneration returns the monotonic directory version, bumped on every identity and source-policy
@@ -475,13 +534,17 @@ func (store *HumanIdentityDirectoryStore) UpsertSourcePolicy(_ context.Context, 
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.sourcePolicies == nil {
-		store.sourcePolicies = map[string]HumanIdentitySourcePolicy{}
+	candidate := make(map[string]HumanIdentitySourcePolicy, len(store.sourcePolicies)+1)
+	for key, existing := range store.sourcePolicies {
+		candidate[key] = existing
 	}
-	store.sourcePolicies[HumanIdentityDirectoryKey(normalized.TenantID, normalized.Source)] = normalized
-	store.persistLocked()
+	candidate[HumanIdentityDirectoryKey(normalized.TenantID, normalized.Source)] = cloneSourcePolicy(normalized)
+	if err := store.saveSnapshotPartsLocked(store.users, store.sourceStates, candidate); err != nil {
+		return HumanIdentitySourcePolicy{}, err
+	}
+	store.sourcePolicies = candidate
 	store.generation.Add(1)
-	return normalized, nil
+	return cloneSourcePolicy(normalized), nil
 }
 
 func (store *HumanIdentityDirectoryStore) ListSourcePolicies(_ context.Context, tenantID string) ([]HumanIdentitySourcePolicy, error) {
@@ -494,7 +557,7 @@ func (store *HumanIdentityDirectoryStore) ListSourcePolicies(_ context.Context, 
 	policies := []HumanIdentitySourcePolicy{}
 	for _, policy := range store.sourcePolicies {
 		if policy.TenantID == tenantID {
-			policies = append(policies, policy)
+			policies = append(policies, cloneSourcePolicy(policy))
 		}
 	}
 	sort.Slice(policies, func(i, j int) bool {
@@ -537,7 +600,7 @@ func (store *HumanIdentityDirectoryStore) List(_ context.Context, tenantID strin
 			if option.AfterID != "" && user.ID <= option.AfterID {
 				continue
 			}
-			users = append(users, user)
+			users = append(users, cloneHumanIdentity(user))
 		}
 	}
 	sort.Slice(users, func(i, j int) bool {
@@ -764,7 +827,7 @@ func HumanIdentityDirectorySourceDueListForConnector(result HumanIdentitySourceD
 	if connectorID == "" {
 		return result
 	}
-	filtered := result.Sources[:0]
+	filtered := make([]HumanIdentitySourceDue, 0, len(result.Sources))
 	for _, source := range result.Sources {
 		if HumanIdentityConnectorMetadataAllowed(source.Metadata, connectorID) {
 			filtered = append(filtered, source)
@@ -1554,11 +1617,10 @@ func HumanIdentityDirectoryUpsertMany(ctx context.Context, store HumanIdentityDi
 }
 
 func copyHumanIdentityMetadata(metadata map[string]any) map[string]any {
-	next := map[string]any{}
-	for key, value := range metadata {
-		next[key] = value
+	if metadata == nil {
+		return map[string]any{}
 	}
-	return next
+	return cloneDirectoryMetadata(metadata)
 }
 
 func NormalizeHumanIdentitySourceState(state HumanIdentitySourceState) (HumanIdentitySourceState, error) {
@@ -1580,6 +1642,9 @@ func NormalizeHumanIdentitySourceState(state HumanIdentitySourceState) (HumanIde
 	}
 	if state.Source == "" {
 		return HumanIdentitySourceState{}, fmt.Errorf("human identity source is required")
+	}
+	if strings.ContainsRune(state.TenantID, 0) || strings.ContainsRune(state.Source, 0) {
+		return HumanIdentitySourceState{}, fmt.Errorf("human identity source state tenant or source contains NUL")
 	}
 	switch state.Status {
 	case "success", "error", "unknown":
@@ -1614,6 +1679,9 @@ func NormalizeHumanIdentitySourcePolicy(policy HumanIdentitySourcePolicy) (Human
 	}
 	if policy.Source == "" {
 		return HumanIdentitySourcePolicy{}, fmt.Errorf("human identity source is required")
+	}
+	if strings.ContainsRune(policy.TenantID, 0) || strings.ContainsRune(policy.Source, 0) {
+		return HumanIdentitySourcePolicy{}, fmt.Errorf("human identity source policy tenant or source contains NUL")
 	}
 	if len(policy.Source) > maxHumanIdentitySourceNameLength {
 		return HumanIdentitySourcePolicy{}, fmt.Errorf("human identity source must be at most %d characters", maxHumanIdentitySourceNameLength)
@@ -1730,6 +1798,9 @@ func NormalizeHumanIdentity(user model.HumanIdentity, tenantID string, now time.
 	if user.Subject == "" {
 		return model.HumanIdentity{}, fmt.Errorf("human identity subject is required")
 	}
+	if strings.ContainsRune(user.TenantID, 0) || strings.ContainsRune(user.ID, 0) {
+		return model.HumanIdentity{}, fmt.Errorf("human identity tenant or ID contains NUL")
+	}
 	user.Source = valueOrDefault(strings.TrimSpace(user.Source), "identity_directory")
 	user.Status = valueOrDefault(strings.TrimSpace(user.Status), "active")
 	if !HumanIdentityStatusAllowed(user.Status) {
@@ -1826,7 +1897,7 @@ func (store *HumanIdentityDirectoryStore) RiskIdentitySnapshot(_ context.Context
 	defer store.mu.RUnlock()
 	people := make([]model.HumanIdentity, 0, len(store.users))
 	for _, person := range store.users {
-		people = append(people, person)
+		people = append(people, cloneHumanIdentity(person))
 	}
 	return people, nil
 }

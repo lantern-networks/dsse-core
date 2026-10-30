@@ -5,11 +5,10 @@
 // where + time, never the raw matched value. Backend: GET /admin/dlp-findings (dlp_match findings only —
 // inspection events + an aggregated summary). See docs/dlp_vision_and_roadmap.md.
 
-// dlpInstanceBadge shows the destination instance class (instance-aware action): corporate = the sanctioned
-// org account, personal = an outside-the-organization account. Blank when not classified.
+// Historical instance labels came from unverified account hints. Current SWG findings leave the class unknown.
 function dlpInstanceBadge(cls) {
-  if (cls === "corporate") return uiBadge(bl({ en: "Corporate", ja: "自社" }), "ok");
-  if (cls === "personal") return uiBadge(bl({ en: "Personal / outside", ja: "個人/社外" }), "err");
+  if (cls === "corporate") return uiBadge(bl({ en: "Corporate hint (unverified)", ja: "自社の可能性（未検証）" }), "off");
+  if (cls === "personal") return uiBadge(bl({ en: "Personal / outside hint (unverified)", ja: "個人/社外の可能性（未検証）" }), "off");
   return null;
 }
 
@@ -17,7 +16,7 @@ function dlpInstanceBadge(cls) {
 // carried, or "—". Device-only steered flows have no corporate session, so User falls back to the OS/signed-in
 // identity, Device to the source IP.
 function dlpAppCell(f) { return f.source_app ? el("code", { text: f.source_app }) : el("span", { class: "ui-view-desc", text: "—" }); }
-function dlpUserCell(f) { const u = f.corporate_user || f.user_id || f.account; return u ? el("span", { text: u }) : el("span", { class: "ui-view-desc", text: "—" }); }
+function dlpUserCell(f) { const u = f.corporate_user || f.user_id; return u ? el("span", { text: u }) : f.account ? el("span", { text: f.account + bl({ en: " (unverified hint)", ja: "（未検証情報）" }) }) : el("span", { class: "ui-view-desc", text: "—" }); }
 function dlpDeviceCell(f) { const dvc = f.device_id || f.source_ip; return dvc ? el("span", { text: dvc }) : el("span", { class: "ui-view-desc", text: "—" }); }
 
 function dlpActionBadge(action) {

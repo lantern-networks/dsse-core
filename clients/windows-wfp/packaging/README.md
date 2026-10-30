@@ -6,7 +6,7 @@ use the [Windows agent guide](../../../docs/windows-agent.md). This page is for 
 ## Prerequisites
 
 - Windows, Go 1.25 or newer, PowerShell, and a .NET SDK.
-- WiX 5 (`dotnet tool install --global wix --version 5.0.2`) and the Windows SDK signing tools.
+- WiX 7.0.0 (`dotnet tool install --global wix --version 7.0.0`) and the Windows SDK signing tools. The build scripts pass `-acceptEula wix7` to the WiX CLI. Review the [OSMF terms](https://docs.firegiant.com/wix/osmf/) before building; confirm the applicable revenue condition as part of release operations.
 - A driver matching the target architecture and accepted by the target's Windows security policy.
 - Your own signing identity for a distributed MSI. The `test` backend is for development only.
 
@@ -56,6 +56,15 @@ generic package with `-UpdatePublisher`. It is distinct from a tenant's profile,
 and rollout-plan signing keys. Verify the actual Windows signer; do not substitute an
 Apple Team ID. See [Agent updates](../../../docs/agent-updates.md).
 
+For a publisher name containing spaces, verify the **installed** `DsseUpdater` service
+command line with Windows argument parsing: `--update-publisher` must have one value
+beginning `subject:` or `thumbprint:`, with no literal `&quot;` fragments. Also test an
+upgrade from an older MSI that installed those fragments. Pre-upgrade capture must
+recover the unambiguous publisher before the old product is removed; a malformed or
+ambiguous value must stop the upgrade with the old product intact. The corrected
+WiX authoring and capture path still require signed-MSI installation and upgrade
+acceptance on Windows.
+
 Inspect both the MSI/Bootstrapper tables (including Properties and CustomActions) and
 extracted payload before distribution. No DSSE deployment or tenant profile, CA, token,
 identity, verification key, region configuration, or connection/recovery address may be
@@ -102,9 +111,9 @@ After the MSI build:
 .\build-bundle.ps1 -Sign -SignBackend evtoken
 ```
 
-This produces `DsseAgentSetup.exe` using WiX Burn. `-WithWebView2` can include the WebView2
-runtime. Build prerequisites include `WixToolset.BootstrapperApplications.wixext` and
-`WixToolset.Util.wixext`. Run the bundle from an ordinary build/output directory, not
+This produces `DsseAgentSetup.exe` using WiX Burn. Authentication uses the user's default
+browser; the retired embedded WebView2 helper is not installed. Build prerequisites include
+`WixToolset.BootstrapperApplications.wixext/7.0.0`. Run the bundle from an ordinary build/output directory, not
 under the Windows system directories.
 
 ## Verify what will be distributed
@@ -128,8 +137,40 @@ A successful signing command or an MSI exit code alone is insufficient.
 is stored there and verified on read. A missing or invalid profile cannot authorize a
 new transport. Installation must establish the intended service start mode and enrolment.
 
-The uninstall runs `dsse-steer --mode recover` before removing the network components.
-Recovery failures do not necessarily fail the entire uninstall, so verify restored
+The uninstall disables and confirms stopped `DsseUpdater`, `DsseWatchdog`, and
+`DsseSteer`, then runs `dsse-steer --mode recover --recover-keep-services` while the
+driver is still available. Recovery must succeed before any trust, profile, or driver
+removal. Independent CA, CA-bundle/environment, profile, and verifier errors are
+collected; they fail MSI. Driver removal must confirm both STOPPED and service absence.
+Rollback packages are pruned only after those steps succeed.
+
+An incomplete removal returns failure. MSI rollback restores its tracked files and
+service rows, but the finalizer keeps user-mode services disabled and repeats network
+recovery. It never reinstalls a removed CA or restores an adopted verifier from an
+unverified file. The installation may remain registered with partially removed state:
+correct the reported access/stop/recovery failure and retry the same uninstall. Absent
+certificates, profile/verifier records, and driver service are idempotent success;
+access errors and pending driver deletion are not. Retained PEM evidence and enrolment
+material are not deleted by this action. Do not start services manually after a partial
+removal; restoring service requires explicit, verified provisioning.
+
+Major upgrades preserve trust/profile/verifier and rollback packages. Old-product
+removal is inside the MSI transaction, and driver replacement requires checked explicit
+network recovery before unloading the old driver. The fresh-install driver-removal
+rollback action is excluded from upgrades and declared downgrades. Rollback holds a
+candidate inert; it does not claim that the restored older deployment can steer.
+Packages predating these rollback actions cannot gain them retroactively: automatic
+service/trust restoration across such a version boundary is not guaranteed. Use the
+updater's existing verified-package rollback/recovery path and validate the restored
+profile and authorities before resuming steering; no signature or anti-rollback check
+is bypassed by these helpers.
+
+These changes have local failure-injection tests, cross-compilation, and static WiX
+checks. The rollback finalizer's intended final disabled/STOPPED state has not been
+validated on Windows. Native MSI rollback may transiently restart a service before
+the finalizer executes; this is not a guarantee of stopped services or no traffic
+throughout rollback. Compiled MSI action tables, cancellation/crash/reboot,
+access-denied cleanup, and upgrade rollback still require fault injection on Windows. Verify restored
 connectivity and inspect remaining trust and identity material afterwards. See the
 [Windows removal limitations](../../../docs/windows-agent.md#removing-it).
 

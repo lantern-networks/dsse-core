@@ -1,7 +1,9 @@
 package inspection
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +18,7 @@ type countAppendPersister struct {
 	data    []byte
 	appends int
 	saves   int
+	saveErr error
 }
 
 func (p *countAppendPersister) Load() ([]byte, error) {
@@ -27,6 +30,9 @@ func (p *countAppendPersister) Save(b []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.saves++
+	if p.saveErr != nil {
+		return p.saveErr
+	}
 	p.data = append([]byte(nil), b...)
 	return nil
 }
@@ -141,6 +147,29 @@ func TestAppendModeLastWriteWins(t *testing.T) {
 	}
 }
 
+func TestAppendModeSameEventIDRetainsBothTenants(t *testing.T) {
+	p := &countAppendPersister{}
+	s := NewStore(0)
+	if err := s.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		s.Upsert(ev("same", tenant, time.Now().UTC()))
+	}
+	if err := s.PersistIfDirty(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := NewStore(0)
+	if err := reloaded.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		if got, ok := reloaded.GetForTenant(tenant, "same"); !ok || got.TenantID != tenant {
+			t.Fatalf("%s event missing after WAL replay: %+v", tenant, got)
+		}
+	}
+}
+
 // A torn final record (crash mid-append) is skipped on replay; earlier events survive.
 func TestAppendModeTornTailRecovery(t *testing.T) {
 	p := &countAppendPersister{}
@@ -163,6 +192,64 @@ func TestAppendModeTornTailRecovery(t *testing.T) {
 	}
 	if _, ok := s2.Get("e3"); ok {
 		t.Fatal("torn e3 must not load")
+	}
+	s2.Upsert(ev("e4", "acme", now))
+	if err := s2.PersistIfDirty(); err != nil {
+		t.Fatal(err)
+	}
+	s3 := NewStore(0)
+	if err := s3.SetPersister(p, 90*24*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s3.Get("e4"); !ok {
+		t.Fatal("records appended after torn-tail recovery must survive restart")
+	}
+}
+
+func TestInvalidLegacySnapshotCannotBecomeEmptyWAL(t *testing.T) {
+	original := []byte(`{"events":{"wrong":{"id":"event","tenant_id":"tenant"}},"order":["wrong"]}`)
+	p := &countAppendPersister{data: bytes.Clone(original)}
+	s := NewStore(0)
+	if err := s.SetPersister(p, 0); err == nil {
+		t.Fatal("invalid snapshot must fail restoration")
+	}
+	if s.Count() != 0 {
+		t.Fatal("invalid snapshot must not create an empty-identity event")
+	}
+	s.Upsert(ev("later", "tenant", time.Now().UTC()))
+	if err := s.PersistIfDirty(); err == nil {
+		t.Fatal("failed restoration must block later overwrite")
+	}
+	if !bytes.Equal(p.data, original) || p.saves != 0 || p.appends != 0 {
+		t.Fatal("failed restoration changed the original snapshot")
+	}
+}
+
+func TestAppendModePendingOverflowCompactsAllLiveEvents(t *testing.T) {
+	p := &countAppendPersister{}
+	s := NewStore(0)
+	if err := s.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	for i := 0; i < 8193; i++ {
+		s.Upsert(ev("event-"+itoa(i), "tenant", now))
+	}
+	if err := s.PersistIfDirty(); err != nil {
+		t.Fatal(err)
+	}
+	if p.saves != 1 {
+		t.Fatalf("overflow needs one full rewrite, saves=%d", p.saves)
+	}
+	reloaded := NewStore(0)
+	if err := reloaded.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Count() != 8193 {
+		t.Fatalf("reloaded count=%d, want 8193", reloaded.Count())
+	}
+	if _, ok := reloaded.GetForTenant("tenant", "event-0"); !ok {
+		t.Fatal("event dropped from pending buffer was lost")
 	}
 }
 
@@ -196,6 +283,29 @@ func TestAppendModeMigratesLegacySnapshot(t *testing.T) {
 	}
 	if s2.Count() != 2 {
 		t.Fatalf("after migration+append+restart Count=%d, want 2", s2.Count())
+	}
+}
+
+func TestFailedLegacySnapshotMigrationCannotAppendMixedFormat(t *testing.T) {
+	snap := storeSnapshot{
+		Events: map[string]model.InspectionEvent{"e1": ev("e1", "tenant", time.Now().UTC())},
+		Order:  []string{"e1"},
+	}
+	original, err := json.Marshal(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &countAppendPersister{data: bytes.Clone(original), saveErr: errors.New("save failed")}
+	s := NewStore(0)
+	if err := s.SetPersister(p, 0); err == nil {
+		t.Fatal("snapshot migration failure must be returned")
+	}
+	s.Upsert(ev("e2", "tenant", time.Now().UTC()))
+	if err := s.PersistIfDirty(); err == nil {
+		t.Fatal("migration failure must block append to snapshot object")
+	}
+	if p.appends != 0 || !bytes.Equal(p.data, original) {
+		t.Fatal("failed migration modified or mixed the original snapshot")
 	}
 }
 

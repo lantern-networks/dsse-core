@@ -22,7 +22,7 @@ The regular [deployment guide](../docs/deployment.md) covers the generated stack
 
 ## Build
 
-Requirements: Docker, network access to the pinned upstream engine release and Go modules,
+Requirements: Docker with Buildx, network access to the pinned upstream engine release and Go modules,
 and a Linux build runtime matching the intended architecture. From the public repository root:
 
 ```sh
@@ -39,13 +39,15 @@ For example, on a matching x86_64 runtime:
 ARCH=amd64 ./build.sh
 ```
 
-The default engine is **v2.2.2**. Both Linux architectures are pinned by SHA-256 in
+The default engine is **v2.2.3** using the musl archives on Alpine. Both Linux architectures are pinned by SHA-256 in
 `engine-checksums.sha256`, using the upstream release asset digests. An engine override
 requires matching, independently reviewed checksums; floating headers are never used.
 The Chrome 146 profile is retained to keep the existing wire behaviour.
 
 The script fetches the native library, headers, and CLI, compiles the Go broker through
-cgo, and packages its runtime image. Those downloaded and generated artifacts are
+cgo, and packages an image for the selected architecture. It checks the resulting image
+architecture; a host-architecture image cannot silently pass for an AMD64 build.
+Those downloaded and generated artifacts are
 ignored by Git. A rebuild does not restart an existing container: deploy the selected
 image explicitly and check the running container's image ID and startup log.
 
@@ -98,4 +100,4 @@ image. The embedded transport tests live in `egressbroker/transport_embedded_tes
 in the parent module. Test actual upstream requests and failures with the selected build;
 a successful compilation alone does not establish a usable deployment integration.
 
-The build uses Go 1.27.1. On an inspected build host, set `DSSE_INSPECTION_ROOT` to its CA PEM (the macOS agent path is detected automatically). This root is used for build-time downloads and removed from the runtime trust bundle. A local builder override requires its verified `DSSE_GO_BUILDER_IMAGE_ID`.
+The build uses Go 1.27.3. On an inspected build host, set `DSSE_INSPECTION_ROOT` to its CA PEM (the macOS agent path is detected automatically). This root is mounted into the Go build container for downloads; the runtime Dockerfile never copies it into the image. The build checks that the runtime image has no inspection-root certificate file. A local builder override requires its verified `DSSE_GO_BUILDER_IMAGE_ID`.

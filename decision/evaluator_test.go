@@ -966,8 +966,8 @@ func TestAllowIsNotADefaultDeny(t *testing.T) {
 		ApplicationID: "app_dummy_https",
 		ServiceFamily: "https",
 	})
-	if dec.Decision == "deny" {
-		t.Skip("fixture evaluator denied; this case only covers the allow path")
+	if dec.Decision != "allow" {
+		t.Fatalf("allow fixture produced %q; the allow path was not exercised", dec.Decision)
 	}
 	if IsDefaultDeny(dec) {
 		t.Fatalf("IsDefaultDeny = true for decision %q", dec.Decision)

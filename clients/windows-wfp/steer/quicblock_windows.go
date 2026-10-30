@@ -10,7 +10,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"syscall"
 	"time"
@@ -34,7 +33,9 @@ func hiddenNetsh(args ...string) (*exec.Cmd, error) {
 
 // addQUICBlock installs an outbound block for UDP:443 (idempotent — any stale rule is removed first).
 func addQUICBlock() error {
-	removeQUICBlock()
+	if err := removeQUICBlock(); err != nil {
+		return fmt.Errorf("remove previous QUIC block before add: %w", err)
+	}
 	c, err := hiddenNetsh("advfirewall", "firewall", "add", "rule",
 		"name="+quicBlockRuleName, "dir=out", "action=block", "protocol=UDP", "remoteport=443", "profile=any")
 	if err != nil {
@@ -47,18 +48,8 @@ func addQUICBlock() error {
 	return nil
 }
 
-// removeQUICBlock deletes the QUIC block rule (best-effort, on shutdown). NOTE: a force-kill skips this, so
-// the rule persists — remove manually with `netsh advfirewall firewall delete rule name="<quicBlockRuleName>"`.
-func removeQUICBlock() {
-	c, err := hiddenNetsh("advfirewall", "firewall", "delete", "rule", "name="+quicBlockRuleName)
-	if err != nil {
-		// Said out loud rather than dropped: this runs on shutdown, and a rule that outlives the agent blocks
-		// UDP:443 on a machine nobody is steering any more. The note names what to remove by hand, which the
-		// comment above already documents.
-		fmt.Fprintf(os.Stderr, "quic block: the rule could NOT be removed (%v) — UDP:443 stays blocked on this box "+
-			"until `netsh advfirewall firewall delete rule name=%q` is run\n", err, quicBlockRuleName)
-		return
-	}
-	// Bounded (review C-2): netsh must not be able to hang a session-0 recover custom action.
-	runBounded(c, 15*time.Second)
+// removeQUICBlock confirms that the exact DSSE rule is absent. A rule that
+// outlives the agent blocks native UDP:443, so callers must report failures.
+func removeQUICBlock() error {
+	return removeOwnedFirewallRules("DisplayName", quicBlockRuleName, 15*time.Second)
 }

@@ -90,9 +90,13 @@ func registerAgentDeviceUpdateRoutes(mux *http.ServeMux, adminEndpoint func(stri
 			}
 		}
 		if deviceFacing != nil {
-			for target, u := range deviceFacing.targets() {
-				if _, ok := offering[target]; !ok {
-					offering[target] = u.Manifest.Version
+			for _, candidate := range deviceFacing.targets() {
+				target := updateTargetKey(candidate.Manifest.Platform, candidate.Manifest.Arch)
+				if _, already := offering[target]; already {
+					continue
+				}
+				if selected, ok := deviceFacing.forTenantTarget(tenantID, candidate.Manifest.Platform, candidate.Manifest.Arch); ok {
+					offering[target] = selected.Manifest.Version
 				}
 			}
 		}
@@ -156,7 +160,7 @@ func registerAgentDeviceUpdateRoutes(mux *http.ServeMux, adminEndpoint func(stri
 					unassigned++
 					continue
 				}
-				if !strings.EqualFold(entryTenant, strings.TrimSpace(tenantID)) {
+				if entryTenant != strings.TrimSpace(tenantID) {
 					continue
 				}
 				if id := enrolledinventory.NormalizeIdentity(entry.Identity); id != "" && !seen[id] {

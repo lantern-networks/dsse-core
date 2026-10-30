@@ -124,6 +124,20 @@ func TestFleetConfigStatusTreatsADifferentEpochAsLagging(t *testing.T) {
 	}
 }
 
+func TestFleetConfigStatusRequiresReportedEpochWhenAuthorityHasOne(t *testing.T) {
+	now := time.Now()
+	s := newFleetConfigStatusStore(time.Minute)
+	s.Record(fleetConfigReport{RegionID: "region-a", NodeID: "edge-1", Generation: 999, HaveApplied: true}, now)
+	got := s.List(1, "authority-epoch", now)
+	if len(got) != 1 || got[0].Status != "lagging" || fleetInSync(got) {
+		t.Fatalf("an unknown epoch cannot prove current configuration: %+v", got)
+	}
+	// Epoch-free authorities retain their generation-only contract.
+	if got := s.List(1, "", now); len(got) != 1 || got[0].Status != "current" {
+		t.Fatalf("epoch-free authority: %+v", got)
+	}
+}
+
 // An Edge that has never applied anything is distinct from one that is behind: it has no configuration at all,
 // which is a different operator action.
 func TestFleetConfigStatusDistinguishesNeverApplied(t *testing.T) {

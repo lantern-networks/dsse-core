@@ -11,6 +11,21 @@ import os
 
 private let dsseMuxLogger = Logger(subsystem: "dsse.ne.flowdiag", category: "mux")
 
+// The Edge and Windows peer already enforce this wire-format bound. It prevents a
+// malformed length header or a stalled flow from retaining unbounded process memory.
+enum DsseMuxFrameSafety {
+    static let maxPayload = 1 << 20
+    static let flowBufferCap = 1 << 20
+
+    static func acceptsFrameLength(_ length: Int) -> Bool {
+        length >= 0 && length <= maxPayload
+    }
+
+    static func acceptsInbound(buffered: Int, incoming: Int) -> Bool {
+        buffered < flowBufferCap && acceptsFrameLength(incoming)
+    }
+}
+
 enum DsseMuxFrameType: UInt8 {
     case open = 0
     case data = 1
@@ -18,12 +33,34 @@ enum DsseMuxFrameType: UInt8 {
     case stepUp = 3  // Edge->NE: payload = a step-up portal URL to open OOB in a browser (native flow can't 302)
     case warn = 4    // Edge->NE: payload = JSON {message,destination,service}. NON-HOLDING learning-lifecycle Warn
                      // notice — the flow is allowed; surface a passive "monitored; auth soon required" message only.
+    case authResult = 5 // Edge->NE: authenticated mux result for this held flow; not a browser callback verdict.
+    case authQuery = 6  // NE->Edge: requery a final result after a lost mux notification.
+}
+
+// A held flow has one non-renewable authentication window. Use monotonic time:
+// wall-clock changes and repeated STEPUP frames must not keep a flow alive forever.
+struct DsseMuxAuthenticationWait {
+    private var beganAt: TimeInterval?
+    private var ended = false
+
+    mutating func begin(at uptime: TimeInterval) {
+        guard beganAt == nil, !ended else { return }
+        beganAt = uptime
+    }
+
+    mutating func end() { ended = true }
+
+    func isPending(at uptime: TimeInterval) -> Bool {
+        guard !ended, let beganAt, uptime >= beganAt else { return false }
+        return uptime - beganAt < 120 // Same upper bound as the Edge/Portal request.
+    }
 }
 
 // Per-flow stream over the shared mux. Conforms to DsseRuntimeCopyTunnelStream so the existing full-duplex
 // pump drives it UNCHANGED (send/receive/close) — it just talks frames on the shared connection.
 public final class DsseMuxFlowStream: DsseRuntimeCopyTunnelStream, @unchecked Sendable {
     let flowID: UInt32
+ let authOwner: DsseAuthOwner?
     private weak var mux: DsseSteerMux?
     private let lock = NSLock()
     private var inbound = Data()
@@ -31,10 +68,24 @@ public final class DsseMuxFlowStream: DsseRuntimeCopyTunnelStream, @unchecked Se
     private var eof = false
     private var failure: Error?
     private var closed = false
+    private var authenticationWait = DsseMuxAuthenticationWait()
 
-    init(flowID: UInt32, mux: DsseSteerMux) {
+    init(flowID: UInt32, mux: DsseSteerMux, authOwner: DsseAuthOwner?) {
+ self.authOwner = authOwner
         self.flowID = flowID
         self.mux = mux
+    }
+
+    public var authenticationWaitPending: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !closed && !eof && failure == nil &&
+            authenticationWait.isPending(at: ProcessInfo.processInfo.systemUptime)
+    }
+
+    func beginAuthenticationWait() {
+        lock.lock(); defer { lock.unlock() }
+        guard !closed, !eof, failure == nil else { return }
+        authenticationWait.begin(at: ProcessInfo.processInfo.systemUptime)
     }
 
     public func send(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) {
@@ -69,6 +120,7 @@ public final class DsseMuxFlowStream: DsseRuntimeCopyTunnelStream, @unchecked Se
         lock.lock()
         let alreadyClosed = closed
         closed = true
+        authenticationWait.end()
         // CRITICAL: fire any receive the pump is blocked on. The copy pump's downstream thread parks in
         // `receive(completion:)` (pendingReceive set); unlike a real NWConnection, closing this virtual stream
         // cancels nothing, so without this the completion never fires and the thread blocks forever — a thread
@@ -85,20 +137,33 @@ public final class DsseMuxFlowStream: DsseRuntimeCopyTunnelStream, @unchecked Se
     }
 
     // ---- called by the mux demux loop ----
-    func deliverInbound(_ data: Data) {
+    func deliverInbound(_ data: Data) -> Bool {
         lock.lock()
+        if closed || eof || failure != nil {
+            lock.unlock()
+            return true
+        }
+        if !data.isEmpty { authenticationWait.end() }
         if let p = pendingReceive {
             pendingReceive = nil
             lock.unlock()
             p(data, nil)
-            return
+            return true
+        }
+        if !DsseMuxFrameSafety.acceptsInbound(buffered: inbound.count, incoming: data.count) {
+            failure = DsseRuntimeCopyTunnelError.connectionFailed("mux flow inbound overflow")
+            closed = true
+            lock.unlock()
+            return false
         }
         inbound.append(data)
         lock.unlock()
+        return true
     }
 
     func deliverEOF() {
         lock.lock()
+        authenticationWait.end()
         eof = true
         if let p = pendingReceive {
             pendingReceive = nil
@@ -111,6 +176,7 @@ public final class DsseMuxFlowStream: DsseRuntimeCopyTunnelStream, @unchecked Se
 
     func deliverFailure(_ error: Error) {
         lock.lock()
+        authenticationWait.end()
         if failure == nil { failure = error }
         if let p = pendingReceive {
             pendingReceive = nil
@@ -123,6 +189,8 @@ public final class DsseMuxFlowStream: DsseRuntimeCopyTunnelStream, @unchecked Se
 }
 
 public final class DsseSteerMux: @unchecked Sendable {
+    private static let queryLeaderLock = NSLock()
+    nonisolated(unsafe) private static var queryLeader: DsseSteerMux? // guarded by queryLeaderLock
     private let connection: NWConnection
     private let queue: DispatchQueue
     private let stateLock = NSLock()
@@ -181,6 +249,7 @@ public final class DsseSteerMux: @unchecked Sendable {
                         switch result {
                         case .success:
                             mux.startReadLoop()
+                            mux.scheduleAuthRequery()
                             completion(.success(mux))
                         case .failure(let err):
                             connection.cancel()
@@ -219,13 +288,17 @@ public final class DsseSteerMux: @unchecked Sendable {
     }
 
     private func readHandshakeResponse(accumulated: Data, completion: @escaping @Sendable (Result<Void, Error>) -> Void) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [self] data, _, _, error in
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [self] data, _, isComplete, error in
             if let error {
                 completion(.failure(DsseRuntimeCopyTunnelError.connectionFailed("\(error)")))
                 return
             }
             var acc = accumulated
             if let data { acc.append(data) }
+            if isComplete {
+                completion(.failure(DsseRuntimeCopyTunnelError.handshakeFailed("mux_handshake_closed")))
+                return
+            }
             guard let headerEnd = acc.range(of: Data("\r\n\r\n".utf8)) else {
                 if acc.count > 64 * 1024 {
                     completion(.failure(DsseRuntimeCopyTunnelError.handshakeFailed("mux_header_too_large")))
@@ -234,8 +307,12 @@ public final class DsseSteerMux: @unchecked Sendable {
                 readHandshakeResponse(accumulated: acc, completion: completion)
                 return
             }
-            let head = String(decoding: acc[..<headerEnd.lowerBound], as: UTF8.self)
-            guard head.contains(" 200 ") else {
+            guard headerEnd.lowerBound <= 64 * 1024 else {
+                completion(.failure(DsseRuntimeCopyTunnelError.handshakeFailed("mux_header_too_large")))
+                return
+            }
+            let head = Data(acc[..<headerEnd.lowerBound])
+            guard DsseRuntimeCopyTunnel.handshakeStatusCode(head) == 200 else {
                 completion(.failure(DsseRuntimeCopyTunnelError.handshakeFailed("mux_non_200")))
                 return
             }
@@ -249,14 +326,14 @@ public final class DsseSteerMux: @unchecked Sendable {
     }
 
     // Registers a new flow, sends OPEN(authority), returns the per-flow stream.
-    public func openFlow(authority: String) -> DsseMuxFlowStream {
+    public func openFlow(authority: String, authOwner: DsseAuthOwner? = nil) -> DsseMuxFlowStream {
         stateLock.lock()
         let id = nextFlowID
         nextFlowID &+= 1
-        let flow = DsseMuxFlowStream(flowID: id, mux: self)
+        let flow = DsseMuxFlowStream(flowID: id, mux: self, authOwner: authOwner)
         flows[id] = flow
         stateLock.unlock()
-        sendFrame(flowID: id, type: .open, payload: Data(authority.utf8), completion: { _ in })
+        sendFrame(flowID: id, type: .open, payload: Data((authOwner?.appendingIdentity(to: authority) ?? authority).utf8), completion: { _ in })
         return flow
     }
 
@@ -279,6 +356,10 @@ public final class DsseSteerMux: @unchecked Sendable {
     }
 
     func sendFrame(flowID: UInt32, type: DsseMuxFrameType, payload: Data, completion: @escaping @Sendable (Error?) -> Void) {
+        guard DsseMuxFrameSafety.acceptsFrameLength(payload.count) else {
+            completion(DsseRuntimeCopyTunnelError.connectionFailed("mux frame too large"))
+            return
+        }
         var frame = Data(capacity: 9 + payload.count)
         var fid = flowID.bigEndian
         withUnsafeBytes(of: &fid) { frame.append(contentsOf: $0) }
@@ -295,15 +376,33 @@ public final class DsseSteerMux: @unchecked Sendable {
     }
 
     private func startReadLoop() {
-        parseFrames() // drain any leftover seeded during the handshake
-        readMore()
+        if parseFrames() { readMore() } // drain any leftover seeded during the handshake
+    }
+
+    private func scheduleAuthRequery() {
+        guard isHealthy else { return }
+        Self.queryLeaderLock.lock()
+        if Self.queryLeader == nil || Self.queryLeader?.isHealthy == false { Self.queryLeader = self }
+        let leader = Self.queryLeader === self
+        Self.queryLeaderLock.unlock()
+        if leader {
+            DispatchQueue.global(qos: .utility).async { [self] in
+                for query in DsseAuthHandoff.resultQueries() {
+                    guard isHealthy else { return }
+                    let fields = ["request_id": query.id, "os_principal": query.principal, "os_session": query.session]
+                    guard let payload = try? JSONSerialization.data(withJSONObject: fields), payload.count <= 256 else { continue }
+                    sendFrame(flowID: 0, type: .authQuery, payload: payload, completion: { _ in })
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + 15) { [self] in scheduleAuthRequery() }
     }
 
     private func readMore() {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [self] data, _, isComplete, error in
             if let data, !data.isEmpty {
                 stateLock.lock(); readBuffer.append(data); stateLock.unlock()
-                parseFrames()
+                if !parseFrames() { return }
             }
             if let error {
                 teardown(DsseRuntimeCopyTunnelError.connectionFailed("\(error)"))
@@ -324,8 +423,9 @@ public final class DsseSteerMux: @unchecked Sendable {
     // drain backpressured the one shared tunnel, the Edge held its per-frame write lock, and small latency-
     // sensitive frames (a new flow's ServerHello, getAsins, passkey/gapi) stalled behind it (down=1563/0) → the
     // browser timed out → heavy pages skeletoned. Offset + single compaction keeps the drain O(n).
-    private func parseFrames() {
+    private func parseFrames() -> Bool {
         var batch: [(UInt32, UInt8, Data)] = []
+        var oversizedFrame = false
         if !readBuffer.isEmpty {
             readBuffer.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
                 let count = raw.count
@@ -333,6 +433,10 @@ public final class DsseSteerMux: @unchecked Sendable {
                     let fid = UInt32(bigEndian: raw.loadUnaligned(fromByteOffset: readOffset, as: UInt32.self))
                     let rawType = raw.load(fromByteOffset: readOffset + 4, as: UInt8.self)
                     let len = Int(UInt32(bigEndian: raw.loadUnaligned(fromByteOffset: readOffset + 5, as: UInt32.self)))
+                    if !DsseMuxFrameSafety.acceptsFrameLength(len) {
+                        oversizedFrame = true
+                        break
+                    }
                     if count - readOffset < muxHeaderLen + len { break }
                     let payload = len > 0 ? Data(bytes: raw.baseAddress! + readOffset + muxHeaderLen, count: len) : Data()
                     batch.append((fid, rawType, payload))
@@ -354,42 +458,53 @@ public final class DsseSteerMux: @unchecked Sendable {
                 readOffset = 0
             }
         }
+        if oversizedFrame {
+            teardown(DsseRuntimeCopyTunnelError.connectionFailed("mux frame too large"))
+            return false
+        }
         for (fid, rawType, payload) in batch {
             guard let type = DsseMuxFrameType(rawValue: rawType) else { continue }
             switch type {
             case .data:
-                lookup(fid)?.deliverInbound(payload)
+                if let flow = lookup(fid), !flow.deliverInbound(payload) {
+                    closeFlow(flowID: fid)
+                }
             case .close:
                 if let flow = lookup(fid) { flow.deliverEOF() }
                 removeFlow(fid)
             case .open:
                 break // Edge never initiates OPEN
             case .stepUp:
-                // This flow's decision is authenticate/reauth with no live grant. The provider (root, no window
-                // server) can't open a browser, so hand the step-up URL to the GUI agent app: drop it in /tmp
-                // (the provider already writes there) and fire a systemwide Darwin notification the app observes.
-                if let url = String(data: payload, encoding: .utf8), !url.isEmpty {
-                    try? url.write(toFile: "/tmp/dsse_stepup_url", atomically: true, encoding: .utf8)
-                    CFNotificationCenterPostNotification(
-                        CFNotificationCenterGetDarwinNotifyCenter(),
-                        CFNotificationName("jp.co.lantern-networks.dsse.stepup" as CFString),
-                        nil, nil, true)
-                    dsseMuxLogger.info("mux stepup: handed step-up URL to the agent app for flow \(fid)")
+                if let flow = lookup(fid), let url = String(data: payload, encoding: .utf8),
+                   DsseAuthHandoff.enqueue(url: url, owner: flow.authOwner) {
+                    flow.beginAuthenticationWait()
+                    // The bounded worker validates and notifies off the mux reader.
+                } else {
+                    dsseMuxLogger.error("mux stepup: no trusted Portal or originating user session")
                 }
             case .warn:
                 // NON-HOLDING Warn-stage notice (S3). The flow is ALREADY allowed/forwarded; this only informs the
-                // user. Like stepUp, the provider (root, no window server) can't display UI, so hand the JSON notice
-                // to the GUI agent app: drop it in /tmp and fire a Darwin notification the app observes + coalesces.
-                if !payload.isEmpty, let notice = String(data: payload, encoding: .utf8) {
-                    try? notice.write(toFile: "/tmp/dsse_warn_notice", atomically: true, encoding: .utf8)
-                    CFNotificationCenterPostNotification(
-                        CFNotificationCenterGetDarwinNotifyCenter(),
-                        CFNotificationName("jp.co.lantern-networks.dsse.warn" as CFString),
-                        nil, nil, true)
+                // user. Keep it in the same originating OS session as STEPUP; the GUI reads a protected
+                // root-owned record after the payload-free Darwin notification.
+                if let flow = lookup(fid), DsseAuthHandoff.enqueueWarn(payload: payload, owner: flow.authOwner) {
                     dsseMuxLogger.info("mux warn: handed monitored-notice to the agent app for flow \(fid)")
+                } else {
+                    dsseMuxLogger.error("mux warn: no validated notice or originating user session")
                 }
+            case .authResult:
+                if fid == 0, DsseAuthHandoff.enqueueQueriedResult(payload: payload) {
+                    // The protected request file supplies the originating login.
+                } else if let flow = lookup(fid), DsseAuthHandoff.enqueueResult(payload: payload, owner: flow.authOwner) {
+                    // The root-owned, session-specific handoff delivers a bounded
+                    // result to the originating user's GUI, not to another login.
+                } else {
+                    dsseMuxLogger.error("mux auth result: no matching request in originating session")
+                }
+            case .authQuery:
+                break // Edge never queries the endpoint.
             }
         }
+        return true
     }
 
     private func teardown(_ error: Error) {
@@ -399,6 +514,9 @@ public final class DsseSteerMux: @unchecked Sendable {
         let all = Array(flows.values)
         flows.removeAll()
         stateLock.unlock()
+        Self.queryLeaderLock.lock()
+        if Self.queryLeader === self { Self.queryLeader = nil }
+        Self.queryLeaderLock.unlock()
         for f in all { f.deliverFailure(error) }
         connection.cancel()
         dsseMuxLogger.error("mux torn down: \(String(describing: error), privacy: .public)")

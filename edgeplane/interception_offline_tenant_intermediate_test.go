@@ -537,6 +537,7 @@ func TestAReplacementAuthorityEndsTheRevokedState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("interception: %v", err)
 	}
+	interception.SetOfflineTenantIntermediateDir(t.TempDir())
 	oldRoot, oldInter, oldKey, _ := tenantOfflineBundle(t, "Northwind", now)
 	if _, err := interception.LoadOfflineTenantIntermediate("tenant_northwind", oldRoot, oldInter, oldKey); err != nil {
 		t.Fatalf("load: %v", err)

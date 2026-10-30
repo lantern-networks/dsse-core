@@ -114,14 +114,20 @@ func enrolmentAttribution(identity oidcbroker.Identity) string {
 	return fmt.Sprintf("enrolled via IdP login by %s (issuer %s)", who, strings.TrimSpace(identity.Issuer))
 }
 
-// fetchEnrollmentJWKS retrieves a connection's JWKS over plain HTTP(S). Separated so tests can substitute it
-// and so the timeout is stated once.
+// fetchEnrollmentJWKS uses the same connection-specific TLS authority as browser
+// authentication. A configured signing-key endpoint may not redirect to another.
 func fetchEnrollmentJWKS(conn idpregistry.Connection) (oidcbroker.JWKS, error) {
 	uri := strings.TrimSpace(conn.JWKSURI)
 	if uri == "" {
 		return oidcbroker.JWKS{}, fmt.Errorf("connection has no jwks_uri")
 	}
-	client := &http.Client{Timeout: 10 * time.Second}
+	client, err := idpHTTPClient(&http.Client{
+		Timeout:       10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}, conn)
+	if err != nil {
+		return oidcbroker.JWKS{}, err
+	}
 	resp, err := client.Get(uri)
 	if err != nil {
 		return oidcbroker.JWKS{}, err

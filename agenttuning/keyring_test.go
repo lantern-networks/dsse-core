@@ -15,7 +15,7 @@ import (
 
 func signedTuning(t *testing.T, signer *agentpolicy.Signer) []byte {
 	t.Helper()
-	env, err := signer.Sign(TuningPolicy{Kind: TuningKind, Captive: &CaptiveTuning{TimeoutSec: 7}}, time.Now())
+	env, err := signer.Sign(TuningPolicy{Kind: TuningKind, TenantID: "acme", Captive: &CaptiveTuning{TimeoutSec: 7}}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,11 +85,12 @@ func TestSyncerPicksUpAKeyAdoptedWhileRunning(t *testing.T) {
 	keys := []string{pinned.PublicKeyHex()} // nothing adopted yet
 	applied := 0
 	s := Syncer{
-		URL:    srv.URL,
-		PinHex: pinned.PublicKeyHex(),
-		Keys:   func() []string { return keys },
-		Client: srv.Client(),
-		Apply:  func(TuningPolicy) { applied++ },
+		URL:      srv.URL,
+		PinHex:   pinned.PublicKeyHex(),
+		TenantID: "acme",
+		Keys:     func() []string { return keys },
+		Client:   srv.Client(),
+		Apply:    func(TuningPolicy) { applied++ },
 	}
 	if err := s.FetchOnce(t.Context()); err == nil {
 		t.Fatal("before adoption the ECDSA-signed policy must be refused")
@@ -117,7 +118,7 @@ func TestSyncerWithoutAKeysCallbackUsesThePin(t *testing.T) {
 	defer srv.Close()
 
 	applied := 0
-	s := Syncer{URL: srv.URL, PinHex: pinned.PublicKeyHex(), Client: srv.Client(), Apply: func(TuningPolicy) { applied++ }}
+	s := Syncer{URL: srv.URL, PinHex: pinned.PublicKeyHex(), TenantID: "acme", Client: srv.Client(), Apply: func(TuningPolicy) { applied++ }}
 	if err := s.FetchOnce(t.Context()); err != nil {
 		t.Fatalf("FetchOnce: %v", err)
 	}

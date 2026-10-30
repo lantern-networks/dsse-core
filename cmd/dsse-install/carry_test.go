@@ -42,6 +42,7 @@ func TestTheCarrySetHoldsNoMintingMaterial(t *testing.T) {
 	// test above is satisfied by a carry set that is empty.
 	for _, needed := range []string{
 		"deployment-anchor.pem", "deployment.env", "docker-compose.yml",
+		"console-server-ca.crt", // public issuer required by joining CP preflight
 		"transport.crt", "transport.key", "device-ca.crt", "device-ca.key",
 		// region.go refuses a region that lacks this, because the Edge's policy loader would mint its own and
 		// come up healthy while rejecting every bundle the control plane serves.
@@ -102,6 +103,23 @@ func TestACarryRefusesToOverwrite(t *testing.T) {
 func TestACarryRefusesWhatIsNotADeployment(t *testing.T) {
 	if _, _, err := carryDeploymentFor(t.TempDir(), filepath.Join(t.TempDir(), "x.tar.gz"), foundingShape, "", nil); err == nil {
 		t.Fatal("an empty directory was packed as if it were a deployment")
+	}
+}
+
+func TestACarryRejectsMissingRequiredMaterialAndRemovesPartialArchive(t *testing.T) {
+	dir := t.TempDir()
+	if err := run(dir, "dsse.example", "Test Deployment", 10, false); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, "start-edge.sh")); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(t.TempDir(), "deployment.tar.gz")
+	if _, _, err := carryDeploymentFor(dir, dest, foundingShape, "", nil); err == nil {
+		t.Fatal("carry succeeded without the Edge startup script mounted by its Compose file")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("failed carry left a private, incomplete archive at %s: %v", dest, err)
 	}
 }
 

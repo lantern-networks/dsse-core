@@ -2,14 +2,216 @@ package main
 
 import (
 	"bufio"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestMuxUnexpectedTransportLossSignalsOnlyCurrentLiveSocket(t *testing.T) {
+	signals := make(chan struct{}, 1)
+	current := &activeEndpoint{}
+	active := &atomic.Pointer[activeEndpoint]{}
+	active.Store(current)
+	newMux := func() *steerMuxClient {
+		return &steerMuxClient{endpoint: current, active: active, transportFailure: signals, dead: make(chan struct{})}
+	}
+	m := newMux()
+	m.signalUnexpectedTransportLoss()
+	select {
+	case <-signals:
+	default:
+		t.Fatal("live current mux loss did not wake the selector")
+	}
+	close(m.dead) // mirrors the intentional-teardown marker without a test socket
+	m.signalUnexpectedTransportLoss()
+	select {
+	case <-signals:
+		t.Fatal("intentional teardown signaled a failure")
+	default:
+	}
+	m = newMux()
+	active.Store(&activeEndpoint{})
+	m.signalUnexpectedTransportLoss()
+	select {
+	case <-signals:
+		t.Fatal("old entrance signaled after endpoint switch")
+	default:
+	}
+}
+
+func TestMuxWarnIsDeliveredOnlyForTheFrameFlowOwner(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	a := testWarnOwner(42, 1, "user-a", 10)
+	b := testWarnOwner(43, 2, "user-b", 11)
+	got := make(chan stepUpOwner, 3)
+	m := &steerMuxClient{
+		conn: client, dead: make(chan struct{}), flows: map[uint32]*muxFlowConn{},
+		warn: newWarnNotifier(func(_, _ string, owner stepUpOwner) { got <- owner }, nil),
+	}
+	m.flows[1] = &muxFlowConn{flowID: 1, mux: m, inbound: newMuxPipe(muxFlowBufCap), owner: a}
+	m.flows[2] = &muxFlowConn{flowID: 2, mux: m, inbound: newMuxPipe(muxFlowBufCap), owner: b}
+	done := make(chan struct{})
+	go func() { m.readLoop(bufio.NewReader(client)); close(done) }()
+	payload := []byte(`{"destination":"10.20.0.10","service":"ssh"}`)
+	for _, id := range []uint32{1, 2, 0, 3} {
+		var hdr [muxHeaderLen]byte
+		binary.BigEndian.PutUint32(hdr[:4], id)
+		hdr[4] = muxFrameWarn
+		binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
+		if _, err := server.Write(append(hdr[:], payload...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = server.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("mux read loop did not close")
+	}
+	seen := map[stepUpOwner]bool{}
+	for len(seen) < 2 {
+		select {
+		case owner := <-got:
+			seen[owner] = true
+		case <-time.After(time.Second):
+			t.Fatalf("missing owner-bound WARN: %+v", seen)
+		}
+	}
+	if !seen[a] || !seen[b] {
+		t.Fatalf("WARN escaped its flow owner: %+v", seen)
+	}
+	select {
+	case owner := <-got:
+		t.Fatalf("unknown flow emitted WARN: %+v", owner)
+	default:
+	}
+}
+
+func TestSlowMuxFlowCannotHoldAnotherFlowBehindItsInboundBuffer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	m := &steerMuxClient{conn: client, dead: make(chan struct{}), flows: make(map[uint32]*muxFlowConn)}
+	slow := &muxFlowConn{flowID: 1, mux: m, inbound: newMuxPipe(4), openedAt: time.Now()}
+	fast := &muxFlowConn{flowID: 2, mux: m, inbound: newMuxPipe(4), openedAt: time.Now()}
+	m.flows[1], m.flows[2] = slow, fast
+	done := make(chan struct{})
+	go func() { m.readLoop(bufio.NewReader(client)); close(done) }()
+	defer func() { m.teardown(); <-done }()
+	write := func(id uint32, payload string) {
+		t.Helper()
+		var hdr [muxHeaderLen]byte
+		binary.BigEndian.PutUint32(hdr[:4], id)
+		hdr[4] = muxFrameData
+		binary.BigEndian.PutUint32(hdr[5:9], uint32(len(payload)))
+		if _, err := server.Write(append(hdr[:], payload...)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(1, "aaaa") // fill the slow flow's bounded inbound buffer
+	write(1, "bbbb") // this flow may be closed, but must not stall the demux
+	write(2, "ok")
+	got := make(chan string, 1)
+	go func() { b := make([]byte, 2); n, _ := fast.Read(b); got <- string(b[:n]) }()
+	select {
+	case s := <-got:
+		if s != "ok" {
+			t.Fatalf("fast flow received %q", s)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("slow flow blocked an unrelated flow behind the demux loop")
+	}
+}
+
+func TestColdMuxDialAbandonsOldEntranceAfterSelectorSwitch(t *testing.T) {
+	current := &activeEndpoint{}
+	active := &atomic.Pointer[activeEndpoint]{}
+	active.Store(current)
+	mm := newMuxManager(edgeConfig{transport: transportConfig{active: active}}, 2*time.Second, 12, 1)
+	oldStarted := make(chan struct{})
+	releaseOld := make(chan struct{})
+	oldClient, oldServer := net.Pipe()
+	defer oldServer.Close()
+	oldMux := &steerMuxClient{conn: oldClient, dead: make(chan struct{}), flows: make(map[uint32]*muxFlowConn)}
+	result := make(chan bool, 1)
+	go func() {
+		_, _, abandoned := mm.openFirstForEpoch(current, func(edgeConfig, time.Duration) (*steerMuxClient, error) {
+			close(oldStarted)
+			<-releaseOld // emulate a blocked dial to the failed entrance
+			return oldMux, nil
+		})
+		result <- abandoned
+	}()
+	<-oldStarted
+	active.Store(&activeEndpoint{})
+	select {
+	case abandoned := <-result:
+		if !abandoned {
+			t.Fatal("old entrance dial completed instead of being abandoned")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("flow remained behind the old entrance dial after switch")
+	}
+	close(releaseOld)
+	select {
+	case <-oldMux.dead:
+	case <-time.After(time.Second):
+		t.Fatal("abandoned dial did not close its eventual mux")
+	}
+}
+
+func TestMuxConnectResponseIsBoundedAfterTCPDial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		// Leave CONNECT unanswered until the client deadline closes the socket.
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	start := time.Now()
+	m, err := openSteerMux(edgeConfig{edgeURL: "http://" + ln.Addr().String()}, 100*time.Millisecond)
+	if m != nil || err == nil {
+		t.Fatalf("unanswered CONNECT must fail, mux=%v err=%v", m, err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("CONNECT deadline was not enforced: %s", elapsed)
+	}
+	select {
+	case <-serverDone:
+	case <-time.After(time.Second):
+		t.Fatal("test server did not see the timed-out socket close")
+	}
+}
 
 // fakeMuxEdge is a minimal server speaking the mux wire protocol: it accepts CONNECT /steer-mux, replies 200,
 // then demultiplexes frames. For each OPEN it records the authority; DATA is echoed back on the same flowID
@@ -138,6 +340,175 @@ func newFakeMuxEdgeMulti(t *testing.T) (accepted func() int, addr string, stop f
 	return accepted, ln.Addr().String(), func() { ln.Close() }
 }
 
+func newFakeMuxTLSEdge(t *testing.T, cert tls.Certificate, accepted chan<- struct{}, release <-chan struct{}) (*fakeMuxEdge, string, func()) {
+	t.Helper()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &fakeMuxEdge{openedAuth: make(map[uint32]string)}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			if accepted != nil {
+				accepted <- struct{}{}
+			}
+			go func() {
+				if release != nil {
+					<-release
+				}
+				f.serveConn(conn)
+			}()
+		}
+	}()
+	return f, ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+func muxTestTransport(certPEM []byte, addr string) (transportConfig, *atomic.Pointer[activeEndpoint]) {
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(certPEM)
+	active := &atomic.Pointer[activeEndpoint]{}
+	active.Store(&activeEndpoint{host: addr, serverName: "127.0.0.1", dialAddrs: []string{addr}})
+	return transportConfig{enabled: true, host: addr, serverName: "127.0.0.1", rootCAs: pool, active: active}, active
+}
+
+func TestMuxManagerSwitchesNewFlowsToNewEndpoint(t *testing.T) {
+	certPEM, _, cert := mkSelfSigned(t, "mux-edge", []net.IP{net.ParseIP("127.0.0.1")})
+	a, addrA, stopA := newFakeMuxTLSEdge(t, cert, nil, nil)
+	defer stopA()
+	b, addrB, stopB := newFakeMuxTLSEdge(t, cert, nil, nil)
+	defer stopB()
+	tc, active := muxTestTransport(certPEM, addrA)
+	mm := newMuxManager(edgeConfig{transport: tc}, 2*time.Second, 12, 1)
+	first, err := mm.openFlow("first.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	oldMux := first.mux
+	if !waitFor(time.Second, func() bool { a.mu.Lock(); defer a.mu.Unlock(); return a.openedAuth[1] == "first.example:443" }) {
+		t.Fatal("initial flow did not reach A")
+	}
+	active.Store(&activeEndpoint{host: addrB, serverName: "127.0.0.1", dialAddrs: []string{addrB}})
+	if _, err := oldMux.openFlow("stale.example:443"); !errors.Is(err, errMuxEndpointChanged) {
+		t.Fatalf("old mux OPEN after switch: %v", err)
+	}
+	second, err := mm.openFlow("second.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if !waitFor(time.Second, func() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.openedAuth[1] == "second.example:443" }) {
+		t.Fatal("new flow did not reach B")
+	}
+	if !waitFor(time.Second, func() bool { return !oldMux.healthy() }) {
+		t.Fatal("old mux was not closed after switch")
+	}
+	a.mu.Lock()
+	_, staleOpened := a.openedAuth[2]
+	a.mu.Unlock()
+	if staleOpened {
+		t.Fatal("A received a flow after the endpoint changed")
+	}
+}
+
+func TestMuxManagerDiscardsDialCompletedAfterSwitch(t *testing.T) {
+	certPEM, _, cert := mkSelfSigned(t, "mux-edge", []net.IP{net.ParseIP("127.0.0.1")})
+	accepted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	a, addrA, stopA := newFakeMuxTLSEdge(t, cert, accepted, release)
+	defer stopA()
+	b, addrB, stopB := newFakeMuxTLSEdge(t, cert, nil, nil)
+	defer stopB()
+	tc, active := muxTestTransport(certPEM, addrA)
+	mm := newMuxManager(edgeConfig{transport: tc}, 2*time.Second, 12, 1)
+	type result struct {
+		flow *muxFlowConn
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() { fc, err := mm.openFlow("after-switch.example:443"); done <- result{fc, err} }()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("dial to A did not start")
+	}
+	active.Store(&activeEndpoint{host: addrB, serverName: "127.0.0.1", dialAddrs: []string{addrB}})
+	close(release)
+	select {
+	case r := <-done:
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		defer r.flow.Close()
+	case <-time.After(3 * time.Second):
+		t.Fatal("dial did not move to B")
+	}
+	if !waitFor(time.Second, func() bool { b.mu.Lock(); defer b.mu.Unlock(); return b.openedAuth[1] == "after-switch.example:443" }) {
+		t.Fatal("new flow did not reach B")
+	}
+	a.mu.Lock()
+	openedOnA := len(a.openedAuth)
+	a.mu.Unlock()
+	if openedOnA != 0 {
+		t.Fatalf("in-flight old dial received %d OPEN frames", openedOnA)
+	}
+}
+
+func TestMuxManagerDoesNotWaitForOldDialTimeoutAfterSwitch(t *testing.T) {
+	certPEM, _, cert := mkSelfSigned(t, "mux-edge", []net.IP{net.ParseIP("127.0.0.1")})
+	accepted := make(chan struct{}, 1)
+	release := make(chan struct{})
+	_, addrA, stopA := newFakeMuxTLSEdge(t, cert, accepted, release)
+	defer stopA()
+	_, addrB, stopB := newFakeMuxTLSEdge(t, cert, nil, nil)
+	defer stopB()
+	tc, active := muxTestTransport(certPEM, addrA)
+	mm := newMuxManager(edgeConfig{transport: tc}, 2*time.Second, 12, 1)
+	firstDone := make(chan error, 1)
+	go func() {
+		fc, err := mm.openFlow("first.example:443")
+		if fc != nil {
+			defer fc.Close()
+		}
+		firstDone <- err
+	}()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("dial to A did not start")
+	}
+	active.Store(&activeEndpoint{host: addrB, serverName: "127.0.0.1", dialAddrs: []string{addrB}})
+	secondDone := make(chan error, 1)
+	go func() {
+		fc, err := mm.openFlow("second.example:443")
+		if fc != nil {
+			defer fc.Close()
+		}
+		secondDone <- err
+	}()
+	select {
+	case err := <-secondDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("new endpoint waited for the old endpoint's stalled TLS handshake")
+	}
+	close(release)
+	select {
+	case err := <-firstDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("old dial caller did not retry on B")
+	}
+}
+
 func TestSteerMuxHandshakeAndEcho(t *testing.T) {
 	f, addr, stop := newFakeMuxEdge(t)
 	defer stop()
@@ -155,6 +526,9 @@ func TestSteerMuxHandshakeAndEcho(t *testing.T) {
 	}
 	if fc.flowID != 1 {
 		t.Fatalf("first flowID = %d, want 1", fc.flowID)
+	}
+	if got := firstFlowDataMS(fc.firstEdgeDataNS.Load()); got != -1 {
+		t.Fatalf("edge data before sending request = %dms, want absent", got)
 	}
 
 	// Write two chunks; expect the same bytes echoed back (possibly re-chunked, so accumulate).
@@ -183,6 +557,9 @@ func TestSteerMuxHandshakeAndEcho(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("echo mismatch: got %q want %q", got, want)
+	}
+	if firstFlowDataMS(fc.firstAppDataNS.Load()) < 0 || firstFlowDataMS(fc.firstEdgeDataNS.Load()) < 0 {
+		t.Fatal("round trip omitted a first-data timestamp")
 	}
 
 	// A second flow must get a distinct monotonic id and its own authority.

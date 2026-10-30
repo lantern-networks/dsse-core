@@ -194,7 +194,7 @@ func registerAgentQualityRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		operatorOrg := operatorTenantConfigured()
 		callerOrg := strings.TrimSpace(adminTenantIDFromRequest(r))
 		forTheDeployment := adminAnsweringForTheDeployment(r) ||
-			(operatorOrg != "" && strings.EqualFold(callerOrg, operatorOrg))
+			(operatorOrg != "" && callerOrg == operatorOrg)
 		out := map[string]agentrollout.AgentRolloutPlan{}
 		if forTheDeployment {
 			for tenant, plan := range plans {

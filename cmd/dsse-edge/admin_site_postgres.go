@@ -121,37 +121,78 @@ func (p *postgresAdminSiteStore) ConfigGeneration() uint64 {
 	if p == nil || p.db == nil {
 		return 0
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	generation, err := p.ConfigGenerationChecked(context.Background())
+	if err != nil {
+		return p.lastGeneration.Load()
+	}
+	return generation
+}
+
+// Bundle publication needs to distinguish an unreadable counter from an
+// unchanged counter. The legacy value-only method retains its cached fallback
+// for health readers; issuing a signed bundle must instead fail and retry.
+func (p *postgresAdminSiteStore) ConfigGenerationChecked(parent context.Context) (uint64, error) {
+	if p == nil || p.db == nil {
+		return 0, errAdminSitePersistence
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// nextval is visible before its writer commits. Use the same transaction
+	// lock as Site writes so the generation can never describe rows that are
+	// still uncommitted, nor miss a write that commits after a later number.
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", "dsse_admin_sites_write_generation"); err != nil {
+		return 0, err
+	}
 	var n int64
 	// ★ is_called IS NOT COSMETIC (2026-08-24, measured — the first write moved nothing). A sequence that has
 	// never been called reports last_value = 1 with is_called = false, and after its FIRST nextval it reports
 	// last_value = 1 with is_called = true. Reading last_value alone therefore gives the same number before
 	// and after the first write, which on a new deployment is the only write that has happened.
-	if err := p.db.QueryRowContext(ctx,
+	if err := tx.QueryRowContext(ctx,
 		"SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM admin_sites_config_generation").Scan(&n); err != nil {
 		// ★ AND AN UNREADABLE COUNTER IS NOT ZERO. Returning 0 here would DROP the aggregate generation for
 		// every other store too, and an Edge that has applied a higher number applies nothing again. A brief
 		// database blip would silently freeze the fleet's configuration.
-		return p.lastGeneration.Load()
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	if n < 0 {
 		n = 0
 	}
-	p.lastGeneration.Store(uint64(n))
-	return uint64(n)
+	return p.rememberGeneration(uint64(n)), nil
 }
 
-// bumpConfigGeneration advances the counter. Called by every write, because every write changes what an Edge
-// should be holding.
-func (p *postgresAdminSiteStore) bumpConfigGeneration(ctx context.Context) {
-	if p == nil || p.db == nil {
-		return
+func (p *postgresAdminSiteStore) rememberGeneration(n uint64) uint64 {
+	for {
+		old := p.lastGeneration.Load()
+		if n <= old || p.lastGeneration.CompareAndSwap(old, n) {
+			if old > n {
+				return old
+			}
+			return n
+		}
 	}
+}
+
+// A Site write and its generation advance share one transaction. A failed
+// counter update therefore rolls back the row instead of reporting success to
+// the administrator while every Edge keeps the previous bundle version.
+func (p *postgresAdminSiteStore) bumpConfigGeneration(ctx context.Context, tx *sql.Tx) (uint64, error) {
 	var n int64
-	if err := p.db.QueryRowContext(ctx, "SELECT nextval('admin_sites_config_generation')").Scan(&n); err == nil && n > 0 {
-		p.lastGeneration.Store(uint64(n))
+	if err := tx.QueryRowContext(ctx, "SELECT nextval('admin_sites_config_generation')").Scan(&n); err != nil {
+		return 0, err
 	}
+	if n <= 0 {
+		return 0, fmt.Errorf("site generation did not advance")
+	}
+	return uint64(n), nil
 }
 
 func (p *postgresAdminSiteStore) List(ctx context.Context, tenantID string) ([]adminSiteModel, error) {
@@ -199,17 +240,6 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	// Preserve server-managed material (created_at, bootstrap secret) from the existing row when the caller omits
-	// it, so a Console metadata edit never rewrites provenance or wipes the issued bootstrap secret hash.
-	if existing, ok, err := p.Get(ctx, site.TenantID, site.SiteID); err == nil && ok {
-		if site.CreatedAt == nil {
-			site.CreatedAt = copyStringPtr(existing.CreatedAt)
-		}
-		if strings.TrimSpace(site.BootstrapSecretHash) == "" {
-			site.BootstrapSecretHash = existing.BootstrapSecretHash
-			site.BootstrapSecretRotatedAt = copyStringPtr(existing.BootstrapSecretRotatedAt)
-		}
-	}
 	normalized, err := normalizeAdminSiteModel(site, now)
 	if err != nil {
 		return adminSiteModel{}, err
@@ -230,7 +260,12 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 		}
 		rotatedAt = t.UTC()
 	}
-	_, err = p.db.ExecContext(ctx, strings.Join([]string{
+	tx, err := p.beginSiteWrite(ctx)
+	if err != nil {
+		return adminSiteModel{}, fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	row := tx.QueryRowContext(ctx, strings.Join([]string{
 		"INSERT INTO admin_sites",
 		"(tenant_id, site_id, name, region, expected_connector_count, routing_namespace, deployment_type, ha_policy, bootstrap_secret_hash, bootstrap_secret_rotated_at, created_at, updated_at)",
 		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz, $11::timestamptz, $12::timestamptz)",
@@ -241,20 +276,29 @@ func (p *postgresAdminSiteStore) Upsert(ctx context.Context, site adminSiteModel
 		"routing_namespace = EXCLUDED.routing_namespace,",
 		"deployment_type = EXCLUDED.deployment_type,",
 		"ha_policy = EXCLUDED.ha_policy,",
-		"bootstrap_secret_hash = EXCLUDED.bootstrap_secret_hash,",
-		"bootstrap_secret_rotated_at = EXCLUDED.bootstrap_secret_rotated_at,",
+		"bootstrap_secret_hash = CASE WHEN EXCLUDED.bootstrap_secret_hash = '' THEN admin_sites.bootstrap_secret_hash ELSE EXCLUDED.bootstrap_secret_hash END,",
+		"bootstrap_secret_rotated_at = CASE WHEN EXCLUDED.bootstrap_secret_hash = '' THEN admin_sites.bootstrap_secret_rotated_at ELSE EXCLUDED.bootstrap_secret_rotated_at END,",
 		"updated_at = EXCLUDED.updated_at",
+		"RETURNING " + adminSiteColumns,
 	}, " "),
 		normalized.TenantID, normalized.SiteID, normalized.Name, normalized.Region, normalized.ExpectedConnectorCount,
 		normalized.RoutingNamespace, normalized.DeploymentType, normalized.HAPolicy, normalized.BootstrapSecretHash,
 		rotatedAt, createdAt.UTC(), updatedAt.UTC())
+	saved, err := scanAdminSiteRow(row.Scan)
 	if err != nil {
-		return adminSiteModel{}, err
+		return adminSiteModel{}, fmt.Errorf("%w: %v", errAdminSitePersistence, err)
 	}
 	// Every write moves the number the bundle's version is built from, or the change is published in every
 	// bundle and applied by nobody.
-	p.bumpConfigGeneration(ctx)
-	return normalized, nil
+	generation, err := p.bumpConfigGeneration(ctx, tx)
+	if err != nil {
+		return adminSiteModel{}, fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return adminSiteModel{}, fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
+	p.rememberGeneration(generation)
+	return saved, nil
 }
 
 func (p *postgresAdminSiteStore) Delete(ctx context.Context, tenantID, siteID string) error {
@@ -266,14 +310,37 @@ func (p *postgresAdminSiteStore) Delete(ctx context.Context, tenantID, siteID st
 	if siteID == "" {
 		return fmt.Errorf("site_id is required")
 	}
-	_, err := p.db.ExecContext(ctx, "DELETE FROM admin_sites WHERE tenant_id = $1 AND site_id = $2", tenantID, siteID)
+	tx, err := p.beginSiteWrite(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM admin_sites WHERE tenant_id = $1 AND site_id = $2", tenantID, siteID); err != nil {
+		return fmt.Errorf("%w: %v", errAdminSitePersistence, err)
 	}
 	// A deletion has to travel too — an Edge that keeps honouring a removed Site's bootstrap secret is the
 	// half of this that is hardest to see.
-	p.bumpConfigGeneration(ctx)
+	generation, err := p.bumpConfigGeneration(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("%w: %v", errAdminSitePersistence, err)
+	}
+	p.rememberGeneration(generation)
 	return nil
+}
+
+func (p *postgresAdminSiteStore) beginSiteWrite(ctx context.Context) (*sql.Tx, error) {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(hashtext($1))", "dsse_admin_sites_write_generation"); err != nil {
+		_ = tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
 }
 
 // scanAdminSiteRow decodes a row in adminSiteColumns order, rendering timestamptz columns back to RFC3339 strings

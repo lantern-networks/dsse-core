@@ -261,14 +261,9 @@ func (s *Store) Stash(src, version string) (string, error) {
 		// Fall through and replace. Deliberately not logged from here — this package has no logger and the
 		// event is normal on a dev box; the installer's own output says which package it stored.
 		//
-		// ★ The rollback marker describes THESE BYTES, so it does not survive them. Two builds of one commit
-		// share a version string (".dirty"), so the package being replaced here may be one that honoured a
-		// declared rollback while the new one does not — and inheriting the marker would let the updater
-		// launch a downgrade the incoming package will refuse. The installer re-marks after a successful
-		// stash if its own package carries the mechanism; silence is the safe direction.
-		if rerr := os.Remove(IntentMarkerPath(existing)); rerr != nil && !os.IsNotExist(rerr) {
-			return "", fmt.Errorf("rollbackstore: clear the stale rollback marker for %s: %w", version, rerr)
-		}
+		// The marker describes the package bytes, not the version. Keep it in place until the replacement
+		// has passed every source and staging check. A failed replacement must not make the still-stored
+		// original package ineligible for rollback.
 	} else if !errors.Is(lerr, ErrNoMaterial) {
 		return "", lerr
 	}
@@ -331,6 +326,56 @@ func (s *Store) Stash(src, version string) (string, error) {
 		return "", fmt.Errorf("rollbackstore: close %s: %w", tmpName, err)
 	}
 
+	// Move any marker out of the canonical name immediately before publishing new bytes. This applies even
+	// when Lookup found no usable package: a marker left by an interrupted earlier attempt must never be
+	// inherited by a newly written package. If publication fails while the original package is unchanged,
+	// restore its marker. A crash between the two renames leaves the marker absent, which is conservative;
+	// it must never leave a marker claiming that unmarked replacement bytes accept rollback intent.
+	marker := IntentMarkerPath(dst)
+	oldDigest := ""
+	markerHold := ""
+	if _, statErr := os.Stat(marker); statErr == nil {
+		if _, packageErr := os.Stat(dst); packageErr == nil {
+			oldDigest, err = fileDigest(dst)
+			if err != nil {
+				return "", fmt.Errorf("rollbackstore: digest existing package before replacement: %w", err)
+			}
+		} else if !os.IsNotExist(packageErr) {
+			return "", fmt.Errorf("rollbackstore: stat existing package before replacement: %w", packageErr)
+		}
+		placeholder, createErr := os.CreateTemp(s.root, namePrefix+"marker-*")
+		if createErr != nil {
+			return "", fmt.Errorf("rollbackstore: reserve marker holding path: %w", createErr)
+		}
+		markerHold = placeholder.Name()
+		if closeErr := placeholder.Close(); closeErr != nil {
+			_ = os.Remove(markerHold)
+			return "", fmt.Errorf("rollbackstore: close marker placeholder: %w", closeErr)
+		}
+		if removeErr := os.Remove(markerHold); removeErr != nil {
+			return "", fmt.Errorf("rollbackstore: release marker placeholder: %w", removeErr)
+		}
+		if moveErr := os.Rename(marker, markerHold); moveErr != nil {
+			return "", fmt.Errorf("rollbackstore: hold prior rollback marker: %w", moveErr)
+		}
+	} else if !os.IsNotExist(statErr) {
+		return "", fmt.Errorf("rollbackstore: stat rollback marker: %w", statErr)
+	}
+	restoreMarker := func() error {
+		if markerHold == "" || oldDigest == "" {
+			return nil
+		}
+		currentDigest, digestErr := fileDigest(dst)
+		if digestErr != nil || currentDigest != oldDigest {
+			return nil // original bytes cannot be established; never restore an unbound marker
+		}
+		if restoreErr := os.Rename(markerHold, marker); restoreErr != nil {
+			return fmt.Errorf("rollbackstore: restore original rollback marker: %w", restoreErr)
+		}
+		markerHold = ""
+		return nil
+	}
+
 	if err := os.Rename(tmpName, dst); err != nil {
 		// ★ THE FALLBACK USED TO REPORT SUCCESS OVER THE WRONG BYTES (2026-08-12, sixth review).
 		//
@@ -350,13 +395,25 @@ func (s *Store) Stash(src, version string) (string, error) {
 				return "", err
 			}
 			if same, cerr := sameContents(existing, tmpName); cerr == nil && same {
+				if markerHold != "" {
+					_ = os.Remove(markerHold)
+				}
 				return existing, nil
+			}
+			if restoreErr := restoreMarker(); restoreErr != nil {
+				return "", errors.Join(err, restoreErr)
 			}
 			return "", fmt.Errorf("rollbackstore: %s could not be replaced (%w) and the package already stored "+
 				"for %s holds DIFFERENT bytes: refusing to report that this build's package is stored when the "+
 				"store would roll back to another one", dst, err, version)
 		}
+		if restoreErr := restoreMarker(); restoreErr != nil {
+			return "", errors.Join(err, restoreErr)
+		}
 		return "", fmt.Errorf("rollbackstore: rename %s -> %s: %w", tmpName, dst, err)
+	}
+	if markerHold != "" {
+		_ = os.Remove(markerHold) // old claim is no longer at the canonical path
 	}
 	// Owned before it is verified: the file was created by this process, and an owner holds WRITE_DAC.
 	if err := claimStoredPackage(dst); err != nil {

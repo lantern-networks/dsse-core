@@ -29,7 +29,7 @@ func userRiskAuditLog(r *http.Request, tenant string, response adminRiskSignalRe
 		EdgeClusterID: &evaluator.EdgeClusterID, SourceIP: stringPtr(sourceIPFromRequest(r)),
 		Timestamp: now.UTC().Format(time.RFC3339), Metadata: metadata,
 	}
-	if caller, ok := adminIdentityFromRequest(r); ok && record.TenantID != "" && !strings.EqualFold(record.TenantID, strings.TrimSpace(caller.TenantID)) {
+	if caller, ok := adminIdentityFromRequest(r); ok && record.TenantID != "" && record.TenantID != strings.TrimSpace(caller.TenantID) {
 		stampOperatorActor(metadata, caller)
 	}
 	return record

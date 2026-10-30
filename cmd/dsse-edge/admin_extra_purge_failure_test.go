@@ -304,10 +304,11 @@ func TestPublishedArtifactCleanupStages(t *testing.T) {
 			if err := os.Remove(local); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.MkdirAll(filepath.Join(local, "tenant_target"), 0700); err != nil {
+			tenantPath := tenantArtifactDir(local, "tenant_target")
+			if err := os.MkdirAll(tenantPath, 0700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(filepath.Join(local, "tenant_target", "artifact"), []byte("bytes"), 0600); err != nil {
+			if err := os.WriteFile(filepath.Join(tenantPath, "artifact"), []byte("bytes"), 0600); err != nil {
 				t.Fatal(err)
 			}
 			result = adminTenantPurgeResult{TenantID: "tenant_target"}
@@ -315,7 +316,7 @@ func TestPublishedArtifactCleanupStages(t *testing.T) {
 			if len(result.Failures) != 0 || result.ArtifactCleanup["local"] != "absence_confirmed" || result.ArtifactCleanup["shared"] != "absence_confirmed" || sharedCalls != 1 {
 				t.Fatalf("repair failed: %+v", result)
 			}
-			if _, err := os.Stat(filepath.Join(local, "tenant_target")); !os.IsNotExist(err) {
+			if _, err := os.Stat(tenantPath); !os.IsNotExist(err) {
 				t.Fatal("local bytes remain", err)
 			}
 		})

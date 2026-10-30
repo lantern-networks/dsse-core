@@ -91,6 +91,9 @@ func (s *adminDownloadTokenStore) updateTokens(ctx context.Context, now time.Tim
 		return errDownloadStoreUnavailable
 	}
 	ctx = captureCPWriteLease(ctx)
+	if err := cpLeaderElectorInstance.checkQuorum(ctx); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var next map[string]adminDownloadToken
@@ -150,6 +153,9 @@ func (s *adminDownloadTokenStore) updateTokens(ctx context.Context, now time.Tim
 		log.Printf("export download token store: save not confirmed: %v", err)
 		if errors.Is(err, errCPLeadershipChanged) {
 			return errDownloadNotLeader
+		}
+		if errors.Is(err, errCPQuorumUnavailable) {
+			return errCPQuorumUnavailable
 		}
 		return errDownloadStoreUnavailable
 	}

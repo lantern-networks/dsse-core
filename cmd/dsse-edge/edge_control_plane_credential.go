@@ -7,7 +7,7 @@ package main
 // owner-level break-glass a human uses — which means a leaked pull credential is an owner of the deployment,
 // and a compromised Edge can author policy for every organization rather than read its own configuration.
 //
-// The machine path calls exactly three routes. Listed here, with the permission each one needs, so the token
+// The machine path's routes are listed here with the permission each one needs, so the token
 // minted for it can be that and no more.
 type edgeControlPlaneCall struct {
 	Method string
@@ -27,6 +27,10 @@ var edgeControlPlaneCalls = []edgeControlPlaneCall{
 			"applied and stops learning about changes",
 	},
 	{
+		Method: "GET", Path: "/admin/grant-bundle-page", Permission: "admin.policy.read",
+		Why: "bounded, signed pages of the same fleet grant evidence formerly embedded in the configuration bundle",
+	},
+	{
 		Method: "GET", Path: "/admin/steer-exclusions", Permission: "admin.steering.read",
 		Why: "the admin-managed steering exclusions this Edge's devices are told about",
 	},
@@ -39,7 +43,7 @@ var edgeControlPlaneCalls = []edgeControlPlaneCall{
 
 // edgeControlPlaneScopes is the scope set a machine credential for this path should carry.
 //
-// It is a WRITE-narrow set on purpose: one write, to report an enrolment, and two reads. A token holding this
+// It is a WRITE-narrow set on purpose: one write, to report an enrolment, and two read scopes. A token holding this
 // cannot author policy, cannot touch PKI, cannot see another organization's devices and cannot mint another
 // token — which is the difference between a leaked pull credential and a leaked deployment.
 func edgeControlPlaneScopes() []string {

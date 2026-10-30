@@ -173,6 +173,48 @@ final class DsseUpdateReportsTests: XCTestCase {
                        "an undelivered claim was swallowed instead of being added back")
     }
 
+    func testRecoveryKeepsClaimWhenLedgerCannotBeWritten() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(dir, name: "dropped.json.claimed", json: ["dropped": 6])
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("dropped.json"),
+                                                withIntermediateDirectories: false)
+
+        DsseUpdateReportStore.recoverClaim(dir.appendingPathComponent("dropped.json.claimed"), in: dir)
+
+        XCTAssertEqual(DsseUpdateReportStore.count(in: dir.appendingPathComponent("dropped.json.claimed")), 6,
+                       "failed recovery discarded the only copy of the drop count")
+    }
+
+    func testUndeliveredClaimSurvivesLedgerWriteFailure() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(dir, name: "dropped.json.claimed", json: ["dropped": 6])
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("dropped.json"),
+                                                withIntermediateDirectories: false)
+
+        DsseUpdateReportStore.releaseDropped(dir.appendingPathComponent("dropped.json.claimed"),
+                                             delivered: false, in: dir)
+
+        XCTAssertEqual(DsseUpdateReportStore.count(in: dir.appendingPathComponent("dropped.json.claimed")), 6,
+                       "failed release discarded the only copy of the drop count")
+    }
+
+    func testClaimDoesNotProceedWithoutTheSharedLedgerLock() throws {
+        let dir = try makeDir()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try write(dir, name: "dropped.json", json: ["dropped": 6])
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("dropped.lock"),
+                                                withIntermediateDirectories: false)
+
+        let (count, claim) = DsseUpdateReportStore.claimDropped(in: dir)
+
+        XCTAssertEqual(count, 0)
+        XCTAssertNil(claim)
+        XCTAssertEqual(DsseUpdateReportStore.droppedCount(in: dir), 6,
+                       "claim ran outside the shared updater ledger lock")
+    }
+
     // ★ THE EDGE'S SCHEMA IS A CHECK CONSTRAINT. update_source must be one of mdm|control_plane|manual, and a
     // refusal has no status of its own — sending "dsse" or "refused" would be rejected at insert, leaving the
     // fleet view empty for a reason nobody would connect to the sender.

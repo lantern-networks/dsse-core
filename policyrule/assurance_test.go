@@ -16,7 +16,7 @@ func TestCompileEastWestCarriesStepUpAssurance(t *testing.T) {
 	rules := []Rule{{
 		ID: "r1", TenantID: "t1", Plane: PlaneEastWest, Direction: DirectionOutbound, Status: StatusActive,
 		Source: []string{SubjectAny}, Destination: []string{"ep-dc"},
-		Action: Action{Access: AccessAuthenticate, RequiredIdPID: "idp_priv", MinACR: "AAL3", RequiredAMR: []string{"phishing_resistant"}, MaxAgeSeconds: 300},
+		Action: Action{Access: AccessAuthenticate, RequiredIdPID: "idp_priv", MinACR: "AAL3", RequiredAMR: []string{"phishing_resistant"}, MaxAgeSeconds: authMaxAgeForTest(300)},
 	}}
 	out := CompileEastWest("t1", rules, stubEWResolver{})
 	if len(out) != 1 {

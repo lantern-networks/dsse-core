@@ -98,6 +98,37 @@ func TestAValidSessionStillGetsTheAsset(t *testing.T) {
 	}
 }
 
+func TestSessionValidationDoesNotAcceptRedirectedLoginPage(t *testing.T) {
+	loginPageRequests := 0
+	authority := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/admin/session":
+			http.Redirect(w, r, "/login", http.StatusFound)
+		case "/login":
+			loginPageRequests++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("login page"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer authority.Close()
+	gate := authGate(authority.URL+"/admin/session", authority.Client(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("PROTECTED ASSET"))
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/app.js", nil)
+	req.Header.Set("Cookie", "admin_session=expired")
+	req.Header.Set("Sec-Fetch-Mode", "no-cors")
+	rec := httptest.NewRecorder()
+	gate.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized || strings.Contains(rec.Body.String(), "PROTECTED ASSET") {
+		t.Fatalf("redirected login page authenticated a session: %d %q", rec.Code, rec.Body.String())
+	}
+	if loginPageRequests != 0 {
+		t.Fatal("session validation followed a redirect with the admin cookie")
+	}
+}
+
 // The login logo is public; other branding paths and application assets remain gated.
 func TestLoginBrandDoesNotExposeAuthenticatedAssets(t *testing.T) {
 	gate := authGate("http://127.0.0.1:1/session", &http.Client{}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -18,7 +18,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/inspectioncrl"
 	"github.com/lantern-networks/dsse-core/internal/posixperm"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"io"
 	"log"
 	"math/big"
@@ -56,7 +58,10 @@ const (
 	// (e.g. one frozen across macOS sleep) keeps serving a leaf from leafCache past its validity — the browser
 	// then rejects the expired cert. The leaf serve path (unlike the root/intermediate) had no expiry check;
 	// this margin makes it re-mint slightly before expiry.
-	networkExtensionLabTLSLeafRenewBefore  = time.Hour
+	networkExtensionLabTLSLeafRenewBefore = time.Hour
+	// Legacy name: this is now the expiry WARNING window for a persisted root.
+	// Replacing a trusted root requires a staged device trust handoff; startup
+	// must not silently mint another one merely because this window began.
 	NetworkExtensionLabTLSRootRotateBefore = 7 * 24 * time.Hour
 	NetworkExtensionLabTLSDrainWait        = 25 * time.Millisecond
 	// A decrypted response body is buffered up to this many bytes, and if it fits it is returned in one piece
@@ -139,6 +144,9 @@ func (networkExtensionLabTLSProbeOnlyDroppedConn) RuntimeCopySessionDone() <-cha
 }
 
 type NetworkExtensionLabTLSInterception struct {
+	// Serializes persistent re-parent adoption and boot restore. A completed snapshot and its live
+	// issuer must be installed in the same order even when two admin requests arrive together.
+	reparentMu     sync.Mutex
 	hostMu         sync.RWMutex // protects runtime inspection and bypass pattern snapshots
 	tenantPatterns map[string]InspectionPatterns
 	mu             sync.Mutex
@@ -148,19 +156,17 @@ type NetworkExtensionLabTLSInterception struct {
 	// Cached, because the check is a real signing operation and will cost HSM throughput once one is wired.
 	custodyChecker *KeyCustodyChecker
 	rootCertPEM    []byte
-	// rootCACertOutPath is the file whose entire purpose is "this is the root to install on devices". It is
-	// written once at construction and was then never touched again.
-	//
-	// ★ SO IT WENT STALE THE MOMENT THE ANCHOR CHANGED (measured 2026-08-16). The reference lab re-parented
-	// its interception root to the MSSP root; the Edge served the new anchor and the distribution file kept
-	// the old one — 5a74ac31… on disk while every leaf chained to 36973669…. An operator following the lab's
-	// own procedure would install the wrong root onto a machine and it would fail every HTTPS site, with the
-	// file that told them to do it looking perfectly valid. Retained now so the anchor and the thing handed
-	// to devices cannot disagree.
+	// rootCACertOutPath is a public active-anchor export only. For a file-backed
+	// signer it is a distinct *.active-anchor.pem path; the historical cert/key
+	// paths are compatibility views of the authoritative private pair snapshot.
+	// Re-parent must never overwrite the signer certificate without its key.
 	rootCACertOutPath string
-	leafKey           *ecdsa.PrivateKey
-	hosts             []string
-	leafCache         map[string]tls.Certificate
+	// Never permit a public export to alias the signer's historical cert/key
+	// views. Re-parent updates only rootCACertOutPath.
+	signerMaterialCertPath string
+	leafKey                *ecdsa.PrivateKey
+	hosts                  []string
+	leafCache              map[string]tls.Certificate
 	// Slice 3: optional rotatable intermediate between the (offline-able) root and the leaves. issuerMu guards
 	// the per-(cache-tenant) issuer cache. useIntermediate off (default) => the root signs leaves directly
 	// (chain [leaf, root], today's behavior); on => leaves are signed by a per-root intermediate the root issued
@@ -243,6 +249,12 @@ type NetworkExtensionLabTLSInterception struct {
 	// who has just declared a key compromised would have been told the revocation succeeded while the traffic
 	// carried on being decrypted, by a different CA, with no announcement to the devices.
 	revokedTenants map[string]string
+	// A damaged revocation record cannot prove which roots are safe. Unlike a
+	// valid revocation, loading a replacement must not clear this quarantine.
+	revocationQuarantinedTenants map[string]string
+	// When the configured revocation directory cannot be read at startup, no
+	// tenant's old root can be proven safe to load or use.
+	revocationStoreUnreadableReason string
 	// offlinePrimaryTenant is the organization the DEFAULT offline intermediate belongs to. It keeps signing
 	// under that intermediate when per-tenant issuers are added, so turning this on does not break the tenant
 	// whose devices already trust the current anchor. Empty means the default intermediate serves the
@@ -253,6 +265,9 @@ type NetworkExtensionLabTLSInterception struct {
 	// organization's traffic — the per-tenant ROOTS had exactly this defect and it was found only by
 	// restarting. The key is written through the same at-rest sealing the root uses.
 	offlineTenantIntermediateDir string
+	// A configured directory alone does not prove that the current issuer was saved. This tracks successful
+	// writes for the live issuer; interrupted multi-file publication remains a separate durability concern.
+	offlineTenantPersistedIssuers map[string]bool
 	// ★★★ AND WHETHER ANYTHING BRINGS IT BACK (2026-08-27). Not having a directory is a PROBLEM when an
 	// operator placed these files here by hand and a restart would lose them — and it is the CORRECT shape
 	// when the node fetches its organizations from the control plane at start-up, because what is being kept
@@ -269,15 +284,13 @@ type NetworkExtensionLabTLSInterception struct {
 	// surfaced in InterceptionIntermediateStatus and the PKI readiness so this shows as degraded/not-ready
 	// rather than being a silent revert. Guarded by issuerMu.
 	reparentRestoreFailedReason string
-	// sessionTicketKeys is a process-stable TLS session-ticket key shared across every per-connection
-	// tls.Config. Resumption keys live in the Config, so a fresh Config per connection would never
-	// resume; sharing one key set lets a returning client skip the full handshake (asymmetric crypto) on
-	// reconnect. SNI-based intercept/bypass routing is decided pre-serve at the ClientHello peek and the
-	// SNI is present on resumed ClientHellos too, so resumption does not affect interception decisions.
-	sessionTicketKeys [][32]byte
-	now               func() time.Time
-	httpHandler       http.Handler
-	probeOnly         bool
+	// Stable per-process or fleet secret; per-connection keys are derived from
+	// the current epoch so long-lived Edges rotate without a restart.
+	// SNI remains present on resumed ClientHellos, so routing is unchanged.
+	sessionTicketSecret string
+	now                 func() time.Time
+	httpHandler         http.Handler
+	probeOnly           bool
 	// bypassHosts are destinations that are raw-forwarded rather than intercepted even under decrypt-all
 	// (`*`). The network extension steers everything and the EDGE decides what to bypass, from the SNI or the
 	// host. That is what lets an operator name a destination — the control channel of the agent running on
@@ -371,38 +384,33 @@ func NewNetworkExtensionLabTLSInterceptionWithPersistentRoot(hostPatterns []stri
 	if now == nil {
 		now = time.Now
 	}
-	rootCACertOut, err := normalizeNetworkExtensionLabTLSRootCACertOutPath(rootCACertOut)
+	material, reused, err := loadOrCreateInterceptionRootPair(rootCACertOut, now, "")
 	if err != nil {
 		return nil, err
 	}
-	material, reused, err := LoadNetworkExtensionLabTLSPersistentRootMaterial(rootCACertOut, now)
-	if err != nil {
-		return nil, err
-	}
-	if material.Cert == nil {
-		material, err = GenerateNetworkExtensionLabTLSRootMaterial(now)
-		if err != nil {
-			return nil, err
-		}
-		if strings.TrimSpace(rootCACertOut) != "" {
-			if err := WriteNetworkExtensionLabTLSPersistentRootMaterial(rootCACertOut, material); err != nil {
-				return nil, err
-			}
-			log.Printf("network_extension_lab_tls progress=root_ca_persistence_created")
-		}
-	} else if reused {
+	if reused {
 		log.Printf("network_extension_lab_tls progress=root_ca_persistence_reused")
-		// At-rest seal migration: if a KEK is configured, re-persist so a previously-plaintext key is SEALED in
-		// place. No new root is minted (the cert/key are unchanged), so device trust is unaffected.
-		if len(GetInterceptionRootKEK()) > 0 && strings.TrimSpace(rootCACertOut) != "" {
-			if err := WriteNetworkExtensionLabTLSPersistentRootMaterial(rootCACertOut, material); err != nil {
-				return nil, err
-			}
-			log.Printf("network_extension_lab_tls progress=root_ca_key_sealed_at_rest")
-		}
+	} else if strings.TrimSpace(rootCACertOut) != "" {
+		log.Printf("network_extension_lab_tls progress=root_ca_persistence_created")
 	}
 	// Default provider: the in-process file key. The seam lets production inject a sealed/HSM provider instead.
-	return NewNetworkExtensionLabTLSInterceptionWithProvider(hostPatterns, now, NewFileInterceptionRootProvider(material))
+	engine, err := NewNetworkExtensionLabTLSInterceptionWithProvider(hostPatterns, now, NewFileInterceptionRootProvider(material))
+	if err != nil || strings.TrimSpace(rootCACertOut) == "" {
+		return engine, err
+	}
+	certPath, err := normalizeNetworkExtensionLabTLSRootCACertOutPath(rootCACertOut)
+	if err != nil {
+		return nil, err
+	}
+	// The signer pair stays at certPath and its sibling key. Distribution uses
+	// a distinct file so a later re-parent cannot replace the signer's cert
+	// without replacing its key.
+	engine.signerMaterialCertPath = certPath
+	engine.rootCACertOutPath = NetworkExtensionLabTLSActiveAnchorExportPath(certPath)
+	// Do not publish here: the caller must replay any durable re-parent first.
+	// Otherwise a crash between construction and replay rolls an already
+	// adopted public anchor back to this self-signed signer certificate.
+	return engine, nil
 }
 
 // NewNetworkExtensionLabTLSInterceptionWithProvider builds an interception engine whose per-SNI leaves are signed
@@ -429,15 +437,13 @@ func NewNetworkExtensionLabTLSInterceptionWithProvider(hostPatterns []string, no
 	// FLEET-WIDE when a shared secret is configured: every Edge derives the same key, so a client that the
 	// load balancer moves to another node still resumes. Without it the key is per-PROCESS random — correct
 	// for a single Edge, but behind an LB every rebalance costs a full handshake (the PKI design).
-	var sessionTicketKeys [][32]byte
-	if keys, ok := fleetSessionTicketKeys(interceptionSessionTicketSecret(), now()); ok {
-		sessionTicketKeys = keys
+	sessionTicketSecret, fleetWide, err := newInterceptionTicketSecret()
+	if err != nil {
+		return nil, err
+	}
+	if fleetWide {
 		log.Printf("interception: session-ticket keys are FLEET-WIDE (derived, rotating every %s) — a client the load balancer moves to another Edge can still resume", sessionTicketRotationPeriod)
 	} else {
-		var ticketKey [32]byte
-		if _, err := rand.Read(ticketKey[:]); err == nil {
-			sessionTicketKeys = [][32]byte{ticketKey}
-		}
 		// Say so. Running several Edges behind a balancer without the shared secret silently costs a full
 		// handshake on every rebalance, and nothing else in the system would reveal it.
 		log.Printf("interception: session-ticket keys are PER-PROCESS (no DSSE_INTERCEPTION_SESSION_TICKET_SECRET) — fine for a single Edge; behind a load balancer every rebalance costs a FULL handshake")
@@ -445,15 +451,15 @@ func NewNetworkExtensionLabTLSInterceptionWithProvider(hostPatterns []string, no
 	// The registry resolves the signing provider per tenant. It defaults to the single given provider for every
 	// tenant (today's behavior) until per-tenant isolation is explicitly enabled (EnablePerTenant).
 	return &NetworkExtensionLabTLSInterception{
-		rootCert:          provider.Certificate(),
-		rootRegistry:      NewTenantInterceptionRootRegistry(provider, now),
-		rootCertPEM:       provider.CertPEM(),
-		leafKey:           leafKey,
-		sessionTicketKeys: sessionTicketKeys,
-		hosts:             hosts,
-		leafCache:         map[string]tls.Certificate{},
-		interceptIssuers:  map[string]*InterceptionIssuer{},
-		now:               now,
+		rootCert:            provider.Certificate(),
+		rootRegistry:        NewTenantInterceptionRootRegistry(provider, now),
+		rootCertPEM:         provider.CertPEM(),
+		leafKey:             leafKey,
+		sessionTicketSecret: sessionTicketSecret,
+		hosts:               hosts,
+		leafCache:           map[string]tls.Certificate{},
+		interceptIssuers:    map[string]*InterceptionIssuer{},
+		now:                 now,
 		// Default: two consecutive intercepted-handshake failures mark a destination as pinned, and it is
 		// raw-forwarded from then on.
 		pinDetectThreshold: 2,
@@ -828,6 +834,7 @@ func (interception *NetworkExtensionLabTLSInterception) SetProbeOnly(enabled boo
 }
 
 func (interception *NetworkExtensionLabTLSInterception) OpenTCPConnection(ctx context.Context, route NetworkExtensionRuntimeCopyTCPRoute) (io.ReadWriteCloser, error) {
+	route.TransportServerName = TransportServerNameFromContext(ctx)
 	if interception == nil || !interception.Matches(route) {
 		return nil, fmt.Errorf("lab TLS interception route is not matched")
 	}
@@ -1047,6 +1054,9 @@ func (interception *NetworkExtensionLabTLSInterception) ListTenantInterceptionRo
 func (interception *NetworkExtensionLabTLSInterception) issuerFor(tenantID, cacheTenant string, provider InterceptionRootProvider) (*InterceptionIssuer, string, error) {
 	interception.issuerMu.Lock()
 	defer interception.issuerMu.Unlock()
+	if interception.revocationStoreUnreadableReason != "" {
+		return nil, "", fmt.Errorf("interception revocation store is unavailable; refusing to sign until it can be read")
+	}
 	// Offline-root mode: a fixed intermediate signs the leaf; the root key is not on the Edge at all.
 	//
 	// With PER-TENANT offline issuers loaded, which one is not a detail — it is the whole separation. The order
@@ -1176,11 +1186,10 @@ func (interception *NetworkExtensionLabTLSInterception) deploymentOwnIssuerLocke
 	return iss, "", true
 }
 
-// normalizeInterceptionTenantKey is how a tenant id becomes a map key here: trimmed and lower-cased, the same
-// way every other tenant boundary in this tree compares them, so a stray space or a capital letter cannot give
-// an organization a second, empty PKI.
+// normalizeInterceptionTenantKey preserves the canonical, case-sensitive tenant ID.
+// Acme and acme are distinct organizations and must never share signing material.
 func normalizeInterceptionTenantKey(tenantID string) string {
-	return strings.ToLower(strings.TrimSpace(tenantID))
+	return strings.TrimSpace(tenantID)
 }
 
 // EnableInterceptionIntermediate turns on the rotatable intermediate (Slice 3): the root signs an intermediate
@@ -1255,8 +1264,8 @@ func (interception *NetworkExtensionLabTLSInterception) serve(conn net.Conn, rou
 			return &cert, nil
 		},
 	}
-	if len(interception.sessionTicketKeys) > 0 {
-		cfg.SetSessionTicketKeys(interception.sessionTicketKeys)
+	if keys := interception.ticketKeysForConnection(); len(keys) > 0 {
+		cfg.SetSessionTicketKeys(keys)
 	}
 	tlsConn := tls.Server(conn, cfg)
 	defer tlsConn.Close()
@@ -1471,8 +1480,10 @@ func BuildNetworkExtensionLabTLSForwardRequest(req *http.Request, route NetworkE
 	// response: writing it back fails once the client connection is gone, and the flow tears down normally. The
 	// deadline is dropped too, which is correct — a streamed reply (SSE) is long-lived by design.
 	forwardCtx := WithSWGNERuntimeUsed(context.WithoutCancel(req.Context()))
+	forwardCtx = WithTransportServerName(forwardCtx, route.TransportServerName)
 	if route.DeviceIdentity != "" {
 		forwardCtx = WithTransportDevice(forwardCtx, route.DeviceIdentity)
+		forwardCtx = WithAuthOwner(forwardCtx, route.AuthOwner)
 	}
 	if route.OSUser != "" {
 		forwardCtx = WithOSUser(forwardCtx, route.OSUser)
@@ -1506,13 +1517,12 @@ func BuildNetworkExtensionLabTLSForwardRequest(req *http.Request, route NetworkE
 // many-host page under decrypt-all does not spray sockets and tunnels until something runs out. Framing,
 // keep-alive and multiplexing are http2.Server's, so nothing here frames by hand.
 func (interception *NetworkExtensionLabTLSInterception) serveHTTP2(tlsConn net.Conn, route NetworkExtensionRuntimeCopyTCPRoute, connState *networkExtensionLabTLSConnState) {
-	// High MaxConcurrentStreams: the default (250) REFUSES the browser's 251st concurrent stream on one origin's
-	// connection with REFUSED_STREAM -> the request fails with net::ERR_FAILED before any response (no cancel).
-	// Under a heavy infinite-scroll page the browser opens many concurrent requests, and the browser-faithful
-	// egress broker holds each stream slightly longer (the extra edge->broker->origin hop) so more are in flight at
-	// once -> the cap is hit and a request like Amazon's getAsins gets refused -> stuck skeleton. Raise the cap so
-	// the browser's concurrency is never refused.
-	server := &http2.Server{MaxConcurrentStreams: 10000}
+	// Retain the existing finite HTTP/2 fan-out default while security and
+	// workload sizing are reviewed. This is not the agent mux-pool setting.
+	server := &http2.Server{
+		MaxConcurrentStreams: runtimequota.HTTP2StreamsDefault("DSSE_HTTP2_MAX_CONCURRENT_STREAMS", 10000),
+		IdleTimeout:          runtimequota.Seconds("DSSE_HTTP_IDLE_TIMEOUT_SECONDS"),
+	}
 	server.ServeConn(tlsConn, &http2.ServeConnOpts{
 		Handler: interception.networkExtensionLabTLSHTTP2Handler(route, connState),
 	})
@@ -1749,6 +1759,9 @@ func (interception *NetworkExtensionLabTLSInterception) leafCertificate(tenantID
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	if issuer.requiresTenantLeafCRL && interception.now().UTC().UnixNano() >= issuer.leafCRLReadyUntil.Load() {
+		return tls.Certificate{}, fmt.Errorf("interception leaf CRL is not published or has expired")
+	}
 	// The signer is part of the cache identity, not just the host. See issuerFor: with per-tenant offline
 	// issuers the root registry contributes nothing to cacheTenant, so without this the cache would hand one
 	// organization a certificate minted under another's CA.
@@ -1805,28 +1818,24 @@ func (interception *NetworkExtensionLabTLSInterception) leafCertificate(tenantID
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
-	// ★★ NO CRL DISTRIBUTION POINT AND NO AIA, AND THAT IS A DECISION (2026-08-19, measured on win-dev-1).
-	//
-	// A client that treats "cannot check revocation" as fatal refuses this certificate, and the clients that do
-	// are the strict ones — so the failure selects for the most careful software on the endpoint:
-	//
-	//   curl (schannel, default)  -> 000, CRYPT_E_NO_REVOCATION_CHECK
-	//   curl --ssl-no-revoke      -> 200
-	//
-	// Publishing revocation information for THIS certificate would mean answering for one minted moments ago,
-	// for one flow, valid for days — a responder that can only ever say "good" about certificates it just
-	// created is not a revocation service, it is a formality that satisfies a check. The formality is still
-	// worth serving (an empty, signed CRL satisfies a strict client without pretending to more), but it needs a
-	// URL an endpoint can reach — and every such URL is another agent-facing address, which is what the enrolment fold of
-	// docs/pki_who_owns_which_certificate.ja.md is reducing to one. So it is served on that one port, with the
-	// fold, rather than opening a fourth address to close this.
-	//
-	// The revocation that carries meaning here is elsewhere and does exist: an endpoint removing the
-	// interception root (a local act), and this deployment revoking an organization's interception authority
-	// (POST /admin/interception-intermediate/{tenant}/revoke, which refuses the revoked fingerprints for good).
-	//
-	// Until the fold lands, this is an exception a strict client needs, and it is declared in the readiness
-	// view rather than left for an operator to discover as a broken tool.
+	// Only a CRL-enabled, per-tenant delegated issuer advertises a leaf CDP. The
+	// issuer's own CDP fixes the tenant and HTTP origin; the leaf points to the
+	// Edge issuer's separately published signed CRL at that same origin. Legacy
+	// authorities keep their existing behavior, without inventing revocation status.
+	if issuer.requiresTenantLeafCRL {
+		if createdAt.UnixNano() >= issuer.leafCRLReadyUntil.Load() {
+			return tls.Certificate{}, fmt.Errorf("interception leaf CRL is not published or has expired")
+		}
+		bases, parseErr := interceptionIssuerCRLBases(issuer, normalizeInterceptionTenantKey(tenantID))
+		if parseErr != nil {
+			return tls.Certificate{}, fmt.Errorf("validate interception issuer CDP: %w", parseErr)
+		}
+		points, urlErr := inspectioncrl.URLs(bases, normalizeInterceptionTenantKey(tenantID), issuer.signingCert)
+		if urlErr != nil {
+			return tls.Certificate{}, fmt.Errorf("construct interception leaf CDP: %w", urlErr)
+		}
+		template.CRLDistributionPoints = points
+	}
 	if ip := net.ParseIP(normalizedHost); ip != nil {
 		template.IPAddresses = []net.IP{ip}
 	} else {
@@ -1846,6 +1855,17 @@ func (interception *NetworkExtensionLabTLSInterception) leafCertificate(tenantID
 	}
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("create lab TLS leaf certificate: %w", err)
+	}
+	if len(template.CRLDistributionPoints) != 0 {
+		issued, parseErr := x509.ParseCertificate(leafDER)
+		if parseErr != nil || len(issued.CRLDistributionPoints) != len(template.CRLDistributionPoints) {
+			return tls.Certificate{}, fmt.Errorf("leaf signer did not preserve the required CRL distribution point")
+		}
+		for index, point := range template.CRLDistributionPoints {
+			if issued.CRLDistributionPoints[index] != point {
+				return tls.Certificate{}, fmt.Errorf("leaf signer did not preserve the required CRL distribution point")
+			}
+		}
 	}
 	cert := tls.Certificate{
 		Certificate: append([][]byte{leafDER}, issuer.chain...),
@@ -2803,15 +2823,155 @@ func WriteNetworkExtensionLabTLSRootCertificatePEM(path string, pemBytes []byte)
 	if err != nil {
 		return err
 	}
-	if path == "" || len(pemBytes) == 0 {
+	if path == "" {
 		return nil
+	}
+	if len(pemBytes) == 0 {
+		return fmt.Errorf("active interception anchor certificate is empty")
 	}
 	if dir := filepath.Dir(path); dir != "." && dir != "" {
 		if err := os.MkdirAll(dir, 0700); err != nil {
 			return fmt.Errorf("create lab TLS root certificate directory: %w", err)
 		}
 	}
-	return os.WriteFile(path, pemBytes, 0600)
+	return writeInterceptionActiveAnchor(path, pemBytes, productionInterceptionRootPairIO)
+}
+
+// ActiveAnchorExportPath names the certificate-only file to distribute after
+// both startup and re-parent. It never names the signer certificate/key pair.
+func (interception *NetworkExtensionLabTLSInterception) ActiveAnchorExportPath() string {
+	if interception == nil {
+		return ""
+	}
+	interception.mu.Lock()
+	defer interception.mu.Unlock()
+	return interception.rootCACertOutPath
+}
+
+// PrepareActiveAnchorExport records a certificate-only output without writing
+// it. Boot must prepare the path before restoring a durable re-parent, so the
+// restore can publish the adopted anchor directly. A lost or wrong restore
+// must not replace an already distributed anchor with the initial root.
+func (interception *NetworkExtensionLabTLSInterception) PrepareActiveAnchorExport(path string, forbiddenInputPaths ...string) error {
+	if interception == nil {
+		return fmt.Errorf("interception is not enabled")
+	}
+	interception.reparentMu.Lock()
+	defer interception.reparentMu.Unlock()
+	path, err := normalizeNetworkExtensionLabTLSRootCACertOutPath(path)
+	if err != nil {
+		return err
+	}
+	if path == "" {
+		return nil
+	}
+	interception.mu.Lock()
+	signerPath := interception.signerMaterialCertPath
+	interception.mu.Unlock()
+	if err := validateActiveAnchorExportInputPaths(path, signerPath, forbiddenInputPaths); err != nil {
+		return err
+	}
+	interception.mu.Lock()
+	interception.rootCACertOutPath = path
+	interception.mu.Unlock()
+	return nil
+}
+
+// ConfigureActiveAnchorExport prepares and publishes an output outside the
+// boot restore path. Existing exports must already match the active root;
+// adopting a different anchor requires the durable re-parent operation.
+func (interception *NetworkExtensionLabTLSInterception) ConfigureActiveAnchorExport(path string, forbiddenInputPaths ...string) error {
+	if interception == nil {
+		return fmt.Errorf("interception is not enabled")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	if err := interception.PrepareActiveAnchorExport(path, forbiddenInputPaths...); err != nil {
+		return err
+	}
+	return interception.PublishActiveAnchorExport()
+}
+
+// ValidateActiveAnchorExportInputs checks already configured output against
+// source certificate/key paths without writing anything. Call before replaying
+// a durable re-parent, so a bad output path cannot damage source material.
+func (interception *NetworkExtensionLabTLSInterception) ValidateActiveAnchorExportInputs(paths ...string) error {
+	if interception == nil {
+		return fmt.Errorf("interception is not enabled")
+	}
+	interception.reparentMu.Lock()
+	defer interception.reparentMu.Unlock()
+	interception.mu.Lock()
+	path, signerPath := interception.rootCACertOutPath, interception.signerMaterialCertPath
+	interception.mu.Unlock()
+	return validateActiveAnchorExportInputPaths(path, signerPath, paths)
+}
+
+func validateActiveAnchorExportInputPaths(output, signerPath string, paths []string) error {
+	if output == "" {
+		return nil
+	}
+	outputCanonical, err := canonicalInterceptionRootOutputPath(output)
+	if err != nil {
+		return fmt.Errorf("resolve active anchor export path: %w", err)
+	}
+	if signerPath != "" {
+		paths = append(append([]string(nil), paths...), signerPath,
+			NetworkExtensionLabTLSRootKeyPath(signerPath), interceptionRootSnapshotPath(signerPath))
+	}
+	for _, input := range paths {
+		if strings.TrimSpace(input) == "" {
+			continue
+		}
+		inputCanonical, err := canonicalInterceptionRootOutputPath(input)
+		if err != nil {
+			return fmt.Errorf("resolve interception signing input path: %w", err)
+		}
+		if outputCanonical == inputCanonical {
+			return fmt.Errorf("active interception anchor export must not alias signing input material")
+		}
+	}
+	return nil
+}
+
+// PublishActiveAnchorExport is the boot-time finalization step. Call it only
+// after ReapplyPersistedReparent, before serving traffic or distributing the
+// file. Constructors deliberately do not replace an existing export.
+func (interception *NetworkExtensionLabTLSInterception) PublishActiveAnchorExport() error {
+	if interception == nil {
+		return fmt.Errorf("interception is not enabled")
+	}
+	interception.reparentMu.Lock()
+	defer interception.reparentMu.Unlock()
+	interception.mu.Lock()
+	path := interception.rootCACertOutPath
+	anchor := append([]byte(nil), interception.rootCertPEM...)
+	interception.mu.Unlock()
+	if path == "" {
+		return nil
+	}
+	// A previously distributed anchor is evidence of the trust devices use.
+	// Only a validated durable adoption/replay may change it; this boot-time
+	// finalizer must never turn a missing re-parent snapshot into a silent
+	// replacement with the initial self-signed root.
+	if existing, err := os.ReadFile(path); err == nil {
+		trimmed := bytes.TrimSpace(existing)
+		block, rest := pem.Decode(trimmed)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 ||
+			!bytes.HasPrefix(trimmed, []byte("-----BEGIN CERTIFICATE-----")) || len(bytes.TrimSpace(rest)) != 0 {
+			return fmt.Errorf("existing active interception anchor is not a single certificate; refusing to replace it")
+		}
+		current, parseErr := ParseInterceptionCertPEM(anchor)
+		persisted, persistErr := x509.ParseCertificate(block.Bytes)
+		if parseErr != nil || persistErr != nil || !bytes.Equal(current.Raw, persisted.Raw) {
+			return fmt.Errorf("existing active interception anchor differs from the restored authority; refusing to replace it")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read existing active interception anchor: %w", err)
+	}
+	return WriteNetworkExtensionLabTLSRootCertificatePEM(path, anchor)
 }
 
 // networkExtensionLabTLSRootCertLegacyFilenames are names this root has been stored under before. The file
@@ -2828,18 +2988,23 @@ func normalizeNetworkExtensionLabTLSRootCACertOutPath(path string) (string, erro
 	info, err := os.Stat(path)
 	if err == nil && info.IsDir() {
 		current := filepath.Join(path, NetworkExtensionLabTLSRootCertFilename)
-		if _, err := os.Stat(current); err == nil {
+		present, err := networkExtensionLabTLSRootPairCandidatePresent(current)
+		if err != nil {
+			return "", err
+		}
+		if present {
 			return current, nil
 		}
 		for _, legacy := range networkExtensionLabTLSRootCertLegacyFilenames {
 			candidate := filepath.Join(path, legacy)
-			if _, err := os.Stat(candidate); err != nil {
+			present, err := networkExtensionLabTLSRootPairCandidatePresent(candidate)
+			if err != nil {
+				return "", err
+			}
+			if !present {
 				continue
 			}
-			if _, err := os.Stat(NetworkExtensionLabTLSRootKeyPath(candidate)); err != nil {
-				continue
-			}
-			log.Printf("network_extension_lab_tls progress=root_ca_persistence_found_under_previous_name")
+			log.Printf("network_extension_lab_tls progress=root_ca_persistence_candidate_under_previous_name")
 			return candidate, nil
 		}
 		return current, nil
@@ -2848,6 +3013,29 @@ func normalizeNetworkExtensionLabTLSRootCACertOutPath(path string) (string, erro
 		return "", fmt.Errorf("stat lab TLS root CA output path: %w", err)
 	}
 	return path, nil
+}
+
+// Any surviving half identifies an existing root pair. Selecting another name
+// or minting a fresh root would bypass the loader's incomplete-pair refusal.
+func networkExtensionLabTLSRootPairCandidatePresent(certPath string) (bool, error) {
+	if _, err := os.Stat(interceptionRootSnapshotPath(certPath)); err == nil {
+		return true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat lab TLS root snapshot candidate: %w", err)
+	}
+	certPresent := false
+	if _, err := os.Stat(certPath); err == nil {
+		certPresent = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat lab TLS root certificate candidate: %w", err)
+	}
+	keyPresent := false
+	if _, err := os.Stat(NetworkExtensionLabTLSRootKeyPath(certPath)); err == nil {
+		keyPresent = true
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("stat lab TLS root key candidate: %w", err)
+	}
+	return certPresent || keyPresent, nil
 }
 
 func NetworkExtensionLabTLSRootKeyPath(certPath string) string {
@@ -2863,56 +3051,35 @@ func NetworkExtensionLabTLSRootKeyPath(certPath string) string {
 }
 
 func LoadNetworkExtensionLabTLSPersistentRootMaterial(rootCACertOut string, now func() time.Time) (networkExtensionLabTLSRootMaterial, bool, error) {
-	rootCACertOut, err := normalizeNetworkExtensionLabTLSRootCACertOutPath(rootCACertOut)
-	if err != nil {
-		return networkExtensionLabTLSRootMaterial{}, false, err
-	}
-	if rootCACertOut == "" {
-		return networkExtensionLabTLSRootMaterial{}, false, nil
-	}
-	keyPath := NetworkExtensionLabTLSRootKeyPath(rootCACertOut)
-	certPEM, certErr := os.ReadFile(rootCACertOut)
-	keyPEM, keyErr := os.ReadFile(keyPath)
-	certMissing := errors.Is(certErr, os.ErrNotExist)
-	keyMissing := errors.Is(keyErr, os.ErrNotExist)
-	if certMissing && keyMissing {
-		return networkExtensionLabTLSRootMaterial{}, false, nil
-	}
-	if certErr != nil && !certMissing {
-		return networkExtensionLabTLSRootMaterial{}, false, fmt.Errorf("read lab TLS persistent root certificate: %w", certErr)
-	}
-	if keyErr != nil && !keyMissing {
-		return networkExtensionLabTLSRootMaterial{}, false, fmt.Errorf("read lab TLS persistent root key: %w", keyErr)
-	}
-	if certMissing || keyMissing {
-		log.Printf("network_extension_lab_tls progress=root_ca_persistence_rotated reason=incomplete_material")
-		return networkExtensionLabTLSRootMaterial{}, false, nil
-	}
-	if err := validateNetworkExtensionLabTLSSecretFileMode(keyPath); err != nil {
-		return networkExtensionLabTLSRootMaterial{}, false, err
-	}
-	// When the key is sealed at rest, decrypt it with the configured KEK before parsing (fail-closed if absent).
-	keyPEM, err = maybeUnsealInterceptionKeyFromDisk(keyPEM)
-	if err != nil {
-		return networkExtensionLabTLSRootMaterial{}, false, err
-	}
-	material, err := parseNetworkExtensionLabTLSPersistentRootMaterial(certPEM, keyPEM)
-	if err != nil {
-		return networkExtensionLabTLSRootMaterial{}, false, err
-	}
+	var material networkExtensionLabTLSRootMaterial
+	var reused bool
+	err := withInterceptionRootPairLock(rootCACertOut, func(certPath string) error {
+		var err error
+		material, reused, err = readInterceptionRootPairLocked(certPath, now, productionInterceptionRootPairIO)
+		return err
+	})
+	return material, reused, err
+}
+
+func validatePersistentRootTime(material networkExtensionLabTLSRootMaterial, now func() time.Time) error {
 	current := time.Now
 	if now != nil {
 		current = now
 	}
+	evaluatedAt := current().UTC()
 	expiresAt := material.Cert.NotAfter
-	if !current().UTC().Before(expiresAt.Add(-NetworkExtensionLabTLSRootRotateBefore)) {
-		log.Printf("network_extension_lab_tls progress=root_ca_persistence_rotated reason=expires_soon")
-		return networkExtensionLabTLSRootMaterial{}, false, nil
+	if !evaluatedAt.Before(expiresAt) {
+		// A root that devices already pin cannot be replaced as a side effect
+		// of restarting this Edge. Preserve its files for an explicit recovery.
+		return fmt.Errorf("lab TLS persistent root certificate has expired; refusing to replace the existing trust anchor")
 	}
-	if current().UTC().Before(material.Cert.NotBefore) {
-		return networkExtensionLabTLSRootMaterial{}, false, fmt.Errorf("lab TLS persistent root certificate is not valid yet")
+	if evaluatedAt.Before(material.Cert.NotBefore) {
+		return fmt.Errorf("lab TLS persistent root certificate is not valid yet")
 	}
-	return material, true, nil
+	if !evaluatedAt.Before(expiresAt.Add(-NetworkExtensionLabTLSRootRotateBefore)) {
+		log.Printf("network_extension_lab_tls WARNING progress=root_ca_persistence_expires_soon not_after=%s — continuing to use the existing trusted root; arrange an explicit trust handoff before expiry", expiresAt.UTC().Format(time.RFC3339))
+	}
+	return nil
 }
 
 func parseNetworkExtensionLabTLSPersistentRootMaterial(certPEM []byte, keyPEM []byte) (networkExtensionLabTLSRootMaterial, error) {
@@ -2989,39 +3156,12 @@ func validateNetworkExtensionLabTLSSecretFileMode(path string) error {
 }
 
 func WriteNetworkExtensionLabTLSPersistentRootMaterial(rootCACertOut string, material networkExtensionLabTLSRootMaterial) error {
-	rootCACertOut, err := normalizeNetworkExtensionLabTLSRootCACertOutPath(rootCACertOut)
-	if err != nil {
-		return err
-	}
-	if rootCACertOut == "" {
-		return nil
-	}
-	keyPath := NetworkExtensionLabTLSRootKeyPath(rootCACertOut)
-	if material.Cert == nil || material.Key == nil || len(material.CertPEM) == 0 || len(material.KeyPEM) == 0 {
-		return fmt.Errorf("lab TLS persistent root material is incomplete")
-	}
-	if dir := filepath.Dir(rootCACertOut); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0700); err != nil {
-			return fmt.Errorf("create lab TLS root directory: %w", err)
+	return withInterceptionRootPairLock(rootCACertOut, func(certPath string) error {
+		if certPath == "" {
+			return nil
 		}
-	}
-	keyBytes, err := maybeSealInterceptionKeyForDisk(material.KeyPEM)
-	if err != nil {
-		return fmt.Errorf("seal lab TLS root key: %w", err)
-	}
-	if err := os.WriteFile(keyPath, keyBytes, 0600); err != nil {
-		return fmt.Errorf("write lab TLS root key: %w", err)
-	}
-	if err := os.Chmod(keyPath, 0600); err != nil {
-		return fmt.Errorf("chmod lab TLS root key: %w", err)
-	}
-	if err := os.WriteFile(rootCACertOut, material.CertPEM, 0600); err != nil {
-		return fmt.Errorf("write lab TLS root certificate: %w", err)
-	}
-	if err := os.Chmod(rootCACertOut, 0600); err != nil {
-		return fmt.Errorf("chmod lab TLS root certificate: %w", err)
-	}
-	return nil
+		return writeInterceptionRootPairLocked(certPath, material, productionInterceptionRootPairIO)
+	})
 }
 
 func NormalizedNetworkExtensionLabTLSHostPatterns(rawPatterns []string) []string {

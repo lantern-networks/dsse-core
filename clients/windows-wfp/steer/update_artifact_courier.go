@@ -26,6 +26,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -143,21 +145,26 @@ func (a *artifactCourier) refreshOnce(ctx context.Context) error {
 		return fmt.Errorf("artifact courier: the edge named version %q, which will not become a path on this "+
 			"device: %w", version, err)
 	}
+	expectedDigest := strings.TrimSpace(resp.Header.Get(agentupdate.ArtifactSHA256Header))
+	if !validArtifactDigest(expectedDigest) {
+		return fmt.Errorf("artifact courier: the edge supplied no valid artifact digest; keeping whatever is already staged")
+	}
 
 	// ★ ALREADY STAGED IS THE COMMON CASE, and re-downloading it would be the expensive one. This loop runs on
 	// the manifest's refresh interval, so without this check a device that is up to date pulls the whole
 	// package every pass, forever — the fleet paying for its own idleness, and on the Edge's uplink.
 	//
-	// Size is a WEAK identity and is used only to skip work, never to approve bytes: the updater hashes the
-	// file against the signed manifest regardless. A same-size file that is wrong is refused there, which is
-	// the check that was always doing this job.
+	// A same-size damaged package must be fetched again. This digest is a cache hint from the Edge, never
+	// installation authority: the updater independently verifies the signed manifest and hashes the bytes.
 	if resp.ContentLength > 0 {
 		if fi, serr := os.Stat(dst); serr == nil && fi.Size() == resp.ContentLength {
-			return nil
+			if digest, derr := artifactFileDigest(dst); derr == nil && digest == expectedDigest {
+				return nil
+			}
 		}
 	}
 
-	written, err := a.stage(dst, resp.Body, resp.ContentLength)
+	written, err := a.stage(dst, resp.Body, resp.ContentLength, expectedDigest)
 	if err != nil {
 		return fmt.Errorf("artifact courier: %w", err)
 	}
@@ -178,7 +185,32 @@ func (a *artifactCourier) refreshOnce(ctx context.Context) error {
 // "Access is denied" while another process holds the destination open — which is exactly the updater hashing
 // it — and that failure is the RIGHT one: the temporary file is discarded and the previously staged package
 // is left intact, so the next pass tries again against a file that was never damaged.
-func (a *artifactCourier) stage(dst string, body io.Reader, declared int64) (int64, error) {
+func validArtifactDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, c := range value {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func artifactFileDigest(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (a *artifactCourier) stage(dst string, body io.Reader, declared int64, expectedDigest string) (int64, error) {
 	dir := filepath.Dir(dst)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return 0, fmt.Errorf("create %s: %w", dir, err)
@@ -205,7 +237,8 @@ func (a *artifactCourier) stage(dst string, body io.Reader, declared int64) (int
 	if limit <= 0 {
 		limit = maxArtifactBytes
 	}
-	written, err := io.Copy(tmp, io.LimitReader(body, limit+1))
+	h := sha256.New()
+	written, err := io.Copy(io.MultiWriter(tmp, h), io.LimitReader(body, limit+1))
 	if err != nil {
 		return 0, fmt.Errorf("download: %w", err)
 	}
@@ -218,6 +251,9 @@ func (a *artifactCourier) stage(dst string, body io.Reader, declared int64) (int
 		// substituted, look tonight".
 		return 0, fmt.Errorf("the edge declared %d bytes and sent %d; keeping whatever is already staged",
 			declared, written)
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != expectedDigest {
+		return 0, fmt.Errorf("the received package does not match the edge's artifact digest; keeping whatever is already staged")
 	}
 	// Sync before the rename, or the directory entry can reach disk ahead of the contents — the torn file this
 	// whole function exists to prevent, appearing only on the box that lost power while updating.

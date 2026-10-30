@@ -75,6 +75,9 @@ func (p postgresBlobPersister) Save(data []byte) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
 	defer cancel()
+	if err := cpLeaderElectorInstance.checkQuorum(ctx); err != nil {
+		return writeNotCommittedError{err}
+	}
 	_, err := p.db.ExecContext(ctx,
 		`INSERT INTO cp_state_blobs (store_key, payload, updated_at) VALUES ($1, $2, now())
 		 ON CONFLICT (store_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
@@ -83,6 +86,73 @@ func (p postgresBlobPersister) Save(data []byte) error {
 		return fmt.Errorf("save cp_state_blob %q: %w", p.key, err)
 	}
 	return nil
+}
+
+// seedArtifactIfAbsent is the startup migration path for verified local
+// release bytes. A live upload may have filled the same row after a seed's
+// Load; an atomic insert-or-fill-empty can keep that newer upload authoritative.
+func (p postgresBlobPersister) seedArtifactIfAbsent(data []byte) (bool, error) {
+	if !strings.HasPrefix(p.key, "agent_update_artifact|") {
+		return false, fmt.Errorf("atomic artifact seed requires an artifact key")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cpStateBlobDBTimeout)
+	defer cancel()
+	if err := cpLeaderElectorInstance.checkQuorum(ctx); err != nil {
+		return false, writeNotCommittedError{err}
+	}
+	result, err := p.db.ExecContext(ctx,
+		`INSERT INTO cp_state_blobs (store_key, payload, updated_at) VALUES ($1, $2, now())
+		 ON CONFLICT (store_key) DO UPDATE SET payload=EXCLUDED.payload, updated_at=EXCLUDED.updated_at
+		 WHERE octet_length(cp_state_blobs.payload)=0`, p.key, data)
+	if err != nil {
+		return false, fmt.Errorf("seed cp_state_blob %q: %w", p.key, err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("inspect seeded cp_state_blob %q: %w", p.key, err)
+	}
+	return n == 1, nil
+}
+
+// An administrative artifact upload carries the leadership term captured
+// before its body was read. Save that upload on the lock-owning SQL session;
+// verified startup shelf seeding uses seedArtifactIfAbsent before election.
+func (p postgresBlobPersister) saveArtifactContext(parent context.Context, data []byte) (err error) {
+	if !strings.HasPrefix(p.key, "agent_update_artifact|") {
+		return fmt.Errorf("contextual artifact save requires an artifact key")
+	}
+	if cpLeaderElectorInstance != nil {
+		if _, ok := parent.Value(cpWriteLeaseKey{}).(cpWriteLease); !ok {
+			return writeNotCommittedError{errCPLeadershipChanged}
+		}
+	}
+	commitAttempted := false
+	defer func() {
+		if err != nil && !commitAttempted {
+			err = writeNotCommittedError{err}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
+	defer cancel()
+	budget := newCPStatementBudget(ctx)
+	defer budget.cancel()
+	tx, finish, err := beginCPWriteTransactionContexts(ctx, budget.sqlCtx, p.db, nil)
+	if err != nil {
+		return err
+	}
+	defer finish()
+	defer tx.Rollback()
+	if _, err := budget.exec(tx,
+		`INSERT INTO cp_state_blobs (store_key, payload, updated_at) VALUES ($1, $2, now())
+		 ON CONFLICT (store_key) DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
+		p.key, data); err != nil {
+		return err
+	}
+	if err := cpWriteContextError(parent, ctx); err != nil {
+		return err
+	}
+	commitAttempted = true
+	return budget.commit(tx)
 }
 
 // Update serializes a read-modify-write across all CP processes. The callback's
@@ -129,7 +199,7 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	} else if absentAsNil && n == 1 {
 		raw = nil
 	}
-	if err := ctx.Err(); err != nil {
+	if err := cpWriteContextError(parent, ctx); err != nil {
 		return err
 	}
 	if n, err := inserted.RowsAffected(); err != nil {
@@ -137,7 +207,7 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	} else if n == 1 {
 		raw = nil
 	}
-	if err := ctx.Err(); err != nil {
+	if err := cpWriteContextError(parent, ctx); err != nil {
 		return err
 	}
 	updated, err := edit(raw)
@@ -145,6 +215,10 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 		return err
 	}
 	if bytes.Equal(raw, updated) {
+		if err := cpWriteContextError(parent, ctx); err != nil {
+			return err
+		}
+		commitAttempted = true
 		return tx.Commit()
 	}
 	if _, err := budget.exec(tx, `UPDATE cp_state_blobs SET payload=$2,updated_at=now() WHERE store_key=$1`, p.key, updated); err != nil {
@@ -154,7 +228,7 @@ func (p postgresBlobPersister) updateContext(parent context.Context, edit func([
 	// definite rollback, so non-idempotent stores do not latch an unknown outcome.
 	// Cancellation racing AFTER this check remains conservative: a driver may
 	// return the same context error after committing, so never reclassify it.
-	if err := ctx.Err(); err != nil {
+	if err := cpWriteContextError(parent, ctx); err != nil {
 		return err
 	}
 	commitAttempted = true
@@ -170,7 +244,7 @@ func newCPStateBlobDB(dsn, migrationDir string, runMigrations bool) (*sql.DB, er
 	if dsn == "" {
 		return nil, nil
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open cp-state blob db: %w", err)
 	}

@@ -25,7 +25,7 @@ func TestDNSPolicySurvivesARestart(t *testing.T) {
 	}
 	booted.SetPolicy(seed)
 	store := newDNSPolicyStore(path)
-	if line := restoreDNSPolicy(store, booted); line == "" {
+	if line, err := restoreDNSPolicy(store, booted); line == "" || err != nil {
 		t.Fatalf("the first boot should seed the store and say so")
 	}
 
@@ -45,7 +45,7 @@ func TestDNSPolicySurvivesARestart(t *testing.T) {
 	// Restart: a fresh resolver built from an environment that knows nothing about the operator's change.
 	restarted := dnsresolver.NewWithUpstream("t", nil, nil)
 	restarted.SetPolicy(seed)
-	if line := restoreDNSPolicy(store, restarted); line == "" {
+	if line, err := restoreDNSPolicy(store, restarted); line == "" || err != nil {
 		t.Fatalf("the stored policy should have been restored")
 	}
 	got := dnsresolver.PolicyToDTO(restarted.CurrentPolicy())
@@ -81,9 +81,8 @@ func TestStoredDNSPolicyBeatsTheBootEnvironment(t *testing.T) {
 	}
 }
 
-// An unreadable store must not take the datapath down. Falling back to the boot configuration is recoverable;
-// refusing to start over a corrupt DNS file is an outage for a fixable problem.
-func TestCorruptDNSPolicyStoreFallsBackToBoot(t *testing.T) {
+// Corrupt operator policy is an explicit startup error, not a fresh deployment.
+func TestCorruptDNSPolicyStoreRefusesBootFallback(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "dns_policy.json")
 	if err := writeFileForTest(path, "{not json"); err != nil {
@@ -93,7 +92,9 @@ func TestCorruptDNSPolicyStoreFallsBackToBoot(t *testing.T) {
 	boot, _ := dnsresolver.PolicyFromDTO(dnsresolver.PolicyDTO{StubIPv4: map[string]string{"app.corp": "100.64.0.9"}})
 	resolver.SetPolicy(boot)
 
-	restoreDNSPolicy(newDNSPolicyStore(path), resolver)
+	if _, err := restoreDNSPolicy(newDNSPolicyStore(path), resolver); err == nil {
+		t.Fatal("corrupt DNS policy accepted")
+	}
 	if dnsresolver.PolicyToDTO(resolver.CurrentPolicy()).StubIPv4["app.corp"] != "100.64.0.9" {
 		t.Fatalf("a corrupt store discarded the boot policy")
 	}

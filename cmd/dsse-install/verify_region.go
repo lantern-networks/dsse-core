@@ -93,8 +93,9 @@ func verifyRegionAgreement(client *http.Client, edgeAdmins []string) []verifyRes
 			multiRegion = true
 		}
 	}
-	if !multiRegion {
-		// One region: every Edge's map is its own region, and there is nothing for them to disagree about.
+	if !multiRegion && len(shapes) < 2 {
+		// One Edge alone offers no peer to compare. A single Region can still advertise
+		// several independent doors, so compare digests whenever multiple Edges are given.
 		return out
 	}
 

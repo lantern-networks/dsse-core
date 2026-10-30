@@ -17,7 +17,8 @@ func TestAdminDNSPolicySaveFailureKeepsAcknowledgedState(t *testing.T) {
 	for _, failure := range []string{"write", "rename"} {
 		t.Run(failure, func(t *testing.T) {
 			dir := t.TempDir()
-			path := filepath.Join(dir, "private-dns.json")
+			stateDir := filepath.Join(dir, "state")
+			path := filepath.Join(stateDir, "private-dns.json")
 			now := time.Now().UTC()
 			tenant := testEvaluator().PolicyBundle.TenantID
 			creds := newLocalAdminCredentialStore("DSSE")
@@ -48,7 +49,10 @@ func TestAdminDNSPolicySaveFailureKeepsAcknowledgedState(t *testing.T) {
 			}
 			live := request("GET", "").Body.Bytes()
 			if failure == "write" {
-				if err := os.Mkdir(path+".tmp", 0700); err != nil {
+				if err := os.Rename(stateDir, stateDir+".backup"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(stateDir, []byte("block staging-directory creation"), 0600); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -70,7 +74,10 @@ func TestAdminDNSPolicySaveFailureKeepsAcknowledgedState(t *testing.T) {
 				t.Fatal("private path leaked")
 			}
 			if failure == "write" {
-				if err := os.Remove(path + ".tmp"); err != nil {
+				if err := os.Remove(stateDir); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(stateDir+".backup", stateDir); err != nil {
 					t.Fatal(err)
 				}
 			} else {

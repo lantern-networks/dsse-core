@@ -58,7 +58,7 @@ func TestDLPPolicySignedAdminLifecycle(t *testing.T) {
 	foreign := policyLibraryFixture("operator", "foreign")
 	raw, _ := json.Marshal(foreign)
 	send("operator", "POST", "/admin/dlp-policies", string(raw), 200)
-	src := configBundleSource{url: server.URL, client: server.Client(), token: "token-customer", tenantID: "customer", verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
+	src := configBundleSource{url: server.URL, client: server.Client(), token: "token-operator", tenantID: "operator", verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
 	before, err := src.fetch(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -95,8 +95,8 @@ func TestDLPPolicySignedAdminLifecycle(t *testing.T) {
 		if bundle.Generation <= before.Generation || bundle.DLP == nil {
 			t.Fatal("policy edit missing from bundle")
 		}
-		if _, ok := bundle.DLP.Policies["operator"]; ok {
-			t.Fatal("foreign policy in scoped bundle")
+		if _, ok := bundle.DLP.Policies["operator"]; !ok {
+			t.Fatal("operator fleet read lost another tenant policy")
 		}
 		if err := edge.Apply(bundle.DLP); err != nil {
 			t.Fatal(err)

@@ -171,20 +171,26 @@ func LoadApplicationRouteProfiles(path string) (map[string]ApplicationRouteProfi
 // without a file entry. The startup file profiles remain the FALLBACK: an application that is not published in
 // the catalog keeps whatever the file map / built-in switch resolves. Lab invariance: catalog entries that
 // are NOT published (e.g. the boot seed mirror of the file routes) produce no overlay, so an edge with no
-// published apps resolves exactly the same routes as before. Fail-closed: a catalog read error returns the
-// base (file) routes unchanged — a publish overlay never widens reachability on error.
-func RouteProfilesWithPublishedCatalog(base map[string]ApplicationRouteProfile, store appcatalog.RuntimeStore, tenantID string) map[string]ApplicationRouteProfile {
+// published apps resolves exactly the same routes as before. A catalog read error must reach the caller:
+// otherwise a base route disabled in the catalog silently becomes routable again.
+func RouteProfilesWithPublishedCatalog(ctx context.Context, base map[string]ApplicationRouteProfile, store appcatalog.RuntimeStore, tenantID string) (map[string]ApplicationRouteProfile, error) {
 	tenantID = strings.TrimSpace(tenantID)
-	if store == nil || tenantID == "" {
-		return base
+	if store == nil {
+		return base, nil
 	}
-	result, err := store.List(context.Background(), tenantID, appcatalog.ListOptions{ApplicationType: "private_app", Limit: 1000})
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant_id is required to read application catalog")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	entries, err := store.ListAll(ctx, tenantID, appcatalog.ListAllOptions{ApplicationType: "private_app"})
 	if err != nil {
-		return base
+		return nil, fmt.Errorf("read application catalog: %w", err)
 	}
 	overlay := map[string]ApplicationRouteProfile{}
 	disabled := map[string]bool{}
-	for _, entry := range result.Applications {
+	for _, entry := range entries {
 		if entry.Status == "disabled" {
 			disabled[entry.ApplicationID] = true
 			continue
@@ -199,7 +205,7 @@ func RouteProfilesWithPublishedCatalog(base map[string]ApplicationRouteProfile, 
 		overlay[entry.ApplicationID] = profile
 	}
 	if len(overlay) == 0 && len(disabled) == 0 {
-		return base
+		return base, nil
 	}
 	merged := make(map[string]ApplicationRouteProfile, len(base)+len(overlay))
 	for id, profile := range base {
@@ -211,7 +217,7 @@ func RouteProfilesWithPublishedCatalog(base map[string]ApplicationRouteProfile, 
 	for id := range disabled {
 		delete(merged, id)
 	}
-	return merged
+	return merged, nil
 }
 
 // ServiceFamilyForPublishProtocol maps the publish app type (web|tcp|network) to a non-secret service family

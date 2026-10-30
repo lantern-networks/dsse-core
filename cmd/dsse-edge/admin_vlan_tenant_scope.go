@@ -42,7 +42,7 @@ func vlanObjectVisibleTo(o model.VLANObject, callerTenant string, isOperator boo
 	// visible: hiding it would take a customer's own unattributed definitions away from them, which is a
 	// different fault than the one being fixed. New objects are always attributed by the write path.
 	owner := strings.TrimSpace(o.TenantID)
-	return owner == "" || strings.EqualFold(owner, callerTenant)
+	return owner == "" || owner == strings.TrimSpace(callerTenant)
 }
 
 func vlanPolicyVisibleTo(p model.VLANBoundaryPolicy, callerTenant string, isOperator bool) bool {
@@ -50,7 +50,7 @@ func vlanPolicyVisibleTo(p model.VLANBoundaryPolicy, callerTenant string, isOper
 		return true
 	}
 	owner := strings.TrimSpace(p.TenantID)
-	return owner == "" || strings.EqualFold(owner, callerTenant)
+	return owner == "" || owner == strings.TrimSpace(callerTenant)
 }
 
 func vlanObjectsVisibleTo(all []model.VLANObject, callerTenant string, isOperator bool) []model.VLANObject {

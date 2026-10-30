@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/policy"
@@ -34,7 +37,6 @@ const (
 	networkExtensionSnapshotDefaultTransportScope      = "real_edge"
 	networkExtensionSnapshotDefaultConnectorRealness   = "over_the_wire_local"
 	networkExtensionSnapshotSourceProtectedAppMap      = "admin_console_policy_snapshot"
-	networkExtensionSnapshotPolicyListLimit            = 10000
 	networkExtensionSnapshotRuntimeEvidenceSchema      = "network_extension_runtime_evidence.v1"
 	networkExtensionSnapshotRuntimeCopyEvidenceSchema  = "network_extension_runtime_copy_evidence.v1"
 	networkExtensionSnapshotRuntimeDiagnosticSchema    = "phase2_provider_runtime_diagnostic.v1"
@@ -68,6 +70,7 @@ type localNetworkExtensionSnapshotPublisherConfig struct {
 }
 
 type localNetworkExtensionSnapshotPublisher struct {
+	mu                                                          sync.Mutex // serialize publication; configuration callbacks are installed before serving
 	outputDir                                                   string
 	edgeURL                                                     string
 	runtimeCopyEndpointPath                                     string
@@ -268,6 +271,8 @@ func (publisher *localNetworkExtensionSnapshotPublisher) PublishAdminPolicySnaps
 	if publisher == nil {
 		return nil
 	}
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
 	if store == nil {
 		return fmt.Errorf("network extension snapshot publisher requires policy store")
 	}
@@ -283,10 +288,13 @@ func (publisher *localNetworkExtensionSnapshotPublisher) PublishAdminPolicySnaps
 	}
 	list, err := store.List(ctx, tenantID, policy.ListOptions{
 		Status: "active",
-		Limit:  networkExtensionSnapshotPolicyListLimit,
+		Limit:  math.MaxInt,
 	})
 	if err != nil {
 		return fmt.Errorf("list active policies for network extension snapshot: %w", err)
+	}
+	if list.Count != len(list.Policies) {
+		return fmt.Errorf("network extension snapshot requires a complete active policy list")
 	}
 	rules, err := networkExtensionRulesFromAdminPolicies(tenantID, list.Policies, bundle, now)
 	if err == nil {
@@ -312,7 +320,7 @@ func (publisher *localNetworkExtensionSnapshotPublisher) PublishAdminPolicySnaps
 		return fmt.Errorf("%w — the agent configuration WAS published; the steering rules were left as they were", err)
 	}
 	agentConfig := publisher.agentConfig(tenantID)
-	if err := os.MkdirAll(publisher.outputDir, 0o750); err != nil {
+	if err := os.MkdirAll(publisher.tenantOutputDir(tenantID), 0o750); err != nil {
 		return fmt.Errorf("create network extension snapshot dir: %w", err)
 	}
 	files := map[string]any{
@@ -324,7 +332,7 @@ func (publisher *localNetworkExtensionSnapshotPublisher) PublishAdminPolicySnaps
 		networkExtensionSnapshotLabRawAuthorityRef:     networkExtensionRawAuthorityDiagnosticPlaceholder(now),
 	}
 	for name, value := range files {
-		if err := writeNetworkExtensionSnapshotJSONAtomic(filepath.Join(publisher.outputDir, name), value); err != nil {
+		if err := writeNetworkExtensionSnapshotJSONAtomic(filepath.Join(publisher.tenantOutputDir(tenantID), name), value); err != nil {
 			return err
 		}
 	}
@@ -798,18 +806,18 @@ func (publisher *localNetworkExtensionSnapshotPublisher) publishAgentConfigOnly(
 	if publisher == nil {
 		return nil
 	}
-	if err := os.MkdirAll(publisher.outputDir, 0o750); err != nil {
+	if err := os.MkdirAll(publisher.tenantOutputDir(tenantID), 0o750); err != nil {
 		return fmt.Errorf("create network extension snapshot dir: %w", err)
 	}
 	return writeNetworkExtensionSnapshotJSONAtomic(
-		filepath.Join(publisher.outputDir, networkExtensionSnapshotAgentConfigRef), publisher.agentConfig(tenantID))
+		filepath.Join(publisher.tenantOutputDir(tenantID), networkExtensionSnapshotAgentConfigRef), publisher.agentConfig(tenantID))
 }
 
 // agentConfigOrganization is what an installer states about the organization a device is being enrolled into.
 // Empty when this deployment cannot say — a field that is absent is honest; one that is present and wrong
 // sends a device to a name nothing answers to.
 func agentConfigOrganization(tenantID string) map[string]any {
-	tenant := strings.ToLower(strings.TrimSpace(tenantID))
+	tenant := strings.TrimSpace(tenantID)
 	if tenant == "" {
 		return nil
 	}
@@ -862,3 +870,9 @@ func agentConfigOrganization(tenantID string) map[string]any {
 // agentConfigTransportAuthority is the control plane's own record of each organization's transport name. Nil
 // on an Edge, which asks its certificate index instead.
 var agentConfigTransportAuthority *tenantTransportAuthority
+
+// Exact tenant bytes select an injective, path-safe namespace. No unscoped
+// aliases are published: a consumer must select its tenant directory explicitly.
+func (publisher *localNetworkExtensionSnapshotPublisher) tenantOutputDir(tenantID string) string {
+	return filepath.Join(publisher.outputDir, "tenants", hex.EncodeToString([]byte(strings.TrimSpace(tenantID))))
+}

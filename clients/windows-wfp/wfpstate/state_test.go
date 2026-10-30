@@ -15,7 +15,7 @@ import (
 // DSSE_STATS would leave the decoder reading the wrong bytes and reporting a plausible wrong answer about
 // whether a machine has a network. This test re-derives the offsets from the header itself.
 
-var cFieldRE = regexp.MustCompile(`^\s*(unsigned\s+int|unsigned\s+short|unsigned\s+char|int|short|char)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;`)
+var cFieldRE = regexp.MustCompile(`^\s*(unsigned\s+long\s+long|unsigned\s+int|unsigned\s+short|unsigned\s+char|int|short|char)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;`)
 
 // parseCStructOffsets returns field name -> byte offset for a byte-packed (pshpack1) C struct in src.
 func parseCStructOffsets(t *testing.T, src, structName string) (map[string]int, int) {
@@ -31,7 +31,7 @@ func parseCStructOffsets(t *testing.T, src, structName string) (map[string]int, 
 	body := src[start : start+end]
 
 	sizes := map[string]int{
-		"unsigned int": 4, "int": 4,
+		"unsigned int": 4, "int": 4, "unsigned long long": 8,
 		"unsigned short": 2, "short": 2,
 		"unsigned char": 1, "char": 1,
 	}
@@ -81,6 +81,8 @@ func TestWFPStatsLayoutMatchesTheDriverHeader(t *testing.T) {
 		{"OwnerPresent", OffOwnerPresent},
 		{"OwnerDisarmOnExit", OffOwnerDisarmOnExit},
 		{"Version", OffVersion},
+		{"CaptiveActive", OffCaptiveActive}, {"CaptiveExpired", OffCaptiveExpired},
+		{"CaptiveGeneration", OffCaptiveGeneration}, {"CaptiveDeadline100ns", OffCaptiveDeadline},
 	} {
 		got, ok := offsets[tc.field]
 		if !ok {
@@ -90,14 +92,14 @@ func TestWFPStatsLayoutMatchesTheDriverHeader(t *testing.T) {
 			t.Errorf("%s: header says offset %d, decoder uses %d", tc.field, got, tc.want)
 		}
 	}
-	if size != StatsV3Size {
-		t.Errorf("sizeof(DSSE_STATS) = %d in the header, decoder expects %d", size, StatsV3Size)
+	if size != StatsV4Size {
+		t.Errorf("sizeof(DSSE_STATS) = %d in the header, decoder expects %d", size, StatsV4Size)
 	}
 
 	// The version constant must match too: a decoder that accepts an older driver would read the state block
 	// out of uninitialised bytes.
-	if !strings.Contains(src, "#define DSSE_STATS_VERSION 3") {
-		t.Errorf("DSSE_STATS_VERSION in the header is not 3; this decoder requires %d", StatsVersion)
+	if !strings.Contains(src, "#define DSSE_STATS_VERSION 4") {
+		t.Errorf("DSSE_STATS_VERSION in the header is not 4; this decoder requires %d", StatsVersion)
 	}
 }
 
@@ -105,7 +107,11 @@ func TestWFPStatsLayoutMatchesTheDriverHeader(t *testing.T) {
 
 // statsBuf builds a DSSE_STATS v3 reply.
 func statsBuf(version uint32, armed, observe, ownerPresent, disarmOnExit bool, pid uint32, port uint16) []byte {
-	b := make([]byte, StatsV3Size)
+	size := StatsV3Size
+	if version >= 4 {
+		size = StatsV4Size
+	}
+	b := make([]byte, size)
 	binary.LittleEndian.PutUint32(b[OffVersion:], version)
 	put32 := func(off int, on bool) {
 		if on {
@@ -192,7 +198,7 @@ func TestUnreadableStatsAreAnErrorNotAZeroValue(t *testing.T) {
 // A driver NEWER than this agent must still be readable: the struct grows append-only, so refusing it would
 // mean a driver upgrade blinds the watchdog that is supposed to survive upgrades.
 func TestANewerDriverIsAccepted(t *testing.T) {
-	buf := append(statsBuf(4, true, false, false, true, 5, 6), make([]byte, 16)...)
+	buf := append(statsBuf(5, true, false, false, true, 5, 6), make([]byte, 16)...)
 	s, err := Parse(buf)
 	if err != nil {
 		t.Fatalf("a newer driver must still decode: %v", err)
@@ -226,5 +232,46 @@ func TestVerifyDisarmed(t *testing.T) {
 	}
 	if !strings.Contains(unknown.Reason, "unknown") {
 		t.Fatalf("reason must say it is unknown, got %q", unknown.Reason)
+	}
+}
+
+func TestCaptiveDeadlineStateCannotVerifyNativeRecovery(t *testing.T) {
+	for _, expired := range []bool{false, true} {
+		b := statsBuf(4, false, false, false, false, 0, 0)
+		binary.LittleEndian.PutUint32(b[OffCaptiveActive:], 1)
+		if expired {
+			binary.LittleEndian.PutUint32(b[OffCaptiveExpired:], 1)
+		}
+		binary.LittleEndian.PutUint64(b[OffCaptiveGeneration:], 42)
+		binary.LittleEndian.PutUint64(b[OffCaptiveDeadline:], 1234)
+		s, err := Parse(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !s.CaptiveSupported || !s.CaptiveActive || s.CaptiveExpired != expired || s.CaptiveGeneration != 42 || s.CaptiveDeadline100ns != 1234 {
+			t.Fatalf("wrong state: %+v", s)
+		}
+		if VerifyDisarmed(s, nil).Verified {
+			t.Fatal("active guard was reported as native recovery")
+		}
+		if strings.Contains(s.String(), "traffic goes direct") {
+			t.Fatal(s.String())
+		}
+	}
+}
+
+func TestCaptiveDeadlineTruncatedOrInconsistentStateIsRejected(t *testing.T) {
+	b := statsBuf(4, false, false, false, false, 0, 0)
+	if _, err := Parse(b[:StatsV4Size-1]); err == nil {
+		t.Fatal("accepted truncated v4")
+	}
+	binary.LittleEndian.PutUint32(b[OffCaptiveActive:], 1)
+	if _, err := Parse(b); err == nil {
+		t.Fatal("accepted active guard without generation/deadline")
+	}
+	binary.LittleEndian.PutUint32(b[OffCaptiveActive:], 0)
+	binary.LittleEndian.PutUint32(b[OffCaptiveExpired:], 1)
+	if _, err := Parse(b); err == nil {
+		t.Fatal("accepted expired inactive guard")
 	}
 }

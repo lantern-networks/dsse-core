@@ -153,7 +153,7 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 		// says so, because nothing is broken — the device is simply in the wrong organization.
 		//
 		// The operator organization exists to ADMINISTER other organizations. It has no devices of its own.
-		if op := strings.TrimSpace(operatorTenantID); op != "" && strings.EqualFold(op, strings.TrimSpace(tenantOf(r))) {
+		if op := strings.TrimSpace(operatorTenantID); op != "" && op == strings.TrimSpace(tenantOf(r)) {
 			writeError(w, http.StatusConflict, fmt.Errorf(
 				"%q is this deployment's OPERATOR organization, which administers the others and has no devices of "+
 					"its own. Approving a device for it would enrol that machine under the deployment's own "+
@@ -201,16 +201,15 @@ func registerAdminEnrolmentTokenEndpoints(mux *http.ServeMux, tokens enrolltoken
 		//
 		// adminTenantIsGone is the right question and already exists: it answers only when the store can
 		// ENUMERATE, so a narrow store keeps working rather than refusing everything it cannot see.
-		if reason, gone := adminTenantIsGone(r.Context(), tenantModelStore, tenantOf(r)); gone &&
-			adminTenantAbsenceIsAuthoritative(configSourceURL) {
-			writeError(w, http.StatusNotFound, fmt.Errorf(
-				"%s, so a device cannot be approved for it", reason))
+		if reason, err := enrolmentLifecycleRefusal(r.Context(), tenantModelStore, tenantOf(r), adminTenantAbsenceIsAuthoritative(configSourceURL)); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("organization admission status is unavailable"))
 			return
-		}
-		if reason, refuse := adminTenantAdministrativelySuspended(r.Context(), tenantModelStore, tenantOf(r)); refuse {
-			writeError(w, http.StatusConflict, fmt.Errorf(
-				"%s, so no new device can be approved for it; the devices it already has keep working",
-				reason))
+		} else if reason != "" {
+			status := http.StatusConflict
+			if reason == enrolmentTenantAbsentReason {
+				status = http.StatusNotFound
+			}
+			writeError(w, status, fmt.Errorf("%s, so no new device can be approved for it", reason))
 			return
 		}
 		now := time.Now().UTC()
@@ -413,7 +412,7 @@ func enrolmentTokenTenantWarning(tokenTenant, enrolsForTenant string, mayNameThe
 	nodeIssuesForTokenTenant bool) string {
 	tokenTenant = strings.TrimSpace(tokenTenant)
 	enrolsForTenant = strings.TrimSpace(enrolsForTenant)
-	if tokenTenant == "" || enrolsForTenant == "" || strings.EqualFold(tokenTenant, enrolsForTenant) {
+	if tokenTenant == "" || enrolsForTenant == "" || tokenTenant == enrolsForTenant {
 		return ""
 	}
 	// ★★★ AND THE NODE'S OWN ORGANIZATION STOPPED BEING THE QUESTION ON 2026-08-21, WHILE THIS SENTENCE WENT ON
@@ -448,7 +447,7 @@ func enrolmentTokenEnrolsForDisclosure(r *http.Request, enrolsForTenant string) 
 		return enrolsForTenant
 	}
 	// A caller inside their own organization: their own name is theirs to see; anybody else's is not.
-	if strings.EqualFold(strings.TrimSpace(adminTenantIDFromRequest(r)), strings.TrimSpace(enrolsForTenant)) {
+	if strings.TrimSpace(adminTenantIDFromRequest(r)) == strings.TrimSpace(enrolsForTenant) {
 		return enrolsForTenant
 	}
 	return ""

@@ -8,10 +8,10 @@ package main
 // administrative privilege.
 //
 // It is not satisfied by default and cannot be. %ProgramFiles% grants BUILTIN\Users ReadAndExecute and every
-// file laid down under it inherits that, so a fresh install leaves all seven binaries runnable by any account
+// file laid down under it inherits that, so a fresh install leaves agent binaries runnable by any account
 // on the machine — measured on win-dev-1 before this existed:
 //
-//	compatcheck.exe  driversvc.exe  dsse-steer.exe  dsse-stepup-window.exe
+//	compatcheck.exe  driversvc.exe  dsse-steer.exe
 //	dsse-updater.exe  dsse-watchdog.exe  profileapply.exe      all: BUILTIN\Users ReadAndExecute
 //
 // ★ THE DACL IS PROTECTED, WHICH IS THE WHOLE MECHANISM. Removing the Users entry without setting "P" would
@@ -23,17 +23,8 @@ package main
 // MajorUpgrade (the new ProductCode is not yet installed), so the hardening is reapplied every time the files
 // are.
 //
-// ★★★ AND ONE BINARY IS DELIBERATELY EXEMPT, because the product cannot work otherwise.
-// dsse-stepup-window.exe is started by the SYSTEM agent with WTSQueryUserToken + CreateProcessAsUserW — it
-// runs AS THE LOGGED-IN USER, in that user's session, because it is a window that user has to see and type
-// into. CreateProcessAsUserW fails if the token holds no execute right on the image, so removing the user's
-// access here does not harden step-up: it removes step-up. The exception is therefore not a relaxation of the
-// rule but a statement of where the rule cannot reach, and it is narrowed to READ|EXECUTE on that single file.
-//
-// ★ THE EXCEPTION IS ACCEPTED, and by whom is worth recording: the operator, 2026-09-09, after being shown
-// that CreateProcessAsUserW is what forces it. It is therefore not an unreviewed gap that a later reader
-// should quietly close — closing it removes step-up authentication from the product. Anyone narrowing this
-// further is reversing a decision, not tightening an oversight, and needs the same conversation again.
+// Step-up now launches the user's default browser. The retired embedded WebView
+// helper is not shipped, so there is no user-executable exception in this list.
 
 import (
 	"fmt"
@@ -51,14 +42,6 @@ import (
 // TrustedInstaller is kept because Windows servicing owns files under %ProgramFiles% and a file it cannot
 // touch is a file that breaks servicing rather than a file that is safer.
 const agentBinaryDACL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464)"
-
-// stepUpWindowDACL is agentBinaryDACL plus READ|EXECUTE for BUILTIN\Users (0x1200a9 = FILE_GENERIC_READ |
-// FILE_GENERIC_EXECUTE). Read is inseparable from execute for an image the loader has to map.
-const stepUpWindowDACL = agentBinaryDACL + "(A;;0x1200a9;;;BU)"
-
-// stepUpWindowExe is the one binary a non-administrator must be able to start. Named here rather than derived,
-// so that adding a second user-context binary is an edit somebody has to make on purpose.
-const stepUpWindowExe = "dsse-stepup-window.exe"
 
 // hardenAgentBinaries applies the protected DACLs to every executable in dir and reports what it did.
 //
@@ -78,11 +61,6 @@ func hardenAgentBinaries(dir string) (lines []string, err error) {
 		}
 		sddl := agentBinaryDACL
 		note := "administrators and SYSTEM only"
-		if strings.EqualFold(e.Name(), stepUpWindowExe) {
-			sddl = stepUpWindowDACL
-			note = "administrators, SYSTEM, and BUILTIN\\Users read+execute — it runs in the user's own " +
-				"session by design (CreateProcessAsUserW) and cannot be locked to administrators"
-		}
 		path := filepath.Join(dir, e.Name())
 		if serr := setProtectedFileDACL(path, sddl); serr != nil {
 			failures = append(failures, e.Name())

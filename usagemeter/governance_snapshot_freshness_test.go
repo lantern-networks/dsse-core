@@ -1,6 +1,7 @@
 package usagemeter
 
 import (
+	"errors"
 	"testing"
 	"time"
 )
@@ -13,11 +14,42 @@ func snapshotPeriod() (time.Time, time.Time, time.Time) {
 
 func recordedSeat(t *testing.T, store *UsageMeterStore, tenantID string, start, end time.Time) (float64, string) {
 	t.Helper()
-	record, found := usageMeterGovernanceSnapshot(store, "human_seat", tenantID, start, end)
-	if !found {
+	record, found, err := usageMeterGovernanceSnapshot(store, "human_seat", tenantID, start, end)
+	if err != nil || !found {
 		t.Fatalf("no human_seat snapshot recorded for %s", tenantID)
 	}
 	return record.Quantity, StringUsageMeterDimension(record.Dimensions, "measurement_scope")
+}
+
+func TestMeasuredZeroReplacesPriorSeatSnapshot(t *testing.T) {
+	start, end, now := snapshotPeriod()
+	store := NewUsageMeterStore()
+	RecordUsageMeterGovernanceSnapshotWithRegistryStatus(store, "tenant_northwind", 1, "identity_directory_active_humans", 1, true, start, end, now)
+	RecordUsageMeterGovernanceSnapshotWithRegistryStatus(store, "tenant_northwind", 0, "identity_directory_active_humans", 0, true, start, end, now.Add(time.Minute))
+	summary := store.Summary("tenant_northwind", start, end)
+	for _, meterType := range []string{"human_seat", "nhi_seat"} {
+		meter, ok := summary.Meters[meterType]
+		if !ok || meter.Quantity != 0 || summary.Records != 2 {
+			t.Fatalf("%s stale after measured zero: %+v", meterType, summary)
+		}
+	}
+}
+
+type failingUsageRecordReader struct{ *UsageMeterStore }
+
+func (f failingUsageRecordReader) UsageMeterRecords(string, time.Time, time.Time) ([]UsageMeterRecord, error) {
+	return nil, errors.New("read unavailable")
+}
+
+func TestGovernanceReadFailureCannotDowngradeMeasuredSnapshot(t *testing.T) {
+	start, end, now := snapshotPeriod()
+	store := NewUsageMeterStore()
+	RecordUsageMeterGovernanceSnapshot(store, "tenant_northwind", 43, "identity_directory_active_humans", 1, start, end, now)
+	RecordUsageMeterGovernanceSnapshot(failingUsageRecordReader{store}, "tenant_northwind", 90, "admin_auth_principals_proxy_until_identity_directory", 1, start, end, now.Add(time.Minute))
+	quantity, scope := recordedSeat(t, store, "tenant_northwind", start, end)
+	if quantity != 43 || scope != "identity_directory_active_humans" {
+		t.Fatalf("failed read downgraded measured value to %v (%s)", quantity, scope)
+	}
 }
 
 // The defect, demonstrated live before it was fixed: the directory went from 43 active people to 42 and the

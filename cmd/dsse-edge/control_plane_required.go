@@ -10,6 +10,25 @@ import (
 // pulled must never claim its empty set means zero.
 var edgeIsControlPlane bool
 
+// Keep the receiver's fixed fallback in one place before selecting stores and
+// registering routes. Dynamic leader selection still governs live CP calls.
+func resolveConfigSourceURL(sourceURL, sourceEndpoints string) (string, error) {
+	fixed := strings.TrimSpace(sourceURL)
+	if strings.TrimSpace(sourceEndpoints) == "" {
+		return fixed, nil
+	}
+	if err := validateCPEndpointSeed(sourceEndpoints); err != nil {
+		return "", err
+	}
+	if fixed != "" {
+		return fixed, nil
+	}
+	// An endpoints-only Edge still needs a nonempty base for role checks and
+	// remote-authority constructors. This is a startup fallback from the declared
+	// list, never a local authority; live calls prefer the existing leader selector.
+	return parseCPEndpoints(sourceEndpoints)[0].Endpoint, nil
+}
+
 // The control plane is not an optional component of this system.
 //
 // Config, admission and revocation are AUTHORED on the control plane and distributed from it. An Edge started
@@ -27,6 +46,11 @@ var edgeIsControlPlane bool
 // process is not part of a fleet without knowing anything else about the flag.
 func requireControlPlaneOrExit(mode string, isControlPlane bool, configSourceURL, configSourceEndpoints string, noControlPlane bool) {
 	edgeIsControlPlane = isControlPlane
+	if isEdgeNeedingAControlPlane(mode, isControlPlane) && strings.TrimSpace(configSourceEndpoints) != "" {
+		if err := validateCPEndpointSeed(configSourceEndpoints); err != nil {
+			log.Fatalf("REFUSING TO START: invalid -config-source-endpoints: %v", err)
+		}
+	}
 	if controlPlaneRequired(mode, isControlPlane, configSourceURL, configSourceEndpoints, noControlPlane) {
 		log.Fatalf("REFUSING TO START: this Edge has no control plane. Set -config-source-url (single CP) or -config-source-endpoints (multi-region), so that config, admission and revocation reach this node from where they are authored. An Edge that holds its own truth drifts from the rest of the fleet and reports itself healthy the whole time. If this really is a single-process test harness rather than a deployment, pass -no-control-plane.")
 	}
@@ -73,5 +97,8 @@ func isEdgeNeedingAControlPlane(mode string, isControlPlane bool) bool {
 }
 
 func hasAControlPlane(configSourceURL, configSourceEndpoints string) bool {
-	return strings.TrimSpace(configSourceURL) != "" || strings.TrimSpace(configSourceEndpoints) != ""
+	if strings.TrimSpace(configSourceEndpoints) != "" {
+		return validateCPEndpointSeed(configSourceEndpoints) == nil
+	}
+	return strings.TrimSpace(configSourceURL) != ""
 }

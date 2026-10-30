@@ -23,7 +23,7 @@ function renderApplicationsView(content) {
   const search = el("input", { class: "ui-input ui-search", type: "search", placeholder: bl({ en: "Search applications…", ja: "アプリを検索…" }) });
   search.value = _appsState.search;
   search.addEventListener("input", () => { _appsState.search = search.value; renderAppList(host); });
-  const typeF = uiField({ name: "type", type: "select", value: _appsState.type, options: [
+  const typeF = uiField({ name: "type", label: bl({ en: "Type", ja: "種別" }), type: "select", value: _appsState.type, options: [
     { value: "all", label: bl({ en: "All types", ja: "全種別" }) },
     { value: "private_app", label: bl({ en: "Internal app", ja: "社内アプリ" }) },
     { value: "saas", label: bl({ en: "SaaS app", ja: "SaaS アプリ" }) },
@@ -180,6 +180,13 @@ function applicationWriteError(r) {
   }
   return (r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status);
 }
+function applicationPublishConfirmed(r, applicationID) {
+  const body = r && r.body, app = body && body.application, review = body && body.review;
+  return r && r.status === 200 && body && body.schema_version === "application_publish.v1" &&
+    app && app.application_id === applicationID && app.published === true &&
+    review && typeof review.published_route === "boolean" && typeof review.policy_assigned === "boolean" &&
+    Number.isSafeInteger(review.users_allowed_now) && review.users_allowed_now >= 0;
+}
 function openPublishWizard(content, existing) {
   existing = existing || null;
   const idF = uiField({ name: "pub_id", label: bl({ en: "Application ID", ja: "アプリ ID" }), required: true, value: existing ? existing.application_id : "",
@@ -274,11 +281,12 @@ function openPublishWizard(content, existing) {
     if (submit.disabled) return;
     if (!idF.validate() || !nameF.validate() || !destF.validate() || !portF.validate() || !nsF.validate()) return;
     submit.disabled = true;
+    const submittedID = idF.get();
     const body = { name: nameF.get(), destination: destF.get(), publish_protocol: typeF.get(), connector_group_id: siteF.get(), routing_namespace: nsF.get() };
     if (portF.get()) body.destination_port = parseInt(portF.get(), 10);
     if (override) body.override_cidr_collision = true;
     try {
-      const r = await apiFetch("POST", "/admin/applications/" + encodeURIComponent(idF.get()) + "/publish", body);
+      const r = await apiFetch("POST", "/admin/applications/" + encodeURIComponent(submittedID) + "/publish", body);
       if (r.status === 409 && r.body && r.body.error === "cidr_route_collision") { renderCollision(r.body); return; }
       if (!r.ok) {
         submit.disabled = false;
@@ -287,6 +295,10 @@ function openPublishWizard(content, existing) {
         else destF.setError(m);
         uiToast(m, "err");
         return;
+      }
+      if (!applicationPublishConfirmed(r, submittedID)) {
+        throw new Error(bl({ en: "The response did not confirm publication. Reload the application before retrying.",
+          ja: "応答から公開完了を確認できません。再試行前にアプリを再読込してください。" }));
       }
       const review = (r.body && r.body.review) || {};
       // review: Published route / Policy assigned / Users allowed now. Make Published != Allow explicit.
@@ -300,7 +312,10 @@ function openPublishWizard(content, existing) {
       submit.textContent = bl({ en: "Done", ja: "完了" });
       submit.disabled = false;
       submit.onclick = () => { modal.close(); renderApplicationsView(document.getElementById("content")); };
-      uiToast(bl({ en: "Private app published.", ja: "社内アプリを公開しました。" }), "ok");
+      uiToast(review.published_route
+        ? bl({ en: "Private app published.", ja: "社内アプリを公開しました。" })
+        : bl({ en: "Publication was saved, but this app has no active route. Check its status and destination.", ja: "公開設定を保存しましたが、このアプリに有効なルートはありません。状態と宛先を確認してください。" }),
+      review.published_route ? "ok" : "warn");
     } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
   }
   // One handler owns the current step. Keeping the original listener alongside

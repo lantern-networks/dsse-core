@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +31,18 @@ func TestPostgresApplicationCatalogMigrationMatchesSchemaSQL(t *testing.T) {
 	}
 }
 
+func TestPostgresApplicationCatalogLegacyImportMigrationMatchesSchemaSQL(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "migrations", "057_application_catalog_import.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := normalizePostgresExportTaskSQLContract(strings.Join(postgresApplicationCatalogImportSchemaSQL(), "\n"))
+	got := normalizePostgresExportTaskSQLContract(string(data))
+	if got != want {
+		t.Fatalf("legacy import migration SQL does not match schema helper\nmigration: %s\nhelper: %s", got, want)
+	}
+}
+
 // TestPostgresApplicationCatalogSchemaSecurityContracts pins the tenant-scoping invariant (composite PK on
 // tenant_id) and the full-fidelity columns that must survive a round-trip.
 func TestPostgresApplicationCatalogSchemaSecurityContracts(t *testing.T) {
@@ -48,11 +62,11 @@ func TestPostgresApplicationCatalogSchemaSecurityContracts(t *testing.T) {
 	}
 }
 
-// TestPostgresApplicationCatalogMigrationVersions confirms the component migration set is the single 026 migration.
+// TestPostgresApplicationCatalogMigrationVersions confirms both the catalog and its durable import ledger apply.
 func TestPostgresApplicationCatalogMigrationVersions(t *testing.T) {
 	versions := postgresApplicationCatalogMigrationVersions()
-	if len(versions) != 1 || versions[0] != postgresMigrationApplicationCatalog {
-		t.Fatalf("application catalog migration versions = %#v, want [%s]", versions, postgresMigrationApplicationCatalog)
+	if len(versions) != 2 || versions[0] != postgresMigrationApplicationCatalog || versions[1] != postgresMigrationApplicationCatalogImport {
+		t.Fatalf("application catalog migration versions = %#v, want [%s, %s]", versions, postgresMigrationApplicationCatalog, postgresMigrationApplicationCatalogImport)
 	}
 }
 
@@ -112,6 +126,71 @@ func TestSetupApplicationCatalogStoreFileUnchanged(t *testing.T) {
 	}
 	if _, ok, gerr := second.Get(ctx, tenantID, "app_seed_https"); gerr != nil || !ok {
 		t.Fatalf("seed entry missing after restart: ok=%v err=%v", ok, gerr)
+	}
+}
+
+func TestPostgresApplicationCatalogListAllBeyondFirstThousand(t *testing.T) {
+	// This bulk test creates/drops the catalog table, so it needs its own
+	// disposable database rather than the shared Postgres E2E database.
+	dsn := os.Getenv("DSSE_CATALOG_LISTALL_E2E_DSN")
+	if dsn == "" {
+		t.Skip("DSSE_CATALOG_LISTALL_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var databaseName string
+	if err := db.QueryRowContext(ctx, "SELECT current_database()").Scan(&databaseName); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(databaseName, "review_") && !strings.HasPrefix(databaseName, "test_") {
+		t.Fatalf("full-catalog E2E requires a disposable review_/test_ database, got %q", databaseName)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS application_catalog"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS application_catalog") }()
+	for _, statement := range postgresApplicationCatalogSchemaSQL() {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const tenant = "tenant_catalog_complete"
+	if _, err := db.ExecContext(ctx, `INSERT INTO application_catalog
+		(tenant_id, application_id, name, application_type, status, updated_at)
+		SELECT $1, 'a' || lpad(g::text, 4, '0'), 'ordinary', 'private_app', 'active', now()
+		FROM generate_series(0, 999) AS g`, tenant); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO application_catalog
+		(tenant_id, application_id, name, application_type, status, published, destination, destination_port, publish_protocol, updated_at)
+		VALUES ($1, 'zzzz', 'disabled', 'private_app', 'disabled', true, 'disabled.example.test', 443, 'web', now())`, tenant); err != nil {
+		t.Fatal(err)
+	}
+	store := &postgresApplicationCatalogStore{db: db}
+	bounded, err := store.List(ctx, tenant, appcatalog.ListOptions{ApplicationType: "private_app", Limit: 1000})
+	if err != nil || bounded.Count != 1001 || len(bounded.Applications) != 1000 {
+		t.Fatalf("bounded List contract changed: count=%d len=%d err=%v", bounded.Count, len(bounded.Applications), err)
+	}
+	all, err := store.ListAll(ctx, tenant, appcatalog.ListAllOptions{ApplicationType: "private_app"})
+	if err != nil || len(all) != 1001 || all[len(all)-1].ApplicationID != "zzzz" {
+		t.Fatalf("trusted full list incomplete: len=%d err=%v", len(all), err)
+	}
+	other, err := store.ListAll(ctx, "other_tenant", appcatalog.ListAllOptions{})
+	if err != nil || len(other) != 0 {
+		t.Fatalf("trusted full list crossed tenant boundary: len=%d err=%v", len(other), err)
+	}
+	base := map[string]edgeplane.ApplicationRouteProfile{"zzzz": {Destination: "old-enabled.example.test"}}
+	routes, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, base, store, tenant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := routes["zzzz"]; ok {
+		t.Fatal("late disabled Postgres row left base route enabled")
 	}
 }
 
@@ -275,5 +354,199 @@ func TestPostgresApplicationCatalogStoreE2E(t *testing.T) {
 	section, removed, err := state.read(ctx, store)
 	if err != nil || removed <= changed || len(section.Entries[tenantB]) != 0 || len(section.Entries[tenantA]) != 2 {
 		t.Fatalf("shared snapshot did not carry tenant-isolated deletion: %v", err)
+	}
+}
+
+func TestPostgresApplicationCatalogImportsAuthoredLocalRowsWithoutReplacingNewerSharedRows(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	base, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	schema := fmt.Sprintf("application_import_%d", time.Now().UnixNano())
+	if _, err := base.ExecContext(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatal(err)
+	}
+	defer base.ExecContext(context.Background(), "DROP SCHEMA "+schema+" CASCADE")
+	u, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := u.Query()
+	query.Set("search_path", schema)
+	u.RawQuery = query.Encode()
+	db, err := sql.Open("postgres", u.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	pgAuth := postgresAdminAuthStore{DB: db}
+	// The same selected component migrations the generated CP runs must create
+	// both durable tables on a fresh database, before any local-file import.
+	if _, err := setupPostgresApplicationCatalogStore(ctx, pgAuth, filepath.Join("..", "..", "migrations"), true, nil); err != nil {
+		t.Fatalf("fresh component migrations: %v", err)
+	}
+	const operator, customer = "tenant_operator", "tenant_customer"
+	seed := map[string]edgeplane.ApplicationRouteProfile{"app_seed": {}}
+	file := filepath.Join(t.TempDir(), "application_catalog.json")
+	local, err := setupApplicationCatalogStore(ctx, file, newAdminAuthStore(), "", false, operator, seed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ tenant, id, name string }{
+		{operator, "app_owned", "stale local copy"},
+		{operator, "app_operator_second", "second operator app"},
+		{customer, "app_customer", "customer private app"},
+		{customer, "app_customer_second", "second customer app"},
+	} {
+		if _, err := local.Upsert(ctx, appcatalog.Entry{ApplicationID: row.id, Name: row.name, ApplicationType: "private_app", Status: "active"}, row.tenant, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	legacyBytes, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shared, err := setupPostgresApplicationCatalogStore(ctx, pgAuth, "", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := shared.Upsert(ctx, appcatalog.Entry{ApplicationID: "app_owned", Name: "newer shared copy", ApplicationType: "private_app", Status: "active"}, operator, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	seedOnlyFile := filepath.Join(t.TempDir(), "application_catalog.json")
+	if err := os.WriteFile(seedOnlyFile, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupApplicationCatalogStore(ctx, "postgres+import:"+seedOnlyFile, pgAuth, "", false, operator, seed, nil); err != nil {
+		t.Fatalf("seed-only old CP startup: %v", err)
+	}
+	if _, err := os.Stat(seedOnlyFile); !os.IsNotExist(err) {
+		t.Fatalf("seed-only old file was not retired: %v", err)
+	}
+	var seals int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM application_catalog_legacy_import_state").Scan(&seals); err != nil || seals != 0 {
+		t.Fatalf("seed-only old CP sealed import before authored CP: seals=%d err=%v", seals, err)
+	}
+	// CP A and C have no local authored file. They start before B and must
+	// observe B's eventual import through the same shared database.
+	absentDir := t.TempDir()
+	cpA, err := setupApplicationCatalogStore(ctx, "postgres+import:"+filepath.Join(absentDir, "a.json"), pgAuth, "", false, operator, seed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpC, err := setupApplicationCatalogStore(ctx, "postgres+import:"+filepath.Join(absentDir, "c.json"), pgAuth, "", false, operator, seed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := "postgres+import:" + file
+	var cpB appcatalog.RuntimeStore
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			// Simulate restoring the stale local file from a node snapshot.
+			if err := os.WriteFile(file, legacyBytes, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		migrated, err := setupApplicationCatalogStore(ctx, selected, pgAuth, "", false, operator, seed, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(file); !os.IsNotExist(err) {
+			t.Fatalf("legacy tenant data remained outside purge after CP startup: %v", err)
+		}
+		cpB = migrated
+		if got, found, err := migrated.Get(ctx, operator, "app_owned"); err != nil || !found || got.Name != "newer shared copy" {
+			t.Fatalf("newer shared row was replaced: %+v, found=%v, err=%v", got, found, err)
+		}
+		if got, found, err := migrated.Get(ctx, customer, "app_customer"); err != nil || !found || got.Name != "customer private app" {
+			t.Fatalf("customer authored row was not imported: %+v, found=%v, err=%v", got, found, err)
+		}
+		if _, found, err := migrated.Get(ctx, operator, "app_seed"); err != nil || !found {
+			t.Fatalf("configuration seed disappeared: found=%v, err=%v", found, err)
+		}
+		var rows int
+		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM application_catalog").Scan(&rows); err != nil || rows != 4 {
+			t.Fatalf("imported authored row count=%d, err=%v; seed must remain config-derived", rows, err)
+		}
+	}
+	edgeCatalog := appcatalog.NewStore()
+	var before *applicationCatalogBundle
+	var generation uint64
+	var bundleState *applicationBundleState
+	for _, cp := range []appcatalog.RuntimeStore{cpA, cpB, cpC} {
+		bundleState = &applicationBundleState{}
+		before, generation, err = bundleState.read(ctx, cp)
+		if err != nil || before == nil || !before.Complete {
+			t.Fatalf("shared catalog did not survive CP leader switch into a complete Edge bundle: generation=%d, err=%v", generation, err)
+		}
+		if err := applyApplicationBundle(edgeCatalog, before); err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range []struct{ tenant, id string }{
+			{operator, "app_owned"}, {operator, "app_operator_second"},
+			{customer, "app_customer"}, {customer, "app_customer_second"},
+		} {
+			if _, found, err := edgeCatalog.Get(ctx, row.tenant, row.id); err != nil || !found {
+				t.Fatalf("CP failover dropped %s/%s from Edge: found=%v, err=%v", row.tenant, row.id, found, err)
+			}
+		}
+	}
+	if _, found, err := edgeCatalog.Get(ctx, customer, "app_customer"); err != nil || !found {
+		t.Fatalf("imported customer route did not reach Edge: found=%v, err=%v", found, err)
+	}
+	if err := shared.Delete(ctx, customer, "app_customer"); err != nil {
+		t.Fatal(err)
+	}
+	// Tenant erasure removes the tenant-keyed import markers. The DB-wide
+	// source seal must still prevent a restored old-node JSON from recreating
+	// the erased application during a later CP restart.
+	if _, err := db.ExecContext(ctx, "DELETE FROM application_catalog_legacy_imports WHERE tenant_id = $1", customer); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, legacyBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	afterDeletion, err := setupApplicationCatalogStore(ctx, selected, pgAuth, "", false, operator, seed, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(file); !os.IsNotExist(err) {
+		t.Fatalf("stale restored source was not retired before CP became ready: %v", err)
+	}
+	if _, found, err := afterDeletion.Get(ctx, customer, "app_customer"); err != nil || found {
+		t.Fatalf("stale local file resurrected intentionally deleted customer app: found=%v, err=%v", found, err)
+	}
+	after, nextGeneration, err := bundleState.read(ctx, afterDeletion)
+	if err != nil || nextGeneration <= generation {
+		t.Fatalf("shared deletion did not advance Edge bundle: %d -> %d, err=%v", generation, nextGeneration, err)
+	}
+	if err := applyApplicationBundle(edgeCatalog, after); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := edgeCatalog.Get(ctx, customer, "app_customer"); err != nil || found {
+		t.Fatalf("deleted customer route remained on Edge: found=%v, err=%v", found, err)
+	}
+	var markers int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM application_catalog_legacy_imports").Scan(&markers); err != nil || markers != 2 {
+		t.Fatalf("remaining operator import marker count=%d, err=%v", markers, err)
+	}
+	if err := os.WriteFile(file, []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupApplicationCatalogStore(ctx, selected, pgAuth, "", false, operator, seed, nil); err == nil {
+		t.Fatal("unreadable migration source was accepted as an empty catalog")
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE application_catalog_legacy_imports"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := setupApplicationCatalogStore(ctx, selected, pgAuth, "", true, operator, seed, nil); err == nil || !strings.Contains(err.Error(), "predates the durable import marker") {
+		t.Fatalf("pre-marker shared catalog with ambiguous import was not refused: %v", err)
 	}
 }

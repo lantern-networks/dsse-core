@@ -35,6 +35,16 @@ type adminTenantModelAdminStore interface {
 	Delete(context.Context, string) error
 }
 
+// MutateExisting evaluates a security-sensitive edit against the latest tenant
+// row while holding the backend's write fence. A Get followed by Put cannot
+// protect a customer withdrawal or retain concurrent elevation history.
+type adminTenantModelConditionalStore interface {
+	MutateExisting(context.Context, string, time.Time, func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error)
+	MutateOrCreate(context.Context, string, time.Time, func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error)
+}
+
+var errAdminTenantModelMissing = errors.New("organization record does not exist")
+
 // adminTenantModelFleetCarrier is everything the tenant registry has to say to the REST OF THE FLEET: the
 // registry's config version, the deletions it carries by name, and the standing erasure orders.
 //
@@ -57,12 +67,20 @@ type adminTenantModelFleetCarrier interface {
 	PurgeOrders() []tenantPurgeOrder
 }
 
+// A bundle must distinguish an empty history from an unreadable one. The older
+// no-error methods remain for local purge checks, where a failed read refuses
+// the purge, but cannot be used to publish an authoritative fleet snapshot.
+type adminTenantModelFleetReader interface {
+	DeletedTenantsChecked(context.Context) ([]tenantDeletion, error)
+	PurgeOrdersChecked(context.Context) ([]tenantPurgeOrder, error)
+}
+
 // tenantPurgeOrderStands verifies the recorded order after a confirmed save.
 // Read-back alone cannot establish durability for an in-memory file-store view.
 func tenantPurgeOrderStands(carrier adminTenantModelFleetCarrier, tenantID string) bool {
 	tenantID = strings.TrimSpace(tenantID)
 	for _, order := range carrier.PurgeOrders() {
-		if strings.EqualFold(strings.TrimSpace(order.TenantID), tenantID) {
+		if strings.TrimSpace(order.TenantID) == tenantID {
 			return true
 		}
 	}
@@ -432,6 +450,10 @@ func (store *adminTenantModelStore) PurgeOrders() []tenantPurgeOrder {
 	return out
 }
 
+func (store *adminTenantModelStore) PurgeOrdersChecked(context.Context) ([]tenantPurgeOrder, error) {
+	return store.PurgeOrders(), nil
+}
+
 // DeletedTenants returns the tombstones — the tenants this node has deleted, by name, with when. The config
 // bundle carries these so a receiving Edge deletes because it was TOLD to; see the field comment for why the
 // alternative (delete anything the payload omits) is not available to us.
@@ -444,6 +466,10 @@ func (store *adminTenantModelStore) DeletedTenants() []tenantDeletion {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
 	return out
+}
+
+func (store *adminTenantModelStore) DeletedTenantsChecked(context.Context) ([]tenantDeletion, error) {
+	return store.DeletedTenants(), nil
 }
 
 func (store *adminTenantModelStore) Get(_ context.Context, tenantID string) (adminTenantModel, error) {
@@ -563,6 +589,54 @@ func (store *adminTenantModelStore) Put(_ context.Context, tenant adminTenantMod
 		tenant.CreatedAt = copyStringPtr(existing.CreatedAt)
 	}
 	normalized, err := normalizeAdminTenantModel(tenant, tenantID, now)
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	if err := store.commitAuthoredTenantLocked(normalized); err != nil {
+		return adminTenantModel{}, err
+	}
+	return stampOperatorFlag(normalized, store.operatorTenantID), nil
+}
+
+func (store *adminTenantModelStore) MutateExisting(ctx context.Context, tenantID string, now time.Time, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+	return store.mutateTenant(ctx, tenantID, now, false, edit)
+}
+
+func (store *adminTenantModelStore) MutateOrCreate(ctx context.Context, tenantID string, now time.Time, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+	return store.mutateTenant(ctx, tenantID, now, true, edit)
+}
+
+func (store *adminTenantModelStore) mutateTenant(ctx context.Context, tenantID string, now time.Time, createIfAbsent bool, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+	if err := ctx.Err(); err != nil {
+		return adminTenantModel{}, err
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" || edit == nil {
+		return adminTenantModel{}, fmt.Errorf("tenant_id and edit are required")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	current, ok := store.tenants[tenantID]
+	if !ok {
+		if !createIfAbsent {
+			return adminTenantModel{}, errAdminTenantModelMissing
+		}
+		if _, deleted := store.deleted[tenantID]; deleted {
+			return adminTenantModel{}, errAdminTenantModelMissing
+		}
+		current = adminTenantModel{TenantID: tenantID, DisplayName: tenantID, Status: "active"}
+	}
+	next, err := edit(stampOperatorFlag(current, store.operatorTenantID))
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	if next.CreatedAt == nil {
+		next.CreatedAt = copyStringPtr(current.CreatedAt)
+	}
+	normalized, err := normalizeAdminTenantModel(next, tenantID, now)
 	if err != nil {
 		return adminTenantModel{}, err
 	}
@@ -733,7 +807,7 @@ func normalizeAdminTenantOptionalToken(value *string, field string) error {
 }
 
 func safeAdminTenantToken(value string) bool {
-	if value == "" {
+	if value == "" || value == "." || value == ".." {
 		return false
 	}
 	for _, ch := range value {
@@ -900,7 +974,7 @@ func stampAdminTenantModelAuditActor(record model.AuditLog, r *http.Request, ten
 			// was, and adminOperateWithinTenantAuditLog had already established it, so this emitter uses those
 			// keys instead of adding a fourth name for one thing.
 			if operating := strings.TrimSpace(identity.TenantID); operating != "" &&
-				!strings.EqualFold(operating, strings.TrimSpace(tenant.TenantID)) {
+				operating != strings.TrimSpace(tenant.TenantID) {
 				stampOperatorActor(record.Metadata, identity)
 			}
 		}
@@ -926,7 +1000,7 @@ func adminTenantExists(ctx context.Context, store adminTenantModelRuntimeStore, 
 	}
 	want := strings.TrimSpace(tenantID)
 	for _, t := range tenants {
-		if strings.EqualFold(strings.TrimSpace(t.TenantID), want) {
+		if strings.TrimSpace(t.TenantID) == want {
 			return true, nil
 		}
 	}

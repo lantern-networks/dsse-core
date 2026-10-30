@@ -72,10 +72,10 @@ func TestStartupFirstBootAndSavedEmptySnapshot(t *testing.T) {
 	if err := restored.SetStateFile(path); err != nil {
 		t.Fatal(err)
 	}
-	if restored.SeatsFor("customer") != 5 {
+	if restored.SeatsFor("Customer") != 5 {
 		t.Fatal("saved seats lost")
 	}
-	if _, err := restored.RemoveConfirmed("customer"); err != nil {
+	if _, err := restored.RemoveConfirmed("Customer"); err != nil {
 		t.Fatal(err)
 	}
 	empty := NewStore()

@@ -60,7 +60,10 @@ func TestTheGeneratedFileIsValidCompose(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read the environment file: %v", err)
 			}
-			extra := "\nDSSE_IMAGE=dsse:test\nDSSE_CONSOLE_IMAGE=dsse-console:test\n"
+			cohort := candidateDataLayer()
+			extra := "\nDSSE_IMAGE=dsse:test\nDSSE_CONSOLE_IMAGE=dsse-console:test\n" +
+				"DSSE_ETCD_IMAGE=" + cohort.EtcdImage + "\nDSSE_POSTGRES_IMAGE=" + cohort.PostgresImage +
+				"\nDSSE_PSQL_IMAGE=" + cohort.PostgresToolsImage + "\n"
 			if err := os.WriteFile(filepath.Join(dir, "deployment.env"), append(env, []byte(extra)...), 0o600); err != nil {
 				t.Fatal(err)
 			}

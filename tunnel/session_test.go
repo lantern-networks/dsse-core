@@ -417,9 +417,9 @@ func TestSessionOpenTCPRejectsInvalidOpenFramesBeforeWrite(t *testing.T) {
 			errContains: "idle_timeout_ms cannot exceed",
 		},
 		{
-			name: "missing_byte_cap",
+			name: "negative_byte_cap",
 			mutate: func(frame *Frame) {
-				frame.ByteCap = 0
+				frame.ByteCap = -1
 			},
 			errContains: "byte_cap",
 		},
@@ -750,9 +750,9 @@ func TestValidateTCPOpenFrameRequiresDoSGuardLimits(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "missing byte cap",
+			name: "negative byte cap",
 			mutate: func(frame *Frame) {
-				frame.ByteCap = 0
+				frame.ByteCap = -1
 			},
 			wantErr: "byte_cap",
 		},
@@ -822,14 +822,14 @@ func TestValidateTCPOpenFrameAllowsUnlimitedIdleAndLifetime(t *testing.T) {
 			},
 		},
 		{
-			name:    "positive idle still capped",
-			mutate:  func(f *Frame) { f.IdleTimeoutMillis = MaxTCPIdleTimeoutMillis + 1 },
+			name:    "negative idle rejected",
+			mutate:  func(f *Frame) { f.IdleTimeoutMillis = -1 },
 			wantErr: "idle_timeout_ms",
 		},
 		{
-			name: "positive lifetime still capped",
+			name: "negative lifetime rejected",
 			mutate: func(f *Frame) {
-				f.MaxConnectionLifetimeMillis = MaxTCPConnectionLifetimeMillis + 1
+				f.MaxConnectionLifetimeMillis = -1
 				f.IdleTimeoutMillis = 0
 			},
 			wantErr: "max_connection_lifetime_ms",
@@ -919,9 +919,9 @@ func TestTCPConnectionRegistryOpenRejectsInvalidFramesWithoutMutation(t *testing
 			wantErr: "idle_timeout_ms cannot exceed",
 		},
 		{
-			name: "missing_byte_cap",
+			name: "negative_byte_cap",
 			mutate: func(frame *Frame) {
-				frame.ByteCap = 0
+				frame.ByteCap = -1
 			},
 			wantErr: "byte_cap",
 		},
@@ -1175,7 +1175,7 @@ func TestValidateTCPCloseFrameRequiresKnownReasonAndMetrics(t *testing.T) {
 	}
 }
 
-func TestTCPConnectionRegistryRejectsDuplicateAndConcurrentCap(t *testing.T) {
+func TestTCPConnectionRegistryRejectsDuplicateWithoutSenderAuthoredCap(t *testing.T) {
 	registry := NewTCPConnectionRegistry()
 	now := time.Date(2026, 5, 26, 9, 0, 0, 0, time.UTC)
 	frame := validTCPOpenFrameWithRequestID("req_tcp_registry_001")
@@ -1190,11 +1190,11 @@ func TestTCPConnectionRegistryRejectsDuplicateAndConcurrentCap(t *testing.T) {
 
 	second := validTCPOpenFrameWithRequestID("req_tcp_registry_002")
 	second.ConcurrentConnectionCap = 1
-	if err := registry.Open(second, now); err == nil || !strings.Contains(err.Error(), "concurrent connection cap") {
-		t.Fatalf("second Open error = %v, want concurrent connection cap", err)
+	if err := registry.Open(second, now); err != nil {
+		t.Fatalf("sender's legacy cap became an operator policy: %v", err)
 	}
-	if got := registry.Count(); got != 1 {
-		t.Fatalf("Count = %d, want 1", got)
+	if got := registry.Count(); got != 2 {
+		t.Fatalf("Count = %d, want 2", got)
 	}
 }
 

@@ -140,7 +140,7 @@ func (store *JSONLStore) Search(ctx context.Context, query SearchQuery) (SearchR
 	if err != nil {
 		return SearchResult{}, err
 	}
-	rows, err := store.writer.ReadJSONL(filename)
+	rows, err := store.writer.ReadJSONLForTenant(tenantID, filename)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -207,7 +207,7 @@ func (store *JSONLStore) ExportRows(ctx context.Context, query SearchQuery, yiel
 	}
 	// Phase 1 JSONL export keeps the adapter simple and reads the lab log file in memory.
 	// Alpha PostgreSQL exports stream database rows through this same callback boundary.
-	rows, err := store.writer.ReadJSONL(filename)
+	rows, err := store.writer.ReadJSONLForTenant(tenantID, filename)
 	if err != nil {
 		return ExportResult{}, err
 	}
@@ -297,7 +297,7 @@ func (store *JSONLStore) RelatedByAccessDecisionID(ctx context.Context, query Re
 		if err := ctx.Err(); err != nil {
 			return RelatedLogResult{}, err
 		}
-		rows, err := store.writer.ReadJSONL(store.streams[stream])
+		rows, err := store.writer.ReadJSONLForTenant(tenantID, store.streams[stream])
 		if err != nil {
 			return RelatedLogResult{}, err
 		}

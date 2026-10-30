@@ -99,7 +99,7 @@ typedef struct _DSSE_INBOUND_RULE {
  *                             no match => BLOCK (DefaultDeny). DefaultDeny is 1 (fixed; the  default). */
 typedef struct _DSSE_INBOUND_POLICY {
     unsigned int      Version;     /* DSSE_INBOUND_POLICY_VERSION */
-    unsigned int      DefaultDeny; /* 1 fixed (default deny for unmatched inbound) */
+    unsigned int      DefaultDeny; /* 1: deny unmatched inbound; 0: leave inbound to system firewall */
     unsigned int      Enforce;     /* 0 = observe-only (S3a), 1 = enforce (S3b) */
     unsigned int      NumRules;
     DSSE_INBOUND_RULE Rules[DSSE_MAX_INBOUND_RULES];
@@ -142,7 +142,7 @@ typedef struct _DSSE_REDIRECT_CONTEXT {
  *
  * Growth is append-only and Version-guarded: an older consumer asking for a smaller buffer still gets its
  * prefix, and a newer consumer checks Version before reading the state block. */
-#define DSSE_STATS_VERSION 3
+#define DSSE_STATS_VERSION 4
 typedef struct _DSSE_STATS {
     unsigned int Version;
     /* Process-creation holds that expired without a verdict. The design promised this counter and the B1
@@ -175,6 +175,11 @@ typedef struct _DSSE_STATS {
      * a watchdog exists to find. */
     unsigned int   OwnerPresent;
     unsigned int   OwnerDisarmOnExit;/* non-zero: closing the owner handle will clear the policy (fail-open) */
+    /* Version 4: independent captive deadline; CLEAR/SET do not reset it. */
+    unsigned int CaptiveActive;
+    unsigned int CaptiveExpired;
+    unsigned long long CaptiveGeneration;
+    unsigned long long CaptiveDeadline100ns;
 } DSSE_STATS;
 
 /* --- process-creation notification (stage 1 of docs/2026-08-06_signature_exclusions_process_notify_design.ja.md)
@@ -254,6 +259,34 @@ typedef struct _DSSE_OWNER_ARM {
     unsigned int DisarmOnExit; /* non-zero: clear the redirect policy when this handle closes */
 } DSSE_OWNER_ARM;
 
+/* ARM must use the current fail-closed policy OWNER handle before CLEAR.
+ * An active window is adopted without extending its monotonic deadline.
+ * FINISH requires the current owner, matching generation and an armed policy;
+ * userspace invokes it only after DNS/QUIC/WFP rearm all succeed. RECOVER is a
+ * separate explicit administrator operation that atomically clears the redirect
+ * and captive guard. The device ACL limits every operation to SYSTEM/admin.
+ * The guard survives owner close/replacement and ordinary SET/CLEAR. It lasts
+ * only while this driver is loaded: dynamic WFP filters do not survive unload
+ * or reboot. Recovery must explicitly clear/read back before driver removal. */
+#define DSSE_CAPTIVE_VERSION 2
+typedef struct _DSSE_CAPTIVE_ARM {
+    unsigned int Version;
+    unsigned int Reserved;
+    unsigned long long Duration100ns;
+    unsigned int NumEdges;
+    unsigned int Reserved2;
+    DSSE_DEST_RULE Edges[DSSE_MAX_DESTS]; /* exact signed-profile TCP Edge pins */
+} DSSE_CAPTIVE_ARM;
+typedef struct _DSSE_CAPTIVE_ACK {
+    unsigned long long Generation;
+    unsigned long long Remaining100ns; /* same monotonic clock, never renewed on adoption */
+} DSSE_CAPTIVE_ACK;
+typedef struct _DSSE_CAPTIVE_FINISH {
+    unsigned int Version;
+    unsigned int Reserved;
+    unsigned long long Generation;
+} DSSE_CAPTIVE_FINISH;
+
 #include <poppack.h>
 
 /*
@@ -284,3 +317,7 @@ typedef struct _DSSE_OWNER_ARM {
 /* Nominate the calling handle as the redirect policy's owner. Input: DSSE_OWNER_ARM. See that struct for why
  * this exists and why DisarmOnExit is a posture input rather than a fixed behaviour. */
 #define IOCTL_DSSE_ARM_OWNER CTL_CODE(0x12, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define IOCTL_DSSE_ARM_CAPTIVE CTL_CODE(0x12, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DSSE_FINISH_CAPTIVE CTL_CODE(0x12, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_DSSE_RECOVER_NETWORK CTL_CODE(0x12, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)

@@ -59,6 +59,7 @@ func PostgresSchemaSQL() []string {
 		"CREATE INDEX IF NOT EXISTS hot_events_decision_idx ON hot_events (tenant_id, access_decision_id, occurred_at DESC, received_at DESC, event_id DESC)",
 		"CREATE EXTENSION IF NOT EXISTS pg_trgm",
 		"CREATE INDEX IF NOT EXISTS hot_events_payload_text_trgm_idx ON hot_events USING gin ((lower(payload::text)) gin_trgm_ops)",
+		"CREATE INDEX IF NOT EXISTS hot_events_retention_idx ON hot_events (tenant_id, stream, received_at, event_id)",
 	}
 }
 
@@ -179,20 +180,18 @@ func (store *PostgresStore) ExportRows(ctx context.Context, query SearchQuery, y
 	}, nil
 }
 
-// oldestEventAt is the earliest event held for a tenant+stream, ignoring the query's time bounds. Its own tiny
-// statement, NOT a change to buildPostgresSearchStatement: that builder must keep emitting the payload +
-// count(*) OVER() + ORDER BY + LIMIT shape its two callers depend on. hot_events_search_idx leads with
-// (tenant_id, stream, occurred_at), so this is an index scan to the first row, not an aggregate over the table.
+// oldestEventAt preserves the selected tenant, stream, fields and free text,
+// ignoring only time bounds and pagination. This reports the same event set as
+// the export rather than an unrelated older event in the tenant's stream.
 func (store *PostgresStore) oldestEventAt(ctx context.Context, query SearchQuery) (time.Time, error) {
-	tenantID := strings.TrimSpace(query.TenantID)
-	stream := strings.TrimSpace(query.Stream)
-	if tenantID == "" || stream == "" {
-		return time.Time{}, nil
+	query.From, query.To = nil, nil
+	conditions, args, err := buildPostgresSearchConditions(query)
+	if err != nil {
+		return time.Time{}, err
 	}
 	var oldest sql.NullTime
-	err := store.db.QueryRowContext(ctx,
-		`SELECT MIN(occurred_at) FROM hot_events WHERE tenant_id = $1 AND stream = $2`,
-		tenantID, stream).Scan(&oldest)
+	err = store.db.QueryRowContext(ctx,
+		"SELECT MIN(occurred_at) FROM hot_events WHERE "+conditions, args...).Scan(&oldest)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("read oldest hot event: %w", err)
 	}
@@ -315,21 +314,14 @@ func likeEscape(s string) string {
 	return strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(s)
 }
 
-func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, error) {
+func buildPostgresSearchConditions(query SearchQuery) (string, []any, error) {
 	tenantID := strings.TrimSpace(query.TenantID)
 	if tenantID == "" {
-		return postgresSearchStatement{}, fmt.Errorf("tenant_id is required")
+		return "", nil, fmt.Errorf("tenant_id is required")
 	}
 	stream := strings.TrimSpace(query.Stream)
 	if stream == "" {
-		return postgresSearchStatement{}, fmt.Errorf("stream is required")
-	}
-	if query.Limit < 1 {
-		return postgresSearchStatement{}, fmt.Errorf("limit must be greater than or equal to 1")
-	}
-	offset, err := decodeSearchCursorOffset(query)
-	if err != nil {
-		return postgresSearchStatement{}, err
+		return "", nil, fmt.Errorf("stream is required")
 	}
 
 	args := []any{tenantID, stream}
@@ -372,7 +364,7 @@ func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, e
 	}
 	if text := strings.ToLower(strings.TrimSpace(query.Text)); text != "" {
 		conditions = append(conditions, fmt.Sprintf("lower(payload::text) LIKE $%d", nextArg))
-		args = append(args, "%"+text+"%")
+		args = append(args, "%"+likeEscape(text)+"%")
 		nextArg++
 	}
 	if query.From != nil {
@@ -385,8 +377,25 @@ func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, e
 		args = append(args, query.To.UTC())
 		nextArg++
 	}
+	return strings.Join(conditions, " AND "), args, nil
+}
+
+func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, error) {
+	if query.Limit < 1 {
+		return postgresSearchStatement{}, fmt.Errorf("limit must be greater than or equal to 1")
+	}
+	offset, err := decodeSearchCursorOffset(query)
+	if err != nil {
+		return postgresSearchStatement{}, err
+	}
+	conditions, args, err := buildPostgresSearchConditions(query)
+	if err != nil {
+		return postgresSearchStatement{}, err
+	}
+	nextArg := len(args) + 1
+
 	if query.countUnknownRegion {
-		return postgresSearchStatement{SQL: "SELECT count(*) FROM hot_events WHERE " + strings.Join(conditions, " AND "), Args: args}, nil
+		return postgresSearchStatement{SQL: "SELECT count(*) FROM hot_events WHERE " + conditions, Args: args}, nil
 	}
 	limitArg := nextArg
 	args = append(args, query.Limit)
@@ -399,7 +408,7 @@ func buildPostgresSearchStatement(query SearchQuery) (postgresSearchStatement, e
 	}
 	statement := fmt.Sprintf(
 		"SELECT payload, count(*) OVER() AS total_matches FROM hot_events WHERE %s ORDER BY occurred_at DESC, received_at DESC, event_id DESC LIMIT $%d%s",
-		strings.Join(conditions, " AND "),
+		conditions,
 		limitArg,
 		offsetClause,
 	)

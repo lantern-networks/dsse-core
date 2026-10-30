@@ -1,6 +1,7 @@
 package dlp
 
 import (
+	"io"
 	"strings"
 	"testing"
 )
@@ -128,5 +129,94 @@ func TestNewClassifierSetDedupAndCap(t *testing.T) {
 	}
 	if !set.Has("dup_id") || set.Has("nope") {
 		t.Fatalf("Has() wrong")
+	}
+}
+
+func TestRegexClassifierRefusesMatchesTheStreamingScannerCannotEnforce(t *testing.T) {
+	for _, tc := range []struct {
+		name, pattern string
+	}{
+		{"overlong finite", `SECRET-[A-Z]{513}`},
+		{"unbounded", `SECRET-[A-Z]+`},
+		{"begin text", `\ASECRET`},
+		{"begin line", `(?m)^SECRET`},
+		{"end text", `SECRET\z`},
+		{"end line", `(?m)SECRET$`},
+		{"word boundary", `\bSECRET\b`},
+		{"word non-boundary", `\BSECRET\B`},
+		{"folded Unicode exceeds byte window", `(?i)k{200}`},
+		{"Unicode class exceeds byte window", `[^\x00-\x7F]{129}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := CompileClassifier(ClassifierSpec{Name: "secret_tag", Kind: ClassifierRegex, Pattern: tc.pattern}); err == nil {
+				t.Fatalf("unscannable regex %q was accepted", tc.pattern)
+			}
+		})
+	}
+}
+
+func TestRegexClassifierAcceptsExactlyBoundedMatchAcrossChunks(t *testing.T) {
+	set, errs := NewClassifierSet([]ClassifierSpec{{Name: "secret_tag", Kind: ClassifierRegex, Pattern: `SECRET-[A-Z]{505}`}})
+	if len(errs) != 0 || !set.Has("secret_tag") {
+		t.Fatalf("exactly 512-byte pattern rejected: %v", errs)
+	}
+	secret := "SECRET-" + strings.Repeat("A", 505)
+	scanner := NewScannerWith(set)
+	body := strings.Repeat("x", windowSize-100) + secret + strings.Repeat("x", 200)
+	for i := 0; i < len(body); i += 97 {
+		end := i + 97
+		if end > len(body) {
+			end = len(body)
+		}
+		_, _ = scanner.Write([]byte(body[i:end]))
+	}
+	found := false
+	for _, finding := range scanner.Findings() {
+		if finding.Type == "secret_tag" && finding.Count == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("bounded match crossing chunks was missed or counted twice")
+	}
+	guard := NewGuardReaderWith(strings.NewReader(body), map[IdentifierType]int{"secret_tag": 1}, set)
+	if _, err := io.Copy(io.Discard, guard); err != ErrBlocked || !guard.Tripped() {
+		t.Fatalf("bounded match was not blocked before release: %v", err)
+	}
+}
+
+func TestRegexClassifierCountsUTF8FoldedWidth(t *testing.T) {
+	set, errs := NewClassifierSet([]ClassifierSpec{{Name: "folded_id", Kind: ClassifierRegex, Pattern: `(?i)k{170}`}})
+	if len(errs) != 0 || !set.Has("folded_id") {
+		t.Fatalf("510-byte folded match rejected: %v", errs)
+	}
+	if got := DetectWith([]byte(strings.Repeat("K", 170)), "text/plain", set); len(got) != 1 || got[0].Type != "folded_id" || got[0].Count != 1 {
+		t.Fatalf("folded Unicode match not detected: %v", got)
+	}
+}
+
+func TestRegexClassifierOverlongMatchWasSilentlyForwarded(t *testing.T) {
+	set, errs := NewClassifierSet([]ClassifierSpec{{Name: "secret_tag", Kind: ClassifierRegex, Pattern: `SECRET-[A-Z]{513}`}})
+	if len(errs) == 0 && set.Has("secret_tag") {
+		body := "prefix " + "SECRET-" + strings.Repeat("A", 513) + " suffix"
+		guard := NewGuardReaderWith(strings.NewReader(body), map[IdentifierType]int{"secret_tag": 1}, set)
+		var delivered strings.Builder
+		if _, err := io.Copy(&delivered, guard); err == nil && strings.Contains(delivered.String(), "SECRET-") {
+			t.Fatal("accepted blocking classifier silently forwarded an overlong match")
+		}
+	}
+}
+
+func TestRegexClassifierAnchorCannotBecomeTrueAtWindowStart(t *testing.T) {
+	set, errs := NewClassifierSet([]ClassifierSpec{{Name: "secret_tag", Kind: ClassifierRegex, Pattern: `^SECRET`}})
+	if len(errs) == 0 && set.Has("secret_tag") {
+		scanner := NewScannerWith(set)
+		body := strings.Repeat("x", windowSize) + "SECRET" + strings.Repeat("x", windowSize-len("SECRET"))
+		_, _ = scanner.Write([]byte(body))
+		for _, f := range scanner.Findings() {
+			if f.Type == "secret_tag" && f.Count > 0 {
+				t.Fatal("^ anchored match became true at an internal scan-window boundary")
+			}
+		}
 	}
 }

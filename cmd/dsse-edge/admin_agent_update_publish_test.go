@@ -160,9 +160,13 @@ func TestAnUnfetchableArtifactKeepsThePreviousRelease(t *testing.T) {
 	_, newEnv := signedUpdate(t, sg, "0.2.5", now)
 
 	artifactDir := t.TempDir()
+	catalogueDir := tenantArtifactDir(artifactDir, agentUpdateCatalogueScope)
+	if err := os.MkdirAll(catalogueDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
 	// The old release's bytes are here — and they must be the REAL ones now: the edge verifies size and digest
 	// before adopting, so a placeholder of the right name would (correctly) be rejected and refetched.
-	if err := os.WriteFile(filepath.Join(artifactDir,
+	if err := os.WriteFile(filepath.Join(catalogueDir,
 		artifactFileName(old.Platform, old.Arch, old.Version)), artifactBytesFor(old.Version), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -174,16 +178,17 @@ func TestAnUnfetchableArtifactKeepsThePreviousRelease(t *testing.T) {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"tenant_id": "tenant_a",
+			"schema_version": "agent_update_distribution.v2",
+			"tenant_id":      agentUpdateCatalogueScope,
 			"envelopes": map[string]agentpolicy.Envelope{
-				updateTargetKey(agentupdate.PlatformWindows, agentupdate.ArchAMD64): serving,
+				tenantTargetKey(agentUpdateCatalogueScope, agentupdate.PlatformWindows, agentupdate.ArchAMD64): serving,
 			},
 		})
 	}))
 	defer cp.Close()
 
 	src := agentUpdateSource{url: cp.URL, token: "t", trustedKeys: keys, artifactDir: artifactDir,
-		interval: time.Hour, client: cp.Client(), tenantID: "tenant_a"}
+		interval: time.Hour, client: cp.Client()}
 	published := &publishedUpdates{byTarget: map[string]publishedUpdate{}}
 
 	// First: the control plane publishes the release whose bytes ARE here.
@@ -193,7 +198,7 @@ func TestAnUnfetchableArtifactKeepsThePreviousRelease(t *testing.T) {
 		t.Fatalf("fetch: %v", err)
 	}
 	published.replace(applySeveableForTest(t, src, set, published.targets()))
-	key := updateTargetKey(agentupdate.PlatformWindows, agentupdate.ArchAMD64)
+	key := tenantTargetKey(agentUpdateCatalogueScope, agentupdate.PlatformWindows, agentupdate.ArchAMD64)
 	if got := published.targets()[key].Manifest.Version; got != "0.2.4" {
 		t.Fatalf("the servable release was not adopted: %q", got)
 	}
@@ -210,16 +215,15 @@ func TestAnUnfetchableArtifactKeepsThePreviousRelease(t *testing.T) {
 	}
 }
 
-// ★ AN EDGE MUST NOT OFFER ANOTHER TENANT'S BUILD. A token scoped to the wrong tenant, or a URL pointing at
-// the wrong control plane, ends with the wrong signed code on these devices — so the answer names the tenant
-// it is for and the edge checks it.
-func TestAPublishedSetForAnotherTenantIsRefused(t *testing.T) {
+// The CP pull is a deployment-wide distribution. A tenant-scoped answer cannot be adopted as that distribution.
+func TestATenantScopedAnswerCannotImpersonateTheDeploymentDistribution(t *testing.T) {
 	now := time.Now().UTC()
 	sg := updateSigner(t)
 	_, env := signedUpdate(t, sg, "0.2.5", now)
 	cp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
-			"tenant_id": "tenant_b",
+			"schema_version": "agent_update_distribution.v2",
+			"tenant_id":      "tenant_b",
 			"envelopes": map[string]agentpolicy.Envelope{
 				updateTargetKey(agentupdate.PlatformWindows, agentupdate.ArchAMD64): env,
 			},
@@ -228,9 +232,9 @@ func TestAPublishedSetForAnotherTenantIsRefused(t *testing.T) {
 	defer cp.Close()
 
 	src := agentUpdateSource{url: cp.URL, token: "t", trustedKeys: []string{pinnedKey(t, sg)},
-		interval: time.Hour, client: cp.Client(), tenantID: "tenant_a"}
+		interval: time.Hour, client: cp.Client()}
 	if _, err := src.fetch(context.Background(), now); err == nil {
-		t.Fatalf("another tenant's published set was adopted")
+		t.Fatalf("a tenant-scoped answer was adopted as the deployment distribution")
 	} else if !strings.Contains(err.Error(), "tenant") {
 		t.Fatalf("the refusal does not say why: %v", err)
 	}

@@ -66,7 +66,7 @@ func setupInternalCAPersistence(ctx context.Context, dsn, migrationDir string, r
 	if strings.TrimSpace(dsn) == "" {
 		return nil, func() error { return nil }, nil
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return nil, nil, err
 	}

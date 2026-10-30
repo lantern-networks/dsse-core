@@ -44,17 +44,20 @@ func TestFederatedAuthGateGrantGate(t *testing.T) {
 	store := grantstore.NewStore()
 	g := &federatedAuthGate{grants: store, brokerBaseURL: "https://edge:8443", tenantID: "t1"}
 	now := time.Now().UTC()
-	if g.hasLiveGrant("", "") {
+	if g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22"}) {
 		t.Fatal("no grant -> not authenticated")
 	}
-	if _, err := store.Mint(grantstore.Grant{GrantID: "g1", TenantID: "t1", UserID: "u1", IdPID: "idp_a"}, time.Hour, now); err != nil {
+	if _, err := store.Mint(authTestBindGrant(t, g, grantstore.Grant{GrantID: "g1", TenantID: "t1", UserID: "u1", IdPID: "idp_a", Scope: "app:22"}), time.Hour, now); err != nil {
 		t.Fatal(err)
 	}
-	if !g.hasLiveGrant("", "") {
+	if !g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22"}) {
 		t.Fatal("a live grant -> authenticated")
 	}
+	if g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{}) || g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "other:22"}) {
+		t.Fatal("grant authorized a missing or different destination")
+	}
 	store.Revoke("g1")
-	if g.hasLiveGrant("", "") {
+	if g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22"}) {
 		t.Fatal("a revoked grant -> not authenticated")
 	}
 }
@@ -64,14 +67,37 @@ func TestFederatedAuthGatePerDeviceBinding(t *testing.T) {
 	g := &federatedAuthGate{grants: store, brokerBaseURL: "https://edge:8443", tenantID: "t1"}
 	now := time.Now().UTC()
 	// a grant bound to device A
-	if _, err := store.Mint(grantstore.Grant{GrantID: "gA", TenantID: "t1", UserID: "u1", IdPID: "idp_a", DeviceID: "dev-A"}, time.Hour, now); err != nil {
+	if _, err := store.Mint(authTestBindGrant(t, g, grantstore.Grant{GrantID: "gA", TenantID: "t1", UserID: "u1", IdPID: "idp_a", DeviceID: "dev-A", Scope: "app:22"}), time.Hour, now); err != nil {
 		t.Fatal(err)
 	}
-	if !g.hasLiveGrant("dev-A", "") {
+	if !g.hasLiveGrantWithRequirements("t1", "dev-A", federatedRequirements{Scope: "app:22", OSPrincipal: testAuthPrincipal, OSSession: testAuthSession}) {
 		t.Fatal("device A's grant should satisfy device A")
 	}
-	if g.hasLiveGrant("dev-B", "") {
+	if g.hasLiveGrantWithRequirements("t1", "dev-B", federatedRequirements{Scope: "app:22"}) {
 		t.Fatal("device A's grant must NOT satisfy device B (per-device binding)")
+	}
+	if g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22"}) {
+		t.Fatal("device A's grant must not authenticate an unbound flow")
+	}
+	if _, err := store.Mint(authTestBindGrant(t, g, grantstore.Grant{GrantID: "unbound", TenantID: "t1", UserID: "u1", IdPID: "idp_a", Scope: "app:22"}), time.Hour, now); err != nil {
+		t.Fatal(err)
+	}
+	if g.hasLiveGrantWithRequirements("t1", "dev-B", federatedRequirements{Scope: "app:22"}) {
+		t.Fatal("removing a binding must not make a grant satisfy other devices")
+	}
+}
+
+func TestFederatedAuthGateRequiresNamedProvider(t *testing.T) {
+	store := grantstore.NewStore()
+	g := &federatedAuthGate{grants: store, tenantID: "t1"}
+	if _, err := store.Mint(authTestBindGrant(t, g, grantstore.Grant{GrantID: "g", TenantID: "t1", UserID: "u", DeviceID: "dev-A", IdPID: "other-provider", ACR: "2", Scope: "app:22"}), time.Hour, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if g.hasLiveGrantWithRequirements("t1", "dev-A", federatedRequirements{Scope: "app:22", ACR: "2", IdP: "required-provider"}) {
+		t.Fatal("an equal ACR from another provider must not satisfy the named IdP rule")
+	}
+	if !g.hasLiveGrantWithRequirements("t1", "dev-A", federatedRequirements{Scope: "app:22", OSPrincipal: testAuthPrincipal, OSSession: testAuthSession, ACR: "2", IdP: "other-provider"}) {
+		t.Fatal("matching provider, device and assurance should satisfy the rule")
 	}
 }
 
@@ -80,26 +106,26 @@ func TestFederatedAuthGateStepUpACRGate(t *testing.T) {
 	g := &federatedAuthGate{grants: store, brokerBaseURL: "https://edge:8443", tenantID: "t1"}
 	now := time.Now().UTC()
 	// a baseline grant (no acr) is minted
-	if _, err := store.Mint(grantstore.Grant{GrantID: "gBase", TenantID: "t1", UserID: "u1", IdPID: "idp_a"}, time.Hour, now); err != nil {
+	if _, err := store.Mint(authTestBindGrant(t, g, grantstore.Grant{GrantID: "gBase", TenantID: "t1", UserID: "u1", IdPID: "idp_a", Scope: "app:22"}), time.Hour, now); err != nil {
 		t.Fatal(err)
 	}
 	// presence-only (no step-up required) is satisfied
-	if !g.hasLiveGrant("", "") {
+	if !g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22"}) {
 		t.Fatal("a live grant should satisfy a resource with no step-up requirement")
 	}
 	// a step-up-gated resource (requires phr) is NOT satisfied by the baseline grant
-	if g.hasLiveGrant("", "phr") {
+	if g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22", ACR: "phr"}) {
 		t.Fatal("a baseline grant (no acr) must NOT satisfy a phr-gated resource")
 	}
 	// a grant minted at the required assurance satisfies it
-	if _, err := store.Mint(grantstore.Grant{GrantID: "gPhr", TenantID: "t1", UserID: "u1", IdPID: "idp_a", ACR: "phr"}, time.Hour, now); err != nil {
+	if _, err := store.Mint(authTestBindGrant(t, g, grantstore.Grant{GrantID: "gPhr", TenantID: "t1", UserID: "u1", IdPID: "idp_a", ACR: "phr", Scope: "app:22"}), time.Hour, now); err != nil {
 		t.Fatal(err)
 	}
-	if !g.hasLiveGrant("", "phr") {
+	if !g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22", ACR: "phr"}) {
 		t.Fatal("a grant with acr=phr must satisfy a phr-gated resource")
 	}
 	// a different required acr is not satisfied by acr=phr (exact match, mirrors mint-time validation)
-	if g.hasLiveGrant("", "urn:okta:loa:2fa:any") {
+	if g.hasLiveGrantWithRequirements("t1", "", federatedRequirements{Scope: "app:22", ACR: "urn:okta:loa:2fa:any"}) {
 		t.Fatal("acr=phr must not satisfy a different required acr (exact match)")
 	}
 }

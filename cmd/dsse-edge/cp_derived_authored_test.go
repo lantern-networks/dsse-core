@@ -148,7 +148,7 @@ func TestCandidateReviewRefusesStandbyBeforeReadingBody(t *testing.T) {
 	req := httptest.NewRequest("POST", "/admin/cert-pin-bypass", standbyUnreadBody{})
 	rec := httptest.NewRecorder()
 	mw("admin.policy_candidates.review", func(http.ResponseWriter, *http.Request) { t.Error("standby review reached handler") })(rec, req)
-	if rec.Code != 409 {
+	if rec.Code != 503 || rec.Header().Get("Retry-After") != "1" {
 		t.Fatal("standby review accepted", rec.Code)
 	}
 }

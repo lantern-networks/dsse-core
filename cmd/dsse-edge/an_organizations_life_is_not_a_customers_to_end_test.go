@@ -99,6 +99,7 @@ func TestEveryTenantPathRouteAsksWhetherTheCallerMay(t *testing.T) {
 	inlineGates := map[string]string{
 		"DELETE /admin/seat-allocations/{tenant}": "compares the path against adminTenantIDFromRequest inline " +
 			"and refuses with \"may only release seats for\"",
+		"GET /pki/crl/{tenant}/{file}": "public certificate distribution point: no admin identity exists at fetch time; the route binds the exact tenant, issuer fingerprint and Host to the signed CRL, exposes no private bytes, and verifies the issuer signature and expiry",
 	}
 
 	entries, err := os.ReadDir(".")

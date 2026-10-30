@@ -122,6 +122,10 @@ func registerRulesAdmin(mux *http.ServeMux, adminEndpoint func(string, http.Hand
 			writeError(w, http.StatusBadRequest, verr)
 			return
 		}
+		if err := validateAuthoredRuleProvider(rule, theIdPRegistry.Load()); err != nil {
+			writeError(w, http.StatusUnprocessableEntity, err)
+			return
+		}
 		stored, err := rules.UpsertContext(r.Context(), rule)
 		if auditMutation != nil {
 			result := "saved"

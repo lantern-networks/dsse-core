@@ -69,7 +69,7 @@ func TestClientlessFrontDoor(t *testing.T) {
 		return rec
 	}
 
-	if rec := post("/admin/applications", `{"application_id":"wiki","name":"Wiki","application_type":"private_app","status":"active"}`); rec.Code != http.StatusOK {
+	if rec := post("/admin/applications", `{"application_id":"wiki","name":"Wiki","application_type":"private_app","status":"active","published":true,"destination":"wiki.internal.test","destination_port":443,"publish_protocol":"web"}`); rec.Code != http.StatusOK {
 		t.Fatalf("seed app: %d %s", rec.Code, rec.Body.String())
 	}
 
@@ -157,7 +157,7 @@ func TestClientlessFrontDoorLiveRelay(t *testing.T) {
 		t.Fatalf("register connector: %d %s", rec.Code, rec.Body.String())
 	}
 	// Publish the app in the catalog.
-	if rec := rawPost("/admin/applications", `{"application_id":"wiki","name":"Wiki","application_type":"private_app","status":"active"}`, nil); rec.Code != http.StatusOK {
+	if rec := rawPost("/admin/applications", `{"application_id":"wiki","name":"Wiki","application_type":"private_app","status":"active","published":true,"destination":"wiki.internal.test","destination_port":443,"publish_protocol":"web"}`, nil); rec.Code != http.StatusOK {
 		t.Fatalf("seed app: %d %s", rec.Code, rec.Body.String())
 	}
 	// Mint a verified session.

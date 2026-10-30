@@ -42,7 +42,12 @@ func streamingReplicas(db *sql.DB) (int, bool) {
 		return 0, false
 	}
 	c := cpDatabaseShapeCache
-	c.mu.Lock()
+	// A health request must not queue behind another database probe. During a
+	// connection fault that probe can outlive this caller; report unknown rather
+	// than accumulating blocked handlers or claiming there are zero replicas.
+	if !c.mu.TryLock() {
+		return 0, false
+	}
 	defer c.mu.Unlock()
 	if c.known && time.Since(c.at) < cpDatabaseShapeRefresh {
 		return c.replicas, true

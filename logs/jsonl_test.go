@@ -50,10 +50,10 @@ func TestTenantPartitionedLogsIsolation(t *testing.T) {
 		t.Fatalf("aggregate: want 3 rows, got %d", len(all))
 	}
 	// Physical separation on disk.
-	if _, err := os.Stat(filepath.Join(dir, "tenants", "tenant_a", "audit.log.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "tenants", safeTenantSegment("tenant_a"), "audit.log.jsonl")); err != nil {
 		t.Fatalf("expected tenant_a partition file: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "tenants", "tenant_b", "audit.log.jsonl")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "tenants", safeTenantSegment("tenant_b"), "audit.log.jsonl")); err != nil {
 		t.Fatalf("expected tenant_b partition file: %v", err)
 	}
 	// The root (co-mingled) file must NOT be written when partitioning is on.

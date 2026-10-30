@@ -8,10 +8,16 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 type postgresAdminExportJobStore struct {
-	DB *sql.DB
+	DB            *sql.DB
+	LeaseTenantID string
+	LeaseTaskID   string
+	LeaseToken    string
 }
 
 const postgresAdminExportJobUpdateTimeout = 30 * time.Second
@@ -131,7 +137,7 @@ func (store postgresAdminExportJobStore) Get(id string) (adminExportJob, bool) {
 
 func (store postgresAdminExportJobStore) MarkRunning(id string, now time.Time) (adminExportJob, error) {
 	return store.updateByID(id, now, func(job *adminExportJob) error {
-		if job.Status != "queued" {
+		if job.Status != "queued" && !(store.LeaseToken != "" && job.Status == "running") {
 			return fmt.Errorf("export job %s cannot transition from %s to running", id, job.Status)
 		}
 		startedAt := now.UTC().Format(time.RFC3339)
@@ -201,25 +207,128 @@ func (store postgresAdminExportJobStore) MarkFailed(id, code string, now time.Ti
 
 func (store postgresAdminExportJobStore) MarkFailedWithMetadata(id, code string, metadata map[string]any, now time.Time) (adminExportJob, error) {
 	return store.updateByID(id, now, func(job *adminExportJob) error {
-		if job.Status != "queued" && job.Status != "running" {
-			return fmt.Errorf("export job %s cannot transition from %s to failed", id, job.Status)
+		return failPostgresAdminExportJob(job, id, code, metadata, now)
+	})
+}
+
+func failPostgresAdminExportJob(job *adminExportJob, id, code string, metadata map[string]any, now time.Time) error {
+	if job.Status != "queued" && job.Status != "running" {
+		return fmt.Errorf("export job %s cannot transition from %s to failed", id, job.Status)
+	}
+	completedAt := now.UTC().Format(time.RFC3339)
+	job.Status = "failed"
+	job.ErrorCode = &code
+	job.CompletedAt = &completedAt
+	if job.Metadata == nil {
+		job.Metadata = map[string]any{}
+	}
+	job.Metadata["progress_phase"] = "failed"
+	job.Metadata["last_progress_at"] = completedAt
+	for key, value := range metadata {
+		if strings.TrimSpace(key) != "" {
+			job.Metadata[key] = value
 		}
-		completedAt := now.UTC().Format(time.RFC3339)
-		job.Status = "failed"
-		job.ErrorCode = &code
-		job.CompletedAt = &completedAt
+	}
+	return nil
+}
+
+func (store postgresAdminExportJobStore) ResetForRetry(id string, now time.Time) (adminExportJob, error) {
+	if store.LeaseToken == "" {
+		return adminExportJob{}, fmt.Errorf("export job retry requires a task lease")
+	}
+	return store.updateByID(id, now, func(job *adminExportJob) error {
+		if job.Status != "queued" && job.Status != "running" && job.Status != "failed" {
+			return fmt.Errorf("export job %s cannot retry from %s", id, job.Status)
+		}
+		job.Status = "queued"
+		job.ErrorCode = nil
+		job.CompletedAt = nil
+		job.ObjectRef = nil
+		job.PayloadChecksum = nil
+		job.RowCount = 0
 		if job.Metadata == nil {
 			job.Metadata = map[string]any{}
 		}
-		job.Metadata["progress_phase"] = "failed"
-		job.Metadata["last_progress_at"] = completedAt
-		for key, value := range metadata {
-			if strings.TrimSpace(key) != "" {
-				job.Metadata[key] = value
-			}
-		}
+		job.Metadata["progress_phase"] = "queued"
+		job.Metadata["rows_exported"] = 0
+		job.Metadata["last_progress_at"] = now.UTC().Format(time.RFC3339)
 		return nil
 	})
+}
+
+func (store postgresAdminExportJobStore) DeadLetterTask(ctx context.Context, taskID, jobID string, attempt, maxAttempts int, now time.Time, reason string, evaluator decision.Evaluator, sourceIP string) (adminExportJob, model.AuditLog, error) {
+	if store.DB == nil || store.LeaseTenantID == "" || store.LeaseToken == "" || store.LeaseTaskID != taskID {
+		return adminExportJob{}, model.AuditLog{}, fmt.Errorf("export task dead letter requires a matching task lease")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	ctx = normalizePostgresExportTaskContext(ctx)
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	get, err := buildPostgresAdminExportJobGetByIDForUpdateStatement(jobID)
+	if err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	var jobPayload []byte
+	if err := tx.QueryRowContext(ctx, get.SQL, get.Args...).Scan(&jobPayload); err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	job, err := decodePostgresAdminExportJobPayload(jobPayload)
+	if err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	if job.TenantID != store.LeaseTenantID {
+		return adminExportJob{}, model.AuditLog{}, fmt.Errorf("export task and job tenant differ")
+	}
+	metadata := map[string]any{
+		"export_worker_task_id": taskID,
+		"attempt":               attempt,
+		"max_attempts":          maxAttempts,
+		"dead_letter_reason":    reason,
+	}
+	if err := failPostgresAdminExportJob(&job, jobID, reason, metadata, now); err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	audit := adminExportJobAuditLog("admin_export_failed", job, evaluator, sourceIP)
+	auditOutbox, err := buildPostgresAdminAuditOutboxInsertStatement(audit, now)
+	if err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	move, err := buildPostgresExportTaskDeadLetterStatement(store.LeaseTenantID, taskID, store.LeaseToken, now, reason)
+	if err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	var movedPayload []byte
+	if err := tx.QueryRowContext(ctx, move.SQL, move.Args...).Scan(&movedPayload); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return adminExportJob{}, model.AuditLog{}, fmt.Errorf("export task %s lost its lease before dead letter", taskID)
+		}
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	upsert, err := buildPostgresAdminExportJobUpsertStatement(job, now)
+	if err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	if _, err := tx.ExecContext(ctx, upsert.SQL, upsert.Args...); err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	if _, err := tx.ExecContext(ctx, auditOutbox.SQL, auditOutbox.Args...); err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return adminExportJob{}, model.AuditLog{}, err
+	}
+	committed = true
+	return job, audit, nil
 }
 
 func (store postgresAdminExportJobStore) MarkCancelled(id, tenantID, cancelledBy, reason string, now time.Time) (adminExportJob, error) {
@@ -286,6 +395,23 @@ func (store postgresAdminExportJobStore) updateByID(id string, now time.Time, mu
 	job, err := decodePostgresAdminExportJobPayload(payload)
 	if err != nil {
 		return adminExportJob{}, err
+	}
+	if store.LeaseToken != "" {
+		if store.LeaseTenantID == "" || store.LeaseTaskID == "" || job.TenantID != store.LeaseTenantID {
+			return adminExportJob{}, fmt.Errorf("export job %s has no matching task lease scope", id)
+		}
+		var present int
+		err := tx.QueryRowContext(ctx, strings.Join([]string{
+			"SELECT 1 FROM export_worker_tasks",
+			"WHERE tenant_id = $1 AND task_id = $2 AND export_job_id = $3",
+			"AND status = 'running' AND lease_owner = $4 FOR UPDATE",
+		}, " "), store.LeaseTenantID, store.LeaseTaskID, id, store.LeaseToken).Scan(&present)
+		if errors.Is(err, sql.ErrNoRows) {
+			return adminExportJob{}, fmt.Errorf("export job %s task lease was lost", id)
+		}
+		if err != nil {
+			return adminExportJob{}, err
+		}
 	}
 	if err := mutate(&job); err != nil {
 		return adminExportJob{}, err

@@ -382,8 +382,9 @@ func (a *connectorFleetAttachments) dropWorker() {
 // knows N — the deployment never has to tell a customer's connector how many Edges it runs.
 func spreadConnectorOverTheFleet(ctx context.Context, doors *connectorEndpoints, connectorID, connectorSecret, privateBaseURL string, tcpRoutes []connectorTCPRoute, tcpDialer connectorTCPConnectionDialer, tlsConfig *tls.Config) {
 	attachments := newConnectorFleetAttachments()
-	// A door change must reach the tunnels that are already held, or the decision is only a log line — see
-	// connectorEndpoints.onMove.
+	// A cross-Region move must reach the tunnels that are already held, or the
+	// decision is only a log line. An entry move inside the same DSSE Region
+	// deliberately keeps healthy Edge tunnels — see connectorEndpoints.onMove.
 	doors.SetOnMove(func() {
 		if letGo := attachments.letGoOfEverything(); len(letGo) > 0 {
 			log.Printf("connector let go of %v because its door changed", letGo)

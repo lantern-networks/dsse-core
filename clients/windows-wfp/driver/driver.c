@@ -20,9 +20,22 @@
 #include <ws2ipdef.h>      /* SOCKADDR_IN / SOCKADDR_IN6 */
 #include <wdmsec.h>        /* IoCreateDeviceSecure + SDDL_DEVOBJ_* (link wdmsec.lib) */
 #include "dsse_wfp.h"
+#include "captive_deadline.h"
+#include "captive_admission.h"
+
+/* Host tests cannot substitute for these official WDK values. */
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_POLICY_CHANGE == 0x01u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_NEW_ARRIVAL_INTERFACE == 0x02u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_NEW_NEXTHOP_INTERFACE == 0x04u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_PROFILE_CROSSING == 0x08u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_CLASSIFY_COMPLETION == 0x10u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_IPSEC_PROPERTIES_CHANGED == 0x20u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_MID_STREAM_INSPECTION == 0x40u);
+C_ASSERT(FWP_CONDITION_REAUTHORIZE_REASON_SOCKET_PROPERTY_CHANGED == 0x80u);
 
 /* Fixed GUIDs for our sublayer + callouts (arbitrary but stable). */
 // {7E1B2C40-9A3D-4E2F-9C11-0A1B2C3D4E01}
+DEFINE_GUID(DSSE_CAPTIVE_SUBLAYER_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x0e);
 DEFINE_GUID(DSSE_SUBLAYER_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x01);
 // {7E1B2C40-9A3D-4E2F-9C11-0A1B2C3D4E02}
 DEFINE_GUID(DSSE_CALLOUT_V4_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x02);
@@ -42,6 +55,13 @@ DEFINE_GUID(DSSE_INBOUND_CALLOUT_V4_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11
 // {7E1B2C40-9A3D-4E2F-9C11-0A1B2C3D4E08}   inbound (server-initiated) callout (ALE_AUTH_RECV_ACCEPT_V6)
 DEFINE_GUID(DSSE_INBOUND_CALLOUT_V6_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x08);
 
+/* Captive expiration denies new ALE admissions only. Existing native flows
+ * retain their WFP lifetime; the deadline is not a packet/session-age limit. */
+DEFINE_GUID(DSSE_CAPTIVE_OUT_V4_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x0a);
+DEFINE_GUID(DSSE_CAPTIVE_OUT_V6_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x0b);
+DEFINE_GUID(DSSE_CAPTIVE_IN_V4_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x0c);
+DEFINE_GUID(DSSE_CAPTIVE_IN_V6_GUID, 0x7e1b2c40, 0x9a3d, 0x4e2f, 0x9c, 0x11, 0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x0d);
+
 #define DSSE_TAG 'ESSD'
 
 static HANDLE g_engine = NULL;
@@ -53,6 +73,16 @@ static UINT32 g_quicCalloutV6 = 0;
 static UINT32 g_inboundCalloutV4 = 0;
 static UINT32 g_inboundCalloutV6 = 0;
 static PDEVICE_OBJECT g_device = NULL;
+static UINT32 g_captiveCallouts[4] = { 0 };
+static UINT32 g_captiveFlowCallouts[2] = { 0 };
+static const GUID DSSE_CAPTIVE_FLOW_V4_GUID = {0x74010f62,0xbdd5,0x4c08,{0x9f,0x41,0xa0,0x6c,0x28,0x81,0x13,0x01}};
+static const GUID DSSE_CAPTIVE_FLOW_V6_GUID = {0x74010f62,0xbdd5,0x4c08,{0x9f,0x41,0xa0,0x6c,0x28,0x81,0x13,0x02}};
+/* Recovery exceptions are copied independently of CLEAR_POLICY. They are only
+ * signed-profile Edge pins supplied by the owner, never ordinary bypasses. */
+static DSSE_DEST_RULE g_captiveEdges[DSSE_MAX_DESTS];
+static UINT32 g_captiveEdgeCount;
+static UINT64 g_captiveAgentPid; /* invalidated by the process-exit callback */
+static DSSE_CAPTIVE_STATE g_captive = { 0 }; /* g_policyLock */
 
 static DSSE_POLICY g_policy;       /* protected by g_policyLock */
 static KSPIN_LOCK g_policyLock;
@@ -203,7 +233,13 @@ static void dsseSignalHold(UINT32 pid)
 static void dsseProcessNotify(PEPROCESS process, HANDLE processId, PPS_CREATE_NOTIFY_INFO createInfo)
 {
     UNREFERENCED_PARAMETER(process);
-    if (createInfo == NULL) return;      /* process EXIT: membership is a property of the image, not the pid */
+    if (createInfo == NULL) {
+        KLOCK_QUEUE_HANDLE q;
+        KeAcquireInStackQueuedSpinLock(&g_policyLock, &q);
+        if (g_captiveAgentPid == (UINT64)(ULONG_PTR)processId) g_captiveAgentPid = 0;
+        KeReleaseInStackQueuedSpinLock(&q);
+        return; /* PID reuse must not inherit the captive Edge exception. */
+    }
     if (!g_procWanted) return;           /* nobody is listening */
 
     /* Capture the pid in a LOCAL. The ring slot below is shared state: once the lock is dropped another
@@ -586,6 +622,241 @@ static NTSTATUS NTAPI DsseNotify(
     return STATUS_SUCCESS;
 }
 
+/* Flow contexts live at ALE_FLOW_ESTABLISHED, where WFP owns the lifetime.
+ * AUTH callbacks look up by flow handle, endpoint handle AND the exact 5-tuple.
+ * A UDP endpoint alone is insufficient: another peer is another admission.
+ * Bucket count is an index layout, not a connection quota; entries are dynamic. */
+#define DSSE_CAPTIVE_FLOW_BUCKETS 256
+#define DSSE_CAPTIVE_FLOW_TAG 'fcSD'
+typedef struct _DSSE_CAPTIVE_KEY {
+    UINT64 Flow, Endpoint;
+    UINT32 Family, Compartment;
+    UINT8 Protocol, Local[16], Remote[16];
+    UINT16 LocalPort, RemotePort;
+} DSSE_CAPTIVE_KEY;
+typedef struct _DSSE_CAPTIVE_FLOW {
+    LIST_ENTRY All, Bucket;
+    DSSE_CAPTIVE_KEY Key;
+    UINT16 Layer;
+    UINT32 Callout;
+    LONG References;
+    BOOLEAN Linked, Native;
+} DSSE_CAPTIVE_FLOW;
+static LIST_ENTRY g_captiveFlowList, g_captiveFlowBuckets[DSSE_CAPTIVE_FLOW_BUCKETS];
+static KSPIN_LOCK g_captiveFlowLock;
+static EX_RUNDOWN_REF g_captiveFlowRundown;
+static KEVENT g_captiveFlowsEmpty;
+static volatile LONG g_captiveUntracked; /* incomplete lifetime evidence; strict WFP fallback only */
+
+/* Indexes differ at each layer; require typed fields rather than treating
+ * FWP_EMPTY during reauthorization as a zero address/port. */
+static BOOLEAN dsseCaptiveKey(const FWPS_INCOMING_VALUES* v,
+    const FWPS_INCOMING_METADATA_VALUES* m, DSSE_CAPTIVE_KEY* k,
+    UINT32* flags, UINT32* reason)
+{
+    UINT32 la, ra, lp, rp, proto, fl, rr = MAXUINT32;
+    BOOLEAN v6;
+#define DSSE_KEY_FIELDS(prefix, ipv6) \
+    la=prefix##_IP_LOCAL_ADDRESS; ra=prefix##_IP_REMOTE_ADDRESS; \
+    lp=prefix##_IP_LOCAL_PORT; rp=prefix##_IP_REMOTE_PORT; \
+    proto=prefix##_IP_PROTOCOL; fl=prefix##_FLAGS; v6=ipv6
+    switch (v->layerId) {
+    case FWPS_LAYER_ALE_AUTH_CONNECT_V4:
+        DSSE_KEY_FIELDS(FWPS_FIELD_ALE_AUTH_CONNECT_V4, FALSE);
+        rr=FWPS_FIELD_ALE_AUTH_CONNECT_V4_REAUTHORIZE_REASON; break;
+    case FWPS_LAYER_ALE_AUTH_CONNECT_V6:
+        DSSE_KEY_FIELDS(FWPS_FIELD_ALE_AUTH_CONNECT_V6, TRUE);
+        rr=FWPS_FIELD_ALE_AUTH_CONNECT_V6_REAUTHORIZE_REASON; break;
+    case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4:
+        DSSE_KEY_FIELDS(FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4, FALSE);
+        rr=FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_REAUTHORIZE_REASON; break;
+    case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6:
+        DSSE_KEY_FIELDS(FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6, TRUE);
+        rr=FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_REAUTHORIZE_REASON; break;
+    case FWPS_LAYER_ALE_FLOW_ESTABLISHED_V4:
+        DSSE_KEY_FIELDS(FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4, FALSE); break;
+    case FWPS_LAYER_ALE_FLOW_ESTABLISHED_V6:
+        DSSE_KEY_FIELDS(FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6, TRUE); break;
+    default: return FALSE;
+    }
+#undef DSSE_KEY_FIELDS
+    RtlZeroMemory(k, sizeof(*k)); *flags=0; *reason=0;
+    if (v->incomingValue[fl].value.type == FWP_UINT32) *flags=v->incomingValue[fl].value.uint32;
+    if (rr != MAXUINT32 && v->incomingValue[rr].value.type == FWP_UINT32)
+        *reason=v->incomingValue[rr].value.uint32;
+    if (m) {
+        if (FWPS_IS_METADATA_FIELD_PRESENT(m,FWPS_METADATA_FIELD_FLOW_HANDLE)) k->Flow=m->flowHandle;
+        if (FWPS_IS_METADATA_FIELD_PRESENT(m,FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE)) k->Endpoint=m->transportEndpointHandle;
+        if (FWPS_IS_METADATA_FIELD_PRESENT(m,FWPS_METADATA_FIELD_COMPARTMENT_ID)) k->Compartment=m->compartmentId;
+    }
+    k->Family=v6 ? AF_INET6 : AF_INET;
+    if (v->incomingValue[proto].value.type != FWP_UINT8 ||
+        v->incomingValue[lp].value.type != FWP_UINT16 || v->incomingValue[rp].value.type != FWP_UINT16) return FALSE;
+    k->Protocol=v->incomingValue[proto].value.uint8;
+    k->LocalPort=v->incomingValue[lp].value.uint16; k->RemotePort=v->incomingValue[rp].value.uint16;
+    if (v6) {
+        if (v->incomingValue[la].value.type != FWP_BYTE_ARRAY16_TYPE ||
+            v->incomingValue[ra].value.type != FWP_BYTE_ARRAY16_TYPE ||
+            !v->incomingValue[la].value.byteArray16 || !v->incomingValue[ra].value.byteArray16) return FALSE;
+        RtlCopyMemory(k->Local,v->incomingValue[la].value.byteArray16->byteArray16,16);
+        RtlCopyMemory(k->Remote,v->incomingValue[ra].value.byteArray16->byteArray16,16);
+    } else {
+        if (v->incomingValue[la].value.type != FWP_UINT32 || v->incomingValue[ra].value.type != FWP_UINT32) return FALSE;
+        UINT32 l=RtlUlongByteSwap(v->incomingValue[la].value.uint32), r=RtlUlongByteSwap(v->incomingValue[ra].value.uint32);
+        RtlCopyMemory(k->Local,&l,4); RtlCopyMemory(k->Remote,&r,4);
+    }
+    return TRUE;
+}
+static void dsseCaptiveFlowRelease(DSSE_CAPTIVE_FLOW* f)
+{
+    if (InterlockedDecrement(&f->References) == 0) ExFreePoolWithTag(f,DSSE_CAPTIVE_FLOW_TAG);
+}
+static void NTAPI DsseCaptiveFlowDelete(UINT16 layer, UINT32 callout, UINT64 context)
+{
+    UNREFERENCED_PARAMETER(layer); UNREFERENCED_PARAMETER(callout);
+    DSSE_CAPTIVE_FLOW* f=(DSSE_CAPTIVE_FLOW*)(ULONG_PTR)context;
+    KLOCK_QUEUE_HANDLE q;
+    KeAcquireInStackQueuedSpinLock(&g_captiveFlowLock,&q);
+    if (f->Linked) {
+        RemoveEntryList(&f->All); RemoveEntryList(&f->Bucket); f->Linked=FALSE;
+        if (IsListEmpty(&g_captiveFlowList)) KeSetEvent(&g_captiveFlowsEmpty,IO_NO_INCREMENT,FALSE);
+    }
+    KeReleaseInStackQueuedSpinLock(&q);
+    dsseCaptiveFlowRelease(f); /* WFP ownership, including synchronous RemoveContext */
+}
+static BOOLEAN dsseCaptiveTracked(const DSSE_CAPTIVE_KEY* k, BOOLEAN markNative, BOOLEAN nativeOnly)
+{
+    if (!k->Flow || !k->Endpoint) return FALSE;
+    BOOLEAN found=FALSE;
+    KLOCK_QUEUE_HANDLE q;
+    KeAcquireInStackQueuedSpinLock(&g_captiveFlowLock,&q);
+    LIST_ENTRY* head=&g_captiveFlowBuckets[k->Flow % DSSE_CAPTIVE_FLOW_BUCKETS];
+    for (LIST_ENTRY* e=head->Flink;e!=head;e=e->Flink) {
+        DSSE_CAPTIVE_FLOW* f=CONTAINING_RECORD(e,DSSE_CAPTIVE_FLOW,Bucket);
+        if (RtlCompareMemory(&f->Key,k,sizeof(*k)) == sizeof(*k)) {
+            if (markNative) f->Native=TRUE;
+            found=!nativeOnly || f->Native; break;
+        }
+    }
+    KeReleaseInStackQueuedSpinLock(&q);
+    return found;
+}
+/* A known flow with a different endpoint/peer must NOT use missing-record
+ * fallback. This covers UDP peer changes and endpoint/tuple reuse. */
+static BOOLEAN dsseCaptiveKnownFlow(const DSSE_CAPTIVE_KEY* k)
+{
+    BOOLEAN found=FALSE;
+    KLOCK_QUEUE_HANDLE q;
+    KeAcquireInStackQueuedSpinLock(&g_captiveFlowLock,&q);
+    LIST_ENTRY* head=&g_captiveFlowBuckets[k->Flow % DSSE_CAPTIVE_FLOW_BUCKETS];
+    for (LIST_ENTRY* e=head->Flink;e!=head;e=e->Flink) {
+        DSSE_CAPTIVE_FLOW* f=CONTAINING_RECORD(e,DSSE_CAPTIVE_FLOW,Bucket);
+        if (f->Key.Flow==k->Flow) { found=TRUE; break; }
+    }
+    KeReleaseInStackQueuedSpinLock(&q);
+    return found;
+}
+static BOOLEAN dsseCaptiveUntrackedExisting(const DSSE_CAPTIVE_KEY* k,UINT32 flags,UINT32 reason)
+{
+    return !dsseCaptiveKnownFlow(k) && dsseCaptiveExistingReason(
+        (flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE) != 0,reason,k->Flow,k->Endpoint);
+}
+static void NTAPI DsseCaptiveFlowClassify(const FWPS_INCOMING_VALUES* v,
+    const FWPS_INCOMING_METADATA_VALUES* m, void* data, const void* cc,
+    const FWPS_FILTER* filter, UINT64 context, FWPS_CLASSIFY_OUT* out)
+{
+    UNREFERENCED_PARAMETER(data); UNREFERENCED_PARAMETER(cc);
+    UNREFERENCED_PARAMETER(filter); UNREFERENCED_PARAMETER(context);
+    if (out->rights & FWPS_RIGHT_ACTION_WRITE) out->actionType=FWP_ACTION_CONTINUE;
+    if (!ExAcquireRundownProtection(&g_captiveFlowRundown)) return;
+    DSSE_CAPTIVE_KEY key; UINT32 flags,reason;
+    if (!dsseCaptiveKey(v,m,&key,&flags,&reason) || !key.Flow || !key.Endpoint || (flags & FWP_CONDITION_FLAG_IS_LOOPBACK)) goto done;
+    DSSE_CAPTIVE_FLOW* f=ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(*f),DSSE_CAPTIVE_FLOW_TAG);
+    if (!f) { InterlockedExchange(&g_captiveUntracked,1); goto done; }
+    RtlZeroMemory(f,sizeof(*f)); f->Key=key; f->Layer=v->layerId;
+    f->Callout=g_captiveFlowCallouts[key.Family == AF_INET6 ? 1 : 0]; f->References=2;
+    KLOCK_QUEUE_HANDLE q;
+    KeAcquireInStackQueuedSpinLock(&g_policyLock,&q);
+    f->Native=g_captive.Active && !g_policyValid;
+    KeReleaseInStackQueuedSpinLock(&q);
+    KeAcquireInStackQueuedSpinLock(&g_captiveFlowLock,&q);
+    InsertTailList(&g_captiveFlowList,&f->All);
+    InsertTailList(&g_captiveFlowBuckets[key.Flow % DSSE_CAPTIVE_FLOW_BUCKETS],&f->Bucket);
+    f->Linked=TRUE; KeClearEvent(&g_captiveFlowsEmpty);
+    KeReleaseInStackQueuedSpinLock(&q);
+    NTSTATUS status=FwpsFlowAssociateContext(key.Flow,f->Layer,f->Callout,(UINT64)(ULONG_PTR)f);
+    if (status != STATUS_SUCCESS) {
+        /* OBJECT_NAME_EXISTS is informational (NT_SUCCESS), but WFP did not
+         * take ownership of this new context. Retire our duplicate record. */
+        if (status != STATUS_OBJECT_NAME_EXISTS) InterlockedExchange(&g_captiveUntracked,1);
+        DsseCaptiveFlowDelete(f->Layer,f->Callout,(UINT64)(ULONG_PTR)f);
+    }
+    dsseCaptiveFlowRelease(f); /* classify ownership; callback may already have run */
+done:
+    ExReleaseRundownProtection(&g_captiveFlowRundown);
+}
+/* Do not make FINISH tear down grandfather records: they last until WFP ends
+ * the flow. Native sessions may outlive this window; no session-age quota. */
+static BOOLEAN dsseCaptiveNativeReauth(const FWPS_INCOMING_VALUES* v,const FWPS_INCOMING_METADATA_VALUES* m)
+{
+    DSSE_CAPTIVE_KEY k; UINT32 flags,reason;
+    if (!dsseCaptiveKey(v,m,&k,&flags,&reason) || !(flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE) ||
+        (reason & FWP_CONDITION_REAUTHORIZE_REASON_CLASSIFY_COMPLETION)) return FALSE;
+    if (dsseCaptiveTracked(&k,FALSE,TRUE)) return TRUE;
+    KLOCK_QUEUE_HANDLE q;
+    KeAcquireInStackQueuedSpinLock(&g_policyLock,&q);
+    BOOLEAN hadWindow=g_captive.Generation != 0;
+    KeReleaseInStackQueuedSpinLock(&q);
+    /* An allocation failure or a flow predating our observer cannot become a
+     * forced disconnect at FINISH. WFP's established-flow evidence remains the
+     * authority; no pending completion, unknown reason or known-tuple mismatch. */
+    return hadWindow && InterlockedCompareExchange(&g_captiveUntracked,0,0) &&
+        dsseCaptiveUntrackedExisting(&k,flags,reason);
+}
+static void NTAPI DsseCaptiveClassify(const FWPS_INCOMING_VALUES* v,
+    const FWPS_INCOMING_METADATA_VALUES* m, void* data, const void* cc,
+    const FWPS_FILTER* filter, UINT64 context, FWPS_CLASSIFY_OUT* out)
+{
+    UNREFERENCED_PARAMETER(data); UNREFERENCED_PARAMETER(cc);
+    UNREFERENCED_PARAMETER(filter); UNREFERENCED_PARAMETER(context);
+    if (!(out->rights & FWPS_RIGHT_ACTION_WRITE)) return;
+    out->actionType=FWP_ACTION_CONTINUE;
+    DSSE_CAPTIVE_KEY k; UINT32 flags=0,reason=0;
+    BOOLEAN keyOK=dsseCaptiveKey(v,m,&k,&flags,&reason);
+    if (flags & FWP_CONDITION_FLAG_IS_LOOPBACK) return;
+    KLOCK_QUEUE_HANDLE q;
+    KeAcquireInStackQueuedSpinLock(&g_policyLock,&q);
+    BOOLEAN active=g_captive.Active != 0;
+    BOOLEAN expired=dsseCaptiveExpired(&g_captive,KeQueryInterruptTime()) != 0;
+    BOOLEAN recovery=FALSE;
+    if (expired && keyOK && k.Protocol == IPPROTO_TCP && g_captiveAgentPid &&
+        FWPS_IS_METADATA_FIELD_PRESENT(m,FWPS_METADATA_FIELD_PROCESS_ID) &&
+        m->processId == g_captiveAgentPid &&
+        (v->layerId == FWPS_LAYER_ALE_AUTH_CONNECT_V4 || v->layerId == FWPS_LAYER_ALE_AUTH_CONNECT_V6)) {
+        for (UINT32 i=0;i<g_captiveEdgeCount;i++) {
+            const DSSE_DEST_RULE* d=&g_captiveEdges[i];
+            if (d->Family == k.Family && d->Port == k.RemotePort &&
+                RtlCompareMemory(d->Addr,k.Remote,16) == 16) { recovery=TRUE; break; }
+        }
+    }
+    KeReleaseInStackQueuedSpinLock(&q);
+    if (!active) return;
+    /* A pending completion is new admission even when other reason bits are
+     * mixed in. A stale tuple/endpoint must not inherit another flow's permit. */
+    BOOLEAN existing=FALSE;
+    if (keyOK && (flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE) &&
+        !(reason & FWP_CONDITION_REAUTHORIZE_REASON_CLASSIFY_COMPLETION)) {
+        existing=dsseCaptiveTracked(&k,TRUE,FALSE);
+        if (!existing && dsseCaptiveUntrackedExisting(&k,flags,reason)) {
+            InterlockedExchange(&g_captiveUntracked,1); existing=TRUE;
+        }
+    }
+    if (!expired || existing || recovery ||
+        (keyOK && dsseCaptiveNetworkControl(k.Family,k.Protocol,k.LocalPort,k.RemotePort))) return;
+    out->actionType=FWP_ACTION_BLOCK;
+    out->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+}
+
 /* DsseQuicClassify: QUIC (UDP/443) gate at ALE_AUTH_CONNECT. Only BLOCK when we are actively steering AND
  * the connecting app is NOT on the bypass list -- so QUIC is forced to TCP (interceptable) for steered apps,
  * while bypassed apps (e.g. the agent itself) keep QUIC, and QUIC is untouched when no policy is loaded.
@@ -609,6 +880,9 @@ static void NTAPI DsseQuicClassify(
         return;
     }
 
+    if (dsseCaptiveNativeReauth(inFixedValues,inMetaValues)) {
+        classifyOut->actionType=FWP_ACTION_CONTINUE; return;
+    }
     BOOLEAN isV6 = (inFixedValues->layerId == FWPS_LAYER_ALE_AUTH_CONNECT_V6);
     const FWP_BYTE_BLOB* appId = isV6
         ? inFixedValues->incomingValue[FWPS_FIELD_ALE_AUTH_CONNECT_V6_ALE_APP_ID].value.byteBlob
@@ -654,6 +928,7 @@ static void NTAPI DsseInboundClassify(
         return;
     }
     classifyOut->actionType = FWP_ACTION_PERMIT; /* default: pass unless we actively deny */
+    if (dsseCaptiveNativeReauth(inFixedValues,inMetaValues)) return;
 
     BOOLEAN isV6 = (inFixedValues->layerId == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6);
     UINT16 remotePort = 0, localPort = 0, proto = 0;
@@ -693,7 +968,9 @@ static void NTAPI DsseInboundClassify(
     BOOLEAN enforce = valid ? (g_inPolicy.Enforce != 0) : FALSE;
     BOOLEAN block = FALSE;
     if (valid && enforce && !loopback) {
-        block = !inboundRuleAllows(family, srcNet, localPort, proto);
+        /* The export's default_action=allow is encoded as DefaultDeny=0 with no allow rules. Ignoring
+         * this field would turn that administrator choice into a block of every non-loopback TCP flow. */
+        block = (g_inPolicy.DefaultDeny != 0) && !inboundRuleAllows(family, srcNet, localPort, proto);
     }
     KeReleaseInStackQueuedSpinLock(&lq);
 
@@ -828,7 +1105,9 @@ static NTSTATUS dsseAddQuicBlockFilter(const GUID* calloutGuid, const GUID* laye
     FWPM_FILTER filter = { 0 };
     filter.layerKey = *layerKey;
     filter.displayData.name = (wchar_t*)name;
-    filter.action.type = FWP_ACTION_CALLOUT_TERMINATING; /* the gate callout decides block vs continue */
+    /* The gate returns CONTINUE for no policy/bypassed apps and BLOCK otherwise.
+     * TERMINATING would interpret CONTINUE as BLOCK; UNKNOWN permits both. */
+    filter.action.type = FWP_ACTION_CALLOUT_UNKNOWN;
     filter.action.calloutKey = *calloutGuid;
     filter.subLayerKey = DSSE_SUBLAYER_GUID;
     filter.weight.type = FWP_EMPTY; /* auto weight */
@@ -861,6 +1140,37 @@ static NTSTATUS dsseAddInboundFilter(const GUID* calloutGuid, const GUID* layerK
     return FwpmFilterAdd(g_engine, &filter, NULL, NULL);
 }
 
+static NTSTATUS dsseRegisterCaptiveGate(PDEVICE_OBJECT device, const GUID* key,
+    const GUID* layer, UINT32* id, const wchar_t* name)
+{
+    FWPS_CALLOUT callout = { 0 };
+    callout.calloutKey = *key;
+    BOOLEAN flow = IsEqualGUID(layer,&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4) ||
+        IsEqualGUID(layer,&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6);
+    callout.classifyFn = flow ? DsseCaptiveFlowClassify : DsseCaptiveClassify;
+    callout.flowDeleteFn = flow ? DsseCaptiveFlowDelete : NULL;
+    callout.notifyFn = DsseNotify;
+    NTSTATUS status = FwpsCalloutRegister(device, &callout, id);
+    if (!NT_SUCCESS(status)) return status;
+    FWPM_CALLOUT m = { 0 };
+    m.calloutKey = *key;
+    m.applicableLayer = *layer;
+    m.displayData.name = L"DsseCaptiveDeadline";
+    status = FwpmCalloutAdd(g_engine, &m, NULL, NULL);
+    if (!NT_SUCCESS(status)) return status;
+    FWPM_FILTER f = { 0 };
+    f.layerKey = *layer;
+    f.displayData.name = (wchar_t*)name;
+    f.subLayerKey = DSSE_CAPTIVE_SUBLAYER_GUID;
+    /* Preserve downstream arbitration before/after the deadline window. A
+     * TERMINATING callout would turn our CONTINUE result into a block. */
+    f.action.type = flow ? FWP_ACTION_CALLOUT_INSPECTION : FWP_ACTION_CALLOUT_UNKNOWN;
+    f.action.calloutKey = *key;
+    f.weight.type = FWP_EMPTY;
+    /* All ALE protocols: TCP, UDP (per peer), ICMP; no IP packet teardown. */
+    return FwpmFilterAdd(g_engine, &f, NULL, NULL);
+}
+
 static NTSTATUS dsseWfpSetup(PDEVICE_OBJECT device)
 {
     NTSTATUS status;
@@ -877,6 +1187,29 @@ static NTSTATUS dsseWfpSetup(PDEVICE_OBJECT device)
     sublayer.displayData.name = L"DsseSteerSublayer";
     sublayer.weight = 0x8000;
     status = FwpmSubLayerAdd(g_engine, &sublayer, NULL);
+    if (!NT_SUCCESS(status)) return status;
+
+    /* Separate arbitration domain: an inbound TERMINATING/PERMIT in the
+     * normal DSSE sublayer must not skip the independent deadline gate. */
+    FWPM_SUBLAYER captiveSublayer={0};
+    captiveSublayer.subLayerKey=DSSE_CAPTIVE_SUBLAYER_GUID;
+    captiveSublayer.displayData.name=L"DsseCaptiveAdmissionSublayer";
+    captiveSublayer.weight=0xffff;
+    status=FwpmSubLayerAdd(g_engine,&captiveSublayer,NULL);
+    if (!NT_SUCCESS(status)) return status;
+
+    status = dsseRegisterCaptiveGate(device, &DSSE_CAPTIVE_OUT_V4_GUID, &FWPM_LAYER_ALE_AUTH_CONNECT_V4, &g_captiveCallouts[0], L"DsseCaptiveOutV4");
+    if (!NT_SUCCESS(status)) return status;
+    status = dsseRegisterCaptiveGate(device, &DSSE_CAPTIVE_OUT_V6_GUID, &FWPM_LAYER_ALE_AUTH_CONNECT_V6, &g_captiveCallouts[1], L"DsseCaptiveOutV6");
+    if (!NT_SUCCESS(status)) return status;
+    status = dsseRegisterCaptiveGate(device, &DSSE_CAPTIVE_IN_V4_GUID, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, &g_captiveCallouts[2], L"DsseCaptiveInV4");
+    if (!NT_SUCCESS(status)) return status;
+    status = dsseRegisterCaptiveGate(device, &DSSE_CAPTIVE_IN_V6_GUID, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, &g_captiveCallouts[3], L"DsseCaptiveInV6");
+    if (!NT_SUCCESS(status)) return status;
+
+    status = dsseRegisterCaptiveGate(device,&DSSE_CAPTIVE_FLOW_V4_GUID,&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,&g_captiveFlowCallouts[0],L"DsseCaptiveFlowV4");
+    if (!NT_SUCCESS(status)) return status;
+    status = dsseRegisterCaptiveGate(device,&DSSE_CAPTIVE_FLOW_V6_GUID,&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6,&g_captiveFlowCallouts[1],L"DsseCaptiveFlowV6");
     if (!NT_SUCCESS(status)) return status;
 
     status = dsseRegisterCallout(device, &DSSE_CALLOUT_V4_GUID, FWPS_LAYER_ALE_CONNECT_REDIRECT_V4, &g_calloutV4);
@@ -924,6 +1257,40 @@ static void dsseWfpTeardown(void)
      *  kernel callout registered against about-to-be-unloaded code = dangling classifyFn on next
      *  connect; and it freed g_redirectHandle out from under an in-flight classify.) */
     if (g_engine) { FwpmEngineClose(g_engine); g_engine = NULL; }
+    /* Closing filters alone does not remove flow contexts. Stop association,
+     * remove each WFP context, wait for async flowDelete, then unregister. */
+    ExWaitForRundownProtectionRelease(&g_captiveFlowRundown);
+    for (;;) {
+        DSSE_CAPTIVE_FLOW* f=NULL;
+        KLOCK_QUEUE_HANDLE q;
+        KeAcquireInStackQueuedSpinLock(&g_captiveFlowLock,&q);
+        if (!IsListEmpty(&g_captiveFlowList)) {
+            f=CONTAINING_RECORD(g_captiveFlowList.Flink,DSSE_CAPTIVE_FLOW,All);
+            InterlockedIncrement(&f->References);
+        }
+        KeReleaseInStackQueuedSpinLock(&q);
+        if (!f) break;
+        NTSTATUS removed=FwpsFlowRemoveContext(f->Key.Flow,f->Layer,f->Callout);
+        dsseCaptiveFlowRelease(f);
+        /* SUCCESS: synchronous callback. PENDING: callback after classify.
+         * UNSUCCESSFUL: natural teardown may already have detached the context
+         * but not yet entered flowDelete. Never free WFP-owned memory here.
+         * Unexpected failures are reported and retried, not silently converted
+         * into an endless event wait or an unsafe unregister/use-after-free. */
+        if (removed != STATUS_SUCCESS) {
+            if (removed != STATUS_PENDING && removed != STATUS_UNSUCCESSFUL)
+                DbgPrintEx(DPFLTR_IHVNETWORK_ID,DPFLTR_ERROR_LEVEL,
+                    "DSSE captive context removal failed: 0x%08x; retaining callback ownership\n",removed);
+            LARGE_INTEGER retry; retry.QuadPart=-1000000; /* 100 ms unload retry, not flow lifetime */
+            KeWaitForSingleObject(&g_captiveFlowsEmpty,Executive,KernelMode,FALSE,&retry);
+        }
+    }
+    for (UINT32 i=0;i<2;i++) {
+        if (g_captiveFlowCallouts[i]) { FwpsCalloutUnregisterById(g_captiveFlowCallouts[i]); g_captiveFlowCallouts[i]=0; }
+    }
+    for (UINT32 i = 0; i < 4; i++) {
+        if (g_captiveCallouts[i]) { FwpsCalloutUnregisterById(g_captiveCallouts[i]); g_captiveCallouts[i] = 0; }
+    }
     if (g_calloutV4) { FwpsCalloutUnregisterById(g_calloutV4); g_calloutV4 = 0; }
     if (g_calloutV6) { FwpsCalloutUnregisterById(g_calloutV6); g_calloutV6 = 0; }
     if (g_quicCalloutV4) { FwpsCalloutUnregisterById(g_quicCalloutV4); g_quicCalloutV4 = 0; }
@@ -953,19 +1320,18 @@ static NTSTATUS dsseDispatchCreateClose(PDEVICE_OBJECT device, PIRP irp)
          * Re-arming is automatic: the long-poll IOCTL carries WaitBlockMs on every call, so a live agent
          * restores the hold on its very next poll. */
         KLOCK_QUEUE_HANDLE lq;
-        BOOLEAN owner = FALSE;
         KeAcquireInStackQueuedSpinLock(&g_holdLock, &lq);
         if (g_procWaitOwner != NULL && g_procWaitOwner == sp->FileObject) {
             g_procWaitOwner = NULL;
-            owner = TRUE;
-        }
-        KeReleaseInStackQueuedSpinLock(&lq);
-        if (owner) {
+            /* Keep owner and interval changes in the SAME critical section as a new waiter's arming.
+             * Otherwise this old close can zero a newly installed waiter's interval. Signal old holds
+             * here too, before a new owner can reserve a fresh slot. */
             InterlockedExchange(&g_procHoldMs, 0);
             for (UINT32 i = 0; i < DSSE_MAX_PROC_HOLDS; i++) {
                 KeSetEvent(&g_procHolds[i].Evt, IO_NO_INCREMENT, FALSE);
             }
         }
+        KeReleaseInStackQueuedSpinLock(&lq);
 
         /* Same shape, applied to the thing whose absence actually takes the box off the network: the redirect
          * policy. When the handle that nominated itself via IOCTL_DSSE_ARM_OWNER closes — for ANY reason,
@@ -1016,6 +1382,13 @@ static NTSTATUS dsseDispatchDeviceControl(PDEVICE_OBJECT device, PIRP irp)
             status = STATUS_REVISION_MISMATCH;
             break;
         }
+        /* A v2 policy has fixed arrays. Reject an over-capacity count instead of
+         * accepting a partial policy that classify would silently clamp. */
+        if (in->NumApps > DSSE_MAX_APPS || in->NumDests > DSSE_MAX_DESTS ||
+            in->NumExactApps > DSSE_MAX_EXACT_APPS) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
         KLOCK_QUEUE_HANDLE lq;
         KeAcquireInStackQueuedSpinLock(&g_policyLock, &lq);
         RtlCopyMemory(&g_policy, in, sizeof(DSSE_POLICY));
@@ -1029,6 +1402,73 @@ static NTSTATUS dsseDispatchDeviceControl(PDEVICE_OBJECT device, PIRP irp)
         KeAcquireInStackQueuedSpinLock(&g_policyLock, &lq);
         g_policyValid = FALSE;
         RtlZeroMemory(&g_policy, sizeof(DSSE_POLICY));
+        KeReleaseInStackQueuedSpinLock(&lq);
+        status = STATUS_SUCCESS;
+        break;
+    }
+    case IOCTL_DSSE_ARM_CAPTIVE: {
+        if (sp->Parameters.DeviceIoControl.InputBufferLength != sizeof(DSSE_CAPTIVE_ARM) ||
+            sp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DSSE_CAPTIVE_ACK)) {
+            status = STATUS_BUFFER_TOO_SMALL; break;
+        }
+        DSSE_CAPTIVE_ARM in = *(DSSE_CAPTIVE_ARM*)irp->AssociatedIrp.SystemBuffer;
+        if (in.Version != DSSE_CAPTIVE_VERSION || in.Reserved != 0 || in.Reserved2 != 0 ||
+            in.NumEdges == 0 || in.NumEdges > DSSE_MAX_DESTS) {
+            status = STATUS_INVALID_PARAMETER; break;
+        }
+        KLOCK_QUEUE_HANDLE lq;
+        KeAcquireInStackQueuedSpinLock(&g_policyLock, &lq);
+        BOOLEAN edgesValid=g_procRegistered; /* exit notification prevents PID reuse */
+        for (UINT32 i=0;i<in.NumEdges && edgesValid;i++) {
+            DSSE_DEST_RULE* d=&in.Edges[i];
+            BOOLEAN inPolicy=FALSE;
+            if ((d->Family != DSSE_AF_INET && d->Family != DSSE_AF_INET6) || !d->Port || d->_pad) { edgesValid=FALSE; break; }
+            for (UINT32 j=0;j<g_policy.NumDests;j++) {
+                if (RtlCompareMemory(d,&g_policy.Dests[j],sizeof(*d)) == sizeof(*d)) { inPolicy=TRUE; break; }
+            }
+            if (!inPolicy) edgesValid=FALSE;
+        }
+        UINT64 now=KeQueryInterruptTime();
+        if (edgesValid && g_policy.ProxyPid == (UINT32)(ULONG_PTR)PsGetCurrentProcessId() &&
+            dsseCaptiveArm(&g_captive, now, in.Duration100ns,
+            g_policyOwner == sp->FileObject, g_policyValid && !g_policy.ObserveOnly,
+            g_policyDisarmOnExit)) {
+            g_captiveAgentPid=(UINT64)(ULONG_PTR)PsGetCurrentProcessId();
+            g_captiveEdgeCount=in.NumEdges;
+            RtlCopyMemory(g_captiveEdges,in.Edges,sizeof(g_captiveEdges));
+            DSSE_CAPTIVE_ACK* ack=(DSSE_CAPTIVE_ACK*)irp->AssociatedIrp.SystemBuffer;
+            ack->Generation=g_captive.Generation;
+            ack->Remaining100ns=now < g_captive.Deadline100ns ? g_captive.Deadline100ns-now : 0;
+            info=sizeof(*ack);
+            status = STATUS_SUCCESS;
+        } else status = STATUS_INVALID_DEVICE_STATE;
+        KeReleaseInStackQueuedSpinLock(&lq);
+        break;
+    }
+    case IOCTL_DSSE_FINISH_CAPTIVE: {
+        if (sp->Parameters.DeviceIoControl.InputBufferLength != sizeof(DSSE_CAPTIVE_FINISH)) {
+            status = STATUS_BUFFER_TOO_SMALL; break;
+        }
+        DSSE_CAPTIVE_FINISH* in = (DSSE_CAPTIVE_FINISH*)irp->AssociatedIrp.SystemBuffer;
+        if (in->Version != DSSE_CAPTIVE_VERSION || in->Reserved != 0) {
+            status = STATUS_INVALID_PARAMETER; break;
+        }
+        KLOCK_QUEUE_HANDLE lq;
+        KeAcquireInStackQueuedSpinLock(&g_policyLock, &lq);
+        status = dsseCaptiveFinish(&g_captive, in->Generation,
+            g_policyOwner == sp->FileObject, g_policyValid && !g_policy.ObserveOnly)
+            ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
+        KeReleaseInStackQueuedSpinLock(&lq);
+        break;
+    }
+    case IOCTL_DSSE_RECOVER_NETWORK: {
+        /* Explicit elevated recovery. Ordinary CLEAR must retain the guard. */
+        KLOCK_QUEUE_HANDLE lq;
+        KeAcquireInStackQueuedSpinLock(&g_policyLock, &lq);
+        g_policyValid = FALSE;
+        RtlZeroMemory(&g_policy, sizeof(g_policy));
+        dsseCaptiveRecover(&g_captive);
+        g_captiveAgentPid=0; g_captiveEdgeCount=0;
         KeReleaseInStackQueuedSpinLock(&lq);
         status = STATUS_SUCCESS;
         break;
@@ -1056,7 +1496,7 @@ static NTSTATUS dsseDispatchDeviceControl(PDEVICE_OBJECT device, PIRP irp)
         break;
     }
     case IOCTL_DSSE_GET_STATS: {
-        if (sp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(DSSE_STATS)) {
+        if (sp->Parameters.DeviceIoControl.OutputBufferLength < FIELD_OFFSET(DSSE_STATS, CaptiveActive)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
@@ -1073,9 +1513,13 @@ static NTSTATUS dsseDispatchDeviceControl(PDEVICE_OBJECT device, PIRP irp)
         out.PolicyObserveOnly = (unsigned short)((g_policyValid && g_policy.ObserveOnly) ? 1 : 0);
         out.OwnerPresent = (g_policyOwner != NULL) ? 1u : 0u;
         out.OwnerDisarmOnExit = g_policyDisarmOnExit ? 1u : 0u;
+        out.CaptiveActive = g_captive.Active;
+        out.CaptiveExpired = dsseCaptiveExpired(&g_captive, KeQueryInterruptTime()) ? 1u : 0u;
+        out.CaptiveGeneration = g_captive.Generation;
+        out.CaptiveDeadline100ns = g_captive.Deadline100ns;
         KeReleaseInStackQueuedSpinLock(&slq);
-        RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, &out, sizeof(DSSE_STATS));
-        info = sizeof(DSSE_STATS);
+        info = min(sp->Parameters.DeviceIoControl.OutputBufferLength, sizeof(DSSE_STATS));
+        RtlCopyMemory(irp->AssociatedIrp.SystemBuffer, &out, info);
         status = STATUS_SUCCESS;
         break;
     }
@@ -1098,10 +1542,10 @@ static NTSTATUS dsseDispatchDeviceControl(PDEVICE_OBJECT device, PIRP irp)
             LONG ms = (LONG)req->WaitBlockMs;
             if (ms < 0) ms = 0;
             if (ms > 1000) ms = 1000; /* hard ceiling: never let a policy value stall launches for seconds */
-            InterlockedExchange(&g_procHoldMs, ms);
             /* Remember WHO armed it, so only this handle's CLOSE disarms (see dsseDispatchCreateClose). */
             KLOCK_QUEUE_HANDLE olq;
             KeAcquireInStackQueuedSpinLock(&g_holdLock, &olq);
+            InterlockedExchange(&g_procHoldMs, ms);
             g_procWaitOwner = sp->FileObject;
             KeReleaseInStackQueuedSpinLock(&olq);
         }
@@ -1237,6 +1681,11 @@ static void DsseUnload(PDRIVER_OBJECT driver)
     for (UINT32 i = 0; i < DSSE_MAX_PROC_HOLDS; i++) {
         KeSetEvent(&g_procHolds[i].Evt, IO_NO_INCREMENT, FALSE);
     }
+    /* Revoke the PID exception before unregistering its exit notification. */
+    KLOCK_QUEUE_HANDLE captiveOwnerLock;
+    KeAcquireInStackQueuedSpinLock(&g_policyLock,&captiveOwnerLock);
+    g_captiveAgentPid=0;
+    KeReleaseInStackQueuedSpinLock(&captiveOwnerLock);
     if (g_procRegistered) {
         PsSetCreateProcessNotifyRoutineEx(dsseProcessNotify, TRUE);
         g_procRegistered = FALSE;
@@ -1254,6 +1703,11 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT driver, _In_ PUNICODE_STRING registryPa
     NTSTATUS status;
 
     KeInitializeSpinLock(&g_policyLock);
+    KeInitializeSpinLock(&g_captiveFlowLock);
+    InitializeListHead(&g_captiveFlowList);
+    for (UINT32 i=0;i<DSSE_CAPTIVE_FLOW_BUCKETS;i++) InitializeListHead(&g_captiveFlowBuckets[i]);
+    ExInitializeRundownProtection(&g_captiveFlowRundown);
+    KeInitializeEvent(&g_captiveFlowsEmpty,NotificationEvent,TRUE);
     KeInitializeSpinLock(&g_obsLock);
     KeInitializeSpinLock(&g_inLock);
     KeInitializeSpinLock(&g_inObsLock);

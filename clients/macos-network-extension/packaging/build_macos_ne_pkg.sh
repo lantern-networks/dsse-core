@@ -33,6 +33,13 @@ umask 022 # Payload directories must remain traversable after PackageKit assigns
 here="$(cd "$(dirname "$0")" && pwd)"
 tree="$(cd "$here/../../.." && pwd)"   # clients/… is one below the tree root, in the monorepo and in a clone alike
 . "$here/lib_provisioning_profile.sh"
+# Refuse a history-free review export without its explicit content identity
+# before building an app or creating a package output directory.
+source_stamp="$(sh "$tree/scripts/build_stamp.sh")" || exit 1
+if [ -n "${DSSE_SOURCE_CONTENT_ID:-}" ]; then
+	( cd "$tree" && go run -buildvcs=false "$tree/scripts/verify_source_content_id.go" \
+		-root "$tree" -expected "$DSSE_SOURCE_CONTENT_ID" ) || exit 1
+fi
 out="${1:-$tree/var/macos-ne-pkg}"
 mkdir -p "$out"
 out="$(cd "$out" && pwd)"
@@ -51,6 +58,10 @@ pkg_id="${DSSE_PKG_ID:-${app_id}.pkg}"
 
 # ---- 1. the .app ------------------------------------------------------------------------------------------
 if [ -n "${DSSE_APP_SRC:-}" ]; then
+	if [ -n "${DSSE_SOURCE_CONTENT_ID:-}" ]; then
+		echo 'build_macos_ne_pkg: a content-ID candidate must build its app from this OSS source export' >&2
+		exit 1
+	fi
 	src_app="$DSSE_APP_SRC"
 	[ -d "$src_app" ] || { echo "build_macos_ne_pkg: DSSE_APP_SRC not found: $src_app"; exit 1; }
 	echo "==> using prebuilt app: $src_app"
@@ -129,8 +140,8 @@ cp -R "$src_app" "$root/Applications/"
 # way to tell was that a log line was ABSENT from --status — inferring a build's age from a missing sentence, on
 # the one component whose entire job is to decide which code runs as root. With a stamp it is one field.
 #
-# Not fatal if the stamp cannot be produced: a build on a machine with no git still has a VERSION file, and
-# refusing to package over provenance metadata would be the wrong trade for a component this deployment needs.
+# A review export without a content ID must stop before this point. An updater
+# stamped "unknown" cannot establish that it belongs to the signed package.
 # ★ THE VERSION IS THE PACKAGE'S, NOT THE REPOSITORY'S. build_stamp.sh reads the the tree's VERSION file (0.1.0
 # today), while this package — and everything the fleet counts, poisons, ratchets and rolls back — is
 # $version, from DSSE_VERSION. Stamping the repo number would give the updater a SECOND version vocabulary that
@@ -138,20 +149,17 @@ cp -R "$src_app" "$root/Applications/"
 # operator comparing "device reports 0.1.0" against a fleet tracking 0.2.9 would conclude the wrong thing twice.
 # The commit and date still come from the one stamp helper.
 updater_bin="$out/dsse-updater"
-updater_stamp="$(sh "$tree/scripts/build_stamp.sh" 2>/dev/null || true)"
-if [ -n "$updater_stamp" ]; then
-	updater_stamp="$(printf '%s' "$updater_stamp" | sed "s|-X main.buildVersion=[^ ]*|-X main.buildVersion=$version|")"
-else
-	echo "build_macos_ne_pkg: WARNING the build stamp could not be produced; the updater will report 0.0.0-dev+unknown and no device will be able to say which build it is running"
-fi
-( cd "$tree" && GOOS=darwin go build -ldflags "$updater_stamp" -o "$updater_bin" ./clients/macos/updater ) \
+updater_stamp="$(printf '%s' "$source_stamp" | sed "s|-X main.buildVersion=[^ ]*|-X main.buildVersion=$version|")"
+( cd "$tree" && GOOS=darwin go build -buildvcs=false -trimpath -ldflags "$updater_stamp" -o "$updater_bin" ./clients/macos/updater ) \
 	|| { echo "FAIL: could not build the updater"; exit 1; }
 # ★ READ BACK FROM THE ARTEFACT. An -X path that no longer matches the variable's package stamps NOTHING and
 # says nothing — the exact silent failure this block exists to end, so it is not taken on trust.
 updater_says="$("$updater_bin" --version 2>/dev/null || true)"
+expected_updater="$version"
+[ -z "${DSSE_SOURCE_CONTENT_ID:-}" ] || expected_updater="$version+$DSSE_SOURCE_CONTENT_ID"
 case "$updater_says" in
-*"$version"*) : ;;
-*) echo "build_macos_ne_pkg: WARNING the updater reports '$updater_says' rather than $version — the -X paths no longer match its variables, and every device will again be unable to say which build it runs" ;;
+*"$expected_updater"*) : ;;
+*) echo "build_macos_ne_pkg: updater build identity does not match $expected_updater" >&2; exit 1 ;;
 esac
 cp "$updater_bin" "$root/Library/Application Support/Dsse/bin/dsse-updater"
 chmod 755 "$root/Library/Application Support/Dsse/bin/dsse-updater"
@@ -162,7 +170,7 @@ chmod 755 "$root/Library/Application Support/Dsse/bin/dsse-updater"
 # decode the profile unchecked (what it did, and what let a profile name its own verifier) or to derive
 # nothing. So it ships, next to the updater and the uninstaller, for the same reason they do.
 profileverify_bin="$out/dsse-profileverify"
-( cd "$tree" && GOOS=darwin go build -o "$profileverify_bin" ./cmd/dsse-profileverify ) \
+( cd "$tree" && GOOS=darwin go build -buildvcs=false -trimpath -o "$profileverify_bin" ./cmd/dsse-profileverify ) \
 	|| { echo "FAIL: could not build the profile verifier"; exit 1; }
 cp "$profileverify_bin" "$root/Library/Application Support/Dsse/bin/dsse-profileverify"
 chmod 755 "$root/Library/Application Support/Dsse/bin/dsse-profileverify"
@@ -204,7 +212,8 @@ fi
 if [ -d "\$APP" ]; then
 	echo "==> removing the transparent proxy configuration and deactivating the extension (as console user \$uid)"
 	if ! launchctl asuser "\$uid" sudo -u "#\$uid" "\$APP/Contents/MacOS/${app_exec}" --uninstall; then
-		echo "dsse-uninstall: the app could not remove the transparent proxy configuration. STOPPING with the" >&2
+		echo "dsse-uninstall: the app could not remove the transparent proxy configuration or deactivate" >&2
+		echo "   its system extension. STOPPING with the" >&2
 		echo "   app still installed — deleting it now would leave a proxy that captures every flow, a provider" >&2
 		echo "   that can never load, and nothing on this machine able to undo either." >&2
 		exit 1
@@ -391,6 +400,21 @@ if [ -n "$updater_identity" ]; then
 elif [ "$app_kind" = "developer-id" ]; then
 	echo "build_macos_ne_pkg: cannot sign the updater daemon — no identity resolved from the app's profile"
 	exit 1
+fi
+
+# preinstall runs before the payload is installed, so it cannot rely on the
+# payload copy of the verifier. Carry the same signed binary in PackageKit's
+# Scripts directory and require it before replacing any active sidecar files.
+# This is not a second verification key: both invocations use the supplied
+# profile_signing_key.txt that postinstall already uses.
+cp "$root/Library/Application Support/Dsse/bin/dsse-profileverify" "$scripts/dsse-profileverify"
+chmod 755 "$scripts/dsse-profileverify"
+cmp -s "$root/Library/Application Support/Dsse/bin/dsse-profileverify" "$scripts/dsse-profileverify" || {
+	echo "build_macos_ne_pkg: the preinstall profile verifier differs from the payload copy" >&2
+	exit 1
+}
+if [ "$app_kind" = "developer-id" ]; then
+	codesign --verify --strict "$scripts/dsse-profileverify" || exit 1
 fi
 
 # KeepAlive rather than a StartInterval schedule: the updater's own loop decides WHEN to act (device-local
@@ -644,8 +668,8 @@ SCHEMA="__CONFIG_SCHEMA__"
 #
 # A changed sidecar profile replaces the current configuration. Read both organizations before moving
 # any existing files or removing trust. An unreadable profile is not evidence of a different organization.
-# Signature verification still occurs in postinstall, before configuration derivation; this preflight
-# checks readability and required inputs only. Operators must verify sidecars before supplying them.
+# Both preinstall and postinstall verify against the operator-supplied pin. Preinstall must do so before
+# adoption moves any active file; postinstall verifies again before deriving a configuration.
 profile_adoption_refuse() {
 	echo "REFUSING TO INSTALL: $1" >&2
 	echo "Existing configuration, enrolment material and trust have not been changed by profile adoption." >&2
@@ -733,6 +757,13 @@ adopt_artefacts_from_beside_the_package() {
 		   && [ -n "$(tr -d '\n\r' < "$beside/enrolment_token.txt")" ] ||
 			profile_adoption_refuse "The supplied profile needs a nonempty enrolment_token.txt beside the package."
 	fi
+	# A readable tenant inside payload_b64 is not an authenticated tenant. In
+	# particular, do not move a working profile/configuration/root before the
+	# signature has been checked by the same verifier postinstall uses.
+	verifier="$(cd "$(dirname "$0")" && pwd)/dsse-profileverify"
+	[ -x "$verifier" ] || profile_adoption_refuse "The package's profile verifier is missing."
+	"$verifier" -profile "$beside/install_profile.json" -pin "$beside/profile_signing_key.txt" >/dev/null 2>&1 ||
+		profile_adoption_refuse "The supplied install profile does not verify against its supplied signing key."
 	mkdir -p "$CONFIG_DIR"
 	if [ -f "$CONFIG_DIR/install_profile.json" ] || [ -f "$CONFIG_DIR/agent_config.json" ]; then
 		stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -1038,9 +1069,11 @@ CONFIG_DIR="/Library/Application Support/Dsse"
 # The profile now carries those facts (installprofile.DeploymentSpec). This derives the device's configuration
 # from it, so the operator places two files and installs.
 #
-# ★ IT NEVER OVERWRITES ONE THAT IS ALREADY THERE. A deployment that DOES use MDM has placed a configuration
-# deliberately, and a package that replaces it on every update would undo an administrator's decision on a
-# schedule. Absent means "derive it"; present means "somebody already answered this".
+# A configuration derived by an older package is regenerated when the verified profile, build or one-time
+# token changes. Existing active files remain in place until the complete candidate is validated. A
+# separately provisioned configuration without a matching derivation marker is also regenerated when an
+# install profile is present (the existing marker contract); this function must never publish a partial
+# derived candidate.
 # dsse_profile_issued_at reads the profile's issued_at without verifying it — the signature is checked by
 # the derivation itself; here it only identifies WHICH profile a configuration came from.
 dsse_profile_issued_at() {
@@ -1102,17 +1135,12 @@ derive_config_from_profile() {
 		echo "  leaving it alone"
 		return 0
 	fi
-	if [ -f "$config" ]; then
-		mv "$config" "$config.rederived-$(date -u +%Y%m%dT%H%M%SZ)"
-		echo "postinstall: re-deriving the configuration (it was written from a different profile, a different"
-		echo "  build of this package, or a different enrolment token); the previous one is beside it"
-	fi
 	dsse_record_derivation() { printf '%s\n' "$want" > "$marker"; chmod 644 "$marker"; }
 	[ -f "$token_file" ] || {
 		echo "postinstall: $profile is here and $token_file is not — this device has nothing to enrol WITH." >&2
 		echo "  The token is shown once, on the Console screen that approved this device. Place it and" >&2
 		echo "  re-run the installer; nothing else is needed." >&2
-		return 0
+		return 1
 	}
 	# ★★★ THE PROFILE DOES NOT SUPPLY THE KEY THAT PROVES THE PROFILE (2026-08-29). This function used to
 	# decode payload_b64 without checking the signature at all, and then take
@@ -1133,14 +1161,16 @@ derive_config_from_profile() {
 		echo "  This is the deployment's profile-signing key, shown in the Console beside the profile itself." >&2
 		echo "  It is placed the same way the enrolment token is placed. Without it the profile could name its" >&2
 		echo "  own verifier, so nothing is derived and this device stays inert." >&2
-		return 0
+		return 1
 	fi
-	verified="$CONFIG_DIR/.install_profile.verified.json"
+	stage="$(mktemp -d "$CONFIG_DIR/.derive.XXXXXXXX")" || return 1
+	chmod 700 "$stage"
+	verified="$stage/verified.json"
 	if ! "$CONFIG_DIR/bin/dsse-profileverify" -profile "$profile" -pin "$pin_file" > "$verified" 2>"$verified.err"; then
 		echo "postinstall: the install profile did NOT verify against $pin_file:" >&2
 		sed 's/^/  /' "$verified.err" >&2 || true
-		rm -f "$verified" "$verified.err"
-		return 0
+		rm -rf "$stage"
+		return 1
 	fi
 	rm -f "$verified.err"
 	chmod 600 "$verified" 2>/dev/null || true
@@ -1148,14 +1178,57 @@ derive_config_from_profile() {
 	# line carrying `<<`, so `|| {` opening a brace group there put the handler INSIDE the python input and
 	# left the shell without its closing brace: "syntax error: unexpected end of file", at install time, on a
 	# package that signing, notarisation and Gatekeeper had all accepted.
-	if ! /usr/bin/python3 - "$verified" "$token_file" "$config" "$CONFIG_DIR" "$pin_file" "$profile" <<'DERIVE'
+	if ! /usr/bin/python3 - "$verified" "$token_file" "$stage/agent_config.json" "$CONFIG_DIR" "$pin_file" "$profile" "$stage" <<'DERIVE'
 import json, pathlib, sys, datetime
 
-verified_path, token_path, out_path, config_dir, pin_path, profile_path = sys.argv[1:7]
+verified_path, token_path, out_path, config_dir, pin_path, profile_path, stage_dir = sys.argv[1:8]
 # The VERIFIED payload, printed by dsse-profileverify. Never the envelope: decoding that here is what let a
 # profile name its own verifier.
 body = json.loads(pathlib.Path(verified_path).read_text())
 dep = body.get("deployment") or {}
+# This is a sensitive bypass, even though the provider also requires the
+# original hostname, the dialed address and TCP/443 at admission. Take it only
+# from the VERIFIED profile payload and refuse malformed/wildcard/address-only
+# entries before writing any root-owned configuration. In particular, never
+# turn a malformed narrow rule into a domain-wide passthrough fallback.
+_exact_endpoints = dep.get("exact_https_passthrough_endpoints")
+if _exact_endpoints is not None:
+    import ipaddress as _ip, re as _re
+    if not isinstance(_exact_endpoints, list):
+        raise ValueError("signed exact HTTPS passthrough endpoints must be an array")
+    _seen_hosts = set()
+    for _entry in _exact_endpoints:
+        if not isinstance(_entry, dict) or set(_entry) != {"hostname", "addresses"}:
+            raise ValueError("signed exact HTTPS passthrough endpoint has an invalid shape")
+        _host, _addresses = _entry["hostname"], _entry["addresses"]
+        _labels = _host.split(".") if isinstance(_host, str) else []
+        if (not _labels or len(_labels) < 2 or len(_host) > 253 or _host in _seen_hosts
+                or any(not _re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                       for label in _labels)):
+            raise ValueError("signed exact HTTPS passthrough endpoint has an invalid or duplicate hostname")
+        if not isinstance(_addresses, list) or not _addresses:
+            raise ValueError("signed exact HTTPS passthrough endpoint has no numeric addresses")
+        for _raw_domain in dep.get("passthrough_domains") or []:
+            _domain = _raw_domain.strip().lower()
+            if _domain.startswith("*."):
+                _domain = _domain[2:]
+            if _domain.startswith("."):
+                _domain = _domain[1:]
+            if _domain.endswith("."):
+                _domain = _domain[:-1]
+            if _domain and (_host == _domain or _host.endswith("." + _domain)):
+                raise ValueError("signed exact HTTPS passthrough endpoint overlaps a domain-wide bypass")
+        _seen_hosts.add(_host)
+        _seen_addresses = set()
+        for _raw in _addresses:
+            try:
+                _address = _ip.ip_address(_raw)
+            except (TypeError, ValueError) as _error:
+                raise ValueError("signed exact HTTPS passthrough endpoint has a nonnumeric address") from _error
+            if (_raw != _address.compressed or _address.is_loopback or _address.is_link_local
+                    or _address.is_multicast or _address.is_unspecified or _address in _seen_addresses):
+                raise ValueError("signed exact HTTPS passthrough endpoint has an unsafe or duplicate address")
+            _seen_addresses.add(_address)
 token = pathlib.Path(token_path).read_text().strip()
 tenant = (body.get("organization") or {}).get("tenant_id") or body.get("tenant_id") or ""
 door = body.get("transport_url") or ""
@@ -1172,13 +1245,13 @@ anchor_ref = ""
 anchors = [a for a in ([dep.get("anchor_pem")] + list(dep.get("transport_anchors_pem") or [])) if (a or "").strip()]
 if anchors:
     anchor_ref = str(pathlib.Path(config_dir) / "deployment-anchor.pem")
-    pathlib.Path(anchor_ref).write_text("\n".join(a.strip() for a in anchors) + "\n")
+    (pathlib.Path(stage_dir) / "deployment-anchor.pem").write_text("\n".join(a.strip() for a in anchors) + "\n")
 
 # ★ STEER-ALL. default_action=tunnel with no exceptions is this product's principle, not a shortcut: a
 # selective list is the foothold a ZTNA deployment must not give. The provider refuses to start without a
 # rules file, and this is the only shape its validator accepts an empty list in.
 rules_ref = "network_extension_steering_rules.json"
-(pathlib.Path(config_dir) / rules_ref).write_text(json.dumps({
+(pathlib.Path(stage_dir) / rules_ref).write_text(json.dumps({
     "schema_version": "network_extension_steering_rules.v1",
     "tenant_id": tenant,
     "version": now,
@@ -1256,6 +1329,8 @@ if dep.get("steer_exclusions"):
     cfg["network_extension_self_exclusion_source_app_signing_identifiers"] = dep["steer_exclusions"]
 if dep.get("passthrough_domains"):
     cfg["network_extension_passthrough_domains"] = dep["passthrough_domains"]
+if _exact_endpoints:
+    cfg["network_extension_exact_https_passthrough_endpoints"] = _exact_endpoints
 # ★★★ THE POSTURE THE PROFILE ASKS FOR, WHICH NOTHING WAS CARRYING (2026-08-31, found by checking that the
 # arming had taken effect BEFORE creating the condition that would fire it).
 #
@@ -1277,8 +1352,6 @@ if dep.get("passthrough_domains"):
 # silent disagreement one layer down. The provider still decides whether to honour it, and still says so at
 # start-up; this only makes the operator's choice reach the device.
 _posture = (body.get("posture") or "").strip().lower()
-if _posture:
-    cfg["network_extension_posture"] = _posture
 if _posture == "fail-open" and body.get("ack_failopen"):
     cfg["network_extension_lab_fail_open_when_region_blocked"] = True
     cfg["network_extension_fail_open_acknowledged"] = True
@@ -1316,8 +1389,63 @@ print("postinstall: derived", out_path, "from the install profile")
 DERIVE
 	then
 		echo "postinstall: could not derive a configuration from the profile" >&2
-		return 0
+		rm -rf "$stage"
+		return 1
 	fi
+	# Publish only after the complete verified configuration has been derived. Keep a local copy of
+	# each existing file so an ordinary copy/rename failure cannot leave a half-adopted profile.
+	if ! /usr/bin/python3 - "$stage" "$CONFIG_DIR" <<'PUBLISH'
+import datetime, os, pathlib, shutil, sys
+
+stage, active = (pathlib.Path(value) for value in sys.argv[1:3])
+names = ("deployment-anchor.pem", "network_extension_steering_rules.json",
+         ".install_profile.verified.json", "agent_config.json")
+sources = {name: stage / ("verified.json" if name == ".install_profile.verified.json" else name)
+           for name in names}
+if not sources["agent_config.json"].is_file() or not sources["network_extension_steering_rules.json"].is_file():
+    raise RuntimeError("derived configuration is incomplete")
+existing = {}
+for name in names:
+    if not sources[name].is_file():
+        continue
+    target = active / name
+    existing[name] = target.exists()
+    if existing[name]:
+        shutil.copy2(target, stage / ("old-" + name))
+published = []
+backup = None
+try:
+    for name in names:
+        source = sources[name]
+        if not source.is_file():
+            continue
+        os.chmod(source, 0o600 if name in ("agent_config.json", ".install_profile.verified.json") else 0o644)
+        os.replace(source, active / name)
+        published.append(name)
+    if existing.get("agent_config.json"):
+        # Keep the former configuration for the same-profile re-derivation path, as the old
+        # installer did. This file may contain an enrolment token, so it stays root-readable.
+        suffix = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = active / ("agent_config.json.rederived-" + suffix + "-" + str(os.getpid()))
+        shutil.copy2(stage / "old-agent_config.json", backup)
+        os.chmod(backup, 0o600)
+except Exception:
+    if backup is not None:
+        backup.unlink(missing_ok=True)
+    for name in reversed(published):
+        target = active / name
+        if existing[name]:
+            os.replace(stage / ("old-" + name), target)
+        else:
+            target.unlink(missing_ok=True)
+    raise
+PUBLISH
+	then
+		echo "postinstall: could not publish the derived configuration" >&2
+		rm -rf "$stage"
+		return 1
+	fi
+	rm -rf "$stage"
 	chown root:wheel "$config" 2>/dev/null || true
 	chmod 600 "$config" 2>/dev/null || true
 	# Only after the derivation has actually produced a configuration: a marker written before it would make
@@ -1813,8 +1941,10 @@ echo "==> pkgbuild"
 #
 # The failure was a heredoc that swallowed its own error handler, which is exactly the kind of thing a parse
 # check catches for free and no amount of signing ever will.
-for script in "$scripts"/*; do
-	[ -f "$script" ] || continue
+# Scripts also contains the signed Mach-O profile verifier. Parse only the
+# required shell entrypoints; the verifier is checked as a signed binary below.
+for script in "$scripts/preinstall" "$scripts/postinstall"; do
+	[ -f "$script" ] || { echo "missing required installer entrypoint: $(basename "$script")" >&2; exit 1; }
 	sh -n "$script" || { echo "the generated $(basename "$script") does not parse — refusing to build a package whose scripts cannot run" >&2; exit 1; }
 	echo "  ok: $(basename "$script") parses"
 done
@@ -1908,6 +2038,19 @@ for s in preinstall postinstall; do
 	! grep -q '__[A-Z_]*__' "$f" || { echo "FAIL: $s still contains an unsubstituted placeholder"; exit 1; }
 	echo "  ok: $s present, executable, fully substituted"
 done
+preinstall_verifier="$inner/Scripts/dsse-profileverify"
+[ -x "$preinstall_verifier" ] || {
+	echo "FAIL: the preinstall profile verifier is missing from the package" >&2
+	exit 1
+}
+cmp -s "$preinstall_verifier" "$root/Library/Application Support/Dsse/bin/dsse-profileverify" || {
+	echo "FAIL: the packaged preinstall verifier differs from the signed payload verifier" >&2
+	exit 1
+}
+if [ "$app_kind" = "developer-id" ]; then
+	codesign --verify --strict "$preinstall_verifier" || exit 1
+fi
+echo "  ok: preinstall verifier present and identical to payload"
 echo "  ok: Distribution present with the macOS ${min_os} gate"
 # ★ Asserted on the ARTIFACT. A <relocate> element in PackageInfo means PackageKit may install the app wherever
 # it finds an older copy — which is how the first Developer ID install ended up writing into the build tree.

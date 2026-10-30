@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/lantern-networks/dsse-core/archive"
@@ -208,12 +209,21 @@ type auditChainVerifyResult struct {
 // inconsistent with the listed preceding segment. This does not verify a trusted terminal hash.
 func verifyAuditChain(ctx context.Context, arc archive.ColdArchive, tenant string) (auditChainVerifyResult, error) {
 	res := auditChainVerifyResult{Tenant: tenant, Status: "unavailable", Scope: "listed_segments_only"}
+	if !validArchivePathComponent(tenant) {
+		return res, fmt.Errorf("invalid tenant archive key component")
+	}
 	if arc == nil {
 		return res, nil
 	}
-	objs, err := arc.List(ctx, "hot_events/"+tenant+"/audit/", 0)
+	prefix := "hot_events/" + tenant + "/audit/"
+	objs, err := arc.List(ctx, prefix, 0)
 	if err != nil {
 		return res, err
+	}
+	for _, obj := range objs {
+		if !strings.HasPrefix(obj.Key, prefix) {
+			return res, fmt.Errorf("archive listing escaped tenant scope")
+		}
 	}
 	sort.Slice(objs, func(i, j int) bool { return objs[i].Key < objs[j].Key }) // keys are timestamp-prefixed => chronological
 	res.Segments = len(objs)

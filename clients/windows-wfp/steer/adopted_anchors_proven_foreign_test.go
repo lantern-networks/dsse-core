@@ -52,8 +52,8 @@ func TestAnAdoptedDistributionThatNamesAnotherDeploymentIsDiscarded(t *testing.T
 			kept++
 		}
 	}
-	if kept != 2 {
-		t.Fatalf("expected the pointer and the anchors kept aside, found %d", kept)
+	if kept != 1 {
+		t.Fatalf("expected the complete adopted CA/serial record kept aside, found %d", kept)
 	}
 	// And the floor no longer gates this organization's distribution.
 	if got := trustSerialFloorForName(dir, "tenant_sakura", "c2neh.hikari.lab"); got != 0 {
@@ -91,6 +91,27 @@ func TestTheTenantStillDecidesWhenBothSidesHaveOne(t *testing.T) {
 	}
 	if discarded, _ := discardForeignAdoptedAnchors(dir, "tenant_sakura", "same.hikari.lab"); !discarded {
 		t.Fatal("a different organization survived because the names matched")
+	}
+}
+
+// Tenant identifiers are exact identities. The same transport SNI can be shared by two tenants,
+// so a case-distinct adopted pointer must not keep another tenant's anchors or replay floor.
+func TestCaseDistinctTenantWithSameTransportNameIsDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	ca := newTestCA(t, "Foreign Transport CA (test)")
+	if _, err := installTrustBundle(dir, agentpolicy.TrustBundlePayload{
+		Serial: 11, TenantID: "Tenant_Sakura", TransportCAPEM: string(ca.pem),
+		TransportServerName: "shared.hikari.lab"}, "", "shared.hikari.lab"); err != nil {
+		t.Fatal(err)
+	}
+	if got := trustSerialFloorForName(dir, "tenant_sakura", "shared.hikari.lab"); got != 0 {
+		t.Fatalf("case-distinct tenant inherited foreign replay floor: %d", got)
+	}
+	if discarded, _ := discardForeignAdoptedAnchors(dir, "tenant_sakura", "shared.hikari.lab"); !discarded {
+		t.Fatal("case-distinct tenant's anchors remained active")
+	}
+	if _, ok := readAdoptedPointer(dir); ok {
+		t.Fatal("foreign pointer remained active")
 	}
 }
 

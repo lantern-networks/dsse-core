@@ -1,13 +1,24 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func connectorTestTenantModel(t *testing.T, tenantID string) *adminTenantModelStore {
+	t.Helper()
+	store := newAdminTenantModelStore(testEvaluator().PolicyBundle, time.Now())
+	if _, err := store.Put(context.Background(), adminTenantModel{TenantID: tenantID, OperatorManaged: true}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
 
 // EdgeEndpoints has been per-organization since 2026-08-29 — connectorEnrollmentEndpointList(tenantID). The
 // line UNDER it took ConnectorEnrollmentEdgeCAPEM, a node-wide flag holding the deployment anchor, and there
@@ -66,7 +77,9 @@ func TestAConnectorIsGivenItsOwnOrganizationsDoor(t *testing.T) {
 		Evaluator:                    testEvaluator(),
 		Registry:                     seedAdminSiteRegistry(t),
 		SiteStore:                    newAdminSiteStore(),
+		TenantModelStore:             connectorTestTenantModel(t, "tenant_kaede"),
 		AdminAuth:                    newAdminAuthStore(),
+		ConnectorEnrollmentEdgeURL:   "https://agents.example.test",
 		ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ndeployment-anchor\n-----END CERTIFICATE-----\n",
 		TenantTransportAuthority:     authority,
 	})
@@ -105,7 +118,9 @@ func TestAConnectorOfAnOrganizationWithoutADoorIsUnchanged(t *testing.T) {
 		Evaluator:                    testEvaluator(),
 		Registry:                     seedAdminSiteRegistry(t),
 		SiteStore:                    newAdminSiteStore(),
+		TenantModelStore:             connectorTestTenantModel(t, "tenant_without_a_door"),
 		AdminAuth:                    newAdminAuthStore(),
+		ConnectorEnrollmentEdgeURL:   "https://agents.example.test",
 		ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ndeployment-anchor\n-----END CERTIFICATE-----\n",
 		TenantTransportAuthority:     newTenantTransportAuthority(nil, func([]byte) error { return nil }, nil),
 	})

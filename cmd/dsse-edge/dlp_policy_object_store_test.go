@@ -55,6 +55,17 @@ func TestDLPPolicyFromDecisionResolvesNamedPolicy(t *testing.T) {
 	if _, ok := dlpPolicyFromDecision(dec, "corporate", store); ok {
 		t.Fatal("personal-scoped named policy must not apply to a corporate destination")
 	}
+	for _, scope := range []string{"personal", "corporate"} {
+		obj, _ := store.Get("acme", "dlpp_pii")
+		obj.InstanceScope = scope
+		if err := store.Upsert(obj); err != nil {
+			t.Fatal(err)
+		}
+		p, ok := dlpPolicyFromDecision(dec, "", store)
+		if !ok || len(p.Rules) != 1 || p.Rules[0].Action != dlp.ActionBlock || len(p.Rules[0].Identifiers) != 2 {
+			t.Fatalf("unknown instance must retain the named %s policy: ok=%v rules=%v", scope, ok, p.Rules)
+		}
+	}
 	// An unresolvable reference falls back to the inline directive fields (here: observe, no identifiers → applies).
 	decMissing := model.AccessDecision{TenantID: "acme", Actions: []model.DecisionAction{{
 		Type:     "dlp_inspect",

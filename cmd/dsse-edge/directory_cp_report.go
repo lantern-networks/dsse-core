@@ -36,20 +36,22 @@ import (
 	humanidentity "github.com/lantern-networks/dsse-core/humanidentity"
 )
 
-// directoryImportReport is one connector-driven import, in the shape the control plane's own import route
-// takes, plus the tenant it belongs to.
+// directoryImportReport is one connector-driven import, with the tenant and
+// connector identity the authority must independently verify.
 type directoryImportReport struct {
 	Request humanidentity.HumanIdentityDirectoryImportRequest `json:"request"`
-	// TenantID is not part of the CP's body — the CP takes the tenant from the caller's admin context. It
-	// travels here so a queued report is replayed into the organization it actually came from rather than
-	// whichever tenant happens to be current when the outbox drains.
+	// TenantID is a claim until the CP checks the reporting Edge certificate,
+	// connector registration and source assignment.
 	TenantID string `json:"tenant_id"`
-	QueuedAt string `json:"queued_at"`
+	// ConnectorID is checked again by the control plane against its own
+	// registration and source policy; a report cannot claim a different source.
+	ConnectorID string `json:"connector_id"`
+	QueuedAt    string `json:"queued_at"`
 }
 
 type directoryCPReporter struct {
+	// url is the machine-door base URL, using the verified Edge mTLS client.
 	url        string
-	token      string
 	client     *http.Client
 	outboxPath string
 	logf       func(string, ...interface{})
@@ -57,11 +59,12 @@ type directoryCPReporter struct {
 	mu sync.Mutex
 }
 
-// Report carries one import to the control plane, queueing it if the control plane cannot take it now. It
-// never returns an error: the caller has already applied the import locally.
-func (d *directoryCPReporter) Report(report directoryImportReport) {
+// Report carries one import to the control plane. A temporary outage may be
+// acknowledged only after the report is durable in the local outbox; otherwise
+// the connector must not advance its checkpoint.
+func (d *directoryCPReporter) Report(report directoryImportReport) error {
 	if d == nil || strings.TrimSpace(d.url) == "" {
-		return
+		return fmt.Errorf("directory machine report channel is unavailable")
 	}
 	if strings.TrimSpace(report.QueuedAt) == "" {
 		report.QueuedAt = time.Now().UTC().Format(time.RFC3339)
@@ -69,31 +72,42 @@ func (d *directoryCPReporter) Report(report directoryImportReport) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := d.post(ctx, report); err != nil {
-		d.queue(report, err)
-		return
+		if queueErr := d.queue(report, err); queueErr != nil {
+			return queueErr
+		}
+		// A content/route refusal can require an operator correction. Keep the
+		// outbox obligation but do not tell the connector it may checkpoint.
+		if isNotRetryable(err) {
+			return err
+		}
+		return nil
 	}
 	if d.logf != nil {
 		d.logf("directory_import_reported_to_control_plane tenant=%q source=%q identities=%d — the authority now "+
 			"holds these people, so every other Edge and the Console see them too",
 			report.TenantID, report.Request.Source, len(report.Request.Identities))
 	}
+	return nil
 }
 
 func (d *directoryCPReporter) post(ctx context.Context, report directoryImportReport) error {
-	body, err := json.Marshal(report.Request)
+	if d.client == nil || strings.TrimSpace(d.url) == "" {
+		return fmt.Errorf("directory machine report channel is not configured")
+	}
+	body, err := json.Marshal(report)
 	if err != nil {
 		return err
+	}
+	base := strings.TrimRight(d.url, "/")
+	if current := controlChannelCurrentDataURL(); current != "" {
+		base = strings.TrimRight(current, "/")
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(d.url, "/")+"/admin/human-identities/import", bytes.NewReader(body))
+		base+"/directory-import-report", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+d.token)
 	req.Header.Set("content-type", "application/json")
-	if tenant := strings.TrimSpace(report.TenantID); tenant != "" {
-		req.Header.Set("X-Operate-Tenant", tenant)
-	}
 	resp, err := d.client.Do(req)
 	if err != nil {
 		return err
@@ -110,47 +124,32 @@ func (d *directoryCPReporter) post(ctx context.Context, report directoryImportRe
 	return nil
 }
 
-func (d *directoryCPReporter) queue(report directoryImportReport, cause error) {
-	if isNotRetryable(cause) {
-		if d.logf != nil {
-			d.logf("directory_import_report_refused tenant=%q source=%q: %v — NOT queued; retrying cannot change "+
-				"this answer, and the control plane does not hold these people",
-				report.TenantID, report.Request.Source, cause)
-		}
-		return
-	}
+func (d *directoryCPReporter) queue(report directoryImportReport, cause error) error {
 	if strings.TrimSpace(d.outboxPath) == "" {
 		if d.logf != nil {
 			d.logf("directory_import_report_lost tenant=%q source=%q: %v — no outbox path, so the control plane "+
 				"will not learn about these people", report.TenantID, report.Request.Source, cause)
 		}
-		return
+		return fmt.Errorf("directory report has no durable outbox: %w", cause)
 	}
 	line, err := json.Marshal(report)
 	if err != nil {
-		return
+		return err
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := os.MkdirAll(filepath.Dir(d.outboxPath), 0o700); err != nil {
-		return
-	}
-	file, err := os.OpenFile(d.outboxPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
+	if err := appendCPReportOutbox(d.outboxPath, line); err != nil {
 		if d.logf != nil {
 			d.logf("directory_import_report_lost tenant=%q: %v", report.TenantID, err)
 		}
-		return
-	}
-	defer file.Close()
-	if _, err := file.Write(append(line, '\n')); err != nil {
-		return
+		return fmt.Errorf("directory report outbox append failed: %w", err)
 	}
 	if d.logf != nil {
 		d.logf("directory_import_report_queued tenant=%q source=%q identities=%d: %v — the import is live on this "+
 			"Edge and will be carried to the control plane when it answers",
 			report.TenantID, report.Request.Source, len(report.Request.Identities), cause)
 	}
+	return nil
 }
 
 func (d *directoryCPReporter) drain(ctx context.Context, every time.Duration) {
@@ -173,30 +172,43 @@ func (d *directoryCPReporter) drainOnce(ctx context.Context) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	raw, err := os.ReadFile(d.outboxPath)
-	if err != nil || len(raw) == 0 {
+	if err != nil {
+		if !os.IsNotExist(err) && d.logf != nil {
+			d.logf("directory_import_report_outbox_read_failed: %v — replay stopped; original outbox preserved", err)
+		}
 		return
 	}
-	kept := [][]byte{}
-	delivered := 0
+	if len(raw) == 0 {
+		return
+	}
+	type queued struct {
+		line   []byte
+		report directoryImportReport
+	}
+	var pending []queued
+	// Validate the complete snapshot before sending any report. A bad interior
+	// line or torn tail is an unresolved obligation, not permission to drop it.
 	for _, line := range bytes.Split(raw, []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var report directoryImportReport
-		if err := json.Unmarshal(line, &report); err != nil {
-			// An unreadable line is dropped rather than retried forever; it can never become deliverable.
+		if err := decodeCPReportObject(line, &report); err != nil {
 			if d.logf != nil {
-				d.logf("directory_import_report_unreadable: %v — dropped from the outbox", err)
+				d.logf("directory_import_report_outbox_unreadable: %v — replay stopped; original outbox preserved", err)
 			}
-			continue
+			return
 		}
+		pending = append(pending, queued{line: line, report: report})
+	}
+	kept := [][]byte{}
+	delivered := 0
+	for _, item := range pending {
+		line, report := item.line, item.report
 		if err := d.post(ctx, report); err != nil {
-			if isNotRetryable(err) {
-				if d.logf != nil {
-					d.logf("directory_import_report_refused tenant=%q source=%q: %v — dropped from the outbox",
-						report.TenantID, report.Request.Source, err)
-				}
-				continue
+			if isNotRetryable(err) && d.logf != nil {
+				d.logf("directory_import_report_refused tenant=%q source=%q: %v — kept for operator correction",
+					report.TenantID, report.Request.Source, err)
 			}
 			kept = append(kept, line)
 			continue
@@ -206,10 +218,15 @@ func (d *directoryCPReporter) drainOnce(ctx context.Context) {
 	if delivered == 0 && len(kept) > 0 {
 		return
 	}
-	if len(kept) == 0 {
-		_ = os.Remove(d.outboxPath)
-	} else {
-		_ = os.WriteFile(d.outboxPath, append(bytes.Join(kept, []byte("\n")), '\n'), 0o600)
+	var remaining []byte
+	if len(kept) > 0 {
+		remaining = append(bytes.Join(kept, []byte("\n")), '\n')
+	}
+	if err := replaceCPReportOutbox(d.outboxPath, remaining); err != nil {
+		if d.logf != nil {
+			d.logf("directory_import_report_outbox_rewrite_failed: %v — original outbox retained or durability unconfirmed", err)
+		}
+		return
 	}
 	if delivered > 0 && d.logf != nil {
 		d.logf("directory_import_outbox_drained delivered=%d still_queued=%d", delivered, len(kept))

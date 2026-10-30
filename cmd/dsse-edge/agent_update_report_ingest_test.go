@@ -325,6 +325,30 @@ func TestTheFleetViewIsRebuiltFromTheLogAfterARestart(t *testing.T) {
 	}
 }
 
+func TestUpdateLogHydrationKeepsCaseDistinctTenantEvents(t *testing.T) {
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"Acme", "acme"} {
+		evaluator := decision.Evaluator{PolicyBundle: model.PolicyBundle{ID: "pb", TenantID: tenant}}
+		event := model.AgentUpdateEvent{ID: "same-event", TenantID: tenant, DeviceID: "same-device",
+			UpdateStatus: "installed", CurrentAgentVersion: "0.4.0", TargetAgentVersion: "0.4.0",
+			ReleaseChannel: "stable", UpdateSource: "control_plane", Timestamp: time.Now().UTC().Format(time.RFC3339)}
+		if err := writer.Append("audit.log.jsonl", agentUpdateAuditLog(event, evaluator, "127.0.0.1")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := agenttelemetry.NewStore()
+	hydrateAgentUpdateTelemetry(store, writer)
+	for _, tenant := range []string{"Acme", "acme"} {
+		summary, err := store.UpdateSummary(context.Background(), tenant)
+		if err != nil || summary["total"] != 1 {
+			t.Fatalf("%s hydrated count = %+v, err=%v", tenant, summary, err)
+		}
+	}
+}
+
 // ★ "darwin" CONTAINS "win". A substring test for the platform matched every Mac as Windows, so the per-device
 // view looked up darwin/amd64, found nothing, and told the operator "no release is published for darwin" while
 // darwin/arm64 sat in the offering it had just printed.

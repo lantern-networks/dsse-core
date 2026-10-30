@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // ★★ TRUST REFUSALS WERE WRITTEN PER TENANT AND READ FOR ONE (2026-08-18).
 //
@@ -11,10 +14,16 @@ import "testing"
 // A trust refusal is the one signal that says a certificate replacement is breaking devices. A tenant whose
 // whole fleet was refusing the Edge showed a clean screen.
 func TestTrustRefusalsAreReadForTheTenantAsked(t *testing.T) {
-	store := &trustRefusalStore{by: map[string][]observedTrustRefusal{}}
-	store.Merge("tenant_reference_lab", "mac-dev-1", []observedTrustRefusal{{Reason: "unknown_ca"}})
-	store.Merge("tenant_northwind", "nw-laptop-001", []observedTrustRefusal{{Reason: "unknown_ca"}})
-	store.Merge("tenant_northwind", "nw-laptop-002", []observedTrustRefusal{{Reason: "expired"}})
+	store := newTrustRefusalStore(filepath.Join(t.TempDir(), "trust.json"))
+	for _, entry := range []struct{ tenant, identity, reason string }{
+		{"tenant_reference_lab", "mac-dev-1", "unknown_ca"},
+		{"tenant_northwind", "nw-laptop-001", "unknown_ca"},
+		{"tenant_northwind", "nw-laptop-002", "expired"},
+	} {
+		if _, err := store.Merge(entry.tenant, entry.identity, []observedTrustRefusal{{Reason: entry.reason}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	lab := store.ForTenant("tenant_reference_lab")
 	if len(lab) != 1 || len(lab["mac-dev-1"]) != 1 {

@@ -8,8 +8,8 @@
 
   Prerequisites:
     - Go (windows/amd64 build)
-    - WiX v5 as a dotnet global tool:  dotnet tool install --global wix --version 5.0.2
-      (WiX v6/v7 add the OSMF EULA gate; v5 does not. See README.)
+    - WiX v7 as a dotnet global tool:  dotnet tool install --global wix --version 7.0.0
+      This build explicitly accepts the wix7 OSMF EULA (see README).
     - Windows SDK signtool (only when -Sign)
 
 .EXAMPLE
@@ -173,6 +173,27 @@ $oss  = (Resolve-Path "$pkg\..\..\..").Path                 # the module root
 # directories above whatever they unpacked into: a build run from ~/Downloads/dsse-core wrote to ~/outputs.
 # The tree is the unit that ships, so it is also the unit that holds what a build produces.
 $repo = $oss
+# A review export has no Git history. Stamp its externally verified OSS content
+# identity, never a private parent repository revision found by Git walking up.
+$sourceContentId = [string]$env:DSSE_SOURCE_CONTENT_ID
+if ($sourceContentId) {
+  if ($sourceContentId.Length -ne 71 -or $sourceContentId -cnotmatch '^source-[0-9a-f]{64}$') {
+    throw 'DSSE_SOURCE_CONTENT_ID must be source- followed by 64 lowercase hexadecimal characters'
+  }
+  # Windows does not preserve Git's 100644/100755 modes in os.Stat. The
+  # issuer-authenticated source archive carries those modes, while the
+  # verifier independently hashes every extracted file and refuses extras.
+  # Both pins are mandatory before any staging directory or build output.
+  $sourceArchive = [string]$env:DSSE_SOURCE_ARCHIVE
+  $sourceArchiveSha256 = [string]$env:DSSE_SOURCE_ARCHIVE_SHA256
+  if (-not $sourceArchive -or $sourceArchiveSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw 'Gitless Windows review build requires DSSE_SOURCE_ARCHIVE and its authenticated lowercase DSSE_SOURCE_ARCHIVE_SHA256'
+  }
+  & go run -buildvcs=false (Join-Path $oss 'scripts/verify_source_content_id.go') -root $oss -expected $sourceContentId -archive $sourceArchive -archive-sha256 $sourceArchiveSha256
+  if ($LASTEXITCODE -ne 0) { throw 'OSS export content does not match DSSE_SOURCE_CONTENT_ID' }
+} elseif (-not (Test-Path -LiteralPath (Join-Path $oss '.git'))) {
+  throw 'Gitless OSS export requires DSSE_SOURCE_CONTENT_ID before building a review MSI'
+}
 $stage = Join-Path $repo "outputs\windows\stage"
 $outDir = Join-Path $repo "outputs\windows"
 $msi = Join-Path $outDir "DsseAgent.msi"
@@ -180,6 +201,10 @@ New-Item -ItemType Directory -Force -Path $stage, $outDir | Out-Null
 
 $wix = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
 if (-not (Test-Path $wix)) { $wix = "wix" }                 # fall back to PATH
+$wixVersion = (& $wix --version).Trim()
+if ($LASTEXITCODE -or $wixVersion -notmatch '^7\.0\.0(?:\+.*)?$') {
+  throw "WiX 7.0.0 is required (found: $wixVersion)"
+}
 $env:DOTNET_ROOT = Join-Path $env:USERPROFILE ".dotnet"
 
 # ★ CHECK THE SIGNING PREREQUISITES BEFORE BUILDING ANYTHING (2026-08-17).
@@ -228,14 +253,24 @@ try {
 # native command's failure is raised as a NativeCommandError and the build dies on this line, whatever git's
 # complaint was — "not a repository" for an unpacked archive, "Needed a single revision" for a fresh `git
 # init`. Anyone given this tree as a tarball was stopped here with a git error and no way to read it as one.
-$stampCommit = "unknown"
-try {
-  $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  $c = & git -C $oss rev-parse --short HEAD 2>$null
-  $ErrorActionPreference = $prev
-  if ($LASTEXITCODE -eq 0 -and $c) { $stampCommit = "$c".Trim() }
-} catch { $stampCommit = "unknown" }
-  git -C $oss diff --quiet 2>$null; $stampDirty = if ($LASTEXITCODE -ne 0) { "true" } else { "false" }
+$stampCommit = $sourceContentId
+$stampDirty = 'false'
+if (-not $sourceContentId) {
+  $prev = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $c = & git -C $oss rev-parse --short HEAD 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $c) { throw 'Cannot identify the OSS Git checkout' }
+    $stampCommit = "$c".Trim()
+    & git -C $oss diff --quiet 2>$null
+    $unstaged = $LASTEXITCODE -ne 0
+    & git -C $oss diff --cached --quiet 2>$null
+    $staged = $LASTEXITCODE -ne 0
+    if ($unstaged -or $staged) { $stampDirty = 'true' }
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+}
   $stamp = "-X main.buildVersion=$Version -X main.buildCommit=$stampCommit -X main.buildDate=$((Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) -X main.buildDirty=$stampDirty"
   if ($Pin) { $stamp = "$stamp -X main.trustAnchorPin=$Pin" }
   $ldArgs = @("-ldflags", $stamp)
@@ -254,7 +289,7 @@ try {
   # ★ These strings are deployment-independent by construction — publisher and version, nothing about any
   # organization, edge, key or tenant — which is the constraint the signed artifacts are held to.
   $verTool = Join-Path $stage "icontosyso.exe"
-  go build -o $verTool ./clients/windows-wfp/packaging/cmd/icontosyso; if ($LASTEXITCODE) { throw "go build icontosyso" }
+  go build -buildvcs=false -trimpath -o $verTool ./clients/windows-wfp/packaging/cmd/icontosyso; if ($LASTEXITCODE) { throw "go build icontosyso" }
   $sysoWritten = @()
   $sysoParked  = @()
   function Add-VersionResource($pkgDir, $exeName, $description, $iconPath) {
@@ -272,36 +307,24 @@ try {
   Add-VersionResource (Join-Path $ossRoot "clients/windows-wfp/compat/cmd/compatcheck")     "compatcheck.exe"        "DSSE compatibility check"       $null
   Add-VersionResource (Join-Path $ossRoot "clients/windows-wfp/packaging/cmd/driversvc")    "driversvc.exe"          "DSSE driver service helper"     $null
   Add-VersionResource (Join-Path $ossRoot "clients/windows-wfp/packaging/cmd/profileapply") "profileapply.exe"       "DSSE profile and trust apply"    $null
-  # ★ THE STEP-UP WINDOW TAKES ONE .syso CARRYING BOTH, because a binary may hold exactly one .rsrc section.
-  # Measured: generating a version .syso beside the committed icon one makes the Go linker refuse outright with
-  # "too many .rsrc sections". So here the icon is regenerated from brand/lantern.ico TOGETHER with the version
-  # into a single object, and the committed rsrc_windows_<arch>.syso is parked for the duration of the build and
-  # put back in the finally block. It stays in the tree as the inspectable artefact it was written to be; it
-  # just stops being a second resource section while a build is running.
-  $swDir  = Join-Path $ossRoot "clients/windows-wfp/stepupwindow"
-  $swIcon = Join-Path $swDir "brand/lantern.ico"
-  $swOld  = Join-Path $swDir "rsrc_windows_$goarch.syso"
-  if (Test-Path $swOld) { Move-Item $swOld "$swOld.parked" -Force; $script:sysoParked += ,@("$swOld.parked", $swOld) }
-  Add-VersionResource $swDir "dsse-stepup-window.exe" "DSSE step-up credential window" $swIcon
-  Write-Host "== version resources: 7 generated (publisher + version only; no deployment or tenant data) =="
+  Write-Host "== version resources: 6 generated (publisher + version only; no deployment or tenant data) =="
 
-  go build @ldArgs -o (Join-Path $stage "dsse-steer.exe")  ./clients/windows-wfp/steer;              if ($LASTEXITCODE) { throw "go build steer" }
+  go build -buildvcs=false -trimpath @ldArgs -o (Join-Path $stage "dsse-steer.exe")  ./clients/windows-wfp/steer;              if ($LASTEXITCODE) { throw "go build steer" }
   # dsse-tray.exe is deliberately NOT built or shipped (2026-08-05). The status endpoint it reads is an
   # unauthenticated loopback listener that any local process can read — it discloses posture, i.e. exactly when
   # enforcement is degraded — so it is off by default, which meant the MSI shipped a tray that could not work.
   # It returns when the ACL'd named-pipe transport lands (status_server.go's stated follow-up). Source is kept.
-  go build -o (Join-Path $stage "dsse-stepup-window.exe") ./clients/windows-wfp/stepupwindow;    if ($LASTEXITCODE) { throw "go build stepup-window" }
   # dsse-watchdog.exe: the process that puts this box back on the network if the WFP redirect is left armed
   # with no agent behind it. It is stamped like the agent because a watchdog whose version nobody knows is one
   # nobody can reason about after an incident.
-  go build @ldArgs -o (Join-Path $stage "dsse-watchdog.exe") ./clients/windows-wfp/watchdog;     if ($LASTEXITCODE) { throw "go build watchdog" }
+  go build -buildvcs=false -trimpath @ldArgs -o (Join-Path $stage "dsse-watchdog.exe") ./clients/windows-wfp/watchdog;     if ($LASTEXITCODE) { throw "go build watchdog" }
   # dsse-updater.exe: decides when this device installs a new agent build. Stamped like the agent and the
   # watchdog, and for a sharper reason than either — after a bad rollout the first question is which version
   # each device was running, and the second is which updater decided to install it.
-  go build @ldArgs -o (Join-Path $stage "dsse-updater.exe") ./clients/windows-wfp/updater;       if ($LASTEXITCODE) { throw "go build updater" }
-  go build -o (Join-Path $stage "compatcheck.exe") ./clients/windows-wfp/compat/cmd/compatcheck;    if ($LASTEXITCODE) { throw "go build compatcheck" }
-  go build -o (Join-Path $stage "driversvc.exe")   ./clients/windows-wfp/packaging/cmd/driversvc;   if ($LASTEXITCODE) { throw "go build driversvc" }
-  go build @ldArgs -o (Join-Path $stage "profileapply.exe") ./clients/windows-wfp/packaging/cmd/profileapply; if ($LASTEXITCODE) { throw "go build profileapply" }
+  go build -buildvcs=false -trimpath @ldArgs -o (Join-Path $stage "dsse-updater.exe") ./clients/windows-wfp/updater;       if ($LASTEXITCODE) { throw "go build updater" }
+  go build -buildvcs=false -trimpath -o (Join-Path $stage "compatcheck.exe") ./clients/windows-wfp/compat/cmd/compatcheck;    if ($LASTEXITCODE) { throw "go build compatcheck" }
+  go build -buildvcs=false -trimpath -o (Join-Path $stage "driversvc.exe")   ./clients/windows-wfp/packaging/cmd/driversvc;   if ($LASTEXITCODE) { throw "go build driversvc" }
+  go build -buildvcs=false -trimpath @ldArgs -o (Join-Path $stage "profileapply.exe") ./clients/windows-wfp/packaging/cmd/profileapply; if ($LASTEXITCODE) { throw "go build profileapply" }
 } finally {
   # ★ REMOVE THE GENERATED .syso FILES, AND DO IT IN finally SO A FAILED BUILD DOES NOT LEAVE THEM BEHIND.
   # They are build inputs, not source: left in the tree, `git diff --quiet` above sees a dirty worktree and the
@@ -654,7 +677,7 @@ if ($Sign) {
 Write-Host "== wix build -> $msi =="
 Push-Location $pkg
 try {
-  & $wix build DsseAgent.wxs -arch $Arch -b $stage -d Version=$Version @wixDefines -o $msi
+  & $wix build -acceptEula wix7 DsseAgent.wxs -arch $Arch -b $stage -d Version=$Version @wixDefines -o $msi
   if ($LASTEXITCODE) { throw "wix build failed ($LASTEXITCODE)" }
 } finally { Pop-Location }
 

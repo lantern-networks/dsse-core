@@ -13,6 +13,20 @@ type contextUpdater interface {
 	UpdateContext(context.Context, func([]byte) ([]byte, error)) error
 }
 
+// mergePendingAdmissionBlocks requires writeMu. Only restrictive unconfirmed
+// edits are carried into the latest shared row; an explicit restore removes its
+// target after this merge and lifts the local block only after a confirmed save.
+func (a *AdmissionRevocations) mergePendingAdmissionBlocks(candidate *admissionRevocationsStateFile) {
+	for id, reason := range a.originPending {
+		candidate.Revoked[id] = reason
+	}
+	// Retain only unconfirmed received blocks. A later authoritative snapshot
+	// may deliberately remove a previously committed mesh block.
+	for id, reason := range a.meshPending {
+		candidate.MeshReceived[id] = reason
+	}
+}
+
 // RevokeCheckedContext carries request authority into shared storage. A refusal
 // before the storage callback applies nothing. Once an authorized callback has
 // run, an unconfirmed save retains the restrictive local decision. File-backed
@@ -45,6 +59,7 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 	}
 	var candidate admissionRevocationsStateFile
 	edited := false
+	initial := false
 	err := p.UpdateContext(ctx, func(raw []byte) ([]byte, error) {
 		candidate = admissionRevocationsStateFile{SchemaVersion: admissionRevocationsStateSchemaVersion, Revoked: map[string]string{}, MeshReceived: map[string]string{}}
 		if raw != nil {
@@ -53,9 +68,11 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 			if err != nil {
 				return nil, err
 			}
-		} else if a.generation.Load() != 0 {
+		} else if a.generation.Load() != 0 && !a.originInitialPending && !a.meshInitialPending {
 			return nil, ErrAdmissionLoad
 		}
+		initial = raw == nil
+		a.mergePendingAdmissionBlocks(&candidate)
 		if revoke {
 			candidate.Revoked[id] = reason
 		} else {
@@ -64,6 +81,9 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 		edited = true
 		return json.Marshal(candidate)
 	})
+	if err != nil && edited && initial && revoke {
+		a.originInitialPending = true
+	}
 	a.mu.Lock()
 	previous, exists := a.revoked[id]
 	notify := revoke && edited && (!exists || previous != reason)
@@ -73,9 +93,19 @@ func (a *AdmissionRevocations) changeAdmissionContext(ctx context.Context, ident
 			a.generation.Add(1)
 		}
 		a.revoked, a.meshReceived = candidate.Revoked, candidate.MeshReceived
+		a.originPending = nil
+		a.originInitialPending = false
+		a.meshInitialPending = false
+		a.meshPending = nil
 	} else if notify {
 		a.revoked[id] = reason
 		a.generation.Add(1)
+	}
+	if err != nil && revoke && edited {
+		if a.originPending == nil {
+			a.originPending = map[string]string{}
+		}
+		a.originPending[id] = reason
 	}
 	reporter, meshReporter, onRevoked := a.reporter, a.meshReporter, a.onRevoked
 	a.mu.Unlock()

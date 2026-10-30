@@ -102,8 +102,10 @@ func regionEndpointBundleSection(isControlPlane bool, cat *regionEndpointCatalog
 	section := &regionEndpointBundle{Endpoints: []regionEndpoint{}, Complete: true}
 	if cat != nil {
 		for _, region := range cat.order {
-			section.Endpoints = append(section.Endpoints,
-				regionEndpoint{Region: region, Endpoint: cat.byRegion[region]})
+			for _, endpoint := range cat.byRegion[region] {
+				section.Endpoints = append(section.Endpoints,
+					regionEndpoint{Region: region, Endpoint: endpoint})
+			}
 		}
 	}
 	return section
@@ -130,18 +132,27 @@ func applyRegionEndpointBundleSection(section *regionEndpointBundle,
 		}
 		return false, 0
 	}
-	next := &regionEndpointCatalog{byRegion: map[string]string{}}
+	next := &regionEndpointCatalog{byRegion: map[string][]string{}}
 	for _, ep := range section.Endpoints {
 		region := strings.ToLower(strings.TrimSpace(ep.Region))
 		endpoint := strings.TrimSpace(ep.Endpoint)
 		if region == "" || endpoint == "" {
 			continue
 		}
-		if _, dup := next.byRegion[region]; dup {
+		duplicate := false
+		for _, existing := range next.byRegion[region] {
+			if existing == endpoint {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
 			continue
 		}
-		next.byRegion[region] = endpoint
-		next.order = append(next.order, region)
+		if len(next.byRegion[region]) == 0 {
+			next.order = append(next.order, region)
+		}
+		next.byRegion[region] = append(next.byRegion[region], endpoint)
 	}
 	if len(next.byRegion) == 0 {
 		// An empty map is nil rather than an empty catalogue, so /steer/region-endpoints answers "geo-steering

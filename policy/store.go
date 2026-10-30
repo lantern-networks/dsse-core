@@ -573,18 +573,19 @@ func (store *Store) RuntimeEvaluator(base decision.Evaluator) decision.Evaluator
 			total += len(compiled)
 		}
 		if total > 0 {
-			present := make(map[string]bool, len(base.Policies))
+			type policyKey struct{ tenantID, id string }
+			present := make(map[policyKey]bool, len(base.Policies))
 			for _, policy := range base.Policies {
-				present[policy.ID] = true
+				present[policyKey{policy.TenantID, policy.ID}] = true
 			}
 			merged := make([]model.Policy, 0, len(base.Policies)+total)
 			merged = append(merged, base.Policies...)
 			for _, owner := range sortedCompiledTenants(store.compiledPolicies) {
 				for _, policy := range store.compiledPolicies[owner] {
-					if present[policy.ID] {
+					if present[policyKey{policy.TenantID, policy.ID}] {
 						continue
 					}
-					present[policy.ID] = true
+					present[policyKey{policy.TenantID, policy.ID}] = true
 					merged = append(merged, policy)
 				}
 			}
@@ -604,6 +605,7 @@ func (store *Store) RuntimeEvaluator(base decision.Evaluator) decision.Evaluator
 	base.EastWestInternalNetworks = store.eastWestInternalNetworks[tenantID]
 	// Partial Enforce (S4): enabled rules bite but unmatched flows are allowed (not default-denied).
 	base.EastWestAllowUnmatched = store.eastWestAllowUnmatched[tenantID]
+	base.EastWestMaxGrantTTLSeconds = store.eastWestMaxGrantTTL[tenantID]
 	// Union the legacy admin rules with the rules compiled from the authored-rule model. Enablement is NOT
 	// implied by having rules — it stays under the existing posture toggle (observe → enforce), so authoring
 	// a rule never silently turns on east-west default-deny.

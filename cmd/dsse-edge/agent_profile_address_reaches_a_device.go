@@ -1,7 +1,7 @@
 package main
 
 import (
-	"net"
+	"net/netip"
 	"net/url"
 	"strings"
 )
@@ -33,7 +33,9 @@ func addressReachesADevice(endpoint string) bool {
 	if host == "" {
 		return false
 	}
-	lower := strings.ToLower(host)
+	// A DNS root dot and an IPv6 zone do not make loopback reachable from
+	// another machine. Parse addresses with their zone before classifying them.
+	lower := strings.TrimSuffix(strings.ToLower(host), ".")
 	switch lower {
 	case "localhost", "ip6-localhost", "ip6-loopback":
 		return false
@@ -43,7 +45,8 @@ func addressReachesADevice(endpoint string) bool {
 	if strings.HasSuffix(lower, ".localhost") {
 		return false
 	}
-	if ip := net.ParseIP(host); ip != nil {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		ip = ip.WithZone("").Unmap()
 		return !ip.IsLoopback() && !ip.IsUnspecified()
 	}
 	return true

@@ -16,7 +16,10 @@ type recordingObservedStore struct {
 	entries []observedExclusionEntry
 }
 
-func (s *recordingObservedStore) Record(e observedExclusionEntry) { s.entries = append(s.entries, e) }
+func (s *recordingObservedStore) Record(e observedExclusionEntry) error {
+	s.entries = append(s.entries, e)
+	return nil
+}
 func (s *recordingObservedStore) Query(string, observedQueryFilter) observedQueryResult {
 	return observedQueryResult{}
 }

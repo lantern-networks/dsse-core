@@ -77,6 +77,9 @@ type Platform struct {
 	// asserting something that was never true, and an alarm that fires on a healthy stand-aside box is how
 	// people learn to ignore the one that matters.
 	armedBeforeDisarm bool
+	// preDisarmKnown distinguishes a confirmed unarmed device from an unreadable driver. Only the former
+	// can be restored by a service restart without checking that the driver armed again.
+	preDisarmKnown bool
 	// disarmObserved distinguishes "the disarm looked and found nothing armed" from "no disarm has run in this
 	// process", so a Rearm reached without one keeps the strict assertion. The safe default is the strict one.
 	disarmObserved bool
@@ -217,6 +220,7 @@ func (p *Platform) Disarm() error {
 func (p *Platform) noteArmedBeforeDisarm() {
 	r := wfpstate.Read()
 	p.disarmObserved = true
+	p.preDisarmKnown = r.Known
 	p.armedBeforeDisarm = r.Present && r.Known && r.State.Armed
 }
 
@@ -228,7 +232,7 @@ func (p *Platform) noteArmedBeforeDisarm() {
 // when something WAS armed would report a restored endpoint that is unprotected — so an unobserved disarm
 // keeps the strict path, which is the only default that fails in the survivable direction.
 func (p *Platform) restorationIsTheServiceComingBack() bool {
-	return p.disarmObserved && !p.armedBeforeDisarm
+	return serviceStartProvesRestoration(p.disarmObserved, p.preDisarmKnown, p.armedBeforeDisarm)
 }
 
 // confirmDisarmed asks the driver whether the redirect is actually gone.

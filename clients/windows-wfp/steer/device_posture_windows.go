@@ -90,11 +90,13 @@ func osDescription() string {
 	return ""
 }
 
-// firewallStatus reports "on" if ANY firewall profile is enabled, "off" if every readable profile is disabled,
-// and "" (unknown) if none is readable. Registry read avoids COM and the session-0 no-child-process constraint.
+// firewallStatus reports "on" only when all three profile settings are enabled, "off" only when all three
+// are disabled, and "" (unknown) for mixed or unreadable settings. The registry does not identify the currently
+// active profile; claiming "on" from just one configured profile can incorrectly mark a device as managed.
+// This is a conservative configuration signal, not a measurement of effective firewall enforcement.
 func firewallStatus() string {
-	readAny := false
-	for _, p := range []string{"DomainProfile", "StandardProfile", "PublicProfile"} {
+	states := [3]int8{-1, -1, -1}
+	for i, p := range []string{"DomainProfile", "StandardProfile", "PublicProfile"} {
 		k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\`+p, registry.QUERY_VALUE)
 		if err != nil {
 			continue
@@ -104,13 +106,9 @@ func firewallStatus() string {
 		if e != nil {
 			continue
 		}
-		readAny = true
-		if v == 1 {
-			return "on"
+		if v == 0 || v == 1 {
+			states[i] = int8(v)
 		}
 	}
-	if readAny {
-		return "off"
-	}
-	return ""
+	return firewallStatusFromProfiles(states)
 }

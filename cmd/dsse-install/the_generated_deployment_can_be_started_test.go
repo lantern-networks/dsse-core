@@ -89,10 +89,19 @@ func checkComposeAndEnvironmentAgree(t *testing.T, holding regionHolding, standb
 			missing = append(missing, name)
 		}
 	}
-	if len(missing) > 0 {
+	// A planless generator intentionally leaves this reviewed image cohort
+	// unset. Official startup rejects it; a complete plan populates all three.
+	cohort := map[string]bool{"DSSE_ETCD_IMAGE": true, "DSSE_POSTGRES_IMAGE": true, "DSSE_PSQL_IMAGE": true}
+	unexpected := []string{}
+	for _, name := range missing {
+		if !cohort[name] {
+			unexpected = append(unexpected, name)
+		}
+	}
+	if len(unexpected) > 0 {
 		t.Fatalf("the generated compose refuses to start without %s, and the generated deployment.env does not "+
-			"set %s — the first command this installer prints would fail", strings.Join(missing, ", "),
-			map[bool]string{true: "them", false: "it"}[len(missing) > 1])
+			"set %s — the first command this installer prints would fail", strings.Join(unexpected, ", "),
+			map[bool]string{true: "them", false: "it"}[len(unexpected) > 1])
 	}
 	if len(seen) == 0 {
 		t.Fatal("no ${VAR:?} was found in the generated compose — this check is looking at the wrong thing")

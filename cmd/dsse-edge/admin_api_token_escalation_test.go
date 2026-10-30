@@ -122,6 +122,17 @@ func TestTheOperatorRoleIsAvailableToATokenAtAll(t *testing.T) {
 	}
 }
 
+func TestCatalogOnlyAdvertisesTokenRolesThatCanBeIssued(t *testing.T) {
+	for _, role := range adminAPITokenAssignableRoles {
+		if !adminAPITokenRoles[role] || len(adminPermissionsByRole[role]) == 0 {
+			t.Fatalf("RBAC catalog advertises unissuable or undefined API-token role %q", role)
+		}
+		if unknown := adminUnknownTokenRoles([]string{role}); len(unknown) != 0 {
+			t.Fatalf("catalog role %q is rejected by token validation: %v", role, unknown)
+		}
+	}
+}
+
 // An unknown role is refused rather than dropped. Asking for ["admin","super_admin"] used to produce a token
 // holding ["admin"] with a 201 — weaker than the one asked for, and nothing said so.
 func TestAnUnknownRoleIsRefusedRatherThanQuietlyDropped(t *testing.T) {

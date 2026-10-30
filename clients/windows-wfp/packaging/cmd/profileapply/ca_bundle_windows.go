@@ -144,33 +144,41 @@ func writeCABundleAndPointAtIt(dataDir string, interceptionRootPEM []byte) error
 // holding this path, and deleting the file underneath them takes TLS away from all of them at once —
 // including, when it happens, whatever the operator is using to work on the machine. Rewriting it without our
 // root leaves those processes verifying the public internet exactly as before, and no longer trusting us.
-func removeCABundlePointers(dataDir string, interceptionRootPEM []byte) {
+func removeCABundlePointers(dataDir string, interceptionRootPEM []byte) error {
 	bundlePath := filepath.Join(dataDir, caBundleName)
-	if _, err := os.Stat(bundlePath); err == nil {
-		if publicRoots, rerr := machineRootStorePEM(interceptionRootPEM); rerr == nil {
-			if werr := os.WriteFile(bundlePath, publicRoots.pem, 0o644); werr == nil {
-				keepPublicReadable(bundlePath)
-				fmt.Printf("profileapply: CA bundle rewritten WITHOUT this organization's interception root "+
-					"-> %s (%d public root(s)). The file is deliberately not deleted: processes started while "+
-					"the agent ran still hold this path, and removing it would take TLS from all of them.\n",
-					bundlePath, publicRoots.count)
-			} else {
-				fmt.Fprintf(os.Stderr, "profileapply: could not rewrite %s (%v) — it still carries this "+
-					"organization's interception root; take that one certificate out by hand, and do not "+
-					"delete the file\n", bundlePath, werr)
+	steps := []cleanupStep{{"rewrite CA bundle", func() error {
+		if _, err := os.Stat(bundlePath); err != nil {
+			if os.IsNotExist(err) {
+				return nil
 			}
+			return err
 		}
-	}
-	for _, name := range append(append([]string{}, caEnvVars...), "NODE_EXTRA_CA_CERTS") {
-		if err := setMachineEnv(name, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "profileapply: could not unset %s (%v) — remove it by hand\n", name, err)
-			continue
+		publicRoots, err := machineRootStorePEM(interceptionRootPEM)
+		if err != nil {
+			return err
 		}
-		fmt.Printf("profileapply: %s unset\n", name)
+		if err := os.WriteFile(bundlePath, publicRoots.pem, 0o644); err != nil {
+			return err
+		}
+		if err := datadir.MakePublicReadable(bundlePath); err != nil {
+			return err
+		}
+		actual, err := os.ReadFile(bundlePath)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(actual, publicRoots.pem) {
+			return fmt.Errorf("CA bundle readback differs")
+		}
+		return nil
+	}}}
+	for _, name := range caEnvVars {
+		steps = append(steps, cleanupStep{name, func() error { return unsetOwnedMachineEnv(name, bundlePath) }})
 	}
-	fmt.Println("profileapply: ★ a shell that was open while the agent ran still holds the old values. It will " +
-		"keep pointing at the bundle until it is closed, which is harmless now that the bundle no longer " +
-		"carries this organization's root.")
+	steps = append(steps, cleanupStep{"NODE_EXTRA_CA_CERTS", func() error {
+		return unsetOwnedMachineEnv("NODE_EXTRA_CA_CERTS", filepath.Join(dataDir, "interception-root.pem"))
+	}})
+	return runCleanup(steps...)
 }
 
 type rootStorePEM struct {
@@ -182,8 +190,20 @@ type rootStorePEM struct {
 // add so it is never written twice.
 func machineRootStorePEM(skipPEM []byte) (rootStorePEM, error) {
 	skip := map[string]bool{}
-	if fp := fingerprintOf(skipPEM); fp != "" {
-		skip[fp] = true
+	for rest := skipPEM; len(rest) > 0; {
+		block, tail := pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		rest = tail
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		root, err := parseRoot(block.Bytes)
+		if err != nil {
+			return rootStorePEM{}, err
+		}
+		skip[root.SHA256] = true
 	}
 	store, err := openMachineRootStore()
 	if err != nil {

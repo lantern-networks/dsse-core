@@ -4,12 +4,11 @@ package main
 
 import "testing"
 
-// TestValidatedStepUpURL pins fail-open review finding #29 (step-up URL): only a well-formed http/https URL with
+// TestValidatedStepUpURL pins fail-open review finding #29 (step-up URL): only a well-formed HTTPS URL with
 // no command-line-breaking characters is accepted; anything else is refused so it is never launched.
 func TestValidatedStepUpURL(t *testing.T) {
 	good := []string{
 		"https://console.local/?activate=ABC123",
-		"http://10.0.0.5:8088/step-up",
 	}
 	for _, u := range good {
 		if got, ok := validatedStepUpURL(u); !ok || got != u {
@@ -18,6 +17,7 @@ func TestValidatedStepUpURL(t *testing.T) {
 	}
 	bad := []string{
 		"",
+		"http://10.0.0.5:8088/step-up",         // step-up credentials must never use cleartext HTTP
 		`https://x/" --evil "y`,                // quote/space -> arg injection
 		"file:///C:/Windows/System32/calc.exe", // non-web scheme -> arbitrary handler
 		"javascript:alert(1)",                  // script scheme

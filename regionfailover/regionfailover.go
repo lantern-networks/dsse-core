@@ -23,7 +23,7 @@ import (
 	"time"
 )
 
-// RegionEndpoint is one allowed region's transport endpoint (from the signed allowed_region_endpoints list).
+// RegionEndpoint is one allowed transport endpoint. A region may publish several independent doors.
 type RegionEndpoint struct {
 	Region   string
 	Endpoint string
@@ -66,6 +66,9 @@ type Health struct {
 
 func (h Health) healthy() bool { return h.Reachable && h.Admitted }
 
+// endpointKey identifies a door, not just its residency region. The separator cannot occur in a URL or region.
+func endpointKey(ep RegionEndpoint) string { return ep.Region + "\x00" + ep.Endpoint }
+
 // Probe measures one endpoint's health. Injected by the agent (real = out-of-band resolve + TCP + mTLS); stubbed
 // in tests. It must be bounded (the agent applies the connect timeout).
 type Probe func(ep RegionEndpoint) Health
@@ -101,7 +104,7 @@ type Decision struct {
 	State State
 	// Current is the region to steer through (valid only when State == StateConnected).
 	Current RegionEndpoint
-	// FailoverSet is the ordered set of healthy ALTERNATE regions (nearest first), the standby targets.
+	// FailoverSet is the ordered set of healthy ALTERNATE endpoints (nearest first), including same-region doors.
 	FailoverSet []RegionEndpoint
 	// Reason is a short non-secret explanation (for agent logs).
 	Reason string
@@ -126,12 +129,12 @@ type Decision struct {
 
 const defaultUnhealthyStrikes = 3
 
-// Selector holds the allowed-region list + sticky current selection + hysteresis state. Not safe for concurrent
+// Selector holds the allowed-endpoint list + sticky current selection + hysteresis state. Not safe for concurrent
 // use; the agent calls Evaluate from a single control loop.
 type Selector struct {
 	allowed []RegionEndpoint
 	home    string
-	// current is the sticky current region id ("" = none selected yet).
+	// current is the sticky (region, endpoint) key ("" = none selected yet).
 	//
 	// ★ STICKY MEANS NO FAIL-BACK WHILE RUNNING, AND THAT IS THE DESIGN (2026-08-10). A healthy current region
 	// is kept even after a higher-priority one recovers. Restarting the agent is the fail-back event: a fresh
@@ -155,7 +158,7 @@ type Selector struct {
 	// remembers it — an obvious-looking optimisation — fail-back disappears silently and the fleet drifts to
 	// whichever regions happened to be up during past blips, with everything reporting healthy. See
 	// TestRestartIsTheFailBackEvent.
-	current         string // sticky current region id ("" = none selected yet)
+	current         string // sticky (region, endpoint) key ("" = none selected yet)
 	currentStrikes  int    // consecutive unhealthy rounds for the current region (hysteresis)
 	unhealthyStrike int    // threshold before failing over off a degraded current region
 
@@ -205,6 +208,18 @@ func (s *Selector) SetUnhealthyStrikes(n int) {
 	s.unhealthyStrike = n
 }
 
+// ExpediteAfterTransportLoss lets a caller that observed an actual current transport
+// socket loss probe promptly. It never chooses another endpoint by itself: the next
+// Evaluate must still verify that the current endpoint is unreachable and that an
+// allowed replacement is healthy. A healthy current endpoint resets the strikes as
+// usual, and admission-deny retains the existing sticky-deny rule.
+// Call only from the selector's single control loop.
+func (s *Selector) ExpediteAfterTransportLoss() {
+	if s.current != "" && s.unhealthyStrike > 1 {
+		s.currentStrikes = s.unhealthyStrike - 1
+	}
+}
+
 // UpdateList replaces the allowed-region list (a residency-policy change / list refresh). If the current region is
 // no longer in the allowed set, it is DROPPED immediately — an out-of-boundary region can never remain current
 // (flap avoidance + residency). Re-selection happens on the next Evaluate.
@@ -224,8 +239,14 @@ func (s *Selector) UpdateList(allowed []RegionEndpoint, home string) {
 	}
 }
 
-// Current returns the sticky current region id ("" when none).
-func (s *Selector) Current() string { return s.current }
+// Current returns the sticky current region id ("" when none). The selection itself is endpoint-specific.
+func (s *Selector) Current() string {
+	if s.current == "" {
+		return ""
+	}
+	region, _, _ := strings.Cut(s.current, "\x00")
+	return region
+}
 
 // Evaluate probes the allowed regions and returns the decision for this round, updating sticky/hysteresis state.
 //
@@ -241,7 +262,7 @@ func (s *Selector) Evaluate(probe Probe) Decision {
 	anyDeniedAdmission := false
 	for _, ep := range s.allowed {
 		h := probe(ep)
-		results[ep.Region] = h
+		results[endpointKey(ep)] = h
 		if h.healthy() {
 			healthy = append(healthy, ep)
 		} else if h.Reachable && !h.Admitted {
@@ -301,11 +322,18 @@ func (s *Selector) Evaluate(probe Probe) Decision {
 		// Otherwise the current region is unreachable: fail over off it (health failover) below.
 	}
 
+	// A newly started device must not shop among doors when one already rejected its identity.
+	// A current healthy door remains sticky; a deny from an alternate probe cannot dislodge it.
+	if s.denyOnAdmissionDeny && anyDeniedAdmission {
+		s.current = ""
+		s.currentStrikes = 0
+		return Decision{State: StateDenied, Reason: "allowed endpoint denied admission — refusing endpoint shopping"}
+	}
 	if len(healthy) > 0 {
 		best := healthy[0]
-		s.current = best.Region
+		s.current = endpointKey(best)
 		s.currentStrikes = 0
-		return s.connected(best.Region, healthy, "selected nearest healthy allowed region")
+		return s.connected(s.current, healthy, "selected nearest healthy allowed endpoint")
 	}
 
 	// No healthy allowed region: fail closed (or surface deny). Never cross the boundary.
@@ -317,13 +345,13 @@ func (s *Selector) Evaluate(probe Probe) Decision {
 	return Decision{State: StateFailClosed, Reason: "no healthy region within the residency boundary — denying egress (never crossing the boundary)"}
 }
 
-// connected builds a StateConnected decision: Current = the chosen region, FailoverSet = the OTHER healthy regions
+// connected builds a StateConnected decision: Current = the chosen door, FailoverSet = the OTHER healthy doors
 // in ranked order.
-func (s *Selector) connected(currentRegion string, rankedHealthy []RegionEndpoint, reason string) Decision {
+func (s *Selector) connected(currentKey string, rankedHealthy []RegionEndpoint, reason string) Decision {
 	var current RegionEndpoint
 	var failover []RegionEndpoint
 	for _, ep := range rankedHealthy {
-		if ep.Region == currentRegion {
+		if endpointKey(ep) == currentKey {
 			current = ep
 			continue
 		}
@@ -331,23 +359,23 @@ func (s *Selector) connected(currentRegion string, rankedHealthy []RegionEndpoin
 	}
 	if current.Region == "" {
 		// The current region is degraded-within-hysteresis (not in the healthy set this round); still report it.
-		current = s.endpointFor(currentRegion)
+		current = s.endpointFor(currentKey)
 	}
 	return Decision{State: StateConnected, Current: current, FailoverSet: failover, Reason: reason}
 }
 
-func (s *Selector) endpointFor(region string) RegionEndpoint {
+func (s *Selector) endpointFor(key string) RegionEndpoint {
 	for _, ep := range s.allowed {
-		if ep.Region == region {
+		if endpointKey(ep) == key {
 			return ep
 		}
 	}
-	return RegionEndpoint{Region: region}
+	return RegionEndpoint{}
 }
 
-func (s *Selector) inAllowed(region string) bool {
+func (s *Selector) inAllowed(key string) bool {
 	for _, ep := range s.allowed {
-		if ep.Region == region {
+		if endpointKey(ep) == key {
 			return true
 		}
 	}
@@ -359,24 +387,24 @@ func (s *Selector) inAllowed(region string) bool {
 func rankHealthy(healthy []RegionEndpoint, results map[string]Health, home string, order []RegionEndpoint) {
 	pos := make(map[string]int, len(order))
 	for i, ep := range order {
-		pos[ep.Region] = i
+		pos[endpointKey(ep)] = i
 	}
 	sort.SliceStable(healthy, func(i, j int) bool {
 		if pi, pj := effectiveRegionPriority(healthy[i].Priority), effectiveRegionPriority(healthy[j].Priority); pi != pj {
 			return pi < pj
 		}
-		ri, rj := results[healthy[i].Region].RTT, results[healthy[j].Region].RTT
+		ri, rj := results[endpointKey(healthy[i])].RTT, results[endpointKey(healthy[j])].RTT
 		if ri != rj {
 			return ri < rj
 		}
 		// Equal/unknown RTT -> home anchor wins, else original list order.
-		if healthy[i].Region == home {
+		if healthy[i].Region == home && healthy[j].Region != home {
 			return true
 		}
-		if healthy[j].Region == home {
+		if healthy[j].Region == home && healthy[i].Region != home {
 			return false
 		}
-		return pos[healthy[i].Region] < pos[healthy[j].Region]
+		return pos[endpointKey(healthy[i])] < pos[endpointKey(healthy[j])]
 	})
 }
 
@@ -386,10 +414,11 @@ func normalize(allowed []RegionEndpoint) []RegionEndpoint {
 	for _, ep := range allowed {
 		region := strings.ToLower(strings.TrimSpace(ep.Region))
 		endpoint := strings.TrimSpace(ep.Endpoint)
-		if region == "" || endpoint == "" || seen[region] {
+		key := endpointKey(RegionEndpoint{Region: region, Endpoint: endpoint})
+		if region == "" || endpoint == "" || seen[key] {
 			continue
 		}
-		seen[region] = true
+		seen[key] = true
 		// Priority is CARRIED. It was dropped here when normalize only copied the two fields it knew about,
 		// which made the field settable, readable and completely inert — the ranking never saw it. A struct
 		// copy would have been immune; enumerating fields is what let a new one go missing silently.

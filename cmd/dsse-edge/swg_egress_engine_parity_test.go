@@ -20,10 +20,11 @@ import (
 // "runtime_copy_lab_tls". So every steered device egressed through Go, and the browser-faithful engine ran for
 // a path that carries almost nothing.
 //
-// Measured: partner.microsoft.com returned the edge's own 502 to a steered browser on two operating systems,
+// Historical measurement: partner.microsoft.com returned the edge's own 502 to a steered browser on two operating systems,
 // with a Go crypto/tls error, while the same URL through the broker returned 301 and the engine's log showed it
 // had already chased and kept the missing link. Every AIA-dependent origin, and every bot-mitigated one, was
-// unreachable through the product while being fine in a plain browser.
+// unreachable through that Go path while being fine in a plain browser. The
+// standard Go path now completes missing CA Issuers links independently.
 //
 // This is a source check because the assignment lives in a function far too large to construct in a test. It is
 // deliberately about the PAIRING rather than about any one client: whatever the device handler egresses with,

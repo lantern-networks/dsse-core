@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // DsseUpdateCourier — the NE carries the two update documents to disk, and deliberately does nothing else
 // with them.
@@ -128,8 +129,7 @@ public final class DsseUpdateCourier: @unchecked Sendable {
     /// ★ AND IT IS WRITTEN WHERE THE UPDATER ALREADY LOOKS. updateplatform.Stage returns immediately when the
     /// staged file's DIGEST already matches, so a couriered package needs no new code over there and no new
     /// trust: the same verification runs on the same bytes, twice, as before.
-    /// alreadyStaged reports that the package this device's manifest names is on disk at the expected size, so
-    /// there is nothing to fetch.
+    /// alreadyStaged reports that the package this device's manifest names is on disk with the expected digest.
     ///
     /// ★★ WITHOUT IT THE FLEET PAYS FOR ITS OWN IDLENESS (2026-08-13, found by win-dev-1 while writing the
     /// Windows twin). This courier runs on the manifest's refresh interval, so a device that is already up to
@@ -137,13 +137,18 @@ public final class DsseUpdateCourier: @unchecked Sendable {
     /// uplink. The first version of this file had no such check, and nothing about it would have looked wrong
     /// in a log.
     ///
-    /// The manifest on disk is read as a HINT ONLY: it names a version and a size, which decide whether to do
-    /// WORK. It decides nothing about what may be installed — the updater hashes the staged bytes against the
-    /// manifest it verifies, twice, and a lying manifest here can at most cause an unnecessary download or a
-    /// skipped one that the updater's own digest check then refuses.
+    /// The manifest on disk is read as a HINT ONLY: it names a version, size and digest, which decide whether to do
+    /// WORK. It decides nothing about what may be installed — the updater verifies the signature and hashes
+    /// staged bytes again before install. Size alone is insufficient here: a same-size damaged package would
+    /// otherwise be skipped forever while the updater correctly refuses it on every pass.
     static func alreadyStaged() -> Bool {
+        alreadyStaged(manifestPath: manifestPath, stagedRoot: stagedRoot)
+    }
+
+    static func alreadyStaged(manifestPath: String, stagedRoot: String) -> Bool {
         guard let raw = FileManager.default.contents(atPath: manifestPath),
               let env = try? JSONDecoder().decode(DsseSignedAgentPolicyEnvelope.self, from: raw),
+              env.type == DsseUpdateManifest.envelopeType,
               let payload = Data(base64Encoded: env.payloadB64),
               let object = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
               let version = object["version"] as? String,
@@ -151,9 +156,26 @@ public final class DsseUpdateCourier: @unchecked Sendable {
         // A size of zero, or an absent one, means "cannot tell" — and cannot-tell must not skip the fetch.
         let declared = (object["artifact_size"] as? NSNumber)?.int64Value ?? 0
         guard declared > 0 else { return false }
+        guard let expectedSHA = object["artifact_sha256"] as? String,
+              expectedSHA.count == 64,
+              expectedSHA.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102) }) else {
+            return false
+        }
         let attrs = try? FileManager.default.attributesOfItem(atPath: stagedRoot + "/" + name)
         guard let onDisk = (attrs?[.size] as? NSNumber)?.int64Value else { return false }
-        return onDisk == declared
+        guard onDisk == declared,
+              let file = FileHandle(forReadingAtPath: stagedRoot + "/" + name) else { return false }
+        defer { try? file.close() }
+        var digest = SHA256()
+        do {
+            while true {
+                let chunk = try file.read(upToCount: 1_048_576) ?? Data()
+                if chunk.isEmpty { break }
+                digest.update(data: chunk)
+            }
+        } catch { return false }
+        let actualSHA = digest.finalize().map { String(format: "%02x", $0) }.joined()
+        return actualSHA == expectedSHA
     }
 
     private func fetchArtifact() {

@@ -59,7 +59,7 @@ func runPostgresExportWorker(ctx context.Context, config postgresExportWorkerCon
 	if config.ObjectStore == nil {
 		return fmt.Errorf("export object store is required")
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return err
 	}

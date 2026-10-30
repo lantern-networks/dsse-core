@@ -47,7 +47,9 @@ func decodeDeviceCARegistrations(raw []byte) (deviceCARegistrationSnapshot, erro
 	}
 	owners := map[string]string{}
 	for _, entry := range doc.Tenants {
-		tenant := strings.ToLower(strings.TrimSpace(entry.TenantID))
+		// Tenant IDs are case-sensitive throughout the registry and managed CA store.
+		// Folding case here combines two organizations' admission anchors.
+		tenant := strings.TrimSpace(entry.TenantID)
 		certs, err := tenantca.ParseCACertsPEM([]byte(entry.CAPEM))
 		if tenant == "" || err != nil || len(certs) == 0 {
 			return nil, fmt.Errorf("device CA registrations contain an incomplete entry")

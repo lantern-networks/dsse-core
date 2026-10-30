@@ -27,6 +27,25 @@ type UsageMeterSummaryReader interface {
 	Summary(tenantID string, periodStart, periodEnd time.Time) UsageMeterSummary
 }
 
+// ReadSummary preserves storage failures instead of presenting partial data as a complete total.
+func ReadSummary(store UsageMeterSummaryReader, tenantID string, start, end time.Time) (UsageMeterSummary, error) {
+	if store == nil {
+		return UsageMeterSummary{}, fmt.Errorf("usage meter store unavailable")
+	}
+	if reader, ok := store.(UsageMeterRecordReader); ok {
+		records, err := reader.UsageMeterRecords(tenantID, start, end)
+		if err != nil {
+			return UsageMeterSummary{}, err
+		}
+		return SummarizeUsageMeterRecords(records, tenantID, start, end), nil
+	}
+	summary := store.Summary(tenantID, start, end)
+	if summary.Incomplete {
+		return UsageMeterSummary{}, fmt.Errorf("usage meter data incomplete")
+	}
+	return summary, nil
+}
+
 type UsageMeterRecordReader interface {
 	UsageMeterRecords(tenantID string, periodStart, periodEnd time.Time) ([]UsageMeterRecord, error)
 }
@@ -169,6 +188,7 @@ type UsageMeterQuota struct {
 }
 
 type UsageMeterSummary struct {
+	Incomplete  bool                              `json:"incomplete,omitempty"`
 	TenantID    string                            `json:"tenant_id"`
 	PeriodStart string                            `json:"period_start"`
 	PeriodEnd   string                            `json:"period_end"`
@@ -177,6 +197,7 @@ type UsageMeterSummary struct {
 }
 
 type UsageMeterHealth struct {
+	DroppedRecords int64    `json:"dropped_records"`
 	TenantID       string   `json:"tenant_id"`
 	Status         string   `json:"status"`
 	Mode           string   `json:"mode"`
@@ -350,6 +371,21 @@ func UsageMeterHealthFor(store UsageMeterRuntimeStore, tenantID, storeMode strin
 			health.Reasons = append(health.Reasons, "usage_meter_pending_records")
 		}
 	}
+	if checker, ok := store.(interface{ CheckUsageStorage() error }); ok {
+		if err := checker.CheckUsageStorage(); err != nil {
+			health.Status = "degraded"
+			health.Reasons = append(health.Reasons, "usage_meter_storage_unavailable")
+			health.LastError = "usage meter durable storage is unavailable"
+		}
+	}
+	if reporter, ok := store.(interface{ DroppedRecordCountForTenant(string) int64 }); ok {
+		health.DroppedRecords = reporter.DroppedRecordCountForTenant(tenantID)
+		if health.DroppedRecords > 0 {
+			health.Status = "degraded"
+			health.Reasons = append(health.Reasons, "usage_meter_data_loss")
+		}
+	}
+
 	return health
 }
 
@@ -384,12 +420,18 @@ func RecordUsageMeterDecision(store UsageMeterRuntimeStore, decision model.Acces
 }
 
 func RecordUsageMeterGovernanceSnapshot(store UsageMeterRuntimeStore, tenantID string, humanSeatCount int, humanMeasurementScope string, registeredNHISeatCount int, periodStart, periodEnd, now time.Time) {
+	// The legacy entry point used zero to mean "registry count unavailable".
+	// Callers which can distinguish an authoritative zero use the explicit API.
+	RecordUsageMeterGovernanceSnapshotWithRegistryStatus(store, tenantID, humanSeatCount, humanMeasurementScope, registeredNHISeatCount, registeredNHISeatCount > 0, periodStart, periodEnd, now)
+}
+
+// RecordUsageMeterGovernanceSnapshotWithRegistryStatus distinguishes an empty
+// NHI registry from a failed read. A measured zero must replace an older count.
+func RecordUsageMeterGovernanceSnapshotWithRegistryStatus(store UsageMeterRuntimeStore, tenantID string, humanSeatCount int, humanMeasurementScope string, registeredNHISeatCount int, nhiRegistryKnown bool, periodStart, periodEnd, now time.Time) {
 	if store == nil || strings.TrimSpace(tenantID) == "" {
 		return
 	}
-	if humanSeatCount > 0 {
-		humanMeasurementScope = valueOrDefault(strings.TrimSpace(humanMeasurementScope), "admin_auth_principals_proxy_until_identity_directory")
-	}
+	humanMeasurementScope = valueOrDefault(strings.TrimSpace(humanMeasurementScope), "admin_auth_principals_proxy_until_identity_directory")
 	if usageMeterGovernanceSnapshotShouldWrite(store, "human_seat", tenantID, humanSeatCount, humanMeasurementScope, periodStart, periodEnd) {
 		store.Record(UsageMeterGovernanceSeatRecord("human_seat", tenantID, humanSeatCount, periodStart, periodEnd, now, map[string]any{
 			"billing_treatment": "subscription_base_observation",
@@ -402,7 +444,7 @@ func RecordUsageMeterGovernanceSnapshot(store UsageMeterRuntimeStore, tenantID s
 	}
 	nhiSeatCount := registeredNHISeatCount
 	nhiMeasurementScope := "registered_nhi_registry_active"
-	if nhiSeatCount <= 0 {
+	if !nhiRegistryKnown {
 		nhiSeatCount = ObservedUsageMeterNHISeatCount(store, tenantID, periodStart, periodEnd)
 		nhiMeasurementScope = "observed_nhi_identities_from_decision_meter"
 	}

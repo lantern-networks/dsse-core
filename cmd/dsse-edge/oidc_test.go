@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -265,6 +267,55 @@ func TestOIDCCodeExchangeAndJWKSUseExplicitProviderEndpoints(t *testing.T) {
 	}
 	if tokenRequests != 1 || jwksRequests != 1 {
 		t.Fatalf("tokenRequests=%d jwksRequests=%d, want 1/1", tokenRequests, jwksRequests)
+	}
+}
+
+func TestOIDCIDTokenRejectsUntrustedAudienceAndAuthorizedParty(t *testing.T) {
+	key := mustRSAKey(t)
+	const keyID = "kid-audience-bound"
+	config := oidcConfig{Issuer: "https://issuer.example.test", ClientID: "dsse-edge", JWKSURI: "https://issuer.example.test/audience-test/jwks"}
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return jsonHTTPResponse(http.StatusOK, map[string]any{"keys": []map[string]string{rsaPublicJWK(key, keyID)}}), nil
+	})}
+	now := time.Now().UTC()
+	for _, tc := range []struct {
+		name string
+		aud  any
+		azp  any
+		pass bool
+	}{
+		{name: "single audience", aud: "dsse-edge", pass: true},
+		{name: "single audience array", aud: []string{"dsse-edge"}, pass: true},
+		{name: "matching authorized party", aud: "dsse-edge", azp: "dsse-edge", pass: true},
+		{name: "untrusted extra audience despite matching authorized party", aud: []string{"dsse-edge", "other-rp"}, azp: "dsse-edge"},
+		{name: "untrusted extra audience without authorized party", aud: []string{"dsse-edge", "other-rp"}},
+		{name: "different authorized party", aud: "dsse-edge", azp: "other-rp"},
+		{name: "non-string authorized party", aud: "dsse-edge", azp: 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := map[string]any{"iss": config.Issuer, "sub": "user-1", "aud": tc.aud, "exp": now.Add(time.Hour).Unix(), "nonce": "nonce-1"}
+			if tc.azp != nil {
+				claims["azp"] = tc.azp
+			}
+			token := signedRS256JWT(t, key, keyID, claims)
+			_, err := verifyOIDCIDToken(context.Background(), client, config, token, "nonce-1", now)
+			if (err == nil) != tc.pass {
+				t.Fatalf("pass=%v err=%v", tc.pass, err)
+			}
+		})
+	}
+}
+
+func TestOIDCJWKRejectsInvalidRSAExponents(t *testing.T) {
+	key := mustRSAKey(t)
+	jwk := rsaPublicJWK(key, "kid-exponent")
+	for _, exponent := range [][]byte{
+		{}, {0}, {2}, {0x80, 0, 0, 0, 1}, {1, 0, 0, 0, 0, 0, 0, 0, 1},
+	} {
+		jwk["e"] = base64.RawURLEncoding.EncodeToString(exponent)
+		if _, err := rsaPublicKeyFromJWK(jwkKey{KTY: jwk["kty"], N: jwk["n"], E: jwk["e"]}); err == nil {
+			t.Fatalf("accepted invalid RSA exponent %x", exponent)
+		}
 	}
 }
 

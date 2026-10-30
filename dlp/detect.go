@@ -16,9 +16,9 @@ type Finding struct {
 }
 
 const (
-	// windowSize is the streaming carry-over/hold window. It must be ≥ the longest possible single match so a
-	// boundary-straddling identifier is always fully present in the retained tail and never missed. All
-	// anchors are bounded well under this (the longest, a JWT, is ~3 KB).
+	// windowSize is the streaming carry-over/hold window. It is larger than every length-bounded identifier
+	// and custom match, so boundary-straddling matches are retained. Email is inspected by a separate
+	// incremental state machine; its unbounded dotted domain never expands this RAM window.
 	windowSize = 4096
 	// chunkSize is the streaming read granularity.
 	chunkSize = 32 * 1024
@@ -63,18 +63,23 @@ type match struct {
 // digit-run pass (fast); API keys use a prefix-gated regex. Matches are confirmed by a validator so false
 // positives stay low.
 func scan(data []byte) []match {
+	out := scanNonEmail(data)
+	// Email: gated on '@' so benign uploads never run the regex.
+	if bytes.IndexByte(data, '@') >= 0 {
+		for _, loc := range emailRE.FindAllIndex(data, -1) {
+			out = append(out, match{Email, loc[0], loc[1]})
+		}
+	}
+	return out
+}
+
+func scanNonEmail(data []byte) []match {
 	var out []match
 	scanDigitRuns(data, &out)
 	scanSeparatedRuns(data, &out)
 	if hasAPIKeyCandidate(data) {
 		for _, loc := range apiKeyRE.FindAllIndex(data, -1) {
 			out = append(out, match{APIKey, loc[0], loc[1]})
-		}
-	}
-	// Email: gated on '@' so benign uploads never run the regex.
-	if bytes.IndexByte(data, '@') >= 0 {
-		for _, loc := range emailRE.FindAllIndex(data, -1) {
-			out = append(out, match{Email, loc[0], loc[1]})
 		}
 	}
 	// Japanese mobile phone: gated on the mobile-prefix literals.
@@ -93,20 +98,36 @@ type Options struct {
 	Classifiers  *ClassifierSet
 	Fingerprints *FingerprintSet
 	Allowlist    *Allowlist
+	// RetentionBudget is the process-scoped streaming Guard resource pool.
+	// Nil uses the same protected process default; ordinary scanners ignore it.
+	RetentionBudget *RetentionBudget
 }
 
 // scanAll runs the built-in scan plus any operator-defined custom classifiers and EDM fingerprint datasets, then
 // drops any match whose value is on the allowlist (known-safe). It is the single entry point every detector
 // (Detect / Scanner / GuardReader) uses so custom identifiers, EDM, and allowlisting are honored uniformly on the
-// buffered, streaming, and hold-before-release paths.
+// buffered path. The streaming paths scan custom classifiers independently to preserve each matcher's
+// non-overlapping phase while avoiding cross-classifier retention chains.
 func scanAll(data []byte, opts Options) []match {
 	out := scan(data)
 	opts.Classifiers.scan(data, &out)
 	opts.Fingerprints.scan(data, &out)
-	if !opts.Allowlist.Empty() {
+	return suppressAllowlisted(data, out, opts.Allowlist)
+}
+
+// The streaming paths commit custom classifiers independently so overlapping
+// matchers cannot chain their shared release frontier backwards forever.
+func scanBaseAll(data []byte, opts Options) []match {
+	out := scanNonEmail(data)
+	opts.Fingerprints.scan(data, &out)
+	return suppressAllowlisted(data, out, opts.Allowlist)
+}
+
+func suppressAllowlisted(data []byte, out []match, allowlist *Allowlist) []match {
+	if !allowlist.Empty() {
 		kept := out[:0]
 		for _, m := range out {
-			if opts.Allowlist.Allowed(m.typ, data[m.start:m.end]) {
+			if allowlist.Allowed(m.typ, data[m.start:m.end]) {
 				continue // known-safe value (e.g. a test card) — suppress the finding
 			}
 			kept = append(kept, m)
@@ -284,11 +305,14 @@ func DetectWithOptions(data []byte, contentType string, opts Options) []Finding 
 // io.TeeReader so it observes an upload without altering it), then call Findings once at the end. It keeps a
 // windowSize-byte carry-over tail so an identifier straddling a Write boundary is never missed and never
 // double-counted: a match is counted once, when it lies entirely before the retained tail (its bytes are then
-// dropped), and the residual tail is counted by Findings. Memory is constant regardless of body size. Not
-// safe for concurrent use.
+// dropped), and the residual tail is counted by Findings. Email uses incremental matching and a complete-value
+// hash for exact allowlist matching, without retaining the unbounded match. Not safe for concurrent use.
 type Scanner struct {
 	counts map[IdentifierType]int
 	buf    []byte
+	origin int64
+	custom *customStreamState
+	email  *emailStream
 	done   bool
 	opts   Options
 }
@@ -303,7 +327,8 @@ func NewScannerWith(set *ClassifierSet) *Scanner {
 
 // NewScannerWithOptions returns a streaming Scanner honoring custom classifiers and/or an allowlist.
 func NewScannerWithOptions(opts Options) *Scanner {
-	return &Scanner{counts: map[IdentifierType]int{}, buf: make([]byte, 0, chunkSize+windowSize), opts: opts}
+	return &Scanner{counts: map[IdentifierType]int{}, buf: make([]byte, 0, chunkSize+windowSize),
+		custom: newCustomStreamState(opts.Classifiers), email: newEmailStream(opts.Allowlist), opts: opts}
 }
 
 // windowCommit returns how far buf may be safely released/dropped in a streaming scan. The base boundary is
@@ -337,35 +362,61 @@ func windowCommit(buf []byte, matches []match, final bool) int {
 // Write feeds bytes to the scanner. It never errors and always consumes all of p, so it is safe as an
 // io.TeeReader sink on the critical forwarding path (it must not stall or fail the upload).
 func (s *Scanner) Write(p []byte) (int, error) {
-	s.buf = append(s.buf, p...)
-	matches := scanAll(s.buf, s.opts)
-	dropTo := windowCommit(s.buf, matches, false)
-	if dropTo > 0 {
-		for _, m := range matches {
-			if m.end <= dropTo {
-				s.counts[m.typ]++
+	n := len(p)
+	for len(p) > 0 {
+		step := len(p)
+		if step > chunkSize {
+			step = chunkSize
+		}
+		s.buf = append(s.buf, p[:step]...)
+		for _, m := range s.email.write(p[:step]) {
+			if !m.allowed {
+				s.counts[Email]++
 			}
 		}
-		// Drop the committed prefix; retain the remainder (>= the last windowSize bytes) so a match straddling
-		// the boundary is preserved intact for the next Write.
-		s.buf = append(s.buf[:0], s.buf[dropTo:]...)
+		s.advance(false)
+		p = p[step:]
 	}
-	return len(p), nil
+	return n, nil
+}
+
+func (s *Scanner) advance(final bool) {
+	matches := scanBaseAll(s.buf, s.opts)
+	dropTo := windowCommit(s.buf, matches, final)
+	for _, m := range matches {
+		if m.end <= dropTo {
+			s.counts[m.typ]++
+		}
+	}
+	for _, m := range s.custom.stable(s.buf, s.origin, dropTo, s.opts.Allowlist) {
+		s.custom.commit(m)
+		if !m.allowed {
+			s.counts[m.typ]++
+		}
+	}
+	if dropTo > 0 && !final {
+		s.buf = append(s.buf[:0], s.buf[dropTo:]...)
+		s.origin += int64(dropTo)
+	}
 }
 
 // Findings finalizes the scan (counting the residual tail) and returns non-secret findings. Idempotent: the
 // residual is counted only once even if called multiple times.
 func (s *Scanner) Findings() []Finding {
 	if !s.done {
-		for _, m := range scanAll(s.buf, s.opts) {
-			s.counts[m.typ]++
+		for _, m := range s.email.finish() {
+			if !m.allowed {
+				s.counts[Email]++
+			}
 		}
+		s.advance(true)
 		s.done = true
 	}
 	return findings(s.counts)
 }
 
-// DetectStream scans a body of any size at constant memory and returns non-secret findings. The caller is
+// DetectStream scans a body of any size and returns non-secret findings. Its email detector retains only a
+// bounded local-part suffix and digest state even for an unfinished long address. The caller is
 // responsible for the Content-Type gate (ShouldScan) and for logging dlp_scan_skipped when it returns false;
 // DetectStream itself scans whatever bytes it is given.
 func DetectStream(r io.Reader) ([]Finding, error) { return DetectStreamWithOptions(r, Options{}) }

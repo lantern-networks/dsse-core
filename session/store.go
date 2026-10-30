@@ -79,6 +79,10 @@ func (s *Store) CreateFromAuthenticationEvent(event model.AuthenticationEvent, p
 	}
 
 	s.mu.Lock()
+	if existing, ok := s.sessions[session.ID]; ok && existing.TenantID != session.TenantID {
+		s.mu.Unlock()
+		return model.Session{}, fmt.Errorf("authentication event session_id is already in use")
+	}
 	s.sessions[session.ID] = session
 	s.mu.Unlock()
 	return session, nil
@@ -89,6 +93,20 @@ func (s *Store) Get(id string) (model.Session, bool) {
 	defer s.mu.RUnlock()
 	session, ok := s.sessions[id]
 	return session, ok
+}
+
+// GetActiveAt is the authorization-facing lookup. Keep Get available for
+// reporting, where an expired session still has to remain inspectable.
+func (s *Store) GetActiveAt(id string, now time.Time) (model.Session, bool) {
+	session, ok := s.Get(id)
+	if !ok || session.Status != "active" {
+		return model.Session{}, false
+	}
+	expiresAt, err := time.Parse(time.RFC3339, session.ExpiresAt)
+	if err != nil || !now.Before(expiresAt) {
+		return model.Session{}, false
+	}
+	return session, true
 }
 
 func valueOrDefault(value, fallback string) string {

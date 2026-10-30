@@ -2,6 +2,8 @@ package hotstore
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
@@ -77,7 +79,10 @@ func TestClickHouseBuildWhereTimeAndText(t *testing.T) {
 }
 
 func TestClickHouseRowFromEvent(t *testing.T) {
-	rec := clickHouseRowFromEvent("inspection_events", sampleInspectionRow(), time.Now())
+	rec, err := clickHouseRowFromEvent("inspection_events", sampleInspectionRow(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if rec["event_id"] != "ie_1" || rec["tenant_id"] != "acme" || rec["stream"] != "inspection_events" {
 		t.Fatalf("core columns wrong: %+v", rec)
 	}
@@ -105,6 +110,29 @@ func TestClickHouseRowFromEvent(t *testing.T) {
 	}
 	if raw, _ := rec["raw"].(string); !strings.Contains(raw, "\"id\":\"ie_1\"") {
 		t.Fatalf("raw did not carry the full record: %v", rec["raw"])
+	}
+}
+
+func TestClickHouseRejectsUnencodableRowBeforeAcknowledgingBatch(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	store := NewClickHouseStore(server.URL, "", "", "dsse", "events")
+	bad := map[string]any{"tenant_id": "acme", "event_id": "bad", "metadata": map[string]any{"invalid": make(chan int)}}
+	if err := store.IngestBatch(context.Background(), []IngestRecord{
+		{Stream: "audit", Row: map[string]any{"tenant_id": "acme", "event_id": "good"}},
+		{Stream: "audit", Row: bad},
+	}); err == nil {
+		t.Fatal("batch with an unencodable row was acknowledged")
+	}
+	if err := store.IngestAt(context.Background(), "audit", bad, time.Now()); err == nil {
+		t.Fatal("single unencodable row was acknowledged")
+	}
+	if requests != 0 {
+		t.Fatalf("partial batch reached hot store: %d request(s)", requests)
 	}
 }
 

@@ -276,24 +276,73 @@ $chainRoot = $null
 $leafIssuer = $null
 $chainRoot = $null
 $chainLen = 0
-$global:dsseServed = $null
+# AuthenticateAsClientAsync can call validation on a worker thread. Keep that
+# callback in managed code: a PowerShell scriptblock requires a runspace.
+if (-not ('DsseStrictTlsObservation' -as [type])) {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public sealed class DsseStrictTlsObservation {
+  public readonly List<X509Certificate2> Served = new List<X509Certificate2>();
+  public SslPolicyErrors Errors;
+  public string[] ChainStatus = new string[0];
+  public RemoteCertificateValidationCallback Callback { get { return Validate; } }
+  public bool Validate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors) {
+    Errors = errors;
+    if (chain != null) {
+      foreach (X509Certificate2 cert in chain.ChainPolicy.ExtraStore)
+        Served.Add(new X509Certificate2(cert.RawData));
+      var statuses = new List<string>();
+      foreach (X509ChainStatus status in chain.ChainStatus) statuses.Add(status.Status.ToString());
+      ChainStatus = statuses.ToArray();
+    }
+    return errors == SslPolicyErrors.None;
+  }
+}
+'@
+}
+$observation = New-Object DsseStrictTlsObservation
+$ssl = $null
+$tcp = $null
+$ch = $null
 try {
   $u = [Uri]$Probe
-  $tcp = New-Object Net.Sockets.TcpClient($u.Host, 443)
-  $cb = { param($sndr, $cert, $chain, $errors) $global:dsseServed = @($chain.ChainPolicy.ExtraStore); return $true }
+  if ($u.Scheme -ne 'https') { throw 'the inspection probe must use HTTPS' }
+  $tcp = New-Object Net.Sockets.TcpClient
+  $connect = $tcp.ConnectAsync($u.Host, $u.Port)
+  if (-not $connect.Wait(5000)) { throw 'TCP connection timed out' }
+  $connect.GetAwaiter().GetResult()
+  $cb = $observation.Callback
   $ssl = New-Object Net.Security.SslStream($tcp.GetStream(), $false, $cb)
-  $ssl.AuthenticateAsClient($u.Host)
+  $auth = $ssl.AuthenticateAsClientAsync($u.Host, (New-Object Security.Cryptography.X509Certificates.X509CertificateCollection), [Security.Authentication.SslProtocols]::None, $true)
+  if (-not $auth.Wait(20000)) { throw 'strict TLS authentication timed out' }
+  $auth.GetAwaiter().GetResult()
   $leaf = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
   $leafIssuer = $leaf.Issuer
   $ch = New-Object Security.Cryptography.X509Certificates.X509Chain
-  $ch.ChainPolicy.RevocationMode = 'NoCheck'
-  if ($global:dsseServed) { foreach ($x in $global:dsseServed) { [void]$ch.ChainPolicy.ExtraStore.Add($x) } }
-  [void]$ch.Build($leaf)
+  $ch.ChainPolicy.RevocationMode = 'Online'
+  $ch.ChainPolicy.RevocationFlag = 'ExcludeRoot'
+  $ch.ChainPolicy.VerificationFlags = 'NoFlag'
+  $ch.ChainPolicy.UrlRetrievalTimeout = [TimeSpan]::FromSeconds(5)
+  foreach ($x in $observation.Served) { [void]$ch.ChainPolicy.ExtraStore.Add($x) }
+  if (-not $ch.Build($leaf)) {
+    throw ("strict online chain validation failed: " + (($ch.ChainStatus | ForEach-Object { "$($_.Status)" }) -join ', '))
+  }
   $chainLen = $ch.ChainElements.Count
-  if ($chainLen -gt 0) { $chainRoot = $ch.ChainElements[$chainLen - 1].Certificate }
-  $ssl.Close()
-  $tcp.Close()
-} catch { bad "could not complete TLS to $Probe : $($_.Exception.Message)" }
+  if ($chainLen -gt 0) { $chainRoot = New-Object Security.Cryptography.X509Certificates.X509Certificate2($ch.ChainElements[$chainLen - 1].Certificate) }
+  ok "SslStream validated the hostname, OS trust and online revocation status"
+} catch {
+  bad "could not complete strict TLS to $Probe : $($_.Exception.Message)"
+  note ("TLS policy errors: " + $observation.Errors)
+  if ($observation.ChainStatus.Length) { note ("chain status: " + ($observation.ChainStatus -join ', ')) }
+} finally {
+  if ($ssl) { $ssl.Dispose() }
+  if ($tcp) { $tcp.Dispose() }
+  if ($ch) { $ch.Dispose() }
+  foreach ($x in $observation.Served) { $x.Dispose() }
+}
 if ($chainLen -eq 1) { na "the chain could not be built past the leaf, so where it leads was not established" }
 
 if ($leafIssuer) {
@@ -330,12 +379,25 @@ Write-Host "== 6b. both trust paths, because on Windows they disagree =="
 # a browser and completely broken for curl, pip, npm and every build script on the machine - and nothing on the
 # machine reports it. Measured on win-dev-1, 2026-09-04: OS path 200, curl "SSL certificate problem".
 $osOk = $false
+$strictHandler = $null
+$strictHttp = $null
+$strictResponse = $null
 try {
-  $r = Invoke-WebRequest -Uri $Probe -TimeoutSec 15 -UseBasicParsing
-  $osOk = ($r.StatusCode -eq 200)
-} catch { }
-if ($osOk) { ok "OS certificate store path (browsers, schannel): $Probe -> 200" }
-else { bad "OS certificate store path cannot reach $Probe - browsers on this machine are broken" }
+  Add-Type -AssemblyName System.Net.Http
+  $strictHandler = New-Object Net.Http.HttpClientHandler
+  $strictHandler.CheckCertificateRevocationList = $true
+  $strictHttp = New-Object Net.Http.HttpClient($strictHandler)
+  $strictHttp.Timeout = [TimeSpan]::FromSeconds(15)
+  $strictResponse = $strictHttp.GetAsync($Probe).GetAwaiter().GetResult()
+  $osOk = ([int]$strictResponse.StatusCode -eq 200)
+} catch { note "strict HttpClient: $($_.Exception.Message)" }
+finally {
+  if ($strictResponse) { $strictResponse.Dispose() }
+  if ($strictHttp) { $strictHttp.Dispose() }
+  elseif ($strictHandler) { $strictHandler.Dispose() }
+}
+if ($osOk) { ok "OS certificate store with online revocation (HttpClient): $Probe -> 200" }
+else { bad "strict OS certificate validation cannot reach $Probe" }
 
 $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
 if ($curl) {

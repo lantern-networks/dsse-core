@@ -46,6 +46,33 @@ func findingsTestRead(h http.Handler, query string) *httptest.ResponseRecorder {
 	h.ServeHTTP(rec, req)
 	return rec
 }
+
+func TestAdminDLPFindingsAccountHintsAreAlwaysUnverified(t *testing.T) {
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	for _, storedTrust := range []string{"", "unverified_request_hint", "verified"} {
+		t.Run("stored_trust_"+storedTrust, func(t *testing.T) {
+			events := newInspectionEventStore()
+			events.Upsert(model.InspectionEvent{ID: "hint", TenantID: testEvaluator().PolicyBundle.TenantID,
+				Timestamp: time.Now().UTC().Format(time.RFC3339), FindingType: stringPtr("dlp_match"),
+				Metadata: map[string]any{"dlp_action": "block", "dlp_identifier_types": []string{"email"},
+					"dlp_account": "hint@corp.example", "dlp_account_trust": storedTrust}})
+			rec := findingsTestRead(findingsTestHandler(t, writer, nil, events), "")
+			var body struct {
+				Findings []map[string]any `json:"findings"`
+			}
+			if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &body) != nil || len(body.Findings) != 1 {
+				t.Fatalf("findings response: %d %s", rec.Code, rec.Body.String())
+			}
+			if row := body.Findings[0]; row["account"] != "hint@corp.example" || row["account_trust"] != "unverified_request_hint" {
+				t.Fatalf("current and historical account hints must remain unverified: %+v", row)
+			}
+		})
+	}
+}
 func TestAdminDLPFindingsStoreFailureDoesNotMasqueradeAsEmpty(t *testing.T) {
 	writer, err := logs.NewWriter(filepath.Join(t.TempDir(), "logs"))
 	if err != nil {

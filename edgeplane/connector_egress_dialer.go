@@ -45,6 +45,42 @@ type PeerEdgeProvider interface {
 	PeerEdgeFor(region string) (*tunnel.Session, bool)
 }
 
+// peerEdgeCandidates keeps the original single-link contract while allowing a
+// multi-Node region to try the other live siblings when one does not hold the
+// destination Connector.
+func peerEdgeCandidates(provider PeerEdgeProvider, region, localRegion string, selected *tunnel.Session) ([]*tunnel.Session, bool) {
+	if provider == nil || selected == nil {
+		return []*tunnel.Session{selected}, false
+	}
+	multi, ok := provider.(interface {
+		PeerEdgesFor(string) []*tunnel.Session
+	})
+	if !ok {
+		return []*tunnel.Session{selected}, false
+	}
+	for _, targetRegion := range []string{region, localRegion} {
+		peers := multi.PeerEdgesFor(targetRegion)
+		isPeer := false
+		for _, peer := range peers {
+			if peer == selected {
+				isPeer = true
+				break
+			}
+		}
+		if !isPeer {
+			continue
+		}
+		result := []*tunnel.Session{selected}
+		for _, peer := range peers {
+			if peer != nil && peer != selected {
+				result = append(result, peer)
+			}
+		}
+		return result, true
+	}
+	return []*tunnel.Session{selected}, false
+}
+
 // ConnectorEgressDialer makes the steered bypass-egress chokepoint connector-aware. Before dialing a steered
 // flow's destination directly, it consults the connector ROUTE layer (reachable_routes): if a LIVE connector
 // fronts the destination by FQDN, the flow egresses THROUGH that connector's tunnel — the Edge has no direct
@@ -52,8 +88,9 @@ type PeerEdgeProvider interface {
 // direct dialer, byte-identical to today (self-gating: with no reachable_routes configured the resolver never
 // matches). This is the reachability decision only; policy still authorizes the flow upstream.
 // ResidencyResolver returns the regions a tenant is allowed to occupy (its residency boundary), or nil/empty for
-// an unpinned tenant (no restriction). *adminTenantModelStore-backed in production; a stub in tests.
-type ResidencyResolver func(tenantID string) []string
+// an unpinned tenant (no restriction). Lookup errors are not an unpinned tenant: callers must deny
+// connector traffic until its residency boundary can be determined.
+type ResidencyResolver func(tenantID string) ([]string, error)
 
 type ConnectorEgressDialer struct {
 	ResolveConnector ConnectorResolveFunc
@@ -240,9 +277,9 @@ func connectorEgressSessionFor(conn model.ConnectorRegistration, destination, lo
 	}
 }
 
-func (r ResidencyResolver) allowedRegions(tenantID string) []string {
+func (r ResidencyResolver) allowedRegions(tenantID string) ([]string, error) {
 	if r == nil {
-		return nil
+		return nil, nil
 	}
 	return r(tenantID)
 }
@@ -322,34 +359,38 @@ func (d ConnectorEgressDialer) OpenTCPConnection(ctx context.Context, route Netw
 	//
 	// "Every member of the site is tried" has to mean tried until one CARRIES the flow. So the open happens
 	// inside the loop, and a candidate that cannot open is passed over like one that cannot be reached.
+	allowedRegions, err := d.Residency.allowedRegions(tenantID)
+	if err != nil {
+		return nil, fmt.Errorf("tenant residency lookup failed: %w", err)
+	}
 	var upstream net.Conn
 	for _, candidate := range candidates {
-		s, serr := d.connectorEgressSession(candidate, destination, d.Residency.allowedRegions(tenantID))
+		s, serr := d.connectorEgressSession(candidate, destination, allowedRegions)
 		if serr != nil {
 			err = serr
 			log.Printf("connector_candidate_unreachable host=%q connector=%q connector_region=%q this_region=%q: %v",
 				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, serr)
 			continue
 		}
-		c, oerr := openConnectorTunnelTCPConn(ctx, s, destination, route.Port, tenantID)
-		if oerr != nil {
-			err = oerr
-			log.Printf("connector_candidate_would_not_open host=%q connector=%q connector_region=%q this_region=%q: %v — "+
-				"the flow could not open through this member, so the next member is tried",
-				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, oerr)
-			// Retire an unresponsive tunnel so an abandoned Connector connection can
-			// recover. An explicit backend refusal proves the Connector answered;
-			// closing its shared tunnel would disconnect unrelated applications.
-			// Caller cancellation also says nothing about tunnel health.
-			if errors.Is(oerr, tunnel.ErrTCPOpenTimeout) {
-				_ = s.Close()
-				log.Printf("connector_session_ended connector=%q this_region=%q — it did not answer an open, so "+
-					"this node stopped holding it; the connector may dial again", candidate.ID, d.LocalRegion)
+		sessions, viaPeer := peerEdgeCandidates(d.PeerEdges, connectorRegionForDecision(candidate), d.LocalRegion, s)
+		for _, session := range sessions {
+			c, oerr := openConnectorTunnelTCPConn(ctx, session, destination, route.Port, tenantID)
+			if oerr == nil {
+				upstream, conn, err = c, candidate, nil
+				break
 			}
-			continue
+			err = oerr
+			log.Printf("connector_candidate_would_not_open host=%q connector=%q connector_region=%q this_region=%q: %v — trying another reachable path",
+				destination, candidate.ID, ConnectorRegionForLog(candidate), d.LocalRegion, oerr)
+			// A peer link is shared by other Connectors. A timeout for this
+			// destination must not disconnect unrelated relayed flows.
+			if !viaPeer && errors.Is(oerr, tunnel.ErrTCPOpenTimeout) {
+				_ = session.Close()
+			}
 		}
-		upstream, conn, err = c, candidate, nil
-		break
+		if upstream != nil {
+			break
+		}
 	}
 	if upstream != nil {
 		log.Printf("connector_route_chosen host=%q connector=%q connector_region=%q this_region=%q",
@@ -385,6 +426,7 @@ func openConnectorTunnelTCPConn(ctx context.Context, session *tunnel.Session, ho
 	// the connector's own tunnel it is redundant and harmless; on a peer-Edge link it is the whole difference
 	// between finding the connector and dialling the destination directly into the egress guard.
 	openFrame.TenantID = strings.TrimSpace(tenantID)
+	openFrame = session.PrepareTCPOpenFrame(openFrame)
 	streamCh, cleanup, _, err := session.OpenTCP(ctx, openFrame)
 	if err != nil {
 		return nil, err
@@ -453,7 +495,7 @@ func ConnectorEgressDialContextWithCandidates(base func(ctx context.Context, net
 			// A destination that a connector fronts, dialled directly, is the exact shape of "the private app
 			// is unreachable and every screen looks correct".
 			log.Printf("connector_route_lookup_failed host=%q tenant=%q: %v — this flow is being dialled "+
-				"DIRECTLY, which for an internal destination reaches nothing", host, tenantID, err)
+				"DIRECTLY, which for an internal destination reaches nothing", host, flowTenant, err)
 			return base(ctx, network, addr)
 		}
 		if !ok {
@@ -469,17 +511,33 @@ func ConnectorEgressDialContextWithCandidates(base func(ctx context.Context, net
 		// is not an outage.
 		candidates := []model.ConnectorRegistration{conn}
 		if listCandidates != nil {
-			if all, cerr := listCandidates(ctx, tenantID, host, ""); cerr == nil && len(all) > 0 {
+			if all, cerr := listCandidates(ctx, flowTenant, host, ""); cerr == nil && len(all) > 0 {
 				candidates = all
 			}
 		}
-		var session *tunnel.Session
 		var lastErr error
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return nil, err
+		}
+		allowedRegions, err := residency.allowedRegions(flowTenant)
+		if err != nil {
+			return nil, fmt.Errorf("tenant residency lookup failed: %w", err)
+		}
 		for _, candidate := range candidates {
-			s, serr := connectorEgressSessionFor(candidate, host, localRegion, residency.allowedRegions(tenantID), meshEligible, tunnels, peerEdges)
+			s, serr := connectorEgressSessionFor(candidate, host, localRegion, allowedRegions, meshEligible, tunnels, peerEdges)
 			if serr == nil {
-				session, conn, lastErr = s, candidate, nil
-				break
+				sessions, _ := peerEdgeCandidates(peerEdges, connectorRegionForDecision(candidate), localRegion, s)
+				for _, session := range sessions {
+					upstream, oerr := openConnectorTunnelTCPConn(ctx, session, host, port, flowTenant)
+					if oerr == nil {
+						log.Printf("connector_route_chosen host=%q connector=%q connector_region=%q this_region=%q",
+							host, candidate.ID, ConnectorRegionForLog(candidate), localRegion)
+						return upstream, nil
+					}
+					lastErr = oerr
+				}
+				continue
 			}
 			lastErr = serr
 			if len(candidates) > 1 {
@@ -496,13 +554,7 @@ func ConnectorEgressDialContextWithCandidates(base func(ctx context.Context, net
 				host, conn.ID, ConnectorRegionForLog(conn), localRegion, err)
 			return nil, err
 		}
-		log.Printf("connector_route_chosen host=%q connector=%q connector_region=%q this_region=%q",
-			host, conn.ID, ConnectorRegionForLog(conn), localRegion)
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return nil, err
-		}
-		return openConnectorTunnelTCPConn(ctx, session, host, port, flowTenant)
+		return nil, fmt.Errorf("connector %s has no reachable session", conn.ID)
 	}
 }
 

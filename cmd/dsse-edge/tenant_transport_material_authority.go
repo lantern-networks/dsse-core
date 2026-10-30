@@ -185,7 +185,7 @@ func newTenantTransportAuthorityWithReload(seed []byte, persist func([]byte) err
 		if err := json.Unmarshal(seed, &rows); err == nil {
 			for i := range rows {
 				row := rows[i]
-				a.cas[strings.ToLower(strings.TrimSpace(row.TenantID))] = &row
+				a.cas[strings.TrimSpace(row.TenantID)] = &row
 			}
 		}
 	}
@@ -220,7 +220,7 @@ func (a *tenantTransportAuthority) saveLocked() error {
 // on every restart — which is the "adopted and un-issuable" state the lab already reached once by minting a
 // CA in a temporary directory and losing the key.
 func (a *tenantTransportAuthority) EnsureCA(tenant, serverName string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	if key == "" {
 		return nil, fmt.Errorf("an organization must be named")
 	}
@@ -271,7 +271,7 @@ func (a *tenantTransportAuthority) EnsureCA(tenant, serverName string) (*storedT
 // three anchors and would leave nobody able to say which one the fleet is moving to. Finish the rotation
 // (every device measured, every Edge serving it) and retire the previous one first.
 func (a *tenantTransportAuthority) RotateCA(tenant string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -331,7 +331,7 @@ func (a *tenantTransportAuthority) RotateCA(tenant string) (*storedTenantTranspo
 // has already adopted it simply carries an anchor nobody signs with, which costs it nothing and goes away on
 // its next bundle.
 func (a *tenantTransportAuthority) AbandonRotation(tenant string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -361,7 +361,7 @@ func (a *tenantTransportAuthority) AbandonRotation(tenant string) (*storedTenant
 // stops existing, which no Edge can know on its own. Doing it too early takes out any Edge that has not
 // promoted yet — which is the failure this whole shape exists to avoid, one level up.
 func (a *tenantTransportAuthority) RetirePrevious(tenant string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -387,7 +387,7 @@ func (a *tenantTransportAuthority) RetirePrevious(tenant string) (*storedTenantT
 
 // IssueFor mints short-lived server material for one Edge, from this organization's authority.
 func (a *tenantTransportAuthority) IssueFor(tenant, edgeID string, ttl time.Duration) (tenantTransportMaterial, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	row, ok, rerr := a.refreshedRowLocked(key)
 	row = copyAuthority(row)
@@ -476,7 +476,7 @@ func (a *tenantTransportAuthority) IssueAllFor(tenant, edgeID string, ttl time.D
 	if ttl <= 0 {
 		return nil, fmt.Errorf("material handed to an Edge must expire, so a lifetime is required")
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	row, ok, err := a.refreshedRowLocked(key)
 	row = copyAuthority(row)
@@ -552,7 +552,7 @@ func (a *tenantTransportAuthority) AnchorsFor(tenant string) []string {
 	// ★★★ SAME RULE AS Row ON THE OTHER TWO AUTHORITIES (2026-08-31). These anchors are what a device
 	// verifies its own organization's door against; a profile issued without them from a control plane that
 	// merely had not received the write installs a device that cannot check what it is served.
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
@@ -565,10 +565,13 @@ func (a *tenantTransportAuthority) AnchorsFor(tenant string) []string {
 	if row == nil {
 		return nil
 	}
-	out := []string{}
-	if pem := strings.TrimSpace(row.CACertPEM); pem != "" {
-		out = append(out, pem)
+	current := strings.TrimSpace(row.CACertPEM)
+	if current == "" {
+		// A staged incoming authority cannot replace a missing current one merely
+		// because a profile asks for its anchors. Refuse an incomplete snapshot.
+		return nil
 	}
+	out := []string{current}
 	if row.Incoming != nil {
 		if pem := strings.TrimSpace(row.Incoming.CACertPEM); pem != "" && pem != out[0] {
 			out = append(out, pem)
@@ -594,7 +597,7 @@ func (a *tenantTransportAuthority) Row(tenant string) (*storedTenantTransportCA,
 	if a == nil {
 		return nil, false
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
@@ -612,7 +615,7 @@ func (a *tenantTransportAuthority) StateFor(tenant string) (serverName, inForceS
 	if a == nil {
 		return "", "", "", false, false
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
@@ -649,7 +652,7 @@ func (a *tenantTransportAuthority) RenameInFlight(tenant string) (previous, sinc
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
-	row, ok := a.cas[strings.ToLower(strings.TrimSpace(tenant))]
+	row, ok := a.cas[strings.TrimSpace(tenant)]
 	if !ok {
 		return "", ""
 	}
@@ -760,7 +763,7 @@ func (a *tenantTransportAuthority) CountForTenant(tenant string) int {
 	if a == nil {
 		return 0
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
@@ -786,7 +789,7 @@ func (a *tenantTransportAuthority) RemoveTenantContext(ctx context.Context, tena
 	if a == nil {
 		return 0, nil
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -869,7 +872,7 @@ func transportLeafNames(row *storedTenantTransportCA) []string {
 // ★ ONE AT A TIME, for the reason every other overlap here gives: two previous names would leave devices
 // spread across three, and "has everybody moved?" would have no single answer.
 func (a *tenantTransportAuthority) RenameServerName(tenant, newName string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	name := strings.ToLower(strings.TrimSpace(newName))
 	if name == "" {
 		return nil, fmt.Errorf("a new server name is required")
@@ -923,7 +926,7 @@ func (a *tenantTransportAuthority) RenameServerName(tenant, newName string) (*st
 // simply a rename in the other direction, subject to the same gate. RetirePreviousServerName remains the only
 // act that drops a name, and it is the only one that needs the readiness answer.
 func (a *tenantTransportAuthority) AbandonRename(tenant string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -953,7 +956,7 @@ func (a *tenantTransportAuthority) AbandonRename(tenant string) (*storedTenantTr
 // the fleet picks this up — including the one that was switched off throughout, which is the one nobody was
 // watching. The evidence is what devices report SENDING; this is the act.
 func (a *tenantTransportAuthority) RetirePreviousServerName(tenant string) (*storedTenantTransportCA, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -1015,5 +1018,5 @@ func (a *tenantTransportAuthority) refreshLocked() error {
 }
 
 func transportAuthorityRowKey(row *storedTenantTransportCA) string {
-	return strings.ToLower(strings.TrimSpace(row.TenantID))
+	return strings.TrimSpace(row.TenantID)
 }

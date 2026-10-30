@@ -17,7 +17,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"sort"
 	"strconv"
 	"strings"
@@ -82,7 +81,8 @@ type Store struct {
 	sharedKnown     bool
 	sharedPending   map[string]map[string]FlowObservation
 	sharedUncertain bool
-	dirty           bool // there are un-persisted changes since the last flush
+	restoreErr      error // an unreadable local inventory must never be replaced by a later flush
+	dirty           bool  // there are un-persisted changes since the last flush
 	// receipts is the report record for a store without a shared persister (see ApplyReport). A shared store
 	// keeps it only in the row.
 	receipts map[string]ReportReceipt
@@ -98,6 +98,7 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 	s.mu.Lock()
 	s.persister = p
 	s.retention = retention
+	s.restoreErr = nil
 	s.mu.Unlock()
 	if p == nil {
 		return nil
@@ -129,22 +130,25 @@ func (s *Store) SetPersister(p blobstore.Persister, retention time.Duration) err
 		s.pruneLocked(time.Now())
 		return nil
 	}
-	if err != nil || len(data) == 0 {
-		return err
-	}
-	flowsRaw, receipts, err := splitRow(data)
 	if err != nil {
+		s.mu.Lock()
+		s.restoreErr = err
+		s.mu.Unlock()
 		return err
 	}
-	var snap map[string]map[string]FlowObservation
-	if err := json.Unmarshal(flowsRaw, &snap); err != nil {
+	if data == nil {
+		return nil
+	}
+	snap, receipts, err := decodeShared(data, true)
+	if err != nil {
+		s.mu.Lock()
+		s.restoreErr = err
+		s.mu.Unlock()
 		return err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if snap != nil {
-		s.flows = snap
-	}
+	s.flows = snap
 	s.receipts = receipts
 	s.pruneLocked(time.Now())
 	return nil
@@ -176,6 +180,11 @@ func (s *Store) PersistIfDirty() error { return s.PersistIfDirtyContext(context.
 
 func (s *Store) PersistIfDirtyContext(ctx context.Context) error {
 	s.mu.Lock()
+	if s.restoreErr != nil {
+		err := s.restoreErr
+		s.mu.Unlock()
+		return err
+	}
 	if !s.dirty || s.persister == nil {
 		s.mu.Unlock()
 		return nil
@@ -226,9 +235,16 @@ func (s *Store) Observe(tenantID, source, user, destination, serviceFamily strin
 	}
 	// Latest sighting wins for the user (re-attribute to whoever last made the flow). Recording an empty user is
 	// meaningful — it flips the flow to "system" (unattended/machine), which is exactly the human-vs-system signal.
-	obs.User = user
+	// Processing order need not be timestamp order (including clock corrections).
+	// Keep a valid interval and attribute the flow to its latest sighting.
+	if ts < obs.FirstSeen {
+		obs.FirstSeen = ts
+	}
+	if ts >= obs.LastSeen {
+		obs.User = user
+		obs.LastSeen = ts
+	}
 	obs.Count++
-	obs.LastSeen = ts
 	s.flows[tenantID][id] = obs
 	if _, ok := s.persister.(sharedPersister); ok {
 		if s.sharedPending[tenantID] == nil {

@@ -6,11 +6,14 @@ package grantstore
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -21,47 +24,70 @@ import (
 
 // Grant is one minted authorization. Times are RFC3339 UTC.
 type Grant struct {
-	GrantID  string `json:"grant_id"`
-	TenantID string `json:"tenant_id"`
-	UserID   string `json:"user_id"`
+	OSPrincipal      string                     `json:"os_principal,omitempty"`
+	OSSession        string                     `json:"os_session,omitempty"`
+	RequiredFeatures []string                   `json:"required_features,omitempty"`
+	UnknownFields    map[string]json.RawMessage `json:"-"`
+	// ReauthenticationStartedAt records a server-side max_age=0 attempt whose
+	// signed auth_time passed freshness validation. It is not the flow start or
+	// the grant mint time. AuthenticationRequestID binds its single permitted use;
+	// revocation records consumption and also survives restart.
+	ReauthenticationStartedAt string `json:"reauthentication_started_at,omitempty"`
+	AuthenticationRequestID   string `json:"authentication_request_id,omitempty"`
+	GrantID                   string `json:"grant_id"`
+	TenantID                  string `json:"tenant_id"`
+	UserID                    string `json:"user_id"`
 	// Human-readable identity, captured from the verified ID token at mint time so the grant is
 	// self-describing (the admin surface must not depend on a directory sync to say WHO was approved).
-	UserEmail       string   `json:"user_email,omitempty"`
-	Username        string   `json:"username,omitempty"`
-	UserDisplayName string   `json:"user_display_name,omitempty"`
-	DeviceID        string   `json:"device_id,omitempty"`
-	IdPID           string   `json:"idp_id"`
-	ACR             string   `json:"acr,omitempty"`
-	AMR             []string `json:"amr,omitempty"`
-	Scope           string   `json:"scope,omitempty"` // app / destination / service the grant covers ("" = tenant-wide)
-	IssuedAt        string   `json:"issued_at"`
-	ExpiresAt       string   `json:"expires_at"`
-	Revoked         bool     `json:"revoked,omitempty"`
+	UserEmail            string   `json:"user_email,omitempty"`
+	Username             string   `json:"username,omitempty"`
+	UserDisplayName      string   `json:"user_display_name,omitempty"`
+	DeviceID             string   `json:"device_id,omitempty"`
+	IdPID                string   `json:"idp_id"`
+	Issuer               string   `json:"issuer,omitempty"`
+	ProviderConfigSHA256 string   `json:"provider_config_sha256,omitempty"`
+	ACR                  string   `json:"acr,omitempty"`
+	AMR                  []string `json:"amr,omitempty"`
+	AuthTime             string   `json:"auth_time,omitempty"` // verified IdP authentication time, never mint time
+	Scope                string   `json:"scope,omitempty"`     // app / destination / service the grant covers ("" = tenant-wide)
+	IssuedAt             string   `json:"issued_at"`
+	ExpiresAt            string   `json:"expires_at"`
+	Revoked              bool     `json:"revoked,omitempty"`
+	// ConsumedAt distinguishes a released single request from an administrator
+	// revocation. Revoked remains the authorization tombstone for old readers.
+	ConsumedAt string `json:"consumed_at,omitempty"`
+	// ReauthenticateAfter is a persistent administrator revocation boundary, not
+	// expiry or single-request consumption. It also constrains replacement IDs.
+	ReauthenticateAfter string `json:"reauthenticate_after,omitempty"`
 }
 
 // Store holds tenant-attributed grants with globally unique bearer IDs, safe for concurrent use.
 type Store struct {
-	readRefreshMu  sync.Mutex
-	readRefreshAt  time.Time
-	readRefreshErr error
-	mu             sync.RWMutex
-	grants         map[string]Grant // grant_id -> grant
-	persister      blobstore.Persister
-	authorityKnown bool
-	pending        map[string]Grant
-	dirty          bool // a locally applied denial still needs persistence
-	// generation advances on every change. The config bundle SUMS it, and an Edge applies a bundle only when
-	// that sum is newer — see ConfigGeneration.
+	// Writers remain serialized across persistence, but authorization readers
+	// must not wait for a filesystem/database save of every tenant's snapshot.
+	writeMu            sync.Mutex
+	readRefreshMu      sync.Mutex
+	readRefreshAt      time.Time
+	readRefreshErr     error
+	readRefreshRunning bool
+	readRefreshAttempt time.Time
+	authorityDigest    [32]byte
+	persistenceEpoch   uint64
+	mu                 sync.RWMutex
+	grants             map[string]Grant // grant_id -> grant
+	fences             reauthenticationReadIndex
+	persister          blobstore.Persister
+	authorityKnown     bool
+	pending            map[string]Grant
+	dirty              bool // a locally applied denial still needs persistence
+	// generation advances on every change. Signed grant snapshots track it
+	// independently of policy configuration, so login activity cannot invalidate
+	// a policy transfer and grant-only changes still reach the enforcing Edge.
 	generation uint64
 }
 
-// ★★★ THE BUNDLE CARRIES THESE GRANTS, SO THE BUNDLE'S VERSION HAS TO MOVE WITH THEM (2026-09-02).
-//
-// An Edge applies a bundle only when its version is newer. A store the version does not count changes the
-// bundle's CONTENTS without changing its VERSION, and no Edge re-pulls — so a grant minted at one node would
-// reach the authority and stop there, and a REVOCATION would never reach the nodes still honouring it. That
-// is the whole point of carrying grants at all, and it was measured failing exactly this way: the authority
-// held the grant and every Edge listed none, indefinitely.
+// ConfigGeneration identifies the local grant authority incarnation's current
+// state. The signed grant reference carries it separately from configuration.
 func (s *Store) ConfigGeneration() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -69,11 +95,15 @@ func (s *Store) ConfigGeneration() uint64 {
 }
 
 // NewStore returns an empty grant store.
-func NewStore() *Store { return &Store{grants: map[string]Grant{}} }
+func NewStore() *Store {
+	return &Store{grants: map[string]Grant{}, fences: make(reauthenticationReadIndex)}
+}
 
 // Mint stores a grant. grant_id and tenant_id are required (the caller supplies a high-entropy id). ttl sets
 // ExpiresAt = now + ttl.
 func (s *Store) mintLocal(g Grant, ttl time.Duration, now time.Time) (Grant, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	g.GrantID = strings.TrimSpace(g.GrantID)
 	g.TenantID = strings.TrimSpace(g.TenantID)
 	if g.GrantID == "" {
@@ -89,6 +119,8 @@ func (s *Store) mintLocal(g Grant, ttl time.Duration, now time.Time) (Grant, err
 	g.IssuedAt = now.Format(time.RFC3339)
 	g.ExpiresAt = now.Add(ttl).Format(time.RFC3339)
 	g.Revoked = false
+	g.ConsumedAt = ""
+	g.ReauthenticateAfter = ""
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, exists := s.grants[g.GrantID]; exists {
@@ -97,7 +129,14 @@ func (s *Store) mintLocal(g Grant, ttl time.Duration, now time.Time) (Grant, err
 	if err := validateGrant(g); err != nil {
 		return Grant{}, err
 	}
-	candidate := cloneGrants(s.grants)
+	if !s.authorizationFreshLocked(g, g.Scope, now) {
+		return Grant{}, ErrReauthenticationRequired
+	}
+	if !s.reauthenticationAfterLocked(g, g.Scope).IsZero() && !slices.Contains(g.RequiredFeatures, FeatureRevocationReauthentication) {
+		g.RequiredFeatures = append(append([]string(nil), g.RequiredFeatures...), FeatureRevocationReauthentication)
+	}
+	var candidate map[string]Grant
+	_ = s.withAuthorizationReaders(func() error { candidate = maps.Clone(s.grants); return nil })
 	candidate[g.GrantID] = cloneGrant(g)
 	if err := s.saveLocked(candidate); err != nil && !savedNonAtomically(err) {
 		return Grant{}, err
@@ -121,14 +160,14 @@ func (s *Store) Get(grantID string) (Grant, bool) {
 // Valid reports whether the grant exists, is not revoked, and has not expired at now.
 func (s *Store) Valid(grantID string, now time.Time) bool {
 	g, ok := s.Get(grantID)
-	if !ok || g.Revoked {
+	if !ok || g.Revoked || !g.Supported() {
 		return false
 	}
 	exp, err := time.Parse(time.RFC3339, g.ExpiresAt)
 	if err != nil {
 		return false
 	}
-	return now.UTC().Before(exp)
+	return now.UTC().Before(exp) && s.authorizationFreshAt(g, g.Scope, now.UTC())
 }
 
 // Revoke is the compatibility entry point: the boolean reports existence, not durability.
@@ -147,6 +186,8 @@ func (s *Store) Revoke(grantID string) bool {
 // ErrSavedWithoutAtomicity is a completed-save warning, while ErrPersistence
 // means confirmation is missing and the pending denial still needs a retry.
 func (s *Store) revokeForTenantLocal(tenantID, grantID string) (Grant, bool, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	tenantID = strings.TrimSpace(tenantID)
 	grantID = strings.TrimSpace(grantID)
 	if tenantID == "" {
@@ -204,6 +245,8 @@ func (s *Store) SetStatePath(path string) error {
 // SetPersister adopts a validated snapshot and its writer together. A failed load preserves both.
 // Shared writers coordinate edits through the persistence transaction.
 func (s *Store) SetPersister(p blobstore.Persister) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Loading even a valid older snapshot must not discard an unsaved denial.
@@ -213,9 +256,12 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 	}
 	if p == nil {
 		s.persister = nil
+		s.persistenceEpoch++
 		return nil
 	}
-	data, err := p.Load()
+	readStarted := time.Now()
+	var data []byte
+	err := s.withAuthorizationReaders(func() (err error) { data, err = p.Load(); return err })
 	if err != nil {
 		return err
 	}
@@ -224,32 +270,25 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 			return ErrInvalidGrant
 		}
 		s.persister = p
+		s.persistenceEpoch++
+		s.readRefreshAt, s.readRefreshErr = readStarted, nil
+		s.authorityDigest = sha256.Sum256(nil)
 		s.dirty = len(s.grants) > 0
 		return nil
 	}
-	var fresh map[string]Grant
-	if err := json.Unmarshal(data, &fresh); err != nil {
-		return ErrInvalidGrant
-	}
-	if fresh == nil {
-		return ErrInvalidGrant
-	}
-	for key, g := range fresh {
-		if key != g.GrantID {
-			return ErrInvalidGrant
-		}
-		if err := validateGrant(g); err != nil {
-			log.Printf("access_grant_restore invalid_legacy_row_skipped=true")
-			delete(fresh, key)
-			continue
-		}
-		fresh[key] = cloneGrant(g)
+	fresh, err := decodeShared(data)
+	if err != nil {
+		return err
 	}
 	if !reflect.DeepEqual(s.grants, fresh) {
 		s.generation++
 	}
 	s.grants, s.persister, s.dirty = fresh, p, false
+	s.rebuildReauthenticationIndexLocked()
 	s.authorityKnown = true
+	s.persistenceEpoch++
+	s.authorityDigest = sha256.Sum256(data)
+	s.readRefreshAt, s.readRefreshErr = readStarted, nil
 	s.pending = nil
 	return nil
 }
@@ -266,10 +305,14 @@ func (s *Store) saveLocked(candidate map[string]Grant) error {
 	if s.persister == nil {
 		return nil
 	}
-	data, err := json.MarshalIndent(candidate, "", "  ")
-	if err == nil {
-		err = s.persister.Save(data)
-	}
+	p := s.persister
+	err := s.withAuthorizationReaders(func() error {
+		data, err := encodeGrantSnapshot(candidate)
+		if err != nil {
+			return err
+		}
+		return p.Save(data)
+	})
 	if err != nil {
 		log.Printf("access grants save: %v", err)
 		if errors.Is(err, blobstore.ErrDurabilityUnconfirmed) {
@@ -281,6 +324,14 @@ func (s *Store) saveLocked(candidate map[string]Grant) error {
 		return ErrPersistence
 	}
 	return nil
+}
+
+// Caller holds writeMu and mu. The immutable candidate and current writer are
+// protected by writeMu while readers keep using the last published state.
+func (s *Store) withAuthorizationReaders(work func() error) error {
+	s.mu.Unlock()
+	defer s.mu.Lock()
+	return work()
 }
 func (s *Store) persistLocked() error {
 	err := s.saveLocked(s.grants)
@@ -307,7 +358,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	defer s.mu.RUnlock()
 	n := 0
 	for _, v := range s.grants {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
+		if v.TenantID == tenantID {
 			n++
 		}
 	}
@@ -328,12 +379,14 @@ func (s *Store) removeTenantLocal(tenantID string) (int, error) {
 		return 0, nil
 	}
 	tenantID = strings.TrimSpace(tenantID)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := cloneGrants(s.grants)
 	n := 0
 	for id, v := range candidate {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
+		if v.TenantID == tenantID {
 			delete(candidate, id)
 			n++
 		}
@@ -345,6 +398,7 @@ func (s *Store) removeTenantLocal(tenantID string) (int, error) {
 		return 0, err
 	}
 	s.grants = candidate
+	s.rebuildReauthenticationIndexLocked()
 	s.generation++
 	s.dirty = false
 	return n, nil

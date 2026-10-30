@@ -289,7 +289,7 @@ func adminAuditOutboxReplayAuditLog(result postgresAdminAuditOutboxReplayResult,
 	}
 	audit := model.AuditLog{
 		ID:            randomEdgeID("audit_admin_audit_outbox_replayed_", time.Now().UTC()),
-		TenantID:      evaluator.PolicyBundle.TenantID,
+		TenantID:      result.TenantID,
 		ActorUserID:   stringPtr(adminPrincipalID),
 		EventType:     "admin_audit_outbox_replayed",
 		TargetType:    stringPtr("admin_audit_outbox"),
@@ -326,7 +326,7 @@ func domainEventOutboxReplayAuditLog(result postgresDomainEventOutboxReplayResul
 	}
 	audit := model.AuditLog{
 		ID:            randomEdgeID("audit_domain_event_outbox_replayed_", time.Now().UTC()),
-		TenantID:      evaluator.PolicyBundle.TenantID,
+		TenantID:      result.TenantID,
 		ActorUserID:   stringPtr(adminPrincipalID),
 		EventType:     "admin_domain_event_outbox_replayed",
 		TargetType:    stringPtr("domain_event_outbox"),

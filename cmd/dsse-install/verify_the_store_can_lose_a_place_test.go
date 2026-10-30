@@ -126,6 +126,22 @@ func TestAStoreWithAVoteInEachPlaceIsGreen(t *testing.T) {
 	}
 }
 
+func TestAStoreWithTwoVotesInOnePlaceCannotLoseThatPlace(t *testing.T) {
+	dir := t.TempDir()
+	host := storeUnder(t, dir, `{"members":[
+	  {"name":"a-1","peerURLs":["https://a.example.test:12390"]},
+	  {"name":"a-2","peerURLs":["https://a.example.test:12391"]},
+	  {"name":"b-1","peerURLs":["https://b.example.test:12390"]},
+	  {"name":"c-1","peerURLs":["https://c.example.test:12390"]}]}`)
+	got := verifyTheStoreCanLoseAPlace(dir, map[string]string{
+		"DSSE_ETCD_CLIENT_SCHEME": "https",
+		"DSSE_ETCD_HOSTS":         "'" + host + "'",
+	})
+	if len(got) != 1 || got[0].ok || !strings.Contains(got[0].note, "2 OF A QUORUM OF 3") {
+		t.Fatalf("loss of a two-vote place was counted as one vote: %+v", got)
+	}
+}
+
 // ★ AND A STORE NOBODY CAN REACH IS NOT GREEN EITHER. "No member answered" is not "nothing is wrong".
 func TestAStoreThatCannotBeAskedIsNotGreen(t *testing.T) {
 	dir := t.TempDir()

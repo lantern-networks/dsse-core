@@ -35,10 +35,27 @@ final class EnrolmentFailuresAreNamedTests: XCTestCase {
             XCTAssertTrue(line.contains("enrolment_error="),
                           "a failure logged only as a number: \(line)")
         }
-        // The reason travels, because "request_failed" without it is the same dead end one level down.
+        // The safe reason category travels; free-form network and response strings do not.
         XCTAssertTrue(providerNonsecretErrorDetail(DsseDeviceEnrolmentError.requestFailed("could not connect"))
-            .contains("could not connect"))
+            .contains("network_reason=connection_failed"))
         XCTAssertTrue(providerNonsecretErrorDetail(DsseDeviceEnrolmentError.serverRefused(status: 403, message: "token spent"))
             .contains("403"))
+    }
+
+    func testServerRefusalCannotCopyUntrustedResponseIntoPublicRuntimeLog() {
+        let marker = "private_fixture_secret_marker"
+        let enrolment = providerNonsecretErrorDetail(
+            DsseDeviceEnrolmentError.serverRefused(status: 403, message: marker))
+        XCTAssertTrue(enrolment.contains("enrolment_error=server_refused status=403"))
+        XCTAssertFalse(enrolment.contains(marker))
+        let renewal = providerNonsecretErrorDetail(
+            DsseCertificateRenewalError.serverRefused(status: 403, message: marker))
+        XCTAssertFalse(renewal.contains(marker))
+        XCTAssertFalse(providerNonsecretErrorDetail(DsseSingleRequestError.transport("refused " + marker))
+            .contains(marker))
+        XCTAssertFalse(providerNonsecretErrorDetail(DsseRuntimeCopyTunnelError.connectionFailed("closed " + marker))
+            .contains(marker))
+        XCTAssertFalse(providerNonsecretErrorDetail(DsseRenewedIdentityStoreError.pointerWriteFailed(marker))
+            .contains(marker))
     }
 }

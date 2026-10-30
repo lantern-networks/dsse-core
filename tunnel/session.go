@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 )
@@ -57,12 +58,12 @@ const (
 )
 
 const (
-	MaxTCPDataFramePayloadBytes    = 64 << 10
-	MaxTCPConnectTimeoutMillis     = int((30 * time.Second) / time.Millisecond)
-	MaxTCPConnectionLifetimeMillis = int((1 * time.Hour) / time.Millisecond)
-	MaxTCPIdleTimeoutMillis        = int((5 * time.Minute) / time.Millisecond)
-	MaxTCPByteCap                  = int64(1 << 30)
-	MaxTCPConcurrentConnections    = 1024
+	MaxTCPDataFramePayloadBytes = 64 << 10
+	MaxTCPConnectTimeoutMillis  = int((30 * time.Second) / time.Millisecond)
+	// LegacyTCPConcurrentConnectionCap is a wire-compatibility hint for old
+	// receivers. It is not an admission limit in updated receivers: a frame
+	// sender cannot author the operator's connection-count policy.
+	LegacyTCPConcurrentConnectionCap = 1024
 )
 
 type Frame struct {
@@ -82,10 +83,12 @@ type Frame struct {
 	MaxConnectionLifetimeMillis int    `json:"max_connection_lifetime_ms,omitempty"`
 	IdleTimeoutMillis           int    `json:"idle_timeout_ms,omitempty"`
 	ByteCap                     int64  `json:"byte_cap,omitempty"`
-	ConcurrentConnectionCap     int    `json:"concurrent_connection_cap,omitempty"`
-	Direction                   string `json:"direction,omitempty"`
-	Data                        string `json:"data,omitempty"`
-	CloseReason                 string `json:"close_reason,omitempty"`
+	// Deprecated wire-compatibility hint. Updated receivers do not use a
+	// sender-selected value as their operator's admission policy.
+	ConcurrentConnectionCap int    `json:"concurrent_connection_cap,omitempty"`
+	Direction               string `json:"direction,omitempty"`
+	Data                    string `json:"data,omitempty"`
+	CloseReason             string `json:"close_reason,omitempty"`
 	// TenantID is the organization the relayed flow belongs to.
 	//
 	// ★★★ A RELAY LOST WHOSE FLOW IT WAS (2026-09-01, measured on a customer's connector pair). An Edge that
@@ -139,20 +142,20 @@ func ValidateTCPOpenFrame(frame Frame) error {
 	// 0 = unlimited (no lifetime / no idle reap). Used by interactive East-West flows (ssh/rdp): a session at a
 	// prompt must not be torn down by a timer. A positive value is still bounded by the cap. The idle<=lifetime
 	// invariant only applies when BOTH are bounded (a bounded idle under an unlimited lifetime is fine).
-	if err := validateNonNegativeBounded("max_connection_lifetime_ms", frame.MaxConnectionLifetimeMillis, MaxTCPConnectionLifetimeMillis); err != nil {
+	if err := validateNonNegativeBounded("max_connection_lifetime_ms", frame.MaxConnectionLifetimeMillis, int(math.MaxInt64/int64(time.Millisecond))); err != nil {
 		return err
 	}
-	if err := validateNonNegativeBounded("idle_timeout_ms", frame.IdleTimeoutMillis, MaxTCPIdleTimeoutMillis); err != nil {
+	if err := validateNonNegativeBounded("idle_timeout_ms", frame.IdleTimeoutMillis, int(math.MaxInt64/int64(time.Millisecond))); err != nil {
 		return err
 	}
 	if frame.MaxConnectionLifetimeMillis > 0 && frame.IdleTimeoutMillis > frame.MaxConnectionLifetimeMillis {
 		return fmt.Errorf("idle_timeout_ms cannot exceed max_connection_lifetime_ms")
 	}
-	if frame.ByteCap <= 0 || frame.ByteCap > MaxTCPByteCap {
-		return fmt.Errorf("byte_cap must be between 1 and %d", MaxTCPByteCap)
+	if frame.ByteCap < 0 {
+		return fmt.Errorf("byte_cap cannot be negative (0 = no byte quota)")
 	}
-	if frame.ConcurrentConnectionCap <= 0 || frame.ConcurrentConnectionCap > MaxTCPConcurrentConnections {
-		return fmt.Errorf("concurrent_connection_cap must be between 1 and %d", MaxTCPConcurrentConnections)
+	if frame.ConcurrentConnectionCap <= 0 || frame.ConcurrentConnectionCap > LegacyTCPConcurrentConnectionCap {
+		return fmt.Errorf("legacy concurrent_connection_cap must be between 1 and %d", LegacyTCPConcurrentConnectionCap)
 	}
 	return nil
 }
@@ -250,9 +253,9 @@ func (r *TCPConnectionRegistry) Open(frame Frame, now time.Time) error {
 	if _, exists := r.connections[frame.RequestID]; exists {
 		return fmt.Errorf("tcp connection %s is already open", frame.RequestID)
 	}
-	if len(r.connections) >= frame.ConcurrentConnectionCap {
-		return fmt.Errorf("tcp concurrent connection cap exceeded: %d/%d", len(r.connections), frame.ConcurrentConnectionCap)
-	}
+	// Connection admission belongs to the receiver's operator. Keep accepting
+	// the legacy frame field for interoperability, but never treat its 32/1024
+	// (or any other sender-selected value) as a connection-count policy.
 	r.connections[frame.RequestID] = &tcpConnectionRecord{
 		requestID:      frame.RequestID,
 		byteCap:        frame.ByteCap,
@@ -288,7 +291,7 @@ func (r *TCPConnectionRegistry) RecordData(frame Frame, now time.Time) (Frame, b
 		record.bytesDown += int64(len(payload))
 	}
 	record.lastActivityAt = now
-	if record.bytesUp+record.bytesDown <= record.byteCap {
+	if record.byteCap == 0 || (record.bytesDown <= record.byteCap && record.bytesUp <= record.byteCap-record.bytesDown) {
 		r.mu.Unlock()
 		return Frame{}, false, nil
 	}
@@ -399,6 +402,7 @@ type Session struct {
 	mu      sync.Mutex
 
 	requestTimeout time.Duration
+	peerTCPQuotas  bool
 }
 
 func NewManager() *Manager {
@@ -432,6 +436,9 @@ func (m *Manager) RegisterWithTransportProtocol(connectorID, tunnelID string, co
 		pending:           map[string]chan Frame{},
 		streams:           map[string]chan Frame{},
 		requestTimeout:    m.requestTimeout,
+	}
+	if peer, ok := conn.(tcpQuotaPeer); ok {
+		session.peerTCPQuotas = peer.PeerSupportsTCPQuotas()
 	}
 	m.mu.Lock()
 	previous, replacing := m.sessions[connectorID]
@@ -487,9 +494,13 @@ func (s *Session) RoundTrip(ctx context.Context, frame Frame) (Frame, error) {
 	}
 	responseCh := make(chan Frame, 1)
 	s.mu.Lock()
+	if _, exists := s.pending[frame.RequestID]; exists {
+		s.mu.Unlock()
+		return Frame{}, fmt.Errorf("tunnel request %s is already pending", frame.RequestID)
+	}
 	s.pending[frame.RequestID] = responseCh
 	s.mu.Unlock()
-	defer s.deletePending(frame.RequestID)
+	defer s.deletePending(frame.RequestID, responseCh)
 
 	frame.TunnelID = s.TunnelID
 	if err := s.conn.WriteJSON(frame); err != nil {
@@ -512,6 +523,7 @@ func (s *Session) OpenTCP(ctx context.Context, frame Frame) (<-chan Frame, func(
 	if err := ValidateTCPOpenFrame(frame); err != nil {
 		return nil, nil, Frame{}, err
 	}
+	frame = s.PrepareTCPOpenFrame(frame)
 	streamCh, cleanup, err := s.RegisterTCPStream(frame.RequestID)
 	if err != nil {
 		return nil, nil, Frame{}, err
@@ -581,7 +593,7 @@ func (s *Session) RegisterTCPStream(requestID string) (<-chan Frame, func(), err
 	// s.mu; "in the map" therefore implies "not closed").
 	cleanup := func() {
 		s.mu.Lock()
-		if registered, ok := s.streams[requestID]; ok {
+		if registered, ok := s.streams[requestID]; ok && registered == ch {
 			delete(s.streams, requestID)
 			close(registered)
 		}
@@ -645,9 +657,11 @@ func (s *Session) failPending(err error) {
 	}
 }
 
-func (s *Session) deletePending(requestID string) {
+func (s *Session) deletePending(requestID string, responseCh chan Frame) {
 	s.mu.Lock()
-	delete(s.pending, requestID)
+	if registered, ok := s.pending[requestID]; ok && registered == responseCh {
+		delete(s.pending, requestID)
+	}
 	s.mu.Unlock()
 }
 

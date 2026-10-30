@@ -23,14 +23,17 @@ import (
 
 	accessdecision "github.com/lantern-networks/dsse-core/accessdecision"
 	delegatedgrant "github.com/lantern-networks/dsse-core/delegatedgrant"
+	"github.com/lantern-networks/dsse-core/dlp"
 	"github.com/lantern-networks/dsse-core/edgeplane"
 	enrolledinventory "github.com/lantern-networks/dsse-core/enrolledinventory"
 	humanapproval "github.com/lantern-networks/dsse-core/humanapproval"
 	inspection "github.com/lantern-networks/dsse-core/inspection"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
+	"github.com/lantern-networks/dsse-core/outboundtls"
 	"github.com/lantern-networks/dsse-core/policy"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
 	"github.com/lantern-networks/dsse-core/revocation"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	swg "github.com/lantern-networks/dsse-core/swg"
 	"github.com/lantern-networks/dsse-core/upstreamtrust"
 	usagemeter "github.com/lantern-networks/dsse-core/usagemeter"
@@ -76,9 +79,8 @@ type edgeSWGHTTPEgressHandlerConfig struct {
 	// DLPClassifiers supplies the operator-defined custom classifiers (/admin/dlp-classifiers) so the DLP scan
 	// detects tenant-specific identifiers alongside the built-ins. nil = built-in identifiers only.
 	DLPClassifiers dlpClassifierProvider
-	// CorporateDomains returns a tenant's verified corporate domains (the sanctioned SaaS instances) so
-	// instance-scoped DLP rules can tell corporate from personal/external destinations. nil = none (scoped rules
-	// stay inert — never over-block an unclassifiable destination).
+	// CorporateDomains supplies the tenant's domain configuration. It does not verify the receiving SaaS
+	// account; until destination-bound account verification exists, DLP keeps the instance class unknown.
 	CorporateDomains func(tenantID string) []string
 	// DLPAllowlist supplies the operator-declared known-safe values (/admin/dlp-allowlist) whose matches the DLP
 	// scan suppresses (false-positive tuning). nil = suppress nothing.
@@ -127,6 +129,7 @@ type edgeSWGHTTPEgressHandlerConfig struct {
 	// (a broken container, or padding a secret past the cap) for exactly the destinations an operator
 	// chose to interrupt. Off = forward-and-log (availability first); the skip is logged either way.
 	DLPBlockUninspectableFiles bool
+	DLPRetentionBudget         *dlp.RetentionBudget
 }
 
 // stripQUICAdvertisement removes response headers that advertise HTTP/3 (QUIC) so the client keeps using
@@ -259,7 +262,12 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	}
 	req := enrichDecisionRequestWithSession(baseReq, config.SessionStore)
 	req = enrichDecisionRequestWithTransportDevice(req, r.Context(), config.DeviceStore)
-	req = enrichDecisionRequestWithRisk(req, config.DeviceStore, config.HighRiskOverlay, config.EnrolledLedger)
+	req, err = enrichDecisionRequestWithRiskChecked(req, config.DeviceStore, config.HighRiskOverlay, config.EnrolledLedger)
+	if err != nil {
+		setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeReadinessDependency)
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk inventory unavailable"))
+		return
+	}
 	req = deriveDecisionRequestActor(req, config.DelegatedGrants)
 	var attestation runtimeWorkloadAttestationEvidence
 	req, attestation, err = enrichDecisionRequestWithRuntimeAttestation(r, req, config.WorkloadAttestationSecret, config.LabMode, config.WorkloadAttestations, time.Now())
@@ -307,9 +315,9 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 		}
 		dec.RequestPath = &p
 	}
-	// The account the user is signed into the assistant with (from the request's JWT) — SEPARATE from the
-	// corporate identity (dec.UserID). Recorded so the AI-usage dashboard shows BOTH; the two often differ (a
-	// corporate user on a personal assistant account = shadow AI).
+	// Unverified account hints decoded from request tokens, separate from the authenticated DSSE identity
+	// (dec.UserID). These are visibility hints only: decoding does not verify a signature, issuer, audience or
+	// destination binding. They must never exempt this upload from DLP.
 	// Read the AI-account identity with the SERVICE's fixed rule (precise per-service fields), not a generic
 	// scan-every-token heuristic. email + name are separate columns (either blank when the service does not expose
 	// it). ai_account (the single-value grouping) is email, else name, else the generic opaque-subject fallback.
@@ -323,6 +331,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	}
 	if acct != "" {
 		dec.Metadata["ai_account"] = acct
+		dec.Metadata["ai_identity_trust"] = "unverified_request_hint"
 	}
 	if aiEmail != "" {
 		dec.Metadata["ai_email"] = aiEmail
@@ -384,15 +393,37 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	usagemeter.RecordUsageMeterDecision(config.UsageMeters, dec, time.Now())
 
 	if !decisionPermitsConnectorRoute(dec.Decision) {
+		requirements := authFlowRequirements(dec, targetURL.String())
+		owner := edgeplane.AuthOwnerFromContext(r.Context())
+		requirements.OSPrincipal, requirements.OSSession = owner.Principal, owner.Session
+		if decisionRequiresOIDCRedirect(dec.Decision) && requirements.MaxAgeSeconds != nil && *requirements.MaxAgeSeconds == 0 {
+			// Redirecting destroys the request we would have to authorize once.
+			// Do not turn that into an eight-hour grant or an endless login loop.
+			setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomePolicyDenied)
+			http.Error(w, "request-bound authentication requires a held flow; redirect authentication cannot satisfy max_age=0", http.StatusForbidden)
+			return
+		}
 		// Steered browser "authenticate" flow: redirect to the tenant's IdP (via the clientless broker)
 		// instead of a bare 401, and allow once a federated grant exists. Every other non-permitted decision
 		// (deny, or a non-browser authenticate flow) serves its status code as before.
 		if config.FederatedAuthGate != nil && config.FederatedAuthGate.isAuthRedirectCase(r, dec.Decision) {
-			reqIdP, reqACR := authStepUpRequirements(dec)
-			if !config.FederatedAuthGate.hasLiveGrantFor(dec.TenantID, edgeplane.TransportDeviceFromContext(r.Context()), reqACR) {
+			requirements := authFlowRequirements(dec, targetURL.String())
+			owner := edgeplane.AuthOwnerFromContext(r.Context())
+			requirements.OSPrincipal, requirements.OSSession = owner.Principal, owner.Session
+			_, matched, grantErr := config.FederatedAuthGate.liveGrantStatusWithRequirements(dec.TenantID, edgeplane.TransportDeviceFromContext(r.Context()), requirements)
+			if grantErr != nil {
+				setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeReadinessDependency)
+				http.Error(w, "authentication authority unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			if !matched {
 				setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomePolicyDenied)
-				config.FederatedAuthGate.redirectToIdP(w, r, targetURL.String(), reqIdP, reqACR,
-					edgeplane.TransportDeviceFromContext(r.Context()), dec.TenantID)
+				stepUp := config.FederatedAuthGate.stepUpURLForRequest(r, targetURL.String(), edgeplane.TransportDeviceFromContext(r.Context()), dec.TenantID, requirements)
+				if stepUp == "" {
+					http.Error(w, "authentication requirements unavailable", http.StatusForbidden)
+					return
+				}
+				http.Redirect(w, r, stepUp, http.StatusFound)
 				return
 			}
 			// a live federated grant satisfies the authenticate requirement — fall through and forward.
@@ -415,9 +446,16 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 			// nothing about how to satisfy it — but it is a smaller thing than "the agents already
 			// understand this", which is what this comment said and was not true.
 			if config.FederatedAuthGate != nil && decisionRequiresOIDCRedirect(dec.Decision) {
-				reqIdP, reqACR := authStepUpRequirements(dec)
-				if u := config.FederatedAuthGate.stepUpURLFor(targetURL.String(), reqIdP, reqACR,
-					edgeplane.TransportDeviceFromContext(r.Context()), dec.TenantID); u != "" {
+				requirements := authFlowRequirements(dec, targetURL.String())
+				owner := edgeplane.AuthOwnerFromContext(r.Context())
+				requirements.OSPrincipal, requirements.OSSession = owner.Principal, owner.Session
+				if _, _, grantErr := config.FederatedAuthGate.liveGrantStatusWithRequirements(dec.TenantID, edgeplane.TransportDeviceFromContext(r.Context()), requirements); grantErr != nil {
+					setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeReadinessDependency)
+					http.Error(w, "authentication authority unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				if u := config.FederatedAuthGate.stepUpURLForRequest(r, targetURL.String(),
+					edgeplane.TransportDeviceFromContext(r.Context()), dec.TenantID, requirements); u != "" {
 					w.Header().Set(stepUpChallengeHeader, u)
 				}
 			}
@@ -462,6 +500,7 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	// guard). finalizeObserve emits the observe event at exit; a guard trip is handled right after Do.
 	dlpHook := installEdgeSWGHTTPEgressDLP(rewritten, config, dec)
 	defer func() { dlpHook.finalizeObserve(r.Context()) }()
+	defer dlpHook.closeGuard()
 	// A buffered file upload is decided at install (before forwarding): a block denies it here so the file is
 	// never sent upstream.
 	if dlpHook.blocked() {
@@ -480,14 +519,21 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	// authority only this organization knows. Widening happens per flow because the organization is per flow —
 	// see the_edge_is_a_client_to_the_private_asset.go. Public destinations are untouched.
 	upstreamClient := swgHTTPEgressProxyClient(config.ProxyClient, swgHTTPEgressNetworkExtensionRuntimeUsed(r))
-	if flowTenant := edgeplane.FlowTenantFromContext(r.Context()); flowTenant != "" {
+	if flowTenant := edgeplane.FlowTenantFromContext(rewritten.Context()); flowTenant != "" {
 		upstreamClient.Transport = upstreamTransportTrustingTheOrganizationsPrivateAssets(
 			upstreamClient.Transport, config.InternalCAs, flowTenant, time.Now().UTC())
 	}
 	if rewritten.URL.Scheme == "https" {
 		upstreamClient.Transport = upstreamtrust.ForHost(upstreamClient.Transport, rewritten.URL.Hostname())
+		upstreamClient.Transport = outboundtls.WrapRoundTripper(upstreamClient.Transport)
 	}
 	resp, err := upstreamClient.Do(rewritten)
+	// A successful response may precede a legitimate duplex upload's end.
+	// Only errors close now; success closes at handler exit. Guard refusal
+	// state is atomic so this check never waits behind a source Read.
+	if err != nil {
+		dlpHook.closeGuard()
+	}
 	// A DLP guard trip denies the upload before the secret leaves: emit the enforcing event and respond
 	// (403 block / 401 authenticate) WITHOUT relaying. Checked via guard state so it is robust to how the
 	// client wraps the aborted-body error.
@@ -532,13 +578,16 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 				"%s is on an internal network, and this gateway carries traffic to the public internet only. "+
 					"Internal destinations are reached as applications published through a connector — publish it "+
 					"there, or, for devices that can already route to it on their own network, add it to this "+
-					"organization's Sites to Bypass", r.Host))
+					"organization's Sites to Bypass", targetURL.Hostname()))
 			return
 		}
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
-	defer resp.Body.Close()
+	// Content-Encoding reconciliation can replace Body with a decoder. Close
+	// the final body so decoder state and the original upstream body are both
+	// released (including when a later relay exits early).
+	defer func() { _ = resp.Body.Close() }()
 	setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomeUpstreamResponse)
 	if swgHTTPEgressIsWebSocketUpgrade(r) && resp.StatusCode == http.StatusSwitchingProtocols {
 		if tunnelWriter, ok := w.(swgHTTPEgressWebSocketTunnelWriter); ok {
@@ -689,8 +738,9 @@ func swgHTTPEgressProxyClient(base *http.Client, stabilizeNetworkExtensionRuntim
 // intercepted subresource — every image on a page like rakuten.co.jp — paid a brand-new TCP+TLS handshake to
 // the origin. A page with dozens of images from one CDN therefore did dozens of handshakes and felt sluggish /
 // dropped images under concurrency. Reuse is safe: net/http pools per origin host:port, and each request is
-// independently policy-checked + rewritten BEFORE it is sent, so a shared connection to the SAME public origin
-// carries no per-user/per-tenant state.
+// independently policy-checked + rewritten BEFORE it is sent. The caller must
+// additionally partition this transport by tenant before use: identical origin
+// names can resolve to different private applications through tenant Connectors.
 var stableNETransportCache sync.Map // base http.RoundTripper -> http.RoundTripper
 
 func stableSWGHTTPEgressNetworkExtensionRuntimeTransport(base http.RoundTripper) http.RoundTripper {
@@ -721,7 +771,7 @@ func stableSWGHTTPEgressNetworkExtensionRuntimeTransport(base http.RoundTripper)
 	stable.DisableKeepAlives = false
 	stable.MaxIdleConns = 256
 	stable.MaxIdleConnsPerHost = 32
-	stable.MaxConnsPerHost = 64
+	stable.MaxConnsPerHost = runtimequota.Count("DSSE_SWG_MAX_CONNECTIONS_PER_HOST")
 	stable.IdleConnTimeout = 90 * time.Second
 	var result http.RoundTripper = stable
 	actual, _ := stableNETransportCache.LoadOrStore(base, result)
@@ -1374,7 +1424,7 @@ func userFromJWT(tok string) string {
 }
 
 // identityFromJWT decodes a JWT and returns the best identity plus whether it is STRONG. Strong = a human-
-// meaningful email or display name (unique/verifiable enough to prefer across a request's other tokens); weak =
+// meaningful email or display name (preferred only for display across a request's other tokens); weak =
 // an opaque subject (uuid / google-oauth2|… / anon session id), returned only as a last resort. id is "" when
 // the token is not a decodable JWT or has no usable claim.
 func identityFromJWT(tok string) (id string, strong bool) {
@@ -1398,7 +1448,8 @@ func identityFromJWT(tok string) (id string, strong bool) {
 	return "", false
 }
 
-// jwtClaims decodes a JWT's payload to a claims map, or nil if tok is not a decodable JWT.
+// jwtClaims decodes an UNVERIFIED JWT payload for visibility hints, or nil when undecodable.
+// It provides no authenticity or destination binding and must not be used for policy exemptions.
 func jwtClaims(tok string) map[string]any {
 	parts := strings.Split(strings.TrimSpace(tok), ".")
 	if len(parts) != 3 { // header.payload.signature

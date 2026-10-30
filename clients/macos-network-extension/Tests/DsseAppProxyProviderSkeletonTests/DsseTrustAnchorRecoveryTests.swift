@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import DsseAppProxyProviderSkeleton
 
 // The decision logic around self-healing. The dangerous mistakes here are not cryptographic — they are deciding
@@ -76,6 +77,47 @@ final class DsseTrustAnchorRecoveryTests: XCTestCase {
             fetchBundle: { _ in self.liveBundle })
         guard case .unrecovered = outcome else { return XCTFail("expected refusal, got \(outcome)") }
         XCTAssertNil(DsseAdoptedTrustAnchorStore.currentAnchors(configDirectory: dir))
+    }
+
+    func testSignedBundleFromAnotherTenantCannotReplaceAnchors() throws {
+        let profileKey = Curve25519.Signing.PrivateKey()
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "kind": "dsse_install_profile.v1",
+            "version": 1,
+            "tenant_id": "tenant_expected",
+            "transport_url": "https://agents.example.invalid",
+            "organization": ["tenant_id": "tenant_expected",
+                             "transport_server_name": "agents.example.invalid"],
+        ])
+        let signature = try profileKey.signature(for: payload)
+        let envelope: [String: Any] = [
+            "type": "dsse_install_profile.v1",
+            "version": "1",
+            "signing_key_id": "test",
+            "created_at": "2026-08-29T00:00:00Z",
+            "payload_sha256": SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined(),
+            "payload_b64": payload.base64EncodedString(),
+            "signature": "ed25519:" + signature.base64EncodedString()
+                .replacingOccurrences(of: "+", with: "-")
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: "=", with: ""),
+        ]
+        try JSONSerialization.data(withJSONObject: envelope)
+            .write(to: dir.appendingPathComponent(DsseInstallProfileApplication.defaultFileName))
+        let profilePin = profileKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+        try Data(profilePin.utf8).write(to: dir.appendingPathComponent("profile_signing_key.txt"))
+        XCTAssertEqual(DsseAdoptedTenantScope.tenantInForce(configDirectory: dir), "tenant_expected")
+
+        let result = DsseTrustAnchorRecovery.recoverIfNeeded(
+            host: "127.0.0.1", port: 1, bundleURL: URL(string: "https://example.invalid/b")!,
+            configDirectory: dir, pinnedPublicKeyHex: pinnedKey, currentAnchors: [],
+            fetchBundle: { _ in self.liveBundle })
+        guard case .unrecovered(let reason) = result else {
+            return XCTFail("other tenant's bundle was adopted: \(result)")
+        }
+        XCTAssertTrue(reason.contains("tenant"))
+        XCTAssertNil(DsseAdoptedTrustAnchorStore.currentAnchors(configDirectory: dir))
+        XCTAssertEqual(DsseAdoptedTrustAnchorStore.lastAcceptedSerial(configDirectory: dir), 0)
     }
 
     private func readLiveAnchors() -> String { DsseTestAnchors.twoCABundlePEM }

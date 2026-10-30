@@ -73,7 +73,7 @@ func TestEveryAdmissionDoorChecksTheOrganizationIsRealAndNotSuspended(t *testing
 	if err != nil {
 		t.Fatalf("read enroll_endpoint.go: %v", err)
 	}
-	if !strings.Contains(string(enrol), "adminTenantAdministrativelySuspended") {
+	if !callsSuspensionCheck(strings.Split(string(enrol), "\n")) {
 		t.Fatal("POST /enroll no longer checks suspension")
 	}
 
@@ -85,7 +85,7 @@ func TestEveryAdmissionDoorChecksTheOrganizationIsRealAndNotSuspended(t *testing
 		if err != nil {
 			continue
 		}
-		if strings.Contains(string(raw), "adminTenantAdministrativelySuspended") {
+		if callsSuspensionCheck(strings.Split(string(raw), "\n")) {
 			t.Fatalf("%s consults suspension; enforcement for devices already enrolled must continue while an "+
 				"organization is suspended", enforcement)
 		}
@@ -106,7 +106,7 @@ func callsSuspensionCheck(lines []string) bool {
 		if i := strings.Index(code, "//"); i >= 0 {
 			code = code[:i]
 		}
-		if strings.Contains(code, "adminTenantAdministrativelySuspended(") {
+		if strings.Contains(code, "adminTenantAdministrativelySuspended(") || strings.Contains(code, "enrolmentLifecycleRefusal(") {
 			return true
 		}
 	}
@@ -120,7 +120,7 @@ func callsExistenceCheck(lines []string) bool {
 		if i := strings.Index(code, "//"); i >= 0 {
 			code = code[:i]
 		}
-		if strings.Contains(code, "adminTenantIsGone(") {
+		if strings.Contains(code, "adminTenantIsGone(") || strings.Contains(code, "enrolmentLifecycleRefusal(") {
 			return true
 		}
 	}

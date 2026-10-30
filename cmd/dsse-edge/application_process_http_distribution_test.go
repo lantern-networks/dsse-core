@@ -382,7 +382,11 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 					t.Fatalf("deleted app in %s: found=%v err=%v", where, found, err)
 				}
 			}
-			if _, found := edgeplane.RouteProfilesWithPublishedCatalog(nil, edgeApps, processDistributionTenant)["wiki"]; found {
+			routes, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, nil, edgeApps, processDistributionTenant)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, found := routes["wiki"]; found {
 				t.Fatal("deleted application route remains")
 			}
 			return
@@ -402,7 +406,11 @@ func testApplicationDistributionAcrossCPAndEdgeProcesses(t *testing.T, usePostgr
 		if err != nil || !cpFound || cpSaved.Status != appStatus || cpSaved.Name != name || cpSaved.Published != published {
 			t.Fatalf("CP saved app=%+v found=%v err=%v", cpSaved, cpFound, err)
 		}
-		_, routed := edgeplane.RouteProfilesWithPublishedCatalog(nil, edgeApps, processDistributionTenant)["wiki"]
+		routes, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, nil, edgeApps, processDistributionTenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, routed := routes["wiki"]
 		if routed != (published && appStatus == "active") {
 			t.Fatalf("status=%s published=%v route=%v", appStatus, published, routed)
 		}

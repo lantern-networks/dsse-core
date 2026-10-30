@@ -29,7 +29,11 @@ func verifyConnectorsReachTheEdges(client *http.Client, cpAdmin string, edgeAdmi
 	}
 	// ★ ONCE PER ORGANIZATION — connectors belong to customer organizations and this check holds the
 	// deployment administrator's token. See the_deployments_connectors_are_not_the_operators.go.
-	organizations := organizationsOfTheDeployment(client, cpAdmin, token)
+	organizations, known := organizationsOfTheDeployment(client, cpAdmin, token)
+	if !known {
+		add(false, "the deployment-wide tenant list could not be read, so Edge connector reachability was not measured")
+		return out
+	}
 	ask := func(base string) ([]string, error) {
 		ids, answered := connectorsForEveryOrganization(client, base, token, organizations)
 		if !answered {

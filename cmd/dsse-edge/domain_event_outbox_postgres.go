@@ -30,6 +30,7 @@ var domainEventOutboxAllowedStreamList = []string{
 	"access_logs",
 	"decision_traces",
 	"connector_logs",
+	"cold_archive_health_events",
 }
 
 var domainEventOutboxAllowedStreams = domainEventOutboxAllowedStreamSet(domainEventOutboxAllowedStreamList)

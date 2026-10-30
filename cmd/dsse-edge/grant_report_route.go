@@ -26,7 +26,7 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 	if grants == nil || strings.TrimSpace(configSourceURL) != "" {
 		return
 	}
-	mux.HandleFunc("POST /grant-report", func(w http.ResponseWriter, r *http.Request) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))
 		if _, verified := auditIngestShipperFrom(r, tenantCARegistry); !verified && !devMode {
 			writeError(w, http.StatusForbidden, fmt.Errorf("grant-report: this request presents no Edge "+
@@ -34,7 +34,8 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 			return
 		}
 		var body struct {
-			Grants []grantstore.Grant `json:"grants"`
+			Grants          []grantstore.Grant `json:"grants"`
+			ProtectedGrants []grantstore.Grant `json:"protected_grants,omitempty"`
 		}
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10))
 		if err := decoder.Decode(&body); err != nil || body.Grants == nil {
@@ -45,7 +46,7 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid grant report"))
 			return
 		}
-		added, updated, err := grants.MergeCheckedContext(r.Context(), body.Grants, time.Now().UTC())
+		added, updated, err := grants.MergeCheckedContext(r.Context(), append(body.Grants, body.ProtectedGrants...), time.Now().UTC())
 		if err != nil {
 			status := http.StatusBadRequest
 			if errors.Is(err, grantstore.ErrConflict) {
@@ -66,5 +67,7 @@ func registerGrantReportRoute(mux *http.ServeMux, grants *grantstore.Store,
 			log.Printf("grant_report_recorded added=%d updated=%d", added, updated)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"added": added, "updated": updated})
-	})
+	}
+	mux.HandleFunc("POST /grant-report", handler)
+	mux.HandleFunc("POST /grant-report-v2", handler)
 }

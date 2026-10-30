@@ -69,7 +69,9 @@ func buildEdgeDNSRuntime(config serverConfig, registry connectorRegistryStore, t
 	// An operator's DNS policy outlives the process. Applied over the boot environment on purpose: a restart
 	// that reverts an admin's change is the bug, not the safety net.
 	edgeDNSPolicyStore := newDNSPolicyStore(config.DNSPolicyStorePath)
-	if line := restoreDNSPolicy(edgeDNSPolicyStore, edgeDNSResolver); line != "" {
+	if line, err := restoreDNSPolicy(edgeDNSPolicyStore, edgeDNSResolver); err != nil {
+		log.Fatalf("DNS policy restore failed (refusing to replace operator state with boot defaults): %v", err)
+	} else if line != "" {
 		log.Print(line)
 	}
 	maybeStartEdgeDNSResolverUDPFromEnv(edgeDNSResolver) // the DNS-over-tunnel route is registered on mux later
@@ -95,9 +97,25 @@ type dlpRuntime struct {
 func buildDLPRuntime(config serverConfig) dlpRuntime {
 	// DLP: live per-tenant rules. dlpRuleStore holds model.DLPRules (/admin/dlp-rules) overlaid onto the
 	// bundle so DLP is an egress-rule option (per-destination, surfaced as a dlp_inspect directive) — the ONLY
-	// scan trigger; there is deliberately no tenant-wide fallback. In-memory hot-swap (cross-restart
-	// persistence deferred, like the other runtime toggles).
+	// scan trigger; there is deliberately no tenant-wide fallback. The CP owns
+	// the durable authority and receiving Edges hold local bundle caches.
 	dlpRuleStore := newDLPRuleRuntimeStore()
+	if storeShouldBeWired(config.DLPRuleStorePath) {
+		if p, e := dlpLibraryPersisterForRole(config.DLPRuleStorePath, cpStateBlobDB, "dlp_rules", config.ConfigSourceURL); e != nil {
+			log.Fatalf("resolve dlp rule store %q: %v", config.DLPRuleStorePath, e)
+		} else if p != nil {
+			if lerr := dlpRuleStore.SetPersister(p); lerr != nil {
+				log.Fatalf("dlp rule store: invalid or unavailable saved configuration")
+			}
+			go func() {
+				for range time.Tick(30 * time.Second) {
+					if err := dlpRuleStore.PersistIfDirty(); err != nil {
+						log.Printf("dlp rule store: persist failed: %v", err)
+					}
+				}
+			}()
+		}
+	}
 	dlpAllowlistStore := newDLPAllowlistRuntimeStore("dsse-dlp-allowlist-v1")
 	// Durable allowlist (optional): rehydrate + recompile on boot + flush periodically so operator-declared
 	// known-safe values (false-positive tuning) survive an Edge restart.

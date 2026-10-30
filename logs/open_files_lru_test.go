@@ -90,3 +90,35 @@ func TestSafeTenantSegmentContainsHostileIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestTenantPartitionsDoNotAliasValidIDsOrSystem(t *testing.T) {
+	ids := []string{"acme:prod", "acme_prod", "_system", ""}
+	segments := make(map[string]string, len(ids))
+	for _, id := range ids {
+		segment := safeTenantSegment(id)
+		if previous, ok := segments[segment]; ok {
+			t.Fatalf("tenant IDs %q and %q share partition %q", previous, id, segment)
+		}
+		segments[segment] = id
+	}
+	w, err := NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.Close() })
+	w.SetTenantPartitionedFiles("access.log.jsonl")
+	for _, id := range ids {
+		if err := w.Append("access.log.jsonl", map[string]any{"tenant_id": id, "marker": id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, id := range ids {
+		rows, err := w.ReadJSONLTenant(id, "access.log.jsonl")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0]["marker"] != id {
+			t.Fatalf("tenant %q read %v", id, rows)
+		}
+	}
+}

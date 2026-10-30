@@ -5,7 +5,12 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
+
+	"github.com/lantern-networks/dsse-core/connector"
+	"github.com/lantern-networks/dsse-core/model"
 )
 
 // reqWithClientCertCN builds an *http.Request as if it arrived over verified mTLS with the given leaf
@@ -54,4 +59,23 @@ func TestConnectorMTLSIdentityBound(t *testing.T) {
 			t.Fatalf("plaintext request must be present=false, got bound=%v present=%v", bound, present)
 		}
 	})
+}
+
+func TestConnectorCertificateCannotAuthenticateCaseDistinctRegistryIdentity(t *testing.T) {
+	registry := connector.NewRegistry()
+	for _, id := range []string{"Conn-ABC", "conn-abc"} {
+		if _, err := registry.Register(model.ConnectorRegistration{
+			ID: id, TenantID: "tenant_a", PrivateBaseURL: "https://internal.example.test",
+		}, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := reqWithClientCertCN("Conn-ABC")
+	response := httptest.NewRecorder()
+	if authorizeConnectorRuntimeRequest(response, request, "", registry, "conn-abc", "tenant_a", true, nil) {
+		t.Fatal("certificate of Conn-ABC authenticated as distinct registered connector conn-abc")
+	}
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("case-distinct certificate rejection status = %d, want 401", response.Code)
+	}
 }

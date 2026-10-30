@@ -9,9 +9,9 @@ test('invalid ports and unsupported UDP do not masquerade as supported services'
 
 test('unreadable defaults never render an allow state or an edit action',async()=>{
  for(const response of [{ok:false,status:503,body:{}},{ok:true,status:200,body:{}},{ok:true,status:200,body:{server_initiated_enabled:'false'}}]){
-  const host={},states=[],f=vm.createContext({bl:x=>x.en,uiState:(h,kind,message,action)=>states.push({kind,message,action}),freshRender:()=>()=>true,apiFetch:async()=>response,el:()=>{throw Error('must not offer editing')}});
+  const headings=[],host={prepend:node=>headings.push(node)},states=[],f=vm.createContext({bl:x=>x.en,uiState:(h,kind,message,action)=>states.push({kind,message,action}),freshRender:()=>()=>true,apiFetch:async()=>response,el:(tag,attrs)=>{assert.equal(tag,'h2');return attrs}});
   vm.runInContext(readFileSync(new URL('./incoming.js',import.meta.url),'utf8'),f);
-  await f.renderIncomingView(host);assert.equal(states.at(-1).kind,'error');assert.equal(states.at(-1).action.label,'Retry');assert.equal(typeof states.at(-1).action.onClick,'function');
+  await f.renderIncomingView(host);assert.equal(states.at(-1).kind,'error');assert.equal(states.at(-1).action.label,'Retry');assert.equal(typeof states.at(-1).action.onClick,'function');assert.match(headings[0].text,/Incoming Connections/);
  }
  assert.equal(c.incomingDefaultBody({ok:true,status:200,body:{server_initiated_enabled:false}}),false);
  assert.equal(c.incomingDefaultBody({ok:true,status:200,body:{server_initiated_enabled:true}}),true);

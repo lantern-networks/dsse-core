@@ -102,8 +102,8 @@ func keepPassthroughResolved(stop <-chan struct{}, dests *liveDests, domains []s
 		if !first && !changed {
 			return
 		}
-		fmt.Printf("steer: passthrough domains=%d addresses=%d — the deployment's own names this device "+
-			"sends STRAIGHT to the customer's network, never through the tunnel\n", len(domains), len(addrs))
+		fmt.Printf("steer: passthrough domains=%d resolved_bypass_candidates=%d — backend application "+
+			"is logged separately; an update error leaves the previous kernel policy in force\n", len(domains), len(addrs))
 		if len(domains) > 0 && len(addrs) == 0 {
 			fmt.Printf("steer: ★ %d passthrough domain(s) were authored and NONE resolved — those "+
 				"destinations WILL be steered, and the deployment's own Console is usually among them\n",

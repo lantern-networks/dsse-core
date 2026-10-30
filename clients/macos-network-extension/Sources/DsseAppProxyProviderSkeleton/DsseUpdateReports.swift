@@ -92,7 +92,7 @@ public enum DsseUpdateReportStore {
     /// claim is either discarded (delivered) or put back (not).
     public static func claimDropped(in dir: URL = directory) -> (count: Int, claim: URL?) {
         // The whole recover-and-rename pair is held, so a producer cannot add between them.
-        withLedgerLock(in: dir) { claimDroppedLocked(in: dir) }
+        withLedgerLock(in: dir) { claimDroppedLocked(in: dir) } ?? (0, nil)
     }
 
     private static func claimDroppedLocked(in dir: URL) -> (count: Int, claim: URL?) {
@@ -101,7 +101,7 @@ public enum DsseUpdateReportStore {
         // actually taken. And an orphaned claim from a previous crash was DELETED here, which lost its count
         // permanently — it is folded back into the ledger instead.
         let claim = dir.appendingPathComponent("dropped.json.claimed")
-        recoverClaim(claim, in: dir)
+        guard recoverClaim(claim, in: dir) else { return (0, nil) }
         do {
             try FileManager.default.moveItem(at: dir.appendingPathComponent("dropped.json"), to: claim)
         } catch {
@@ -118,17 +118,17 @@ public enum DsseUpdateReportStore {
     /// Folds a claim left behind by a crash back into the ledger, rather than discarding it.
     ///
     /// Called with the ledger lock already held (from claimDroppedLocked), so it adds WITHOUT taking it again.
-    static func recoverClaim(_ claim: URL, in dir: URL) {
+    @discardableResult
+    static func recoverClaim(_ claim: URL, in dir: URL) -> Bool {
         let n = count(in: claim)
         guard n > 0 else {
             try? FileManager.default.removeItem(at: claim)
-            return
+            return true
         }
         let total = droppedCount(in: dir) + n
-        if let data = try? JSONSerialization.data(withJSONObject: ["dropped": total]) {
-            try? data.write(to: dir.appendingPathComponent("dropped.json"))
-        }
+        guard writeDroppedCount(total, in: dir) else { return false }
         try? FileManager.default.removeItem(at: claim)
+        return true
     }
 
     static func count(in file: URL) -> Int {
@@ -143,36 +143,51 @@ public enum DsseUpdateReportStore {
     /// there could each overwrite the other's increment. The Go side takes a flock on `dropped.lock`; this
     /// takes the same one, on the same file, so the two actually exclude each other.
     ///
-    /// Best-effort: failing to take it does not skip the update — a ledger that under-counts is better than one
-    /// that stops counting — but it is the only path here that proceeds without exclusion.
-    static func withLedgerLock<T>(in dir: URL, _ body: () -> T) -> T {
+    /// If the lock is unavailable, leave the claim and ledger intact. An unlocked
+    /// read-modify-write can silently lose counts written by the Go updater.
+    static func withLedgerLock<T>(in dir: URL, _ body: () -> T) -> T? {
         let path = dir.appendingPathComponent("dropped.lock").path
         let fd = open(path, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { return body() }
+        guard fd >= 0 else { return nil }
         defer { close(fd) }
-        guard flock(fd, LOCK_EX) == 0 else { return body() }
+        guard flock(fd, LOCK_EX) == 0 else { return nil }
         defer { flock(fd, LOCK_UN) }
         return body()
     }
 
-    static func add(_ n: Int, in dir: URL) {
+    @discardableResult
+    static func add(_ n: Int, in dir: URL) -> Bool {
         withLedgerLock(in: dir) {
             let total = droppedCount(in: dir) + n
-            if let data = try? JSONSerialization.data(withJSONObject: ["dropped": total]) {
-                try? data.write(to: dir.appendingPathComponent("dropped.json"))
-            }
+            return writeDroppedCount(total, in: dir)
+        } ?? false
+    }
+
+    private static func writeDroppedCount(_ count: Int, in dir: URL) -> Bool {
+        guard let data = try? JSONSerialization.data(withJSONObject: ["dropped": count]),
+              (try? data.write(to: dir.appendingPathComponent("dropped.json"), options: .atomic)) != nil else {
+            return false
         }
+        return true
     }
 
     /// Discards a delivered claim, or ADDS it back to whatever has accumulated since. Adding rather than
     /// overwriting: those are different drops and both happened.
     public static func releaseDropped(_ claim: URL?, delivered: Bool, in dir: URL = directory) {
         guard let claim else { return }
-        defer { try? FileManager.default.removeItem(at: claim) }
-        if delivered { return }
+        if delivered {
+            try? FileManager.default.removeItem(at: claim)
+            return
+        }
         let n = count(in: claim)
-        guard n > 0 else { return }
-        add(n, in: dir)
+        guard n > 0 else {
+            try? FileManager.default.removeItem(at: claim)
+            return
+        }
+        // A failed write must not discard the only copy of undelivered drops.
+        if add(n, in: dir) {
+            try? FileManager.default.removeItem(at: claim)
+        }
     }
 
     /// Reads one, or nil when it cannot be parsed — in which case it is removed, because a file nothing can

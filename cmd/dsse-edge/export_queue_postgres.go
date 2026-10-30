@@ -129,12 +129,41 @@ func (worker postgresQueuedAdminExportWorker) runOne(ctx context.Context, now ti
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	wallStartedAt := time.Now()
 	item, ok, err := worker.Queue.Lease(ctx, now)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
 		return false, nil
+	}
+	leaseQueue := worker.Queue
+	leaseQueue.WorkerID = item.LeaseToken
+	if store, ok := item.Task.Store.(postgresAdminExportJobStore); ok {
+		store.LeaseToken = item.LeaseToken
+		store.LeaseTaskID = item.Document.ID
+		store.LeaseTenantID = item.Document.TenantID
+		item.Task.Store = store
+	}
+	if item.Job.Status == "completed" || item.Job.Status == "cancelled" {
+		return true, leaseQueue.Complete(ctx, item.Document.ID)
+	}
+	if item.Job.Status == "failed" {
+		code := adminExportWorkerJobErrorCode(item.Task.Store, item.Job.ID, adminExportWorkerDefaultErrorCode)
+		if !adminExportWorkerShouldRetry(item.Document.RetryPolicy, code) {
+			return true, leaseQueue.Complete(ctx, item.Document.ID)
+		}
+		store, ok := item.Task.Store.(postgresAdminExportJobStore)
+		if !ok {
+			return true, fmt.Errorf("postgres export task %s cannot reset a failed job without a fenced store", item.Document.ID)
+		}
+		if _, err := store.ResetForRetry(item.Job.ID, now); err != nil {
+			return true, err
+		}
+		item.Job.Status = "queued"
+	}
+	if item.Document.Attempt >= item.Document.MaxAttempts {
+		return true, worker.deadLetterClaimed(ctx, leaseQueue, item, now, "max_attempts_exhausted")
 	}
 	timeout := worker.Timeout
 	if timeout <= 0 {
@@ -145,35 +174,93 @@ func (worker postgresQueuedAdminExportWorker) runOne(ctx context.Context, now ti
 		leaseDuration = 30 * time.Second
 	}
 	workerCtx, cancel := context.WithTimeout(context.Background(), timeout)
-	stopLeaseExtension := worker.startLeaseExtension(workerCtx, cancel, item.Document.ID, leaseDuration)
+	stopLeaseExtension := worker.startLeaseExtension(leaseQueue, workerCtx, cancel, item.Document.ID, leaseDuration)
 	_, err = runAdminExportJob(workerCtx, item.Task.Writer, item.Task.AdminAuditOutbox, item.Task.ObjectStore, item.Task.HotStore, item.Task.Store, item.Task.Evaluator, item.Job, item.Task.Request, item.Task.SourceIP, now)
 	leaseErr := stopLeaseExtension()
+	finishedAt := postgresExportTaskFinishedAt(now, wallStartedAt, time.Now())
 	ackCtx, ackCancel := context.WithTimeout(context.Background(), defaultPostgresExportTaskAckTimeout)
 	defer ackCancel()
 	if err != nil {
-		errorCode := adminExportWorkerJobErrorCode(item.Task.Store, item.Job.ID, adminExportWorkerDefaultErrorCode)
-		if adminExportWorkerShouldRetry(item.Document.RetryPolicy, errorCode) && adminExportWorkerJobRetryable(item.Task.Store, item.Job.ID) {
-			retried, queued, retryErr := worker.Queue.Retry(ackCtx, item, now)
+		current, found := item.Task.Store.Get(item.Job.ID)
+		if !found {
+			return true, fmt.Errorf("export job %s state unavailable after worker failure: %w", item.Job.ID, err)
+		}
+		errorCode := adminExportWorkerDefaultErrorCode
+		if current.ErrorCode != nil && strings.TrimSpace(*current.ErrorCode) != "" {
+			errorCode = strings.TrimSpace(*current.ErrorCode)
+		}
+		if adminExportWorkerShouldRetry(item.Document.RetryPolicy, errorCode) &&
+			(current.Status == "queued" || current.Status == "running" || current.Status == "failed") {
+			if store, ok := item.Task.Store.(postgresAdminExportJobStore); ok {
+				if _, resetErr := store.ResetForRetry(item.Job.ID, finishedAt); resetErr != nil {
+					return true, resetErr
+				}
+			} else if current.Status == "failed" {
+				return true, fmt.Errorf("export job %s retry requires a fenced store", item.Job.ID)
+			}
+			_, queued, retryErr := leaseQueue.Retry(ackCtx, item, finishedAt)
 			if retryErr != nil {
 				return true, retryErr
 			}
-			if !queued && strings.TrimSpace(retried.Document.ID) != "" {
-				adminExportMarkDeadLettered(retried, now)
+			if !queued {
+				return true, worker.deadLetterClaimed(ackCtx, leaseQueue, item, finishedAt, "max_attempts_exhausted")
 			}
 			return true, leaseErr
 		}
-		if completeErr := worker.Queue.Complete(ackCtx, item.Document.ID); completeErr != nil {
+		if current.Status == "queued" || current.Status == "running" {
+			if _, markErr := item.Task.Store.MarkFailed(item.Job.ID, errorCode, finishedAt); markErr != nil {
+				return true, markErr
+			}
+		} else if current.Status != "failed" && current.Status != "completed" && current.Status != "cancelled" {
+			return true, fmt.Errorf("export job %s has unexpected state %s after worker failure", item.Job.ID, current.Status)
+		}
+		if completeErr := leaseQueue.Complete(ackCtx, item.Document.ID); completeErr != nil {
 			return true, completeErr
 		}
 		return true, leaseErr
 	}
-	if completeErr := worker.Queue.Complete(ackCtx, item.Document.ID); completeErr != nil {
+	if completeErr := leaseQueue.Complete(ackCtx, item.Document.ID); completeErr != nil {
 		return true, completeErr
 	}
 	return true, leaseErr
 }
 
-func (worker postgresQueuedAdminExportWorker) startLeaseExtension(ctx context.Context, cancel context.CancelFunc, taskID string, leaseDuration time.Duration) func() error {
+// The caller's logical claim time may be fixed in tests or supplied by a scheduler.
+// Retry backoff nevertheless starts after processing ends, never before a slow failure.
+func postgresExportTaskFinishedAt(claimAt, wallStartedAt, wallFinishedAt time.Time) time.Time {
+	if wallFinishedAt.Before(wallStartedAt) {
+		return claimAt
+	}
+	return claimAt.Add(wallFinishedAt.Sub(wallStartedAt))
+}
+
+func (worker postgresQueuedAdminExportWorker) deadLetterClaimed(ctx context.Context, queue postgresExportTaskQueueAdapter, item adminExportQueuedTask, now time.Time, reason string) error {
+	if store, ok := item.Task.Store.(postgresAdminExportJobStore); ok {
+		_, audit, err := store.DeadLetterTask(ctx, item.Document.ID, item.Job.ID, item.Document.Attempt, item.Document.MaxAttempts, now, reason, item.Task.Evaluator, item.Task.SourceIP)
+		if err != nil {
+			return err
+		}
+		// The matching outbox row committed with the job and dead letter. A local
+		// JSONL failure cannot erase the only durable record of this terminal act.
+		if item.Task.Writer == nil {
+			logErrorf("admin export dead-letter local audit writer is not configured")
+		} else if err := item.Task.Writer.Append("audit.log.jsonl", audit); err != nil {
+			logErrorf("admin export dead-letter local audit write failed: %v", err)
+		}
+		return nil
+	}
+	dead, moved, err := queue.DeadLetter(ctx, item.Document.ID, now, reason)
+	if err != nil {
+		return err
+	}
+	if !moved {
+		return fmt.Errorf("postgres export task %s lost its lease before dead letter", item.Document.ID)
+	}
+	adminExportMarkDeadLettered(dead, now)
+	return nil
+}
+
+func (worker postgresQueuedAdminExportWorker) startLeaseExtension(queue postgresExportTaskQueueAdapter, ctx context.Context, cancel context.CancelFunc, taskID string, leaseDuration time.Duration) func() error {
 	taskID = strings.TrimSpace(taskID)
 	if taskID == "" || leaseDuration <= 0 {
 		return func() error {
@@ -203,7 +290,7 @@ func (worker postgresQueuedAdminExportWorker) startLeaseExtension(ctx context.Co
 				done <- nil
 				return
 			case tick := <-ticker.C:
-				if _, ok, err := worker.Queue.ExtendLease(extensionCtx, taskID, tick, leaseDuration); err != nil {
+				if _, ok, err := queue.ExtendLease(extensionCtx, taskID, tick, leaseDuration); err != nil {
 					select {
 					case <-stopping:
 						done <- nil
@@ -254,31 +341,53 @@ func (adapter postgresExportTaskQueueAdapter) Lease(ctx context.Context, now tim
 	if duration <= 0 {
 		duration = 30 * time.Second
 	}
-	statement, err := buildPostgresExportTaskLeaseStatement(adapter.TenantID, adapter.WorkerID, now, duration)
+	nonce, err := randomURLToken(32)
+	if err != nil {
+		return adminExportQueuedTask{}, false, fmt.Errorf("create export task lease token: %w", err)
+	}
+	leaseToken := adapter.WorkerID + ":" + nonce
+	statement, err := buildPostgresExportTaskLeaseStatement(adapter.TenantID, leaseToken, now, duration)
 	if err != nil {
 		return adminExportQueuedTask{}, false, err
 	}
-	return adapter.queryTaskPayload(ctx, statement, now)
+	item, ok, err := adapter.queryTaskPayload(ctx, statement, now)
+	if err == nil && ok {
+		item.LeaseToken = leaseToken
+	}
+	return item, ok, err
 }
 
 func (adapter postgresExportTaskQueueAdapter) Complete(ctx context.Context, taskID string) error {
 	if adapter.DB == nil {
 		return fmt.Errorf("postgres export task queue db is not configured")
 	}
-	statement, err := buildPostgresExportTaskCompleteStatement(adapter.TenantID, taskID)
+	statement, err := buildPostgresExportTaskCompleteStatement(adapter.TenantID, taskID, adapter.WorkerID)
 	if err != nil {
 		return err
 	}
 	ctx = normalizePostgresExportTaskContext(ctx)
-	_, err = adapter.DB.ExecContext(ctx, statement.SQL, statement.Args...)
-	return err
+	result, err := adapter.DB.ExecContext(ctx, statement.SQL, statement.Args...)
+	if err != nil {
+		return err
+	}
+	if result == nil {
+		return fmt.Errorf("postgres export task %s completion returned no result", taskID)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("postgres export task %s lost its lease before completion", taskID)
+	}
+	return nil
 }
 
 func (adapter postgresExportTaskQueueAdapter) Release(ctx context.Context, taskID string, now time.Time) (adminExportQueuedTask, bool, error) {
 	if adapter.DB == nil {
 		return adminExportQueuedTask{}, false, fmt.Errorf("postgres export task queue db is not configured")
 	}
-	statement, err := buildPostgresExportTaskReleaseStatement(adapter.TenantID, taskID, now)
+	statement, err := buildPostgresExportTaskReleaseStatement(adapter.TenantID, taskID, adapter.WorkerID, now)
 	if err != nil {
 		return adminExportQueuedTask{}, false, err
 	}
@@ -301,29 +410,18 @@ func (adapter postgresExportTaskQueueAdapter) Retry(ctx context.Context, item ad
 		return adminExportQueuedTask{}, false, fmt.Errorf("postgres export task queue db is not configured")
 	}
 	backoffSeconds := adminExportWorkerRetryBackoffSeconds(item.Document.RetryPolicy, item.Document.Attempt)
-	statement, err := buildPostgresExportTaskRetryStatement(adapter.TenantID, item.Document.ID, now, backoffSeconds)
+	statement, err := buildPostgresExportTaskRetryStatement(adapter.TenantID, item.Document.ID, adapter.WorkerID, now, backoffSeconds)
 	if err != nil {
 		return adminExportQueuedTask{}, false, err
 	}
-	retried, queued, err := adapter.queryTaskPayload(ctx, statement, now)
-	if err != nil || queued {
-		return retried, queued, err
-	}
-	deadLettered, deadLetterQueued, err := adapter.DeadLetter(ctx, item.Document.ID, now, "max_attempts_exhausted")
-	if err != nil {
-		return adminExportQueuedTask{}, false, err
-	}
-	if deadLetterQueued {
-		return deadLettered, false, nil
-	}
-	return adminExportQueuedTask{}, false, nil
+	return adapter.queryTaskPayload(ctx, statement, now)
 }
 
 func (adapter postgresExportTaskQueueAdapter) DeadLetter(ctx context.Context, taskID string, now time.Time, reason string) (adminExportQueuedTask, bool, error) {
 	if adapter.DB == nil {
 		return adminExportQueuedTask{}, false, fmt.Errorf("postgres export task queue db is not configured")
 	}
-	statement, err := buildPostgresExportTaskDeadLetterStatement(adapter.TenantID, taskID, now, reason)
+	statement, err := buildPostgresExportTaskDeadLetterStatement(adapter.TenantID, taskID, adapter.WorkerID, now, reason)
 	if err != nil {
 		return adminExportQueuedTask{}, false, err
 	}
@@ -433,11 +531,13 @@ func buildPostgresExportTaskLeaseStatement(tenantID, workerID string, now time.T
 	leaseExpiresAt := now.UTC().Add(leaseDuration)
 	statement := strings.Join([]string{
 		"UPDATE export_worker_tasks",
-		"SET status = 'running', lease_owner = $2, lease_expires_at = $3::timestamptz, updated_at = $4::timestamptz,",
-		"payload = jsonb_set(jsonb_set(payload, '{status}', to_jsonb('running'::text), true), '{lease_expires_at}', to_jsonb($3::timestamptz), true)",
+		"SET status = 'running', lease_owner = $2, lease_expires_at = $3::timestamptz, retry_not_before = NULL, updated_at = $4::timestamptz,",
+		"attempt = CASE WHEN status = 'running' THEN attempt + 1 ELSE attempt END,",
+		"payload = jsonb_set(jsonb_set(jsonb_set(payload, '{status}', to_jsonb('running'::text), true), '{lease_expires_at}', to_jsonb($3::timestamptz), true), '{attempt}', to_jsonb(CASE WHEN status = 'running' THEN attempt + 1 ELSE attempt END), true)",
 		"WHERE tenant_id = $1 AND task_id = (",
 		"SELECT task_id FROM export_worker_tasks",
-		"WHERE tenant_id = $1 AND status = 'queued' AND (retry_not_before IS NULL OR retry_not_before <= $4::timestamptz)",
+		"WHERE tenant_id = $1 AND ((status = 'queued' AND (retry_not_before IS NULL OR retry_not_before <= $4::timestamptz))",
+		"OR (status = 'running' AND lease_expires_at <= $4::timestamptz))",
 		"ORDER BY created_at ASC, task_id ASC",
 		"FOR UPDATE SKIP LOCKED LIMIT 1",
 		")",
@@ -446,28 +546,34 @@ func buildPostgresExportTaskLeaseStatement(tenantID, workerID string, now time.T
 	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, workerID, leaseExpiresAt, now.UTC()}}, nil
 }
 
-func buildPostgresExportTaskCompleteStatement(tenantID, taskID string) (postgresExportTaskQueueStatement, error) {
+func buildPostgresExportTaskCompleteStatement(tenantID, taskID, leaseToken string) (postgresExportTaskQueueStatement, error) {
 	tenantID, taskID, err := normalizePostgresExportTaskIDs(tenantID, taskID)
 	if err != nil {
 		return postgresExportTaskQueueStatement{}, err
 	}
-	statement := "DELETE FROM export_worker_tasks WHERE tenant_id = $1 AND task_id = $2"
-	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID}}, nil
+	if strings.TrimSpace(leaseToken) == "" {
+		return postgresExportTaskQueueStatement{}, fmt.Errorf("export task lease token is required")
+	}
+	statement := "DELETE FROM export_worker_tasks WHERE tenant_id = $1 AND task_id = $2 AND status = 'running' AND lease_owner = $3"
+	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, leaseToken}}, nil
 }
 
-func buildPostgresExportTaskReleaseStatement(tenantID, taskID string, now time.Time) (postgresExportTaskQueueStatement, error) {
+func buildPostgresExportTaskReleaseStatement(tenantID, taskID, leaseToken string, now time.Time) (postgresExportTaskQueueStatement, error) {
 	tenantID, taskID, err := normalizePostgresExportTaskIDs(tenantID, taskID)
 	if err != nil {
 		return postgresExportTaskQueueStatement{}, err
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return postgresExportTaskQueueStatement{}, fmt.Errorf("export task lease token is required")
 	}
 	statement := strings.Join([]string{
 		"UPDATE export_worker_tasks",
-		"SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = $3,",
+		"SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL, updated_at = $4,",
 		"payload = jsonb_set(jsonb_set(payload, '{status}', to_jsonb('queued'::text), true), '{lease_expires_at}', 'null'::jsonb, true)",
-		"WHERE tenant_id = $1 AND task_id = $2 AND status = 'running'",
+		"WHERE tenant_id = $1 AND task_id = $2 AND status = 'running' AND lease_owner = $3",
 		"RETURNING payload",
 	}, " ")
-	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, now.UTC()}}, nil
+	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, leaseToken, now.UTC()}}, nil
 }
 
 func buildPostgresExportTaskExtendLeaseStatement(tenantID, taskID, workerID string, now time.Time, leaseDuration time.Duration) (postgresExportTaskQueueStatement, error) {
@@ -493,10 +599,13 @@ func buildPostgresExportTaskExtendLeaseStatement(tenantID, taskID, workerID stri
 	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, workerID, leaseExpiresAt, now.UTC()}}, nil
 }
 
-func buildPostgresExportTaskRetryStatement(tenantID, taskID string, now time.Time, backoffSeconds int) (postgresExportTaskQueueStatement, error) {
+func buildPostgresExportTaskRetryStatement(tenantID, taskID, leaseToken string, now time.Time, backoffSeconds int) (postgresExportTaskQueueStatement, error) {
 	tenantID, taskID, err := normalizePostgresExportTaskIDs(tenantID, taskID)
 	if err != nil {
 		return postgresExportTaskQueueStatement{}, err
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return postgresExportTaskQueueStatement{}, fmt.Errorf("export task lease token is required")
 	}
 	if backoffSeconds < 0 {
 		return postgresExportTaskQueueStatement{}, fmt.Errorf("backoff_seconds must be greater than or equal to zero")
@@ -504,18 +613,21 @@ func buildPostgresExportTaskRetryStatement(tenantID, taskID string, now time.Tim
 	retryNotBefore := now.UTC().Add(time.Duration(backoffSeconds) * time.Second)
 	statement := strings.Join([]string{
 		"UPDATE export_worker_tasks",
-		"SET status = 'queued', attempt = attempt + 1, lease_owner = NULL, lease_expires_at = NULL, retry_not_before = $3::timestamptz, updated_at = $4::timestamptz,",
-		"payload = jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(payload, '{status}', to_jsonb('queued'::text), true), '{attempt}', to_jsonb(attempt + 1), true), '{lease_expires_at}', 'null'::jsonb, true), '{metadata,retry_not_before}', to_jsonb($3::timestamptz), true), '{metadata,retry_scheduled_at}', to_jsonb($4::timestamptz), true), '{metadata,retry_backoff_seconds}', to_jsonb($5::int), true)",
-		"WHERE tenant_id = $1 AND task_id = $2 AND status = 'running' AND attempt + 1 < max_attempts",
+		"SET status = 'queued', attempt = attempt + 1, lease_owner = NULL, lease_expires_at = NULL, retry_not_before = $4::timestamptz, updated_at = $5::timestamptz,",
+		"payload = jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(jsonb_set(payload, '{status}', to_jsonb('queued'::text), true), '{attempt}', to_jsonb(attempt + 1), true), '{lease_expires_at}', 'null'::jsonb, true), '{metadata,retry_not_before}', to_jsonb($4::timestamptz), true), '{metadata,retry_scheduled_at}', to_jsonb($5::timestamptz), true), '{metadata,retry_backoff_seconds}', to_jsonb($6::int), true)",
+		"WHERE tenant_id = $1 AND task_id = $2 AND lease_owner = $3 AND status = 'running' AND attempt + 1 < max_attempts",
 		"RETURNING payload",
 	}, " ")
-	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, retryNotBefore, now.UTC(), backoffSeconds}}, nil
+	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, leaseToken, retryNotBefore, now.UTC(), backoffSeconds}}, nil
 }
 
-func buildPostgresExportTaskDeadLetterStatement(tenantID, taskID string, now time.Time, reason string) (postgresExportTaskQueueStatement, error) {
+func buildPostgresExportTaskDeadLetterStatement(tenantID, taskID, leaseToken string, now time.Time, reason string) (postgresExportTaskQueueStatement, error) {
 	tenantID, taskID, err := normalizePostgresExportTaskIDs(tenantID, taskID)
 	if err != nil {
 		return postgresExportTaskQueueStatement{}, err
+	}
+	if strings.TrimSpace(leaseToken) == "" {
+		return postgresExportTaskQueueStatement{}, fmt.Errorf("export task lease token is required")
 	}
 	reason = strings.TrimSpace(reason)
 	if reason == "" {
@@ -524,17 +636,17 @@ func buildPostgresExportTaskDeadLetterStatement(tenantID, taskID string, now tim
 	statement := strings.Join([]string{
 		"WITH moved AS (",
 		"DELETE FROM export_worker_tasks",
-		"WHERE tenant_id = $1 AND task_id = $2 AND attempt + 1 >= max_attempts",
+		"WHERE tenant_id = $1 AND task_id = $2 AND lease_owner = $3 AND status = 'running' AND attempt + 1 >= max_attempts",
 		"RETURNING tenant_id, task_id, export_job_id, attempt, max_attempts, payload",
 		")",
 		"INSERT INTO export_worker_task_dead_letters",
 		"(tenant_id, task_id, export_job_id, attempt, max_attempts, dead_letter_reason, dead_lettered_at, payload)",
-		"SELECT tenant_id, task_id, export_job_id, attempt, max_attempts, $3, $4,",
-		"jsonb_set(jsonb_set(payload, '{status}', to_jsonb('failed'::text), true), '{metadata,dead_letter_reason}', to_jsonb($3::text), true)",
+		"SELECT tenant_id, task_id, export_job_id, attempt, max_attempts, $4, $5,",
+		"jsonb_set(jsonb_set(payload, '{status}', to_jsonb('failed'::text), true), '{metadata,dead_letter_reason}', to_jsonb($4::text), true)",
 		"FROM moved",
 		"RETURNING payload",
 	}, " ")
-	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, reason, now.UTC()}}, nil
+	return postgresExportTaskQueueStatement{SQL: statement, Args: []any{tenantID, taskID, leaseToken, reason, now.UTC()}}, nil
 }
 
 func normalizePostgresExportTaskIDs(tenantID, taskID string) (string, string, error) {

@@ -30,7 +30,7 @@ func TestAControlPlaneMachineDefinesNoEdges(t *testing.T) {
 	// deployment already answers the host dying — every region holds a control plane and the authority is one
 	// across them. The same argument retired the second database member beside the first.
 	for _, want := range []string{"dsse-control-plane-a", "dsse-postgres-a",
-		"dsse-store-a", "dsse-clickhouse", "dsse-archive", "dsse-console"} {
+		"dsse-store-a", "dsse-clickhouse", "dsse-console"} {
 		if !strings.Contains(compose, "\n  "+want+":") {
 			t.Fatalf("a Control Plane machine must run %s — it is part of what the word means here", want)
 		}

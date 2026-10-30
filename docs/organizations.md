@@ -43,14 +43,13 @@ Complete the tenant creation dialog:
 | **Time zone** | the zone reports and log timestamps are read in |
 | **Home region** | where this organization's devices are served from by default |
 | **Regions they may occupy** | their traffic and data stay inside the ones you tick |
-| **Give them their own address on the Edges** | leave this ticked — see below |
 | **Who runs it** | *We run it for them* is the delegation the operator needs to administer it |
 | **Their first administrator** | optional; produces an invitation you hand over |
 
-**"Give them their own address on the Edges" is the transport authority, and the dialog says why it is now
-rather than later:** *their devices then verify this deployment with nothing but their own organization's
-certificate, and no other tenant's name is offered to them. Doing it later means moving devices onto a new
-name; doing it now does not, because they have none.*
+New organizations use the deployment's shared Edge transport hostname. The signed profile and
+device certificate identify the organization; its device identity CA, inspection CA,
+Connectors and policies remain organization-specific. Creating a new organization does not
+require additional DNS records or a separate TLS SNI name.
 
 **"Who runs it" is what makes the organization administrable by you.** Without the delegation, every
 operator read inside it answers 403 — *…has not delegated its management to the operator* — including the
@@ -63,7 +62,7 @@ expires in 24 hours; issue a new one if it is lost.
 
 ## 2. Give it its own authorities — Enter → Certificates
 
-The organization now exists, has its own door name and can be administered. Two things remain, and they are
+The organization now exists and can be administered through the shared deployment address. Two things remain, and they are
 what make a device this organization's rather than the deployment's:
 
 - **device identity** — the CA that issues its devices' certificates. A device pins it, so without it a
@@ -139,25 +138,25 @@ dsse-profileverify: signed by the pinned key. This is what the device would join
   organization               tenant_<customer-id>
   posture                    fail-closed
   transport                  https://agents.region-a.example.test
-  this organization's door   <customer-id>.example.test
-  enrolment door             enrol.<customer-id>.example.test
+  this organization's door   NONE
+  enrolment door             NONE
   interception root          this organization's own
   device CA pin              <device-CA-SHA256-pin>
 ```
 
-Four lines say step 2 worked: the organization on the first, its own door, **interception root: this
-organization's own**, and a device CA pin rather than nothing. A profile issued before step 2 names the
-organization, carries the deployment's shared root instead of its own, and has no pin.
+The organization ID, shared transport URL, **interception root: this organization's own**,
+and device CA pin confirm the intended configuration. A profile issued before step 2 may
+have no tenant inspection root or device CA pin; do not install it.
 
 ## 5. Check endpoint name resolution
 
 Devices dial the regional transport and recovery URLs in the verified profile. Those names
 must resolve on the device to the intended deployment addresses. The profile also contains
-`organization.transport_server_name` and `organization.enrolment_server_name`: these are
-organization-specific SNI names used while connecting to a regional endpoint. A name used
-only as SNI does not itself require an agent DNS lookup. Configure a DNS record if a tool
-or client will connect directly to that name. Use the actual generated/profile values;
-do not derive them from an organization's display name.
+For a normal multi-organization installation, both organizations resolve the same
+deployment hostnames. The signed profile's `organization` object contains the tenant ID,
+but no `transport_server_name` or `enrolment_server_name`. Existing deployments that
+already issued dedicated transport names need a separately planned migration; do not
+silently change their running devices.
 
 ## What the organization carries from the moment it exists
 

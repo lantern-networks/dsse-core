@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,58 @@ import (
 
 	"github.com/lantern-networks/dsse-core/model"
 )
+
+func TestIdentitySyncUsesCurrentDoorAfterRegionFailover(t *testing.T) {
+	hits := make(chan string, 8)
+	serve := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/identity-sources/due" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			select {
+			case hits <- name:
+			default:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"sources":[]}`)
+		}))
+	}
+	a, b := serve("a"), serve("b")
+	defer a.Close()
+	defer b.Close()
+	doors := parseConnectorEndpoints("a=" + a.URL + ";b=" + b.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		identitySyncLoop(ctx, newConnectorEdgeHTTPClient(nil), doors, "id", "secret", "", "", "", 10*time.Millisecond, &connectorIdentitySyncMonitor{})
+	}()
+	waitFor := func(want string) {
+		t.Helper()
+		deadline := time.After(time.Second)
+		for {
+			select {
+			case got := <-hits:
+				if got == want {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("identity sync did not reach %s door", want)
+			}
+		}
+	}
+	waitFor("a")
+	doors.advance(errors.New("region unavailable"))
+	waitFor("b")
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("identity sync loop did not stop")
+	}
+}
 
 func TestConnectorIdentitySyncImportsDueSourceFromFile(t *testing.T) {
 	secret := "tenant-runtime-secret"

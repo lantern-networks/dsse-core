@@ -48,7 +48,7 @@ func adminTenantForWrite(r *http.Request, bodyTenant string) (string, error) {
 		}
 		return target, nil
 	}
-	if named := strings.TrimSpace(bodyTenant); named != "" && !strings.EqualFold(named, strings.TrimSpace(resolved)) {
+	if named := strings.TrimSpace(bodyTenant); named != "" && named != strings.TrimSpace(resolved) {
 		return "", fmt.Errorf(
 			"this request writes into organization %q and you may only write into %q — it would otherwise have "+
 				"been carried out in your own organization, which is not what you asked for", named, resolved)

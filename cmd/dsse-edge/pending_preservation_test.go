@@ -125,7 +125,7 @@ func TestPostgresPendingPreservationStopsDestructiveBoundary(t *testing.T) {
 		}
 	}
 	now := time.Now()
-	cfg := retentionConfig{hotEvents: time.Hour, outboxPublished: time.Hour, legalHold: h, override: r}
+	cfg := retentionConfig{interval: time.Hour, hotEvents: time.Hour, outboxPublished: time.Hour, legalHold: h, override: r}
 	if h.Set("target", "review", "", true, now) == nil || r.Set("audit", 0) == nil {
 		t.Fatal("save refusal missing")
 	}
@@ -149,7 +149,7 @@ func TestPostgresPendingPreservationStopsDestructiveBoundary(t *testing.T) {
 		}
 	}
 	count("hot_events", "target", 2)
-	count("hot_events", "free", 1)
+	count("hot_events", "free", 2) // no external S3: the scheduled sweep preserves hot rows
 	for _, table := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		count(table, "target", 1)
 		count(table, "free", 0)
@@ -161,8 +161,8 @@ func TestPostgresPendingPreservationStopsDestructiveBoundary(t *testing.T) {
 		t.Fatal("explicit successful relaxation failed")
 	}
 	runRetentionPrune(context.Background(), hp.db, cfg)
-	count("hot_events", "target", 0)
-	count("hot_events", "free", 0)
+	count("hot_events", "target", 2)
+	count("hot_events", "free", 2)
 	for _, table := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		count(table, "target", 0)
 	}

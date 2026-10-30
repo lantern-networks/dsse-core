@@ -107,6 +107,7 @@ func TestSaaSDistributionAcrossCPAndEdgeProcesses(t *testing.T) {
 	if err := json.Unmarshal(rawFixture, &fixture); err != nil {
 		t.Fatal(err)
 	}
+	fixture.PolicyBundle = tenantRestrictionInspectionFixtureFor(fixture.PolicyBundle, processDistributionTenant)
 	fixture.PolicyBundle.SaaSCatalog = nil
 	fixture.PolicyBundle.SWGTenantRestrictionRules = nil
 	fixture.PolicyBundle.SWGTLSBypassRules = nil

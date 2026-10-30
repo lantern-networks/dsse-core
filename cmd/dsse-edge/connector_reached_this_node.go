@@ -53,6 +53,7 @@ func siblingsRelayNow() bool {
 // denominator a connector needs before it can claim to cover the fleet rather than merely to spread over it).
 func connectorTunnelHandshakeHeaders(nodeID string, regionNodes int, siblingsRelay bool) http.Header {
 	h := http.Header{}
+	h.Set(tunnel.TCPQuotaCapabilityHeader, tunnel.TCPQuotaCapabilityV1)
 	if nodeID != "" {
 		h.Set(connectorReachedNodeHeader, nodeID)
 	}

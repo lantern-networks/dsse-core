@@ -40,6 +40,9 @@ func applyPlanToThisMachine(plan *Plan, dir, machineName string) error {
 }
 
 func applyPlanTo(plan *Plan, dir string, founding PlanRegion, machine PlanMachine) error {
+	if err := prepareAuthRollout(plan, dir, machine.Name); err != nil {
+		return err
+	}
 	values, err := plan.MachineEnvironment(machine.Name)
 	if err != nil {
 		return err
@@ -60,9 +63,14 @@ func applyPlanTo(plan *Plan, dir string, founding PlanRegion, machine PlanMachin
 			if werr := os.WriteFile(filepath.Join(dir, storeMemberFile), cert, 0o644); werr != nil {
 				return werr
 			}
-			if werr := os.WriteFile(filepath.Join(dir, storeMemberKeyFile), key, 0o600); werr != nil {
+			if werr := publishPrivateInstallerKey(filepath.Join(dir, storeMemberKeyFile), key); werr != nil {
 				return werr
 			}
+		}
+	}
+	if plan.shapeOf(founding, machine).holds.holdsState() {
+		if err := runtimeTransportForPlanApply(dir, values, time.Now().UTC()); err != nil {
+			return err
 		}
 	}
 	if werr := os.WriteFile(path, []byte(PlanEnvironmentFor(string(body), values)), 0o600); werr != nil {
@@ -95,6 +103,9 @@ func applyPlanTo(plan *Plan, dir string, founding PlanRegion, machine PlanMachin
 		return err
 	}
 	if err := writeDatabaseFrontDoorConfig(dir); err != nil {
+		return err
+	}
+	if err := writeInstallPlan(dir, plan); err != nil {
 		return err
 	}
 	fmt.Printf("\n★ FROM THE PLAN — this deployment is %q, and it has %d region(s):\n",

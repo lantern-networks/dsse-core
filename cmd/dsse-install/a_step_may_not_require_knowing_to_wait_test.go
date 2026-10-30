@@ -50,3 +50,18 @@ func TestTheWaitForALeaderGivesUp(t *testing.T) {
 		t.Errorf("a control plane that never leads was reported as %d", code)
 	}
 }
+
+func TestBootstrapWaitsFor503AuthorityRefusalButNotAccountSetupFailure(t *testing.T) {
+	shortenTheLeadershipWait(t)
+	for _, reason := range []string{"this control plane does not hold leadership", "control-plane consensus is unavailable; retry shortly", "no accepting control-plane is available; retry shortly"} {
+		calls := 0
+		code, _, err := waitForALeaderToExist(503, []byte(`{"error":"`+reason+`"}`), func() (int, []byte, error) { calls++; return 201, nil, nil })
+		if err != nil || code != 201 || calls != 1 {
+			t.Fatal("503 routing refusal was not retried", code, err)
+		}
+	}
+	code, _, err := waitForALeaderToExist(503, []byte(`{"error":"first-party accounts are disabled"}`), func() (int, []byte, error) { t.Fatal("permanent setup failure retried"); return 201, nil, nil })
+	if err != nil || code != 503 {
+		t.Fatal("setup failure changed", code, err)
+	}
+}

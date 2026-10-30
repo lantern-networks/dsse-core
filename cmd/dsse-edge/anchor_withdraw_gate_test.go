@@ -12,7 +12,7 @@ import (
 
 type fakeObserved struct{ ready map[string][]string }
 
-func (f fakeObserved) Record(observedExclusionEntry) {}
+func (f fakeObserved) Record(observedExclusionEntry) error { return nil }
 func (f fakeObserved) Query(string, observedQueryFilter) observedQueryResult {
 	return observedQueryResult{}
 }

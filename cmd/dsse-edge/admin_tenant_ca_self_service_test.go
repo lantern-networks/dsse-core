@@ -1,13 +1,57 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestTenantCACaseDistinctScopeAndWrites(t *testing.T) {
+	handler, registry, _, _ := tenantCARoutesForTest(t)
+	const otherTenant = "TENANT_NORTHWIND"
+	if _, err := tenantCAHarnessTenantStore.Put(context.Background(), adminTenantModel{
+		TenantID: otherTenant, DisplayName: otherTenant, Status: "active",
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	otherCert, otherPEM := tenantCATestCA(t, "Case distinct CA")
+	if _, err := registry.Register(otherTenant, otherPEM); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("GET", func(t *testing.T) {
+		got := asNorthwindAdmin(t, handler, http.MethodGet, "/admin/tenant-cas", nil)
+		if got.Code != http.StatusOK {
+			t.Fatalf("GET tenant CAs: HTTP %d", got.Code)
+		}
+		if strings.Contains(got.Body.String(), otherTenant) {
+			t.Fatal("tenant admin read the device CA of a distinct case-sensitive tenant")
+		}
+	})
+	_, ownPEM := tenantCATestCA(t, "Own CA")
+	t.Run("POST", func(t *testing.T) {
+		write := asNorthwindAdmin(t, handler, http.MethodPost, "/admin/tenant-cas", map[string]string{
+			"tenant_id": otherTenant, "ca_pem": string(ownPEM),
+		})
+		if write.Code != http.StatusForbidden {
+			t.Fatalf("case-distinct CA registration returned HTTP %d, want 403", write.Code)
+		}
+	})
+	sum := sha256.Sum256(otherCert.Raw)
+	t.Run("DELETE", func(t *testing.T) {
+		withdraw := asNorthwindAdmin(t, handler, http.MethodDelete,
+			"/admin/tenant-cas/"+otherTenant+"/"+hex.EncodeToString(sum[:]), nil)
+		if withdraw.Code != http.StatusForbidden {
+			t.Fatalf("case-distinct CA withdrawal returned HTTP %d, want 403", withdraw.Code)
+		}
+	})
+}
 
 // asNorthwindAdmin issues a request as an ORDINARY admin of tenant_northwind — the customer, not the operator.
 func asNorthwindAdmin(t *testing.T, handler http.Handler, method, path string, body any) *httptest.ResponseRecorder {

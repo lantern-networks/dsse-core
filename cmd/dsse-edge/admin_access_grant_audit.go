@@ -29,6 +29,10 @@ func accessGrantAuditReference(id string) string {
 func adminAccessGrantRevocationAuditLog(r *http.Request, g grantstore.Grant, evaluator decision.Evaluator, now time.Time, partial bool) model.AuditLog {
 	result := "revoked"
 	meta := map[string]any{"applied": true, "user_present": g.UserID != "", "device_bound": g.DeviceID != "", "scope_present": g.Scope != ""}
+	if g.ReauthenticateAfter != "" {
+		meta["revocation_mode"] = "require_fresh_identity"
+		meta["reauthenticate_after"] = g.ReauthenticateAfter
+	}
 	if partial {
 		result = "partial"
 		meta["persistence"] = "unconfirmed"

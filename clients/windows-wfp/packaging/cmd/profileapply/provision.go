@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/lantern-networks/dsse-core/clients/windows-wfp/configstore"
 	"github.com/lantern-networks/dsse-core/installprofile"
 )
 
@@ -67,6 +68,28 @@ type provisionPlan struct {
 	UpdateSigningKeys     []string
 	UpdatePublisherID     string
 	Notes                 []string
+}
+
+// verifyPlanAndApplyProvision checks every signed deployment fact before changing the config store.
+// Apply still performs its own signature and anti-rollback checks at commit time; the first
+// verification cannot replace that check, because the previously applied profile may change.
+func verifyPlanAndApplyProvision(be configstore.Backend, envelope []byte, pin, token, now string) (installprofile.InstallProfile, provisionPlan, error) {
+	profile, verified, err := installprofile.Load(envelope, pin)
+	if err != nil {
+		return installprofile.InstallProfile{}, provisionPlan{}, fmt.Errorf("verify profile before provisioning: %w", err)
+	}
+	if !verified {
+		return installprofile.InstallProfile{}, provisionPlan{}, fmt.Errorf("verify profile before provisioning: signature was not accepted")
+	}
+	plan, err := planProvision(profile, token)
+	if err != nil {
+		return installprofile.InstallProfile{}, provisionPlan{}, fmt.Errorf("provision: %w", err)
+	}
+	profile, err = configstore.Apply(be, envelope, pin, "path", now)
+	if err != nil {
+		return installprofile.InstallProfile{}, provisionPlan{}, fmt.Errorf("apply profile: %w", err)
+	}
+	return profile, plan, nil
 }
 
 // planProvision derives everything from the verified profile and the token.
@@ -280,5 +303,5 @@ func identityIsForAnotherOrganization(identityTenant, profileTenant string) bool
 	if a == "" || b == "" {
 		return false
 	}
-	return !strings.EqualFold(a, b)
+	return a != b
 }

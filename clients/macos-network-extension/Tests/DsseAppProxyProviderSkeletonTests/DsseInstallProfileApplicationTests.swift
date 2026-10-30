@@ -163,6 +163,22 @@ final class DsseInstallProfileApplicationTests: XCTestCase {
                                                            configDirectory: staged.dir))
     }
 
+    func testProfileIsNotAppliedWhenAntiRollbackStampCannotBePersisted() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let env = try profileEnvelope(signedBy: key, transportURL: "https://new.dsse.lab",
+                                      issuedAt: "2026-08-28T01:33:07Z")
+        let staged = try stage(pin: hex(key), localTransportURL: "https://agents.dsse.lab", profile: env)
+        // An existing directory at the stamp path reliably rejects atomic file
+        // replacement without relying on the test process's OS privileges.
+        try FileManager.default.createDirectory(
+            at: staged.dir.appendingPathComponent(DsseInstallProfileApplication.appliedStampFileName),
+            withIntermediateDirectories: false)
+        var said: [String] = []
+        XCTAssertNil(DsseInstallProfileApplication.inForce(agentConfigPath: staged.configPath,
+                                                           configDirectory: staged.dir, log: { said.append($0) }))
+        XCTAssertTrue(said.contains { $0.contains("REFUSED=stamp_write") }, "\(said)")
+    }
+
     // A profile present and a pin absent is the one case that must be LOUD: the operator placed the file and has
     // every reason to believe it took effect.
     func testAProfileThatCannotBeJudgedSaysSo() throws {
@@ -202,6 +218,23 @@ final class DsseInstallProfileApplicationTests: XCTestCase {
                              "number first")
         // Junk in the list is skipped rather than turning the seed into nothing.
         XCTAssertTrue(DsseInstallProfileApplication.regionSeed(profile: nil).isEmpty)
+    }
+
+    func testThreeDoorsInOneRegionSharePriorityTier() throws {
+        let key = Curve25519.Signing.PrivateKey()
+        let env = try profileEnvelope(signedBy: key, transportURL: "https://agents.node-a.dsse.lab",
+                                      endpoints: ["region-a=https://agents.node-a.dsse.lab",
+                                                  "region-a=https://agents.node-b.dsse.lab",
+                                                  "region-b=https://agents.region-b.dsse.lab",
+                                                  "region-a=https://agents.node-c.dsse.lab"])
+        let staged = try stage(pin: hex(key), localTransportURL: "https://agents.dsse.lab", profile: env)
+        let profile = DsseInstallProfileApplication.inForce(agentConfigPath: staged.configPath,
+                                                            configDirectory: staged.dir)
+        let seed = DsseInstallProfileApplication.regionSeed(profile: profile)
+        XCTAssertEqual(seed.map { $0.region }, ["region-a", "region-a", "region-b", "region-a"])
+        XCTAssertEqual(seed[0].priority, seed[1].priority)
+        XCTAssertEqual(seed[0].priority, seed[3].priority)
+        XCTAssertGreaterThan(seed[0].priority, seed[2].priority)
     }
 
     // ★★ THE DEPLOYMENT MAY CLOSE A POSTURE THE DEVICE OPENED, NEVER THE REVERSE.

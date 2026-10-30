@@ -95,6 +95,16 @@ var operatorElevatedActs = []operatorElevatedAct{
 			"authority — refused at the handshake, including a laptop that was switched off throughout",
 	},
 	{
+		Method: http.MethodPost, Path: "/admin/tenant-interception-authority/root-crl",
+		Why: "publishes offline-root-signed revocation status for an organization's interception PKI; " +
+			"a newly revoked authority can stop verification across that organization's devices",
+	},
+	{
+		Method: http.MethodPost, Path: "/admin/tenant-interception-authority/revoke-delegation",
+		Why: "permanently revokes a recorded Edge interception CA, affecting every certificate it signed " +
+			"for this organization",
+	},
+	{
 		Method: http.MethodPost, Path: "/admin/tenant-interception-authority/promote",
 		Why: "makes this organization's staged interception authority the one every Edge signs under; every " +
 			"device that has not adopted its root loses every HTTPS site at that moment",

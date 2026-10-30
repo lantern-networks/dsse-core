@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -15,17 +16,44 @@ import (
 // storeHolding builds a rollback store in a temp dir with a package stashed for each version.
 func storeHolding(t *testing.T, versions ...string) *rollbackstore.Store {
 	t.Helper()
-	src := filepath.Join(t.TempDir(), "pkg.msi")
+	root := protectedRollbackFixtureRoot(t)
+	src := filepath.Join(root, "pkg.msi")
 	if err := os.WriteFile(src, []byte("not a real msi, but not empty either"), 0o644); err != nil {
 		t.Fatalf("write source package: %v", err)
 	}
-	s := rollbackstore.New(t.TempDir())
+	s := rollbackstore.New(filepath.Join(root, "store"))
 	for _, v := range versions {
 		if _, err := s.Stash(src, v); err != nil {
 			t.Fatalf("stash %s: %v", v, err)
 		}
 	}
 	return s
+}
+
+// Stash verifies the full directory ancestry. A normal t.TempDir under the
+// user's profile cannot satisfy that production ACL guarantee on Windows.
+func protectedRollbackFixtureRoot(t *testing.T) string {
+	t.Helper()
+	base := filepath.Join(os.Getenv("SystemRoot"), "Temp")
+	if os.Getenv("SystemRoot") == "" {
+		t.Skip("SystemRoot is unavailable")
+	}
+	root, err := os.MkdirTemp(base, "dsse-updater-rollback-")
+	if err != nil {
+		t.Skipf("administrator-owned fixture root unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	for _, args := range [][]string{
+		{root, "/inheritance:r"},
+		{root, "/grant", "*S-1-5-18:(OI)(CI)F"},
+		{root, "/grant", "*S-1-5-32-544:(OI)(CI)F"},
+		{root, "/setowner", "*S-1-5-32-544"},
+	} {
+		if output, err := exec.Command("icacls", args...).CombinedOutput(); err != nil {
+			t.Skipf("protect rollback fixture: %v (%s)", err, strings.TrimSpace(string(output)))
+		}
+	}
+	return root
 }
 
 // ★ --status must name what this box HOLDS, in every branch — especially the ones that refuse.

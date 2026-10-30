@@ -6,6 +6,15 @@ import XCTest
 final class DsseRuntimeCopyTunnelTests: XCTestCase {
     private var listener: NWListener?
 
+    func testHandshakeAcceptsOnlyTheActualHTTPStatusToken() {
+        XCTAssertEqual(DsseRuntimeCopyTunnel.handshakeStatusCode(Data("HTTP/1.1 200 Connection Established".utf8)), 200)
+        XCTAssertEqual(DsseRuntimeCopyTunnel.handshakeStatusCode(Data("HTTP/1.0 200 OK".utf8)), 200)
+        XCTAssertEqual(DsseRuntimeCopyTunnel.handshakeStatusCode(Data("HTTP/1.1 502 Retry after 200 seconds".utf8)), 502)
+        XCTAssertNil(DsseRuntimeCopyTunnel.handshakeStatusCode(Data("garbage 200 accepted".utf8)))
+        XCTAssertNil(DsseRuntimeCopyTunnel.handshakeStatusCode(Data("HTTP/1.1 ２00 OK".utf8)))
+        XCTAssertNil(DsseRuntimeCopyTunnel.handshakeStatusCode(Data("HTTP/1.1 2000 OK".utf8)))
+    }
+
     override func tearDown() {
         listener?.cancel()
         listener = nil

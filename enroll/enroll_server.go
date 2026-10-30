@@ -151,10 +151,14 @@ func (i Issuer) Handler() http.HandlerFunc {
 		if i.SignerFor != nil {
 			if per := i.SignerFor(tenant); per != nil {
 				signer = per
-			} else if i.Signer == nil {
+			} else {
 				writeJSON(w, http.StatusForbidden, Response{Error: "this node cannot issue an identity for that organization"})
 				return
 			}
+		}
+		if signer == nil {
+			writeJSON(w, http.StatusServiceUnavailable, Response{Error: "device identity issuer is unavailable"})
+			return
 		}
 		certPEM, err := signer.Sign([]byte(req.CSRPEM), subject, i.CertTTL)
 		if err != nil {

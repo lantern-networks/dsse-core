@@ -7,17 +7,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/agentpolicy"
 	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
 func posturePolicyServer(t *testing.T, signer *agentpolicy.Signer, posture steerPostureConfig) http.Handler {
 	t.Helper()
+	ledger := enrolledinventory.NewLedger()
+	if _, err := ledger.Enroll("win-dev-1", "tenant-b", "posture test", time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
 	return newServerWithConfig(serverConfig{
 		Evaluator:         decision.Evaluator{PolicyBundle: model.PolicyBundle{TenantID: "t1"}},
+		EnrolledLedger:    ledger,
 		Registry:          connector.NewRegistry(),
 		AdminAuth:         newAdminAuthStore(),
 		AgentPolicySigner: signer,
@@ -52,11 +59,27 @@ func TestSteeringPostureEndpointSignsCPConfig(t *testing.T) {
 	if err := json.Unmarshal(payloadBytes, &p); err != nil {
 		t.Fatal(err)
 	}
-	if p.SchemaVersion != agentpolicy.SteeringPostureSchema || p.DeviceIdentity != "win-dev-1" {
+	if p.SchemaVersion != agentpolicy.SteeringPostureSchema || p.DeviceIdentity != "win-dev-1" || p.TenantID != "tenant-b" {
 		t.Fatalf("posture payload wrong: %+v", p)
 	}
 	if !p.FailOpenPermitted() || p.FailOpenCooldownMS != 8000 || !p.RegionFailover {
 		t.Fatalf("CP posture not reflected: %+v", p)
+	}
+}
+
+func TestSteeringPostureRefusesUnattributedDevice(t *testing.T) {
+	handler := newServerWithConfig(serverConfig{
+		Evaluator: decision.Evaluator{PolicyBundle: model.PolicyBundle{TenantID: "node-tenant"}},
+		Registry:  connector.NewRegistry(),
+		AdminAuth: newAdminAuthStore(),
+	})
+	cert := leafWithCN(t, "unknown-device")
+	req := httptest.NewRequest(http.MethodGet, "/steer/agent-policy/posture", nil)
+	req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{cert}, VerifiedChains: [][]*x509.Certificate{{cert}}}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for unattributed device", rec.Code)
 	}
 }
 

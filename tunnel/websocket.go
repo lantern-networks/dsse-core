@@ -35,7 +35,10 @@ type Conn struct {
 	// ResponseHeader is what the accepting side said about itself in the 101, on a dialled connection. Nil for
 	// an accepted or in-process one. It is how a client behind an L4 front door learns WHICH node it reached.
 	ResponseHeader http.Header
+	peerTCPQuotas  bool
 }
+
+func (c *Conn) PeerSupportsTCPQuotas() bool { return c != nil && c.peerTCPQuotas }
 
 var _ FrameTransport = (*Conn)(nil)
 
@@ -141,7 +144,7 @@ func UpgradeWithHeaders(w http.ResponseWriter, r *http.Request, extra http.Heade
 		rawConn.Close()
 		return nil, err
 	}
-	return &Conn{conn: rawConn, reader: rw.Reader, maskWrites: false}, nil
+	return &Conn{conn: rawConn, reader: rw.Reader, maskWrites: false, peerTCPQuotas: SupportsTCPQuotaV1(r.Header)}, nil
 }
 
 func Dial(ctx context.Context, rawURL string, headers http.Header) (*Conn, error) {
@@ -174,9 +177,9 @@ func DialTLS(ctx context.Context, rawURL string, headers http.Header, tlsConfig 
 	if parsed.Port() == "" {
 		switch parsed.Scheme {
 		case "wss":
-			host = net.JoinHostPort(host, "443")
+			host = net.JoinHostPort(parsed.Hostname(), "443")
 		case "ws":
-			host = net.JoinHostPort(host, "80")
+			host = net.JoinHostPort(parsed.Hostname(), "80")
 		}
 	}
 	var rawConn net.Conn
@@ -199,26 +202,31 @@ func DialTLS(ctx context.Context, rawURL string, headers http.Header, tlsConfig 
 		// HTTP/2-capable register/heartbeat client never negotiates h2 — which would make the server
 		// answer with HTTP/2 frames and break the WebSocket upgrade.
 		cfg.NextProtos = []string{"http/1.1"}
-		rawConn, err = tls.DialWithDialer(&dialer, "tcp", host, cfg)
+		tlsDialer := tls.Dialer{NetDialer: &dialer, Config: cfg}
+		rawConn, err = tlsDialer.DialContext(ctx, "tcp", host)
 	default:
 		return nil, fmt.Errorf("unsupported websocket scheme %q", parsed.Scheme)
 	}
 	if err != nil {
 		return nil, err
 	}
+	// A successful TCP/TLS dial does not finish the WebSocket handshake. The
+	// peer may stop responding before its HTTP 101. Cancel that wait with the
+	// caller's context, then detach cancellation once the tunnel is established.
+	stopCancellation := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+	defer stopCancellation()
 
 	key, err := randomWebSocketKey()
 	if err != nil {
 		rawConn.Close()
 		return nil, err
 	}
-	path := parsed.RequestURI()
-	if path == "" {
-		path = "/"
-	}
 	req := &http.Request{
 		Method: "GET",
-		URL:    &url.URL{Path: path},
+		URL: &url.URL{
+			Path: parsed.Path, RawPath: parsed.RawPath,
+			RawQuery: parsed.RawQuery, ForceQuery: parsed.ForceQuery,
+		},
 		Host:   host,
 		Header: make(http.Header),
 	}
@@ -233,12 +241,18 @@ func DialTLS(ctx context.Context, rawURL string, headers http.Header, tlsConfig 
 	}
 	if err := req.Write(rawConn); err != nil {
 		rawConn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	reader := bufio.NewReader(rawConn)
 	resp, err := http.ReadResponse(reader, req)
 	if err != nil {
 		rawConn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -250,7 +264,11 @@ func DialTLS(ctx context.Context, rawURL string, headers http.Header, tlsConfig 
 		rawConn.Close()
 		return nil, fmt.Errorf("websocket accept header mismatch")
 	}
-	return &Conn{conn: rawConn, reader: reader, maskWrites: true, ResponseHeader: resp.Header.Clone()}, nil
+	if !stopCancellation() {
+		rawConn.Close()
+		return nil, ctx.Err()
+	}
+	return &Conn{conn: rawConn, reader: reader, maskWrites: true, ResponseHeader: resp.Header.Clone(), peerTCPQuotas: SupportsTCPQuotaV1(resp.Header)}, nil
 }
 
 func (c *Conn) ReadJSON(value any) error {
@@ -281,7 +299,9 @@ func (c *Conn) WriteJSON(value any) error {
 }
 
 func (c *Conn) Close() error {
-	_ = c.writeFrame(opcodeClose, nil)
+	// Close must interrupt pending reads and writes. Sending a close frame first
+	// can wait forever behind writeMu or a peer that has stopped reading, which
+	// would also stall session replacement and shutdown.
 	return c.conn.Close()
 }
 

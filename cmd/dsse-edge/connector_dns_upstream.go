@@ -26,6 +26,17 @@ type connectorDNSUpstream struct {
 // that reaches it, and returns the raw DNS response. Fails (so the resolver returns SERVFAIL) rather than
 // leaking an internal name — no connector, no tunnel, or a connector-side error all return an error.
 func (c *connectorDNSUpstream) ResolveViaConnector(ctx context.Context, upstream string, raw []byte) ([]byte, error) {
+	return c.ResolveViaConnectorForTenant(ctx, c.tenantID, upstream, raw)
+}
+
+// ResolveViaConnectorForTenant routes an authenticated DNS-over-tunnel query only
+// through a connector owned by that request's tenant. The legacy UDP listener
+// continues to use the resolver's startup tenant via ResolveViaConnector.
+func (c *connectorDNSUpstream) ResolveViaConnectorForTenant(ctx context.Context, tenantID, upstream string, raw []byte) ([]byte, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, fmt.Errorf("dns connector tenant is unavailable")
+	}
 	upstream = strings.TrimSpace(upstream)
 	if upstream == "" {
 		return nil, fmt.Errorf("no internal dns upstream configured")
@@ -36,13 +47,13 @@ func (c *connectorDNSUpstream) ResolveViaConnector(ctx context.Context, upstream
 	}
 	// Route by the internal DNS server's address — the connector that reaches it (also applies admin route
 	// governance, so a HELD route won't be used for DNS either).
-	conn, ok, err := connectorForDestination(ctx, c.registry, c.tenantID, host, c.namespace)
+	conn, ok, err := connectorForDestination(ctx, c.registry, tenantID, host, c.namespace)
 	if err != nil {
 		logWarnf("connector_dns error=route_lookup host=%s ns=%q err=%v", host, c.namespace, err)
 		return nil, err
 	}
 	if !ok {
-		logWarnf("connector_dns error=no_connector host=%s ns=%q tenant=%s", host, c.namespace, c.tenantID)
+		logWarnf("connector_dns error=no_connector host=%s ns=%q tenant=%s", host, c.namespace, tenantID)
 		return nil, fmt.Errorf("no connector reaches internal dns %s", host)
 	}
 	if c.tunnelManager == nil {

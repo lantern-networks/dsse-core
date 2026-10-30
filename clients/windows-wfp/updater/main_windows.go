@@ -104,7 +104,7 @@ func main() {
 		os.Exit(agentupdate.ForgetAssumedOutcomeCommand(filepath.Join(stateRoot(), "journal.json"), os.Stdout, os.Stderr))
 	case *serviceInstall:
 		if err := installService(serviceRunArgs(serviceRunFlags{
-			updatePins: *updatePins, planPin: *planPin, failOpen: *failOpen,
+			updatePins: *updatePins, planPin: *planPin, publisher: *updatePublisher, failOpen: *failOpen,
 			manifestFile: *manifestFile, planFile: *planFile, rolloutFile: *rolloutFile,
 			steerExe: *steerExe, interval: *interval,
 		})); err != nil {
@@ -297,14 +297,17 @@ func build(o buildOpts) (*updater, error) {
 	// carries the FREEZE, so one key for both means the party a halt exists to stop is the party who signs the
 	// halt: a compromised release key could publish a bad build and lift the stop that would have caught it.
 	//
-	// The PLAN key is dropped rather than the update key. Refusing the update key would leave the device unable
-	// to update at all, which is the state this product spent weeks escaping; dropping the plan key leaves it
-	// unable to verify a plan, which LoadRollout already has an answer for.
-	planPins, refusedPlanPins := agentupdate.SeparatePlanKeys(splitPins(pins), splitPins(o.planPin))
+	// Keep any independent plan keys, but do not turn an explicitly configured
+	// plan authority into the legacy unverified opt-out when every key collides.
+	configuredPlanPins := splitPins(o.planPin)
+	planPins, refusedPlanPins := agentupdate.SeparatePlanKeys(splitPins(pins), configuredPlanPins)
 	if len(refusedPlanPins) > 0 {
 		log.Printf("★ REFUSED %d plan-signing key(s) that are also this device's UPDATE-signing key: one key "+
 			"signing both the release and the halt means a compromised release key can also unfreeze the fleet",
 			len(refusedPlanPins))
+	}
+	if len(configuredPlanPins) > 0 && len(planPins) == 0 {
+		return nil, fmt.Errorf("configured plan-signing keys all conflict with the update-signing authority; refusing an unverified rollout")
 	}
 
 	return &updater{

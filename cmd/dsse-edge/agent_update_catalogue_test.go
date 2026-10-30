@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/lantern-networks/dsse-core/agentpolicy"
@@ -48,7 +47,7 @@ func TestTheDeploymentsCatalogueIsOfferedToEveryOrganization(t *testing.T) {
 // pending/active split exists to prevent, reintroduced one layer down.
 func TestAnOrganizationDownloadsTheCatalogueArtifact(t *testing.T) {
 	dir := t.TempDir()
-	shelf := filepath.Join(dir, agentUpdateCatalogueScope)
+	shelf := tenantArtifactDir(dir, agentUpdateCatalogueScope)
 	if err := os.MkdirAll(shelf, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +62,7 @@ func TestAnOrganizationDownloadsTheCatalogueArtifact(t *testing.T) {
 			"404s and the fleet stays where it is", got)
 	}
 	// An organization that has its own bytes uses those.
-	own := filepath.Join(dir, "tenant_customer")
+	own := tenantArtifactDir(dir, "tenant_customer")
 	if err := os.MkdirAll(own, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -73,31 +72,4 @@ func TestAnOrganizationDownloadsTheCatalogueArtifact(t *testing.T) {
 	if got := artifactReadPath(dir, "tenant_customer", "darwin", "arm64", "0.3.0"); got != filepath.Join(own, name) {
 		t.Fatalf("the organization's own bytes were not preferred: %q", got)
 	}
-}
-
-// ★★★ AND AN EDGE MUST ACCEPT THE CATALOGUE (2026-08-28). The Edge refuses a published set answered for any
-// organization but the one it enforces — right, because handing one customer's release to another's devices is
-// exactly what that check is for. But an Edge serves EVERY organization on the deployment, and what the
-// operator publishes for all of them arrives under the catalogue's name. Refusing it left each Edge carrying
-// only its own enforcement tenant's set, which is how a device of a customer organization was answered "no
-// agent updates are published by this edge" while the control plane held one for it.
-func TestAnEdgeAcceptsTheDeploymentsCatalogueAndStillRefusesAnothersRelease(t *testing.T) {
-	answered := func(edgeTenant, answeredFor string) bool {
-		want := edgeTenant
-		return !(want != "" && !equalFoldTrim(answeredFor, want) && !equalFoldTrim(answeredFor, agentUpdateCatalogueScope))
-	}
-	if !answered("tenant_default", agentUpdateCatalogueScope) {
-		t.Error("an Edge refused the deployment's own catalogue, so no organization but its own can be updated")
-	}
-	if !answered("tenant_default", "tenant_default") {
-		t.Error("an Edge refused its own organization's release")
-	}
-	if answered("tenant_default", "tenant_somebody_else") {
-		t.Error("an Edge accepted ANOTHER organization's release — that is the cross-customer hand-off this " +
-			"check exists to stop, and it must stay stopped")
-	}
-}
-
-func equalFoldTrim(a, b string) bool {
-	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 }

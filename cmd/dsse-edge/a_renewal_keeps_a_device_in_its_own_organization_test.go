@@ -45,8 +45,8 @@ func TestARenewalIsSignedUnderTheDevicesOwnOrganization(t *testing.T) {
 		t.Errorf("no ledger means no answer, not a default: %q", got)
 	}
 
-	// ★ An organization this node holds no authority for falls back to the node's signer — the behaviour a
-	// single-tenant deployment has always had — rather than refusing a renewal, which would strand the device.
+	// Only the node's own tenant may use its configured signer. Other tenants
+	// must wait for their managed authority; see the endpoint regression tests.
 	if signerFor("tenant_no_authority") != nil {
 		t.Fatal("this test's node holds no authority for that organization; the fixture is wrong")
 	}

@@ -35,8 +35,10 @@ func (e Evaluator) serverInitiatedDecisionFor(req model.DecisionRequest, now tim
 		return "allow", "Server-initiated access allowed (warn) by Legacy Exception.", []string{"server_initiated_legacy_exception_warn"}
 	case "observe":
 		return "allow", "Server-initiated access allowed (observe) by Legacy Exception.", []string{"server_initiated_legacy_exception_observe"}
-	default: // allow
+	case "allow":
 		return "allow", "Server-initiated access allowed by Legacy Exception.", []string{"server_initiated_legacy_exception_allow"}
+	default:
+		return "deny", "Server-initiated access denied because the matching Legacy Exception is invalid.", []string{"server_initiated_invalid_exception"}
 	}
 }
 

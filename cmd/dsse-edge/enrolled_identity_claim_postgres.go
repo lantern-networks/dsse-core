@@ -160,15 +160,10 @@ func (c postgresEnrolledIdentityClaims) BackfillClaims(ctx context.Context, clai
 	return inserted, nil
 }
 
-// canonicalClaimTenant is how a tenant id becomes a claim key.
-//
-// ★ THE REST OF THE SYSTEM TREATS TENANTS CASE-INSENSITIVELY AND THIS PRIMARY KEY DID NOT (2026-08-13,
-// twenty-sixth review). The ledger compares with EqualFold and the token store canonicalises, so
-// `Tenant_A/device-1` and `tenant_a/device-1` are the same device everywhere except here — where they would
-// be two rows, two claims, and two certificates for one machine. A key that disagrees with the identity model
-// around it is not a key.
+// Tenant IDs are exact, case-distinct identities. Only surrounding whitespace is
+// removed; lowercasing would merge separate organizations' one-time claims.
 func canonicalClaimTenant(tenantID string) string {
-	return strings.ToLower(strings.TrimSpace(tenantID))
+	return strings.TrimSpace(tenantID)
 }
 
 // ensureIdentityClaimBarrier records — or requires — that the EXISTING fleet has been imported into the claim.

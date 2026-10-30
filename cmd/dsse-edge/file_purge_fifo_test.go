@@ -20,7 +20,7 @@ import (
 func blockTenantLogAppend(t *testing.T, w *logs.Writer, tenant string) func() {
 	t.Helper()
 	name := "stalled.log.jsonl"
-	path := filepath.Join(w.Dir(), "tenants", tenant, name)
+	path := filepath.Join(w.Dir(), "tenants", logs.SafeTenantSegment(tenant), name)
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestFilePurgeBlockedFilesystemReturnsUnknown(t *testing.T) {
 	if !newLegalHoldStore(h.persister).IsHeld("target") {
 		t.Fatal("marker missing after failed erasure")
 	}
-	if _, err = os.Stat(filepath.Join(w.Dir(), "tenants", "target", "stalled.log.jsonl")); err != nil {
+	if _, err = os.Stat(filepath.Join(w.Dir(), "tenants", logs.SafeTenantSegment("target"), "stalled.log.jsonl")); err != nil {
 		t.Fatal("late close proceeded to deletion", err)
 	}
 }

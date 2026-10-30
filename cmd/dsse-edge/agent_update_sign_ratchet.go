@@ -173,7 +173,7 @@ func (r *agentUpdateSignRatchet) FloorsForTenant(tenantID string) map[string]str
 	if r == nil {
 		return out
 	}
-	prefix := strings.ToLower(strings.TrimSpace(tenantID)) + "|"
+	prefix := strings.TrimSpace(tenantID) + "|"
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for k, v := range r.high {

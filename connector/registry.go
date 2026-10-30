@@ -18,8 +18,8 @@ type Registry struct {
 	connectors map[string]model.ConnectorRegistration
 	// catalogGen is a monotonic counter bumped ONLY when the route-relevant connector catalog changes (a new
 	// connector, or a change to tenant/status/region/cluster/private-base-url/reachable-routes). It is NOT bumped
-	// by heartbeats or runtime-secret rotation, so a config-bundle distributor can fan the catalog fleet-wide and
-	// trigger an Edge re-pull on real catalog changes only (no per-heartbeat churn).
+	// by steady heartbeats or runtime-secret rotation. A heartbeat that changes status or reachable routes is
+	// route-relevant and bumps the generation, without causing per-heartbeat churn.
 	catalogGen uint64
 	// persister, when set, makes the registry DURABLE. It was in-memory only, and that turns a routine Edge
 	// restart into a connector outage: the registry is wiped, a connector only registers ONCE at startup, so
@@ -202,7 +202,7 @@ func (r *Registry) Heartbeat(heartbeat model.ConnectorHeartbeat, now time.Time) 
 	if !ok {
 		return conn, fmt.Errorf("connector %s is not registered", heartbeat.ID)
 	}
-	priorStatus := conn.Status
+	prior := conn
 	if heartbeat.TenantID != "" && heartbeat.TenantID != conn.TenantID {
 		return conn, fmt.Errorf("connector tenant_id %s does not match registered tenant_id %s", heartbeat.TenantID, conn.TenantID)
 	}
@@ -239,8 +239,9 @@ func (r *Registry) Heartbeat(heartbeat model.ConnectorHeartbeat, now time.Time) 
 		conn.ReachableRoutes = *heartbeat.ReachableRoutes
 	}
 	r.connectors[conn.ID] = conn
-	if conn.Status != priorStatus {
-		r.persistLocked() // a transition is state an operator reads; a steady beat is not
+	if connectorCatalogChanged(prior, conn) {
+		r.catalogGen++
+		r.persistLocked() // route/status changes are durable; a steady beat is not
 	}
 	return conn, nil
 }

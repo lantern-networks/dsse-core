@@ -33,6 +33,29 @@ func TestAnAdministratorOfADeletedTenantIsRefused(t *testing.T) {
 	}
 }
 
+func TestDeletedTenantIsNotResurrectedByCaseDistinctTenant(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	store := newAdminTenantModelStore(model.PolicyBundle{}, now)
+	for _, tenant := range []string{"Acme", "acme"} {
+		if _, err := store.Put(ctx, adminTenantModel{TenantID: tenant, DisplayName: tenant, Status: "active"}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Delete(ctx, "Acme"); err != nil {
+		t.Fatal(err)
+	}
+	if _, gone := adminTenantIsGone(ctx, store, "Acme"); !gone {
+		t.Fatal("deleted Acme was treated as present because acme remains")
+	}
+	if adminTenantStillExists(ctx, store, "Acme") {
+		t.Fatal("deleted Acme was blocked from purge because acme remains")
+	}
+	if _, gone := adminTenantIsGone(ctx, store, "acme"); gone {
+		t.Fatal("remaining acme was treated as deleted")
+	}
+}
+
 // The refusal must never fire on "I cannot tell". A node whose registry failed to load, or which is not the
 // tenant authority at all, enumerates nothing — and reading that as "every tenant was deleted" would lock
 // every administrator out of the control plane, which is far worse than the defect being fixed. This is the

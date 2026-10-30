@@ -108,7 +108,7 @@ func adminAPITokenAuditLog(eventType string, token adminAPIToken, evaluator deci
 	result := "success"
 	return model.AuditLog{
 		ID:             randomEdgeID("audit_"+eventType+"_", time.Now().UTC()),
-		TenantID:       evaluator.PolicyBundle.TenantID,
+		TenantID:       token.TenantID,
 		ActorUserID:    &token.CreatedByAdminPrincipalID,
 		EventType:      eventType,
 		TargetType:     stringPtr("admin_api_token"),

@@ -80,3 +80,33 @@ func TestInspectionStore(t *testing.T) {
 		t.Fatalf("count %d exceeds capacity %d", s.Count(), s.Capacity())
 	}
 }
+
+func TestInspectionSameIDIsTenantScopedInMemoryAndSnapshot(t *testing.T) {
+	p := &memPersister{}
+	s := NewStore(0)
+	if err := s.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		s.Upsert(model.InspectionEvent{ID: "same", TenantID: tenant})
+	}
+	if s.Count() != 2 {
+		t.Fatalf("count=%d, want 2", s.Count())
+	}
+	if err := s.PersistIfDirty(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := NewStore(0)
+	if err := reloaded.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		got, ok := reloaded.GetForTenant(tenant, "same")
+		if !ok || got.TenantID != tenant {
+			t.Fatalf("%s event missing: %+v", tenant, got)
+		}
+	}
+	if _, ok := reloaded.Get("same"); ok {
+		t.Fatal("unscoped same-ID lookup must refuse")
+	}
+}

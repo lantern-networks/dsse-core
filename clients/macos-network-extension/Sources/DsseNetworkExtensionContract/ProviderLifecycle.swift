@@ -85,7 +85,7 @@ public final class ProviderLifecycleManager {
     private var decider: ProviderFlowDeciding?
     private var loadedRules: NetworkExtensionRules?
     private var lifecycleState: ProviderLifecycleState?
-    private var lastRulesModificationDate: Date?
+    private var lastRulesFileStamp: ProviderRulesFileStamp?
     private var lastAgentConfigPath: String?
 
     public var state: ProviderLifecycleState? {
@@ -108,7 +108,7 @@ public final class ProviderLifecycleManager {
             let rulesURL = try resolveProviderRulesRef(rulesRef, relativeTo: configDirectory)
             let rules = try loadRules(from: rulesURL)
             try NetworkExtensionRulesValidator.validate(rules)
-            let rulesModificationDate = rulesFileModificationDate(from: rulesURL)
+            let rulesFileStamp = providerRulesFileStamp(from: rulesURL)
             let nextState = ProviderLifecycleState(
                 status: .running,
                 agentConfig: agentConfigName,
@@ -125,7 +125,7 @@ public final class ProviderLifecycleManager {
             self.decider = RulesBackedProviderFlowDecider(rules: rules)
             self.loadedRules = rules
             self.lifecycleState = nextState
-            self.lastRulesModificationDate = rulesModificationDate
+            self.lastRulesFileStamp = rulesFileStamp
             self.lastAgentConfigPath = agentConfigPath
             reloadLock.unlock()
             return nextState
@@ -146,7 +146,7 @@ public final class ProviderLifecycleManager {
             self.decider = nil
             self.loadedRules = nil
             self.lifecycleState = nextState
-            self.lastRulesModificationDate = nil
+            self.lastRulesFileStamp = nil
             self.lastAgentConfigPath = nil
             reloadLock.unlock()
             return nextState
@@ -503,21 +503,18 @@ public final class ProviderLifecycleManager {
             }
             let configDirectory = URL(fileURLWithPath: configPath).deletingLastPathComponent()
             let rulesURL = try resolveProviderRulesRef(rulesRef, relativeTo: configDirectory)
-            let currentDate = rulesFileModificationDate(from: rulesURL)
-            if let currentDate, let lastRulesModificationDate {
-                guard currentDate > lastRulesModificationDate else {
-                    return "skipped_not_newer"
-                }
-            } else {
-                guard currentDate != lastRulesModificationDate else {
-                    return "skipped_not_newer"
-                }
+            let currentStamp = providerRulesFileStamp(from: rulesURL)
+            // Rules are commonly replaced atomically. The replacement may have the
+            // same (or an older restored) mtime, while its file identity changes.
+            // Only an unchanged, readable stamp permits skipping validation.
+            if let currentStamp, currentStamp == lastRulesFileStamp {
+                return "skipped_not_newer"
             }
             let rules = try loadRules(from: rulesURL)
             try NetworkExtensionRulesValidator.validate(rules)
             self.decider = RulesBackedProviderFlowDecider(rules: rules)
             self.loadedRules = rules
-            self.lastRulesModificationDate = currentDate
+            self.lastRulesFileStamp = currentStamp
             self.lifecycleState = ProviderLifecycleState(
                 status: .running,
                 agentConfig: URL(fileURLWithPath: configPath).lastPathComponent,
@@ -563,7 +560,7 @@ public final class ProviderLifecycleManager {
         self.decider = nil
         self.loadedRules = nil
         self.lifecycleState = nil
-        self.lastRulesModificationDate = nil
+        self.lastRulesFileStamp = nil
         self.lastAgentConfigPath = nil
         reloadLock.unlock()
     }
@@ -677,8 +674,21 @@ private func loadRules(from url: URL) throws -> NetworkExtensionRules {
     }
 }
 
-private func rulesFileModificationDate(from url: URL) -> Date? {
-    (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+private struct ProviderRulesFileStamp: Equatable {
+    let modificationDate: Date?
+    let fileNumber: UInt64?
+    let size: UInt64?
+}
+
+private func providerRulesFileStamp(from url: URL) -> ProviderRulesFileStamp? {
+    guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+        return nil
+    }
+    return ProviderRulesFileStamp(
+        modificationDate: attributes[.modificationDate] as? Date,
+        fileNumber: (attributes[.systemFileNumber] as? NSNumber)?.uint64Value,
+        size: (attributes[.size] as? NSNumber)?.uint64Value
+    )
 }
 
 private func providerLifecycleErrorDescription(_ error: Error) -> String {

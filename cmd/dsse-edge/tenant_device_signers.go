@@ -66,7 +66,7 @@ var tenantDeviceIdentity = &tenantDeviceSigners{signers: map[string]*deviceca.Si
 // resolved is worse than none.
 func (t *tenantDeviceSigners) Install(mat tenantDeviceMaterial, registry *tenantca.TenantCARegistry,
 	persist func(*tenantca.TenantCARegistry) error) error {
-	tenant := strings.ToLower(strings.TrimSpace(mat.TenantID))
+	tenant := strings.TrimSpace(mat.TenantID)
 	if tenant == "" {
 		return fmt.Errorf("device-identity material names no organization")
 	}
@@ -171,7 +171,7 @@ func (t *tenantDeviceSigners) Rotation(tenantID string) (deviceAuthorityFingerpr
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	p, ok := t.rotation[strings.ToLower(strings.TrimSpace(tenantID))]
+	p, ok := t.rotation[strings.TrimSpace(tenantID)]
 	return p, ok
 }
 
@@ -182,7 +182,7 @@ func (t *tenantDeviceSigners) For(tenantID string) *deviceca.Signer {
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.signers[strings.ToLower(strings.TrimSpace(tenantID))]
+	return t.signers[strings.TrimSpace(tenantID)]
 }
 
 // Organizations names the organizations this node can enrol for, for the start-up line and the admin surface.

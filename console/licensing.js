@@ -352,6 +352,7 @@ async function openApplyLicence(content) {
   const preview = el("div", {});
   const applyBtn = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Check this licence", ja: "ライセンスを確認" }) });
   let verified = false;
+  let previewedRaw = "";
 
   const m = uiModal({
     title: bl({ en: "Apply a licence", ja: "ライセンスを適用" }),
@@ -367,10 +368,25 @@ async function openApplyLicence(content) {
   applyBtn.addEventListener("click", async () => {
     const raw = area.value.trim();
     if (!raw) { uiToast(bl({ en: "Paste or choose a licence file first.", ja: "先にライセンスファイルを指定してください。" }), "err"); return; }
+    // The preview authorizes only the exact licence bytes it displayed. A pasted edit or a
+    // newly chosen file must be checked again before the apply request is sent.
+    if (verified && raw !== previewedRaw) {
+      verified = false;
+      previewedRaw = "";
+      preview.innerHTML = "";
+      applyBtn.textContent = bl({ en: "Check this licence", ja: "ライセンスを確認" });
+    }
     applyBtn.disabled = true;
 
     if (!verified) {
-      const r = await apiFetch("POST", "/admin/license?dry_run=true", raw);
+      let r;
+      try {
+        r = await apiFetch("POST", "/admin/license?dry_run=true", raw);
+      } catch (_) {
+        applyBtn.disabled = false;
+        uiToast(bl({ en: "Could not check the licence. Try again.", ja: "ライセンスを確認できませんでした。再試行してください。" }), "err");
+        return;
+      }
       applyBtn.disabled = false;
       if (!r.ok) {
         preview.innerHTML = "";
@@ -391,11 +407,19 @@ async function openApplyLicence(content) {
       }
       lines.forEach((t) => preview.appendChild(el("p", { class: "ui-view-desc", text: t })));
       verified = true;
+      previewedRaw = raw;
       applyBtn.textContent = bl({ en: "Apply it", ja: "適用する" });
       return;
     }
 
-    const r = await apiFetch("POST", "/admin/license", raw);
+    let r;
+    try {
+      r = await apiFetch("POST", "/admin/license", raw);
+    } catch (_) {
+      applyBtn.disabled = false;
+      uiToast(bl({ en: "Could not apply the licence. Check its status before retrying.", ja: "ライセンスを適用できませんでした。状態を確認してから再試行してください。" }), "err");
+      return;
+    }
     if (!r.ok) {
       applyBtn.disabled = false;
       uiToast((r.body && r.body.error) || ("HTTP " + r.status), "err"); return;

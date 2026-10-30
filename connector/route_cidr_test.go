@@ -44,3 +44,22 @@ func TestResolveConnectorForIPTieBreakByID(t *testing.T) {
 		t.Fatalf("tie-break: got (%q,%v), want conn-a", id, ok)
 	}
 }
+
+func TestResolveConnectorsForDestinationKeepsHAPairWithinIPNamespace(t *testing.T) {
+	all := []model.ConnectorRegistration{
+		cidrConn("a-osaka", "osaka", "10.0.0.0/8"),
+		cidrConn("b-osaka", "osaka", "10.0.0.0/8"),
+		cidrConn("a-tokyo", "tokyo", "10.0.0.0/8"),
+		cidrConn("b-tokyo", "tokyo", "10.0.0.0/8"),
+	}
+	got := ResolveConnectorsForDestination("10.2.3.4", "tokyo", all)
+	if len(got) != 2 || got[0] != "a-tokyo" || got[1] != "b-tokyo" {
+		t.Fatalf("tokyo IP candidates = %v, want only its HA pair", got)
+	}
+	if got := ResolveConnectorsForDestination("10.2.3.4", "", all); len(got) != 0 {
+		t.Fatalf("unscoped overlapping site IP candidates = %v, want none", got)
+	}
+	if got := ResolveConnectorsForHost("10.2.3.4", all); len(got) != 0 {
+		t.Fatalf("legacy unscoped resolver bypassed site ambiguity: %v", got)
+	}
+}

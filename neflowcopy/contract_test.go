@@ -345,17 +345,14 @@ func TestContractRejectsDuplicateAndConcurrentRegistryOpen(t *testing.T) {
 		Port:          443,
 		Limits:        limits,
 	})
-	if err == nil {
-		t.Fatal("Open returned nil error after concurrent cap was reached")
+	if err != nil {
+		t.Fatalf("legacy sender cap became an operator policy: %v", err)
 	}
-	if !strings.Contains(err.Error(), "concurrent connection cap") {
-		t.Fatalf("concurrent Open error = %q, want concurrent connection cap", err.Error())
+	if got := contract.Count(); got != 2 {
+		t.Fatalf("Count = %d, want both admitted connections", got)
 	}
-	if got := contract.Count(); got != 1 {
-		t.Fatalf("Count = %d after concurrent cap rejection, want original connection only", got)
-	}
-	if _, ok := contract.TenantID("req_tcp_ne_registry_002"); ok {
-		t.Fatal("tenant metadata recorded for rejected concurrent-cap open")
+	if tenant, ok := contract.TenantID("req_tcp_ne_registry_002"); !ok || tenant != "tenant_lab_002" {
+		t.Fatal("new flow lost its own tenant scope")
 	}
 }
 

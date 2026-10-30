@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/idpregistry"
 	"github.com/lantern-networks/dsse-core/model"
 )
 
@@ -41,9 +42,20 @@ const (
 )
 
 type deviceRuntimeInfo struct {
-	os            string
-	loggedInUsers map[string]bool
-	lastSeen      time.Time
+	os string
+	// The version is reported by a verified device heartbeat, not inferred from
+	// the installed package or a steer connection. It travels in the existing
+	// device_state shipment so the control plane can show it fleet-wide.
+	agentVersion           string
+	agentVersionReportedAt time.Time
+	loggedInUsers          map[string]bool
+	// Observed over a verified device mux. These are candidate IDs for an
+	// administrator to assign, never an automatic identity assignment.
+	authAccounts map[string]string // OS principal -> agent-reported display name
+	// Oldest first. Included in device_state history so a reader restoring
+	// those rows can preserve the bounded candidate list's eviction order.
+	authAccountOrder []string
+	lastSeen         time.Time
 	// lastSteered is the last time this device actually STEERED something: a mux CONNECT or a flow OPEN.
 	//
 	// ★★ IT IS NOT lastSeen, AND CONFLATING THEM TOLD AN OPERATOR THE OPPOSITE OF THE TRUTH (2026-08-13, from
@@ -121,6 +133,18 @@ func (s *endpointRuntimeStore) entry(deviceID string) *deviceRuntimeInfo {
 	return e
 }
 
+// entryForTenant is called under mu before applying any newly reported fields.
+// A reused identity must not carry OS, posture, activity, or provenance from its
+// previous tenant, including fields omitted by the new tenant's sparse report.
+func (s *endpointRuntimeStore) entryForTenant(deviceID, tenantID string) *deviceRuntimeInfo {
+	e := s.entry(deviceID)
+	if tenantID != "" && e.tenant != tenantID {
+		e = &deviceRuntimeInfo{tenant: tenantID, loggedInUsers: map[string]bool{}}
+		s.m[deviceID] = e
+	}
+	return e
+}
+
 // ingestFromConnect reads the OS + posture headers off a steer-mux CONNECT and records them for deviceID, and
 // stamps last-seen. Returns the parsed posture (and whether posture was present) so the caller can log it.
 func (s *endpointRuntimeStore) ingestFromConnect(deviceID, tenantID string, h http.Header, sourceIP string, now time.Time) (model.DevicePostureSignals, bool) {
@@ -133,7 +157,7 @@ func (s *endpointRuntimeStore) ingestFromConnect(deviceID, tenantID string, h ht
 	os := sanitizeRuntimeField(h.Get(deviceHeaderOS), 64)
 
 	s.mu.Lock()
-	e := s.entry(deviceID)
+	e := s.entryForTenant(deviceID, tenantID)
 	e.lastSeen = now
 	if sourceIP != "" {
 		e.sourceIP = sourceIP
@@ -142,9 +166,7 @@ func (s *endpointRuntimeStore) ingestFromConnect(deviceID, tenantID string, h ht
 	// update courier, which speaks to the same Edge over the same transport and steers nothing.
 	e.lastSteered = now
 	e.steering = true
-	if tenantID != "" {
-		e.tenant = tenantID
-	}
+
 	if os != "" {
 		e.os = os
 	}
@@ -189,14 +211,12 @@ func (s *endpointRuntimeStore) ingestFromReport(deviceID, tenantID, osName strin
 		return
 	}
 	s.mu.Lock()
-	e := s.entry(deviceID)
+	e := s.entryForTenant(deviceID, tenantID)
 	e.lastSeen = now
 	if sourceIP != "" {
 		e.sourceIP = sourceIP
 	}
-	if tenantID != "" {
-		e.tenant = tenantID
-	}
+
 	if o := sanitizeRuntimeField(osName, 64); o != "" {
 		e.os = o
 	}
@@ -226,6 +246,27 @@ func (s *endpointRuntimeStore) ingestFromReport(deviceID, tenantID, osName strin
 	emitDeviceStateChange(event)
 }
 
+// ingestAgentVersion is called only after a heartbeat has been accepted for a
+// verified transport identity and authoritative tenant. A bounded refresh
+// keeps the control-plane view current even while an endpoint is idle, without
+// shipping every 15-second heartbeat as a separate state event.
+func (s *endpointRuntimeStore) ingestAgentVersion(deviceID, tenantID, version string, now time.Time) {
+	deviceID = strings.TrimSpace(deviceID)
+	version = strings.TrimSpace(version)
+	if deviceID == "" || tenantID == "" || version == "" {
+		return
+	}
+	s.mu.Lock()
+	e := s.entryForTenant(deviceID, tenantID)
+
+	e.agentVersion = version
+	e.agentVersionReportedAt = now.UTC()
+	e.lastSeen = now.UTC()
+	event := s.changeEventLocked(e, deviceID)
+	s.mu.Unlock()
+	emitDeviceStateChange(event)
+}
+
 // changeSignature is the state whose CHANGE is worth persisting: OS + logged-in users + posture. Extracted so
 // the startup hydration can seed it from restored state — a device restored from history and then reporting the
 // SAME state must not look like a transition and emit a spurious change event.
@@ -235,6 +276,7 @@ func (e *deviceRuntimeInfo) changeSignature() string {
 		users = append(users, u)
 	}
 	sort.Strings(users)
+	accounts := observedAuthAccountSignature(e.authAccounts)
 	// ★ THE STEERING COMPONENT CARRIES A COARSE CLOCK (2026-08-14). It used to be the bare boolean, so a device
 	// that kept steering never differed from itself and shipped nothing after its first flow — freezing
 	// last_steered on every OTHER Edge's copy of it, two minutes after which the fleet view called the whole
@@ -248,7 +290,11 @@ func (e *deviceRuntimeInfo) changeSignature() string {
 	// The address is part of the state: a device that moves to another network is the same device somewhere
 	// else, and that is a change an operator is entitled to see. It changes when the network changes and not
 	// on a clock, so including it re-ships nothing on its own.
-	return e.os + "\x1f" + strings.Join(users, ",") + "\x1f" + steer + "\x1f" + boolPtrLog(e.posture.DiskEncryptionEnabled) + "\x1f" + boolPtrLog(e.posture.FirewallEnabled) + "\x1f" + e.sourceIP
+	versionBucket := ""
+	if e.agentVersion != "" {
+		versionBucket = strconv.FormatInt(e.agentVersionReportedAt.UTC().Truncate(time.Minute).Unix(), 10)
+	}
+	return e.os + "\x1f" + strings.Join(users, ",") + "\x1f" + accounts + "\x1f" + steer + "\x1f" + boolPtrLog(e.posture.DiskEncryptionEnabled) + "\x1f" + boolPtrLog(e.posture.FirewallEnabled) + "\x1f" + e.sourceIP + "\x1f" + e.agentVersion + "\x1f" + versionBucket
 }
 
 // changeEventLocked (mutex held) returns a device-state change event to persist when e's meaningful state
@@ -260,7 +306,7 @@ func (s *endpointRuntimeStore) changeEventLocked(e *deviceRuntimeInfo, deviceID 
 		users = append(users, u)
 	}
 	sort.Strings(users)
-	if e.os == "" && len(users) == 0 && e.posture.DiskEncryptionEnabled == nil && e.posture.FirewallEnabled == nil {
+	if e.os == "" && len(users) == 0 && e.posture.DiskEncryptionEnabled == nil && e.posture.FirewallEnabled == nil && e.agentVersion == "" {
 		return nil // nothing meaningful yet
 	}
 	// A steering transition is a change worth shipping; steering CONTINUING is not, or every device would emit
@@ -272,15 +318,19 @@ func (s *endpointRuntimeStore) changeEventLocked(e *deviceRuntimeInfo, deviceID 
 	}
 	e.lastSig = sig
 	return map[string]any{
-		"tenant_id": e.tenant,
-		"device_id": deviceID,
-		"event":     "device_state_changed",
-		"os":        e.os,
+		"tenant_id":                 e.tenant,
+		"device_id":                 deviceID,
+		"event":                     "device_state_changed",
+		"os":                        e.os,
+		"agent_version":             e.agentVersion,
+		"agent_version_reported_at": rfc3339OrEmpty(e.agentVersionReportedAt),
 		// Where it reached us from, so a fleet-wide view can answer it for a device steering through another
 		// node. A reader that does not know this field is the failure this repository has hit twice; both
 		// restore paths below read it.
 		"source_ip":               e.sourceIP,
 		"logged_in_users":         users,
+		"auth_accounts":           observedAuthAccountRows(e.authAccounts),
+		"auth_account_order":      append([]string(nil), e.authAccountOrder...),
 		"disk_encryption_enabled": e.posture.DiskEncryptionEnabled,
 		"firewall_enabled":        e.posture.FirewallEnabled,
 		// ★ AND WHEN, AND FROM WHAT (2026-08-14). The two booleans shipped and the rest did not, so a reader on
@@ -319,21 +369,26 @@ func emitDeviceStateChange(event map[string]any) {
 // 2026-08-14, and under that name its one caller invoked it only when a username was present, so any flow
 // without one left the device recorded as never having steered.
 func (s *endpointRuntimeStore) recordSteeredFlow(deviceID, tenantID, osUser string, now time.Time) {
+	s.recordSteeredFlowWithOwner(deviceID, tenantID, osUser, "", now)
+}
+
+func (s *endpointRuntimeStore) recordSteeredFlowWithOwner(deviceID, tenantID, osUser, principal string, now time.Time) {
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID == "" {
 		return
 	}
 	s.mu.Lock()
-	e := s.entry(deviceID)
+	e := s.entryForTenant(deviceID, tenantID)
 	e.lastSeen = now
 	// A flow OPEN is steering: this is traffic being carried, not a device asking a question.
 	e.lastSteered = now
 	e.steering = true
-	if tenantID != "" {
-		e.tenant = tenantID
-	}
+
 	if u := sanitizeRuntimeField(osUser, 128); u != "" {
 		e.loggedInUsers[u] = true
+		if idpregistry.ValidOSPrincipal(principal) {
+			e.observeAuthAccount(principal, u)
+		}
 	}
 	event := s.changeEventLocked(e, deviceID)
 	s.mu.Unlock()

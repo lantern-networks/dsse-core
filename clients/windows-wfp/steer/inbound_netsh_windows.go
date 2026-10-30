@@ -16,6 +16,7 @@ package main
 // service cannot spawn child processes (0xC0000142; see quicblock_windows.go for the same constraint).
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -214,7 +215,7 @@ func fwFingerprint(rules []fwRule) string {
 // each poll instead of pushing to the WFP driver. The firewall backend is always enforcing (rules are real);
 // cfg.enforce is ignored and observe is deferred (handoff v1). Wired in main_windows.go behind
 // -inbound-backend=firewall.
-func runInboundNetsh(cfg inboundRuntimeConfig) error {
+func runInboundNetsh(cfg inboundRuntimeConfig) (result error) {
 	lastFP := "\x00never" // != any real fingerprint => first pass always reconciles
 	sincePush := 0
 	reconcile := func() {
@@ -242,7 +243,11 @@ func runInboundNetsh(cfg inboundRuntimeConfig) error {
 	fmt.Printf("inbound: firewall backend active — reconciling group %q (device_group=%q)\n", dsseFirewallGroup, cfg.deviceGroup)
 	reconcile()
 	defer func() {
-		removeDSSEFirewallRules() // cleanup on clean shutdown (a force-kill skips this; --mode recover also clears)
+		if err := removeDSSEFirewallRules(); err != nil {
+			result = errors.Join(result, fmt.Errorf("inbound firewall cleanup: %w", err))
+			log.Printf("dsse inbound: firewall rules not confirmed cleared: %v", err)
+			return
+		}
 		fmt.Println("inbound: firewall rules cleared")
 	}()
 
@@ -275,19 +280,10 @@ func runInboundNetsh(cfg inboundRuntimeConfig) error {
 	}
 }
 
-// removeDSSEFirewallRules clears the DSSE group (shutdown / backend switch). Best-effort.
-func removeDSSEFirewallRules() {
-	c, err := hiddenPowerShell(fmt.Sprintf("Get-NetFirewallRule -Group '%s' -ErrorAction SilentlyContinue | Remove-NetFirewallRule", dsseFirewallGroup))
-	if err != nil {
-		// Said out loud: these are inbound ALLOW rules this agent added, and leaving them behind on a box that is
-		// no longer steering is a hole nobody knows is open. The group name is the whole recipe for clearing it.
-		log.Printf("dsse inbound: the firewall rules in group %q could NOT be removed (%v) — they are still in "+
-			"effect on this box and must be cleared by hand", dsseFirewallGroup, err)
-		return
-	}
-	// Bounded (review C-2): powershell/NetSecurity module init can hang in a session-0 recover custom action;
-	// a hard timeout keeps a hung child from wedging the msiexec transaction.
-	runBounded(c, 20*time.Second)
+// removeDSSEFirewallRules confirms all DSSE-group rules are absent. These may
+// include inbound ALLOW rules, so an uncertain result must be visible to recovery.
+func removeDSSEFirewallRules() error {
+	return removeOwnedFirewallRules("Group", dsseFirewallGroup, 20*time.Second)
 }
 
 // sanitizePSName / sanitizePSValue strip single quotes (and control chars) so an id/address cannot break out of

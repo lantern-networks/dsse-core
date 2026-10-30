@@ -20,7 +20,7 @@ func adminIdPChangeAuditLog(r *http.Request, tenant, id, action string, evaluato
 		PolicyBundleID: &evaluator.PolicyBundle.ID, EdgeRegionID: &evaluator.EdgeRegionID,
 		EdgeClusterID: &evaluator.EdgeClusterID, Timestamp: now.Format(time.RFC3339), Metadata: metadata,
 	}
-	if caller, ok := adminIdentityFromRequest(r); ok && !strings.EqualFold(tenant, caller.TenantID) {
+	if caller, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(tenant) != strings.TrimSpace(caller.TenantID) {
 		stampOperatorActor(metadata, caller)
 	}
 	return audit

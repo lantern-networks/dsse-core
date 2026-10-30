@@ -76,14 +76,18 @@ func (f *fileCredentialPersistence) LoadAll(_ context.Context) ([]*localAdminCre
 	if err != nil {
 		return nil, fmt.Errorf("read admin credential snapshot: %w", err)
 	}
-	f.byEmail = map[string]*localAdminCredential{}
 	if len(strings.TrimSpace(string(data))) == 0 {
+		f.byEmail = map[string]*localAdminCredential{}
 		return []*localAdminCredential{}, nil
 	}
 	var records []persistedCredential
 	if err := json.Unmarshal(data, &records); err != nil {
 		return nil, fmt.Errorf("parse admin credential snapshot: %w", err)
 	}
+	if records == nil {
+		return nil, fmt.Errorf("admin credential snapshot must be an array")
+	}
+	next := make(map[string]*localAdminCredential, len(records))
 	out := make([]*localAdminCredential, 0, len(records))
 	for i := range records {
 		cred, err := credentialFromPersisted(records[i])
@@ -92,9 +96,17 @@ func (f *fileCredentialPersistence) LoadAll(_ context.Context) ([]*localAdminCre
 			// the operator's 2FA silently. Do not include secret material in the error.
 			return nil, fmt.Errorf("load admin credential %s: %w", records[i].Email, err)
 		}
-		f.byEmail[credentialEmailKey(cred.Email)] = cred
+		key := credentialEmailKey(cred.Email)
+		if key == "" || strings.TrimSpace(cred.TenantID) == "" || strings.TrimSpace(cred.PrincipalID) == "" {
+			return nil, fmt.Errorf("admin credential snapshot contains an incomplete identity")
+		}
+		if _, duplicate := next[key]; duplicate {
+			return nil, fmt.Errorf("admin credential snapshot contains a duplicate email")
+		}
+		next[key] = cred
 		out = append(out, cloneCredential(cred))
 	}
+	f.byEmail = next
 	return out, nil
 }
 

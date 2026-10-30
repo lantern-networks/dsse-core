@@ -5,12 +5,16 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/authportal"
 	grantstore "github.com/lantern-networks/dsse-core/grantstore"
+	"github.com/lantern-networks/dsse-core/idpregistry"
 	model "github.com/lantern-networks/dsse-core/model"
 )
 
@@ -25,9 +29,9 @@ import (
 // that rotates on restart is sufficient. That is true of ONE Edge. This deployment has a fleet: the step-up
 // URL names the deployment's agent plane, the region's door hands that connection to whichever Edge it
 // likes, and the Edge that ISSUED the URL is usually not the Edge that receives it. The signature then does
-// not verify — and it does not fail loudly, because an unverifiable device is treated as "no device
-// identity", which mints a tenant-wide grant instead of a device-bound one. The binding this whole mechanism
-// exists to provide would have been silently absent on every ceremony that crossed a node.
+// not verify. Historically this fell back to an unbound grant. The broker now rejects
+// invalid binding parameters before redirecting to the IdP, so mismatched fleet keys
+// cause an explicit failed ceremony rather than silently losing the binding.
 //
 // So the key is a deployment secret, generated once by the installer and carried to every Edge, like the
 // connector and audit-ingest secrets beside it. A node given none falls back to a random key and says so:
@@ -68,6 +72,18 @@ func (s *deviceBindingSigner) signBinding(device, tenant string) string {
 
 func (s *deviceBindingSigner) sign(device string) string { return s.signBinding(device, "") }
 
+// grantIDForRequest is stable across Portal processes sharing the deployment
+// signer, but cannot be reconstructed from the browser-visible request ID.
+// Shared grant storage atomically rejects a second mint with this ID.
+func (s *deviceBindingSigner) grantIDForRequest(requestID string) string {
+	if s == nil || len(s.key) == 0 || requestID == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, s.key)
+	mac.Write([]byte("dsse authentication grant id v1|" + requestID))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
 // verifiedBinding returns the device and organization iff the signature covers exactly those two values.
 func (s *deviceBindingSigner) verifiedBinding(device, tenant, sig string) (string, string) {
 	device, tenant, sig = strings.TrimSpace(device), strings.TrimSpace(tenant), strings.TrimSpace(sig)
@@ -106,9 +122,15 @@ func (s *deviceBindingSigner) verifiedDevice(device, sig string) string {
 // the edge's steering-excluded address, so the device cannot reach the callback any other way). A tenant-wide
 // grant (no device / no signer) remains the fallback. See docs/idp_federated_authentication_design.md.
 type federatedAuthGate struct {
-	grants        *grantstore.Store
-	brokerBaseURL string
-	tenantID      string
+	rollout         *authRolloutRuntime
+	draining        *atomic.Bool
+	waitBudget      authWaitBudget
+	registry        *idpregistry.Store
+	grants          *grantstore.Store
+	refreshGrants   func(tenant, device, scope string) bool
+	brokerBaseURL   string
+	entranceOrigins map[string]string
+	tenantID        string
 	// signer binds the verified (T) device into the step-up start URL so the broker (holding the same signer)
 	// can mint a device-bound grant even though the browser→broker hop is not itself steered/decrypted (the
 	// broker is co-located on the edge's steering-excluded address). Nil → grants stay tenant-wide.
@@ -127,46 +149,132 @@ func (g *federatedAuthGate) isAuthRedirectCase(r *http.Request, decision string)
 	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
 }
 
-// hasLiveGrant reports whether a live federated grant satisfies this flow. When the steered flow carries a
-// verified transport device identity, the grant must be bound to THAT device (per-device) — except a
-// tenant-wide grant (no device) still satisfies it, the documented lab fallback for flows whose device
-// identity is not yet plumbed. When the flow has no device identity, tenant-level presence is used.
-//
-// When the resource requires a step-up assurance (requiredACR != ""), the satisfying grant must ALSO carry that
-// acr — exact match, the same semantics the broker enforces at grant-mint (oidcbroker.ValidateIDToken). Without
-// this, a baseline grant (acr absent) would satisfy a step-up-gated resource and the step-up requirement would
-// leak; the user must hold a grant minted at the required assurance. An empty requiredACR keeps presence-only.
-func (g *federatedAuthGate) hasLiveGrant(deviceID, requiredACR string) bool {
-	return g.hasLiveGrantFor("", deviceID, requiredACR)
+func (g *federatedAuthGate) hasLiveGrantWithRequirements(tenantID, deviceID string, req federatedRequirements) bool {
+	_, ok := g.liveGrantWithRequirements(tenantID, deviceID, req)
+	return ok
 }
 
-// ★★★ AND IT LOOKS UNDER THE FLOW'S ORGANIZATION (2026-09-02). Asking g.tenantID — this node's own — is the
-// same defect as the broker's: the grant a customer's user just earned is filed under the customer, and a
-// gate that looks for it under the operator finds none and holds the flow again, forever.
-func (g *federatedAuthGate) hasLiveGrantFor(tenantID, deviceID, requiredACR string) bool {
-	if g == nil || g.grants == nil {
-		return false
+func (g *federatedAuthGate) liveGrantWithRequirements(tenantID, deviceID string, req federatedRequirements) (grantstore.Grant, bool) {
+	grant, ok, _ := g.liveGrantStatusWithRequirements(tenantID, deviceID, req)
+	return grant, ok
+}
+
+var errAuthenticationGrantAuthorityUnavailable = errors.New("authentication grant authority unavailable")
+
+func (g *federatedAuthGate) liveGrantStatusWithRequirements(tenantID, deviceID string, req federatedRequirements) (grantstore.Grant, bool, error) {
+	grant, ok, err := g.localGrantStatusWithRequirements(tenantID, deviceID, req)
+	if ok || err != nil || g == nil || g.refreshGrants == nil || req.Invalid || strings.TrimSpace(req.Scope) == "" {
+		return grant, ok, err
+	}
+	// A completed login can have landed on another Edge since our last poll.
+	// Consult signed authority evidence before opening another browser ceremony.
+	if !g.refreshGrants(tenantID, deviceID, req.Scope) {
+		return grantstore.Grant{}, false, errAuthenticationGrantAuthorityUnavailable
+	}
+	return g.localGrantStatusWithRequirements(tenantID, deviceID, req)
+}
+
+func (g *federatedAuthGate) localGrantStatusWithRequirements(tenantID, deviceID string, req federatedRequirements) (grantstore.Grant, bool, error) {
+	requiredACR, requiredIdP := req.ACR, req.IdP
+	if g == nil || req.Invalid || strings.TrimSpace(req.Scope) == "" {
+		return grantstore.Grant{}, false, nil
+	}
+	if g.grants == nil {
+		return grantstore.Grant{}, false, errAuthenticationGrantAuthorityUnavailable
 	}
 	if strings.TrimSpace(tenantID) == "" {
 		tenantID = g.tenantID
 	}
 	deviceID = strings.TrimSpace(deviceID)
 	requiredACR = strings.TrimSpace(requiredACR)
+	requiredIdP = strings.TrimSpace(requiredIdP)
+	var provider idpregistry.Connection
+	providerDigest := ""
+	if g.registry != nil {
+		var ok bool
+		provider, ok = g.registry.ResolveForAuthorization(strings.TrimSpace(tenantID), requiredIdP)
+		if !ok {
+			return grantstore.Grant{}, false, nil
+		}
+		requiredIdP = provider.IdPID
+		providerDigest = authEvidenceProviderDigest(provider)
+	}
+	identityEnabled, identityKnown := g.rollout.deviceUserBindingMode()
+	if deviceID != "" && !identityKnown {
+		return grantstore.Grant{}, false, nil
+	}
+	identityRequired := deviceID != "" && identityEnabled
+	expectedSubject := ""
+	if identityRequired {
+		if !validAuthOwner(req.OSPrincipal, req.OSSession) || g.registry == nil {
+			return grantstore.Grant{}, false, nil
+		}
+		var assigned bool
+		expectedSubject, assigned = provider.AssignedSubject(deviceID, req.OSPrincipal)
+		if !assigned {
+			return grantstore.Grant{}, false, nil
+		}
+	}
 	now := time.Now().UTC()
-	for _, gr := range g.grants.ListForAuthorization(strings.TrimSpace(tenantID)) {
+	grants, err := g.grants.ListForAuthorizationChecked(strings.TrimSpace(tenantID))
+	if err != nil {
+		return grantstore.Grant{}, false, err
+	}
+	for _, gr := range grants {
 		expires, err := time.Parse(time.RFC3339, gr.ExpiresAt)
 		if gr.Revoked || err != nil || !now.Before(expires) {
 			continue
 		}
-		if deviceID != "" && strings.TrimSpace(gr.DeviceID) != "" && gr.DeviceID != deviceID {
-			continue // a grant bound to a different device does not satisfy this device
+		// Re-evaluate the current resource's cap on every use. A previously
+		// minted long-lived grant cannot bypass a newly shortened policy.
+		if req.GrantTTLSeconds != nil && !authGrantWithinTTL(gr.IssuedAt, *req.GrantTTLSeconds, now) {
+			continue
+		}
+		if strings.TrimSpace(gr.DeviceID) != deviceID {
+			continue
+		}
+		if requiredIdP != "" && strings.TrimSpace(gr.IdPID) != requiredIdP {
+			continue
+		}
+		if gr.OSPrincipal != "" || gr.OSSession != "" || identityRequired {
+			if !identityRequired || gr.UserID != expectedSubject || gr.OSPrincipal != req.OSPrincipal || gr.OSSession != req.OSSession || gr.Issuer != provider.Issuer || gr.ProviderConfigSHA256 != authEvidenceForOwner(provider, deviceID, req.OSPrincipal, req.OSSession) {
+				continue
+			}
+		} else if g.registry != nil && (gr.Issuer != provider.Issuer || gr.ProviderConfigSHA256 != providerDigest) && !g.rollout.acceptLegacy(gr, providerDigest, now) {
+			continue // old/missing provider identity cannot authorize a current flow
 		}
 		if requiredACR != "" && strings.TrimSpace(gr.ACR) != requiredACR {
 			continue // a grant minted at a weaker (or absent) assurance does not satisfy a step-up-gated resource
 		}
-		return true
+		if gr.AuthenticationRequestID != "" && gr.AuthenticationRequestID != req.RequestID {
+			continue
+		}
+		grantRequirements := req
+		if req.MaxAgeSeconds != nil && *req.MaxAgeSeconds == 0 {
+			// Zero is one authenticated release of this exact request, never
+			// a reusable device/scope grant, even if its TTL has not elapsed.
+			if req.RequestID == "" || gr.AuthenticationRequestID != req.RequestID || !g.rollout.featureEnabled("single-request-v1") {
+				continue
+			}
+			started, err := time.Parse(time.RFC3339, gr.ReauthenticationStartedAt)
+			if err != nil {
+				continue
+			}
+			grantRequirements.AuthenticationStartedAt = started
+		}
+		if !requirementsMatchGrant(gr.AMR, gr.AuthTime, gr.Scope, grantRequirements, now) {
+			continue
+		}
+		fresh, err := g.grants.AuthorizationFreshChecked(gr, req.Scope)
+		if err != nil {
+			return grantstore.Grant{}, false, err
+		}
+		if !fresh {
+			continue
+		}
+		return gr, true, nil
 	}
-	return false
+	return grantstore.Grant{}, false, nil
 }
 
 // stepUpChallengeHeader carries the step-up portal URL on a NON-browser (native: SMB/RDP/WinRM) authenticate
@@ -196,13 +304,25 @@ func (g *federatedAuthGate) stepUpURL(returnTo, requiredIdP, requiredACR, device
 // to mint a grant. An unsigned organization in a client-visible URL would let a device ask to be
 // authenticated by another customer's IdP.
 func (g *federatedAuthGate) stepUpURLFor(returnTo, requiredIdP, requiredACR, deviceID, tenantID string) string {
+	if g == nil {
+		return ""
+	}
+	return g.stepUpURLForOrigin(g.brokerBaseURL, returnTo, requiredIdP, requiredACR, deviceID, tenantID)
+}
+
+func (g *federatedAuthGate) stepUpURLForOrigin(baseURL, returnTo, requiredIdP, requiredACR, deviceID, tenantID string) string {
 	// ★ A NODE WITH NO PORTAL HAS NO URL TO GIVE, and must say nothing rather than a relative path. A header
 	// carrying "/clientless/auth/start?..." is an address an agent would open against whatever host it
 	// happened to be talking to.
-	if g == nil || strings.TrimSpace(g.brokerBaseURL) == "" {
+	if g == nil || strings.TrimSpace(baseURL) == "" {
 		return ""
 	}
 	q := url.Values{}
+	origin, err := authportal.Origin(baseURL)
+	if err != nil {
+		return ""
+	}
+	q.Set("portal_origin", origin)
 	q.Set("return_to", returnTo)
 	if strings.TrimSpace(requiredIdP) != "" {
 		q.Set("idp", strings.TrimSpace(requiredIdP))
@@ -220,12 +340,16 @@ func (g *federatedAuthGate) stepUpURLFor(returnTo, requiredIdP, requiredACR, dev
 		q.Set("tenant", tenantID)
 		q.Set("device_sig", sig)
 	}
-	return strings.TrimRight(g.brokerBaseURL, "/") + "/clientless/auth/start?" + q.Encode()
+	if err := addAuthStartLifetime(q, time.Now().UTC()); err != nil {
+		return ""
+	}
+	q.Set("requirements_sig", g.signer.signRequirements(q))
+	return strings.TrimRight(baseURL, "/") + "/clientless/auth/start?" + q.Encode()
 }
 
 // redirectToIdP writes the 302 to the step-up portal (browser flows can follow it inline).
 func (g *federatedAuthGate) redirectToIdP(w http.ResponseWriter, r *http.Request, returnTo, requiredIdP, requiredACR, deviceID, tenantID string) {
-	http.Redirect(w, r, g.stepUpURLFor(returnTo, requiredIdP, requiredACR, deviceID, tenantID), http.StatusFound)
+	http.Redirect(w, r, g.stepUpURLForRequest(r, returnTo, deviceID, tenantID, federatedRequirements{IdP: requiredIdP, ACR: requiredACR}), http.StatusFound)
 }
 
 // authStepUpRequirements pulls the required IdP + step-up acr from an authenticate decision's

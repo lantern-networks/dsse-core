@@ -39,14 +39,14 @@ func envBoolDefault(key string, def bool) bool {
 	}
 }
 
-// posturePolicyConfigurableStore is implemented by the in-memory device store; lets the edge apply
-// the configured posture ruleset at boot.
+// posturePolicyConfigurableStore lets each device-store backend apply the
+// configured posture ruleset at boot.
 type posturePolicyConfigurableStore interface {
 	SetPosturePolicy(devicestore.PosturePolicy) error
 }
 
 // applyConfiguredPosturePolicy sets the env-derived posture ruleset on the device store if it
-// supports configuration (no-op otherwise, e.g. a postgres-backed store).
+// supports configuration.
 func applyConfiguredPosturePolicy(store any) {
 	if setter, ok := store.(posturePolicyConfigurableStore); ok {
 		if err := setter.SetPosturePolicy(posturePolicyFromEnv()); err != nil {

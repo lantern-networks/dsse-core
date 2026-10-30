@@ -95,7 +95,7 @@ func validKey(tenant, id string) error {
 func cloneEvents(events map[string]model.HumanApprovalEvent) map[string]model.HumanApprovalEvent {
 	result := make(map[string]model.HumanApprovalEvent, len(events)+1)
 	for key, event := range events {
-		result[key] = event
+		result[key] = cloneApprovalEvent(event)
 	}
 	return result
 }
@@ -132,13 +132,13 @@ func (s *Store) UpsertContext(ctx context.Context, event model.HumanApprovalEven
 				return ErrCapacity
 			}
 		}
-		next[key] = event
+		next[key] = cloneApprovalEvent(event)
 		return nil
 	})
 	if err != nil {
 		return model.HumanApprovalEvent{}, err
 	}
-	return event, nil
+	return cloneApprovalEvent(event), nil
 }
 
 // Get is a compatibility lookup and refuses IDs shared by multiple tenants.
@@ -156,7 +156,7 @@ func (s *Store) Get(id string) (model.HumanApprovalEvent, bool) {
 			if found {
 				return model.HumanApprovalEvent{}, false
 			}
-			result, found = event, true
+			result, found = cloneApprovalEvent(event), true
 		}
 	}
 	return result, found
@@ -171,7 +171,7 @@ func (s *Store) GetForTenant(tenantID, id string) (model.HumanApprovalEvent, boo
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	event, ok := s.events[approvalKey(tenantID, id)]
-	return event, ok
+	return cloneApprovalEvent(event), ok
 }
 
 func (s *Store) GetActive(id string, now time.Time) (model.HumanApprovalEvent, bool) {
@@ -198,7 +198,7 @@ func (s *Store) Snapshot() []model.HumanApprovalEvent {
 	defer s.mu.RUnlock()
 	out := make([]model.HumanApprovalEvent, 0, len(s.events))
 	for _, e := range s.events {
-		out = append(out, e)
+		out = append(out, cloneApprovalEvent(e))
 	}
 	return out
 }
@@ -265,7 +265,7 @@ func (s *Store) revokeContext(ctx context.Context, tenant, id, reason string) (m
 		s.pendingRevocations[key] = result.Reason
 		s.events[key] = result
 	}
-	return result, found, err
+	return cloneApprovalEvent(result), found, err
 }
 
 func validateTransition(existing, next model.HumanApprovalEvent) error {

@@ -93,12 +93,12 @@ func (s *postgresEnrolmentTokenStore) IssueContext(parent context.Context, polic
 	defer tx.Rollback()
 	// All issuers, including unlimited-policy callers, serialize on the tenant.
 	// A transaction-scoped two-key lock is separate from the CP election lock.
-	if _, err := budget.exec(tx, `SELECT pg_advisory_xact_lock(1162760780, hashtext(lower($1)))`, tenantID); err != nil {
+	if _, err := budget.exec(tx, `SELECT pg_advisory_xact_lock(1162760780, hashtext($1))`, tenantID); err != nil {
 		return enrolltoken.Token{}, "", fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 	}
 	if policy.MaxOutstanding > 0 {
 		var outstanding int
-		if err := budget.queryRow(tx, `SELECT count(*) FROM enrolment_tokens WHERE lower(tenant_id)=lower($1) AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$2`, tenantID, now.UTC()).Scan(&outstanding); err != nil {
+		if err := budget.queryRow(tx, `SELECT count(*) FROM enrolment_tokens WHERE tenant_id=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$2`, tenantID, now.UTC()).Scan(&outstanding); err != nil {
 			return enrolltoken.Token{}, "", fmt.Errorf("%w: %v", enrolltoken.ErrStateUnavailable, err)
 		}
 		if outstanding >= policy.MaxOutstanding {
@@ -134,14 +134,20 @@ func (s *postgresEnrolmentTokenStore) IssueContext(parent context.Context, polic
 // Verify answers "would this work right now" without spending, so the enrolment endpoint can run its remaining
 // checks — a device an admin disabled is refused — before burning a credential the admin would have to re-issue.
 func (s *postgresEnrolmentTokenStore) Verify(secret, tenantID string, now time.Time) (enrolltoken.Token, error) {
-	row := s.db.QueryRow(`SELECT `+enrolmentTokenColumns+` FROM enrolment_tokens WHERE token_hash = $1`,
+	return s.VerifyContext(context.Background(), secret, tenantID, now)
+}
+
+func (s *postgresEnrolmentTokenStore) VerifyContext(parent context.Context, secret, tenantID string, now time.Time) (enrolltoken.Token, error) {
+	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
+	defer cancel()
+	row := s.db.QueryRowContext(ctx, `SELECT `+enrolmentTokenColumns+` FROM enrolment_tokens WHERE token_hash = $1`,
 		enrolltoken.HashSecret(secret))
 	tok, err := scanEnrolmentToken(row.Scan)
 	if err == sql.ErrNoRows {
 		return enrolltoken.Token{}, enrolltoken.ErrUnknownToken
 	}
 	if err != nil {
-		return enrolltoken.Token{}, fmt.Errorf("read enrolment token: %w", err)
+		return enrolltoken.Token{}, fmt.Errorf("%w: read enrolment token: %w", enrolltoken.ErrStateUnavailable, err)
 	}
 	return tok, enrolmentTokenUsability(tok, tenantID, now)
 }
@@ -157,6 +163,9 @@ func (s *postgresEnrolmentTokenStore) Spend(id, tenantID, deviceID string, now t
 }
 
 func (s *postgresEnrolmentTokenStore) SpendContext(parent context.Context, id, tenantID, deviceID string, now time.Time) (enrolltoken.Token, error) {
+	if tenantID != "" && strings.TrimSpace(tenantID) == "" {
+		return enrolltoken.Token{}, enrolltoken.ErrWrongTenant
+	}
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
 	budget := newCPStatementBudget(ctx)
@@ -170,7 +179,7 @@ func (s *postgresEnrolmentTokenStore) SpendContext(parent context.Context, id, t
 	id = strings.TrimSpace(id)
 	tok, err := scanEnrolmentToken(budget.queryRow(tx, `UPDATE enrolment_tokens SET used_at=$1, used_by=$2
  WHERE id=$3 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$1
- AND ($4='' OR lower(tenant_id)=lower($4)) RETURNING `+enrolmentTokenColumns,
+ AND ($4='' OR tenant_id=$4) RETURNING `+enrolmentTokenColumns,
 		now.UTC(), strings.TrimSpace(deviceID), id, strings.TrimSpace(tenantID)).Scan)
 	if err == nil {
 		if err := budget.commit(tx); err != nil {
@@ -210,7 +219,7 @@ func enrolmentTokenUsability(tok enrolltoken.Token, tenantID string, now time.Ti
 	if !tok.Outstanding(now) {
 		return enrolltoken.ErrTokenExpired
 	}
-	if t := strings.TrimSpace(tenantID); t != "" && !strings.EqualFold(t, tok.TenantID) {
+	if tenantID != "" && strings.TrimSpace(tenantID) != strings.TrimSpace(tok.TenantID) {
 		return enrolltoken.ErrWrongTenant
 	}
 	return nil
@@ -224,6 +233,9 @@ func (s *postgresEnrolmentTokenStore) Revoke(id, revokedBy string, now time.Time
 }
 
 func (s *postgresEnrolmentTokenStore) RevokeForTenantContext(parent context.Context, tenant, id, revokedBy string, now time.Time) (enrolltoken.Token, bool, error) {
+	if tenant != "" && strings.TrimSpace(tenant) == "" {
+		return enrolltoken.Token{}, false, nil
+	}
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
 	budget := newCPStatementBudget(ctx)
@@ -237,7 +249,7 @@ func (s *postgresEnrolmentTokenStore) RevokeForTenantContext(parent context.Cont
 	// RETURNING ties the reported identity to the mutation, without a second read
 	// which could fail after the revocation has already committed.
 	tok, err := scanEnrolmentToken(budget.queryRow(tx, `UPDATE enrolment_tokens SET revoked_at=$1, revoked_by=$2
- WHERE id=$3 AND revoked_at IS NULL AND ($4='' OR lower(tenant_id)=lower($4)) RETURNING `+enrolmentTokenColumns,
+ WHERE id=$3 AND revoked_at IS NULL AND ($4='' OR tenant_id=$4) RETURNING `+enrolmentTokenColumns,
 		now.UTC(), strings.TrimSpace(revokedBy), strings.TrimSpace(id), strings.TrimSpace(tenant)).Scan)
 	if err == sql.ErrNoRows {
 		return enrolltoken.Token{}, false, nil
@@ -261,9 +273,9 @@ func (s *postgresEnrolmentTokenStore) ListContext(parent context.Context, tenant
 	defer cancel()
 	query := `SELECT ` + enrolmentTokenColumns + ` FROM enrolment_tokens`
 	args := []any{}
-	if t := strings.TrimSpace(tenantID); t != "" {
-		query += ` WHERE lower(tenant_id) = lower($1)`
-		args = append(args, t)
+	if tenantID != "" {
+		query += ` WHERE tenant_id = $1`
+		args = append(args, strings.TrimSpace(tenantID))
 	}
 	query += ` ORDER BY issued_at DESC, id ASC`
 	rows, err := s.db.QueryContext(ctx, query, args...)
@@ -296,13 +308,13 @@ func (s *postgresEnrolmentTokenStore) OutstandingContext(parent context.Context,
 	ctx, cancel := context.WithTimeout(parent, cpStateBlobDBTimeout)
 	defer cancel()
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM enrolment_tokens WHERE lower(tenant_id)=lower($1) AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$2`, strings.TrimSpace(tenantID), now.UTC()).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM enrolment_tokens WHERE tenant_id=$1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at>$2`, strings.TrimSpace(tenantID), now.UTC()).Scan(&n)
 	return n, err
 }
 
 func (s *postgresEnrolmentTokenStore) ExpiringWithin(tenantID string, window time.Duration, now time.Time) []enrolltoken.Token {
 	rows, err := s.db.Query(`SELECT `+enrolmentTokenColumns+` FROM enrolment_tokens
-		 WHERE lower(tenant_id) = lower($1) AND used_at IS NULL AND revoked_at IS NULL
+		 WHERE tenant_id = $1 AND used_at IS NULL AND revoked_at IS NULL
 		   AND expires_at > $2 AND expires_at < $3
 		 ORDER BY expires_at ASC`,
 		strings.TrimSpace(tenantID), now.UTC(), now.Add(window).UTC())

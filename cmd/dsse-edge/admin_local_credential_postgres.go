@@ -173,7 +173,7 @@ func setupLocalCredentialPersistence(ctx context.Context, mode, dsn, migrationDi
 		if strings.TrimSpace(dsn) == "" {
 			return nil, nil, fmt.Errorf("first-party-store-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

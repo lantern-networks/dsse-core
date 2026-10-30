@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"sort"
@@ -22,9 +23,10 @@ import (
 // So they are kept here, durable by default off -state-dir, independent of how telemetry is stored.
 
 type trustRefusalStore struct {
-	mu   sync.Mutex
-	path string
-	by   map[string][]observedTrustRefusal
+	mu      sync.Mutex
+	path    string
+	by      map[string][]observedTrustRefusal
+	loadErr error
 }
 
 func newTrustRefusalStore(path string) *trustRefusalStore {
@@ -36,6 +38,7 @@ func newTrustRefusalStore(path string) *trustRefusalStore {
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("trust_refusal_store progress=load_failed detail=%v", err)
+			s.loadErr = err
 		}
 		return s
 	}
@@ -45,6 +48,12 @@ func newTrustRefusalStore(path string) *trustRefusalStore {
 	}
 	if err := json.Unmarshal(blob, &stored); err != nil {
 		log.Printf("trust_refusal_store progress=load_failed detail=%v", err)
+		s.loadErr = err
+		return s
+	}
+	if stored.SchemaVersion != "trust_refusal_store.v1" || stored.By == nil {
+		s.loadErr = fmt.Errorf("invalid trust refusal journal schema")
+		log.Printf("trust_refusal_store progress=load_failed detail=%v", s.loadErr)
 		return s
 	}
 	for k, v := range stored.By {
@@ -57,26 +66,37 @@ func newTrustRefusalStore(path string) *trustRefusalStore {
 }
 
 func trustRefusalKey(tenantID, identity string) string {
-	return strings.ToLower(strings.TrimSpace(tenantID)) + "\x00" + strings.ToLower(strings.TrimSpace(identity))
+	return strings.TrimSpace(tenantID) + "\x00" + strings.ToLower(strings.TrimSpace(identity))
 }
 
 // Merge folds a device's report into what is already recorded and returns the result. Merging rather than
 // replacing is required, not a nicety: the device empties its journal once accepted, so its very next report
 // carries none, and a store that took that at face value would erase what it had just been given.
-func (s *trustRefusalStore) Merge(tenantID, identity string, incoming []observedTrustRefusal) []observedTrustRefusal {
-	if s == nil || strings.TrimSpace(identity) == "" {
-		return nil
+func (s *trustRefusalStore) Merge(tenantID, identity string, incoming []observedTrustRefusal) ([]observedTrustRefusal, error) {
+	if s == nil || strings.TrimSpace(identity) == "" || strings.TrimSpace(tenantID) == "" {
+		if len(incoming) > 0 {
+			return nil, fmt.Errorf("trust refusal journal has no organization, identity, or store")
+		}
+		return nil, nil
 	}
 	key := trustRefusalKey(tenantID, identity)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.loadErr != nil && len(incoming) > 0 {
+		return nil, fmt.Errorf("trust refusal journal could not be loaded: %w", s.loadErr)
+	}
 	merged := mergeTrustRefusals(s.by[key], incoming)
 	if len(merged) == 0 {
-		return nil
+		return nil, nil
+	}
+	if len(incoming) == 0 {
+		return merged, nil
+	}
+	if err := s.persistLocked(key, merged); err != nil {
+		return nil, err
 	}
 	s.by[key] = merged
-	s.persistLocked()
-	return merged
+	return merged, nil
 }
 
 // ForTenant returns every device's refusals, device identity attached.
@@ -85,7 +105,7 @@ func (s *trustRefusalStore) ForTenant(tenantID string) map[string][]observedTrus
 	if s == nil {
 		return out
 	}
-	prefix := strings.ToLower(strings.TrimSpace(tenantID)) + "\x00"
+	prefix := strings.TrimSpace(tenantID) + "\x00"
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, v := range s.by {
@@ -120,24 +140,29 @@ func (s *trustRefusalStore) All() map[string][]observedTrustRefusal {
 	return out
 }
 
-func (s *trustRefusalStore) persistLocked() {
+func (s *trustRefusalStore) persistLocked(key string, merged []observedTrustRefusal) error {
 	if s.path == "" {
-		return
+		return fmt.Errorf("trust refusal journal has no durable path")
 	}
+	candidate := make(map[string][]observedTrustRefusal, len(s.by)+1)
+	for k, v := range s.by {
+		candidate[k] = v
+	}
+	candidate[key] = merged
 	blob, err := json.MarshalIndent(struct {
 		SchemaVersion string                            `json:"schema_version"`
 		By            map[string][]observedTrustRefusal `json:"by"`
-	}{"trust_refusal_store.v1", s.by}, "", "  ")
+	}{"trust_refusal_store.v1", candidate}, "", "  ")
 	if err != nil {
-		log.Printf("trust_refusal_store progress=persist_failed detail=%v", err)
-		return
+		return err
 	}
 	// ★ ONE DURABLE WRITE (2026-08-14). Staged by hand and finished on a bare os.Rename — see
 	// ops/checks/one_durable_write.sh: the gate matched only the copies that fsync the directory, so the
 	// ones that never did were invisible to it and read as compliant.
 	if err := durablefile.Write(s.path, blob, 0o600); err != nil {
-		log.Printf("trust_refusal_store progress=persist_failed detail=%v", err)
+		return err
 	}
+	return nil
 }
 
 // sortedDeviceKeys keeps the report stable across reads.

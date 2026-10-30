@@ -338,6 +338,9 @@ func askDoor(d door, anchors *x509.CertPool, identity tls.Certificate, connector
 	req.Header.Set("x-connector-id", connectorID)
 	client := &http.Client{
 		Timeout: 8 * time.Second,
+		// A different door's 200 does not prove that this door knows the
+		// connector. Never forward its runtime secret through a redirect.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				// Regional addresses select a machine; the persisted organization name selects its TLS identity.

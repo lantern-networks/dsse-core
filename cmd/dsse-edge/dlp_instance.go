@@ -4,13 +4,12 @@ import (
 	"strings"
 
 	"github.com/lantern-networks/dsse-core/idpregistry"
-	"github.com/lantern-networks/dsse-core/model"
 )
 
 // corporateDomainsForTenant builds the CorporateDomains resolver from the tenant's registered end-user IdP
 // connections: the union of every connection's VerifiedDomains is the tenant's sanctioned corporate domains
 // (the authoritative "our organization" set), reused here to classify a DLP destination instance. Returns nil
-// when the store is nil so instance-scoped rules stay inert.
+// when the store is nil. Domains alone do not verify a destination account.
 func corporateDomainsForTenant(store *idpregistry.Store) func(tenantID string) []string {
 	if store == nil {
 		return nil
@@ -33,18 +32,17 @@ func corporateDomainsForTenant(store *idpregistry.Store) func(tenantID string) [
 
 // Instance-aware DLP action (slice I, the sovereign "here not there"): a DLP rule may be scoped to the
 // destination INSTANCE — the corporate (sanctioned) tenant of a SaaS vs a personal/external account. The class
-// is derived from the account the SWG egress path already extracts (dec.Metadata ai_email / ai_account, from the
-// request's identity token), classified against the tenant's verified corporate domains. Non-secret: only the
-// class ("corporate" / "personal" / "") is ever used or recorded, never the account address itself.
+// requires independently verified destination-account evidence before it can exclude a scoped rule. The
+// ai_email / ai_account request hints are not such evidence. Unknown accounts retain scoped inspection.
 
-// dlpInstanceClass classifies a destination instance from the signed-in account email:
+// dlpInstanceClass compares an independently verified account email with the tenant's domains. It does not
+// authenticate that email, and must not be called with request JWT/cookie hints to make a policy exemption:
 //   - "corporate": the account domain is one of the tenant's verified corporate domains (the sanctioned instance).
 //   - "personal":  a confirmed account domain that is NOT one of them (a consumer or other-org account).
-//   - "":          no account signal, or no corporate domains configured — cannot classify, so a scoped rule is
-//     inert (this deliberately never over-blocks an unclassifiable destination).
+//   - "":          no account signal, or no corporate domains configured — cannot classify.
 func dlpInstanceClass(accountEmail string, corporateDomains []string) string {
 	if len(corporateDomains) == 0 {
-		return "" // without the sanctioned set we cannot say "corporate" vs not — fail open (scoped rules inert)
+		return "" // unknown does not exempt the request from scoped inspection
 	}
 	at := strings.LastIndexByte(accountEmail, '@')
 	if at < 0 || at == len(accountEmail)-1 {
@@ -64,10 +62,17 @@ func dlpInstanceClass(accountEmail string, corporateDomains []string) string {
 
 // dlpInstanceScopeApplies reports whether a DLP rule with the given instance scope applies to a request of the
 // given instance class. Empty/"any" scope always applies (back-compat). A corporate/personal scope applies only
-// when the class is confidently that; an unknown class ("") matches no scoped rule.
+// when the class is confidently that. Unknown or unrecognized classes apply both corporate and personal
+// scopes: absence of verified account evidence must not disable an administrator's DLP rule.
 func dlpInstanceScopeApplies(scope, class string) bool {
 	scope = strings.TrimSpace(scope)
 	if scope == "" || scope == "any" {
+		return true
+	}
+	if scope != "corporate" && scope != "personal" {
+		return false
+	}
+	if class != "corporate" && class != "personal" {
 		return true
 	}
 	return scope == class
@@ -81,19 +86,4 @@ func dlpKnownInstanceScope(scope string) bool {
 	default:
 		return false
 	}
-}
-
-// dlpDecisionAccountEmail returns the signed-in account the SWG egress path stamped on the decision (ai_email
-// preferred — a real address; else the ai_account grouping key), used to classify the destination instance.
-func dlpDecisionAccountEmail(dec model.AccessDecision) string {
-	if dec.Metadata == nil {
-		return ""
-	}
-	if e, ok := dec.Metadata["ai_email"].(string); ok && strings.TrimSpace(e) != "" {
-		return e
-	}
-	if a, ok := dec.Metadata["ai_account"].(string); ok {
-		return a
-	}
-	return ""
 }

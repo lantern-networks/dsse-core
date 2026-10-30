@@ -39,6 +39,7 @@ const placeholderHost = "REPLACE-WITH-THE-DEPLOYMENTS-CONTROL-PLANE-HOST"
 
 // regionInstall prepares an EXISTING deployment's material for one more region. It mints nothing.
 func regionInstall(dir, region string, shape machineShape) error {
+
 	dir = strings.TrimSpace(dir)
 	region = strings.ToLower(strings.TrimSpace(region))
 	if dir == "" {
@@ -47,6 +48,12 @@ func regionInstall(dir, region string, shape machineShape) error {
 	}
 	if region == "" {
 		return fmt.Errorf("-region is required and names this region, e.g. region-b")
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, authCensusFile)); err == nil {
+		return fmt.Errorf("authentication census is enabled: adding a region requires a complete -plan and an explicit membership generation; do not clone a member identity")
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 
 	minted, err := alreadyMinted(dir)
@@ -267,7 +274,7 @@ func setRegionEnvironment(dir, region string, standbyControlPlane, stateBearingJ
 	// first place anybody learns it exists.
 	if standbyControlPlane {
 		setUnlessAnswered("DSSE_POSTGRES_DSN",
-			"postgres://dsse:CHANGE-ME@"+placeholderHost+":5432/dsse?sslmode=disable")
+			"postgres://dsse:CHANGE-ME@"+placeholderHost+":5432/dsse?sslmode=verify-full&sslrootcert=/deployment/database-ca.pem")
 	}
 	// ★★★ A REGION THAT KEEPS STATE ANSWERS A DIFFERENT QUESTION (2026-08-27). It does NOT reach across to
 	// another region's database — it runs members of the deployment's cluster here, which is the whole point,

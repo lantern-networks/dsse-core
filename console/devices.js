@@ -55,7 +55,7 @@ function renderDevicesTab(content) {
   const search = el("input", { class: "ui-input ui-search", type: "search", placeholder: bl({ en: "Search devices…", ja: "デバイスを検索…" }) });
   search.value = _devicesState.search;
   search.addEventListener("input", () => { _devicesState.search = search.value; renderList(listHost); });
-  const filter = uiField({ name: "status", type: "select", value: _devicesState.filter, options: [
+  const filter = uiField({ name: "status", label: bl({ en: "Status", ja: "状態" }), type: "select", value: _devicesState.filter, options: [
     { value: "all", label: bl({ en: "All", ja: "全て" }) },
     { value: "enabled", label: bl({ en: "Allowed", ja: "許可" }) },
     { value: "disabled", label: bl({ en: "Blocked", ja: "ブロック" }) },
@@ -173,12 +173,12 @@ function applyUpdateState(st, u) {
 
 // Inventory and transport admission are independent gates. Keep the stored
 // inventory flag intact, and derive the display from both verified read results.
-function deviceIsBlocked(d) { return !d.enabled || d.transport_revoked === true; }
+function deviceIsBlocked(d) { return d.transport_known !== false && (!d.enabled || d.transport_revoked === true); }
 function deviceTenantSelection() { return typeof operateTenant === "string" ? operateTenant : ""; }
 function deviceContextPath(path, tenant) {
   return tenant ? path + "?expected_tenant_id=" + encodeURIComponent(tenant) : path;
 }
-function deviceAdmissionRows(inventory, transport, selection) {
+function deviceInventoryRows(inventory, selection) {
   const validID = value => typeof value === "string" && value.trim() !== "";
   if (!inventory || inventory.schema_version !== "admin_enrolled_inventory.v1" ||
       !validID(inventory.tenant_id) || (selection && inventory.tenant_id !== selection) ||
@@ -188,6 +188,11 @@ function deviceAdmissionRows(inventory, transport, selection) {
       new Set(inventory.devices.map(d => d.identity.trim().toLowerCase())).size !== inventory.devices.length) {
     throw new Error(bl({en: "The device inventory response could not be verified.", ja: "デバイス一覧の応答を確認できません。"}));
   }
+  return inventory.devices.map(d => ({...d, admissionContext: {tenant: inventory.tenant_id, selection}}));
+}
+function deviceAdmissionRows(inventory, transport, selection) {
+  const rows = deviceInventoryRows(inventory, selection);
+  const validID = value => typeof value === "string" && value.trim() !== "";
   if (!transport || transport.schema_version !== "admin_transport_admission.v1" ||
       transport.tenant_id !== inventory.tenant_id || !Array.isArray(transport.revoked_identities) ||
       !Number.isInteger(transport.withheld_unattributable) || transport.withheld_unattributable < 0 ||
@@ -197,11 +202,11 @@ function deviceAdmissionRows(inventory, transport, selection) {
       ja: "接続の遮断状態を確認できません。デバイスを変更する前に再読込してください。"}));
   }
   const revoked = new Set(transport.revoked_identities);
-  return inventory.devices.map(d => ({...d, transport_revoked: revoked.has(d.identity.trim().toLowerCase()),
-    admissionContext: {tenant: inventory.tenant_id, selection}}));
+  return rows.map(d => ({...d, transport_known: true,
+    transport_revoked: revoked.has(d.identity.trim().toLowerCase())}));
 }
 
-function deviceStateOf(d, obs, rt, effSev) {
+function deviceStateOf(d, obs, rt, effSev, runtimeFleetWide = true) {
   const st = { severity: "", signals: [], steering: false, failOpen: false, offline: false, excluded: 0, sub: "" };
   const p = (rt && rt.posture) || {};
   if (deviceIsBlocked(d)) {
@@ -218,6 +223,9 @@ function deviceStateOf(d, obs, rt, effSev) {
       st.sub = (rt.edge && String(rt.edge).trim())
         ? bl({ en: "via " + rt.edge, ja: rt.edge + " 経由" })
         : bl({ en: "state not reported", ja: "詳細未報告" });
+    } else if (!runtimeFleetWide) {
+      st.severity = "warn"; st.pill = { text: bl({ en: "Status unknown", ja: "稼働状態 不明" }), tone: "warn" };
+      st.sub = bl({ en: "fleet runtime is unavailable", ja: "全端末の稼働情報を取得できません" });
     } else {
       st.offline = true; st.severity = "off"; st.pill = { text: bl({ en: "No report", ja: "報告なし" }), tone: "off" };
       st.sub = bl({ en: "not steering yet", ja: "未ステア" });
@@ -284,6 +292,11 @@ function deviceStateOf(d, obs, rt, effSev) {
   // required screen lock, no agent reads it, and every device sat noncompliant with no screen anywhere
   // saying why. Absence of a signal is information; it must not look like a clean bill of health.
   st.posture = postureFacts(p);
+  if (d.transport_known === false) {
+    st.signals.push({ text: bl({ en: "admission unknown", ja: "接続許可状態 不明" }), tone: "warn" });
+    st.sub += (st.sub ? " · " : "") + bl({ en: "connection block status unavailable", ja: "接続の遮断状態を取得できません" });
+    if (st.severity === "") st.severity = "warn";
+  }
   if (effSev === "critical") st.severity = "danger";
   else if ((effSev === "high" || effSev === "medium") && st.severity !== "danger" && st.severity !== "off") st.severity = "warn";
   if (st.steering && st.signals.length === 0) st.signals.push({ text: bl({ en: "✓ managed", ja: "✓ 管理下" }), tone: "ok" });
@@ -292,12 +305,12 @@ function deviceStateOf(d, obs, rt, effSev) {
 
 // overflowMenu — the row's "⋯": Block/Allow stays a first-class button; Group / Risk / Remove fold in here so the
 // row isn't a wall of buttons. Risk levels below the device's group floor are disabled (they wouldn't take effect).
-function overflowMenu(d, host, sev, grpSev, riskReadable = true) {
+function overflowMenu(d, host, sev, grpSev, riskReadable = true, admissionReadable = true) {
   const wrap = el("span", { class: "dev-ov" });
   const btn = el("button", { class: "ui-btn ui-btn-sm", text: "⋯", title: bl({ en: "More", ja: "その他" }) });
   btn.setAttribute("data-device-admission-control", "1");
   btn.setAttribute("data-device-risk-control", "1");
-  btn.disabled = !!((host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity)) ||
+  btn.disabled = !admissionReadable || !!((host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity)) ||
     (host.__deviceRiskPending && host.__deviceRiskPending.has(d.identity)));
   let menu = null;
   const onDoc = (e) => { if (!wrap.contains(e.target)) close(); };
@@ -364,7 +377,7 @@ async function renderList(host) {
   uiState(host, "loading");
   const selection = deviceTenantSelection(), renderCurrent = freshRender(host);
   const current = () => renderCurrent() && host.isConnected !== false && selection === deviceTenantSelection();
-  let devices, tenant;
+  let devices, tenant, inventoryBody;
   // ★ unassigned IS PART OF THE ANSWER (2026-08-12, seventeenth review). The endpoint withholds devices that
   // belong to no tenant — they are nobody's to see or act on — and reports how many. Reading only `devices`
   // threw that number away, so the guarantee that made withholding safe ("nothing vanishes, it becomes a
@@ -381,16 +394,25 @@ async function renderList(host) {
       throw new Error(bl({en: "The device organization could not be verified. Reload before continuing.",
         ja: "デバイスの所属組織を確認できません。再読込してください。"}));
     }
-    const transport = await apiFetch("GET", deviceContextPath("/admin/transport-admission", tenant), undefined, "control");
-    if (!current()) return;
-    if (!transport.ok) throw new Error(bl({en: "Connection block status unavailable", ja: "接続の遮断状態を取得できません"}) + " (HTTP " + transport.status + ")");
-    devices = deviceAdmissionRows(r.body, transport.body, selection);
+    inventoryBody = r.body;
+    devices = deviceInventoryRows(inventoryBody, selection);
     unassigned = r.body.unassigned === undefined ? 0 : r.body.unassigned;
-    withheldBlocks = transport.body.withheld_unattributable;
   } catch (e) {
     if (!current()) return;
     uiState(host, "error", deviceReadFailure(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
     return;
+  }
+  let admissionReadable = true;
+  try {
+    const transport = await apiFetch("GET", deviceContextPath("/admin/transport-admission", tenant), undefined, "control");
+    if (!current()) return;
+    if (!transport.ok) throw new Error("HTTP " + transport.status);
+    devices = deviceAdmissionRows(inventoryBody, transport.body, selection);
+    withheldBlocks = transport.body.withheld_unattributable;
+  } catch (e) {
+    if (!current()) return;
+    admissionReadable = false;
+    devices = devices.map(d => ({...d, transport_known: false}));
   }
   // Runtime facts the endpoint agent reports over the steer transport (OS, logged-in user, steer state, posture),
   // keyed by device identity. Best-effort — the list still renders if it is unavailable.
@@ -404,15 +426,17 @@ async function renderList(host) {
   let runtime = {}, runtimeFleetWide = false;
   try {
     const rr = await apiFetch("GET", "/admin/device-runtime", undefined, "control");
-    if (rr.ok && rr.body && rr.body.devices) {
+    if (rr.ok && rr.body && rr.body.schema_version === "admin_device_runtime.v1" &&
+        rr.body.devices && typeof rr.body.devices === "object" && !Array.isArray(rr.body.devices)) {
       runtime = rr.body.devices;
-      runtimeFleetWide = !!rr.body.fleet_wide;
+      runtimeFleetWide = rr.body.fleet_wide === true;
     }
   } catch (e) { /* fall through to the local Edge */ }
-  if (!Object.keys(runtime).length) {
+  if (!runtimeFleetWide) {
     try {
       const rr = await apiFetch("GET", "/admin/device-runtime");
-      if (rr.ok && rr.body && rr.body.devices) runtime = rr.body.devices;
+      if (rr.ok && rr.body && rr.body.devices && typeof rr.body.devices === "object" &&
+          !Array.isArray(rr.body.devices)) runtime = {...rr.body.devices, ...runtime};
     } catch (e) { /* best-effort */ }
   }
   // What each device did with the release it was offered. Best-effort like every other overlay here: a fleet
@@ -441,10 +465,10 @@ async function renderList(host) {
       if (ru.body.frozen) updateFrozen = ru.body.frozen_reason || bl({ en: "rollout halted", ja: "配布停止中" });
     }
   } catch (e) { /* best-effort */ }
-  // The overlay is needed to edit risk. A reader without this permission can still
-  // view enrolled devices and their server-resolved effective risk, but cannot edit
-  // an unknown overlay. Other failures remain errors rather than clearing risk.
-  let riskMap, riskReadable = true;
+  // The overlay is needed to edit risk. A refusal or outage cannot erase the
+  // enrolled inventory; keep the server-resolved effective risk where present,
+  // mark missing values Unknown, and disable risk edits until a verified read.
+  let riskMap, riskReadable = true, riskUnavailable = false;
   try {
     riskMap = await deviceRiskMarks(tenant);
     if (!current()) return;
@@ -454,9 +478,9 @@ async function renderList(host) {
     }
   } catch (e) {
     if (!current()) return;
-    uiState(host, "error", bl({ en: "Risk status could not be read. Reload before changing device risk.", ja: "リスク状態を取得できません。変更する前に再読込してください。" }),
-      { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderList(host) });
-    return;
+    riskReadable = false;
+    riskUnavailable = true;
+    riskMap = {};
   }
   // Device-group RISK FLOOR: a group can carry a risk floor, and a member device's EFFECTIVE risk is
   // max(its own overlay risk, its group's floor). Fetch the registry so this list REFLECTS the group floor.
@@ -513,10 +537,11 @@ async function renderList(host) {
     const effSev = riskReadable
       ? (d.effective_risk && d.effective_risk.trim()) || riskMax(sev || "none", grpSev || "none")
       : deviceEffectiveRiskWithoutOverlay(d.effective_risk);
-    const st = deviceStateOf(d, obs, rt, effSev);
+    const st = deviceStateOf(d, obs, rt, effSev, runtimeFleetWide);
     applyUpdateState(st, updates[d.identity]);
     return { d, rt, obs, sev, grpSev, effSev, st };
   });
+  const withoutRuntime = enrich.filter(({d}) => !runtime[d.identity] && !runtime[deviceKey(d.identity)]).length;
 
   // Fleet summary — the counts an admin actually asks, before the table (and clickable as filters).
   const counts = {
@@ -526,6 +551,7 @@ async function renderList(host) {
     excluded: enrich.filter((x) => x.st.excluded > 0).length,
     offline: enrich.filter((x) => x.st.offline).length,
     blocked: enrich.filter((x) => deviceIsBlocked(x.d)).length,
+    admissionUnknown: enrich.filter((x) => x.d.transport_known === false).length,
     updPending: enrich.filter((x) => x.st.updateChip === "pending").length,
     updFailed: enrich.filter((x) => x.st.updateChip === "failed" || x.st.updateChip === "refused").length,
     updSilent: enrich.filter((x) => x.st.updateChip === "never_reported").length,
@@ -534,13 +560,13 @@ async function renderList(host) {
   const ff = _devicesState.fleet || "all";
   const q = _devicesState.search.trim().toLowerCase();
   const filtered = enrich.filter(({ d, st }) => {
-    if (_devicesState.filter === "enabled" && deviceIsBlocked(d)) return false;
-    if (_devicesState.filter === "disabled" && !deviceIsBlocked(d)) return false;
+    if (admissionReadable && _devicesState.filter === "enabled" && deviceIsBlocked(d)) return false;
+    if (admissionReadable && _devicesState.filter === "disabled" && !deviceIsBlocked(d)) return false;
     if (ff === "steering" && !st.steering) return false;
     if (ff === "failopen" && !st.failOpen) return false;
     if (ff === "excluded" && !(st.excluded > 0)) return false;
     if (ff === "offline" && !st.offline) return false;
-    if (ff === "blocked" && !deviceIsBlocked(d)) return false;
+    if (admissionReadable && ff === "blocked" && !deviceIsBlocked(d)) return false;
     if (ff === "updPending" && st.updateChip !== "pending") return false;
     if (ff === "updFailed" && !(st.updateChip === "failed" || st.updateChip === "refused")) return false;
     if (ff === "updSilent" && st.updateChip !== "never_reported") return false;
@@ -553,9 +579,23 @@ async function renderList(host) {
 
   if (!current()) return;
   host.innerHTML = "";
+  if (!runtimeFleetWide) host.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
+    en: "Fleet-wide device runtime is unavailable. Identity and enrollment come from the verified inventory; activity, OS and user details may be incomplete.",
+    ja: "全端末の稼働情報を取得できません。端末IDと登録情報は確認済みの台帳から表示していますが、稼働状態・OS・ユーザー情報は不完全な可能性があります。",
+  }) }));
+  if (runtimeFleetWide && withoutRuntime) host.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
+    en: withoutRuntime + " enrolled device(s) have no runtime report yet. Their identity is registered, but OS, user and active steering cannot be confirmed.",
+    ja: "登録済みの " + withoutRuntime + " 台には稼働情報の報告がありません。端末IDは登録済みですが、OS・ユーザー・現在のステア状態は確認できません。",
+  }) }));
+  if (!admissionReadable) host.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
+    en: "Device inventory is available, but connection block status is not. Admission is unknown and device actions are disabled until a verified reload.",
+    ja: "デバイス一覧は取得できましたが、接続の遮断状態は取得できません。接続許可状態は不明で、確認済みの再読込まで端末操作は無効です。",
+  }) }));
   if (!riskReadable) host.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
-    en: "Risk settings cannot be read. Devices remain visible; missing effective risk is Unknown and risk editing is unavailable.",
-    ja: "リスク設定を取得できません。デバイス一覧は表示できますが、実効リスクのない項目は不明となり編集できません。",
+    en: riskUnavailable ? "Risk status is unavailable. Devices remain visible; missing effective risk is Unknown and risk editing is unavailable." :
+      "Risk settings cannot be read. Devices remain visible; missing effective risk is Unknown and risk editing is unavailable.",
+    ja: riskUnavailable ? "リスク状態を取得できません。デバイス一覧は表示できますが、実効リスクのない項目は不明となり編集できません。" :
+      "リスク設定を取得できません。デバイス一覧は表示できますが、実効リスクのない項目は不明となり編集できません。",
   }) }));
   const stat = (key, dot, n, label) => el("div", {
     class: "dev-stat" + (ff === key ? " is-active" : ""),
@@ -570,9 +610,10 @@ async function renderList(host) {
     stat("failopen", "danger", counts.failopen, bl({ en: "fail-open engaged", ja: "fail-open 発動" })),
     stat("excluded", "off", counts.excluded, bl({ en: "excluded apps", ja: "除外アプリ" })),
     stat("offline", "off", counts.offline, bl({ en: "not reporting", ja: "報告なし" })),
-    stat("blocked", "danger", counts.blocked, bl({ en: "blocked", ja: "ブロック" })),
-  ]));
-  if (!riskReadable) {
+    stat("blocked", "danger", admissionReadable ? counts.blocked : "?", bl({ en: "blocked", ja: "ブロック" })),
+    counts.admissionUnknown ? stat("all", "warn", counts.admissionUnknown, bl({ en: "admission unknown", ja: "接続許可状態 不明" })) : null,
+  ].filter(Boolean)));
+  if (!riskReadable && !riskUnavailable) {
     host.appendChild(el("div", { class: "ui-view-desc", role: "status", text: bl({
       en: "You do not have permission to read risk settings. Risk editing is unavailable; the list shows the reported effective risk, or Unknown when unavailable.",
       ja: "リスク設定の閲覧権限がないため、リスクは編集できません。一覧には取得済みの実効リスクを表示し、取得できない場合は不明と表示します。",
@@ -682,11 +723,13 @@ async function renderList(host) {
       meta.appendChild(el("span", { style: "color:#6b7382", text: "·" }));
       meta.appendChild(el("span", { text: bl({ en: "from " + from, ja: from + " から" }) }));
     }
-    const primary = !deviceIsBlocked(d)
+    const primary = d.transport_known === false
+      ? el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Admission unknown", ja: "接続許可状態 不明" }) })
+      : !deviceIsBlocked(d)
       ? el("button", { class: "ui-btn ui-btn-sm ui-btn-danger", text: bl({ en: "Block", ja: "ブロック" }), onClick: () => disableDevice(d, host) })
       : el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Allow", ja: "許可" }), onClick: () => enableDevice(d, host) });
     primary.setAttribute("data-device-admission-control", "1");
-    primary.disabled = !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity));
+    primary.disabled = d.transport_known === false || !!(host.__deviceAdmissionPending && host.__deviceAdmissionPending.has(d.identity));
     const signals = st.signals.length
       ? st.signals.map((s) => el("span", { class: "dev-chip" + (s.tone ? " dev-chip-" + s.tone : ""), text: s.text, title: s.title || undefined }))
       : [el("span", { class: "dev-risk-ok", text: "—" })];
@@ -697,10 +740,10 @@ async function renderList(host) {
       el("td", {}, postureFactsCell(st.posture)),
       el("td", {}, el("div", { class: "dev-signals" }, signals)),
       el("td", {}, effSev === "unknown" ? uiBadge(bl({ en: "Unknown", ja: "不明" }), "off") : (!effSev || effSev === "none") ? el("span", { class: "dev-risk-ok", text: bl({ en: "Normal", ja: "通常" }) }) : uiBadge(riskLabel(effSev), riskTone(effSev))),
-      el("td", { class: "ui-row-actions", style: "text-align:right" }, el("div", { style: "display:flex;gap:7px;justify-content:flex-end;align-items:center" }, [primary, overflowMenu(d, host, sev, grpSev, riskReadable)])),
+      el("td", { class: "ui-row-actions", style: "text-align:right" }, el("div", { style: "display:flex;gap:7px;justify-content:flex-end;align-items:center" }, [primary, overflowMenu(d, host, sev, grpSev, riskReadable, admissionReadable)])),
     ]);
   });
-  host.appendChild(el("table", { class: "ui-table" }, [
+  host.appendChild(el("div", { style: "overflow-x:auto;max-width:100%" }, el("table", { class: "ui-table" }, [
     el("thead", {}, el("tr", {}, [
       el("th", { text: bl({ en: "Device", ja: "デバイス" }) }),
       el("th", { text: bl({ en: "Steering", ja: "ステア状態" }) }),
@@ -711,7 +754,7 @@ async function renderList(host) {
       el("th", { class: "ui-row-actions", text: bl({ en: "Actions", ja: "操作" }) }),
     ])),
     el("tbody", {}, rows),
-  ]));
+  ])));
   // ★★ A HIDDEN DEVICE MUST SAY IT IS HIDDEN, AND WHERE THE HIDING CAME FROM (2026-08-13, from an operator who
   // could not find a device that was in the list all along). The fleet chip is kept in memory for the session,
   // so one click three screens ago goes on filtering — and "Showing 1 / 2" at the BOTTOM of the table is not
@@ -1020,7 +1063,7 @@ async function renderGroupsList(host) {
   });
   if (!current()) return;
   host.innerHTML = "";
-  host.appendChild(el("table", { class: "ui-table" }, [
+  host.appendChild(el("div", { style: "overflow-x:auto;max-width:100%" }, el("table", { class: "ui-table" }, [
     el("thead", {}, el("tr", {}, [
       el("th", { text: bl({ en: "Group", ja: "グループ名" }) }),
       el("th", { text: bl({ en: "Description", ja: "説明" }) }),
@@ -1029,7 +1072,7 @@ async function renderGroupsList(host) {
       el("th", { class: "ui-row-actions", text: bl({ en: "Actions", ja: "操作" }) }),
     ])),
     el("tbody", {}, rows),
-  ]));
+  ])));
   host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Showing ", ja: "表示 " }) + groups.length + " / " + groups.length }));
 }
 

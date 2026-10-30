@@ -27,7 +27,7 @@ func connectorIdentitiesFor(registry connectorRegistryStore, tenant string) map[
 	if registry == nil {
 		return out
 	}
-	want := strings.ToLower(strings.TrimSpace(tenant))
+	want := strings.TrimSpace(tenant)
 	for _, c := range registry.List() {
 		id := strings.ToLower(strings.TrimSpace(c.ID))
 		if id == "" {
@@ -35,7 +35,7 @@ func connectorIdentitiesFor(registry connectorRegistryStore, tenant string) map[
 		}
 		// An operator answering for the whole deployment passes no tenant and gets every connector; inside an
 		// organization, only its own — the same scoping rule the device list itself follows.
-		if want != "" && strings.ToLower(strings.TrimSpace(c.TenantID)) != want {
+		if want != "" && strings.TrimSpace(c.TenantID) != want {
 			continue
 		}
 		out[id] = true

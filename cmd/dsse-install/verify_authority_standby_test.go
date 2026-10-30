@@ -22,6 +22,7 @@ func TestAuthorityRosterComparisonHandlesStandbyReadRefusal(t *testing.T) {
 		{"auth failure cannot hide behind standby", []int{401, 409}, []string{`{}`, refusal}, []int{200, 503}, false, false},
 		{"all standby is failure", []int{409, 409}, []string{refusal, refusal}, []int{503, 503}, false, false},
 		{"disagreement cannot hide behind standby", []int{200, 200, 409}, []string{`{"devices":[]}`, `{"devices":[{"identity":"a"}]}`, refusal}, []int{200, 200, 503}, false, false},
+		{"same count different identities", []int{200, 200}, []string{`{"devices":[{"identity":"a"}]}`, `{"devices":[{"identity":"b"}]}`}, []int{200, 200}, false, false},
 		{"readable peers still compare", []int{200, 200}, []string{`{"devices":[{"identity":"a"}]}`, `{"devices":[{"identity":"a"}]}`}, []int{200, 200}, false, true},
 	}
 	for _, tt := range cases {

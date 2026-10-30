@@ -41,17 +41,33 @@ func registerUsageEventsRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 					log.Printf("usage meter governance snapshot could not read identity directory: %v", err)
 				}
 				registeredNHI := 0
+				nhiRegistryKnown := false
 				if count, err := nonHumanIdentities.CountActive(r.Context(), tenantID, now); err == nil {
 					registeredNHI = count
+					if count > 0 {
+						nhiRegistryKnown = true
+					} else if identities, err := nonHumanIdentities.List(r.Context(), tenantID); err == nil {
+						// A populated registry with no active identities is a measured zero.
+						// An empty registry cannot displace observed NHI usage yet.
+						nhiRegistryKnown = len(identities) > 0
+					} else {
+						log.Printf("usage meter governance snapshot could not list NHI registry: %v", err)
+					}
 				} else {
 					log.Printf("usage meter governance snapshot could not read NHI registry: %v", err)
 				}
-				usagemeter.RecordUsageMeterGovernanceSnapshot(usageMeters, tenantID, humanSeatCount, humanMeasurementScope, registeredNHI, periodStart, periodEnd, now)
+				usagemeter.RecordUsageMeterGovernanceSnapshotWithRegistryStatus(usageMeters, tenantID, humanSeatCount, humanMeasurementScope, registeredNHI, nhiRegistryKnown, periodStart, periodEnd, now)
 			} else {
 				log.Printf("usage meter governance snapshot skipped: %v", err)
 			}
 		}
-		writeJSON(w, http.StatusOK, usageMeters.Summary(tenantID, periodStart, periodEnd))
+		summary, err := usagemeter.ReadSummary(usageMeters, tenantID, periodStart, periodEnd)
+		if err != nil {
+			log.Printf("usage meter summary unavailable: %v", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("usage meter summary is unavailable; durable data could not be read completely"))
+			return
+		}
+		writeJSON(w, http.StatusOK, summary)
 	}))
 	mux.HandleFunc("GET /admin/usage/health", adminEndpoint("admin.usage.read", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, usagemeter.UsageMeterHealthFor(usageMeters, adminTenantIDFromRequest(r), usageMeterStoreMode(usageMeters), time.Now()))

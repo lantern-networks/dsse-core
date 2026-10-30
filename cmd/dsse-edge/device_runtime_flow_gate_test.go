@@ -23,7 +23,7 @@ func TestTheSteeredFlowIsRecordedWhetherOrNotAUserIsKnown(t *testing.T) {
 
 	calls := 0
 	for i, ln := range lines {
-		if !strings.Contains(ln, "deviceRuntime.recordSteeredFlow(") {
+		if !strings.Contains(ln, "deviceRuntime.recordSteeredFlowWithOwner(") {
 			continue
 		}
 		calls++
@@ -44,7 +44,7 @@ func TestTheSteeredFlowIsRecordedWhetherOrNotAUserIsKnown(t *testing.T) {
 		}
 	}
 	if calls == 0 {
-		t.Fatal("no call to deviceRuntime.recordSteeredFlow in main.go — if it moved, move this guard with it; " +
+		t.Fatal("no call to deviceRuntime.recordSteeredFlowWithOwner in main.go — if it moved, move this guard with it; " +
 			"a guard that silently stops guarding is worse than none")
 	}
 }

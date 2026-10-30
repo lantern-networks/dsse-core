@@ -15,8 +15,49 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/agentpolicy"
+	"github.com/lantern-networks/dsse-core/clients/windows-wfp/configstore"
 	"github.com/lantern-networks/dsse-core/installprofile"
 )
+
+func TestInvalidDeploymentCannotReplaceAppliedProfile(t *testing.T) {
+	signer, err := agentpolicy.LoadOrGenerateSigner("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := func(p installprofile.InstallProfile, at time.Time) []byte {
+		t.Helper()
+		p.Kind = installprofile.ProfileKind
+		p.Version = 3
+		p.IssuedAt = at.Format(time.RFC3339)
+		envelope, err := installprofile.Sign(signer, p, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(envelope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	old := profileWithDeployment(t)
+	old.TenantID = "tenant_original"
+	newer := old
+	newer.TenantID = "tenant_wrong"
+	newer.Deployment = installprofile.DeploymentSpec{}
+	at := time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC)
+	be := configstore.NewMemoryBackend()
+	if _, _, err := verifyPlanAndApplyProvision(be, issue(old, at), signer.PublicKeyHex(), "", at.Format(time.RFC3339)); err != nil {
+		t.Fatalf("first provision: %v", err)
+	}
+	if _, _, err := verifyPlanAndApplyProvision(be, issue(newer, at.Add(time.Minute)), signer.PublicKeyHex(), "", at.Add(time.Minute).Format(time.RFC3339)); err == nil {
+		t.Fatal("missing deployment was accepted")
+	}
+	got, meta, err := configstore.Load(be, signer.PublicKeyHex())
+	if err != nil || !meta.Verified || got.TenantID != old.TenantID {
+		t.Fatalf("failed provision displaced the existing profile: verified=%t tenant=%q err=%v", meta.Verified, got.TenantID, err)
+	}
+}
 
 func testCA(t *testing.T, cn string) string {
 	t.Helper()
@@ -281,8 +322,36 @@ func TestAnIdentityThatNamesNoOrganizationIsLeftAlone(t *testing.T) {
 	if !identityIsForAnotherOrganization("tenant_a", "tenant_b") {
 		t.Fatal("two different organizations were not distinguished")
 	}
-	if identityIsForAnotherOrganization("TENANT_A", "tenant_a") {
-		t.Fatal("case decided the answer")
+	if !identityIsForAnotherOrganization("TENANT_A", "tenant_a") {
+		t.Fatal("case-distinct tenant IDs were treated as one organization")
+	}
+}
+
+func TestCaseDistinctEnrolledIdentityDoesNotSuppressNewSeed(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "device.crt"), []byte("old identity"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "enrolled.json"), []byte(`{"tenant":"TenantA"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "enrolment.json"), []byte(`{"tenant":"TenantA","enrolment_token":"old"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seed := &enrolmentSeed{EnrolURL: "https://edge.example/enroll", Tenant: "tenanta", Token: "new"}
+	if _, err := writeSeedForOrganization(dir, seed, "tenanta"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "enrolment.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got enrolmentSeed
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Tenant != "tenanta" || got.Token != "new" {
+		t.Fatalf("case-distinct previous organization suppressed new seed: tenant=%q token=%q", got.Tenant, got.Token)
 	}
 }
 

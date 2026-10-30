@@ -258,11 +258,11 @@ async function arUploadArtifact(file, platform, arch, context) {
     "&arch=" + encodeURIComponent(arch) + "&expected_tenant_id=" + encodeURIComponent(context.scope) +
     "&expected_manifest_sha256=" + encodeURIComponent(context.manifestSHA256);
   try {
-    const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", body: file });
+    const res = await fetch(base + path, { method: "PUT", headers, credentials: "include", redirect: "error", cache: "no-store", body: file });
     const text = await res.text();
     let parsed;
     try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
-    return { ok: res.ok, status: res.status, body: parsed };
+    return { ok: res.ok && !res.redirected, status: res.status, body: parsed };
   } catch (e) {
     return { ok: false, status: 0, body: { error: String(e) } };
   }

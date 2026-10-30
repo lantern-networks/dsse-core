@@ -90,6 +90,76 @@ final class DsseRuntimeCopyTunnelIdleReapTests: XCTestCase {
         XCTAssertFalse(dsseIsInteractiveEastWestPort(nil), "nil port must not be exempt")
     }
 
+    func testAuthenticationWaitSurvivesIdleThresholdThenReturnsToNormalCleanup() {
+        let liveGuard = DsseLiveRuntimeCopyGuard()
+        let flow = ParkingMockFlow()
+        let tunnel = AuthenticationParkingTunnel()
+        let done = XCTestExpectation(description: "normal cleanup after authentication")
+        let loop = DsseLiveRuntimeCopyTunnelLoop(
+            flow: flow, requestID: "auth-wait", tunnel: tunnel, liveGuard: liveGuard,
+            emitProgress: { _ in },
+            makeSuccessResult: { _, _ in Self.dummyResult() },
+            closeGuardAndFlow: { _ in },
+            completionHandler: { _ in done.fulfill() },
+            idleReapThreshold: 0.01
+        )
+        Thread.sleep(forTimeInterval: 0.03)
+        loop.reapIfIdle()
+        XCTAssertFalse(tunnel.wasClosed, "a held authentication flow is not an idle keep-alive")
+        tunnel.finishAuthentication()
+        loop.reapIfIdle()
+        XCTAssertFalse(tunnel.wasClosed, "resumption gets a fresh ordinary idle budget")
+        Thread.sleep(forTimeInterval: 0.03)
+        loop.reapIfIdle()
+        wait(for: [done], timeout: 1)
+        XCTAssertTrue(tunnel.wasClosed, "authentication must not permanently disable leak cleanup")
+    }
+
+    func testHalfClosedRequestRemainsOpenDuringAuthenticationAndDrainsResponse() {
+        let tunnel = AuthenticationDrainTunnel()
+        let flow = HalfClosedAuthenticationFlow()
+        let done = XCTestExpectation(description: "held half-closed request resumes")
+        let resultBox = DsseUnsafeBox<Result<DsseLocalRuntimeCopyResult, Error>>()
+        let loop = DsseLiveRuntimeCopyTunnelLoop(
+            flow: flow, requestID: "auth-half-close", tunnel: tunnel,
+            liveGuard: DsseLiveRuntimeCopyGuard(), emitProgress: { _ in },
+            makeSuccessResult: { _, _ in Self.dummyResult() },
+            closeGuardAndFlow: { _ in },
+            completionHandler: { result in resultBox.value = result; done.fulfill() },
+            idleReapThreshold: 0.01
+        )
+        loop.run()
+        // Cross both the ordinary idle poll and the five-second EOF drain grace.
+        Thread.sleep(forTimeInterval: 6)
+        XCTAssertFalse(tunnel.wasClosed, "send-side EOF is not cancellation of a pending authentication")
+        tunnel.resumeWithResponse(Data("authenticated response".utf8))
+        wait(for: [done], timeout: 2)
+        XCTAssertEqual(flow.received, Data("authenticated response".utf8))
+        guard case .success = resultBox.value else { return XCTFail("held response must drain successfully") }
+    }
+
+    func testAuthenticationWindowIsMonotonicBoundedAndCannotBeRenewed() {
+        var window = DsseMuxAuthenticationWait()
+        XCTAssertFalse(window.isPending(at: 10))
+        window.begin(at: 10)
+        XCTAssertTrue(window.isPending(at: 40), "30 seconds without bytes must allow human authentication")
+        window.begin(at: 100)
+        XCTAssertTrue(window.isPending(at: 129.99))
+        XCTAssertFalse(window.isPending(at: 130), "repeated STEPUP cannot extend the 120-second bound")
+        XCTAssertFalse(window.isPending(at: 9), "clock regression must not create an unbounded window")
+        window.begin(at: 131)
+        XCTAssertFalse(window.isPending(at: 131))
+    }
+
+    func testApplicationDataOrClosePermanentlyEndsAuthenticationWindow() {
+        var window = DsseMuxAuthenticationWait()
+        window.begin(at: 10)
+        window.end()
+        XCTAssertFalse(window.isPending(at: 11))
+        window.begin(at: 12)
+        XCTAssertFalse(window.isPending(at: 13), "completed flow cannot acquire another exemption")
+    }
+
     private static func dummyResult() -> DsseLocalRuntimeCopyResult {
         DsseLocalRuntimeCopyResult(
             status: "t", implementation: "t", bytesUp: 0, bytesDown: 0,
@@ -118,4 +188,60 @@ private final class ParkingMockTunnel: DsseRuntimeCopyTunnelStream, @unchecked S
     func send(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) { completion(nil) }
     func receive(completion: @escaping @Sendable (Data?, Error?) -> Void) { /* park */ }
     func close() { lock.lock(); closed = true; lock.unlock() }
+}
+
+private final class AuthenticationParkingTunnel: DsseRuntimeCopyTunnelStream, @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiting = true
+    private var closed = false
+    var authenticationWaitPending: Bool { lock.lock(); defer { lock.unlock() }; return waiting && !closed }
+    var wasClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed }
+    func finishAuthentication() { lock.lock(); waiting = false; lock.unlock() }
+    func send(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) { completion(nil) }
+    func receive(completion: @escaping @Sendable (Data?, Error?) -> Void) {}
+    func close() { lock.lock(); closed = true; lock.unlock() }
+}
+
+private final class AuthenticationDrainTunnel: DsseRuntimeCopyTunnelStream, @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiting = true
+    private var closed = false
+    private var response: Data?
+    private var receiver: (@Sendable (Data?, Error?) -> Void)?
+    var authenticationWaitPending: Bool { lock.lock(); defer { lock.unlock() }; return waiting && !closed }
+    var wasClosed: Bool { lock.lock(); defer { lock.unlock() }; return closed }
+    func send(_ data: Data, completion: @escaping @Sendable (Error?) -> Void) { completion(nil) }
+    func receive(completion: @escaping @Sendable (Data?, Error?) -> Void) {
+        lock.lock()
+        if waiting { receiver = completion; lock.unlock(); return }
+        let data = response; response = nil
+        lock.unlock()
+        completion(data, nil)
+    }
+    func resumeWithResponse(_ data: Data) {
+        lock.lock(); waiting = false
+        let callback = receiver; receiver = nil
+        if callback == nil { response = data }
+        lock.unlock()
+        callback?(data, nil)
+    }
+    func close() {
+        lock.lock(); closed = true
+        let callback = receiver; receiver = nil
+        lock.unlock()
+        callback?(nil, nil)
+    }
+}
+
+private final class HalfClosedAuthenticationFlow: DsseProviderTCPFlowCopyIO, @unchecked Sendable {
+    private let lock = NSLock()
+    private var response = Data()
+    var received: Data { lock.lock(); defer { lock.unlock() }; return response }
+    func openForCopy(completionHandler: @escaping @Sendable (Error?) -> Void) { completionHandler(nil) }
+    func readDataForCopy(completionHandler: @escaping @Sendable (Data?, Error?) -> Void) { completionHandler(nil, nil) }
+    func writeDataForCopy(_ data: Data, completionHandler: @escaping @Sendable (Error?) -> Void) {
+        lock.lock(); response.append(data); lock.unlock(); completionHandler(nil)
+    }
+    func closeReadForCopy(error: Error?) {}
+    func closeWriteForCopy(error: Error?) {}
 }

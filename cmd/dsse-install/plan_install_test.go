@@ -45,7 +45,7 @@ func installFromPlan(t *testing.T, planPath, dir string) *Plan {
 	if err != nil {
 		t.Fatalf("plan: %v", err)
 	}
-	if err := run(dir, strings.Join(plan.CertificateNames(), ","), "Test Deployment", 10, false); err != nil {
+	if err := run(dir, strings.Join(plan.CertificateNames(), ","), "Test Deployment", 10, false, plan.BrowserPortalNames()...); err != nil {
 		t.Fatalf("install: %v", err)
 	}
 	if err := applyPlanToFoundingMachine(plan, dir); err != nil {
@@ -96,6 +96,9 @@ func TestTheFoundingMachinesDoorsNameTheOtherRegions(t *testing.T) {
 		}
 	}
 	database := deploymentFileContents(t, dir, "haproxy-postgres.cfg")
+	if !strings.Contains(database, "default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions") {
+		t.Error("the database door retains sessions to a former primary after primary readiness fails")
+	}
 	if !strings.Contains(database, "203.0.113.11:15433") {
 		t.Errorf("the database door names no member in the other region, so this region stops entirely "+
 			"whenever the primary is there:\n%s", database)
@@ -239,7 +242,7 @@ func TestEachMachineRunsItsOwnComponentAndNotItsRegions(t *testing.T) {
 	dir := filepath.Join(work, "region-a")
 	plan := installFromPlan(t, writePlan(t, work), dir)
 
-	state := []string{"dsse-postgres-a:", "dsse-store-a:", "dsse-clickhouse:", "dsse-archive:"}
+	state := []string{"dsse-postgres-a:", "dsse-store-a:", "dsse-clickhouse:"}
 	for _, region := range plan.Regions {
 		for _, machine := range region.Machines {
 			if region.Founding && machine.Holds.has("control-plane") {

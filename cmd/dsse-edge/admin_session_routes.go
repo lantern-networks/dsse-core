@@ -138,7 +138,7 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				writeError(w, http.StatusUnauthorized, fmt.Errorf("invalid credentials"))
 				return
 			}
-			challenge, err := firstPartyChallenges.Issue(cred.Email, time.Now())
+			challenge, err := firstPartyChallenges.Issue(cred, time.Now())
 			if err != nil {
 				writeCredentialError(w, http.StatusInternalServerError, err)
 				return
@@ -155,12 +155,12 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 				return
 			}
-			email, ok := firstPartyChallenges.Consume(req.ChallengeToken, time.Now())
+			challenge, ok := firstPartyChallenges.Consume(req.ChallengeToken, time.Now())
 			if !ok {
 				writeError(w, http.StatusUnauthorized, fmt.Errorf("login challenge is invalid or expired"))
 				return
 			}
-			cred, err := config.LocalCredentials.VerifyTOTP(email, req.Code, time.Now())
+			cred, err := config.LocalCredentials.VerifyLoginChallenge(challenge, req.Code, time.Now())
 			if err != nil {
 				if errors.Is(err, errCredentialPersistence) {
 					_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_login_failed", nil, nil, evaluator, r, "credential_storage_unavailable"), time.Now())
@@ -256,17 +256,23 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		writeJSON(w, http.StatusOK, payload)
 	}))
 	mux.HandleFunc("POST /admin/logout", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
-		if cookie, err := r.Cookie("admin_session"); err == nil {
-			if _, _, err := adminAuth.RevokeSessionForTenant(r.Context(), strings.TrimSpace(cookie.Value), adminTenantIDFromRequest(r), time.Now()); err != nil {
-				log.Printf("revoke admin session: %v", err)
-			}
-		}
 		// Attribute the logout to the authenticated caller (resolve the principal for the email), not "System":
 		// the wrapper already authenticated this request, so the identity is in context.
 		var principal *adminPrincipal
 		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.PrincipalID) != "" {
+			principal = &adminPrincipal{ID: identity.PrincipalID, TenantID: identity.TenantID}
 			if p, found, perr := adminAuth.FindPrincipal(r.Context(), identity.PrincipalID, adminTenantIDFromRequest(r)); perr == nil && found {
 				principal = &p
+			}
+		}
+		if cookie, err := r.Cookie("admin_session"); err == nil {
+			if _, _, err := adminAuth.RevokeSessionForTenant(r.Context(), strings.TrimSpace(cookie.Value), adminTenantIDFromRequest(r), time.Now()); err != nil {
+				log.Printf("revoke admin session: %v", err)
+				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_logout_failed", principal, nil, evaluator, r, "session_revocation_unconfirmed"), time.Now())
+				// Keep the browser credential so the caller can retry. Clearing the
+				// cookie cannot revoke a copied credential at the authority.
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("sign-out could not be confirmed; retry when the authentication service is available"))
+				return
 			}
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminLoginAuditLog("admin_logout", principal, nil, evaluator, r, ""), time.Now())
@@ -287,8 +293,13 @@ func registerAdminSessionRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminDownloadAuditLog("admin_export_download_failed", token, evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())
 			}
 			log.Printf("export download refused: token spend was not confirmed")
+			if errors.Is(err, errCPQuorumUnavailable) {
+				writeError(w, http.StatusServiceUnavailable, err)
+				return
+			}
 			if errors.Is(err, errDownloadNotLeader) {
-				writeError(w, http.StatusConflict, errDownloadNotLeader)
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusServiceUnavailable, errDownloadNotLeader)
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, errDownloadStoreUnavailable)
@@ -386,7 +397,7 @@ func adminTenantIsGone(ctx context.Context, store adminTenantModelRuntimeStore, 
 		return "", false
 	}
 	for _, tenant := range tenants {
-		if strings.EqualFold(strings.TrimSpace(tenant.TenantID), tenantID) {
+		if strings.TrimSpace(tenant.TenantID) == tenantID {
 			return "", false
 		}
 	}

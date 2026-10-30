@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"github.com/lantern-networks/dsse-core/tunnel"
 )
 
@@ -28,6 +29,7 @@ func ProxyConnectViaTunnel(w http.ResponseWriter, r *http.Request, session *tunn
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
+	openFrame = session.PrepareTCPOpenFrame(openFrame)
 	streamCh, cleanup, _, err := session.OpenTCP(r.Context(), openFrame)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)
@@ -54,6 +56,11 @@ func ProxyConnectViaTunnel(w http.ResponseWriter, r *http.Request, session *tunn
 		return
 	}
 	defer clientConn.Close()
+	clientConn, err = preserveBufferedTunnelInput(clientConn, rw.Reader)
+	if err != nil {
+		log.Printf("read buffered CONNECT input: %v", err)
+		return
+	}
 	if _, err := rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		log.Printf("write CONNECT established response: %v", err)
 		return
@@ -77,27 +84,28 @@ func ProxyConnectViaTunnel(w http.ResponseWriter, r *http.Request, session *tunn
 
 func PrivateAppTCPSessionAuditDetails(dec model.AccessDecision, req model.DecisionRequest, openFrame tunnel.Frame, profile ApplicationRouteProfile, tunnelID string) map[string]any {
 	details := map[string]any{
-		"access_decision_id":                dec.ID,
-		"application_id":                    req.ApplicationID,
-		"application_sensitivity":           req.ApplicationSensitivity,
-		"decision":                          dec.Decision,
-		"destination_port":                  req.DestinationPort,
-		"destination_role":                  req.DestinationRole,
-		"network_extension_runtime_used":    false,
-		"private_app_session_audit":         true,
-		"private_app_session_audit_event":   "tcp_session_started",
-		"private_app_session_audit_version": "m813.v1",
-		"protocol":                          valueOrDefault(req.Protocol, "tcp"),
-		"raw_payload_logged":                false,
-		"credential_material_logged":        false,
-		"service_family":                    req.ServiceFamily,
-		"tcp_byte_cap":                      openFrame.ByteCap,
-		"tcp_concurrent_connection_cap":     openFrame.ConcurrentConnectionCap,
-		"tcp_connect_timeout_ms":            openFrame.ConnectTimeoutMillis,
-		"tcp_idle_timeout_ms":               openFrame.IdleTimeoutMillis,
-		"tcp_max_connection_lifetime_ms":    openFrame.MaxConnectionLifetimeMillis,
-		"tcp_request_id":                    openFrame.RequestID,
-		"transport_path":                    "edge_connector_tcp_tunnel",
+		"access_decision_id":                    dec.ID,
+		"application_id":                        req.ApplicationID,
+		"application_sensitivity":               req.ApplicationSensitivity,
+		"decision":                              dec.Decision,
+		"destination_port":                      req.DestinationPort,
+		"destination_role":                      req.DestinationRole,
+		"network_extension_runtime_used":        false,
+		"private_app_session_audit":             true,
+		"private_app_session_audit_event":       "tcp_session_started",
+		"private_app_session_audit_version":     "m813.v1",
+		"protocol":                              valueOrDefault(req.Protocol, "tcp"),
+		"raw_payload_logged":                    false,
+		"credential_material_logged":            false,
+		"service_family":                        req.ServiceFamily,
+		"tcp_byte_cap":                          openFrame.ByteCap,
+		"tcp_concurrent_connection_cap":         0, // Only the receiving operator can configure admission.
+		"tcp_legacy_concurrent_connection_hint": openFrame.ConcurrentConnectionCap,
+		"tcp_connect_timeout_ms":                openFrame.ConnectTimeoutMillis,
+		"tcp_idle_timeout_ms":                   openFrame.IdleTimeoutMillis,
+		"tcp_max_connection_lifetime_ms":        openFrame.MaxConnectionLifetimeMillis,
+		"tcp_request_id":                        openFrame.RequestID,
+		"transport_path":                        "edge_connector_tcp_tunnel",
 	}
 	if tunnelID != "" {
 		details["tunnel_id"] = tunnelID
@@ -184,29 +192,18 @@ func parseEdgeConnectAuthorityCandidate(candidate string) (string, int, error) {
 func defaultEdgeTCPConnectLimits() EdgeTCPConnectLimits {
 	return EdgeTCPConnectLimits{
 		ConnectTimeoutMillis:        int((5 * time.Second) / time.Millisecond),
-		MaxConnectionLifetimeMillis: int((5 * time.Minute) / time.Millisecond),
-		IdleTimeoutMillis:           int((30 * time.Second) / time.Millisecond),
-		ByteCap:                     64 << 20,
-		ConcurrentConnectionCap:     32,
+		MaxConnectionLifetimeMillis: int(runtimequota.Seconds("DSSE_TCP_STREAM_MAX_LIFETIME_SECONDS") / time.Millisecond),
+		IdleTimeoutMillis:           int(runtimequota.Seconds("DSSE_TCP_STREAM_IDLE_TIMEOUT_SECONDS") / time.Millisecond),
+		ByteCap:                     runtimequota.Bytes("DSSE_TCP_STREAM_MAX_BYTES"),
+		ConcurrentConnectionCap:     tunnel.LegacyTCPConcurrentConnectionCap,
 	}
 }
 
-// InteractiveEastWestEdgeTCPConnectLimits is for a STEERED interactive East-West session (ssh/rdp) egressing over
-// the connector tunnel. idle=0 and lifetime=0 mean UNLIMITED (0 = unlimited in ValidateTCPOpenFrame): an
-// interactive session must never be torn down by a timer — a user can sit at a prompt, or wait on a long silent
-// command, for an arbitrary time. The connector therefore never reaps the stream on idle/lifetime; teardown is
-// driven by the natural EOF/RST relayed from the Edge bridge, which keeps a half-close linger so an ABANDONED
-// (half-closed) flow is still reclaimed. The byte cap (1 GiB) + concurrency cap still bound resource use, so an
-// unlimited-lifetime flow cannot leak unbounded bytes. (The 30s default connector-stream idle used to drop ssh
-// after ~30s; a bounded 5m idle still cut a thinking session — hence unlimited for interactive.)
+// InteractiveEastWestEdgeTCPConnectLimits uses the same explicit operator budgets
+// as other Connector TCP flows. Unconfigured byte, lifetime and idle quotas are
+// disabled. Peer EOF/RST and transport failure still close the underlying socket.
 func InteractiveEastWestEdgeTCPConnectLimits() EdgeTCPConnectLimits {
-	return EdgeTCPConnectLimits{
-		ConnectTimeoutMillis:        int((5 * time.Second) / time.Millisecond),
-		MaxConnectionLifetimeMillis: 0, // unlimited
-		IdleTimeoutMillis:           0, // unlimited
-		ByteCap:                     tunnel.MaxTCPByteCap,
-		ConcurrentConnectionCap:     32,
-	}
+	return defaultEdgeTCPConnectLimits()
 }
 
 func CopyEdgeTCPClientToTunnel(ctx context.Context, session *tunnel.Session, RequestID string, client net.Conn) error {
@@ -272,6 +269,7 @@ func ProxyPublishedWebAppViaTunnel(w http.ResponseWriter, r *http.Request, sessi
 		writeError(w, http.StatusBadGateway, err)
 		return
 	}
+	openFrame = session.PrepareTCPOpenFrame(openFrame)
 	streamCh, cleanup, _, err := session.OpenTCP(r.Context(), openFrame)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err)

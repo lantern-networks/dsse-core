@@ -24,11 +24,11 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/registry"
@@ -40,19 +40,25 @@ import (
 // provider path). Set NoActiveProbe=1 here to disable NCSI's active connectivity probe for the steered lifetime.
 const ncsiPolicyPath = `SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator`
 
-// ncsiReadNoActiveProbe returns the current NoActiveProbe DWORD as a decimal string, or ("",false) if the key or
-// value is absent. In-process registry read (no child process — session-0 safe).
-func ncsiReadNoActiveProbe() (string, bool) {
+// ncsiReadNoActiveProbe distinguishes an absent value from a failed registry read. A read error must never
+// become an "absent" backup, because that would delete an operator's prior policy on recovery.
+func ncsiReadNoActiveProbe() (string, bool, error) {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, ncsiPolicyPath, registry.QUERY_VALUE)
 	if err != nil {
-		return "", false
+		if errors.Is(err, registry.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, err
 	}
 	defer k.Close()
 	v, _, err := k.GetIntegerValue("NoActiveProbe")
 	if err != nil {
-		return "", false
+		if errors.Is(err, registry.ErrNotExist) {
+			return "", false, nil
+		}
+		return "", false, err
 	}
-	return strconv.FormatUint(v, 10), true
+	return strconv.FormatUint(v, 10), true, nil
 }
 
 // ncsiWriteNoActiveProbe sets NoActiveProbe to val (creating the key if needed).
@@ -69,7 +75,10 @@ func ncsiWriteNoActiveProbe(val uint32) error {
 func ncsiDeleteNoActiveProbe() error {
 	k, err := registry.OpenKey(registry.LOCAL_MACHINE, ncsiPolicyPath, registry.SET_VALUE)
 	if err != nil {
-		return nil
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil
+		}
+		return err
 	}
 	defer k.Close()
 	if err := k.DeleteValue("NoActiveProbe"); err != nil && err != registry.ErrNotExist {
@@ -122,49 +131,17 @@ func ncsiProbeBackupPath() string {
 	return filepath.Join(filepath.Dir(exe), "dsse_ncsi_probe_backup.txt")
 }
 
-// isAllDigits reports whether s is a non-empty run of ASCII digits — the only shape we ever write back into
-// the registry value, so a corrupted/garbage backup can never be injected into the restore PowerShell.
-func isAllDigits(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
-}
-
 // suppressNCSIActiveProbe snapshots the current NoActiveProbe value (or "absent") to the backup file, sets
 // NoActiveProbe=1, and restarts NlaSvc so the change takes effect promptly (the initial arm has no network
 // change to trigger a re-probe on its own).
 func suppressNCSIActiveProbe() {
-	backup := ncsiProbeBackupPath()
-	// Snapshot the PRE-steer value exactly once. If a snapshot already exists we are RE-arming — a supervisor
-	// restart, or an UNCLEAN exit that skipped the restore defer and left NoActiveProbe=1 — so keep it: it holds
-	// the true pre-steer value. Re-capturing here would snapshot our OWN "=1" and leave NCSI's active test stuck
-	// off after the next clean stop. Mirrors resolverManager.start(), which loads the persisted DNS backup rather
-	// than re-capturing the (already-taken-over) live config.
-	prior := ""
-	if b, err := os.ReadFile(backup); err == nil {
-		prior = strings.TrimSpace(string(b))
-	}
-	if prior == "" {
-		prior = "absent"
-		if v, ok := ncsiReadNoActiveProbe(); ok {
-			prior = v
-		}
-		if err := os.WriteFile(backup, []byte(prior), 0o600); err != nil {
-			fmt.Printf("ncsi_probe: WARNING could not persist NoActiveProbe backup: %v\n", err)
-		}
-	}
-	if err := ncsiWriteNoActiveProbe(1); err != nil {
-		fmt.Printf("ncsi_probe: WARNING could not disable NCSI active test: %v\n", err)
+	prior, err := ncsiSuppressWith(ncsiPolicyOps{
+		backupPath: ncsiProbeBackupPath(), read: ncsiReadNoActiveProbe,
+		write: ncsiWriteNoActiveProbe, delete: ncsiDeleteNoActiveProbe, restart: restartService,
+	})
+	if err != nil {
+		fmt.Printf("ncsi_probe: WARNING could not safely disable NCSI active test: %v\n", err)
 		return
-	}
-	if err := restartService("NlaSvc"); err != nil {
-		fmt.Printf("ncsi_probe: WARNING NoActiveProbe=1 set but NlaSvc restart failed (applies on next network event): %v\n", err)
 	}
 	fmt.Printf("ncsi_probe: NCSI active connectivity test DISABLED (NoActiveProbe=1, prior=%s) — under steer-all the active probe is intercepted/unsatisfiable; passive detection + IPv6 aggregate now drive the OS connectivity label. Restored on clean stop.\n", prior)
 }
@@ -172,29 +149,16 @@ func suppressNCSIActiveProbe() {
 // restoreNCSIActiveProbe puts NoActiveProbe back to its pre-steer value (removing the value if it was absent)
 // and restarts NlaSvc. Reads the persisted snapshot so it works even across a service restart. Idempotent:
 // running it twice (e.g. clean stop after --mode recover already ran) is a harmless no-op.
-func restoreNCSIActiveProbe() {
-	prior := "absent"
-	if b, err := os.ReadFile(ncsiProbeBackupPath()); err == nil {
-		if s := strings.TrimSpace(string(b)); s != "" {
-			prior = s
-		}
-	}
-	var err error
-	if isAllDigits(prior) {
-		v, _ := strconv.ParseUint(prior, 10, 32)
-		err = ncsiWriteNoActiveProbe(uint32(v))
-	} else {
-		// "absent" or anything unexpected -> remove the value so NCSI returns to its default (active test on).
-		prior = "absent"
-		err = ncsiDeleteNoActiveProbe()
-	}
+func restoreNCSIActiveProbe() error {
+	prior, err := ncsiRestoreWith(ncsiPolicyOps{
+		backupPath: ncsiProbeBackupPath(), read: ncsiReadNoActiveProbe,
+		write: ncsiWriteNoActiveProbe, delete: ncsiDeleteNoActiveProbe, restart: restartService,
+	})
 	if err != nil {
-		fmt.Printf("ncsi_probe: WARNING could not restore NCSI active test: %v\n", err)
-	} else {
-		if rerr := restartService("NlaSvc"); rerr != nil {
-			fmt.Printf("ncsi_probe: WARNING NoActiveProbe restored but NlaSvc restart failed: %v\n", rerr)
-		}
+		fmt.Printf("ncsi_probe: WARNING could not safely restore NCSI active test: %v\n", err)
+		return err
+	} else if prior != "" {
 		fmt.Printf("ncsi_probe: NCSI active connectivity test restored (NoActiveProbe -> %s)\n", prior)
 	}
-	_ = os.Remove(ncsiProbeBackupPath())
+	return nil
 }

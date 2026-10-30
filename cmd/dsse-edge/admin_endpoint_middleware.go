@@ -28,6 +28,10 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 	}
 	return func(permission string, handler http.HandlerFunc) http.HandlerFunc {
 		recordRefusal := refusals.forPermission(permission)
+		recordQuorumRefusal := func() {}
+		if cpLeaderElectorInstance != nil && cpLeaderElectorInstance.quorumCheck != nil {
+			recordQuorumRefusal = refusals.forReason(permission, "quorum_unavailable")
+		}
 		return func(w http.ResponseWriter, r *http.Request) {
 			// ★★★ BEFORE ANYTHING ELSE: a change written to a node that does not lead is accepted and then
 			// discarded. See admin_writes_belong_to_the_leader.go — measured with its control, a device blocked
@@ -40,6 +44,13 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			if adminWriteRefusedOnAStandby(w, permission) {
 				recordRefusal()
 				return
+			}
+			if adminPermissionWrites(permission) {
+				if err := cpLeaderElectorInstance.checkQuorum(r.Context()); err != nil {
+					writeError(w, http.StatusServiceUnavailable, err)
+					recordQuorumRefusal()
+					return
+				}
 			}
 			identity, ok, err := adminRequestIdentity(r, evaluator.PolicyBundle.TenantID, adminToken, adminAuth, devMode, time.Now())
 			if ok && err == nil {
@@ -113,7 +124,7 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 			// route's answer carry answered_for and printing "this answer is about X, not Y". A per-screen
 			// workaround for a server-wide rule only covers the routes that happen to report it.
 			if requested := strings.TrimSpace(r.Header.Get("X-Operate-Tenant")); requested != "" &&
-				!strings.EqualFold(requested, strings.TrimSpace(identity.TenantID)) &&
+				requested != strings.TrimSpace(identity.TenantID) &&
 				!adminIdentityMayActAcrossOrganizations(identity) {
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminRBACDeniedAuditLog(identity, "admin.tenant.admin", evaluator, sourceIPFromRequest(r), r.UserAgent()), time.Now())
 				would := "carried out in"
@@ -343,7 +354,7 @@ func newAdminEndpointMiddleware(evaluator decision.Evaluator, writer *logs.Write
 					configChange.Result = &result
 				}
 				if strings.TrimSpace(auditTenant) != "" &&
-					!strings.EqualFold(strings.TrimSpace(auditTenant), strings.TrimSpace(identity.TenantID)) {
+					strings.TrimSpace(auditTenant) != strings.TrimSpace(identity.TenantID) {
 					stampOperatorActor(configChange.Metadata, identity)
 				}
 				_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, configChange, time.Now())

@@ -128,6 +128,17 @@ func TestATenantSeesItsOwnDevicesAndNoOthers(t *testing.T) {
 	}
 }
 
+func TestCaseDistinctTenantCannotReadAnotherTenantDeviceUpdates(t *testing.T) {
+	ledger := enrolledinventory.NewLedger()
+	mustEnroll(t, ledger, "upper-device", "Acme")
+	mustEnroll(t, ledger, "lower-device", "acme")
+	body := deviceUpdatesResponse(t, "acme", ledger, nil)
+	ids := deviceIDs(t, body)
+	if len(ids) != 1 || ids[0] != "lower-device" {
+		t.Fatalf("case-distinct tenant saw another tenant's devices: %v", ids)
+	}
+}
+
 // ★ A TELEMETRY OUTAGE MUST NOT RENDER AS A REPORTING OUTAGE. Answering from an empty set made a Postgres
 // timeout indistinguishable from a fleet that had genuinely stopped reporting.
 func TestATelemetryOutageIsDeclaredAndPublishesNoCoverage(t *testing.T) {
@@ -492,5 +503,36 @@ func TestAPullingEdgeReportsTheReleaseItIsActuallyServing(t *testing.T) {
 	if got := body.Offering[updateTargetKey("windows", "amd64")]; got != "0.2.1+3f8f2b02" {
 		t.Fatalf("the screen reports %q for windows/amd64 — this Edge is serving 0.2.1+3f8f2b02 to that fleet, "+
 			"and every device on this page reads as having no release", got)
+	}
+}
+
+func TestDeviceUpdateAdminViewDoesNotExposeOtherTenantCanary(t *testing.T) {
+	mux := http.NewServeMux()
+	facing := &publishedUpdates{byTarget: map[string]publishedUpdate{
+		tenantTargetKey("Acme", "windows", "amd64"):                    {Manifest: agentupdate.Manifest{Version: "0.4.1", Platform: "windows", Arch: "amd64"}, TenantID: "Acme"},
+		tenantTargetKey("acme", "windows", "amd64"):                    {Manifest: agentupdate.Manifest{Version: "0.4.2", Platform: "windows", Arch: "amd64"}, TenantID: "acme"},
+		tenantTargetKey(agentUpdateCatalogueScope, "windows", "amd64"): {Manifest: agentupdate.Manifest{Version: "0.4.0", Platform: "windows", Arch: "amd64"}, TenantID: agentUpdateCatalogueScope},
+	}}
+	registerAgentDeviceUpdateRoutes(mux, func(_ string, fn http.HandlerFunc) http.HandlerFunc { return fn },
+		devicestore.NewStore(), enrolledinventory.NewLedger(), agenttelemetry.NewStore(), newPublishedAgentUpdateStore(), facing,
+		nil, nil, nil)
+	for _, tc := range []struct{ tenant, version string }{{"Acme", "0.4.1"}, {"acme", "0.4.2"}, {"other", "0.4.0"}} {
+		req := httptest.NewRequest(http.MethodGet, "/admin/agent/device-updates", nil)
+		req = req.WithContext(context.WithValue(req.Context(), adminIdentityContextKey{},
+			adminIdentity{PrincipalID: "admin", TenantID: tc.tenant, AuthMethod: "admin_session"}))
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d: %s", tc.tenant, rec.Code, rec.Body.String())
+		}
+		var body struct {
+			Offering map[string]string `json:"offering"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if got := body.Offering[updateTargetKey("windows", "amd64")]; got != tc.version || len(body.Offering) != 1 {
+			t.Fatalf("%s view contains another tenant publication: %#v", tc.tenant, body.Offering)
+		}
 	}
 }

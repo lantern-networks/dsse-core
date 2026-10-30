@@ -8,8 +8,9 @@ import (
 	"time"
 )
 
-// Gated postgres E2E: aged rows are pruned, recent rows are kept. Set POSTGRES_QUEUE_E2E_DSN to run.
-func TestRetentionPrunerPostgresE2E(t *testing.T) {
+// Gated postgres E2E: aged rows remain local when no S3 archive is configured.
+// Set POSTGRES_QUEUE_E2E_DSN to run.
+func TestRetentionPrunerPreservesRowsWithoutArchivePostgresE2E(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
 	if dsn == "" {
 		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
@@ -36,7 +37,7 @@ func TestRetentionPrunerPostgresE2E(t *testing.T) {
 		_, _ = db.ExecContext(context.Background(), "DELETE FROM hot_events WHERE event_id IN ('ret-old','ret-fresh')")
 	})
 
-	// Prune anything older than 30 days.
+	// An aged row must stay in the durable local store until archival can succeed.
 	runRetentionPrune(ctx, db, retentionConfig{interval: time.Hour, hotEvents: 30 * 24 * time.Hour})
 
 	count := func(id string) int {
@@ -44,8 +45,8 @@ func TestRetentionPrunerPostgresE2E(t *testing.T) {
 		_ = db.QueryRowContext(ctx, "SELECT count(*) FROM hot_events WHERE event_id=$1", id).Scan(&n)
 		return n
 	}
-	if count("ret-old") != 0 {
-		t.Fatal("aged hot_events row must be pruned")
+	if count("ret-old") != 1 {
+		t.Fatal("aged hot_events row was deleted without an archive")
 	}
 	if count("ret-fresh") != 1 {
 		t.Fatal("recent hot_events row must be kept")

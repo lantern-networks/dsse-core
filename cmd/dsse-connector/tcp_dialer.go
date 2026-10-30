@@ -50,12 +50,17 @@ type connectorTCPConnectionHandler struct {
 }
 
 type connectorTunnelTCPDispatcher struct {
-	mu          sync.Mutex
-	routes      []connectorTCPRoute
-	reachable   model.ConnectorReachableRoutes
-	dialer      connectorTCPConnectionDialer
-	registry    *tunnel.TCPConnectionRegistry
-	handlers    map[string]*connectorTCPConnectionHandler
+	mu        sync.Mutex
+	routes    []connectorTCPRoute
+	reachable model.ConnectorReachableRoutes
+	dialer    connectorTCPConnectionDialer
+	registry  *tunnel.TCPConnectionRegistry
+	handlers  map[string]*connectorTCPConnectionHandler
+	// A closed registry record cannot be reused until its old asynchronous
+	// publisher has finished. Entries are removed when the publisher exits.
+	pending     map[string]int
+	opening     map[string]bool
+	closed      bool
 	writeFrames func([]tunnel.Frame) error
 	now         func() time.Time
 }
@@ -69,6 +74,8 @@ func newConnectorTunnelTCPDispatcher(routes []connectorTCPRoute, dialer connecto
 		dialer:   dialer,
 		registry: tunnel.NewTCPConnectionRegistry(),
 		handlers: map[string]*connectorTCPConnectionHandler{},
+		pending:  map[string]int{},
+		opening:  map[string]bool{},
 		now:      now,
 	}
 }
@@ -80,6 +87,25 @@ func (dispatcher *connectorTunnelTCPDispatcher) SetResponseWriter(writeFrames fu
 	dispatcher.mu.Lock()
 	defer dispatcher.mu.Unlock()
 	dispatcher.writeFrames = writeFrames
+}
+
+// A transport failure must release its sockets and any process-wide admission
+// reservations. Other attachments remain live and keep their own handlers.
+func (dispatcher *connectorTunnelTCPDispatcher) CloseAll() {
+	if dispatcher == nil {
+		return
+	}
+	dispatcher.mu.Lock()
+	dispatcher.closed = true
+	handlers := dispatcher.handlers
+	dispatcher.handlers = map[string]*connectorTCPConnectionHandler{}
+	dispatcher.mu.Unlock()
+	for _, handler := range handlers {
+		_, _ = handler.Close(tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonError, dispatcher.now())
+		// A concurrent read pump may already have removed the registry record.
+		// The admitted connection makes duplicate Close idempotent.
+		_ = handler.conn.Close()
+	}
 }
 
 // SetReachableRoutes configures the connector's reachable routes (the destination-driven authorization layer):
@@ -251,9 +277,12 @@ func (dispatcher *connectorTunnelTCPDispatcher) HandleFrame(ctx context.Context,
 	}
 	switch frame.Type {
 	case tunnel.FrameTCPOpen:
+		if !dispatcher.beginOpen(frame.RequestID) {
+			return []tunnel.Frame{connectorTCPDispatchErrorFrame(frame, "tcp request_id is still in use")}, nil
+		}
 		response, handler := handleTunnelTCPOpenConnection(ctx, frame, dispatcher.routesForFrame(frame), dispatcher.dialer, dispatcher.registry, dispatcher.now())
-		if handler != nil {
-			dispatcher.storeHandler(frame.RequestID, handler)
+		if !dispatcher.finishOpen(frame.RequestID, handler) {
+			return []tunnel.Frame{connectorTCPDispatchErrorFrame(frame, "tcp request_id is no longer active")}, nil
 		}
 		return []tunnel.Frame{response}, nil
 	case tunnel.FrameTCPData:
@@ -266,7 +295,7 @@ func (dispatcher *connectorTunnelTCPDispatcher) HandleFrame(ctx context.Context,
 			return []tunnel.Frame{connectorTCPDispatchErrorFrame(frame, err.Error())}, nil
 		}
 		if containsTCPClose(frames) {
-			dispatcher.removeHandler(frame.RequestID)
+			dispatcher.removeHandler(frame.RequestID, handler)
 		}
 		return frames, nil
 	case tunnel.FrameTCPClose:
@@ -280,21 +309,52 @@ func (dispatcher *connectorTunnelTCPDispatcher) HandleFrame(ctx context.Context,
 		closeFrame, err := handler.Close(frame.Direction, frame.CloseReason, dispatcher.now())
 		if err != nil {
 			if closeFrame.Type != "" {
-				dispatcher.removeHandler(frame.RequestID)
+				dispatcher.removeHandler(frame.RequestID, handler)
 			}
 			return []tunnel.Frame{connectorTCPDispatchErrorFrame(frame, err.Error())}, nil
 		}
-		dispatcher.removeHandler(frame.RequestID)
+		dispatcher.removeHandler(frame.RequestID, handler)
 		return nil, nil
 	default:
 		return nil, nil
 	}
 }
 
-func (dispatcher *connectorTunnelTCPDispatcher) storeHandler(requestID string, handler *connectorTCPConnectionHandler) {
+func (dispatcher *connectorTunnelTCPDispatcher) beginOpen(requestID string) bool {
 	dispatcher.mu.Lock()
 	defer dispatcher.mu.Unlock()
-	dispatcher.handlers[requestID] = handler
+	if dispatcher.closed || dispatcher.pending[requestID] != 0 || dispatcher.handlers[requestID] != nil {
+		return false
+	}
+	dispatcher.pending[requestID]++
+	dispatcher.opening[requestID] = true
+	return true
+}
+
+func (dispatcher *connectorTunnelTCPDispatcher) finishOpen(requestID string, handler *connectorTCPConnectionHandler) bool {
+	dispatcher.mu.Lock()
+	valid := dispatcher.opening[requestID] && !dispatcher.closed && dispatcher.handlers[requestID] == nil
+	delete(dispatcher.opening, requestID)
+	if !valid && handler != nil {
+		// Keep the reservation while closing this in-flight dial. An expiry
+		// may already have removed its registry record, but no new generation
+		// may claim the ID until this socket and its cleanup have finished.
+		dispatcher.mu.Unlock()
+		_, _ = handler.Close(tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonError, dispatcher.now())
+		_ = handler.conn.Close()
+		dispatcher.releasePending(requestID)
+		return false
+	}
+	if dispatcher.pending[requestID] <= 1 {
+		delete(dispatcher.pending, requestID)
+	} else {
+		dispatcher.pending[requestID]--
+	}
+	if valid && handler != nil {
+		dispatcher.handlers[requestID] = handler
+	}
+	dispatcher.mu.Unlock()
+	return valid
 }
 
 func (dispatcher *connectorTunnelTCPDispatcher) handlerFor(requestID string) *connectorTCPConnectionHandler {
@@ -303,18 +363,22 @@ func (dispatcher *connectorTunnelTCPDispatcher) handlerFor(requestID string) *co
 	return dispatcher.handlers[requestID]
 }
 
-func (dispatcher *connectorTunnelTCPDispatcher) removeHandler(requestID string) {
+func (dispatcher *connectorTunnelTCPDispatcher) removeHandler(requestID string, expected *connectorTCPConnectionHandler) {
 	dispatcher.mu.Lock()
 	defer dispatcher.mu.Unlock()
-	delete(dispatcher.handlers, requestID)
+	if dispatcher.handlers[requestID] == expected {
+		delete(dispatcher.handlers, requestID)
+	}
 }
 
-func (dispatcher *connectorTunnelTCPDispatcher) takeHandler(requestID string) *connectorTCPConnectionHandler {
+func (dispatcher *connectorTunnelTCPDispatcher) releasePending(requestID string) {
 	dispatcher.mu.Lock()
 	defer dispatcher.mu.Unlock()
-	handler := dispatcher.handlers[requestID]
-	delete(dispatcher.handlers, requestID)
-	return handler
+	if dispatcher.pending[requestID] <= 1 {
+		delete(dispatcher.pending, requestID)
+	} else {
+		dispatcher.pending[requestID]--
+	}
 }
 
 func (dispatcher *connectorTunnelTCPDispatcher) responseWriter() func([]tunnel.Frame) error {
@@ -327,7 +391,7 @@ func (dispatcher *connectorTunnelTCPDispatcher) StartReadPumpForRequest(requestI
 	if dispatcher == nil {
 		return
 	}
-	dispatcher.startReadPump(dispatcher.handlerFor(requestID))
+	dispatcher.startReadPump(requestID)
 }
 
 func (dispatcher *connectorTunnelTCPDispatcher) StartExpiryLoop(ctx context.Context, interval time.Duration) {
@@ -355,10 +419,15 @@ func (dispatcher *connectorTunnelTCPDispatcher) PublishExpiredConnections(now ti
 	if dispatcher == nil {
 		return nil
 	}
-	frames := dispatcher.CloseExpired(now)
+	frames := dispatcher.closeExpired(now, true)
 	if len(frames) == 0 {
 		return nil
 	}
+	defer func() {
+		for _, frame := range frames {
+			dispatcher.releasePending(frame.RequestID)
+		}
+	}()
 	writeFrames := dispatcher.responseWriter()
 	if writeFrames == nil {
 		return nil
@@ -367,26 +436,45 @@ func (dispatcher *connectorTunnelTCPDispatcher) PublishExpiredConnections(now ti
 }
 
 func (dispatcher *connectorTunnelTCPDispatcher) CloseExpired(now time.Time) []tunnel.Frame {
+	return dispatcher.closeExpired(now, false)
+}
+
+func (dispatcher *connectorTunnelTCPDispatcher) closeExpired(now time.Time, reservePublication bool) []tunnel.Frame {
 	if dispatcher == nil || dispatcher.registry == nil {
 		return nil
 	}
+	dispatcher.mu.Lock()
 	frames := dispatcher.registry.CloseExpired(now)
+	var handlers []*connectorTCPConnectionHandler
 	for _, frame := range frames {
-		if handler := dispatcher.takeHandler(frame.RequestID); handler != nil && handler.conn != nil {
-			_ = handler.conn.Close()
+		if dispatcher.opening[frame.RequestID] {
+			dispatcher.opening[frame.RequestID] = false
 		}
+		if handler := dispatcher.handlers[frame.RequestID]; handler != nil {
+			handlers = append(handlers, handler)
+			delete(dispatcher.handlers, frame.RequestID)
+		}
+		if reservePublication {
+			dispatcher.pending[frame.RequestID]++
+		}
+	}
+	dispatcher.mu.Unlock()
+	for _, handler := range handlers {
+		_ = handler.conn.Close()
 	}
 	return frames
 }
 
-func (dispatcher *connectorTunnelTCPDispatcher) startReadPump(handler *connectorTCPConnectionHandler) {
-	writeFrames := dispatcher.responseWriter()
-	if writeFrames == nil || handler == nil {
+func (dispatcher *connectorTunnelTCPDispatcher) startReadPump(requestID string) {
+	dispatcher.mu.Lock()
+	handler := dispatcher.handlers[requestID]
+	writeFrames := dispatcher.writeFrames
+	if writeFrames == nil || handler == nil || dispatcher.closed || !handler.claimReadPumpStart() {
+		dispatcher.mu.Unlock()
 		return
 	}
-	if !handler.claimReadPumpStart() {
-		return
-	}
+	dispatcher.pending[requestID]++
+	dispatcher.mu.Unlock()
 	go dispatcher.pumpTCPReads(handler, writeFrames)
 }
 
@@ -404,6 +492,7 @@ func (handler *connectorTCPConnectionHandler) claimReadPumpStart() bool {
 }
 
 func (dispatcher *connectorTunnelTCPDispatcher) pumpTCPReads(handler *connectorTCPConnectionHandler, writeFrames func([]tunnel.Frame) error) {
+	defer dispatcher.releasePending(handler.requestID)
 	for {
 		frames, err := handler.ReadFrames(dispatcher.now())
 		if err != nil {
@@ -422,12 +511,12 @@ func (dispatcher *connectorTunnelTCPDispatcher) pumpTCPReads(handler *connectorT
 		if len(frames) > 0 {
 			if writeErr := writeFrames(frames); writeErr != nil {
 				_, _ = handler.Close(tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonError, dispatcher.now())
-				dispatcher.removeHandler(handler.requestID)
+				dispatcher.removeHandler(handler.requestID, handler)
 				return
 			}
 		}
 		if err != nil || containsTCPClose(frames) {
-			dispatcher.removeHandler(handler.requestID)
+			dispatcher.removeHandler(handler.requestID, handler)
 			return
 		}
 	}

@@ -239,7 +239,10 @@ func decodeStrict(payload []byte) (Manifest, error) {
 	if err := dec.Decode(&m); err != nil {
 		return Manifest{}, fmt.Errorf("%w: %v", ErrMalformed, err)
 	}
-	if dec.More() {
+	// More reports whether another element remains inside the current array or
+	// object; at the top level it returns false for stray closing delimiters.
+	// Only EOF after the first value proves that the payload is one document.
+	if err := dec.Decode(new(any)); err != io.EOF {
 		return Manifest{}, fmt.Errorf("%w: trailing content after the manifest object", ErrMalformed)
 	}
 	return m, nil
@@ -273,6 +276,10 @@ func (m Manifest) Validate() error {
 	case ArtifactKindMSI, ArtifactKindPKG:
 	default:
 		return fmt.Errorf("%w: unknown artifact_kind %q", ErrMalformed, m.ArtifactKind)
+	}
+	if (m.Platform == PlatformWindows && m.ArtifactKind != ArtifactKindMSI) ||
+		(m.Platform == PlatformDarwin && m.ArtifactKind != ArtifactKindPKG) {
+		return fmt.Errorf("%w: artifact_kind %q is not valid for platform %q", ErrMalformed, m.ArtifactKind, m.Platform)
 	}
 	if strings.TrimSpace(m.Channel) == "" {
 		return fmt.Errorf("%w: channel is required", ErrMalformed)

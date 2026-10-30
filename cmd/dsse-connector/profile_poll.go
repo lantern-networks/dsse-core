@@ -28,30 +28,21 @@ const connectorProfilePollEvery = 5 * time.Minute
 
 type connectorProfileAnswer struct {
 	SchemaVersion string   `json:"schema_version"`
+	TenantID      string   `json:"tenant_id"`
 	EdgeEndpoints []string `json:"edge_endpoints"`
 	Note          string   `json:"note"`
 }
 
 // pollConnectorProfile keeps this connector's door list matching the deployment's, and persists it so a
 // restart does not go back to what the token said.
-func pollConnectorProfile(ctx context.Context, doors *connectorEndpoints, stateDir, connectorID, connectorSecret string, tlsConfig *tls.Config) {
+func pollConnectorProfile(ctx context.Context, doors *connectorEndpoints, stateDir, connectorID, connectorSecret, tenantID string, tlsConfig *tls.Config) {
 	client := newConnectorEdgeHTTPClient(tlsConfig)
 	read := func() {
-		answer, err := fetchConnectorProfile(ctx, client, doors.current(), connectorID, connectorSecret)
-		if err != nil {
-			// Best-effort, like the routes poll beside it: the last known list keeps working, and a deployment
-			// that is briefly unreachable is not a reason to forget where its doors are.
-			return
+		if err := refreshConnectorProfile(ctx, client, doors, stateDir, connectorID, connectorSecret, tenantID, tlsConfig != nil); err != nil {
+			// A transport/authority failure leaves the last verified decision in
+			// force. An authoritative empty list is handled separately below.
+			log.Printf("connector profile poll: %v", err)
 		}
-		list := strings.Join(answer.EdgeEndpoints, ";")
-		if strings.TrimSpace(list) == "" {
-			return
-		}
-		if !doors.replace(parseConnectorEndpoints(list)) {
-			return
-		}
-		log.Printf("connector doors updated from the deployment: %s — %s", doors.describe(), answer.Note)
-		persistConnectorDoors(stateDir, list)
 	}
 	go func() {
 		read()
@@ -68,6 +59,40 @@ func pollConnectorProfile(ctx context.Context, doors *connectorEndpoints, stateD
 	}()
 }
 
+func refreshConnectorProfile(ctx context.Context, client *http.Client, doors *connectorEndpoints,
+	stateDir, connectorID, connectorSecret, tenantID string, pinnedTLS bool) error {
+	at := doors.profileDoor()
+	if at == "" {
+		return fmt.Errorf("no verified profile GET address")
+	}
+	answer, err := fetchConnectorProfile(ctx, client, at, connectorID, connectorSecret)
+	if err != nil {
+		return err
+	}
+	if answer.SchemaVersion != "connector_profile.v1" || strings.TrimSpace(tenantID) == "" ||
+		answer.TenantID != tenantID || answer.EdgeEndpoints == nil {
+		return fmt.Errorf("profile schema, tenant or door list could not be verified")
+	}
+	list := strings.Join(answer.EdgeEndpoints, ";")
+	if len(answer.EdgeEndpoints) == 0 {
+		if doors.withdraw(at) {
+			log.Printf("connector: deployment withdrew all data doors; existing tunnels closed; profile GET only")
+		}
+		return persistConnectorDoors(stateDir, "", at, true)
+	}
+	next := parseConnectorEndpoints(list)
+	if next.count() != len(answer.EdgeEndpoints) {
+		return fmt.Errorf("profile contains an invalid Edge door")
+	}
+	if err := validateConnectorDoorURLs(next, pinnedTLS); err != nil {
+		return fmt.Errorf("rejected deployment Edge doors: %w", err)
+	}
+	if doors.replace(next) {
+		log.Printf("connector doors updated from the deployment: %s — %s", doors.describe(), answer.Note)
+	}
+	return persistConnectorDoors(stateDir, list, "", false)
+}
+
 func fetchConnectorProfile(ctx context.Context, client *http.Client, edgeURL, connectorID, connectorSecret string) (connectorProfileAnswer, error) {
 	url := fmt.Sprintf("%s/connectors/%s/profile", strings.TrimRight(edgeURL, "/"), connectorID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -77,7 +102,11 @@ func fetchConnectorProfile(ctx context.Context, client *http.Client, edgeURL, co
 	if connectorSecret != "" {
 		req.Header.Set(connectorSecretHeader, connectorSecret)
 	}
-	resp, err := client.Do(req)
+	// The retained profile-only address is a single verified management GET,
+	// not permission to follow a redirect to another data or management host.
+	profileClient := *client
+	profileClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := profileClient.Do(req)
 	if err != nil {
 		return connectorProfileAnswer{}, err
 	}
@@ -94,24 +123,30 @@ func fetchConnectorProfile(ctx context.Context, client *http.Client, edgeURL, co
 
 // persistConnectorDoors writes the current list into the saved state, so the next start begins where this
 // connector actually is rather than where its token pointed months ago.
-func persistConnectorDoors(stateDir, list string) {
+func persistConnectorDoors(stateDir, list, profileDoor string, withdrawn bool) error {
 	stateDir = strings.TrimSpace(stateDir)
 	if stateDir == "" {
-		return
+		return nil
 	}
 	path := filepath.Join(stateDir, "connector-state.json")
 	st, ok, err := loadConnectorState(path)
-	if !ok || err != nil {
-		return
+	if err != nil {
+		return err
 	}
-	if st.EdgeEndpoints == list {
-		return
+	if !ok {
+		return fmt.Errorf("enrolled connector state is missing")
+	}
+	if st.EdgeEndpoints == list && st.DoorListWithdrawn == withdrawn && st.ProfileDoorURL == profileDoor {
+		return nil
 	}
 	st.EdgeEndpoints = list
+	st.DoorListWithdrawn = withdrawn
+	st.ProfileDoorURL = profileDoor
 	if err := saveConnectorState(path, st); err != nil {
-		log.Printf("connector: could not persist the deployment's door list (%v) — it will be re-read on the "+
-			"next poll, but a restart before then goes back to the previous one", err)
-		return
+		return fmt.Errorf("persist deployment door decision: %w", err)
 	}
-	_ = os.Chmod(path, 0o600)
+	if err := os.Chmod(path, 0o600); err != nil {
+		return err
+	}
+	return nil
 }

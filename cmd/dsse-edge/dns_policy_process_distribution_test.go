@@ -191,8 +191,8 @@ func TestDNSAdminChangesReachSeparateEdgeUDP(t *testing.T) {
 		if err := json.Unmarshal(request("GET", "/admin/dns-policy", ""), &displayed); err != nil {
 			t.Fatal(err)
 		}
-		saved, ok := newDNSPolicyStore(filepath.Join(dir, "dns.json")).load()
-		if !ok {
+		saved, ok, err := newDNSPolicyStore(filepath.Join(dir, "dns.json")).load()
+		if !ok || err != nil {
 			t.Fatal("saved DNS unavailable")
 		}
 		a, _ := json.Marshal(saved)

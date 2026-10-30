@@ -75,9 +75,11 @@ func TestEastWestConnectRealFlowHoldsThenReleasesWithGrant(t *testing.T) {
 			return nil, nil
 		})},
 	})
+	managedTLS := managedApplicationTestTLS(t, handler, tenant, "dev_east_west_001")
 
 	connectReq := func() *http.Request {
 		req := httptest.NewRequest(http.MethodConnect, "/apps/"+appID+"?connector_id=conn_lab_001&service_family=ssh", nil)
+		req.TLS = managedTLS
 		req.Header.Set(edgeplane.ConnectAuthorityHeader, "dc-01:22")
 		return req
 	}

@@ -118,6 +118,33 @@ func TestStatusTransitionPersistsButSteadyBeatDoesNot(t *testing.T) {
 	}
 }
 
+func TestSameStatusRouteHeartbeatSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "connector_registry.json")
+	now := time.Now()
+	r1 := newPersistedRegistry(t, path)
+	conn := testRegistration("conn_route")
+	conn.Status = "healthy"
+	conn.ReachableRoutes = model.ConnectorReachableRoutes{CIDRs: []string{"10.1.0.0/24"}}
+	if _, err := r1.Register(conn, now); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	before := r1.ConfigGeneration()
+	if _, err := r1.Heartbeat(model.ConnectorHeartbeat{
+		ID: "conn_route", TenantID: "tenant_a", Status: "healthy",
+		ReachableRoutes: &model.ConnectorReachableRoutes{CIDRs: []string{"10.2.0.0/24"}},
+	}, now.Add(time.Minute)); err != nil {
+		t.Fatalf("route heartbeat: %v", err)
+	}
+	if r1.ConfigGeneration() != before+1 {
+		t.Fatal("route change must trigger fleet catalog refresh")
+	}
+	r2 := newPersistedRegistry(t, path)
+	got, ok := r2.Get("conn_route")
+	if !ok || len(got.ReachableRoutes.CIDRs) != 1 || got.ReachableRoutes.CIDRs[0] != "10.2.0.0/24" {
+		t.Fatalf("same-status route change lost across restart: ok=%v routes=%v", ok, got.ReachableRoutes.CIDRs)
+	}
+}
+
 // Persistence is opt-in: without a persister nothing is written and the old behaviour is unchanged.
 func TestNoPersisterKeepsInMemoryBehaviour(t *testing.T) {
 	r := NewRegistry()

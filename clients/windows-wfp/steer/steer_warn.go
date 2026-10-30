@@ -17,26 +17,40 @@ type warnPayload struct {
 	Service     string `json:"service"`
 }
 
-// warnNotifier surfaces the Warn-stage notice, coalesced once per "service|destination" per agent session (belt
+// warnNotifier surfaces the Warn-stage notice, coalesced once per owner and "service|destination" (belt
 // and suspenders with the Edge's own once-per-connection coalescing). It is pure / cross-platform and unit
 // testable: the actual toast is an injected func (defaultWarnLauncher on Windows; a no-op stub elsewhere). It
 // NEVER holds/retries/opens anything — a WARN frame is fire-and-forget.
 type warnNotifier struct {
 	mu       sync.Mutex
-	seen     map[string]struct{}
-	announce func(dest, service string)
+	seen     map[warnNoticeKey]struct{}
+	announce func(dest, service string, owner stepUpOwner)
 	logf     func(format string, args ...any)
 }
 
-// newWarnNotifier builds a notifier. announce == nil yields a no-op Notify (notices disabled).
-func newWarnNotifier(announce func(dest, service string), logf func(format string, args ...any)) *warnNotifier {
-	return &warnNotifier{seen: map[string]struct{}{}, announce: announce, logf: logf}
+type warnNoticeKey struct {
+	owner       stepUpOwner
+	destination string
+	service     string
 }
 
-// Notify parses a WARN frame payload and shows the passive notice once per service|destination. Safe on a nil
-// receiver and nil launcher, so the caller can always call it without guarding.
-func (w *warnNotifier) Notify(payload []byte) {
-	if w == nil || w.announce == nil {
+// newWarnNotifier builds a notifier. announce == nil yields a no-op notification (notices disabled).
+func newWarnNotifier(announce func(dest, service string, owner stepUpOwner), logf func(format string, args ...any)) *warnNotifier {
+	return &warnNotifier{seen: map[warnNoticeKey]struct{}{}, announce: announce, logf: logf}
+}
+
+func validWarnOwner(owner stepUpOwner) bool {
+	return owner.PID != 0 && owner.Created != 0 && owner.Session != 0 && owner.SID != "" && owner.LogonID != 0
+}
+
+func warnOwnerStillCurrent(owner stepUpOwner, capture func(uint32) stepUpOwner) bool {
+	return validWarnOwner(owner) && capture(owner.PID) == owner
+}
+
+// NotifyForOwner parses a WARN frame payload and shows it only to the originating flow owner.
+// Without a verified owner it cannot select a user's desktop safely. Safe on a nil receiver.
+func (w *warnNotifier) NotifyForOwner(payload []byte, owner stepUpOwner) {
+	if w == nil || w.announce == nil || !validWarnOwner(owner) {
 		return
 	}
 	var p warnPayload
@@ -48,11 +62,11 @@ func (w *warnNotifier) Notify(payload []byte) {
 	if dest == "" {
 		return
 	}
-	key := service + "|" + dest
+	key := warnNoticeKey{owner: owner, destination: dest, service: service}
 	w.mu.Lock()
 	if _, ok := w.seen[key]; ok {
 		w.mu.Unlock()
-		return // coalesced: already announced this resource this session
+		return // coalesced: already announced this resource to this flow owner
 	}
 	w.seen[key] = struct{}{}
 	w.mu.Unlock()
@@ -60,5 +74,5 @@ func (w *warnNotifier) Notify(payload []byte) {
 		w.logf("steer_warn_notice dest=%s service=%s (monitored; auth soon required)", dest, service)
 	}
 	// Show off the demux goroutine: a toast must not block the mux read loop (the flow is already forwarded).
-	go w.announce(dest, service)
+	go w.announce(dest, service, owner)
 }

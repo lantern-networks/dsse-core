@@ -11,14 +11,14 @@ import XCTest
 /// "the server sent nothing usable".
 final class DsseSingleRequestParseTests: XCTestCase {
     func testAPlainResponseIsSplitAtTheHeaderBoundary() throws {
-        let raw = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"cert_pem\":\"x\"}".utf8)
+        let raw = Data("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"cert_pem\":\"x\"}".utf8)
         let r = try DsseSingleRequestOverNW.parse(raw)
         XCTAssertEqual(r.status, 200)
         XCTAssertEqual(String(data: r.body, encoding: .utf8), "{\"cert_pem\":\"x\"}")
     }
 
     func testARefusalKeepsItsStatusAndBody() throws {
-        let raw = Data("HTTP/1.1 403 Forbidden\r\nContent-Length: 29\r\n\r\n{\"error\":\"identity revoked\"}".utf8)
+        let raw = Data("HTTP/1.1 403 Forbidden\r\nContent-Length: 28\r\n\r\n{\"error\":\"identity revoked\"}".utf8)
         let r = try DsseSingleRequestOverNW.parse(raw)
         XCTAssertEqual(r.status, 403, "the caller distinguishes refused from unreachable, and only the status can")
         XCTAssertTrue(String(data: r.body, encoding: .utf8)!.contains("revoked"))
@@ -40,5 +40,20 @@ final class DsseSingleRequestParseTests: XCTestCase {
 
     func testAStatusLineWithoutACodeIsRefused() {
         XCTAssertThrowsError(try DsseSingleRequestOverNW.parse(Data("GARBAGE\r\n\r\nbody".utf8)))
+    }
+
+    func testChunkedBodyWithoutTerminalChunkIsRefused() {
+        let raw = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n".utf8)
+        XCTAssertThrowsError(try DsseSingleRequestOverNW.parse(raw))
+    }
+
+    func testChunkWithDeclaredSizeLargerThanDataIsRefused() {
+        let raw = Data("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello\r\n0\r\n\r\n".utf8)
+        XCTAssertThrowsError(try DsseSingleRequestOverNW.parse(raw))
+    }
+
+    func testContentLengthMismatchIsRefused() {
+        let raw = Data("HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n{\"cert_pem\":\"x\"}".utf8)
+        XCTAssertThrowsError(try DsseSingleRequestOverNW.parse(raw))
     }
 }

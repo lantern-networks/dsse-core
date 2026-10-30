@@ -127,7 +127,7 @@ func TestOutboxReplayStandbyRefusalIsAudited(t *testing.T) {
 	for _, path := range []string{"/admin/audit-outbox/dead/dead/replay", "/admin/domain-event-outbox/dead/dead/replay?event_plane=domain"} {
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"reason":"retry"}`)))
-		if rec.Code != http.StatusConflict {
+		if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
 			t.Fatal(rec.Code, rec.Body.String())
 		}
 	}

@@ -1,0 +1,120 @@
+{
+  "profile": "three-regions-multi-edge",
+  "deployment": "dsse.example",
+  "agent_publisher": "",
+  "image_revision": "",
+  "service_image": "dsse:release",
+  "console_image": "dsse-console:release",
+  "mesh": true,
+  "regions": [
+    {
+      "id": "region-a",
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "cp-a",
+          "holds": "control-plane",
+          "failure_domain": "cp-a",
+          "addresses": [
+            "10.20.0.10"
+          ],
+          "reachable": "cp-a.dsse.example",
+          "reachable_address": "10.20.0.10"
+        },
+        {
+          "name": "edge-a-1",
+          "holds": "edges",
+          "failure_domain": "edge-a-1",
+          "addresses": [
+            "10.20.0.21"
+          ],
+          "reachable": "edge-a-1.dsse.example",
+          "reachable_address": "10.20.0.21"
+        },
+        {
+          "name": "edge-a-2",
+          "holds": "edges",
+          "failure_domain": "edge-a-2",
+          "addresses": [
+            "10.20.0.22"
+          ],
+          "reachable": "edge-a-2.dsse.example",
+          "reachable_address": "10.20.0.22"
+        }
+      ],
+      "founding": true
+    },
+    {
+      "id": "region-b",
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "cp-b",
+          "holds": "control-plane",
+          "failure_domain": "cp-b",
+          "addresses": [
+            "10.21.0.10"
+          ],
+          "reachable": "cp-b.dsse.example",
+          "reachable_address": "10.21.0.10"
+        },
+        {
+          "name": "edge-b-1",
+          "holds": "edges",
+          "failure_domain": "edge-b-1",
+          "addresses": [
+            "10.21.0.21"
+          ],
+          "reachable": "edge-b-1.dsse.example",
+          "reachable_address": "10.21.0.21"
+        },
+        {
+          "name": "edge-b-2",
+          "holds": "edges",
+          "failure_domain": "edge-b-2",
+          "addresses": [
+            "10.21.0.22"
+          ],
+          "reachable": "edge-b-2.dsse.example",
+          "reachable_address": "10.21.0.22"
+        }
+      ]
+    },
+    {
+      "id": "region-c",
+      "holds_state": true,
+      "machines": [
+        {
+          "name": "cp-c",
+          "holds": "control-plane",
+          "failure_domain": "cp-c",
+          "addresses": [
+            "10.22.0.10"
+          ],
+          "reachable": "cp-c.dsse.example",
+          "reachable_address": "10.22.0.10"
+        },
+        {
+          "name": "edge-c-1",
+          "holds": "edges",
+          "failure_domain": "edge-c-1",
+          "addresses": [
+            "10.22.0.21"
+          ],
+          "reachable": "edge-c-1.dsse.example",
+          "reachable_address": "10.22.0.21"
+        },
+        {
+          "name": "edge-c-2",
+          "holds": "edges",
+          "failure_domain": "edge-c-2",
+          "addresses": [
+            "10.22.0.22"
+          ],
+          "reachable": "edge-c-2.dsse.example",
+          "reachable_address": "10.22.0.22"
+        }
+      ]
+    }
+  ]
+}

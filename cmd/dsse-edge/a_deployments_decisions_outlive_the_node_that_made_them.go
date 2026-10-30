@@ -50,15 +50,15 @@ func accessDecisionFromRow(row map[string]any) (model.AccessDecision, bool) {
 }
 
 // accessTrendsFromHotStore reads a tenant's access decisions for [from, to] out of the hot store. ok is false
-// when no hot store is wired or the read failed — only then may the caller fall back to this node's ring; an
-// empty result with ok true means the deployment recorded nothing in the window, which is an answer.
+// when no hot store is wired — only then may the caller fall back to this node's ring. A read failure is
+// returned separately; an empty result with ok true means the deployment recorded nothing in the window.
 //
 // oldestRead is the earliest decision actually read, which is what tells a truncated window where it really
 // begins; oldestHeld is the earliest this tenant has in the stream at all, ignoring the window, so "the first
 // half is empty" can be told apart from "we no longer hold the first half".
-func accessTrendsFromHotStore(ctx context.Context, store hotstore.Store, tenantID string, from, to time.Time) (decisions []model.AccessDecision, oldestRead, oldestHeld time.Time, truncated, ok bool) {
+func accessTrendsFromHotStore(ctx context.Context, store hotstore.Store, tenantID string, from, to time.Time) (decisions []model.AccessDecision, oldestRead, oldestHeld time.Time, truncated, ok bool, readErr error) {
 	if store == nil || strings.TrimSpace(tenantID) == "" {
-		return nil, time.Time{}, time.Time{}, false, false
+		return nil, time.Time{}, time.Time{}, false, false, nil
 	}
 	rows := 0
 	export, err := store.ExportRows(ctx, hotstore.SearchQuery{
@@ -84,7 +84,7 @@ func accessTrendsFromHotStore(ctx context.Context, store hotstore.Store, tenantI
 		return nil
 	})
 	if err != nil {
-		return nil, time.Time{}, time.Time{}, false, false
+		return nil, time.Time{}, time.Time{}, false, false, err
 	}
-	return decisions, oldestRead, export.OldestMatchedAt, rows >= accessTrendsHotStoreRowCap, true
+	return decisions, oldestRead, export.OldestMatchedAt, rows >= accessTrendsHotStoreRowCap, true, nil
 }

@@ -99,7 +99,7 @@ func enrolledIdentitiesForTenant(config serverConfig, tenant string) []string {
 		if !entry.Enabled {
 			continue
 		}
-		if !strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenant)) {
+		if strings.TrimSpace(entry.TenantID) != strings.TrimSpace(tenant) {
 			continue
 		}
 		out = append(out, entry.Identity)
@@ -159,7 +159,7 @@ func deviceCAWithdrawalGate(config serverConfig, tenant, sha256Hex string, remai
 		if err != nil {
 			return interceptionWithdrawalVerdict{Text: "managed device authority could not be read: " + err.Error()}
 		}
-		managed := certificatesInPEM([]byte(deviceAnchorsOf(snapshot.cas[strings.ToLower(tenant)])))
+		managed := certificatesInPEM([]byte(deviceAnchorsOf(snapshot.cas[tenant])))
 		for _, cert := range managed {
 			if strings.EqualFold(certFingerprint(cert), target) {
 				return interceptionWithdrawalVerdict{Text: "this CA is still admitted by the managed device authority; finish its managed rotation before removing this registration"}

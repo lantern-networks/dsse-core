@@ -13,9 +13,10 @@ import (
 var edgeControlPlaneAdminPath = regexp.MustCompile(`"(/admin/[a-z0-9\-/]+)(?:\?|")`)
 
 // The files that make up the Edge's machine path to its control plane. Named rather than discovered, because
-// the point of the gate is to notice when a FOURTH one appears.
+// the point of the gate is to notice when another one appears.
 var edgeControlPlaneSyncFiles = []string{
 	"config_bundle_sync.go",
+	"config_bundle_grant_pages.go",
 	"steer_exclusion_sync.go",
 	"enrolment_cp_report.go",
 }
@@ -28,6 +29,9 @@ var edgeControlPlaneSyncFiles = []string{
 // So this reads the sync sources for the control-plane routes they call and checks the list covers exactly
 // those, in both directions: a call with no scope fails, and a scope with no call fails too.
 func TestTheControlPlaneCredentialCoversExactlyTheCallsItMakes(t *testing.T) {
+	wasCP := edgeIsControlPlane
+	edgeIsControlPlane = true
+	t.Cleanup(func() { edgeIsControlPlane = wasCP })
 	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: newAdminAuthStore()})
 	mux, ok := handler.(*http.ServeMux)
 	if !ok {
@@ -79,7 +83,7 @@ func TestTheControlPlaneCredentialCoversExactlyTheCallsItMakes(t *testing.T) {
 	}
 }
 
-// And the set stays narrow: two reads and exactly one write. The property is what makes a leaked pull
+// And the set stays narrow: two read scopes and exactly one write. The property is what makes a leaked pull
 // credential different from a leaked deployment, so it is asserted rather than left to review.
 func TestTheControlPlaneCredentialCarriesOneWriteAndNoPlatformPowers(t *testing.T) {
 	scopes := edgeControlPlaneScopes()

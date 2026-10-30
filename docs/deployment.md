@@ -157,6 +157,7 @@ Replace them before minting:
 | `archive.bucket` | Existing bucket with versioning and Object Lock enabled |
 | `archive.region` | Bucket region when required by the provider |
 | `archive.auth_mode` | `static` for a dedicated key pair in private `deployment.env`, or `iam` for workload identity available to the CP process |
+| `archive.webhook_url` | Required with an archive: HTTPS receiver for archive failure and recovery alerts, without credentials, query or fragment. See [Operations](operations.md) |
 
 The examples do not name the images to run, and the installer cannot generate a
 startable deployment without them. Add `image_revision`, `service_image`,

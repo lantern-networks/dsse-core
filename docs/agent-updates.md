@@ -108,12 +108,14 @@ dsse-signupdate -key <deployment>/authority/agent-update-signing.key -manifest m
 ```
 
 ```
-dsse-signupdate: ★ SIGNED THE AUTHORITY TO EXECUTE CODE. 0.4.0 darwin/arm64, delivery=dsse,
-artifact sha256:39e828…, valid until 2027-09-05T00:00:00Z. Every endpoint pinning
-cf3f57f854… will run this.
+dsse-signupdate: ★ SIGNED THE AUTHORITY TO EXECUTE CODE. 0.4.0 darwin/arm64, delivery=dsse, artifact sha256:39e828748caa42c2d03f632ab822cd00836d478f1db0a6590e42ebb55e493420, valid until 2027-09-05T00:00:00Z. Every endpoint pinning cf3f57f8549eceb7c079d63575ccb69ff3bb56623644ea93ff0a1d9d61c5a68b will run this.
+dsse-signupdate: ★ 0.4.0 carries no build metadata, so whether it was built from a modified tree could not be checked — that check reads the build stamp. The binaries stamp themselves (e.g. 0.3.0+9d0ccdb); publishing the version the artefact reports is what makes this release traceable to a commit.
+dsse-signupdate: wrote manifest.signed.json
 ```
 
 It reads back what it just authorised. That sentence is the last chance to notice you signed the wrong build.
+The second line appears when `version` has no build stamp after `+`; it is a warning,
+and the manifest is still written.
 
 ## Publish through the Console
 

@@ -1042,7 +1042,7 @@ rejection is audited, or that local append is a crash-durable transaction.
 ## Finding deployment operation audits
 
 In **Logs & Audit → Logs → Admin audit**, a deployment operator outside a selected
-organization can choose **Audit scope → Deployment operations**. This reads only
+organization can choose **Audit scope → Agent distribution catalog records**. This reads only
 the reserved deployment audit namespace. It does not combine customer logs.
 **Current organization** remains the default and shows the authenticated
 organization's records; entering an organization uses that selected organization's

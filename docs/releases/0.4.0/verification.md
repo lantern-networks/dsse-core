@@ -170,7 +170,8 @@ mux resumption, interception identity retention,
 unknown-ingress rejection, unchanged three-origin upgrade configuration,
 activation gating and explicit tenant Region-impact confirmation. These are code
 checks, not a real entrance outage or live rolling-replacement measurement.
-Before release, stop only an entrance/CP-L4 host with its Edges
-still healthy and run repeated fresh authentication on both supported endpoint
-OSes through every surviving entrance. Also measure one-node-at-a-time upgrades
-with fresh authenticated native traffic throughout the activation sequence.
+Not yet measured: stopping only an entrance/CP-L4 host with its Edges still
+healthy while repeating fresh authentication on both supported endpoint OSes
+through every surviving entrance, and one-node-at-a-time upgrades with fresh
+authenticated native traffic throughout the activation sequence. Measure both
+before relying on entrance failover or rolling upgrades.

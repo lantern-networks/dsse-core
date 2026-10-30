@@ -5,8 +5,9 @@ installation and current limitations. In the one-Region profile, each entrance
 distributes browser authentication, endpoint and Connector transport to the
 same three Edges. In the three-Region profile, each entrance distributes those
 connections only to its own Region's Edges. Authentication grants and revocation
-still propagate across all Regions. This is an unpublished distribution review,
-not release approval.
+still propagate across all Regions. 0.4.0 is an experimental release; see
+[Acceptance and limitations](verification.md) for what was measured and what
+remains open.
 
 ## Topologies and implementation status
 
@@ -44,10 +45,10 @@ uses a fixed, configured OIDC redirect URI for the selected origin, the shared b
 ceremony state and CP one-time consumption. Cross-origin substitution, replay and
 unknown Host/SNI are refused. Management and Console routing stay leader-aware.
 
-The installer now generates regional backend pools for the three-Region profile,
-and its routing tests pass locally. This does not certify the exact release
-candidate on Linux hosts with real endpoints. Keep deployment acceptance on hold
-until those end-to-end checks pass.
+The installer generates regional backend pools for the three-Region profile.
+The released images were installed in that profile on Linux hosts with real macOS
+and Windows endpoints; see [Acceptance and limitations](verification.md). The
+one-Region profile has not been installed from the released images.
 
 ## Install one Region with three combined Nodes
 
@@ -62,8 +63,7 @@ Prepare three Linux hosts, persistent disks, Docker/Compose v2, synchronized tim
 private IPv4 peer routing, stable DNS and verified SSH host keys. IdP/Connector
 fixtures are additional infrastructure. Test real IPv6 egress from every Edge
 host and container before enrolling dual-stack endpoints. Use source, images and
-installer from one reviewed revision; unpublished candidates are not assumed to
-be available on public main. Follow [Building](../../building.md) for the two
+installer from one reviewed revision. Follow [Building](../../building.md) for the two
 first-party service images and preload required third-party images. Carries do not carry images.
 
 ```sh
@@ -88,7 +88,7 @@ and `postgres_tools_image` references plus `postgres_major: 18`. The 0.4.0
 release publishes these images; their digests are listed in the
 [release README](README.md#server-container-images). Use the same
 reviewed cohort on every machine and make the images available to each Linux
-host. The sample plans omit this candidate-specific field: add it before
+host. The sample plans omit this release-specific field: add it before
 `-preflight` or `-start-node`. The installer carries these values; setup
 preflight refuses an omitted cohort and checks the actual PostgreSQL binary
 major before startup. Generated Compose also requires explicit data-layer image
@@ -101,7 +101,11 @@ both completed supported plans against every scanned built image.
 ### Using the published images
 
 To install the released images, put these values in the plan before generating
-the deployment directory. They are the images the release acceptance ran:
+the deployment directory. They are the images the release acceptance ran. They
+are linux/amd64 only, so every host must be x86-64; on an arm64 host `-preflight`
+refuses them, and you build the images from source instead (see
+[Building](../../building.md)). The HAProxy and ClickHouse images the installer
+pins cover both architectures:
 
 ```json
 "image_revision": "source-768a8c72fb96156d00d2e78d6a0f3903b506f59c988e5692c2e951efd6ddd6f8",
@@ -475,7 +479,7 @@ of client DNS selection, which physical CP and Edge handled a connection,
 automatic Region failover, or an IdP/browser round trip. A missing entrance,
 SAN, or trust chain fails.
 Unperformed browser, endpoint and failure acceptance is explicitly `n/a`, never
-PASS; it remains mandatory before device admission and release. Review every
+PASS; it remains mandatory before device admission. Review every
 `n/a` even when the measured server checks exit 0.
 
 On a CP-only verifier host, an approved private browser CA must be trusted by the

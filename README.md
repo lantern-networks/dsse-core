@@ -23,13 +23,15 @@ A successful installation check is not evidence of long-duration reliability or 
 security audit. It has not been independently run at length by anyone who did not write it.
 See the [threat model](docs/threat-model.md) and each platform's limitations.
 
-## Latest release — 0.3.1 experimental
+## Latest release — 0.4.0 experimental
 
-[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental) was released on September 29, 2026.
-This is the first maintenance release following 0.3.0, focused on everyday reliability,
-regional installation, and endpoint compatibility.
-See the release notes for signed downloads, upgrade guidance and verification scope,
-and [maintenance and release history](docs/maintenance.md) for delivered fixes and follow-up validation.
+[0.4.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.0-experimental) was released on October 30, 2026.
+It adds a three-Region layout with dedicated control-plane and Edge hosts, shared
+authentication across all Edges, and five published server container images
+(linux/amd64). It is accepted for fresh installations only.
+See the release notes for signed downloads, the [0.4.0 documentation](docs/releases/0.4.0/README.md)
+for installation, what was measured, the known issue and the open acceptance items, and
+[maintenance and release history](docs/maintenance.md) for earlier releases.
 
 ## Why we built it
 
@@ -135,7 +137,7 @@ runs one Edge on loopback. It is **not a deployment** and does not install an en
 | [Agent updates](docs/agent-updates.md) | Publish signed packages to enrolled devices |
 | [Operations](docs/operations.md) | Routine checks, change control, state, and recovery preparation |
 | [Troubleshooting](docs/troubleshooting.md) | Diagnose deployment, endpoint, policy, and update failures |
-| [Egress broker](egress-broker/README.md) | Experimental source, not packaged or qualified in the proposed 0.4.0 distribution; the standard deployment uses Go HTTP/TLS |
+| [Egress broker](egress-broker/README.md) | Experimental source, not packaged or qualified in the 0.4.0 release; the standard deployment uses Go HTTP/TLS |
 
 The policy evaluator is default-deny. The Console's initial organization policy can
 explicitly allow and inspect all traffic, and connector access starts in OBSERVE mode;

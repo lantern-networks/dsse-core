@@ -3,7 +3,7 @@
 0.4.0 is accepted as a fresh installation. Existing 0.3.1 deployments,
 if any, need separate validation of upgrade and data migration, including any
 previously bundled object-store data. The legacy upgrade procedure below is
-reference for a future supported upgrade and is not a 0.4.0 publication gate.
+reference for a future supported upgrade and is not part of 0.4.0 acceptance.
 
 ## New deployment
 
@@ -62,7 +62,7 @@ for the exact storage, membership and compatibility contract.
 - Treat the tenant-boundary fix as a security update. Assess prior exposure and plan
   IdP client-secret rotation, token/session invalidation and reauthentication as
   applicable. Do not include secrets or grants in support bundles or release assets.
-  Candidate notes are not a substitute for the approved security advisory.
+  These notes are not a security advisory.
 - Build from one reviewed revision. Generate a complete operator-inventoried rollout
   census with individual process identities. A standalone new-install census does
   not establish the versions or membership of an existing multi-node deployment.

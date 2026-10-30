@@ -26,7 +26,7 @@ export DSSE_REVISION="$(git rev-parse HEAD)"
 For a source archive, **do not run Git in or above the extracted directory**.
 It has no Git history; an enclosing checkout can report an unrelated revision.
 Set `DSSE_REVISION` to the exact public commit recorded with the archive, or the
-`source-<content-sha256>` identifier in an unpublished candidate's tools README.
+`source-<content-sha256>` identity recorded in the release's `release-manifest.json`.
 Use that same value as `image_revision` in the installation plan. Do not use
 `unknown`, a private repository commit, or a new timestamp as source identity.
 
@@ -47,7 +47,7 @@ provenance: build from the reviewed source and verify distribution hashes.
 
 The generated `deployment.env` selects `DSSE_IMAGE=dsse:release` and
 `DSSE_CONSOLE_IMAGE=dsse-console:release`. For a shared-fleet plan, set `service_image` and `console_image`
-to the intended references (immutable registry digests for a release candidate), and `image_revision`
+to the intended references (immutable registry digests, such as the published release images), and `image_revision`
 to the source identity above. Generate each node from that complete plan; do not
 hand-edit image references into generated files. Unspecified image references
 retain the local tags above; `image_revision` is required by setup preflight.
@@ -103,7 +103,7 @@ reach their registries. Inspect the generated Compose configuration for their ex
 
 For the native curl-impersonate upstream transport, follow the separate
 [egress broker build and integration guide](../egress-broker/README.md). These service builds
-do not compile that nested native module. The proposed 0.4.0 distribution does not
+do not compile that nested native module. The 0.4.0 release does not
 include or qualify a broker executable or image.
 
 ## Build operator tools and native binaries

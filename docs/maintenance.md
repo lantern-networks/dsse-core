@@ -1,9 +1,11 @@
 # Maintenance and release history
 
-Updated: 2026-09-29. Lantern DSSE is actively maintained by Lantern Networks, Inc.
-The latest published version is [0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental), released on September 29.
-The release notes provide signed endpoint downloads, upgrade guidance, exact artifact
-identities and the verified scope. The changes below are included in 0.3.1.
+Updated: 2026-10-30. Lantern DSSE is actively maintained by Lantern Networks, Inc.
+The latest published version is [0.4.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.0-experimental), released on October 30.
+Its changes, acceptance record and open items are in the
+[0.4.0 documentation](releases/0.4.0/README.md). The sections below record
+[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental),
+released on September 29; the changes below are included in 0.3.1.
 Per-change evidence describes what was checked during development; remaining deployment validation is follow-up work,
 not a pending publication step. The [release verification summary](#031-verification-scope-and-follow-up)
 records the completed evaluation and its scope.

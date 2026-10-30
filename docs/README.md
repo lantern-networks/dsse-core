@@ -7,18 +7,16 @@ with values from your deployment. Use the documentation from the revision you bu
 
 ## Current release
 
-[0.3.1 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.3.1-experimental)
-was published on September 29, 2026 as the first maintenance release after 0.3.0.
-Its release notes provide signed macOS and Windows downloads, upgrade instructions,
-and verification scope. [Maintenance history](maintenance.md) describes the fixes
-included in this version.
-
-Additional topology support is under development for 0.4.0. The presence of installer
-options in development source does not establish release or deployment acceptance.
-The [0.4.0 distribution review](releases/0.4.0/README.md) defines candidate artifacts,
-changes since 0.3.1, migration and remaining publication gates. It is not a release announcement.
-For its three-entrance shared-fleet layouts and existing three-node installation, use the
+[0.4.0 experimental](https://github.com/lantern-networks/dsse-core/releases/tag/v0.4.0-experimental)
+was published on October 30, 2026. Its release notes provide signed macOS and Windows
+downloads, the server container images and the artifact checksums. The
+[0.4.0 documentation](releases/0.4.0/README.md) lists the assets and images,
+[changes since 0.3.1](releases/0.4.0/changes.md) and
+[acceptance and limitations](releases/0.4.0/verification.md), including the known
+issue and the acceptance items that remain open. 0.4.0 is accepted for fresh
+installations only. For its three-entrance layouts, use the
 [multi-Edge installation guide](releases/0.4.0/install-multi-edge.md).
+[Maintenance history](maintenance.md) describes 0.3.1 and earlier.
 
 ## Choose a starting point
 
@@ -45,7 +43,7 @@ For its three-entrance shared-fleet layouts and existing three-node installation
 
 The standard deployment uses Go HTTP/TLS for outbound inspected traffic. Experimental
 [egress broker](../egress-broker/README.md) source remains available but is not packaged
-or qualified in the proposed 0.4.0 distribution.
+or qualified in the 0.4.0 release.
 [Dependency versions](dependency-versions.md) records the selected build inputs.
 [SaaS tenant restriction](saas-tenant-restriction.md) covers account restrictions separately
 from DLP and access policy.

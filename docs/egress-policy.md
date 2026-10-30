@@ -5,7 +5,7 @@ destinations. An access decision, TLS inspection, and DLP are separate controls.
 The optional egress broker changes the upstream HTTP/TLS implementation; it is
 not the policy engine and is not required by the standard generated deployment.
 Standard inspected egress uses Go HTTP/TLS. The broker is not packaged or qualified
-in the proposed 0.4.0 distribution.
+in the 0.4.0 release.
 
 This guide describes the current experimental source. Read it with
 [Organizations](organizations.md), [IdP integration](idp.md), and [PKI](pki.md).

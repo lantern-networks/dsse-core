@@ -141,13 +141,13 @@ proof that the origin certificate has not been revoked.
 The endpoint sees an inspection certificate instead of the origin's certificate,
 so its validation of that inspection certificate cannot verify the origin's
 revocation status. Legacy inspection authorities lack CRL distribution points;
-the development candidate adds signed distribution for newly issued authorities,
+0.4.0 adds signed distribution for newly issued authorities,
 pending strict-client validation. Bypassing a
 known certificate-validation responder preserves that responder's connection,
 but does not restore verification of the original certificate on an intercepted
 site. Customer overrides can change the effective bypass set.
 
-Strict-client compatibility remains unverified. The signed-CRL candidate must be
+Strict-client compatibility remains unverified. The signed CRL must still be
 tested with client revocation checks enabled, including every link of the chain
 and status fetching after expiry or failover. The readiness report retains
 `attention`. The candidate does not establish origin certificate status.

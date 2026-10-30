@@ -78,6 +78,11 @@ the two shapes an organization can be in — it brought a CA of its own, or this
 | **This tenant's device identity** | **Register this tenant's device CA** — this deployment then admits what that CA issues | **Let this deployment issue them** |
 | **This tenant's interception authority** | **Load this tenant's interception CA** — their root, issuing certificate and key | **Let this deployment make one** |
 
+The same page also shows the deployment's own **Device Trust CA** and **The name this
+tenant's devices dial**. Neither is needed here: the first already exists for every
+organization, and the second gives an organization a dedicated name, which a new
+organization does not need.
+
 **For one-time-token enrolment, choose "Let this deployment issue them" for device identity.**
 Registering an external device CA alone establishes trust in its certificates; it does not
 supply a private key with which this deployment can issue a new device identity. Configure

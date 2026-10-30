@@ -402,15 +402,25 @@ dsse-install -plan "$DSSE_PLAN" -dir "$DSSE_DIR" -carry node-b.tar.gz -machine n
 scp node-b.tar.gz operator@node-b.example.test:
 ```
 
-On B, preload the reviewed images, then:
+The printed `scp` assumes Node A can reach Node B over SSH. Any channel you
+trust works, for example copying through the operator's workstation; delete
+every transit copy once the archive is extracted.
+
+On B, extract the carry, pull that host's images (see
+[Using the published images](#using-the-published-images)), then start it:
 
 ```sh
 umask 077
-mkdir -p /opt/dsse/kiri
+sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" /opt/dsse/kiri
 tar xzpf node-b.tar.gz -C /opt/dsse/kiri
+cd /opt/dsse/kiri
+docker compose --env-file deployment.env pull
 # If using a distinct Edge key, import its approved all-Portal SAN pair here.
 dsse-install -start-node -dir /opt/dsse/kiri -machine node-b
 ```
+
+The installer's printed order shows `mkdir -p /opt/dsse/kiri`, which fails for an
+account that cannot write `/opt`; create the directory as above.
 
 The carry retains the complete plan and closed-bootstrap marker, never issuing
 keys or the operator token. Protect and retire temporary carry copies. After all
@@ -627,11 +637,12 @@ exact plan name, for example:
 ```sh
 dsse-install -plan "$DSSE_PLAN" -dir "$DSSE_DIR" \
   -carry edge-b-1.tar.gz -machine edge-b-1
-# On edge-b-1, after private transfer and image loading:
+# On edge-b-1, after private transfer:
 umask 077
-mkdir -p /opt/dsse/region-b
+sudo install -d -m 0700 -o "$(id -un)" -g "$(id -gn)" /opt/dsse/region-b
 tar xzpf edge-b-1.tar.gz -C /opt/dsse/region-b
 cd /opt/dsse/region-b
+docker compose --env-file deployment.env pull
 dsse-install -start-node -dir /opt/dsse/region-b -machine edge-b-1 \
   -install-portal-certificate /secure/portal-fullchain.pem -portal-key /secure/portal.key
 ```

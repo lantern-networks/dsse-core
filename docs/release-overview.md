@@ -76,8 +76,9 @@ endpoints. Fleet verification, default-browser sign-in with resumption of held
 native requests, and each agent's regular stop and uninstall were measured. The
 [acceptance record](releases/0.4.0/verification.md) lists the results, the known
 issue that the audit hot store is not replicated between control planes, and the
-items that remain open, including a one-Region installation from the released
-images, database failover and backup/restore.
+items that remain open, including database failover and backup/restore. A
+one-Region, three-node installation was also built from the published guides,
+images and packages alone, through Console setup and a steering macOS endpoint.
 
 ### 0.3.1 — September 29, 2026
 

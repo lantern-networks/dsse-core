@@ -8,8 +8,9 @@ to configure an organization and connect an endpoint. **This release is experime
 Its `-plan ... -order` output is the command reference for your topology. Run each step
 on the machine it names; the output is instructions, not a shell script to execute wholesale.
 
-The 0.4.0 acceptance installation used the dedicated-node three-Region topology:
-one CP+HAProxy host and two Edge hosts per Region. Install that topology with the
+The 0.4.0 images were installed in two topologies: three Regions with one CP+HAProxy
+host and two Edge hosts each, and one Region with three combined nodes, the second
+using only the published guides. Install either with the
 [0.4.0 installation guide](releases/0.4.0/install-multi-edge.md); it uses a different
 service layout and installation order from the combined-node examples below, which
 have not been installed from the released images.
@@ -334,7 +335,8 @@ from `install-order.txt` in order. The installer prints the exact membership com
 1. On the founding node, add the next state member as a learner and generate its archive
    with `-plan ... -carry <machine>.tar.gz -machine <machine>`.
 2. Copy that archive to the named host. Adapt the printed `scp` destination to your SSH
-   user and key. Both service images must already be loaded there.
+   user and key. Every image its Compose file names must be available there (pulled
+   from the registry or loaded).
 3. On that host, extract into the printed directory with `tar xzpf` and start its generated
    Compose project. The `p` preserves the archive's file permissions under a private
    `umask`: public HAProxy configuration and the store CA must remain readable to their
@@ -436,7 +438,8 @@ through to the Edge. Use the generated hostnames, not bare IP URLs.
 | State-bearing nodes to one another | Generated etcd client/peer and database ports, restricted to deployment peers |
 | Control planes to operator-managed S3, if configured | TLS to the archive endpoint declared in the plan; no S3 egress requirement for local-only storage |
 
-Typical state ports include 12379/12390 (etcd), 18008 (Patroni), and 15432 (database).
+Typical state ports between peers include 12379/12390 (etcd), 15433 (PostgreSQL member)
+and 18008 (Patroni). The local database port 15432 binds to loopback and is not a peer port.
 The generated `deployment.env` and Compose file are authoritative; inspect
 them for every host rather than opening a range to the Internet. Direct Edge ports are
 published for peer communication and verification; an unadvertised port still needs a firewall.
@@ -474,8 +477,8 @@ arguments, as before.
 
 ## State, stopping, and restarting
 
-The control plane owns Postgres and ClickHouse and writes cold audit segments to an
-operator-managed S3-compatible bucket. Edges retain local audit spools and ship records
+The control plane owns Postgres and ClickHouse and, when an archive is configured, writes
+cold audit segments to an operator-managed S3-compatible bucket. Edges retain local audit spools and ship records
 to the control plane. Include the local stores and external bucket in backup and
 capacity planning. If S3 is unavailable, aged hot rows stay in persistent local
 storage until archival succeeds; plan disk headroom for that interval.

@@ -87,7 +87,7 @@ from the administrator for the organization this device will join:
 
 | File | Purpose |
 |---|---|
-| `DsseAgent.msi` | Signed installer for the device's architecture |
+| `DsseAgent.msi` | Signed installer for the device's architecture. The 0.4.0 release file is `DsseAgent-0.4.0-windows-x64.msi`; substitute its name for `DsseAgent.msi` in the commands below |
 | `install_profile.json` | Signed configuration and trust material |
 | `enrolment_token.txt` | One-time authorization for this device to join |
 | `profile_signing_key.txt` | Public key used to verify the profile |

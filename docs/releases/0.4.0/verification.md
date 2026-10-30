@@ -77,6 +77,15 @@ configured.
   `golang.org/x/crypto/openpgp` package, which has no fix and is not imported.
   The next release updates `golang.org/x/net` to v0.62.0, which fixes the two
   `html` advisories.
+- The five published images were scanned by digest with Trivy, each with a
+  CycloneDX inventory of its contents. No high or critical finding was reported
+  except CVE-2021-38599 against the source-built WAL-G in `dsse-postgres`, the
+  version-mapping exception explained in
+  [Dependency versions](../../dependency-versions.md). The HAProxy and ClickHouse
+  images the installer pins were scanned at the same digests with no high or
+  critical finding.
+- Both installations above used the same signed macOS package with separately
+  supplied deployment and organization inputs.
 
 ## Verified development scope
 
@@ -137,9 +146,8 @@ deciding where to deploy 0.4.0.
 | Tenant isolation | Regression coverage of deployment-only distribution APIs and tenant APIs; upgrades and data migration from any existing 0.3.1 installation require separate acceptance |
 | Audit storage | Accept local-only mode with durable hot-store capacity, backup and restore evidence. Verify scoped, audited manual hot-log deletion with preview, legal-hold refusal and confirmed completion on PostgreSQL and ClickHouse. If external S3 is selected, verify CP-scoped credentials, real Put/Get, outage retention and replay, and an operator-visible failure/backlog/recovery alert through the signed webhook and Console; S3 itself is not a prerequisite for local-only installation |
 | Final image installation | The three-Region and one-Region installations above ran the final images with three-member synchronous PostgreSQL replication, etcd quorum, ClickHouse and CP startup without S3. Still required with the same images: PostgreSQL primary failover and rejoin, and backup/restore. Earlier MinIO-era AWS trials and two-member local HA tests do not satisfy this gate |
-| Dependency security | Current blocking source/binary checks for shipped components, including the S3 client library, plus the [image inventory and per-image scanner](../../../scripts/scan_release_images.py) for shipped third-party bases and built images selected by both plans. The scanner also requires a CycloneDX inventory for each built image and rejects unresolved local Go module identities such as `pkg:golang/..`. No missing digest, image role, component identity or high/critical finding may be reported as approved |
 | Windows package | Updater publisher argument validation with the released MSI. Fresh installation, payload hashes, signatures, the Microsoft-signed driver, WFP recovery and uninstall are measured above |
-| Generic packaging | No baked tenant/deployment inputs; same signed package verified with separately supplied independent deployment inputs |
+| Generic packaging | The same signed Windows MSI installed against a second, independent deployment. The macOS package is measured above |
 | Admin Console | With the final Console and server images on a real deployment, review every tenant-administrator and operator page against actual API responses, including populated and empty states, API failure and session expiry. Verify device identity, OS, last report and certificate details against enrolled endpoints; exercise create/save/read-back/cancel/delete only in a dedicated test tenant and confirm cross-tenant and role restrictions. Local synthetic-data screenshots and navigation checks do not satisfy this gate |
 | Authority failure | Full Connector/held-flow test with a slow synchronous database replica; distinguish database write delay from an unreachable Region |
 | Authorization availability | Local regressions now distinguish an unavailable/stale shared grant store from a verified empty result and suppress new login ceremonies when grant authority cannot be verified. Repeat this with the final binaries and an actual shared-store outage across browser and native traffic before approval |

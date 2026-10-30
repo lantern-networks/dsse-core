@@ -15,6 +15,7 @@ alone does not show interactive UI.
 - A Mac meeting the package's minimum OS requirement, an administrator account, and a
   running [deployment](deployment.md) with a configured [customer organization](organizations.md).
 - A signed, notarized package appropriate for that Mac and the deployment's expected publisher.
+  The 0.4.0 release package is for Apple silicon only.
 - Working DNS for the regional transport and recovery URLs in the profile.
 - A working `/usr/bin/python3` from Apple's developer tools. The current installer uses it
   to read and derive configuration from the signed profile. Check it before installation;

@@ -102,7 +102,8 @@ Follow these pages in order. All commands use this repository's root, where `go.
 
 1. [Deployment](docs/deployment.md): prerequisites, build, plan, start, bootstrap the
    administrator, and verify. Includes plans for **three regions with one node each**
-   and for a single-machine lab.
+   and for a single-machine lab. The topologies installed with the 0.4.0 images are in
+   the [0.4.0 installation guide](docs/releases/0.4.0/install-multi-edge.md).
 2. [First use](docs/after-verify.md): trust the Console certificate, sign in with MFA,
    and prepare the first customer organization.
 3. [Organizations](docs/organizations.md): configure its authorities and policies,

@@ -7,7 +7,7 @@ with `-lab-mode`. To install DSSE with the Console and endpoint enrolment, use
 
 ## Prerequisites and build
 
-Use a Unix shell, Git, Go 1.26 or newer, curl, and OpenSSL with `req -addext` support.
+Use a Unix shell, Git, Go 1.26.9 or newer, curl, and OpenSSL with `req -addext` support.
 Port 18443 must be free. The commands start from a new checkout of the **public repository**:
 
 ```sh

@@ -47,8 +47,9 @@ unknown Host/SNI are refused. Management and Console routing stay leader-aware.
 
 The installer generates regional backend pools for the three-Region profile.
 The released images were installed in that profile on Linux hosts with real macOS
-and Windows endpoints; see [Acceptance and limitations](verification.md). The
-one-Region profile has not been installed from the released images.
+and Windows endpoints. The one-Region profile was installed from the released images
+and macOS package using only the published guides. See
+[Acceptance and limitations](verification.md) for what each installation covered.
 
 ## Install one Region with three combined Nodes
 
@@ -106,7 +107,7 @@ To install the released images, put these values in the plan before generating
 the deployment directory. They are the images the release acceptance ran. They
 are linux/amd64 only, so every host must be x86-64; on an arm64 host `-preflight`
 refuses them, and you build the images from source instead (see
-[Building](../../building.md)). The HAProxy and ClickHouse images the installer
+[Building](../../building.md#build-the-data-layer-images)). The HAProxy and ClickHouse images the installer
 pins cover both architectures:
 
 ```json

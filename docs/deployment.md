@@ -8,9 +8,11 @@ to configure an organization and connect an endpoint. **This release is experime
 Its `-plan ... -order` output is the command reference for your topology. Run each step
 on the machine it names; the output is instructions, not a shell script to execute wholesale.
 
-For the development-only dedicated-node topology, see
-[Three regions with multiple dedicated Edges](three-regions-multi-edge.md).
-It uses a different service layout and installation order from the combined-node examples below.
+The 0.4.0 acceptance installation used the dedicated-node three-Region topology:
+one CP+HAProxy host and two Edge hosts per Region. Install that topology with the
+[0.4.0 installation guide](releases/0.4.0/install-multi-edge.md); it uses a different
+service layout and installation order from the combined-node examples below, which
+have not been installed from the released images.
 For a smaller authentication lab with one CP/L4 machine and two or more dedicated
 Edges, see [One region with dedicated Edges](one-region-multi-edge.md).
 
@@ -54,8 +56,9 @@ Before starting, prepare:
   Without an archive, aged raw events remain in the persistent local hot store;
   size, back up and monitor that store accordingly. Object Lock and archived
   audit-chain verification are unavailable in this mode.
-- A package-signing identity and signed Windows/macOS installers if endpoints will join.
-  These are separate from the deployment's TLS authorities; see [Building](building.md).
+- Signed Windows/macOS packages if endpoints will join: the packages published with
+  the release, or packages you build and sign yourself (see [Building](building.md)).
+  Package signing is separate from the deployment's TLS authorities.
 
 ### Choose IPv4-only or dual-stack before enrolling devices
 
@@ -114,8 +117,11 @@ go build -o bin/dsse-profileverify ./cmd/dsse-profileverify
 export PATH="$PWD/bin:$PATH"
 ```
 
-Use the revision associated with the release you are evaluating. Build **both** service
-images and load them on every node, following [Building](building.md#build-the-service-images).
+Use the revision associated with the release you are evaluating. Each node needs the
+server images its generated Compose file names: either the images published with the
+release (see [Using the published images](releases/0.4.0/install-multi-edge.md#using-the-published-images)),
+or both service images and the data-layer images built from this revision and loaded on
+every node, following [Building](building.md#build-the-service-images).
 Keep `dsse-install` on `PATH` when changing directories. If a separate build host is used,
 copy the matching installer binary and the chosen plan to the founding node as well.
 
@@ -135,7 +141,7 @@ Replace them before minting:
 | Field | Value to supply |
 |---|---|
 | `deployment` | DNS suffix under your control; `example.test` is only a private test example |
-| `agent_publisher` | Identity expected by the endpoint package verifier, matching your signed packages; not a display name or the example placeholder |
+| `agent_publisher` | Identity expected by the endpoint package verifier, matching your signed packages; not a display name or the example placeholder. For the published 0.4.0 packages use `M4U8GSBL6C` |
 | `regions[].id` | Stable region identifier |
 | `founding` | `true` on exactly one region, where authorities are first minted |
 | `holds_state` | `true` on each of the three voting regions |
@@ -150,6 +156,13 @@ Replace them before minting:
 | `archive.bucket` | Existing bucket with versioning and Object Lock enabled |
 | `archive.region` | Bucket region when required by the provider |
 | `archive.auth_mode` | `static` for a dedicated key pair in private `deployment.env`, or `iam` for workload identity available to the CP process |
+
+The examples do not name the images to run, and the installer cannot generate a
+startable deployment without them. Add `image_revision`, `service_image`,
+`console_image` and `data_layer` before minting. For the published 0.4.0 images, copy
+the values from [Using the published images](releases/0.4.0/install-multi-edge.md#using-the-published-images);
+for images you built, see [Building](building.md). Without `data_layer`, Compose refuses
+to start with `required variable DSSE_ETCD_IMAGE is missing a value`.
 
 Behind NAT, the bind address and the DNS-visible address may differ. Do not put an
 unassigned public/NAT address in `addresses`; provide working routing for `reachable` and `reachable_address`.

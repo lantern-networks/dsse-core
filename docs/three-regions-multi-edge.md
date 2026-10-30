@@ -8,10 +8,10 @@ See [the installation guide](releases/0.4.0/install-multi-edge.md) for both the
 three-combined-node and dedicated-node layouts, browser SAN certificates and
 capability activation.
 
-This **development profile** is not a released or fully validated deployment mode.
-Use the installer and server binaries from the same source revision. End-to-end
-region failure, endpoint/Connector recovery, and capacity acceptance still require
-integration tests on that revision.
+The 0.4.0 acceptance installation used this profile with the released images; see
+[Acceptance and limitations](releases/0.4.0/verification.md) for what was measured.
+Use the installer and server images from the same release. Region failure,
+endpoint/Connector recovery and capacity have not been accepted for this profile.
 
 ## Layout
 

@@ -142,6 +142,11 @@ docker image inspect --format '{{json .RepoDigests}} {{index .Config.Labels "org
 
 The digest must be the one in the plan, the [release README](README.md#server-container-images)
 and `release-manifest.json`, and the revision label must equal `image_revision`.
+
+To enroll endpoints with the published signed packages, set `"agent_publisher":
+"M4U8GSBL6C"`, the Apple Team ID that signs the macOS package. A plan carries one
+publisher; the acceptance installation used this value for both the macOS and the
+Windows endpoints. Validating Windows agent updates against it is an open item.
 `-preflight` repeats the label check and also checks each image's OS and
 architecture and the service binary's own revision. To check the images'
 source, see [Checking the images yourself](README.md#checking-the-images-yourself).

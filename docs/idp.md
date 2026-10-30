@@ -188,7 +188,7 @@ and the [rolling-upgrade requirements](authentication-rolling-upgrades.md).
 ## Review and revoke access approvals
 
 Open **Access Approvals** inside the customer organization. **Active** shows
-unexpired approvals; **All (incl. revoked/expired)** includes history. Search by
+unexpired approvals; **All (incl. used/revoked/expired)** includes history. Search by
 person, email, device, destination or provider. The table includes captured
 identity, binding, scope, assurance, sign-in method and validity. These are recorded
 claims, not proof that every flow-policy requirement listed above is enforced.

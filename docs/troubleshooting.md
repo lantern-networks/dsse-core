@@ -8,7 +8,7 @@ diagnosing identity or trust failures.
 
 | Symptom | Check first | Next step |
 |---|---|---|
-| Containers do not start | `docker compose ... ps -a` and `logs --tail=100` in the generated directory | Check both service images, architecture, bind addresses, ports, and container subnet conflicts in [Building](building.md) |
+| Containers do not start | `docker compose ... ps -a` and `logs --tail=100` in the generated directory | Check that every image the Compose file names is present and matches the host architecture (the published 0.4.0 images are linux/amd64), then bind addresses, ports, and container subnet conflicts in [Building](building.md) |
 | Host reaches a name, container cannot | DNS from both environments; generated aliases and reachable addresses | Correct name resolution using [Deployment](deployment.md); host-only DNS does not configure containers |
 | Console certificate warning | Expected hostname, clock, and verified deployment anchor in the browser's trust store | Follow [First use](after-verify.md#1-trust-the-deployment-and-sign-in); do not accept an unknown certificate |
 | Password works but MFA fails | Authenticator initialized from the bootstrap second-factor secret; synchronized clocks | Use the intended account and its recovery codes if needed; an API token is not a TOTP code |

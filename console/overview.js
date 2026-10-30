@@ -85,6 +85,21 @@ function ovNum(n) { n = Number(n) || 0; if (n >= 1e6) return (n / 1e6).toFixed(1
 function ovBytes(n) { n = Number(n) || 0; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return n.toFixed(i ? 1 : 0) + " " + u[i]; }
 function ovAgo(iso) { if (!iso) return "—"; const t = Date.parse(iso); if (isNaN(t)) return "—"; const m = Math.floor((Date.now() - t) / 60000); if (m < 1) return "just now"; if (m < 60) return m + "m ago"; const h = Math.floor(m / 60); return h < 48 ? h + "h ago" : Math.floor(h / 24) + "d ago"; }
 function ovHealthTone(s) { s = (s || "").toLowerCase(); if (s === "ok" || s === "healthy") return "ok"; if (s === "unconfigured" || s === "disabled" || s === "memory" || s === "") return "off"; if (s === "degraded" || s === "warn") return "warn"; return "danger"; }
+// A control plane does not hold Connector tunnels, so its tenant-scoped list omits this field.
+// Only an explicit Edge observation can say a tunnel is up or down.
+function ovConnectorTunnelView(c) {
+  if (c.tunnel_connected === true) return { text: bl({ en: "up", ja: "接続中" }), tone: "ok" };
+  if (c.tunnel_connected === false) return { text: bl({ en: "down", ja: "切断" }), tone: "danger" };
+  return { text: bl({ en: "not reported", ja: "未報告" }), tone: "off" };
+}
+function ovConnectorNetworkRoutes(c) {
+  const routes = c.reachable_routes;
+  if (!routes || !Number.isSafeInteger(routes.cidr_count) || routes.cidr_count < 0
+      || !Number.isSafeInteger(routes.fqdn_domain_count) || routes.fqdn_domain_count < 0) {
+    return bl({ en: "not reported", ja: "未報告" });
+  }
+  return (routes.cidr_count + routes.fqdn_domain_count) + bl({ en: " routes", ja: " 経路" });
+}
 function ovWindow() { const now = new Date(); const from = new Date(now.getTime() - ({ "24h": 24, "7d": 168, "30d": 720 }[_ovPeriod] || 168) * 3600 * 1000); return { from: from.toISOString(), to: now.toISOString(), gran: _ovPeriod === "24h" ? "1h" : "1d" }; }
 async function ovGet(path, plane) { try { return await apiFetch("GET", path, undefined, plane); } catch (e) { return { ok: false, status: 0, body: null, error: String(e) }; } }
 function ovPanel(title, more) {
@@ -189,9 +204,13 @@ async function ovLoadStrip(strip, fleetP) {
     strip.appendChild(el("span", { class: "ov-sys" }, [el("span", { class: "ov-dot ov-dot-" + tone }),
       document.createTextNode(bl({ en: "Config in effect", ja: "設定の反映" }) + (roll.behind.length ? bl({ en: " · " + roll.behind.length + " behind", ja: " · " + roll.behind.length + " 台未反映" }) : ""))]));
   } else {
-    const csEnabled = cs.ok && cs.body && cs.body.enabled;
-    strip.appendChild(el("span", { class: "ov-sys" }, [el("span", { class: "ov-dot ov-dot-" + (csEnabled ? (cs.body.healthy === false ? "warn" : "ok") : "off") }),
-      document.createTextNode(bl({ en: "Config sync (this node)", ja: "設定の同期(このノード)" }) + (csEnabled ? "" : bl({ en: " · off", ja: " · 無効" })))]));
+    const csKnown = cs.ok && cs.body && typeof cs.body.enabled === "boolean";
+    const csEnabled = csKnown && cs.body.enabled;
+    const tone = !csKnown ? "warn" : csEnabled ? (cs.body.healthy === false ? "warn" : "ok") : "off";
+    const detail = !csKnown ? bl({ en: " · unavailable", ja: " · 取得できていません" })
+      : csEnabled ? "" : bl({ en: " · off", ja: " · 無効" });
+    strip.appendChild(el("span", { class: "ov-sys" }, [el("span", { class: "ov-dot ov-dot-" + tone }),
+      document.createTextNode(bl({ en: "Config sync (this node)", ja: "設定の同期(このノード)" }) + detail)]));
   }
   // ★ The identity chip named whichever Edge the front door proxies to — one node's cluster id, region and
   // bundle version, presented as the system's. On a dashboard for the whole of DSSE a fleet has no single
@@ -301,7 +320,7 @@ function ovTile(lbl, big, small, extra, onClick, bigColor) {
 
 // ---- device aggregate (reuses deviceStateOf from devices.js) ---------------------------------------------
 async function ovDeviceAggregate() {
-  const out = { total: 0, steering: 0, failopen: 0, offline: 0, blocked: 0, excluded: 0, encOn: 0, encTot: 0, fwOn: 0, fwTot: 0, platform: {}, risk: { none: 0, medium: 0, high: 0, critical: 0 }, reporting: 0 };
+  const out = { total: 0, steering: 0, failopen: 0, offline: 0, blocked: 0, excluded: 0, encOn: 0, encTot: 0, fwOn: 0, fwTot: 0, platform: {}, risk: { none: 0, medium: 0, high: 0, critical: 0, unknown: 0 }, reporting: 0 };
   // two-planes-deliberate: the two that decide the answer — who is enrolled, and whether they are steering —
   // both come from the authority, which is the only place that knows the whole fleet. The other three add
   // DETAIL about the devices this node happens to serve: exclusions, risk and groups. Their absence downgrades
@@ -317,16 +336,24 @@ async function ovDeviceAggregate() {
   const steer = byDeviceIdentity((ob.ok && ob.body && ob.body.observed) || []);
   const riskMap = (rk.ok && rk.body && rk.body.high_risk) || {};
   const groupRisk = Object.create(null); ((gr.ok && gr.body && gr.body.groups) || []).forEach((g) => { groupRisk[(g.name || "").trim().toLowerCase()] = g.risk || ""; });
+  const riskDetailsReadable = rk.ok && rk.body && rk.body.high_risk && typeof rk.body.high_risk === "object" &&
+    !Array.isArray(rk.body.high_risk) && gr.ok && gr.body && Array.isArray(gr.body.groups);
   out.total = devices.length;
   devices.forEach((d) => {
-    const r = runtime[d.identity] || runtime[deviceKey(d.identity)] || {}; const obs = steer[deviceKey(d.identity)];
+    const runtimeRow = runtime[d.identity] || runtime[deviceKey(d.identity)];
+    const r = runtimeRow || {}; const obs = steer[deviceKey(d.identity)];
     const sev = Object.hasOwn(riskMap, d.identity) ? riskMap[d.identity] : undefined; const grp = groupRisk[(d.group || "").trim().toLowerCase()] || "";
-    const eff = (d.effective_risk && d.effective_risk.trim()) || (typeof riskMax === "function" ? riskMax(sev || "none", grp || "none") : (sev || "none"));
+    const serverRisk = typeof d.effective_risk === "string" ? d.effective_risk.trim().toLowerCase() : "";
+    const eff = ["none", "medium", "high", "critical"].includes(serverRisk) ? serverRisk
+      : !riskDetailsReadable ? "unknown"
+      : (typeof riskMax === "function" ? riskMax(sev || "none", grp || "none") : (sev || "none"));
     out.risk[eff] = (out.risk[eff] || 0) + 1;
     const st = (typeof deviceStateOf === "function") ? deviceStateOf(d, obs, r, eff) : { steering: r.steer_active === true, offline: !obs, blocked: !d.enabled, failOpen: false, excluded: 0 };
     if (!d.enabled) out.blocked++; else if (st.failOpen) out.failopen++; else if (st.steering) out.steering++; else out.offline++;
     if (st.excluded > 0) out.excluded++;
-    if (obs) out.reporting++;
+    // The fleet runtime is itself a device report. Reverse telemetry can lag
+    // behind it, so its absence must not label a steering device "no report".
+    if (obs || runtimeRow) out.reporting++;
     const p = r.posture || {};
     if (p.disk_encryption_enabled != null) { out.encTot++; if (p.disk_encryption_enabled) out.encOn++; }
     if (p.firewall_enabled != null) { out.fwTot++; if (p.firewall_enabled) out.fwOn++; }
@@ -368,16 +395,23 @@ async function ovLoadDevices(host, setMore) {
     el("div", { class: "ov-note", style: "margin-top:12px", text: bl({ en: "\"Fail-open engaged\" is self-reported; a device cut off from the edge appears under \"Not reporting\" (state unknown), not fail-open.", ja: "「fail-open 発動」は自己申告 ―― edge から切れた端末は fail-open でも「報告なし（状態不明）」に出ます。" }) }),
   ]);
   if (d.excluded > 0) c1.appendChild(el("div", { style: "margin-top:12px" }, el("span", { class: "ui-badge", text: d.excluded + bl({ en: " with excluded apps", ja: " 台 除外アプリあり" }) })));
-  const encPct = d.encTot ? Math.round((d.encOn / d.encTot) * 100) : 0, fwPct = d.fwTot ? Math.round((d.fwOn / d.fwTot) * 100) : 0;
+  const encPct = d.encTot ? Math.round((d.encOn / d.encTot) * 100) + "%" : "—";
+  const fwPct = d.fwTot ? Math.round((d.fwOn / d.fwTot) * 100) + "%" : "—";
   const c2 = el("div", {}, [
     el("div", { class: "ov-metric", style: "margin-bottom:10px", text: bl({ en: "Device posture", ja: "デバイスの状態" }) }),
     el("div", { style: "display:flex;gap:12px;justify-content:space-around" }, [
-      el("div", { class: "ov-donutwrap" }, [ovDonut([{ value: d.encOn, color: OV_TONE.ok }, { value: d.encTot - d.encOn, color: OV_TONE.danger }], 84, encPct + "%", bl({ en: "encrypted", ja: "暗号化" })), el("div", { class: "ov-note", text: d.encOn + " / " + d.encTot })]),
-      el("div", { class: "ov-donutwrap" }, [ovDonut([{ value: d.fwOn, color: (d.fwTot - d.fwOn) > 0 ? OV_TONE.warn : OV_TONE.ok }, { value: d.fwTot - d.fwOn, color: OV_TONE.warn }], 84, fwPct + "%", bl({ en: "firewall", ja: "FW" })), el("div", { class: "ov-note", text: d.fwOn + " / " + d.fwTot + (d.fwTot - d.fwOn > 0 ? " · " + (d.fwTot - d.fwOn) + " off" : "") })]),
+      el("div", { class: "ov-donutwrap" }, [ovDonut([{ value: d.encOn, color: OV_TONE.ok }, { value: d.encTot - d.encOn, color: OV_TONE.danger }], 84, encPct, bl({ en: "encrypted", ja: "暗号化" })), el("div", { class: "ov-note", text: d.encOn + " / " + d.encTot })]),
+      el("div", { class: "ov-donutwrap" }, [ovDonut([{ value: d.fwOn, color: (d.fwTot - d.fwOn) > 0 ? OV_TONE.warn : OV_TONE.ok }, { value: d.fwTot - d.fwOn, color: OV_TONE.warn }], 84, fwPct, bl({ en: "firewall", ja: "FW" })), el("div", { class: "ov-note", text: d.fwOn + " / " + d.fwTot + (d.fwTot - d.fwOn > 0 ? " · " + (d.fwTot - d.fwOn) + bl({ en: " off", ja: " 未有効" }) : "") })]),
     ]),
     el("div", { class: "ov-metric", style: "margin:16px 0 8px", text: bl({ en: "Risk", ja: "リスク" }) }),
-    ovSegbar([{ value: d.risk.none, color: OV_TONE.off }, { value: d.risk.medium, color: OV_TONE.warn }, { value: d.risk.high, color: OV_TONE.danger }, { value: d.risk.critical, color: OV_TONE.danger2 }], 8),
-    el("div", { class: "ov-legend", style: "margin-top:8px" }, [ovLegSmall(OV_TONE.off, d.risk.none + " normal"), ovLegSmall(OV_TONE.warn, d.risk.medium + " med"), ovLegSmall(OV_TONE.danger, d.risk.high + " high"), ovLegSmall(OV_TONE.danger2, d.risk.critical + " crit")]),
+    ovSegbar([{ value: d.risk.none, color: OV_TONE.off }, { value: d.risk.medium, color: OV_TONE.warn }, { value: d.risk.high, color: OV_TONE.danger }, { value: d.risk.critical, color: OV_TONE.danger2 }, { value: d.risk.unknown, color: OV_TONE.muted }], 8),
+    el("div", { class: "ov-legend", style: "margin-top:8px" }, [
+      ovLegSmall(OV_TONE.off, d.risk.none + bl({ en: " normal", ja: " 通常" })),
+      ovLegSmall(OV_TONE.warn, d.risk.medium + bl({ en: " med", ja: " 中" })),
+      ovLegSmall(OV_TONE.danger, d.risk.high + bl({ en: " high", ja: " 高" })),
+      ovLegSmall(OV_TONE.danger2, d.risk.critical + bl({ en: " crit", ja: " 重大" })),
+      ovLegSmall(OV_TONE.muted, d.risk.unknown + bl({ en: " unknown", ja: " 不明" })),
+    ]),
   ]);
   const platRows = Object.entries(d.platform).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ k, v, color: OV_TONE.accent }));
   const c3 = el("div", {}, [
@@ -508,7 +542,11 @@ async function ovLoadTenantsRegions(tHost, setMore, rHost) {
       el("td", {}, [el("strong", { text: t.display_name || t.tenant_id || "—" }), ...(t.is_operator ? [el("span", { class: "ui-badge ui-badge-off", style: "margin-left:6px", text: bl({ en: "operator", ja: "運営" }) })] : [])]),
       el("td", { class: "ui-view-desc", text: t.plan || "—" }),
       el("td", {}, el("code", { text: t.home_region || t.region || "—" })),
-      el("td", {}, uiBadge(t.status || "—", t.status === "active" ? "ok" : t.status === "suspended" ? "warn" : "off")),
+      el("td", {}, uiBadge(({
+        active: bl({ en: "Active", ja: "有効" }),
+        suspended: bl({ en: "Suspended", ja: "停止中" }),
+        archived: bl({ en: "Archived", ja: "保管" }),
+      })[t.status] || t.status || "—", t.status === "active" ? "ok" : t.status === "suspended" ? "warn" : "off")),
       el("td", { style: "text-align:right" }, el("code", { text: t.policy_bundle_version ? "v" + t.policy_bundle_version : "—" })),
     ]));
     tHost.appendChild(el("div", { style: "overflow-x:auto" }, el("table", { class: "ui-table" }, [
@@ -555,15 +593,18 @@ async function ovLoadEdge(host, setMore) {
   const connectors = (conn.ok && conn.body && conn.body.connectors) || [];
   setMore(connectors.length + bl({ en: " registered", ja: " 登録済み" }));
   const grid = el("div", { class: "ov-grid", style: "grid-template-columns:1.4fr 1fr" });
-  const rows = connectors.map((c) => el("tr", {}, [
-    el("td", {}, [el("code", { text: c.id || "—" }), ...(c.name ? [el("span", { class: "ui-view-desc", style: "margin-left:6px", text: c.name })] : [])]),
-    el("td", {}, el("code", { text: c.edge_region_id || "—" })),
-    el("td", {}, uiBadge(c.tunnel_connected === true ? bl({ en: "up", ja: "up" }) : bl({ en: "down", ja: "断" }), c.tunnel_connected === true ? "ok" : "danger")),
-    el("td", { class: "ui-view-desc", text: ovAgo(c.last_heartbeat_at) }),
-    el("td", { class: "ui-view-desc", style: "text-align:right", text: (((c.reachable_routes && (c.reachable_routes.cidr_count || 0) + (c.reachable_routes.fqdn_domain_count || 0)) || 0)) + bl({ en: " routes", ja: " 経路" }) }),
-  ]));
+  const rows = connectors.map((c) => {
+    const tunnel = ovConnectorTunnelView(c);
+    return el("tr", {}, [
+      el("td", {}, [el("code", { text: c.id || "—" }), ...(c.name ? [el("span", { class: "ui-view-desc", style: "margin-left:6px", text: c.name })] : [])]),
+      el("td", {}, el("code", { text: c.edge_region_id || "—" })),
+      el("td", {}, uiBadge(tunnel.text, tunnel.tone)),
+      el("td", { class: "ui-view-desc", text: ovAgo(c.last_heartbeat_at) }),
+      el("td", { class: "ui-view-desc", style: "text-align:right", text: ovConnectorNetworkRoutes(c) }),
+    ]);
+  });
   const left = connectors.length ? el("div", { style: "overflow-x:auto" }, el("table", { class: "ui-table" }, [
-    el("thead", {}, el("tr", {}, [[bl({ en: "Connector", ja: "コネクタ" }), 0], [bl({ en: "Region", ja: "リージョン" }), 0], [bl({ en: "Tunnel", ja: "トンネル" }), 0], [bl({ en: "Heartbeat", ja: "最終応答" }), 0], [bl({ en: "Routes", ja: "経路" }), 1]].map(([h, r]) => el("th", { style: r ? "text-align:right" : "", text: h })))),
+    el("thead", {}, el("tr", {}, [[bl({ en: "Connector", ja: "コネクタ" }), 0], [bl({ en: "Region", ja: "リージョン" }), 0], [bl({ en: "Tunnel", ja: "トンネル" }), 0], [bl({ en: "Heartbeat", ja: "最終応答" }), 0], [bl({ en: "Network routes", ja: "ネットワーク経路" }), 1]].map(([h, r]) => el("th", { style: r ? "text-align:right" : "", text: h })))),
     el("tbody", {}, rows),
   ])) : ovEmpty(bl({ en: "No connectors registered.", ja: "コネクタ未登録。" }));
   const counts = (st.ok && st.body && st.body.counts) || {};

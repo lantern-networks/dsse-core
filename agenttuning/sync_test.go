@@ -16,7 +16,7 @@ func TestSyncer_FetchOnce_AppliesVerifiedTuning(t *testing.T) {
 	defer srv.Close()
 
 	var applied *TuningPolicy
-	s := Syncer{URL: srv.URL, PinHex: pub, Client: http.DefaultClient, Apply: func(p TuningPolicy) { applied = &p }}
+	s := Syncer{URL: srv.URL, PinHex: pub, TenantID: "acme", Client: http.DefaultClient, Apply: func(p TuningPolicy) { applied = &p }}
 	if err := s.FetchOnce(context.Background()); err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -36,7 +36,7 @@ func TestSyncer_FetchOnce_WrongPin_DoesNotApply(t *testing.T) {
 
 	other, _ := agentpolicySigner(t)
 	called := false
-	s := Syncer{URL: srv.URL, PinHex: other, Client: http.DefaultClient, Apply: func(TuningPolicy) { called = true }}
+	s := Syncer{URL: srv.URL, PinHex: other, TenantID: "acme", Client: http.DefaultClient, Apply: func(TuningPolicy) { called = true }}
 	if err := s.FetchOnce(context.Background()); err == nil {
 		t.Fatalf("wrong pin must error")
 	}
@@ -51,7 +51,7 @@ func TestSyncer_FetchOnce_ServerError_DoesNotApply(t *testing.T) {
 	defer srv.Close()
 
 	called := false
-	s := Syncer{URL: srv.URL, PinHex: pub, Client: http.DefaultClient, Apply: func(TuningPolicy) { called = true }}
+	s := Syncer{URL: srv.URL, PinHex: pub, TenantID: "acme", Client: http.DefaultClient, Apply: func(TuningPolicy) { called = true }}
 	if err := s.FetchOnce(context.Background()); err == nil {
 		t.Fatalf("5xx must error")
 	}
@@ -68,7 +68,7 @@ func TestSyncer_FetchOnce_TimesOut(t *testing.T) {
 	defer srv.Close()
 
 	called := false
-	s := Syncer{URL: srv.URL, PinHex: pub, Client: http.DefaultClient, FetchTimeout: 200 * time.Millisecond, Apply: func(TuningPolicy) { called = true }}
+	s := Syncer{URL: srv.URL, PinHex: pub, TenantID: "acme", Client: http.DefaultClient, FetchTimeout: 200 * time.Millisecond, Apply: func(TuningPolicy) { called = true }}
 	start := time.Now()
 	err := s.FetchOnce(context.Background())
 	if err == nil {
@@ -89,7 +89,7 @@ func TestSyncer_Run_StopsOnContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		Syncer{URL: srv.URL, PinHex: pub, Client: http.DefaultClient, Interval: 10 * time.Millisecond}.Run(ctx)
+		Syncer{URL: srv.URL, PinHex: pub, TenantID: "acme", Client: http.DefaultClient, Interval: 10 * time.Millisecond}.Run(ctx)
 		close(done)
 	}()
 	cancel()
@@ -105,4 +105,24 @@ func agentpolicySigner(t *testing.T) (string, error) {
 	t.Helper()
 	_, pub := sign(t, TuningPolicy{TenantID: "x"})
 	return pub, nil
+}
+
+func TestSyncer_FetchOnce_RejectsOtherTenantBeforeApply(t *testing.T) {
+	env, pub := sign(t, TuningPolicy{TenantID: "other", Captive: &CaptiveTuning{TimeoutSec: 300}})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(env) }))
+	defer srv.Close()
+	called := false
+	s := Syncer{URL: srv.URL, PinHex: pub, TenantID: "acme", Client: srv.Client(), Apply: func(TuningPolicy) { called = true }}
+	if err := s.FetchOnce(context.Background()); err == nil || called {
+		t.Fatal("a signed policy for another tenant must not change local tuning")
+	}
+}
+
+func TestSyncer_FetchOnce_RequiresVerifiedProfileTenantBeforeFetch(t *testing.T) {
+	_, pub := sign(t, TuningPolicy{TenantID: "acme"})
+	called := false
+	s := Syncer{URL: "http://127.0.0.1:1", PinHex: pub, Apply: func(TuningPolicy) { called = true }}
+	if err := s.FetchOnce(context.Background()); err == nil || called {
+		t.Fatal("tuning must fail closed without a locally verified profile tenant")
+	}
 }

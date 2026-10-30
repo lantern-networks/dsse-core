@@ -8,10 +8,8 @@ import (
 	"testing"
 )
 
-// isAllDigits is the guard that decides whether a persisted NoActiveProbe snapshot is safe to splice back into
-// the restore PowerShell as a literal -Value. Anything that is not a pure digit run must be rejected (treated
-// as "absent" -> Remove), so a corrupted or hostile backup file can never inject a command. These cases pin
-// that contract, including the injection-shaped inputs the guard exists to stop.
+// isAllDigits is the first guard for a persisted NoActiveProbe DWORD. Invalid snapshots are rejected without
+// changing the registry; ncsiBackupValue also rejects digit strings outside the DWORD range.
 func TestIsAllDigits(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -32,7 +30,7 @@ func TestIsAllDigits(t *testing.T) {
 		{"1,2", false}, // comma
 		{"0x1", false}, // hex prefix
 		{"１２３", false}, // full-width digits (not ASCII 0-9)
-		// injection-shaped values that MUST be rejected so they are never written as -Value:
+		// injection-shaped values that MUST be rejected before any registry write:
 		{"1; Remove-Item C:\\ -Recurse", false},
 		{"1`nStop-Service Foo", false},
 		{"$(Get-Process)", false},

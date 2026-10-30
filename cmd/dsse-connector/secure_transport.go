@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/certreload"
 )
 
 // Connector↔Edge encrypted transport. The connector dials the Edge over TLS, pinning the Edge
@@ -87,11 +89,20 @@ func buildConnectorTLSConfig(cfg connectorTransportConfig) (*tls.Config, error) 
 	clientKey := strings.TrimSpace(cfg.ClientKeyFile)
 	switch {
 	case clientCert != "" && clientKey != "":
-		cert, err := tls.LoadX509KeyPair(clientCert, clientKey)
+		identity, err := certreload.NewReloadableCert(clientCert, clientKey)
 		if err != nil {
 			return nil, fmt.Errorf("load connector identity certificate: %w", err)
 		}
-		tlsConfig.Certificates = []tls.Certificate{cert}
+		tlsConfig.Certificates = []tls.Certificate{*identity.Current()}
+		// TLS configs are cloned by each transport/region. A shared callback reads
+		// the committed pair for every new handshake, so renewal takes effect
+		// without restarting or mutating a config that another goroutine uses.
+		tlsConfig.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			if err := identity.Reload(); err != nil {
+				return nil, fmt.Errorf("reload connector identity: %w", err)
+			}
+			return identity.Current(), nil
+		}
 	case clientCert != "" || clientKey != "":
 		return nil, fmt.Errorf("connector identity requires BOTH --connector-client-cert and --connector-client-key")
 	case !cfg.DevMode:
@@ -178,5 +189,17 @@ func newConnectorEdgeHTTPClient(tlsConfig *tls.Config) *http.Client {
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.TLSClientConfig = tlsConfig
-	return &http.Client{Transport: transport, Timeout: connectorEdgeRequestTimeout}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   connectorEdgeRequestTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("connector pinned transport exceeded redirect limit")
+			}
+			if req.URL.Scheme != "https" {
+				return fmt.Errorf("connector pinned transport refuses non-HTTPS redirect")
+			}
+			return nil
+		},
+	}
 }

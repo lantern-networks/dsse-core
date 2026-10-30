@@ -424,7 +424,7 @@ function pinnedCandidate(c, tenant) {
 function pinnedLists(candidates, bypass, tenant) {
   if (pinnedTenant(candidates) !== tenant || pinnedTenant(bypass) !== tenant) throw new Error(pinnedChanged());
   const list = candidates.body, hosts = bypass.body.hosts;
-  if (!Array.isArray(list.candidates) || !Number.isSafeInteger(list.count) || list.count < list.candidates.length ||
+  if (!Array.isArray(list.candidates) || !Number.isSafeInteger(list.count) || list.count !== list.candidates.length ||
       !Number.isSafeInteger(list.limit) || list.limit < 1 || list.candidates.length > list.limit ||
       !Object.hasOwn(bypass.body,"hosts") || (hosts !== null && !Array.isArray(hosts))) throw new Error(pinnedInvalid());
   const ids = new Set();
@@ -476,7 +476,7 @@ function pinnedView(content, candidates, bypass, input, addButton, filter) {
       if (!current() || stamp !== revision) return;
       if (selected !== pinnedSelection() || (selected && selected !== owner)) throw new Error(pinnedChanged());
       const q = "expected_tenant_id=" + encodeURIComponent(owner);
-      const [cs, bs] = await Promise.all([apiFetch("GET","/admin/policy-candidates?"+q),apiFetch("GET","/admin/intercept/bypass-hosts?scoped=1&"+q)]);
+      const [cs, bs] = await Promise.all([apiFetch("GET","/admin/policy-candidates?candidate_type=bypass_policy&limit=1000&"+q),apiFetch("GET","/admin/intercept/bypass-hosts?scoped=1&"+q)]);
       if (!current() || stamp !== revision) return;
       if (selected !== pinnedSelection()) throw new Error(pinnedChanged());
       const lists = pinnedLists(cs,bs,owner);

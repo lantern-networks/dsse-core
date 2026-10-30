@@ -120,10 +120,16 @@ func registerTenantTransportMaterialRoute(mux *http.ServeMux, authority *tenantT
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
+		interceptionSource := interception
 		interception, err := interception.materialSnapshot()
 		if err != nil {
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
+		}
+		if interception != nil {
+			interception.recordIssued = func(tenant, edgeID, certPEM string) error {
+				return interceptionSource.recordDelegation(r.Context(), tenant, edgeID, certPEM)
+			}
 		}
 		deviceIdentity, err := deviceIdentity.materialSnapshot()
 		if err != nil {
@@ -236,7 +242,7 @@ func registerTenantTransportMaterialRoute(mux *http.ServeMux, authority *tenantT
 					out.Refused = append(out.Refused, "device-identity "+strings.TrimSpace(tenant)+": "+err.Error())
 					continue
 				}
-				mat.AdmissionCAPEM = deviceAdmissionAnchors(deviceIdentity.cas[strings.ToLower(strings.TrimSpace(tenant))], registrations)
+				mat.AdmissionCAPEM = deviceAdmissionAnchors(deviceIdentity.cas[strings.TrimSpace(tenant)], registrations)
 				out.DeviceIdentity = append(out.DeviceIdentity, mat)
 			}
 		}
@@ -641,8 +647,9 @@ func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 				RootPEM        string `json:"root_pem"`
 				IssuingCertPEM string `json:"issuing_cert_pem"`
 				IssuingKeyPEM  string `json:"issuing_key_pem"`
+				RootCRL        []byte `json:"root_crl,omitempty"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 256<<10)).Decode(&body); err != nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&body); err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
@@ -702,7 +709,7 @@ func registerTenantInterceptionAuthorityAdminRoute(mux *http.ServeMux,
 					"authority its Edges sign that organization's traffic under, and every Edge takes the same "+
 					"one", tenant, name)
 			}
-			row, err := authority.Import(tenant, rootPEM, issuingPEM, issuingKeyPEM)
+			row, err := authority.Import(tenant, rootPEM, issuingPEM, issuingKeyPEM, body.RootCRL)
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
@@ -866,7 +873,11 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 				"can be authored for"))
 			return
 		}
-		reg.TenantID = body.TenantID
+		reg.TenantID = strings.TrimSpace(body.TenantID)
+		if !devMode && !edgeMayShipForTenant(shipper, reg.TenantID) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("connector-report: this Edge is not authorized for the requested tenant"))
+			return
+		}
 		// ★★★ AN ATTACHMENT REPORT TOUCHES ONE FIELD, AND ONLY WHEN THE AUTHORITY ALREADY HAS THE CONNECTOR.
 		// The reporting node's copy of a registration comes FROM here and can be a generation behind, so
 		// writing the whole record back on every tunnel attach would let a stale node undo an operator's
@@ -875,7 +886,11 @@ func registerConnectorReportRoute(mux *http.ServeMux, registry connectorRegistry
 		// registration is recorded as before, so the report is never simply lost.
 		if region := strings.TrimSpace(body.AttachedRegionID); region != "" {
 			if recorder, ok := registry.(connectorAttachmentRecorder); ok {
-				if _, known := registry.Get(reg.ID); known {
+				if existing, known := registry.Get(reg.ID); known {
+					if existing.TenantID != reg.TenantID {
+						writeError(w, http.StatusForbidden, fmt.Errorf("connector-report: this connector belongs to another tenant"))
+						return
+					}
 					if _, err := recorder.RecordAttachedRegion(reg.ID, region); err != nil {
 						writeError(w, http.StatusConflict, err)
 						return

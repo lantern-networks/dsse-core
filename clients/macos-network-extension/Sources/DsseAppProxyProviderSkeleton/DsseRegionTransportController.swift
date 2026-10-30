@@ -24,7 +24,8 @@ public final class DsseRegionTransportController: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dsse.region-transport-controller")
     private var timer: DispatchSourceTimer?
     private var lastCurrentRegion: String = ""
-    private var heldLogKey: String = "" // dedup: (region|kind) of the last-logged hold; a change (region OR benign->admission-deny) re-logs
+    private var lastCurrentEndpoint: String = ""
+    private var heldLogKey: String = "" // dedup: (door|kind) of the last-logged hold
 
     public init(selector: DsseRegionSelector,
                 probe: @escaping (DsseRegionEndpoint) -> DsseRegionHealth,
@@ -51,10 +52,10 @@ public final class DsseRegionTransportController: @unchecked Sendable {
         // device kept steering through this region until the kill-switch takes effect). Mirrors the Windows
         // agent's act(). See docs/2026-07-26_region_failover_hysteresis_accepted_risk.ja.md.
         if dec.held {
-            // Dedup on (region|kind): log once per entry, but ALWAYS re-log when the region changes or a benign
+            // Dedup on (door|kind): log once per entry, but ALWAYS re-log when the endpoint changes or a benign
             // unreachable hold ESCALATES to an admission-deny (revocation) — a single bool would swallow that.
             let region = dec.current?.region ?? "?"
-            let key = region + "|" + (dec.heldAdmissionDenied ? "denied" : "unreach")
+            let key = region + "\u{0}" + (dec.current?.endpoint ?? "") + "|" + (dec.heldAdmissionDenied ? "denied" : "unreach")
             if key != heldLogKey {
                 if dec.heldAdmissionDenied {
                     dsseRegionFailoverLogger.warning("HOLDING admission-denied region \(region, privacy: .public) under hysteresis (revoked/not-enrolled) — failover suppressed for stability; client-side deny in <=\(dec.heldRoundsRemaining, privacy: .public) more round(s). The Edge still denies this device independently per connection.")
@@ -66,10 +67,11 @@ public final class DsseRegionTransportController: @unchecked Sendable {
         } else {
             heldLogKey = ""
         }
-        let changedRegion = (dec.current?.region ?? "") != lastCurrentRegion
+        let changedRegion = (dec.current?.region ?? "") != lastCurrentRegion || (dec.current?.endpoint ?? "") != lastCurrentEndpoint
         lastCurrentRegion = dec.current?.region ?? ""
+        lastCurrentEndpoint = dec.current?.endpoint ?? ""
         // Always deliver so the provider can act on fail-closed/denied too; it rebuilds the transport only when
-        // the current region actually changed (regionChanged).
+        // the selected door actually changed (regionChanged).
         onDecision(dec, changedRegion)
         return dec
     }

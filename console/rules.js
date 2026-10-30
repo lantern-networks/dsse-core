@@ -616,13 +616,65 @@ async function loadRuleDLPPolicies(field, selectedID) {
 // Authenticate (with provider-aware step-up assurance) is available on both planes. onSaved re-renders the list.
 // When `existing` (a rule object) is passed, the editor prefills every field and saves back to the same rule id
 // (upsert) — i.e. Edit; otherwise it creates a new rule.
+function identityTreeFromDirectory(items) {
+  const byGroup = Object.create(null);
+  if (!Array.isArray(items)) return [];
+  items.forEach((i) => {
+    const g = i && typeof i.department === "string" ? i.department.trim() : "";
+    const rawID = i && (i.subject || i.id || i.email);
+    const pid = typeof rawID === "string" ? rawID.trim() : "";
+    if (!g || !pid) return;
+    // Directory-provided names can be "__proto__" or "constructor". A plain object would both omit
+    // those groups and let an IdP row mutate Object.prototype in this page.
+    const people = byGroup[g] || (byGroup[g] = Object.create(null));
+    people[pid] = { id: pid, label: i.display_name || i.email || pid };
+  });
+  return Object.keys(byGroup).sort().map((g) => ({
+    group: g,
+    people: Object.values(byGroup[g]).sort((a, b) => (a.label || "").localeCompare(b.label || "")),
+  }));
+}
+
+function maxAgeMinutesFromAction(action) {
+  const seconds = action && action.max_age_seconds;
+  // The API distinguishes an omitted age from zero (one connection request).
+  // Return a string because uiField treats a numeric 0 as an empty value.
+  return seconds == null ? "" : String(seconds / 60);
+}
+
+function parseMaxAgeMinutes(value, originalSeconds) {
+  const raw = String(value == null ? "" : value).trim();
+  if (raw === "") return null;
+  // Do not use parseInt: it silently turns 0.01 minute, NaN or a negative
+  // value into a different policy. Fractional minutes are valid only when
+  // they represent a whole number of seconds.
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(raw)) throw new Error("Invalid max sign-in age");
+  // A very large existing integer can lose a second when represented as a
+  // decimal number of minutes. An untouched editor must not rewrite it.
+  if (Number.isSafeInteger(originalSeconds) && originalSeconds >= 0 &&
+      raw === maxAgeMinutesFromAction({ max_age_seconds: originalSeconds })) return originalSeconds;
+  const seconds = Number(raw) * 60;
+  const wholeSeconds = Math.round(seconds);
+  if (!Number.isFinite(seconds) || !Number.isSafeInteger(wholeSeconds) ||
+      (wholeSeconds === 0 && /[1-9]/.test(raw)) || Math.abs(seconds - wholeSeconds) > 1e-9) {
+    throw new Error("Invalid max sign-in age");
+  }
+  return wholeSeconds;
+}
+
 async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) {
   existing = existing || null;
   let savePending = false, writeAttempted = false;
   let savedOk = false; // set true on a successful save so onCancelled (below) does NOT fire on close
   let idx, editorTenant;
   try { [idx, editorTenant] = await Promise.all([catalogIndex(), ruleEditorTenant()]); }
-  catch (e) { uiToast(bl({ en: "Could not load the catalog: ", ja: "カタログを読み込めません: " }) + (e.message || e), "err"); return; }
+  catch (e) {
+    // A caller may have created a draft endpoint for this editor. If the editor never
+    // opens, its normal onClose cleanup cannot run.
+    if (typeof onCancelled === "function") await onCancelled();
+    uiToast(bl({ en: "Could not load the catalog: ", ja: "カタログを読み込めません: " }) + (e.message || e), "err");
+    return;
+  }
 
   const eAction = (existing && existing.action) || {};
   // existing WITH an id = Edit; existing WITHOUT an id = a PRE-FILLED new rule (e.g. adopting an observed flow) —
@@ -667,14 +719,7 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
       const dr = await apiFetch("GET", "/admin/human-identities", null, "control");
       if (!(dr && dr.ok && dr.body)) return;
       const items = dr.body.identities || dr.body.items || (Array.isArray(dr.body) ? dr.body : []);
-      const byGroup = {}; // group -> { id -> {id,label} }  (dedup people by id: the directory can hold duplicates)
-      items.forEach((i) => {
-        const g = ((i && i.department) || "").trim();
-        const pid = ((i && (i.subject || i.id || i.email)) || "").trim();
-        if (!g || !pid) return;
-        (byGroup[g] = byGroup[g] || {})[pid] = { id: pid, label: (i.display_name || i.email || pid) };
-      });
-      src.setIdpTree(Object.keys(byGroup).sort().map((g) => ({ group: g, people: Object.values(byGroup[g]).sort((a, b) => (a.label || "").localeCompare(b.label || "")) })));
+      src.setIdpTree(identityTreeFromDirectory(items));
     } catch (e) { /* directory optional — the free-text identity-group input still works */ }
   })();
   // Same lazily, for the agent (NHI) source: populate the "+ Add agent" list with the registered service
@@ -724,7 +769,10 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
   // can satisfy). Shown only when Authenticate is chosen.
   const idpF = uiField({ name: "idp", label: bl({ en: "Identity provider", ja: "ID プロバイダ" }), type: "select", value: "", options: [{ value: "", label: bl({ en: "(tenant default IdP)", ja: "(テナント既定 IdP)" }) }] });
   const asrF = uiField({ name: "asr", label: bl({ en: "Required sign-in strength", ja: "要求するサインイン強度" }), type: "select", value: "none", options: [{ value: "none", label: bl({ en: "No extra sign-in", ja: "追加サインインなし" }) }] });
-  const maxAgeF = uiField({ name: "maxage", label: bl({ en: "Require a sign-in within (minutes)", ja: "この分数以内のサインインを要求" }), type: "number", value: eAction.max_age_seconds ? Math.round(eAction.max_age_seconds / 60) : (plane === "east_west" ? 15 : "") });
+  const maxAgeF = uiField({ name: "maxage", label: bl({ en: "Require a sign-in within (minutes)", ja: "この分数以内のサインインを要求" }), type: "number", value: maxAgeMinutesFromAction(eAction), hint: bl({ en: "Blank: no sign-in age requirement. 0: verify for this one connection request only (SSH, RDP or SMB); web requests cannot use 0.", ja: "空欄: サインインの鮮度を指定しません。0: この通信要求1件だけ本人確認します (SSH・RDP・SMB)。Web通信では0を使用できません。" }) });
+  const maxAgeInput = maxAgeF.el.querySelector("input");
+  maxAgeInput.min = "0";
+  maxAgeInput.step = "any"; // e.g. 1.5 minutes is exactly 90 seconds
   const customAcrF = uiField({ name: "acr", label: bl({ en: "Custom acr (advanced)", ja: "カスタム acr(上級)" }), placeholder: "acr" });
   const customAmrF = uiField({ name: "amr", label: bl({ en: "Custom amr (comma-separated)", ja: "カスタム amr(カンマ区切り)" }), placeholder: "fido, mfa" });
   customAcrF.el.style.display = "none"; customAmrF.el.style.display = "none";
@@ -900,6 +948,12 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
     if (agentRule && !destination.length) destination = [SUBJECT_ANY];
     if (!source.length || !destination.length) { uiToast(bl({ en: "Pick a source and a destination.", ja: "送信元と宛先を選択してください。" }), "err"); return; }
 
+    let maxAgeSeconds = null;
+    if (accessF.get() === "authenticate") {
+      try { maxAgeSeconds = parseMaxAgeMinutes(maxAgeF.get(), eAction.max_age_seconds); maxAgeF.setError(""); }
+      catch (_) { maxAgeF.setError(bl({ en: "Enter a non-negative number of minutes that equals whole seconds, or leave it blank.", ja: "0以上の分数を秒単位の整数になるように入力するか、空欄にしてください。" })); return; }
+    }
+
     const action = Object.assign({}, eAction, { access: accessF.get(), inspection: inspF.get() });
     for (const key of ["required_idp_id","min_acr","required_amr","max_age_seconds","device_attested_auto","dlp"]) delete action[key];
     if (plane === "egress" && dlpPolicyF.get()) {
@@ -911,8 +965,7 @@ async function openRuleEditor(plane, direction, onSaved, existing, onCancelled) 
       const a = applyPreset(asrF.get());
       if (a.min_acr) action.min_acr = a.min_acr;
       if (a.required_amr) action.required_amr = a.required_amr;
-      const mins = parseInt(maxAgeF.get(), 10);
-      if (mins > 0) action.max_age_seconds = mins * 60;
+      if (maxAgeSeconds !== null) action.max_age_seconds = maxAgeSeconds;
       if (deviceAttestedF.get()) action.device_attested_auto = true; // machine/non-interactive: device attestation in lieu of a human ceremony
     }
 
@@ -983,7 +1036,7 @@ function subjectPicker(labelText, subjects, opts) {
   const search = el("input", { class: "ui-input subject-search", type: "search", placeholder: bl({ en: "filter by name / platform…", ja: "名前 / プラットフォームで絞り込み…" }) });
   const list = el("div", { class: "subject-list" });
   const summary = el("div", { class: "subject-summary" });
-  const checks = {};
+  const checks = Object.create(null);
   const rows = [];
   let idInput = null;
   // Disclosure hosts: "+ Add person / group" and "+ Add agent" each reveal a focused, checkable LIST (rendered
@@ -998,7 +1051,7 @@ function subjectPicker(labelText, subjects, opts) {
     const sel = rows.filter((r) => r.cb.checked).map((r) => r.label);
     summary.textContent = sel.length ? bl({ en: "Selected: ", ja: "選択中: " }) + sel.join(", ") : bl({ en: "Nothing selected", ja: "未選択" });
   };
-  const expandedGroups = {}; // IdP-group drill-down: group name -> expanded?
+  const expandedGroups = Object.create(null); // IdP-group drill-down: group name -> expanded?
   const applyFilter = () => {
     const q = search.value.trim().toLowerCase();
     rows.forEach((r) => {

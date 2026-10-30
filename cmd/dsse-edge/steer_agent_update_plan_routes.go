@@ -35,6 +35,7 @@ import (
 
 	"github.com/lantern-networks/dsse-core/agentrollout"
 	"github.com/lantern-networks/dsse-core/agentupdate"
+	"github.com/lantern-networks/dsse-core/internal/strictjson"
 )
 
 // rolloutControl is the operator-authored file behind this endpoint: the wave schedule, and the halt.
@@ -81,6 +82,14 @@ func loadRolloutControl(path string) (rolloutControl, error) {
 			"the rollout control file could not be read (%v), so this fleet is held until it can be", err)}, err
 	}
 	var rc rolloutControl
+	// A complete object is required. null, duplicate keys and a valid JSON
+	// prefix followed by another value must not silently clear a local halt.
+	if err := strictjson.RejectDuplicateKeys(raw); err != nil {
+		return rolloutControl{Frozen: true, FrozenReason: "the rollout control file is unreadable, so this fleet is held until it is corrected"}, err
+	}
+	if err := strictjson.RejectUnknownFields(raw, rolloutControl{}); err != nil {
+		return rolloutControl{Frozen: true, FrozenReason: "the rollout control file is unreadable, so this fleet is held until it is corrected"}, err
+	}
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if derr := dec.Decode(&rc); derr != nil {
@@ -260,10 +269,13 @@ func registerSteerAgentUpdatePlanRoutes(mux *http.ServeMux, config serverConfig,
 		// stamped with the DEVICE's tenant, from its client certificate; the halt has to be fetched for the same
 		// tenant or a multi-tenant control plane serves everybody the bundle tenant's freeze — tenant B's halt
 		// reaching nobody, and the bundle tenant's stopping every fleet on the box.
-		planTenant := evaluator.tenantID()
-		if bound, terr := authoritativeTenantForRequest(r, "", config.TenantCARegistry); terr == nil &&
-			strings.TrimSpace(bound) != "" {
-			planTenant = bound
+		planTenant, bound := deviceUpdateTenantForRequest(r, config)
+		if !bound {
+			writeError(w, http.StatusForbidden, fmt.Errorf("the verified device certificate has no registered tenant CA"))
+			return
+		}
+		if planTenant == "" {
+			planTenant = evaluator.tenantID()
 		}
 
 		rc, rerr := resolveRolloutControl(config, planTenant)
@@ -301,7 +313,7 @@ func registerSteerAgentUpdatePlanRoutes(mux *http.ServeMux, config serverConfig,
 		// With nothing published there is no wave to be in, and the field is omitted rather than zeroed — the
 		// device reads an absent eligible_since as "no schedule", which is not the same as "your wave opened at
 		// the zero time".
-		if u, ok := config.PublishedUpdates.forTarget(platform, arch); ok {
+		if u, ok := config.PublishedUpdates.forTenantTarget(planTenant, platform, arch); ok {
 			if released, perr := time.Parse(time.RFC3339, u.Manifest.ReleasedAt); perr == nil {
 				start, assignment := rc.Waves.WaveStart(groups, released)
 				if !start.IsZero() {

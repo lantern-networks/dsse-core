@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 
 	"github.com/lantern-networks/dsse-core/logs"
 )
@@ -62,21 +64,18 @@ func shipObservedExclusion(writer *logs.Writer, entry observedExclusionEntry) {
 // recordShippedObservedExclusion folds a shipped report into this process's observed-exclusion store. Runs on
 // the control plane, where the durable copy lives.
 //
-// Best-effort and silent on anything that is not one, exactly like the device-state and agent-update folds
-// beside it: this path carries every shipped record in the deployment, and a control plane that refused a
-// shipment because one record did not parse would lose the whole batch to protect a summary.
-func recordShippedObservedExclusion(store observedExclusionStoreAPI, stream string, body []byte) {
+// Unrelated streams are ignored. Relevant reports are acknowledged only after
+// the durable projection commits; PKI readiness gates consume this projection.
+func recordShippedObservedExclusion(store observedExclusionStoreAPI, stream string, body []byte) error {
 	if store == nil || stream != observedExclusionShipStream {
-		return
+		return nil
 	}
 	var entry observedExclusionEntry
-	if json.Unmarshal(body, &entry) != nil {
-		return
+	if err := json.Unmarshal(body, &entry); err != nil {
+		return fmt.Errorf("invalid observed exclusion report: %w", err)
 	}
-	if entry.TenantID == "" || entry.DeviceIdentity == "" {
-		// A report that names neither an organization nor a device cannot be filed against anything, and
-		// storing it would put a row in the durable copy that no screen can ever show.
-		return
+	if strings.TrimSpace(entry.TenantID) == "" || strings.TrimSpace(entry.DeviceIdentity) == "" || entry.ReportedAt.IsZero() {
+		return fmt.Errorf("observed exclusion report lacks identity or timestamp")
 	}
-	store.Record(entry)
+	return store.Record(entry)
 }

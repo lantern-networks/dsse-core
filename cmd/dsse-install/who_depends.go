@@ -66,14 +66,18 @@ func verifyWhoDepends(client *http.Client, cpAdmin, token string) []verifyResult
 	// The very next line of the same report said "45 device(s) across 6 node(s)", so the report contradicted
 	// itself and still rendered a tick. This is the one question asked immediately before an irreversible act,
 	// and a wrong "nobody" here is the most expensive wrong answer the tool can give.
-	organizations := organizationsOfTheDeployment(client, edgeAdmin, token)
+	organizations, known := organizationsOfTheDeployment(client, edgeAdmin, token)
+	if !known {
+		return append(out, verifyResult{name: "who trusts this deployment",
+			note: "could not be counted: the deployment-wide tenant list did not answer"})
+	}
 	type enrolledDevice struct {
 		Identity string `json:"identity"`
 		Enabled  bool   `json:"enabled"`
 		Kind     string `json:"kind"`
 	}
-	seen := map[string]enrolledDevice{}
-	answered := false
+	type enrollmentKey struct{ tenant, identity string }
+	seen := map[enrollmentKey]enrolledDevice{}
 	for _, org := range organizations {
 		endpoint := edgeAdmin + "/admin/enrolled-devices"
 		if org != "" {
@@ -81,24 +85,21 @@ func verifyWhoDepends(client *http.Client, cpAdmin, token string) []verifyResult
 		}
 		code, raw, err := get(client, endpoint, token)
 		if err != nil || code != 200 {
-			continue
+			return append(out, verifyResult{name: "who trusts this deployment",
+				note: fmt.Sprintf("could not be counted: GET /admin/enrolled-devices for %q -> %d %v", org, code, err)})
 		}
-		answered = true
 		var inventory struct {
-			Devices []enrolledDevice `json:"devices"`
+			Devices *[]enrolledDevice `json:"devices"`
 		}
-		if json.Unmarshal(raw, &inventory) != nil {
-			continue
+		if json.Unmarshal(raw, &inventory) != nil || inventory.Devices == nil {
+			return append(out, verifyResult{name: "who trusts this deployment",
+				note: fmt.Sprintf("could not be counted: GET /admin/enrolled-devices for %q returned no device list", org)})
 		}
-		for _, d := range inventory.Devices {
+		for _, d := range *inventory.Devices {
 			if id := strings.TrimSpace(d.Identity); id != "" {
-				seen[id] = d
+				seen[enrollmentKey{strings.TrimSpace(org), id}] = d
 			}
 		}
-	}
-	if !answered {
-		return append(out, verifyResult{name: "who trusts this deployment",
-			note: "could not be counted: GET /admin/enrolled-devices did not answer for any organization"})
 	}
 	rep := dependentsReport{Enrolled: len(seen)}
 	for _, d := range seen {

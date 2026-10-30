@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 
@@ -31,7 +30,7 @@ func setupEdgeDomainEventOutbox(ctx context.Context, config edgeDomainEventOutbo
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("domain-event-outbox-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

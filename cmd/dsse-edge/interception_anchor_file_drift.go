@@ -83,7 +83,7 @@ func agentTrustedCABundle(interception *edgeplane.NetworkExtensionLabTLSIntercep
 	}
 	rootPEM, own, commonName := "", false, ""
 	for _, issuer := range interception.ListOfflineTenantIntermediates() {
-		if strings.EqualFold(strings.TrimSpace(issuer.Tenant), tenant) {
+		if strings.TrimSpace(issuer.Tenant) == tenant {
 			rootPEM, own, commonName = issuer.RootPEM, true, issuer.RootCommonName
 		}
 	}

@@ -43,6 +43,9 @@ type edgeConfig struct {
 	// transport is the (T) secure transport (). When enabled, the CONNECT to the edge rides inside a
 	// pinned mTLS tunnel to the transport listener instead of a plaintext TCP connection to edgeURL.
 	transport transportConfig
+	// transportFailure reports an unexpected live mux socket loss to the region selector.
+	// It is coalesced and nil outside region failover; no flow may bypass policy on it.
+	transportFailure chan<- struct{}
 	// stepUp mediates agent-driven step-up: on an "authenticate" 401 carrying X-Dsse-Stepup-Url, surface a
 	// prompt + open the portal in the default browser (coalesced per resource). nil disables the prompt
 	// (the flow is still denied -- fail-closed). Safe to leave nil in tests / non-stepup deployments.
@@ -100,11 +103,7 @@ func (s edgeSteerer) run(capture SteeringCapture) {
 		if s.cfg.interception != nil {
 			mm := s.mux
 			s.cfg.interception.probe = makeInterceptionProbe(func(authority string) (net.Conn, error) {
-				mux, err := mm.acquire()
-				if err != nil {
-					return nil, err
-				}
-				return mux.openFlow(authority)
+				return mm.openFlow(authority)
 			})
 			stop := make(chan struct{})
 			defer close(stop)
@@ -130,6 +129,9 @@ func (s edgeSteerer) run(capture SteeringCapture) {
 
 func (s edgeSteerer) handleFlow(flow SteeredFlow) {
 	defer flow.Conn.Close()
+	// Resolve the WFP-attributed process before dialing. A delayed response must
+	// not resolve a reused PID to a different user's browser.
+	owner := captureStepUpOwner(flow.PID)
 	origDst := flow.OrigDst
 
 	// NCSI web probe (port 80 only — HTTP, client speaks first): answer Windows' connectivity probe locally so
@@ -203,7 +205,7 @@ func (s edgeSteerer) handleFlow(flow SteeredFlow) {
 		// itself STAYS denied (fail-closed) -- once the user completes the step-up a device grant is minted and
 		// the retried connection is allowed. Coalesced per resource so a burst opens the portal once.
 		if decision == "authenticate_required" && stepUpURL != "" {
-			s.cfg.stepUp.Trigger(origDst.String(), stepUpURL)
+			s.cfg.stepUp.TriggerForOwner(origDst.String(), stepUpURL, owner)
 		}
 		fmt.Printf("steer_blocked reason=%s dst_port=%d edge_body=%q\n", decision, origDst.Port(), body)
 		return
@@ -284,6 +286,13 @@ func dialEdgeCONNECT(cfg edgeConfig, origDst netip.AddrPort) (net.Conn, int, str
 		}
 		conn = c
 	}
+	// The TCP/TLS dial may succeed while the Edge never answers CONNECT. Apply the existing
+	// dial timeout to this setup exchange as well; a silent peer must not strand the flow
+	// (including the configured fail-open/fail-closed decision) indefinitely.
+	if err := conn.SetDeadline(time.Now().Add(dialTimeout)); err != nil {
+		conn.Close()
+		return nil, 0, "", "", err
+	}
 	// W3 generic steer: send the recovered original destination as the authority to CONNECT /steer; the
 	// edge derives port->family and applies policy. No app id, no authority override.
 	authority := origDst.String()
@@ -330,6 +339,11 @@ func dialEdgeCONNECT(cfg edgeConfig, origDst netip.AddrPort) (net.Conn, int, str
 		snippet, _ := io.ReadAll(io.LimitReader(reader, 512))
 		conn.Close()
 		return nil, status, strings.TrimSpace(string(snippet)), stepUpURL, fmt.Errorf("edge CONNECT status %d", status)
+	}
+	// Successful tunnels have no session lifetime limit from the setup timeout.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, 0, "", "", err
 	}
 	return &bufferedConn{Conn: conn, reader: reader}, status, "", stepUpURL, nil
 }

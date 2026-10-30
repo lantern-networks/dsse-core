@@ -106,6 +106,37 @@ func TestWhatIsWrittenIsNotReadableByEverything(t *testing.T) {
 	if !strings.Contains(string(body), "--state-dir '"+state+"'") {
 		t.Fatalf("the script does not persist into the directory that was prepared:\n%s", body)
 	}
+	if !strings.Contains(string(body), "--listen '127.0.0.1:18090'") {
+		t.Fatal("the original private listener was not preserved")
+	}
+}
+
+func TestCoLocatedConnectorUsesItsOwnLoopbackPort(t *testing.T) {
+	dir := t.TempDir()
+	token := tokenFor(t, map[string]any{
+		"v": 1, "site": "tokyo-dc", "tenant_id": "t1", "edge_url": "https://a.example",
+	})
+	for _, listen := range []string{"0.0.0.0:18091", "127.0.0.1:0", "127.0.0.1:65536", "localhost:18091"} {
+		state := filepath.Join(dir, "rejected")
+		if err := runWithListen(token, state, "/bin/true", "dsse-connector", true, listen); err == nil {
+			t.Fatalf("unsafe listen address %q was accepted", listen)
+		}
+		if _, err := os.Stat(state); !os.IsNotExist(err) {
+			t.Fatalf("unsafe listen address %q wrote a state directory", listen)
+		}
+	}
+	state := filepath.Join(dir, "backup")
+	if err := runWithListen(token, state, aConnectorProgram(t, dir, "dsse-connector"),
+		"backup-connector", true, "127.0.0.1:18091"); err != nil {
+		t.Fatalf("install backup connector: %v", err)
+	}
+	body, err := os.ReadFile(filepath.Join(state, "start-connector.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "--listen '127.0.0.1:18091'") {
+		t.Fatal("backup connector did not retain its distinct local listener")
+	}
 }
 
 // ★ A VALUE CARRYING A SHELL METACHARACTER WOULD BE RUN. The deployment's own env file carries a warning

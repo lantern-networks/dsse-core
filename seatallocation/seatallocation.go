@@ -95,7 +95,7 @@ func (s *Store) AllocateContext(ctx context.Context, policy Policy, tenantID str
 		if !policy.AllowOversubscription {
 			total := 0
 			for id, a := range candidate {
-				if !strings.EqualFold(id, tenantID) {
+				if id != tenantID {
 					total += a.Seats
 				}
 			}
@@ -103,7 +103,7 @@ func (s *Store) AllocateContext(ctx context.Context, policy Policy, tenantID str
 				return fmt.Errorf("%w: %d already allocated to other tenants, %d in the pool", ErrPoolExceeded, total, policy.PoolSeats)
 			}
 		}
-		candidate[strings.ToLower(tenantID)] = a
+		candidate[tenantID] = a
 		return nil
 	})
 	if err != nil {
@@ -118,7 +118,7 @@ func (s *Store) AllocateContext(ctx context.Context, policy Policy, tenantID str
 func (s *Store) SeatsFor(tenantID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.allocations[strings.ToLower(strings.TrimSpace(tenantID))].Seats
+	return s.allocations[strings.TrimSpace(tenantID)].Seats
 }
 
 // Allocated is the sum handed out.
@@ -150,7 +150,7 @@ func (s *Store) Unallocated(poolSeats int) int {
 func (s *Store) Has(tenantID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, ok := s.allocations[strings.ToLower(strings.TrimSpace(tenantID))]
+	_, ok := s.allocations[strings.TrimSpace(tenantID)]
 	return ok
 }
 
@@ -181,7 +181,7 @@ func (s *Store) RemoveConfirmed(tenantID string) (bool, error) {
 	return s.RemoveConfirmedContext(context.Background(), tenantID)
 }
 func (s *Store) RemoveConfirmedContext(ctx context.Context, tenantID string) (bool, error) {
-	k := strings.ToLower(strings.TrimSpace(tenantID))
+	k := strings.TrimSpace(tenantID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	removed := false
@@ -231,7 +231,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	if s == nil {
 		return 0
 	}
-	tenantID = strings.ToLower(strings.TrimSpace(tenantID))
+	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return 0
 	}

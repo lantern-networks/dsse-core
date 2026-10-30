@@ -32,6 +32,46 @@ type storeMemberReport struct {
 	IsLearner bool     `json:"isLearner"`
 }
 
+type storeQuorumSurvival struct {
+	voting, learners, places, quorum, worstRemaining int
+	survives                                         bool
+}
+
+// A lost place removes every voting member located there, not merely one vote.
+func storeSurvivalByPlace(members []storeMemberReport) (storeQuorumSurvival, error) {
+	var result storeQuorumSurvival
+	votesByPlace := map[string]int{}
+	for _, member := range members {
+		if member.IsLearner {
+			result.learners++
+			continue
+		}
+		placeNames := map[string]bool{}
+		for _, peerURL := range member.PeerURLs {
+			if place := hostOfURL(peerURL); place != "" {
+				placeNames[place] = true
+			}
+		}
+		if len(placeNames) != 1 {
+			return result, fmt.Errorf("voting member %q does not have exactly one identifiable place", member.Name)
+		}
+		for place := range placeNames {
+			votesByPlace[place]++
+		}
+		result.voting++
+	}
+	result.places = len(votesByPlace)
+	result.quorum = result.voting/2 + 1
+	result.worstRemaining = result.voting
+	for _, votes := range votesByPlace {
+		if remaining := result.voting - votes; remaining < result.worstRemaining {
+			result.worstRemaining = remaining
+		}
+	}
+	result.survives = result.places >= 3 && result.worstRemaining >= result.quorum
+	return result, nil
+}
+
 // verifyTheStoreCanLoseAPlace asks each member it can reach for the cluster's membership, and reports whether
 // losing one of the places those members sit in leaves a quorum.
 func verifyTheStoreCanLoseAPlace(dir string, env map[string]string) []verifyResult {
@@ -73,39 +113,30 @@ func verifyTheStoreCanLoseAPlace(dir string, env map[string]string) []verifyResu
 		}}
 	}
 
-	voting, learners, places := 0, 0, map[string]bool{}
+	quorumState, quorumErr := storeSurvivalByPlace(members)
+	if quorumErr != nil {
+		return []verifyResult{{name: "the consensus store can lose one place", note: quorumErr.Error()}}
+	}
 	names := []string{}
 	for _, m := range members {
-		if m.IsLearner {
-			learners++
-		} else {
-			voting++
-			for _, p := range m.PeerURLs {
-				places[hostOfURL(p)] = true
-			}
-		}
 		label := m.Name
 		if m.IsLearner {
 			label += " (learner, no vote)"
 		}
 		names = append(names, label)
 	}
-	// A quorum is more than half the VOTING members. Losing one place removes the votes that sit in it, which
-	// with a member per region is one.
-	quorum := voting/2 + 1
-	survives := voting-1 >= quorum && len(places) >= 3
-
-	note := fmt.Sprintf("%d voting member(s) in %d place(s)", voting, len(places))
-	if learners > 0 {
-		note += fmt.Sprintf(", and %d learner(s) that do not vote yet", learners)
+	// A quorum is more than half the voting members. The worst place to lose may hold more than one vote.
+	note := fmt.Sprintf("%d voting member(s) in %d place(s)", quorumState.voting, quorumState.places)
+	if quorumState.learners > 0 {
+		note += fmt.Sprintf(", and %d learner(s) that do not vote yet", quorumState.learners)
 	}
 	note += fmt.Sprintf(" — %s. Asked at %s.", strings.Join(names, ", "), reachedFrom)
-	if !survives {
+	if !quorumState.survives {
 		note += fmt.Sprintf(" ★ LOSING ONE LEAVES %d OF A QUORUM OF %d: promotion would be MANUAL, and until "+
-			"it happened the deployment would enforce and could not be authored. Redundancy arrives with the "+
-			"THIRD voting member, not the second.", voting-1, quorum)
+			"it happened the deployment would enforce and could not be authored. Distribute voting members "+
+			"so the loss of any one place still leaves quorum.", quorumState.worstRemaining, quorumState.quorum)
 	}
-	return []verifyResult{{ok: survives, name: "the consensus store can lose one place", note: note}}
+	return []verifyResult{{ok: quorumState.survives, name: "the consensus store can lose one place", note: note}}
 }
 
 // storeClientHosts turns Patroni's host list — 'a:2379','b:2379' — into addresses.

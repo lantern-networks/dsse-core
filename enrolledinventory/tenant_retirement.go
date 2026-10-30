@@ -24,7 +24,7 @@ func (l *Ledger) RetireTenantChecked(tenantID, now string) (int, error) {
 	}
 	n, changed := 0, false
 	for id, e := range l.entries {
-		if !strings.EqualFold(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenantID)) {
+		if !sameGroupTenant(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenantID)) {
 			continue
 		}
 		n++
@@ -56,7 +56,7 @@ func (l *Ledger) CountTenantRecords(tenantID string) int {
 	defer l.mu.Unlock()
 	n := 0
 	for _, e := range l.entries {
-		if strings.EqualFold(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenantID)) {
+		if sameGroupTenant(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenantID)) {
 			n++
 		}
 	}

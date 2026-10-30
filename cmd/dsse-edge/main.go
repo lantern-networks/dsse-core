@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof" // DIAGNOSTIC: registers /debug/pprof on http.DefaultServeMux; served only when -pprof-listen is set
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -57,11 +58,13 @@ import (
 	idpregistry "github.com/lantern-networks/dsse-core/idpregistry"
 	inspection "github.com/lantern-networks/dsse-core/inspection"
 	inspectionposture "github.com/lantern-networks/dsse-core/inspectionposture"
+	"github.com/lantern-networks/dsse-core/installprofile"
 	knownbypass "github.com/lantern-networks/dsse-core/knownbypass"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
 	policycandidate "github.com/lantern-networks/dsse-core/policycandidate"
 	policyrule "github.com/lantern-networks/dsse-core/policyrule"
 	"github.com/lantern-networks/dsse-core/revocation"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"github.com/lantern-networks/dsse-core/seatallocation"
 
 	"github.com/lantern-networks/dsse-core/internalca"
@@ -84,6 +87,7 @@ import (
 	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/decision"
 	devicestore "github.com/lantern-networks/dsse-core/device"
+	"github.com/lantern-networks/dsse-core/dlp"
 	"github.com/lantern-networks/dsse-core/dnsech"
 	"github.com/lantern-networks/dsse-core/hotstore"
 	"github.com/lantern-networks/dsse-core/logs"
@@ -105,7 +109,8 @@ const (
 )
 
 type serverConfig struct {
-	StandbyAudit *adminStandbyAudit
+	AuthRolloutReporter *authRolloutReporter
+	StandbyAudit        *adminStandbyAudit
 	// ===================================================================================
 	// DEPLOYMENT CONFIGURATION — flag-parsed values (addresses, paths, tokens, durations, toggles).
 	// ===================================================================================
@@ -214,6 +219,9 @@ type serverConfig struct {
 	// (not just status-flipped). nil = no interception engine wired (e.g. headless control plane).
 	ApplyMaterializedCertPinBypass func(tenantID string)
 	// ── DLP ──
+	// DLPRuleStorePath persists admin-authored egress DLP rules. The CP owns
+	// this authority; bundle receivers keep only a node-local copy.
+	DLPRuleStorePath string
 	// DLPClassifierStorePath persists operator-defined custom DLP classifiers so they survive an Edge restart.
 	// Empty = in-memory only. "postgres" (needs -postgres-dsn) or a file path.
 	DLPClassifierStorePath string
@@ -236,6 +244,8 @@ type serverConfig struct {
 	// forwarded uninspected — closes the corrupt-container DLP bypass at the cost of blocking broken-but-benign
 	// uploads.
 	DLPBlockUninspectableFiles bool
+	// One process resource pool shared by external and in-process SWG paths.
+	DLPRetentionBudget *dlp.RetentionBudget
 	// ── SWG / egress / inspection ──
 	// InspectionEventsStorePath persists inspection events — notably the DLP findings — so the DLP Findings view
 	// survives an Edge restart. Empty = in-memory only. "postgres" (needs -postgres-dsn) or a file path.
@@ -303,12 +313,16 @@ type serverConfig struct {
 	ClientlessAccessEnabled   bool // opt-in. When false (default) the PUBLIC clientless web front door is 404 (no pre-auth web attack surface).
 	// ClientlessBaseURL (when non-empty) enables the clientless federated-auth broker and is the RP base for
 	// the OIDC redirect_uri. GrantStorePath persists the minted grants.
-	ClientlessBaseURL string
+	ClientlessBaseURL     string
+	EntrancePortalOrigins string
 
 	// ClientlessTLSCert/Key are the certificate a browser validates at the step-up portal. Not minted here:
 	// the portal is a browser-facing page and its name is one the operator holds.
 	ClientlessTLSCert string
 	ClientlessTLSKey  string
+	// ClientlessTLSCA is additional trust for checking this node's Portal pair,
+	// never a process-wide or upstream/IdP trust anchor.
+	ClientlessTLSCA string
 
 	// StepUpPortalCertificateIsOperators says the portal is served on a certificate the operator provided —
 	// in production, one the world already trusts. It travels in every device profile, because it decides
@@ -338,14 +352,18 @@ type serverConfig struct {
 	// AdminConsoleOrigins is every address the Console answers on, for the profile's never-steer list. See the
 	// flag for why it is stated rather than derived from the region catalogue.
 	AdminConsoleOrigins string
+	// Exact operator-declared authentication portals are control paths, not inspected application traffic.
+	StepUpPortalOrigins string
 
 	// Endpoints of the TLS paths this node DIALS but does not own the certificate for. They are carried only
 	// so the paths view can list them: a registry that silently omits the IdP, the mesh and the stores tells an
 	// operator every path is accounted for when eight are not (review C8). Marked externally managed there.
-	IdPIssuerURL             string
-	HotStoreEndpoint         string
-	ColdArchiveEndpoint      string
-	AdminInviteEmailSinkPath string // lab email sink: activation messages are appended here (no SMTP)
+	IdPIssuerURL string
+	// Optional operator-authored, dedicated HTTPS IdP exceptions issued only in signed install profiles.
+	ExactHTTPSPassthroughEndpoints []installprofile.ExactHTTPSPassthroughEndpoint
+	HotStoreEndpoint               string
+	ColdArchiveEndpoint            string
+	AdminInviteEmailSinkPath       string // lab email sink: activation messages are appended here (no SMTP)
 	// IdPConnectionStorePath: when set, the per-tenant end-user IdP registry persists to this JSON file so
 	// registered IdP connections + the default survive a restart. Empty = in-memory only.
 	IdPConnectionStorePath string
@@ -367,6 +385,9 @@ type serverConfig struct {
 	// config resources are rejected (Phase 1 write-path inversion, design/ 1c): config is authored on the
 	// control plane, not a puller Edge — "no node-local source of truth".
 	ConfigSourceURL string
+	// Machine-mTLS CP authority for final held-flow outcomes on a zero-DB Edge.
+	AuthResultAuthorityURL    string
+	AuthResultAuthorityClient *http.Client
 	// SteerExclusionSourceURL is the control-plane base this Edge PULLS its steer exclusions from
 	// (-steer-exclusion-source-url). Separate from ConfigSourceURL because the two syncs are separate: an Edge
 	// can pull exclusions without pulling the config bundle. A write accepted HERE while this is set is erased
@@ -459,6 +480,7 @@ type serverConfig struct {
 	// EnrolmentCPReporter tells the control plane about enrolments completed on this Edge. Nil on an Edge
 	// with no control plane, where the local ledger IS the authority and there is nobody to tell.
 	EnrolmentCPReporter *enrolmentCPReporter
+	GrantCPReporter     *grantCPReporter
 	// DirectoryCPReporter carries a connector-driven directory import to the control plane. Same reason as the
 	// enrolment reporter above: a connector reaches the Edge and nothing else, so what lands here has to be
 	// carried or the authority never learns about it.
@@ -567,9 +589,11 @@ type serverConfig struct {
 	HumanIdentities         humanidentity.HumanIdentityDirectoryRuntimeStore
 	WorkloadAttestations    runtimeWorkloadAttestationNonceStore
 	// ── Admin plane ──
-	LegalHold           *legalHoldStore         // litigation/e-discovery holds (shared with the retention pruner; nil = none)
-	ColdArchive         archive.ColdArchive     // sovereign cold-archive backend (for the audit-chain verify API; nil = none)
-	RetentionOverride   *retentionOverrideStore // admin-configurable per-stream retention (shared with the pruner; nil = flags only)
+	LegalHold           *legalHoldStore            // litigation/e-discovery holds (shared with the retention pruner; nil = none)
+	ColdArchive         archive.ColdArchive        // sovereign cold-archive backend (for the audit-chain verify API; nil = none)
+	ArchiveHealth       *coldArchiveHealthMonitor  // shared operator-only S3 health and durable notification queue
+	ManualHotLogDelete  *manualHotLogDeleteManager // scoped, durable hot-row deletion jobs
+	RetentionOverride   *retentionOverrideStore    // admin-configurable per-stream retention (shared with the pruner; nil = flags only)
 	Writer              *logs.Writer
 	ExportObjectStore   adminExportObjectStore
 	OIDC                oidcConfig
@@ -957,6 +981,9 @@ func normalizedStringList(values []string) []string {
 // AI Ops analytics (access trends / incident timeline). Bounded by the store capacity.
 
 func main() {
+	if err := runtimequota.ValidateEnvironment(); err != nil {
+		log.Fatal(err)
+	}
 	initMetricsStart(time.Now())
 	mode := flag.String("mode", "edge", "run mode: edge, postgres-export-worker, postgres-audit-publisher, or postgres-domain-event-publisher")
 	listen := flag.String("listen", ":8080", "listen address")
@@ -965,14 +992,18 @@ func main() {
 	// REFUSES to start unless -allow-insecure-plaintext is explicitly set (loud insecure escape hatch).
 	mainTLSCert := flag.String("tls-cert", "", "server certificate PEM for the main -listen (HTTPS); omit in -lab-mode to auto-generate a self-signed cert")
 	mainTLSKey := flag.String("tls-key", "", "server private key PEM for the main -listen (HTTPS)")
+	cpUnavailableListen := registerCPUnavailableFlag()
 	allowInsecurePlaintext := flag.Bool("allow-insecure-plaintext", false, "DANGER: serve the main -listen over plaintext HTTP instead of TLS (local debug only; the Edge is TLS-only by default)")
 	drainPeriod := flag.Duration("drain-period", 5*time.Second, "Phase 4 graceful drain: on SIGTERM/SIGINT the Edge marks itself unhealthy (/healthz -> 503 so the LB drains it), bleeds in-flight requests for this period, then shuts down cleanly. Enables zero-outage rolling upgrades. SIGKILL still dies immediately (a crash, handled by failover).")
 	// GUI / Admin Console separation. The Edge is API-only; the Console is a separate-host app
 	// that calls the admin API over TLS. -admin-listen puts the admin+auth surface on its OWN TLS listener
 	// (must NOT be loopback — the Console is remote); the data-plane listener then excludes admin+auth.
 	adminListen := flag.String("admin-listen", "", "dedicated TLS listener for the admin+auth surface (host:port, must NOT be loopback — the Admin Console is a separate host); empty = admin served on the main listener")
+	crlListen := registerInspectionCRLListenerFlag()
 	adminConsoleOrigin := flag.String("admin-console-origin", "", "CORS origin of the separate-host Admin Console (e.g. https://console.internal); enables cross-origin admin API calls for that exact origin only. Empty = no CORS (same-origin only)")
 	adminConsoleOrigins := registerAdminConsoleOriginsFlag()
+	stepUpPortalOrigins := registerStepUpPortalOriginsFlag()
+	entrancePortalOrigins := registerEntrancePortalOriginsFlag()
 	adminSessionAuthorityURL := flag.String("admin-session-authority-url", "", "centralized admin auth: control-plane session endpoint (e.g. https://controlplane:9443/admin/session). When set, an admin_session cookie not known to this Edge's local store is INTROSPECTED here and accepted on success. Empty = this Edge is the sole session authority")
 	adminSessionAuthorityCA := flag.String("admin-session-authority-ca", "", "PEM CA pinning the admin-session-authority's TLS cert (empty = system roots)")
 	// (T) secure transport — additive TLS listener for the endpoint↔Edge tunnel. Default OFF; the
@@ -1084,6 +1115,7 @@ func main() {
 	adminRuntimeStateStorePath := flag.String("admin-runtime-state-store", "", "durable JSON store for Admin-API runtime TOGGLES (tenant-restriction status, east-west enabled/rules/maxTTL); restored on boot so they survive a restart. Empty = in-memory only")
 	eastWestObserveStorePath := flag.String("east-west-observe-store", "", "durable store for the East-West Observe inventory (learned lateral flows); restored on boot so observations survive a restart (90-day retention). Empty = in-memory only; \"postgres\" or a file path")
 	inspectionEventsStorePath := flag.String("inspection-events-store", "", "durable store for inspection events (notably the DLP findings); restored on boot so the DLP Findings view survives a restart (90-day retention). Empty = in-memory only; \"postgres\" or a file path")
+	dlpRuleStorePath := registerDLPRuleStoreFlag()
 	dlpClassifierStorePath := flag.String("dlp-classifier-store", "", "durable store for operator-defined custom DLP classifiers (/admin/dlp-classifiers); restored + recompiled on boot so custom identifiers survive a restart. Empty = in-memory only; \"postgres\" or a file path")
 	dlpAllowlistStorePath := flag.String("dlp-allowlist-store", "", "durable store for operator-declared known-safe DLP values (/admin/dlp-allowlist, false-positive tuning); restored on boot so the allowlist survives a restart. Empty = in-memory only; \"postgres\" or a file path")
 	dlpFingerprintStorePath := flag.String("dlp-fingerprint-store", "", "durable store for operator EDM datasets (/admin/dlp-fingerprints, exact-data-match; salted hashes only); restored on boot so fingerprints survive a restart. Empty = in-memory only; \"postgres\" or a file path")
@@ -1096,7 +1128,7 @@ func main() {
 	applicationCatalogStorePath := flag.String("application-catalog-store", "", "durable store for operator-authored applications; merged on top of the config-seeded catalog on boot so authored apps/edits survive a restart. Empty = in-memory only; a path = file/JSON durability; \"postgres\" = control-plane Postgres backend (reuses the admin-auth-store=postgres connection)")
 	idpConnectionStorePath := flag.String("idp-connection-store", "", "durable JSON store for the per-tenant end-user IdP registry (federated-auth connections + default), managed via /admin/idp-connections; restored on boot so registered IdPs survive a restart. Empty = in-memory only")
 	stepUpBindingSecret := stepUpBindingSecretFlag()
-	clientlessTLSCert, clientlessTLSKey := stepUpPortalCertificateFlags()
+	clientlessTLSCert, clientlessTLSKey, clientlessTLSCA := stepUpPortalCertificateFlags()
 	clientlessBaseURL := flag.String("clientless-base-url", "", "when set, enables the clientless federated-auth broker at /clientless/auth/* and is the RP base URL for the OIDC redirect_uri (e.g. https://edge.example.com:8443). Empty = broker disabled (no clientless front door).")
 	grantStorePath := flag.String("grant-store", "", "durable JSON store for federated-auth grants minted by the clientless broker; a revoked grant stays revoked across a restart. Empty = in-memory only")
 	delegatedGrantStorePath := flag.String("delegated-grant-store", "", "durable JSON store for delegated-access (east-west NHI) grants; in-flight grants and revocations survive a restart. Empty = in-memory only")
@@ -1104,7 +1136,7 @@ func main() {
 	breakGlassStorePath := flag.String("break-glass-store", "", "durable JSON store for break-glass emergency-access requests; a pending/approved request survives a restart instead of being lost mid-ceremony. Empty = in-memory only")
 	swgRuntimeTLSDecryptionObserved := flag.Bool("swg-runtime-tls-decryption-observed", false, "non-secret SWG readiness signal indicating default TLS decryption was observed by the runtime")
 	swgMacCATrustObserved := flag.Bool("swg-mac-ca-trust-observed", false, "non-secret SWG readiness signal indicating Mac CA trust was observed by the runtime; does not mutate the trust store")
-	networkExtensionConfigPublishDir := flag.String("network-extension-config-publish-dir", "", "directory where Admin Console policy snapshots for the macOS Network Extension are written; disabled when empty")
+	networkExtensionConfigPublishDir := flag.String("network-extension-config-publish-dir", "", "root directory for tenant-scoped macOS Network Extension policy snapshots (tenants/<hex-tenant-id>/); disabled when empty")
 	networkExtensionRuntimeCopyEdgeURL := flag.String("network-extension-runtime-copy-edge-url", "", "host-separated Edge runtime-copy base URL written to Network Extension snapshots")
 	networkExtensionRuntimeCopyEndpointPath := flag.String("network-extension-runtime-copy-endpoint-path", networkExtensionSnapshotDefaultEndpointPath, "runtime-copy endpoint path written to Network Extension snapshots")
 	networkExtensionRuntimeCopySessionEndpointPath := flag.String("network-extension-runtime-copy-session-endpoint-path", networkExtensionSnapshotDefaultSessionEndpointPath, "session runtime-copy endpoint path written to Network Extension snapshots")
@@ -1154,7 +1186,7 @@ func main() {
 	connectorEnrollmentStateDir := flag.String("connector-enrollment-state-dir", "", "the --state-dir path rendered into the enrollment command where a connector persists after enrolling (default /var/lib/dsse-connector)")
 	connectorEnrollmentEdgeCA := flag.String("connector-enrollment-edge-ca", "", "PEM path of the Edge transport CA to fold into the enrollment token (public, not a secret) so a connector pins it on first run with no separate CA file to hand-place")
 	operatorTenantID := flag.String("operator-tenant-id", "", "the SSE operator's own tenant id in the multi-tenant Admin Console. When set, that tenant is seeded (display name \"Operator\", status active), flagged is_operator in GET /admin/tenants, hidden from the Console customer list, and refused for deletion (lockout protection). Empty (default) = feature off: no operator tenant, all tenants shown normally — the lab behavior is unchanged")
-	networkExtensionRuntimeCopyLabTLSRootCACertOut := flag.String("network-extension-runtime-copy-lab-tls-root-ca-cert-out", "", "optional file or directory path where the lab TLS interception root CA certificate PEM is written; directories use lantern_dsse_interception_root_ca.pem, and a sibling .key.pem file is stored with 0600 permissions and reused for stable local lab trust")
+	networkExtensionRuntimeCopyLabTLSRootCACertOut := flag.String("network-extension-runtime-copy-lab-tls-root-ca-cert-out", "", "optional interception root path; file-key mode stores its signer pair here and publishes a separate *.active-anchor.pem after restoring durable state; offline/HSM mode uses this as certificate-only output. Directories use lantern_dsse_interception_root_ca.pem")
 	networkExtensionRuntimeCopyLabTLSBypassHosts := flag.String("network-extension-runtime-copy-lab-tls-bypass-hosts", "", "comma-separated hostnames or *.suffix patterns the Edge bypasses (raw_forward, never decrypts) even under decrypt-all; the Edge decides bypass here rather than relying on an NE-level passthrough exception (e.g. the AI dev-agent control plane and cert-pinned apps)")
 	networkExtensionRuntimeCopyLabTLSSNIBasedIntercept := flag.Bool("network-extension-runtime-copy-lab-tls-sni-based-intercept", false, "decide intercept vs raw_forward from the TLS ClientHello SNI instead of route.Host; robust for connect-by-IP clients (Chrome/IPv6) where route.Host is an IP. Requires steer-all (no intercept-only-domains) so all flows reach the Edge; non-SNI-matching flows are raw_forwarded without decryption")
 	// HSM-backed interception key custody (docs/2026-07-28_pki_key_custody_sidecar_decision.ja.md). When a
@@ -1164,7 +1196,7 @@ func main() {
 	interceptionHSMAgentToken := flag.String("interception-hsm-agent-token", "", "bearer token for dsse-hsm-agent")
 	interceptionHSMAgentKeyID := flag.String("interception-hsm-agent-key-id", "", "key id in the token to sign with. Empty = adopt the only key the agent holds")
 	interceptionHSMAgentCert := flag.String("interception-hsm-agent-ca-cert", "", "path to the interception CA certificate for the HSM-held key. Minted (self-signed by the token key) and persisted here on first run")
-	interceptionReparentStateDir := flag.String("interception-reparent-state-dir", "", "directory where a completed interception-root RE-PARENT is persisted (root + intermediate PEM) so it survives a restart. When the token key has been re-issued a certificate under a central (MSSP) root via POST /admin/interception-intermediate/adopt, that posture is restored on boot instead of reverting to the self-signed root. Empty = the reparent is live-only (reverts on restart). Certificates only; the signing key stays in the token.")
+	interceptionReparentStateDir := flag.String("interception-reparent-state-dir", "", "directory for the durable, atomic interception RE-PARENT certificate-pair snapshot, restored on boot after a successful adopt. Required for POST /admin/interception-intermediate/adopt; an empty value refuses adoption. Legacy split files or an invalid snapshot fail closed. Certificates only; the signing key stays in the token.")
 	networkExtensionRuntimeCopyLabTLSDynamicPinDetection := flag.Bool("network-extension-runtime-copy-lab-tls-dynamic-pin-detection", false, "OPT-IN: dynamically learn cert-pinned destinations from repeated intercept handshake failures and raw_forward them. Default OFF for security: an attacker could deliberately fail handshakes to get their destination raw_forwarded (escaping inspection/tenant-restriction). When OFF, only the static bypass list decides raw_forward; cert-pinned OS infra (Apple daemons etc.) must be listed there explicitly")
 	policyCandidateStatePath := flag.String("policy-candidate-store", "", "path to a JSON file persisting policy candidates (incl. cert-pinning bypass proposals). When set, candidates survive an edge restart so an unreviewed proposal is never lost. Empty = in-memory only")
 	catalogOverrideStatePath := flag.String("predefined-catalog-override-store", "", "path to a JSON file persisting per-tenant predefined-catalog overrides (force-inspect/disable a curated bypass entry). When set, overrides survive an edge restart. Empty = in-memory only")
@@ -1172,6 +1204,7 @@ func main() {
 	catalogFeedTrustedKeysFile := flag.String("predefined-catalog-feed-trusted-keys-file", "", "path to a JSON file mapping signing_key_id -> base64(std) ed25519 public key. A signed catalog feed is applied only if its signer is in this ring. Empty = no feed can be applied (built-in default served)")
 	stripAltSvc := flag.Bool("strip-alt-svc", true, "strip the Alt-Svc response header on intercepted flows so clients do not switch to HTTP/3 (QUIC). Default on: QUIC is un-interceptable, so it is disabled by default for a decrypt-all SSE (matching the endpoint UDP/443 drop), which also avoids the QUIC-timeout fallback that slows QUIC-preferring clients like Safari")
 	dlpBlockUninspectableFiles := flag.Bool("dlp-block-uninspectable-files", false, "when an interrupting (block/authenticate) DLP rule governs a flow and an uploaded file cannot be text-extracted (encrypted/corrupt/adversarial PDF or Office file), BLOCK the upload instead of forwarding it uninspected. Default off (availability first): the skip is logged either way, but a deliberately-corrupted container is a DLP bypass vehicle — set this for tenants whose block rules must not be evadable that way")
+	dlpRetentionPerStream, dlpRetentionProcess := registerDLPRetentionFlags()
 	swgEgressBrowserMimic := flag.Bool("swg-egress-browser-mimic", false, "OPT-IN: re-originate the device decrypt-all upstream through the egress broker's REAL Chrome network stack (curl-impersonate: BoringSSL TLS(JA3/JA4) + HTTP/2(Akamai SETTINGS/pseudo-header order) + header order), so bot-mitigation (AWS WAF / Akamai / Imperva / Cloudflare) treats the intercepted re-originated connection as a real browser instead of Go (fixes Amazon WAF challenge / EC-site 502 without bypassing decryption). REQUIRES EGRESS_BROKER_URL — the Edge refuses to start without it, as no in-process fallback engine exists. Default OFF (Go fingerprint); device decrypt-all path only")
 	defaultBypassList := flag.Bool("default-bypass-list", true, "raw-forward a curated set of well-known un-interceptable services (Apple push/iCloud, OS updates, OCSP) by default, so they work out of the box and do not generate cert-pinning detection noise. Set false to intercept everything (then bypass via detection/admin)")
 	networkExtensionRuntimeCopyLabTLSProbeOnly := flag.Bool("network-extension-runtime-copy-lab-tls-probe-only", false, "lab-only mode: answer non-probe lab TLS HTTP requests with a synthetic 204 instead of forwarding them through SWG egress")
@@ -1227,6 +1260,7 @@ func main() {
 			"fixed remotely, so a fleet-wide redeploy with a bad file would take the deployment down entirely "+
 			"rather than partially. Set it where failing closed is preferred to serving a certificate nobody "+
 			"can verify.")
+	authRolloutFlags := registerAuthRolloutFlags()
 	isControlPlane := flag.Bool("control-plane", false, "this process IS the control plane, not an Edge that needs one. The control plane runs the same binary as an Edge and until now nothing on its command line said which it was — the difference lived only in which stores happened to be wired. Declaring it makes the startup requirement below expressible, and makes a compose file legible to somebody who has not read the store list.")
 	transportAnchorAckStorePath := flag.String("transport-anchor-ack-store", "", "durable store for an operator's per-identity assertions that a transport trust anchor is held by other means (a connector whose CA file was updated, say). Without one, a restart re-closes a withdrawal gate the operator had deliberately opened. File path | empty = defaults to the state dir when -state-dir is set.")
 	deviceClientCAStorePath := flag.String("device-client-ca-store", "", "durable, runtime-mutable store for the CAs device client certificates are verified against (seeded from -transport-tls-client-ca on first run). When set, an admin can retire a CA that no observed device still chains to — with no restart. Empty = the flag file is the fixed set.")
@@ -1316,18 +1350,19 @@ func main() {
 	edgeDomainEventOutboxPostgresDSN := flag.String("domain-event-outbox-postgres-dsn", "", "PostgreSQL DSN for edge domain-event-outbox=postgres; defaults to -postgres-dsn when omitted")
 	postgresDSN := flag.String("postgres-dsn", "", "PostgreSQL DSN for postgres-export-worker mode")
 	retentionPollInterval := flag.Duration("retention-poll", time.Hour, "interval to prune aged log/outbox rows (postgres tables; control plane). 0 disables.")
-	hotEventsRetention := flag.Duration("hot-events-retention", 720*time.Hour, "delete hot_events older than this (0 = keep forever). Default 30d.")
+	coldArchiveAlertAfter := coldArchiveAlertAfterFlag()
+	hotEventsRetention := flag.Duration("hot-events-retention", 720*time.Hour, "archive, then delete hot_events older than this (0 = keep forever). Default 30d.")
 	outboxPublishedRetention := flag.Duration("outbox-published-retention", 720*time.Hour, "delete PUBLISHED outbox rows older than this (0 = keep). Default 30d.")
 	outboxDeadRetention := flag.Duration("outbox-dead-retention", 336*time.Hour, "delete DEAD outbox rows older than this (0 = keep). Default 14d.")
-	// Sovereign cold-archive (S3-compatible; NOT AWS). The retention lifecycle tiers aged log segments here
-	// instead of deleting them. Endpoint is host:port of a self-hosted MinIO/Ceph (default target) or an in-country
-	// provider — never an AWS ARN/URL. Empty endpoint = disabled (prune still deletes; no cold tier).
-	coldArchiveEndpoint := flag.String("cold-archive-endpoint", "", "S3-compatible cold-archive endpoint host:port (e.g. minio:9000). Empty = disabled. NOT AWS — self-hosted MinIO/Ceph or an in-country provider.")
+	// The external archive is operated by the deployment owner. An absent archive
+	// pauses hot-event pruning so an omitted endpoint never silently loses data.
+	coldArchiveEndpoint := flag.String("cold-archive-endpoint", "", "operator-managed S3-compatible endpoint host:port; empty pauses hot-event pruning")
 	coldArchiveBucket := flag.String("cold-archive-bucket", "", "cold-archive bucket (should be object-lock-enabled for WORM)")
 	coldArchiveAccessKey := flag.String("cold-archive-access-key", "", "cold-archive S3 access key")
 	coldArchiveSecretKey := flag.String("cold-archive-secret-key", "", "cold-archive S3 secret key")
-	coldArchiveRegion := flag.String("cold-archive-region", "", "cold-archive S3 region (optional; most self-hosted stores ignore it)")
-	coldArchiveUseSSL := flag.Bool("cold-archive-use-ssl", false, "use TLS to the cold-archive endpoint")
+	coldArchiveRegion := flag.String("cold-archive-region", "", "cold-archive S3 region")
+	coldArchiveAuthMode := coldArchiveAuthModeFlag()
+	coldArchiveUseSSL := flag.Bool("cold-archive-use-ssl", true, "use TLS to the external archive; disabling is rejected")
 	auditColdRetention := flag.Duration("audit-cold-retention", 8760*time.Hour, "WORM object-lock retention for archived AUDIT-stream segments (tamper-proof). Default 365d. 0 = no lock. Requires an object-lock-enabled bucket.")
 	hotEventsRetentionOverrides := flag.String("hot-events-retention-overrides", "audit=8760h,human_approval_events=8760h,delegated_access_grants=8760h", "per-stream hot-events retention overrides (comma list of stream=duration); a stream not listed uses -hot-events-retention. Keep compliance streams (audit/approvals/grants) longer than access. 0 keeps a stream forever.")
 	legalHoldStorePath := flag.String("legal-hold-store", "", "durable JSON store for legal holds (litigation/e-discovery). A held tenant's logs are preserved (retention frozen) until released; survives restart. Empty = in-memory only.")
@@ -1380,7 +1415,7 @@ func main() {
 	domainEventPublisherDelivery := flag.String("domain-event-publisher-delivery", "jsonl", "PostgreSQL domain event outbox delivery mode: jsonl, objectstore, or webhook")
 	domainEventPublisherWebhookURL := flag.String("domain-event-publisher-webhook-url", "", "HTTP endpoint for domain-event-publisher-delivery=webhook")
 	domainEventPublisherWebhookToken := flag.String("domain-event-publisher-webhook-token", "", "optional bearer token for domain-event-publisher-delivery=webhook")
-	domainEventPublisherWebhookSecret := flag.String("domain-event-publisher-webhook-signing-secret", "", "optional HMAC-SHA256 signing secret for domain-event-publisher-delivery=webhook")
+	domainEventPublisherWebhookSecret := flag.String("domain-event-publisher-webhook-signing-secret", os.Getenv("DSSE_DOMAIN_EVENT_PUBLISHER_WEBHOOK_SIGNING_SECRET"), "optional HMAC-SHA256 signing secret for domain-event-publisher-delivery=webhook (or DSSE_DOMAIN_EVENT_PUBLISHER_WEBHOOK_SIGNING_SECRET)")
 	domainEventPublisherWebhookKeyID := flag.String("domain-event-publisher-webhook-signing-key-id", "", "optional HMAC signing key id header for domain-event-publisher-delivery=webhook")
 	domainEventPublisherWebhookTimeout := flag.Duration("domain-event-publisher-webhook-timeout", 10*time.Second, "HTTP timeout for domain-event-publisher-delivery=webhook")
 	// optional per-client rate limit on the /auth + /admin surfaces (0 = disabled). Default
@@ -1396,7 +1431,60 @@ func main() {
 	if handleVersionFlag() {
 		return
 	}
+	secretEnv := secretEnvFlag()
 	flag.Parse()
+	if err := applySecretEnv(flag.CommandLine, *secretEnv, os.LookupEnv, os.Unsetenv); err != nil {
+		log.Fatalf("%v", err)
+	}
+	dlpRetentionBudget, dlpRetentionErr := dlp.ConfigureProcessRetention(*dlpRetentionPerStream, *dlpRetentionProcess)
+	if dlpRetentionErr != nil {
+		log.Fatalf("DLP retention configuration: %v", dlpRetentionErr)
+	}
+	dlpRetentionStatus := dlpRetentionBudget.Status()
+	log.Printf("dlp_retention per_stream_bytes=%d process_bytes=%d working_bytes_per_guard=%d", dlpRetentionStatus.PerStreamBytes, dlpRetentionStatus.ProcessBytes, dlpRetentionStatus.WorkingBytesPerGuard)
+	exactHTTPSPassthroughEndpoints, exactHTTPSPassthroughErr := installprofile.ParseExactHTTPSPassthroughEndpoints(*networkExtensionExactHTTPSPassthrough)
+	if exactHTTPSPassthroughErr != nil {
+		log.Fatalf("network-extension-exact-https-passthrough-endpoints-json: %v", exactHTTPSPassthroughErr)
+	}
+	// A webhook publisher is a standalone outbox sender. It needs the shared
+	// database and webhook credentials, not an Edge policy bundle, signing
+	// keys, listeners, or the CP's configuration stores. Dispatch it before
+	// server initialization so the installer-generated service can actually
+	// start from its deliberately minimal mounts.
+	if *mode == "postgres-domain-event-publisher" && strings.EqualFold(strings.TrimSpace(*domainEventPublisherDelivery), "webhook") {
+		dsn := strings.TrimSpace(*domainEventPublisherPostgresDSN)
+		if dsn == "" {
+			dsn = strings.TrimSpace(*postgresDSN)
+		}
+		if err := runPostgresDomainEventOutboxPublisher(context.Background(), postgresDomainEventOutboxPublisherConfig{
+			DSN:            dsn,
+			MigrationDir:   *migrationDir,
+			RunMigrations:  *postgresRunMigrations,
+			TenantID:       strings.TrimSpace(*workerTenantID),
+			EventPlane:     *domainEventPublisherPlane,
+			PublisherID:    *domainEventPublisherID,
+			PollInterval:   *domainEventPublisherPollInterval,
+			BatchSize:      *domainEventPublisherBatchSize,
+			LockDuration:   *domainEventPublisherLockDuration,
+			RetryDelay:     *domainEventPublisherRetryDelay,
+			MaxAttempts:    *domainEventPublisherMaxAttempts,
+			DeliveryMode:   *domainEventPublisherDelivery,
+			WebhookURL:     *domainEventPublisherWebhookURL,
+			WebhookToken:   *domainEventPublisherWebhookToken,
+			WebhookSecret:  *domainEventPublisherWebhookSecret,
+			WebhookKeyID:   *domainEventPublisherWebhookKeyID,
+			WebhookTimeout: *domainEventPublisherWebhookTimeout,
+		}); err != nil {
+			log.Fatalf("postgres domain event outbox publisher: %v", err)
+		}
+		return
+	}
+	if *cpUnavailableListen != "" {
+		if err := serveCPUnavailable(*cpUnavailableListen, *mainTLSCert, *mainTLSKey); err != nil {
+			log.Fatalf("CP unavailable responder: %v", err)
+		}
+		return
+	}
 
 	// ★ the enrolment fold: the document handed to every new device must name one agent-facing port. Said here, at start-up,
 	// because it was true for a day and only a code comment knew — see
@@ -1453,12 +1541,14 @@ func main() {
 	configureAdminBreakGlass(*adminToken, *adminBreakGlassFlagSet.armed,
 		!strings.EqualFold(strings.TrimSpace(*edgeAdminAuthStore), "memory"))
 	requireControlPlaneOrExit(*mode, *isControlPlane, *configSourceURL, *configSourceEndpoints, *noControlPlane)
+	resolvedSourceURL, sourceErr := resolveConfigSourceURL(*configSourceURL, *configSourceEndpoints)
+	if sourceErr != nil {
+		log.Fatalf("REFUSING TO START: %v", sourceErr)
+	}
+	*configSourceURL = resolvedSourceURL
 	// Only a CONTROL PLANE aggregates fleet config status; an Edge reports and does not collect. Sized from the
 	// CP's own poll interval so a deliberately slow-polling deployment does not paint its own fleet red.
 	var fleetConfigStatus *fleetConfigStatusStore
-	if *isControlPlane {
-		fleetConfigStatus = newFleetConfigStatusStore(*configSourcePoll)
-	}
 	// ★★ THE SHARED DATABASE IS OPENED FIRST, BECAUSE THE STORE DEFAULTS DEPEND ON IT (2026-08-21). It used to
 	// be opened several hundred lines below, which was invisible while an unset store meant "a file": the
 	// stores resolved before it simply got paths. The moment an unset store means "share it", those same
@@ -1478,6 +1568,24 @@ func main() {
 	// With a shared database, a store this node holds NO copy of follows the fleet rather than starting from an
 	// empty per-node one. See durableStorePath for why the rule is this narrow.
 	sharedStateDSNConfigured = cpStateBlobDB != nil
+	if *isControlPlane {
+		// Erasure evidence must follow a promoted CP even when an Edge is offline.
+		// Never restore those observations as live configuration status.
+		storePath := ""
+		if cpStateBlobDB == nil {
+			storePath = durableStorePath(*stateDir, "", "fleet_tenant_erasure")
+		}
+		p := mustCPStateBlobPersister(storePath, "fleet_tenant_erasure")
+		if p == nil && *devMode {
+			fleetConfigStatus = newFleetConfigStatusStore(*configSourcePoll)
+		} else {
+			var err error
+			fleetConfigStatus, err = newPersistentFleetConfigStatusStore(*configSourcePoll, p)
+			if err != nil {
+				log.Fatalf("open fleet erasure evidence: %v", err)
+			}
+		}
+	}
 
 	// Durable-by-default (design/): resolve every CONFIG store's backend from -state-dir before use, so
 	// the safe path is the default path. An explicit -‹x›-store (a path or "postgres") always wins; only an unset
@@ -1549,6 +1657,20 @@ func main() {
 	*delegatedGrantStorePath = durableStorePath(*stateDir, *delegatedGrantStorePath, "delegated_grants")
 	*enrolledInventoryStore = durableStorePath(*stateDir, *enrolledInventoryStore, "enrolled_inventory")
 	*grantStorePath = durableStorePath(*stateDir, *grantStorePath, "grants")
+	authRole := "edge"
+	if *isControlPlane {
+		authRole = "cp"
+	}
+	authRolloutReport, authRolloutErr := newAuthRolloutReporter(*authRolloutFlags.census, *authRolloutFlags.url, *authRolloutFlags.ca, *authRolloutFlags.cert, *authRolloutFlags.key, authRole)
+	if authRolloutErr != nil {
+		log.Fatalf("authentication rollout configuration: %v", authRolloutErr)
+	}
+	if authRolloutReport != nil {
+		// A process without the deployment-wide key cannot decrypt another
+		// Portal's state, even when it runs the upgraded binary. CP-only
+		// members do not serve browser callbacks and need no key.
+		authRolloutReport.ceremonyRecoveryReady = (authRole == "cp" && strings.TrimSpace(*clientlessBaseURL) == "") || strings.TrimSpace(*stepUpBindingSecret) != ""
+	}
 	*humanApprovalStorePath = durableStorePath(*stateDir, *humanApprovalStorePath, "human_approvals")
 	*idpConnectionStorePath = durableStorePath(*stateDir, *idpConnectionStorePath, "idp_connections")
 	*tenantModelStorePath = durableStorePath(*stateDir, *tenantModelStorePath, "tenant_model")
@@ -2162,12 +2284,9 @@ func main() {
 		}
 		networkExtensionLabTLS, err = edgeplane.NewNetworkExtensionLabTLSInterceptionWithProvider(
 			splitPaths(*networkExtensionRuntimeCopyLabTLSInterceptionHosts), time.Now, provider)
-		if err == nil && networkExtensionLabTLS != nil && strings.TrimSpace(*networkExtensionRuntimeCopyLabTLSRootCACertOut) != "" {
-			// Endpoints trust the ROOT; publish it exactly as the file-key path does.
-			if werr := os.WriteFile(strings.TrimSpace(*networkExtensionRuntimeCopyLabTLSRootCACertOut), provider.CertPEM(), 0o644); werr != nil {
-				log.Fatalf("write interception root CA cert: %v", werr)
-			}
-		}
+		// Publish only after restoring any durable re-parent below. Publishing
+		// the provider certificate here could roll the public anchor backwards
+		// if startup is interrupted before restoration.
 	} else {
 		networkExtensionLabTLS, err = edgeplane.NewNetworkExtensionLabTLSInterceptionWithPersistentRoot(splitPaths(*networkExtensionRuntimeCopyLabTLSInterceptionHosts), time.Now, *networkExtensionRuntimeCopyLabTLSRootCACertOut)
 	}
@@ -2177,16 +2296,37 @@ func main() {
 	if networkExtensionLabTLS == nil && strings.TrimSpace(*networkExtensionRuntimeCopyLabTLSRootCACertOut) != "" {
 		log.Fatalf("network-extension-runtime-copy-lab-tls-root-ca-cert-out requires -network-extension-runtime-copy-lab-tls-interception-hosts")
 	}
-	// Restore a previously adopted re-parent (interception under a central root, key still in the token)
-	// before any traffic is served. Runs after the provider is built — the token key it validates against is
-	// live now — and only when a complete persisted pair is present and still matches; otherwise the
-	// self-signed root stands. This is what stops a redeploy from silently reverting the migration.
+	// Restore the durable authority before publishing an anchor or serving traffic.
+	// Corrupt or incomplete restoration is a startup error, never permission to
+	// fall back to a different trust root.
 	if networkExtensionLabTLS != nil {
-		edgeplane.ReapplyPersistedReparent(networkExtensionLabTLS, strings.TrimSpace(*interceptionReparentStateDir))
-		// The anchor may have just moved. The file operators are told to distribute does not move with it in
-		// persistent-root mode, so say so rather than leaving a valid-looking certificate that breaks every
-		// site on the machine it is installed onto.
-		warnIfInterceptionAnchorFileHasDrifted(networkExtensionLabTLS, *networkExtensionRuntimeCopyLabTLSRootCACertOut)
+		providerExport := ""
+		if strings.TrimSpace(*interceptionHSMAgentSocket) != "" {
+			providerExport = strings.TrimSpace(*networkExtensionRuntimeCopyLabTLSRootCACertOut)
+		}
+		if err := restoreAndPublishInterceptionAnchor(networkExtensionLabTLS, strings.TrimSpace(*interceptionReparentStateDir), providerExport,
+			offlineRootCert, offlineInterCert, offlineInterKey, strings.TrimSpace(*interceptionHSMAgentCert),
+			strings.TrimSpace(*profileInterceptionRootCert), strings.TrimSpace(*interceptionRootKEKFile)); err != nil {
+			log.Fatalf("restore interception authority: %v", err)
+		}
+		if path := networkExtensionLabTLS.ActiveAnchorExportPath(); path != "" {
+			log.Printf("interception: active public anchor export=%q; distribute this certificate or the tenant install bundle", path)
+		}
+	}
+	// The generated deployment shares one root across its transport and interception
+	// issuing CAs. Pass the explicit trust bundle, not the interception CA itself,
+	// to bind leaf CRL locations to that deployment and the immediate signer.
+	if networkExtensionLabTLS != nil {
+		var deploymentRoots []byte
+		if path := strings.TrimSpace(*trustBundleCA); path != "" {
+			deploymentRoots, err = os.ReadFile(path)
+			if err != nil {
+				log.Fatalf("read deployment CRL trust anchors: %v", err)
+			}
+		}
+		if err := networkExtensionLabTLS.ConfigureDeploymentInterceptionCRL(deploymentRoots); err != nil {
+			log.Fatalf("configure deployment interception leaf CRL: %v", err)
+		}
 	}
 	// The agent configuration now carries the organization's own trusted authorities, so a device's trust is
 	// part of what it was installed with rather than a separate manual step that drifts. Wired here because
@@ -2400,6 +2540,17 @@ func main() {
 	if cpLeaderErr != nil {
 		log.Fatalf("start CP leader election: %v", cpLeaderErr)
 	}
+	if *isControlPlane && threeVoterDeployment(os.Getenv("DSSE_TOPOLOGY_PROFILE")) {
+		if cpLeaderElectorInstance == nil {
+			log.Fatal("three-node CP requires PostgreSQL leadership election")
+		}
+		cpLeaderElectorInstance.quorumCheck, cpLeaderErr = newCPQuorumCheck(os.Getenv("DSSE_CP_QUORUM_ENDPOINTS"), "/deployment/store-ca.pem", "/deployment/cp-quorum.pem", "/deployment/cp-quorum-key.pem", cpQuorumBootstrap{
+			allowed: os.Getenv("DSSE_CP_QUORUM_BOOTSTRAP") == "true", marker: "/deployment/runtime/admin-bootstrapped", founderEndpoint: os.Getenv("DSSE_CP_QUORUM_LOCAL_ENDPOINT"),
+		})
+		if cpLeaderErr != nil {
+			log.Fatalf("configure CP quorum admission: %v", cpLeaderErr)
+		}
+	}
 	ruleStore := policyrule.NewStore()
 	rulePersister, rulePersisterErr := cpStateBlobPersister(*policyRuleStorePath, cpStateBlobDB, "policy_rules")
 	if rulePersisterErr != nil {
@@ -2518,6 +2669,9 @@ func main() {
 		}
 		if !addEdgeClientCAPEM(pem) {
 			log.Fatalf("audit-ingest client CA %q contained no usable certificates", p)
+		}
+		if !setAuditIngestOperatorCAPEM(pem) {
+			log.Fatalf("audit-ingest operator CA %q contained no usable certificates", p)
 		}
 		log.Printf("audit-ingest: shipping edges are verified against %s (a client certificate is requested)", p)
 	}
@@ -2818,6 +2972,8 @@ func main() {
 		configSourceBaseForClaims   string
 		configSourceTokenForClaims  string
 		configSourceClientForClaims *http.Client
+		authResultMachineURL        string
+		authResultMachineClient     *http.Client
 	)
 	var enrolmentTokens enrolltoken.Authority
 	// Announced once the selection has settled — see the deferred log below. A node that pulls its config
@@ -2970,19 +3126,66 @@ func main() {
 	// Config versioning + rollback (V-1): durable on the control plane (where -postgres-dsn is set). The
 	// enforcing Edge (no postgres) gets a nil store and does not version. Every admin config change appends
 	// an immutable version so an admin can list history and roll back.
-	// Sovereign cold-archive backend (S3-compatible; MinIO/Ceph or an in-country provider, NOT AWS). Constructed when an endpoint
-	// is configured; held for the retention lifecycle to tier aged segments to (instead of hard-deleting).
+	// External S3-compatible archive. Invalid configuration is fatal; an absent
+	// endpoint preserves aged hot rows locally until an archive is configured.
 	var coldArchive archive.ColdArchive
-	if ep := strings.TrimSpace(*coldArchiveEndpoint); ep != "" {
+	ep := strings.TrimSpace(*coldArchiveEndpoint)
+	archiveModeSpecified := false
+	flag.Visit(func(f *flag.Flag) {
+		// The generated CP launcher passes this flag even for local-only
+		// deployments. An explicitly empty value is not archive configuration.
+		if f.Name == "cold-archive-auth-mode" && strings.TrimSpace(f.Value.String()) != "" {
+			archiveModeSpecified = true
+		}
+	})
+	if ep == "" && (strings.TrimSpace(*coldArchiveBucket) != "" || strings.TrimSpace(*coldArchiveRegion) != "" || archiveModeSpecified || strings.TrimSpace(*coldArchiveAccessKey) != "" || strings.TrimSpace(*coldArchiveSecretKey) != "" || strings.TrimSpace(os.Getenv("DSSE_ARCHIVE_ACCESS_KEY")) != "" || strings.TrimSpace(os.Getenv("DSSE_ARCHIVE_SECRET_KEY")) != "") {
+		log.Fatal("cold-archive configuration is incomplete: endpoint is required when archive settings are present")
+	}
+	if ep != "" {
+		accessKey, secretKey := *coldArchiveAccessKey, *coldArchiveSecretKey
+		if accessKey == "" {
+			accessKey = os.Getenv("DSSE_ARCHIVE_ACCESS_KEY")
+		}
+		if secretKey == "" {
+			secretKey = os.Getenv("DSSE_ARCHIVE_SECRET_KEY")
+		}
 		ca, aerr := archive.New(archive.Config{
-			Endpoint: ep, Bucket: *coldArchiveBucket, AccessKey: *coldArchiveAccessKey,
-			SecretKey: *coldArchiveSecretKey, Region: *coldArchiveRegion, UseSSL: *coldArchiveUseSSL,
+			Endpoint: ep, Bucket: *coldArchiveBucket, AccessKey: accessKey,
+			SecretKey: secretKey, Region: *coldArchiveRegion, UseSSL: *coldArchiveUseSSL,
+			AuthMode: *coldArchiveAuthMode,
 		})
 		if aerr != nil {
-			log.Printf("cold-archive setup failed (continuing without a cold tier): %v", aerr)
+			log.Fatalf("cold-archive setup failed: %v", aerr)
+		}
+		coldArchive = ca
+		log.Printf("external cold-archive enabled (%s)", ca.Backend())
+	} else {
+		log.Printf("cold-archive disabled: aged hot events remain in the persistent local store")
+	}
+	var archiveHealth *coldArchiveHealthMonitor
+	var archiveObserver *observedColdArchive
+	if coldArchive != nil {
+		if *coldArchiveAlertAfter <= 0 {
+			log.Fatal("cold-archive-alert-after must be positive")
+		}
+		if *isControlPlane && cpStateBlobDB == nil {
+			log.Fatal("external cold archive on a control plane requires shared PostgreSQL state for durable health notifications")
+		}
+		if cpStateBlobDB != nil {
+			archiveOutbox := domainEventOutbox
+			if archiveOutbox == nil {
+				// The installer publishes deployment health only. Enabling the
+				// global domain outbox would retain customer login events without
+				// a corresponding customer-tenant delivery worker.
+				archiveOutbox = postgresDomainEventOutboxStore{DB: cpStateBlobDB}
+			}
+			archiveHealth = &coldArchiveHealthMonitor{
+				state:  postgresBlobPersister{db: cpStateBlobDB, key: "cold_archive_health"},
+				outbox: archiveOutbox, alertAfter: *coldArchiveAlertAfter,
+			}
+			archiveObserver = &observedColdArchive{backend: coldArchive}
 		} else {
-			coldArchive = ca
-			log.Printf("sovereign cold-archive ENABLED (%s) — aged segments tier to cold instead of delete", ca.Backend())
+			log.Printf("cold-archive health unavailable: shared CP PostgreSQL is required")
 		}
 	}
 
@@ -3006,13 +3209,28 @@ func main() {
 	if err := configureExistingDeletionSafety(legalHold, retentionOverride, strings.TrimSpace(*postgresDSN) != ""); err != nil {
 		log.Fatalf("configure deletion safety: %v", err)
 	}
+	manualHotDSN := strings.TrimSpace(*edgeHotStorePostgresDSN)
+	if manualHotDSN == "" {
+		manualHotDSN = strings.TrimSpace(*postgresDSN)
+	}
+	var manualHotDelete *manualHotLogDeleteManager
+	if *isControlPlane {
+		manualHotDelete = newManualHotLogDeleteManager(cpStateBlobDB, adminHotStore, *postgresDSN, manualHotDSN, legalHold)
+	}
+	if manualHotDelete != nil {
+		go manualHotDelete.run(context.Background())
+	}
 
 	// W4: prune aged postgres log/outbox rows so the durable tables don't bloat unbounded (control plane).
 	// With a cold archive configured, hot_events pruning TIERS aged rows to the sovereign store before delete.
 	if dsn := strings.TrimSpace(*postgresDSN); dsn != "" {
+		pruneArchive := coldArchive
+		if archiveObserver != nil {
+			pruneArchive = archiveObserver
+		}
 		rcfg := retentionConfig{interval: *retentionPollInterval, hotEvents: *hotEventsRetention,
 			outboxPublished: *outboxPublishedRetention, outboxDead: *outboxDeadRetention,
-			archive: coldArchive, auditColdRetain: *auditColdRetention,
+			archive: pruneArchive, archiveHealth: archiveHealth, observedArchive: archiveObserver, auditColdRetain: *auditColdRetention,
 			perStream: parseRetentionOverrides(*hotEventsRetentionOverrides), legalHold: legalHold, auditChain: auditChain, override: retentionOverride}
 		if hot, ok := adminHotStore.(*hotstore.ClickHouseStore); ok {
 			lifecycle := &clickhouseRetentionLifecycle{db: cpStateBlobDB, hot: hot, cfg: rcfg}
@@ -3221,6 +3439,7 @@ func main() {
 	// Edge follows a control plane, because that is exactly when the omission bites: the config bundle
 	// rebuilds the enrolled ledger from the CP's copy, and an enrolment the CP never heard of is dropped.
 	var enrolmentCPReport *enrolmentCPReporter
+	var grantCPReport *grantCPReporter
 	var directoryCPReport *directoryCPReporter
 	if cfgURL, cpEndpointsSeed := strings.TrimSpace(*configSourceURL), strings.TrimSpace(*configSourceEndpoints); cfgURL != "" || cpEndpointsSeed != "" {
 		token := strings.TrimSpace(*steerExclusionSourceToken)
@@ -3368,6 +3587,12 @@ func main() {
 				}
 			}
 		}
+		if machineURL != "" && machineClient != nil {
+			authResultMachineURL = strings.TrimRight(cfgURL, "/") + "/auth-flow-results"
+			shortClient := *machineClient
+			shortClient.Timeout = 3 * time.Second
+			authResultMachineClient = &shortClient
+		}
 		enrolmentCPReport = &enrolmentCPReporter{
 			url: cfgURL, token: token, client: cfgClient,
 			machineURL: machineURL, machineClient: machineClient,
@@ -3396,12 +3621,14 @@ func main() {
 			// one Edge could run the ceremony on one node and hold the flow on another. A reconcile rather
 			// than an outbox — grants are few, small and idempotent, so sending the live set converges after
 			// any outage. See grant_cp_report.go.
-			go (&grantCPReporter{
-				url:    strings.TrimSuffix(strings.TrimRight(machineURL, "/"), "/enrolment-report") + "/grant-report",
-				client: machineClient,
-				grants: theGrantStore.Load,
-				logf:   log.Printf,
-			}).reconcile(context.Background(), 30*time.Second)
+			grantCPReport = &grantCPReporter{
+				authorityURL: strings.TrimRight(cfgURL, "/"),
+				url:          strings.TrimSuffix(strings.TrimRight(machineURL, "/"), "/enrolment-report") + "/grant-report",
+				client:       machineClient,
+				grants:       theGrantStore.Load,
+				logf:         log.Printf,
+			}
+			go grantCPReport.reconcile(context.Background(), 30*time.Second)
 			log.Printf("connector→CP reporting ENABLED (target=%s) — a connector that joins this node is named "+
 				"to the control plane, which is the only place it can be given a name or routes",
 				connectorCPReport.url)
@@ -3412,13 +3639,18 @@ func main() {
 		}
 		// The same shape for the people directory: a connector reaches only the Edge, so an import that lands
 		// here has to be carried to the authority or the rest of the deployment never learns about it.
-		directoryCPReport = &directoryCPReporter{
-			url: cfgURL, token: token, client: cfgClient,
-			outboxPath: directoryImportOutboxPath(*stateDir, *logDir),
-			logf:       log.Printf,
+		if machineURL != "" && machineClient != nil {
+			directoryCPReport = &directoryCPReporter{
+				url:        strings.TrimSuffix(strings.TrimRight(machineURL, "/"), "/enrolment-report"),
+				client:     machineClient,
+				outboxPath: directoryImportOutboxPath(*stateDir, *logDir),
+				logf:       log.Printf,
+			}
+			go directoryCPReport.drain(context.Background(), 30*time.Second)
+			log.Printf("directory-import→CP machine reporting ENABLED (target=%s outbox=%s)", sourceLabel, directoryCPReport.outboxPath)
+		} else {
+			log.Printf("directory-import→CP machine reporting UNAVAILABLE: connector imports will be refused until an Edge machine identity is configured")
 		}
-		go directoryCPReport.drain(context.Background(), 30*time.Second)
-		log.Printf("directory-import→CP reporting ENABLED (target=%s outbox=%s) — a connector's directory sync lands on this node and is carried to the control plane, which is what makes the fleet and the Console see the same people", sourceLabel, directoryCPReport.outboxPath)
 		log.Printf("enrolment→CP reporting ENABLED (target=%s outbox=%s) — a device enrolled on this node is named to the control plane, so the next config bundle keeps it admitted", sourceLabel, enrolmentCPReport.outboxPath)
 	}
 	trustBundleCAPEM := ""
@@ -3755,7 +3987,7 @@ func main() {
 		} else if len(meshPeerTLS.Certificates) > 0 {
 			meshAuth = "mTLS client cert"
 		}
-		log.Printf("multi-region mesh: %d peer edge link(s) configured (dial auth=%s)", len(meshPeerConfigs), meshAuth)
+		log.Printf("edge mesh: %d peer edge link(s) configured (dial auth=%s)", len(meshPeerConfigs), meshAuth)
 	}
 	meshEligible := meshEligibleFromHosts(*meshEligibleHosts)
 
@@ -3793,7 +4025,7 @@ func main() {
 		}
 		go agentUpdateSource{url: updURL, token: updateToken,
 			trustedKeys: splitAgentUpdatePins(*agentUpdate.pin), artifactDir: strings.TrimSpace(*agentUpdate.dir),
-			interval: *agentUpdate.sourcePoll, client: updClient, tenantID: pb.TenantID}.run(context.Background(),
+			interval: *agentUpdate.sourcePoll, client: updClient}.run(context.Background(),
 			publishedAgentUpdates)
 	}
 
@@ -4242,6 +4474,9 @@ func main() {
 			// The interception tier goes straight into the engine, in memory. A node with interception off
 			// simply does not take one.
 			if interception := networkExtensionLabTLS; interception != nil {
+				fetcher.publishInterceptionCRL = func(tenant string) error {
+					return fetcher.publishTenantLeafCRL(interception, tenant)
+				}
 				// This node assembles its organizations from the control plane, so what it is handed comes
 				// back on its own after a restart — and a short-lived signing key is deliberately not written
 				// to a node that may not exist tomorrow. Told so it does not warn about the shape it has.
@@ -4438,6 +4673,20 @@ func main() {
 		tenantInterceptionAuthorityValue.persistContext = func(ctx context.Context, raw []byte) error { return saveAuthorityContext(ctx, persister, raw) }
 		log.Printf("tenant interception authorities loaded: %d organization(s) have delegated interception to "+
 			"this control plane", len(tenantInterceptionAuthorityValue.Organizations()))
+		go func(a *tenantInterceptionAuthority) {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				if cpLeaderElectorInstance != nil {
+					if !cpLeaderElectorInstance.IsLeader() || cpLeaderElectorInstance.checkQuorum(context.Background()) != nil {
+						continue
+					}
+				}
+				if err := a.refreshIssuingCRLs(trustDistributionWriteContext(context.Background())); err != nil {
+					log.Printf("interception issuing CRL refresh unavailable: %v", err)
+				}
+			}
+		}(tenantInterceptionAuthorityValue)
 	}
 
 	refuseStartOnUnusableCertificateFlag = *refuseStartOnUnusableCertificate
@@ -4608,18 +4857,22 @@ func main() {
 		ApplicationCatalogStorePath:  *applicationCatalogStorePath,
 		IdPConnectionStorePath:       *idpConnectionStorePath,
 		ClientlessBaseURL:            *clientlessBaseURL,
+		EntrancePortalOrigins:        *entrancePortalOrigins,
 		ClientlessTLSCert:            *clientlessTLSCert,
 		ClientlessTLSKey:             *clientlessTLSKey,
+		ClientlessTLSCA:              *clientlessTLSCA,
 		// ★ THE CONTROL PLANE ISSUES PROFILES AND DOES NOT SERVE THE PORTAL, so it cannot see the file. The
 		// deployment states it once, in its own environment, and the installer keeps that statement true
 		// whenever the pair appears or is taken away — the same bookkeeping the Console's certificate gets.
 		StepUpPortalCertificateIsOperators: strings.EqualFold(strings.TrimSpace(os.Getenv("DSSE_STEP_UP_PORTAL_CERTIFICATE")), "operator"),
 		StepUpBindingSecret:                *stepUpBindingSecret,
+		AuthRolloutReporter:                authRolloutReport,
 		GrantStorePath:                     *grantStorePath,
 		DelegatedGrantStorePath:            *delegatedGrantStorePath,
 		HumanApprovalStorePath:             *humanApprovalStorePath,
 		EastWestObserveStorePath:           *eastWestObserveStorePath,
 		InspectionEventsStorePath:          *inspectionEventsStorePath,
+		DLPRuleStorePath:                   configBundleStorePath(*stateDir, *configSourceURL, *dlpRuleStorePath, "dlp_rules"),
 		DLPClassifierStorePath:             configBundleStorePath(*stateDir, *configSourceURL, *dlpClassifierStorePath, "dlp_classifiers"),
 		DLPAllowlistStorePath:              configBundleStorePath(*stateDir, *configSourceURL, *dlpAllowlistStorePath, "dlp_allowlist"),
 		DLPFingerprintStorePath:            configBundleStorePath(*stateDir, *configSourceURL, *dlpFingerprintStorePath, "dlp_fingerprints"),
@@ -4631,10 +4884,13 @@ func main() {
 		StripAltSvc:                        *stripAltSvc,
 		SWGEgressBrowserMimic:              *swgEgressBrowserMimic,
 		DLPBlockUninspectableFiles:         *dlpBlockUninspectableFiles,
+		DLPRetentionBudget:                 dlpRetentionBudget,
 		Evaluator:                          evaluator,
 		ConfigSyncStatus:                   configSyncStatus,
 		RevocationSyncStatus:               revocationSyncState,
 		ConfigSourceURL:                    strings.TrimSpace(*configSourceURL),
+		AuthResultAuthorityURL:             authResultMachineURL,
+		AuthResultAuthorityClient:          authResultMachineClient,
 		DelegatedRevocationReporter:        delegatedRevocations,
 		SteerExclusionSourceURL:            strings.TrimSpace(*steerExclusionSourceURL),
 		ConfigBundleSource:                 configBundlePuller,
@@ -4679,104 +4935,109 @@ func main() {
 		// withdrawal gate then relies on. Losing it on restart does not lose a fact anybody can re-observe: it
 		// loses a judgement somebody made, and the gate goes back to refusing a retirement that was already
 		// vouched for. Same rule as every other operator-config store: durable by default under -state-dir.
-		TransportAnchorAckStorePath:   durableStorePath(*stateDir, *transportAnchorAckStorePath, "transport_anchor_acks"),
-		InterceptionHSMAgentSocket:    *interceptionHSMAgentSocket,
-		EnrolmentTokenStoreMode:       *enrolmentTokenStore,
-		EnrolmentTokenMaxLifetime:     *enrolmentTokenMaxLifetime,
-		EnrolmentTokenMaxOutstanding:  *enrolmentTokenMaxOutstanding,
-		EnrollRenewGraceWindow:        *enrollRenewGraceWindow,
-		EnrollIdPEligibility:          buildEnrollIdPEligibility(*enrollIdPConnectionID, *enrollIdPRequiredGroup, theIdPRegistry.Load),
-		EnrolmentCPReporter:           enrolmentCPReport,
-		DirectoryCPReporter:           directoryCPReport,
-		EnrollDefaultGroup:            *enrollDefaultGroup,
-		EnrollCertTTL:                 *enrollCertTTL,
-		DisableEmbeddedOutboxAdmin:    !*embeddedOutboxAdmin, // decoupled by default: outbox admin off unless explicitly enabled
-		AuditIngestReceiverToken:      *auditIngestReceiverToken,
-		AuditShipHealth:               auditShipHealthFn,
-		InterceptionAnchorPEM:         readFileOrEmpty(*interceptionAnchorCert),
-		InterceptionPendingRootPEM:    readFileOrEmpty(*interceptionPendingRootCert),
-		IdPIssuerURL:                  strings.TrimSpace(*oidcIssuer),
-		MeshPeerSpec:                  strings.TrimSpace(*meshPeers),
-		HotStoreEndpoint:              strings.TrimSpace(*edgeHotStoreClickHouseEndpoint),
-		ColdArchiveEndpoint:           strings.TrimSpace(*coldArchiveEndpoint),
-		Writer:                        writer,
-		ExportObjectStore:             exportObjectStore,
-		Registry:                      connectorRegistry,
-		ConnectorSecret:               *connectorSecret,
-		RequireConnectorRuntimeSecret: *requireConnectorRuntimeSecret,
-		WorkloadAttestationSecret:     *workloadAttestationSecret,
-		TrustedKeyring:                trustedKeyring,
-		RouteProfiles:                 routeProfiles,
-		SWGRuntime:                    swgRuntime,
-		PolicyStore:                   policyStore,
-		OIDC:                          oidc,
-		AdminConsoleOrigin:            *adminConsoleOrigin,
-		AdminConsoleOrigins:           *adminConsoleOrigins,
-		LocalCredentials:              localCredentials,
-		SteerExclusions:               steerExclusions,
-		InternalCAs:                   internalCAs,
-		ObservedExclusions:            observedExclusions,
-		ObservedKnownFloor:            parseObservedKnownFloor(*steerExclusionKnownFloor),
-		ConfigVersions:                configVersions,
-		CPVersions:                    cpVersions,
-		AgentPolicySigner:             agentPolicySigner,
-		PublishedUpdates:              publishedAgentUpdates,
-		AgentUpdateArtifactDir:        strings.TrimSpace(*agentUpdate.dir),
-		ConnectorProgramDir:           resolveConnectorProgramDir(*connectorProgramDir, *stateDir),
-		PullsAgentUpdates:             strings.TrimSpace(*agentUpdate.sourceURL) != "",
-		RolloutControlPath:            *rolloutControl.path,
-		AgentRolloutCache:             agentRolloutPulled,
-		AgentRolloutPlans:             agentRolloutDurable,
-		PublishedAgentUpdateStore:     publishedDurable.WithArtifactDir(strings.TrimSpace(*agentUpdate.dir)),
-		AgentUpdatePins:               splitAgentUpdatePins(*agentUpdate.pin),
-		AgentUpdatePublisher:          strings.TrimSpace(*agentUpdate.publisher),
-		AgentUpdateSigner:             agentUpdateSigner,
-		AgentUpdateSignFloor:          agentUpdateSignFloor,
-		AgentPolicyNextPublicKeys:     agentPolicyNextPublicKeys,
-		InterceptionReparentStateDir:  strings.TrimSpace(*interceptionReparentStateDir),
-		TrustBundleCAPEM:              trustBundleCAPEM,
-		TransportTrustStorePath:       *transportTrustStorePath,
-		TransportTrustSharedStore:     transportTrustShared,
-		TenantTrustDistributionStore:  tenantTrustDistributionStore,
-		DistributedTenantTrust:        distributedTenantTrust,
-		TransportAnchorAckSharedStore: transportAnchorAckShared,
-		TransportTrustCarriedFromPath: strings.TrimSpace(*transportTrustCarriedFrom),
-		PKIOperationStorePath:         *pkiOperationStorePath,
-		TrustBundleCAPath:             strings.TrimSpace(*trustBundleCA),
-		TrustBundleSerial:             *trustBundleSerial,
-		TrustBundleRecoveryEndpoint:   strings.TrimSpace(*networkExtensionRenewalRecoveryEndpoint),
-		TenantTransportMaterialFromCP: *tenantTransportMaterialFromCP,
-		SteerPosture:                  steerPostureConfig{FailOpenMode: *steerFailOpenMode, FailOpenCooldownMS: *steerFailOpenCooldownMS, RegionFailover: *steerRegionFailover}.normalized(),
-		ClientlessAccessEnabled:       *clientlessAccessEnabled,
-		AdminInviteEmailSinkPath:      *adminInviteEmailSink,
-		AdminExportJobs:               adminExportJobs,
-		AdminExportWorker:             configuredAdminExportWorker,
-		AdminAuditOutbox:              adminAuditOutbox,
-		AdminAuth:                     adminAuthStore,
-		NetworkExtensionPublisher:     networkExtensionPublisher,
-		NetworkExtensionLabTLS:        networkExtensionLabTLS,
-		DeploymentInterceptionRootPEM: profileInterceptionRootPEM,
-		UsageMeters:                   usageMeters,
-		DeviceStore:                   deviceInventory,
-		HumanIdentities:               humanIdentities,
-		WorkloadAttestations:          workloadAttestations,
-		AgentTelemetry:                agentTelemetry,
-		NonHumanIdentities:            nhiRegistry,
-		HotStore:                      adminHotStore,
-		HotStoreMirror:                hotStoreMirrorMonitor,
-		DomainEventOutbox:             domainEventOutbox,
-		DomainEventMirror:             domainEventOutboxMirrorMonitor,
-		AgentTargetVersion:            *agentTargetVersion,
-		AgentReleaseChannel:           *agentReleaseChannel,
-		AdminToken:                    *adminToken,
-		LabMode:                       devMode,
-		TenantCARegistry:              tenantCAReg,
-		TenantCARegistryPath:          strings.TrimSpace(*transportTenantCARegistry),
-		RenewalRecoverySNI:            renewalRecoverySNIAnnouncement(*renewalRecoverySNI),
-		TenantTransportAuthority:      tenantTransportAuthorityStoreValue,
-		TenantTransportMaterialTTL:    *tenantTransportMaterialTTL,
-		TenantInterceptionAuthority:   tenantInterceptionAuthorityValue,
-		TenantDeviceAuthority:         tenantDeviceAuthorityValue,
+		TransportAnchorAckStorePath:    durableStorePath(*stateDir, *transportAnchorAckStorePath, "transport_anchor_acks"),
+		InterceptionHSMAgentSocket:     *interceptionHSMAgentSocket,
+		EnrolmentTokenStoreMode:        *enrolmentTokenStore,
+		EnrolmentTokenMaxLifetime:      *enrolmentTokenMaxLifetime,
+		EnrolmentTokenMaxOutstanding:   *enrolmentTokenMaxOutstanding,
+		EnrollRenewGraceWindow:         *enrollRenewGraceWindow,
+		EnrollIdPEligibility:           buildEnrollIdPEligibility(*enrollIdPConnectionID, *enrollIdPRequiredGroup, theIdPRegistry.Load),
+		EnrolmentCPReporter:            enrolmentCPReport,
+		GrantCPReporter:                grantCPReport,
+		DirectoryCPReporter:            directoryCPReport,
+		EnrollDefaultGroup:             *enrollDefaultGroup,
+		EnrollCertTTL:                  *enrollCertTTL,
+		DisableEmbeddedOutboxAdmin:     !*embeddedOutboxAdmin, // decoupled by default: outbox admin off unless explicitly enabled
+		AuditIngestReceiverToken:       *auditIngestReceiverToken,
+		AuditShipHealth:                auditShipHealthFn,
+		InterceptionAnchorPEM:          readFileOrEmpty(*interceptionAnchorCert),
+		InterceptionPendingRootPEM:     readFileOrEmpty(*interceptionPendingRootCert),
+		IdPIssuerURL:                   strings.TrimSpace(*oidcIssuer),
+		ExactHTTPSPassthroughEndpoints: exactHTTPSPassthroughEndpoints,
+		MeshPeerSpec:                   strings.TrimSpace(*meshPeers),
+		HotStoreEndpoint:               strings.TrimSpace(*edgeHotStoreClickHouseEndpoint),
+		ColdArchiveEndpoint:            strings.TrimSpace(*coldArchiveEndpoint),
+		Writer:                         writer,
+		ExportObjectStore:              exportObjectStore,
+		Registry:                       connectorRegistry,
+		ConnectorSecret:                *connectorSecret,
+		RequireConnectorRuntimeSecret:  *requireConnectorRuntimeSecret,
+		WorkloadAttestationSecret:      *workloadAttestationSecret,
+		TrustedKeyring:                 trustedKeyring,
+		RouteProfiles:                  routeProfiles,
+		SWGRuntime:                     swgRuntime,
+		PolicyStore:                    policyStore,
+		OIDC:                           oidc,
+		AdminConsoleOrigin:             *adminConsoleOrigin,
+		AdminConsoleOrigins:            *adminConsoleOrigins,
+		StepUpPortalOrigins:            *stepUpPortalOrigins,
+		LocalCredentials:               localCredentials,
+		SteerExclusions:                steerExclusions,
+		InternalCAs:                    internalCAs,
+		ObservedExclusions:             observedExclusions,
+		ObservedKnownFloor:             parseObservedKnownFloor(*steerExclusionKnownFloor),
+		ConfigVersions:                 configVersions,
+		CPVersions:                     cpVersions,
+		AgentPolicySigner:              agentPolicySigner,
+		PublishedUpdates:               publishedAgentUpdates,
+		AgentUpdateArtifactDir:         strings.TrimSpace(*agentUpdate.dir),
+		ConnectorProgramDir:            resolveConnectorProgramDir(*connectorProgramDir, *stateDir),
+		PullsAgentUpdates:              strings.TrimSpace(*agentUpdate.sourceURL) != "",
+		RolloutControlPath:             *rolloutControl.path,
+		AgentRolloutCache:              agentRolloutPulled,
+		AgentRolloutPlans:              agentRolloutDurable,
+		PublishedAgentUpdateStore:      publishedDurable.WithArtifactDir(strings.TrimSpace(*agentUpdate.dir)),
+		AgentUpdatePins:                splitAgentUpdatePins(*agentUpdate.pin),
+		AgentUpdatePublisher:           strings.TrimSpace(*agentUpdate.publisher),
+		AgentUpdateSigner:              agentUpdateSigner,
+		AgentUpdateSignFloor:           agentUpdateSignFloor,
+		AgentPolicyNextPublicKeys:      agentPolicyNextPublicKeys,
+		InterceptionReparentStateDir:   strings.TrimSpace(*interceptionReparentStateDir),
+		TrustBundleCAPEM:               trustBundleCAPEM,
+		TransportTrustStorePath:        *transportTrustStorePath,
+		TransportTrustSharedStore:      transportTrustShared,
+		TenantTrustDistributionStore:   tenantTrustDistributionStore,
+		DistributedTenantTrust:         distributedTenantTrust,
+		TransportAnchorAckSharedStore:  transportAnchorAckShared,
+		TransportTrustCarriedFromPath:  strings.TrimSpace(*transportTrustCarriedFrom),
+		PKIOperationStorePath:          *pkiOperationStorePath,
+		TrustBundleCAPath:              strings.TrimSpace(*trustBundleCA),
+		TrustBundleSerial:              *trustBundleSerial,
+		TrustBundleRecoveryEndpoint:    strings.TrimSpace(*networkExtensionRenewalRecoveryEndpoint),
+		TenantTransportMaterialFromCP:  *tenantTransportMaterialFromCP,
+		SteerPosture:                   steerPostureConfig{FailOpenMode: *steerFailOpenMode, FailOpenCooldownMS: *steerFailOpenCooldownMS, RegionFailover: *steerRegionFailover}.normalized(),
+		ClientlessAccessEnabled:        *clientlessAccessEnabled,
+		AdminInviteEmailSinkPath:       *adminInviteEmailSink,
+		AdminExportJobs:                adminExportJobs,
+		AdminExportWorker:              configuredAdminExportWorker,
+		AdminAuditOutbox:               adminAuditOutbox,
+		AdminAuth:                      adminAuthStore,
+		NetworkExtensionPublisher:      networkExtensionPublisher,
+		NetworkExtensionLabTLS:         networkExtensionLabTLS,
+		DeploymentInterceptionRootPEM:  profileInterceptionRootPEM,
+		UsageMeters:                    usageMeters,
+		DeviceStore:                    deviceInventory,
+		HumanIdentities:                humanIdentities,
+		WorkloadAttestations:           workloadAttestations,
+		AgentTelemetry:                 agentTelemetry,
+		NonHumanIdentities:             nhiRegistry,
+		HotStore:                       adminHotStore,
+		HotStoreMirror:                 hotStoreMirrorMonitor,
+		ArchiveHealth:                  archiveHealth,
+		ManualHotLogDelete:             manualHotDelete,
+		DomainEventOutbox:              domainEventOutbox,
+		DomainEventMirror:              domainEventOutboxMirrorMonitor,
+		AgentTargetVersion:             *agentTargetVersion,
+		AgentReleaseChannel:            *agentReleaseChannel,
+		AdminToken:                     *adminToken,
+		LabMode:                        devMode,
+		TenantCARegistry:               tenantCAReg,
+		TenantCARegistryPath:           strings.TrimSpace(*transportTenantCARegistry),
+		RenewalRecoverySNI:             renewalRecoverySNIAnnouncement(*renewalRecoverySNI),
+		TenantTransportAuthority:       tenantTransportAuthorityStoreValue,
+		TenantTransportMaterialTTL:     *tenantTransportMaterialTTL,
+		TenantInterceptionAuthority:    tenantInterceptionAuthorityValue,
+		TenantDeviceAuthority:          tenantDeviceAuthorityValue,
 	})
 	// (T) secure transport: additive TLS listener for the encrypted endpoint↔Edge tunnel. Default
 	// OFF; a bind/config error here must NOT take down the plaintext data plane, so it is logged and the
@@ -4953,6 +5214,22 @@ func main() {
 		log.Printf("centralized admin auth ENABLED — unknown admin_session cookies are introspected against %s", strings.TrimSpace(*adminSessionAuthorityURL))
 	}
 	mainHandler := hardenedHandler
+	if strings.TrimSpace(*crlListen) != "" {
+		if tenantInterceptionAuthorityValue == nil {
+			log.Fatal("inspection CRL listener requires -tenant-interception-authority-store")
+		}
+		crlMux := http.NewServeMux()
+		registerTenantInspectionCRLPublicRoute(crlMux, tenantInterceptionAuthorityValue)
+		go func() {
+			server := &http.Server{Addr: *crlListen, Handler: crlMux, ReadHeaderTimeout: 5 * time.Second,
+				ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second,
+				MaxHeaderBytes: 8192}
+			log.Printf("signed inspection CRL bytes on dedicated read-only HTTP listener %s", *crlListen)
+			if err := server.ListenAndServe(); err != nil {
+				log.Fatalf("inspection CRL listener: %v", err)
+			}
+		}()
+	}
 	if strings.TrimSpace(*adminListen) != "" {
 		mainHandler = dataPlaneOnlyMiddleware(hardenedHandler)
 		go func() {
@@ -4964,6 +5241,11 @@ func main() {
 	}
 	// TLS-only (fail-closed plaintext) + Slowloris-safe timeouts, serving the rate-limit +
 	// security-headers wrapped handler.
+	grantMaintenanceContext, stopGrantMaintenance := context.WithCancel(context.Background())
+	defer stopGrantMaintenance()
+	go maintainAuthGrants(grantMaintenanceContext, theGrantStore.Load())
+	go maintainAuthResults(grantMaintenanceContext, thePostgresAuthResultStore.Load())
+	go authRolloutReport.run(grantMaintenanceContext)
 	if err := serveMainEdgeListener(*listen, "agent-plane", mainHandler, *mainTLSCert, *mainTLSKey, *devMode, *allowInsecurePlaintext, drainState, *drainPeriod); err != nil {
 		log.Fatalf("listen: %v", err)
 	}
@@ -5069,6 +5351,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// every device verified the certificate fine). Listeners start after this function returns, so the
 	// check still runs before anything is presented to a device.
 	config = config.withDefaults()
+	if config.DLPRetentionBudget == nil {
+		config.DLPRetentionBudget = dlp.DefaultRetentionBudget()
+	}
 	if config.TenantTrustDistributionStore != nil {
 		config.TenantTrustDistributor = &tenantTrustDistributor{config: config, store: config.TenantTrustDistributionStore, now: time.Now}
 	}
@@ -5098,7 +5383,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// "Renew every certificate issued before T", carried in the signed agent policy. Durable: a restart that
 	// forgot it would stop a fleet-wide renewal half-way through, and the devices that had not checked in yet
 	// would never be told.
-	edgeRenewBefore := newRenewBeforeSetting(config.RenewBeforeStorePath)
+	edgeRenewBefore, renewBeforeErr := newRenewBeforeSetting(config.RenewBeforeStorePath)
+	if renewBeforeErr != nil {
+		log.Fatalf("renewal declaration restore failed (refusing to discard operator state): %v", renewBeforeErr)
+	}
 	if at, ok := edgeRenewBefore.At(); ok {
 		log.Printf("device certificates: renewal is being asked of every device whose certificate was issued before %s", at.Format(time.RFC3339))
 	}
@@ -5110,7 +5398,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	dlpPolicyObjects := dlpRT.policyObjects
 	dlpFingerprintStore := dlpRT.fingerprints
 	dlpClassifierStore := dlpRT.classifiers
-	config.DLPDistribution = &dlpConfigStores{policies: dlpPolicyObjects, classifiers: dlpClassifierStore, fingerprints: dlpFingerprintStore, allowlist: dlpAllowlistStore}
+	config.DLPDistribution = &dlpConfigStores{rules: dlpRuleStore, policies: dlpPolicyObjects, classifiers: dlpClassifierStore, fingerprints: dlpFingerprintStore, allowlist: dlpAllowlistStore}
 	trustedKeyring := config.TrustedKeyring
 	routeProfiles := config.RouteProfiles
 	swgRuntime := config.SWGRuntime
@@ -5214,6 +5502,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	agentToolStore := config.AgentToolStore
 	endpointInventoryStore := config.EndpointInventoryStore
 	tenantModelStore := config.TenantModelStore
+	var fleetResidency sharedFleetResidencyCheck
+	if strings.TrimSpace(config.ConfigSourceURL) != "" {
+		fleetResidency = newSharedFleetResidencyCheck(os.Getenv("DSSE_TOPOLOGY_PROFILE"), evaluator.EdgeRegionID, tenantModelStore)
+	}
 	siteStore := config.SiteStore
 	operatorTenantID := strings.TrimSpace(config.OperatorTenantID)
 	// Which organization operates this deployment — read by every cross-organization gate. Declared here, once,
@@ -5244,11 +5536,14 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// handleConnectorApplication. Safe as a value copy: none of these locals is reassigned after this point.
 	connAppDeps := connectorApplicationDeps{
 		evaluator:                 evaluator,
+		configBundleSource:        config.ConfigBundleSource,
+		configSyncStatus:          config.ConfigSyncStatus,
 		policyStore:               policyStore,
 		writer:                    writer,
 		registry:                  registry,
 		tunnelManager:             tunnelManager,
 		sessionStore:              sessionStore,
+		tenantCARegistry:          tcaReg,
 		deviceStore:               deviceStore,
 		proxyClient:               proxyClient,
 		routeProfiles:             routeProfiles,
@@ -5307,7 +5602,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// CP leader status for the follows-leader load balancer (HAProxy httpchk): 200 only on the active CP, 503 on
 	// a standby. On the active's death its advisory lock releases, a standby is elected, and the LB routes to it.
 	mux.HandleFunc("GET /leader", func(w http.ResponseWriter, r *http.Request) {
-		if cpLeaderElectorInstance.IsLeader() {
+		if cpLeaderElectorInstance.IsLeader() && cpLeaderElectorInstance.checkQuorum(r.Context()) == nil {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{"leader":true}` + "\n"))
 			return
@@ -5321,6 +5616,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// rolling upgrade zero-outage.
 		if config.DrainState != nil && config.DrainState.Load() {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "draining"})
+			return
+		}
+		if !configBundleReadyForTraffic(config.ConfigBundleSource, configSyncStatus) {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "awaiting_initial_config_bundle"})
 			return
 		}
 		// Key custody readiness. A signing key that cannot sign means this node can no longer intercept any
@@ -5362,6 +5661,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// structural facts a load balancer, an installer and an operator all need, and hiding them would mean
 		// the only way to establish the deployment's shape is to trust that it was configured correctly.
 		body["role"] = map[bool]string{true: "control-plane", false: "edge"}[edgeIsControlPlane]
+		if machine := strings.TrimSpace(os.Getenv("DSSE_NODE_NAME")); machine != "" {
+			body["machine"] = machine
+		}
 		body["holds_database"] = cpStateBlobDB != nil
 		// ★★★ AND WHICH BUILD THIS NODE IS (2026-08-25, after an hour spent on a defect that was not one). A
 		// control plane left running an older image served STALE configuration to the whole fleet — a removed
@@ -5511,8 +5813,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
 			return
 		}
-		writeJSON(w, http.StatusOK, configSyncStatus.snapshot())
+		status := configSyncStatus.snapshot()
+		status["auth_rollout"] = theAuthRollout.Load().statusSnapshot()
+		writeJSON(w, http.StatusOK, status)
 	}))
+	registerDLPRetentionStatusRoute(mux, adminEndpoint, config.DLPRetentionBudget, config.OperatorTenantID)
 	// Audit/persistence decoupling: the control plane receives audit/events shipped by enforcement Edges and
 	// persists them (POST /audit-ingest; registered only when a receiver token is set).
 	// The fleet's own channel for the one decision an Edge cannot make alone: may this one-time enrolment
@@ -5552,6 +5857,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerConnectorReportRoute(mux, registry, tcaReg, strings.TrimSpace(config.ConfigSourceURL),
 		config.LabMode != nil && *config.LabMode)
 	registerTenantTransportAuthorityAdminRoute(mux, adminEndpoint, config.TenantTransportAuthority)
+	registerTenantInspectionCRLRoute(mux, config.TenantInterceptionAuthority, config.AuditIngestReceiverToken, tcaReg)
+	registerTenantInspectionCRLAdminRoutes(mux, adminEndpoint, config.TenantInterceptionAuthority, func(r *http.Request, tenant, action string, metadata map[string]any) {
+		entry := pkiMaterialAuditLog(tenant, action, "tenant_interception_authority", tenant, "Signed revocation state updated.", metadata, principalIDForAudit(r), sourceIPFromRequest(r), evaluator)
+		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, entry, time.Now())
+	})
 	registerTenantInterceptionAuthorityAdminRoute(mux, adminEndpoint, config.TenantInterceptionAuthority, config.TenantModelStore,
 		func(r *http.Request, tenant, action string, row *storedTenantInterceptionIssuer) {
 			root, _ := summarizeCertificatePEM(row.RootPEM)
@@ -5584,9 +5894,33 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// Gate the DNS-over-tunnel resolver on a verified device identity, exactly like every sibling /steer/*
 	// control endpoint (agent-tuning, server-initiated-export, …). Without this the route was an
 	// UNAUTHENTICATED open resolver on the (T) listener — any caller that reached it could resolve arbitrary
-	// names through the Edge (review #28). The resolver body itself (OverTunnelHandler) is unchanged.
+	// names through the Edge (review #28). Its conntrack and connector lookup must
+	// also use the certificate's tenant, not this node's startup tenant.
 	{
-		dnsOverTunnel := dnsresolver.OverTunnelHandler(edgeDNSResolver)
+		dnsOverTunnel := dnsresolver.OverTunnelHandlerForTenant(edgeDNSResolver, func(r *http.Request) (string, bool) {
+			identity, verified := transportDeviceIdentityFromRequest(r)
+			if !verified || strings.TrimSpace(identity) == "" {
+				return "", false
+			}
+			if tcaReg != nil {
+				// The registered issuing CA is authoritative on a multi-tenant
+				// transport. Never attribute an unresolved certificate to the
+				// node's default tenant or a request-supplied field.
+				return transportTenantFromRequest(r, tcaReg)
+			}
+			if config.EnrolledLedger != nil {
+				entry, ok := config.EnrolledLedger.EntryFor(identity)
+				if !ok || !entry.Enabled {
+					return "", false
+				}
+				tenant := strings.TrimSpace(entry.TenantID)
+				return tenant, tenant != ""
+			}
+			// Legacy single-tenant deployments have no tenant CA registry or
+			// enrolled ledger; TLS still verified the device certificate.
+			tenant := strings.TrimSpace(evaluator.PolicyBundle.TenantID)
+			return tenant, tenant != ""
+		})
 		// Count every resolution. This subsystem previously had no durable output at all, so when it failed for
 		// two hours on 2026-08-09 (20,616 agent-side failures) the cause could not be established afterwards.
 		// A count, not a log: no qname is involved, and the per-query audit's deliberate silence is unchanged.
@@ -5594,13 +5928,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// Declare that this node serves the route, so a zero failure count means "healthy" here and cannot be
 		// confused with the zero a node that never registered it also reports.
 		setDNSOverTunnelEnabled(true)
-		mux.HandleFunc("POST /steer/dns-query", func(w http.ResponseWriter, r *http.Request) {
-			if identity, verified := transportDeviceIdentityFromRequest(r); !verified || strings.TrimSpace(identity) == "" {
-				writeError(w, http.StatusUnauthorized, fmt.Errorf("a verified device transport identity is required"))
-				return
-			}
-			dnsOverTunnel(w, r)
-		})
+		mux.HandleFunc("POST /steer/dns-query", dnsOverTunnel)
 	}
 	mux.HandleFunc("GET /admin/state", adminEndpoint("admin.state.read", func(w http.ResponseWriter, r *http.Request) {
 		state, err := adminState(runtimeEvaluatorForPolicyStore(evaluator, policyStore), adminTenantIDFromRequest(r), writer, registry, deviceStore, config.EnrolledLedger, humanApprovals, delegatedGrants, decisionStore, inspectionEvents, routeProfiles, !edgeIsControlPlane)
@@ -5663,6 +5991,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			"no_secret_attestation": true,
 		})
 	}))
+	registerObservedAuthAccountRoutes(mux, adminEndpoint, adminHotStore == nil)
 	registerAIOpsRoutes(mux, adminEndpoint, evaluator, policyStore, decisionStore, adminHotStore)
 	// Management-plane certificate rotation (slice 2): list the rotatable server certs, and rotate one from the
 	// admin surface with NO restart (hot-reload). Validate-before-accept; a bad cert/key never bricks the link.
@@ -5830,7 +6159,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					if !entry.Enabled {
 						continue
 					}
-					tenant := strings.ToLower(strings.TrimSpace(entry.TenantID))
+					tenant := strings.TrimSpace(entry.TenantID)
 					if tenants != nil && !tenants[tenant] {
 						continue
 					}
@@ -5842,7 +6171,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			}
 			if config.NetworkExtensionLabTLS != nil {
 				for _, issuer := range config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates() {
-					tenant := strings.ToLower(strings.TrimSpace(issuer.Tenant))
+					tenant := strings.TrimSpace(issuer.Tenant)
 					if tenant == "" {
 						continue
 					}
@@ -5856,7 +6185,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// deployment where every organization has an authority of its own.
 			served := map[string]bool{}
 			for _, tenant := range tenantsWithoutTheirOwnInterceptionIssuer(config) {
-				served[strings.ToLower(strings.TrimSpace(tenant))] = true
+				served[strings.TrimSpace(tenant)] = true
 			}
 			// Per organization, not over the pooled list: the node-wide root can still serve several, and each
 			// one's devices filed their reports under their own organization.
@@ -5906,7 +6235,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// organization, which is how a Mac that reports its pins every thirty seconds appeared as
 			// "not reported".
 			for _, tenant := range organizationsOf(config.EnrolledLedger, config.TenantIDForTrust) {
-				mine := devicesOf(map[string]bool{strings.ToLower(strings.TrimSpace(tenant)): true})
+				mine := devicesOf(map[string]bool{strings.TrimSpace(tenant): true})
 				if len(mine) == 0 {
 					continue
 				}
@@ -5915,7 +6244,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				}
 			}
 			for tenant, anchorPEM := range transportTenantCertificates.anchorsByTenant() {
-				mine := devicesOf(map[string]bool{strings.ToLower(strings.TrimSpace(tenant)): true})
+				mine := devicesOf(map[string]bool{strings.TrimSpace(tenant): true})
 				for _, c := range parseAllCerts([]byte(anchorPEM)) {
 					measureAnchor(certFingerprint(c), tenant, mine)
 				}
@@ -6201,8 +6530,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerSteerAgentUpdatePlanRoutes(mux, config, agentUpdatePlanTenant{id: evaluator.PolicyBundle.TenantID})
 	registerVLANRoutes(mux, adminEndpoint, vlanBoundary, configSourceURL)
 	registerSWGTenantRestrictionRoutes(mux, adminEndpoint, evaluator, writer, policyStore, swgRuntime, config.CPVersions, configSourceURL, adminAuditOutbox)
+	registerUpstreamTLSRoutes(mux, adminEndpoint, config, policyStore)
 	registerRiskServerInitiatedRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, configSourceURL)
-	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride)
+	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride, config.ArchiveHealth)
+	registerManualHotLogDeleteRoutes(mux, adminEndpoint, config.ManualHotLogDelete, evaluator, writer, config.AdminAuditOutbox)
 	registerUsageEventsRoutes(mux, adminEndpoint, adminAuth, usageMeters, adminHotStore, humanIdentities, nonHumanIdentities)
 	registerAgentQualityRoutes(mux, adminEndpoint, evaluator, writer, deviceStore, agentTelemetry, agentRolloutPlans, agentTargetVersion, agentReleaseChannel, config.AgentRolloutCache, adminHotStore, config.AdminAuditOutbox)
 	// The per-device view the Devices list folds in: everything this lane does has otherwise been reachable
@@ -6212,10 +6543,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		agentRolloutPlans, config.AgentRolloutCache, config.AgentUpdatePins)
 	registerAgentUpdatePublishRoutes(mux, adminEndpoint, publishedStoreOrEmpty(config.PublishedAgentUpdateStore),
 		config.AgentUpdatePins, config.PullsAgentUpdates, writer, evaluator, config.AgentUpdateArtifactDir,
-		config.PublishedUpdates, config.AgentUpdateSigner, config.AgentUpdateSignFloor)
+		config.PublishedUpdates, config.AgentUpdateSigner, config.AgentUpdateSignFloor, config.OperatorTenantID)
 	registerAgentUpdateArtifactAdminRoutes(mux, adminEndpoint, publishedStoreOrEmpty(config.PublishedAgentUpdateStore),
 		config.AgentUpdatePins, config.AgentUpdateArtifactDir, config.PullsAgentUpdates, writer, evaluator,
-		config.PublishedUpdates)
+		config.PublishedUpdates, config.OperatorTenantID)
 	// ★ THE PROGRAM BESIDE THE PROFILE. "Add connector" tells a customer to run dsse-connector-install, and
 	// until this lane existed nothing in the product put that program on their machine — the endpoint agent's
 	// artifact route cannot serve it, because that one lives inside the tunnel under mandatory mTLS and a
@@ -6283,7 +6614,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		}
 		devices := make([]assetcatalog.EnrolledDevice, 0)
 		for _, e := range ledger.List() {
-			if !e.Enabled {
+			if !e.Enabled || strings.TrimSpace(e.TenantID) != strings.TrimSpace(tenant) {
 				continue
 			}
 			name, platform := e.Identity, ""
@@ -6390,11 +6721,39 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	clientlessGrants = grantStore
 	if p, e := cpStateBlobPersister(config.GrantStorePath, cpStateBlobDB, "grants"); e != nil {
 		log.Fatalf("resolve grant store: %v", e)
-	} else if err := grantStore.SetPersister(p); err != nil {
+	} else if err := grantStore.SetPersister(rollingGrantPersister(p)); err != nil {
 		log.Fatalf("load grant store: %v", err)
 	}
 	theGrantStore.Store(grantStore)
-	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox)
+	var authResults authFlowResultStore
+	thePostgresAuthResultStore.Store(nil)
+	if strings.TrimSpace(config.ConfigSourceURL) != "" {
+		if config.AuthResultAuthorityURL != "" && config.AuthResultAuthorityClient != nil {
+			authResults = remoteAuthResultStore{url: config.AuthResultAuthorityURL, client: config.AuthResultAuthorityClient}
+		}
+	} else {
+		if cpStateBlobDB != nil {
+			results := newPostgresAuthResultStore(cpStateBlobDB)
+			authResults = results
+			thePostgresAuthResultStore.Store(results)
+		} else {
+			authResults = newAuthResultLedger(nil)
+		}
+		registerAuthResultAuthorityRoutes(mux, authResults, config.ConfigSourceURL, func(r *http.Request, tenant string) bool {
+			return authResultEdgeAuthorized(r, tcaReg, tenant)
+		})
+	}
+	authRollout, rolloutErr := newAuthRolloutRuntime(config)
+	if rolloutErr != nil {
+		log.Fatalf("load authentication rollout: %v", rolloutErr)
+	}
+	theAuthRollout.Store(authRollout)
+	registerAuthRolloutRoutes(mux, adminEndpoint, authRollout)
+	registerGrantsAdmin(mux, adminEndpoint, grantStore, evaluator, writer, adminAuditOutbox, authRollout, config.ConfigSourceURL)
+	registerAuthenticationGrantSnapshot(mux, adminEndpoint, grantStore, config.AgentPolicySigner, config.ConfigSourceURL, config.OperatorTenantID)
+	registerAuthenticationGrantAuthority(mux, grantStore, config.ConfigSourceURL, func(r *http.Request, tenant string) bool {
+		return authResultEdgeAuthorized(r, tcaReg, tenant)
+	})
 	// ★ AND THE AUTHORITY RECEIVES WHAT THE FLEET MINTED. Registered only on a node that does not pull its
 	// own configuration — the same rule the connector report states. See grant_cp_report.go.
 	registerDelegatedRevocationReport(mux, delegatedGrants, tcaReg, strings.TrimSpace(config.ConfigSourceURL), config.LabMode != nil && *config.LabMode, writer)
@@ -6416,13 +6775,48 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				log.Fatalf("init device-binding signer: %v", err)
 			}
 			log.Printf("step-up device binding: no -step-up-binding-secret, so this node signs with a key of " +
-				"its own. A step-up that starts here and lands on another Edge will lose its device binding " +
-				"(the grant becomes organization-wide). Set the deployment's shared secret on every Edge.")
+				"its own. A step-up that starts here and lands on another Edge will be rejected " +
+				"(binding verification fails). Set the deployment's shared secret on every Edge.")
 		}
-		configureStepUpPortalCertificate(config.ClientlessBaseURL, config.ClientlessTLSCert, config.ClientlessTLSKey)
-		broker := newClientlessBroker(idpConnectionStore, grantStore, &http.Client{Timeout: 10 * time.Second}, config.ClientlessBaseURL, evaluator.PolicyBundle.TenantID, 8*time.Hour, deviceSigner)
-		broker.register(mux)
-		federatedAuthGateForEgress = &federatedAuthGate{grants: grantStore, brokerBaseURL: config.ClientlessBaseURL, tenantID: evaluator.PolicyBundle.TenantID, signer: deviceSigner}
+		profile := os.Getenv("DSSE_TOPOLOGY_PROFILE")
+		requireBrowserCertificate := threeVoterDeployment(profile) && !(config.LabMode != nil && *config.LabMode)
+		approvedOrigins, err := configuredBrokerOrigins(config)
+		if err != nil {
+			log.Fatalf("authentication Portal origins: %v", err)
+		}
+		servedOrigins, err := servedBrokerOrigins(profile, config, approvedOrigins)
+		if err != nil {
+			log.Fatalf("authentication Portal served origin: %v", err)
+		}
+		entranceOrigins, err := parseEntrancePortalOrigins(config.EntrancePortalOrigins, approvedOrigins)
+		if err != nil {
+			log.Fatalf("authentication entrance mapping: %v", err)
+		}
+		entranceOrigins = localizeEntrancePortalOrigins(profile, entranceOrigins, servedOrigins)
+		configureStepUpPortalCertificatesForServedOriginsWithTrust(approvedOrigins, servedOrigins, config.ClientlessTLSCert, config.ClientlessTLSKey, config.ClientlessTLSCA, requireBrowserCertificate)
+		if len(entranceOrigins) > 0 && !authRollout.featureEnabled("ceremony-recovery-v1") {
+			log.Printf("authentication_portal_not_ready reason=shared_fleet_recovery_not_activated; keep owner-pinned routing and omit entrance mapping until fleet activation")
+		}
+		portalHandlers := map[string]http.Handler{}
+		for _, origin := range servedOrigins {
+			broker := newClientlessBroker(idpConnectionStore, grantStore, &http.Client{Timeout: 10 * time.Second}, origin, evaluator.PolicyBundle.TenantID, 8*time.Hour, deviceSigner)
+			broker.checkTenantRegion = fleetResidency
+			broker.draining = config.DrainState
+			broker.rollout = authRollout
+			broker.authorityRequired = strings.TrimSpace(config.ConfigSourceURL) != ""
+			if config.GrantCPReporter != nil {
+				broker.publishGrants = config.GrantCPReporter.report
+				broker.authority = config.GrantCPReporter
+			}
+			broker.recoverySharedKey = strings.TrimSpace(config.StepUpBindingSecret) != ""
+			broker.requireFleetRecovery = len(entranceOrigins) > 0
+			perOrigin := http.NewServeMux()
+			broker.register(perOrigin)
+			portalHandlers[origin] = perOrigin
+		}
+		registerBrokerOriginsForProfile(mux, servedOrigins, portalHandlers, profile == "three-regions-multi-edge")
+		federatedAuthGateForEgress = &federatedAuthGate{rollout: authRollout, draining: config.DrainState, registry: idpConnectionStore, grants: grantStore, brokerBaseURL: config.ClientlessBaseURL, entranceOrigins: entranceOrigins, tenantID: evaluator.PolicyBundle.TenantID, signer: deviceSigner}
+		federatedAuthGateForEgress.refreshGrants = newAuthGrantRefresh(config.ConfigBundleSource, grantStore)
 	}
 
 	// Unified rule authoring (source → destination : service ⇒ action) across the east-west and egress
@@ -6514,18 +6908,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	tenantRegions := func(tenantID string) []regionEndpoint {
 		// Read live rather than captured: a region added after this node started must appear in the next
 		// profile without restarting it.
-		catalog := regionMap.Catalog()
-		id := strings.TrimSpace(tenantID)
-		if id == "" || tenantModelStore == nil {
-			return catalog.allowedRegionEndpoints(nil, "")
-		}
-		tenant, ok := organizationSetupTenant(context.Background(), tenantModelStore, id)
-		if !ok {
-			// An organization this node has no row for is not a reason to hand out a boundary-free list; it is
-			// a reason to hand out the deployment's, which is what it did for everyone until today.
-			return catalog.allowedRegionEndpoints(nil, "")
-		}
-		return catalog.allowedRegionEndpoints(tenant.AllowedRegions, tenant.HomeRegion)
+		return tenantProfileRegionEndpoints(regionMap.Catalog(), tenantModelStore, tenantID,
+			strings.TrimSpace(config.ConnectorEnrollmentEdgeURL), evaluator.EdgeRegionID)
 	}
 	registerAgentProfileRoutes(mux, adminEndpoint, config, evaluator, writer, adminAuditOutbox,
 		strings.TrimSpace(config.ConnectorEnrollmentEdgeURL), tenantRegions)
@@ -6550,7 +6934,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerTenantAdminRoutes(mux, adminEndpoint, config, evaluator, writer, tenantModelStore, operatorTenantID, adminAuditOutbox, adminAuth, ruleStore, vlanBoundary,
 		adminTenantExtraStores{
 			AssetCatalog:       assetStore,
+			DLP:                config.DLPDistribution,
 			TenantRestrictions: managedTenantRestrictionStoreOrNil(policyStore),
+			UpstreamTLS:        managedTenantRestrictionStoreOrNil(policyStore),
 			DelegatedGrants:    config.DelegatedGrants,
 			HumanApprovals:     config.HumanApprovals,
 			ClientlessGrants:   clientlessGrants,
@@ -6677,7 +7063,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// (bound to the identity just proven) so the held flow is released. The user then retries.
 		if challengeID, ok := eastWestChallengeFromRequest(r); ok {
 			http.SetCookie(w, expiredEastWestChallengeCookie())
-			if grant, gerr := eastwest.CompleteCeremony(policyStore, eastWestAuthChallenges, challengeID, session.UserID, time.Now()); gerr != nil {
+			if grant, gerr := eastwest.CompleteCeremony(policyStore, eastWestAuthChallenges, challengeID, session.TenantID, session.UserID, time.Now()); gerr != nil {
 				log.Printf("east_west_ceremony grant_not_issued reason=%s", gerr.Error())
 			} else {
 				log.Printf("east_west_ceremony_completed protocol=%s", grant.Protocol)
@@ -6706,7 +7092,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return
 		}
 		appID := strings.TrimSpace(r.PathValue("application_id"))
-		session, authenticated := activeSessionFromRequest(r, sessionStore)
+		session, authenticated := clientlessBrowserSession(r, sessionStore)
 		if !authenticated {
 			loginURL, cookies, err := buildOIDCLoginURL(oidc)
 			if err != nil {
@@ -6747,10 +7133,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		// the app with no endpoint agent and no inbound hole. Returns 404 if no connector is registered for
 		// the app (the live connector + real backend is the deployment dependency, not new Edge code).
 		log.Printf("clientless_front_door_granted tenant=%q app=%q user=%q -> connector relay", tenantID, appID, session.UserID)
-		handleConnectorApplication(w, r, connAppDeps)
+		handleConnectorApplication(w, withVerifiedClientlessSession(r, session), connAppDeps)
 	})
 	mux.HandleFunc("POST /auth/events", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		var event model.AuthenticationEvent
@@ -6758,7 +7145,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode authentication event: %w", err))
 			return
 		}
-		session, err := sessionStore.CreateFromAuthenticationEvent(event, evaluator.PolicyBundle.ID, evaluator.PolicyBundle.TenantID, time.Now())
+		session, err := sessionStore.CreateFromAuthenticationEvent(event, evaluator.PolicyBundle.ID, callerTenant, time.Now())
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -6918,11 +7305,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusCreated, session)
 	})
 	mux.HandleFunc("GET /sessions/{session_id}", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		session, ok := sessionStore.Get(r.PathValue("session_id"))
-		if !ok {
+		if !ok || session.TenantID != callerTenant {
 			writeError(w, http.StatusNotFound, fmt.Errorf("session %s is not found", r.PathValue("session_id")))
 			return
 		}
@@ -7046,6 +7434,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			logInfof("device_posture_regression device_trust_prev=%s device_trust_now=%s (recorded; enforcement is the policy's, evaluated per request)",
 				prevTrust, dev.DeviceTrustLevel)
 		}
+		// The Console reads enrollment from the control plane, while endpoint
+		// heartbeats land on an Edge. Ship the verified device's reported build
+		// through the existing fleet device-state stream before acknowledging it.
+		deviceRuntime.ingestAgentVersion(dev.ID, dev.TenantID, dev.AgentVersion, time.Now())
 		appendDeviceDomainEvent(r.Context(), domainEventOutbox, dev, "device_heartbeat", dev.LastSeenAt, time.Now())
 		if err := writer.Append("audit.log.jsonl", deviceAuditLog("device_heartbeat", dev, evaluator, sourceIPFromRequest(r))); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -7203,7 +7595,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusAccepted, req)
 	})
 	mux.HandleFunc("POST /devices/{device_id}/agent-status", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		var req model.AgentStatus
@@ -7214,7 +7607,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if req.DeviceID == "" {
 			req.DeviceID = r.PathValue("device_id")
 		}
-		dev, ok, err := deviceForTenant(deviceStore, evaluator.PolicyBundle.TenantID, req.DeviceID)
+		dev, ok, err := deviceForTenant(deviceStore, callerTenant, req.DeviceID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("device inventory is unavailable"))
 			return
@@ -7240,10 +7633,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusAccepted, req)
 	})
 	mux.HandleFunc("GET /devices/{device_id}/agent-rollout", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		dev, ok, err := deviceForTenant(deviceStore, evaluator.PolicyBundle.TenantID, r.PathValue("device_id"))
+		dev, ok, err := deviceForTenant(deviceStore, callerTenant, r.PathValue("device_id"))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("device inventory is unavailable"))
 			return
@@ -7273,10 +7667,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /devices", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		devices, err := devicesForTenant(deviceStore, evaluator.PolicyBundle.TenantID)
+		devices, err := devicesForTenant(deviceStore, callerTenant)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("device inventory is unavailable"))
 			return
@@ -7284,10 +7679,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, devices)
 	})
 	mux.HandleFunc("GET /devices/{device_id}", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		dev, ok, err := deviceForTenant(deviceStore, evaluator.PolicyBundle.TenantID, r.PathValue("device_id"))
+		dev, ok, err := deviceForTenant(deviceStore, callerTenant, r.PathValue("device_id"))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("device inventory is unavailable"))
 			return
@@ -7299,10 +7695,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, dev)
 	})
 	mux.HandleFunc("GET /devices/{device_id}/policy-bundle", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		dev, ok, err := deviceForTenant(deviceStore, evaluator.PolicyBundle.TenantID, r.PathValue("device_id"))
+		dev, ok, err := deviceForTenant(deviceStore, callerTenant, r.PathValue("device_id"))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("device inventory is unavailable"))
 			return
@@ -7322,10 +7719,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		})
 	})
 	mux.HandleFunc("GET /devices/{device_id}/trusted-keyring", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		dev, ok, err := deviceForTenant(deviceStore, evaluator.PolicyBundle.TenantID, r.PathValue("device_id"))
+		dev, ok, err := deviceForTenant(deviceStore, callerTenant, r.PathValue("device_id"))
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("device inventory is unavailable"))
 			return
@@ -7342,7 +7740,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	})
 	mux.HandleFunc("POST /human-approvals/events", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		now := time.Now()
@@ -7351,7 +7750,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode human approval event: %w", err))
 			return
 		}
-		if err := normalizeHumanApprovalEvent(&event, evaluator.PolicyBundle.TenantID, now); err != nil {
+		if err := normalizeHumanApprovalEvent(&event, callerTenant, now); err != nil {
 			writeError(w, statusForHumanApprovalEventError(err), err)
 			return
 		}
@@ -7383,10 +7782,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusAccepted, event)
 	})
 	mux.HandleFunc("GET /human-approvals/events/{approval_id}", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		event, ok := humanApprovals.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("approval_id"))
+		event, ok := humanApprovals.GetForTenant(callerTenant, r.PathValue("approval_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("human approval event %s is absent", r.PathValue("approval_id")))
 			return
@@ -7395,7 +7795,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	})
 	mux.HandleFunc("POST /delegated-grants", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		now := time.Now()
@@ -7404,7 +7805,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode delegated access grant: %w", err))
 			return
 		}
-		if err := normalizeDelegatedAccessGrant(&grant, evaluator.PolicyBundle.TenantID, now); err != nil {
+		if err := normalizeDelegatedAccessGrant(&grant, callerTenant, now); err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
 		}
@@ -7430,10 +7831,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusAccepted, grant)
 	})
 	mux.HandleFunc("GET /delegated-grants/{grant_id}", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
-		grant, ok := delegatedGrants.GetForTenant(evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"))
+		grant, ok := delegatedGrants.GetForTenant(callerTenant, r.PathValue("grant_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("delegated access grant %s is absent", r.PathValue("grant_id")))
 			return
@@ -7442,7 +7844,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	})
 	mux.HandleFunc("POST /delegated-grants/{grant_id}/revoke", func(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(captureCPWriteLease(r.Context()))
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		now := time.Now()
@@ -7451,7 +7854,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode delegated access grant revoke request: %w", err))
 			return
 		}
-		grant, err := delegatedGrants.RevokeForTenantContext(r.Context(), evaluator.PolicyBundle.TenantID, r.PathValue("grant_id"), req.RevocationReason, now)
+		grant, err := delegatedGrants.RevokeForTenantContext(r.Context(), callerTenant, r.PathValue("grant_id"), req.RevocationReason, now)
 		if err != nil {
 			writeError(w, statusForDelegatedGrantError(err), err)
 			return
@@ -7474,7 +7877,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusOK, grant)
 	})
 	mux.HandleFunc("POST /tools/events", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		callerTenant, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !authorized {
 			return
 		}
 		now := time.Now()
@@ -7483,7 +7887,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode tool call event: %w", err))
 			return
 		}
-		if err := toolcallaudit.Normalize(&event, evaluator.PolicyBundle.TenantID, now); err != nil {
+		if err := toolcallaudit.Normalize(&event, callerTenant, now); err != nil {
 			writeError(w, statusForToolCallEventError(err), err)
 			return
 		}
@@ -7491,7 +7895,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, nhi.StatusForReferenceError(err), err)
 			return
 		}
-		if err := validateToolCallEventReferences(event, evaluator.PolicyBundle.TenantID, decisionStore, humanApprovals, delegatedGrants, inspectionEvents, now); err != nil {
+		if err := validateToolCallEventReferences(event, callerTenant, decisionStore, humanApprovals, delegatedGrants, inspectionEvents, now); err != nil {
 			writeError(w, statusForToolCallEventError(err), err)
 			return
 		}
@@ -7511,7 +7915,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusAccepted, event)
 	})
 	mux.HandleFunc("POST /inspection/events", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		tenantID, ok := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !ok {
+			return
+		}
+		if tenantID == "" {
+			writeError(w, http.StatusUnauthorized, fmt.Errorf("inspection tenant is not authenticated"))
 			return
 		}
 		now := time.Now()
@@ -7520,11 +7929,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode inspection event: %w", err))
 			return
 		}
-		if err := normalizeInspectionEvent(&event, evaluator.PolicyBundle.TenantID, now); err != nil {
+		if err := normalizeInspectionEvent(&event, tenantID, now); err != nil {
 			writeError(w, statusForInspectionEventError(err), err)
 			return
 		}
-		if err := validateInspectionEventReferences(event, evaluator.PolicyBundle.TenantID, decisionStore); err != nil {
+		if err := validateInspectionEventReferences(event, tenantID, decisionStore); err != nil {
 			writeError(w, statusForInspectionEventError(err), err)
 			return
 		}
@@ -7545,10 +7954,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		writeJSON(w, http.StatusAccepted, event)
 	})
 	mux.HandleFunc("GET /inspection/events/{inspection_id}", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+		tenantID, ok := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
+		if !ok {
 			return
 		}
-		event, ok := inspectionEvents.Get(r.PathValue("inspection_id"))
+		if tenantID == "" {
+			writeError(w, http.StatusUnauthorized, fmt.Errorf("inspection tenant is not authenticated"))
+			return
+		}
+		event, ok := inspectionEvents.GetForTenant(tenantID, r.PathValue("inspection_id"))
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Errorf("inspection event %s is absent", r.PathValue("inspection_id")))
 			return
@@ -7566,28 +7980,30 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			return
 		}
 		req = enrichDecisionRequestWithSession(req, sessionStore)
-		req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
-		if riskErr != nil {
-			writeError(w, http.StatusServiceUnavailable, riskErr)
-			return
-		}
-		req = enrichDecisionRequestWithRisk(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
-		req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now()) // D1: recover FQDN for connect-by-IP / non-TLS flows
-		req = deriveDecisionRequestActor(req, delegatedGrants)
-		req = nhi.EnrichDecisionRequestWithRisk(r.Context(), req, nonHumanIdentities, time.Now()) // block or gate a high-risk NHI's access (nhi_risk_severity)
-		req = enrichDecisionRequestWithTransportIdentity(r, req)                                  // W2: bind verified mTLS device identity (authoritative)
-		// tenant isolation: bind the AUTHORITATIVE tenant from the (T) mTLS issuing CA onto the decision
-		// (not the client-claimed tenant_id). A body that claims a different tenant than its certificate proves
-		// is a cross-tenant attempt — denied here, before evaluation, so a decision can never be keyed to a
-		// tenant the connection has not authenticated as. Phase 3 (G1): on a multi-tenant production Edge
-		// (registry configured + !devMode) an unresolved tenant is denied here instead of falling back to the
-		// seed/primary PolicyBundle tenant; lab/devMode and single-tenant (nil registry) keep the seed fallback.
+		// A session may supply its tenant when the body omits it. Check that claim
+		// against the verified connector certificate before any tenant-keyed risk,
+		// grant, or NHI lookup. Otherwise an empty body tenant skips risk and a
+		// later certificate binding makes the resulting allow look tenant-scoped.
+		req = enrichDecisionRequestWithTransportIdentity(r, req)
 		boundReq, tenantErr := enrichDecisionRequestWithTransportTenant(r, req, tcaReg, devMode)
 		if tenantErr != nil {
 			writeError(w, http.StatusForbidden, tenantErr)
 			return
 		}
 		req = boundReq
+		req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
+		if riskErr != nil {
+			writeError(w, http.StatusServiceUnavailable, riskErr)
+			return
+		}
+		req, riskErr = enrichDecisionRequestWithRiskChecked(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
+		if riskErr != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk inventory unavailable"))
+			return
+		}
+		req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now()) // D1: recover FQDN for connect-by-IP / non-TLS flows
+		req = deriveDecisionRequestActor(req, delegatedGrants)
+		req = nhi.EnrichDecisionRequestWithRisk(r.Context(), req, nonHumanIdentities, time.Now()) // block or gate a high-risk NHI's access (nhi_risk_severity)
 		var err error
 		var attestation runtimeWorkloadAttestationEvidence
 		req, attestation, err = enrichDecisionRequestWithRuntimeAttestation(r, req, workloadAttestationSecret, devMode, workloadAttestations, time.Now())
@@ -7683,18 +8099,11 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, runtimeEvaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
 			return
 		}
-		var req eastwest.GrantIssueRequest
-		if err := decodeLimitedJSONBody(w, r, &req, maxEdgeRuntimeJSONBodyBytes); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("decode east-west grant request: %w", err))
-			return
-		}
-		resp, err := eastwest.IssueGrantFromChallenge(policyStore, eastWestAuthChallenges, req.ChallengeID, time.Now())
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		log.Printf("east_west_grant_issued tenant=%s protocol=%s", resp.TenantID, resp.Protocol)
-		writeJSON(w, http.StatusOK, resp)
+		// A challenge ID is sent to the held client in its 401 response. It is
+		// not proof of the user's identity, even when a connector presents valid
+		// mTLS. Only the OIDC callback's CompleteCeremony path may issue this
+		// grant after checking the authenticated subject against the challenge.
+		writeError(w, http.StatusForbidden, fmt.Errorf("east-west grants require completed browser authentication"))
 	})
 	// W3 generic steer-judgment path: a transparently-steered flow (Windows steer-all agent) to an
 	// ARBITRARY original destination. Applies policy on that destination; on allow the Edge dials it
@@ -7791,6 +8200,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					transportDeviceID, reason, flowID)
 				return
 			}
+			if !configBundleReadyForTraffic(config.ConfigBundleSource, config.ConfigSyncStatus) {
+				// A direct or already-established mux can bypass the load balancer's
+				// /healthz check. Keep the connection, but refuse this flow until
+				// the CP's first complete policy bundle has been applied.
+				return
+			}
 			// Rebuild the runtime evaluator PER FLOW so an admin rule change (add/edit/delete) is reflected
 			// immediately — the mux CONNECT above builds one once, but the tunnel is long-lived, so a
 			// connection-scoped evaluator went stale until the mux reconnected (required an edge restart).
@@ -7800,6 +8215,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// this is the only per-user signal); old agents send just "host:port". splitSteerAuthorityMeta parses
 			// + strips it and blanks non-interactive / system accounts (macOS _mdnsresponder, Windows
 			// NT AUTHORITY\SYSTEM, …). Shared with CONNECT /steer so the two transports cannot diverge.
+			authOwner := authOwnerFromAuthority(authority)
 			var osUser, sourceApp string
 			authority, osUser, sourceApp = splitSteerAuthorityMeta(authority)
 			// ★ NOT GATED ON THE USER (2026-08-14). This was `if osUser != ""`, and the name it used to have —
@@ -7842,7 +8258,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			// attribution defect into an outage for any device whose CA is not in the registry. Named as the
 			// remaining half rather than done quietly.
 			flowTenant := steerMuxFlowTenant(r, tcaReg, runtimeEvaluator.PolicyBundle.TenantID, transportDeviceID)
-			deviceRuntime.recordSteeredFlow(transportDeviceID, flowTenant, osUser, time.Now())
+			runtimeEvaluator = runtimeEvaluatorForTenant(evaluator, policyStore, flowTenant)
+			// A legacy unresolved-tenant flow can still be observed as traffic,
+			// but must never create an identity-assignment candidate under the
+			// node's fallback tenant.
+			observedPrincipal := ""
+			if bound, ok := transportTenantFromRequest(r, tcaReg); ok && bound == flowTenant {
+				observedPrincipal = authOwner.Principal
+			}
+			deviceRuntime.recordSteeredFlowWithOwner(transportDeviceID, flowTenant, osUser, observedPrincipal, time.Now())
 			host, portStr, serr := net.SplitHostPort(authority)
 			if serr != nil {
 				logWarnf("steer_mux_bad_authority flow=%d", flowID)
@@ -7850,6 +8274,12 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			}
 			port, _ := strconv.Atoi(portStr)
 			req := steerDecisionRequest(flowTenant, host, port)
+			// Classify a custom-port flow on a live governed Connector route as
+			// Connector Access before evaluating policy. A client-supplied connector
+			// identifier is never used as this proof.
+			if _, routed, routeErr := connectorForDestination(r.Context(), config.Registry, flowTenant, host, ""); routeErr == nil && routed {
+				req.ConnectorRouteVerified = true
+			}
 			// Bind the mux flow's AUTHORITATIVE identity onto the decision request: the verified (T) transport
 			// device (mTLS CN, e.g. win-dev-1) + the steered OS-user carried on the mux OPEN metadata. Without
 			// this the per-OPEN decision carried NEITHER, so an East-West grant bound to the device (or user)
@@ -7875,16 +8305,28 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			if req.DeviceID == "" {
 				req.DeviceID = transportDeviceID
 			}
-			req.DeviceTrustLevel = valueOrDefault(req.DeviceTrustLevel, connectDeviceTrustLevel)
-			req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, humanIdentities, config.HighRiskOverlay)
+			resumeBase := req // transport facts; enrichment is rebuilt for every evaluation
+			buildCurrentRequest := func() (model.DecisionRequest, error) {
+				fresh := resumeBase
+				var err error
+				fresh, err = enrichDecisionRequestWithDirectoryRisk(r.Context(), fresh, humanIdentities, config.HighRiskOverlay)
+				if err != nil {
+					return fresh, err
+				}
+				fresh, err = enrichSteerDeviceRequest(fresh, connectDeviceTrustLevel, deviceRuntime, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
+				if err != nil {
+					return fresh, err
+				}
+				fresh = dns.EnrichDecisionRequestWithDNS(fresh, dnsConntrack, time.Now())
+				fresh = deriveDecisionRequestActor(fresh, delegatedGrants)
+				fresh = nhi.EnrichDecisionRequestWithRisk(r.Context(), fresh, nonHumanIdentities, time.Now())
+				return fresh, nil
+			}
+			req, riskErr := buildCurrentRequest()
 			if riskErr != nil {
-				logErrorf("steer_mux_user_risk_directory_unavailable")
+				logErrorf("steer_mux_current_device_or_directory_unavailable")
 				return
 			}
-			req = enrichDecisionRequestWithRisk(req, deviceStore, config.HighRiskOverlay, config.EnrolledLedger)
-			req = dns.EnrichDecisionRequestWithDNS(req, dnsConntrack, time.Now())
-			req = deriveDecisionRequestActor(req, delegatedGrants)
-			req = nhi.EnrichDecisionRequestWithRisk(r.Context(), req, nonHumanIdentities, time.Now())
 			// Plane membership, decided the SAME way the evaluator decides it (protocol AND destination
 			// locality). Asking IsEastWestProtocol here instead would put a public-internet ssh into the lateral
 			// adoption queue while the evaluator sent it to the north-bound plane — and the candidate capture
@@ -7971,24 +8413,93 @@ func newServerWithConfig(config serverConfig) http.Handler {
 					"is public, the request reached the Edge without a usable address",
 					host, port, req.ServiceFamily, dec.Decision)
 			}
+			heldAuthRequestID := ""
+			var heldAuthResult *authResultNotifier
 			if dec.Decision != "allow" && !decisionPermitsConnectorRoute(dec.Decision) {
 				allowedByGrant := false
 				stepUpURL := ""
-				reqACR := ""
+				requirements := authFlowRequirements(dec, authority)
+				requirements.OSPrincipal, requirements.OSSession = authOwner.Principal, authOwner.Session
+				attemptStarted := time.Now().UTC()
+				requirements.AuthenticationStartedAt = attemptStarted
 				if federatedAuthGateForEgress != nil && decisionRequiresOIDCRedirect(dec.Decision) {
-					var reqIdP string
-					reqIdP, reqACR = authStepUpRequirements(dec)
-					if federatedAuthGateForEgress.hasLiveGrantFor(dec.TenantID, transportDeviceID, reqACR) {
+					_, matched, grantErr := federatedAuthGateForEgress.liveGrantStatusWithRequirements(dec.TenantID, transportDeviceID, requirements)
+					if grantErr != nil {
+						logWarnf("steer_mux_auth_authority_unavailable dst_port=%d — no new authentication ceremony issued", port)
+						return
+					}
+					if matched {
 						allowedByGrant = true
 					} else {
-						stepUpURL = federatedAuthGateForEgress.stepUpURLFor(authority, reqIdP, reqACR, transportDeviceID, dec.TenantID)
+						stepUpURL = federatedAuthGateForEgress.stepUpURLForRequest(r, authority, transportDeviceID, dec.TenantID, requirements)
+						if start, err := url.Parse(stepUpURL); err == nil {
+							requirements.RequestID = start.Query().Get("request_id")
+							if validAuthResultRequestID(requirements.RequestID) && validAuthOwner(authOwner.Principal, authOwner.Session) {
+								heldAuthResult = &authResultNotifier{store: authResults, flow: vc, base: authFlowResult{
+									RequestID: requirements.RequestID, TenantID: dec.TenantID, DeviceID: transportDeviceID,
+									Principal: authOwner.Principal, Session: authOwner.Session,
+								}}
+							}
+						}
 					}
+				}
+				authorizeResume := func() bool {
+					// Rebuild immediately before forwarding: the user may have spent minutes
+					// at the IdP while policy, device status or directory risk changed.
+					current, permitted := authorizeAuthenticatedResume(federatedAuthGateForEgress, flowTenant, transportDeviceID, authority, attemptStarted,
+						func() uint64 {
+							if policyStore == nil {
+								return 0
+							}
+							return policyStore.ConfigGeneration()
+						},
+						func() (model.AccessDecision, bool) {
+							select {
+							case <-vc.Closed():
+								return model.AccessDecision{}, false
+							case <-r.Context().Done():
+								return model.AccessDecision{}, false
+							default:
+							}
+							if !configBundleReadyForTraffic(config.ConfigBundleSource, config.ConfigSyncStatus) {
+								return model.AccessDecision{}, false
+							}
+							if config.AdmissionRevocations != nil {
+								if _, revoked := config.AdmissionRevocations.IsRevoked(transportDeviceID); revoked {
+									return model.AccessDecision{}, false
+								}
+							}
+							fresh, err := buildCurrentRequest()
+							if err != nil {
+								return model.AccessDecision{}, false
+							}
+							fresh.ConnectorRouteVerified = false
+							if _, routed, err := connectorForDestination(r.Context(), config.Registry, flowTenant, host, ""); err != nil {
+								return model.AccessDecision{}, false
+							} else {
+								fresh.ConnectorRouteVerified = routed
+							}
+							currentEvaluator := runtimeEvaluatorForTenant(evaluator, policyStore, flowTenant)
+							fresh = resolveDestinationForLocality(r.Context(), fresh, currentEvaluator.EastWestInternalNetworks, time.Now())
+							return evaluateWithRuntimeEvidence(r.Context(), currentEvaluator, fresh, humanApprovals, delegatedGrants, nonHumanIdentities, time.Now()), true
+						}, requirements.RequestID, requirements.OSPrincipal, requirements.OSSession)
+					if !permitted {
+						log.Printf("steer_mux_auth_resume_denied device=%q", transportDeviceID)
+						return false
+					}
+					dec = current
+					decisionStore.Upsert(dec)
+					if shouldLogAccessDecision(dec) {
+						if err := appendAccessDecisionLogs(r.Context(), writer, domainEventOutbox, dec, time.Now()); err != nil {
+							logErrorf("steer_mux_auth_resume_audit_failed: %v", err)
+						}
+					}
+					return true
 				}
 				if !allowedByGrant {
 					if stepUpURL != "" {
 						// A native TCP client can't follow a 302, so — like the single-flow /steer path's
 						// X-Dsse-Stepup-Url header — ask the agent to open the step-up portal OOB in a browser.
-						_ = vc.SendStepUp(stepUpURL)
 						// INFO, not debug. This is the moment a security ceremony STARTS: a flow was held and
 						// the user was asked to authenticate out-of-band. It was previously logDebugf, so the
 						// entire ceremony lifecycle was invisible at the default level — on 2026-08-05 it could
@@ -8010,8 +8521,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 						// bounded so a native client is never pinned past its own patience; on timeout we fall back
 						// to the original drop-and-retry (the client's retried OPEN is then allowed by the grant).
 						if federatedAuthGateForEgress != nil &&
-							waitForStepUpGrant(r.Context(), federatedAuthGateForEgress, transportDeviceID, reqACR, vc, steerMuxStepUpGrantWait) {
-							log.Printf("east_west_stepup_completed device=%s dst=%s:%d service=%s — grant minted during the ceremony; the held flow resumes with no client retry",
+							waitForStepUpGrantChecked(r.Context(), federatedAuthGateForEgress, dec.TenantID, transportDeviceID, requirements, vc, steerMuxStepUpGrantWait, stepUpURL, authorizeResume, heldAuthResult.Final) {
+							heldAuthRequestID = requirements.RequestID
+							log.Printf("east_west_stepup_completed device=%s dst=%s:%d service=%s — authentication evidence and current access policy verified",
 								transportDeviceID, host, port, req.ServiceFamily)
 							// grant minted during the ceremony — fall through to forward on the held flow.
 						} else {
@@ -8019,8 +8531,8 @@ func newServerWithConfig(config serverConfig) http.Handler {
 							// user-visible symptom (the connection just fails) says nothing about why, and the
 							// two causes — nobody completed the ceremony, versus the ceremony completed but the
 							// grant never arrived — need different fixes.
-							log.Printf("east_west_stepup_incomplete device=%s dst=%s:%d service=%s waited=%s — no grant arrived; the held flow is dropped and the client must retry",
-								transportDeviceID, host, port, req.ServiceFamily, steerMuxStepUpGrantWait)
+							log.Printf("east_west_stepup_incomplete device=%s dst=%s:%d service=%s waited=%s — authentication wait or current authorization failed; held flow dropped",
+								transportDeviceID, host, port, req.ServiceFamily, time.Since(attemptStarted))
 							return
 						}
 					} else {
@@ -8042,6 +8554,9 @@ func newServerWithConfig(config serverConfig) http.Handler {
 						return
 					}
 				}
+				if allowedByGrant && !authorizeResume() {
+					return
+				}
 			}
 			// Warn stage (S3, learning lifecycle): a matched authenticate/deny rule under Warn ALLOWED this flow
 			// (non-holding) but asks us to surface a passive "monitored; authentication will soon be required"
@@ -8054,8 +8569,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				}
 			}
 			logDebugf("steer_mux_forwarded host=%s dst_port=%d family=%s", host, port, req.ServiceFamily)
-			route := edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: host, Port: port, DeviceIdentity: transportDeviceID, OSUser: osUser, SourceApp: sourceApp, TenantID: req.TenantID, TunnelSourceIP: edgeplane.RemoteAddrString(clientConn), BuiltBy: "steer-mux"}
-			if err := steerEgressForward(r.Context(), vc, authority, route, steerInterceptionDialer); err != nil {
+			route := edgeplane.NetworkExtensionRuntimeCopyTCPRoute{Host: host, Port: port, DeviceIdentity: transportDeviceID, OSUser: osUser, AuthOwner: authOwner, SourceApp: sourceApp, TenantID: req.TenantID, TunnelSourceIP: edgeplane.RemoteAddrString(clientConn), BuiltBy: "steer-mux"}
+			if err := steerEgressForward(r.Context(), vc, authority, route, steerInterceptionDialer, func() {
+				if heldAuthRequestID != "" {
+					heldAuthResult.FinalAsync("resumed")
+				}
+			}); err != nil {
+				if heldAuthRequestID != "" {
+					heldAuthResult.Final("not_resumed")
+				}
 				// Coalesced per target: a client retrying one unreachable host sets this line's rate, not the
 				// operator. First failure reports immediately; identical repeats fold into a summary count.
 				// Keyed by TARGET only (host|port), not by error category: on success we must be able to clear
@@ -8084,11 +8606,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 				// being swallowed as a "repeat" of an old, already-resolved storm.
 				edgeplane.SteerEgressFailureCoalescer.Forget(fmt.Sprintf("%s|%d", host, port))
 			}
+		}, func(payload []byte) []byte {
+			tenant := steerDeviceTenant(r, config, transportDeviceID, runtimeEvaluator.PolicyBundle.TenantID)
+			return handleAuthResultQuery(authResults, transportDeviceAuthenticated, tenant, transportDeviceID,
+				deviceIsAdmitted(config.EnrolledLedger, transportDeviceID), payload)
 		})
 		logDebugf("steer_mux_closed")
 	})
 	networkExtensionRuntimeCopyTenantID := runtimeEvaluatorForPolicyStore(evaluator, policyStore).PolicyBundle.TenantID
-	networkExtensionRuntimeCopySessions := edgeplane.NewNetworkExtensionRuntimeCopySessionManager(0, 0, nil)
+	networkExtensionRuntimeCopySessions := edgeplane.NewNetworkExtensionRuntimeCopySessionManager(runtimequota.Seconds("DSSE_NE_SESSION_IDLE_TIMEOUT_SECONDS"), runtimequota.Count("DSSE_NE_MAX_SESSIONS"), nil)
 	swgEgressConfig := edgeSWGHTTPEgressHandlerConfig{
 		TenantCARegistry:              config.TenantCARegistry,
 		Evaluator:                     evaluator,
@@ -8126,6 +8652,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		ConnectorSecret:               connectorSecret,
 		RequireConnectorRuntimeSecret: requireConnectorRuntimeSecret,
 		DLPBlockUninspectableFiles:    config.DLPBlockUninspectableFiles,
+		DLPRetentionBudget:            config.DLPRetentionBudget,
 	}
 	// Trusted in-process variant for the NE/WFP decrypt-all forward: skips connector authorization because the
 	// flow was already device-authenticated at the (T) transport mTLS layer + admitted via enrolled inventory
@@ -8140,16 +8667,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// by no connector route dials exactly as before.
 	// The flow tenant's residency boundary (allowed regions) — the reach layer denies a connector whose region is
 	// outside it. Resolved per-flow from the admin tenant model; nil for an unpinned tenant (no restriction).
-	tenantResidency := edgeplane.ResidencyResolver(func(tenantID string) []string {
-		if tenantModelStore == nil {
-			return nil
-		}
-		tenant, err := tenantModelStore.Get(context.Background(), tenantID)
-		if err != nil {
-			return nil
-		}
-		return tenant.AllowedRegions
-	})
+	tenantResidency := tenantResidencyResolver(tenantModelStore)
 	// Multi-region MESH: peerEdges/meshEligible come from -mesh-peers/-mesh-eligible-hosts. Both nil when
 	// the fabric is unconfigured, so mesh fails closed (self-gating) and every cross-region app hairpins.
 	if config.SWGEgressBrowserMimic {
@@ -8210,11 +8728,13 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		//
 		//   egress engine: AIA chase learned "Microsoft TLS ECC Root G2" (issued by "DigiCert Global Root G3")
 		//
-		// The link AIA learns is added to the CURL side's bundle. The Go path never consults it, so every
-		// AIA-dependent origin is unreachable through the product while being fine in a plain browser — and
+		// The link AIA learns is added to the CURL side's bundle. At the time, the Go path never consulted it, so
+		// AIA-dependent origins were unreachable through the product while being fine in a plain browser — and
 		// during six requests after that line was logged, the engine logged no chase at all, because nothing
 		// reached it. Bot-mitigated origins were the same story for the same reason.
 		//
+		// The standard Go egress path now completes missing CA Issuers links in
+		// outboundtls without enabling the optional browser-faithful engine.
 		// Connector authorization is untouched: that gate is about who may CALL the route, and this is about
 		// which stack dials the origin. Connector-fronted destinations still tunnel — the round tripper picks
 		// per destination — so an internal app is unaffected.
@@ -8235,7 +8755,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	swgHTTPEgressHandler := newEdgeSWGHTTPEgressHandler(swgEgressConfig)
 	// ★ DIAGNOSTIC (2026-08-18): name the concrete egress transport of BOTH handlers at startup.
 	//
-	// partner.microsoft.com still fails with a Go crypto/tls error after the browser-faithful client was put on
+	// Historically partner.microsoft.com still failed with a Go crypto/tls error after the browser-faithful client was put on
 	// both handlers, and the engine logs ZERO AIA chase attempts for it — so the request is reaching neither
 	// handler's client, or one of them is not what this code believes it is. Reading the wiring has now been
 	// wrong twice; this prints what is actually there.
@@ -8304,13 +8824,15 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		DeviceTenant:      networkExtensionRuntimeCopyDeviceTenant,
 		TransportIdentity: transportDeviceIdentityFromRequest,
 	}))
-	mux.HandleFunc(edgeplane.NetworkExtensionRuntimeCopySessionPath, edgeplane.NewNetworkExtensionRuntimeCopySessionHandler(edgeplane.NetworkExtensionRuntimeCopySessionHandlerConfig{
+	legacySessionHandler := edgeplane.NewNetworkExtensionRuntimeCopySessionHandler(edgeplane.NetworkExtensionRuntimeCopySessionHandlerConfig{
 		TenantID:          networkExtensionRuntimeCopyTenantID,
 		DeviceTenant:      networkExtensionRuntimeCopyDeviceTenant,
 		Dialer:            networkExtensionRuntimeCopySessionDialer,
 		SessionManager:    networkExtensionRuntimeCopySessions,
 		TransportIdentity: transportDeviceIdentityFromRequest,
-	}))
+	})
+	mux.HandleFunc(edgeplane.NetworkExtensionRuntimeCopySessionPath,
+		legacySessionRoute(os.Getenv("DSSE_STEER_MUX_ONLY") == "true", legacySessionHandler))
 	mux.HandleFunc(edgeplane.NetworkExtensionRuntimeCopyTunnelPath, edgeplane.NewNetworkExtensionRuntimeCopyTunnelHandler(edgeplane.NetworkExtensionRuntimeCopyTunnelHandlerConfig{
 		TenantID:          networkExtensionRuntimeCopyTenantID,
 		DeviceTenant:      networkExtensionRuntimeCopyDeviceTenant,
@@ -8424,6 +8946,10 @@ func newServerWithConfig(config serverConfig) http.Handler {
 		if req.ID == "" {
 			req.ID = r.PathValue("connector_id")
 		}
+		if req.ID != r.PathValue("connector_id") {
+			writeError(w, http.StatusForbidden, fmt.Errorf("connector heartbeat ID does not match authenticated connector"))
+			return
+		}
 		// A heartbeat carries no Site, so the Site is read from what this connector registered as — the
 		// registration is where the organization was already admitted, and repeating that decision is the
 		// point. A connector this node has never seen falls through to the node's own organization.
@@ -8535,11 +9061,22 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	})
 	// ★ THE DURABLE HALF OF A CONNECTOR'S CONFIGURATION. See connector_profile_route.go: the token is
 	// one-time, so anything it carries is frozen on the day it was issued.
-	registerConnectorProfileRoute(mux, func(w http.ResponseWriter, r *http.Request, cid string) bool {
-		return authorizeConnectorRuntimeRequest(w, r, connectorSecret, registry, cid,
-			evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry)
-	}, evaluator.PolicyBundle.TenantID, strings.TrimSpace(config.ConnectorEnrollmentEdgeURL),
-		connectorEnrollmentRegions, func(cid string) string {
+	registerConnectorProfileRoute(mux, func(w http.ResponseWriter, r *http.Request, cid string) (string, bool) {
+		if !authorizeConnectorRuntimeRequest(w, r, connectorSecret, registry, cid,
+			evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, config.TenantCARegistry) {
+			return "", false
+		}
+		if tenant, ok := transportTenantFromRequest(r, config.TenantCARegistry); ok {
+			return tenant, true
+		}
+		// Legacy shared-CA authentication is still scoped by the registered
+		// Connector owner, never by an arbitrary tenant in the request.
+		return connectorTenantFromRegistry(registry, cid), true
+	}, strings.TrimSpace(config.ConnectorEnrollmentEdgeURL),
+		func(ctx context.Context, tenantID string) ([]regionEndpoint, error) {
+			return tenantProfileRegionEndpointsChecked(ctx, regionMap.Catalog(), tenantModelStore, tenantID,
+				strings.TrimSpace(config.ConnectorEnrollmentEdgeURL), evaluator.EdgeRegionID)
+		}, func(cid string) string {
 			if c, ok := registry.Get(cid); ok {
 				return c.ConnectorGroupID
 			}
@@ -8636,7 +9173,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("mesh ingress anti-replay: %w", err))
 			return
 		}
-		wsConn, err := tunnel.Upgrade(w, r)
+		wsConn, err := tunnel.UpgradeWithHeaders(w, r, http.Header{tunnel.TCPQuotaCapabilityHeader: []string{tunnel.TCPQuotaCapabilityV1}})
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -8749,7 +9286,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	// refuse this" verdict that outlived the restart (2026-08-02).
 	reportServedCertificatesAtStartup(config, refuseStartOnUnusableCertificateFlag)
 
-	return mux
+	return transportIngressMiddleware(cpQuorumAdmissionMiddleware(sharedFleetResidencyMiddleware(mux, config, fleetResidency)))
 }
 
 func appendAccessDecisionLogs(ctx context.Context, writer *logs.Writer, domainEventOutbox domainEventOutboxWriter, dec model.AccessDecision, now time.Time) error {
@@ -8852,19 +9389,22 @@ func validateConnectorTenant(connectorTenantID, expectedTenantID string) error {
 // destination (publish_protocol=="web" && published && destination!=""). Only such apps take the new
 // CONNECT-over-tunnel HTTP-proxy data path; everything else (un-published, no destination, tcp/network
 // publish protocol, or empty publish_protocol) keeps the legacy privateBaseURL HTTP-frame path — preserving
-// the lab invariant. Fail-closed: a nil catalog or a read error returns false (legacy path).
-func publishedWebAppRoute(ctx context.Context, catalog appcatalog.RuntimeStore, tenantID, applicationID string) bool {
+// the lab invariant. A nil catalog is the legacy deployment; a configured catalog read failure is an error.
+func publishedWebAppRoute(ctx context.Context, catalog appcatalog.RuntimeStore, tenantID, applicationID string) (bool, error) {
 	if catalog == nil {
-		return false
+		return false, nil
 	}
 	entry, found, err := catalog.Get(ctx, strings.TrimSpace(tenantID), strings.TrimSpace(applicationID))
-	if err != nil || !found || !entry.Published || entry.Status == "disabled" {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if !found || !entry.Published || entry.Status == "disabled" {
+		return false, nil
 	}
 	if strings.TrimSpace(entry.Destination) == "" {
-		return false
+		return false, nil
 	}
-	return strings.TrimSpace(entry.PublishProtocol) == "web"
+	return strings.TrimSpace(entry.PublishProtocol) == "web", nil
 }
 
 func wantsHTMLResponse(r *http.Request) bool {
@@ -8989,37 +9529,6 @@ func policyConditionStringValues(conditions map[string]any, key string) []string
 		}
 	}
 	return out
-}
-
-// steerMuxStepUpGrantWait bounds how long a held native flow is parked waiting for the OOB step-up ceremony to
-// mint a grant before we give up and drop it (the client then retries). Long enough for a human to complete an
-// interactive IdP login; short enough not to pin a native client past its own connect patience.
-const steerMuxStepUpGrantWait = 120 * time.Second
-const steerMuxStepUpPollInterval = 500 * time.Millisecond
-
-// waitForStepUpGrant parks a held steer-mux flow until the device earns a live step-up grant (the OOB browser
-// ceremony completed) or the bound elapses / the client gives up. Returns true only if a grant appeared, so the
-// caller can resume forwarding on the same held connection (auto-release, task #5). It never blocks the mux
-// demux: handleOpen runs per-flow in its own goroutine, and peer CLOSE still routes to vc via the demux loop.
-func waitForStepUpGrant(ctx context.Context, gate *federatedAuthGate, deviceID, acr string, vc *edgeplane.MuxVirtualConn, maxWait time.Duration) bool {
-	deadline := time.Now().Add(maxWait)
-	t := time.NewTicker(steerMuxStepUpPollInterval)
-	defer t.Stop()
-	for {
-		if gate.hasLiveGrant(deviceID, acr) {
-			return true
-		}
-		select {
-		case <-vc.Closed():
-			return false // client/agent gave up (peer CLOSE) or the mux tore down
-		case <-ctx.Done():
-			return false
-		case <-t.C:
-			if !time.Now().Before(deadline) {
-				return false
-			}
-		}
-	}
 }
 
 func adminState(evaluator decision.Evaluator, tenantID string, writer *logs.Writer, registry connectorRegistryStore, deviceStore deviceRuntimeStore, enrolledLedger *enrolledinventory.Ledger, humanApprovals *humanapproval.Store, delegatedGrants *delegatedgrant.Store, decisionStore *accessdecision.Store, inspectionEvents *inspection.Store, routeProfiles map[string]edgeplane.ApplicationRouteProfile, enforcementEdge bool) (map[string]any, error) {
@@ -9178,7 +9687,7 @@ func adminRecentLogs(writer *logs.Writer, tenantID string) (map[string]any, erro
 				// single-tenant deployment that is the whole log, and dropping it would blank the dashboard of
 				// the only organization there is. What is fixed here is the row that SAYS it is somebody
 				// else's, which is what the lab was actually serving.
-				if owner == "" || strings.EqualFold(owner, tenantID) {
+				if owner == "" || owner == strings.TrimSpace(tenantID) {
 					kept = append(kept, row)
 				}
 			}
@@ -9791,7 +10300,7 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	if dec.Decision != "allow" || !isDelegatedActorType(dec.ActorType) {
 		return dec
 	}
-	policy, _ := policyForDecision(evaluator, dec.PolicyID)
+	policy, _ := policyForDecision(evaluator, dec)
 
 	if reason, evidenceResult, ok := nhi.ValidateRuntimeEvidence(ctx, nonHumanIdentities, req, dec.TenantID, req.ActorNHIID, now); !ok {
 		return denyRuntimeEvidence(dec, reason, []string{"policy_matched", evidenceResult}, evidenceResult)
@@ -9851,9 +10360,16 @@ func evaluateWithRuntimeEvidence(ctx context.Context, evaluator decision.Evaluat
 	return dec
 }
 
-func policyForDecision(evaluator decision.Evaluator, policyID string) (model.Policy, bool) {
+func policyForDecision(evaluator decision.Evaluator, dec model.AccessDecision) (model.Policy, bool) {
+	// Evaluate records the tenant of the policy it actually matched. The
+	// decision tenant alone is insufficient: a global and tenant-specific
+	// policy can both use the same ID, and either can win by priority.
+	matchedTenant, ok := dec.Metadata["matched_policy_tenant_id"].(string)
+	if !ok || dec.PolicyID == "" || (matchedTenant != "" && matchedTenant != dec.TenantID) {
+		return model.Policy{}, false
+	}
 	for _, policy := range evaluator.Policies {
-		if policy.ID == policyID {
+		if policy.ID == dec.PolicyID && policy.TenantID == matchedTenant {
 			return policy, true
 		}
 	}
@@ -9905,8 +10421,8 @@ func activeSessionFromRequest(r *http.Request, sessionStore *sessionstore.Store)
 	if sid == "" {
 		return model.Session{}, false
 	}
-	session, ok := sessionStore.Get(sid)
-	if !ok || session.Status != "active" {
+	session, ok := sessionStore.GetActiveAt(sid, time.Now())
+	if !ok {
 		return model.Session{}, false
 	}
 	return session, true
@@ -10092,6 +10608,11 @@ func writeJSONL(w http.ResponseWriter, status int, values []map[string]any) {
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {
+	if errors.Is(err, errCPQuorumUnavailable) {
+		status = http.StatusServiceUnavailable
+		w.Header().Set("Retry-After", "1")
+	}
+	status, err = publicHotStoreError(status, err)
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 
@@ -10401,7 +10922,7 @@ func validateToolCallEventReferences(event model.ToolCallEvent, expectedTenantID
 		}
 	}
 	if event.InspectionEventID != nil && *event.InspectionEventID != "" {
-		inspection, ok := inspectionEvents.Get(*event.InspectionEventID)
+		inspection, ok := inspectionEvents.GetForTenant(event.TenantID, *event.InspectionEventID)
 		if !ok {
 			return fmt.Errorf("inspection event %s is absent", *event.InspectionEventID)
 		}

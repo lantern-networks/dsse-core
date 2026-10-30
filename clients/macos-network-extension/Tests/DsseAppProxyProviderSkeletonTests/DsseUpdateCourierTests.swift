@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import XCTest
 @testable import DsseAppProxyProviderSkeleton
 
@@ -168,9 +169,58 @@ final class DsseUpdateCourierStagedNameTests: XCTestCase {
 // already staged pulled tens of megabytes every fifteen minutes, for ever, off the Edge's uplink — the fleet
 // paying for its own idleness, and nothing about it would have looked wrong in a log.
 //
-// These exercise the DECISION, not the network: alreadyStaged reads the couriered manifest as a hint and
-// compares the size on disk. Whether the bytes are RIGHT is the updater's question, asked with a digest.
+// These exercise the DECISION, not the network: alreadyStaged reads the couriered manifest as a hint. The
+// updater independently verifies the signature and digest before install, but the courier must re-fetch a
+// same-size damaged package rather than skipping it for every future refresh.
 final class DsseUpdateCourierStagedSkipTests: XCTestCase {
+    private func stagedFixture(bytes: Data, expectedBytes: Data, envelopeType: String = DsseUpdateManifest.envelopeType,
+                               includeDigest: Bool = true) throws -> (manifest: String, root: String) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let stagedRoot = dir.appendingPathComponent("staged")
+        try FileManager.default.createDirectory(at: stagedRoot, withIntermediateDirectories: true)
+        try bytes.write(to: stagedRoot.appendingPathComponent("dsse-agent-1.2.3.pkg"))
+        var payload: [String: Any] = ["version": "1.2.3", "artifact_size": expectedBytes.count]
+        if includeDigest {
+            payload["artifact_sha256"] = SHA256.hash(data: expectedBytes)
+                .map { String(format: "%02x", $0) }.joined()
+        }
+        let payloadData = try JSONSerialization.data(withJSONObject: payload)
+        let envelope: [String: String] = [
+            "type": envelopeType,
+            "signing_key_id": "test",
+            "payload_sha256": "test",
+            "payload_b64": payloadData.base64EncodedString(),
+            "signature": "test",
+        ]
+        let manifest = dir.appendingPathComponent("manifest.json")
+        try JSONSerialization.data(withJSONObject: envelope).write(to: manifest)
+        return (manifest.path, stagedRoot.path)
+    }
+
+    func testOnlyMatchingDigestSkipsArtifactFetch() throws {
+        let good = Data("valid package".utf8)
+        let fixture = try stagedFixture(bytes: good, expectedBytes: good)
+        XCTAssertTrue(DsseUpdateCourier.alreadyStaged(manifestPath: fixture.manifest, stagedRoot: fixture.root))
+    }
+
+    func testSameSizeDamagedArtifactIsRefetched() throws {
+        let fixture = try stagedFixture(bytes: Data("wrong package".utf8),
+                                        expectedBytes: Data("valid package".utf8))
+        XCTAssertFalse(DsseUpdateCourier.alreadyStaged(manifestPath: fixture.manifest, stagedRoot: fixture.root),
+                       "size-only reuse leaves a damaged artifact in place forever while the updater refuses it")
+    }
+
+    func testMissingDigestOrWrongDocumentTypeNeverSkips() throws {
+        let data = Data("valid package".utf8)
+        let missing = try stagedFixture(bytes: data, expectedBytes: data, includeDigest: false)
+        let wrongType = try stagedFixture(bytes: data, expectedBytes: data,
+                                          envelopeType: DsseRolloutPlan.envelopeType)
+        XCTAssertFalse(DsseUpdateCourier.alreadyStaged(manifestPath: missing.manifest, stagedRoot: missing.root))
+        XCTAssertFalse(DsseUpdateCourier.alreadyStaged(manifestPath: wrongType.manifest, stagedRoot: wrongType.root))
+    }
+
     // Nothing on disk at all: there is a manifest path that does not exist, and "cannot tell" must not skip.
     func testWithNoManifestItDoesNotSkip() {
         XCTAssertFalse(DsseUpdateCourier.alreadyStaged(),

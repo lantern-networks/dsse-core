@@ -435,6 +435,8 @@ func (s *AgentRolloutStore) SetContext(ctx context.Context, tenantID string, pla
 
 // CountForTenant is how many plans this store holds for one organization: one, or none. It exists because a
 // deletion has to be able to say what is LEFT, and a store nobody counts contributes nothing to that answer.
+// Administrative deletion checks must use CountForTenantChecked so a stale or unreadable shared authority
+// cannot be mistaken for an empty tenant.
 func (s *AgentRolloutStore) CountForTenant(tenantID string) int {
 	if s == nil {
 		return 0
@@ -445,6 +447,19 @@ func (s *AgentRolloutStore) CountForTenant(tenantID string) int {
 		return 1
 	}
 	return 0
+}
+
+// CountForTenantChecked reads the shared authority before reporting a tenant's footprint. A failed read is
+// unknown state, not zero remaining records.
+func (s *AgentRolloutStore) CountForTenantChecked(tenantID string) (int, error) {
+	plans, err := s.SnapshotChecked()
+	if err != nil {
+		return 0, err
+	}
+	if _, ok := plans[strings.TrimSpace(tenantID)]; ok {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // RemoveTenant erases an organization's plan and persists the removal before returning, like every other write

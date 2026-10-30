@@ -7,12 +7,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // The renewal window must match renewalDue() in cmd/edge/enroll_renew_endpoint.go and the macOS client
@@ -276,6 +279,68 @@ func TestPointerCarriesNoKeyMaterial(t *testing.T) {
 		if strings.Contains(string(raw), forbidden) {
 			t.Fatalf("the pointer file contains %q — it must hold references and metadata only", forbidden)
 		}
+	}
+}
+
+func TestRenewalPointerDoesNotWriteThroughAStaleFixedTempName(t *testing.T) {
+	dir := t.TempDir()
+	old := deviceIdentityPointer{CertificateSHA256: "old", CertFile: "old.crt", KeyFile: "old.key"}
+	if err := writeIdentityPointer(dir, old); err != nil {
+		t.Fatal(err)
+	}
+	// A fixed staging filename can be left behind by an interrupted writer. Writing directly into it also
+	// follows a symlink, corrupting a different file before the pointer's rename runs. The production writer
+	// must use a freshly created staging file in the same directory, never this predictable old name.
+	victim := filepath.Join(dir, "unrelated.key")
+	if err := os.WriteFile(victim, []byte("unchanged"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(dir, renewalPointerFile+".tmp")); err != nil {
+		t.Skipf("this host cannot create the stale staging symlink: %v", err)
+	}
+	newPointer := deviceIdentityPointer{CertificateSHA256: "new", CertFile: "new.crt", KeyFile: "new.key"}
+	if err := writeIdentityPointer(dir, newPointer); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "unchanged" {
+		t.Fatalf("renewal pointer writer changed another identity file: value=%q err=%v", got, err)
+	}
+	if got, err := readIdentityPointer(dir); err != nil || got.CertificateSHA256 != "new" {
+		t.Fatalf("renewed pointer was not published independently of the stale staging name: pointer=%+v err=%v", got, err)
+	}
+}
+
+func TestRenewalPointerReadbackClassifiesVisibleReplacement(t *testing.T) {
+	dir := t.TempDir()
+	pointer := deviceIdentityPointer{CertificateSHA256: "renewed", CertFile: "renewed.crt", KeyFile: "renewed.key"}
+	if err := writeIdentityPointer(dir, pointer); err != nil {
+		t.Fatal(err)
+	}
+	if !identityPointerReadbackMatches(dir, pointer) {
+		t.Fatal("a visible exact replacement was not recognized; post-replace errors could delete its key")
+	}
+	if visible, retain := classifyIdentityPointerWrite(dir, pointer, durablefile.ErrReplacedNotFlushed); !visible || !retain {
+		t.Fatal("post-publication flush failure would discard a visible pointer's key")
+	}
+	other := pointer
+	other.CertificateSHA256 = "different"
+	if identityPointerReadbackMatches(dir, other) {
+		t.Fatal("a different published identity was mistaken for this candidate")
+	}
+	if visible, retain := classifyIdentityPointerWrite(dir, other, durablefile.ErrReplacedNotFlushed); visible || !retain {
+		t.Fatal("ambiguous post-publication failure must retain material without adopting a different pointer")
+	}
+	if err := os.WriteFile(filepath.Join(dir, renewalPointerFile), []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if identityPointerReadbackMatches(dir, pointer) {
+		t.Fatal("an incomplete pointer was mistaken for the proven candidate")
+	}
+	if visible, retain := classifyIdentityPointerWrite(dir, pointer, durablefile.ErrReplacedNotFlushed); visible || !retain {
+		t.Fatal("unreadable post-publication pointer must preserve candidate material")
+	}
+	if visible, retain := classifyIdentityPointerWrite(dir, pointer, errors.New("staging failed")); visible || retain {
+		t.Fatal("a pre-publication write failure must not adopt or retain the uncommitted candidate")
 	}
 }
 

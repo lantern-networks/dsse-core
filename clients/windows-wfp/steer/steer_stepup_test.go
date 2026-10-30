@@ -130,6 +130,120 @@ func TestStepUp_NoOpWhenDisabledOrEmpty(t *testing.T) {
 	}
 }
 
+func TestStepUpOwnerIsolationValidationAndCapacity(t *testing.T) {
+	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	launched := make(chan stepUpOwner, 40)
+	c := newStepUpCoordinator(time.Minute, nil, nil)
+	c.now = clk.now
+	c.validate = func(url string) bool { return url == "https://trusted.example/request" }
+	c.launchForOwner = func(_, _ string, owner stepUpOwner) { launched <- owner }
+	owner := stepUpOwner{PID: 123, Session: 1, SID: "user-a", Created: 99}
+	if c.TriggerForOwner("app:22", "https://attacker.example", owner) || c.TriggerForOwner("app:22", "https://trusted.example/request", stepUpOwner{}) {
+		t.Fatal("untrusted destination or unattributed process opened a browser")
+	}
+	for i := 0; i < 32; i++ {
+		candidate := owner
+		candidate.Session = uint32(i + 1)
+		if !c.TriggerForOwner("app:22", "https://trusted.example/request", candidate) {
+			t.Fatal("another OS session incorrectly coalesced")
+		}
+		select {
+		case got := <-launched:
+			if got != candidate {
+				t.Fatal("launcher received another process owner")
+			}
+		case <-time.After(time.Second):
+			t.Fatal("launcher not called")
+		}
+	}
+	if c.TriggerForOwner("another:22", "https://trusted.example/request", owner) {
+		t.Fatal("unbounded prompt allocation")
+	}
+	clk.add(time.Minute)
+	if !c.TriggerForOwner("app:22", "https://trusted.example/request", owner) {
+		t.Fatal("expired prompts did not release capacity")
+	}
+}
+
+func TestStepUpExpiryBetweenFlowAndBrowserLaunch(t *testing.T) {
+	const portal = "https://trusted.example/clientless/auth/start?request_id=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	owner := stepUpOwner{PID: 123, Session: 1, SID: "user-a", Created: 99}
+	var checks atomic.Int32
+	launched := make(chan struct{}, 1)
+	refused := make(chan struct{}, 1)
+	c := newStepUpCoordinator(time.Minute, nil, func(format string, _ ...any) {
+		if strings.Contains(format, "invalid_before_browser_launch") {
+			refused <- struct{}{}
+		}
+	})
+	c.validate = func(string) bool { return checks.Add(1) == 1 }
+	c.launchForOwner = func(string, string, stepUpOwner) { launched <- struct{}{} }
+	if !c.TriggerForOwner("app:22", portal, owner) {
+		t.Fatal("the request should pass its first deadline check")
+	}
+	select {
+	case <-refused:
+	case <-time.After(time.Second):
+		t.Fatal("the delayed browser launch was not refused")
+	}
+	select {
+	case <-launched:
+		t.Fatal("an expired request opened a browser")
+	default:
+	}
+	c.mu.Lock()
+	remaining := len(c.requestIDs)
+	c.mu.Unlock()
+	if remaining != 0 {
+		t.Fatal("the expired request remained available for result recovery")
+	}
+	// A fresh request for the same resource must not be suppressed by the
+	// aborted browser launch's prompt-coalescing window.
+	c.validate = func(string) bool { return true }
+	if !c.TriggerForOwner("app:22", portal, owner) {
+		t.Fatal("the aborted launch suppressed a fresh request")
+	}
+	select {
+	case <-launched:
+	case <-time.After(time.Second):
+		t.Fatal("the fresh request did not launch")
+	}
+}
+
+func TestStepUpBrowserLaunchIsBoundedFromReceipt(t *testing.T) {
+	var ticks atomic.Int32
+	base := time.Now()
+	refused := make(chan struct{}, 1)
+	launched := make(chan struct{}, 1)
+	c := newStepUpCoordinator(time.Minute, nil, func(format string, _ ...any) {
+		if strings.Contains(format, "invalid_before_browser_launch") {
+			refused <- struct{}{}
+		}
+	})
+	c.now = func() time.Time {
+		if ticks.Add(1) == 1 {
+			return base
+		}
+		return base.Add(120 * time.Second)
+	}
+	c.validate = func(string) bool { return true } // e.g. server and client clocks differ
+	c.launchForOwner = func(string, string, stepUpOwner) { launched <- struct{}{} }
+	owner := stepUpOwner{PID: 123, Session: 1, SID: "user-a"}
+	if !c.TriggerForOwner("app:22", "https://trusted.example/request", owner) {
+		t.Fatal("request was not admitted")
+	}
+	select {
+	case <-refused:
+	case <-time.After(time.Second):
+		t.Fatal("delayed launch was not refused")
+	}
+	select {
+	case <-launched:
+		t.Fatal("a request older than its local 120-second window opened a browser")
+	default:
+	}
+}
+
 // TestReadCONNECTStatus_CapturesStepUpHeader proves the agent recovers X-Dsse-Stepup-Url off a 401 CONNECT
 // response (previously the header was drained and discarded) and leaves the reader at the body.
 func TestReadCONNECTStatus_CapturesStepUpHeader(t *testing.T) {

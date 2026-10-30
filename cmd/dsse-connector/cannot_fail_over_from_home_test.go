@@ -57,9 +57,10 @@ func TestGoingHomeIsNotEvidenceAgainstHome(t *testing.T) {
 		t.Fatal("setup: the connector should be away from home")
 	}
 
+	oldSelection := doors.selection()
 	doors.resetToPreferred() // the home watch decides to go back
 	// The tunnel it was holding now ends, because going home ended it. That must not move it again.
-	doors.advance(errors.New("use of closed network connection"))
+	doors.advanceIfSelected(oldSelection, errors.New("use of closed network connection"))
 	if !doors.atPreferred() {
 		t.Fatal("the connector left home again on a tunnel it ended itself — the loop that was measured")
 	}

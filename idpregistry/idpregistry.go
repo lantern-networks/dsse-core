@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 )
@@ -25,24 +26,34 @@ var validDomainMode = map[string]bool{"google_hd": true, "email_domain": true}
 
 // Connection is one tenant's trusted end-user IdP: its OIDC transport coordinates, how its tokens' assurance
 // and identity claims are read, and which email domains it is allowed to assert (anti-cross-tenant).
+// DeviceUserBinding is authored by the tenant administrator, never learned from
+// a browser callback or endpoint-reported display name. Subject is OIDC sub.
+type DeviceUserBinding struct {
+	Revision    string `json:"revision"` // server-assigned; rotates on reassignment or removal/recreation
+	DeviceID    string `json:"device_id"`
+	OSPrincipal string `json:"os_principal"`
+	Subject     string `json:"subject"`
+}
+
 type Connection struct {
-	IdPID                 string   `json:"idp_id"`
-	TenantID              string   `json:"tenant_id"`
-	Type                  string   `json:"type"` // entra | google | okta | oidc
-	DisplayName           string   `json:"display_name,omitempty"`
-	Issuer                string   `json:"issuer"`
-	JWKSURI               string   `json:"jwks_uri,omitempty"`
-	AuthorizationEndpoint string   `json:"authorization_endpoint"`
-	TokenEndpoint         string   `json:"token_endpoint,omitempty"`
-	ClientID              string   `json:"client_id"`
-	ClientSecret          string   `json:"client_secret,omitempty"` // RP secret; the admin API redacts it on read
-	UsePKCE               bool     `json:"use_pkce,omitempty"`
-	GroupsClaim           string   `json:"groups_claim,omitempty"`
-	ACRClaim              string   `json:"acr_claim,omitempty"`           // default "acr"
-	AMRClaim              string   `json:"amr_claim,omitempty"`           // default "amr"
-	HostedDomainClaim     string   `json:"hosted_domain_claim,omitempty"` // google "hd"
-	VerifiedDomains       []string `json:"verified_domains,omitempty"`    // anti-cross-tenant: identity domain must be one of these
-	DomainMode            string   `json:"domain_mode,omitempty"`         // google_hd | email_domain
+	DeviceUserBindings    []DeviceUserBinding `json:"device_user_bindings,omitempty"`
+	IdPID                 string              `json:"idp_id"`
+	TenantID              string              `json:"tenant_id"`
+	Type                  string              `json:"type"` // entra | google | okta | oidc
+	DisplayName           string              `json:"display_name,omitempty"`
+	Issuer                string              `json:"issuer"`
+	JWKSURI               string              `json:"jwks_uri,omitempty"`
+	AuthorizationEndpoint string              `json:"authorization_endpoint"`
+	TokenEndpoint         string              `json:"token_endpoint,omitempty"`
+	ClientID              string              `json:"client_id"`
+	ClientSecret          string              `json:"client_secret,omitempty"` // RP secret; the admin API redacts it on read
+	UsePKCE               bool                `json:"use_pkce,omitempty"`
+	GroupsClaim           string              `json:"groups_claim,omitempty"`
+	ACRClaim              string              `json:"acr_claim,omitempty"`           // default "acr"
+	AMRClaim              string              `json:"amr_claim,omitempty"`           // default "amr"
+	HostedDomainClaim     string              `json:"hosted_domain_claim,omitempty"` // google "hd"
+	VerifiedDomains       []string            `json:"verified_domains,omitempty"`    // anti-cross-tenant: identity domain must be one of these
+	DomainMode            string              `json:"domain_mode,omitempty"`         // google_hd | email_domain
 	// CAPEM is the authority that issues this identity provider's TLS certificate, for a provider the public
 	// web does not vouch for.
 	//
@@ -61,6 +72,7 @@ type Connection struct {
 func (c Connection) Redacted() Connection {
 	c.ClientSecret = ""
 	c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+	c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 	return c
 }
 
@@ -105,6 +117,10 @@ func normalize(c Connection) (Connection, error) {
 	if !validDomainMode[c.DomainMode] {
 		return Connection{}, fmt.Errorf("domain_mode %q is invalid (want google_hd|email_domain)", c.DomainMode)
 	}
+	if err := validateDeviceUserBindings(c.DeviceUserBindings); err != nil {
+		return Connection{}, err
+	}
+	c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 	c.VerifiedDomains = normalizedDomains(c.VerifiedDomains)
 	return c, nil
 }
@@ -113,6 +129,11 @@ func normalize(c Connection) (Connection, error) {
 // use; persists to a JSON state path when configured (see persistence.go) so registered IdPs survive a
 // restart.
 type Store struct {
+	// restart-durability: ephemeral — coalesces authority reads only; never persists authorization.
+	// populated-by: side_effect — ResolveForAuthorization refreshes at most once per polling interval.
+	authReadMu     sync.Mutex
+	authReadAt     time.Time
+	authReadErr    error
 	appliedDomains atomic.Pointer[map[string][]string]
 	mu             sync.RWMutex
 	connections    map[string]map[string]Connection // tenant -> idp_id -> connection
@@ -148,6 +169,7 @@ func NewStore() *Store {
 
 // Upsert validates and stores a connection. The first connection registered for a tenant becomes its default.
 func (s *Store) upsertLocal(c Connection) (Connection, error) {
+	bindingsProvided := c.DeviceUserBindings != nil
 	normalized, err := normalize(c)
 	if err != nil {
 		return Connection{}, err
@@ -178,6 +200,12 @@ func (s *Store) upsertLocal(c Connection) (Connection, error) {
 			normalized.ClientSecret = existing.ClientSecret
 		}
 	}
+	if !bindingsProvided {
+		normalized.DeviceUserBindings = append([]DeviceUserBinding(nil), s.connections[normalized.TenantID][normalized.IdPID].DeviceUserBindings...)
+	}
+	if err := renewDeviceUserBindings(&normalized, s.connections[normalized.TenantID][normalized.IdPID]); err != nil {
+		return Connection{}, err
+	}
 	candidate.Connections[normalized.TenantID][normalized.IdPID] = normalized
 	if strings.TrimSpace(candidate.Defaults[normalized.TenantID]) == "" {
 		candidate.Defaults[normalized.TenantID] = normalized.IdPID
@@ -188,6 +216,7 @@ func (s *Store) upsertLocal(c Connection) (Connection, error) {
 	s.connections, s.defaults = candidate.Connections, candidate.Defaults
 	s.generation++
 	normalized.VerifiedDomains = append([]string(nil), normalized.VerifiedDomains...)
+	normalized.DeviceUserBindings = append([]DeviceUserBinding(nil), normalized.DeviceUserBindings...)
 	return normalized, nil
 }
 
@@ -200,6 +229,7 @@ func (s *Store) Get(tenantID, idpID string) (Connection, bool) {
 	defer s.mu.RUnlock()
 	c, ok := s.connections[strings.TrimSpace(tenantID)][strings.TrimSpace(idpID)]
 	c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+	c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 	return c, ok
 }
 
@@ -213,6 +243,7 @@ func (s *Store) List(tenantID string) []Connection {
 	out := make([]Connection, 0, len(s.connections[strings.TrimSpace(tenantID)]))
 	for _, c := range s.connections[strings.TrimSpace(tenantID)] {
 		c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+		c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].IdPID < out[j].IdPID })
@@ -277,6 +308,7 @@ func (s *Store) Default(tenantID string) (Connection, bool) {
 	}
 	c, ok := s.connections[strings.TrimSpace(tenantID)][id]
 	c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+	c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 	return c, ok
 }
 
@@ -386,6 +418,7 @@ func (s *Store) ListAll() []Connection {
 	for _, byTenant := range s.connections {
 		for _, c := range byTenant {
 			c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+			c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 			out = append(out, c)
 		}
 	}
@@ -440,6 +473,7 @@ func (s *Store) ReplaceAllChecked(conns []Connection, defaults map[string]string
 			return fmt.Errorf("duplicate identity provider connection")
 		}
 		c.VerifiedDomains = append([]string(nil), c.VerifiedDomains...)
+		c.DeviceUserBindings = append([]DeviceUserBinding(nil), c.DeviceUserBindings...)
 		next.Connections[c.TenantID][c.IdPID] = c
 	}
 	for tenant, id := range defaults {

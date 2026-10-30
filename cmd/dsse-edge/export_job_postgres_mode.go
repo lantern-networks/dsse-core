@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -41,7 +40,7 @@ func setupEdgeAdminExportJobStore(ctx context.Context, config edgeAdminExportJob
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("admin-export-job-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -86,7 +85,7 @@ func setupEdgeAdminExportWorker(ctx context.Context, config edgeAdminExportWorke
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("admin-export-queue-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

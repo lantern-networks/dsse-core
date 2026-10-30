@@ -96,9 +96,11 @@ var adminTenantFootprintPostgresTables = []string{
 	// the other half of what this node tells the fleet about a terminated tenant, and dropping it before the
 	// rest of the erasure has succeeded leaves nodes that have not caught up with nothing to act on.
 	"admin_tenant_model_purge_orders",
+	"auth_flow_results",
 	"agent_status_events",
 	"agent_update_events",
 	"application_catalog",
+	"application_catalog_legacy_imports",
 	"config_versions",
 	"connector_registrations",
 	"device_inventory",
@@ -108,6 +110,7 @@ var adminTenantFootprintPostgresTables = []string{
 	"export_worker_task_dead_letters",
 	"export_worker_tasks",
 	"hot_events",
+	"manual_hot_log_delete_jobs",
 	"human_identities",
 	"human_identity_source_policies",
 	"human_identity_source_states",
@@ -339,9 +342,14 @@ func tenantModelFleetCarryingTable(table string) bool {
 // passes them here. On the erasure path they MUST be captured before the ledger is cleared.
 type adminTenantExtraStores struct {
 	AssetCatalog       *assetcatalog.Store
+	DLP                *dlpConfigStores
 	TenantRestrictions interface {
 		CountTenantRestrictions(string) int
 		RemoveTenantRestrictionsContext(context.Context, string) (int, error)
+	}
+	UpstreamTLS interface {
+		CountUpstreamTLSSettings(string) int
+		RemoveUpstreamTLSSettingsContext(context.Context, string) (int, error)
 	}
 	TenantTrustDistributions *tenantTrustDistributor
 	DelegatedGrants          *delegatedgrant.Store
@@ -380,6 +388,47 @@ type adminTenantExtraStores struct {
 	DeviceIDs             []string
 }
 
+type tenantDLPErasureStore interface {
+	CountForTenant(string) int
+	RemoveTenantContext(context.Context, string) (int, error)
+	RefreshShared() error
+}
+
+type tenantDLPErasureRow struct {
+	name  string
+	store tenantDLPErasureStore
+}
+
+func (e adminTenantExtraStores) dlpErasureRows() []tenantDLPErasureRow {
+	rows := []tenantDLPErasureRow{
+		// Remove references before their classifier/EDM definitions. Every
+		// intermediate signed bundle remains valid during a multi-store purge.
+		{name: "dlp_policy_objects"},
+		{name: "dlp_rules"},
+		{name: "dlp_classifiers"},
+		{name: "dlp_fingerprints"},
+		{name: "dlp_allowlist"},
+	}
+	if e.DLP != nil {
+		if e.DLP.policies != nil {
+			rows[0].store = e.DLP.policies
+		}
+		if e.DLP.rules != nil {
+			rows[1].store = e.DLP.rules
+		}
+		if e.DLP.classifiers != nil {
+			rows[2].store = e.DLP.classifiers
+		}
+		if e.DLP.fingerprints != nil {
+			rows[3].store = e.DLP.fingerprints
+		}
+		if e.DLP.allowlist != nil {
+			rows[4].store = e.DLP.allowlist
+		}
+	}
+	return rows
+}
+
 func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 	add := func(store string, present bool, n int, absent string) {
 		if !present {
@@ -395,6 +444,17 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 	} else {
 		f.add(adminTenantFootprintRow{Store: "asset_catalog_records", Count: int64(n), Note: "authored objects and alias metadata; excludes built-ins and inventory-derived endpoints"})
 	}
+	for _, row := range e.dlpErasureRows() {
+		if row.store == nil {
+			f.NotCounted = append(f.NotCounted, row.name+" (no DLP store on this node)")
+			continue
+		}
+		if err := row.store.RefreshShared(); err != nil {
+			f.add(adminTenantFootprintRow{Store: row.name, Count: -1, Error: "DLP state is unavailable"})
+			continue
+		}
+		f.add(adminTenantFootprintRow{Store: row.name, Count: int64(row.store.CountForTenant(f.TenantID))})
+	}
 	add("delegated_access_grants", e.DelegatedGrants != nil, e.DelegatedGrants.CountForTenant(f.TenantID), "no delegated-grant store on this node")
 	add("human_approvals", e.HumanApprovals != nil, e.HumanApprovals.CountForTenant(f.TenantID), "no human-approval store on this node")
 	add("clientless_grants", e.ClientlessGrants != nil, e.ClientlessGrants.CountForTenant(f.TenantID), "no clientless grant store on this node")
@@ -407,6 +467,11 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 		add("saas_tenant_restrictions", true, e.TenantRestrictions.CountTenantRestrictions(f.TenantID), "")
 	} else {
 		add("saas_tenant_restrictions", false, 0, "no managed SaaS configuration on this node")
+	}
+	if e.UpstreamTLS != nil {
+		add("upstream_tls_settings", true, e.UpstreamTLS.CountUpstreamTLSSettings(f.TenantID), "")
+	} else {
+		add("upstream_tls_settings", false, 0, "no upstream TLS settings on this node")
 	}
 	add("seat_allocation", e.SeatAllocations != nil, e.SeatAllocations.CountForTenant(f.TenantID), "no seat allocation store on this node")
 	if e.PolicyCandidates == nil {
@@ -431,8 +496,13 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 	}
 	add("tenant_interception_authorities", e.TenantInterceptionAuthorities != nil,
 		e.TenantInterceptionAuthorities.CountForTenant(f.TenantID), "no organization has delegated interception to this node")
-	add("agent_rollout_plans", e.AgentRolloutPlans != nil, e.AgentRolloutPlans.CountForTenant(f.TenantID),
-		"no agent rollout store on this node")
+	if e.AgentRolloutPlans == nil {
+		add("agent_rollout_plans", false, 0, "no agent rollout store on this node")
+	} else if n, err := e.AgentRolloutPlans.CountForTenantChecked(f.TenantID); err != nil {
+		f.add(adminTenantFootprintRow{Store: "agent_rollout_plans", Count: -1, Error: "agent rollout state is unavailable"})
+	} else {
+		add("agent_rollout_plans", true, n, "")
+	}
 	add("published_agent_releases", e.PublishedAgentUpdates != nil, e.PublishedAgentUpdates.CountForTenant(f.TenantID),
 		"no published-release store on this node")
 }
@@ -458,6 +528,25 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 	}
 
 	tenantID := result.TenantID
+	dlpReferencesCleared := true
+	for _, row := range e.dlpErasureRows() {
+		if row.store == nil {
+			continue
+		}
+		if !dlpReferencesCleared && (row.name == "dlp_classifiers" || row.name == "dlp_fingerprints") {
+			result.Failures = append(result.Failures, row.name+": retained because DLP references could not be erased")
+			continue
+		}
+		n, err := row.store.RemoveTenantContext(ctx, tenantID)
+		if err != nil {
+			result.Failures = append(result.Failures, row.name+": erasure saving could not be confirmed")
+			if row.name == "dlp_policy_objects" || row.name == "dlp_rules" {
+				dlpReferencesCleared = false
+			}
+			continue
+		}
+		add(row.name, n)
+	}
 	if e.AssetCatalog != nil {
 		eraseChecked("asset_catalog_records", func(id string) (int, error) { return e.AssetCatalog.RemoveTenantContext(ctx, id) })
 	}
@@ -468,6 +557,9 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		} else {
 			add("saas_tenant_restrictions", n)
 		}
+	}
+	if e.UpstreamTLS != nil {
+		eraseChecked("upstream_tls_settings", func(id string) (int, error) { return e.UpstreamTLS.RemoveUpstreamTLSSettingsContext(ctx, id) })
 	}
 	if e.DelegatedGrants != nil {
 		eraseChecked("delegated_access_grants", func(tenant string) (int, error) { return e.DelegatedGrants.RemoveTenantContext(ctx, tenant) })
@@ -576,7 +668,7 @@ func tenantExtraStoresFor(base adminTenantExtraStores, ledger *enrolledinventory
 		seen[id] = true
 	}
 	for _, entry := range ledger.Authoritative() {
-		if strings.EqualFold(strings.TrimSpace(entry.TenantID), strings.TrimSpace(tenantID)) && !seen[entry.Identity] {
+		if strings.TrimSpace(entry.TenantID) == strings.TrimSpace(tenantID) && !seen[entry.Identity] {
 			base.DeviceIDs = append(base.DeviceIDs, entry.Identity)
 			seen[entry.Identity] = true
 		}

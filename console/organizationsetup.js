@@ -149,7 +149,9 @@ async function organizationSetupMerged(tenantId) {
     try {
       // Named per call, so filling a list of organizations cannot leave the console pointed at one of them.
       const r = await apiFetch("GET", "/admin/organization-setup", undefined, plane, undefined, tenantId);
-      return r.ok ? r.body : null;
+      // The selector may be ignored for a caller without cross-tenant rights. Check EACH plane before
+      // merging: a matching control answer must not launder another tenant's Edge facts into this row.
+      return r.ok && r.body && r.body.tenant_id === tenantId && Array.isArray(r.body.items) ? r.body : null;
     } catch (e) { return null; }
   };
   const [edge, control] = await Promise.all([ask("edge"), ask("control")]);

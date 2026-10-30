@@ -36,7 +36,7 @@ func TestPostgresAgentTelemetryMigrationMatchesSchemaSQL(t *testing.T) {
 // touches these tables must be selected. A new one is a test failure until it is listed.
 func TestPostgresAgentTelemetryMigrationVersions(t *testing.T) {
 	got := postgresAgentTelemetryMigrationVersions()
-	if want := []string{"019", "033", "034"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"019", "033", "034", "059"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("agent telemetry versions = %#v, want %#v", got, want)
 	}
 	// And every one of them must exist on disk: a version listed here with no file would fail at startup on a

@@ -35,7 +35,9 @@ type regionFailoverActions struct {
 	// other regions (the engine already refuses to). Idempotent.
 	surfaceDenied func(reason string)
 	// connectedOK is invoked when the agent is (re)connected to a healthy region — announce/clear a prior deny.
-	connectedOK func(ep regionfailover.RegionEndpoint)
+	// It returns false if the local steering rearm failed. The driver then retries this action on the next
+	// healthy tick without repeating the endpoint switch.
+	connectedOK func(ep regionfailover.RegionEndpoint) bool
 }
 
 // regionFailoverOptions configures the driver's I/O cadence and the signed list source.
@@ -74,10 +76,16 @@ type regionFailover struct {
 	mu      sync.Mutex // guards allowed (refresh goroutine vs. control loop read)
 	allowed []regionfailover.RegionEndpoint
 
-	lastState  regionfailover.State
-	lastRegion string
-	haveState  bool
-	heldLogKey string // dedup: (region|kind) of the last-logged hold; a change (region OR benign->admission-deny) re-logs
+	lastState          regionfailover.State
+	lastRegion         string
+	lastEndpoint       string
+	haveState          bool
+	heldLogKey         string // dedup: (door|kind) of the last-logged hold
+	pendingConnectedOK bool
+}
+
+func probedEndpointKey(ep regionfailover.RegionEndpoint) string {
+	return strings.ToLower(strings.TrimSpace(ep.Region)) + "\x00" + strings.TrimSpace(ep.Endpoint)
 }
 
 func newRegionFailover(seed []regionfailover.RegionEndpoint, home string, probeOne regionfailover.Probe, actions regionFailoverActions, opts regionFailoverOptions) *regionFailover {
@@ -133,7 +141,10 @@ func (r *regionFailover) run(ctx context.Context, failureEvent <-chan struct{}, 
 		case <-health.C:
 			r.evaluateOnce(ctx)
 		case <-failureEvent:
-			// A live transport failure — re-evaluate now rather than waiting for the next tick (fast failover).
+			// A live mux socket failed. Probe before any switch; if the current endpoint is still
+			// healthy Evaluate resets the strike. Otherwise avoid waiting for two more periodic
+			// rounds while new application connections queue behind a dead entrance.
+			r.sel.ExpediteAfterTransportLoss()
 			r.evaluateOnce(ctx)
 		case <-list.C:
 			r.refreshList(ctx)
@@ -185,7 +196,7 @@ func (r *regionFailover) refreshList(ctx context.Context) {
 				"so failing over no longer changes which name is sent", p.TransportServerName)
 		}
 	}
-	r.opts.logf("region_failover: allowed regions refreshed: %d region(s), home=%q", len(next), p.HomeRegion)
+	r.opts.logf("region_failover: allowed endpoints refreshed: %d door(s), home=%q", len(next), p.HomeRegion)
 }
 
 // evaluateOnce probes the allowed regions (in parallel, bounded) and acts on the engine's decision.
@@ -194,7 +205,7 @@ func (r *regionFailover) evaluateOnce(ctx context.Context) {
 	dec := r.sel.Evaluate(func(ep regionfailover.RegionEndpoint) regionfailover.Health {
 		// The engine iterates its own (identical) allowed set; we serve the pre-measured result. A missing entry
 		// (should not happen) reads as the zero Health = unreachable, which is the safe (fail-closed) default.
-		return results[ep.Region]
+		return results[probedEndpointKey(ep)]
 	})
 	r.act(dec)
 }
@@ -224,7 +235,7 @@ func (r *regionFailover) probeAll(ctx context.Context) map[string]regionfailover
 			defer func() { <-sem }()
 			h := r.probeOne(ep)
 			mu.Lock()
-			results[ep.Region] = h
+			results[probedEndpointKey(ep)] = h
 			mu.Unlock()
 		}(ep)
 	}
@@ -242,13 +253,13 @@ func (r *regionFailover) act(dec regionfailover.Decision) {
 		// steering through this region until the kill-switch takes effect). The Edge still denies this device
 		// independently per connection. See docs/2026-07-26_region_failover_hysteresis_accepted_risk.ja.md.
 		if dec.Held {
-			// Dedup on (region|kind): log once per entry, but ALWAYS re-log when the region changes or a benign
+			// Dedup on (door|kind): log once per entry, but ALWAYS re-log when the endpoint changes or a benign
 			// unreachable hold ESCALATES to an admission-deny (revocation) — a single bool would swallow that.
 			kind := "unreach"
 			if dec.HeldAdmissionDenied {
 				kind = "denied"
 			}
-			key := dec.Current.Region + "|" + kind
+			key := probedEndpointKey(dec.Current) + "|" + kind
 			if key != r.heldLogKey {
 				if dec.HeldAdmissionDenied {
 					secs := int(r.opts.healthTick.Seconds()) * dec.HeldRoundsRemaining
@@ -266,7 +277,7 @@ func (r *regionFailover) act(dec regionfailover.Decision) {
 		} else {
 			r.heldLogKey = "" // healthy again -> allow the next distinct hold to log
 		}
-		regionChanged := !r.haveState || dec.Current.Region != r.lastRegion
+		regionChanged := !r.haveState || dec.Current.Region != r.lastRegion || dec.Current.Endpoint != r.lastEndpoint
 		if regionChanged {
 			if err := r.actions.switchTo(dec.Current); err != nil {
 				// Could not make the new endpoint live. Do NOT bypass; keep state so we retry next round. Dials to
@@ -276,22 +287,24 @@ func (r *regionFailover) act(dec regionfailover.Decision) {
 			}
 			r.opts.logf("region_failover: steering through region %q (%s) — %s", dec.Current.Region, dec.Current.Endpoint, dec.Reason)
 		}
-		if r.lastState != regionfailover.StateConnected || regionChanged {
-			r.actions.connectedOK(dec.Current)
+		if r.lastState != regionfailover.StateConnected || regionChanged || r.pendingConnectedOK {
+			r.pendingConnectedOK = r.actions.connectedOK != nil && !r.actions.connectedOK(dec.Current)
 		}
-		r.lastState, r.lastRegion, r.haveState = regionfailover.StateConnected, dec.Current.Region, true
+		r.lastState, r.lastRegion, r.lastEndpoint, r.haveState = regionfailover.StateConnected, dec.Current.Region, dec.Current.Endpoint, true
 	case regionfailover.StateFailClosed:
+		r.pendingConnectedOK = false
 		if !r.haveState || r.lastState != regionfailover.StateFailClosed {
 			r.opts.logf("region_failover: FAIL-CLOSED — %s", dec.Reason)
 			r.actions.failClosed(dec.Reason)
 		}
-		r.lastState, r.lastRegion, r.haveState = regionfailover.StateFailClosed, "", true
+		r.lastState, r.lastRegion, r.lastEndpoint, r.haveState = regionfailover.StateFailClosed, "", "", true
 	case regionfailover.StateDenied:
+		r.pendingConnectedOK = false
 		if !r.haveState || r.lastState != regionfailover.StateDenied {
 			r.opts.logf("region_failover: DENIED — %s", dec.Reason)
 			r.actions.surfaceDenied(dec.Reason)
 		}
-		r.lastState, r.lastRegion, r.haveState = regionfailover.StateDenied, "", true
+		r.lastState, r.lastRegion, r.lastEndpoint, r.haveState = regionfailover.StateDenied, "", "", true
 	}
 }
 

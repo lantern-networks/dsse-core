@@ -12,7 +12,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 
 	idpregistry "github.com/lantern-networks/dsse-core/idpregistry"
@@ -27,10 +30,11 @@ type AuthorizeParams struct {
 	CodeChallenge string // PKCE S256 challenge (base64url of sha256(code_verifier))
 	LoginHint     string // optional login_hint (e.g. the user's email)
 	// ACRValues requests a stronger authentication context from the SAME IdP (OIDC step-up / RFC 9470): the
-	// IdP re-prompts for the requested assurance (e.g. phishing-resistant MFA) and returns a token with that
-	// acr. This is how one corporate IdP serves both normal auth AND step-up — no second IdP needed. The
-	// value is the IdP's acr identifier(s) (e.g. an Entra Authentication-Strength id, an Okta loa URN).
-	ACRValues string
+	// IdP must support the configured value; requesting a value is not proof that it was satisfied.
+	// Entra uses an authentication context in the acrs claim, not an Authentication Strength ID.
+	ACRValues     string
+	MaxAgeSeconds *int64   // nil omits max_age; zero requests active reauthentication
+	RequiredAMR   []string // request signed method information; validation still enforces every method
 }
 
 // AuthorizeURL builds the OIDC authorization-code + PKCE redirect to the connection's authorization endpoint.
@@ -55,8 +59,25 @@ func AuthorizeURL(conn idpregistry.Connection, p AuthorizeParams) string {
 	if strings.TrimSpace(p.LoginHint) != "" {
 		q.Set("login_hint", strings.TrimSpace(p.LoginHint))
 	}
-	if strings.TrimSpace(p.ACRValues) != "" {
+	if strings.TrimSpace(p.ACRValues) != "" && conn.Type != "entra" {
 		q.Set("acr_values", strings.TrimSpace(p.ACRValues)) // OIDC step-up: ask the SAME IdP for a stronger context
+	}
+	if p.MaxAgeSeconds != nil && conn.Type != "google" {
+		q.Set("max_age", strconv.FormatInt(*p.MaxAgeSeconds, 10))
+	}
+	claims := map[string]any{}
+	if conn.Type == "entra" && strings.TrimSpace(p.ACRValues) != "" {
+		claims["acrs"] = map[string]any{"essential": true, "value": strings.TrimSpace(p.ACRValues)}
+	}
+	if p.MaxAgeSeconds != nil {
+		claims["auth_time"] = map[string]any{"essential": true}
+	}
+	if len(p.RequiredAMR) > 0 {
+		claims[firstNonBlank(conn.AMRClaim, "amr")] = map[string]any{"essential": true}
+	}
+	if len(claims) > 0 {
+		encoded, _ := json.Marshal(map[string]any{"id_token": claims})
+		q.Set("claims", string(encoded))
 	}
 	// Google enforces the hosted domain at the IdP too when hd is hinted.
 	if conn.DomainMode == "google_hd" && len(conn.VerifiedDomains) == 1 {
@@ -106,4 +127,29 @@ func randomURLToken(nbytes int) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// ValidateAuthorizeParams rejects requirements the selected request mechanism cannot express.
+// This is a safety gate, not a declaration of full provider compatibility.
+func ValidateAuthorizeParams(conn idpregistry.Connection, p AuthorizeParams) error {
+	if p.MaxAgeSeconds != nil && (*p.MaxAgeSeconds < 0 || *p.MaxAgeSeconds > 86400) {
+		return fmt.Errorf("invalid maximum authentication age")
+	}
+	if conn.Type == "google" && (strings.TrimSpace(p.ACRValues) != "" || (p.MaxAgeSeconds != nil && *p.MaxAgeSeconds == 0)) {
+		return fmt.Errorf("Google does not support requesting account reauthentication or an ACR; an additional verified authentication method is required")
+	}
+	// A positive Google age bound can be verified against a returned auth_time,
+	// but cannot force Google to refresh it. Missing/stale claims still fail token
+	// validation; do not send an unsupported max_age or loop ordinary SSO.
+	if conn.Type == "entra" && p.ACRValues != "" {
+		// Contexts are tenant-authored c1..c99. Their CA policy meaning must be configured by the operator.
+		n, err := strconv.Atoi(strings.TrimPrefix(p.ACRValues, "c"))
+		if err != nil || n < 1 || n > 99 || p.ACRValues != "c"+strconv.Itoa(n) {
+			return fmt.Errorf("Entra requires a tenant authentication context c1..c99")
+		}
+		if conn.ACRClaim != "" && conn.ACRClaim != "acrs" {
+			return fmt.Errorf("Entra authentication contexts must be validated using acrs")
+		}
+	}
+	return nil
 }

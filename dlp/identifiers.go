@@ -5,7 +5,8 @@
 //
 // The engine is anchor-based (a format match, then a validator: My Number mod-11, Corporate Number mod-9,
 // credit-card Luhn, API-key prefix) so false positives stay low, and it is streaming (DetectStream, see
-// detect.go) so a body of any size is inspectable at constant memory. It has no I/O and no real PII — every
+// detect.go) so a body of any size is inspectable without a body-size quota. An unfinished email uses
+// incremental matching; GuardReader encrypts pending bytes in a private temporary file. It logs no PII — every
 // test vector is a synthetic, checksum-valid value that corresponds to no real person or entity — so it lives
 // in the OSS-core (dsse-core) tree alongside oss/knownbypass. See docs/dlp_minimal_design.md.
 package dlp
@@ -61,8 +62,8 @@ var (
 			`|-----BEGIN [A-Z ]{0,32}PRIVATE KEY-----` + // PEM private-key header
 			`|eyJ[0-9A-Za-z_\-]{10,1000}\.eyJ[0-9A-Za-z_\-]{10,1000}\.[0-9A-Za-z_\-]{10,1000}`) // JWT
 
-	// emailRE matches an email address. Gated behind a cheap '@' pre-check (hasEmailCandidate). The TLD is 2–24
-	// letters so random "a@b" noise (no dotted TLD) does not match. Bounded well under windowSize.
+	// emailRE is the buffered reference expression. Streaming inspection implements its byte-level semantics
+	// incrementally. The TLD is 2–24 letters, but the number of dotted labels is unbounded.
 	emailRE = regexp.MustCompile(`[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,62}\.)+[A-Za-z]{2,24}`)
 
 	// phoneJPRE matches a Japanese mobile number: 070/080/090 then 4+4 digits, optionally hyphen/space separated

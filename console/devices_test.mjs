@@ -59,7 +59,12 @@ function fixture() {
     rows.set(id, {row, primary, overflow, unrelated}); return row;
   };
   addRow(identity); addRow(otherDevice.identity);
-  const context = vm.createContext({el, document: {body}, bl: value => value.en,
+  const context = vm.createContext({el, document: {body, addEventListener() {}, removeEventListener() {}}, bl: value => value.en,
+    deviceKey: value => String(value).toLowerCase(),
+    uiBadge: text => el('span', {text}),
+    riskRank: value => ['none','medium','high','critical'].indexOf(value),
+    riskMax: (a,b) => ['none','medium','high','critical'].indexOf(a) >= ['none','medium','high','critical'].indexOf(b) ? a : b,
+    setTimeout: fn => fn(),
     uiState: (host, state, message, retry) => states.push({state,message,retry}),
     freshRender: host => { const seq=host.renderSequence=(host.renderSequence||0)+1; return ()=>host.renderSequence===seq; },
     apiFetch: async (...args) => { calls.push(args); return responseFor(...args); },
@@ -403,6 +408,16 @@ test('device status derives from both admission gates and takes precedence over 
   assert.equal(f.context.deviceIsBlocked(rows[4]),false);
 });
 
+test('unknown admission does not erase independently reported steering', () => {
+  const f=fixture();
+  const d={...f.context.deviceInventoryRows(inventoryAnswer(),'tenant-a')[4],transport_known:false};
+  const st=f.context.deviceStateOf(d,null,{steer_active:true,edge:'edge-a'},'none',true);
+  assert.equal(st.steering,true);
+  assert.equal(st.pill.text,'Steering');
+  assert.ok(st.signals.some(signal=>signal.text==='admission unknown'));
+  assert.equal(f.context.deviceIsBlocked(d),false);
+});
+
 test('malformed or wrong-tenant admission reads never become a known unblocked list', () => {
   const f = fixture();
   for (const patch of [{schema_version:'unknown'}, {tenant_id:'tenant-b'}, {revoked_identities:null},
@@ -449,19 +464,27 @@ test('inventory may omit the zero unassigned count as specified by the API', () 
 });
 
 
-test('required connection reads fail visibly without fetching optional telemetry or sending writes', async () => {
+test('unavailable connection status preserves verified inventory but disables admission actions', async () => {
   for (const response of [{ok:false,status:503}, {ok:true,body:{}}, new Error('network lost'), new TypeError('Failed to fetch'), new TypeError('Load failed'), new TypeError('NetworkError when attempting to fetch resource.'), new TypeError('unexpected programming error')]) {
     const f=fixture();f.invokeWith((method,path)=>{
       assert.equal(method,'GET');
       if(path==='/admin/enrolled-devices')return {ok:true,body:inventoryAnswer()};
-      assert.equal(path,'/admin/transport-admission?expected_tenant_id=tenant-a');
-      if(response instanceof Error)throw response;return response;
+      if(path==='/admin/transport-admission?expected_tenant_id=tenant-a') {
+        if(response instanceof Error)throw response;return response;
+      }
+      return {ok:false,status:503};
     });
-    await f.actualRenderList(f.host);assert.equal(f.calls.length,2);
-    assert.deepEqual(f.states.map(s=>s.state),['loading','error']);
-    if(response instanceof TypeError && response.message !== 'unexpected programming error') {
-      assert.equal(f.states[1].message,'Cannot reach the management server. Check your connection, then retry.');
-    } else if(response instanceof Error) assert.equal(f.states[1].message,String(response));
+    await f.actualRenderList(f.host);
+    assert.deepEqual(f.states.map(s=>s.state),['loading']);
+    assert.match(f.host.textContent,/Device inventory is available, but connection block status is not/);
+    const rows=f.host.querySelectorAll('[data-device-identity]');
+    assert.equal(rows.length,5);
+    for(const row of rows) {
+      assert.match(row.textContent,/Admission unknown/);
+      assert.ok(row.querySelectorAll('button').every(button=>button.disabled));
+    }
+    assert.ok(!f.host.textContent.includes('5 blocked'));
+    assert.ok(f.calls.every(c=>c[0]==='GET'));
   }
 });
 
@@ -503,13 +526,16 @@ function answerBeforeRisk(path) {
  if(path.includes('/transport-admission'))return {ok:true,body:transportAnswer()};
  return {ok:false,status:503};
 }
-test('risk HTTP, network and malformed reads stop the list instead of displaying Normal', async()=>{
+test('risk HTTP, network and malformed reads retain inventory but do not assert Normal', async()=>{
  for(const reply of [{ok:false,status:401},{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{...riskReadAnswer(),tenant_id:'tenant-b'}},new Error('network')]){
  const f=fixture();let observed;f.invokeWith((method,path,body,plane)=>{
  if(!path.includes('/risk-signals'))return answerBeforeRisk(path);
  observed={method,path,plane};if(reply instanceof Error)throw reply;return reply;
- });await f.actualRenderList(f.host);assert.deepEqual(observed,{method:'GET',path:'/admin/risk-signals?expected_tenant_id=tenant-a',plane:'control'});assert.deepEqual(f.states.map(x=>x.state),['loading','error']);assert.match(f.states[1].message,/Risk status could not be read/);assert.equal(f.toasts.length,0);
- assert.ok(!f.calls.some(c=>c[1].includes('/device-groups')));
+ });await f.actualRenderList(f.host);assert.deepEqual(observed,{method:'GET',path:'/admin/risk-signals?expected_tenant_id=tenant-a',plane:'control'});assert.deepEqual(f.states.map(x=>x.state),['loading']);
+ assert.match(f.host.textContent,/Risk status is unavailable/);
+ assert.equal(f.host.querySelectorAll('[data-device-identity]').length,5);
+ assert.ok(f.host.querySelectorAll('[data-device-identity]').every(row=>row.children[5].textContent==='Unknown'));
+ assert.equal(f.toasts.length,0);
  }
 });
 test('stale risk reads cannot render after a tenant switch or navigation',async()=>{
@@ -522,7 +548,41 @@ test('stale risk reads cannot render after a tenant switch or navigation',async(
 });
 test('risk read errors are translated without displaying backend detail', async()=>{
  const f=fixture();f.context.bl=value=>value.ja;f.invokeWith((method,path)=>path.includes('/risk-signals')?{ok:false,status:503,body:{error:'PRIVATE_PATH'}}:answerBeforeRisk(path));
- await f.actualRenderList(f.host);assert.match(f.states[1].message,/リスク状態を取得できません/);assert.ok(!f.states[1].message.includes('PRIVATE_PATH'));
+ await f.actualRenderList(f.host);assert.match(f.host.textContent,/リスク状態を取得できません/);assert.ok(!f.host.textContent.includes('PRIVATE_PATH'));
+});
+
+test('missing fleet runtime does not label a device as stopped or hide its inventory details', async()=>{
+ const f=fixture();
+ f.invokeWith((method,path)=>{
+  if(path.includes('/enrolled-devices'))return {ok:true,body:inventoryAnswer()};
+  if(path.includes('/transport-admission'))return {ok:true,body:transportAnswer()};
+  if(path.includes('/risk-signals'))return {ok:true,body:{...riskReadAnswer(),high_risk:{}}};
+  if(path==='/admin/device-runtime')return {ok:true,body:{devices:{},fleet_wide:false}};
+  return {ok:false,status:503};
+ });
+ await f.actualRenderList(f.host);
+ assert.match(f.host.textContent,/Fleet-wide device runtime is unavailable/);
+ const rows=f.host.querySelectorAll('[data-device-identity]');
+ assert.equal(rows.length,5);
+ const clear=rows.find(row=>row.getAttribute('data-device-identity')==='clear');
+ assert.ok(clear);
+ assert.match(clear.textContent,/Status unknown/);
+ assert.ok(!clear.textContent.includes('not steering yet'));
+});
+
+test('a seeded fleet response still discloses enrolled devices without runtime reports', async()=>{
+ const f=fixture();
+ f.invokeWith((method,path)=>{
+  if(path.includes('/enrolled-devices'))return {ok:true,body:inventoryAnswer()};
+  if(path.includes('/transport-admission'))return {ok:true,body:transportAnswer()};
+  if(path.includes('/risk-signals'))return {ok:true,body:{...riskReadAnswer(),high_risk:{}}};
+  if(path==='/admin/device-runtime')return {ok:true,body:{schema_version:'admin_device_runtime.v1',
+    fleet_wide:true,devices:{clear:{os:'Windows',steer_active:true}}}};
+  return {ok:false,status:503};
+ });
+ await f.actualRenderList(f.host);
+ assert.match(f.host.textContent,/4 enrolled device\(s\) have no runtime report yet/);
+ assert.equal(f.host.querySelectorAll('[data-device-identity]').length,5);
 });
 
 
@@ -632,7 +692,8 @@ test('overview aggregation handles reserved property names for missing and confi
   for (const groups of [[], [{ name: '__proto__', risk: 'high' }]]) {
     context.apiFetch = async (_, path) => ({ ok: true, status: 200, body:
       path === '/admin/enrolled-devices' ? { devices: [{ identity: '__proto__', group: '__proto__', enabled: true }] } :
-      path === '/admin/device-groups' ? { groups } : {} });
+      path === '/admin/device-groups' ? { groups } :
+      path === '/admin/risk-signals' ? { high_risk: {} } : {} });
     const got = await context.ovDeviceAggregate();
     assert.equal(got.total, 1);
     assert.equal(got.risk[groups.length ? 'high' : 'none'], 1);

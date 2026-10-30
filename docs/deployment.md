@@ -8,6 +8,12 @@ to configure an organization and connect an endpoint. **This release is experime
 Its `-plan ... -order` output is the command reference for your topology. Run each step
 on the machine it names; the output is instructions, not a shell script to execute wholesale.
 
+For the development-only dedicated-node topology, see
+[Three regions with multiple dedicated Edges](three-regions-multi-edge.md).
+It uses a different service layout and installation order from the combined-node examples below.
+For a smaller authentication lab with one CP/L4 machine and two or more dedicated
+Edges, see [One region with dedicated Edges](one-region-multi-edge.md).
+
 ## 1. Prepare the machines
 
 | Shape | Machines | Availability |
@@ -31,13 +37,23 @@ Before starting, prepare:
 
 - Linux hosts with Docker Engine and the Compose v2 plugin, persistent storage, and
   permission to run Docker and create the deployment directories. The examples use `/opt/dsse`.
-- A build environment with Git and a patched Go toolchain; use Go 1.27.1 for this release
+- A build environment with Git and a patched Go toolchain; use Go 1.27.3 for this release
   as described in [Building](building.md). All nodes must run the same chosen revision.
 - Synchronized clocks on the servers and endpoints. Certificate validity and MFA depend on time.
 - Stable host addresses and DNS records that resolve from the hosts, containers,
   administrator's computer, connectors, and endpoint devices.
 - Firewall access as described under [Network access](#network-access), and registry
   access for the generated stack's third-party images (or preloaded copies).
+- Optional: an operator-managed S3-compatible bucket for cold audit segments. Enable versioning
+  and Object Lock before writing audit data, and give every control plane outbound TLS
+  access to it. Keep the bucket private: block public access, deny customer-tenant
+  principals direct object access, and give archive credentials only to the control
+  planes. A deployment uses one bucket and one credential scope across its tenants;
+  S3 does not enforce per-tenant isolation for DSSE. The storage operator can read all
+  archived tenants. DSSE does not install or operate an object-storage server.
+  Without an archive, aged raw events remain in the persistent local hot store;
+  size, back up and monitor that store accordingly. Object Lock and archived
+  audit-chain verification are unavailable in this mode.
 - A package-signing identity and signed Windows/macOS installers if endpoints will join.
   These are separate from the deployment's TLS authorities; see [Building](building.md).
 
@@ -81,7 +97,7 @@ do not match, correct the network mode and repeat the endpoint check before coun
 the installation as successful.
 
 Disk and memory needs depend on traffic, audit retention, and database workload. No
-production sizing is claimed here. Monitor disk use for Postgres, ClickHouse, MinIO, and
+production sizing is claimed here. Monitor disk use for Postgres, ClickHouse, and
 Edge audit spools during the lab; do not treat an empty-stack startup as a capacity test.
 
 ## 2. Clone and build
@@ -91,7 +107,7 @@ On the founding node, or a build host targeting that node's architecture:
 ```sh
 git clone https://github.com/lantern-networks/dsse-core.git
 cd dsse-core
-export GOTOOLCHAIN=go1.27.1
+export GOTOOLCHAIN=go1.27.3
 mkdir -p bin
 go build -o bin/dsse-install ./cmd/dsse-install
 go build -o bin/dsse-profileverify ./cmd/dsse-profileverify
@@ -129,6 +145,11 @@ Replace them before minting:
 | `reachable` | Name other machines use to reach that host, also used for TLS |
 | `reachable_address` | Explicit IP where peers reach that host; required for cross-region routing and may differ from its local bind address behind NAT |
 | `mesh` | `true` to relay private-application traffic between regions; does not grant policy access |
+| `archive` | Optional; omit the complete object for local-only hot-event retention |
+| `archive.endpoint` | When configured: existing S3-compatible TLS `host:port` (for example, `s3.ap-northeast-1.amazonaws.com:443`), without `https://` |
+| `archive.bucket` | Existing bucket with versioning and Object Lock enabled |
+| `archive.region` | Bucket region when required by the provider |
+| `archive.auth_mode` | `static` for a dedicated key pair in private `deployment.env`, or `iam` for workload identity available to the CP process |
 
 Behind NAT, the bind address and the DNS-visible address may differ. Do not put an
 unassigned public/NAT address in `addresses`; provide working routing for `reachable` and `reachable_address`.
@@ -178,6 +199,41 @@ It does not create a customer or set its Console display name. Create customers 
 in the Console. Record the printed names and trust-anchor fingerprint. Protect the
 whole generated directory: it contains credentials and private keys. Keep an encrypted
 backup of the founding authority material; do not commit it or copy it into an image.
+
+Before carrying the deployment to other control planes, set
+`DSSE_ARCHIVE_ACCESS_KEY` and `DSSE_ARCHIVE_SECRET_KEY` in the founding node's
+private `deployment.env` when using `static`. Those credentials are carried to CP
+nodes only. For `iam`, leave both fields empty and ensure the workload identity is
+available inside each CP container. The `iam` mode accepts temporary workload
+credentials set as `DSSE_ARCHIVE_AWS_ACCESS_KEY_ID`,
+`DSSE_ARCHIVE_AWS_SECRET_ACCESS_KEY`, and `DSSE_ARCHIVE_AWS_SESSION_TOKEN` in the
+private `deployment.env`, or a host IAM role whose metadata endpoint is reachable
+from the CP container. The CP launcher exports AWS credentials only for `iam`;
+Compose does not copy generic `AWS_*` values from the operator's shell. Rotate
+temporary credentials before expiry and recreate the CP to reload them. A
+web-identity token requires an operator-provided token mount and is not installed
+by DSSE. Keep the file at
+owner-only permissions and do not put these values in the plan or process
+arguments. For an archive-enabled plan, every CP's setup preflight
+checks the bucket's reachability, versioning, Object Lock and list permission without
+modifying it. The read-only check does not prove Put permission or that host IAM
+credentials work inside the CP container: verify a real archive batch and object
+retrieval before treating the archive as accepted. It also
+does not inspect provider-specific public-access blocks, bucket policies, ACLs, or IAM
+policies. Inspect those controls with the storage provider before enrolling tenants;
+never issue the bucket credentials or direct object access to a customer administrator.
+For a local-only installation, leave every `DSSE_ARCHIVE_*` value empty. The CP starts
+without S3 and never deletes aged hot events solely because a retention period elapsed.
+This is a deliberate storage mode, not evidence of cold archival or immutable retention.
+The Console reports this mode and does not offer retention-day controls; the API rejects
+retention-day changes until an external archive is configured.
+
+If S3 becomes unavailable later, the retention worker keeps aged raw events in its
+local persistent hot database and retries archival on later sweeps. It deletes only
+after successful S3 write (and readback where that retention path requires it).
+Monitor free space and backlog;
+if the local store fills, ingestion can fail. Restore S3 connectivity or capacity
+without deleting the pending journal, hot rows or audit chain state.
 
 Minting outputs the names the deployment needs. Configure all of them, including:
 
@@ -362,17 +418,54 @@ through to the Edge. Use the generated hostnames, not bare IP URLs.
 | Administrator to Console and admin names | TCP 443, restricted to administrator networks |
 | Nodes to other regional doors | TCP 443 for authority and mesh paths |
 | Peer nodes to published Edge ports | Generated agent/admin ports (defaults 8443 / 19443), restricted to deployment peers and verification hosts |
-| State-bearing nodes to one another | Generated etcd client/peer, Patroni, database, and archive ports, restricted to deployment peers |
+| `one-region-three-nodes` peer doorways to each Node's CP | Direct admin/data ports 19543 / 19545 on the Node address, restricted to the three Node addresses |
+| `one-region-three-nodes` peer doorways to each Node's Console | Direct TLS port 19544 on the Node address, restricted to the three Node addresses; `/ready` accepts only the Console colocated with the CP leader |
+| State-bearing nodes to one another | Generated etcd client/peer and database ports, restricted to deployment peers |
+| Control planes to operator-managed S3, if configured | TLS to the archive endpoint declared in the plan; no S3 egress requirement for local-only storage |
 
-Typical state ports include 12379/12390 (etcd), 18008 (Patroni), 15432 (database), and
-19000 (archive). The generated `deployment.env` and Compose file are authoritative; inspect
+Typical state ports include 12379/12390 (etcd), 18008 (Patroni), and 15432 (database).
+The generated `deployment.env` and Compose file are authoritative; inspect
 them for every host rather than opening a range to the Internet. Direct Edge ports are
 published for peer communication and verification; an unadvertised port still needs a firewall.
+For `one-region-three-nodes`, the generated Edge admin/health port is TCP 9443 by default.
+The generated Edge agent/portal port is TCP 8443. Both bind to the Node address and must be
+allowed only between the three Node addresses; leaving either closed prevents peer doorway
+traffic or health checks. Each doorway routes all three Node-specific portal names to their
+owning Edge, so the names can share the Region's one public IP.
+The profile also publishes each Node's CP admin/data listeners on its plan address only.
+Both peer leader probes and forwarded admin/authority traffic use those listeners directly;
+opening a peer doorway on 443 as the CP backend can produce false leader health and routing loops.
+
+## Secrets and the process command line
+
+Every local user can read a process's command line through `ps` or
+`/proc/<pid>/cmdline`. The control-plane, Edge and archive-publisher launch
+scripts that `dsse-install` generates therefore pass secrets through environment
+variables and name them with `-secret-env`, for example
+`-secret-env=admin-token=ADMIN_TOKEN,postgres-dsn=DSSE_POSTGRES_DSN`.
+`dsse-edge` reads each variable into its flag and then removes the variable from
+its own environment, so child processes do not inherit it.
+
+`-secret-env` accepts only these flags: `-admin-token`,
+`-audit-ingest-receiver-token`, `-audit-ingest-token`, `-connector-secret`,
+`-hot-store-clickhouse-password`, `-postgres-dsn`,
+`-steer-exclusion-source-token`, `-step-up-binding-secret` and
+`-workload-attestation-secret`. The process refuses to start when a listed
+variable is not set, when the same flag is also given on the command line, or
+when an entry names any other flag. Its error messages name flags and variables,
+never values. Use the same form if you start `dsse-edge` yourself.
+
+A generated launch script passes `-secret-env` only when `dsse-edge -help` lists
+it. A binary that predates the option receives the secrets as command-line
+arguments, as before.
 
 ## State, stopping, and restarting
 
-The control plane owns Postgres, ClickHouse, and MinIO. Edges retain local audit spools
-and ship records to the control plane. Include all of these in storage and backup planning.
+The control plane owns Postgres and ClickHouse and writes cold audit segments to an
+operator-managed S3-compatible bucket. Edges retain local audit spools and ship records
+to the control plane. Include the local stores and external bucket in backup and
+capacity planning. If S3 is unavailable, aged hot rows stay in persistent local
+storage until archival succeeds; plan disk headroom for that interval.
 
 In a shared PostgreSQL deployment, east-west and policy-candidate observation
 reports are committed with their receipt in the control-plane store. Receipts retain the most recent 4,096 sequence positions
@@ -404,12 +497,29 @@ bound on the total number of reporter identities.
 
 A backup is not proved until it can be restored with its matching authority material.
 
-Audit ingestion authenticates each Edge with its client identity and authorizes tenant
-records and device enrolment reports through `audit-ingest-authority.json`. Check the generated mappings when adding
-a customer; an Edge may enforce its traffic while its audit records are refused by the
-control plane. Verify delivery and receipt for that customer, not only the operator tenant.
-Enrolment reports remain in the Edge outbox during storage failures or a leader change.
-Authorization failures also require correcting the identity mapping before delivery can resume.
+Audit ingestion authenticates each Edge with the operator-issued client certificate
+(`edge-identity.crt`, verified against `management-ca.crt`) and authorizes tenant
+records and device enrolment reports through `audit-ingest-authority.json`. The
+generated fleet identity is mapped to `"*"`, so a new tenant does not require a
+new mapping. If you replace it with per-Edge identities, explicitly include every
+tenant that each Edge serves; verify delivery and receipt for a newly added tenant,
+not only the operator tenant. An Edge can enforce traffic while its audit records
+are refused by the control plane. Enrolment reports remain in the Edge outbox
+during storage failures or a leader change. Authorization failures require fixing
+the identity mapping before delivery resumes.
+
+Connector-driven people-directory imports use the same Edge machine certificate
+over the control-plane data channel (`/directory-import-report`), without an
+administrator bearer. On the active control plane, register the connector for the
+exact tenant and assign each enabled directory source to it with source-policy
+`metadata.connector_id`. The control plane checks the operator-issued Edge
+certificate, Edge-to-tenant mapping, connector registration and source assignment
+before committing an import. An Edge following a control plane rejects imports
+when its machine report channel is not configured. A temporarily unavailable
+control plane leaves accepted imports in the Edge's durable report outbox for
+retry. With a custom Edge identity or authority map, configure
+`-audit-ingest-client-ca` and `-audit-ingest-authority` on every control plane and
+restart those processes to load a changed map before accepting imports.
 
 From the generated directory, stop a single-machine lab without removing its volumes:
 
@@ -426,4 +536,5 @@ before proceeding. Do not use `down -v` to restart: it removes persistent volume
 To retire a device, block or remove it in the Console, then uninstall its agent following
 the platform guide. Removing a package does not revoke the enrolled identity.
 
-Enrolment reports also require the Edge-to-tenant mappings in `audit-ingest-authority.json`. Verify each served customer mapping before upgrading: an unreported device may lose admission on a later configuration refresh.
+An unreported enrolment may lose admission on a later configuration refresh;
+check the Edge report outbox and the control-plane receipt after upgrading.

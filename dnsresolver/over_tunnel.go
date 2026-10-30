@@ -4,6 +4,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -80,9 +81,33 @@ func dnsOverTunnelShouldLog(now time.Time) bool {
 }
 
 // OverTunnelHandler returns the HTTP handler that resolves a DNS query carried over the tunnel using
-// the shared Edge resolver. Returns nil when no resolver is available (route not registered).
+// the resolver's boot tenant. Shared Edge routes must use OverTunnelHandlerForTenant.
 func OverTunnelHandler(resolver *Resolver) http.HandlerFunc {
+	return OverTunnelHandlerForTenant(resolver, func(*http.Request) (string, bool) {
+		if resolver == nil {
+			return "", false
+		}
+		return resolver.tenantID, true
+	})
+}
+
+// OverTunnelHandlerForTenant obtains tenant identity from the host's verified
+// transport context; the body and untrusted HTTP headers cannot select it.
+func OverTunnelHandlerForTenant(resolver *Resolver, tenantFromRequest func(*http.Request) (string, bool)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if resolver == nil {
+			http.Error(w, "DNS resolver unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var tenant string
+		var verified bool
+		if tenantFromRequest != nil {
+			tenant, verified = tenantFromRequest(r)
+		}
+		if !verified || strings.TrimSpace(tenant) == "" {
+			http.Error(w, "a verified DNS query tenant is required", http.StatusUnauthorized)
+			return
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxDNSMessageBytes+1))
 		if err != nil {
 			http.Error(w, "read dns query", http.StatusBadRequest)
@@ -93,7 +118,7 @@ func OverTunnelHandler(resolver *Resolver) http.HandlerFunc {
 			return
 		}
 		start := time.Now()
-		resp, herr := resolver.HandleQuery(body, start)
+		resp, herr := resolver.HandleQueryForTenant(r.Context(), tenant, body, start)
 		elapsed := time.Since(start)
 		if herr != nil || len(resp) == 0 {
 			observeOverTunnel(false, elapsed)

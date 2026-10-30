@@ -21,8 +21,8 @@ func IsPDF(filename, contentType string) bool {
 
 // ExtractPDFText extracts the text layer of a PDF using dslipak/pdf (pure Go, BSD-licensed, rsc.io/pdf
 // lineage — no CGo, no external process). Cap-bounded. A scanned/image PDF has no text layer and yields
-// nothing (OCR is out of scope). Encrypted or malformed PDFs return an error (the caller fails open and
-// forwards uninspected). The extractor libraries can panic on adversarial input, so it is recover-guarded —
+// nothing (OCR is out of scope). Encrypted, malformed or over-budget PDFs return an error so the
+// caller can apply its configured uninspectable-file policy. The extractor libraries can panic on adversarial input, so it is recover-guarded —
 // a bad PDF must never crash the Edge.
 func ExtractPDFText(data []byte) (text string, err error) {
 	defer func() {
@@ -39,6 +39,12 @@ func ExtractPDFText(data []byte) (text string, err error) {
 		return "", err
 	}
 	var sb strings.Builder
-	_, _ = io.Copy(&sb, io.LimitReader(tr, DefaultMaxExtractedBytes)) // partial text on a copy error is fine
+	n, err := io.Copy(&sb, io.LimitReader(tr, DefaultMaxExtractedBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if n > DefaultMaxExtractedBytes {
+		return "", ErrExtractionLimit
+	}
 	return sb.String(), nil
 }

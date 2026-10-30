@@ -78,5 +78,5 @@ func (i connectorFleetIdentity) contradictsRegistry(registryTenant string) bool 
 	if registryTenant == "" || i.TenantID == "" {
 		return false
 	}
-	return !strings.EqualFold(registryTenant, i.TenantID)
+	return registryTenant != i.TenantID
 }

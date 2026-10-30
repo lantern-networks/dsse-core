@@ -73,7 +73,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		tenantID := adminTenantIDFromRequest(r)
 		if identity, ok := adminIdentityFromRequest(r); ok {
 			if named, fromHeader := adminOperateTenant(r, identity); fromHeader && strings.TrimSpace(named) != "" &&
-				!strings.EqualFold(strings.TrimSpace(named), strings.TrimSpace(identity.TenantID)) {
+				strings.TrimSpace(named) != strings.TrimSpace(identity.TenantID) {
 				if known, err := adminTenantExists(r.Context(), tenantModelStore, named); err == nil && !known {
 					writeError(w, http.StatusNotFound, fmt.Errorf(
 						"this deployment has no organization %q. It may belong to another deployment, or have "+
@@ -87,7 +87,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, tenant)
+		writeJSON(w, http.StatusOK, tenantSharedFleetView(config, tenant))
 	}))
 	mux.HandleFunc("POST /admin/tenant", adminEndpoint("admin.tenant.write", func(w http.ResponseWriter, r *http.Request) {
 		// An Edge that PULLS its config is not the tenant authority, and accepting a write here would store a
@@ -125,13 +125,24 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeTenantSettingsEditError(w, err)
 			return
 		}
-		updated, err := tenantModelStore.Update(r.Context(), tenant, adminTenantIDFromRequest(r), now)
+		if !confirmSharedFleetTenantChange(w, r, config, tenantModelStore, tenant, raw, false) {
+			return
+		}
+		conditional, ok := tenantModelStore.(adminTenantModelConditionalStore)
+		if !ok {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("this node cannot atomically author tenant settings"))
+			return
+		}
+		updated, err := conditional.MutateOrCreate(r.Context(), adminTenantIDFromRequest(r), now,
+			func(latest adminTenantModel) (adminTenantModel, error) {
+				return mergeTenantSettingsEditAgainst(latest, adminTenantIDFromRequest(r), raw)
+			})
 		if err != nil {
-			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
+			writeTenantSettingsMutationError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelAuditLogFor(r, updated, evaluator, now), now)
-		writeJSON(w, http.StatusOK, updated)
+		writeJSON(w, http.StatusOK, tenantSharedFleetView(config, updated))
 	}))
 	// Cross-tenant (super-admin) tenant administration: list every tenant, create/upsert an arbitrary tenant,
 	// and delete one. Gated on admin.tenant.admin (a strict super-admin permission distinct from the self-scoped
@@ -160,13 +171,17 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			caller := strings.TrimSpace(adminTenantIDFromRequest(r))
 			own := make([]adminTenantModel, 0, 1)
 			for _, tenant := range tenants {
-				if caller != "" && strings.EqualFold(strings.TrimSpace(tenant.TenantID), caller) {
+				if caller != "" && strings.TrimSpace(tenant.TenantID) == caller {
 					own = append(own, tenant)
 				}
 			}
 			tenants = own
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"tenants": tenants})
+		views := make([]sharedFleetTenantView, 0, len(tenants))
+		for _, tenant := range tenants {
+			views = append(views, tenantSharedFleetView(config, tenant))
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"tenants": views, "shared_fleet_regions": sharedFleetSettingsRegions(config)})
 	}))
 	mux.HandleFunc("POST /admin/tenants", adminEndpoint("admin.tenant.admin", func(w http.ResponseWriter, r *http.Request) {
 		// ★★★ See an_organizations_life_is_not_a_customers_to_end.go. A customer's super_admin holds
@@ -244,9 +259,26 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			}
 			tenant = merged
 		}
-		saved, err := adminStore.Put(r.Context(), tenant, now)
+		if !confirmSharedFleetTenantChange(w, r, config, tenantModelStore, tenant, raw, action == "create") {
+			return
+		}
+		var saved adminTenantModel
+		var err error
+		if action == "update" {
+			conditional, ok := tenantModelStore.(adminTenantModelConditionalStore)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("this node cannot atomically author tenant settings"))
+				return
+			}
+			saved, err = conditional.MutateExisting(r.Context(), tenant.TenantID, now,
+				func(latest adminTenantModel) (adminTenantModel, error) {
+					return mergeTenantSettingsEditAgainst(latest, tenant.TenantID, raw)
+				})
+		} else {
+			saved, err = adminStore.Put(r.Context(), tenant, now)
+		}
 		if err != nil {
-			writeAdminTenantSaveError(w, http.StatusBadRequest, err)
+			writeTenantSettingsMutationError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, adminTenantModelLifecycleAuditLogFor(r, saved, action, evaluator, now), now)
@@ -496,7 +528,7 @@ func registerTenantAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 			return
 		}
-		if !strings.EqualFold(strings.TrimSpace(req.ConfirmTenantID), tenantID) {
+		if strings.TrimSpace(req.ConfirmTenantID) != tenantID {
 			writeError(w, http.StatusBadRequest, fmt.Errorf(
 				"to erase organization %q, send confirm_tenant_id with that exact id — this cannot be undone", tenantID))
 			return
@@ -675,6 +707,10 @@ func mergeTenantSettingsEdit(ctx context.Context, store adminTenantModelRuntimeS
 	if err != nil {
 		return adminTenantModel{}, err
 	}
+	return mergeTenantSettingsEditAgainst(existing, tenantID, raw)
+}
+
+func mergeTenantSettingsEditAgainst(existing adminTenantModel, tenantID string, raw []byte) (adminTenantModel, error) {
 	stored, err := json.Marshal(existing)
 	if err != nil {
 		return adminTenantModel{}, err
@@ -715,6 +751,19 @@ func writeTenantSettingsEditError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant settings could not be read; no changes were saved"))
+}
+
+func writeTenantSettingsMutationError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errTenantEnvelopeEdit):
+		writeError(w, http.StatusForbidden, err)
+	case errors.Is(err, errAdminTenantModelMissing):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, errAdminTenantSaveUnconfirmed):
+		writeAdminTenantSaveError(w, http.StatusServiceUnavailable, err)
+	default:
+		writeError(w, http.StatusBadRequest, err)
+	}
 }
 
 // adminTenantCreateAnswer is the created organization plus what else the creation did. Embedded so every field

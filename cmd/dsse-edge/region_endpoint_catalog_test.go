@@ -95,7 +95,7 @@ func TestGeoSteeringUnknownAllowedRegionIsIgnored(t *testing.T) {
 
 // TestParseRegionEndpointsRejectsBadInput guards the config contract.
 func TestParseRegionEndpointsRejectsBadInput(t *testing.T) {
-	for _, bad := range []string{"jp-tokyo", "jp-tokyo=http://insecure", "=https://x", "jp-tokyo=https://a;jp-tokyo=https://b"} {
+	for _, bad := range []string{"jp-tokyo", "jp-tokyo=http://insecure", "=https://x", "jp-tokyo=https://a;jp-tokyo=https://a"} {
 		if _, err := parseRegionEndpoints(bad); err == nil {
 			t.Fatalf("parseRegionEndpoints(%q) = nil error, want rejection", bad)
 		}

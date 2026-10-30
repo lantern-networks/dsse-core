@@ -124,6 +124,7 @@ public struct DsseInstallProfile: Decodable, Equatable {
         /// this is the whole list — and an empty one is an answer, not a gap.
         public let steerExclusions: [String]?
         public let passthroughDomains: [String]?
+ public let stepUpPortalOrigins: [String]?
 
         enum CodingKeys: String, CodingKey {
             case anchorPEM = "anchor_pem"
@@ -135,6 +136,7 @@ public struct DsseInstallProfile: Decodable, Equatable {
             case updatePublisherTeamID = "update_publisher_team_id"
             case steerExclusions = "steer_exclusions"
             case passthroughDomains = "passthrough_domains"
+ case stepUpPortalOrigins = "step_up_portal_origins"
         }
     }
 

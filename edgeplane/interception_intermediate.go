@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,12 @@ type InterceptionIssuer struct {
 	signingCert *x509.Certificate
 	signer      crypto.Signer
 	chain       [][]byte // DER certs appended AFTER the leaf, signing cert first: [root] or [intermediate, root]
+	// Only a tenant-delegated issuer participates in the authenticated Edge-to-CP
+	// leaf CRL publisher. A deployment CA's own CDP points to the parent
+	// issuer's CRL covering that CA; it does not enable the tenant protocol.
+	deploymentLeafCRLPoints []string // immutable deployment publisher URLs for signingCert
+	requiresTenantLeafCRL   bool
+	leafCRLReadyUntil       atomic.Int64 // publication acknowledged by CP; zero until then
 
 	// The validity window of the whole PRESENTED path, computed once. See usableAt.
 	pathOnce  sync.Once

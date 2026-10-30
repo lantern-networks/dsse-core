@@ -5,21 +5,19 @@ package main
 import (
 	"fmt"
 	neturl "net/url"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"unsafe"
 
-	"github.com/lantern-networks/dsse-core/clients/windows-wfp/winbin"
+	"golang.org/x/sys/windows"
 )
 
 // The agent runs as a LocalSystem Windows service in session 0. A plain spawn (exec.Command) would land the
 // browser/toast in session 0 -- no user desktop and no per-user default-browser association -- so the user
-// never sees the step-up portal. These launch the portal in the ACTIVE CONSOLE SESSION (the logged-in user)
-// via WTSQueryUserToken + CreateProcessAsUserW. Raw syscalls (no x/sys/windows dependency), consistent with
-// service_windows.go. kernel32/advapi32 are the package-level lazy DLLs declared in the other _windows files.
+// never sees the step-up portal. Authentication uses the WFP flow owner's session
+// through WTSQueryUserToken + CreateProcessAsUserW, checking its SID again.
+// Passive warnings and authentication both require the originating flow owner's session.
 var (
 	wtsapi32                    = syscall.NewLazyDLL("wtsapi32.dll")
 	userenv                     = syscall.NewLazyDLL("userenv.dll")
@@ -37,57 +35,14 @@ const (
 	invalidSessionID         = 0xFFFFFFFF
 )
 
-// defaultStepUpLauncher is the Windows step-up surface. It prefers the Lantern DSSE-branded, app-owned OOB
-// window (dsse-stepup-window.exe — a WebView2 host, task #14, parity with the macOS StepUpAuthWindow) launched
-// into the active console session, replacing the "surprise default-browser tab". The window hosts the REAL IdP
-// login page (the client never sees the secret -> phishing-resistant) and auto-closes on the Edge "Access
-// approved" callback; the held flow then auto-releases server-side (task #5). If the window exe is missing or
-// cannot launch, it FALLS BACK to opening the portal in the user's default browser (+ a tray balloon) so the
-// ceremony never strands. Best-effort and non-fatal: a launch failure must never wedge the steering data path.
+// Callers without a verified flow owner cannot choose a desktop. Production uses
+// defaultStepUpLauncherForOwner; there is no SYSTEM or embedded-WebView fallback.
 func defaultStepUpLauncher(resource, portalURL string) {
-	// The portal URL is EDGE-SUPPLIED and reaches a command line / FileProtocolHandler, so validate it before
-	// launching (fail-open review #29): only a well-formed http/https URL with no command-line-breaking or
-	// argument characters is launched. This blocks argument injection (a URL with a quote/space) and arbitrary
-	// protocol-handler launch (a non-web scheme like file:/javascript:/an .exe path). An invalid URL is refused
-	// and surfaced — never launched.
-	safeURL, ok := validatedStepUpURL(portalURL)
-	if !ok {
-		fmt.Printf("steer_stepup_rejected_invalid_portal_url resource=%s url=%q\n", stepUpDestLabel(resource), portalURL)
-		showStepUpToast(resource)
-		return
-	}
-	if exe := stepUpWindowExePath(); exe != "" {
-		dest := stepUpDestLabel(resource)
-		host := fmt.Sprintf(`"%s" --portal "%s" --dest "%s"`, exe, safeURL, dest)
-		if err := launchInActiveSession(host); err == nil {
-			return // the branded window IS the surface; no toast needed on the happy path
-		} else {
-			fmt.Printf("steer_stepup_window_fallback resource=%s err=%v\n", dest, err)
-		}
-	}
-	// Fallback: default browser in the user session (prior behaviour) + a tray balloon cue. Pass the validated URL
-	// as a SINGLE argv element (no shell string) so it cannot inject; the launchInActiveSession string form uses
-	// the same validated value.
-	// rundll32 from the system directory, in BOTH forms — see package winbin. The string form is handed to the
-	// logged-in user's session, where %PATH% is the user's and not this service's.
-	rundll32, rerr := winbin.System("rundll32.exe")
-	if rerr != nil {
-		fmt.Printf("steer_stepup_browser_unavailable resource=%s err=%v\n", resource, rerr)
-		showStepUpToast(resource)
-		return
-	}
-	browser := fmt.Sprintf(`"%s" url.dll,FileProtocolHandler %s`, rundll32, safeURL)
-	if err := launchInActiveSession(browser); err != nil {
-		fmt.Printf("steer_stepup_browser_session_fallback resource=%s err=%v\n", resource, err)
-		c := exec.Command(rundll32, "url.dll,FileProtocolHandler", safeURL)
-		c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		_ = c.Start()
-	}
-	showStepUpToast(resource)
+	fmt.Printf("steer_stepup_requires_flow_owner\n")
 }
 
-// validatedStepUpURL returns the URL only if it is a well-formed http/https URL safe to place on a command line:
-// a parseable absolute URL, scheme http or https, a non-empty host, and no whitespace, quotes, backslashes, or
+// validatedStepUpURL performs command-line hygiene after the coordinator has
+// checked the signed Portal list and request lifetime. It requires HTTPS and no whitespace, quotes, backslashes, or
 // control characters that could break out of the quoted argument or the FileProtocolHandler invocation. Returns
 // ("", false) otherwise so the caller refuses to launch it.
 func validatedStepUpURL(raw string) (string, bool) {
@@ -104,40 +59,13 @@ func validatedStepUpURL(raw string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	if u.Scheme != "https" && u.Scheme != "http" {
+	if u.Scheme != "https" {
 		return "", false
 	}
-	if strings.TrimSpace(u.Host) == "" {
+	if strings.TrimSpace(u.Host) == "" || u.User != nil || u.Fragment != "" {
 		return "", false
 	}
 	return raw, true
-}
-
-// stepUpWindowExePath resolves the branded OOB window exe next to the agent binary. Returns "" if it is not
-// present, so the caller falls back to the browser.
-func stepUpWindowExePath() string {
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-	// Name comes from runtimeCompanions (companions.go) rather than a literal here, so the packaging test and
-	// the startup report cannot drift from what is actually looked up.
-	p := filepath.Join(filepath.Dir(exe), stepUpWindowCompanion().Exe)
-	if _, err := os.Stat(p); err != nil {
-		return ""
-	}
-	return p
-}
-
-// stepUpWindowCompanion is the declared entry for the branded window.
-func stepUpWindowCompanion() companion {
-	for _, c := range runtimeCompanions {
-		if strings.Contains(c.Exe, "stepup-window") {
-			return c
-		}
-	}
-	// Unreachable while the table is intact; companions_test.go pins it.
-	return companion{Exe: "dsse-stepup-window.exe"}
 }
 
 // stepUpDestLabel derives a clean "host:port" for the window's --dest display from the step-up resource. The mux
@@ -159,6 +87,30 @@ const stepUpToastScript = `$ErrorActionPreference='SilentlyContinue';` +
 	`$n.BalloonTipIcon=[System.Windows.Forms.ToolTipIcon]::Warning;$n.BalloonTipTitle='Authentication required';` +
 	`$n.BalloonTipText='Sign in to reach __DSSE_RESOURCE__. Your browser is opening the step-up portal; complete it, then retry.';` +
 	`$n.Visible=$true;$n.ShowBalloonTip(8000);Start-Sleep -Seconds 9;$n.Dispose()`
+
+// AUTH_RESULT is received only on the authenticated mux flow that raised the
+// request. Show its outcome in that flow owner's desktop; never fall back to
+// the active console or SYSTEM when the original session has disappeared.
+func showStepUpResultForOwner(result string, owner stepUpOwner) {
+	if owner.Session == 0 || owner.SID == "" || owner.LogonID == 0 {
+		return
+	}
+	message := "This connection was not resumed. Reconnect from the original app."
+	if result == "resumed" {
+		message = "The authenticated connection resumed."
+	} else if result != "not_resumed" {
+		return
+	}
+	script := `$ErrorActionPreference='SilentlyContinue';` +
+		`Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing;` +
+		`$n=New-Object System.Windows.Forms.NotifyIcon;$n.Icon=[System.Drawing.SystemIcons]::Shield;` +
+		`$n.BalloonTipTitle='Lantern DSSE';$n.BalloonTipText='` + message + `';` +
+		`$n.Visible=$true;$n.ShowBalloonTip(8000);Start-Sleep -Seconds 9;$n.Dispose()`
+	command := fmt.Sprintf(`powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -Command "%s"`, script)
+	if err := launchInSession(command, uintptr(owner.Session), owner.SID, owner.LogonID); err != nil {
+		fmt.Printf("steer_stepup_result_notice_unavailable reason=session_changed\n")
+	}
+}
 
 // showStepUpToast shows the balloon in the active console session (best-effort; the browser open is the
 // actionable bit). The resource is sanitized then substituted into the script literal.
@@ -196,12 +148,28 @@ func launchInActiveSession(commandLine string) error {
 	if uint32(sid) == invalidSessionID {
 		return fmt.Errorf("no active console session")
 	}
+	return launchInSession(commandLine, sid, "")
+}
+
+func launchInSession(commandLine string, sid uintptr, expectedSID string, expectedLogonID ...uint64) error {
 	var token syscall.Handle
 	r1, _, e1 := procWTSQueryUserToken.Call(sid, uintptr(unsafe.Pointer(&token)))
 	if r1 == 0 {
 		return fmt.Errorf("WTSQueryUserToken(session=%d): %v", uint32(sid), e1)
 	}
 	defer procStepupCloseHandle.Call(uintptr(token))
+	if expectedSID != "" {
+		identity, err := windows.Token(token).GetTokenUser()
+		if err != nil || identity.User.Sid.String() != expectedSID {
+			return fmt.Errorf("session owner changed")
+		}
+	}
+	if len(expectedLogonID) == 1 && expectedLogonID[0] != 0 {
+		logonID, err := stepUpTokenLogonID(windows.Token(token))
+		if err != nil || logonID != expectedLogonID[0] {
+			return fmt.Errorf("session login changed")
+		}
+	}
 
 	// Build the TARGET USER's environment block. Without it CreateProcessAsUserW passes NULL -> the child
 	// inherits the SERVICE's (session-0 SYSTEM) environment, and `rundll32 url.dll,FileProtocolHandler` then
@@ -209,14 +177,14 @@ func launchInActiveSession(commandLine string) error {
 	// HKCU are the SYSTEM account's), so rundll32 runs but NO browser opens — even though the token/desktop are
 	// correct (a self-contained command like the PowerShell toast still works, which is why the toast shows but
 	// the portal did not). CreateEnvironmentBlock(token) gives the child the real user env; pass it with
-	// CREATE_UNICODE_ENVIRONMENT. Best-effort: if it fails, fall back to NULL (prior behavior).
+	// CREATE_UNICODE_ENVIRONMENT. Failure refuses the launch; never inherit SYSTEM.
 	var envBlock uintptr
 	creationFlags := uintptr(createNoWindow)
 	if r, _, _ := procCreateEnvironmentBlock.Call(uintptr(unsafe.Pointer(&envBlock)), uintptr(token), 0); r != 0 && envBlock != 0 {
 		creationFlags |= createUnicodeEnvironment
 		defer procDestroyEnvironmentBlock.Call(envBlock)
 	} else {
-		envBlock = 0
+		return fmt.Errorf("target user environment unavailable")
 	}
 
 	// CreateProcessAsUserW mutates the command-line buffer in place, so pass a writable UTF-16 slice.
@@ -237,7 +205,7 @@ func launchInActiveSession(commandLine string) error {
 		0, 0,                               // process/thread security attributes
 		0,             // bInheritHandles = FALSE
 		creationFlags, // dwCreationFlags (+ CREATE_UNICODE_ENVIRONMENT when an env block is supplied)
-		envBlock,      // lpEnvironment (the target user's block, or NULL on failure)
+		envBlock,      // lpEnvironment (the validated target user's block)
 		0,             // lpCurrentDirectory (NULL)
 		uintptr(unsafe.Pointer(&si)),
 		uintptr(unsafe.Pointer(&pi)),

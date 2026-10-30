@@ -162,7 +162,9 @@ type Action struct {
 	RequiredIdPID string   `json:"required_idp_id,omitempty"`
 	MinACR        string   `json:"min_acr,omitempty"`
 	RequiredAMR   []string `json:"required_amr,omitempty"`
-	MaxAgeSeconds int      `json:"max_age_seconds,omitempty"`
+	// Nil leaves freshness unspecified. Explicit zero binds the resulting
+	// authentication to one held request; it must survive storage and compilation.
+	MaxAgeSeconds *int `json:"max_age_seconds,omitempty"`
 	// DeviceAttestedAuto (default false) opts an authenticate-mode East-West rule into the machine/non-interactive
 	// path: a flow with a VERIFIED mTLS device identity + trusted posture but NO human at the keyboard is released
 	// by DEVICE attestation instead of holding forever for an impossible OOB ceremony. This is the "sensitivity
@@ -266,6 +268,9 @@ func (r *Rule) normalizeAndValidate() error {
 	}
 	if r.Action.GrantTTLSeconds < 0 {
 		return fmt.Errorf("grant_ttl_seconds cannot be negative")
+	}
+	if r.Action.MaxAgeSeconds != nil && (*r.Action.MaxAgeSeconds < 0 || *r.Action.MaxAgeSeconds > 86400) {
+		return fmt.Errorf("max_age_seconds must be an integer from 0 to 86400")
 	}
 
 	if len(r.Source) == 0 {

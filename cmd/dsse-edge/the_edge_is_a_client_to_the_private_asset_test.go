@@ -115,12 +115,18 @@ func TestTheOrganizationsAnchorsAreADDEDToThePlatformsRootsNotSubstitutedForThem
 	}
 }
 
-func TestAnOrganizationThatVouchedForNothingIsLeftExactlyAsItWas(t *testing.T) {
+func TestAnOrganizationWithoutAnchorsKeepsTrustButIsolatesConnections(t *testing.T) {
 	store, _ := internalca.NewStore(nil)
 	base := http.DefaultTransport.(*http.Transport).Clone()
-	// The whole public web goes through here. It must stay on the platform's own verification, with no clone,
-	// no extra pool and no second connection pool per organization.
-	if got := upstreamTransportTrustingTheOrganizationsPrivateAssets(base, store, "kaede", time.Now().UTC()); got != http.RoundTripper(base) {
-		t.Fatal("an organization with no authored authority must get the untouched transport back")
+	mine := upstreamTransportTrustingTheOrganizationsPrivateAssets(base, store, "kaede", time.Now().UTC()).(*http.Transport)
+	theirs := upstreamTransportTrustingTheOrganizationsPrivateAssets(base, store, "northwind", time.Now().UTC())
+	if mine == base || mine == theirs {
+		t.Fatal("tenant connection pools must be separate")
+	}
+	if mine != upstreamTransportTrustingTheOrganizationsPrivateAssets(base, store, "kaede", time.Now().UTC()) {
+		t.Fatal("same tenant must reuse its pool")
+	}
+	if mine.TLSClientConfig != nil && mine.TLSClientConfig.RootCAs != nil {
+		t.Fatal("no private authority should be added")
 	}
 }

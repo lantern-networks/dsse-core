@@ -26,6 +26,9 @@ var ErrApplicationNotDeletable = errors.New("application is config-seeded and ca
 
 type RuntimeStore interface {
 	List(context.Context, string, ListOptions) (ListResponse, error)
+	// ListAll is for trusted internal decisions that require a complete tenant
+	// population. User-facing List keeps its bounded response contract.
+	ListAll(context.Context, string, ListAllOptions) ([]Entry, error)
 	Get(context.Context, string, string) (Entry, bool, error)
 	Upsert(context.Context, Entry, string, time.Time) (Entry, error)
 	// Delete removes an operator-authored application (the durable overlay) for a tenant. It NEVER removes a
@@ -39,6 +42,11 @@ type ListOptions struct {
 	ApplicationType string
 	Status          string
 	Limit           int
+}
+
+type ListAllOptions struct {
+	ApplicationType string
+	Status          string
 }
 
 type ListResponse struct {
@@ -99,7 +107,19 @@ type Store struct {
 	seed map[string]map[string]struct{}
 }
 
-func (store *Store) List(_ context.Context, tenantID string, options ListOptions) (ListResponse, error) {
+func (store *Store) List(ctx context.Context, tenantID string, options ListOptions) (ListResponse, error) {
+	return store.list(ctx, tenantID, options, false)
+}
+
+func (store *Store) ListAll(ctx context.Context, tenantID string, options ListAllOptions) ([]Entry, error) {
+	response, err := store.list(ctx, tenantID, ListOptions{ApplicationType: options.ApplicationType, Status: options.Status}, true)
+	if err != nil {
+		return nil, err
+	}
+	return response.Applications, nil
+}
+
+func (store *Store) list(_ context.Context, tenantID string, options ListOptions, all bool) (ListResponse, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return ListResponse{}, fmt.Errorf("tenant_id is required")
@@ -132,7 +152,9 @@ func (store *Store) List(_ context.Context, tenantID string, options ListOptions
 	}
 	sortEntries(rows)
 	count := len(rows)
-	if len(rows) > limit {
+	if all {
+		limit = count
+	} else if len(rows) > limit {
 		rows = rows[:limit]
 	}
 	return ListResponse{
@@ -416,6 +438,10 @@ func serviceFamilyForDestinationPort(port int) string {
 
 func copyEntry(application Entry) Entry {
 	application.Tags = append([]string(nil), application.Tags...)
+	if application.UpdatedAt != nil {
+		updated := *application.UpdatedAt
+		application.UpdatedAt = &updated
+	}
 	if application.LastProbeAt != nil {
 		probe := *application.LastProbeAt
 		application.LastProbeAt = &probe
@@ -475,7 +501,7 @@ func ValidStatus(status string) bool { return validStatus(status) }
 // alternative backends return identically ordered lists.
 func SortEntries(applications []Entry) { sortEntries(applications) }
 
-// CopyEntry returns a defensive deep copy of an entry (independent Tags slice + LastProbeAt pointer). Exported so
+// CopyEntry returns a defensive deep copy of an entry (independent Tags slice and timestamp pointers). Exported so
 // alternative backends isolate returned values from their internal/seed state exactly like the file store.
 func CopyEntry(application Entry) Entry { return copyEntry(application) }
 

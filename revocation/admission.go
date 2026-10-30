@@ -38,8 +38,14 @@ type AdmissionRevocations struct {
 	// pushes, so a received item does not bounce back (the no-loop discipline).
 	meshInitialPending bool // writeMu: first shared save ran its edit but was unconfirmed
 	meshReceived       map[string]string
-	persister          blobstore.Persister // guarded by writeMu; snapshot of revoked + meshReceived; nil = volatile
-	generation         atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
+	meshPending        map[string]string // writeMu: received blocks with unconfirmed shared commits
+	// originPending retains authorized, restrictive origin edits whose shared
+	// commit was unconfirmed. A later independent shared write must include them
+	// before replacing revoked from the latest durable row.
+	originPending        map[string]string   // writeMu
+	originInitialPending bool                // writeMu: first shared row was unconfirmed
+	persister            blobstore.Persister // guarded by writeMu; snapshot of revoked + meshReceived; nil = volatile
+	generation           atomic.Uint64       // bumped on any state change; the CP serves it in the feed so edges re-pull
 	// reporter, when set (puller mode), is called on a NEW node-local revocation so this node's own W-2
 	// auto-revocation propagates UP to the control plane, which redistributes it fleet-wide (slice 3b: a dark
 	// device caught on one node is then denied on every node, not just this one). Not called for ReplaceSynced.

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,6 +82,26 @@ func postgresApplicationCatalogSchemaSQL() []string {
 	}
 }
 
+func postgresApplicationCatalogImportSchemaSQL() []string {
+	return []string{
+		strings.Join([]string{
+			"CREATE TABLE IF NOT EXISTS application_catalog_legacy_imports (",
+			"tenant_id text NOT NULL,",
+			"application_id text NOT NULL,",
+			"imported_at timestamptz NOT NULL DEFAULT now(),",
+			"PRIMARY KEY (tenant_id, application_id)",
+			")",
+		}, " "),
+		strings.Join([]string{
+			"CREATE TABLE IF NOT EXISTS application_catalog_legacy_import_state (",
+			"singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),",
+			"source_sha256 text NOT NULL,",
+			"imported_at timestamptz NOT NULL DEFAULT now()",
+			")",
+		}, " "),
+	}
+}
+
 // setupApplicationCatalogStore builds the catalog store from the deployment config: it seeds the config-derived
 // catalog (route profiles + SaaS catalog) and then selects the durable backend by storePath. Empty path / a file
 // path keeps the lab default (in-memory seed + optional file/JSON durability of authored entries, unchanged);
@@ -95,6 +118,24 @@ func setupApplicationCatalogStore(ctx context.Context, storePath string, adminAu
 	// there: the catalog came up looking complete, because the config-derived half is the bigger half.
 	if strings.EqualFold(storeBackend(storePath), "postgres") {
 		importFrom := storeImportSource(storePath)
+		if importFrom != "" {
+			pg, ok := adminAuthStore.(postgresAdminAuthStore)
+			if !ok || pg.DB == nil {
+				return nil, fmt.Errorf("application-catalog-store=postgres requires admin-auth-store=postgres (it reuses that connection)")
+			}
+			// A deployment that already used postgres+import before the durable
+			// marker existed could have deleted an imported row. Replaying its old
+			// JSON now would recreate it. New deployments have neither table;
+			// upgraded deployments with the marker have both. The ambiguous
+			// intermediate state needs an operator-reviewed migration, not a guess.
+			var catalogExists, markersExist, sealExists bool
+			if err := pg.DB.QueryRowContext(ctx, "SELECT to_regclass('application_catalog') IS NOT NULL, to_regclass('application_catalog_legacy_imports') IS NOT NULL, to_regclass('application_catalog_legacy_import_state') IS NOT NULL").Scan(&catalogExists, &markersExist, &sealExists); err != nil {
+				return nil, fmt.Errorf("application catalog import: inspect existing schema: %w", err)
+			}
+			if catalogExists && (!markersExist || !sealExists) {
+				return nil, fmt.Errorf("application catalog import: shared catalog predates the durable import marker; refusing ambiguous replay from %s until an operator reviews prior imports and deletions", importFrom)
+			}
+		}
 		store, err := setupPostgresApplicationCatalogStore(ctx, adminAuthStore, migrationDir, runMigrations, seedStore.Snapshot())
 		if err != nil {
 			return nil, err
@@ -125,7 +166,7 @@ func setupPostgresApplicationCatalogStore(ctx context.Context, adminAuthStore ad
 		if err != nil {
 			return nil, fmt.Errorf("load application catalog migrations: %w", err)
 		}
-		migrations, err = selectPostgresComponentMigrations(migrations, "application catalog", postgresMigrationApplicationCatalog)
+		migrations, err = selectPostgresComponentMigrations(migrations, "application catalog", postgresApplicationCatalogMigrationVersions()...)
 		if err != nil {
 			return nil, err
 		}
@@ -142,6 +183,18 @@ func setupPostgresApplicationCatalogStore(ctx context.Context, adminAuthStore ad
 // List returns the merged catalog (config seed + durable authored overlay) for a tenant, filtered/sorted/limited
 // identically to the file store. The seed is the base; authored DB rows overlay it (authored wins).
 func (p *postgresApplicationCatalogStore) List(ctx context.Context, tenantID string, options appcatalog.ListOptions) (appcatalog.ListResponse, error) {
+	return p.list(ctx, tenantID, options, false)
+}
+
+func (p *postgresApplicationCatalogStore) ListAll(ctx context.Context, tenantID string, options appcatalog.ListAllOptions) ([]appcatalog.Entry, error) {
+	response, err := p.list(ctx, tenantID, appcatalog.ListOptions{ApplicationType: options.ApplicationType, Status: options.Status}, true)
+	if err != nil {
+		return nil, err
+	}
+	return response.Applications, nil
+}
+
+func (p *postgresApplicationCatalogStore) list(ctx context.Context, tenantID string, options appcatalog.ListOptions, all bool) (appcatalog.ListResponse, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	if tenantID == "" {
 		return appcatalog.ListResponse{}, fmt.Errorf("tenant_id is required")
@@ -191,7 +244,9 @@ func (p *postgresApplicationCatalogStore) List(ctx context.Context, tenantID str
 	}
 	appcatalog.SortEntries(out)
 	count := len(out)
-	if len(out) > limit {
+	if all {
+		limit = count
+	} else if len(out) > limit {
 		out = out[:limit]
 	}
 	return appcatalog.ListResponse{Applications: out, Count: count, Limit: limit}, nil
@@ -236,6 +291,16 @@ func (p *postgresApplicationCatalogStore) CreateOrMatch(ctx context.Context, app
 }
 
 func (p *postgresApplicationCatalogStore) persistApplication(ctx context.Context, application appcatalog.Entry, tenantID string, now time.Time, createOnly bool) (appcatalog.Entry, error) {
+	return p.persistApplicationWithExecutor(ctx, p.db, application, tenantID, now, createOnly, false)
+}
+
+type applicationCatalogExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+// importOnly uses the same normalization and columns as an ordinary write, but
+// never overwrites a shared authored row. Its caller holds the import transaction.
+func (p *postgresApplicationCatalogStore) persistApplicationWithExecutor(ctx context.Context, executor applicationCatalogExecutor, application appcatalog.Entry, tenantID string, now time.Time, createOnly, importOnly bool) (appcatalog.Entry, error) {
 	normalized, err := appcatalog.Normalize(application, tenantID, now)
 	if err != nil {
 		return appcatalog.Entry{}, err
@@ -283,13 +348,15 @@ func (p *postgresApplicationCatalogStore) persistApplication(ctx context.Context
 		"routing_namespace = EXCLUDED.routing_namespace,",
 		"updated_at = EXCLUDED.updated_at",
 	}, " ")
-	if createOnly {
-		if _, seeded := p.seed[normalized.TenantID][normalized.ApplicationID]; seeded {
-			return appcatalog.Entry{}, appcatalog.ErrCandidateApplicationConflict
+	if createOnly || importOnly {
+		if createOnly {
+			if _, seeded := p.seed[normalized.TenantID][normalized.ApplicationID]; seeded {
+				return appcatalog.Entry{}, appcatalog.ErrCandidateApplicationConflict
+			}
 		}
 		query = strings.Split(query, " ON CONFLICT ")[0] + " ON CONFLICT (tenant_id, application_id) DO NOTHING"
 	}
-	result, err := p.db.ExecContext(ctx, query,
+	result, err := executor.ExecContext(ctx, query,
 		normalized.TenantID, normalized.ApplicationID, normalized.Name, normalized.ApplicationType, normalized.ServiceFamily,
 		normalized.Protocol, normalized.DestinationRole, normalized.ApplicationSensitivity, normalized.RouteRef,
 		normalized.SaaSProvider, normalized.SaaSCategory, normalized.SaaSRiskTier, normalized.DomainPatternCount,
@@ -396,11 +463,12 @@ func importAuthoredApplicationsOnce(ctx context.Context, store *postgresApplicat
 	if sourcePath == "" {
 		return nil
 	}
-	if _, err := os.Stat(sourcePath); errors.Is(err, os.ErrNotExist) {
+	sourceBefore, err := os.ReadFile(sourcePath)
+	if errors.Is(err, os.ErrNotExist) {
 		log.Printf("application catalog import: nothing to carry across — %s does not exist", sourcePath)
 		return nil
 	} else if err != nil {
-		return fmt.Errorf("application catalog import: %s is named as the source but could not be examined: %w", sourcePath, err)
+		return fmt.Errorf("application catalog import: %s is named as the source but could not be read: %w", sourcePath, err)
 	}
 	configOnly := seedStore.Snapshot()
 	if err := seedStore.SetStatePath(sourcePath); err != nil {
@@ -409,34 +477,117 @@ func importAuthoredApplicationsOnce(ctx context.Context, store *postgresApplicat
 		return fmt.Errorf("application catalog import: %s could not be read, and the catalog would come up looking complete with every authored application missing: %w", sourcePath, err)
 	}
 	withFile := seedStore.Snapshot()
+	sourceAfter, err := os.ReadFile(sourcePath)
+	if err != nil || !bytes.Equal(sourceBefore, sourceAfter) {
+		return fmt.Errorf("application catalog import: %s changed while being read; stop the legacy writer before importing: %v", sourcePath, err)
+	}
+	// A CP whose old file contains no authored override must not claim the
+	// one-time fleet import. Another CP may still hold the only authored file.
+	authored := 0
+	for tenantID, byID := range withFile {
+		for applicationID, entry := range byID {
+			if before, ok := configOnly[tenantID][applicationID]; !ok || !reflect.DeepEqual(before, entry) {
+				authored++
+			}
+		}
+	}
+	if authored == 0 {
+		return retireLegacyApplicationCatalogFile(sourcePath, sourceBefore)
+	}
+	sourceHash := sha256.Sum256(sourceBefore)
+	sourceDigest := hex.EncodeToString(sourceHash[:])
+
+	// Lock both tables for the whole import: another CP may migrate a different
+	// local file, and an older CP may still accept a deletion during a rollout.
+	// Atomic rows + markers mean a crash cannot leave an unmarked import that a
+	// later boot could replay after an administrator deletes that application.
+	tx, err := store.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("application catalog import: begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "LOCK TABLE application_catalog, application_catalog_legacy_imports, application_catalog_legacy_import_state IN SHARE ROW EXCLUSIVE MODE"); err != nil {
+		return fmt.Errorf("application catalog import: lock: %w", err)
+	}
+	var sealedDigest string
+	sealErr := tx.QueryRowContext(ctx, "SELECT source_sha256 FROM application_catalog_legacy_import_state WHERE singleton = true").Scan(&sealedDigest)
+	if sealErr != nil && !errors.Is(sealErr, sql.ErrNoRows) {
+		return fmt.Errorf("application catalog import: read one-time seal: %w", sealErr)
+	}
+	if sealedDigest != "" && sealedDigest != sourceDigest {
+		return fmt.Errorf("application catalog import: another legacy source was already sealed; reconcile old CP files before startup")
+	}
 
 	carried, skipped := 0, 0
 	now := time.Now().UTC()
-	for tenantID, byID := range withFile {
-		for applicationID, entry := range byID {
-			if before, ok := configOnly[tenantID][applicationID]; ok && reflect.DeepEqual(before, entry) {
-				continue // config-derived and untouched: rebuilt from configuration on every boot
+	if sealedDigest == "" {
+		for tenantID, byID := range withFile {
+			for applicationID, entry := range byID {
+				if before, ok := configOnly[tenantID][applicationID]; ok && reflect.DeepEqual(before, entry) {
+					continue // config-derived and untouched: rebuilt from configuration on every boot
+				}
+				// An import marker survives deliberate deletion of the shared row.
+				// A stale JSON file on a later boot must never resurrect that row.
+				var present int
+				if err := tx.QueryRowContext(ctx,
+					"SELECT 1 FROM application_catalog_legacy_imports WHERE tenant_id = $1 AND application_id = $2",
+					tenantID, applicationID).Scan(&present); err == nil {
+					skipped++
+					continue
+				} else if !errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("application catalog import: probing legacy marker for %s/%s failed: %w", tenantID, applicationID, err)
+				}
+				if err := tx.QueryRowContext(ctx,
+					"SELECT 1 FROM application_catalog WHERE tenant_id = $1 AND application_id = $2",
+					tenantID, applicationID).Scan(&present); errors.Is(err, sql.ErrNoRows) {
+					if _, err := store.persistApplicationWithExecutor(ctx, tx, entry, tenantID, now, false, true); err != nil {
+						return fmt.Errorf("application catalog import: carrying %s/%s failed: %w", tenantID, applicationID, err)
+					}
+					carried++
+				} else if err != nil {
+					return fmt.Errorf("application catalog import: probing shared row %s/%s failed: %w", tenantID, applicationID, err)
+				} else {
+					skipped++
+				}
+				if _, err := tx.ExecContext(ctx,
+					"INSERT INTO application_catalog_legacy_imports (tenant_id, application_id) VALUES ($1, $2)",
+					tenantID, applicationID); err != nil {
+					return fmt.Errorf("application catalog import: marking %s/%s failed: %w", tenantID, applicationID, err)
+				}
 			}
-			// A ROW check, not Get: Get falls back to the seed, so it answers true for entries that have no
-			// durable row at all — which would skip exactly the applications this is here to carry.
-			var present int
-			if err := store.db.QueryRowContext(ctx,
-				"SELECT 1 FROM application_catalog WHERE tenant_id = $1 AND application_id = $2",
-				tenantID, applicationID).Scan(&present); err == nil {
-				skipped++
-				continue
-			} else if !errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("application catalog import: probing %s/%s failed: %w", tenantID, applicationID, err)
-			}
-			if _, err := store.Upsert(ctx, entry, tenantID, now); err != nil {
-				return fmt.Errorf("application catalog import: carrying %s/%s failed: %w", tenantID, applicationID, err)
-			}
-			carried++
 		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO application_catalog_legacy_import_state (singleton, source_sha256) VALUES (true, $1)", sourceDigest); err != nil {
+			return fmt.Errorf("application catalog import: seal source: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("application catalog import: commit: %w", err)
+	}
+	// The legacy JSON is not the authority anymore. Leaving tenant data on disk
+	// outside the shared catalog's erasure path would make a later purge falsely
+	// report completion, and could let a stale file return after its import
+	// markers were erased. The caller must preserve any required migration
+	// evidence before startup; a failed retirement refuses startup.
+	if err := retireLegacyApplicationCatalogFile(sourcePath, sourceBefore); err != nil {
+		return err
 	}
 	if carried+skipped > 0 {
 		log.Printf("★ application catalog import: carried %d authored application(s) from %s into the shared store (%d were already there and were left alone)",
 			carried, sourcePath, skipped)
+	}
+	return nil
+}
+
+func retireLegacyApplicationCatalogFile(sourcePath string, sourceBefore []byte) error {
+	lastBytes, err := os.ReadFile(sourcePath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("application catalog import: verify retired source: %w", err)
+	}
+	if err == nil && !bytes.Equal(lastBytes, sourceBefore) {
+		return fmt.Errorf("application catalog import: legacy writer changed %s during import; stop it before startup", sourcePath)
+	}
+	if err := os.Remove(sourcePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("application catalog import: shared rows committed but legacy source %s could not be retired: %w", sourcePath, err)
 	}
 	return nil
 }

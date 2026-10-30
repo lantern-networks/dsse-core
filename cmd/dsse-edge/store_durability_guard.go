@@ -28,8 +28,8 @@ func storeUnderstandsSharedState(name string) bool {
 	// Edge polling the front door read them alternately.
 	case "admin_runtime_state", "admission_revocations", "high_risk_overlay", "agent_rollout", "agent_updates", "asset_catalog",
 		"audit_chain", "break_glass", "delegated_grants",
-		"dlp_allowlist", "dlp_classifiers", "dlp_fingerprints", "dlp_policy_objects",
-		"enrolled_inventory", "enrolment_tokens", "grants", "human_approvals", "idp_connections",
+		"dlp_allowlist", "dlp_classifiers", "dlp_fingerprints", "dlp_policy_objects", "dlp_rules",
+		"enrolled_inventory", "enrolment_tokens", "fleet_tenant_erasure", "grants", "human_approvals", "idp_connections",
 		// inspection_posture UNDERSTANDS shared state but is never resolved to it automatically — see
 		// storeStaysNodeLocal below. The two lists answer different questions: this one is "would =postgres
 		// work if an operator asked for it", and a control plane running leader+standby needs exactly that so

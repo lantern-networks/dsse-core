@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"strings"
 	"testing"
@@ -19,7 +23,7 @@ func TestGrantsAreReportedPublishedAndApplied(t *testing.T) {
 			"a node never tells the authority what it minted"},
 		{"admin_policy_routes.go", "grantBundleSection(",
 			"the authority never puts the grants in the bundle, so no Edge can learn them"},
-		{"config_bundle_sync.go", "applyGrantBundleSectionChecked(",
+		{"config_bundle_sync.go", "applyGrantBundleEvidence(",
 			"an Edge never applies them, so the bundle carries them and nothing reads them"},
 	} {
 		body, err := os.ReadFile(c.file)
@@ -32,11 +36,39 @@ func TestGrantsAreReportedPublishedAndApplied(t *testing.T) {
 	}
 	// ★ AND THE REPORTER READS THE STORE PER REPORT. It is constructed hundreds of lines before the store
 	// exists, so taking the pointer eagerly captures nil — a reporter that runs forever and reports nothing.
-	body, err := os.ReadFile("main.go")
+	source, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(body), "grants: theGrantStore.Load,") {
+	lazy := false
+	ast.Inspect(source, func(node ast.Node) bool {
+		literal, ok := node.(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		kind, ok := literal.Type.(*ast.Ident)
+		if !ok || kind.Name != "grantCPReporter" {
+			return true
+		}
+		for _, item := range literal.Elts {
+			field, ok := item.(*ast.KeyValueExpr)
+			if !ok {
+				continue
+			}
+			key, ok := field.Key.(*ast.Ident)
+			if !ok || key.Name != "grants" {
+				continue
+			}
+			value, ok := field.Value.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			owner, ok := value.X.(*ast.Ident)
+			lazy = lazy || (ok && owner.Name == "theGrantStore" && value.Sel.Name == "Load")
+		}
+		return true
+	})
+	if !lazy {
 		t.Error("the grant reporter is given a store rather than a way to find one; at the point it is " +
 			"constructed there is no store yet, so it would report nothing forever")
 	}
@@ -83,5 +115,29 @@ func TestApplyingTheAuthoritysGrantsDoesNotDeleteAFreshOne(t *testing.T) {
 	if added, _ := applyGrantBundleSection(local, &grantBundle{Complete: true,
 		Grants: []grantstore.Grant{old}}, now); added != 0 {
 		t.Error("an expired grant was merged, so the set grows forever")
+	}
+}
+
+func TestConfigBundleRestoresReleasedEvidenceOnlyAfterSignatureVerification(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	store := grantstore.NewStore()
+	old, err := store.Mint(grantstore.Grant{GrantID: "issued", TenantID: "tenant", DeviceID: "device", UserID: "user", IdPID: "corp", Scope: "app:22"}, time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := old
+	full.Issuer = "https://idp.invalid"
+	full.ProviderConfigSHA256 = fmt.Sprintf("%064x", 1)
+	full.AuthTime = now.Format(time.RFC3339)
+	section := &grantBundle{Complete: true, Grants: []grantstore.Grant{full}}
+	if _, _, err = applyGrantBundleEvidence(store, section, now, false); err == nil {
+		t.Fatal("unsigned payload enriched a released grant")
+	}
+	if _, updated, err := applyGrantBundleEvidence(store, section, now, true); err != nil || updated != 1 {
+		t.Fatal("verified CP evidence not restored", updated, err)
+	}
+	got, _ := store.Get(old.GrantID)
+	if got.AuthTime != full.AuthTime || got.ProviderConfigSHA256 != full.ProviderConfigSHA256 {
+		t.Fatal("restored evidence differs")
 	}
 }

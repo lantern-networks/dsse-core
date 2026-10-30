@@ -197,7 +197,7 @@ func registerDeviceAuthorityRotationRoute(mux *http.ServeMux,
 			if config.TenantCARegistry != nil {
 				for _, anchor := range config.TenantCARegistry.Anchors() {
 					owner, resolved := chainsToTenant([][]*x509.Certificate{{anchor}}, config.TenantCARegistry)
-					if !resolved || !strings.EqualFold(strings.TrimSpace(owner), tenant) {
+					if !resolved || strings.TrimSpace(owner) != tenant {
 						continue
 					}
 					fp := strings.ToLower(certFingerprint(anchor))

@@ -49,7 +49,7 @@ func TestConnectorEgressDialerMeshRelaysViaPeerEdge(t *testing.T) {
 	direct := &recordingDirectDialer{}
 	dialer := edgeplane.ConnectorEgressDialer{
 		ResolveConnector: connectorDestinationResolver(reg), Tunnels: tunnel.NewManager(), TenantID: "tenant-a", LocalRegion: "jp-tokyo",
-		Residency:    func(string) []string { return []string{"jp-tokyo", "jp-osaka"} },
+		Residency:    func(string) ([]string, error) { return []string{"jp-tokyo", "jp-osaka"}, nil },
 		PeerEdges:    stubPeerEdges{region: "jp-osaka", session: session},
 		MeshEligible: func(string) bool { return true },
 		Direct:       direct,
@@ -90,7 +90,7 @@ func TestConnectorEgressDialerHairpinFailsClosedWithoutMesh(t *testing.T) {
 	direct := &recordingDirectDialer{}
 	dialer := edgeplane.ConnectorEgressDialer{
 		ResolveConnector: connectorDestinationResolver(reg), Tunnels: tunnel.NewManager(), TenantID: "tenant-a", LocalRegion: "jp-tokyo",
-		Residency:    func(string) []string { return []string{"jp-tokyo", "jp-osaka"} },
+		Residency:    func(string) ([]string, error) { return []string{"jp-tokyo", "jp-osaka"}, nil },
 		PeerEdges:    stubPeerEdges{region: "jp-osaka", session: nil},
 		MeshEligible: func(string) bool { return false }, // not opted in -> hairpin
 		Direct:       direct,
@@ -120,7 +120,7 @@ func TestConnectorEgressDialerResidencyDeniesOutOfBoundary(t *testing.T) {
 	direct := &recordingDirectDialer{}
 	dialer := edgeplane.ConnectorEgressDialer{
 		ResolveConnector: connectorDestinationResolver(reg), Tunnels: tunnel.NewManager(), TenantID: "tenant-a", LocalRegion: "jp-tokyo",
-		Residency: func(string) []string { return []string{"jp-tokyo", "jp-osaka"} }, Direct: direct,
+		Residency: func(string) ([]string, error) { return []string{"jp-tokyo", "jp-osaka"}, nil }, Direct: direct,
 	}
 	_, err := dialer.OpenTCPConnection(context.Background(), edgeplane.NetworkExtensionRuntimeCopyTCPRoute{
 		Host: "host.corp.internal", Port: 443, SNI: "host.corp.internal", TenantID: "tenant-a",

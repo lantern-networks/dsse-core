@@ -3,7 +3,6 @@ package hotstore
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -48,6 +47,9 @@ type BatchIngestor struct {
 	onFlush      func(rows int)
 
 	spoolPath string
+	// A startup spool read/parse failure must fence later writes to that path.
+	// The previous backlog may be recoverable even when this process cannot read it.
+	spoolLoadErr error
 
 	stop     chan struct{}
 	stopped  sync.WaitGroup
@@ -192,6 +194,16 @@ func (b *BatchIngestor) spoolBacklog(backlog [][]IngestRecord) error {
 
 // persistBacklog spools and REPORTS. Called synchronously wherever the backlog changes.
 func (b *BatchIngestor) persistBacklog(backlog [][]IngestRecord) {
+	if b.spoolLoadErr != nil {
+		if b.onFlushError != nil {
+			rows := 0
+			for _, held := range backlog {
+				rows += len(held)
+			}
+			b.onFlushError(fmt.Errorf("the hot-store backlog could NOT be spooled after a startup read failure (%w): the original spool is preserved and %d new row(s) are memory-only", b.spoolLoadErr, rows), rows)
+		}
+		return
+	}
 	if err := b.spoolBacklog(backlog); err != nil && b.onFlushError != nil {
 		rows := 0
 		for _, held := range backlog {
@@ -203,32 +215,22 @@ func (b *BatchIngestor) persistBacklog(backlog [][]IngestRecord) {
 }
 
 // loadSpooledBacklog reads what a previous process could not write.
-func (b *BatchIngestor) loadSpooledBacklog() [][]IngestRecord {
+func (b *BatchIngestor) loadSpooledBacklog() ([][]IngestRecord, error) {
 	if b.spoolPath == "" {
-		return nil
+		return nil, nil
 	}
 	raw, err := os.ReadFile(b.spoolPath)
 	if err != nil {
-		// ★ A READ ERROR IS NOT AN EMPTY SPOOL (2026-08-13, twenty-ninth review). This returned nil silently,
-		// and the next spoolBacklog then OVERWRITES the file — so rows this subsystem had accepted as durably
-		// held vanished with no log line and no counter, which is the one thing the spool exists to prevent.
-		// The unmarshal error beside it was already reported; the read error was not.
-		if !os.IsNotExist(err) && b.onFlushError != nil {
-			b.onFlushError(fmt.Errorf("the hot-store spool could not be READ (%w): rows held for a later flush "+
-				"cannot be recovered, and the next write will replace the file", err), 0)
+		if os.IsNotExist(err) {
+			return nil, nil
 		}
-		return nil
+		return nil, fmt.Errorf("read hot-store spool: %w", err)
 	}
 	var backlog [][]IngestRecord
-	if json.Unmarshal(raw, &backlog) != nil {
-		// Unreadable: removed rather than left to block every later write. One lost spool, said out loud.
-		_ = os.Remove(b.spoolPath)
-		if b.onFlushError != nil {
-			b.onFlushError(errors.New("the hot-store spool could not be read and was discarded"), 0)
-		}
-		return nil
+	if err := json.Unmarshal(raw, &backlog); err != nil {
+		return nil, fmt.Errorf("decode hot-store spool: %w", err)
 	}
-	return backlog
+	return backlog, nil
 }
 
 // Add queues a record. It never blocks: a full queue drops the record and says so.
@@ -261,7 +263,11 @@ func (b *BatchIngestor) run() {
 	defer ticker.Stop()
 	batch := make([]IngestRecord, 0, b.maxRows)
 	// Anything a previous process could not write. Resumed rather than forgotten.
-	backlog := b.loadSpooledBacklog()
+	var backlog [][]IngestRecord
+	backlog, b.spoolLoadErr = b.loadSpooledBacklog()
+	if b.spoolLoadErr != nil && b.onFlushError != nil {
+		b.onFlushError(fmt.Errorf("the hot-store spool could not be loaded and is preserved for recovery: %w", b.spoolLoadErr), 0)
+	}
 	if len(backlog) > 0 && b.onFlushError != nil {
 		rows := 0
 		for _, held := range backlog {
@@ -299,7 +305,7 @@ func (b *BatchIngestor) run() {
 			}
 		}
 		if err == nil {
-			if b.onFlush != nil {
+			if b.onFlush != nil && b.spoolLoadErr == nil {
 				b.onFlush(len(batch))
 			}
 			batch = batch[:0]
@@ -364,7 +370,7 @@ func (b *BatchIngestor) run() {
 			}
 			return
 		}
-		if b.onFlush != nil {
+		if b.onFlush != nil && b.spoolLoadErr == nil {
 			b.onFlush(len(oldest))
 		}
 	}
@@ -405,7 +411,9 @@ func (b *BatchIngestor) run() {
 				}
 				if b.onFlushError != nil {
 					where := "they are in the canonical jsonl and nothing replays it"
-					if b.spoolPath != "" {
+					if b.spoolLoadErr != nil {
+						where = "memory-only; the unreadable startup spool remains untouched for recovery"
+					} else if b.spoolPath != "" {
 						where = "held in " + b.spoolPath + " and resumed on the next start"
 					}
 					b.onFlushError(fmt.Errorf("shutting down with %d batch(es) / %d row(s) not yet written to the "+

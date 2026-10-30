@@ -3,6 +3,7 @@ package fileextract
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -85,8 +86,8 @@ func TestExtractCap(t *testing.T) {
 	big := strings.Repeat("A", 1<<20) // 1 MiB of text in one node
 	f := buildZip(t, map[string]string{"word/document.xml": "<w:t>" + big + "</w:t>"})
 	text, err := extractOOXMLText(f, 4096) // small cap
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	if !errors.Is(err, ErrExtractionLimit) {
+		t.Fatalf("incomplete extraction must be reported: %v", err)
 	}
 	if len(text) > 4096+64 { // allow a little slack for the last node
 		t.Errorf("extraction exceeded the cap: %d bytes", len(text))
@@ -104,8 +105,8 @@ func TestExtractReadBudgetBoundsDecompression(t *testing.T) {
 		"word/document.xml": "<w:body>" + whitespace + "<w:t>" + syntheticMyNumber + "</w:t></w:body>",
 	})
 	text, err := extractOOXMLText(f, 4096)
-	if err != nil {
-		t.Fatalf("extract: %v", err)
+	if !errors.Is(err, ErrExtractionLimit) {
+		t.Fatalf("decompression budget exhaustion must be reported: %v", err)
 	}
 	if strings.Contains(text, syntheticMyNumber) {
 		t.Errorf("read budget not enforced: 1 MiB of whitespace was decompressed for free and the trailing text surfaced")

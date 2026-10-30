@@ -38,6 +38,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/blobstore"
 )
 
 // fleetConfigReport is what one Edge says about itself.
@@ -166,7 +168,7 @@ func fleetConfigEntriesForTenant(entries []fleetConfigEntry, callerTenant string
 		}
 		if callerTenant != "" {
 			for _, er := range e.Erasures {
-				if strings.EqualFold(strings.TrimSpace(er.TenantID), callerTenant) {
+				if strings.TrimSpace(er.TenantID) == strings.TrimSpace(callerTenant) {
 					row.Erasures = append(row.Erasures, er)
 				}
 			}
@@ -178,21 +180,15 @@ func fleetConfigEntriesForTenant(entries []fleetConfigEntry, callerTenant string
 
 // fleetConfigStatusStore holds the last report from each Edge. Control-plane side only.
 //
-// restart-durability: ephemeral — every entry is re-reported by its Edge within one poll interval, so a
-// control-plane restart costs one interval of blankness and nothing more. Deliberately NOT persisted: a view
-// whose whole job is to say who is currently reachable must not answer from memory of a previous process. A
-// remembered "region-b: current" surviving a restart would be the exact claim this store exists to stop being
-// made without evidence.
+// restart-durability: cp_durable — erasure participants and their last evidence are committed to the shared
+// CP database (or the single CP's state directory). Configuration liveness remains process-local: restoring
+// an erasure answer never restores a claim that the reporting node is currently reachable.
 //
 // populated-by: assertion — each Edge POSTs its own status on EVERY config-bundle poll, applied or not, so the
 // view re-converges on its own within one interval and an Edge that stops asserting simply leaves the fleet.
 // Reporting only on change was considered and rejected: an Edge that reports nothing because nothing changed
 // and one that reports nothing because it is gone would be indistinguishable, and membership is derived from
 // exactly this stream.
-//
-// In-memory ON PURPOSE, and it is one of the few stores in this tree where that is right: every entry is
-// re-reported within one poll interval, and a CP restart that showed a REMEMBERED fleet would be claiming
-// knowledge it does not have. Losing it costs one interval of blankness, which is honest.
 type fleetConfigStatusStore struct {
 	mu      sync.RWMutex
 	entries map[string]fleetConfigEntry // "region/cluster" -> latest
@@ -209,7 +205,12 @@ type fleetConfigStatusStore struct {
 	// So a node that once said "I still hold N" keeps saying it until it says otherwise. Absence is not
 	// resolution, which is the same rule the config bundle applies to a missing tenant and the footprint
 	// applies to a store it could not count.
-	erasures map[string]map[string]fleetTenantErasureState // tenant_id -> node key -> last answer
+	erasures         map[string]map[string]fleetTenantErasureState // tenant_id -> node key -> last answer
+	erasurePersister blobstore.Persister
+	erasureKnown     bool
+	// Unacknowledged evidence survives a local write failure until a later confirmed write includes it.
+	// A failed read/write must never allow the completion view to quietly omit that evidence.
+	erasurePending map[string]map[string]fleetTenantErasureState
 	// authoritySince is when this process became the node reports arrive at. See cp_leader_election.go's
 	// leaderSince: a store that has been listening for less than freshFor cannot tell a fleet of two from a
 	// fleet of four whose other half has not had time to speak.
@@ -283,33 +284,25 @@ func fleetConfigKey(region, cluster, node string) string {
 }
 
 // Record stores one Edge's report.
-func (s *fleetConfigStatusStore) Record(rep fleetConfigReport, now time.Time) {
+func (s *fleetConfigStatusStore) Record(rep fleetConfigReport, now time.Time) error {
+	return s.RecordContext(context.Background(), rep, now)
+}
+
+func (s *fleetConfigStatusStore) RecordContext(ctx context.Context, rep fleetConfigReport, now time.Time) error {
 	if s == nil {
-		return
+		return fmt.Errorf("fleet status store is unavailable")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := s.recordErasureLocked(ctx, rep, now); err != nil {
+		return err
+	}
 	key := fleetConfigKey(rep.RegionID, rep.ClusterID, rep.NodeID)
 	s.entries[key] = fleetConfigEntry{
 		fleetConfigReport: rep,
 		ReportedAt:        now.UTC(),
 	}
-	for _, erasure := range rep.Erasures {
-		tenantID := strings.TrimSpace(erasure.TenantID)
-		if tenantID == "" {
-			continue
-		}
-		if s.erasures[tenantID] == nil {
-			s.erasures[tenantID] = map[string]fleetTenantErasureState{}
-		}
-		s.erasures[tenantID][key] = fleetTenantErasureState{
-			NodeKey:    key,
-			NodeID:     rep.NodeID,
-			Clean:      erasure.Clean,
-			Remaining:  erasure.Remaining,
-			ReportedAt: now.UTC(),
-		}
-	}
+	return nil
 }
 
 // NodesInRegion counts the Edge nodes of one region that have reported WITHIN the freshness window.
@@ -364,27 +357,35 @@ type fleetTenantErasureState struct {
 // the fleet. Complete requires every node that has ever answered to say clean; a node that answered "not
 // clean" and then went silent keeps the erasure incomplete, and says so with stale=true.
 func (s *fleetConfigStatusStore) TenantErasure(tenantID string, now time.Time) ([]fleetTenantErasureState, bool) {
+	nodes, complete, err := s.tenantErasure(tenantID, now)
+	return nodes, complete && err == nil
+}
+
+func (s *fleetConfigStatusStore) tenantErasure(tenantID string, now time.Time) ([]fleetTenantErasureState, bool, error) {
 	out := []fleetTenantErasureState{}
 	if s == nil {
-		return out, false
+		return out, false, fmt.Errorf("fleet status store is unavailable")
 	}
 	tenantID = strings.TrimSpace(tenantID)
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.refreshErasureLocked(); err != nil {
+		return out, false, err
+	}
 	for _, state := range s.erasures[tenantID] {
 		state.Stale = now.Sub(state.ReportedAt) > s.freshFor
 		out = append(out, state)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeKey < out[j].NodeKey })
 	if len(out) == 0 {
-		return out, false // nobody has answered: not evidence of anything, least of all completion
+		return out, false, nil // nobody has answered: not evidence of anything, least of all completion
 	}
 	for _, state := range out {
-		if !state.Clean {
-			return out, false
+		if !state.Clean || state.Remaining != 0 {
+			return out, false, nil
 		}
 	}
-	return out, true
+	return out, true, nil
 }
 
 // List returns every known Edge with its status judged against the control plane's CURRENT generation.
@@ -421,9 +422,9 @@ func fleetConfigEntryStatus(e fleetConfigEntry, cpGeneration uint64, cpEpoch str
 	if strings.TrimSpace(e.LastError) != "" {
 		return "error"
 	}
-	// A different epoch means the CP restarted since this report; the generation numbers are not comparable, so
+	// A different or missing epoch makes the generation numbers incomparable, so
 	// claiming "current" would be a guess. Treated as lagging until the Edge reports against the new epoch.
-	if cpEpoch != "" && e.Epoch != "" && e.Epoch != cpEpoch {
+	if cpEpoch != "" && e.Epoch != cpEpoch {
 		return "lagging"
 	}
 	if e.Generation < cpGeneration {
@@ -465,6 +466,9 @@ func registerFleetConfigStatusRoutes(mux *http.ServeMux, adminEndpoint func(stri
 	// allowed to say which generation of it it holds.
 	// control-plane-only: the fleet surface exists only where the fleet is aggregated (measured: an Edge answers 404)
 	mux.HandleFunc("POST /admin/fleet/config-status", adminEndpoint("admin.policy.read", func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeFleetConfigurationRead(w, r, operatorTenantConfigured()) {
+			return
+		}
 		var rep fleetConfigReport
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&rep); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("malformed fleet config report: %w", err))
@@ -475,7 +479,10 @@ func registerFleetConfigStatusRoutes(mux *http.ServeMux, adminEndpoint func(stri
 			return
 		}
 		now := time.Now().UTC()
-		store.Record(rep, now)
+		if err := store.RecordContext(r.Context(), rep, now); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("fleet erasure evidence could not be committed"))
+			return
+		}
 		// ★ ANSWER WITH THE REPORTER'S OWN DENOMINATOR. The Edges cannot see each other — they push here and
 		// the aggregation lives here — so this reply is the only place a node can learn how many siblings its
 		// region has. It is what a connector needs before it can say whether it covers the fleet or merely
@@ -555,7 +562,11 @@ func registerFleetConfigStatusRoutes(mux *http.ServeMux, adminEndpoint func(stri
 		if !adminTenantPathReadAllowed(w, r, tenantID, "reading the erasure progress of") {
 			return
 		}
-		nodes, complete := store.TenantErasure(tenantID, time.Now().UTC())
+		nodes, complete, err := store.tenantErasure(tenantID, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("fleet erasure evidence is unavailable"))
+			return
+		}
 		stale := 0
 		for _, n := range nodes {
 			if n.Stale {

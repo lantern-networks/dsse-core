@@ -218,3 +218,49 @@ func TestThePublishedCatalogueNamesTheOrganizationsItSpeaksFor(t *testing.T) {
 			"or deleting its last Site never propagates", section.Tenants)
 	}
 }
+
+func TestSiteBundleKeepsCaseDistinctTenantsSeparate(t *testing.T) {
+	cp, edge := siteBundleStore(t), siteBundleStore(t)
+	putSite(t, cp, "TenantA", "upper-site", connectorRuntimeSecretHash("upper-secret"))
+	putSite(t, cp, "tenanta", "lower-site", connectorRuntimeSecretHash("lower-secret"))
+
+	section := siteBundleSection(context.Background(), cp, []string{"TenantA", "tenanta"})
+	if section == nil {
+		t.Fatal("Site catalog was not published")
+	}
+	if !section.Complete || len(section.Tenants) != 2 || len(section.Sites) != 2 {
+		t.Fatalf("case-distinct tenant catalogs collapsed: complete=%t tenants=%d sites=%d",
+			section.Complete, len(section.Tenants), len(section.Sites))
+	}
+	if _, _, err := applySiteBundleSection(context.Background(), edge, section, time.Now().UTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := siteIDs(t, edge, "TenantA"); !listsSite(got, "upper-site") {
+		t.Fatalf("uppercase tenant Site was not delivered: %v", got)
+	}
+	if got := siteIDs(t, edge, "tenanta"); !listsSite(got, "lower-site") {
+		t.Fatalf("lowercase tenant Site was not delivered: %v", got)
+	}
+}
+
+func TestSiteBundleDeletesLastSiteForUppercaseTenant(t *testing.T) {
+	cp, edge := siteBundleStore(t), siteBundleStore(t)
+	putSite(t, cp, "TenantA", "last-site", connectorRuntimeSecretHash("old-secret"))
+	section := siteBundleSection(context.Background(), cp, []string{"TenantA"})
+	if _, _, err := applySiteBundleSection(context.Background(), edge, section, time.Now().UTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := siteIDs(t, edge, "TenantA"); !listsSite(got, "last-site") {
+		t.Fatalf("precondition: Site did not arrive: %v", got)
+	}
+	if err := cp.Delete(context.Background(), "TenantA", "last-site"); err != nil {
+		t.Fatal(err)
+	}
+	section = siteBundleSection(context.Background(), cp, []string{"TenantA"})
+	if _, _, err := applySiteBundleSection(context.Background(), edge, section, time.Now().UTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := siteIDs(t, edge, "TenantA"); len(got) != 0 {
+		t.Fatalf("deleted Site and bootstrap hash survived on Edge: %v", got)
+	}
+}

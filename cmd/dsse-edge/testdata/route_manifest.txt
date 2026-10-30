@@ -47,6 +47,7 @@ GET /admin/agent-tools/{tool_id}
 GET /admin/agent-update-artifact
 GET /admin/agent-update-sign-floor
 GET /admin/agent-updates
+GET /admin/agent-updates/distribution
 GET /admin/agent/device-updates
 GET /admin/agent/quality
 GET /admin/ai-ops/access-trends
@@ -54,6 +55,7 @@ GET /admin/ai-usage-report
 GET /admin/api-tokens
 GET /admin/applications
 GET /admin/applications/{application_id}
+GET /admin/archive-health
 GET /admin/assets/endpoints
 GET /admin/assets/groups
 GET /admin/assets/groups/{group_id}/members
@@ -64,7 +66,10 @@ GET /admin/audit-outbox/dead/{outbox_id}
 GET /admin/audit-outbox/health
 GET /admin/audit-outbox/stats
 GET /admin/audit-writer/health
+GET /admin/auth-observed-accounts
+GET /admin/auth-rollout
 GET /admin/auth/health
+GET /admin/authentication-grants
 GET /admin/break-glass-token
 GET /admin/catalog-groups
 GET /admin/certs
@@ -90,6 +95,7 @@ GET /admin/dlp-classifiers
 GET /admin/dlp-findings
 GET /admin/dlp-fingerprints
 GET /admin/dlp-policies
+GET /admin/dlp-retention-status
 GET /admin/dlp-rules
 GET /admin/dns-policy
 GET /admin/domain-event-outbox/dead
@@ -117,6 +123,7 @@ GET /admin/export-jobs
 GET /admin/export-jobs/{job_id}
 GET /admin/fleet/config-status
 GET /admin/fleet/tenant-erasure/{tenant_id}
+GET /admin/grant-bundle-page
 GET /admin/grants
 GET /admin/hot-store/health
 GET /admin/human-approval-events
@@ -144,6 +151,9 @@ GET /admin/legal-hold
 GET /admin/license
 GET /admin/logs/{stream}
 GET /admin/logs/{stream}/export
+GET /admin/manual-hot-log-delete
+GET /admin/manual-hot-log-delete/all
+GET /admin/manual-hot-log-delete/{job_id}
 GET /admin/non-human-identities
 GET /admin/non-human-identities/risk
 GET /admin/operator-access
@@ -193,6 +203,7 @@ GET /admin/transport-admission
 GET /admin/transport-ca-readiness
 GET /admin/transport-name-rename
 GET /admin/transport-trust-anchors
+GET /admin/upstream-tls
 GET /admin/usage/health
 GET /admin/usage/summary
 GET /admin/vlan-boundary-policies
@@ -226,6 +237,7 @@ GET /inspection/events/{inspection_id}
 GET /leader
 GET /mesh/ingress/tunnel
 GET /metrics
+GET /pki/crl/{tenant}/{file}
 GET /sessions/{session_id}
 GET /steer/agent-policy
 GET /steer/agent-policy/posture
@@ -237,6 +249,7 @@ GET /steer/agent-update-plan
 GET /steer/region-endpoints
 GET /steer/server-initiated-export
 GET /swg/tls-readiness/status
+GET /tenant-inspection-crl
 PATCH /admin/device-groups/{id}
 POST /admin/activate/password
 POST /admin/activate/totp/begin
@@ -259,6 +272,7 @@ POST /admin/assets/endpoints
 POST /admin/assets/groups
 POST /admin/assets/services
 POST /admin/audit-outbox/dead/{outbox_id}/replay
+POST /admin/auth-rollout/activate
 POST /admin/cert-pin-bypass
 POST /admin/certs/{name}/rollback
 POST /admin/config-versions
@@ -324,6 +338,9 @@ POST /admin/license
 POST /admin/login/password
 POST /admin/login/totp
 POST /admin/logout
+POST /admin/manual-hot-log-delete/preview
+POST /admin/manual-hot-log-delete/{job_id}/cancel
+POST /admin/manual-hot-log-delete/{job_id}/confirm
 POST /admin/non-human-identities
 POST /admin/operator-elevations
 POST /admin/operator-elevations/{id}/approve
@@ -361,6 +378,8 @@ POST /admin/tenant-device-authority/retire-previous
 POST /admin/tenant-device-authority/rotate
 POST /admin/tenant-interception-authority
 POST /admin/tenant-interception-authority/promote
+POST /admin/tenant-interception-authority/revoke-delegation
+POST /admin/tenant-interception-authority/root-crl
 POST /admin/tenant-interception-authority/withdraw-incoming
 POST /admin/tenant-transport-authority
 POST /admin/tenant-transport-authority/abandon-rename
@@ -376,14 +395,21 @@ POST /admin/transport-admission/restore
 POST /admin/transport-admission/revoke
 POST /admin/transport-trust-anchors
 POST /admin/transport-trust-anchors/{sha256}/acknowledge
+POST /admin/upstream-tls
 POST /admin/vlan-boundary-policies
 POST /admin/vlan-objects
 POST /audit-ingest
+POST /auth-flow-results
+POST /auth-flow-results/query
 POST /auth/events
+POST /authentication-grants/mint
+POST /authentication-grants/reauthentication
 POST /break-glass/requests
 POST /break-glass/requests/{request_id}/approve
 POST /break-glass/requests/{request_id}/issue-session
 POST /break-glass/sessions
+POST /clientless/auth/retry
+POST /clientless/auth/start
 POST /connector-report
 POST /connectors/register
 POST /connectors/{connector_id}/heartbeat
@@ -396,12 +422,15 @@ POST /devices/register
 POST /devices/{device_id}/agent-status
 POST /devices/{device_id}/agent-updates
 POST /devices/{device_id}/heartbeat
+POST /directory-import-report
 POST /dns/strip-ech
 POST /east-west/grant
 POST /enroll
 POST /enroll/renew
 POST /enrolment-report
+POST /fleet-capabilities/report
 POST /grant-report
+POST /grant-report-v2
 POST /human-approvals/events
 POST /identity-sources/import
 POST /ingest/dns-resolution-observation
@@ -412,10 +441,12 @@ POST /revocation-mesh/admission
 POST /steer/agent-policy/effective
 POST /steer/dns-query
 POST /tenant-edge-material
+POST /tenant-inspection-crl
 POST /tools/events
 PUT /admin/agent-rollout
 PUT /admin/agent-update-artifact
 PUT /admin/agent-updates
+PUT /admin/auth-rollout
 PUT /admin/certs/{name}
 PUT /admin/connector-program
 PUT /admin/dns-policy

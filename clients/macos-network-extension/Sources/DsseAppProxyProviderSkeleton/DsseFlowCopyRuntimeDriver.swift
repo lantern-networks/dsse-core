@@ -61,6 +61,7 @@ public struct DsseLocalRuntimeCopyMetadata: Equatable, Sendable {
     // It is per-flow, so a shared device still attributes each flow to the right person. Conveyed to the Edge in
     // the steer OPEN frame ("u=<user>") and used there as the authoritative "who".
     public let osUser: String?
+ public let authOwner: DsseAuthOwner?
     // sourceApp is the app/process that originated THIS flow (the flow's sourceAppSigningIdentifier). Conveyed
     // to the Edge in the steer OPEN frame ("a=<app>") as the "what tool" dimension (browser vs CLI vs AI agent).
     public let sourceApp: String?
@@ -72,6 +73,7 @@ public struct DsseLocalRuntimeCopyMetadata: Equatable, Sendable {
         destinationHost: String? = nil,
         destinationPort: Int? = nil,
         osUser: String? = nil,
+ authOwner: DsseAuthOwner? = nil,
         sourceApp: String? = nil
     ) {
         self.tenantID = tenantID
@@ -80,6 +82,7 @@ public struct DsseLocalRuntimeCopyMetadata: Equatable, Sendable {
         self.destinationHost = destinationHost
         self.destinationPort = destinationPort
         self.osUser = osUser
+ self.authOwner = authOwner
         self.sourceApp = sourceApp
     }
 }
@@ -1236,6 +1239,10 @@ public final class DsseProviderRuntimeDiagnosticWriter: @unchecked Sendable {
     }
 
     private func update(_ mutate: (inout MutableState) -> Void) throws {
+        // Keep state changes and their disk publication in call order. A later update must not publish an
+        // older snapshot after a terminal one, and a failed write must remain retryable.
+        writeDedupLock.lock()
+        defer { writeDedupLock.unlock() }
         lock.lock()
         if diagnosticSealed { // one-shot: terminal snapshot already persisted; do no work, touch no disk.
             lock.unlock()
@@ -1338,12 +1345,10 @@ public final class DsseProviderRuntimeDiagnosticWriter: @unchecked Sendable {
         // "completed" snapshot is persisted the writer stops entirely (per-flow rewrites of a last-writer-wins
         // verification file carry no information and were the disk-writes bug).
         let dedupKey = try Self.encodeDiagnostic(makeDiagnostic(from: state, createdAtOverride: ""))
-        writeDedupLock.lock()
         let unchanged = (dedupKey == lastWrittenDiagnostic)
-        if !unchanged { lastWrittenDiagnostic = dedupKey }
-        writeDedupLock.unlock()
         if !unchanged {
             try Self.writeDiagnostic(try Self.encodeDiagnostic(diagnostic), to: diagnosticURL)
+            lastWrittenDiagnostic = dedupKey
         }
         if terminal { // seal AFTER the terminal snapshot is (or already was) on disk
             lock.lock()
@@ -1886,7 +1891,11 @@ public protocol DsseProviderTCPFlowCopyIO: AnyObject, Sendable {
 }
 
 public struct DsseLiveRuntimeCopyGuardConfiguration: Equatable, Sendable {
-    public static let defaults = DsseLiveRuntimeCopyGuardConfiguration()
+    public static let defaults = DsseLiveRuntimeCopyGuardConfiguration(
+        maxConcurrentConnections: DssePerformanceLimits.current.maxConcurrentConnections,
+        maxByteCapBytes: DssePerformanceLimits.current.maxBytesPerFlow,
+        maxIdleTimeInterval: DssePerformanceLimits.current.idleTimeoutSeconds
+    )
 
     public let maxConcurrentConnections: Int
     public let maxByteCapBytes: Int
@@ -1894,9 +1903,9 @@ public struct DsseLiveRuntimeCopyGuardConfiguration: Equatable, Sendable {
     public let backpressureQueueCapacity: Int
 
     public init(
-        maxConcurrentConnections: Int = 1_024,
-        maxByteCapBytes: Int = 1_073_741_824,
-        maxIdleTimeInterval: TimeInterval = 300,
+        maxConcurrentConnections: Int = 0,
+        maxByteCapBytes: Int = 0,
+        maxIdleTimeInterval: TimeInterval = 0,
         backpressureQueueCapacity: Int = 16
     ) {
         self.maxConcurrentConnections = maxConcurrentConnections
@@ -1947,7 +1956,7 @@ public final class DsseLiveRuntimeCopyGuard: @unchecked Sendable {
         guard openRecords[metadata.requestID] == nil else {
             throw DsseLocalRuntimeCopyDriverError.duplicateRuntimeCopyRequestID
         }
-        guard openRecords.count < configuration.maxConcurrentConnections else {
+        guard configuration.maxConcurrentConnections == 0 || openRecords.count < configuration.maxConcurrentConnections else {
             throw DsseLocalRuntimeCopyDriverError.runtimeCopyConcurrentCapExceeded
         }
         let openedAt = now()
@@ -1965,7 +1974,7 @@ public final class DsseLiveRuntimeCopyGuard: @unchecked Sendable {
         try mutateRecord(requestID: requestID) { record, currentTime in
             try Self.throwIfIdle(record: record, now: currentTime, configuration: configuration)
             let nextBytesUp = record.bytesUp + count
-            guard nextBytesUp + record.bytesDown <= configuration.maxByteCapBytes else {
+            guard configuration.maxByteCapBytes == 0 || nextBytesUp + record.bytesDown <= configuration.maxByteCapBytes else {
                 throw DsseLocalRuntimeCopyDriverError.runtimeCopyByteCapExceeded
             }
             record.bytesUp = nextBytesUp
@@ -1980,7 +1989,7 @@ public final class DsseLiveRuntimeCopyGuard: @unchecked Sendable {
                 throw DsseLocalRuntimeCopyDriverError.runtimeCopyBackpressureOverflowClosed
             }
             let nextBytesDown = record.bytesDown + count
-            guard record.bytesUp + nextBytesDown <= configuration.maxByteCapBytes else {
+            guard configuration.maxByteCapBytes == 0 || record.bytesUp + nextBytesDown <= configuration.maxByteCapBytes else {
                 throw DsseLocalRuntimeCopyDriverError.runtimeCopyByteCapExceeded
             }
             record.bytesDown = nextBytesDown
@@ -2024,7 +2033,7 @@ public final class DsseLiveRuntimeCopyGuard: @unchecked Sendable {
         now: Date,
         configuration: DsseLiveRuntimeCopyGuardConfiguration
     ) throws {
-        guard now.timeIntervalSince(record.lastActivityAt) <= configuration.maxIdleTimeInterval else {
+        guard configuration.maxIdleTimeInterval == 0 || now.timeIntervalSince(record.lastActivityAt) <= configuration.maxIdleTimeInterval else {
             throw DsseLocalRuntimeCopyDriverError.runtimeCopyIdleTimeoutExceeded
         }
     }
@@ -2381,7 +2390,7 @@ public final class DsseURLSessionRuntimeCopyHTTPClient: DsseInstrumentedEdgeRunt
             // A domain, a code and the system's own description of a transport failure. Never key material,
             // and useless to withhold from the person who has to make the device work.
             dsseRuntimeLog("edge_round_trip_failed url=\(request.url?.host.map { $0 + (request.url?.path ?? "") } ?? "?") " +
-                           "domain=\(nsError.domain) code=\(nsError.code) reason=\(nsError.localizedDescription)")
+                           "domain=\(nsError.domain) code=\(nsError.code) reason=\(providerNonsecretNetworkFailureCategory(nsError.localizedDescription))")
             throw DsseLocalRuntimeCopyDriverError.edgeTransportRequestFailed
         }
         guard let statusCode = box.statusCode, let data = box.data else {
@@ -2500,7 +2509,7 @@ public final class DsseEdgeRuntimeCopyTransport: DsseInstrumentedLocalRuntimeCop
         withPooledMux(host: host, port: port) { result in
             switch result {
             case .success(let mux):
-                completion(.success(mux.openFlow(authority: authority) as DsseRuntimeCopyTunnelStream))
+                completion(.success(mux.openFlow(authority: authority, authOwner: metadata.authOwner) as DsseRuntimeCopyTunnelStream))
             case .failure(let error):
                 completion(.failure(error))
             }
@@ -2799,6 +2808,13 @@ public final class DsseEdgeRuntimeCopyTransport: DsseInstrumentedLocalRuntimeCop
 }
 
 public enum DsseLocalRuntimeCopyTransportFactory {
+    static func securityForRegionEndpoint(_ base: DsseTransportSecurity,
+                                          host: String, port: Int) -> DsseTransportSecurity {
+        DsseTransportSecurity(host: host, port: port, mtlsRequired: base.mtlsRequired,
+                              pinnedCACertificates: base.pinnedCACertificates,
+                              clientIdentity: base.clientIdentity)
+    }
+
     public static func make(
         agentConfigPath: String,
         httpClient: any DsseEdgeRuntimeCopyHTTPClient = DsseURLSessionRuntimeCopyHTTPClient()
@@ -2869,13 +2885,7 @@ public enum DsseLocalRuntimeCopyTransportFactory {
         guard let baseSecurity = DsseTransportSecurityResolver.resolve(contract: contract, configDirectory: configDir, agentConfigPath: agentConfigPath) else {
             return nil
         }
-        let regionSecurity = DsseTransportSecurity(
-            host: host,
-            port: port,
-            mtlsRequired: baseSecurity.mtlsRequired,
-            pinnedCACertificate: baseSecurity.pinnedCACertificate,
-            clientIdentity: baseSecurity.clientIdentity
-        )
+        let regionSecurity = securityForRegionEndpoint(baseSecurity, host: host, port: port)
         let configuration = DsseEdgeRuntimeCopyTransportConfiguration(
             edgeBaseURL: endpoint,
             endpointPath: loaded.configuration.endpointPath,
@@ -2961,7 +2971,7 @@ public struct DsseLocalRuntimeCopyDriver: Sendable {
     // this deadline the timer tore down live flows — a held ssh and even normal long-lived flows dropped with
     // "closed by remote host". Fixed by completing the token; the value stays a local-open guard.)
     public static let defaultFlowOpenTimeoutInterval: TimeInterval = 25
-    public static let defaultMaxSessionExchangeCount = 256
+    public static var defaultMaxSessionExchangeCount: Int { DssePerformanceLimits.current.maxSessionExchangesPerFlow }
 
     private let liveGuard: DsseLiveRuntimeCopyGuard
     private let stepTimeoutInterval: TimeInterval
@@ -2977,7 +2987,7 @@ public struct DsseLocalRuntimeCopyDriver: Sendable {
         self.liveGuard = liveGuard
         self.stepTimeoutInterval = stepTimeoutInterval
         self.flowOpenTimeoutInterval = max(0.01, flowOpenTimeoutInterval)
-        self.maxSessionExchangeCount = max(1, maxSessionExchangeCount)
+        self.maxSessionExchangeCount = max(0, maxSessionExchangeCount)
     }
 
     private static func flowWriteErrorCategory(for error: Error?) -> String {
@@ -3296,7 +3306,7 @@ public struct DsseLocalRuntimeCopyDriver: Sendable {
         let tunnelOpenOnce = DsseOnce()
         let handleCarryFailure: @Sendable (Error) -> Void = { error in
             guard tunnelOpenOnce.tryRun() else { return }
-            dsseFlowDiagLogger.error("leg=tunnel_open fail req=\(requestID, privacy: .public) host=\(destinationHost ?? "?", privacy: .public) err=\(String(describing: error), privacy: .public)")
+            dsseFlowDiagLogger.error("leg=tunnel_open fail req=\(requestID, privacy: .public) host=\(destinationHost ?? "?", privacy: .public) category=\(providerNonsecretNetworkFailureCategory(String(describing: error)), privacy: .public)")
             // In production this is deny_closed. Under fail-open, splice the still-open flow to a DIRECT connection
             // to its real destination instead of dropping it, so the machine's own traffic keeps flowing —
             // triggering on the carry-failure itself, not a health prediction. No destination or a failing direct
@@ -3632,7 +3642,7 @@ private final class DsseLiveRuntimeCopySessionLoop: @unchecked Sendable {
         emitProgress(.edgeRoundTripCompleted)
         if exchangeResult.downstreamPayload.isEmpty {
             totals.record(upstreamBytes: upstreamPayload.count, downstreamBytes: 0)
-            if exchangeResult.sessionClosed || totals.snapshot.exchangeCount >= maxSessionExchangeCount {
+            if exchangeResult.sessionClosed || (maxSessionExchangeCount > 0 && totals.snapshot.exchangeCount >= maxSessionExchangeCount) {
                 finishSuccess(edgeToken)
                 return
             }
@@ -3665,7 +3675,7 @@ private final class DsseLiveRuntimeCopySessionLoop: @unchecked Sendable {
                 return
             }
             self.totals.record(upstreamBytes: upstreamPayload.count, downstreamBytes: exchangeResult.downstreamPayload.count)
-            if exchangeResult.sessionClosed || self.totals.snapshot.exchangeCount >= self.maxSessionExchangeCount {
+            if exchangeResult.sessionClosed || (self.maxSessionExchangeCount > 0 && self.totals.snapshot.exchangeCount >= self.maxSessionExchangeCount) {
                 self.finishSuccess(writeToken, delayFlowClose: exchangeResult.sessionClosed)
                 return
             }

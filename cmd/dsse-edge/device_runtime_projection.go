@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/hotstore"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -43,13 +44,17 @@ import (
 // renders, and nothing else. Keeping it narrow is deliberate — a projection that grows toward the full record
 // becomes a second copy of the log with different bugs.
 type fleetDeviceRecord struct {
-	TenantID      string
-	DeviceID      string
-	OS            string
-	LoggedInUsers []string
-	Edge          string
-	LastSteered   string
-	Timestamp     string
+	ObservedAt             runtimeObservationTimes
+	TenantID               string
+	DeviceID               string
+	OS                     string
+	AgentVersion           string
+	AgentVersionReportedAt string
+	LoggedInUsers          []string
+	AuthAccounts           map[string]string
+	Edge                   string
+	LastSteered            string
+	Timestamp              string
 	// SourceIP is the address the device reached its Edge from, carried for the same reason Posture is: the
 	// node answering a fleet-wide question is usually not the node the device is connected to.
 	SourceIP string
@@ -91,9 +96,10 @@ func newFleetDeviceProjection() *fleetDeviceProjection {
 	return &fleetDeviceProjection{byName: map[string]map[string]fleetDeviceRecord{}}
 }
 
-// Fold records a shipped device_state row, keeping the newest per device.
+// Fold records a shipped device_state row, retaining the newest observation of
+// each field per device. Sparse heartbeats are presence, not new inventory.
 //
-// Newest by the row's own timestamp, not by arrival order: the shipper RETAINS and REPLAYS on failure, so a
+// Newest by each field's original observation clock, not arrival order: the shipper RETAINS and REPLAYS on failure, so a
 // batch that was stuck for an afternoon arrives after the rows that overtook it. region-b did exactly that on
 // 2026-08-14 — 176 records delivered at once, oldest first — and an arrival-ordered fold would have left every
 // device described by whichever row happened to land last.
@@ -102,14 +108,18 @@ func (p *fleetDeviceProjection) Fold(row map[string]any) {
 		return
 	}
 	rec := fleetDeviceRecord{
-		TenantID:      strings.TrimSpace(stringFromRow(row, "tenant_id")),
-		DeviceID:      strings.TrimSpace(stringFromRow(row, "device_id")),
-		OS:            strings.TrimSpace(stringFromRow(row, "os")),
-		LoggedInUsers: stringsFromRow(row, "logged_in_users"),
-		Edge:          strings.TrimSpace(stringFromRow(row, "edge")),
-		SourceIP:      strings.TrimSpace(stringFromRow(row, "source_ip")),
-		LastSteered:   strings.TrimSpace(stringFromRow(row, "last_steered")),
-		Timestamp:     strings.TrimSpace(stringFromRow(row, "timestamp")),
+		TenantID:               strings.TrimSpace(stringFromRow(row, "tenant_id")),
+		DeviceID:               enrolledinventory.NormalizeIdentity(stringFromRow(row, "device_id")),
+		ObservedAt:             runtimeTimesFromRow(row),
+		OS:                     strings.TrimSpace(stringFromRow(row, "os")),
+		AgentVersion:           strings.TrimSpace(stringFromRow(row, "agent_version")),
+		AgentVersionReportedAt: strings.TrimSpace(stringFromRow(row, "agent_version_reported_at")),
+		LoggedInUsers:          stringsFromRow(row, "logged_in_users"),
+		AuthAccounts:           parseObservedAuthAccountRows(row["auth_accounts"]),
+		Edge:                   strings.TrimSpace(stringFromRow(row, "edge")),
+		SourceIP:               strings.TrimSpace(stringFromRow(row, "source_ip")),
+		LastSteered:            strings.TrimSpace(stringFromRow(row, "last_steered")),
+		Timestamp:              strings.TrimSpace(stringFromRow(row, "timestamp")),
 		Posture: model.DevicePostureSignals{
 			DiskEncryptionEnabled:   boolPtrFromRow(row, "disk_encryption_enabled"),
 			FirewallEnabled:         boolPtrFromRow(row, "firewall_enabled"),
@@ -118,7 +128,8 @@ func (p *fleetDeviceProjection) Fold(row map[string]any) {
 			Source:                  strings.TrimSpace(stringFromRow(row, "posture_source")),
 		},
 	}
-	if rec.DeviceID == "" || rec.Timestamp == "" {
+	recordedAt, err := time.Parse(time.RFC3339Nano, rec.Timestamp)
+	if rec.DeviceID == "" || err != nil {
 		// A row with no device or no time is not a state of anything. Same rule as seedFromHistory.
 		return
 	}
@@ -129,9 +140,21 @@ func (p *fleetDeviceProjection) Fold(row map[string]any) {
 		devices = map[string]fleetDeviceRecord{}
 		p.byName[rec.TenantID] = devices
 	}
-	if existing, ok := devices[rec.DeviceID]; ok && existing.Timestamp >= rec.Timestamp {
-		return
+	if existing, ok := devices[rec.DeviceID]; ok {
+		merged := mergeRuntimeViews(runtimeViewFromRecord(existing, recordedAt), runtimeViewFromRecord(rec, recordedAt))
+		// Authentication-account candidates share the explicit user observation,
+		// not the unrelated heartbeat/presence timestamp.
+		if !runtimeTime(rec.ObservedAt["users"]).After(runtimeTime(existing.ObservedAt["users"])) {
+			rec.AuthAccounts = existing.AuthAccounts
+		}
+		if rec.AgentVersion == "" || !runtimeTime(rec.AgentVersionReportedAt).After(runtimeTime(existing.AgentVersionReportedAt)) {
+			rec.AgentVersion, rec.AgentVersionReportedAt = existing.AgentVersion, existing.AgentVersionReportedAt
+		}
+		rec.OS, rec.LoggedInUsers, rec.Posture = merged.OS, merged.LoggedInUsers, merged.Posture
+		rec.LastSteered, rec.Edge, rec.SourceIP = merged.LastSteered, merged.Edge, merged.SourceIP
+		rec.Timestamp, rec.ObservedAt = merged.LastSeen, merged.ObservedAt
 	}
+
 	devices[rec.DeviceID] = rec
 }
 
@@ -175,40 +198,36 @@ func (p *fleetDeviceProjection) Seed(rows []map[string]any) int {
 // fleetDeviceProjectionStore is the process-wide projection, fed by the audit-ingest receiver.
 var fleetDeviceProjectionStore = newFleetDeviceProjection()
 
-// mergeFleetDeviceRuntimeFromProjection fills a node's live view with devices it has not seen itself.
-//
-// The local map still wins where they overlap, for the reason it always did: this node's view is being written
-// by traffic as the request is served, while the projection records what some Edge last reported.
+// mergeFleetDeviceRuntimeFromProjection combines local and shipped observations.
+// A local heartbeat must not hide inventory reported through a different Edge;
+// an older shipped snapshot must not undo a newer local observation.
 func mergeFleetDeviceRuntimeFromProjection(local map[string]deviceRuntimeView, p *fleetDeviceProjection,
 	tenantID string, now time.Time) (map[string]deviceRuntimeView, bool) {
 	records, seeded := p.Devices(tenantID)
 	out := make(map[string]deviceRuntimeView, len(local)+len(records))
-	for id, v := range local {
+	for id, v := range keyDeviceRuntimeTheWayTheLedgerDoes(local) {
 		out[id] = v
 	}
 	for _, rec := range records {
-		if _, seenHere := local[rec.DeviceID]; seenHere {
-			continue // live beats recorded
-		}
-		view := deviceRuntimeView{
-			OS:            rec.OS,
-			LoggedInUsers: rec.LoggedInUsers,
-			LastSeen:      rec.Timestamp,
-			Edge:          rec.Edge,
-			LastSteered:   rec.LastSteered,
-			SourceIP:      rec.SourceIP,
-			Posture:       rec.Posture,
-		}
-		// steer_active is derived HERE rather than trusted from the record, because the record is a moment and
-		// this answers a question about now. A device that was steering an hour ago is not steering.
-		if view.LastSteered != "" {
-			if at, perr := time.Parse(time.RFC3339, view.LastSteered); perr == nil {
-				view.SteerActive = now.Sub(at) < steerActiveWindow
-			}
+		view := runtimeViewFromRecord(rec, now)
+		if held, exists := out[rec.DeviceID]; exists {
+			view = mergeRuntimeViews(held, view)
 		}
 		out[rec.DeviceID] = view
 	}
 	return out, seeded
+}
+
+func runtimeViewFromRecord(rec fleetDeviceRecord, now time.Time) deviceRuntimeView {
+	view := deviceRuntimeView{
+		OS: rec.OS, LoggedInUsers: rec.LoggedInUsers, LastSeen: rec.Timestamp,
+		Edge: rec.Edge, LastSteered: rec.LastSteered, SourceIP: rec.SourceIP,
+		Posture: rec.Posture, ObservedAt: rec.ObservedAt,
+	}
+	if at := runtimeTime(view.LastSteered); !at.IsZero() {
+		view.SteerActive = !at.After(now) && now.Sub(at) < steerActiveWindow
+	}
+	return view
 }
 
 // seedFleetDeviceProjection builds the projection from the canonical history, once.

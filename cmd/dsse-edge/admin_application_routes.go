@@ -376,12 +376,25 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			return
 		}
 		runtimeEvaluator := runtimeEvaluatorForPolicyStore(evaluator, policyStore)
-		merged := edgeplane.RouteProfilesWithPublishedCatalog(routeProfiles, applicationCatalogStore, tenantID)
+		merged, err := edgeplane.RouteProfilesWithPublishedCatalog(r.Context(), routeProfiles, applicationCatalogStore, tenantID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application catalog cannot be read"))
+			return
+		}
 		profile := edgeplane.ApplicationRouteProfileFor(applicationID, merged)
 		conn, connectorFound, err := connectorForApplication(r.Context(), r, registry, applicationCatalogStore, tenantID, applicationID)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
+		}
+		var allowedRegions []string
+		if connectorFound && tenantModelStore != nil {
+			tenant, err := tenantModelStore.Get(r.Context(), tenantID)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("tenant residency state is unavailable"))
+				return
+			}
+			allowedRegions = tenant.AllowedRegions
 		}
 		var (
 			session         *tunnel.Session
@@ -393,14 +406,8 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			// edgeplane/a_diagnostic_must_reach_the_way_a_flow_reaches.go). Asking only this node's tunnel
 			// manager reported "tunnel not connected" for a connector on another region's door while a steered
 			// device was fetching the app through this very Edge over the peer-Edge relay.
-			var probeRegions []string
-			if tenantModelStore != nil {
-				if tenant, terr := tenantModelStore.Get(r.Context(), tenantID); terr == nil {
-					probeRegions = tenant.AllowedRegions
-				}
-			}
 			session, _ = edgeplane.ConnectorProbeSession(conn, profile.Destination, evaluator.EdgeRegionID,
-				probeRegions, config.MeshEligible, tunnelManager, config.PeerEdges)
+				allowedRegions, config.MeshEligible, tunnelManager, config.PeerEdges)
 			tunnelConnected = session != nil
 			if tunnelConnected && session != nil {
 				prober = func(ctx context.Context, frame tunnel.Frame) (tunnel.Frame, error) {
@@ -413,12 +420,6 @@ func registerApplicationAdminRoutes(mux *http.ServeMux, adminEndpoint func(strin
 		// connector's region is outside the tenant's residency boundary — the same fail-closed decision the live
 		// egress dialer enforces. Tenant residency comes from the admin tenant model (nil = unpinned, no restriction).
 		if connectorFound {
-			var allowedRegions []string
-			if tenantModelStore != nil {
-				if tenant, terr := tenantModelStore.Get(r.Context(), tenantID); terr == nil {
-					allowedRegions = tenant.AllowedRegions
-				}
-			}
 			result.RouteError = evaluateReachabilityResidency(conn.EdgeRegionID, evaluator.EdgeRegionID, allowedRegions, config.MeshEligible, profile.Destination)
 		}
 		now := time.Now()

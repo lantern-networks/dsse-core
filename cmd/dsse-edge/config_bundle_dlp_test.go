@@ -15,7 +15,7 @@ import (
 )
 
 func dlpStoresForTest(salt string) *dlpConfigStores {
-	return &dlpConfigStores{policies: newDLPPolicyObjectStore(), classifiers: newDLPClassifierRuntimeStore(), fingerprints: newDLPFingerprintRuntimeStore(salt), allowlist: newDLPAllowlistRuntimeStore(salt)}
+	return &dlpConfigStores{rules: newDLPRuleRuntimeStore(), policies: newDLPPolicyObjectStore(), classifiers: newDLPClassifierRuntimeStore(), fingerprints: newDLPFingerprintRuntimeStore(salt), allowlist: newDLPAllowlistRuntimeStore(salt)}
 }
 
 func TestDistributedDLPDefinitionsBlockOnTheReceivingEdge(t *testing.T) {
@@ -24,6 +24,7 @@ func TestDistributedDLPDefinitionsBlockOnTheReceivingEdge(t *testing.T) {
 	cp.classifiers.SetSpecs("a", []dlp.ClassifierSpec{{Name: "project", Kind: "keyword", Keywords: []string{"PROJECT-ORCHID-SECRET"}}})
 	cp.fingerprints.SetDataset("a", "records", []string{"CUSTOMER-7654321"})
 	cp.policies.Upsert(model.DLPPolicyObject{ID: "protect", TenantID: "a", Name: "Protect", Identifiers: []string{"credit_card", "project", "records"}, OnMatch: "block", Status: "active"})
+	cp.rules.SetRules("a", []model.DLPRule{{ID: "destination", TenantID: "a", SaaSApplicationID: "saas_openai_chatgpt", Identifiers: []string{"credit_card"}, OnMatch: "block", Status: "active"}})
 	src := configBundleSource{tenantID: "a"}
 	targets := configApplyTargets{policyStore: policy.NewStore(nil), dlp: edge}
 	b := configBundlePayload{DLP: cp.Snapshot()}
@@ -40,6 +41,9 @@ func TestDistributedDLPDefinitionsBlockOnTheReceivingEdge(t *testing.T) {
 	}
 	if _, err = src.apply(received, targets); err != nil {
 		t.Fatal(err)
+	}
+	if rules := edge.rules.RulesForTenant("a"); len(rules) != 1 || rules[0].ID != "destination" {
+		t.Fatalf("authored DLP rule did not reach receiving Edge: %+v", rules)
 	}
 	cfg, _ := newDLPTestConfig(t)
 	cfg.DLPPolicies = edge.policies
@@ -84,6 +88,9 @@ func TestDistributedDLPDefinitionsBlockOnTheReceivingEdge(t *testing.T) {
 	if _, err = src.apply(configBundlePayload{}, targets); err != nil {
 		t.Fatal(err)
 	}
+	if len(edge.rules.RulesForTenant("a")) != 1 {
+		t.Fatal("older bundle silently erased accepted DLP rule")
+	}
 	if _, ok := edge.policies.Get("a", "protect"); !ok {
 		t.Fatal("older authority wiped DLP")
 	}
@@ -106,6 +113,17 @@ func TestDistributedDLPDefinitionsBlockOnTheReceivingEdge(t *testing.T) {
 	if _, ok := edge.policies.Get("a", "protect"); ok {
 		t.Fatal("deleted policy survived distribution")
 	}
+	gen = cp.Generation()
+	cp.rules.SetRules("a", nil)
+	if cp.Generation() <= gen {
+		t.Fatal("DLP rule clear did not wake bundle sync")
+	}
+	if _, err = src.apply(configBundlePayload{DLP: cp.Snapshot()}, targets); err != nil {
+		t.Fatal(err)
+	}
+	if len(edge.rules.RulesForTenant("a")) != 0 {
+		t.Fatal("deleted DLP rule survived distribution")
+	}
 }
 
 func TestDLPDistributionLibraryEditsAndTenantScope(t *testing.T) {
@@ -121,8 +139,10 @@ func TestDLPDistributionLibraryEditsAndTenantScope(t *testing.T) {
 		t.Fatal("dataset edit did not advance generation")
 	}
 	s.policies.Upsert(model.DLPPolicyObject{ID: "other", TenantID: "b", Identifiers: []string{"credit_card"}, OnMatch: "block"})
+	s.rules.SetRules("a", []model.DLPRule{testDurableDLPRule("a")})
+	s.rules.SetRules("b", []model.DLPRule{testDurableDLPRule("b")})
 	scoped := s.Snapshot().ForTenant("a")
-	if len(scoped.Policies) != 0 || len(scoped.Classifiers) != 1 || len(scoped.Datasets) != 1 {
+	if len(scoped.Policies) != 0 || len(scoped.Classifiers) != 1 || len(scoped.Datasets) != 1 || len(scoped.Rules) != 1 || len(scoped.Rules["a"]) != 1 {
 		t.Fatal("scope included another tenant or lost its own library")
 	}
 	edge := dlpStoresForTest("different")
@@ -141,6 +161,11 @@ func TestDLPDistributionLibraryEditsAndTenantScope(t *testing.T) {
 	invalid.Datasets = nil
 	if err := edge.Apply(invalid); err == nil {
 		t.Fatal("truncated library accepted")
+	}
+	invalid = s.Snapshot()
+	invalid.Rules["a"][0].TenantID = "b"
+	if err := edge.Apply(invalid); err == nil || len(edge.rules.RulesForTenant("a")) != 1 {
+		t.Fatal("misattributed DLP rule changed received enforcement")
 	}
 	gen = s.Generation()
 	s.classifiers.SetSpecs("a", nil)

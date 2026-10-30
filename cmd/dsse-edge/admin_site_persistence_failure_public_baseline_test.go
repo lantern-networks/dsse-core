@@ -31,7 +31,7 @@ func TestAdminSitePersistenceFailurePreservesCommittedGenerationPublicBaseline(t
 				if err != nil {
 					t.Fatal(err)
 				}
-				handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: auth, SiteStore: store, Writer: writer,
+				handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: auth, TenantModelStore: connectorTestTenantModel(t, tenant), SiteStore: store, Writer: writer,
 					ConnectorEnrollmentEdgeURL: "https://edge.example.test", ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ntest-anchor\n-----END CERTIFICATE-----\n"})
 				request := func(method, route, body string) *httptest.ResponseRecorder {
 					req := httptest.NewRequest(method, route, strings.NewReader(body))

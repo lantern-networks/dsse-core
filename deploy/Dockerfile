@@ -4,7 +4,9 @@
 # -control-plane. There is no separate control-plane binary — dsse-cp was a reduced reference that is not what
 # a deployment runs, and it was retired on 2026-08-23 with the decision that the published binary is the
 # product one. Splitting the roles into two binaries is a separate, later change.
-FROM golang:1.27.1-alpine3.24@sha256:cf6fca6641884b8433441b2b0652976f975e1d0fdd26d177eaaf8596087f3125 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS build
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /src
 # ★★★ THE NESTED MODULE'S go.mod HAS TO ARRIVE FIRST (2026-08-23, found by building this tree on its own).
 # go.mod carries `replace ... => ./egress-broker`, so `go mod download` opens that path — and the usual
@@ -16,7 +18,7 @@ WORKDIR /src
 # monorepo build hits this, because there the whole tree is already on disk.
 COPY go.mod go.sum ./
 COPY egress-broker/go.mod egress-broker/go.sum ./egress-broker/
-RUN go mod download
+RUN apk upgrade --no-cache && go mod download
 COPY . .
 # ★★★ dsse-connector-install SHIPS WITH dsse-connector, and it was written without being added here
 # (2026-08-26). An installer nothing builds is an installer nobody can run: the customer was still left with
@@ -36,20 +38,26 @@ COPY . .
 # told still reports something, and reports it identically on every node built the same way.
 ARG DSSE_REVISION=unknown
 RUN LD="-X main.buildVersion=$(sh scripts/build_stamp.sh --version) -X main.buildCommit=${DSSE_REVISION} -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.buildDirty=false" \
- && CGO_ENABLED=0 go build -trimpath -ldflags "$LD" -o /out/dsse-edge ./cmd/dsse-edge \
- && CGO_ENABLED=0 go build -trimpath -ldflags "$LD" -o /out/dsse-connector ./cmd/dsse-connector \
- && CGO_ENABLED=0 go build -trimpath -ldflags "$LD" -o /out/dsse-connector-install ./cmd/dsse-connector-install \
- && CGO_ENABLED=0 go build -trimpath -ldflags "$LD" -o /out/dsse-install ./cmd/dsse-install \
- && CGO_ENABLED=0 go build -trimpath -ldflags "$LD" -o /out/dsse-signupdate ./cmd/dsse-signupdate
+ && export GOOS="$TARGETOS" GOARCH="$TARGETARCH" CGO_ENABLED=0 \
+ && go build -trimpath -ldflags "$LD" -o /out/dsse-edge ./cmd/dsse-edge \
+ && go build -trimpath -ldflags "$LD" -o /out/dsse-connector ./cmd/dsse-connector \
+ && go build -trimpath -ldflags "$LD" -o /out/dsse-connector-install ./cmd/dsse-connector-install \
+ && go build -trimpath -ldflags "$LD" -o /out/dsse-install ./cmd/dsse-install \
+ && go build -trimpath -o /out/dsse-deployment-crl ./cmd/dsse-deployment-crl \
+ && go build -trimpath -ldflags "$LD" -o /out/dsse-signupdate ./cmd/dsse-signupdate
 
-FROM alpine:3.24.1@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
-RUN apk add --no-cache ca-certificates
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+ARG DSSE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$DSSE_REVISION
+
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates
 # ★★★ AND dsse-signupdate, FOR THE SAME REASON (2026-08-28). A control plane holds the update-signing key only
 # when it has a token; the key has no on-disk fallback by design, so on every other deployment the ONLY way to
 # publish a release is to sign the manifest away from the nodes and publish the envelope. The Console says so on
 # its own release screen — and the program that does it was built by nothing, so the instruction ended at a
 # command not found on the machine where the key already is.
-COPY --from=build /out/dsse-edge /out/dsse-connector /out/dsse-connector-install /out/dsse-install /out/dsse-signupdate /usr/local/bin/
+COPY --from=build /out/dsse-edge /out/dsse-connector /out/dsse-connector-install /out/dsse-install /out/dsse-deployment-crl /out/dsse-signupdate /usr/local/bin/
 # ★★★ THE MIGRATIONS SHIP WITH THE BINARY THAT RUNS THEM (2026-08-23). Until the Edge became the published
 # binary this was invisible: the LOADER was published and the 45 .sql files it reads were in the product tree.
 # A published deployment would have had a control plane that requires -migration-dir and nothing to point it

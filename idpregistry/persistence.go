@@ -64,6 +64,7 @@ func (s *Store) snapshotLocked() persistedRegistry {
 		copied := make(map[string]Connection, len(connections))
 		for id, connection := range connections {
 			connection.VerifiedDomains = append([]string(nil), connection.VerifiedDomains...)
+			connection.DeviceUserBindings = append([]DeviceUserBinding(nil), connection.DeviceUserBindings...)
 			copied[id] = connection
 		}
 		snapshot.Connections[tenant] = copied

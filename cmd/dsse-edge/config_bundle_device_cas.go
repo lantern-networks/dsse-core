@@ -111,7 +111,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 	managed := map[string]bool{}
 	if section != nil {
 		for _, tenant := range section.ManagedTenants {
-			managed[strings.ToLower(strings.TrimSpace(tenant))] = true
+			managed[strings.TrimSpace(tenant)] = true
 		}
 	}
 	// For managed tenants the material route carries BOTH managed and registered
@@ -122,7 +122,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 		if json.Unmarshal(section.Snapshot, &doc) == nil {
 			kept := doc.Tenants[:0]
 			for _, entry := range doc.Tenants {
-				if !managed[strings.ToLower(strings.TrimSpace(entry.TenantID))] && !reg.MaterialManaged(entry.TenantID) && tenantDeviceIdentity.For(entry.TenantID) == nil {
+				if !managed[strings.TrimSpace(entry.TenantID)] && !reg.MaterialManaged(entry.TenantID) && tenantDeviceIdentity.For(entry.TenantID) == nil {
 					kept = append(kept, entry)
 				}
 			}
@@ -131,7 +131,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 			copySection.Snapshot, _ = json.Marshal(doc)
 			copySection.Tenants = nil
 			for _, tenant := range section.Tenants {
-				if !managed[strings.ToLower(strings.TrimSpace(tenant))] && !reg.MaterialManaged(tenant) && tenantDeviceIdentity.For(tenant) == nil {
+				if !managed[strings.TrimSpace(tenant)] && !reg.MaterialManaged(tenant) && tenantDeviceIdentity.For(tenant) == nil {
 					copySection.Tenants = append(copySection.Tenants, tenant)
 				}
 			}
@@ -185,7 +185,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 	carries := map[string]bool{}
 	authored := map[string]bool{}
 	for _, e := range doc.Tenants {
-		if t := strings.ToLower(strings.TrimSpace(e.TenantID)); t != "" && strings.TrimSpace(e.CAPEM) != "" {
+		if t := strings.TrimSpace(e.TenantID); t != "" && strings.TrimSpace(e.CAPEM) != "" {
 			carries[t] = true
 		}
 		certs, perr := tenantca.ParseCACertsPEM([]byte(e.CAPEM))
@@ -203,7 +203,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 	}
 	named := map[string]bool{}
 	for _, t := range section.Tenants {
-		if key := strings.ToLower(strings.TrimSpace(t)); carries[key] {
+		if key := strings.TrimSpace(t); carries[key] {
 			named[key] = true
 		} else if logf != nil {
 			logf("config_bundle_device_cas_named_but_empty tenant=%q reason=%q", t,
@@ -212,7 +212,7 @@ func applyDeviceCABundleSection(reg *tenantca.TenantCARegistry, section *deviceC
 		}
 	}
 	for _, held := range reg.AnchorsByTenant() {
-		if !named[strings.ToLower(strings.TrimSpace(held.TenantID))] {
+		if !named[strings.TrimSpace(held.TenantID)] {
 			continue // an organization the control plane said nothing about
 		}
 		if authored[tenantca.CAAnchorKey(held.Cert)] {

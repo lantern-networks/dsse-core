@@ -32,7 +32,9 @@ func TestTheConnectorProfileCarriesEveryDoor(t *testing.T) {
 // ★ ONE DOOR IS NOT A LIST, AND SAYING SO IS THE POINT. A connector reading this is the party that finds out
 // first when a region goes away.
 func TestTheConnectorProfileSaysWhenThereIsOnlyOneDoor(t *testing.T) {
-	one := connectorProfileFor("t", "s", "https://only.example", func(string) []regionEndpoint { return nil })
+	// A legacy single-region node has no region resolver. A configured resolver
+	// returning no allowed doors must not restore a potentially forbidden fallback.
+	one := connectorProfileFor("t", "s", "https://only.example", nil)
 	if len(one.EdgeEndpoints) != 1 {
 		t.Fatalf("a deployment with no region map still answers with the address it knows: %v", one.EdgeEndpoints)
 	}
@@ -40,7 +42,7 @@ func TestTheConnectorProfileSaysWhenThereIsOnlyOneDoor(t *testing.T) {
 		t.Fatalf("one door has a consequence and the note must carry it: %q", one.Note)
 	}
 
-	none := connectorProfileFor("t", "s", "", func(string) []regionEndpoint { return nil })
+	none := connectorProfileFor("t", "s", "", nil)
 	if len(none.EdgeEndpoints) != 0 {
 		t.Fatalf("nothing known must be answered as nothing, not invented: %v", none.EdgeEndpoints)
 	}

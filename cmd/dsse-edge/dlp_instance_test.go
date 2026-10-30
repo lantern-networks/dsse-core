@@ -26,7 +26,7 @@ func TestDLPInstanceClass(t *testing.T) {
 			t.Errorf("dlpInstanceClass(%q) = %q, want %q", tc.email, got, tc.want)
 		}
 	}
-	// No corporate domains configured → cannot classify (fail open, scoped rules inert).
+	// No corporate domains configured means unknown; it must not exempt a scoped rule.
 	if got := dlpInstanceClass("tanaka@acme.co.jp", nil); got != "" {
 		t.Errorf("with no corporate domains, class = %q, want \"\"", got)
 	}
@@ -43,8 +43,11 @@ func TestDLPInstanceScopeApplies(t *testing.T) {
 		{"corporate", "personal", false},
 		{"personal", "personal", true},
 		{"personal", "corporate", false},
-		{"corporate", "", false}, // unknown class → scoped rule inert
-		{"personal", "", false},
+		{"corporate", "", true}, // unknown class must not exempt either scoped rule
+		{"personal", "", true},
+		{"personal", "unrecognized", true},
+		{"corporate", "unrecognized", true},
+		{"invalid", "", false},
 	}
 	for _, tc := range cases {
 		if got := dlpInstanceScopeApplies(tc.scope, tc.class); got != tc.want {
@@ -113,12 +116,30 @@ func TestDLPPolicyFromDecisionInstanceScope(t *testing.T) {
 	if _, ok := dlpPolicyFromDecision(mk("personal"), "corporate", nil); ok {
 		t.Error("personal-scoped rule must NOT apply to a corporate destination")
 	}
-	// Unknown class → scoped rule inert.
-	if _, ok := dlpPolicyFromDecision(mk("personal"), "", nil); ok {
-		t.Error("scoped rule must be inert when the instance class is unknown")
+	// Unknown class cannot establish the opposite account class: keep the rule active.
+	if _, ok := dlpPolicyFromDecision(mk("personal"), "", nil); !ok {
+		t.Error("scoped rule must apply when the instance class is unknown")
 	}
 	// An unscoped rule always applies.
 	if _, ok := dlpPolicyFromDecision(mk(""), "", nil); !ok {
 		t.Error("unscoped rule should always apply")
+	}
+}
+
+func TestDLPInstanceClassForRejectsAccountHints(t *testing.T) {
+	config := edgeSWGHTTPEgressHandlerConfig{CorporateDomains: func(string) []string {
+		return []string{"corp.example"}
+	}}
+	for _, email := range []string{"bob@corp.example", "alice@gmail.com", "opaque-subject", ""} {
+		t.Run(email, func(t *testing.T) {
+			dec := model.AccessDecision{TenantID: "acme", Metadata: map[string]any{
+				"ai_email": email, "ai_account": email,
+				// Arbitrary metadata must not create trusted account evidence.
+				"ai_identity_verified": true, "dlp_instance_class": "corporate",
+			}}
+			if got := dlpInstanceClassFor(config, dec); got != "" {
+				t.Fatalf("unverified account hint classified as %q", got)
+			}
+		})
 	}
 }

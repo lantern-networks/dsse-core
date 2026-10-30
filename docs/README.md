@@ -13,6 +13,13 @@ Its release notes provide signed macOS and Windows downloads, upgrade instructio
 and verification scope. [Maintenance history](maintenance.md) describes the fixes
 included in this version.
 
+Additional topology support is under development for 0.4.0. The presence of installer
+options in development source does not establish release or deployment acceptance.
+The [0.4.0 distribution review](releases/0.4.0/README.md) defines candidate artifacts,
+changes since 0.3.1, migration and remaining publication gates. It is not a release announcement.
+For its three-entrance shared-fleet layouts and existing three-node installation, use the
+[multi-Edge installation guide](releases/0.4.0/install-multi-edge.md).
+
 ## Choose a starting point
 
 | Your task | Reading order |
@@ -36,8 +43,9 @@ included in this version.
 | Publish endpoint updates | [Agent updates](agent-updates.md), [Operator tools](operator-tools.md) |
 | Contribute a change | [Contributing](../CONTRIBUTING.md), [Building](building.md) |
 
-The standard deployment uses Go HTTP/TLS for outbound inspected traffic. The optional
-[egress broker](../egress-broker/README.md) has its own build and integration requirements.
+The standard deployment uses Go HTTP/TLS for outbound inspected traffic. Experimental
+[egress broker](../egress-broker/README.md) source remains available but is not packaged
+or qualified in the proposed 0.4.0 distribution.
 [Dependency versions](dependency-versions.md) records the selected build inputs.
 [SaaS tenant restriction](saas-tenant-restriction.md) covers account restrictions separately
 from DLP and access policy.

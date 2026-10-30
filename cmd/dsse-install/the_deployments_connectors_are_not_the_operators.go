@@ -25,39 +25,44 @@ import (
 //
 // connectorsForEveryOrganization asks once per organization the deployment holds, and merges.
 
-// organizationsOfTheDeployment lists every organization, or a single empty id when the registry cannot be
-// read — asking once with no name then behaves exactly as before rather than silently measuring nothing.
-func organizationsOfTheDeployment(client *http.Client, cpAdmin, token string) []string {
+// organizationsOfTheDeployment lists every organization. The second result is false when the operator's
+// deployment-wide tenant list could not be read; falling back to one unnamed tenant would turn a partial
+// fleet measurement into a reassuring zero.
+func organizationsOfTheDeployment(client *http.Client, cpAdmin, token string) ([]string, bool) {
 	code, body, err := get(client, strings.TrimRight(cpAdmin, "/")+"/admin/tenants", token)
 	if err != nil || code != 200 {
-		return []string{""}
+		return nil, false
 	}
 	var payload struct {
-		Tenants []struct {
+		Tenants *[]struct {
 			TenantID string `json:"tenant_id"`
 		} `json:"tenants"`
 	}
-	if json.Unmarshal(body, &payload) != nil || len(payload.Tenants) == 0 {
-		return []string{""}
+	if json.Unmarshal(body, &payload) != nil || payload.Tenants == nil {
+		return nil, false
+	}
+	if len(*payload.Tenants) == 0 {
+		return []string{""}, true
 	}
 	ids := []string{}
-	for _, t := range payload.Tenants {
-		if id := strings.TrimSpace(t.TenantID); id != "" {
-			ids = append(ids, id)
+	for _, t := range *payload.Tenants {
+		id := strings.TrimSpace(t.TenantID)
+		if id == "" {
+			return nil, false
 		}
-	}
-	if len(ids) == 0 {
-		return []string{""}
+		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	return ids
+	return ids, true
 }
 
 // connectorsForEveryOrganization returns every connector id one door knows of, across the given organizations.
 // The second return is false when a door could not be asked at all — the caller must not read that as "none".
 func connectorsForEveryOrganization(client *http.Client, door, token string, organizations []string) ([]string, bool) {
+	if len(organizations) == 0 {
+		return nil, false
+	}
 	seen := map[string]bool{}
-	answered := false
 	for _, org := range organizations {
 		endpoint := strings.TrimRight(door, "/") + "/admin/connectors"
 		if org != "" {
@@ -65,21 +70,24 @@ func connectorsForEveryOrganization(client *http.Client, door, token string, org
 		}
 		code, body, err := get(client, endpoint, token)
 		if err != nil || code != 200 {
-			continue
+			return nil, false
 		}
-		answered = true
 		var payload struct {
-			Connectors []struct {
+			Connectors *[]struct {
 				ID string `json:"id"`
 			} `json:"connectors"`
+			Count *int `json:"count"`
 		}
-		if json.Unmarshal(body, &payload) != nil {
-			continue
+		if json.Unmarshal(body, &payload) != nil || payload.Connectors == nil ||
+			payload.Count == nil || *payload.Count != len(*payload.Connectors) {
+			return nil, false
 		}
-		for _, c := range payload.Connectors {
-			if id := strings.TrimSpace(c.ID); id != "" {
-				seen[id] = true
+		for _, c := range *payload.Connectors {
+			id := strings.TrimSpace(c.ID)
+			if id == "" {
+				return nil, false
 			}
+			seen[id] = true
 		}
 	}
 	ids := make([]string, 0, len(seen))
@@ -87,5 +95,5 @@ func connectorsForEveryOrganization(client *http.Client, door, token string, org
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	return ids, answered
+	return ids, true
 }

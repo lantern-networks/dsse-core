@@ -16,7 +16,7 @@ func (l *Ledger) RemoveTenantContext(ctx context.Context, tenant string) (ids []
 	removed := map[string]Entry{}
 	shared, err := l.mutateShared(ctx, func(c *Ledger) error {
 		for _, e := range c.Authoritative() {
-			if strings.EqualFold(strings.TrimSpace(e.TenantID), tenant) {
+			if sameGroupTenant(strings.TrimSpace(e.TenantID), tenant) {
 				removed[e.Identity] = e
 			}
 		}
@@ -56,7 +56,7 @@ func (l *Ledger) RetireTenantContext(ctx context.Context, tenant, now string) (n
 		n, err = c.RetireTenantChecked(tenant, now)
 		if err == nil {
 			for _, e := range c.Authoritative() {
-				if strings.EqualFold(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenant)) {
+				if sameGroupTenant(strings.TrimSpace(e.TenantID), strings.TrimSpace(tenant)) {
 					retired = append(retired, e)
 				}
 			}
@@ -68,7 +68,7 @@ func (l *Ledger) RetireTenantContext(ctx context.Context, tenant, now string) (n
 		changed := false
 		for _, e := range retired {
 			current, ok := l.entries[e.Identity]
-			if ok && strings.EqualFold(current.TenantID, e.TenantID) && current.ReenrolmentNonce == e.ReenrolmentNonce && (!current.isTombstone() || current.Enabled) {
+			if ok && sameGroupTenant(current.TenantID, e.TenantID) && current.ReenrolmentNonce == e.ReenrolmentNonce && (!current.isTombstone() || current.Enabled) {
 				l.entries[e.Identity] = e
 				changed = true
 			}

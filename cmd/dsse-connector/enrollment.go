@@ -54,12 +54,19 @@ type connectorState struct {
 	Site          string `json:"site"`
 	ConnectorID   string `json:"connector_id"`
 	RuntimeSecret string `json:"runtime_secret"`
-	Region        string `json:"region"`
-	Cluster       string `json:"cluster"`
-	EdgeCAPath    string `json:"edge_ca_path,omitempty"`
+	// Kept only until the first authenticated registration completes, so interrupted
+	// identity issuance can resume with the same connector ID and no new profile.
+	PendingBootstrap string `json:"pending_bootstrap,omitempty"`
+	Region           string `json:"region"`
+	Cluster          string `json:"cluster"`
+	EdgeCAPath       string `json:"edge_ca_path,omitempty"`
 	// EdgeEndpoints persists the door list so every later start has it without the token — the same reason
 	// every other enrolment fact is persisted here.
 	EdgeEndpoints string `json:"edge_endpoints,omitempty"`
+	// The authoritative profile may revoke every data door. Keep its last
+	// verified address only for profile GET so a restart cannot reuse EdgeURL.
+	DoorListWithdrawn bool   `json:"door_list_withdrawn,omitempty"`
+	ProfileDoorURL    string `json:"profile_door_url,omitempty"`
 	// EdgeServerName is the name this connector sends in the ClientHello, and EdgeEnrolmentServerName the one
 	// it sends on the connection that carries a CSR. Empty on a connector whose organization has no door of
 	// its own: the dialled host is then the name, exactly as before.
@@ -150,6 +157,7 @@ func (f connectorEnrollmentFlags) apply(st connectorState) {
 	*f.Site = st.Site
 	*f.ConnectorID = st.ConnectorID
 	*f.ConnectorSecret = st.RuntimeSecret
+	*f.BootstrapSecret = st.PendingBootstrap
 	if st.Region != "" {
 		*f.Region = st.Region
 	}
@@ -202,6 +210,12 @@ func resolveConnectorEnrollment(stateDir, token string, f connectorEnrollmentFla
 		// again, and re-enrolling is not what it asks for. A token naming something DIFFERENT is a deliberate
 		// move — that is the one case where the state is replaced, and it says so out loud.
 		if st, ok, lerr := loadConnectorState(statePath); lerr == nil && ok && connectorStateMatchesToken(st, tok) {
+			if st.PendingBootstrap == "" && (!fileExistsNonEmpty(filepath.Join(stateDir, connectorIdentityCertFile)) || !fileExistsNonEmpty(filepath.Join(stateDir, connectorIdentityKeyFile))) {
+				st.PendingBootstrap = tok.Bootstrap
+				if err := saveConnectorState(statePath, st); err != nil {
+					return false, err
+				}
+			}
 			f.apply(st)
 			return false, nil
 		} else if lerr == nil && ok {
@@ -211,13 +225,14 @@ func resolveConnectorEnrollment(stateDir, token string, f connectorEnrollmentFla
 				stateDir, st.TenantID, st.Site, st.EdgeURL, tok.TenantID, tok.Site, tok.EdgeURL)
 		}
 		st := connectorState{
-			EdgeURL:       tok.EdgeURL,
-			TenantID:      tok.TenantID,
-			Site:          tok.Site,
-			ConnectorID:   generateConnectorID(),
-			RuntimeSecret: generateConnectorRuntimeSecret(),
-			Region:        connectorFirstNonEmpty(tok.Region, *f.Region),
-			Cluster:       connectorFirstNonEmpty(tok.Cluster, *f.Cluster),
+			EdgeURL:          tok.EdgeURL,
+			TenantID:         tok.TenantID,
+			Site:             tok.Site,
+			ConnectorID:      generateConnectorID(),
+			RuntimeSecret:    generateConnectorRuntimeSecret(),
+			PendingBootstrap: tok.Bootstrap,
+			Region:           connectorFirstNonEmpty(tok.Region, *f.Region),
+			Cluster:          connectorFirstNonEmpty(tok.Cluster, *f.Cluster),
 			// ★ THE BOOTSTRAP HALF. This is what the FIRST connection needs when the region the token names is
 			// the one that is away; the durable list arrives over the tunnel afterwards and replaces it, the
 			// same way a device takes its region list from its profile rather than from what it enrolled with.
@@ -262,9 +277,8 @@ func resolveConnectorEnrollment(stateDir, token string, f connectorEnrollmentFla
 		return false, nil
 	}
 	f.apply(st)
-	// Already enrolled: re-register with the runtime secret (empty bootstrap falls back to it), so a rotated Site
-	// bootstrap secret is irrelevant here.
-	*f.BootstrapSecret = ""
+	// Completed enrollments use the runtime secret. Interrupted first runs resume their bootstrap.
+	*f.BootstrapSecret = st.PendingBootstrap
 	return false, nil
 }
 
@@ -277,5 +291,25 @@ func connectorStateMatchesToken(st connectorState, tok connectorEnrollmentToken)
 	same := func(a, b string) bool {
 		return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
 	}
-	return same(st.TenantID, tok.TenantID) && same(st.Site, tok.Site) && same(st.EdgeURL, tok.EdgeURL)
+	// Tenant IDs are identities, not DNS names. A case-distinct tenant is a different organization even
+	// when the same Site name and Edge URL appear in a newly issued token.
+	return strings.TrimSpace(st.TenantID) == strings.TrimSpace(tok.TenantID) &&
+		same(st.Site, tok.Site) && same(st.EdgeURL, tok.EdgeURL)
+}
+
+// Erase the first-run credential only after the Edge acknowledged registration.
+func completeConnectorBootstrap(stateDir string) error {
+	if strings.TrimSpace(stateDir) == "" {
+		return nil
+	}
+	path := filepath.Join(stateDir, "connector-state.json")
+	st, ok, err := loadConnectorState(path)
+	if err != nil {
+		return err
+	}
+	if !ok || st.PendingBootstrap == "" {
+		return nil
+	}
+	st.PendingBootstrap = ""
+	return saveConnectorState(path, st)
 }

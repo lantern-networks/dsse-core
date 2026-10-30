@@ -13,12 +13,19 @@ func LegacyExceptionsFromModel(exs []model.LegacyException) []LegacyException {
 	out := make([]LegacyException, 0, len(exs))
 	for _, ex := range exs {
 		var expires time.Time
-		if t, err := time.Parse(time.RFC3339, strings.TrimSpace(ex.ExpiresAt)); err == nil {
-			expires = t
-		}
 		mode := strings.TrimSpace(ex.Mode)
 		if mode == "" {
 			mode = "allow"
+		}
+		if value := strings.TrimSpace(ex.ExpiresAt); value != "" {
+			if t, err := time.Parse(time.RFC3339, value); err == nil {
+				expires = t
+			} else {
+				// A malformed stored expiry is not an unlimited exception.
+				// Keep the selector so matching traffic is refused rather than
+				// falling through to a later permissive exception.
+				mode = "invalid"
+			}
 		}
 		out = append(out, LegacyException{
 			ID: ex.ID, SourceServer: ex.SourceServer, DeviceGroup: ex.DeviceGroup,

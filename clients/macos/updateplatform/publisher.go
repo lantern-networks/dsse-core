@@ -39,10 +39,13 @@ package updateplatform
 // output, rather than only on the platform where a mistake installs something.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
+
+	"github.com/lantern-networks/dsse-core/internal/strictjson"
 )
 
 // PublisherRequirement is what this device demands of a package before a privileged installer is pointed at it.
@@ -88,6 +91,24 @@ func LoadPublisherRequirement(path string) (PublisherRequirement, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return PublisherRequirement{}, fmt.Errorf("read the agent configuration %s: %w", path, err)
+	}
+	// An absent optional pin is supported, but damaged or ambiguous configuration
+	// must not turn a configured publisher check into that opt-out state.
+	if err := strictjson.RejectDuplicateKeys(raw); err != nil {
+		return PublisherRequirement{}, fmt.Errorf("invalid agent configuration: %w", err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return PublisherRequirement{}, fmt.Errorf("the agent configuration %s must be a JSON object", path)
+	}
+	const publisherField = "update_publisher_team_id"
+	for name, value := range fields {
+		if !strings.EqualFold(name, publisherField) {
+			continue
+		}
+		if name != publisherField || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return PublisherRequirement{}, fmt.Errorf("invalid %s field in agent configuration", publisherField)
+		}
 	}
 	var cfg agentConfigPublisher
 	if err := json.Unmarshal(raw, &cfg); err != nil {

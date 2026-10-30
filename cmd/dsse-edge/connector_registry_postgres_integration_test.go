@@ -183,6 +183,44 @@ func TestPostgresConnectorRegistryStoreE2E(t *testing.T) {
 	if got.Metadata["runtime_secret_rotated_by"] != "admin_001" {
 		t.Fatalf("persisted metadata = %#v, want rotated_by admin_001", got.Metadata)
 	}
+
+	// The remaining connector has an earlier catalog timestamp. Removing the newest row used to make
+	// count(*) + max(updated_at) move backwards and strand every Edge that had seen the prior bundle.
+	pgStore := store.(postgresConnectorRegistryStore)
+	beforeLiveness := pgStore.ConfigGeneration()
+	if changed, err := pgStore.RecordLiveness("conn_pg_001", "degraded", now.Add(4*time.Minute).Format(time.RFC3339)); err != nil || !changed {
+		t.Fatalf("record connector liveness: changed=%v err=%v", changed, err)
+	}
+	if after := pgStore.ConfigGeneration(); after != beforeLiveness {
+		t.Fatalf("liveness churned connector catalog generation: %d -> %d", beforeLiveness, after)
+	}
+	if _, err := store.Register(model.ConnectorRegistration{
+		ID: "conn_pg_purge_001", TenantID: "tenant_purge", ConnectorGroupID: "cgrp_purge",
+		EdgeRegionID: "jp-001", EdgeClusterID: "edge-001", PrivateBaseURL: "http://purge-connector.local",
+	}, now); err != nil {
+		t.Fatalf("register connector for purge: %v", err)
+	}
+	beforePurge := pgStore.ConfigGeneration()
+	if row := purgeTenantRows(ctx, db, "connector_registrations", "tenant_purge", nil); row.Error != "" || row.Count != 1 {
+		t.Fatalf("purge connector batch: count=%d error=%q", row.Count, row.Error)
+	}
+	if after := pgStore.ConfigGeneration(); after <= beforePurge {
+		t.Fatalf("catalog generation did not advance on tenant purge: %d -> %d", beforePurge, after)
+	}
+	if _, found := pgStore.Get("conn_pg_purge_001"); found {
+		t.Fatal("purged connector remains")
+	}
+	beforeRemoval := pgStore.ConfigGeneration()
+	removed, err := pgStore.RemoveForTenant("tenant_lab_001", "conn_pg_001")
+	if err != nil || !removed {
+		t.Fatalf("remove newest connector: removed=%v err=%v", removed, err)
+	}
+	if after := pgStore.ConfigGeneration(); after <= beforeRemoval {
+		t.Fatalf("catalog generation did not advance on removal: %d -> %d", beforeRemoval, after)
+	}
+	if other, found := pgStore.Get("conn_pg_other_001"); !found || other.TenantID != "tenant_other" {
+		t.Fatalf("other tenant connector changed after removal: found=%v tenant=%q", found, other.TenantID)
+	}
 }
 
 func TestAdminConnectorRegistryEndpointPostgresE2E(t *testing.T) {

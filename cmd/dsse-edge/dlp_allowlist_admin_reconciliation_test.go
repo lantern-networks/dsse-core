@@ -66,7 +66,7 @@ func TestAllowlistAdminSaveFailurePreservesLive(t *testing.T) {
 }
 func TestAllowlistRuntimeDistributionWiring(t *testing.T) {
 	rt := buildDLPRuntime(serverConfig{})
-	stores := &dlpConfigStores{policies: rt.policyObjects, classifiers: rt.classifiers, fingerprints: rt.fingerprints, allowlist: rt.allowlist}
+	stores := &dlpConfigStores{rules: rt.rules, policies: rt.policyObjects, classifiers: rt.classifiers, fingerprints: rt.fingerprints, allowlist: rt.allowlist}
 	before := stores.Generation()
 	rt.allowlist.SetValues("own", []string{"safe@example.invalid"})
 	raw, _ := json.Marshal(stores.Snapshot())

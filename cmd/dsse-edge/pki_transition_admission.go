@@ -34,7 +34,7 @@ func (a *tenantTransportAuthority) admitTransition(tenant, action string, gates 
 		a.mu.Unlock()
 		return nil, err
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	expected := encodeAuthoritySnapshot(a.cas)
 	before := copyAuthority(a.cas[key])
 	candidate := newTenantTransportAuthority(expected, nil, a.now)
@@ -69,7 +69,7 @@ func (a *tenantDeviceAuthority) admitTransition(tenant, action string, gates []p
 		a.mu.Unlock()
 		return nil, err
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	expected := encodeAuthoritySnapshot(a.cas)
 	before := copyAuthority(a.cas[key])
 	candidate := newTenantDeviceAuthority(expected, nil, a.now)
@@ -104,7 +104,7 @@ func (a *tenantInterceptionAuthority) admitTransition(tenant, action string, gat
 		a.mu.Unlock()
 		return nil, err
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	expected := encodeAuthoritySnapshot(a.issuers)
 	before := copyAuthority(a.issuers[key])
 	candidate := newTenantInterceptionAuthority(expected, nil, a.now)

@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"github.com/lantern-networks/dsse-core/authportal"
 	"net"
 	"net/url"
 	"strings"
@@ -95,6 +96,8 @@ func deploymentFactsFor(config serverConfig, tenant string) installprofile.Deplo
 	}
 	spec.SteerExclusions = authoredSteerExclusions(config.SteerExclusions, tenant)
 	spec.PassthroughDomains = thisDeploymentsOwnAdminNames(config)
+	spec.ExactHTTPSPassthroughEndpoints = append([]installprofile.ExactHTTPSPassthroughEndpoint(nil), config.ExactHTTPSPassthroughEndpoints...)
+	spec.StepUpPortalOrigins = thisDeploymentsAuthPortalOrigins(config)
 	return spec
 }
 
@@ -139,6 +142,19 @@ func thisDeploymentsOwnAdminNames(config serverConfig) []string {
 	for _, origin := range strings.FieldsFunc(config.AdminConsoleOrigins, func(r rune) bool {
 		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
 	}) {
+		add(origin)
+	}
+	// A step-up must remain reachable before authentication exists. Only explicit
+	// operator-owned origins are included; this neither broadens Console CORS nor
+	// trusts their certificates differently. In particular no parent-domain wildcard
+	// or IdP inferred from a request can become a device-wide exclusion.
+	for _, origin := range append([]string{config.ClientlessBaseURL}, strings.FieldsFunc(config.StepUpPortalOrigins, func(r rune) bool {
+		return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n'
+	})...) {
+		u, err := url.Parse(strings.TrimSpace(origin))
+		if err != nil || u.Scheme != "https" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || u.Hostname() == "" || strings.ContainsAny(u.Hostname(), "* \t\r\n") {
+			continue
+		}
 		add(origin)
 	}
 	if len(out) == 0 {
@@ -214,4 +230,24 @@ func registerDeploymentInterceptionRootFlag() *string {
 		"PEM path of THIS DEPLOYMENT's interception root, for a node that must NAME it in the device profiles "+
 			"it issues without signing anything with it — a control plane. The Edges that actually inspect get "+
 			"the root through the interception flags in main.go")
+}
+
+// Keep browser-launch trust distinct from destination/process exclusions.
+func thisDeploymentsAuthPortalOrigins(config serverConfig) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range append([]string{config.ClientlessBaseURL}, strings.FieldsFunc(config.StepUpPortalOrigins, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' })...) {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		origin, err := authportal.Origin(raw)
+		if err != nil {
+			continue
+		} // no inferred wildcard or fallback trust
+		if !seen[origin] {
+			seen[origin] = true
+			out = append(out, origin)
+		}
+	}
+	return out
 }

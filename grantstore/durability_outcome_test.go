@@ -1,7 +1,6 @@
 package grantstore
 
 import (
-	"encoding/json"
 	"errors"
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"testing"
@@ -143,8 +142,8 @@ func TestGrantAdmissionRejectsUnconfirmedFlushButAcceptsSyncedInPlace(t *testing
 			if errors.Is(err, ErrPersistence) != uncertain || s.Valid(g.GrantID, now) == uncertain {
 				t.Fatalf("mint=%v uncertain=%v err=%v", mint, uncertain, err)
 			}
-			var saved map[string]Grant
-			if e := json.Unmarshal(p.data, &saved); e != nil {
+			saved, e := decodeShared(p.data)
+			if e != nil {
 				t.Fatal(e)
 			}
 			if _, ok := saved[g.GrantID]; !ok {

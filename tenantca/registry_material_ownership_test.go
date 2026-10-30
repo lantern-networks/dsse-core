@@ -35,7 +35,7 @@ func TestMaterialOwnershipCommitsWithAnchorsAndSurvivesRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !restarted.MaterialManaged("MANAGED") || restarted.MaterialManaged("byo") {
+	if !restarted.MaterialManaged("managed") || restarted.MaterialManaged("MANAGED") || restarted.MaterialManaged("byo") {
 		t.Fatal("restart lost material/BYO distinction")
 	}
 	// A remote snapshot cannot clear local ownership, nor assert ownership of BYO.

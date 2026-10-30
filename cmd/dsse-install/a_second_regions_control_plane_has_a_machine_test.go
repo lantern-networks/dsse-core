@@ -36,7 +36,7 @@ func TestAJoiningRegionsControlPlaneCanHaveItsOwnMachine(t *testing.T) {
 	// ★ ONE OF EACH (2026-09-02): a pair on one machine survives a process crash and not the machine, and the
 	// deployment answers the machine dying with the control plane in the next region.
 	for _, want := range []string{"dsse-control-plane-a", "dsse-postgres-a",
-		"dsse-clickhouse", "dsse-archive", "dsse-console"} {
+		"dsse-clickhouse", "dsse-console"} {
 		if !strings.Contains(compose, "\n  "+want+":") {
 			t.Errorf("a joining region's Control Plane machine does not run %s", want)
 		}

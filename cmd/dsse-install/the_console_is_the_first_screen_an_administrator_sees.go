@@ -95,7 +95,11 @@ func reportConsoleFirstVisit(dir, consoleURL string) {
 	if consoleURL != "" {
 		fmt.Printf("    the Console      %s\n", consoleURL)
 	}
-	if fp := certificateFingerprintFile(filepath.Join(dir, "management.crt")); fp != "" {
+	leaf := filepath.Join(dir, "console-server.crt")
+	if _, err := os.Stat(leaf); os.IsNotExist(err) {
+		leaf = filepath.Join(dir, "management.crt") // legacy deployment
+	}
+	if fp := certificateFingerprintFile(leaf); fp != "" {
 		fmt.Printf("    what it presents %s\n", fp)
 		fmt.Printf("    ★ COMPARE THAT in the browser's certificate view before you proceed. Comparing a\n")
 		fmt.Printf("      fingerprint is a different act from dismissing a warning; only the first one tells\n")
@@ -184,9 +188,10 @@ func adoptStepUpPortalCertificate(dir string) string {
 	_, keyErr := os.Stat(key)
 	present := crtErr == nil && keyErr == nil
 
-	was := strings.ToLower(strings.TrimSpace(readDeploymentEnv(dir)[stepUpPortalCertEnvKey]))
+	env := readDeploymentEnv(dir)
+	was := strings.ToLower(strings.TrimSpace(env[stepUpPortalCertEnvKey]))
 	want := "deployment"
-	if present {
+	if present || declaredNodeMapProfile(env["DSSE_TOPOLOGY_PROFILE"]) {
 		want = "operator"
 	}
 	if was == want {
@@ -198,6 +203,9 @@ func adoptStepUpPortalCertificate(dir string) string {
 	if present {
 		return "the step-up portal is on YOUR certificate now — device profiles will say so, and a device " +
 			"joining from here adds nothing to its trust store to complete a step-up"
+	}
+	if want == "operator" {
+		return "shared-fleet profiles require operator-provisioned Portal certificates on every Edge; this CP records that contract without receiving their private keys"
 	}
 	return "★ clientless/ holds no certificate pair, so the step-up portal is on this deployment's own. " +
 		"Every device joining from here has to trust this organization's transport anchor to complete a " +

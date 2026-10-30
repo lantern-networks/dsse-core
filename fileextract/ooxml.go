@@ -13,6 +13,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"strings"
 )
@@ -69,42 +70,48 @@ func extractOOXMLText(data []byte, maxBytes int) (string, error) {
 		return "", err
 	}
 	var sb strings.Builder
-	// readBudget bounds DECOMPRESSED bytes read from the archive, not just produced text. Capping only the
-	// collected text left the read side unbounded: a zip bomb whose XML inflates to whitespace (or markup)
-	// never grows sb, so the cap never tripped and decompression burned unbounded CPU + per-token memory.
-	// The budget is shared across parts; when it runs out the XML decoder sees EOF and extraction stops with
-	// whatever text was collected (the same take-what-we-have semantics as the text cap).
+	// Keep the decompression bound, but report incomplete inspection to callers.
+	// A small compressed archive may hide text after a large whitespace prefix.
 	readBudget := int64(maxBytes)
 	for _, f := range zr.File {
-		if sb.Len() >= maxBytes || readBudget <= 0 {
-			break
-		}
 		if !strings.HasSuffix(strings.ToLower(f.Name), ".xml") {
-			continue // media, binary parts, relationships — no scannable text
+			continue
+		}
+		if f.UncompressedSize64 > uint64(readBudget) {
+			return sb.String(), ErrExtractionLimit
 		}
 		rc, err := f.Open()
 		if err != nil {
-			continue // skip an unreadable part rather than failing the whole file
+			return sb.String(), fmt.Errorf("cannot open Office XML member: %w", err)
 		}
-		lr := &io.LimitedReader{R: rc, N: readBudget}
-		appendXMLText(&sb, lr, maxBytes)
-		readBudget = lr.N
-		rc.Close()
+		lr := &io.LimitedReader{R: rc, N: readBudget + 1}
+		err = appendXMLText(&sb, lr, maxBytes)
+		consumed := readBudget + 1 - lr.N
+		closeErr := rc.Close()
+		if consumed > readBudget {
+			return sb.String(), ErrExtractionLimit
+		}
+		readBudget -= consumed
+		if err != nil {
+			return sb.String(), fmt.Errorf("cannot inspect Office XML member: %w", err)
+		}
+		if closeErr != nil {
+			return sb.String(), closeErr
+		}
 	}
 	return sb.String(), nil
 }
 
-// appendXMLText writes each non-empty XML text node from r to sb (one per line), stopping at the byte cap.
-func appendXMLText(sb *strings.Builder, r io.Reader, maxBytes int) {
+// appendXMLText never reports malformed or truncated XML as successfully inspected.
+func appendXMLText(sb *strings.Builder, r io.Reader, maxBytes int) error {
 	dec := xml.NewDecoder(r)
 	for {
-		remaining := maxBytes - sb.Len()
-		if remaining <= 0 {
-			return
-		}
 		tok, err := dec.Token()
+		if err == io.EOF {
+			return nil
+		}
 		if err != nil {
-			return // EOF or malformed — take what we have
+			return err
 		}
 		cd, ok := tok.(xml.CharData)
 		if !ok {
@@ -114,8 +121,8 @@ func appendXMLText(sb *strings.Builder, r io.Reader, maxBytes int) {
 		if t == "" {
 			continue
 		}
-		if len(t) > remaining { // truncate a single oversize node so one node can't blow the cap
-			t = t[:remaining]
+		if len(t)+1 > maxBytes-sb.Len() {
+			return ErrExtractionLimit
 		}
 		sb.WriteString(t)
 		sb.WriteByte('\n')

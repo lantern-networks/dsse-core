@@ -45,7 +45,23 @@ func TestSharedApplicationCatalogAcrossPostgresProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Registry: connector.NewRegistry(),
-		AdminAuth: newAdminAuthStore(), OperatorTenantID: tenant, AssetStore: viewer})
+		AdminAuth: newAdminAuthStore(), OperatorTenantID: tenant, AssetStore: viewer,
+		FleetConfigStatus: newFleetConfigStatusStore(time.Minute)})
+	fleetGeneration := func() float64 {
+		t.Helper()
+		read := doAdmin(t, handler, http.MethodGet, "/admin/fleet/config-status", "")
+		if read.Code != http.StatusOK {
+			t.Fatalf("fleet status=%d body=%s", read.Code, read.Body.String())
+		}
+		var body struct {
+			Generation float64 `json:"control_plane_generation"`
+		}
+		if err := json.Unmarshal(read.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.Generation
+	}
+	initialFleetGeneration := fleetGeneration()
 	dir := t.TempDir()
 	ready, resume := filepath.Join(dir, "ready"), filepath.Join(dir, "resume")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -91,6 +107,9 @@ func TestSharedApplicationCatalogAcrossPostgresProcesses(t *testing.T) {
 	if len(latest.ListGroups(tenant)) != 1 || latest.ConfigGeneration() != 3 {
 		t.Fatalf("shared group/generation did not converge: groups=%d generation=%d", len(latest.ListGroups(tenant)), latest.ConfigGeneration())
 	}
+	if got := fleetGeneration(); got != initialFleetGeneration+float64(latest.ConfigGeneration()) {
+		t.Fatalf("stale CP fleet generation after peer writes=%v, want %v", got, initialFleetGeneration+float64(latest.ConfigGeneration()))
+	}
 	var endpoints []assetcatalog.Endpoint
 	read := doAdmin(t, handler, http.MethodGet, "/admin/assets/endpoints", "")
 	if read.Code != http.StatusOK || json.Unmarshal(read.Body.Bytes(), &endpoints) != nil || len(endpoints) != 2 {
@@ -101,6 +120,9 @@ func TestSharedApplicationCatalogAcrossPostgresProcesses(t *testing.T) {
 	if bundleRead.Code != http.StatusOK || json.Unmarshal(bundleRead.Body.Bytes(), &bundle) != nil ||
 		bundle.Rules == nil || len(bundle.Rules.Endpoints) != 2 || bundle.Generation < 3 {
 		t.Fatalf("stale CP Edge bundle did not refresh from PostgreSQL: status=%d body=%s", bundleRead.Code, bundleRead.Body.String())
+	}
+	if got := fleetGeneration(); got != float64(bundle.Generation) {
+		t.Fatalf("fleet generation=%v does not match Edge bundle generation=%d", got, bundle.Generation)
 	}
 	if deleted, err := latest.DeleteApplicationEndpoint(tenant, "alpha", false); err != nil || !deleted {
 		t.Fatalf("delete alpha: deleted=%v err=%v", deleted, err)
@@ -113,6 +135,9 @@ func TestSharedApplicationCatalogAcrossPostgresProcesses(t *testing.T) {
 	_, beta := reloaded.GetEndpoint(tenant, "app-beta")
 	if alpha || !beta || reloaded.ConfigGeneration() != 4 {
 		t.Fatalf("delete/reload lost peer state: alpha=%v beta=%v generation=%d", alpha, beta, reloaded.ConfigGeneration())
+	}
+	if got := fleetGeneration(); got != initialFleetGeneration+float64(reloaded.ConfigGeneration()) {
+		t.Fatalf("stale CP fleet generation after peer delete=%v, want %v", got, initialFleetGeneration+float64(reloaded.ConfigGeneration()))
 	}
 }
 

@@ -80,6 +80,18 @@ func TestOpenAcceptsAWellFormedSignedManifest(t *testing.T) {
 	}
 }
 
+func TestManifestRefusesArtifactKindForAnotherPlatform(t *testing.T) {
+	m := goodManifest()
+	m.ArtifactKind = ArtifactKindPKG
+	if err := m.Validate(); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("Windows PKG must be refused before signing: %v", err)
+	}
+	m.Platform, m.ArtifactKind = PlatformDarwin, ArtifactKindMSI
+	if err := m.Validate(); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("macOS MSI must be refused before signing: %v", err)
+	}
+}
+
 // The step-1 acceptance condition: a manifest whose signature was altered and an artifact whose hash does not
 // match are BOTH refused, and refused for DIFFERENT reasons. Asserting only "an error came back" would pass
 // against code that refuses everything, which is the failure mode a negative test is most likely to have.

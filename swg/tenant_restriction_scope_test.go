@@ -83,3 +83,50 @@ func TestTenantRestrictionUpdateRefusesAnotherOrganizationsRule(t *testing.T) {
 		t.Fatalf("the operator must not be refused, got %q", refused)
 	}
 }
+
+func TestTenantRestrictionDoesNotExposeForeignReferences(t *testing.T) {
+	s := trStatus()
+	s.OperatorConfigRefs = []string{"operator_config_ref:google_allowed", "operator_config_ref:ms_allowed", "operator_config_ref:claude_allowed"}
+	got := s.ForTenant("tenant_northwind", false)
+	for _, ref := range got.OperatorConfigRefs {
+		if ref == "operator_config_ref:google_allowed" {
+			t.Fatal("foreign operator config reference is visible")
+		}
+	}
+	if len(got.OperatorConfigRefs) != 2 || len(s.OperatorConfigRefs) != 3 {
+		t.Fatal("scope removed own/global references or changed the original status")
+	}
+	if got := s.ForTenant("TENANT_NORTHWIND", false); got.RuleCount != 1 {
+		t.Fatal("case-distinct tenant received another tenant's rule")
+	}
+}
+
+func TestTenantRestrictionUpdatesRequireExclusiveTenantOwnership(t *testing.T) {
+	for _, mode := range []string{"shared_ref", "global_ref", "global_toggle", "unknown_ref", "case_distinct_owner"} {
+		t.Run(mode, func(t *testing.T) {
+			s := trStatus()
+			caller := "tenant_northwind"
+			req := TenantRestrictionUpdateRequest{}
+			switch mode {
+			case "shared_ref":
+				s.Rules[0].HeaderValueRef = s.Rules[1].HeaderValueRef
+				req.HeaderValueUpdates = map[string]string{s.Rules[1].HeaderValueRef: "changed.example"}
+			case "global_ref":
+				req.HeaderValueUpdates = map[string]string{s.Rules[2].HeaderValueRef: "changed.example"}
+			case "global_toggle":
+				req.SaaSEnablement = map[string]bool{s.Rules[2].SaaSApplicationID: true}
+			case "unknown_ref":
+				req.HeaderValueUpdates = map[string]string{"operator_config_ref:uncited": "changed.example"}
+			case "case_distinct_owner":
+				caller = "TENANT_NORTHWIND"
+				req.HeaderValueUpdates = map[string]string{s.Rules[1].HeaderValueRef: "changed.example"}
+			}
+			if refused := s.UpdateRefusal(req, caller, false); refused == "" {
+				t.Fatal("tenant may change a reference or rule it does not exclusively own")
+			}
+			if refused := s.UpdateRefusal(req, "", true); refused != "" {
+				t.Fatal("deployment operator was incorrectly refused")
+			}
+		})
+	}
+}

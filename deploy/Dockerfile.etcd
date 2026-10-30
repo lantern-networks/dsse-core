@@ -1,0 +1,39 @@
+# Build the current etcd release from its exact upstream commit with the
+# maintained Go compiler and patched x/net. Never substitute a moving tag.
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS build
+
+ARG TARGETOS
+ARG TARGETARCH
+RUN apk upgrade --no-cache && apk add --no-cache git
+WORKDIR /src
+RUN git clone --depth 1 --branch v3.7.2 --filter=blob:none https://github.com/etcd-io/etcd.git . \
+    && test "$(git rev-parse HEAD)" = 68c065e562994b89e333e77b039ad066f933c586
+RUN go work edit -replace=golang.org/x/net=golang.org/x/net@v0.61.0 \
+    && for module in \
+         go.opentelemetry.io/otel \
+         go.opentelemetry.io/otel/metric \
+         go.opentelemetry.io/otel/trace \
+         go.opentelemetry.io/otel/sdk \
+         go.opentelemetry.io/otel/sdk/metric \
+         go.opentelemetry.io/otel/exporters/otlp/otlptrace \
+         go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc; do \
+         go work edit "-replace=${module}=${module}@v1.47.0"; \
+       done \
+    && test "$(go list -m -f '{{.Replace.Version}}' golang.org/x/net)" = v0.61.0 \
+    && test "$(go list -m -f '{{.Replace.Version}}' go.opentelemetry.io/otel/sdk)" = v1.47.0
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    GOTOOLCHAIN=local GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath \
+       -ldflags '-X go.etcd.io/etcd/api/v3/version.GitSHA=68c065e562994b89e333e77b039ad066f933c586' \
+       -o /out/etcd ./server \
+    && GOTOOLCHAIN=local GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -o /out/etcdctl ./etcdctl \
+    && GOTOOLCHAIN=local GOOS=$TARGETOS GOARCH=$TARGETARCH CGO_ENABLED=0 go build -trimpath -o /out/etcdutl ./etcdutl \
+    && test -x /out/etcd && test -x /out/etcdctl && test -x /out/etcdutl
+
+FROM alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates
+COPY --from=build /out/etcd /out/etcdctl /out/etcdutl /usr/local/bin/
+WORKDIR /var/lib/etcd
+EXPOSE 2379 2380
+ENTRYPOINT ["/usr/local/bin/etcd"]

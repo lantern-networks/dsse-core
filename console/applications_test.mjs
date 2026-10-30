@@ -48,14 +48,34 @@ function publicationFixture(responses) {
  vm.runInContext(source,c);vm.runInContext('renderApplicationsView=()=>{}',c);c.openPublishWizard({});
  return{calls,nodes,fields,toasts,get button(){return modal.footer[1]},get preview(){return modal.body.at(-1)},get closed(){return closed}};
 }
+const publishedResponse=()=>({ok:true,status:200,body:{schema_version:'application_publish.v1',application:{application_id:'jira',published:true},review:{published_route:true,policy_assigned:false,users_allowed_now:0}}});
 test('asset save partial result never presents a completed publication and can be retried deliberately',async()=>{
- const f=publicationFixture([{ok:false,status:500,body:{error:'application_asset_update_unconfirmed',partial:true}},{ok:true,body:{review:{published_route:true}}}]);
+ const f=publicationFixture([{ok:false,status:500,body:{error:'application_asset_update_unconfirmed',partial:true}},publishedResponse()]);
  await f.button.click();assert.equal(f.calls.length,1);assert.notEqual(f.button.textContent,'Done');assert.match(f.preview.textContent,/not confirmed/);assert.equal(f.toasts.at(-1).kind,'err');assert.doesNotMatch(f.toasts.at(-1).message,/^application_asset_update_unconfirmed$/);
  await f.button.click();assert.equal(f.calls.length,2);assert.equal(f.button.textContent,'Done');
 });
 test('publication Done only closes and never submits a second publish',async()=>{
- const f=publicationFixture([{ok:true,body:{review:{published_route:true}}}]);await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.button.textContent,'Done');await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.closed,1);
+ const f=publicationFixture([publishedResponse()]);await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.button.textContent,'Done');await f.button.click();assert.equal(f.calls.length,1);assert.equal(f.closed,1);
 });
 test('collision step requires explicit approval and sends exactly one override',async()=>{
- const f=publicationFixture([{ok:false,status:409,body:{error:'cidr_route_collision',collisions:[]}},{ok:true,body:{review:{published_route:true}}}]);await f.button.click();assert.equal(f.calls.length,1);await f.button.click();assert.equal(f.calls.length,1);f.nodes.findLast(n=>n.type==='checkbox').checked=true;await f.button.click();await new Promise(resolve=>setImmediate(resolve));assert.equal(f.calls.length,2);assert.equal(f.calls[1].body.override_cidr_collision,true);await f.button.click();assert.equal(f.calls.length,2);assert.equal(f.closed,1);
+ const f=publicationFixture([{ok:false,status:409,body:{error:'cidr_route_collision',collisions:[]}},publishedResponse()]);await f.button.click();assert.equal(f.calls.length,1);await f.button.click();assert.equal(f.calls.length,1);f.nodes.findLast(n=>n.type==='checkbox').checked=true;await f.button.click();await new Promise(resolve=>setImmediate(resolve));assert.equal(f.calls.length,2);assert.equal(f.calls[1].body.override_cidr_collision,true);await f.button.click();assert.equal(f.calls.length,2);assert.equal(f.closed,1);
+});
+test('publication never claims success from an incomplete or foreign 2xx response',async()=>{
+ for(const body of [null,{},
+  {...publishedResponse().body,schema_version:'other'},
+  {...publishedResponse().body,application:{application_id:'different',published:true}},
+  {...publishedResponse().body,application:{application_id:'jira',published:false}},
+  {...publishedResponse().body,review:{published_route:null,policy_assigned:false,users_allowed_now:0}},
+  {...publishedResponse().body,review:{published_route:true}},
+ ]){
+  const f=publicationFixture([{ok:true,status:200,body}]);await f.button.click();
+  assert.notEqual(f.button.textContent,'Done');assert.equal(f.button.disabled,false);
+  assert.equal(f.toasts.at(-1)?.kind,'err');
+ }
+});
+test('a saved but inactive route is reported as a warning, not a reachable publication',async()=>{
+ const response=publishedResponse();response.body.review.published_route=false;
+ const f=publicationFixture([response]);await f.button.click();
+ assert.equal(f.button.textContent,'Done');assert.equal(f.toasts.at(-1)?.kind,'warn');
+ assert.match(f.toasts.at(-1)?.message,/no active route/);
 });

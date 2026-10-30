@@ -70,7 +70,7 @@ public struct DsseRegionDecision: Sendable {
     public let state: DsseRegionState
     /// The region to steer through (non-nil only when state == .connected).
     public let current: DsseRegionEndpoint?
-    /// The ordered standby set of healthy ALTERNATE regions (nearest first).
+    /// The ordered standby set of healthy ALTERNATE endpoints, including doors in the same region.
     public let failoverSet: [DsseRegionEndpoint]
     public let reason: String
 
@@ -113,7 +113,7 @@ public final class DsseRegionSelector {
     // optimisation whose cost is that the fleet never comes home, silently, with everything reporting healthy.
     // Mirrors the Go engine; see regionfailover/failback_test.go.
     private var home: String
-    private var current: String = ""   // sticky current region id ("" = none selected yet)
+    private var current: String = ""   // sticky (region, endpoint) key ("" = none selected yet)
     private var currentStrikes: Int = 0
     private var unhealthyStrikes: Int = 3
     // Opt-in: treat a PERSISTENT current-region admission-deny (reachable && !admitted surviving hysteresis) as
@@ -143,7 +143,9 @@ public final class DsseRegionSelector {
     /// gets hysteresis. Parity with the Go engine's SetInstantRevokeOnAdmissionDeny.
     public func setInstantRevokeOnAdmissionDeny(_ v: Bool) { instantRevokeOnAdmissionDeny = v }
 
-    public var currentRegion: String { current }
+    public var currentRegion: String { current.components(separatedBy: "\u{0}").first ?? "" }
+
+    private static func key(_ ep: DsseRegionEndpoint) -> String { ep.region + "\u{0}" + ep.endpoint }
 
     /// Replace the allowed list (a residency-policy change / list refresh). If the current region is no longer in
     /// the allowed set, it is DROPPED immediately — an out-of-boundary region can never remain current.
@@ -169,7 +171,7 @@ public final class DsseRegionSelector {
         var anyDeniedAdmission = false
         for ep in allowed {
             let h = probe(ep)
-            results[ep.region] = h
+            results[Self.key(ep)] = h
             if h.healthy {
                 healthy.append(ep)
             } else if h.reachable && !h.admitted {
@@ -223,10 +225,18 @@ public final class DsseRegionSelector {
             // Otherwise the current region is unreachable: fail over off it (health failover) below.
         }
 
-        if let best = healthy.first {
-            current = best.region
+        // A newly started device must not shop for an admitting door after another denied it.
+        // A healthy sticky current is handled above and is not displaced by an alternate probe.
+        if denyOnAdmissionDeny && anyDeniedAdmission {
+            current = ""
             currentStrikes = 0
-            return connected(best.region, ranked: healthy, reason: "selected nearest healthy allowed region")
+            return DsseRegionDecision(state: .denied, current: nil, failoverSet: [],
+                reason: "allowed endpoint denied admission — refusing endpoint shopping")
+        }
+        if let best = healthy.first {
+            current = Self.key(best)
+            currentStrikes = 0
+            return connected(current, ranked: healthy, reason: "selected nearest healthy allowed endpoint")
         }
 
         // No healthy allowed region: fail closed (or surface deny). Never cross the boundary.
@@ -245,7 +255,7 @@ public final class DsseRegionSelector {
         var current: DsseRegionEndpoint?
         var failover: [DsseRegionEndpoint] = []
         for ep in ranked {
-            if ep.region == currentRegion { current = ep } else { failover.append(ep) }
+            if Self.key(ep) == currentRegion { current = ep } else { failover.append(ep) }
         }
         if current == nil { current = endpointFor(currentRegion) } // degraded-within-hysteresis: still report it
         return DsseRegionDecision(state: .connected, current: current, failoverSet: failover, reason: reason,
@@ -253,26 +263,26 @@ public final class DsseRegionSelector {
     }
 
     private func endpointFor(_ region: String) -> DsseRegionEndpoint {
-        allowed.first(where: { $0.region == region }) ?? DsseRegionEndpoint(region: region, endpoint: "")
+        allowed.first(where: { Self.key($0) == region }) ?? DsseRegionEndpoint(region: "", endpoint: "")
     }
 
-    private func inAllowed(_ region: String) -> Bool { allowed.contains(where: { $0.region == region }) }
+    private func inAllowed(_ region: String) -> Bool { allowed.contains(where: { Self.key($0) == region }) }
 
     /// Rank healthy endpoints by operator PRIORITY, then nearest RTT, then the home anchor, then original list
     /// order (stable/deterministic). Priority first: see DsseRegionEndpoint.priority.
     private func rankHealthy(_ healthy: inout [DsseRegionEndpoint], _ results: [String: DsseRegionHealth]) {
         var pos: [String: Int] = [:]
-        for (i, ep) in allowed.enumerated() { pos[ep.region] = i }
+        for (i, ep) in allowed.enumerated() { pos[Self.key(ep)] = i }
         healthy.sort { a, b in
             let pa = dsseEffectiveRegionPriority(a.priority)
             let pb = dsseEffectiveRegionPriority(b.priority)
             if pa != pb { return pa < pb }
-            let ra = results[a.region]?.rttMillis ?? Int.max
-            let rb = results[b.region]?.rttMillis ?? Int.max
+            let ra = results[Self.key(a)]?.rttMillis ?? Int.max
+            let rb = results[Self.key(b)]?.rttMillis ?? Int.max
             if ra != rb { return ra < rb }
-            if a.region == home { return true }
-            if b.region == home { return false }
-            return (pos[a.region] ?? Int.max) < (pos[b.region] ?? Int.max)
+            if a.region == home && b.region != home { return true }
+            if b.region == home && a.region != home { return false }
+            return (pos[Self.key(a)] ?? Int.max) < (pos[Self.key(b)] ?? Int.max)
         }
     }
 
@@ -282,8 +292,9 @@ public final class DsseRegionSelector {
         for ep in allowed {
             let region = ep.region.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             let endpoint = ep.endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-            if region.isEmpty || endpoint.isEmpty || seen.contains(region) { continue }
-            seen.insert(region)
+            let key = region + "\u{0}" + endpoint
+            if region.isEmpty || endpoint.isEmpty || seen.contains(key) { continue }
+            seen.insert(key)
             // priority is CARRIED — the Go engine dropped it here first and the field went completely inert
             // (settable, readable, never ranked on). Enumerating fields is what lets a new one go missing.
             out.append(DsseRegionEndpoint(region: region, endpoint: endpoint, priority: ep.priority))

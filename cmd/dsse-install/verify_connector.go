@@ -37,7 +37,12 @@ func verifyConnector(client *http.Client, dir, cpAdmin, edgeTransport, edgeAdmin
 	edgeTransport = strings.TrimRight(edgeTransport, "/")
 	edgeAdmin = strings.TrimRight(edgeAdmin, "/")
 
-	siteID := "dsse-install-verification-" + strings.ToLower(randomSecret()[:8])
+	siteNonce, err := randomSecret()
+	if err != nil {
+		add("a Site can be created on the control plane", false, "could not generate verification Site ID: %v", err)
+		return out
+	}
+	siteID := "dsse-install-verification-" + strings.ToLower(siteNonce[:8])
 	body, _ := json.Marshal(map[string]any{"site_id": siteID, "name": "installer verification"})
 	code, raw, err := post(client, cpAdmin+"/admin/sites", token, body)
 	if err != nil || (code != 200 && code != 201) {
@@ -87,7 +92,12 @@ func verifyConnector(client *http.Client, dir, cpAdmin, edgeTransport, edgeAdmin
 	// ★ THE SITE HAS TO TRAVEL BEFORE THE EDGE CAN CHECK ANYTHING. It goes in the config bundle, so the Edge
 	// is briefly behind — and that is not a defect, it is how configuration moves. Waiting bounded is the
 	// difference between checking the deployment and checking the poll interval.
-	connectorID := "dsse-install-connector-" + strings.ToLower(randomSecret()[:8])
+	connectorNonce, err := randomSecret()
+	if err != nil {
+		add("a connector can enrol through the Edge", false, "could not generate verification connector ID: %v", err)
+		return out
+	}
+	connectorID := "dsse-install-connector-" + strings.ToLower(connectorNonce[:8])
 	keyPEM, csrPEM, cerr := generateVerificationCSR(connectorID)
 	if cerr != nil {
 		add("a connector can enrol through the Edge", false, "could not build a request: %v", cerr)
@@ -117,13 +127,17 @@ func verifyConnector(client *http.Client, dir, cpAdmin, edgeTransport, edgeAdmin
 			code, connectorSiteTravelWait, first(raw, 160))
 		return out
 	}
-	add("a connector can enrol through the Edge", true, "an identity was issued under %s", tenant)
-
 	// ★★★ AND THEN IT USES IT. Enrolling proves the deployment can MINT a connector identity; taking its place
 	// proves a connector holding one can join. Those are different deployments and this is the second.
 	if issuedCert := enrolledCertificatePEM(raw); issuedCert != "" {
+		add("a connector can enrol through the Edge", true, "an identity was issued under %s", tenant)
 		out = append(out, verifyConnectorTakesItsPlace(dir, edgeTransport, cpAdmin, token, tenant, connectorID,
 			siteID, issued.BootstrapSecret, []byte(issuedCert), keyPEM, client)...)
+	} else {
+		add("a connector can enrol through the Edge", false,
+			"POST /enroll answered 200 without an issued certificate; the connector cannot present an identity")
+		add("the connector can take its place", false,
+			"no issued certificate was returned, so registration with an issued identity cannot be verified")
 	}
 
 	// ★★★ THE BOUNDARY. The same valid secret, claiming a different organization.

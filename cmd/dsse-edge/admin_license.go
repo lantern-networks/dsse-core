@@ -62,10 +62,10 @@ func (d adminLicenseDeps) tenantViews() []tenantSeatView {
 	var ids []string
 	add := func(t string) {
 		t = strings.TrimSpace(t)
-		if t == "" || seen[strings.ToLower(t)] {
+		if t == "" || seen[t] {
 			return
 		}
-		seen[strings.ToLower(t)] = true
+		seen[t] = true
 		ids = append(ids, t)
 	}
 	for _, a := range d.allocations.List() {
@@ -78,7 +78,7 @@ func (d adminLicenseDeps) tenantViews() []tenantSeatView {
 			add(t)
 		}
 	}
-	sort.Slice(ids, func(i, j int) bool { return strings.ToLower(ids[i]) < strings.ToLower(ids[j]) })
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 
 	out := make([]tenantSeatView, 0, len(ids))
 	for _, id := range ids {
@@ -183,7 +183,7 @@ func registerAdminLicenseEndpoints(mux *http.ServeMux, d adminLicenseDeps,
 			caller := strings.TrimSpace(adminTenantIDFromRequest(r))
 			mine := make([]tenantSeatView, 0, 1)
 			for _, view := range visible {
-				if strings.EqualFold(strings.TrimSpace(view.TenantID), caller) {
+				if strings.TrimSpace(view.TenantID) == caller {
 					mine = append(mine, view)
 				}
 			}

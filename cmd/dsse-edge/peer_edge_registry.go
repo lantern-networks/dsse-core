@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	urlpkg "net/url"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,11 +32,11 @@ import (
 // peerEdgeRegistry maps a region to its live peer-edge session. PeerEdgeFor satisfies edgeplane.PeerEdgeProvider.
 type peerEdgeRegistry struct {
 	mu       sync.RWMutex
-	sessions map[string]*tunnel.Session // region (lower-cased) -> live session; absent/nil = no live link
+	sessions map[string]map[string]*tunnel.Session // region -> peer URL -> live session
 }
 
 func newPeerEdgeRegistry() *peerEdgeRegistry {
-	return &peerEdgeRegistry{sessions: map[string]*tunnel.Session{}}
+	return &peerEdgeRegistry{sessions: map[string]map[string]*tunnel.Session{}}
 }
 
 // PeerEdgeFor returns the live session for a region's peer edge. Nil-receiver safe so a typed-nil never panics.
@@ -42,22 +44,58 @@ func (r *peerEdgeRegistry) PeerEdgeFor(region string) (*tunnel.Session, bool) {
 	if r == nil {
 		return nil, false
 	}
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	s, ok := r.sessions[strings.ToLower(strings.TrimSpace(region))]
-	return s, ok && s != nil
+	peers := r.PeerEdgesFor(region)
+	if len(peers) == 0 {
+		return nil, false
+	}
+	return peers[0], true
 }
 
 func (r *peerEdgeRegistry) set(region string, s *tunnel.Session) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.sessions[strings.ToLower(strings.TrimSpace(region))] = s
+	r.setForPeer(region, "", s)
 }
 
-func (r *peerEdgeRegistry) clear(region string) {
+func (r *peerEdgeRegistry) setForPeer(region, peerURL string, s *tunnel.Session) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.sessions, strings.ToLower(strings.TrimSpace(region)))
+	region = strings.ToLower(strings.TrimSpace(region))
+	if r.sessions[region] == nil {
+		r.sessions[region] = map[string]*tunnel.Session{}
+	}
+	r.sessions[region][peerURL] = s
+}
+
+func (r *peerEdgeRegistry) clearForPeer(region, peerURL string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	region = strings.ToLower(strings.TrimSpace(region))
+	delete(r.sessions[region], peerURL)
+	if len(r.sessions[region]) == 0 {
+		delete(r.sessions, region)
+	}
+}
+
+// PeerEdgesFor returns all live links for a region. A connector can be attached
+// to any sibling Node, so the dialer tries each link until one opens the flow.
+func (r *peerEdgeRegistry) PeerEdgesFor(region string) []*tunnel.Session {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	byURL := r.sessions[strings.ToLower(strings.TrimSpace(region))]
+	keys := make([]string, 0, len(byURL))
+	for key := range byURL {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var sessions []*tunnel.Session
+	for _, key := range keys {
+		if s := byURL[key]; s != nil {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
 }
 
 // parseMeshIngressAllowedPeers parses the -mesh-ingress-allowed-peers value (comma-separated peer-edge mTLS
@@ -131,10 +169,15 @@ func parseMeshPeers(raw string) ([]meshPeerConfig, error) {
 		if !strings.HasPrefix(url, "ws://") && !strings.HasPrefix(url, "wss://") {
 			return nil, fmt.Errorf("mesh peer %q URL must be ws:// or wss://", entry)
 		}
-		if seen[region] {
-			return nil, fmt.Errorf("mesh peer region %q is configured more than once", region)
+		parsed, err := urlpkg.Parse(url)
+		if err != nil || parsed.Host == "" || strings.ContainsAny(url, ",; ") {
+			return nil, fmt.Errorf("mesh peer %q has an invalid URL", entry)
 		}
-		seen[region] = true
+		key := region + "=" + url
+		if seen[key] {
+			return nil, fmt.Errorf("mesh peer %q is configured more than once", entry)
+		}
+		seen[key] = true
 		peers = append(peers, meshPeerConfig{region: region, url: url})
 	}
 	return peers, nil
@@ -188,18 +231,18 @@ func startMeshPeerLinks(ctx context.Context, peers []meshPeerConfig, secret stri
 	}
 	registry := newPeerEdgeRegistry()
 	manager := tunnel.NewManager()
-	for _, peer := range peers {
-		go runMeshPeerLink(ctx, registry, manager, peer, secret, tlsConfig)
+	for i, peer := range peers {
+		go runMeshPeerLink(ctx, registry, manager, peer, i, secret, tlsConfig)
 	}
 	return registry
 }
 
-func runMeshPeerLink(ctx context.Context, registry *peerEdgeRegistry, manager *tunnel.Manager, peer meshPeerConfig, secret string, tlsConfig *tls.Config) {
+func runMeshPeerLink(ctx context.Context, registry *peerEdgeRegistry, manager *tunnel.Manager, peer meshPeerConfig, index int, secret string, tlsConfig *tls.Config) {
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		if err := connectMeshPeerOnce(ctx, registry, manager, peer, secret, tlsConfig); err != nil && ctx.Err() == nil {
+		if err := connectMeshPeerOnce(ctx, registry, manager, peer, index, secret, tlsConfig); err != nil && ctx.Err() == nil {
 			log.Printf("mesh peer %s (%s) link down: %v; retrying in 2s", peer.region, peer.url, err)
 		}
 		if ctx.Err() != nil {
@@ -213,8 +256,9 @@ func runMeshPeerLink(ctx context.Context, registry *peerEdgeRegistry, manager *t
 	}
 }
 
-func connectMeshPeerOnce(ctx context.Context, registry *peerEdgeRegistry, manager *tunnel.Manager, peer meshPeerConfig, secret string, tlsConfig *tls.Config) error {
+func connectMeshPeerOnce(ctx context.Context, registry *peerEdgeRegistry, manager *tunnel.Manager, peer meshPeerConfig, index int, secret string, tlsConfig *tls.Config) error {
 	headers := http.Header{}
+	headers.Set(tunnel.TCPQuotaCapabilityHeader, tunnel.TCPQuotaCapabilityV1)
 	if strings.TrimSpace(secret) != "" {
 		headers.Set("x-mesh-secret", secret)
 		// Anti-replay: stamp the tunnel-upgrade request so a captured upgrade cannot be replayed to open a
@@ -233,13 +277,13 @@ func connectMeshPeerOnce(ctx context.Context, registry *peerEdgeRegistry, manage
 	if err != nil {
 		return err
 	}
-	connectorID := "peer_" + peer.region
+	connectorID := fmt.Sprintf("peer_%s_%d", peer.region, index)
 	tunnelID := randomEdgeID("mesh_", time.Now().UTC())
 	session, _ := manager.Register(connectorID, tunnelID, conn)
-	registry.set(peer.region, session)
+	registry.setForPeer(peer.region, peer.url, session)
 	log.Printf("mesh peer %s link up via %s", peer.region, peer.url)
 	defer func() {
-		registry.clear(peer.region)
+		registry.clearForPeer(peer.region, peer.url)
 		manager.Unregister(connectorID, tunnelID)
 	}()
 	return session.Run()

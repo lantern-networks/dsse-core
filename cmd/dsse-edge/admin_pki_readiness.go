@@ -363,57 +363,26 @@ func assessPKIReadiness(in pkiReadinessInput) pkiReadinessReport {
 		})
 	}
 
-	// 0b. What an intercepted certificate says about revocation. Stated because the answer is "nothing", and a
-	// strict client refuses it for that reason alone — so an operator meets this as a broken tool rather than
-	// as a policy unless the assessment says otherwise.
+	// Strict clients reject inspection certificates without revocation information. This is
+	// an unresolved compatibility failure, independent of admission and origin revocation.
+	// The enrolment-port fold has landed; it does not supply status information by itself.
 	if in.IntermediateActive {
-		// ★★★ THE CONDITION THIS ITEM WAS WAITING FOR HAS HAPPENED, AND THE ANSWER IS STILL NO (2026-08-29).
-		//
-		// The remediation used to say "wait for the agent plane to fold onto one port and serve a signed, empty
-		// CRL from it". The fold has landed — every Edge says so at start-up, `agent-facing ports: 1` — so that
-		// text told an operator to wait for something already done, which is worse than saying nothing.
-		//
-		// The conclusion it was waiting to reach does not survive the real lifetimes:
-		//
-		//	leaf          30 days   minted per host by the Edge. The only party who could revoke it is the one
-		//	                        who mints it, and it withdraws one by not minting it.
-		//	per-Edge CA   12 hours  expiry IS the revocation, and it is faster than any CRL an endpoint polls.
-		//	tenant CA      5 years  the one where revocation carries meaning — AND IT ALREADY EXISTS:
-		//	                        POST /admin/interception-intermediate/{tenant}/revoke, refused by the Edges
-		//	                        themselves, which is stronger than a CRL because it does not depend on the
-		//	                        client bothering to check.
-		//
-		// So a CRL buys no security here. It would be served for one reason — to stop strict clients
-		// hard-failing — which is COMPATIBILITY, priced at a new unauthenticated address, a fetch from every
-		// endpoint, and the loop where a CRL fetched through the tunnel is itself intercepted. An empty
-		// responder that can only ever say "good" is not revocation, and putting it on a screen under that word
-		// would be the worse of the two outcomes: it teaches a reader this deployment has something it has not.
-		//
-		// The item stays "ok" and stops naming the fold at all: it is no longer part of the answer.
-		revocationRemediation := "Allow the exception on the clients that require revocation checking, " +
-			"deliberately. Nothing here is waiting to be built: the certificate where revocation carries " +
-			"meaning is this organization's interception CA, and revoking it is already an act this deployment " +
-			"performs — POST /admin/interception-intermediate/{tenant}/revoke, refused by the Edges themselves, " +
-			"which holds whether or not a client checks. What a client would look up instead is a leaf the Edge " +
-			"mints per host and withdraws by not minting, under a per-Edge CA that expires in hours. Serving a " +
-			"CRL would satisfy the check without adding revocation, at the price of an address every endpoint " +
-			"must reach WITHOUT being steered — a CRL fetched through the tunnel is itself intercepted, and a " +
-			"certificate whose revocation check needs a certificate is a loop. Revisit only if a fleet's own " +
-			"software cannot be excepted, and staple a response on the connection rather than opening an address."
 		items = append(items, pkiReadinessItem{
 			ID: "interception_leaf_revocation", Title: "Revocation information on intercepted certificates",
-			// ★ ok, NOT attention: this is a DECISION with its reasons written down (the certificate-ownership design),
-			// and a permanent attention item is noise that teaches an operator to skim the list. What the reader
-			// needs is to recognise the failure when a strict client produces it — so the detail says what is
-			// absent and the consequence says what it looks like, on an item that is not asking to be fixed.
-			Status: "ok",
-			Detail: "none, by decision — certificates minted for intercepted sites carry no CRL distribution " +
-				"point and no OCSP responder, so a client that requires revocation checking needs an exception",
-			Consequence: "a client that treats \"cannot check revocation\" as fatal refuses them — measured on " +
-				"Windows: curl over schannel answers CRYPT_E_NO_REVOCATION_CHECK and the same request with " +
-				"--ssl-no-revoke succeeds. The clients that fail are the strict ones, so this selects for the " +
-				"most careful software on an endpoint.",
-			Remediation: revocationRemediation,
+			Status: "attention",
+			Detail: "inspection certificates carry no CRL distribution point or OCSP responder; " +
+				"strict-client compatibility is unresolved",
+			Consequence: "clients requiring revocation status can refuse intercepted HTTPS: Windows " +
+				"Schannel reports CRYPT_E_NO_REVOCATION_CHECK and online chain validation reports " +
+				"RevocationStatusUnknown. Another client's HTTPS success does not establish compatibility.",
+			Remediation: "Keep client revocation checking enabled. Evaluate a signed CRL on the existing " +
+				"folded enrolment port or a supported stapled response as a separate compatibility remedy; " +
+				"neither is implemented. Validate issuer-chain coverage, signing-key custody, freshness, " +
+				"failure behavior, and reachability without recursive interception before adoption. An empty " +
+				"CRL must not conceal known revoked certificates. Re-test strict clients before enabling " +
+				"interception for them. POST /admin/interception-intermediate/{tenant}/revoke remains the " +
+				"deployment's authority-revocation action; it does not resolve this compatibility failure " +
+				"or check origin revocation. See docs/pki.md.",
 		})
 	}
 

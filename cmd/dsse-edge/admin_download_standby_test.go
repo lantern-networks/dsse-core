@@ -25,8 +25,8 @@ func (p *standbyDownloadRow) UpdateContext(ctx context.Context, edit func([]byte
 }
 
 // On a standby the storage is healthy; only the write term is elsewhere. The
-// answer used to be 503 "storage is unavailable; retry later", which retrying on
-// the same node never fixes. It is now the same 409 every other admin write gives.
+// response identifies leadership loss and advertises a bounded retry through
+// the leader-routing front door, without consuming the one-time download token.
 func TestDownloadOnAStandbyIsNotBlamedOnStorage(t *testing.T) {
 	p := &standbyDownloadRow{}
 	s := newAdminDownloadTokenStore()
@@ -45,7 +45,7 @@ func TestDownloadOnAStandbyIsNotBlamedOnStorage(t *testing.T) {
 	registerAdminSessionRoutes(mux, func(_ string, next http.HandlerFunc) http.HandlerFunc { return next }, serverConfig{}, testEvaluator(), nil, nil, newAdminAuthStore(), s, nil, nil, true)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/admin/export-downloads/"+tok.Token, nil))
-	if rr.Code != http.StatusConflict || strings.Contains(rr.Body.String(), "retry later") {
+	if rr.Code != http.StatusServiceUnavailable || rr.Header().Get("Retry-After") != "1" || strings.Contains(rr.Body.String(), "retry later") {
 		t.Fatalf("standby consume: %d %s", rr.Code, rr.Body)
 	}
 	p.standby = false

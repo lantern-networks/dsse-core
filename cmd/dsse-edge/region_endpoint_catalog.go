@@ -23,10 +23,10 @@ type regionEndpoint struct {
 	Endpoint string `json:"endpoint"`
 }
 
-// regionEndpointCatalog maps a region id to its edge endpoint. Built from -region-endpoints (class-1 config).
+// regionEndpointCatalog preserves every independent door in each region.
 type regionEndpointCatalog struct {
-	byRegion map[string]string // region (lower-cased) -> endpoint URL
-	order    []string          // region ids in configured order (stable output)
+	byRegion map[string][]string // region (lower-cased) -> endpoint URLs
+	order    []string            // unique region ids in configured order
 }
 
 // parseRegionEndpoints parses "region=URL;region=URL". Empty -> nil (geo-steering disabled; single-region).
@@ -35,7 +35,7 @@ func parseRegionEndpoints(raw string) (*regionEndpointCatalog, error) {
 	if raw == "" {
 		return nil, nil
 	}
-	cat := &regionEndpointCatalog{byRegion: map[string]string{}}
+	cat := &regionEndpointCatalog{byRegion: map[string][]string{}}
 	for _, entry := range strings.Split(raw, ";") {
 		entry = strings.TrimSpace(entry)
 		if entry == "" {
@@ -50,11 +50,15 @@ func parseRegionEndpoints(raw string) (*regionEndpointCatalog, error) {
 		if !strings.HasPrefix(endpoint, "https://") && !strings.HasPrefix(endpoint, "wss://") {
 			return nil, fmt.Errorf("region endpoint %q URL must be https:// or wss://", entry)
 		}
-		if _, dup := cat.byRegion[region]; dup {
-			return nil, fmt.Errorf("region %q is configured more than once", region)
+		for _, existing := range cat.byRegion[region] {
+			if existing == endpoint {
+				return nil, fmt.Errorf("region endpoint %q is configured more than once", entry)
+			}
 		}
-		cat.byRegion[region] = endpoint
-		cat.order = append(cat.order, region)
+		if len(cat.byRegion[region]) == 0 {
+			cat.order = append(cat.order, region)
+		}
+		cat.byRegion[region] = append(cat.byRegion[region], endpoint)
 	}
 	return cat, nil
 }
@@ -79,24 +83,26 @@ func (c *regionEndpointCatalog) allowedRegionEndpoints(allowedRegions []string, 
 	home := strings.ToLower(strings.TrimSpace(homeRegion))
 
 	out := make([]regionEndpoint, 0, len(c.order))
-	seen := map[string]bool{}
 	add := func(region string) {
-		if region == "" || seen[region] {
+		if region == "" {
 			return
 		}
-		ep, ok := c.byRegion[region]
+		eps, ok := c.byRegion[region]
 		if !ok {
 			return
 		}
 		if pinned && !allowedSet[region] {
 			return // residency boundary beats everything — never emit an out-of-boundary endpoint
 		}
-		out = append(out, regionEndpoint{Region: region, Endpoint: ep})
-		seen[region] = true
+		for _, ep := range eps {
+			out = append(out, regionEndpoint{Region: region, Endpoint: ep})
+		}
 	}
-	add(home) // anchor first (tiebreak / preferred failover target,)
+	add(home) // anchor first
 	for _, region := range c.order {
-		add(region)
+		if region != home {
+			add(region)
+		}
 	}
 	return out
 }
@@ -135,7 +141,11 @@ func (c *regionEndpointCatalog) digest() string {
 	sort.Strings(regions)
 	h := sha256.New()
 	for _, region := range regions {
-		fmt.Fprintf(h, "%s=%s;", region, c.byRegion[region])
+		endpoints := append([]string(nil), c.byRegion[region]...)
+		sort.Strings(endpoints)
+		for _, ep := range endpoints {
+			fmt.Fprintf(h, "%s=%s;", region, ep)
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }

@@ -309,9 +309,147 @@ function renderInspectionPostureView(content) {
     ]),
   ]));
   const result = el("div", {});
-  content.appendChild(el("button",{class:"ui-btn",text:bl({en:"Reload",ja:"再読込"}),onClick:()=>loadInspectionPosture(result)}));
+  const upstreamTLS = el("section", { class: "ui-card", style: "margin:12px 0" });
+  content.appendChild(el("button",{class:"ui-btn",text:bl({en:"Reload",ja:"再読込"}),onClick:()=>{
+    loadInspectionPosture(result);
+    loadTenantUpstreamTLS(upstreamTLS);
+  }}));
+  content.appendChild(upstreamTLS);
   content.appendChild(result);
+  // This setting belongs to the selected tenant, not to the deployment-wide posture below.
+  // Its read and capabilities must remain available even when that posture cannot be loaded.
+  loadTenantUpstreamTLS(upstreamTLS);
   loadInspectionPosture(result);
+}
+
+function tenantUpstreamTLSContext() {
+  const selection = typeof operateTenant === "undefined" ? null : operateTenant || null;
+  const session = typeof idpSession === "undefined" ? null : idpSession;
+  const operator = typeof signedInAsOperator === "function" && signedInAsOperator();
+  return { selection, operator, tenantID: selection || session?.tenant_id || "", principalID: session?.principal_id || "" };
+}
+
+function sameTenantUpstreamTLSContext(before) {
+  const now = tenantUpstreamTLSContext();
+  return before.selection === now.selection && before.operator === now.operator && before.tenantID === now.tenantID && before.principalID === now.principalID;
+}
+
+function validatedTenantUpstreamTLS(body, tenantID) {
+  if (!body || typeof body !== "object" || Array.isArray(body) || typeof tenantID !== "string" || !tenantID ||
+      body.tenant_id !== tenantID || body.scope !== "tenant" ||
+      !["strict", "browser_compatible"].includes(body.mode) || typeof body.configurable !== "boolean") {
+    throw new Error(bl({en:"The TLS settings could not be verified for this organization.",ja:"この組織のTLS設定を確認できませんでした。"}));
+  }
+  return { tenant_id: body.tenant_id, scope: body.scope, mode: body.mode, configurable: body.configurable };
+}
+
+async function loadTenantUpstreamTLS(host) {
+  if (host.__upstreamTLSPending) return;
+  const context = tenantUpstreamTLSContext();
+  const current = freshRender(host);
+  const active = () => current() && host.isConnected !== false && sameTenantUpstreamTLSContext(context);
+  const request = (method, path, body) => apiFetch(method, path, body, "control", undefined, context.selection || undefined);
+  const retry = { label: bl({en:"Reload",ja:"再読込"}), onClick: () => loadTenantUpstreamTLS(host) };
+  if (context.operator && !context.selection) {
+    uiState(host, "empty", bl({
+      en:"Choose an organization to view and change its origin TLS settings.",
+      ja:"接続先のTLS設定を表示・変更する組織を選択してください。",
+    }), typeof renderGroup === "function" ? {label:bl({en:"Choose organization",ja:"組織を選択"}),onClick:()=>renderGroup("tenants")} : undefined);
+    return;
+  }
+  uiState(host, "loading");
+  let data, tenant;
+  try {
+    if (!context.tenantID) throw new Error(bl({en:"Choose an organization to read its TLS settings.",ja:"TLS設定を確認する組織を選択してください。"}));
+    const [settings, organization] = await Promise.all([
+      request("GET", "/admin/upstream-tls"), request("GET", "/admin/tenant"),
+    ]);
+    if (!active()) return;
+    if (!settings?.ok || settings.status !== 200 || !organization?.ok || organization.status !== 200 ||
+        organization.body?.tenant_id !== context.tenantID) {
+      throw new Error(bl({en:"Could not load this organization's TLS settings.",ja:"この組織のTLS設定を読み込めませんでした。"}));
+    }
+    tenant = organization.body;
+    data = validatedTenantUpstreamTLS(settings.body, context.tenantID);
+  } catch (error) {
+    if (active()) uiState(host, "error", error.message || String(error), retry);
+    return;
+  }
+  if (!active()) return;
+  host.innerHTML = "";
+  host.appendChild(el("h3", {class:"ui-card-title",text:bl({en:"Origin TLS compatibility",ja:"接続先のTLS互換性"})}));
+  // The organization name is what the reader knows; its identifier stays in the tooltip.
+  const organizationName = tenant.display_name || tenant.tenant_id;
+  host.appendChild(el("p", {class:"ui-view-desc",title:tenant.tenant_id,text:bl({
+    en:"Applies only to " + organizationName + ".",
+    ja:organizationName + "だけに適用されます。",
+  })}));
+  const options = [
+    {value:"browser_compatible",label:bl({en:"Same as browsers (default)",ja:"ブラウザと同じ（既定）"})},
+    {value:"strict",label:bl({en:"Strict",ja:"厳格"})},
+  ];
+  const mode = uiField({name:"upstream_tls_mode",label:bl({en:"Connection mode",ja:"接続モード"}),type:"select",value:data.mode,options});
+  host.appendChild(mode.el);
+  host.appendChild(el("p", {class:"ui-view-desc",text:bl({
+    en:"With Strict, some older sites that open in a browser may not open through DSSE.",
+    ja:"厳格にすると、ブラウザで開ける古いサイトでも、DSSE経由では開けない場合があります。",
+  })}));
+  // Keep the tradeoff visible until a saved change away from compatibility is confirmed.
+  const tradeoff = el("p", {class:"ui-callout ui-callout-warn",text:bl({
+    en:"Uses an older key exchange as well. If a site's server key leaks later, recorded traffic could be decrypted. Certificate checks and inspection stay on.",
+    ja:"古い鍵交換方式も使います。相手サーバーの鍵が後で漏れると、記録された通信を解読されるおそれがあります。証明書の確認と検査はそのまま行います。",
+  })});
+  host.appendChild(tradeoff);
+  const saved = el("p", {class:"ui-view-desc"});
+  const readonly = el("p", {class:"ui-view-desc",text:bl({en:"Read-only in your current session.",ja:"現在のセッションでは閲覧のみ可能です。"})});
+  const notice = el("p", {role:"status","aria-live":"polite"});
+  const save = el("button", {class:"ui-btn ui-btn-primary",text:bl({en:"Save",ja:"保存"})});
+  let saveUnconfirmed = false;
+  const repaint = () => {
+    mode.el.querySelectorAll("select").forEach(input => input.disabled = !data.configurable || !!host.__upstreamTLSPending);
+    save.disabled = !data.configurable || !!host.__upstreamTLSPending || saveUnconfirmed || mode.get() === data.mode;
+    readonly.hidden = data.configurable;
+    tradeoff.hidden = mode.get() !== "browser_compatible" && data.mode !== "browser_compatible" && !saveUnconfirmed;
+    saved.textContent = (saveUnconfirmed
+      ? bl({en:"Last confirmed mode: ",ja:"最後に確認できたモード: "})
+      : bl({en:"Saved mode: ",ja:"保存されているモード: "})) + options.find(option => option.value === data.mode).label;
+  };
+  mode.el.addEventListener("change", repaint);
+  save.addEventListener("click", async () => {
+    if (!active() || host.__upstreamTLSPending || saveUnconfirmed || !data.configurable || mode.get() === data.mode) return;
+    const chosen = mode.get();
+    if (!options.some(option => option.value === chosen)) return;
+    host.__upstreamTLSPending = true;
+    notice.textContent = bl({en:"Saving…",ja:"保存中…"});
+    notice.setAttribute("role", "status");
+    repaint();
+    try {
+      const response = await request("POST", "/admin/upstream-tls", {mode:chosen});
+      if (!active()) return;
+      if (!response?.ok || response.status !== 200 || validatedTenantUpstreamTLS(response.body, context.tenantID).mode !== chosen) throw new Error("Unconfirmed TLS save");
+      const readback = await request("GET", "/admin/upstream-tls");
+      if (!active()) return;
+      if (!readback?.ok || readback.status !== 200) throw new Error("Unconfirmed TLS readback");
+      const verified = validatedTenantUpstreamTLS(readback.body, context.tenantID);
+      if (verified.mode !== chosen) throw new Error("TLS readback differs");
+      data = verified;
+      notice.textContent = bl({en:"Saved for this organization. Allow time for the updated setting to take effect.",ja:"この組織の設定を保存しました。反映には少し時間がかかる場合があります。"});
+    } catch (_) {
+      if (active()) {
+        saveUnconfirmed = true;
+        notice.setAttribute("role", "alert");
+        notice.textContent = bl({en:"Save not confirmed. Reload to check the current setting before retrying.",ja:"保存を確認できませんでした。再読込して現在の設定を確認してから再試行してください。"});
+      }
+    } finally {
+      host.__upstreamTLSPending = false;
+      if (active()) repaint();
+    }
+  });
+  host.appendChild(saved);
+  host.appendChild(readonly);
+  host.appendChild(save);
+  host.appendChild(notice);
+  repaint();
 }
 
 async function loadInspectionPosture(result) {

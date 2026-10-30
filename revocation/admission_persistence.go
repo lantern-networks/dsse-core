@@ -88,6 +88,11 @@ func (a *AdmissionRevocations) restoreSnapshotLocked(p blobstore.Persister, refr
 	if err != nil {
 		return err
 	}
+	// Leadership reload is a read, not confirmation that this process's prior
+	// restrictive edit was committed. Keep unconfirmed origin and received mesh
+	// blocks live until a later shared write saves them or an explicit restore
+	// commits their removal.
+	a.mergePendingAdmissionBlocks(&f)
 	a.mu.Lock()
 	if !maps.Equal(a.revoked, f.Revoked) || !maps.Equal(a.meshReceived, f.MeshReceived) {
 		a.generation.Add(1)

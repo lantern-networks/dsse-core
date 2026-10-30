@@ -49,6 +49,23 @@ test('issued profile and subsequent token dialog retain the submitted group whil
   }
 });
 
+test('profile result and token dialog refuse an operator selection changed after form creation', async () => {
+  const f = fixture(); let finish;
+  f.context.apiFetch = (...args) => { f.calls.push(args); return new Promise(resolve => { finish = resolve; }); };
+  const pending = f.click();
+  f.context.operateTenant = 'another-tenant';
+  finish({ok: true, body: {payload_b64: 'signed'}}); await pending;
+  assert.equal(f.made.length, 0);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.notices.length, 1);
+
+  const tokens = tokenFixture();
+  tokens.context.operateTenant = 'another-tenant';
+  await tokens.send();
+  assert.equal(tokens.calls.length, 0);
+  assert.equal(tokens.notices.length, 1);
+});
+
 test('reentrant issuance makes one request and permits the next request after completion', async () => {
   const f = fixture(); let finish;
   f.context.apiFetch = (...args) => { f.calls.push(args); return new Promise(resolve => { finish = resolve; }); };

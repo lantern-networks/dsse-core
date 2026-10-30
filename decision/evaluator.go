@@ -66,6 +66,8 @@ type Evaluator struct {
 	// nobody would complete. Empty is valid and correct for a flat private estate — see decision/locality.go.
 	EastWestInternalNetworks InternalNetworks
 	EastWestRules            []EastWestRule
+	// Tenant ceiling for newly issued and reused federated Connector Access grants.
+	EastWestMaxGrantTTLSeconds int
 	// EastWestGrants are the active ephemeral grants that RELEASE an authenticate-mode hold for a matching
 	// (identity x device x destination x protocol) until they expire (E3). A grant only releases an
 	// authenticate hold; it never overrides an explicit deny.
@@ -151,6 +153,12 @@ func (e Evaluator) Evaluate(req model.DecisionRequest) model.AccessDecision {
 		reason = "No active policy matched the request. " + whyNot + "."
 	} else if ok {
 		policyID = matchedPolicy.ID
+		// Policy IDs are tenant-scoped, and global policies may share an ID
+		// with a tenant policy. Runtime evidence validation needs the actual
+		// matched policy, not a second ID-only lookup. This metadata is made
+		// here from the evaluator's match; decisionMetadata never copies an
+		// untrusted request field with this name. Empty means a global policy.
+		metadata["matched_policy_tenant_id"] = matchedPolicy.TenantID
 		// A matched policy with an EMPTY decision is a MISCONFIGURATION, not an allow (fail-open review #16). The
 		// authoring paths already reject an empty decision (policy.Store.Upsert / the policy loader require
 		// action.decision), so an empty value reaching the evaluator means a policy bypassed validation — treat it
@@ -167,7 +175,9 @@ func (e Evaluator) Evaluate(req model.DecisionRequest) model.AccessDecision {
 		if matchedPolicy.Log != nil {
 			metadata["log_traffic"] = *matchedPolicy.Log
 		}
-		if decisionValue == "allow" && matchedPolicy.RequiredWorkloadAttestation && !workloadAttestationSatisfied(workloadAttestationState) {
+		// A federated grant can release require_reauthentication directly. Do
+		// not let that release bypass an independently required workload proof.
+		if (decisionValue == "allow" || decisionValue == "require_reauthentication") && matchedPolicy.RequiredWorkloadAttestation && !workloadAttestationSatisfied(workloadAttestationState) {
 			decisionValue = "require_workload_attestation"
 			workloadAttestationState = "required"
 		}
@@ -572,7 +582,7 @@ func (e Evaluator) firstMatchedPolicyWithDiagnosis(req model.DecisionRequest, ac
 func policyTenantAppliesTo(policy model.Policy, req model.DecisionRequest) bool {
 	pt := strings.TrimSpace(policy.TenantID)
 	rt := strings.TrimSpace(req.TenantID)
-	return pt == "" || rt == "" || strings.EqualFold(pt, rt)
+	return pt == "" || rt == "" || pt == rt
 }
 
 func (e Evaluator) orderedPolicies() []model.Policy {
@@ -629,7 +639,7 @@ func matchPolicy(policy model.Policy, req model.DecisionRequest, actorType strin
 	// an empty tenant on either side is treated as global/unscoped (lockout-safe — this preserves single-tenant and
 	// deliberately tenant-less "global" policies, and only ADDS filtering between two DISTINCT known tenants).
 	if pt := strings.TrimSpace(policy.TenantID); pt != "" {
-		if rt := strings.TrimSpace(req.TenantID); rt != "" && !strings.EqualFold(pt, rt) {
+		if rt := strings.TrimSpace(req.TenantID); rt != "" && pt != rt {
 			return false, nil
 		}
 	}
@@ -811,11 +821,16 @@ func actionsForPolicyDecision(decisionValue string, req model.DecisionRequest, p
 		if acr := stringMetadataValue(policy.Metadata, "min_acr"); acr != "" {
 			meta["min_acr"] = acr
 		}
-		if amr := splitCommaList(stringMetadataValue(policy.Metadata, "required_amr")); len(amr) > 0 {
-			meta["required_amr"] = amr
-		}
-		if maxAge := intMetadata(policy.Metadata, "max_age_seconds", 0); maxAge > 0 {
-			meta["max_age_seconds"] = maxAge
+		// Preserve explicit zero and malformed requirements for the enforcement
+		// validator. Dropping them would silently weaken the authored rule.
+		for _, key := range []string{"required_amr", "max_age_seconds", "grant_ttl_seconds"} {
+			if value, present := policy.Metadata[key]; present {
+				if methods, ok := value.(string); key == "required_amr" && ok && strings.TrimSpace(methods) != "" {
+					meta[key] = splitCommaList(methods)
+				} else {
+					meta[key] = value
+				}
+			}
 		}
 		return []model.DecisionAction{
 			{
@@ -1218,17 +1233,16 @@ func (e Evaluator) tenantRootCAByID(id string) (model.TenantRootCA, bool) {
 	return model.TenantRootCA{}, false
 }
 
-func tenantMatches(candidate string, allowed ...string) bool {
+// The authenticated flow is authoritative. The policy and bundle tenant are
+// fallbacks only for callers without a flow tenant, never additional owners
+// whose resources another tenant may use. An explicitly global resource remains
+// global; tenant IDs are case-sensitive, like the stores that own them.
+func tenantMatches(candidate, bundleTenant, policyTenant, requestTenant string) bool {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		return true
 	}
-	for _, value := range allowed {
-		if strings.TrimSpace(value) == candidate {
-			return true
-		}
-	}
-	return false
+	return candidate == firstNonEmpty(requestTenant, policyTenant, bundleTenant)
 }
 
 func applyTLSInspectionReadinessMetadata(metadata map[string]any, ctx tlsInspectionReadinessContext) {
@@ -1582,7 +1596,7 @@ func anyActualCIDRContains(actual []string, expectedValue any) bool {
 		}
 		for _, prefixValue := range prefixes {
 			prefix, err := netip.ParsePrefix(prefixValue)
-			if err == nil && prefix.Masked().Contains(addr) {
+			if err == nil && (prefix.Masked().Contains(addr) || prefix.Masked().Contains(addr.Unmap())) {
 				return true
 			}
 		}
@@ -2146,10 +2160,14 @@ func ipLiteralConditionMatchesDestination(destination string, expected any) bool
 	if dst == "" {
 		return false
 	}
-	if _, err := netip.ParseAddr(dst); err != nil {
+	addr, err := netip.ParseAddr(dst)
+	if err != nil {
 		return false
 	}
-	if conditionMatches([]string{dst}, expected) {
+	// Dual-stack clients can name the same IPv4 host as ::ffff:a.b.c.d.
+	// Keep the original form and also compare its IPv4 equivalent, so an
+	// endpoint deny cannot fall through to a later allow rule.
+	if conditionMatches([]string{dst, addr.Unmap().String()}, expected) {
 		return true
 	}
 	return anyActualCIDRContains([]string{dst}, expected)

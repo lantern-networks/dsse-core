@@ -4,10 +4,10 @@ The Windows agent combines the `DsseWfp` kernel callout driver, `DsseSteer` serv
 watchdog, and updater in an MSI. It captures outbound TCP and carries it to the deployment.
 Use an isolated lab for this experimental release.
 
-For user-facing authentication during internal access, see the
-[Windows and macOS OOB windows](east-west-policy.md#windows-and-macos-authentication-windows).
-The Windows helper uses WebView2 and needs its Runtime; that section explains
-launch behavior, browser fallback, and returning to the original connection.
+For user-facing authentication during internal access, see
+[Windows and macOS authentication](east-west-policy.md#windows-and-macos-authentication).
+The agent opens the signed Portal link in the originating user's default browser.
+An embedded WebView2 helper is not installed.
 
 ## Prerequisites
 
@@ -98,6 +98,15 @@ tokens outside the MSI. Apply the verified external configuration at
 installation. A routine software upgrade preserves the enrolled device's protected state;
 moving it to another organization requires an explicit migration and fresh enrolment.
 
+With the default WFP backend, destination exclusions in the signed profile accept IPv4 `address:port` and IPv6
+`[address]:port`. A bare address or hostname explicitly excludes all ports to that
+host. Hostname exclusions resolve both A and AAAA answers when capture starts;
+they are not a continuously refreshed DNS policy. A port-specific exclusion does
+not exclude other ports or an entire application. Interface-scoped IPv6 rules are
+unsupported and are not broadened into exclusions for every interface.
+The optional WinDivert backend does not apply IPv6 destination exclusions; use
+WFP when those exclusions are required.
+
 A newly created deployment may offer only the last three files: the operator must
 [publish a signed package](agent-updates.md) or provide it separately. Do not assume
 that the archive contains an installer until you check it.
@@ -133,10 +142,12 @@ Devices dial the regional URLs in the profile. Configure DNS, or for an isolated
 the Windows hosts file at `C:\Windows\System32\drivers\etc\hosts`, using the addresses
 provided by the deployment operator. Include the recovery names the profile actually names.
 
-`organization.transport_server_name` and `organization.enrolment_server_name` select
-organization-specific TLS identities. They are SNI names: the agent can send them while
-dialling a regional endpoint. They do not necessarily require a separate DNS lookup by
-the agent. Tools that connect directly to those names do need them to resolve.
+In the standard multi-organization setup, every organization uses the deployment's
+published regional transport and recovery hostnames. Tenant identity comes from the
+signed profile and device certificate, not a separate DNS name. Older deployments may
+have `organization.transport_server_name` and `organization.enrolment_server_name` in
+their signed profiles. Those optional SNI names select dedicated transport identities;
+keep their existing DNS and trust configuration until a planned migration is complete.
 
 Do not infer the server's identity from its certificate issuer name. To diagnose a
 regional address with OpenSSL, use the [anchor and hostname verification command](after-verify.md#1-trust-the-deployment-and-sign-in).
@@ -300,13 +311,34 @@ $p = Start-Process msiexec.exe -Wait -PassThru -ArgumentList "/x `"$msi`" /qn /l
 $p.ExitCode
 ```
 
-Removal attempts to restore DNS, QUIC policy, and WFP filters before removing the services.
-**Known limitation:** a successful uninstall may leave trusted certificates and enrolment
-material behind. Run the post-uninstall check from the repository root:
+Removal confirms the user-mode services stopped and recovers DNS, QUIC policy, WFP
+filters, and any supported captive guard before removing the driver. Recovery and
+cleanup failures return a failed MSI result. A failed removal can leave the product
+registered with services disabled and some state already removed; fix the reported
+failure and retry the same uninstall. Rollback does not re-trust removed certificates.
+Do not manually start services in that partial state.
+
+Certificates are matched against the retained DSSE PEM artifacts by fingerprint;
+certificates without such evidence and enrolment material can remain. Successful MSI
+exit alone is not proof that all deployment material is gone. The updated rollback
+sequence still needs Windows cancellation, crash, reboot, and upgrade fault tests,
+including its intended final disabled/STOPPED state. Native MSI rollback may restart
+services temporarily before the finalizer; continuous shutdown is not guaranteed;
+older packages do not acquire the new rollback helpers retroactively. See the
+[installer recovery contract](../clients/windows-wfp/packaging/README.md#runtime-and-removal).
+Run the post-uninstall check from the repository root:
 
 ```powershell
 .\clients\windows-wfp\packaging\verify-windows-install.ps1 -AfterUninstall
 ```
+
+Uninstall deliberately keeps a copy of the verified signed install profile at
+`%ProgramData%\DSSE\install-profile.json`, with `profile_signing_key.txt`, the
+adopted trust anchors and the device identity under `enroll\`, so that reinstalling
+for the same organization restores its configuration: a later MSI installation reads
+that copy when it is given no new profile. The post-uninstall check reports these
+files. They name the deployment the PC belonged to. Before installing for another deployment or organization, or when
+the PC leaves DSSE, remove them after confirming they are the old deployment's.
 
 Review remaining certificates and identity files. Remove obsolete certificates by their
 verified fingerprint, never by subject name: two deployments can use the same name with

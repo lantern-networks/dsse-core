@@ -1,6 +1,7 @@
 package usagemeter
 
 import (
+	"errors"
 	"log"
 	"strings"
 	"time"
@@ -45,10 +46,14 @@ func usageMeterMeasurementStrength(scope string) int {
 // measures it better than whatever is there. No when it would only restate what is already recorded, and no
 // when this node is guessing at something another node measured.
 func usageMeterGovernanceSnapshotShouldWrite(store UsageMeterRuntimeStore, meterType, tenantID string, quantity int, scope string, periodStart, periodEnd time.Time) bool {
-	if store == nil || quantity <= 0 {
+	if store == nil || quantity < 0 {
 		return false
 	}
-	existing, found := usageMeterGovernanceSnapshot(store, meterType, tenantID, periodStart, periodEnd)
+	existing, found, err := usageMeterGovernanceSnapshot(store, meterType, tenantID, periodStart, periodEnd)
+	if err != nil {
+		log.Printf("usage meter governance snapshot skipped: %v", err)
+		return false
+	}
 	if !found {
 		return true
 	}
@@ -63,24 +68,23 @@ func usageMeterGovernanceSnapshotShouldWrite(store UsageMeterRuntimeStore, meter
 	return int(existing.Quantity) != quantity
 }
 
-// usageMeterGovernanceSnapshot returns the period's recorded snapshot for a meter type. A store that cannot be
-// read reports "not found", which makes this node write — an unreadable store must not silently freeze a
-// number, and the write is an upsert on a deterministic id, so the worst case is restating the same value.
-func usageMeterGovernanceSnapshot(store UsageMeterRuntimeStore, meterType, tenantID string, periodStart, periodEnd time.Time) (UsageMeterRecord, bool) {
+// usageMeterGovernanceSnapshot returns the period's recorded snapshot for a meter type.
+// A failed read is distinct from an absent row: writing a weaker observation
+// after a read failure could replace a stronger one stored on another node.
+func usageMeterGovernanceSnapshot(store UsageMeterRuntimeStore, meterType, tenantID string, periodStart, periodEnd time.Time) (UsageMeterRecord, bool, error) {
 	reader, ok := store.(UsageMeterRecordReader)
 	if !ok {
-		return UsageMeterRecord{}, false
+		return UsageMeterRecord{}, false, errors.New("usage meter record reader unavailable")
 	}
 	records, err := reader.UsageMeterRecords(tenantID, periodStart, periodEnd)
 	if err != nil {
-		log.Printf("usage meter governance snapshot could not read the recorded %s: %v", meterType, err)
-		return UsageMeterRecord{}, false
+		return UsageMeterRecord{}, false, err
 	}
 	wanted := UsageMeterSnapshotID(meterType, tenantID, periodStart, periodEnd)
 	for _, record := range records {
 		if record.ID == wanted {
-			return record, true
+			return record, true, nil
 		}
 	}
-	return UsageMeterRecord{}, false
+	return UsageMeterRecord{}, false, nil
 }

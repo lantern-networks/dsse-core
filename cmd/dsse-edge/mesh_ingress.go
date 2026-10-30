@@ -49,7 +49,6 @@ func serveMeshIngressTunnel(ctx context.Context, transport tunnel.FrameTransport
 	if dialer == nil {
 		return fmt.Errorf("mesh ingress dialer is required")
 	}
-	registry := tunnel.NewTCPConnectionRegistry()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	probeSlots := make(chan struct{}, 8)
@@ -71,9 +70,35 @@ func serveMeshIngressTunnel(ctx context.Context, transport tunnel.FrameTransport
 
 	var mu sync.Mutex
 	handlers := map[string]*meshIngressConnHandler{}
+	defer func() {
+		mu.Lock()
+		remaining := handlers
+		handlers = map[string]*meshIngressConnHandler{}
+		mu.Unlock()
+		for _, handler := range remaining {
+			_, _ = handler.close(tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonError, time.Now())
+		}
+	}()
 	store := func(id string, h *meshIngressConnHandler) { mu.Lock(); handlers[id] = h; mu.Unlock() }
 	load := func(id string) *meshIngressConnHandler { mu.Lock(); defer mu.Unlock(); return handlers[id] }
-	drop := func(id string) { mu.Lock(); delete(handlers, id); mu.Unlock() }
+	drop := func(h *meshIngressConnHandler) {
+		mu.Lock()
+		if handlers[h.requestID] == h {
+			delete(handlers, h.requestID)
+		}
+		mu.Unlock()
+	}
+	// The read pump can finish after the peer has closed and reopened this ID.
+	// Serialize ownership checking with publication, so late bytes/close from
+	// the old backend never reach the replacement stream.
+	writeCurrent := func(h *meshIngressConnHandler, frames []tunnel.Frame) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlers[h.requestID] != h {
+			return nil
+		}
+		return write(frames)
+	}
 
 	for {
 		var frame tunnel.Frame
@@ -103,7 +128,15 @@ func serveMeshIngressTunnel(ctx context.Context, transport tunnel.FrameTransport
 				}
 			}
 		case tunnel.FrameTCPOpen:
-			result, handler := meshIngressOpen(ctx, frame, dialer, registry, tenantID)
+			if load(frame.RequestID) != nil {
+				if err := write([]tunnel.Frame{meshIngressOpenResult(frame, "tcp connection is already open")}); err != nil {
+					return err
+				}
+				continue
+			}
+			// Keep bookkeeping scoped to the particular handler. An old pump
+			// must never Close/RecordData against a newer use of the same ID.
+			result, handler := meshIngressOpen(ctx, frame, dialer, tunnel.NewTCPConnectionRegistry(), tenantID)
 			if werr := write([]tunnel.Frame{result}); werr != nil {
 				if handler != nil {
 					_ = handler.conn.Close()
@@ -112,7 +145,7 @@ func serveMeshIngressTunnel(ctx context.Context, transport tunnel.FrameTransport
 			}
 			if handler != nil {
 				store(frame.RequestID, handler)
-				go meshIngressReadPump(handler, write, drop)
+				go meshIngressReadPump(handler, writeCurrent, drop)
 			}
 		case tunnel.FrameTCPData:
 			handler := load(frame.RequestID)
@@ -121,17 +154,17 @@ func serveMeshIngressTunnel(ctx context.Context, transport tunnel.FrameTransport
 				continue
 			}
 			frames := handler.write(frame, time.Now())
-			_ = write(frames)
+			_ = writeCurrent(handler, frames)
 			if containsMeshTCPClose(frames) {
-				drop(frame.RequestID)
+				drop(handler)
 			}
 		case tunnel.FrameTCPClose:
 			handler := load(frame.RequestID)
 			if handler == nil {
 				continue
 			}
+			drop(handler)
 			_, _ = handler.close(tunnel.TCPDirectionRemote, tunnel.TCPCloseReasonEOF, time.Now())
-			drop(frame.RequestID)
 		default:
 			// HTTP frames are not used on the mesh path; ignore.
 		}
@@ -233,41 +266,41 @@ func (h *meshIngressConnHandler) close(direction, reason string, now time.Time) 
 
 // meshIngressReadPump streams downstream (backend->Y) bytes from the dialed connection back over the mesh link as
 // tcp_data frames, emitting a tcp_close on EOF/error. Mirrors connector pumpTCPReads.
-func meshIngressReadPump(handler *meshIngressConnHandler, write func([]tunnel.Frame) error, drop func(string)) {
+func meshIngressReadPump(handler *meshIngressConnHandler, write func(*meshIngressConnHandler, []tunnel.Frame) error, drop func(*meshIngressConnHandler)) {
 	for {
 		frame, _, err := tunnel.ReadTCPDataFrame(handler.conn, handler.requestID, tunnel.TCPDirectionDown, handler.chunkSize)
 		if err == io.EOF {
 			closeFrame, cerr := handler.close(tunnel.TCPDirectionRemote, tunnel.TCPCloseReasonEOF, time.Now())
 			if cerr == nil {
-				_ = write([]tunnel.Frame{closeFrame})
+				_ = write(handler, []tunnel.Frame{closeFrame})
 			}
-			drop(handler.requestID)
+			drop(handler)
 			return
 		}
 		if err != nil {
 			closeFrame, cerr := handler.close(tunnel.TCPDirectionRemote, tunnel.TCPCloseReasonError, time.Now())
 			if cerr == nil {
 				closeFrame.Error = err.Error()
-				_ = write([]tunnel.Frame{closeFrame})
+				_ = write(handler, []tunnel.Frame{closeFrame})
 			}
-			drop(handler.requestID)
+			drop(handler)
 			return
 		}
 		recClose, closed, recErr := handler.registry.RecordData(frame, time.Now())
 		if recErr != nil {
 			_, _ = handler.close(tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonError, time.Now())
-			drop(handler.requestID)
+			drop(handler)
 			return
 		}
 		if closed {
 			_ = handler.conn.Close()
-			_ = write([]tunnel.Frame{recClose})
-			drop(handler.requestID)
+			_ = write(handler, []tunnel.Frame{recClose})
+			drop(handler)
 			return
 		}
-		if werr := write([]tunnel.Frame{frame}); werr != nil {
+		if werr := write(handler, []tunnel.Frame{frame}); werr != nil {
 			_, _ = handler.close(tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonError, time.Now())
-			drop(handler.requestID)
+			drop(handler)
 			return
 		}
 	}

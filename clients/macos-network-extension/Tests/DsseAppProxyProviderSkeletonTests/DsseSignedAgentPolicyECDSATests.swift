@@ -10,7 +10,8 @@ import XCTest
 final class DsseSignedAgentPolicyECDSATests: XCTestCase {
 
     private func envelope(signedBy key: P256.Signing.PrivateKey, excluding ids: [String]) throws -> Data {
-        let payload = try JSONSerialization.data(withJSONObject: ["excluded_app_signing_ids": ids])
+        let payload = try JSONSerialization.data(withJSONObject: [
+            "device_identity": "mac-dev-1", "tenant_id": "tenant-a", "excluded_app_signing_ids": ids])
         let digest = SHA256.hash(data: payload)
         let sig = try key.signature(for: digest)
         let env: [String: Any] = [
@@ -40,14 +41,17 @@ final class DsseSignedAgentPolicyECDSATests: XCTestCase {
         // Signed by the provisioned ECDSA pin: accepted.
         let byPin = try envelope(signedBy: provisioned, excluding: ["com.example.a"])
         XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
-            envelopeData: byPin, pinnedPublicKeyHex: pubHex(provisioned)), ["com.example.a"])
+            envelopeData: byPin, pinnedPublicKeyHex: pubHex(provisioned),
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-a"), ["com.example.a"])
 
         // Signed by an ECDSA next-key: refused until adopted, accepted once it is in alsoAccept — the overlap.
         let byNext = try envelope(signedBy: next, excluding: ["com.example.b"])
         XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
             envelopeData: byNext, pinnedPublicKeyHex: pubHex(provisioned)))
         XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
-            envelopeData: byNext, pinnedPublicKeyHex: pubHex(provisioned), alsoAccept: [pubHex(next)]),
+            envelopeData: byNext, pinnedPublicKeyHex: pubHex(provisioned),
+            expectedDeviceIdentity: "mac-dev-1", expectedTenantID: "tenant-a",
+            alsoAccept: [pubHex(next)]),
             ["com.example.b"])
 
         // A stranger's ECDSA key is refused however long the accepted list.

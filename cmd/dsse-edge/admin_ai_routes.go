@@ -147,7 +147,12 @@ func registerAIOpsRoutes(mux *http.ServeMux, adminEndpoint func(string, http.Han
 		// See a_deployments_decisions_outlive_the_node_that_made_them.go for what this replaced.
 		var within []model.AccessDecision
 		var coverage aiops.TrendCoverage
-		if decisions, oldestRead, oldestHeld, capped, served := accessTrendsFromHotStore(r.Context(), adminHotStore, tenantID, from, to); served {
+		decisions, oldestRead, oldestHeld, capped, served, readErr := accessTrendsFromHotStore(r.Context(), adminHotStore, tenantID, from, to)
+		if readErr != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("Access trends are unavailable because the access log could not be read. Retry when storage is available."))
+			return
+		}
+		if served {
 			within, _ = aiops.DecisionsWithin(decisions, from, to)
 			// Truncated here means the row cap, not the window, decided where the data starts — the same
 			// distinction the AI-usage report draws above. Capacity is the cap that applied, so the two

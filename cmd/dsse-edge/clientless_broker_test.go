@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -15,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/edgeplane"
 	grantstore "github.com/lantern-networks/dsse-core/grantstore"
 	idpregistry "github.com/lantern-networks/dsse-core/idpregistry"
 	oidcbroker "github.com/lantern-networks/dsse-core/oidcbroker"
@@ -64,10 +66,26 @@ func TestClientlessBrokerEndToEnd(t *testing.T) {
 	}
 	grants := grantstore.NewStore()
 	broker := newClientlessBroker(reg, grants, server.Client(), "https://edge", "t1", time.Hour, nil)
+	published := false
+	broker.publishGrants = func(ctx context.Context) {
+		if len(grants.ListAll()) != 1 {
+			t.Fatal("publication ran before the grant was saved")
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 3*time.Second {
+			t.Fatal("grant publication is not bounded")
+		}
+		published = true
+	}
+	missingDestination := httptest.NewRecorder()
+	broker.startForTest(missingDestination, httptest.NewRequest(http.MethodGet, "/clientless/auth/start", nil))
+	if missingDestination.Code != http.StatusBadRequest {
+		t.Fatal("unscoped sign-in started without an application request")
+	}
 
 	// 1) start -> 302 to the IdP authorize
 	rec := httptest.NewRecorder()
-	broker.handleStart(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start", nil))
+	broker.startForTest(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start?return_to=ssh.example%3A22", nil))
 	if rec.Code != http.StatusFound {
 		t.Fatalf("start: want 302, got %d", rec.Code)
 	}
@@ -86,7 +104,15 @@ func TestClientlessBrokerEndToEnd(t *testing.T) {
 
 	// 3) callback completes the flow
 	rec2 := httptest.NewRecorder()
-	broker.handleCallback(rec2, httptest.NewRequest(http.MethodGet, "/clientless/auth/callback?"+cb.RawQuery, nil))
+	cbReq := httptest.NewRequest(http.MethodGet, "/clientless/auth/callback?"+cb.RawQuery, nil)
+	cbReq = cbReq.WithContext(edgeplane.WithTransportDevice(cbReq.Context(), "callback-carrier"))
+	for _, c := range rec.Result().Cookies() {
+		cbReq.AddCookie(c)
+	}
+	broker.handleCallback(rec2, cbReq)
+	if !published {
+		t.Fatal("completion response preceded authority publication")
+	}
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("callback: want 200, got %d: %s", rec2.Code, rec2.Body.String())
 	}
@@ -101,6 +127,10 @@ func TestClientlessBrokerEndToEnd(t *testing.T) {
 	}
 	if !grants.Valid(grantCookie, time.Now().UTC()) {
 		t.Fatal("minted grant should be valid")
+	}
+	issued, _ := grants.GetForAuthorization(grantCookie)
+	if issued.DeviceID != "" {
+		t.Fatal("anonymous start gained the callback transport's device authority")
 	}
 
 	// 4) whoami honours the grant
@@ -130,7 +160,7 @@ func TestClientlessBrokerFailClosed(t *testing.T) {
 	broker := newClientlessBroker(reg, grantstore.NewStore(), nil, "https://edge", "t1", time.Hour, nil)
 	// no registered IdP -> start fails closed
 	rec := httptest.NewRecorder()
-	broker.handleStart(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start?idp=idp_unknown", nil))
+	broker.startForTest(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start?idp=idp_unknown", nil))
 	if rec.Code == http.StatusFound {
 		t.Fatal("start with no usable IdP must not redirect")
 	}
@@ -143,7 +173,7 @@ func TestClientlessBrokerFailClosed(t *testing.T) {
 }
 
 // The grant the broker mints is bound to the device the gate SIGNED into the start URL (per-device binding),
-// and a forged/unsigned device is ignored (the grant is tenant-wide, never mis-bound). This is the broker half
+// and a forged/unsigned binding is refused before authentication. This is the broker half
 // of the per-device fix: the browser→broker hop is not steered, so the verified device can only arrive via the
 // signed start URL.
 func TestClientlessBrokerBindsSignedDevice(t *testing.T) {
@@ -191,7 +221,7 @@ func TestClientlessBrokerBindsSignedDevice(t *testing.T) {
 	// run the full start->authorize->callback flow with the given start query, returning the minted grant.
 	runFlow := func(startQuery string) grantstore.Grant {
 		rec := httptest.NewRecorder()
-		broker.handleStart(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start?"+startQuery, nil))
+		broker.startForTest(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start?"+startQuery, nil))
 		if rec.Code != http.StatusFound {
 			t.Fatalf("start: want 302, got %d (%s)", rec.Code, rec.Body.String())
 		}
@@ -203,7 +233,11 @@ func TestClientlessBrokerBindsSignedDevice(t *testing.T) {
 		}
 		cb, _ := url.Parse(resp.Header.Get("Location"))
 		rec2 := httptest.NewRecorder()
-		broker.handleCallback(rec2, httptest.NewRequest(http.MethodGet, "/clientless/auth/callback?"+cb.RawQuery, nil))
+		cbReq := httptest.NewRequest(http.MethodGet, "/clientless/auth/callback?"+cb.RawQuery, nil)
+		for _, c := range rec.Result().Cookies() {
+			cbReq.AddCookie(c)
+		}
+		broker.handleCallback(rec2, cbReq)
 		if rec2.Code != http.StatusOK {
 			t.Fatalf("callback: want 200, got %d: %s", rec2.Code, rec2.Body.String())
 		}
@@ -222,19 +256,26 @@ func TestClientlessBrokerBindsSignedDevice(t *testing.T) {
 
 	// a VALID signed device -> the grant binds to it
 	sig := signer.sign("dev-A")
-	g := runFlow("device=dev-A&device_sig=" + url.QueryEscape(sig))
+	gate := &federatedAuthGate{signer: signer, brokerBaseURL: "https://edge", tenantID: "t1"}
+	authTestAssign(t, reg, "t1", "dev-A", "user-xyz", "idp_test")
+	start, _ := url.Parse(authTestSignedLink(gate, gate.stepUpURLFor("ssh.example:22", "idp_test", "", "dev-A", "t1")))
+	g := runFlow(start.RawQuery)
 	if g.DeviceID != "dev-A" {
 		t.Fatalf("a validly-signed device should bind the grant, got DeviceID=%q", g.DeviceID)
 	}
 
-	// a FORGED signature -> ignored, grant is tenant-wide (NOT mis-bound to dev-B)
-	g2 := runFlow("device=dev-B&device_sig=not-a-valid-signature")
-	if g2.DeviceID != "" {
-		t.Fatalf("a forged device sig must be ignored (tenant-wide), got DeviceID=%q", g2.DeviceID)
+	// A forged binding must not become a clientless grant or create pending state.
+	for _, query := range []string{"device=dev-B&device_sig=not-a-valid-signature", "device=dev-A", "tenant=t1", "device_sig=x", "device=&device_sig=", "device=dev-A&device_sig=" + url.QueryEscape(sig) + "&device=dev-B"} {
+		rec := httptest.NewRecorder()
+		broker.startForTest(rec, httptest.NewRequest(http.MethodGet, "/clientless/auth/start?"+query, nil))
+		if (rec.Code != http.StatusUnauthorized && rec.Code != http.StatusBadRequest) || len(broker.pending) != 0 || len(grants.ListAll()) != 1 {
+			t.Fatalf("invalid binding admitted: status=%d pending=%d grants=%d", rec.Code, len(broker.pending), len(grants.ListAll()))
+		}
 	}
 
-	// no device params -> tenant-wide
-	g3 := runFlow("")
+	// No device binding remains possible for a clientless flow, but its grant
+	// still cannot authorize a different destination.
+	g3 := runFlow("return_to=ssh.example%3A22")
 	if g3.DeviceID != "" {
 		t.Fatalf("no device -> tenant-wide grant, got DeviceID=%q", g3.DeviceID)
 	}

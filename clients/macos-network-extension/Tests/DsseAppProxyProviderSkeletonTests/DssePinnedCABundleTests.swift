@@ -76,6 +76,32 @@ final class DssePinnedCABundleTests: XCTestCase {
         XCTAssertEqual(security.pinnedCACertificates.count, 2)
         XCTAssertNotNil(security.pinnedCACertificate, "the single-certificate accessor must still work")
     }
+
+    func testRenewalProbeRetainsBothCAsDuringRotation() {
+        let pinned = DsseTransportSecurityFactory.certificates(fromPEM: Self.bundlePEM)
+        XCTAssertEqual(pinned.count, 2)
+        let live = DsseTransportSecurity(host: "edge.example.com", port: 18543, mtlsRequired: true,
+                                         pinnedCACertificates: pinned, clientIdentity: nil)
+        let probe = DsseCertificateRenewalScheduler.probeTransportSecurity(like: live, candidate: nil)
+        XCTAssertEqual(probe.host, live.host)
+        XCTAssertEqual(probe.port, live.port)
+        XCTAssertTrue(probe.mtlsRequired)
+        XCTAssertEqual(probe.pinnedCAFingerprints, live.pinnedCAFingerprints,
+                       "an Edge serving the incoming CA must not make the candidate renewal probe fail")
+    }
+
+    func testRegionFailoverRetainsBothCAsDuringRotation() {
+        let pinned = DsseTransportSecurityFactory.certificates(fromPEM: Self.bundlePEM)
+        XCTAssertEqual(pinned.count, 2)
+        let live = DsseTransportSecurity(host: "region-a.example.com", port: 18543, mtlsRequired: true,
+                                         pinnedCACertificates: pinned, clientIdentity: nil)
+        let failover = DsseLocalRuntimeCopyTransportFactory.securityForRegionEndpoint(
+            live, host: "region-b.example.com", port: 443)
+        XCTAssertEqual(failover.host, "region-b.example.com")
+        XCTAssertEqual(failover.port, 443)
+        XCTAssertEqual(failover.pinnedCAFingerprints, live.pinnedCAFingerprints,
+                       "region failover must accept the incoming CA already trusted by the live tunnel")
+    }
 }
 
 // The readiness signal an operator needs before rotating the transport CA: which CAs does this device pin?

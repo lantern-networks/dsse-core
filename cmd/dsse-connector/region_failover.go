@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -29,12 +32,16 @@ type connectorEndpoints struct {
 	regions []string // parallel to urls; "" when the operator gave a bare URL
 	urls    []string
 	at      int
+	// profileURL is used only for the authenticated profile GET while the
+	// authoritative data-door list is empty. It must never enter urls.
+	profileURL string
+	dataCtx    context.Context
+	cancelData context.CancelFunc
 
-	// movedOnPurpose marks that this connector has just been sent somewhere BY ITSELF, so the tunnel it is
-	// about to lose is one it chose to end. See advance().
-	movedOnPurpose bool
+	revision uint64 // identifies the selection a reachability verdict actually measured
 
-	// onMove is what to do to the tunnels this connector is holding when the door changes.
+	// onMove is what to do to held tunnels when the DSSE Region changes. Switching
+	// entrances inside the same named Region must preserve surviving Edge tunnels.
 	//
 	// ★★★ DECIDING TO MOVE DID NOT MOVE ANYTHING (2026-09-02, measured twice in one window). With the door
 	// decision driven by the heartbeat the connector concluded at +98s that the region was gone — and the new
@@ -47,8 +54,8 @@ type connectorEndpoints struct {
 	onMove func()
 }
 
-// SetOnMove registers what to do to held tunnels when this connector changes door. Set once, by the thing that
-// owns the attachments.
+// SetOnMove registers what to do to held tunnels when this connector changes
+// DSSE Region. Set once, by the thing that owns the attachments.
 func (e *connectorEndpoints) SetOnMove(f func()) {
 	if e == nil {
 		return
@@ -83,6 +90,28 @@ func parseConnectorEndpoints(raw string) *connectorEndpoints {
 	return out
 }
 
+// validateConnectorDoorURLs checks every effective door, including failover doors.
+// A pinned transport must never be allowed to fall back to plaintext merely
+// because a later door came from a saved profile or a deployment update.
+func validateConnectorDoorURLs(doors *connectorEndpoints, pinnedTLS bool) error {
+	if doors == nil || doors.count() == 0 {
+		return fmt.Errorf("no Edge doors configured")
+	}
+	for i, raw := range doors.urls {
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
+			return fmt.Errorf("Edge door %d is not a valid base URL", i+1)
+		}
+		if pinnedTLS && parsed.Scheme != "https" {
+			return fmt.Errorf("Edge door %d must use HTTPS with pinned transport TLS", i+1)
+		}
+		if parsed.Scheme != "https" && parsed.Scheme != "http" {
+			return fmt.Errorf("Edge door %d has an unsupported URL scheme", i+1)
+		}
+	}
+	return nil
+}
+
 // len reports how many doors this connector knows.
 func (e *connectorEndpoints) count() int {
 	if e == nil {
@@ -106,6 +135,62 @@ func (e *connectorEndpoints) current() string {
 	return e.urls[e.at%len(e.urls)]
 }
 
+func (e *connectorEndpoints) profileDoor() string {
+	if e == nil {
+		return ""
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.urls) > 0 {
+		return e.urls[e.at%len(e.urls)]
+	}
+	return e.profileURL
+}
+
+// selectionForData ties a dial to the current authoritative door set. A
+// withdrawal cancels in-flight dials as well as already-held attachments.
+func (e *connectorEndpoints) selectionForData() (connectorDoorSelection, context.Context) {
+	if e == nil {
+		return connectorDoorSelection{}, nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.urls) == 0 {
+		return connectorDoorSelection{revision: e.revision}, nil
+	}
+	if e.dataCtx == nil {
+		e.dataCtx, e.cancelData = context.WithCancel(context.Background())
+	}
+	at := e.at % len(e.urls)
+	return connectorDoorSelection{e.urls[at], e.regions[at], e.revision}, e.dataCtx
+}
+
+// withdraw closes all held data tunnels and leaves only the last verified
+// profile GET address. Empty data doors are authoritative, not a failover to
+// the old enrolment URL.
+func (e *connectorEndpoints) withdraw(profileURL string) bool {
+	if e == nil || strings.TrimSpace(profileURL) == "" {
+		return false
+	}
+	e.mu.Lock()
+	changed := len(e.urls) > 0
+	e.profileURL = profileURL
+	if changed {
+		if e.cancelData != nil {
+			e.cancelData()
+		}
+		e.dataCtx, e.cancelData = nil, nil
+		e.urls, e.regions, e.at = nil, nil, 0
+		e.revision++
+	}
+	move := e.onMove
+	e.mu.Unlock()
+	if changed && move != nil {
+		move()
+	}
+	return changed
+}
+
 // currentRegion names the region of the door in use, for a log line an operator can act on.
 func (e *connectorEndpoints) currentRegion() string {
 	if e == nil {
@@ -119,44 +204,61 @@ func (e *connectorEndpoints) currentRegion() string {
 	return e.regions[e.at%len(e.regions)]
 }
 
+// A door change inside one named DSSE Region must not evict tunnels held on
+// other healthy Edge nodes. Unnamed doors cannot establish this relationship.
+func sameConnectorRegion(a, b string) bool {
+	return a != "" && a == b
+}
+
 // advance moves to the next door and reports where it went. A single-door connector stays where it is: moving
 // to the same address and announcing a failover would be a lie in the log.
+type connectorDoorSelection struct {
+	url, region string
+	revision    uint64
+}
+
+func (e *connectorEndpoints) selection() connectorDoorSelection {
+	if e == nil {
+		return connectorDoorSelection{}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.urls) == 0 {
+		return connectorDoorSelection{revision: e.revision}
+	}
+	at := e.at % len(e.urls)
+	return connectorDoorSelection{e.urls[at], e.regions[at], e.revision}
+}
+
 func (e *connectorEndpoints) advance(because error) string {
+	return e.advanceIfSelected(e.selection(), because)
+}
+
+// A late failure belongs to the selection tested, never to its replacement.
+// This also rejects ABA (A -> B -> A) and removes the global self-close marker,
+// which incorrectly suppressed a real heartbeat failure after failback.
+func (e *connectorEndpoints) advanceIfSelected(expected connectorDoorSelection, because error) string {
 	if e == nil {
 		return ""
 	}
 	e.mu.Lock()
-	if e.movedOnPurpose {
-		e.movedOnPurpose = false
-		at := e.at
-		urls := append([]string(nil), e.urls...)
-		regions := append([]string(nil), e.regions...)
+	n := len(e.urls)
+	if n == 0 || e.revision != expected.revision || e.urls[e.at%n] != expected.url {
 		e.mu.Unlock()
-		if at < len(urls) {
-			log.Printf("connector: the tunnel this connector ended ITSELF is not counted against %s%s",
-				urls[at], regionSuffix(regionAt(regions, at)))
-			return urls[at]
-		}
 		return ""
 	}
-	e.mu.Unlock()
-
-	e.mu.Lock()
-	n := len(e.urls)
-	if n <= 1 {
+	if n == 1 {
+		to := e.urls[0]
 		e.mu.Unlock()
-		return e.current()
+		return to
 	}
-	from := e.urls[e.at%n]
+	from, fromRegion := e.urls[e.at%n], e.regions[e.at%n]
 	e.at = (e.at + 1) % n
-	to, region := e.urls[e.at], e.regions[e.at]
+	e.revision++
+	to, region, move := e.urls[e.at], e.regions[e.at], e.onMove
 	e.mu.Unlock()
-	log.Printf("connector region failover: %s did not hold (%v) — trying %s%s. Everything behind this connector "+
-		"is reachable again only once one of its doors answers", from, because, to, regionSuffix(region))
-	e.mu.Lock()
-	move := e.onMove
-	e.mu.Unlock()
-	if move != nil {
+	log.Printf("connector entry failover: %s%s unavailable (%v); trying %s%s", from, regionSuffix(fromRegion), because, to, regionSuffix(region))
+	if move != nil && !sameConnectorRegion(fromRegion, region) {
 		move()
 	}
 	return to
@@ -164,26 +266,28 @@ func (e *connectorEndpoints) advance(because error) string {
 
 // resetToPreferred returns to the operator's first choice. Called when a connection has held long enough to
 // count as good, so a connector that failed over does not stay in the second region for ever.
-func (e *connectorEndpoints) resetToPreferred() {
+// resetToPreferred reports whether the move crossed a DSSE Region boundary.
+// The decision and the index change happen under one lock so the caller can
+// decide whether to retire old-region tunnels without a stale region snapshot.
+func (e *connectorEndpoints) resetToPreferred() bool { return e.resetToPreferredIfSelected(nil) }
+
+func (e *connectorEndpoints) resetToPreferredIfSelected(expected *connectorDoorSelection) bool {
 	if e == nil {
-		return
+		return false
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if expected != nil && (len(e.urls) == 0 || e.revision != expected.revision || e.urls[e.at%len(e.urls)] != expected.url) {
+		return false
+	}
 	if e.at != 0 && len(e.urls) > 0 {
+		crossRegion := !sameConnectorRegion(e.regions[e.at%len(e.regions)], e.regions[0])
 		log.Printf("connector: returning to %s%s, the first door configured", e.urls[0], regionSuffix(regionAt(e.regions, 0)))
 		e.at = 0
-		// ★★★ AND THE TUNNEL THIS IS ABOUT TO END IS NOT EVIDENCE (2026-09-02, measured: the connector decided
-		// to go home every three minutes and reconnected to the region it was leaving, for ever). Going home
-		// tears the tunnel down; the tunnel-end handler then sees a connection that did not hold for a minute
-		// — because it was just moved — and calls advance(), which puts it straight back. Decide, undo,
-		// decide, undo: the log said "returning to osaka" and two seconds later "tunnel connected to
-		// tokyo-east", three times, and nothing in either line is wrong on its own.
-		//
-		// The connector already knows this shape: a tunnel ended by its OWN probe is explicitly not counted
-		// against the door. A tunnel ended by its own failback is the same fact.
-		e.movedOnPurpose = true
+		e.revision++
+		return crossRegion
 	}
+	return false
 }
 
 // atPreferred reports whether this connector is on the operator's first door.
@@ -239,8 +343,8 @@ func (e *connectorEndpoints) replace(next *connectorEndpoints) bool {
 		return false
 	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if sameConnectorDoorList(e.urls, e.regions, next.urls, next.regions) {
+		e.mu.Unlock()
 		return false
 	}
 	current := ""
@@ -248,11 +352,24 @@ func (e *connectorEndpoints) replace(next *connectorEndpoints) bool {
 		current = e.urls[e.at%len(e.urls)]
 	}
 	e.urls, e.regions, e.at = next.urls, next.regions, 0
+	e.profileURL = ""
+	e.revision++
+	stillAllowed := current == ""
 	for i, u := range e.urls {
 		if u == current {
 			e.at = i
+			stillAllowed = true
 			break
 		}
+	}
+	move := e.onMove
+	if !stillAllowed && e.cancelData != nil {
+		e.cancelData()
+		e.dataCtx, e.cancelData = nil, nil
+	}
+	e.mu.Unlock()
+	if !stillAllowed && move != nil {
+		move()
 	}
 	return true
 }

@@ -407,7 +407,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	defer s.mu.RUnlock()
 	n := 0
 	for _, v := range s.grants {
-		if strings.EqualFold(strings.TrimSpace(v.TenantID), tenantID) {
+		if strings.TrimSpace(v.TenantID) == tenantID {
 			n++
 		}
 	}
@@ -436,7 +436,7 @@ func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, er
 	n := 0
 	err := s.editLocked(ctx, func(next map[string]model.DelegatedAccessGrant) error {
 		for key, v := range next {
-			if strings.EqualFold(strings.TrimSpace(v.TenantID), tenant) {
+			if strings.TrimSpace(v.TenantID) == tenant {
 				delete(next, key)
 				n++
 			}
@@ -451,7 +451,7 @@ func (s *Store) RemoveTenantContext(ctx context.Context, tenant string) (int, er
 	}
 	// Only this explicit, confirmed erasure releases absent denial identifiers.
 	for key := range s.pendingRevocations {
-		if strings.EqualFold(strings.SplitN(key, "\x00", 2)[0], tenant) {
+		if strings.SplitN(key, "\x00", 2)[0] == tenant {
 			delete(s.pendingRevocations, key)
 		}
 	}

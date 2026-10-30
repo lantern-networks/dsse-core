@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/lantern-networks/dsse-core/blobstore"
+	"github.com/lantern-networks/dsse-core/internal/strictjson"
 	"github.com/lantern-networks/dsse-core/model"
 	"log"
 )
@@ -20,6 +21,18 @@ type updater interface {
 var errNoChange = errors.New("authorization state unchanged")
 
 func decodeSnapshot(data []byte) (map[string]model.HumanApprovalEvent, error) {
+	if err := strictjson.RejectDuplicateKeys(data); err != nil {
+		return nil, err
+	}
+	var rawEvents map[string]json.RawMessage
+	if err := json.Unmarshal(data, &rawEvents); err != nil {
+		return nil, err
+	}
+	for _, raw := range rawEvents {
+		if err := strictjson.RejectUnknownFields(raw, model.HumanApprovalEvent{}); err != nil {
+			return nil, err
+		}
+	}
 	var snap map[string]model.HumanApprovalEvent
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return nil, err
@@ -195,5 +208,5 @@ func (s *Store) GetForTenantContext(ctx context.Context, tenant, id string) (mod
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.events[approvalKey(tenant, id)]
-	return v, ok, nil
+	return cloneApprovalEvent(v), ok, nil
 }

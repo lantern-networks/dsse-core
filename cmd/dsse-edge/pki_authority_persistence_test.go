@@ -475,12 +475,17 @@ func TestPKIConcurrentLocalRenameAndIssue(t *testing.T) {
 
 func TestPKIRuntimeLoaderRejectsCorruptSeed(t *testing.T) {
 	for _, kind := range []string{"transport", "device", "interception"} {
-		for _, raw := range []string{"null", "{}", "[null]", "[{}]", "[{\"tenant_id\":\"a\"},{\"tenant_id\":\" A \"}]"} {
+		for _, raw := range []string{"null", "{}", "[null]", "[{}]", "[{\"tenant_id\":\"a\"},{\"tenant_id\":\" a \"}]"} {
 			b := &authorityMemoryCAS{data: []byte(raw)}
 			p := protectPKIAuthorityPersister(b, "tenant_"+kind+"_authorities")
 			if _, err := p.Load(); err == nil {
 				t.Fatalf("%s accepted corrupt initial snapshot", kind)
 			}
+		}
+		b := &authorityMemoryCAS{data: []byte(`[{"tenant_id":"a"},{"tenant_id":"A"}]`)}
+		p := protectPKIAuthorityPersister(b, "tenant_"+kind+"_authorities")
+		if _, err := p.Load(); err != nil {
+			t.Fatalf("%s merged distinct tenant identities: %v", kind, err)
 		}
 	}
 }

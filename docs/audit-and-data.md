@@ -8,23 +8,57 @@ See [Operations](operations.md) for state and backup preparation.
 
 The standard deployment stores logs in ClickHouse. The control-plane retention worker
 now applies the saved per-stream periods and tenant legal holds to the raw event
-store. Expired rows are copied to the configured archive, read back and compared,
-then deleted by immutable insertion receipts. The existing audit-chain verification
+store. Expired ClickHouse rows are copied to the configured archive, read back and
+compared, then deleted by immutable insertion receipts. PostgreSQL hot rows are
+deleted after a successful S3 Put; independently retrieve and verify an archived
+object during installation acceptance. The existing audit-chain verification
 API checks the archived audit segments. A saved zero-day override keeps a stream in
 hot storage indefinitely; a legal hold preserves the tenant's hot rows until released.
 
-New archive buckets are created with object locking enabled, as required by the
-default audit retention period. Existing non-locking buckets are not converted by
-`mc mb --ignore-existing`. Before enabling archival, provision a compatible locking
-bucket and migrate/verify any existing archive history; preserve original objects
-and chain state. Do not disable audit object retention to hide a write failure.
-See [MinIO object locking](https://min.io/docs/minio/windows/administration/object-management/object-retention.html).
+S3 cold archival is optional. If selected, DSSE does not create the bucket. Provision
+an external S3-compatible bucket with versioning and Object Lock enabled before
+installation; setup checks those properties
+read-only. Existing non-locking buckets cannot be converted in place by the DSSE
+installer. For a fresh installation, start with an empty dedicated bucket. Do not
+disable audit object retention to hide a write failure.
+
+The current archive configuration names one bucket for the deployment. Objects are
+grouped under `hot_events/<tenant_id>/<stream>/`, and the retention worker selects
+hot rows by tenant before writing a segment. This is logical organization, not
+storage-level tenant isolation: the control plane uses one S3 credential set for the
+bucket, and DSSE does not provision a separate bucket, IAM principal, or encryption
+key per tenant. An operator with that credential set can access every tenant's
+archived objects. Do not describe the current archive as independently isolated per
+tenant at the S3 infrastructure layer. Customer administrators are not given the
+archive credentials; the Console's audit-chain route uses their authenticated tenant
+and rejects an attempted cross-tenant override. The designated deployment operator
+may inspect a selected tenant. Setup checks bucket existence, versioning, Object
+Lock, and listing, but does not certify the external bucket's public-access settings
+or IAM/bucket policy. Provision a private bucket and never give its credentials or
+object access to customer tenants.
+Archive writes and chain listings reject malformed tenant or stream identifiers
+before constructing an object key. A rejected retention batch leaves its hot rows
+in place for investigation; it never falls back to a broader S3 prefix.
 
 A PostgreSQL journal records an admitted batch and its protection fence. Restarted
 workers resume that batch. A hold or retention change during a pending batch returns
 an error instead of falsely reporting protection; retry after completion. An archive
-failure preserves hot data and the pending journal. Repair archive availability and
-let the worker retry; do not delete the journal/fence or regenerate receipt IDs.
+failure preserves hot data and the pending journal. If no archive is configured, the
+worker leaves aged hot rows in the local persistent database instead of deleting them.
+This is a supported local-only storage mode: budget disk capacity and backups for
+retained history. It does not provide S3 Object Lock or archived-chain verification.
+When an archive is configured but unavailable, local retention is a temporary buffer;
+monitor database capacity and the age of pending batches with operator-provided
+database/log monitoring. DSSE does not yet expose a complete archive backlog and
+last-success view in Console/API; this remains an acceptance gap for archive-enabled
+deployments. Repair archive availability and let the
+worker retry; do not delete the journal/fence or regenerate receipt IDs.
+
+### Legacy installation reference
+
+The following schema and state-import steps document compatibility with older
+deployments. They are not required for a fresh 0.4.0 installation. Upgrades and
+any existing data require separate migration and recovery acceptance.
 
 The generated CP startup script stores audit-chain state in PostgreSQL and imports
 its former `audit_chain.json` once, together with `legal_holds.json` and
@@ -57,6 +91,8 @@ rematerialize existing receipts during normal operation**: pending batches refer
 those identities. Adapt database/table names for customized installations. The API
 refuses retention operations until the required schema, archive and shared policy
 stores are configured. New installations include this schema.
+
+### Fresh-install behavior
 
 This worker archives and expires **raw events**. Aggregate rollups remain preserved
 without an independent TTL; cold objects, backups and exported files have their own
@@ -193,11 +229,13 @@ is separate, and other stores and backups need their own lifecycle controls.
 
 With a usable cold archive, aged hot events are written as compressed NDJSON segments
 before deletion from PostgreSQL. A failed archive write leaves those rows for retry.
-Without a cold archive, the same hot-event path deletes aged rows. Cold-archive setup
-failure can leave the deployment running without that tier; check startup logs and a
-sample archived object before relying on it. Requested audit object retention requires
-a compatible, correctly configured object-lock bucket. Its presence in a flag is not
-proof that every log is immutable or that a retention obligation is met.
+Without a cold archive, the hot-event path retains aged rows in the local persistent
+database. A deliberately omitted archive lets the CP start; an incomplete or invalid
+archive configuration is rejected. Check hot database capacity in local-only mode,
+and verify a sample archived object before relying on configured cold storage.
+Requested audit object retention requires a compatible, correctly configured
+object-lock bucket. Its presence in a flag is not proof that every log is immutable
+or that a retention obligation is met.
 
 | Other copy | What must be managed separately |
 |---|---|

@@ -9,6 +9,24 @@
 
 let _adminRolesCache = null;
 
+// Modal confirmation and role loading can outlive the tenant in which an
+// administrator row was opened. Never send the resulting write to a newly
+// selected organization.
+function administratorActionContext(host) {
+  const tenant = typeof operateTenant === "undefined" ? null : operateTenant;
+  const session = typeof idpSession === "undefined" ? null : idpSession;
+  const token = typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "";
+  return () => (host?.isConnected !== false) &&
+    (typeof operateTenant === "undefined" ? null : operateTenant) === tenant &&
+    (typeof idpSession === "undefined" ? null : idpSession) === session &&
+    (typeof localStorage === "undefined" ? "" : localStorage.getItem("adminToken") || "") === token;
+}
+
+function administratorContextChanged() {
+  uiToast(bl({en:"The login or tenant changed. Reopen the administrator list before continuing.",
+    ja:"ログインまたはテナントが変わりました。管理者一覧を開き直してから操作してください。"}), "err");
+}
+
 function roleLabelBL(role) {
   const m = {
     super_admin: { en: "Operator (cross-tenant)", ja: "運営(横断)" },
@@ -191,7 +209,9 @@ function openInvitationHandover(invitation, opts) {
 }
 
 async function openInviteForm(content) {
+  const sameContext = administratorActionContext(content);
   const roles = assignableForCaller(await loadAssignableRoles());
+  if (!sameContext()) { administratorContextChanged(); return; }
   const emailF = uiField({ name: "email", label: bl({ en: "Email", ja: "メールアドレス" }), required: true, placeholder: "admin@example.com",
     validate: (v) => (/.+@.+\..+/.test(v) ? "" : bl({ en: "Enter a valid email address.", ja: "正しいメールアドレスを入力してください。" })) });
   // ★ SAY WHAT EACH ROLE LETS THEM DO (2026-08-17). The list offered "管理者" and "テナント管理者" side by side
@@ -218,11 +238,14 @@ async function openInviteForm(content) {
       ja: "一度だけ使えるリンクが表示されます。ご自身で本人に渡してください(メールは送られません)。本人はそのリンクでパスワードを決め、認証アプリを登録します。" }) })],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
+    if (!sameContext()) { administratorContextChanged(); return; }
     if (!emailF.validate()) return;
     submit.disabled = true;
     try {
       const invite = async () => {
+        if (!sameContext()) { administratorContextChanged(); return null; }
         const rr = await apiFetch("POST", "/admin/admins/invite", { email: emailF.get(), roles: [roleF.get()] });
+        if (!sameContext()) { administratorContextChanged(); return null; }
         if (!rr.ok) {
           const msg = (rr.body && (rr.body.error || rr.body.message)) || ("HTTP " + rr.status);
           emailF.setError(msg); uiToast(msg, "err");
@@ -243,7 +266,9 @@ async function openInviteForm(content) {
 }
 
 async function openRolesForm(a, host) {
+  const sameContext = administratorActionContext(host);
   const catalog = await loadAssignableRoles();
+  if (!sameContext()) { administratorContextChanged(); return; }
   const assignable = new Set(assignableForCaller(catalog));
   const current = new Set(a.roles || []);
   // Tenant-internal roles + any role this admin already holds, so an existing operator/owner role stays visible
@@ -256,11 +281,13 @@ async function openRolesForm(a, host) {
     body: [el("p", { class: "ui-view-desc", text: a.email || a.principal_id || "" }), list],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit] });
   submit.addEventListener("click", async () => {
+    if (!sameContext()) { administratorContextChanged(); return; }
     const sel = boxes.filter(({ cb }) => cb.checked).map(({ r }) => r);
     if (!sel.length) { uiToast(bl({ en: "Pick at least one role.", ja: "ロールを1つ以上選択してください。" }), "err"); return; }
     submit.disabled = true;
     try {
       const r = await apiFetch("POST", "/admin/admins/" + encodeURIComponent(a.principal_id) + "/roles", { roles: sel });
+      if (!sameContext()) { administratorContextChanged(); return; }
       if (!r.ok) { submit.disabled = false; uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
       m.close(); uiToast(bl({ en: "Roles updated.", ja: "ロールを更新しました。" }), "ok"); renderAdminList(host);
     } catch (e) { submit.disabled = false; uiToast(String(e), "err"); }
@@ -268,24 +295,30 @@ async function openRolesForm(a, host) {
 }
 
 async function adminStatusChange(a, action, host) {
+  const sameContext = administratorActionContext(host);
   if (action === "suspend") {
     const ok = await uiConfirm({ title: bl({ en: "Suspend this administrator?", ja: "この管理者を停止しますか?" }),
       body: (a.email || a.principal_id) + " " + bl({ en: "will not be able to sign in until reactivated.", ja: "は再開するまでサインインできなくなります。" }),
       confirmLabel: bl({ en: "Suspend", ja: "停止" }), danger: true });
     if (!ok) return;
   }
+  if (!sameContext()) { administratorContextChanged(); return; }
   const r = await apiFetch("POST", "/admin/admins/" + encodeURIComponent(a.principal_id) + "/" + action, {});
+  if (!sameContext()) { administratorContextChanged(); return; }
   if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
   uiToast(action === "suspend" ? bl({ en: "Suspended.", ja: "停止しました。" }) : bl({ en: "Reactivated.", ja: "再開しました。" }), "ok");
   renderAdminList(host);
 }
 
 async function adminDelete(a, host) {
+  const sameContext = administratorActionContext(host);
   const ok = await uiConfirm({ title: bl({ en: "Remove this administrator?", ja: "この管理者を削除しますか?" }),
     body: bl({ en: "Permanently removes ", ja: "完全に削除します: " }) + (a.email || a.principal_id) + ".",
     confirmLabel: bl({ en: "Remove", ja: "削除" }), danger: true });
   if (!ok) return;
+  if (!sameContext()) { administratorContextChanged(); return; }
   const r = await apiFetch("DELETE", "/admin/admins/" + encodeURIComponent(a.principal_id));
+  if (!sameContext()) { administratorContextChanged(); return; }
   if (!r.ok) { uiToast((r.body && (r.body.error || r.body.message)) || ("HTTP " + r.status), "err"); return; }
   uiToast(bl({ en: "Administrator removed.", ja: "管理者を削除しました。" }), "ok");
   renderAdminList(host);

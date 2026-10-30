@@ -53,7 +53,7 @@ func raiseOwnStartTypeAfterEnrolment(serviceRun bool, justEnrolled bool) {
 			"but whether it steers after the next reboot is now unknown\n", err)
 		return
 	}
-	if current == windows.SERVICE_AUTO_START {
+	if !shouldRaiseOwnStartType(current) {
 		return
 	}
 	if err := setOwnStartTypeAuto(); err != nil {

@@ -22,8 +22,8 @@ import (
 // with Postgres. The Edge is normally zero-DB, so this is opt-in. Each device keeps exactly ONE row
 // (PRIMARY KEY (tenant_id, device_identity)); Record is a latest-wins UPSERT. Tenant scoping is enforced by
 // the composite key + a tenant_id predicate on every read, so a tenant admin can never read another tenant's
-// device reports. The store carries no enforcement weight; it is observability only, so Record is best-effort:
-// a DB error is logged and dropped, never panicked or blocked on (the data-plane report path must not stall).
+// device reports. PKI readiness gates also consume these reports. A write failure
+// must reach the receiver so its shipper retains the unacknowledged record.
 type postgresObservedExclusionStore struct {
 	db *sql.DB
 }
@@ -131,7 +131,7 @@ func setupPostgresObservedExclusionStore(ctx context.Context, dsn, migrationDir 
 	if strings.TrimSpace(dsn) == "" {
 		return nil, nil, fmt.Errorf("observed-exclusion-store-postgres-dsn is required")
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -158,11 +158,11 @@ func setupPostgresObservedExclusionStore(ctx context.Context, dsn, migrationDir 
 	return &postgresObservedExclusionStore{db: db}, db.Close, nil
 }
 
-// Record UPSERTs a device's latest report (latest-wins; one row per (tenant, device)). It is best-effort: a DB
-// error is logged and dropped so the data-plane report path never blocks or fails on the durable store.
-func (p *postgresObservedExclusionStore) Record(e observedExclusionEntry) {
+// Record UPSERTs only newer evidence, one row per (tenant, device). Database
+// errors are returned so a shipped report can be retried instead of discarded.
+func (p *postgresObservedExclusionStore) Record(e observedExclusionEntry) error {
 	if p == nil || p.db == nil {
-		return
+		return fmt.Errorf("observed exclusion database is unavailable")
 	}
 	reportedAt := e.ReportedAt
 	if reportedAt.IsZero() {
@@ -199,6 +199,7 @@ func (p *postgresObservedExclusionStore) Record(e observedExclusionEntry) {
 		"renewal_recovery_target = EXCLUDED.renewal_recovery_target,",
 		"interception_refusals = EXCLUDED.interception_refusals,",
 		"transport_server_name_sent = EXCLUDED.transport_server_name_sent",
+		"WHERE observed_steer_exclusions.reported_at < EXCLUDED.reported_at",
 	}, " "),
 		e.TenantID, e.DeviceIdentity, e.DeviceGroup, e.Platform,
 		jsonArrayBytes(e.EffectiveAppSigningIDs), jsonArrayBytes(e.AdminAppSigningIDs), jsonArrayBytes(e.UnmanagedAppSigningIDs),
@@ -209,16 +210,9 @@ func (p *postgresObservedExclusionStore) Record(e observedExclusionEntry) {
 		jsonArrayBytes(e.AgentPolicyPublicKeys), e.InterceptionRootPinSHA256, e.RenewalRecoverySNISent, jsonArrayBytes(e.IgnoredAppSigningIDs), e.RenewalRecoveryTarget,
 		jsonTrustRefusalBytes(e.InterceptionRefusals), e.TransportServerNameSent)
 	if err != nil {
-		// ★★★ THIS IS "BEST-EFFORT" AND IT IS ALSO THE ONLY COPY (2026-08-22, measured after it dropped every
-		// report from every device for fourteen hours). Not blocking the data path on a durable write is
-		// right; letting the fleet go silent while one line per minute scrolls past is not. Every readiness
-		// gate in this product is computed from these rows, so a device whose report is dropped here is
-		// INDISTINGUISHABLE from a device that is switched off — and that is precisely how this looked: two
-		// platforms "down", one of them investigated on the wrong continent.
-		log.Printf("observed-exclusion: DROPPED the report from device %q tenant %q — this device now looks "+
-			"SWITCHED OFF to every readiness gate, and no rotation, rename or retirement it is counted in can "+
-			"complete: %v", e.DeviceIdentity, e.TenantID, err)
+		return fmt.Errorf("persist observed exclusion report: %w", err)
 	}
+	return nil
 }
 
 // Query returns one filtered, paginated page (newest first) plus the total matching count, computing the filter

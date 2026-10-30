@@ -8,42 +8,50 @@ import (
 )
 
 const (
-	postgresMigrationExportWorkerQueue         = "001"
-	postgresMigrationAdminExportJobs           = "002"
-	postgresMigrationHotEvents                 = "003"
-	postgresMigrationAdminAuditOutbox          = "004"
-	postgresMigrationAdminAuth                 = "005"
-	postgresMigrationDomainEventOutbox         = "006"
-	postgresMigrationDomainEventStream         = "007"
-	postgresMigrationUsageMeter                = "008"
-	postgresMigrationNonHumanIdentity          = "009"
-	postgresMigrationHotEventsText             = "010"
-	postgresMigrationHotEventsRegion           = "050"
-	postgresMigrationWorkloadNonce             = "011"
-	postgresMigrationHumanIdentity             = "012"
-	postgresMigrationHumanIdentityImportRun    = "013"
-	postgresMigrationHumanIdentitySource       = "014"
-	postgresMigrationHumanIdentitySourceState  = "015"
-	postgresMigrationHumanIdentitySourcePolicy = "016"
-	postgresMigrationConnectorRegistry         = "017"
-	postgresMigrationDeviceInventory           = "018"
-	postgresMigrationAgentTelemetry            = "019"
-	postgresMigrationLocalCredentials          = "020"
-	postgresMigrationCredentialTOTP            = "048"
-	postgresMigrationCredentialRevision        = "049"
-	postgresMigrationCredentialWriterProtocol  = "051"
-	postgresMigrationSteerExclusions           = "021"
-	postgresMigrationConfigVersions            = "022"
-	postgresMigrationAdminTenantModel          = "023"
-	postgresMigrationAdminTenantModelOperator  = "024"
-	postgresMigrationAdminSites                = "025"
-	postgresMigrationApplicationCatalog        = "026"
-	postgresMigrationObservedExclusions        = "027"
-	postgresMigrationCPStateBlobs              = "028"
-	postgresMigrationEnrolmentTokens           = "029"
-	postgresMigrationEnrolmentTokenIssuerLabel = "030"
-	postgresMigrationObservedTrustTelemetry    = "031"
-	postgresMigrationObservedAgentPolicyKeys   = "032"
+	postgresMigrationExportWorkerQueue           = "001"
+	postgresMigrationAdminExportJobs             = "002"
+	postgresMigrationHotEvents                   = "003"
+	postgresMigrationAdminAuditOutbox            = "004"
+	postgresMigrationAdminAuth                   = "005"
+	postgresMigrationDomainEventOutbox           = "006"
+	postgresMigrationDomainEventStream           = "007"
+	postgresMigrationColdArchiveHealthEvents     = "054"
+	postgresMigrationUsageMeter                  = "008"
+	postgresMigrationNonHumanIdentity            = "009"
+	postgresMigrationHotEventsText               = "010"
+	postgresMigrationHotEventsRegion             = "050"
+	postgresMigrationWorkloadNonce               = "011"
+	postgresMigrationHumanIdentity               = "012"
+	postgresMigrationHumanIdentityImportRun      = "013"
+	postgresMigrationHumanIdentitySource         = "014"
+	postgresMigrationHumanIdentitySourceState    = "015"
+	postgresMigrationHumanIdentitySourcePolicy   = "016"
+	postgresMigrationConnectorRegistry           = "017"
+	postgresMigrationConnectorRegistryGeneration = "060"
+	postgresMigrationDeviceInventory             = "018"
+	postgresMigrationDevicePostureTrust          = "058"
+	postgresMigrationAgentTelemetry              = "019"
+	postgresMigrationAgentPostureTrust           = "059"
+	postgresMigrationLocalCredentials            = "020"
+	postgresMigrationCredentialTOTP              = "048"
+	postgresMigrationCredentialRevision          = "049"
+	postgresMigrationCredentialWriterProtocol    = "051"
+	postgresMigrationSteerExclusions             = "021"
+	postgresMigrationConfigVersions              = "022"
+	postgresMigrationAdminTenantModel            = "023"
+	postgresMigrationAdminTenantModelOperator    = "024"
+	postgresMigrationAdminSites                  = "025"
+	postgresMigrationApplicationCatalog          = "026"
+	postgresMigrationApplicationCatalogImport    = "057"
+	postgresMigrationObservedExclusions          = "027"
+	postgresMigrationCPStateBlobs                = "028"
+	postgresMigrationGrantBlobRevision           = "056"
+	postgresMigrationAuthFlowResults             = "053"
+	postgresMigrationManualHotLogDelete          = "055"
+	postgresMigrationEnrolmentTokens             = "029"
+	postgresMigrationEnrolmentTokenIssuerLabel   = "030"
+	postgresMigrationObservedTrustTelemetry      = "031"
+	postgresMigrationObservedAgentPolicyKeys     = "032"
 	// 042 adds the recovery name a device says it holds, and what it deliberately did not apply. Listed here
 	// because a component applies ONLY its own migrations: a migration file this list does not name is a file
 	// that never runs, and the column then exists in the in-memory store and nowhere else.
@@ -104,7 +112,7 @@ const (
 // travel together because they are selected by the same flag and opened on the same handle: an operator who set
 // -enrolment-token-store=postgres and found the table missing would have no separate knob to turn.
 func postgresCPStateBlobsMigrationVersions() []string {
-	return []string{postgresMigrationCPStateBlobs, postgresMigrationEnrolmentTokens, postgresMigrationEnrolmentTokenIssuerLabel, "047"}
+	return []string{postgresMigrationCPStateBlobs, postgresMigrationEnrolmentTokens, postgresMigrationEnrolmentTokenIssuerLabel, "047", postgresMigrationAuthFlowResults, postgresMigrationManualHotLogDelete, postgresMigrationGrantBlobRevision}
 }
 
 func selectPostgresComponentMigrations(migrations []migrationstore.Migration, component string, versions ...string) ([]migrationstore.Migration, error) {
@@ -140,6 +148,7 @@ func postgresDomainEventOutboxMigrationVersions() []string {
 	return []string{
 		postgresMigrationDomainEventOutbox,
 		postgresMigrationDomainEventStream,
+		postgresMigrationColdArchiveHealthEvents,
 	}
 }
 
@@ -174,12 +183,14 @@ func postgresHumanIdentityDirectoryMigrationVersions() []string {
 func postgresConnectorRegistryMigrationVersions() []string {
 	return []string{
 		postgresMigrationConnectorRegistry,
+		postgresMigrationConnectorRegistryGeneration,
 	}
 }
 
 func postgresDeviceInventoryMigrationVersions() []string {
 	return []string{
 		postgresMigrationDeviceInventory,
+		postgresMigrationDevicePostureTrust,
 	}
 }
 
@@ -199,6 +210,7 @@ func postgresAgentTelemetryMigrationVersions() []string {
 		// same store, so it is applied wherever the telemetry tables are.
 		postgresMigrationAgentUpdateEventScope,
 		postgresMigrationAgentUpdateRefused,
+		postgresMigrationAgentPostureTrust,
 	}
 }
 
@@ -211,6 +223,7 @@ func postgresAdminSiteMigrationVersions() []string {
 func postgresApplicationCatalogMigrationVersions() []string {
 	return []string{
 		postgresMigrationApplicationCatalog,
+		postgresMigrationApplicationCatalogImport,
 	}
 }
 

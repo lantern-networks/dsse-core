@@ -1,10 +1,10 @@
 //go:build windows
 
-// steer_wfp_filters_windows.go — W-3 refinement: enumerate the live WFP filters and confirm the driver's six
+// steer_wfp_filters_windows.go — W-3 refinement: enumerate the live WFP filters and confirm the driver's required
 // filters are all present. The control-device open + stats IOCTL (steer_heartbeat.go) prove the driver is
 // LOADED and responsive, but not that its filters are still installed. An admin tamper can delete individual
 // filters (FwpmFilterDeleteByKey) while the driver stays loaded -> enforcement silently stops for those layers.
-// This check closes that gap: if any of the six DSSE filters is missing, enforcement_agent_healthy goes false.
+// This check closes that gap: if any required DSSE filter is missing, enforcement_agent_healthy goes false.
 //
 // Uses fwpuclnt.dll directly (FwpmEngineOpen0 / FwpmFilterCreateEnumHandle0 / FwpmFilterEnum0). We only read
 // each FWPM_FILTER0's display name, which sits at offset 16 (right after the 16-byte filterKey GUID; the
@@ -31,12 +31,14 @@ var (
 
 const rpcCAuthnWinNT = 0xFFFFFFFF // RPC_C_AUTHN_WINNT (open the WFP engine with the caller's identity)
 
-// dsseFilterNames are the six filters the driver registers (outbound steer v4/v6, QUIC gate v4/v6, inbound
-// server-initiated v4/v6). All six must be present for the agent to be "actually enforcing".
+// dsseFilterNames are the filters the driver registers (outbound steer v4/v6, QUIC gate v4/v6, inbound
+// server-initiated v4/v6, captive admission gates in/out v4/v6). All must be present for the agent to be "actually enforcing".
 var dsseFilterNames = []string{
 	"DsseSteerV4", "DsseSteerV6",
 	"DsseQuicGateV4", "DsseQuicGateV6",
 	"DsseInboundV4", "DsseInboundV6",
+	"DsseCaptiveOutV4", "DsseCaptiveOutV6", "DsseCaptiveInV4", "DsseCaptiveInV6",
+	"DsseCaptiveFlowV4", "DsseCaptiveFlowV6",
 }
 
 // utf16PtrToStringW reads a NUL-terminated UTF-16 string from a pointer (bounded to avoid running away on a
@@ -56,8 +58,8 @@ func utf16PtrToStringW(p *uint16) string {
 	return string(utf16.Decode(u))
 }
 
-// dsseFiltersPresent enumerates WFP filters and returns how many of the six DSSE filters are installed (0..6)
-// and whether the enumeration itself succeeded. Caller treats (success && count==6) as "filters healthy".
+// dsseFiltersPresent enumerates WFP filters and returns how many required DSSE filter are installed (0..6)
+// and whether the enumeration itself succeeded. Caller treats (success && count==len(dsseFilterNames)) as "filters healthy".
 func dsseFiltersPresent() (count int, ok bool) {
 	var engine syscall.Handle
 	r, _, _ := procFwpmEngineOpen0.Call(0, rpcCAuthnWinNT, 0, 0, uintptr(unsafe.Pointer(&engine)))
@@ -113,7 +115,7 @@ func dsseFiltersPresent() (count int, ok bool) {
 // deleteFirstDsseFilter deletes ONE of the driver's WFP filters by key -- a TEST AFFORDANCE that simulates an
 // admin "partial tamper" (driver stays loaded but a filter is removed). It reads the matching filter's key
 // (FWPM_FILTER0.filterKey at offset 0) and calls FwpmFilterDeleteByKey0. Reverse with sc stop/start
-// DsseWfp (DriverEntry re-adds all six). Returns the deleted filter's display name.
+// DsseWfp (DriverEntry re-adds all required filters). Returns the deleted filter's display name.
 func deleteFirstDsseFilter() (string, error) {
 	var engine syscall.Handle
 	if r, _, _ := procFwpmEngineOpen0.Call(0, rpcCAuthnWinNT, 0, 0, uintptr(unsafe.Pointer(&engine))); r != 0 {

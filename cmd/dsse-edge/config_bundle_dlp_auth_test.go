@@ -27,7 +27,7 @@ func TestConfigBundleFleetTokenReceivesCustomerDLP(t *testing.T) {
 	previous := operatorTenantConfigured()
 	t.Cleanup(func() { operatorTenantAuthority.Store(previous) })
 	auth := newAdminAuthStore()
-	for _, tenant := range []string{"operator", "customer"} {
+	for _, tenant := range []string{"operator", "customer", "Operator"} {
 		auth.UpsertPrincipal(adminPrincipal{ID: tenant, TenantID: tenant, Roles: []string{"admin"}, Status: "active"})
 		auth.UpsertAPIToken(adminAPIToken{ID: tenant, TenantID: tenant, TokenHash: adminTokenHash("token-" + tenant), Roles: []string{"admin"}, Scopes: []string{"admin.policy.read"}, CreatedByAdminPrincipalID: tenant, Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)})
 	}
@@ -52,9 +52,15 @@ func TestConfigBundleFleetTokenReceivesCustomerDLP(t *testing.T) {
 	}
 	server := httptest.NewServer(newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, OperatorTenantID: "operator", DLPPolicyObjectStorePath: path, AgentPolicySigner: signer}))
 	defer server.Close()
-	for _, tenant := range []string{"operator", "customer"} {
+	for _, tenant := range []string{"operator", "customer", "Operator"} {
 		src := configBundleSource{url: server.URL, client: server.Client(), token: "token-" + tenant, tenantID: tenant, verifyPubKeyHex: signer.PublicKeyHex(), requireSigned: true}
 		bundle, err := src.fetch(context.Background())
+		if tenant != "operator" {
+			if err == nil {
+				t.Fatalf("tenant %q downloaded fleet configuration", tenant)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -62,17 +68,8 @@ func TestConfigBundleFleetTokenReceivesCustomerDLP(t *testing.T) {
 			t.Fatal("DLP absent")
 		}
 		want := 2
-		if tenant == "customer" {
-			want = 1
-		}
 		if len(bundle.DLP.Policies) != want {
 			t.Fatalf("%s received %d tenant policies, want %d", tenant, len(bundle.DLP.Policies), want)
-		}
-		if tenant == "customer" {
-			if _, ok := bundle.DLP.Policies["other"]; ok {
-				t.Fatal("customer received another customer's DLP")
-			}
-			continue
 		}
 		receiving := dlpStoresForTest("edge-salt")
 		if _, err := src.apply(bundle, configApplyTargets{rules: policyrule.NewStore(), applications: appcatalog.NewStore(), policyStore: policy.NewStore(nil), dlp: receiving}); err != nil {

@@ -247,7 +247,7 @@ func registerRiskServerInitiatedRoutes(mux *http.ServeMux, adminEndpoint func(st
 		}
 		row := model.AuditLog{ID: randomEdgeID("audit_incoming_", now), TenantID: tenant, ActorUserID: auditActorPrincipal(r), EventType: "admin_incoming_changed", TargetType: stringPtr("incoming_policy"), TargetID: stringPtr(target), Action: stringPtr(action), Result: &result, Timestamp: now.Format(time.RFC3339), EdgeRegionID: &evaluator.EdgeRegionID, EdgeClusterID: &evaluator.EdgeClusterID}
 		row.Metadata = map[string]any{"target_tenant_id": tenant}
-		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && !strings.EqualFold(identity.TenantID, tenant) {
+		if identity, ok := adminIdentityFromRequest(r); ok && strings.TrimSpace(identity.TenantID) != "" && identity.TenantID != tenant {
 			stampOperatorActor(row.Metadata, identity)
 		}
 		_ = appendAdminAudit(r.Context(), writer, config.AdminAuditOutbox, row, now)

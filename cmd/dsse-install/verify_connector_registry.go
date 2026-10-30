@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -40,7 +41,11 @@ func verifyConnectorRegistryIsShared(client *http.Client, cpAdmins []string, tok
 	// ★ ONCE PER ORGANIZATION. Connectors belong to CUSTOMER organizations and this check asks with the
 	// deployment administrator's token, so asking without naming one measured the operator's own organization
 	// and found nothing — see the_deployments_connectors_are_not_the_operators.go.
-	organizations := organizationsOfTheDeployment(client, doors[0], token)
+	organizations, known := organizationsOfTheDeployment(client, doors[0], token)
+	if !known {
+		add(false, "the deployment-wide tenant list could not be read, so its connectors were not measured")
+		return out
+	}
 	seen := map[string][]string{}
 	for _, door := range doors {
 		ids, answered := connectorsForEveryOrganization(client, door, token, organizations)
@@ -52,6 +57,15 @@ func verifyConnectorRegistryIsShared(client *http.Client, cpAdmins []string, tok
 	}
 
 	first := seen[doors[0]]
+	for _, door := range doors[1:] {
+		if strings.Join(seen[door], ",") != strings.Join(first, ",") {
+			add(false, "%s holds %d and %s holds %d — the Console reads whichever answers, so a site's "+
+				"connectors change on refresh. The registry must be the deployment's database, not each "+
+				"node's memory: -connector-registry-store=postgres",
+				doors[0], len(first), door, len(seen[door]))
+			return out
+		}
+	}
 	if len(first) == 0 {
 		// ★★★ EMPTY IS TWO DIFFERENT ANSWERS AND THIS USED TO GIVE THEM THE SAME ONE (2026-08-26, found by
 		// generating a deployment and walking it). "Every node having nothing is the shape of every node
@@ -64,7 +78,12 @@ func verifyConnectorRegistryIsShared(client *http.Client, cpAdmins []string, tok
 		// records every connector this deployment has ever admitted. Nothing there and nothing here is a
 		// deployment with no connectors. Something there and nothing here is the loss shape, and it still
 		// fails — louder, because now it can say what is missing.
-		if ever, known := connectorsTheDeploymentHasAdmitted(client, doors[0], token); known && ever > 0 {
+		ever, known := connectorsTheDeploymentHasAdmitted(client, doors[0], token, organizations)
+		if !known {
+			add(false, "the enrolled connector inventory could not be read for every tenant, so an empty registry cannot be accepted as never used")
+			return out
+		}
+		if ever > 0 {
 			add(false, "this deployment has admitted %d connector(s) and NO control plane holds any — that is "+
 				"the shape of a registry kept in each node's memory, emptied by a restart. The Console reads "+
 				"whichever node answers, so a site's connectors appear and disappear on refresh: "+
@@ -76,15 +95,6 @@ func verifyConnectorRegistryIsShared(client *http.Client, cpAdmins []string, tok
 			"connector is registered")
 		return out
 	}
-	for _, door := range doors[1:] {
-		if strings.Join(seen[door], ",") != strings.Join(first, ",") {
-			add(false, "%s holds %d and %s holds %d — the Console reads whichever answers, so a site's "+
-				"connectors change on refresh. The registry must be the deployment's database, not each "+
-				"node's memory: -connector-registry-store=postgres",
-				doors[0], len(first), door, len(seen[door]))
-			return out
-		}
-	}
 	add(true, "%d connector(s), the same set on all %d control planes", len(first), len(doors))
 	return out
 }
@@ -92,27 +102,33 @@ func verifyConnectorRegistryIsShared(client *http.Client, cpAdmins []string, tok
 // connectorsTheDeploymentHasAdmitted counts the connectors in the durable enrolled inventory — what this
 // deployment has ever let in, as opposed to what a node currently holds in the registry. known is false when
 // the question could not be asked, so a failure to read is never turned into a number.
-func connectorsTheDeploymentHasAdmitted(client *http.Client, door, token string) (count int, known bool) {
-	code, body, err := get(client, strings.TrimRight(door, "/")+"/admin/enrolled-devices", token)
-	if err != nil || code != 200 {
-		return 0, false
-	}
-	var doc struct {
-		Devices []struct {
-			Identity string `json:"identity"`
-			Kind     string `json:"kind"`
-			Note     string `json:"note"`
-		} `json:"devices"`
-	}
-	if json.Unmarshal(body, &doc) != nil {
-		return 0, false
-	}
-	for _, d := range doc.Devices {
-		// A connector is recorded as one either by kind or by the note enrolment writes. Both are checked
-		// because the kind was added later and older entries carry only the note.
-		if strings.EqualFold(strings.TrimSpace(d.Kind), "connector") ||
-			strings.Contains(strings.ToLower(d.Note), "as a connector") {
-			count++
+func connectorsTheDeploymentHasAdmitted(client *http.Client, door, token string, organizations []string) (count int, known bool) {
+	for _, org := range organizations {
+		endpoint := strings.TrimRight(door, "/") + "/admin/enrolled-devices"
+		if org != "" {
+			endpoint += "?tenant_id=" + url.QueryEscape(org)
+		}
+		code, body, err := get(client, endpoint, token)
+		if err != nil || code != 200 {
+			return 0, false
+		}
+		var doc struct {
+			Devices *[]struct {
+				Identity string `json:"identity"`
+				Kind     string `json:"kind"`
+				Note     string `json:"note"`
+			} `json:"devices"`
+		}
+		if json.Unmarshal(body, &doc) != nil || doc.Devices == nil {
+			return 0, false
+		}
+		for _, d := range *doc.Devices {
+			// A connector is recorded as one either by kind or by the note enrolment writes. Both are checked
+			// because the kind was added later and older entries carry only the note.
+			if strings.EqualFold(strings.TrimSpace(d.Kind), "connector") ||
+				strings.Contains(strings.ToLower(d.Note), "as a connector") {
+				count++
+			}
 		}
 	}
 	return count, true

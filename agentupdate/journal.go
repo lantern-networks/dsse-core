@@ -848,6 +848,16 @@ func (j *Journal) clone() *Journal {
 			c.Poisoned[k] = v
 		}
 	}
+	if j.RestoreMaterial != nil {
+		c.RestoreMaterial = append([]string{}, j.RestoreMaterial...)
+	}
+	if j.PendingReport != nil {
+		pending := *j.PendingReport
+		c.PendingReport = &pending
+	}
+	if j.Quarantined != nil {
+		c.Quarantined = append([]QuarantinedReport{}, j.Quarantined...)
+	}
 	return &c
 }
 

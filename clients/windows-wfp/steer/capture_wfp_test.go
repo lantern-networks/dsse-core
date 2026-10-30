@@ -4,12 +4,22 @@ package main
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net/netip"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"unsafe"
 )
+
+func mustBuildWFPPolicy(t *testing.T, cfg captureConfig) wfpPolicy {
+	t.Helper()
+	p, err := buildWFPPolicy(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
 
 func TestWFPRedirectContextOrigDstIPv4(t *testing.T) {
 	var ctx wfpRedirectContext
@@ -55,7 +65,7 @@ func TestBuildWFPPolicyMarshalsAppsAndDests(t *testing.T) {
 		bypassApps:  []string{"Automation", "  ", "chrome"},
 		bypassDests: parseAddrPorts([]string{"160.79.104.10:443"}),
 	}
-	p := buildWFPPolicy(cfg)
+	p := mustBuildWFPPolicy(t, cfg)
 	if p.Version != wfpPolicyVer || p.LocalPort != 18099 {
 		t.Fatalf("policy header wrong: ver=%d port=%d", p.Version, p.LocalPort)
 	}
@@ -77,6 +87,41 @@ func TestBuildWFPPolicyMarshalsAppsAndDests(t *testing.T) {
 	}
 }
 
+func TestBuildWFPPolicyRejectsUnrepresentableBypasses(t *testing.T) {
+	t.Run("destinations", func(t *testing.T) {
+		var dests []netip.AddrPort
+		for i := 1; i <= wfpMaxDests+1; i++ {
+			dests = append(dests, netip.AddrPortFrom(netip.AddrFrom4([4]byte{10, 20, 0, byte(i)}), 443))
+		}
+		if _, err := buildWFPPolicy(captureConfig{bypassDests: dests[:wfpMaxDests]}); err != nil {
+			t.Fatalf("exact ABI capacity rejected: %v", err)
+		}
+		if _, err := buildWFPPolicy(captureConfig{bypassDests: dests}); err == nil {
+			t.Fatal("33 destinations must not silently publish only 32")
+		}
+	})
+	t.Run("apps", func(t *testing.T) {
+		var apps []string
+		for i := 0; i <= wfpMaxApps; i++ {
+			apps = append(apps, fmt.Sprintf("owned-app-%02d", i))
+		}
+		if _, err := buildWFPPolicy(captureConfig{bypassApps: apps}); err == nil {
+			t.Fatal("17 app bypasses must not silently publish only 16")
+		}
+	})
+	t.Run("verified exact apps", func(t *testing.T) {
+		var paths []string
+		for i := 0; i <= wfpMaxExactApps; i++ {
+			paths = append(paths, fmt.Sprintf(`\Device\HarddiskVolume3\owned-app-%02d.exe`, i))
+		}
+		ep := &atomic.Pointer[[]string]{}
+		ep.Store(&paths)
+		if _, err := buildWFPPolicy(captureConfig{verifiedExactApps: ep}); err == nil {
+			t.Fatal("17 verified app paths must not silently publish only 16")
+		}
+	})
+}
+
 func TestBuildWFPPolicyExactAppsAndSkipsSignatureSubstrings(t *testing.T) {
 	exact := []string{`\Device\HarddiskVolume3\Program Files\Anthropic\automation.exe`}
 	ep := &atomic.Pointer[[]string]{}
@@ -86,7 +131,7 @@ func TestBuildWFPPolicyExactAppsAndSkipsSignatureSubstrings(t *testing.T) {
 		bypassApps:        []string{"automation", "subject:anthropic, pbc", "thumbprint:aabb"},
 		verifiedExactApps: ep,
 	}
-	p := buildWFPPolicy(cfg)
+	p := mustBuildWFPPolicy(t, cfg)
 	// Signature forms must NOT be pushed as kernel substrings (they would never match a path) — only the plain
 	// "automation" substring remains in the substring table.
 	if p.NumApps != 1 || nulString(p.Apps[0][:]) != "automation" {
@@ -117,11 +162,11 @@ func TestBuildWFPPolicyAlwaysBypassesSelfImage(t *testing.T) {
 		bypassApps: []string{"automation"},
 		selfImage:  "DSSE-Steer.exe", // mixed case on purpose -> must be lowercased
 	}
-	p := buildWFPPolicy(cfg)
+	p := mustBuildWFPPolicy(t, cfg)
 	if p.NumApps != 2 {
 		t.Fatalf("NumApps = %d, want 2 (self + automation)", p.NumApps)
 	}
-	// self is added FIRST so it survives even a full app list.
+	// self is added FIRST; an app list that cannot fit is rejected.
 	if got := nulString(p.Apps[0][:]); got != "dsse-steer.exe" {
 		t.Fatalf("app[0] = %q, want dsse-steer.exe (self, lowercased, added first)", got)
 	}
@@ -142,12 +187,20 @@ func TestBypassDestWholeHostWildcard(t *testing.T) {
 	if got := aps[0].Addr().String(); got != "10.10.0.10" {
 		t.Fatalf("bare-IP bypass addr = %s, want 10.10.0.10", got)
 	}
-	p := buildWFPPolicy(captureConfig{localPort: 18099, bypassDests: aps})
+	p := mustBuildWFPPolicy(t, captureConfig{localPort: 18099, bypassDests: aps})
 	if p.NumDests != 1 || p.Dests[0].Family != afInet || p.Dests[0].Port != 0 {
 		t.Fatalf("wildcard dest rule wrong: num=%d fam=%d port=%d", p.NumDests, p.Dests[0].Family, p.Dests[0].Port)
 	}
 	if [4]byte{p.Dests[0].Addr[0], p.Dests[0].Addr[1], p.Dests[0].Addr[2], p.Dests[0].Addr[3]} != [4]byte{10, 10, 0, 10} {
 		t.Fatalf("wildcard dest addr = %v, want 10.10.0.10", p.Dests[0].Addr[:4])
+	}
+}
+
+func TestWFPPolicyRetainsExactIPv6DestinationBypass(t *testing.T) {
+	address := netip.MustParseAddr("2001:db8::10")
+	p := mustBuildWFPPolicy(t, captureConfig{localPort: 18099, bypassDests: parseAddrPorts([]string{"[2001:db8::10]:22"})})
+	if p.NumDests != 1 || p.Dests[0].Family != afInet6 || p.Dests[0].Addr != address.As16() || p.Dests[0].Port != 22 {
+		t.Fatalf("exact IPv6 exclusion did not reach the driver policy: %+v", p.Dests[0])
 	}
 }
 

@@ -9,6 +9,7 @@ package main
 // when the deployment was decided. It is derived now.
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -27,6 +28,9 @@ const (
 	planPgPortB       = 15434
 	planPgAPIA        = 18008
 	planPgAPIB        = 18009
+	planCPAdminPortA  = 19543
+	planCPDataPortA   = 19545
+	planConsolePortA  = 19544
 )
 
 // MachineEnvironment is what one machine's deployment.env must say that is NOT the same on every machine.
@@ -97,27 +101,44 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 	//
 	// Derived from the plan, so an operator declares machines and the doors follow. The health check is on the
 	// admin port and traffic on the agent one — see edgeFleetServers.
-	if machine.Holds.has("control-plane") && machine.Holds.has("edges") {
+	if machine.Holds.has("control-plane") {
 		behind := []string{}
-		for _, other := range region.Machines {
-			if other.Name == machine.Name || other.Holds.has("control-plane") || !other.Holds.has("edges") {
+		for _, other := range p.doorwayEdgeCandidates(region) {
+			if other.Name == machine.Name || (!p.oneRegionThreeNodes() && other.Holds.has("control-plane")) || !other.Holds.has("edges") {
 				continue
 			}
 			if len(other.Addresses) == 0 {
 				continue
 			}
-			behind = append(behind, fmt.Sprintf("%s:%d", strings.TrimSpace(other.Addresses[0]), planEdgeBehindDoorAgentPort))
+			at := strings.TrimSpace(other.Addresses[0])
+			if declaredNodeMapProfile(p.Profile) {
+				at = other.reachableAt()
+			}
+			behind = append(behind, fmt.Sprintf("%s:%d", at, planEdgeBehindDoorAgentPort))
 		}
 		if len(behind) > 0 {
 			sort.Strings(behind)
-			// The doorway's own Edge first, then the machines behind it: the list the door balances over.
-			env[edgeBackendsKey] = strings.Join(append([]string{"dsse-edge-a:8443"}, behind...), ",")
+			// A CP-only door has no local Edge. Name only the Edge machines that actually exist.
+			if machine.Holds.has("edges") {
+				behind = append([]string{"dsse-edge-a:8443"}, behind...)
+			}
+			env[edgeBackendsKey] = strings.Join(behind, ",")
 		}
 	}
 
 	// ★ THE MAP OF EVERY REGION, IDENTICAL EVERYWHERE. An Edge holding a shorter one is healthy and hands its
 	// devices a map missing the region it never heard about.
 	env["DSSE_REGION_ENDPOINTS"] = p.RegionEndpoints()
+	if p.oneRegionThreeNodes() {
+		// A colocated CP can be a standby. Machine reports (including newly
+		// issued grants) must reach the elected writer through the Region door,
+		// rather than the local container merely because it is on the same Node.
+		planes := p.PlaneNamesFor(region.ID)
+		env["DSSE_CONTROL_PLANE"] = "https://" + planes["admin"]
+		env["DSSE_CONTROL_PLANE_DATA"] = "https://" + planes["authority"]
+		// Node-specific agent doors do not imply node-specific Console names.
+		env["ADMIN_CONSOLE_ORIGINS"] = "https://" + p.PlaneNamesFor(region.ID)["console"]
+	}
 	if pub := strings.TrimSpace(p.Publisher); pub != "" {
 		env["DSSE_AGENT_PUBLISHER"] = pub
 	}
@@ -128,7 +149,34 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 	spanning := p.stateBearingRegions()
 	founding := p.foundingRegion().controlPlane()
 	etcd := []string{}
-	if len(spanning) > 1 {
+	if p.oneRegionThreeNodes() {
+		env["DSSE_TOPOLOGY_PROFILE"] = p.Profile
+		env[planHostAliasesKey] = p.oneRegionHostAliases(region)
+		adminTargets, _ := json.Marshal(p.nodeAdminTargets())
+		env[planNodeAdminKey] = string(adminTargets)
+		// The front door has a fixed address inside this region's Compose subnet.
+		// Keep its bind address and the Edge's trusted PROXY sender in the same network.
+		octet := regionSubnetOctet(region.ID)
+		env["DSSE_SUBNET"] = fmt.Sprintf("10.%d.0.0/16", octet)
+		env["DSSE_SUBNET_RANGE"] = fmt.Sprintf("10.%d.1.0/24", octet)
+		env["DSSE_SUBNET_V6"] = fmt.Sprintf("fd00:d55e:%d::/64", octet)
+		env["DSSE_FRONT_DOOR_A"] = fmt.Sprintf("10.%d.0.5", octet)
+		for _, m := range region.Machines {
+			if !m.Holds.has("control-plane") {
+				continue
+			}
+			etcd = append(etcd, fmt.Sprintf("'%s:%d'", m.reachableName(), planEtcdPortA))
+		}
+		quorumEndpoints := []string{}
+		for _, m := range region.Machines {
+			if !m.Holds.has("control-plane") {
+				continue
+			}
+			quorumEndpoints = append(quorumEndpoints, fmt.Sprintf("https://%s:%d", m.reachableName(), planEtcdPortA))
+		}
+		quorumJSON, _ := json.Marshal(quorumEndpoints)
+		env["DSSE_CP_QUORUM_ENDPOINTS"] = string(quorumJSON)
+	} else if len(spanning) > 1 {
 		// ★★★ ONE MEMBER IN EACH STATE-BEARING REGION. Every one of them is a client endpoint, and Patroni is
 		// told all of them: the cluster it asks for its member list will answer with these.
 		for _, r := range spanning {
@@ -145,9 +193,12 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 		local := strings.TrimSpace(machine.Addresses[0])
 		reach := machine.reachableName()
 		switch {
-		case len(spanning) > 1 && region.HoldsState:
+		case (len(spanning) > 1 && region.HoldsState) || p.oneRegionThreeNodes():
 			// ★★★ THIS REGION'S ONE MEMBER OF THE DEPLOYMENT'S ONE STORE (2026-08-31).
 			env["DSSE_ETCD_A_NAME"] = storeMemberName(region.ID)
+			if p.oneRegionThreeNodes() {
+				env["DSSE_ETCD_A_NAME"] = storeMemberNameForMachine(machine)
+			}
 			env["DSSE_ETCD_A_PUBLISH"] = fmt.Sprintf("%s:%d", local, planEtcdPortA)
 			env["DSSE_ETCD_A_PEER_PUBLISH"] = fmt.Sprintf("%s:%d", local, planEtcdPeerPortA)
 			env["DSSE_ETCD_A_ADVERTISE"] = fmt.Sprintf("https://%s:%d", reach, planEtcdPortA)
@@ -164,54 +215,18 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 			const caPath, certPath, keyPath = "/deployment/store-ca.pem", "/deployment/store-member.pem", "/deployment/store-member-key.pem"
 			env["DSSE_ETCD_LISTEN_CLIENT_URLS"] = "https://0.0.0.0:2379"
 			env["DSSE_ETCD_LISTEN_PEER_URLS"] = "https://0.0.0.0:2380"
-			// ★★★ THE CLIENT CA IS WHAT DEMANDS A CLIENT CERTIFICATE — NOT THE FLAG NAMED FOR IT
-			// (2026-08-31, measured: without a certificate the client endpoint refused the handshake while
-			// ETCD_CLIENT_CERT_AUTH was already false). etcd turns on client-certificate verification when a
-			// trusted CA is configured for the client endpoint; the flag does not turn that back off. So
-			// leaving this empty is how the client endpoint is encrypted and server-authenticated without
-			// asking the caller for one — and the PEER CA below is untouched, which is the traffic that
-			// crosses a network.
-			//
-			// ★ The measurement is the only reason this is known. Setting the flag and reading it back said
-			// "false" on a store that was refusing every certificate-less caller.
-			env["DSSE_ETCD_TRUSTED_CA_FILE"] = ""
+			env["DSSE_ETCD_TRUSTED_CA_FILE"] = caPath
 			env["DSSE_ETCD_CERT_FILE"] = certPath
 			env["DSSE_ETCD_KEY_FILE"] = keyPath
-			// ★★★ THE CLIENT ENDPOINT IS ENCRYPTED AND DOES NOT DEMAND A CERTIFICATE, AND THAT IS A GAP
-			// (2026-08-31, measured on the first three-region lab: Patroni could not start).
-			//
-			// Every private key this deployment mounts is 0600, which works because every container that reads
-			// one runs as root. The database image does not: Patroni runs as uid 101, so the member key it was
-			// told to present was unreadable and the only symptom was
-			// PermissionError(13) inside a urllib3 ProtocolError — a permission error wearing a network
-			// error's clothes.
-			//
-			// What crosses a network here is PEER traffic, and that keeps mutual certificates. The client
-			// endpoint is reached by Patroni on this same machine and by the operator's -verify; it is
-			// encrypted and the server is authenticated, and it does not require a certificate from the
-			// caller. So anything that can reach the published client port can talk to the store without one.
-			// The security group holds that set down to this deployment's own machines and the operator's
-			// address, and every one of those machines already holds a member key — but the operator's
-			// network is in it too, and that is the part that is weaker than it should be.
-			//
-			// ★ THE RIGHT FIX IS PER-CONSUMER CLIENT MATERIAL OWNED BY THE UID THAT READS IT, which needs the
-			// installer to know that uid or to run as root. Written down rather than guessed at: this is a
-			// deliberate, stated gap and not an oversight.
-			env["DSSE_ETCD_CLIENT_CERT_AUTH"] = "false"
+			env["DSSE_ETCD_CLIENT_CERT_AUTH"] = "true"
 			env["DSSE_ETCD_PEER_TRUSTED_CA_FILE"] = caPath
 			env["DSSE_ETCD_PEER_CERT_FILE"] = certPath
 			env["DSSE_ETCD_PEER_KEY_FILE"] = keyPath
 			env["DSSE_ETCD_PEER_CLIENT_CERT_AUTH"] = "true"
-
-			// ★ AND PATRONI REACHES IT THE SAME WAY. Its host list stays bare host:port — the protocol is its
-			// own setting, so a deployment that "configured TLS" by writing https:// into the hosts would talk
-			// plaintext and look configured.
 			env["DSSE_ETCD_CLIENT_SCHEME"] = "https"
 			env["DSSE_ETCD_CLIENT_CACERT"] = caPath
-			// ★ AND PATRONI IS NOT TOLD TO PRESENT ONE. Pointing it at a key it cannot read is the failure
-			// above; pointing it at nothing is the honest expression of the line above this.
-			env["DSSE_ETCD_CLIENT_CERT"] = ""
-			env["DSSE_ETCD_CLIENT_KEY"] = ""
+			env["DSSE_ETCD_CLIENT_CERT"] = "/run/dsse-postgres-tls/store-client.pem"
+			env["DSSE_ETCD_CLIENT_KEY"] = "/run/dsse-postgres-tls/store-client-key.pem"
 
 			// ★★★ THE FOUNDING MEMBER STARTS A CLUSTER OF ONE, AND THE OTHERS JOIN IT (2026-08-31).
 			//
@@ -228,16 +243,23 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 			// are promoted. The install order carries `member add --learner` and `member promote` for exactly
 			// this reason. See the design note beside this shape.
 			members := []string{}
-			for _, r := range spanning {
-				cp := r.controlPlane()
-				_ = cp
-				members = append(members, storeMemberName(r.ID)+"="+p.storeMemberPeerURL(r))
-				if strings.EqualFold(r.ID, region.ID) {
-					break // a joining member names the cluster as it will be when it joins, and no further
+			if p.oneRegionThreeNodes() {
+				for _, m := range region.Machines {
+					members = append(members, storeMemberNameForMachine(m)+"="+storeMemberPeerURLForMachine(m))
+					if strings.EqualFold(m.Name, machine.Name) {
+						break
+					}
+				}
+			} else {
+				for _, r := range spanning {
+					members = append(members, storeMemberName(r.ID)+"="+p.storeMemberPeerURL(r))
+					if strings.EqualFold(r.ID, region.ID) {
+						break // a joining member names the cluster as it will be when it joins
+					}
 				}
 			}
 			env["DSSE_ETCD_INITIAL_CLUSTER"] = strings.Join(members, ",")
-			if region.Founding {
+			if region.Founding && (!p.oneRegionThreeNodes() || machine.Name == region.controlPlane().Name) {
 				env["DSSE_ETCD_INITIAL_CLUSTER_STATE"] = "new"
 			} else {
 				env["DSSE_ETCD_INITIAL_CLUSTER_STATE"] = "existing"
@@ -251,6 +273,9 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 		// same in every region — so the second region's first member announces a name the deployment already
 		// has, and Patroni refuses it outright. One cluster spans every region.
 		env["DSSE_PG_A_NAME"] = "dsse-pg-" + env["DSSE_EDGE_REGION"] + "-a"
+		if p.oneRegionThreeNodes() {
+			env["DSSE_PG_A_NAME"] = "dsse-pg-" + strings.ToLower(strings.TrimSpace(machine.Name))
+		}
 		env["DSSE_PG_B_NAME"] = "dsse-pg-" + env["DSSE_EDGE_REGION"] + "-b"
 		env["DSSE_PG_A_MEMBER_PUBLISH"] = fmt.Sprintf("%s:%d", local, planPgPortA)
 		env["DSSE_PG_B_MEMBER_PUBLISH"] = fmt.Sprintf("%s:%d", local, planPgPortB)
@@ -386,6 +411,105 @@ func (p *Plan) MachineEnvironment(machineName string) (map[string]string, error)
 	}
 	env["DSSE_CP_HOME"] = strings.ToLower(strings.TrimSpace(region.ID))
 	env["DSSE_CP_DATA_PEERS"] = strings.Join(data, ",")
+	if p.oneRegionThreeNodes() {
+		// The existing region loops intentionally skip their own region. This profile has
+		// three independently addressable stateful machines *inside* that one region.
+		// The peer leader checks use these published ports. Bind them to the Node's
+		// private address so the direct CP listeners are not additional public mouths.
+		env["DSSE_CP_A_BIND"] = strings.TrimSpace(machine.Addresses[0]) + ":"
+		env["DSSE_CP_A_ADMIN_PORT"] = fmt.Sprint(planCPAdminPortA)
+		env["DSSE_CP_A_DATA_PORT"] = fmt.Sprint(planCPDataPortA)
+		env["DSSE_EDGE_BIND"] = strings.TrimSpace(machine.Addresses[0]) + ":"
+		env["DSSE_CONSOLE_BIND"] = strings.TrimSpace(machine.Addresses[0]) + ":"
+		env["DSSE_CONSOLE_PORT"] = fmt.Sprint(planConsolePortA)
+		env["DSSE_CONSOLE_LOCAL_CP_LEADER_URL"] = "https://dsse-control-plane-a:9443/leader"
+		env["DSSE_CONSOLE_LOCAL_CP_LEADER_NAME"] = p.PlaneNamesFor(region.ID)["admin"]
+		pgPeers, pgHosts, adminPeers, dataPeers := []string{},
+			[]string{"dsse-postgres-a:5432"}, []string{}, []string{}
+		consoleBackends, portalPeers, portalOrigins := []string{}, []string{}, []string{}
+		trusted := []string{fmt.Sprintf("10.%d.0.5", regionSubnetOctet(region.ID))}
+		for _, candidate := range region.Machines {
+			consoleBackends = append(consoleBackends, fmt.Sprintf("%s:%d", candidate.reachableAt(), planConsolePortA))
+			portalOrigins = append(portalOrigins, "https://"+strings.ToLower(strings.TrimSpace(candidate.Portal)))
+			if !strings.EqualFold(candidate.Name, machine.Name) {
+				portalPeers = append(portalPeers, strings.ToLower(strings.TrimSpace(candidate.Portal))+"@"+candidate.reachableAt())
+			}
+		}
+		for _, other := range region.Machines {
+			if strings.EqualFold(other.Name, machine.Name) {
+				continue
+			}
+			at := other.reachableAt()
+			pgPeers = append(pgPeers, fmt.Sprintf("%s:%d:%d", at, planPgPortA, planPgAPIA))
+			pgHosts = append(pgHosts, fmt.Sprintf("%s:%d", at, planPgPortA))
+			// Reach the peer CP itself. Sending a leader probe through another Node's
+			// region doorway can report that doorway healthy because it routes back to
+			// this Node, and can create a forwarding loop after a leader change.
+			adminPeers = append(adminPeers, fmt.Sprintf("https://%s@%s:%d", p.PlaneNamesFor(region.ID)["admin"], at, planCPAdminPortA))
+			dataPeers = append(dataPeers, fmt.Sprintf("%s:%d:%d", at, planCPDataPortA, planCPAdminPortA))
+			trusted = append(trusted, at)
+		}
+		sort.Strings(pgPeers)
+		sort.Strings(adminPeers)
+		sort.Strings(dataPeers)
+		sort.Strings(trusted)
+		sort.Strings(consoleBackends)
+		sort.Strings(portalPeers)
+		sort.Strings(portalOrigins)
+		env["DSSE_PG_PEERS"] = strings.Join(pgPeers, ",")
+		env["DSSE_PG_HOSTS"] = strings.Join(pgHosts, ",")
+		env["DSSE_CP_PEERS"] = strings.Join(adminPeers, ",")
+		env["DSSE_CP_DATA_PEERS"] = strings.Join(dataPeers, ",")
+		env["DSSE_CONSOLE_BACKENDS"] = strings.Join(consoleBackends, ",")
+		env["DSSE_PORTAL_PEERS"] = strings.Join(portalPeers, ",")
+		env["DSSE_STEPUP_PORTAL_ORIGINS"] = strings.Join(portalOrigins, ",")
+		env["DSSE_TRUSTED_FRONT_DOORS"] = strings.Join(trusted, ",")
+		env["DSSE_EDGE_AGENT_PORT"] = fmt.Sprint(planEdgeBehindDoorAgentPort)
+		env["DSSE_EDGE_ADMIN_PORT"] = fmt.Sprint(planEdgeBehindDoorAdminPort)
+		// New mux connections can land on any healthy Edge. The legacy multi-request
+		// session API is disabled on those Edges, so a follow-up cannot lose its owner.
+		env["DSSE_EDGE_BALANCE"] = "leastconn"
+		env["DSSE_STEER_MUX_ONLY"] = "true"
+		env["DSSE_EDGE_CHECK_TLS_NAME"] = p.PlaneNamesFor(region.ID)["agents"]
+		env["DSSE_NODE_PORTAL_NAME"] = strings.ToLower(strings.TrimSpace(machine.Portal))
+		env["DSSE_CLIENTLESS_BASE_URL"] = "https://" + env["DSSE_NODE_PORTAL_NAME"]
+	}
+	if p.dedicatedMultiEdge() {
+		p.threeRegionEnvironment(region, machine, env)
+	}
+	if p.Archive != nil {
+		env["DSSE_ARCHIVE_ENDPOINT"] = p.Archive.Endpoint
+		env["DSSE_ARCHIVE_BUCKET"] = p.Archive.Bucket
+		env["DSSE_ARCHIVE_REGION"] = p.Archive.Region
+		env["DSSE_ARCHIVE_AUTH_MODE"] = p.Archive.AuthMode
+		env["DSSE_ARCHIVE_WEBHOOK_URL"] = p.Archive.WebhookURL
+	}
+	for key, value := range map[string]string{"DSSE_IMAGE": p.ServiceImage, "DSSE_CONSOLE_IMAGE": p.ConsoleImage, "DSSE_IMAGE_REVISION": p.ImageRevision} {
+		if value != "" {
+			env[key] = value
+		}
+	}
+	if d := p.DataLayer; d != nil {
+		env["DSSE_ETCD_IMAGE"] = d.EtcdImage
+		env["DSSE_POSTGRES_IMAGE"] = d.PostgresImage
+		env["DSSE_PSQL_IMAGE"] = d.PostgresToolsImage
+		env["DSSE_POSTGRES_MAJOR"] = fmt.Sprintf("%d", d.PostgresMajor)
+	}
+
+	if declaredNodeMapProfile(p.Profile) {
+		// These profiles require an operator-provisioned browser SAN pair on
+		// every Edge. CP-only hosts issue the same profile contract without
+		// holding those browser private keys themselves.
+		env[stepUpPortalCertEnvKey] = "operator"
+	}
+	if p.oneRegionMultiEdge() {
+		// One state-bearing host is intentional; do not invent three voters.
+		env["DSSE_CP_QUORUM_ENDPOINTS"] = ""
+	}
+	if declaredNodeMapProfile(p.Profile) {
+		env[consoleLeaderRoutingKey] = p.consoleLeaderRouting(machine)
+		env[entrancePortalOriginsKey] = p.entrancePortalOrigins()
+	}
 	return env, nil
 }
 
@@ -439,11 +563,13 @@ func shellQuoted(value string) string {
 	if !strings.Contains(value, "'") {
 		return "'" + value + "'"
 	}
-	if !strings.Contains(value, `"`) && !strings.Contains(value, "$") && !strings.Contains(value, "`") {
+	if !strings.ContainsAny(value, "\"$`\\") {
 		return `"` + value + `"`
 	}
-	// Both kinds present: close, escape, reopen — the only form that survives either.
-	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+	// Use the same escape form as the deployment writer and its reader.
+	// Double quotes interpret backslashes; a trailing one even consumes the
+	// closing quote and makes the generated file impossible to source.
+	return shellQuote(value)
 }
 
 // siblingEdgeURL is how one Edge of a region dials another.

@@ -430,6 +430,40 @@ func TestReplacingAStoredPackageClearsItsRollbackMarker(t *testing.T) {
 	}
 }
 
+func TestFailedReplacementKeepsOriginalRollbackMarker(t *testing.T) {
+	dir := testStoreRoot(t)
+	s := New(dir)
+	const version = "1.0.0.dirty"
+	old := filepath.Join(dir, "old.msi")
+	empty := filepath.Join(dir, "empty.msi")
+	if err := os.WriteFile(old, []byte("verified old package"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(empty, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Stash(old, version); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkAcceptsRollbackIntent(version); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Stash(empty, version); err == nil {
+		t.Fatal("empty replacement unexpectedly succeeded")
+	}
+	pkg, err := s.Lookup(version)
+	if err != nil {
+		t.Fatalf("original package lost after failed replacement: %v", err)
+	}
+	got, err := os.ReadFile(pkg)
+	if err != nil || string(got) != "verified old package" {
+		t.Fatalf("original package changed after failed replacement: bytes=%q err=%v", got, err)
+	}
+	if ok, err := s.AcceptsRollbackIntent(version); err != nil || !ok {
+		t.Fatalf("failed replacement lost original rollback eligibility: ok=%t err=%v", ok, err)
+	}
+}
+
 // Re-stashing IDENTICAL bytes is a no-op and must not throw away a true marker: a repair or a re-run of the
 // installer is ordinary, and losing the marker would leave a box unable to roll back for no reason.
 func TestRestashingTheSameBytesKeepsTheMarker(t *testing.T) {

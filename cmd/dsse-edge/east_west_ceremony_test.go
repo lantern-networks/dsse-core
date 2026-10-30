@@ -22,7 +22,7 @@ func TestCompleteEastWestCeremonyIssuesGrantOnIdentityMatch(t *testing.T) {
 	now := time.Now()
 	c := ceremonyChallenge(challenges, now, "u9") // subject falls back to user "u9"
 
-	resp, err := eastwest.CompleteCeremony(store, challenges, c.ID, "u9", now)
+	resp, err := eastwest.CompleteCeremony(store, challenges, c.ID, "t1", "u9", now)
 	if err != nil {
 		t.Fatalf("matching identity must issue a grant: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestCompleteEastWestCeremonyRejectsIdentityMismatch(t *testing.T) {
 	c := ceremonyChallenge(challenges, now, "u9")
 
 	// A different user completing the browser ceremony must NOT release u9's held flow.
-	if _, err := eastwest.CompleteCeremony(store, challenges, c.ID, "attacker", now); err == nil {
+	if _, err := eastwest.CompleteCeremony(store, challenges, c.ID, "t1", "attacker", now); err == nil {
 		t.Fatal("identity mismatch must be rejected")
 	}
 	if len(store.EastWestGrantsFor("t1", now)) != 0 {

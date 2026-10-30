@@ -159,7 +159,7 @@ func TestPostgresRetentionHoldRequestAndPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 	mux := http.NewServeMux()
-	registerLogsRetentionRoutes(mux, func(_ string, next http.HandlerFunc) http.HandlerFunc { return next }, nil, nil, nil, h, r)
+	registerLogsRetentionRoutes(mux, func(_ string, next http.HandlerFunc) http.HandlerFunc { return next }, nil, nil, &fakeArchive{objs: map[string][]byte{}}, h, r)
 	for _, op := range []struct {
 		path, body string
 		p          postgresBlobPersister
@@ -209,8 +209,8 @@ func TestPostgresRetentionHoldRequestAndPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 	pruneHotEventsPerStream(context.Background(), hp.db, cfg, now)
-	if count() != 0 {
-		t.Fatal("committed release/clear did not resume pruning")
+	if count() != 2 {
+		t.Fatal("rows were deleted without a configured S3 archive")
 	}
 	freshH, freshR := newLegalHoldStore(hp), newRetentionOverrideStore(rp)
 	if freshH.IsHeld("a") || !freshH.IsHeld("b") {

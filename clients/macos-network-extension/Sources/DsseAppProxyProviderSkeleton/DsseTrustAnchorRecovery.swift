@@ -36,6 +36,12 @@ public enum DsseTrustAnchorRecoveryOutcome: Sendable, Equatable {
 
 public enum DsseTrustAnchorRecovery {
 
+    static func bundleMatchesTenant(_ bundle: DsseVerifiedTrustBundle, expectedTenant: String) -> Bool {
+        let expected = expectedTenant.trimmingCharacters(in: .whitespacesAndNewlines)
+        let offered = bundle.tenantID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !expected.isEmpty && !offered.isEmpty && offered == expected
+    }
+
     /// probeAnchorsValidateEdge answers "do the anchors I hold still validate this Edge?" by FETCHING the chain
     /// the Edge serves and evaluating it locally, anchors-only.
     ///
@@ -243,6 +249,10 @@ public enum DsseTrustAnchorRecovery {
             // can serve this device anything cannot walk it back onto a withdrawn CA.
             return .unrecovered(reason: "trust bundle failed verification (signature, schema, or serial)")
         }
+        if let expected = DsseAdoptedTenantScope.tenantInForce(configDirectory: configDirectory),
+           !bundleMatchesTenant(bundle, expectedTenant: expected) {
+            return .unrecovered(reason: "trust bundle tenant differs from the verified install profile")
+        }
         do {
             let adopted = try DsseAdoptedTrustAnchorStore.install(bundle, configDirectory: configDirectory)
             log("trust_anchor_recovery ADOPTED serial=\(adopted.serial) anchors=\(adopted.fingerprints.count)")
@@ -273,6 +283,11 @@ public enum DsseTrustAnchorRecovery {
                 alsoAccept: DsseAdoptedTrustAnchorStore.acceptedAgentPolicyKeys(configDirectory: configDirectory)) else {
             // Nothing newer on offer is the common case and is silent; a bundle at or below the accepted
             // serial is refused by the same rule that blocks a rollback onto a withdrawn CA.
+            return .anchorsStillValid
+        }
+        if let expected = DsseAdoptedTenantScope.tenantInForce(configDirectory: configDirectory),
+           !bundleMatchesTenant(bundle, expectedTenant: expected) {
+            log("trust_anchor_adoption REFUSED: signed bundle tenant differs from the verified install profile")
             return .anchorsStillValid
         }
         let offered = DsseTransportSecurityFactory.certificates(fromPEM: bundle.anchorsPEM)

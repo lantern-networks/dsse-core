@@ -246,7 +246,7 @@ func (s *Store) checkLocked(id, tenantID string, now time.Time) (Token, error) {
 	if tok.expired(now) {
 		return Token{}, ErrTokenExpired
 	}
-	if t := strings.TrimSpace(tenantID); t != "" && !strings.EqualFold(t, tok.TenantID) {
+	if tenantID != "" && strings.TrimSpace(tenantID) != strings.TrimSpace(tok.TenantID) {
 		// One tenant's token must not enrol a device into another, even on an Edge that serves both.
 		return Token{}, ErrWrongTenant
 	}
@@ -292,9 +292,11 @@ func (s *Store) Revoke(id, revokedBy string, now time.Time) (Token, bool) {
 func (s *Store) List(tenantID string) []Token {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	all := tenantID == ""
+	tenantID = strings.TrimSpace(tenantID)
 	out := make([]Token, 0, len(s.tokens))
 	for _, t := range s.tokens {
-		if tenantID == "" || strings.EqualFold(t.TenantID, tenantID) {
+		if all || (tenantID != "" && strings.TrimSpace(t.TenantID) == tenantID) {
 			out = append(out, t)
 		}
 	}
@@ -318,7 +320,7 @@ func (s *Store) Outstanding(tenantID string, now time.Time) int {
 func (s *Store) outstandingLocked(tenantID string, now time.Time) int {
 	n := 0
 	for _, t := range s.tokens {
-		if strings.EqualFold(t.TenantID, tenantID) && t.Outstanding(now) {
+		if strings.TrimSpace(t.TenantID) == strings.TrimSpace(tenantID) && t.Outstanding(now) {
 			n++
 		}
 	}
@@ -411,7 +413,7 @@ func (s *Store) CountForTenant(tenantID string) int {
 	defer s.mu.Unlock()
 	n := 0
 	for _, t := range s.tokens {
-		if strings.EqualFold(strings.TrimSpace(t.TenantID), tenantID) {
+		if strings.TrimSpace(t.TenantID) == tenantID {
 			n++
 		}
 	}
@@ -431,7 +433,7 @@ func (s *Store) RemoveTenant(tenantID string) int {
 	next := s.copyTokensLocked()
 	n := 0
 	for id, t := range s.tokens {
-		if strings.EqualFold(strings.TrimSpace(t.TenantID), tenantID) {
+		if strings.TrimSpace(t.TenantID) == tenantID {
 			delete(next, id)
 			n++
 		}

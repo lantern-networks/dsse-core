@@ -140,13 +140,13 @@ func TestPostgresPolicyAssetsOldRequestAndReadFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	auth := newAdminAuthStore()
-	auth.UpsertPrincipal(adminPrincipal{ID: "review", TenantID: tenant, Roles: []string{"admin"}, Status: "active"})
-	auth.UpsertSession(adminSession{ID: "shared-session", TenantID: tenant, AdminPrincipalID: "review", Roles: []string{"admin"}, Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), Metadata: map[string]any{adminCSRFTokenKey: "shared-csrf"}})
+	auth.UpsertPrincipal(adminPrincipal{ID: "review", TenantID: tenant, Roles: []string{"admin", "super_admin"}, Status: "active"})
+	auth.UpsertSession(adminSession{ID: "shared-session", TenantID: tenant, AdminPrincipalID: "review", Roles: []string{"admin", "super_admin"}, Status: "active", ExpiresAt: now.Add(time.Hour).Format(time.RFC3339), Metadata: map[string]any{adminCSRFTokenKey: "shared-csrf"}})
 	w, err := logs.NewWriter(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := newServerWithConfig(serverConfig{Writer: w, Evaluator: testEvaluator(), AdminAuth: auth, RuleStore: rules, AssetStore: assets})
+	h := newServerWithConfig(serverConfig{Writer: w, Evaluator: testEvaluator(), AdminAuth: auth, RuleStore: rules, AssetStore: assets, OperatorTenantID: tenant})
 	old := cpLeaderElectorInstance
 	cpLeaderElectorInstance = a
 	defer func() { cpLeaderElectorInstance = old }()

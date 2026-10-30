@@ -75,6 +75,320 @@ func TestPostgresExportTaskQueueWorkerE2E(t *testing.T) {
 	}
 }
 
+func TestPostgresExportTaskRetryableFailureRetriesAndCompletesE2E(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resetPostgresExportTaskQueueTables(t, ctx, db)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		resetPostgresExportTaskQueueTables(t, cleanupCtx, db)
+		_ = db.Close()
+	})
+	applyPostgresExportTaskQueueMigration(t, ctx, db)
+
+	adapter, document, _ := newPostgresExportTaskQueueAdapterFixture(t)
+	adapter.DB = postgresExportTaskSQLDB{DB: db}
+	jobStore := attachPostgresAdminExportJobStoreToAdapter(t, ctx, db, &adapter, document)
+	if err := adapter.Enqueue(ctx, adminExportQueuedTask{Document: document}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.Resolver.HotStore = delayedPostgresQueueHotStore{delay: 50 * time.Millisecond}
+	worker := postgresQueuedAdminExportWorker{Queue: adapter, Timeout: 5 * time.Millisecond}
+	now := time.Now().UTC()
+	processed, err := worker.runOne(ctx, now)
+	if err != nil || !processed {
+		t.Fatalf("first runOne processed=%t err=%v", processed, err)
+	}
+	job, ok := jobStore.Get(document.ExportJobID)
+	if !ok || job.Status != "queued" || job.CompletedAt != nil || job.ErrorCode != nil {
+		t.Fatalf("retryable failure left job=%#v ok=%t, want queued", job, ok)
+	}
+	var status string
+	var attempt int
+	var retryNotBefore time.Time
+	if err := db.QueryRowContext(ctx, "SELECT status, attempt, retry_not_before FROM export_worker_tasks WHERE tenant_id=$1 AND task_id=$2", document.TenantID, document.ID).Scan(&status, &attempt, &retryNotBefore); err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" || attempt != 1 {
+		t.Fatalf("retry task status=%q attempt=%d, want queued/1", status, attempt)
+	}
+	if !retryNotBefore.After(now.Add(30 * time.Second)) {
+		t.Fatalf("retry_not_before=%s must be after failure completion plus 30s backoff, not claim time", retryNotBefore)
+	}
+	worker.Queue.Resolver.HotStore = hotstore.NewJSONLStore(worker.Queue.Resolver.Writer, adminLogStreamFilenameMap())
+	worker.Timeout = 5 * time.Second
+	processed, err = worker.runOne(ctx, now.Add(31*time.Second))
+	if err != nil || !processed {
+		t.Fatalf("retry runOne processed=%t err=%v", processed, err)
+	}
+	job, ok = jobStore.Get(document.ExportJobID)
+	if !ok || job.Status != "completed" || job.ObjectRef == nil {
+		t.Fatalf("successful retry left job=%#v ok=%t, want completed", job, ok)
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 0 {
+		t.Fatalf("active retry task count=%d, want 0", count)
+	}
+}
+
+func TestPostgresExportTaskAuditFailureTerminalizesBeforeAckE2E(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resetPostgresExportTaskQueueTables(t, ctx, db)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		resetPostgresExportTaskQueueTables(t, cleanupCtx, db)
+		_ = db.Close()
+	})
+	applyPostgresExportTaskQueueMigration(t, ctx, db)
+
+	adapter, document, _ := newPostgresExportTaskQueueAdapterFixture(t)
+	adapter.DB = postgresExportTaskSQLDB{DB: db}
+	jobStore := attachPostgresAdminExportJobStoreToAdapter(t, ctx, db, &adapter, document)
+	if err := adapter.Enqueue(ctx, adminExportQueuedTask{Document: document}); err != nil {
+		t.Fatal(err)
+	}
+	adapter.Resolver.Writer.SetAppendHook(func(filename string, _ []byte) error {
+		if filename == "audit.log.jsonl" {
+			return fmt.Errorf("injected audit delivery failure")
+		}
+		return nil
+	})
+	worker := postgresQueuedAdminExportWorker{Queue: adapter, Timeout: 5 * time.Second}
+	processed, err := worker.runOne(ctx, time.Now().UTC())
+	if err != nil || !processed {
+		t.Fatalf("runOne processed=%t err=%v", processed, err)
+	}
+	job, ok := jobStore.Get(document.ExportJobID)
+	if !ok || job.Status != "failed" || job.ErrorCode == nil || *job.ErrorCode != "write_failed" {
+		t.Fatalf("audit failure left job=%#v ok=%t, want failed/write_failed", job, ok)
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 0 {
+		t.Fatalf("audit failure left active task count=%d, want 0", count)
+	}
+}
+
+func TestPostgresExportTaskDeadLetterFencesReclaimedWorkerAndJobE2E(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resetPostgresExportTaskQueueTables(t, ctx, db)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		resetPostgresExportTaskQueueTables(t, cleanupCtx, db)
+		_ = db.Close()
+	})
+	applyPostgresExportTaskQueueMigration(t, ctx, db)
+
+	adapter, document, _ := newPostgresExportTaskQueueAdapterFixture(t)
+	adapter.DB = postgresExportTaskSQLDB{DB: db}
+	document.MaxAttempts = 1
+	jobStore := attachPostgresAdminExportJobStoreToAdapter(t, ctx, db, &adapter, document)
+	if err := adapter.Enqueue(ctx, adminExportQueuedTask{Document: document}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	first, ok, err := adapter.Lease(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("first lease ok=%t err=%v", ok, err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE export_worker_tasks SET lease_expires_at=$1 WHERE tenant_id=$2 AND task_id=$3", now.Add(-time.Second), document.TenantID, document.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := adapter.Lease(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("reclaimed lease ok=%t err=%v", ok, err)
+	}
+	oldStore, newStore := jobStore, jobStore
+	for _, store := range []*postgresAdminExportJobStore{&oldStore, &newStore} {
+		store.LeaseTenantID = document.TenantID
+		store.LeaseTaskID = document.ID
+	}
+	oldStore.LeaseToken, newStore.LeaseToken = first.LeaseToken, second.LeaseToken
+	if _, _, err := oldStore.DeadLetterTask(ctx, document.ID, document.ExportJobID, first.Document.Attempt, document.MaxAttempts, now, "max_attempts_exhausted", adapter.Resolver.Evaluator, "127.0.0.1"); err == nil {
+		t.Fatal("stale worker moved a reclaimed task to dead letter")
+	}
+	job, ok := jobStore.Get(document.ExportJobID)
+	if !ok || job.Status != "queued" {
+		t.Fatalf("stale worker changed job=%#v ok=%t", job, ok)
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 1 {
+		t.Fatalf("stale dead letter removed active task count=%d", count)
+	}
+	second.Task.Store = newStore
+	adapter.Resolver.Writer.SetAppendHook(func(filename string, _ []byte) error {
+		if filename == "audit.log.jsonl" {
+			return fmt.Errorf("injected local audit failure after durable commit")
+		}
+		return nil
+	})
+	newQueue := adapter
+	newQueue.WorkerID = second.LeaseToken
+	worker := postgresQueuedAdminExportWorker{Queue: adapter}
+	if err := worker.deadLetterClaimed(ctx, newQueue, second, now, "max_attempts_exhausted"); err != nil {
+		t.Fatalf("new owner dead letter with failed local audit: %v", err)
+	}
+	job, ok = jobStore.Get(document.ExportJobID)
+	if !ok || job.Status != "failed" {
+		t.Fatalf("new owner dead letter job=%#v ok=%t", job, ok)
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsDeadLetterTable); count != 1 {
+		t.Fatalf("dead letters=%d, want 1", count)
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 0 {
+		t.Fatalf("active tasks=%d, want 0", count)
+	}
+	var auditCount int
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM admin_audit_outbox WHERE tenant_id=$1 AND event_type='admin_export_failed'", document.TenantID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 {
+		t.Fatalf("durable dead-letter audit rows=%d, want 1 despite local write failure", auditCount)
+	}
+}
+
+func TestPostgresExportTaskExpiredLeaseReclaimFencesOldWorkerAndArtifactE2E(t *testing.T) {
+	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
+	if dsn == "" {
+		t.Skip("POSTGRES_QUEUE_E2E_DSN is not set")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	resetPostgresExportTaskQueueTables(t, ctx, db)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		resetPostgresExportTaskQueueTables(t, cleanupCtx, db)
+		_ = db.Close()
+	})
+	applyPostgresExportTaskQueueMigration(t, ctx, db)
+
+	adapter, document, _ := newPostgresExportTaskQueueAdapterFixture(t)
+	adapter.DB = postgresExportTaskSQLDB{DB: db}
+	jobStore := attachPostgresAdminExportJobStoreToAdapter(t, ctx, db, &adapter, document)
+	if err := adapter.Enqueue(ctx, adminExportQueuedTask{Document: document}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	first, ok, err := adapter.Lease(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("first lease ok=%t err=%v", ok, err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE export_worker_tasks SET lease_expires_at = $1 WHERE tenant_id = $2 AND task_id = $3", now.Add(-time.Second), document.TenantID, document.ID); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := adapter.Lease(ctx, now)
+	if err != nil || !ok {
+		t.Fatalf("reclaimed lease ok=%t err=%v", ok, err)
+	}
+	if first.LeaseToken == second.LeaseToken || second.Document.Attempt != first.Document.Attempt+1 {
+		t.Fatalf("reclaim reused lease or did not count attempt: first=%d second=%d", first.Document.Attempt, second.Document.Attempt)
+	}
+	oldQueue, newQueue := adapter, adapter
+	oldQueue.WorkerID, newQueue.WorkerID = first.LeaseToken, second.LeaseToken
+	if err := oldQueue.Complete(ctx, document.ID); err == nil {
+		t.Fatal("stale worker deleted the reclaimed queue row")
+	}
+	if count := countPostgresExportTaskRows(t, ctx, db, postgresExportTaskRowsActiveTable); count != 1 {
+		t.Fatalf("active queue rows=%d, want 1", count)
+	}
+	oldJobStore, newJobStore := jobStore, jobStore
+	oldJobStore.LeaseTenantID, newJobStore.LeaseTenantID = document.TenantID, document.TenantID
+	oldJobStore.LeaseTaskID, newJobStore.LeaseTaskID = document.ID, document.ID
+	oldJobStore.LeaseToken, newJobStore.LeaseToken = first.LeaseToken, second.LeaseToken
+	if _, err := oldJobStore.MarkRunning(document.ExportJobID, now); err == nil {
+		t.Fatal("stale worker changed the export job")
+	}
+	job, err := newJobStore.MarkRunning(document.ExportJobID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRef, err := adminExportObjectRefForRuntime(job, oldJobStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRef, err := adminExportObjectRefForRuntime(job, newJobStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldFile, err := adminExportLocalFilenameForRuntime(job, oldJobStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newFile, err := adminExportLocalFilenameForRuntime(job, newJobStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldRef == newRef || oldFile == newFile {
+		t.Fatal("two attempts share an artifact destination")
+	}
+	if _, err := adapter.Resolver.ObjectStore.WriteGzipJSONL(newFile, []map[string]any{{"attempt": "new"}}); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := newJobStore.MarkCompleted(job.ID, 1, 1, false, newRef, "sha256:new", nil, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := adapter.Resolver.ObjectStore.WriteGzipJSONL(oldFile, []map[string]any{{"attempt": "old"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldJobStore.MarkCompleted(job.ID, 1, 1, false, oldRef, "sha256:old", nil, now); err == nil {
+		t.Fatal("stale worker replaced completed export pointer")
+	}
+	readback, ok := jobStore.Get(job.ID)
+	if !ok || readback.ObjectRef == nil || *readback.ObjectRef != newRef || readback.PayloadChecksum == nil || *readback.PayloadChecksum != "sha256:new" {
+		t.Fatalf("completed pointer changed after stale write: %#v", readback)
+	}
+	selected, err := adminExportCompletedLocalFilename(completed)
+	if err != nil || selected != newFile {
+		t.Fatalf("download selected %q, err=%v; want %q", selected, err, newFile)
+	}
+	if err := newQueue.Complete(ctx, document.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPostgresExportTaskQueueWorkerExtendsLeaseE2E(t *testing.T) {
 	dsn := os.Getenv("POSTGRES_QUEUE_E2E_DSN")
 	if dsn == "" {
@@ -1329,6 +1643,7 @@ func resetPostgresExportTaskQueueTables(t *testing.T, ctx context.Context, db *s
 		"DROP TABLE IF EXISTS admin_sessions",
 		"DROP TABLE IF EXISTS admin_principals",
 		"DROP TABLE IF EXISTS connector_registrations",
+		"DROP TABLE IF EXISTS connector_registry_generation",
 		"DROP TABLE IF EXISTS human_identity_source_policies",
 		"DROP TABLE IF EXISTS human_identity_source_states",
 		"DROP TABLE IF EXISTS human_identities",

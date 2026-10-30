@@ -552,23 +552,27 @@ func registerOrganizationSetupRoute(mux *http.ServeMux, adminEndpoint func(strin
 // organizationSetupTenant reads the registered row, and says whether there was one.
 //
 // The runtime read SYNTHESISES a row for an unknown id, so existence is only answerable against the list —
-// the same trap the invite path and the operator delegation both had to work around.
+// the same trap the invite path and the operator delegation both had to work around. Both production stores
+// implement the admin list contract. A failed list or a Get-only store cannot establish existence.
 func organizationSetupTenant(ctx context.Context, store adminTenantModelRuntimeStore, tenantID string) (adminTenantModel, bool) {
-	if admin, ok := store.(adminTenantModelAdminStore); ok {
-		if tenants, err := admin.List(ctx); err == nil {
-			for _, tenant := range tenants {
-				if strings.EqualFold(strings.TrimSpace(tenant.TenantID), tenantID) {
-					return tenant, true
-				}
-			}
-			return adminTenantModel{TenantID: tenantID}, false
-		}
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return adminTenantModel{}, false
 	}
-	tenant, err := store.Get(ctx, tenantID)
+	admin, ok := store.(adminTenantModelAdminStore)
+	if !ok {
+		return adminTenantModel{TenantID: tenantID}, false
+	}
+	tenants, err := admin.List(ctx)
 	if err != nil {
 		return adminTenantModel{TenantID: tenantID}, false
 	}
-	return tenant, strings.TrimSpace(tenant.TenantID) != ""
+	for _, tenant := range tenants {
+		if tenant.TenantID == tenantID {
+			return tenant, true
+		}
+	}
+	return adminTenantModel{TenantID: tenantID}, false
 }
 
 // policyCountForThisNode is how many rules this node enforces for the organization that asked — or nil when

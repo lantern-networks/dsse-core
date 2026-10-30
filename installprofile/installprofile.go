@@ -240,6 +240,14 @@ type DeploymentSpec struct {
 	SteerExclusions []string `json:"steer_exclusions,omitempty"`
 	// PassthroughDomains are names left uninspected, authored the same way.
 	PassthroughDomains []string `json:"passthrough_domains,omitempty"`
+	// ExactHTTPSPassthroughEndpoints are explicitly authored dedicated IdP endpoints. The macOS
+	// Network Extension passes through only TCP/443 when the original hostname and the dialed
+	// numeric address both match; this is never a domain-wide bypass. The field is always
+	// emitted by new profiles, including as [], so removing a rule cannot leave an old local
+	// bypass effective after the profile is reinstalled.
+	ExactHTTPSPassthroughEndpoints []ExactHTTPSPassthroughEndpoint `json:"exact_https_passthrough_endpoints"`
+	// Exact HTTPS origins allowed to launch user authentication; not traffic bypass rules.
+	StepUpPortalOrigins []string `json:"step_up_portal_origins,omitempty"`
 }
 
 // OrganizationSpec carries the names this organization's agents put in a ClientHello, stated at INSTALL time.

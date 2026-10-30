@@ -140,8 +140,8 @@ type DLPSpec struct {
 	MinCount    int      `json:"min_count,omitempty"`
 	OnMatch     string   `json:"on_match"` // observe | block | authenticate
 	// InstanceScope binds the action to the destination instance class (the sovereign "here not there"): "" / "any"
-	// everywhere, "corporate" only to the tenant's verified corporate instance, "personal" only to a confirmed
-	// non-corporate account. See DLPRule.InstanceScope.
+	// everywhere, "corporate" to corporate or unknown accounts, "personal" to non-corporate or unknown accounts.
+	// Request identity hints cannot exempt a flow. See DLPRule.InstanceScope.
 	InstanceScope string `json:"instance_scope,omitempty"`
 	// PolicyID references a reusable named DLP Policy object (see DLPPolicyObject). When set, the egress rule
 	// inherits that policy's detectors + action + instance scope + device-risk conditions; the inline fields
@@ -158,7 +158,7 @@ type DLPDeviceRiskCondition struct {
 	MinDistinctTypes int    `json:"min_distinct_types"`          // at least K distinct confidential-data types (strongest FP filter)
 	SameDestination  bool   `json:"same_destination"`            // all detections to ONE destination (single-place exfil)
 	WindowSeconds    int    `json:"window_seconds"`              // the sliding window (burst detection)
-	DestinationClass string `json:"destination_class,omitempty"` // "" / "any" | "personal" (only count personal/outside-org)
+	DestinationClass string `json:"destination_class,omitempty"` // "" / "any" | "personal" (personal/outside-org or unknown)
 	Severity         string `json:"severity"`                    // risk severity to set (e.g. "high")
 }
 
@@ -194,10 +194,9 @@ type DLPRule struct {
 	MinCount          int      `json:"min_count,omitempty"`
 	OnMatch           string   `json:"on_match"` // observe | block | authenticate
 	// InstanceScope binds the rule to the destination INSTANCE class (the sovereign "here not there"): "" / "any"
-	// applies everywhere (default), "corporate" applies only when the signed-in account is one of the tenant's
-	// verified corporate domains, "personal" applies only when it is confidently NOT (a non-corporate account).
-	// The class is derived from the account the substrate already extracts; when it can't be determined a scoped
-	// rule does not fire (never over-blocks an unclassifiable destination).
+	// applies everywhere (default). Corporate/personal scopes both include unknown accounts. Excluding a flow
+	// requires independently verified, destination-bound account evidence. The current SWG has only unverified
+	// request hints, so the instance is unknown and both scopes apply to matched destinations.
 	InstanceScope string         `json:"instance_scope,omitempty"`
 	Status        string         `json:"status"`
 	Metadata      map[string]any `json:"metadata,omitempty"`
@@ -751,6 +750,11 @@ type DecisionRequest struct {
 	ApplicationID          string `json:"application_id"`
 	ApplicationSensitivity string `json:"application_sensitivity"`
 	ConnectorID            string `json:"connector_id"`
+	// ConnectorRouteVerified is set only by the Edge after selecting a live, governed
+	// Connector route. It is intentionally absent from JSON: a client must not be
+	// able to move its request from Internet Access to Connector Access by claiming
+	// a Connector ID.
+	ConnectorRouteVerified bool   `json:"-"`
 	SourceIP               string `json:"source_ip"`
 	SourcePort             int    `json:"source_port"`
 	Destination            string `json:"destination"`

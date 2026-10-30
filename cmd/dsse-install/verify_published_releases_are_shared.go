@@ -74,12 +74,6 @@ func verifyPublishedReleasesAreShared(client *http.Client, cpAdmins []string, to
 	}
 
 	first := seen[doors[0]]
-	if len(first) == 0 {
-		add(true, "nothing has been published to this deployment yet, and no control plane claims otherwise — "+
-			"there is nothing here to be inconsistent about. This becomes a real comparison the moment a "+
-			"release is published")
-		return out
-	}
 	for _, door := range doors[1:] {
 		if strings.Join(seen[door], ",") != strings.Join(first, ",") {
 			add(false, "%s offers %d release(s) and %s offers %d — an edge polls the front door, so it is told "+
@@ -88,6 +82,12 @@ func verifyPublishedReleasesAreShared(client *http.Client, cpAdmins []string, to
 				doors[0], len(first), door, len(seen[door]))
 			return out
 		}
+	}
+	if len(first) == 0 {
+		add(true, "nothing has been published to this deployment yet, and no control plane claims otherwise — "+
+			"there is nothing here to be inconsistent about. This becomes a real comparison the moment a "+
+			"release is published")
+		return out
 	}
 	add(true, "%d control plane(s) offer the same %d release(s), by digest — whichever one the front door picks, "+
 		"a device is told the same thing", len(doors), len(first))

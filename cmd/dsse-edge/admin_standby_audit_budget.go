@@ -32,6 +32,7 @@ type adminStandbyAudit struct {
 
 type adminStandbyAuditBucket struct {
 	permission        string
+	reason            string
 	count             uint64
 	first, last, next time.Time
 }
@@ -43,14 +44,22 @@ func newAdminStandbyAudit(writer *logs.Writer, evaluator decision.Evaluator) *ad
 // Called while registering routes, not when processing untrusted input. Repeated
 // routes with the same permission share the same counter and write budget.
 func (a *adminStandbyAudit) forPermission(permission string) func() {
+	return a.forReason(permission, "not_leader")
+}
+
+func (a *adminStandbyAudit) forReason(permission, reason string) func() {
 	if !adminPermissionWrites(permission) {
 		return func() {}
 	}
 	a.mu.Lock()
-	b := a.buckets[permission]
+	key := permission
+	if reason != "not_leader" {
+		key += "|" + reason
+	}
+	b := a.buckets[key]
 	if b == nil {
-		b = &adminStandbyAuditBucket{permission: permission}
-		a.buckets[permission] = b
+		b = &adminStandbyAuditBucket{permission: permission, reason: reason}
+		a.buckets[key] = b
 	}
 	a.mu.Unlock()
 	return func() {
@@ -76,7 +85,7 @@ func (a *adminStandbyAudit) emit(b *adminStandbyAuditBucket, now time.Time) {
 	if b.count == 0 {
 		return
 	}
-	recordAdminStandbyRefusal(a.writer, a.evaluator, b.permission, now, b.first, b.last, b.count)
+	recordAdminStandbyRefusal(a.writer, a.evaluator, b.permission, now, b.first, b.last, b.count, b.reason)
 	b.count = 0
 	b.next = now.Add(adminStandbyAuditInterval)
 }

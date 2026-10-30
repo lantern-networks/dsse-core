@@ -42,9 +42,13 @@ func agentProfileMuxWithTransportAuthority(t *testing.T, signed bool, regions []
 	}
 	t.Cleanup(func() { _ = writer.Close() })
 	mux := http.NewServeMux()
+	var resolveRegions func(string) []regionEndpoint
+	if regions != nil {
+		resolveRegions = func(string) []regionEndpoint { return regions }
+	}
 	registerAgentProfileRoutes(mux, func(_ string, h http.HandlerFunc) http.HandlerFunc { return h },
 		config, decision.Evaluator{}, writer, nil, "https://agents.example.test",
-		func(string) []regionEndpoint { return regions })
+		resolveRegions)
 	return mux
 }
 
@@ -128,6 +132,27 @@ func TestTheProfileCarriesEveryRegionTheDeploymentPublishes(t *testing.T) {
 	if payload.TransportURL != "https://agents.example.test" {
 		t.Fatalf("transport_url %q is not a dialable address; an older agent dials this one verbatim",
 			payload.TransportURL)
+	}
+}
+
+func TestSignedProfileCarriesEveryDoorInOneRegion(t *testing.T) {
+	mux := agentProfileMux(t, true, []regionEndpoint{
+		{Region: "kiri", Endpoint: "https://agents.node-a.example.test"},
+		{Region: "kiri", Endpoint: "https://agents.node-b.example.test"},
+		{Region: "kiri", Endpoint: "https://agents.node-c.example.test"},
+	})
+	code, body := issueProfile(t, mux, "tenant_acme", `{}`)
+	if code != http.StatusOK {
+		t.Fatalf("issue: %d %+v", code, body)
+	}
+	profile := decodeProfilePayload(t, body)
+	want := []string{
+		"kiri=https://agents.node-a.example.test",
+		"kiri=https://agents.node-b.example.test",
+		"kiri=https://agents.node-c.example.test",
+	}
+	if strings.Join(profile.TransportEndpoints, ",") != strings.Join(want, ",") {
+		t.Fatalf("signed transport endpoints=%v, want %v", profile.TransportEndpoints, want)
 	}
 }
 

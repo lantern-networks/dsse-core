@@ -30,7 +30,7 @@ type EgressResolver interface {
 func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver) []model.Policy {
 	var out []model.Policy
 	for _, r := range rules {
-		if r.Plane != PlaneEgress || r.Status != StatusActive {
+		if (r.TenantID != "" && r.TenantID != tenant) || r.Plane != PlaneEgress || r.Status != StatusActive {
 			continue
 		}
 		var dec string
@@ -54,8 +54,11 @@ func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver)
 			if len(r.Action.RequiredAMR) > 0 {
 				stepUpMeta["required_amr"] = strings.Join(r.Action.RequiredAMR, ",")
 			}
-			if r.Action.MaxAgeSeconds > 0 {
-				stepUpMeta["max_age_seconds"] = r.Action.MaxAgeSeconds
+			if r.Action.GrantTTLSeconds > 0 {
+				stepUpMeta["grant_ttl_seconds"] = r.Action.GrantTTLSeconds
+			}
+			if r.Action.MaxAgeSeconds != nil {
+				stepUpMeta["max_age_seconds"] = *r.Action.MaxAgeSeconds
 			}
 		default:
 			continue
@@ -153,16 +156,17 @@ func CompileEgressPolicies(tenant string, rules []Rule, resolver EgressResolver)
 						suffix += "-" + transport["protocol"].(string)
 					}
 					out = append(out, model.Policy{
-						ID:             "rule-egress-" + r.ID + suffix,
-						TenantID:       tenant,
-						Name:           "Authored egress rule " + r.ID,
-						Priority:       r.Priority,
-						Status:         "active",
-						Conditions:     conditions,
-						Action:         model.PolicyAction{Decision: dec},
-						DLP:            r.Action.DLP,     // Access × Inspection × DLP — carry the rule's DLP onto the policy
-						AllowedToolIDs: r.AllowedToolIDs, // agent rule (Who = nhi:) ⇒ the agentic tool boundary
-						Metadata:       stepUpMeta,
+						ID:                          "rule-egress-" + r.ID + suffix,
+						TenantID:                    tenant,
+						Name:                        "Authored egress rule " + r.ID,
+						Priority:                    r.Priority,
+						Status:                      "active",
+						Conditions:                  conditions,
+						Action:                      model.PolicyAction{Decision: dec},
+						DLP:                         r.Action.DLP,     // Access × Inspection × DLP — carry the rule's DLP onto the policy
+						AllowedToolIDs:              r.AllowedToolIDs, // agent rule (Who = nhi:) ⇒ the agentic tool boundary
+						RequiredWorkloadAttestation: r.Action.RequireWorkloadAttestation,
+						Metadata:                    stepUpMeta,
 					})
 				}
 			}

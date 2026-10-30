@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -55,12 +57,77 @@ func artifactServer(t *testing.T, version string, body []byte, hits *int64) *htt
 			w.Header().Set(agentupdate.ArtifactVersionHeader, version)
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
+		sum := sha256.Sum256(body)
+		w.Header().Set(agentupdate.ArtifactSHA256Header, hex.EncodeToString(sum[:]))
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+func TestArtifactCourierReplacesSameSizeStalePackage(t *testing.T) {
+	var hits int64
+	fresh := []byte("FRESH-MSI")
+	srv := artifactServer(t, "0.2.1", fresh, &hits)
+	c, rec := newArtifactRec(t, srv.URL)
+	dst := filepath.Join(rec.dir, "dsse-agent-0.2.1.msi")
+	if err := os.WriteFile(dst, []byte("STALE-MSI"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.refreshOnce(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != string(fresh) {
+		t.Fatalf("stale same-size package was kept: %q, %v", got, err)
+	}
+}
+
+func TestArtifactCourierMissingOrInvalidDigestKeepsPriorPackage(t *testing.T) {
+	for _, header := range []string{"", strings.Repeat("z", 64)} {
+		t.Run(header, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set(agentupdate.ArtifactVersionHeader, "0.2.1")
+				if header != "" {
+					w.Header().Set(agentupdate.ArtifactSHA256Header, header)
+				}
+				_, _ = w.Write([]byte("FRESH-MSI"))
+			}))
+			defer srv.Close()
+			c, rec := newArtifactRec(t, srv.URL)
+			dst := filepath.Join(rec.dir, "dsse-agent-0.2.1.msi")
+			if err := os.WriteFile(dst, []byte("PRIOR-MSI"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.refreshOnce(context.Background()); err == nil {
+				t.Fatal("missing or invalid digest was accepted")
+			}
+			if got, _ := os.ReadFile(dst); string(got) != "PRIOR-MSI" {
+				t.Fatalf("prior package changed: %q", got)
+			}
+		})
+	}
+}
+
+func TestArtifactCourierBodyDigestMismatchKeepsPriorPackage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(agentupdate.ArtifactVersionHeader, "0.2.1")
+		w.Header().Set(agentupdate.ArtifactSHA256Header, strings.Repeat("0", 64))
+		_, _ = w.Write([]byte("FRESH-MSI"))
+	}))
+	defer srv.Close()
+	c, rec := newArtifactRec(t, srv.URL)
+	dst := filepath.Join(rec.dir, "dsse-agent-0.2.1.msi")
+	if err := os.WriteFile(dst, []byte("PRIOR-MSI"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.refreshOnce(context.Background()); err == nil {
+		t.Fatal("digest mismatch was accepted")
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "PRIOR-MSI" {
+		t.Fatalf("prior package changed: %q", got)
+	}
 }
 
 func TestArtifactCourierStagesUnderTheNameTheUpdaterLooksFor(t *testing.T) {
@@ -215,6 +282,8 @@ func TestArtifactCourierRefusesAVersionThatWouldEscapeTheStagingDirectory(t *tes
 func TestArtifactCourierRefusesATruncatedBodyAndKeepsWhatIsStaged(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(agentupdate.ArtifactVersionHeader, "0.2.1")
+		sum := sha256.Sum256([]byte("short"))
+		w.Header().Set(agentupdate.ArtifactSHA256Header, hex.EncodeToString(sum[:]))
 		w.Header().Set("Content-Length", "500")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("short"))

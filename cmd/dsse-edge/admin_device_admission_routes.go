@@ -597,6 +597,7 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			// rather than as a wrong version.
 			log.Printf("admin enrolled-devices: agent version/last-seen join unavailable (%v); those columns will be blank", err)
 		}
+		fleetVersions := fleetAgentVersionsByIdentity(fleetDeviceProjectionStore, callerTenant)
 		out := make([]enrolledDeviceDTO, 0, len(entries))
 		// unassigned is what this answer WITHHELD because it belongs to no tenant. Counted rather than dropped:
 		// withholding without saying so is a device that vanished, and a fleet nobody can act on is exactly the
@@ -621,14 +622,25 @@ func registerDeviceAdmissionRoutes(mux *http.ServeMux, adminEndpoint func(string
 			if !deviceGroupVisibleToTenant(e.TenantID, callerTenant) {
 				continue
 			}
-			eff := enrichDecisionRequestWithRisk(
+			effective, riskErr := enrichDecisionRequestWithRiskChecked(
 				model.DecisionRequest{DeviceID: e.Identity, TenantID: e.TenantID},
 				deviceStore, config.HighRiskOverlay, config.EnrolledLedger,
-			).RiskStateSeverity
-			dto := enrolledDeviceDTO{Entry: e, EffectiveRisk: eff}
-			if d, ok := runtimeByID[enrolledinventory.NormalizeIdentity(e.Identity)]; ok {
+			)
+			if riskErr != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("device risk inventory unavailable"))
+				return
+			}
+			dto := enrolledDeviceDTO{Entry: e, EffectiveRisk: effective.RiskStateSeverity}
+			if d, ok := runtimeByID[enrolledinventory.NormalizeIdentity(e.Identity)]; ok &&
+				(e.DeviceEnrolledAt == "" || newerVersionReport(d.LastSeenAt, e.DeviceEnrolledAt)) {
 				dto.AgentVersion = d.AgentVersion
 				dto.LastSeenAt = d.LastSeenAt
+			}
+			if report, ok := fleetVersions[enrolledinventory.NormalizeIdentity(e.Identity)]; ok &&
+				(e.DeviceEnrolledAt == "" || newerVersionReport(report.ReportedAt, e.DeviceEnrolledAt)) &&
+				(dto.AgentVersion == "" || newerVersionReport(report.ReportedAt, dto.LastSeenAt)) {
+				dto.AgentVersion = report.Version
+				dto.LastSeenAt = report.ReportedAt
 			}
 			out = append(out, dto)
 		}

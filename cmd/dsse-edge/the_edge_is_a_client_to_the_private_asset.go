@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/edgeplane"
 	"github.com/lantern-networks/dsse-core/internalca"
 )
 
@@ -42,48 +43,71 @@ type organizationInternalCAPool interface {
 // deletion. Material identity also separates stores whose local revision counters happen to match.
 var perOrganizationUpstreamTransports sync.Map
 
-// upstreamTransportTrustingTheOrganizationsPrivateAssets returns base unchanged when the organization vouches
-// for nothing, which is the whole public web and must stay on the platform's own verification.
+type unavailableTenantConnectorTransport struct{}
+
+func (unavailableTenantConnectorTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, fmt.Errorf("tenant-specific connector transport is unavailable")
+}
+
+// upstreamTransportTrustingTheOrganizationsPrivateAssets isolates connections by
+// tenant even when no private CA is configured. The same host can name different
+// applications behind different tenant Connectors; a pooled connection bypasses
+// DialContext, so a request context alone cannot isolate those routes.
+// Without authored anchors, the base TLS verification policy is unchanged.
 func upstreamTransportTrustingTheOrganizationsPrivateAssets(base http.RoundTripper, anchors organizationInternalCAPool, tenantID string, now time.Time) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	if anchors == nil || tenantID == "" {
+	if tenantID == "" {
 		return base
 	}
-	pem := anchors.AnchorsPEM(tenantID, now)
-	if len(pem) == 0 {
-		return base
+	var pem []string
+	if anchors != nil {
+		pem = anchors.AnchorsPEM(tenantID, now)
 	}
 	cacheKey := fmt.Sprintf("%p|%s|%x", base, tenantID, sha256.Sum256([]byte(strings.Join(pem, "\x00"))))
 	if cached, ok := perOrganizationUpstreamTransports.Load(cacheKey); ok {
 		return cached.(http.RoundTripper)
 	}
 	transport, ok := base.(*http.Transport)
+	scope, scoped := base.(edgeplane.TenantConnectorTransport)
+	if scoped {
+		transport, ok = scope.ConnectorTransport().(*http.Transport)
+	}
 	if !ok {
+		if scoped {
+			// Keep the public broker path usable, but do not share an opaque connector pool across tenants.
+			return scope.WithTenantConnectorTransport(tenantID, unavailableTenantConnectorTransport{})
+		}
 		// Nothing to widen: a transport we did not build owns its own verification. Say nothing and change
 		// nothing rather than silently falling back to a pool that trusts less.
 		return base
 	}
-	// ★ SYSTEM ROOTS FIRST, THEN THE ORGANIZATION'S. An x509.CertPool handed to crypto/tls REPLACES the
-	// platform's roots; building from the organization's anchors alone would make every public origin fail to
-	// verify for every device in that organization — an outage shaped like a certificate problem on the
-	// internet rather than a change we made here.
-	merged, err := x509.SystemCertPool()
-	if err != nil || merged == nil {
-		merged = x509.NewCertPool()
-	}
-	for _, anchor := range pem {
-		merged.AppendCertsFromPEM([]byte(anchor))
-	}
 	widened := transport.Clone()
-	if widened.TLSClientConfig == nil {
-		widened.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-	} else {
-		widened.TLSClientConfig = widened.TLSClientConfig.Clone()
+	if len(pem) > 0 {
+		// Preserve an explicitly configured root pool; otherwise start with the
+		// operating system roots. Add only this tenant's authored authorities.
+		var merged *x509.CertPool
+		if widened.TLSClientConfig != nil && widened.TLSClientConfig.RootCAs != nil {
+			merged = widened.TLSClientConfig.RootCAs.Clone()
+		} else {
+			merged, _ = x509.SystemCertPool()
+			if merged == nil {
+				merged = x509.NewCertPool()
+			}
+		}
+		for _, anchor := range pem {
+			merged.AppendCertsFromPEM([]byte(anchor))
+		}
+		if widened.TLSClientConfig == nil {
+			widened.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		widened.TLSClientConfig.RootCAs = merged
 	}
-	widened.TLSClientConfig.RootCAs = merged
 	var result http.RoundTripper = widened
+	if scoped {
+		result = scope.WithTenantConnectorTransport(tenantID, widened)
+	}
 	actual, _ := perOrganizationUpstreamTransports.LoadOrStore(cacheKey, result)
 	return actual.(http.RoundTripper)
 }

@@ -1,0 +1,70 @@
+diff --git a/postgres-appliance/Dockerfile b/postgres-appliance/Dockerfile
+index 6608483..bda95cf 100644
+--- a/postgres-appliance/Dockerfile
++++ b/postgres-appliance/Dockerfile
+@@ -1 +1 @@
+-ARG BASE_IMAGE=ubuntu:22.04
++ARG BASE_IMAGE=ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
+@@ -8,9 +7,0 @@ ARG ADDITIONAL_LOCALES=
+-FROM ubuntu:18.04 as ubuntu-18
+-
+-ARG ADDITIONAL_LOCALES
+-
+-COPY build_scripts/locales.sh /builddeps/
+-
+-RUN bash /builddeps/locales.sh
+-
+-
+@@ -21 +11,0 @@ ARG DEMO
+-ENV WALG_VERSION=v3.0.8
+@@ -39,2 +28,0 @@ RUN bash /builddeps/prepare.sh
+-COPY --from=ubuntu-18 /usr/lib/locale/locale-archive /usr/lib/locale/locale-archive.18
+-
+@@ -67 +55 @@ RUN bash base.sh
+-COPY --from=dependencies-builder /builddeps/wal-g /usr/local/bin/
++COPY --from=dsse_walg /wal-g /usr/local/bin/wal-g
+@@ -72 +60 @@ COPY build_scripts/patroni.sh build_scripts/compress_build.sh /builddeps/
+-ENV PATRONIVERSION=4.1.0
++ENV PATRONIVERSION=4.1.5
+@@ -120,0 +109,2 @@ COPY launch.sh /
++# COPY preserves upstream root-only modes; Patroni runs as postgres and needs these helpers.
++RUN chmod -R a+rX /scripts /etc/runit/runsvdir/default/patroni
+diff --git a/postgres-appliance/build_scripts/base.sh b/postgres-appliance/build_scripts/base.sh
+index bc4633d..48d133b 100644
+--- a/postgres-appliance/build_scripts/base.sh
++++ b/postgres-appliance/build_scripts/base.sh
+@@ -197 +197 @@ apt-get update
+-apt-get install -y postgresql postgresql-server-dev-all postgresql-all libpq-dev
++apt-get install -y libpq-dev
+diff --git a/postgres-appliance/build_scripts/dependencies.sh b/postgres-appliance/build_scripts/dependencies.sh
+index 2f1ef68..f680b12 100644
+--- a/postgres-appliance/build_scripts/dependencies.sh
++++ b/postgres-appliance/build_scripts/dependencies.sh
+@@ -29,11 +29 @@ apt-get install -y curl ca-certificates
+-mkdir /builddeps/wal-g
+-
+-if [ "$ARCH" = "amd64" ]; then
+-    PKG_NAME='wal-g-pg-22.04-amd64'
+-else
+-    PKG_NAME='wal-g-pg-22.04-aarch64'
+-fi
+-
+-curl -sL "https://github.com/wal-g/wal-g/releases/download/$WALG_VERSION/$PKG_NAME.tar.gz" \
+-            | tar -C /builddeps/wal-g -xz
+-mv "/builddeps/wal-g/$PKG_NAME" /builddeps/wal-g/wal-g
++# WAL-G is built from pinned source in the separate dsse_walg build context.
+diff --git a/postgres-appliance/build_scripts/patroni.sh b/postgres-appliance/build_scripts/patroni.sh
+index e9fe60a..be3323c 100644
+--- a/postgres-appliance/build_scripts/patroni.sh
++++ b/postgres-appliance/build_scripts/patroni.sh
+@@ -39 +39 @@ if [ "$DEMO" != "true" ]; then
+-            'git+https://github.com/zalando/pg_view.git@master#egg=pg-view'
++            'git+https://github.com/zalando/pg_view.git@3b35609f34b25db861252e2ce9912c2dab8a7934#egg=pg-view'
+diff --git a/postgres-appliance/launch.sh b/postgres-appliance/launch.sh
+index 07f1747..8f8cad0 100755
+--- a/postgres-appliance/launch.sh
++++ b/postgres-appliance/launch.sh
+@@ -22 +22,2 @@ if [ "$USE_OLD_LOCALES" = "true" ]; then
+-    ln -snf /usr/lib/locale/locale-archive.18 /run/locale-archive
++    echo "USE_OLD_LOCALES is unsupported: this image does not include end-of-life Ubuntu 18.04 locale data" >&2
++    exit 1

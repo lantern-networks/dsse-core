@@ -9,11 +9,10 @@ import (
 // Small package-local helpers replicated so the directory store carries no edge-glue dependency.
 
 func copyAnyMap(input map[string]any) map[string]any {
-	copied := map[string]any{}
-	for key, value := range input {
-		copied[key] = value
+	if input == nil {
+		return map[string]any{}
 	}
-	return copied
+	return cloneDirectoryMetadata(input)
 }
 
 func valueOrDefault(value, fallback string) string {
@@ -30,7 +29,5 @@ func validateOptionalRFC3339(value *string, field string) error {
 	if _, err := time.Parse(time.RFC3339, strings.TrimSpace(*value)); err != nil {
 		return fmt.Errorf("%s must be RFC3339", field)
 	}
-	trimmed := strings.TrimSpace(*value)
-	*value = trimmed
 	return nil
 }

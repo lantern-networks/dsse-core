@@ -48,19 +48,22 @@ func TestDecideClientlessAccess(t *testing.T) {
 	}
 }
 
-// only a private_app with status=active is publishable over the clientless front door; high
+// Only an explicitly published, active private_app is reachable over the clientless front door; high
 // sensitivity flags it managed-device-only.
 func TestClientlessPublishedAppFromCatalogEntry(t *testing.T) {
-	if app, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "wiki", TenantID: "t1", ApplicationType: "private_app", Status: "active"}); !ok || app.RequireManagedDevice {
+	if app, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "wiki", TenantID: "t1", ApplicationType: "private_app", Status: "active", Published: true}); !ok || app.RequireManagedDevice {
 		t.Fatalf("active private_app should be published, not managed-only: app=%+v ok=%v", app, ok)
 	}
-	if app, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "p", TenantID: "t1", ApplicationType: "private_app", Status: "active", ApplicationSensitivity: "high"}); !ok || !app.RequireManagedDevice {
+	if app, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "p", TenantID: "t1", ApplicationType: "private_app", Status: "active", Published: true, ApplicationSensitivity: "high"}); !ok || !app.RequireManagedDevice {
 		t.Fatalf("high-sensitivity private_app should be managed-only: %+v ok=%v", app, ok)
 	}
-	if _, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "s", TenantID: "t1", ApplicationType: "saas", Status: "active"}); ok {
+	if _, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "s", TenantID: "t1", ApplicationType: "saas", Status: "active", Published: true}); ok {
 		t.Fatal("saas app is not publishable over the clientless front door")
 	}
 	if _, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "w", TenantID: "t1", ApplicationType: "private_app", Status: "inactive"}); ok {
 		t.Fatal("inactive app is not published")
+	}
+	if _, ok := clientlessPublishedAppFromCatalogEntry(appcatalog.Entry{ApplicationID: "draft", TenantID: "t1", ApplicationType: "private_app", Status: "active"}); ok {
+		t.Fatal("active but unpublished app is not publishable over clientless")
 	}
 }

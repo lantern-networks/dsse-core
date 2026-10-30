@@ -4,10 +4,11 @@ The macOS agent uses a Network Extension to steer device traffic to DSSE. This g
 covers a fresh installation, local verification, trust troubleshooting, and removal.
 Use an isolated lab for this experimental release.
 
-For internal-access authentication, see the
-[Windows and macOS OOB windows](east-west-policy.md#windows-and-macos-authentication-windows).
+For internal-access authentication, see
+[Windows and macOS authentication](east-west-policy.md#windows-and-macos-authentication).
 The macOS resident agent presents notifications and a menu-bar entry that open
-its WKWebView authentication window; the Network Extension alone does not show it.
+the signed Portal link in the current user's default browser; the Network Extension
+alone does not show interactive UI.
 
 ## Prerequisites
 
@@ -262,6 +263,14 @@ deactivate the extension. If that fails, it stops before deleting the app needed
 recovery. Resolve approval or a pending OS restart and retry; do not manually delete the
 app while its proxy configuration remains active.
 
+The uninstaller removes the app and its extension but leaves the deployment
+configuration in `/Library/Application Support/Dsse`, including the signed
+`install_profile.json`, `agent_config.json`, `enrolment_token.txt` and
+`profile_signing_key.txt`, and the package receipt stays registered with `pkgutil`.
+These name the deployment the Mac belonged to. Before installing for another
+deployment or organization, or when the Mac leaves DSSE, remove them after confirming
+they are the old deployment's.
+
 After removal, check extension state and restored connectivity. Review trust-store and
 identity remnants, particularly on a Mac that has used several deployments. The current
 `interception-root.pem` identifies the current certificate, not every previously installed
@@ -332,3 +341,13 @@ Do not rely on a previously installed developer's app to supply profiles on a cl
 The build reports signature, notarization, and Gatekeeper checks. A development or
 unnotarized build is not a distributable release package. Verify the resulting package
 on a separate lab Mac before distributing it.
+
+### Tenant-scoped published snapshots
+
+When `-network-extension-config-publish-dir` is configured, the Edge writes each
+tenant's configuration and rules beneath
+`<directory>/tenants/<hex-encoded UTF-8 tenant ID>/`. Tenant IDs are case-sensitive
+after trimming surrounding whitespace. Shared root-level snapshot files are not
+published. Deployment tooling must select the authenticated tenant's directory;
+it must not fall back to another tenant's files when rules are unavailable.
+A failed policy read or incomplete policy listing stops publication.

@@ -86,7 +86,7 @@ func renewTenantOf(ledger *enrolledinventory.Ledger, identity string) string {
 	if !ok {
 		return ""
 	}
-	return strings.ToLower(strings.TrimSpace(entry.TenantID))
+	return strings.TrimSpace(entry.TenantID)
 }
 
 func registerEnrollRenewEndpointWithIdentity(mux *http.ServeMux, signer *deviceca.Signer, ledger *enrolledinventory.Ledger,
@@ -144,12 +144,14 @@ func registerEnrollRenewEndpointWithIdentity(mux *http.ServeMux, signer *devicec
 		if deviceOrg := renewTenantOf(ledger, normalized); deviceOrg != "" {
 			if own := signerFor(deviceOrg); own != nil {
 				signWith, org = own, deviceOrg
-			} else if !strings.EqualFold(deviceOrg, tenant) && logf != nil {
-				// Said, not silently absorbed: renewing another organization's device under THIS node's
-				// authority is exactly how a fleet ends up unable to leave the deployment's CA.
-				logf("enroll_renew_no_tenant_authority identity=%q tenant=%q — this node holds no "+
-					"device-identity authority for that organization, so the renewal is signed under the "+
-					"node's own and that device cannot move onto its own", normalized, deviceOrg)
+			} else if deviceOrg != strings.TrimSpace(tenant) {
+				// A missing tenant signer cannot change the device's identity
+				// authority to this node's. Hold renewal until its material is available.
+				if logf != nil {
+					logf("enroll_renew_no_tenant_authority identity=%q tenant=%q", normalized, deviceOrg)
+				}
+				writeJSON(w, http.StatusServiceUnavailable, renewResponse{Error: "device-identity authority is unavailable"})
+				return
 			}
 		}
 

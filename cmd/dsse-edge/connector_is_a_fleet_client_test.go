@@ -62,3 +62,10 @@ func TestAConnectorMayRegisterWithAnEdgeThatHasNeverMetIt(t *testing.T) {
 		t.Fatalf("a certificate naming another connector was allowed to register as conn-abc")
 	}
 }
+
+func TestFleetCertificateCannotContradictCaseDistinctRegistryTenant(t *testing.T) {
+	identity := connectorFleetIdentity{Presented: true, BoundToID: true, TenantID: "Tenant-A"}
+	if !identity.contradictsRegistry("tenant-a") {
+		t.Fatal("case-distinct tenant registration was treated as the certificate tenant")
+	}
+}

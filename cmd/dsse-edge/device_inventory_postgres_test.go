@@ -75,6 +75,10 @@ func TestBuildPostgresDeviceInventoryUpsertStatementSerializesPayload(t *testing
 	if !strings.Contains(statement.SQL, "WHERE device_inventory.tenant_id = EXCLUDED.tenant_id") {
 		t.Fatalf("statement SQL = %s, want tenant ownership guard", statement.SQL)
 	}
+	if !strings.Contains(statement.SQL, "jsonb_set(EXCLUDED.payload, '{status}', to_jsonb(device_inventory.status), true)") ||
+		!strings.Contains(statement.SQL, "RETURNING payload") {
+		t.Fatal("revoked status must be retained in the returned and persisted JSON payload, not only the status column")
+	}
 	if got, want := len(statement.Args), 16; got != want {
 		t.Fatalf("args = %#v, want %d", statement.Args, want)
 	}

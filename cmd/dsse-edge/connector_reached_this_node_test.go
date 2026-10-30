@@ -63,9 +63,9 @@ func TestTheHandshakeSendsAFleetSizeOnlyWhenItIsKnown(t *testing.T) {
 	if got := h.Get(connectorReachedNodeHeader); got != "edge-a" {
 		t.Fatalf("the node still names itself: got %q", got)
 	}
-	// An Edge with neither fact sends no handshake headers at all rather than empty ones.
-	if h := connectorTunnelHandshakeHeaders("", 0, false); h != nil {
-		t.Fatalf("expected no headers, got %v", h)
+	// Unknown fleet facts stay absent; protocol support is independent.
+	if h := connectorTunnelHandshakeHeaders("", 0, false); len(h) != 1 || h.Get(tunnel.TCPQuotaCapabilityHeader) != tunnel.TCPQuotaCapabilityV1 {
+		t.Fatalf("expected only protocol capability, got %v", h)
 	}
 }
 

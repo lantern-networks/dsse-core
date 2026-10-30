@@ -9,7 +9,7 @@ function dlpActionLabel(a) {
   return { observe: bl({ en: "Observe", ja: "監視" }), warn: bl({ en: "Warn", ja: "警告" }), block: bl({ en: "Block", ja: "遮断" }), authenticate: bl({ en: "Require verification", ja: "認証要求" }) }[a] || a || "—";
 }
 function dlpInstanceScopeLabel(s) {
-  return { corporate: bl({ en: "Corporate only", ja: "自社のみ" }), personal: bl({ en: "Personal / outside only", ja: "個人/社外のみ" }) }[s] || bl({ en: "Any account", ja: "すべて" });
+  return { corporate: bl({ en: "Corporate or unverified", ja: "自社または未確認" }), personal: bl({ en: "Personal / outside or unverified", ja: "個人/社外または未確認" }) }[s] || bl({ en: "Any account", ja: "すべて" });
 }
 
 // Every dependency is required for a safe edit: an unavailable detector library
@@ -58,7 +58,7 @@ async function renderDLPPoliciesView(content) {
   content.appendChild(section);
   let _policies = [];
   let _library = { custom: [], edm: [] };
-  let _orgDomains = []; // the "our company" domains that decide corporate vs personal (S6)
+  let _orgDomains = []; // configured company domains; not proof of the receiving SaaS account
 
   async function load() {
     const current = freshRender(section);
@@ -125,16 +125,16 @@ async function renderDLPPoliciesView(content) {
     const scopeF = uiField({ name: "scope", label: bl({ en: "Apply to which account?", ja: "どのアカウントに適用?" }), type: "select", value: (existing && existing.instance_scope) || "any", options: [
       { value: "any", label: dlpInstanceScopeLabel("any") }, { value: "corporate", label: dlpInstanceScopeLabel("corporate") }, { value: "personal", label: dlpInstanceScopeLabel("personal") },
     ] });
-    // Corporate/Personal depends on the ORGANIZATION DOMAINS (S6). Show what "our company" is, warn when unset
-    // (scoped rules would never fire), and offer to edit — the discoverable home DLP references.
+    // Show the conservative scope behavior regardless of whether company domains are configured.
     const orgBox = el("div", { style: "margin:0 0 0.4rem 1rem" });
     const syncOrg = () => {
       orgBox.innerHTML = "";
       if (scopeF.get() === "any") return;
+      orgBox.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "Unverified accounts are covered by both scopes. The current SWG does not verify the receiving SaaS account, so both scopes apply even when a request claims a company email. Company domains and DSSE sign-in do not create an exemption.", ja: "未確認のアカウントは両方の範囲に含まれます。現在の SWG は送信先 SaaS アカウントを検証しないため、リクエストが自社メールを示していても両方の範囲が適用されます。自社ドメインや DSSE ログインだけでは適用除外になりません。" }) }));
       if (_orgDomains.length) {
         orgBox.appendChild(el("span", { class: "ui-view-desc", text: bl({ en: "Our company = ", ja: "自社 = " }) + _orgDomains.join(", ") + "  " }));
       } else {
-        orgBox.appendChild(el("span", { class: "ui-view-desc", style: "color:var(--ui-warn,#c60)", text: bl({ en: "⚠ No tenant domains set — Corporate/Personal can't be determined, so this rule never fires. ", ja: "⚠ 自社ドメイン未設定 — 自社/個人を判定できず、このルールは発火しません。 " }) }));
+        orgBox.appendChild(el("span", { class: "ui-view-desc", text: bl({ en: "No tenant domains set. Scoped inspection remains active. ", ja: "自社ドメイン未設定。範囲を指定した検査は引き続き適用されます。 " }) }));
       }
       orgBox.appendChild(el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Edit tenant domains…", ja: "自社ドメインを編集…" }), onClick: editOrgDomains }));
     };
@@ -175,7 +175,7 @@ async function renderDLPPoliciesView(content) {
     }
     const drWinF = uiField({ name: "dr_win", label: bl({ en: "Within", ja: "計測期間" }), type: "select", value: String(riskWindow), options: riskWindowOptions });
     const drClassF = uiField({ name: "dr_class", label: bl({ en: "Only to", ja: "対象宛先" }), type: "select", value: (dr && dr.destination_class) || "any", options: [
-      { value: "any", label: bl({ en: "Any destination", ja: "すべての宛先" }) }, { value: "personal", label: bl({ en: "Personal / outside-org only", ja: "個人/社外のみ" }) },
+      { value: "any", label: bl({ en: "Any destination", ja: "すべての宛先" }) }, { value: "personal", label: dlpInstanceScopeLabel("personal") },
     ] });
     const drBox = el("div", { style: "margin-left:1rem" }, [drCountF.el, drTypesF.el, drSameF.el, drWinF.el, drClassF.el]);
     const syncDr = () => { drBox.style.display = drEnableF.get() ? "" : "none"; };
@@ -198,7 +198,7 @@ async function renderDLPPoliciesView(content) {
 
     // editOrgDomains opens a small editor for the organization ("our company") domains (S6), then refreshes the note.
     function editOrgDomains() {
-      const df = uiField({ name: "orgd", label: bl({ en: "Tenant domains (one per line)", ja: "自社ドメイン(1 行に 1 件)" }), type: "textarea", value: _orgDomains.join("\n"), placeholder: "acme.com\nacme.co.jp", hint: bl({ en: "The domains that count as your company. An account whose email domain matches is 'Corporate'; any other confirmed domain is 'Personal'.", ja: "自社とみなすドメイン。メールドメインが一致するアカウントは「自社」、それ以外の確定ドメインは「個人/社外」。" }) });
+      const df = uiField({ name: "orgd", label: bl({ en: "Tenant domains (one per line)", ja: "自社ドメイン(1 行に 1 件)" }), type: "textarea", value: _orgDomains.join("\n"), placeholder: "acme.com\nacme.co.jp", hint: bl({ en: "Your company's domains. A matching request email is an unverified hint and does not exempt an upload from DLP.", ja: "自社のドメイン。リクエスト内のメールが一致しても未検証の情報であり、DLP の適用除外にはなりません。" }) });
       const dm = uiModal({
         title: bl({ en: "Tenant domains", ja: "自社ドメイン" }),
         body: [df.el],

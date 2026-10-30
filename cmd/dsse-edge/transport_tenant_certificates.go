@@ -229,7 +229,7 @@ func loadTransportTenantCertificates(dir string) (int, error) {
 func (t *transportTenantCerts) put(tenant string, names []string, cert *tls.Certificate, anchorPEM string, effectiveOpt ...time.Time) {
 	effective := effectiveDeadlineOrCertificateEnd(cert, effectiveOpt)
 	defer noteTransportDeadlinesChanged()
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.anchorOf[key] = anchorPEM
@@ -251,7 +251,7 @@ func (t *transportTenantCerts) put(tenant string, names []string, cert *tls.Cert
 	// ★ Only names that are BOTH this organization's and absent from what it now has. A name whose tenantOf
 	// entry names somebody else belongs to them, however it got there.
 	for name, owner := range t.tenantOf {
-		if keep[name] || !strings.EqualFold(strings.TrimSpace(owner), key) {
+		if keep[name] || owner != key {
 			continue
 		}
 		delete(t.bySNI, name)
@@ -266,7 +266,7 @@ func (t *transportTenantCerts) put(tenant string, names []string, cert *tls.Cert
 // that has takes either — which is what makes the switch survivable. Withdrawing the shared anchor is a
 // separate, LATER act, gated on every device of that organization reporting that it holds this one.
 func (t *transportTenantCerts) AnchorFor(tenant string) (string, bool) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return "", false
 	}
@@ -290,7 +290,7 @@ var transportSelectorClock = time.Now
 // organization out of service, and "keep routing traffic into a door that cannot work" is the exact state
 // the whole expiry design exists to prevent.
 func (t *transportTenantCerts) Refuse(tenant, reason string) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return
 	}
@@ -303,7 +303,7 @@ func (t *transportTenantCerts) Refuse(tenant, reason string) {
 }
 
 func (t *transportTenantCerts) Allow(tenant string) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.refused, key)
@@ -324,7 +324,7 @@ func (t *transportTenantCerts) refusalFor(sni string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	if reason, dead := t.refused[strings.ToLower(strings.TrimSpace(t.tenantOf[key]))]; dead {
+	if reason, dead := t.refused[t.tenantOf[key]]; dead {
 		return reason, true
 	}
 	// ★ AND THE TIME IS CHECKED HERE TOO, not only by the watcher. Between an expiry and the watcher's next
@@ -334,7 +334,7 @@ func (t *transportTenantCerts) refusalFor(sni string) (string, bool) {
 		// The effective deadline: the path verified at install and the lease, not the leaf alone.
 		at := cert.Leaf.NotAfter.UTC()
 		what := "its certificate expired at "
-		if eff, has := t.activeDeadlineOf[strings.ToLower(strings.TrimSpace(t.tenantOf[key]))]; has &&
+		if eff, has := t.activeDeadlineOf[t.tenantOf[key]]; has &&
 			!eff.IsZero() && eff.Before(at) {
 			at, what = eff, "the chain it presents stopped being verifiable at "
 		}
@@ -384,7 +384,7 @@ func (t *transportTenantCerts) AnchorFingerprints() []string {
 			// fleet-promise guard — "was promised the name … and this node has no certificate for it" — and
 			// exits. Every node reads the same announcement, so it is every node, in every region, at once,
 			// hours after the deletion that armed it, on whatever unrelated restart happens to come first.
-			if t.retiring[strings.ToLower(strings.TrimSpace(tenant))] {
+			if t.retiring[tenant] {
 				continue
 			}
 			for _, c := range parseAllCerts([]byte(anchorPEM)) {
@@ -413,7 +413,7 @@ func dedupeStrings(in []string) []string {
 // measurement is keyed by. One anchor per organization: the roadmap D withdrawal asks "does every device hold
 // THIS one", and an organization mid-rotation with two would need the question asked of both.
 func (t *transportTenantCerts) AnchorFingerprintFor(tenant string) (string, bool) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return "", false
 	}
@@ -441,14 +441,14 @@ func (t *transportTenantCerts) RenameState(tenant string) (current, previous str
 	if t == nil {
 		return "", ""
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.renamingTo[key], t.renamingFrom[key]
 }
 
 func (t *transportTenantCerts) noteRename(tenant, current, previous string) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return
 	}
@@ -468,14 +468,14 @@ func (t *transportTenantCerts) noteRename(tenant, current, previous string) {
 }
 
 func (t *transportTenantCerts) ServerNameFor(tenant string) (string, bool) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return "", false
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for name, owner := range t.tenantOf {
-		if strings.EqualFold(owner, key) {
+		if owner == key {
 			if cert, ok := t.bySNI[name]; ok && cert.Leaf != nil && len(cert.Leaf.DNSNames) > 0 {
 				return cert.Leaf.DNSNames[0], true
 			}
@@ -563,7 +563,7 @@ func (t *transportTenantCerts) ServerNameAnnouncements() []string {
 	byTenant := map[string][]string{}
 	recoveryOnly := map[string][]string{}
 	for name, tenant := range t.tenantOf {
-		key := strings.ToLower(strings.TrimSpace(tenant))
+		key := tenant
 		n := strings.ToLower(strings.TrimSpace(name))
 		if key == "" || n == "" {
 			continue
@@ -626,6 +626,9 @@ func (t *transportTenantCerts) Names() []string {
 func transportCertificateForClientHello(shared func(*tls.ClientHelloInfo) (*tls.Certificate, error)) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	return func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if hello != nil {
+			if err := stepUpPortalCertificateRefusal(hello.ServerName); err != nil {
+				return nil, err
+			}
 			// ★ THE OPERATOR'S OWN CERTIFICATE FOR THE STEP-UP PORTAL WINS. It is browser-facing and its
 			// name is one the operator holds — see the_step_up_portal_is_a_browser_facing_page.go.
 			if cert := stepUpPortalCertificateFor(hello.ServerName); cert != nil {
@@ -643,7 +646,21 @@ func transportCertificateForClientHello(shared func(*tls.ClientHelloInfo) (*tls.
 			}
 			noteUnservedServerName(hello.ServerName)
 		}
-		return shared(hello)
+		cert, err := shared(hello)
+		if err != nil || cert == nil || hello == nil || hello.ServerName == "" || len(cert.Certificate) == 0 {
+			return cert, err
+		}
+		leaf := cert.Leaf
+		if leaf == nil {
+			leaf, err = x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				return nil, err
+			}
+		}
+		if err := leaf.VerifyHostname(hello.ServerName); err != nil {
+			return nil, fmt.Errorf("transport material for requested server name is not available on this node")
+		}
+		return cert, nil
 	}
 }
 
@@ -704,7 +721,7 @@ func noteUnservedServerName(name string) {
 // The anchor is taken from what was handed over rather than derived again, so the bundle names the authority
 // that actually signed the certificate this node will present.
 func installTenantTransportMaterial(mat tenantTransportMaterial) error {
-	tenant := strings.ToLower(strings.TrimSpace(mat.TenantID))
+	tenant := mat.TenantID
 	if tenant == "" {
 		return fmt.Errorf("material with no organization")
 	}
@@ -836,7 +853,7 @@ func (t *transportTenantCerts) putPending(tenant string, names []string, cert *t
 // completed promotion even if promotion happens while the refresh is being installed.
 func (t *transportTenantCerts) putPendingUnlessServingSuccessor(tenant string, names []string, cert *tls.Certificate, anchorPEM, successor string, effective time.Time) bool {
 	defer noteTransportDeadlinesChanged()
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if successor != "" && fingerprintOfFirstCert(t.anchorOf[key]) == successor {
@@ -857,7 +874,7 @@ func (t *transportTenantCerts) putPendingUnlessServingSuccessor(tenant string, n
 // this node is preparing to move to. Both, because an overlap that announces only one end strands whichever
 // half of the fleet has not moved.
 func (t *transportTenantCerts) AnchorsFor(tenant string) []string {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := []string{}
@@ -885,7 +902,7 @@ func (t *transportTenantCerts) AnchorFingerprintsFor(tenant string) []string {
 // PromotePending starts serving what was until now only announced. The caller decides WHEN — the measurement
 // that says every device holds the new anchor is the whole point of the overlap.
 func (t *transportTenantCerts) PromotePending(tenant string) bool {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	defer noteTransportDeadlinesChanged()
@@ -985,7 +1002,7 @@ func (t *transportTenantCerts) ActiveDeadlines() map[string]time.Time {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for name, cert := range t.bySNI {
-		tenant := strings.ToLower(strings.TrimSpace(t.tenantOf[name]))
+		tenant := t.tenantOf[name]
 		if tenant == "" || cert == nil || cert.Leaf == nil {
 			continue
 		}
@@ -1003,7 +1020,7 @@ func (t *transportTenantCerts) ActiveDeadlines() map[string]time.Time {
 }
 
 func (t *transportTenantCerts) PendingDeadlineFor(tenant string) (time.Time, bool) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	cert, ok := t.pendingCertOf[key]
@@ -1021,7 +1038,7 @@ func (t *transportTenantCerts) PendingDeadlineFor(tenant string) (time.Time, boo
 // the deadline is derived from the certificate, its deadline. Used when the control plane's own snapshot no
 // longer carries that authority — a rotation the operator abandoned.
 func (t *transportTenantCerts) DropPending(tenant string) bool {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	defer noteTransportDeadlinesChanged()
@@ -1037,7 +1054,7 @@ func (t *transportTenantCerts) DropPending(tenant string) bool {
 }
 
 func (t *transportTenantCerts) PendingFingerprintFor(tenant string) string {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	for _, c := range parseAllCerts([]byte(t.pendingAnchorOf[key])) {
@@ -1059,7 +1076,7 @@ func (t *transportTenantCerts) StopServing(tenant string) int {
 	if t == nil {
 		return 0
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return 0
 	}
@@ -1067,7 +1084,7 @@ func (t *transportTenantCerts) StopServing(tenant string) int {
 	defer t.mu.Unlock()
 	dropped := 0
 	for name, owner := range t.tenantOf {
-		if !strings.EqualFold(strings.TrimSpace(owner), key) {
+		if owner != key {
 			continue
 		}
 		delete(t.tenantOf, name)
@@ -1090,7 +1107,6 @@ func (t *transportTenantCerts) ServedTenants() []string {
 	seen := map[string]bool{}
 	out := []string{}
 	for _, owner := range t.tenantOf {
-		owner = strings.ToLower(strings.TrimSpace(owner))
 		if owner == "" || seen[owner] {
 			continue
 		}
@@ -1107,7 +1123,7 @@ func (t *transportTenantCerts) BeginRetiring(tenant string) bool {
 	if t == nil {
 		return false
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := tenant
 	if key == "" {
 		return false
 	}
@@ -1130,7 +1146,7 @@ func (t *transportTenantCerts) IsRetiring(tenant string) bool {
 	}
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.retiring[strings.ToLower(strings.TrimSpace(tenant))]
+	return t.retiring[tenant]
 }
 
 // Retiring names the organizations in that state, for the caller that finishes the job.

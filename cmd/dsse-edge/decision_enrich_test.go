@@ -45,15 +45,17 @@ func TestDecisionEvaluateEnrichesRiskFromDeviceRiskMetadata(t *testing.T) {
 		TenantID:         "tenant_lab_001",
 		UserID:           "user_lab_001",
 		DeviceTrustLevel: "managed",
-		Metadata: map[string]any{
-			"risk_state_id":           "risk_state_lab_001",
-			"risk_state_severity":     "high",
-			"risk_signal_sources":     []any{"manual_high_risk", "agent_tamper"},
-			"risk_recommended_action": "apply_ransomware_protection_mode",
-		},
 	}, evaluator.PolicyBundle, time.Now())
 	if err != nil {
 		t.Fatalf("register device: %v", err)
+	}
+	riskNow := time.Date(2026, 7, 22, 0, 0, 0, 0, time.UTC)
+	riskStateID := "risk_dev_lab_risk_001_20260722T000000Z"
+	if _, found, _, err := deviceStore.ApplyRiskSignal("dev_lab_risk_001", model.RiskSignal{
+		EntityType: "device", EntityID: "dev_lab_risk_001", Severity: "high",
+		Source: "agent_tamper", SuggestedAction: "apply_ransomware_protection_mode",
+	}, riskNow); err != nil || !found {
+		t.Fatalf("apply device risk: found=%t err=%v", found, err)
 	}
 	handler := newServerWithConfig(serverConfig{
 		Evaluator:   evaluator,
@@ -87,8 +89,8 @@ func TestDecisionEvaluateEnrichesRiskFromDeviceRiskMetadata(t *testing.T) {
 	}
 	// ...but the risk state must still be ENRICHED onto the decision, because that is what a risk-gated policy
 	// condition matches against. Losing this would make risk unusable from policy.
-	if dec.RiskStateID == nil || *dec.RiskStateID != "risk_state_lab_001" {
-		t.Fatalf("risk_state_id = %#v, want risk_state_lab_001", dec.RiskStateID)
+	if dec.RiskStateID == nil || *dec.RiskStateID != riskStateID {
+		t.Fatalf("risk_state_id = %#v, want %s", dec.RiskStateID, riskStateID)
 	}
 	// The removed overlay's vocabulary must not appear on the wire any more.
 	for _, code := range []string{"ransomware_protection_mode_active", "risk_state_recommended_emergency_block"} {
@@ -96,8 +98,8 @@ func TestDecisionEvaluateEnrichesRiskFromDeviceRiskMetadata(t *testing.T) {
 			t.Fatalf("reason_codes = %v, must not contain the removed overlay code %s", dec.ReasonCodes, code)
 		}
 	}
-	if dec.Metadata["risk_state_id"] != "risk_state_lab_001" {
-		t.Fatalf("metadata risk_state_id = %v, want risk_state_lab_001", dec.Metadata["risk_state_id"])
+	if dec.Metadata["risk_state_id"] != riskStateID {
+		t.Fatalf("metadata risk_state_id = %v, want %s", dec.Metadata["risk_state_id"], riskStateID)
 	}
 
 	accessLog, err := os.ReadFile(filepath.Join(logDir, "access.log.jsonl"))
@@ -107,7 +109,7 @@ func TestDecisionEvaluateEnrichesRiskFromDeviceRiskMetadata(t *testing.T) {
 	// The risk state must remain VISIBLE in the audit trail even though it no longer denies — an operator has
 	// to be able to see that a decision was made for a high-risk device, and a risk-gated policy needs the same
 	// fields to match on.
-	for _, want := range []string{`"risk_state_severity":"high"`, `"risk_state_id":"risk_state_lab_001"`, `"agent_tamper"`} {
+	for _, want := range []string{`"risk_state_severity":"high"`, `"risk_state_id":"` + riskStateID + `"`, `"agent_tamper"`} {
 		if !strings.Contains(string(accessLog), want) {
 			t.Fatalf("access log = %s, want %s", string(accessLog), want)
 		}

@@ -23,6 +23,7 @@ func TestEveryRefusalReasonSurvivesTheTripBackAsItsOwnError(t *testing.T) {
 		enrolltoken.ErrTokenRevoked,
 		enrolltoken.ErrTokenExpired,
 		enrolltoken.ErrWrongTenant,
+		enrolltoken.ErrStateUnavailable,
 	} {
 		reason := enrolmentTokenReason(want)
 		if reason == "" || reason == "refused" {

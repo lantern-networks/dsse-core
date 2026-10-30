@@ -31,17 +31,18 @@ func verifyConsole(client *http.Client, consoleURL string) []verifyResult {
 		add("the Console answers", false, "%s -> %v", consoleURL, err)
 		return out
 	}
-	add("the Console answers", true, "%s -> %d", consoleURL, code)
+	add("the Console answers", code == http.StatusOK, "%s -> %d", consoleURL, code)
 
 	// The gate, asked with the request it exists to refuse: a gated asset with no session.
 	gated, _, gerr := get(client, consoleURL+"/app.js", "")
 	switch {
 	case gerr != nil:
 		add("the Console refuses an unauthenticated request", false, "could not ask: %v", gerr)
-	case gated == 200:
+	case gated != http.StatusUnauthorized:
 		add("the Console refuses an unauthenticated request", false,
-			"a gated asset was served with no session (200). The admin application is handed to anybody who "+
-				"asks, and every check after this one is about a deployment that has already lost")
+			"a gated asset answered %d without a session; expected 401. A 200 serves the admin application "+
+				"without authentication, while any other status does not establish a working Console auth gate",
+			gated)
 	default:
 		add("the Console refuses an unauthenticated request", true, "answered %d with no session", gated)
 	}

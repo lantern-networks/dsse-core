@@ -37,7 +37,7 @@ func TestRetentionOverrideLoadFailurePreservesLogs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, RetentionOverride: store})
+			handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, RetentionOverride: store, ColdArchive: &fakeArchive{objs: map[string][]byte{}}})
 			for _, method := range []string{"GET", "POST"} {
 				rec := httptest.NewRecorder()
 				handler.ServeHTTP(rec, httptest.NewRequest(method, "/admin/retention-config", strings.NewReader(`{"stream":"audit","days":1}`)))

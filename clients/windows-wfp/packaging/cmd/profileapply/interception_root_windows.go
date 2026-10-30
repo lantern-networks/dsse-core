@@ -5,6 +5,7 @@ package main
 // interception_root_windows.go — the store I/O behind planRootInstall. No decisions here.
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"fmt"
 	"unsafe"
@@ -180,6 +181,10 @@ func removeFromStore(store windows.Handle, der []byte) error {
 	if err != nil || ctx == nil {
 		return fmt.Errorf("locate certificate for removal by SHA-1 %x: %w", sum, err)
 	}
+	if !bytes.Equal(unsafe.Slice(ctx.EncodedCert, ctx.Length), der) {
+		windows.CertFreeCertificateContext(ctx)
+		return fmt.Errorf("certificate found by SHA-1 does not match the requested DER")
+	}
 	// CertDeleteCertificateFromStore frees the context whether it succeeds or fails, so it must not be freed
 	// again here.
 	if derr := windows.CertDeleteCertificateFromStore(ctx); derr != nil {
@@ -190,44 +195,21 @@ func removeFromStore(store windows.Handle, der []byte) error {
 
 // doRemoveInterceptionRoot takes out the root THIS package installed, named by the package's own artifact.
 //
-// ★ It never fails the uninstall. An uninstall that refuses leaves the machine holding both the agent and the
-// root, which is strictly worse than either. Everything it cannot do, it says.
+// Missing artifacts and already absent certificates are idempotent success.
+// Every other error propagates, and successful deletions are read back.
 func doRemoveInterceptionRoot(path string) error {
 	ours, err := readOurRoots(path)
 	if err != nil {
-		fmt.Printf("profileapply: %v\n", err)
-		return nil
+		return err
 	}
 	if len(ours) == 0 {
-		fmt.Printf("profileapply: no interception-root artifact at %q — nothing this package can prove it "+
-			"installed, so no certificate is removed\n", path)
 		return nil
 	}
 	store, err := openMachineRootStore()
 	if err != nil {
-		fmt.Printf("profileapply: could not open the machine trust store to remove the interception root (%v) "+
-			"— remove it by fingerprint by hand\n", err)
-		return nil
+		return err
 	}
 	defer windows.CertCloseStore(store, 0)
-
-	existing, err := enumerateStore(store)
-	if err != nil {
-		fmt.Printf("profileapply: could not read the machine trust store (%v) — no certificate is removed\n", err)
-		return nil
-	}
-	plan := planRootRemoval(existing, ours)
-	for _, r := range plan.Absent {
-		fmt.Printf("profileapply: interception root already absent, nothing to do: %s (%s)\n", r.Subject, r.SHA256)
-	}
-	for _, r := range plan.Remove {
-		if rerr := removeFromStore(store, r.DER); rerr != nil {
-			fmt.Printf("profileapply: ★ FAILED to remove the interception root %s (%s): %v — this machine "+
-				"still trusts a CA for every name on the internet, whose key belongs to a deployment that may "+
-				"no longer exist. Remove it by fingerprint by hand.\n", r.Subject, r.SHA256, rerr)
-			continue
-		}
-		fmt.Printf("profileapply: interception root REMOVED from LocalMachine"+`\`+"Root: %s (%s)\n", r.Subject, r.SHA256)
-	}
-	return nil
+	return removeRootsVerified(ours, func() ([]parsedRoot, error) { return enumerateStore(store) },
+		func(root parsedRoot) error { return removeFromStore(store, root.DER) })
 }

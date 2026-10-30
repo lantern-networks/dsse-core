@@ -31,9 +31,10 @@ import (
 //
 // ★ AND THE INVENTORY IS WHERE THIS MATTERS MOST, not the decision. The operator's next action on this screen
 // is "adopt this flow into a lateral rule". Adopting github.com as a lateral rule is not a display defect, it
-// is a wrong rule authored from a correct-looking prompt. So the OBSERVATION gate resolves the name and
-// classifies the address; ENFORCEMENT is untouched and still admits Unknown, which is the decision this splits
-// apart deliberately rather than quietly unifying.
+// is a wrong rule authored from a correct-looking prompt. The mux path now resolves before both observation
+// and enforcement, including after authentication.
+// Cache DNS answers only: select the internal address using the current tenant network declarations on
+// every evaluation. A previous tenant or policy must not determine the next flow's classification.
 //
 // An unresolvable name is still recorded. That is the same reasoning one paragraph up: not knowing is not
 // evidence of being public, and the failure that costs something is dropping a private destination.
@@ -48,9 +49,9 @@ const observeLocalityTTL = 5 * time.Minute
 const observeResolveTimeout = 250 * time.Millisecond
 
 type observeLocalityEntry struct {
-	// ip is the address chosen for this name, or "" when nothing was resolved.
-	ip string
-	at time.Time
+	// ips contains DNS answers, never a tenant's policy-dependent choice.
+	ips []string
+	at  time.Time
 }
 
 // restart-durability: ephemeral — a replay cache for DNS answers. Losing it costs one lookup per lateral
@@ -67,26 +68,24 @@ func newObserveLocalityCache() *observeLocalityCache {
 	return &observeLocalityCache{m: map[string]observeLocalityEntry{}}
 }
 
-func (c *observeLocalityCache) get(host string, now time.Time) (string, bool) {
+func (c *observeLocalityCache) get(host string, now time.Time) ([]string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.m[host]
 	if !ok || now.Sub(e.at) > observeLocalityTTL {
-		return "", false
+		return nil, false
 	}
-	return e.ip, true
+	return append([]string(nil), e.ips...), true
 }
 
-func (c *observeLocalityCache) put(host string, ip string, now time.Time) {
+func (c *observeLocalityCache) put(host string, ips []string, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// Bounded by forgetting everything rather than by evicting cleverly: this holds one boolean per lateral
-	// destination seen in five minutes, and a cache that needs an eviction policy to be safe is a cache that
-	// will one day need it debugged.
+	// Keep the existing bounded cache. Eviction costs a DNS lookup, not a denied flow.
 	if len(c.m) > 4096 {
 		c.m = map[string]observeLocalityEntry{}
 	}
-	c.m[host] = observeLocalityEntry{ip: ip, at: now}
+	c.m[host] = observeLocalityEntry{ips: append([]string(nil), ips...), at: now}
 }
 
 var observeLocality = newObserveLocalityCache()
@@ -125,33 +124,30 @@ func resolveDestinationForLocality(ctx context.Context, req model.DecisionReques
 	if host == "" || net.ParseIP(host) != nil {
 		return req
 	}
-	if cached, ok := observeLocality.get(host, now); ok {
-		if cached != "" {
-			req.DestinationResolvedIP = cached
+	ips, cached := observeLocality.get(host, now)
+	if !cached {
+		lookupCtx, cancel := context.WithTimeout(ctx, observeResolveTimeout)
+		defer cancel()
+		resolved, err := observeResolver(lookupCtx, host)
+		if err != nil || len(resolved) == 0 {
+			// A failed lookup remains Unknown and is not cached.
+			return req
 		}
-		return req
+		for _, ip := range resolved {
+			ips = append(ips, ip.String())
+		}
+		observeLocality.put(host, ips, now)
 	}
 
-	lookupCtx, cancel := context.WithTimeout(ctx, observeResolveTimeout)
-	defer cancel()
-	ips, err := observeResolver(lookupCtx, host)
-	if err != nil || len(ips) == 0 {
-		// Not resolvable is not evidence of anything. Left empty, the classifier answers Unknown, which east-west
-		// admits — the same preserving answer as before this file existed. Deliberately NOT cached: a transient
-		// DNS failure must not pin the answer for the TTL.
-		return req
-	}
-
-	chosen := ips[0].String()
+	chosen := ips[0]
 	for _, ip := range ips {
 		probe := req
-		probe.DestinationResolvedIP = ip.String()
+		probe.DestinationResolvedIP = ip
 		if decision.ClassifyDestinationLocality(probe, networks) != decision.LocalityPublic {
-			chosen = ip.String()
+			chosen = ip
 			break
 		}
 	}
-	observeLocality.put(host, chosen, now)
 	req.DestinationResolvedIP = chosen
 	return req
 }

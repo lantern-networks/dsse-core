@@ -34,6 +34,24 @@ func resolverFor(fronted map[string]bool, err error) ConnectorResolveFunc {
 	}
 }
 
+func TestConnectorOrBrokerSelectionUsesFlowTenant(t *testing.T) {
+	connector, broker := &markerTransport{}, &markerTransport{}
+	resolve := func(_ context.Context, tenant, host, _ string) (model.ConnectorRegistration, bool, error) {
+		return model.ConnectorRegistration{}, tenant == "tenant_customer" && host == "private.example", nil
+	}
+	rt := NewConnectorOrBrokerRoundTripper(resolve, "tenant_operator", connector, broker)
+	req, err := http.NewRequestWithContext(WithFlowTenant(context.Background(), "tenant_customer"), http.MethodGet, "https://private.example/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	if !connector.used || broker.used {
+		t.Fatal("customer private traffic was selected using the operator's routes")
+	}
+}
+
 // A private app published behind a connector must reach it through the tunnel. Sending it to the broker means a
 // separate process direct-dialing into internal address space, where the SSRF pre-flight refuses it — so the app
 // becomes unreachable from a steered browser, which is the product's core promise.

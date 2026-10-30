@@ -518,7 +518,7 @@ fixes and signed generic macOS and Windows packages. The release-candidate
 [CI checks passed](https://github.com/lantern-networks/dsse-core/actions/runs/36523518835). Applicable
 upgrade procedures and exact source/artifact correspondence are in its notes and manifest.
 
-A September 28–29 evaluation used three DSSE Regions with one node each on separate
+A controlled evaluation used three DSSE Regions with one node each on separate
 hosts in three availability zones across two cloud-provider regions. DSSE region IDs
 and cloud-provider regions are separate topology dimensions. Two tenant/device and
 Connector lanes covered allowed and denied traffic, service-level failover, and two
@@ -748,6 +748,17 @@ Device admission reads require the active CP when leader election is enabled; ma
 Device enrolment reports, enrolment-token issuance/revocation, inventory edits and seat allocations retain the accepted control-plane leadership term until durable storage completes. A storage or leadership failure is retryable and is not acknowledged as a saved enrolment. Promotion reloads shared inventory and seat allocations before serving writes; standby inventory refreshes cannot overwrite a promoted writer. Token issue/spend/revoke responses and audit records distinguish confirmed persistence from uncertain results.
 
 Enrolment-report authorization now uses the Edge-to-tenant authority map as well as the verified client identity. Before upgrading a multi-tenant or operator-anchored Edge deployment, configure `-audit-ingest-authority` to cover each enrolling Edge and every tenant it serves. Missing mappings return 403 and keep reports queued; devices absent from CP inventory may lose admission on the next bundle refresh. Without a map, only a certificate resolved to the requested tenant is accepted. Startup warns when the CP report endpoint has no mapping; the warning cannot establish completeness of a configured map.
+
+Connector-driven people-directory reports use the control-plane data listener and
+the operator-issued Edge client certificate. The source policy must be enabled
+and its `metadata.connector_id` must name a connector registered under the same
+exact tenant. The machine report is refused if the certificate is not verified
+against `-audit-ingest-client-ca`, its identity is absent from
+`-audit-ingest-authority`, or the connector/source assignment disagrees. The
+generated installer uses `dsse-edge-fleet:["*"]`; custom authority files are read
+at control-plane start, so update every control plane and restart it after a map
+change. Inspect the Edge directory-report outbox and the control-plane directory
+after a leader change or a new tenant is added.
 
 Inventory/seat reload failure prevents promotion; recover shared storage and restart an inventory process whose initial empty snapshot load failed. Route `/enroll` to the active CP. If token consumption commits but acknowledgement is lost, enrolment may require a new token after checking the existing device record; do not assume an uncertain response means the token was unused.
 ### Incoming exception edits and audit attribution

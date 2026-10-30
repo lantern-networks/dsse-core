@@ -195,7 +195,7 @@ func TestAdmissionPromotionWaitsForReadAndReleasesFailedLock(t *testing.T) {
 	if r := promotionRead(h, "/admin/revocations"); r.Code != 409 {
 		t.Fatalf("feed status %d", r.Code)
 	}
-	if r := transportAuditRequest(h, "revoke", `{"identity":"owned-device"}`, transportAuditBearer); r.Code != 409 {
+	if r := transportAuditRequest(h, "revoke", `{"identity":"owned-device"}`, transportAuditBearer); r.Code != 503 || r.Header().Get("Retry-After") != "1" {
 		t.Fatalf("write admitted while preparing: %d", r.Code)
 	}
 	peer.tick()

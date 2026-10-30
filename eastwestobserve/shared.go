@@ -37,7 +37,7 @@ func decodeShared(raw []byte, known bool) (map[string]map[string]FlowObservation
 		for id, o := range rows {
 			first, e1 := time.Parse(time.RFC3339, o.FirstSeen)
 			last, e2 := time.Parse(time.RFC3339, o.LastSeen)
-			if o.TenantID != tenant || o.ObservationID != id || o.Destination == "" || o.Source == "" || o.Count < 1 || id != ObservationKey(o.Source, o.Destination, o.ServiceFamily, o.Port) || e1 != nil || e2 != nil || first.After(last) {
+			if o.TenantID != tenant || o.ObservationID != id || o.Destination == "" || o.Source == "" || o.Count < 1 || o.Port < 0 || o.Port > 65535 || id != ObservationKey(o.Source, o.Destination, o.ServiceFamily, o.Port) || e1 != nil || e2 != nil || first.After(last) {
 				return nil, nil, fmt.Errorf("invalid shared observation")
 			}
 		}
@@ -139,6 +139,9 @@ func (s *Store) RefreshShared() error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.restoreErr != nil {
+		return s.restoreErr
+	}
 	if _, ok := s.persister.(sharedPersister); !ok {
 		return nil
 	}

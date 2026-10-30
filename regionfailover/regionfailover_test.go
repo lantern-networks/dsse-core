@@ -54,6 +54,42 @@ func TestInBoundaryFailover(t *testing.T) {
 	}
 }
 
+func TestExpediteAfterTransportLossRequiresUnreachableProbe(t *testing.T) {
+	s := New([]RegionEndpoint{tok, osa}, "jp-tokyo")
+	s.SetUnhealthyStrikes(3)
+	good := map[string]Health{"jp-tokyo": up(1), "jp-osaka": up(2)}
+	if d := s.Evaluate(probeFrom(good)); d.Current.Region != "jp-tokyo" {
+		t.Fatalf("initial current=%s", d.Current.Region)
+	}
+	s.ExpediteAfterTransportLoss()
+	if d := s.Evaluate(probeFrom(good)); d.Current.Region != "jp-tokyo" {
+		t.Fatalf("healthy current switched on socket loss alone: %s", d.Current.Region)
+	}
+	// A recovered current probe must also reset the expedited strike. One later
+	// unreachable sample still gets ordinary hysteresis.
+	bad := map[string]Health{"jp-tokyo": down(), "jp-osaka": up(2)}
+	if d := s.Evaluate(probeFrom(bad)); !d.Held || d.Current.Region != "jp-tokyo" {
+		t.Fatalf("healthy probe did not reset strikes: %+v", d)
+	}
+	s.ExpediteAfterTransportLoss()
+	if d := s.Evaluate(probeFrom(bad)); d.Current.Region != "jp-osaka" {
+		t.Fatalf("unreachable current did not fail over promptly: %+v", d)
+	}
+}
+
+func TestExpediteAfterTransportLossNeverEndpointShopsOnAdmissionDeny(t *testing.T) {
+	s := New([]RegionEndpoint{tok, osa}, "jp-tokyo")
+	s.SetUnhealthyStrikes(3)
+	s.SetDenyOnAdmissionDeny(true)
+	s.SetInstantRevokeOnAdmissionDeny(true)
+	s.Evaluate(probeFrom(map[string]Health{"jp-tokyo": up(1), "jp-osaka": up(2)}))
+	s.ExpediteAfterTransportLoss()
+	d := s.Evaluate(probeFrom(map[string]Health{"jp-tokyo": deniedAdmit(), "jp-osaka": up(2)}))
+	if d.State != StateDenied || s.Current() != "jp-tokyo" {
+		t.Fatalf("admission deny must stay sticky, not shop for an alternate: %+v current=%s", d, s.Current())
+	}
+}
+
 // fail closed when no in-boundary peer is healthy: deny, never reach outside the boundary.
 func TestFailClosedWhenNoHealthyAllowed(t *testing.T) {
 	s := New([]RegionEndpoint{tok, osa, ish}, "jp-tokyo")

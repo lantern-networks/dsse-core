@@ -77,7 +77,7 @@ func deviceCACertificatesForTenant(config serverConfig, tenant string) []*x509.C
 	}
 	wanted := map[string]bool{}
 	for _, fact := range config.TenantCARegistry.Facts(time.Now()) {
-		if strings.EqualFold(fact.TenantID, tenant) {
+		if strings.TrimSpace(fact.TenantID) == strings.TrimSpace(tenant) {
 			wanted[strings.ToLower(strings.TrimSpace(fact.SHA256))] = true
 		}
 	}

@@ -23,6 +23,25 @@ func TestPostgresHotStoreMigrationVersions(t *testing.T) {
 	}
 }
 
+func TestPostgresCPStateIncludesPerRequestAuthResults(t *testing.T) {
+	versions := postgresCPStateBlobsMigrationVersions()
+	for _, version := range versions {
+		if version == postgresMigrationAuthFlowResults {
+			return
+		}
+	}
+	t.Fatalf("CP migrations omitted per-request authentication results: %v", versions)
+}
+
+func TestPostgresCPStateIncludesGrantRevision(t *testing.T) {
+	for _, version := range postgresCPStateBlobsMigrationVersions() {
+		if version == postgresMigrationGrantBlobRevision {
+			return
+		}
+	}
+	t.Fatal("CP migrations omitted grant revision stamping for released writers")
+}
+
 func TestPostgresWorkloadAttestationNonceMigrationVersions(t *testing.T) {
 	if got, want := postgresWorkloadAttestationNonceMigrationVersions(), []string{"011"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("workload attestation nonce versions = %#v, want %#v", got, want)
@@ -36,19 +55,19 @@ func TestPostgresHumanIdentityDirectoryMigrationVersions(t *testing.T) {
 }
 
 func TestPostgresConnectorRegistryMigrationVersions(t *testing.T) {
-	if got, want := postgresConnectorRegistryMigrationVersions(), []string{"017"}; !reflect.DeepEqual(got, want) {
+	if got, want := postgresConnectorRegistryMigrationVersions(), []string{"017", "060"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("connector registry versions = %#v, want %#v", got, want)
 	}
 }
 
 func TestPostgresDeviceInventoryMigrationVersions(t *testing.T) {
-	if got, want := postgresDeviceInventoryMigrationVersions(), []string{"018"}; !reflect.DeepEqual(got, want) {
+	if got, want := postgresDeviceInventoryMigrationVersions(), []string{"018", "058"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("device inventory versions = %#v, want %#v", got, want)
 	}
 }
 
 func TestPostgresDomainEventOutboxMigrationVersions(t *testing.T) {
-	if got, want := postgresDomainEventOutboxMigrationVersions(), []string{"006", "007"}; !reflect.DeepEqual(got, want) {
+	if got, want := postgresDomainEventOutboxMigrationVersions(), []string{"006", "007", "054"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("domain event outbox versions = %#v, want %#v", got, want)
 	}
 }
@@ -57,17 +76,18 @@ func TestSelectPostgresDomainEventOutboxMigrationsIncludesStreamCheck(t *testing
 	migrations := []migrationstore.Migration{
 		{Version: "006", Name: "domain_event_outbox"},
 		{Version: "007", Name: "domain_event_outbox_stream_check"},
+		{Version: "054", Name: "cold_archive_health_events"},
 		{Version: "999", Name: "unrelated"},
 	}
 	selected, err := selectPostgresComponentMigrations(migrations, "domain event outbox", postgresDomainEventOutboxMigrationVersions()...)
 	if err != nil {
 		t.Fatalf("select domain event outbox migrations returned error: %v", err)
 	}
-	if got, want := len(selected), 2; got != want {
+	if got, want := len(selected), 3; got != want {
 		t.Fatalf("selected migrations = %#v, want %d", selected, want)
 	}
-	if selected[0].Version != "006" || selected[1].Version != "007" {
-		t.Fatalf("selected migrations = %#v, want 006 then 007", selected)
+	if selected[0].Version != "006" || selected[1].Version != "007" || selected[2].Version != "054" {
+		t.Fatalf("selected migrations = %#v, want 006 then 007 then 054", selected)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/inspectioncrl"
 	"math/big"
 	"sort"
 	"strings"
@@ -60,7 +61,9 @@ type tenantInterceptionAuthority struct {
 	// generation changes whenever the set of authorities does, so an Edge asking the cheap question about the
 	// material response sees an interception authority that was imported since it last fetched. See
 	// materialGeneration: a change the number does not carry is invisible.
-	generation uint64
+	generation   uint64
+	snapshotOnly bool
+	recordIssued func(tenant, edgeID, certPEM string) error
 }
 
 // ★ AND THE TWO TIERS PERSIST DIFFERENTLY, ON PURPOSE (2026-08-21, written down after moving the reference
@@ -88,7 +91,11 @@ func (a *tenantInterceptionAuthority) Generation() uint64 {
 }
 
 type storedTenantInterceptionIssuer struct {
-	TenantID string `json:"tenant_id"`
+	TenantID    string                            `json:"tenant_id"`
+	RootCRL     []byte                            `json:"root_crl,omitempty"`
+	IssuingCRL  []byte                            `json:"issuing_crl,omitempty"`
+	CRLBaseURL  string                            `json:"crl_base_url,omitempty"`
+	Delegations map[string]interceptionDelegation `json:"delegations,omitempty"`
 	// RootPEM is the customer's root. Held only so the material handed to an Edge can carry the chain up to
 	// what devices actually trust; nothing here ever signs with it, because its key is not here.
 	RootPEM string `json:"root_pem"`
@@ -153,7 +160,7 @@ func newTenantInterceptionAuthorityInner(seed []byte, persist func([]byte) error
 		if err := json.Unmarshal(seed, &rows); err == nil {
 			for i := range rows {
 				row := rows[i]
-				a.issuers[strings.ToLower(strings.TrimSpace(row.TenantID))] = &row
+				a.issuers[strings.TrimSpace(row.TenantID)] = &row
 			}
 		}
 	}
@@ -185,10 +192,13 @@ func (a *tenantInterceptionAuthority) saveLocked() error {
 // ★ IT VERIFIES THE CHAIN BEFORE ACCEPTING IT. An issuing certificate that does not chain to the root, or is
 // not a CA, or whose key does not match it, would produce leaves every device refuses — and the refusal would
 // arrive at the browser, not here.
-func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuingKeyPEM string) (*storedTenantInterceptionIssuer, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuingKeyPEM string, rootCRLs ...[]byte) (*storedTenantInterceptionIssuer, error) {
+	key := strings.TrimSpace(tenant)
 	if key == "" {
 		return nil, fmt.Errorf("an organization must be named")
+	}
+	if len(rootCRLs) > 1 {
+		return nil, fmt.Errorf("one root CRL required")
 	}
 	root, err := parseFirstCertificatePEM([]byte(rootPEM))
 	if err != nil {
@@ -233,11 +243,24 @@ func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuin
 		return nil, fmt.Errorf("the key does not belong to the issuing certificate")
 	}
 	now := a.now().UTC()
+	var rootCRL []byte
+	if len(rootCRLs) == 1 {
+		rootCRL = rootCRLs[0]
+	}
+	crlBase, err := authorityCRLBase(root, issuing, strings.TrimSpace(tenant), rootCRL, now)
+	if err != nil {
+		return nil, err
+	}
 	row := &storedTenantInterceptionIssuer{
 		TenantID: key, RootPEM: strings.TrimSpace(rootPEM) + "\n",
 		IssuingCertPEM: strings.TrimSpace(issuingPEM) + "\n",
 		IssuingKeyPEM:  strings.TrimSpace(issuingKeyPEM) + "\n",
-		ImportedAt:     now.Format(time.RFC3339),
+		ImportedAt:     now.Format(time.RFC3339), RootCRL: append([]byte(nil), rootCRL...), CRLBaseURL: crlBase,
+	}
+	if crlBase != "" {
+		if err := signIssuingCRL(row, now, false); err != nil {
+			return nil, err
+		}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -288,7 +311,7 @@ func (a *tenantInterceptionAuthority) Import(tenant, rootPEM, issuingPEM, issuin
 // before that is the same mistake staging exists to prevent, one step later — see
 // interceptionAuthorityRotationReadiness.
 func (a *tenantInterceptionAuthority) Promote(tenant string) (*storedTenantInterceptionIssuer, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -319,7 +342,7 @@ func (a *tenantInterceptionAuthority) Promote(tenant string) (*storedTenantInter
 // — the wrong pathLenConstraint, the wrong root, a key nobody can produce — could only be got rid of by
 // promoting it, which is the one thing it must not do.
 func (a *tenantInterceptionAuthority) WithdrawIncoming(tenant string) (*storedTenantInterceptionIssuer, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -345,7 +368,7 @@ func (a *tenantInterceptionAuthority) WithdrawIncoming(tenant string) (*storedTe
 
 // IssueFor mints one Edge's short-lived interception intermediate.
 func (a *tenantInterceptionAuthority) IssueFor(tenant, edgeID string, ttl time.Duration) (tenantInterceptionMaterial, error) {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	row, ok, rerr := a.refreshedIssuerLocked(key)
 	row = copyAuthority(row)
@@ -391,9 +414,53 @@ func (a *tenantInterceptionAuthority) IssueFor(tenant, edgeID string, ttl time.D
 		MaxPathLen:            0,
 		MaxPathLenZero:        true,
 	}
+	root, err := parseFirstCertificatePEM([]byte(row.RootPEM))
+	if err != nil {
+		return tenantInterceptionMaterial{}, err
+	}
+	if template.NotAfter.After(issuing.NotAfter) {
+		template.NotAfter = issuing.NotAfter
+	}
+	if template.NotAfter.After(root.NotAfter) {
+		template.NotAfter = root.NotAfter
+	}
+	if row.CRLBaseURL != "" {
+		bases, baseErr := authorityCRLBases(root, issuing, row.TenantID, row.RootCRL, now)
+		if baseErr != nil {
+			return tenantInterceptionMaterial{}, baseErr
+		}
+		if len(bases) == 0 || bases[0] != row.CRLBaseURL {
+			return tenantInterceptionMaterial{}, fmt.Errorf("stored CRL origin differs from the issuing certificate")
+		}
+		if _, err = inspectioncrl.ParseAndValidate(row.IssuingCRL, issuing, now); err != nil {
+			return tenantInterceptionMaterial{}, fmt.Errorf("interception issuing CRL is unavailable: %w", err)
+		}
+		points, pointErr := inspectioncrl.URLs(bases, row.TenantID, issuing)
+		if pointErr != nil {
+			return tenantInterceptionMaterial{}, pointErr
+		}
+		template.CRLDistributionPoints = points
+	}
 	der, err := x509.CreateCertificate(rand.Reader, template, issuing, &edgeKey.PublicKey, issuingKey)
 	if err != nil {
 		return tenantInterceptionMaterial{}, err
+	}
+	if row.CRLBaseURL != "" {
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			return tenantInterceptionMaterial{}, err
+		}
+		certPEM := interceptionCertPEM(cert)
+		if a.recordIssued != nil {
+			err = a.recordIssued(tenant, edgeID, certPEM)
+		} else if a.snapshotOnly {
+			err = fmt.Errorf("snapshot cannot issue an unrecorded CRL delegation")
+		} else {
+			err = a.recordDelegation(context.Background(), tenant, edgeID, certPEM)
+		}
+		if err != nil {
+			return tenantInterceptionMaterial{}, err
+		}
 	}
 	keyDER, err := x509.MarshalECPrivateKey(edgeKey)
 	if err != nil {
@@ -447,7 +514,7 @@ func (a *tenantInterceptionAuthority) Row(tenant string) (storedTenantIntercepti
 	// The material paths already went through the shared store on a miss, with a comment saying exactly why —
 	// "a control plane that did not receive a write does not refuse an organization's enrolments as if it had
 	// none". The read that BUILDS THE PROFILE did not. Same rule, one call site over.
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
@@ -485,7 +552,7 @@ func (a *tenantInterceptionAuthority) CountForTenant(tenant string) int {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
-	if _, ok := a.issuers[strings.ToLower(strings.TrimSpace(tenant))]; ok {
+	if _, ok := a.issuers[strings.TrimSpace(tenant)]; ok {
 		return 1
 	}
 	return 0
@@ -507,7 +574,7 @@ func (a *tenantInterceptionAuthority) RemoveTenantContext(ctx context.Context, t
 	if a == nil {
 		return 0, nil
 	}
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshLocked(); err != nil {
@@ -543,7 +610,7 @@ func (a *tenantInterceptionAuthority) IsStaged(tenant string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	_ = a.refreshLocked() // Metadata retains the last committed view on a read error; issuance refuses.
-	row, ok := a.issuers[strings.ToLower(strings.TrimSpace(tenant))]
+	row, ok := a.issuers[strings.TrimSpace(tenant)]
 	return ok && row != nil && row.Incoming != nil
 }
 
@@ -593,5 +660,5 @@ func (a *tenantInterceptionAuthority) refreshLocked() error {
 }
 
 func interceptionAuthorityRowKey(row *storedTenantInterceptionIssuer) string {
-	return strings.ToLower(strings.TrimSpace(row.TenantID))
+	return strings.TrimSpace(row.TenantID)
 }

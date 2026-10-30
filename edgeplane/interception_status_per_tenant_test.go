@@ -23,6 +23,7 @@ func TestInterceptionStatusAnswersAboutTheTenantAsked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("offline interception: %v", err)
 	}
+	interception.SetOfflineTenantIntermediateDir(t.TempDir())
 	interception.SetOfflinePrimaryTenant("tenant_lab")
 	nwRoot, nwInter, nwKey, _ := tenantOfflineBundle(t, "Northwind", now)
 	if _, err := interception.LoadOfflineTenantIntermediate("tenant_northwind", nwRoot, nwInter, nwKey); err != nil {

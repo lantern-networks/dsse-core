@@ -15,7 +15,7 @@ type deviceRetirementPreview struct {
 }
 
 func previewDeviceRetirement(snapshot *tenantDeviceAuthority, tenant string, gates []pkiTransitionAdmission) deviceRetirementPreview {
-	key := strings.ToLower(strings.TrimSpace(tenant))
+	key := strings.TrimSpace(tenant)
 	before := copyAuthority(snapshot.cas[key])
 	candidate := newTenantDeviceAuthority(encodeAuthoritySnapshot(snapshot.cas), nil, snapshot.now)
 	_, err := candidate.RetirePrevious(key)

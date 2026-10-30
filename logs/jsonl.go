@@ -14,6 +14,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // logFile holds a persistent append handle for one JSONL log file plus a mutex that
@@ -30,8 +32,16 @@ type logFile struct {
 	lastUsed uint64
 }
 
+// pathGate serializes lifecycle changes and rotation for one on-disk path,
+// including the gap after a handle leaves openFiles but before its fd closes.
+// refs prevents a waiter from getting a different gate for the same path.
+type pathGate struct {
+	mu   sync.Mutex
+	refs int
+}
+
 // defaultMaxOpenLogFiles bounds how many append handles the Writer keeps open at once. On a multi-tenant Edge
-// each distinct tenant-partitioned path (tenants/<tenant>/<file>) opened one persistent fd that was NEVER
+// each distinct tenant-partitioned path (tenants/<tenant-segment>/<file>) opened one persistent fd that was NEVER
 // closed — unbounded fd growth (review #32). The LRU caps the working set; an evicted handle reopens on its
 // next Append.
 const defaultMaxOpenLogFiles = 512
@@ -47,8 +57,9 @@ type Writer struct {
 	appendHook     AppendHook
 	generatedLocks map[string]*sync.Mutex
 	openFiles      map[string]*logFile
+	pathGates      map[string]*pathGate
 	// tenantPartitioned: log filenames whose rows are physically separated per tenant on disk
-	// (tenant isolation). For these, Append routes each row to tenants/<tenant_id>/<filename>
+	// (tenant isolation). For these, Append routes each row to tenants/<SafeTenantSegment(tenant_id)>/<filename>
 	// based on the row's tenant_id; ReadJSONL aggregates the partitions (back-compat) and
 	// ReadJSONLTenant reads exactly one tenant's partition. Default empty = no partitioning.
 	tenantPartitioned map[string]bool
@@ -112,25 +123,17 @@ func SafeTenantSegment(tenantID string) string { return safeTenantSegment(tenant
 
 // safeTenantSegment maps a tenant id to a single safe path segment. Empty/unknown → "_system" so
 // tenant-less rows are kept in their own partition (never co-mingled with a real tenant).
+//
+// Do not replace disallowed path characters with underscores: both ':' and '_' are valid in tenant IDs,
+// so that mapping would put two distinct tenants in one partition. A fixed-length digest also keeps an
+// unusually long (or malformed) ID from exceeding a filesystem component limit. The "t_" prefix keeps
+// every real tenant separate from the reserved system partition.
 func safeTenantSegment(tenantID string) string {
-	t := strings.TrimSpace(tenantID)
-	if t == "" {
+	if tenantID == "" {
 		return "_system"
 	}
-	var b strings.Builder
-	for _, r := range t {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-', r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	seg := b.String()
-	if seg == "" || seg == "." || seg == ".." {
-		return "_system"
-	}
-	return seg
+	sum := sha256.Sum256([]byte(tenantID))
+	return "t_" + hex.EncodeToString(sum[:])
 }
 
 // tenantPartitionPath builds the on-disk relative path for a tenant's partition of a log file.
@@ -158,7 +161,31 @@ func NewWriter(dir string) (*Writer, error) {
 		dir:            dir,
 		generatedLocks: map[string]*sync.Mutex{},
 		openFiles:      map[string]*logFile{},
+		pathGates:      map[string]*pathGate{},
 	}, nil
+}
+
+// lockPath allows distinct log paths to continue in parallel. Never wait for
+// a path gate while holding Writer.mu: rotation takes the locks in that order.
+func (w *Writer) lockPath(clean string) func() {
+	w.mu.Lock()
+	gate := w.pathGates[clean]
+	if gate == nil {
+		gate = &pathGate{}
+		w.pathGates[clean] = gate
+	}
+	gate.refs++
+	w.mu.Unlock()
+	gate.mu.Lock()
+	return func() {
+		gate.mu.Unlock()
+		w.mu.Lock()
+		gate.refs--
+		if gate.refs == 0 && w.pathGates[clean] == gate {
+			delete(w.pathGates, clean)
+		}
+		w.mu.Unlock()
+	}
 }
 
 // fileFor returns a persistent append handle for clean, opening it once and reusing it.
@@ -249,16 +276,31 @@ func (w *Writer) evictOpenFilesOverCapLocked() []*logFile {
 // unless the writer is closed first. The Writer stays usable after Close (handles reopen on next Append).
 func (w *Writer) Close() error {
 	w.mu.Lock()
-	defer w.mu.Unlock()
-	var firstErr error
-	for _, lf := range w.openFiles {
-		lf.mu.Lock()
-		if err := lf.f.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		lf.mu.Unlock()
+	paths := make([]string, 0, len(w.openFiles))
+	for clean := range w.openFiles {
+		paths = append(paths, clean)
 	}
-	w.openFiles = map[string]*logFile{}
+	w.mu.Unlock()
+	// Path gates let an in-flight append finish rotation before detaching its
+	// handle, while unrelated files continue writing. Do not hold Writer.mu
+	// while waiting for a gate or a file mutex.
+	var firstErr error
+	for _, clean := range paths {
+		unlockPath := w.lockPath(clean)
+		w.mu.Lock()
+		lf := w.openFiles[clean]
+		delete(w.openFiles, clean)
+		w.mu.Unlock()
+		if lf != nil {
+			lf.mu.Lock()
+			lf.closed = true
+			if err := lf.f.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			lf.mu.Unlock()
+		}
+		unlockPath()
+	}
 	return firstErr
 }
 
@@ -332,6 +374,12 @@ func (w *Writer) Append(filename string, value any) (appendErr error) {
 	if partitioned {
 		writeClean = tenantPartitionPath(tenantIDFromEncoded(line), clean)
 	}
+	unlockPath := w.lockPath(writeClean)
+	defer func() {
+		if unlockPath != nil {
+			unlockPath()
+		}
+	}()
 
 	phase = "open"
 	lf, err := w.fileFor(writeClean)
@@ -345,7 +393,7 @@ func (w *Writer) Append(filename string, value any) (appendErr error) {
 	w.mu.Unlock()
 
 	lf.mu.Lock()
-	if lf.closed {
+	for lf.closed {
 		// Evicted from the LRU between fileFor and here; reopen (it becomes most-recently-used, so it will
 		// not be immediately re-evicted) and use the fresh handle.
 		lf.mu.Unlock()
@@ -369,6 +417,8 @@ func (w *Writer) Append(filename string, value any) (appendErr error) {
 	}
 	lf.mu.Unlock()
 	logLineBufPool.Put(buf)
+	unlockPath()
+	unlockPath = nil
 	if writeErr != nil {
 		return fmt.Errorf("write jsonl value: %w", writeErr)
 	}
@@ -514,6 +564,33 @@ func (w *Writer) ReadJSONLTenant(tenantID, filename string) ([]map[string]any, e
 	return w.readJSONLClean(tenantPartitionPath(tenantID, clean))
 }
 
+// ReadJSONLForTenant reads only the requested partition when partitioning is
+// enabled. For an unpartitioned source it filters rows before returning them, so
+// callers cannot expose another tenant's row count as query diagnostics.
+func (w *Writer) ReadJSONLForTenant(tenantID, filename string) ([]map[string]any, error) {
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant_id is required")
+	}
+	clean, err := safeRelativeLogPath(filename)
+	if err != nil {
+		return nil, err
+	}
+	if w.isTenantPartitioned(clean) {
+		clean = tenantPartitionPath(tenantID, clean)
+	}
+	rows, err := w.readJSONLClean(clean)
+	if err != nil {
+		return nil, err
+	}
+	own := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		if id, ok := row["tenant_id"].(string); ok && id == tenantID {
+			own = append(own, row)
+		}
+	}
+	return own, nil
+}
+
 // tenantPartitionSegments lists the tenant segment dirs under tenants/.
 func (w *Writer) tenantPartitionSegments() ([]string, error) {
 	entries, err := os.ReadDir(filepath.Join(w.dir, "tenants"))
@@ -535,6 +612,8 @@ func (w *Writer) tenantPartitionSegments() ([]string, error) {
 
 // readJSONLClean reads a single already-cleaned log path.
 func (w *Writer) readJSONLClean(clean string) ([]map[string]any, error) {
+	unlockPath := w.lockPath(clean)
+	defer unlockPath()
 	// Serialize with concurrent writers to THIS file only (not every flow), so a read does
 	// not observe a partially written line. Writes are synchronous to the OS, so a fresh
 	// os.Open here sees all prior appends.
@@ -604,16 +683,16 @@ func (w *Writer) WriteGzipJSONLStreamWithComment(filename, comment string, next 
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", fmt.Errorf("create jsonl export dir: %w", err)
 	}
-	file, err := os.Create(path)
+	// Build beside the committed object. A failed source or disk write must
+	// never truncate the previous successful export/outbox delivery.
+	file, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return "", fmt.Errorf("create jsonl export: %w", err)
 	}
-	committed := false
+	staged := file.Name()
 	defer func() {
 		_ = file.Close()
-		if !committed {
-			_ = os.Remove(path)
-		}
+		_ = os.Remove(staged)
 	}()
 
 	hash := sha256.New()
@@ -637,7 +716,15 @@ func (w *Writer) WriteGzipJSONLStreamWithComment(filename, comment string, next 
 	if err := gzipWriter.Close(); err != nil {
 		return "", fmt.Errorf("close jsonl export gzip: %w", err)
 	}
-	committed = true
+	if err := file.Sync(); err != nil {
+		return "", fmt.Errorf("flush generated object: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return "", fmt.Errorf("close generated object: %w", err)
+	}
+	if err := durablefile.Replace(staged, path); err != nil {
+		return "", fmt.Errorf("commit generated object: %w", err)
+	}
 
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
 }
@@ -746,23 +833,30 @@ func safeRelativeLogPath(filename string) (string, error) {
 func (w *Writer) CloseTenant(tenantID string) error {
 	prefix := filepath.Join("tenants", safeTenantSegment(tenantID)) + string(filepath.Separator)
 	w.mu.Lock()
-	var closing []*logFile
-	for key, lf := range w.openFiles {
+	var paths []string
+	for key := range w.openFiles {
 		if strings.HasPrefix(key, prefix) {
-			delete(w.openFiles, key)
-			closing = append(closing, lf)
+			paths = append(paths, key)
 		}
 	}
 	w.mu.Unlock()
 
 	var firstErr error
-	for _, lf := range closing {
-		lf.mu.Lock()
-		lf.closed = true
-		if err := lf.f.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	for _, clean := range paths {
+		unlockPath := w.lockPath(clean)
+		w.mu.Lock()
+		lf := w.openFiles[clean]
+		delete(w.openFiles, clean)
+		w.mu.Unlock()
+		if lf != nil {
+			lf.mu.Lock()
+			lf.closed = true
+			if err := lf.f.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			lf.mu.Unlock()
 		}
-		lf.mu.Unlock()
+		unlockPath()
 	}
 	return firstErr
 }

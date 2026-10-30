@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,6 +42,7 @@ func (store postgresConnectorRegistryStore) Register(conn model.ConnectorRegistr
 			_ = tx.Rollback()
 		}
 	}()
+	catalogChanged := true
 	if existing, ok, err := queryPostgresConnectorRegistryByID(ctx, tx, normalized.ID, true); err != nil {
 		return model.ConnectorRegistration{}, err
 	} else if ok {
@@ -48,6 +51,7 @@ func (store postgresConnectorRegistryStore) Register(conn model.ConnectorRegistr
 		}
 		preserveConnectorRuntimeCredentialMetadata(existing.Metadata, normalized.Metadata)
 		preserveConnectorRegistrationLifecycle(existing, &normalized)
+		catalogChanged = postgresConnectorCatalogChanged(existing, normalized)
 	}
 	statement, err := buildPostgresConnectorRegistryUpsertStatement(normalized, now)
 	if err != nil {
@@ -57,8 +61,17 @@ func (store postgresConnectorRegistryStore) Register(conn model.ConnectorRegistr
 	if err != nil {
 		return model.ConnectorRegistration{}, fmt.Errorf("upsert connector registration: %w", err)
 	}
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return model.ConnectorRegistration{}, fmt.Errorf("confirm connector registration: %w", err)
+	}
+	if rows != 1 {
 		return model.ConnectorRegistration{}, fmt.Errorf("connector %s is already registered for another tenant", normalized.ID)
+	}
+	if catalogChanged {
+		if err := advancePostgresConnectorCatalogGeneration(ctx, tx); err != nil {
+			return model.ConnectorRegistration{}, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return model.ConnectorRegistration{}, fmt.Errorf("commit connector registration: %w", err)
@@ -241,6 +254,7 @@ func (store postgresConnectorRegistryStore) updateByIDOptionalWithLookup(id stri
 	if err != nil || !ok {
 		return model.ConnectorRegistration{}, ok, err
 	}
+	previous := conn
 	if err := mutate(&conn); err != nil {
 		return model.ConnectorRegistration{}, false, err
 	}
@@ -252,8 +266,17 @@ func (store postgresConnectorRegistryStore) updateByIDOptionalWithLookup(id stri
 	if err != nil {
 		return model.ConnectorRegistration{}, false, fmt.Errorf("update connector registration: %w", err)
 	}
-	if rows, err := result.RowsAffected(); err == nil && rows == 0 {
-		return model.ConnectorRegistration{}, false, fmt.Errorf("connector %s update did not affect a row", strings.TrimSpace(id))
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return model.ConnectorRegistration{}, false, fmt.Errorf("confirm connector registry update: %w", err)
+	}
+	if rows != 1 {
+		return model.ConnectorRegistration{}, false, fmt.Errorf("connector %s update did not affect one row", strings.TrimSpace(id))
+	}
+	if postgresConnectorCatalogChanged(previous, conn) {
+		if err := advancePostgresConnectorCatalogGeneration(ctx, tx); err != nil {
+			return model.ConnectorRegistration{}, false, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return model.ConnectorRegistration{}, false, fmt.Errorf("commit connector registry update: %w", err)
@@ -355,16 +378,8 @@ func buildPostgresConnectorRegistryUpsertStatement(conn model.ConnectorRegistrat
 			"INSERT INTO connector_registrations (connector_id, tenant_id, connector_group_id, name, edge_region_id, edge_cluster_id, application_ids, private_base_url, status, registered_at, last_heartbeat_at, metadata, payload, created_at, updated_at)",
 			"VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10::timestamptz, $11::timestamptz, $12::jsonb, $13::jsonb, $14, $14)",
 			"ON CONFLICT (connector_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, connector_group_id = EXCLUDED.connector_group_id, name = EXCLUDED.name, edge_region_id = EXCLUDED.edge_region_id, edge_cluster_id = EXCLUDED.edge_cluster_id, application_ids = EXCLUDED.application_ids, private_base_url = EXCLUDED.private_base_url, status = EXCLUDED.status, registered_at = EXCLUDED.registered_at, last_heartbeat_at = EXCLUDED.last_heartbeat_at, metadata = EXCLUDED.metadata, payload = EXCLUDED.payload, " +
-				// ★★★ updated_at MOVES WHEN THE ROUTING-RELEVANT CONTENT DOES, NOT ON EVERY HEARTBEAT
-				// (2026-08-26). This column is what the config-bundle generation is derived from, and a
-				// connector re-registers on a timer: moving it every time made the fleet re-apply the whole
-				// bundle every thirty seconds, and each re-apply undid a connector's local registration.
-				//
-				// The obvious alternative — hashing the class-1 fields — is WORSE, and was measured being
-				// worse: the bundle generation is a SUM of monotonic terms, an Edge applies only a generation
-				// GREATER than the one it holds, and a hash goes DOWN as readily as up. One decrease and the
-				// fleet stops applying configuration for ever. So the term stays a clock; what changes is
-				// that the clock only ticks when something an Edge would act on has actually changed.
+				// Keep the historical updated_at behavior for readers of this column. The authoritative
+				// bundle version now lives in connector_registry_generation and advances transactionally.
 				"updated_at = CASE WHEN connector_registrations.tenant_id IS DISTINCT FROM EXCLUDED.tenant_id " +
 				"OR connector_registrations.connector_group_id IS DISTINCT FROM EXCLUDED.connector_group_id " +
 				"OR connector_registrations.edge_region_id IS DISTINCT FROM EXCLUDED.edge_region_id " +
@@ -622,24 +637,42 @@ func (store postgresConnectorRegistryStore) RemoveForTenant(tenantID, id string)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), postgresConnectorRegistryTimeout)
 	defer cancel()
-	conn, ok, err := store.getByID(ctx, id, false)
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin connector removal: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	conn, ok, err := queryPostgresConnectorRegistryByID(ctx, tx, id, true)
 	if err != nil || !ok {
 		return false, err
 	}
 	if tenantID != "" && strings.TrimSpace(conn.TenantID) != tenantID {
 		return false, fmt.Errorf("connector %s belongs to another tenant", id)
 	}
-	res, err := store.DB.ExecContext(ctx, "DELETE FROM connector_registrations WHERE connector_id = $1", id)
+	res, err := tx.ExecContext(ctx, "DELETE FROM connector_registrations WHERE connector_id = $1 AND tenant_id = $2", id, conn.TenantID)
 	if err != nil {
 		return false, fmt.Errorf("remove connector: %w", err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		// The delete ran; the driver could not say how many rows it touched. Reporting "not removed" here
-		// would send an operator to do it again on a connector that is already gone.
-		return true, nil
+		return false, fmt.Errorf("confirm connector removal: %w", err)
 	}
-	return n > 0, nil
+	if n != 1 {
+		return false, fmt.Errorf("connector %s changed while removing it", id)
+	}
+	if err := advancePostgresConnectorCatalogGeneration(ctx, tx); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit connector removal: %w", err)
+	}
+	committed = true
+	return true, nil
 }
 
 // ★★★ AND THE BUNDLE'S VERSION HAS TO MOVE WHEN THE CATALOG DOES (2026-08-26). The aggregate generation an
@@ -649,35 +682,56 @@ func (store postgresConnectorRegistryStore) RemoveForTenant(tenantID, id string)
 // version has not moved. A catalog that travels and a version that does not move are the same as not carrying
 // it at all.
 //
-// Derived from what is stored rather than counted in memory: a counter held by one process is not a version
-// two control planes can agree on, and this store exists precisely because they must.
+// The counter lives in the shared database and advances in the same transaction as a catalog edit. A deleted
+// row must not make the version decrease, and runtime liveness must not churn it.
 func (store postgresConnectorRegistryStore) ConfigGeneration() uint64 {
 	if store.DB == nil {
 		return 0
 	}
-	// ★★★ MONOTONIC, BECAUSE AN EDGE APPLIES ONLY WHAT IS NEWER (2026-08-26, measured twice on the way to
-	// getting this right).
-	//
-	// The bundle's generation is a SUM of terms and an Edge applies a generation GREATER than the one it
-	// holds. A term that can DECREASE therefore does not slow the fleet down — it stops it: one decrease and
-	// no Edge ever applies configuration again, silently, until the control plane restarts and the epoch
-	// changes. A fingerprint of the fields was tried here and was exactly that.
-	//
-	// So it is a clock, and the write path is what keeps it quiet: updated_at moves only when a
-	// routing-relevant field changes, never on a heartbeat. See the upsert.
 	ctx, cancel := context.WithTimeout(context.Background(), postgresConnectorRegistryTimeout)
 	defer cancel()
-	var count int64
-	var latest sql.NullTime
+	var generation int64
 	if err := store.DB.QueryRowContext(ctx,
-		"SELECT count(*), max(updated_at) FROM connector_registrations").Scan(&count, &latest); err != nil {
+		"SELECT generation FROM connector_registry_generation WHERE singleton = true").Scan(&generation); err != nil {
 		return 0
 	}
-	gen := uint64(count)
-	if latest.Valid {
-		gen += uint64(latest.Time.UTC().Unix())
+	if generation < 0 {
+		return 0
 	}
-	return gen
+	return uint64(generation)
+}
+
+func advancePostgresConnectorCatalogGeneration(ctx context.Context, tx *sql.Tx) error {
+	var generation int64
+	if err := tx.QueryRowContext(ctx, "UPDATE connector_registry_generation SET generation = generation + 1 WHERE singleton = true RETURNING generation").Scan(&generation); err != nil {
+		return fmt.Errorf("advance connector catalog generation: %w", err)
+	}
+	if generation <= 0 {
+		return fmt.Errorf("connector catalog generation did not advance")
+	}
+	return nil
+}
+
+func postgresConnectorCatalogChanged(a, b model.ConnectorRegistration) bool {
+	if a.TenantID != b.TenantID || a.ConnectorGroupID != b.ConnectorGroupID ||
+		a.EdgeRegionID != b.EdgeRegionID || a.EdgeClusterID != b.EdgeClusterID ||
+		a.PrivateBaseURL != b.PrivateBaseURL || a.Status != b.Status ||
+		!slices.Equal(a.ApplicationIDs, b.ApplicationIDs) ||
+		a.ReachableRoutes.Namespace != b.ReachableRoutes.Namespace {
+		return true
+	}
+	return !samePostgresConnectorRouteSet(a.ReachableRoutes.FQDNDomains, b.ReachableRoutes.FQDNDomains) ||
+		!samePostgresConnectorRouteSet(a.ReachableRoutes.CIDRs, b.ReachableRoutes.CIDRs)
+}
+
+func samePostgresConnectorRouteSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	a, b = slices.Clone(a), slices.Clone(b)
+	sort.Strings(a)
+	sort.Strings(b)
+	return slices.Equal(a, b)
 }
 
 // RecordLiveness writes ONLY what a reporting Edge observed — that this connector was heard from, and what it
@@ -698,7 +752,17 @@ func (store postgresConnectorRegistryStore) RecordLiveness(id, status, heartbeat
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), postgresConnectorRegistryTimeout)
 	defer cancel()
-	conn, ok, err := store.getByID(ctx, id, false)
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin connector liveness update: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	conn, ok, err := queryPostgresConnectorRegistryByID(ctx, tx, id, true)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -732,14 +796,24 @@ func (store postgresConnectorRegistryStore) RecordLiveness(id, status, heartbeat
 	if err != nil {
 		return false, fmt.Errorf("marshal connector liveness payload: %w", err)
 	}
-	res, err := store.DB.ExecContext(ctx,
-		"UPDATE connector_registrations SET last_heartbeat_at = $2, status = $3, payload = $4 WHERE connector_id = $1",
-		id, hb, st, payload)
+	res, err := tx.ExecContext(ctx,
+		"UPDATE connector_registrations SET last_heartbeat_at = $3, status = $4, payload = $5 WHERE connector_id = $1 AND tenant_id = $2",
+		id, conn.TenantID, hb, st, payload)
 	if err != nil {
 		return false, fmt.Errorf("record connector liveness: %w", err)
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("confirm connector liveness update: %w", err)
+	}
+	if n != 1 {
+		return false, fmt.Errorf("connector %s changed during liveness update", id)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit connector liveness update: %w", err)
+	}
+	committed = true
+	return true, nil
 }
 
 // RecordAttachedRegion notes where this connector's tunnel is currently terminating. See

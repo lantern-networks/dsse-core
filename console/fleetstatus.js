@@ -54,7 +54,7 @@ async function fleetStatus() {
 // grouping. Kept in ONE place so the strip, the reach panel and the Edge list cannot count differently.
 function fleetRollup(body) {
   const edges = (body && Array.isArray(body.edges) ? body.edges : []);
-  const byRegion = {};
+  const byRegion = Object.create(null);
   edges.forEach((e) => {
     const k = String(e.region_id || "").trim() || "—";
     (byRegion[k] = byRegion[k] || { name: k, all: [] }).all.push(e);
@@ -93,10 +93,20 @@ async function ovLoadFleetConfig(host, setMore, shared) {
   }
 
   const { edges, regions, behind } = fleetRollup(res.body);
+  const formed = res.body.fleet_view_formed === true;
+
+  // A newly elected control plane only knows which Edges have reported so far.
+  // Even if every reported Edge is current, this is not yet a complete fleet claim.
+  if (!formed) host.appendChild(ovEmpty(bl({
+    en: "Fleet view is still forming; other Edges may not have reported yet.",
+    ja: "フリートの一覧を形成中です。未報告の Edge がある可能性があります。",
+  })));
 
   // ★ Counted in INSTANCES, not regions. A region is not one Edge — production fronts several behind a load
   // balancer, and "region-a is fine" is exactly the summary that hid a lagging sibling.
-  if (res.body.in_sync) {
+  if (!formed) {
+    setMore(bl({ en: "fleet view forming", ja: "フリート一覧を形成中" }));
+  } else if (res.body.in_sync) {
     setMore(bl({ en: "all " + edges.length + " in effect", ja: edges.length + " 台すべて反映済み" }));
   } else if (!edges.length) {
     setMore(bl({ en: "none reporting", ja: "報告なし" }));
@@ -149,10 +159,13 @@ async function ovLoadFleetConfig(host, setMore, shared) {
 function fleetStripChip(res) {
   if (!res || !res.ok || !res.body || !Array.isArray(res.body.edges)) return null;
   const { edges, regions, behind } = fleetRollup(res.body);
+  const formed = res.body.fleet_view_formed === true;
   if (!edges.length) {
-    return el("span", { class: "ov-id" }, [el("b", { text: bl({ en: "no Edges reporting", ja: "報告中の Edge なし" }) })]);
+    return el("span", { class: "ov-id" }, [el("b", { text: formed
+      ? bl({ en: "no Edges reporting", ja: "報告中の Edge なし" })
+      : bl({ en: "fleet view forming", ja: "フリート一覧を形成中" }) })]);
   }
-  const tone = behind.length ? (behind.some((e) => e.status === "error") ? "danger" : "warn") : "ok";
+  const tone = behind.some((e) => e.status === "error") ? "danger" : (!formed || behind.length ? "warn" : "ok");
   return el("span", { class: "ov-id" }, [
     el("span", { class: "ov-dot ov-dot-" + tone, style: "margin-right:6px" }),
     el("b", { text: String(edges.length) }),
@@ -162,6 +175,7 @@ function fleetStripChip(res) {
     el("b", { text: String(regions.length) }),
     document.createTextNode(bl({ en: (regions.length === 1 ? " region" : " regions"), ja: " リージョン" })),
     ...(behind.length ? [document.createTextNode(bl({ en: " · " + behind.length + " behind", ja: " · " + behind.length + " 台が未反映" }))] : []),
+    ...(!formed ? [document.createTextNode(bl({ en: " · fleet view forming", ja: " · フリート一覧を形成中" }))] : []),
   ]);
 }
 
@@ -183,7 +197,7 @@ function fleetStripChip(res) {
 // act on is the region and how much of it holds the current configuration.
 // fleetByState collapses a region's instances into one row per configuration state, worst first.
 function fleetByState(all) {
-  const by = {};
+  const by = Object.create(null);
   all.forEach((e) => {
     const k = e.status || "—";
     (by[k] = by[k] || { status: k, count: 0, rules: e.rule_count });
@@ -208,15 +222,22 @@ async function ovLoadEdgesByRegion(host, setMore, shared) {
     return;
   }
   const { edges, regions } = fleetRollup(res.body);
+  const formed = res.body.fleet_view_formed === true;
+  if (!formed) host.appendChild(ovEmpty(bl({
+    en: "Fleet view is still forming; this list may be incomplete.",
+    ja: "フリートの一覧を形成中です。この一覧はまだ完全ではない可能性があります。",
+  })));
   if (!edges.length) {
-    setMore("");
+    setMore(formed ? "" : bl({ en: "fleet view forming", ja: "フリート一覧を形成中" }));
     host.appendChild(ovEmpty(bl({
       en: "No Edge has reported.",
       ja: "報告した Edge がありません。",
     })));
     return;
   }
-  setMore(bl({ en: edges.length + " across " + regions.length + " regions", ja: regions.length + " リージョン · " + edges.length + " 台" }));
+  setMore(formed
+    ? bl({ en: edges.length + " across " + regions.length + " regions", ja: regions.length + " リージョン · " + edges.length + " 台" })
+    : bl({ en: "fleet view forming · " + edges.length + " reporting", ja: "フリート一覧を形成中 · " + edges.length + " 台が報告中" }));
 
   regions.forEach((g, gi) => {
     host.appendChild(el("div", { style: (gi ? "margin-top:14px;" : "") + "font-weight:600", text: g.name }));

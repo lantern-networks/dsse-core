@@ -195,7 +195,7 @@ func (e *enrolmentLicensing) noteOverQuota(tenantID string, used, quota int) {
 	if e == nil {
 		return
 	}
-	key := strings.ToLower(strings.TrimSpace(tenantID))
+	key := strings.TrimSpace(tenantID)
 	if _, already := e.overQuotaSeen.LoadOrStore(key, used); already {
 		return
 	}

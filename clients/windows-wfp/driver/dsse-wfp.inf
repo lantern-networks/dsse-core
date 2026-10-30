@@ -7,11 +7,9 @@
 ; only be test-signed, which is what pinned this box to `bcdedit testsigning on` and blocked the MSI
 ; happy-path install everywhere else.
 ;
-; THE CAB CARRIES THIS INF AND dsse-wfp.sys, AND NOTHING ELSE. An earlier version of this comment said the
-; submission also holds the symbols. It did, and that is precisely what Microsoft is changing: files a driver
-; package contains but the INF does not reference are covered by a new signing policy
-; (https://aka.ms/UnreferencedInfFiles). Symbols belong in a symbol store. See build-attestation-cab.ps1 in
-; ../packaging, which builds the submission from exactly the files named below.
+; The attestation submission carries this INF, dsse-wfp.sys, a generated CAT, and
+; the matching PDB for Microsoft crash analysis. PDB symbols need no INF reference
+; and are not installed as endpoint payload. See build-attestation-cab.ps1.
 ;
 ; It is deliberately a non-PnP, [DefaultInstall]-style INF: there is no hardware to enumerate. That shape is
 ; accepted for attestation — the .sys comes back Microsoft-signed — provided the file itself passes InfVerif.
@@ -28,7 +26,7 @@ Class       = System
 ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider    = %ManufacturerName%
 CatalogFile = dsse-wfp.cat
-DriverVer   = 08/07/2026,1.0.0.0
+DriverVer   = 10/26/2026,1.0.0.1
 PnpLockdown = 1
 
 [DestinationDirs]

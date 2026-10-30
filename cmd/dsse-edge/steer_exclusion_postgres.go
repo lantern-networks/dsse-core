@@ -80,7 +80,7 @@ func setupSteerExclusionPersistence(ctx context.Context, mode, dsn, migrationDir
 		if strings.TrimSpace(dsn) == "" {
 			return nil, nil, fmt.Errorf("steer-exclusion-store-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

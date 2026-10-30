@@ -449,8 +449,8 @@ func Run(j *Journal, m Manifest, cfg Config, p Platform, save func(*Journal) err
 		// part of the state somebody needs.
 		j.LastFailureReason = failureWithSteering(j.LastFailureReason, true, true, rerr)
 		serr := save(j)
-		unprotected := fmt.Errorf("★ STEERING WAS TAKEN DOWN FOR THIS INSTALL AND COULD NOT BE RESTORED (%w); "+
-			"this endpoint is on its native network with the control OFF and needs a person now", rerr)
+		unprotected := fmt.Errorf("★ STEERING WAS TAKEN DOWN FOR THIS INSTALL AND RESTORATION COULD NOT BE CONFIRMED (%w); "+
+			"the endpoint may be unprotected or blocked; inspect the driver and network now", rerr)
 		if serr != nil {
 			unprotected = fmt.Errorf("%w; and it could not be recorded either (%v)", unprotected, serr)
 		}
@@ -467,15 +467,19 @@ func Run(j *Journal, m Manifest, cfg Config, p Platform, save func(*Journal) err
 			return Outcome{}, fmt.Errorf("record the disarm: %w", err)
 		}
 		if derr := p.Disarm(); derr != nil {
-			// Could not confirm steering is down. Proceeding would hand the box to an installer while the
-			// redirect may still be armed — the black hole this ordering exists to avoid.
-			j.RecordFailure("disarm failed: "+derr.Error(), cfg.MaxAttempts, now)
+			// The helper may have cleared steering before its final driver read failed. This error alone
+			// proves neither that steering stayed armed nor that it was safely taken down. In particular,
+			// do not restart the service blindly: the same error can mean an armed or broken driver.
+			// Stop the install and make the uncertain endpoint state explicit for recovery.
+			uncertain := "disarm failed: " + derr.Error() + "; steering may already have been cleared; " +
+				"inspect the driver and normal network before another update attempt"
+			j.RecordFailure(uncertain, cfg.MaxAttempts, now)
 			if err := save(j); err != nil {
 				return Outcome{}, fmt.Errorf("record the disarm failure: %w", err)
 			}
 			return Outcome{Action: ActionRefused, Reason: fmt.Sprintf("NOT starting: could not confirm steering was "+
-				"taken down (%v), and handing the installer a box whose redirect may still be armed is how it ends up "+
-				"refusing every connection", derr)}, nil
+				"taken down (%v). The driver may still be redirecting and refusing every connection, or steering may "+
+				"already have been cleared. Inspect the driver and normal network before another update attempt", derr)}, nil
 		}
 		disarmed = true
 	}
@@ -493,8 +497,19 @@ func Run(j *Journal, m Manifest, cfg Config, p Platform, save func(*Journal) err
 		disarmed = false // handled here; the defer must not attempt it twice
 		j.RecordFailure(failureWithSteering("execute failed: "+xerr.Error(), wasDisarmed, restored, rerr),
 			cfg.MaxAttempts, now)
-		if err := save(j); err != nil {
-			return Outcome{}, fmt.Errorf("record the execute failure: %w", err)
+		if serr := save(j); serr != nil {
+			// A failed journal write must not hide a failed Rearm. The installer did not start and the
+			// protection state may be unknown; surface all three failures even without a durable record.
+			failure := fmt.Sprintf("the installer could not be launched: %v.%s", xerr,
+				steeringSentence(wasDisarmed, restored, rerr))
+			var steeringErr error
+			if wasDisarmed && rerr != nil {
+				steeringErr = fmt.Errorf("★ STEERING WAS TAKEN DOWN; restoration could not be confirmed: %w", rerr)
+			}
+			return Outcome{Action: ActionRefused, Reason: failure}, errors.Join(
+				fmt.Errorf("record the execute failure: %w", serr),
+				fmt.Errorf("installer launch failed: %w", xerr),
+				steeringErr)
 		}
 		return Outcome{Action: ActionRefused, Reason: fmt.Sprintf("the installer could not be launched: %v.%s",
 			xerr, steeringSentence(wasDisarmed, restored, rerr))}, nil
@@ -525,9 +540,8 @@ func steeringSentence(disarmed, restored bool, rerr error) string {
 	case restored && rerr == nil:
 		return " Steering was taken down for the install and has been put back."
 	default:
-		return fmt.Sprintf(" ★ STEERING WAS TAKEN DOWN FOR THIS INSTALL AND COULD NOT BE RESTORED (%v). This "+
-			"endpoint is on its native network with the control OFF, and no further attempt will fix that by "+
-			"itself — it needs a person or a working agent restart NOW.", rerr)
+		return fmt.Sprintf(" ★ STEERING WAS TAKEN DOWN FOR THIS INSTALL AND RESTORATION COULD NOT BE CONFIRMED (%v). "+
+			"The endpoint may be unprotected or blocked; inspect the driver and network before retrying.", rerr)
 	}
 }
 
@@ -536,5 +550,5 @@ func failureWithSteering(reason string, disarmed, restored bool, rerr error) str
 	if !disarmed || (restored && rerr == nil) {
 		return reason
 	}
-	return reason + "; ★ steering could NOT be restored afterwards: " + rerr.Error()
+	return reason + "; ★ steering restoration could NOT be confirmed afterwards: " + rerr.Error()
 }

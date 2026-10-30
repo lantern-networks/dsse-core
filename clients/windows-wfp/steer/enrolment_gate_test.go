@@ -63,6 +63,27 @@ func TestEnrolmentConfigLoadStates(t *testing.T) {
 	}
 }
 
+func TestEnrolmentConfigReadFailureIsNotMissing(t *testing.T) {
+	// A directory has an entry at this path, but it is not a readable config. Treating every ReadFile
+	// error as absence can make an installed device stand aside without saying why.
+	path := filepath.Join(t.TempDir(), "enrolment.json")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := loadEnrolmentConfig(path); ok || err == nil {
+		t.Fatalf("unreadable existing config: ok=%v err=%v, want explicit error", ok, err)
+	}
+}
+
+func TestIdentityTenantIsCaseSensitive(t *testing.T) {
+	if identityServesThisOrganization("TenantA", "tenanta") {
+		t.Fatal("an identity from case-distinct tenant suppressed re-enrolment")
+	}
+	if !identityServesThisOrganization("TenantA", "TenantA") {
+		t.Fatal("matching tenant identity was refused")
+	}
+}
+
 // A config with neither an endpoint-CA nor a device-CA pin must not count as a pinned bootstrap: enrolment is
 // the trust bootstrap and must not run over an unpinned channel.
 func TestEnrolmentConfigUnpinnedBootstrap(t *testing.T) {

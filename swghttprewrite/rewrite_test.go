@@ -228,9 +228,6 @@ func loadRewritePreflightConfig(t *testing.T) trackARewritePreflightConfig {
 	path := filepath.Join("testdata", "swg_saas_tenant_enforcement_preflight.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			t.Skipf("fixture not shipped with the dsse-core module (monorepo-only): %s", path)
-		}
 		t.Fatalf("read %s: %v", path, err)
 	}
 	var config trackARewritePreflightConfig
@@ -244,7 +241,7 @@ func loadRewriteOperatorResolver(t *testing.T, bundle model.PolicyBundle) Operat
 	t.Helper()
 	opPath := filepath.Join("testdata", "swg_tenant_restriction_operator_config.json")
 	if _, statErr := os.Stat(opPath); statErr != nil {
-		t.Skipf("fixture not shipped with the dsse-core module (monorepo-only): %s", opPath)
+		t.Fatalf("read required package fixture %s: %v", opPath, statErr)
 	}
 	resolver, err := LoadOperatorManagedHeaderValueResolver(opPath, bundle)
 	if err != nil {
@@ -258,9 +255,6 @@ func loadRewriteOperatorConfig(t *testing.T) OperatorManagedHeaderValueConfig {
 	path := filepath.Join("testdata", "swg_tenant_restriction_operator_config.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			t.Skipf("fixture not shipped with the dsse-core module (monorepo-only): %s", path)
-		}
 		t.Fatalf("read %s: %v", path, err)
 	}
 	var config OperatorManagedHeaderValueConfig

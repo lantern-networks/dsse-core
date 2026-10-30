@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,17 @@ type ClickHouseStore struct {
 	password string
 	database string
 	table    string
+}
+
+// ClickHouseHTTPError means the server answered the request. A 4xx response
+// to ALTER is a definite rejection; a transport failure or 5xx is ambiguous.
+type ClickHouseHTTPError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *ClickHouseHTTPError) Error() string {
+	return fmt.Sprintf("clickhouse http %d: %s", e.StatusCode, e.Message)
 }
 
 // NewClickHouseStore builds a store against the ClickHouse HTTP endpoint (e.g. http://clickhouse:8123).
@@ -95,15 +107,21 @@ func (s *ClickHouseStore) execWithSettings(ctx context.Context, sql string, para
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		// The transport error repeats the request URL, which carries the bound
+		// query parameters. Keep only the host and the underlying cause.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return nil, unavailable("clickhouse "+u.Host, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read clickhouse response: %w", err)
+		return nil, unavailable("clickhouse "+u.Host+" response", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("clickhouse http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, &ClickHouseHTTPError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}
 	}
 	return body, nil
 }
@@ -306,11 +324,13 @@ func (s *ClickHouseStore) IngestBatch(ctx context.Context, records []IngestRecor
 	sum := sha256.New()
 	keyless := false
 	for _, record := range records {
-		rec := clickHouseRowFromEvent(record.Stream, record.Row, record.ReceivedAt)
+		rec, err := clickHouseRowFromEvent(record.Stream, record.Row, record.ReceivedAt)
+		if err != nil {
+			return fmt.Errorf("encode hot-store batch row: %w", err)
+		}
 		payload, err := json.Marshal(rec)
 		if err != nil {
-			// One unencodable record must not lose the batch around it.
-			continue
+			return fmt.Errorf("encode hot-store batch insert: %w", err)
 		}
 		body.Write(payload)
 		body.WriteByte('\n')
@@ -346,7 +366,10 @@ func (s *ClickHouseStore) IngestBatch(ctx context.Context, records []IngestRecor
 }
 
 func (s *ClickHouseStore) IngestAt(ctx context.Context, stream string, row map[string]any, receivedAt time.Time) error {
-	rec := clickHouseRowFromEvent(stream, row, receivedAt)
+	rec, err := clickHouseRowFromEvent(stream, row, receivedAt)
+	if err != nil {
+		return fmt.Errorf("encode hot-store row: %w", err)
+	}
 	payload, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -534,7 +557,7 @@ func parseClickHouseRawRows(body []byte) ([]map[string]any, error) {
 }
 
 // clickHouseRowFromEvent maps a record to the dsse.events column shape (best-effort) plus the full JSON in `raw`.
-func clickHouseRowFromEvent(stream string, row map[string]any, receivedAt time.Time) map[string]any {
+func clickHouseRowFromEvent(stream string, row map[string]any, receivedAt time.Time) (map[string]any, error) {
 	str := func(k string) string {
 		if v, ok := row[k].(string); ok {
 			return v
@@ -570,7 +593,10 @@ func clickHouseRowFromEvent(stream string, row map[string]any, receivedAt time.T
 	if eventID == "" {
 		eventID = str("event_id")
 	}
-	raw, _ := json.Marshal(row)
+	raw, err := json.Marshal(row)
+	if err != nil {
+		return nil, err
+	}
 	return map[string]any{
 		"event_id":         eventID,
 		"tenant_id":        str("tenant_id"),
@@ -587,7 +613,7 @@ func clickHouseRowFromEvent(stream string, row map[string]any, receivedAt time.T
 		"instance_class":   mstr("dlp_instance_class"),
 		"rule_id":          mstr("dlp_rule_id"),
 		"raw":              string(raw),
-	}
+	}, nil
 }
 
 // clickHouseQueryBound renders an instant for a QUERY PARAMETER, with its offset written out.

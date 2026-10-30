@@ -52,6 +52,23 @@ func addAnEdgeToARunningRegion(dir, planPath, machineName string) error {
 	if len(machine.Addresses) == 0 {
 		return fmt.Errorf("%q has no address in the plan, so the door would have nothing to send to", machineName)
 	}
+	if plan.dedicatedMultiEdge() {
+		// Dedicated Edge fleets require the same complete plan on every
+		// machine, while each CP/L4 balances only its own Region's Edges. Do
+		// not append a fictitious local Edge to a CP-only host. Reapplication
+		// also checks explicit census admission before writing any configuration.
+		env := readDeploymentEnv(dir)
+		self := env["DSSE_NODE_NAME"]
+		_, current, found := plan.find(self)
+		if !found || !current.Holds.has("control-plane") || env["DSSE_TOPOLOGY_PROFILE"] != plan.Profile {
+			return fmt.Errorf("shared-fleet Edge admission must run on a declared CP/L4 host of the same plan")
+		}
+		if err := applyPlanToThisMachine(plan, dir, self); err != nil {
+			return err
+		}
+		fmt.Println("Regional Edge-fleet configuration regenerated for this CP/L4 only. Apply the complete admitted census and plan on every CP/L4 and affected Edge; verify TLS, capabilities and health before reloading each doorway. No service was restarted.")
+		return nil
+	}
 	// ★ THIS MUST BE THE DOOR OF THAT REGION. Run on the wrong machine it would write a backend list naming
 	// Edges that machine cannot reach, and the region it IS the door of would lose its own list.
 	env := readDeploymentEnv(dir)

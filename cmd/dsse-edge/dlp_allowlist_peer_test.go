@@ -89,7 +89,7 @@ func TestAllowlistAdminTenantConflictAndRetry(t *testing.T) {
 }
 func TestDLPReceiverLibraryStoreRole(t *testing.T) {
 	db := &sql.DB{}
-	for _, key := range []string{"dlp_allowlist", "dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints"} {
+	for _, key := range []string{"dlp_rules", "dlp_allowlist", "dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints"} {
 		p, err := dlpLibraryPersisterForRole("", db, key, "https://cp.example.test")
 		if err != nil || p != nil {
 			t.Fatal(key, err)

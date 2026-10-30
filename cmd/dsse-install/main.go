@@ -24,6 +24,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -39,6 +40,7 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -49,14 +51,33 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/bundle"
+	"github.com/lantern-networks/dsse-core/deploymentcrl"
 	"github.com/lantern-networks/dsse-core/model"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"github.com/lantern-networks/dsse-core/signedconfig"
 )
 
 func main() {
+	if err := runtimequota.ValidateEnvironment(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	dir := flag.String("dir", "", "directory the deployment's keys and certificates live in. Created if absent, "+
 		"and NEVER a temporary path: an authority that does not outlive the installer leaves anchors devices "+
 		"have adopted and nobody can issue for")
+	portalCertificate := flag.Bool("verify-portal-certificate", false, "read-only: verify this Edge browser TLS pair, system trust, expiry and every Portal name served by this Edge; use -dir on each Edge host")
+	installPortal := flag.String("install-portal-certificate", "", "provision a verified full-chain browser certificate on this Edge; requires -portal-key and -dir; use before service startup")
+	portalKey := flag.String("portal-key", "", "private key paired with -install-portal-certificate; never copied to CP-only hosts")
+	portalCA := flag.String("portal-ca", "", "explicitly approved public PEM CA bundle for browser certificate installation or Portal TLS checks with -verify; verifier-only trust is not installed, and endpoint browser trust is provisioned separately")
+	activateAuth := flag.Bool("activate-auth", false, "activate shared-fleet authentication through the existing CP authority and wait for every declared Edge to apply it")
+	authFeatures := flag.String("auth-features", "", "with -activate-auth: optional device-user-session-v1 after endpoint and administrator-assignment preparation; existing features are always retained")
+	adminTokenFile := flag.String("admin-token-file", "", "private operator token file: with -bootstrap-admin create it without overwrite; with -activate-auth/-verify/-who-depends read it without putting the token in argv")
+	edgeReadTokenFile := flag.String("edge-read-token-file", "", "with -activate-auth: private admin.state.read-only token for Edge inspection; default is authority/installation-state-read-token on the issuer, never the operator credential")
+	preflight := flag.Bool("preflight", false, "read-only local-node setup checks: complete plan, input, bind addresses, Docker images, certificates and private peer DNS; no service starts")
+	startNode := flag.Bool("start-node", false, "provision optional Portal material, require local preflight, then start this node's generated Compose project; never edit generated files")
+	networkPlan := flag.Bool("network-plan", false, "print the declared shared-fleet cross-host TCP requirements without changing a firewall")
+	setupTimeout := flag.Duration("setup-timeout", 5*time.Minute, "operator setup deadline for -activate-auth, -preflight or -start-node; does not limit application traffic")
+	proxyResources := flag.Bool("verify-proxy-resources", false, "read-only: measure actual HAProxy Maxconn and descriptor limits on the local Linux Docker host (requires stats socket permission)")
 	host := flag.String("host", "", "the name or address this deployment answers on. Repeatable as a "+
 		"comma-separated list; every entry lands in the certificates this deployment presents")
 	orgName := flag.String("organization", "DSSE Deployment", "the O= this deployment's own certificates carry")
@@ -106,6 +127,14 @@ func main() {
 	planMachine := flag.String("machine", "",
 		"with -plan and -carry: which machine of the plan to pack. Its shape, its region and every address it "+
 			"is given come from the plan")
+	clientHosts := flag.String("client-hosts", "",
+		"with -plan and -entry-ip: write a marked client hosts block derived from the plan; "+
+			"with -verify and -plan: check the complete block from outside the deployment using OS name resolution and verified TLS on 443")
+	entryIP := flag.String("entry-ip", "", "with -client-hosts: address for shared names; with -node-entry-ips it must be one of the three Node addresses")
+	nodeEntryIPs := flag.String("node-entry-ips", "", "with -client-hosts and -entry-ip: comma-separated Node=public-IP entries for the three independent agent doors")
+	tenantDNSLabels := flag.String("tenant-dns-labels", "",
+		"with -client-hosts and -plan: comma-separated server-issued tenant DNS labels; regenerate after creating tenants")
+	clientCA := flag.String("client-ca", "", "with -verify -client-hosts: public PEM trust anchors for the presented certificates; does not change OS trust")
 	edgeAdmin := flag.String("edge-admin", "",
 		"with -verify: an Edge's admin URL, e.g. https://edge.example:9443. Comma-separated for a fleet — "+
 			"whether every Edge hands devices the SAME region map is a property of the fleet and cannot be "+
@@ -198,6 +227,202 @@ func main() {
 		"with -bootstrap-admin: their password. Generated and printed once when omitted, which is the "+
 			"better of the two — a password on a command line is in the shell history and in every ps listing")
 	flag.Parse()
+	newOperations := 0
+	for _, yes := range []bool{*installPortal != "" && !*startNode, *activateAuth, *preflight, *networkPlan, *startNode} {
+		if yes {
+			newOperations++
+		}
+	}
+	if newOperations > 1 || newOperations > 0 && (*bootstrapAdmin || *verify || *whoDepends || *carryTo != "" || *planOrder || *proxyResources || *portalCertificate) {
+		fmt.Fprintln(os.Stderr, "select only one installer operation")
+		os.Exit(1)
+	}
+	if *portalKey != "" && *installPortal == "" || *portalCA != "" && *installPortal == "" && !*verify || *authFeatures != "" && !*activateAuth {
+		fmt.Fprintln(os.Stderr, "certificate and feature options require their corresponding setup operation")
+		os.Exit(1)
+	}
+	if *edgeReadTokenFile != "" && !*activateAuth {
+		fmt.Fprintln(os.Stderr, "-edge-read-token-file requires -activate-auth")
+		os.Exit(1)
+	}
+	if *adminTokenFile != "" && !*bootstrapAdmin {
+		if *verifyAdminToken != "" || !(*activateAuth || *verify || *whoDepends) {
+			fmt.Fprintln(os.Stderr, "-admin-token-file requires one operator API operation and cannot be combined with -admin-token")
+			os.Exit(1)
+		}
+		token, err := readOperatorToken(*adminTokenFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		*verifyAdminToken = token
+	}
+	if *installPortal != "" && !*startNode {
+		if *dir == "" || *portalKey == "" {
+			fmt.Fprintln(os.Stderr, "-dir and -portal-key are required")
+			os.Exit(1)
+		}
+		if err := installPortalCertificate(*dir, *installPortal, *portalKey, *portalCA); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("Portal certificate installed and all declared names verified; run preflight before starting services.")
+		return
+	}
+	if *activateAuth || *preflight || *networkPlan || *startNode {
+		if strings.TrimSpace(*dir) == "" && !(*networkPlan && *planFile != "") {
+			fmt.Fprintln(os.Stderr, "-dir is required for local setup operations")
+			os.Exit(1)
+		}
+		if *installPortal != "" && *portalKey == "" {
+			fmt.Fprintln(os.Stderr, "-portal-key is required with -install-portal-certificate")
+			os.Exit(1)
+		}
+		if *setupTimeout <= 0 {
+			fmt.Fprintln(os.Stderr, "-setup-timeout must be positive")
+			os.Exit(1)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), *setupTimeout)
+		defer cancel()
+		if *activateAuth {
+			if *verifyAdminToken == "" {
+				token, err := readOperatorToken(privateTokenDestination(*dir))
+				if err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+				*verifyAdminToken = token
+			}
+			if *edgeReadTokenFile == "" {
+				*edgeReadTokenFile = privateInstallReadTokenDestination(*dir)
+			}
+			edgeToken, err := readOperatorToken(*edgeReadTokenFile)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "read issuer-only installation read token: provision an admin.state.read-only API credential from a named administrator session; do not re-arm bootstrap or use the operator token")
+				os.Exit(1)
+			}
+			result, err := runActivateAuth(ctx, *dir, *planFile, *cpAdmin, *verifyAdminToken, edgeToken, *authFeatures)
+			json.NewEncoder(os.Stdout).Encode(result)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+		plan, err := loadInstallPlan(*dir, *planFile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if *networkPlan {
+			if !declaredNodeMapProfile(plan.Profile) {
+				fmt.Fprintln(os.Stderr, "network-plan requires a declared shared-fleet profile")
+				os.Exit(1)
+			}
+			json.NewEncoder(os.Stdout).Encode(planNetworkRequirements(plan))
+			return
+		}
+		if *startNode {
+			result, err := runStartNode(ctx, plan, *dir, *planMachine, *installPortal, *portalKey, *portalCA)
+			json.NewEncoder(os.Stdout).Encode(result)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+		result, err := runInstallPreflight(ctx, plan, *dir, *planMachine)
+		json.NewEncoder(os.Stdout).Encode(result)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *portalCertificate {
+		if strings.TrimSpace(*dir) == "" {
+			fmt.Fprintln(os.Stderr, "-dir is required for Portal certificate verification")
+			os.Exit(1)
+		}
+		env, err := readEnvFile(filepath.Join(*dir, "deployment.env"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		result := verifyOneRegionThreeNodesPortalCertificate(*dir, env)
+		if err := json.NewEncoder(os.Stdout).Encode(map[string]any{"check": result.name, "ok": result.ok, "detail": result.note}); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if !result.ok {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *proxyResources {
+		if strings.TrimSpace(*dir) == "" {
+			fmt.Fprintln(os.Stderr, "-dir is required for proxy resource verification")
+			os.Exit(1)
+		}
+		rows, err := verifyLocalProxyResources(*dir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(rows); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *clientHosts != "" {
+		var err error
+		if *planFile == "" || (!*verify && *entryIP == "") {
+			err = fmt.Errorf("-client-hosts requires -plan and either -entry-ip or -verify")
+		} else {
+			var plan *Plan
+			plan, err = LoadPlan(*planFile)
+			if err == nil {
+				var labels []string
+				if *tenantDNSLabels != "" {
+					for _, label := range strings.Split(*tenantDNSLabels, ",") {
+						labels = append(labels, strings.TrimSpace(label))
+					}
+				}
+				if *verify {
+					err = runVerifyClientHosts(*clientHosts, *clientCA, plan, labels)
+				} else {
+					var body string
+					nodeIPs := map[string]string{}
+					if *nodeEntryIPs != "" {
+						for _, part := range strings.Split(*nodeEntryIPs, ",") {
+							name, ip, ok := strings.Cut(part, "=")
+							if !ok || strings.TrimSpace(name) == "" || strings.TrimSpace(ip) == "" || nodeIPs[strings.TrimSpace(name)] != "" {
+								err = fmt.Errorf("-node-entry-ips must contain distinct Node=public-IP entries")
+								break
+							}
+							nodeIPs[strings.TrimSpace(name)] = strings.TrimSpace(ip)
+						}
+						if err == nil {
+							body, err = plan.RenderClientHostsWithNodeIPs(*entryIP, nodeIPs, labels)
+						}
+					} else {
+						body, err = plan.RenderClientHosts(*entryIP, labels)
+					}
+					if err == nil {
+						err = os.WriteFile(*clientHosts, []byte(body), 0644)
+					}
+				}
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if strings.TrimSpace(*addEdge) != "" {
 		if strings.TrimSpace(*planFile) == "" {
@@ -221,7 +446,7 @@ func main() {
 	}
 
 	if *bootstrapAdmin {
-		if err := runBootstrapAdmin(*dir, *cpAdmin, *adminEmail, *adminPassword); err != nil {
+		if err := runBootstrapAdminWithTokenFile(*dir, *cpAdmin, *adminEmail, *adminPassword, *adminTokenFile); err != nil {
 			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
 			os.Exit(1)
 		}
@@ -308,7 +533,7 @@ func main() {
 	}
 
 	if *verify {
-		if err := runVerify(*dir, *cpAdmin, *edgeAdmin, *edgeTransport, *verifyAdminToken, *consoleURL, *cpPeers, *verifyNoWait); err != nil {
+		if err := runVerify(*dir, *cpAdmin, *edgeAdmin, *edgeTransport, *verifyAdminToken, *consoleURL, *cpPeers, *verifyNoWait, *portalCA); err != nil {
 			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
 			os.Exit(1)
 		}
@@ -328,7 +553,7 @@ func main() {
 			os.Exit(1)
 		}
 		hosts = strings.Join(plan.CertificateNames(), ",")
-		if err := run(*dir, hosts, orgFromPlan, *years, *force); err != nil {
+		if err := runWithDeploymentCRL(*dir, hosts, orgFromPlan, *years, *force, plan.DeploymentCRLOrigins, plan.BrowserPortalNames()...); err != nil {
 			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
 			os.Exit(1)
 		}
@@ -342,7 +567,7 @@ func main() {
 		return
 	}
 
-	if err := run(*dir, hosts, orgFromPlan, *years, *force); err != nil {
+	if err := runStandalone(*dir, hosts, orgFromPlan, *years, *force); err != nil {
 		fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
 		os.Exit(1)
 	}
@@ -351,14 +576,16 @@ func main() {
 // deploymentAuthorities is what a deployment holds. Named rather than a bag of files, because the set is the
 // design: adding one later is a decision about what a device has to be told, not a detail.
 type deploymentAuthorities struct {
-	RootCert  *x509.Certificate
-	RootKey   *ecdsa.PrivateKey
-	AdminCA   *x509.Certificate
-	AdminKey  *ecdsa.PrivateKey
-	TransCA   *x509.Certificate
-	TransKey  *ecdsa.PrivateKey
-	DeviceCA  *x509.Certificate
-	DeviceKey *ecdsa.PrivateKey
+	RootCert   *x509.Certificate
+	RootKey    *ecdsa.PrivateKey
+	AdminCA    *x509.Certificate
+	AdminKey   *ecdsa.PrivateKey
+	ConsoleCA  *x509.Certificate
+	ConsoleKey *ecdsa.PrivateKey
+	TransCA    *x509.Certificate
+	TransKey   *ecdsa.PrivateKey
+	DeviceCA   *x509.Certificate
+	DeviceKey  *ecdsa.PrivateKey
 	// InterceptCA is the THIRD TIER, and a deployment without it inspects nothing.
 	//
 	// ★★★ THE ARCHITECTURE NAMES THREE AND THIS INSTALLER MINTED TWO (2026-08-26, reported from real hardware
@@ -376,7 +603,11 @@ type deploymentAuthorities struct {
 // threading a flag through all of them to decide one printed line is worse than saying it once here.
 var installingFromAPlan bool
 
-func run(dir, hosts, orgName string, years int, force bool) error {
+func run(dir, hosts, orgName string, years int, force bool, browserPortalNames ...string) error {
+	return runWithDeploymentCRL(dir, hosts, orgName, years, force, nil, browserPortalNames...)
+}
+
+func runWithDeploymentCRL(dir, hosts, orgName string, years int, force bool, crlOrigins []string, browserPortalNames ...string) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return fmt.Errorf("-dir is required: name the directory this deployment's authorities live in, and " +
@@ -405,6 +636,17 @@ func run(dir, hosts, orgName string, years int, force bool) error {
 			"a device that reaches a name the certificate does not carry cannot tell that from an outage")
 	}
 	if existing && !force {
+		// root.crt is written before the rest of a new deployment. If a
+		// later step failed, that certificate alone cannot make a retry a
+		// successful repair: the node may have no executable launcher or
+		// environment to start from. Keep its minted authority intact and
+		// require the operator to inspect the interrupted installation.
+		for _, name := range []string{agentPolicySigningKeyFile, "deployment.env", composeFileName()} {
+			info, statErr := os.Stat(filepath.Join(dir, name))
+			if statErr != nil || !info.Mode().IsRegular() {
+				return fmt.Errorf("incomplete deployment in %s: required %s is missing or not a regular file; do not use -force to conceal an interrupted installation", dir, name)
+			}
+		}
 		fmt.Printf("dsse-install: %s already holds this deployment's authorities — nothing to do.\n", dir)
 		fmt.Printf("  Replacing them is a rotation, not an install: it orphans every anchor already\n")
 		fmt.Printf("  distributed. Use the rotation acts on a running deployment, which announce the new\n")
@@ -437,12 +679,24 @@ func run(dir, hosts, orgName string, years int, force bool) error {
 	}
 
 	now := time.Now().UTC()
-	auth, err := mint(orgName, now, years)
+	auth, err := mintWithDeploymentCRL(orgName, now, years, crlOrigins)
 	if err != nil {
 		return err
 	}
 	if err := writeAuthorities(dir, auth); err != nil {
 		return err
+	}
+	if len(crlOrigins) > 0 {
+		if err := deploymentcrl.Refresh(authorityPath(dir, ""), filepath.Join(dir, "deployment-crl"), auth.RootCert, []deploymentcrl.Issuer{
+			{Certificate: auth.RootCert, Key: auth.RootKey},
+			{Certificate: auth.AdminCA, Key: auth.AdminKey},
+			{Certificate: auth.ConsoleCA, Key: auth.ConsoleKey},
+			{Certificate: auth.TransCA, Key: auth.TransKey},
+			{Certificate: auth.DeviceCA, Key: auth.DeviceKey},
+			{Certificate: auth.InterceptCA, Key: auth.InterceptKey},
+		}, nil, now); err != nil {
+			return fmt.Errorf("issue initial deployment CRLs: %w", err)
+		}
 	}
 	// ★★★ THE STORE'S OWN AUTHORITY, MINTED HERE BECAUSE NOTHING LATER CAN (2026-08-31). Once the consensus
 	// store has a member in each state-bearing region its members talk across whatever is between those
@@ -464,11 +718,26 @@ func run(dir, hosts, orgName string, years int, force bool) error {
 		if werr := os.WriteFile(filepath.Join(dir, storeMemberFile), cert, 0o644); werr != nil {
 			return werr
 		}
-		if werr := os.WriteFile(filepath.Join(dir, storeMemberKeyFile), key, 0o600); werr != nil {
+		if werr := publishPrivateInstallerKey(filepath.Join(dir, storeMemberKeyFile), key); werr != nil {
 			return werr
 		}
 	}
-	if err := issueServerCertificates(dir, auth, names, ips, now); err != nil {
+	if err := mintDatabaseAuthority(dir, orgName, now, years); err != nil {
+		return err
+	}
+	material, err := runtimeTransportMaterialFor(dir, nil, now)
+	if err != nil {
+		return err
+	}
+	if err := writeRuntimeTransportMaterial(dir, material); err != nil {
+		return err
+	}
+	if len(browserPortalNames) > 0 {
+		if err := writeBrowserPortalNames(dir, browserPortalNames); err != nil {
+			return err
+		}
+	}
+	if err := issueServerCertificatesWithCDP(dir, auth, names, ips, now, crlOrigins, browserPortalNames...); err != nil {
 		return err
 	}
 	if err := writeSchemasAndPolicy(dir); err != nil {
@@ -507,6 +776,9 @@ func run(dir, hosts, orgName string, years int, force bool) error {
 		return err
 	}
 	if err := writeComposeFile(dir); err != nil {
+		return err
+	}
+	if err := writeIssuedDeploymentCRLServices(dir, auth, crlOrigins); err != nil {
 		return err
 	}
 	if err := writeLaunchScripts(dir); err != nil {
@@ -571,6 +843,10 @@ func newKey() (*ecdsa.PrivateKey, error) { return ecdsa.GenerateKey(elliptic.P25
 // two CAs under it, plus a device CA — so that an installed deployment and the reference one are the same
 // thing, and a document written about one is true of the other.
 func mint(orgName string, now time.Time, years int) (*deploymentAuthorities, error) {
+	return mintWithDeploymentCRL(orgName, now, years, nil)
+}
+
+func mintWithDeploymentCRL(orgName string, now time.Time, years int, origins []string) (*deploymentAuthorities, error) {
 	a := &deploymentAuthorities{}
 	var err error
 	if a.RootKey, err = newKey(); err != nil {
@@ -583,12 +859,20 @@ func mint(orgName string, now time.Time, years int) (*deploymentAuthorities, err
 	if err != nil {
 		return nil, err
 	}
+	var rootPoints []string
+	if len(origins) > 0 {
+		rootPoints, err = deploymentcrl.DistributionPoints(origins, a.RootCert, a.RootCert)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for _, sub := range []struct {
 		cn   string
 		cert **x509.Certificate
 		key  **ecdsa.PrivateKey
 	}{
 		{orgName + " Management CA", &a.AdminCA, &a.AdminKey},
+		{orgName + " Console Server CA", &a.ConsoleCA, &a.ConsoleKey},
 		{orgName + " Transport CA", &a.TransCA, &a.TransKey},
 		{orgName + " Device CA", &a.DeviceCA, &a.DeviceKey},
 	} {
@@ -597,7 +881,7 @@ func mint(orgName string, now time.Time, years int) (*deploymentAuthorities, err
 			return nil, err
 		}
 		c, err := issueCA(pkix.Name{Organization: []string{orgName}, CommonName: sub.cn}, k,
-			a.RootCert, a.RootKey, now, now.AddDate(years, 0, 0))
+			a.RootCert, a.RootKey, now, now.AddDate(years, 0, 0), rootPoints...)
 		if err != nil {
 			return nil, err
 		}
@@ -617,7 +901,7 @@ func mint(orgName string, now time.Time, years int) (*deploymentAuthorities, err
 		return nil, err
 	}
 	ic, err := issueCARSA(pkix.Name{Organization: []string{orgName}, CommonName: orgName + " Interception CA"},
-		ik, a.RootCert, a.RootKey, now, now.AddDate(years, 0, 0))
+		ik, a.RootCert, a.RootKey, now, now.AddDate(years, 0, 0), rootPoints...)
 	if err != nil {
 		return nil, err
 	}
@@ -630,8 +914,12 @@ func mint(orgName string, now time.Time, years int) (*deploymentAuthorities, err
 func newInterceptionKey() (*rsa.PrivateKey, error) { return rsa.GenerateKey(rand.Reader, 2048) }
 
 func selfSigned(subject pkix.Name, key *ecdsa.PrivateKey, notBefore, notAfter time.Time) (*x509.Certificate, error) {
+	serialNumber, err := serial()
+	if err != nil {
+		return nil, fmt.Errorf("generate root certificate serial: %w", err)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: serial(), Subject: subject, NotBefore: notBefore.Add(-time.Hour), NotAfter: notAfter,
+		SerialNumber: serialNumber, Subject: subject, NotBefore: notBefore.Add(-time.Hour), NotAfter: notAfter,
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -642,12 +930,17 @@ func selfSigned(subject pkix.Name, key *ecdsa.PrivateKey, notBefore, notAfter ti
 }
 
 func issueCA(subject pkix.Name, key *ecdsa.PrivateKey, parent *x509.Certificate,
-	parentKey *ecdsa.PrivateKey, notBefore, notAfter time.Time) (*x509.Certificate, error) {
+	parentKey *ecdsa.PrivateKey, notBefore, notAfter time.Time, crlPoints ...string) (*x509.Certificate, error) {
+	serialNumber, err := serial()
+	if err != nil {
+		return nil, fmt.Errorf("generate CA certificate serial: %w", err)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: serial(), Subject: subject, NotBefore: notBefore.Add(-time.Hour), NotAfter: notAfter,
+		SerialNumber: serialNumber, Subject: subject, NotBefore: notBefore.Add(-time.Hour), NotAfter: notAfter,
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true,
 		// One tier below, because the control plane mints a short-lived per-node certificate under this one.
 		MaxPathLen: 1, MaxPathLenZero: false,
+		CRLDistributionPoints: append([]string(nil), crlPoints...),
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
 	if err != nil {
@@ -659,11 +952,16 @@ func issueCA(subject pkix.Name, key *ecdsa.PrivateKey, parent *x509.Certificate,
 // issueCARSA is issueCA for a subject whose key is RSA — the interception tier. Kept separate rather than
 // made generic so the ordinary path stays exactly what it was, and the one tier that differs says why.
 func issueCARSA(subject pkix.Name, key *rsa.PrivateKey, parent *x509.Certificate,
-	parentKey *ecdsa.PrivateKey, notBefore, notAfter time.Time) (*x509.Certificate, error) {
+	parentKey *ecdsa.PrivateKey, notBefore, notAfter time.Time, crlPoints ...string) (*x509.Certificate, error) {
+	serialNumber, err := serial()
+	if err != nil {
+		return nil, fmt.Errorf("generate interception CA certificate serial: %w", err)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: serial(), Subject: subject, NotBefore: notBefore.Add(-time.Hour), NotAfter: notAfter,
+		SerialNumber: serialNumber, Subject: subject, NotBefore: notBefore.Add(-time.Hour), NotAfter: notAfter,
 		KeyUsage: x509.KeyUsageCertSign | x509.KeyUsageCRLSign, BasicConstraintsValid: true, IsCA: true,
 		MaxPathLen: 1, MaxPathLenZero: false,
+		CRLDistributionPoints: append([]string(nil), crlPoints...),
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, &key.PublicKey, parentKey)
 	if err != nil {
@@ -672,10 +970,16 @@ func issueCARSA(subject pkix.Name, key *rsa.PrivateKey, parent *x509.Certificate
 	return x509.ParseCertificate(der)
 }
 
-func serial() *big.Int {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return new(big.Int).SetBytes(b)
+func serial() (*big.Int, error) {
+	for {
+		b := make([]byte, 16)
+		if _, err := io.ReadFull(rand.Reader, b); err != nil {
+			return nil, fmt.Errorf("read random bytes: %w", err)
+		}
+		if n := new(big.Int).SetBytes(b); n.Sign() > 0 {
+			return n, nil
+		}
+	}
 }
 
 // writeAuthorities puts the deployment's own material on disk, with the permissions the design promises.
@@ -698,6 +1002,8 @@ func writeAuthorities(dir string, a *deploymentAuthorities) error {
 		{"root.key", keyPEM(a.RootKey), 0o600},
 		{"management-ca.crt", certPEM(a.AdminCA), 0o644},
 		{"management-ca.key", keyPEM(a.AdminKey), 0o600},
+		{"console-server-ca.crt", certPEM(a.ConsoleCA), 0o644},
+		{"console-server-ca.key", keyPEM(a.ConsoleKey), 0o600},
 		{"transport-ca.crt", certPEM(a.TransCA), 0o644},
 		{"transport-ca.key", keyPEM(a.TransKey), 0o600},
 		{"device-ca.crt", certPEM(a.DeviceCA), 0o644},
@@ -781,7 +1087,13 @@ func writeAuthorities(dir string, a *deploymentAuthorities) error {
 	}
 	// The anchor a device is told to trust: the root alone. Written separately from root.crt so that the file
 	// an operator distributes has a name that says what it is for.
-	return os.WriteFile(filepath.Join(dir, "deployment-anchor.pem"), certPEM(a.RootCert), 0o644)
+	anchorPath := filepath.Join(dir, "deployment-anchor.pem")
+	if err := os.WriteFile(anchorPath, certPEM(a.RootCert), 0o644); err != nil {
+		return err
+	}
+	// Operators mint under umask 077. The anchor contains only a public
+	// certificate, and the unprivileged HAProxy container must read its bind mount.
+	return os.Chmod(anchorPath, 0o644)
 }
 
 // issueServerCertificates issues what this deployment's own processes present.
@@ -793,8 +1105,13 @@ func writeAuthorities(dir string, a *deploymentAuthorities) error {
 // from one CA would make an organization's devices verify the management plane too, which is more trust than
 // the job needs.
 func issueServerCertificates(dir string, a *deploymentAuthorities, names []string, ips []net.IP,
-	now time.Time) error {
-	for _, item := range []struct {
+	now time.Time, browserPortalNames ...string) error {
+	return issueServerCertificatesWithCDP(dir, a, names, ips, now, nil, browserPortalNames...)
+}
+
+func issueServerCertificatesWithCDP(dir string, a *deploymentAuthorities, names []string, ips []net.IP,
+	now time.Time, crlOrigins []string, browserPortalNames ...string) error {
+	items := []struct {
 		file   string
 		cn     string
 		parent *x509.Certificate
@@ -817,7 +1134,17 @@ func issueServerCertificates(dir string, a *deploymentAuthorities, names []strin
 		// the transport certificate in this rendering, and per-node shipping identities would be per-node
 		// configuration for a question ("may this node ship") whose answer is the same for all of them.
 		{"edge-identity", "dsse-edge-fleet", a.AdminCA, a.AdminKey, true},
-	} {
+	}
+	if a.ConsoleCA != nil && a.ConsoleKey != nil {
+		items = append(items, struct {
+			file    string
+			cn      string
+			parent  *x509.Certificate
+			key     *ecdsa.PrivateKey
+			fixedCN bool
+		}{"console-server", "console", a.ConsoleCA, a.ConsoleKey, true})
+	}
+	for _, item := range items {
 		leafKey, err := newKey()
 		if err != nil {
 			return err
@@ -895,20 +1222,46 @@ func issueServerCertificates(dir string, a *deploymentAuthorities, names []strin
 				san = append(san, "*.admin."+primary)
 			}
 		}
+		if item.file == "management" {
+			// Console and Portal can share an IP. If this leaf also covers a Portal
+			// name, HTTP/2 clients may coalesce a Portal request onto an existing
+			// Console TLS connection and reach the wrong application by its Host.
+			san = withoutBrowserPortalNames(san, browserPortalNames)
+		}
 		// ★★★ AND THE REGION'S OWN ADDRESS IS ONE A DEVICE REACHES. It is held by whichever front door is alive,
 		// so it belongs to no container and would appear in no list of service names — and a device that reaches
 		// the region by it and cannot verify what answers has a deployment that works until the moment it fails
 		// over. Repairing that afterwards means re-minting, which orphans every anchor already distributed.
 		certIPs := append(append([]net.IP{}, ips...), net.ParseIP(composeRegionAddress),
 			net.ParseIP("127.0.0.1"), net.ParseIP("::1"))
+		if item.file == "console-server" {
+			// This browser-facing identity has no client-auth purpose and cannot cover
+			// the Portal or transport names that share the front-door address.
+			san = consoleServerDNSNames(names, ips)
+			certIPs = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+			cn = san[0]
+		}
+		serialNumber, err := serial()
+		if err != nil {
+			return fmt.Errorf("issue the %s certificate serial: %w", item.file, err)
+		}
 		tmpl := &x509.Certificate{
-			SerialNumber: serial(),
+			SerialNumber: serialNumber,
 			Subject:      pkix.Name{Organization: item.parent.Subject.Organization, CommonName: cn},
 			NotBefore:    now.Add(-time.Hour), NotAfter: now.AddDate(1, 0, 0),
 			KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 			DNSNames:    san, IPAddresses: certIPs,
 			BasicConstraintsValid: true,
+		}
+		if item.file == "console-server" {
+			tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		}
+		if len(crlOrigins) > 0 {
+			tmpl.CRLDistributionPoints, err = deploymentcrl.DistributionPoints(crlOrigins, a.RootCert, item.parent)
+			if err != nil {
+				return fmt.Errorf("issue the %s certificate CDP: %w", item.file, err)
+			}
 		}
 		der, err := x509.CreateCertificate(rand.Reader, tmpl, item.parent, &leafKey.PublicKey, item.key)
 		if err != nil {
@@ -929,6 +1282,30 @@ func issueServerCertificates(dir string, a *deploymentAuthorities, names []strin
 		}
 	}
 	return writeBundle(dir)
+}
+
+func consoleServerDNSNames(names []string, ips []net.IP) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name != "" && !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	for _, name := range names {
+		if strings.HasPrefix(strings.ToLower(name), "console.") {
+			add(name)
+		}
+	}
+	if planes := planeNamesFor(cnHostFor(names, ips)); planes.Split {
+		add(planes.Console)
+	}
+	if len(out) == 0 {
+		add("localhost")
+	}
+	return out
 }
 
 // startingBundleID, shippedPolicyIDs and policyFileForID keep one fact in one place: what this installer
@@ -1058,6 +1435,11 @@ func writeBundle(dir string) error {
 			return nil
 		}
 		fmt.Printf("  policy bundle: rewriting %s — %s\n", filepath.Base(path), reason)
+	} else if !os.IsNotExist(err) {
+		// A read failure is not a new deployment. In particular, do not replace
+		// the signing keys before discovering that the existing bundle cannot be
+		// read or replaced.
+		return fmt.Errorf("read existing policy-bundle.json before issuing signing material: %w", err)
 	}
 	var b model.PolicyBundle
 	if err := json.Unmarshal([]byte(startingBundle), &b); err != nil {
@@ -1231,15 +1613,28 @@ func writeEnvironment(dir string, names []string, ips []net.IP) error {
 		// place of a device-bound one, with nothing said anywhere.
 		"STEPUP_BINDING_SECRET",
 		"EDGE_CP_TOKEN", "PG_PASSWORD", "PG_SUPERUSER_PASSWORD", "DSSE_VRRP_PASSWORD",
-		"CLICKHOUSE_PASSWORD", "MINIO_ROOT_PASSWORD"} {
-		b.WriteString(k + "=" + shellQuote(randomSecret()) + "\n")
+		"CLICKHOUSE_PASSWORD"} {
+		secret, err := randomSecret()
+		if err != nil {
+			return fmt.Errorf("generate random secret for %s: %w", k, err)
+		}
+		b.WriteString(k + "=" + shellQuote(secret) + "\n")
 	}
 	// Where the control plane's own durable components answer. Named here rather than repeated in the start
 	// scripts, and overridable, because a host install puts them somewhere else than a container rendering.
 	b.WriteString("\nDSSE_CLICKHOUSE_ENDPOINT=" + shellQuote("http://dsse-clickhouse:8123") + "\n")
-	b.WriteString("DSSE_ARCHIVE_ENDPOINT=" + shellQuote("dsse-archive:9000") + "\n")
-	b.WriteString("DSSE_ARCHIVE_BUCKET=" + shellQuote("dsse-audit-archive") + "\n")
-	b.WriteString("MINIO_ROOT_USER=" + shellQuote("dsse-archive") + "\n")
+	b.WriteString("# Optional external S3 archive. Without a plan archive, leave every field empty and retain aged hot events locally.\n")
+	b.WriteString("# For static auth, set dedicated least-privilege keys here before carrying CP nodes.\n")
+	b.WriteString("# IAM auth leaves static keys empty. Use CP-only DSSE_ARCHIVE_AWS_* inputs or a CP-reachable role.\n")
+	b.WriteString("DSSE_ARCHIVE_ENDPOINT=''\nDSSE_ARCHIVE_BUCKET=''\nDSSE_ARCHIVE_REGION=''\n")
+	b.WriteString("DSSE_ARCHIVE_AUTH_MODE=''\nDSSE_ARCHIVE_ACCESS_KEY=''\nDSSE_ARCHIVE_SECRET_KEY=''\n")
+	b.WriteString("DSSE_ARCHIVE_AWS_ACCESS_KEY_ID=''\nDSSE_ARCHIVE_AWS_SECRET_ACCESS_KEY=''\nDSSE_ARCHIVE_AWS_SESSION_TOKEN=''\n")
+	b.WriteString("# Give this signing secret to the HTTPS webhook receiver; it is never placed in the public plan.\n")
+	webhookSecret, err := randomSecret()
+	if err != nil {
+		return fmt.Errorf("generate random archive webhook secret: %w", err)
+	}
+	b.WriteString("DSSE_ARCHIVE_WEBHOOK_URL=''\nDSSE_ARCHIVE_WEBHOOK_SIGNING_SECRET=" + shellQuote(webhookSecret) + "\n")
 	// ★★★ WHICH IMAGES THIS DEPLOYMENT RUNS, BECAUSE WITHOUT THEM IT DOES NOT START AT ALL (2026-08-26,
 	// found by generating a deployment and running the command its own compose file prints at the top):
 	//
@@ -1631,14 +2026,14 @@ func interceptionKeyPEM(k *rsa.PrivateKey) []byte {
 //
 // The fix is at the mint, not at each use: quoting every call site is a rule someone has to keep, and the
 // first place it is forgotten is a place nobody looks. A leading "-" is simply not minted.
-func randomSecret() string {
+func randomSecret() (string, error) {
 	for {
 		b := make([]byte, 24)
-		if _, err := rand.Read(b); err != nil {
-			return "GENERATE-A-LONG-RANDOM-SECRET-AND-PUT-IT-HERE"
+		if _, err := io.ReadFull(rand.Reader, b); err != nil {
+			return "", fmt.Errorf("read random bytes: %w", err)
 		}
 		if secret := base64.RawURLEncoding.EncodeToString(b); !strings.HasPrefix(secret, "-") {
-			return secret
+			return secret, nil
 		}
 	}
 }

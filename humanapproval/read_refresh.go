@@ -28,5 +28,5 @@ func (s *Store) GetForAuthorization(tenant, id string) (model.HumanApprovalEvent
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	v, ok := s.events[approvalKey(tenant, id)]
-	return v, ok
+	return cloneApprovalEvent(v), ok
 }

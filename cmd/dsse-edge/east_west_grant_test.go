@@ -1,6 +1,9 @@
 package main
 
 import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -8,8 +11,25 @@ import (
 	"github.com/lantern-networks/dsse-core/policy"
 
 	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 )
+
+func TestRuntimeGrantRouteCannotCompleteChallengeWithoutBrowserIdentity(t *testing.T) {
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, LabMode: boolPtr(true)})
+	// The held endpoint is given the challenge ID in its 401 response. Sending
+	// that ID to this runtime route must never stand in for an OIDC callback.
+	request := httptest.NewRequest(http.MethodPost, "/east-west/grant", strings.NewReader(`{"challenge_id":"ewc_0123456789abcdef0123456789abcdef"}`))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("bare challenge ID received status %d, want refusal", recorder.Code)
+	}
+}
 
 func TestIssueEastWestGrantFromChallengeReleasesAndCompletes(t *testing.T) {
 	store := policy.NewStore(nil)
@@ -21,7 +41,7 @@ func TestIssueEastWestGrantFromChallengeReleasesAndCompletes(t *testing.T) {
 		TenantID: tenant, UserID: "u9", DeviceID: "dev1", Destination: "dc-01", ServiceFamily: "rdp",
 	}), now)
 
-	resp, err := eastwest.IssueGrantFromChallenge(store, challenges, challenge.ID, now)
+	resp, err := eastwest.CompleteCeremony(store, challenges, challenge.ID, tenant, "u9", now)
 	if err != nil {
 		t.Fatalf("issue grant: %v", err)
 	}
@@ -40,7 +60,7 @@ func TestIssueEastWestGrantFromChallengeReleasesAndCompletes(t *testing.T) {
 	}
 
 	// The challenge is consumed (completed) -> issuing again fails, and it is no longer pending.
-	if _, err := eastwest.IssueGrantFromChallenge(store, challenges, challenge.ID, now); err == nil {
+	if _, err := eastwest.CompleteCeremony(store, challenges, challenge.ID, tenant, "u9", now); err == nil {
 		t.Fatal("re-issuing against a completed challenge must fail")
 	}
 	if got := challenges.ListPending(tenant, now); len(got) != 0 {

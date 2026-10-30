@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof" // DIAGNOSTIC: registers /debug/pprof on http.DefaultServeMux; served only when -pprof-listen is set
@@ -18,6 +19,7 @@ import (
 	"github.com/lantern-networks/dsse-core/humanidentity"
 	nhi "github.com/lantern-networks/dsse-core/nhi"
 	"github.com/lantern-networks/dsse-core/revocation"
+	"github.com/lantern-networks/dsse-core/tenantca"
 	usagemeter "github.com/lantern-networks/dsse-core/usagemeter"
 
 	// The IANA timezone database, compiled in. The runtime image is FROM scratch, so there is no
@@ -34,17 +36,113 @@ import (
 	"github.com/lantern-networks/dsse-core/tunnel"
 )
 
+// Only the /clientless/apps front door may put an already checked IdP session
+// here. The relay must not re-read a client-controlled session_id query value.
+type verifiedClientlessSessionKey struct{}
+
+func withVerifiedClientlessSession(r *http.Request, session model.Session) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), verifiedClientlessSessionKey{}, session))
+}
+
+func verifiedClientlessSessionFromRequest(r *http.Request) (model.Session, bool) {
+	session, ok := r.Context().Value(verifiedClientlessSessionKey{}).(model.Session)
+	return session, ok && session.ID != "" && session.TenantID != ""
+}
+
+// Browsers authenticate the clientless front door with its session cookie.
+// Query/header session IDs are not proof for this public browser route.
+func clientlessBrowserSession(r *http.Request, store *sessionstore.Store) (model.Session, bool) {
+	if store == nil {
+		return model.Session{}, false
+	}
+	cookie, err := r.Cookie("session_id")
+	if err != nil || cookie.Value == "" {
+		return model.Session{}, false
+	}
+	return store.GetActiveAt(cookie.Value, time.Now())
+}
+
+// Agent application GETs may carry a session in a header or cookie, but the
+// query string cannot override the browser cookie or assert another actor.
+func applicationSessionID(r *http.Request) string {
+	if cookie, err := r.Cookie("session_id"); err == nil && cookie.Value != "" {
+		return cookie.Value
+	}
+	return r.Header.Get("x-session-id")
+}
+
+func verifiedManagedApplicationDevice(r *http.Request, tenantID string, deps connectorApplicationDeps) (model.Device, bool, error) {
+	deviceID, ok := transportDeviceIdentityFromRequest(r)
+	if !ok || deviceID == "" {
+		return model.Device{}, false, nil
+	}
+	if deps.tenantCARegistry != nil {
+		certTenant, ok := transportTenantFromRequest(r, deps.tenantCARegistry)
+		if !ok || certTenant != tenantID {
+			return model.Device{}, false, nil
+		}
+	}
+	// A connector certificate also chains to a tenant CA. Its identity is not
+	// an enrolled endpoint, even if the same ID was accidentally registered in
+	// both stores.
+	if deps.registry != nil {
+		_, isConnector, err := connectorRegistrationForTenantWithContext(r.Context(), deps.registry, deviceID, tenantID)
+		if err != nil {
+			return model.Device{}, false, err
+		}
+		if isConnector {
+			return model.Device{}, false, nil
+		}
+	}
+	if deps.deviceStore == nil {
+		return model.Device{}, false, nil
+	}
+	device, found, err := deviceForTenant(deps.deviceStore, tenantID, deviceID)
+	if err != nil {
+		return model.Device{}, false, err
+	}
+	if !found || device.TenantID != tenantID || strings.EqualFold(strings.TrimSpace(device.Status), "revoked") {
+		return model.Device{}, false, nil
+	}
+	return device, true, nil
+}
+
+// The device record that proved managed status is also the record used for risk
+// evaluation. A second storage read could fail after admission and erase an
+// administrator's high-risk signal from the policy decision.
+type applicationDeviceSnapshotStore struct {
+	deviceRuntimeStore
+	device model.Device
+}
+
+func (s applicationDeviceSnapshotStore) Get(id string) (model.Device, bool) {
+	if id == s.device.ID {
+		return s.device, true
+	}
+	return s.deviceRuntimeStore.Get(id)
+}
+
+func (s applicationDeviceSnapshotStore) GetByTenant(tenantID, id string) (model.Device, bool, error) {
+	if id == s.device.ID && tenantID == s.device.TenantID {
+		return s.device, true, nil
+	}
+	return model.Device{}, false, nil
+}
+
 // connectorApplicationDeps carries the private-app (connector application) data-plane
 // dependencies. One value is built in newServerWithConfig and shared by every route
 // that dispatches here. Every field is set once during construction and read-only
 // afterwards — the handler must not treat this as a mutable service locator.
 type connectorApplicationDeps struct {
 	evaluator                 decision.Evaluator
+	configBundleSource        *configBundleSource
+	configSyncStatus          *configBundleSyncStatus
 	policyStore               policy.RuntimeStore
 	writer                    *logs.Writer
 	registry                  connectorRegistryStore
 	tunnelManager             *tunnel.Manager
 	sessionStore              *sessionstore.Store
+	tenantCARegistry          *tenantca.TenantCARegistry
 	deviceStore               deviceRuntimeStore
 	proxyClient               *http.Client
 	routeProfiles             map[string]edgeplane.ApplicationRouteProfile
@@ -65,6 +163,10 @@ type connectorApplicationDeps struct {
 }
 
 func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps connectorApplicationDeps) {
+	if !configBundleReadyForTraffic(deps.configBundleSource, deps.configSyncStatus) {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("initial policy configuration is not yet applied"))
+		return
+	}
 	policyStore := deps.policyStore
 	writer := deps.writer
 	registry := deps.registry
@@ -87,6 +189,59 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 	highRisk := deps.highRisk
 	enrolledLedger := deps.enrolledLedger
 	evaluator := runtimeEvaluatorForPolicyStore(deps.evaluator, policyStore)
+	// Clientless identity is supplied only by the pre-authorized front door.
+	// Direct application sessions additionally require an enrolled mTLS device.
+	activeSession, clientlessVerified := verifiedClientlessSessionFromRequest(r)
+	hasSession := clientlessVerified
+	sessionID := ""
+	if clientlessVerified {
+		sessionID = activeSession.ID
+	} else if r.Method == http.MethodGet || r.Method == http.MethodConnect {
+		if r.Method == http.MethodGet {
+			sessionID = applicationSessionID(r)
+		} else {
+			sessionID = sessionIDFromRequest(r)
+		}
+		if sessionID != "" {
+			if sessionStore == nil {
+				writeError(w, http.StatusUnauthorized, fmt.Errorf("application session is unavailable"))
+				return
+			}
+			var ok bool
+			activeSession, ok = sessionStore.GetActiveAt(sessionID, time.Now())
+			if !ok {
+				writeError(w, http.StatusUnauthorized, fmt.Errorf("application session is inactive"))
+				return
+			}
+			hasSession = true
+		}
+	}
+	callerTenant := evaluator.PolicyBundle.TenantID
+	if hasSession {
+		callerTenant = activeSession.TenantID
+	}
+	certificateTenant, hasCertificateTenant := transportTenantFromRequest(r, deps.tenantCARegistry)
+	if hasCertificateTenant {
+		if hasSession && activeSession.TenantID != certificateTenant {
+			writeError(w, http.StatusForbidden, fmt.Errorf("session and device certificate belong to different tenants"))
+			return
+		}
+		callerTenant = certificateTenant
+	}
+	managedDeviceRecord, managedDevice, deviceErr := verifiedManagedApplicationDevice(r, callerTenant, deps)
+	if deviceErr != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("managed device authority cannot be read"))
+		return
+	}
+	if hasSession && !clientlessVerified && !managedDevice {
+		writeError(w, http.StatusForbidden, fmt.Errorf("application session requires a verified managed device"))
+		return
+	}
+	if hasSession && !clientlessVerified && activeSession.DeviceID != nil &&
+		strings.TrimSpace(*activeSession.DeviceID) != "" && strings.TrimSpace(*activeSession.DeviceID) != managedDeviceRecord.ID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("application session belongs to another device"))
+		return
+	}
 	applicationID := r.PathValue("application_id")
 	if applicationID == "" {
 		// ★ NO APPLICATION MEANS NO ANSWER, NOT A SAMPLE ONE (2026-09-04). This used to fall back to
@@ -96,7 +251,7 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 		writeError(w, http.StatusBadRequest, fmt.Errorf("no application named in the request path"))
 		return
 	}
-	conn, ok, err := connectorForApplication(r.Context(), r, registry, applicationCatalogStore, evaluator.PolicyBundle.TenantID, applicationID)
+	conn, ok, err := connectorForApplication(r.Context(), r, registry, applicationCatalogStore, callerTenant, applicationID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -108,19 +263,53 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 
 	// Slice 2: overlay PUBLISHED catalog routes onto the startup file routes for the connector's tenant. The
 	// file route map stays the fallback for un-published apps (lab invariant).
-	routeProfiles = edgeplane.RouteProfilesWithPublishedCatalog(routeProfiles, applicationCatalogStore, conn.TenantID)
+	routeProfiles, err = edgeplane.RouteProfilesWithPublishedCatalog(r.Context(), routeProfiles, applicationCatalogStore, conn.TenantID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application catalog cannot be read"))
+		return
+	}
+	publishedWebRoute := false
+	if r.Method == http.MethodGet {
+		publishedWebRoute, err = publishedWebAppRoute(r.Context(), applicationCatalogStore, conn.TenantID, applicationID)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("application catalog cannot be read"))
+			return
+		}
+	}
 
 	baseReq := decisionRequestForApplicationRoute(r, conn, applicationID, routeProfiles)
 	if r.Method == http.MethodConnect {
 		baseReq = decisionRequestForApplicationConnect(r, conn, applicationID, routeProfiles)
 	}
+	if r.Method == http.MethodGet || r.Method == http.MethodConnect {
+		baseReq.SessionID = sessionID
+	}
+	if managedDevice {
+		baseReq.DeviceID = managedDeviceRecord.ID
+		baseReq.SourceRole = "managed_endpoint"
+	} else if strings.EqualFold(baseReq.ApplicationSensitivity, "high") {
+		writeError(w, http.StatusForbidden, fmt.Errorf("high-sensitivity application requires a verified managed device"))
+		return
+	}
+	baseReq.ConnectorRouteVerified = true // conn was selected by the server above.
+	evaluator = runtimeEvaluatorForTenant(deps.evaluator, policyStore, conn.TenantID)
 	req := enrichDecisionRequestWithSession(baseReq, sessionStore)
+	if !managedDevice {
+		// An IdP session's optional device_id is identity metadata, not a
+		// transport certificate proving this browser is a managed endpoint.
+		req.DeviceID = ""
+		req.SourceRole = ""
+	}
 	req, riskErr := enrichDecisionRequestWithDirectoryRisk(r.Context(), req, deps.humanIdentities, highRisk)
 	if riskErr != nil {
 		writeError(w, http.StatusServiceUnavailable, riskErr)
 		return
 	}
-	req = enrichDecisionRequestWithRisk(req, deviceStore, highRisk, enrolledLedger)
+	riskDeviceStore := deviceStore
+	if managedDevice {
+		riskDeviceStore = applicationDeviceSnapshotStore{deviceRuntimeStore: deviceStore, device: managedDeviceRecord}
+	}
+	req = enrichDecisionRequestWithRisk(req, riskDeviceStore, highRisk, enrolledLedger)
 	req = deriveDecisionRequestActor(req, delegatedGrants)
 	var attestation runtimeWorkloadAttestationEvidence
 	req, attestation, err = enrichDecisionRequestWithRuntimeAttestation(r, req, workloadAttestationSecret, devMode, workloadAttestations, time.Now())
@@ -213,7 +402,7 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 	// instead of the legacy privateBaseURL HTTP frame (which targets the connector's built-in server and ignores
 	// the published destination). Requires a live tunnel; otherwise fall through to the legacy path. Authorization
 	// already ran above (Published != Allow); the connector authorizes the destination via reachable_routes.
-	if tunnelAvailable && publishedWebAppRoute(r.Context(), applicationCatalogStore, conn.TenantID, applicationID) {
+	if tunnelAvailable && publishedWebRoute {
 		edgeplane.ProxyPublishedWebAppViaTunnel(w, r, tunnelSession, conn, dec, req, connectorAuditAppender(writer, domainEventOutbox), applicationID, routeProfiles)
 		return
 	}
@@ -225,46 +414,22 @@ func handleConnectorApplication(w http.ResponseWriter, r *http.Request, deps con
 }
 
 func decisionRequestForApplicationRoute(r *http.Request, conn model.ConnectorRegistration, applicationID string, routeProfiles map[string]edgeplane.ApplicationRouteProfile) model.DecisionRequest {
-	query := r.URL.Query()
 	profile := edgeplane.ApplicationRouteProfileFor(applicationID, routeProfiles)
 	return model.DecisionRequest{
-		TenantID:                  valueOrDefault(query.Get("tenant_id"), conn.TenantID),
-		SessionID:                 sessionIDFromRequest(r),
-		UserID:                    query.Get("user_id"),
-		SubjectUserID:             query.Get("subject_user_id"),
-		UserGroups:                splitOptionalCSV(query.Get("user_groups")),
-		ActorNHIID:                query.Get("actor_nhi_id"),
-		DelegatedAccessGrantID:    query.Get("delegated_access_grant_id"),
-		AgentTaskSessionID:        query.Get("agent_task_session_id"),
-		ToolID:                    query.Get("tool_id"),
-		ToolActionType:            query.Get("tool_action_type"),
-		ToolPermissionProfile:     query.Get("tool_permission_profile"),
-		ToolVersion:               query.Get("tool_version"),
-		ToolSignatureState:        query.Get("tool_signature_state"),
-		MCPServerID:               query.Get("mcp_server_id"),
-		MCPResourceURI:            query.Get("mcp_resource_uri"),
-		MCPAudience:               query.Get("mcp_audience"),
-		MCPTokenPassthroughPolicy: query.Get("mcp_token_passthrough_policy"),
-		RuntimeEnvironmentID:      query.Get("runtime_environment_id"),
-		ContextBoundaryID:         query.Get("context_boundary_id"),
-		DataClassification:        query.Get("data_classification"),
-		TokenBindingState:         query.Get("token_binding_state"),
-		HumanApprovalEventID:      query.Get("human_approval_event_id"),
-		DeviceID:                  query.Get("device_id"),
-		DeviceTrustLevel:          query.Get("device_trust_level"),
-		ApplicationID:             applicationID,
-		ApplicationSensitivity:    profile.ApplicationSensitivity,
-		ConnectorID:               conn.ID,
-		SourceIP:                  sourceIPFromRequest(r),
-		Destination:               profile.Destination,
-		DestinationPort:           profile.DestinationPort,
-		Protocol:                  profile.Protocol,
-		FQDN:                      profile.Destination,
-		SNI:                       profile.Destination,
-		ServiceFamily:             profile.ServiceFamily,
-		ConnectionInitiator:       "client",
-		SourceRole:                "managed_endpoint",
-		DestinationRole:           profile.DestinationRole,
+		TenantID:               conn.TenantID,
+		SessionID:              "", // supplied only after trusted route/session selection
+		ApplicationID:          applicationID,
+		ApplicationSensitivity: profile.ApplicationSensitivity,
+		ConnectorID:            conn.ID,
+		SourceIP:               sourceIPFromRequest(r),
+		Destination:            profile.Destination,
+		DestinationPort:        profile.DestinationPort,
+		Protocol:               profile.Protocol,
+		FQDN:                   profile.Destination,
+		SNI:                    profile.Destination,
+		ServiceFamily:          profile.ServiceFamily,
+		ConnectionInitiator:    "client",
+		DestinationRole:        profile.DestinationRole,
 	}
 }
 
@@ -284,7 +449,7 @@ func decisionRequestForApplicationConnect(r *http.Request, conn model.ConnectorR
 		SNI:                    profile.Destination,
 		ServiceFamily:          profile.ServiceFamily,
 		ConnectionInitiator:    "client",
-		SourceRole:             "managed_endpoint",
+		SourceRole:             "", // assigned only after enrolled mTLS device proof
 		DestinationRole:        profile.DestinationRole,
 	}
 }

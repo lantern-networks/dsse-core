@@ -48,4 +48,23 @@ final class DsseRuntimeDiagnosticDedupTests: XCTestCase {
         XCTAssertEqual(mSealed, mAfter,
                        "once the terminal snapshot is captured the writer must never write again (one-shot)")
     }
+
+    func testFailedTerminalWriteCanBeRetriedBeforeSealing() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsse-diag-retry-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let parent = root.appendingPathComponent("initially-missing")
+        let url = parent.appendingPathComponent("network_extension_runtime_diagnostic.json")
+        let writer = DsseProviderRuntimeDiagnosticWriter(diagnosticURL: url)
+
+        XCTAssertThrowsError(try writer.recordLiveCopyCompleted())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try writer.recordLiveCopyCompleted()
+        let data = try Data(contentsOf: url)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(object["live_copy_status"] as? String, "completed")
+    }
 }

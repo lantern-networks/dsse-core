@@ -1,11 +1,13 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -22,17 +24,28 @@ const (
 	postgresUsageMeterSpoolFile    = "usage_meter_pending.log.jsonl"
 )
 
+// postgresUsageMeterStore stores accepted records in PostgreSQL and retries a
+// durable local spool before recording further usage.
+// restart-durability: bounded_buffer — if both PostgreSQL and the spool fail,
+// pending observations use MaxPending (default 1000) memory entries. Overflow
+// and process exit lose these unsaved entries; droppedByTenant health counters
+// also cover only this process lifetime. Successfully emitted records belong
+// to usage_meter_records, and the disk spool is replayed after restart.
+// populated-by: side_effect — Record receives completed usage observations;
+// PendingRecordCounts and the health API expose this fallback's delivery state.
 type postgresUsageMeterStore struct {
 	DB         *sql.DB
 	SpoolDir   string
 	mu         sync.Mutex
+	deliveryMu sync.Mutex
 	pending    []usagemeter.UsageMeterRecord
 	MaxPending int
 	// droppedRecords is the cumulative count of usage/billing records DROPPED because the in-memory pending
 	// buffer overflowed while Postgres was unreachable and the disk spool was unavailable — irreversible
 	// billing data loss. Surfaced via DroppedRecordCount so a health check can alarm on degraded mode
 	// (review #33). Guarded by mu.
-	droppedRecords int64
+	droppedRecords  int64
+	droppedByTenant map[string]int64
 }
 
 // DroppedRecordCount returns how many usage/billing records have been irreversibly dropped (Postgres down +
@@ -47,6 +60,28 @@ func (store *postgresUsageMeterStore) DroppedRecordCount() int64 {
 	return store.droppedRecords
 }
 
+func (store *postgresUsageMeterStore) DroppedRecordCountForTenant(tenantID string) int64 {
+	if store == nil {
+		return 0
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.droppedByTenant[strings.TrimSpace(tenantID)]
+}
+
+func (store *postgresUsageMeterStore) CheckUsageStorage() error {
+	if store == nil || store.DB == nil {
+		return fmt.Errorf("usage meter database is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), postgresUsageMeterTimeout)
+	defer cancel()
+	rows, err := store.DB.QueryContext(ctx, "SELECT payload FROM usage_meter_records LIMIT 0")
+	if err != nil {
+		return err
+	}
+	return rows.Close()
+}
+
 var _ usagemeter.UsageMeterRuntimeStore = (*postgresUsageMeterStore)(nil)
 var _ usagemeter.UsageMeterRecordReader = (*postgresUsageMeterStore)(nil)
 
@@ -54,6 +89,8 @@ func (store *postgresUsageMeterStore) Record(record usagemeter.UsageMeterRecord)
 	if store == nil {
 		return
 	}
+	store.deliveryMu.Lock()
+	defer store.deliveryMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), postgresUsageMeterTimeout)
 	defer cancel()
 	if err := store.flushPending(ctx, time.Now().UTC()); err != nil {
@@ -66,45 +103,43 @@ func (store *postgresUsageMeterStore) Record(record usagemeter.UsageMeterRecord)
 }
 
 func (store *postgresUsageMeterStore) Summary(tenantID string, periodStart, periodEnd time.Time) usagemeter.UsageMeterSummary {
-	if store == nil {
-		return usagemeter.SummarizeUsageMeterRecords(nil, tenantID, periodStart, periodEnd)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), postgresUsageMeterTimeout)
-	defer cancel()
-	if err := store.flushPending(ctx, time.Now().UTC()); err != nil {
-		log.Printf("usage meter postgres summary pending flush failed: %v", err)
-	}
-	records, err := store.ListByTenant(ctx, tenantID, periodStart, periodEnd)
-	pending := store.pendingSnapshot()
-	if err != nil {
-		log.Printf("usage meter postgres summary failed: %v", err)
-		return usagemeter.SummarizeUsageMeterRecords(pending, tenantID, periodStart, periodEnd)
-	}
-	records = append(records, pending...)
-	return usagemeter.SummarizeUsageMeterRecords(records, tenantID, periodStart, periodEnd)
+	records, err := store.UsageMeterRecords(tenantID, periodStart, periodEnd)
+	summary := usagemeter.SummarizeUsageMeterRecords(records, tenantID, periodStart, periodEnd)
+	summary.Incomplete = err != nil
+	return summary
 }
 
 func (store *postgresUsageMeterStore) UsageMeterRecords(tenantID string, periodStart, periodEnd time.Time) ([]usagemeter.UsageMeterRecord, error) {
 	if store == nil {
-		return nil, nil
+		return nil, fmt.Errorf("usage meter store unavailable")
 	}
+	store.deliveryMu.Lock()
+	defer store.deliveryMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), postgresUsageMeterTimeout)
 	defer cancel()
 	if err := store.flushPending(ctx, time.Now().UTC()); err != nil {
 		log.Printf("usage meter postgres records pending flush failed: %v", err)
 	}
 	records, err := store.ListByTenant(ctx, tenantID, periodStart, periodEnd)
-	pending := store.pendingSnapshot()
-	if err != nil {
-		return pending, err
+	pending, pendingErr := store.pendingSnapshotWithError()
+	if store.DroppedRecordCountForTenant(tenantID) > 0 {
+		pendingErr = errors.Join(pendingErr, fmt.Errorf("usage meter records were lost while storage was unavailable"))
 	}
-	return append(records, pending...), nil
+	scoped := make([]usagemeter.UsageMeterRecord, 0, len(records)+len(pending))
+	for _, record := range append(records, pending...) {
+		if record.TenantID == strings.TrimSpace(tenantID) && usagemeter.UsageMeterRecordOverlaps(record, periodStart, periodEnd) {
+			scoped = append(scoped, record)
+		}
+	}
+	return scoped, errors.Join(err, pendingErr)
 }
 
 func (store *postgresUsageMeterStore) ReplayPending(ctx context.Context) error {
 	if store == nil {
 		return nil
 	}
+	store.deliveryMu.Lock()
+	defer store.deliveryMu.Unlock()
 	if _, ok := ctx.Deadline(); ok {
 		return store.flushPending(ctx, time.Now().UTC())
 	}
@@ -196,15 +231,20 @@ func (store *postgresUsageMeterStore) bufferPending(record usagemeter.UsageMeter
 }
 
 func (store *postgresUsageMeterStore) pendingSnapshot() []usagemeter.UsageMeterRecord {
+	records, _ := store.pendingSnapshotWithError()
+	return records
+}
+
+func (store *postgresUsageMeterStore) pendingSnapshotWithError() ([]usagemeter.UsageMeterRecord, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	records := append([]usagemeter.UsageMeterRecord(nil), store.pending...)
 	spooled, err := store.spooledPendingLocked()
 	if err != nil {
 		log.Printf("usage meter postgres pending spool read failed: %v", err)
-		return records
+		return records, err
 	}
-	return append(records, spooled...)
+	return append(records, spooled...), nil
 }
 
 func (store *postgresUsageMeterStore) trimPendingLocked() {
@@ -216,6 +256,12 @@ func (store *postgresUsageMeterStore) trimPendingLocked() {
 		return
 	}
 	dropped := len(store.pending) - limit
+	if store.droppedByTenant == nil {
+		store.droppedByTenant = map[string]int64{}
+	}
+	for _, record := range store.pending[:dropped] {
+		store.droppedByTenant[strings.TrimSpace(record.TenantID)]++
+	}
 	store.pending = append([]usagemeter.UsageMeterRecord(nil), store.pending[dropped:]...)
 	store.droppedRecords += int64(dropped)
 	// Fail loud: this is IRREVERSIBLE billing/usage data loss (Postgres down + spool unavailable + memory
@@ -240,10 +286,13 @@ func (store *postgresUsageMeterStore) appendSpoolLocked(record usagemeter.UsageM
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if _, err := store.spooledPendingLocked(); err != nil {
+		return fmt.Errorf("refuse append to unreadable usage spool: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create usage meter spool dir: %w", err)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o600)
 	if err != nil {
 		return fmt.Errorf("open usage meter spool: %w", err)
 	}
@@ -252,10 +301,32 @@ func (store *postgresUsageMeterStore) appendSpoolLocked(record usagemeter.UsageM
 	if err != nil {
 		return fmt.Errorf("marshal usage meter spool record: %w", err)
 	}
+	if st, err := file.Stat(); err != nil {
+		return err
+	} else if st.Size() > 0 {
+		var last [1]byte
+		if _, err := file.ReadAt(last[:], st.Size()-1); err != nil {
+			return err
+		}
+		if last[0] != '\n' {
+			encoded = append([]byte{'\n'}, encoded...)
+		}
+	}
 	if _, err := file.Write(append(encoded, '\n')); err != nil {
 		return fmt.Errorf("write usage meter spool record: %w", err)
 	}
-	return nil
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync usage meter spool: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func (store *postgresUsageMeterStore) spooledPending() ([]usagemeter.UsageMeterRecord, error) {
@@ -281,17 +352,25 @@ func (store *postgresUsageMeterStore) spooledPendingLocked() ([]usagemeter.Usage
 	}
 	defer file.Close()
 	var records []usagemeter.UsageMeterRecord
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
+	decoder := json.NewDecoder(file)
+	for {
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("decode usage meter spool: %w", err)
+		}
+		raw = bytes.TrimSpace(raw)
+		if len(raw) == 0 || raw[0] != '{' {
+			return nil, fmt.Errorf("usage meter spool record must be an object")
+		}
 		var record usagemeter.UsageMeterRecord
-		if err := json.Unmarshal(scanner.Bytes(), &record); err != nil {
-			return nil, fmt.Errorf("decode usage meter spool record: %w", err)
+		if err := json.Unmarshal(raw, &record); err != nil {
+			return nil, err
 		}
 		records = append(records, record)
 	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan usage meter spool: %w", err)
-	}
+
 	return records, nil
 }
 

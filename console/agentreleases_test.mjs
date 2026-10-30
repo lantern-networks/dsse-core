@@ -185,8 +185,19 @@ for (const kind of ['agent', 'connector']) test(kind + ' raw upload preserves it
  assert.equal(q.searchParams.get('expected_tenant_id'), kind === 'agent' ? 'selected' : null);
  assert.equal(q.searchParams.get('expected_manifest_sha256'), kind === 'agent' ? 'b'.repeat(64) : null);
  assert.equal(opts.method, 'PUT'); assert.equal(opts.body, bytes); assert.equal(opts.credentials, 'include');
+ assert.equal(opts.redirect, 'error'); assert.equal(opts.cache, 'no-store');
  assert.equal(opts.headers['x-csrf-token'], 'csrf'); assert.equal(opts.headers['x-operate-tenant'], 'selected'); assert.equal(opts.headers.authorization, undefined);
  if (kind === 'connector') { assert.equal(opts.headers['x-artifact-sha256'], 'c'.repeat(64)); assert.equal(opts.headers['x-artifact-version'], '0.3.2'); }
+});
+
+test('agent raw upload never accepts a redirected success response', async () => {
+ const f = fixture();
+ Object.assign(f.c, {
+   baseForPlane: () => '/control', localStorage: { getItem: () => '' }, idpSession: null, operateTenant: '',
+   fetch: async () => ({ ok: true, status: 200, redirected: true, text: async () => '{"stored":true}' }),
+ });
+ const response = await f.c.arUploadArtifact(new Uint8Array([1]), 'windows', 'amd64', { scope: 'own', manifestSHA256: 'b'.repeat(64) });
+ assert.equal(response.ok, false);
 });
 
 function resumeFixture(signed=true) {

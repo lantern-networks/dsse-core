@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 type retentionSharedUpdater interface {
@@ -190,6 +192,10 @@ func (s *legalHoldStore) SetContext(ctx context.Context, tenantID, heldBy, reaso
 		return raw, err
 	})
 	if err != nil {
+		var pgErr *pq.Error
+		if errors.As(err, &pgErr) && pgErr.Code == "55000" && pgErr.Constraint == "manual_hot_log_delete_running" {
+			return errManualHotLogDeleteInProgress
+		}
 		if active && !errors.Is(err, errTenantErasureInProgress) {
 			s.rememberPendingHold(tenantID)
 		}

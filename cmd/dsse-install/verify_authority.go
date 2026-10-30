@@ -4,12 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 )
 
 // verify_authority.go — is the deployment's authority a single point of failure?
 //
-// ★★★ A CONTROL PLANE INCLUDES ITS DATABASE. The architecture lists what it owns — Postgres, ClickHouse, MinIO — so
+// ★★★ A CONTROL PLANE INCLUDES ITS DATABASE. The architecture lists what it owns — Postgres and ClickHouse — so
 // "how many control planes are there" is not answered by counting processes. Two processes in front of one
 // Postgres are one control plane with two front ends, and since the leadership lock lives in that same
 // Postgres, losing it loses leadership too. This file used to answer the count and call it redundancy.
@@ -52,7 +53,7 @@ func verifyAuthorityIsNotASinglePoint(client *http.Client, cpAdmin string, peers
 		return out
 	}
 	// ★★★ TWO PROCESSES ARE NOT TWO CONTROL PLANES (2026-08-24, corrected). The architecture says what a control plane
-	// OWNS: Postgres, ClickHouse, MinIO. So counting the processes and calling the authority redundant is
+	// OWNS: Postgres and ClickHouse; S3 is operator-managed. So counting the processes and calling the authority redundant is
 	// counting the wrong thing — a pair in front of a single database is one control plane with two front
 	// processes, and the leadership lock lives in that same database, so losing it takes leadership with it.
 	//
@@ -110,6 +111,10 @@ func verifyAuthorityIsNotASinglePoint(client *http.Client, cpAdmin string, peers
 // without a person is a property of what manages the cluster, and a replica nobody promotes automatically is
 // a backup: it survives the data and not the outage. The note says which half this is.
 func verifyAuthorityStateIsRedundant(client *http.Client, cpAdmin string) []verifyResult {
+	return verifyAuthorityStateForProfile(client, cpAdmin, false)
+}
+
+func verifyAuthorityStateForProfile(client *http.Client, cpAdmin string, oneRegionThreeNodes bool) []verifyResult {
 	out := []verifyResult{}
 	add := func(name string, ok bool, format string, args ...any) {
 		out = append(out, verifyResult{name: name, ok: ok, note: fmt.Sprintf(format, args...)})
@@ -140,6 +145,11 @@ func verifyAuthorityStateIsRedundant(client *http.Client, cpAdmin string) []veri
 		return out
 	}
 	n := *health.Database.ReplicasStreaming
+	if oneRegionThreeNodes && n < 2 {
+		add("the authority's durable state has three copies", false,
+			"%d replica(s) streaming; this profile requires both other Node databases before admission", n)
+		return out
+	}
 	if n < 1 {
 		add("the authority's durable state is redundant", false,
 			"no replica is streaming. A control plane owns its Postgres, so an authority with one copy of its "+
@@ -150,6 +160,11 @@ func verifyAuthorityStateIsRedundant(client *http.Client, cpAdmin string) []veri
 	add("the authority's durable state is redundant", true,
 		"%d replica(s) streaming. That the state EXISTS elsewhere; whether it is promoted without a person is "+
 			"the cluster manager's property and is not established here", n)
+	if oneRegionThreeNodes {
+		add("the authority's durable state has three copies", true,
+			"two replicas stream from the primary; this establishes three database members, not strict synchronous acknowledgement")
+		return out
+	}
 
 	// ★★★ AND WHETHER ANY OF THEM IS SOMEWHERE ELSE (2026-08-27). The check above passed on a deployment whose
 	// second region had no database at all — the first region's own pair answered it. A replica beside the
@@ -196,10 +211,10 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 		return nil // the single-point check beside this one already says the peers were not given
 	}
 	type answer struct {
-		url     string
-		count   int
-		err     error
-		standby bool
+		url        string
+		identities []string
+		err        error
+		standby    bool
 	}
 	answers := make([]answer, 0, len(live))
 	for _, peer := range live {
@@ -223,15 +238,29 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 			continue
 		}
 		var body struct {
-			Devices []struct {
+			Devices *[]struct {
 				Identity string `json:"identity"`
 			} `json:"devices"`
 		}
-		if uerr := json.Unmarshal(raw, &body); uerr != nil {
-			answers = append(answers, answer{url: peer, err: uerr})
+		if uerr := json.Unmarshal(raw, &body); uerr != nil || body.Devices == nil {
+			answers = append(answers, answer{url: peer, err: fmt.Errorf("missing or invalid enrolled roster: %v", uerr)})
 			continue
 		}
-		answers = append(answers, answer{url: peer, count: len(body.Devices)})
+		identities := make([]string, 0, len(*body.Devices))
+		for _, device := range *body.Devices {
+			id := strings.TrimSpace(device.Identity)
+			if id == "" {
+				identities = nil
+				break
+			}
+			identities = append(identities, id)
+		}
+		if identities == nil {
+			answers = append(answers, answer{url: peer, err: fmt.Errorf("enrolled roster contains an empty identity")})
+			continue
+		}
+		sort.Strings(identities)
+		answers = append(answers, answer{url: peer, identities: identities})
 	}
 	for _, a := range answers {
 		if a.err != nil {
@@ -263,19 +292,19 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 	answers = readable
 	first := answers[0]
 	for _, a := range answers[1:] {
-		if a.count != first.count {
+		if strings.Join(a.identities, "\x00") != strings.Join(first.identities, "\x00") {
 			return []verifyResult{{name: "the control planes hold the same authority",
-				note: fmt.Sprintf("%s names %d enrolled device(s) and %s names %d. The front door serves "+
+				note: fmt.Sprintf("%s names %d enrolled device(s) and %s names %d with a different identity set. The front door serves "+
 					"whichever is leader, so what the fleet receives depends on the moment — and an Edge that "+
 					"receives an empty roster keeps its own, which means every node ends up with a different "+
-					"one and blocking a device stops it nowhere", first.url, first.count, a.url, a.count)}}
+					"one and blocking a device stops it nowhere", first.url, len(first.identities), a.url, len(a.identities))}}
 		}
 	}
 	if standbys > 0 {
 		return []verifyResult{{name: "the control planes hold the same authority", skipped: true,
 			note: fmt.Sprintf("%d standby control plane(s) intentionally refuse admission reads; their snapshots reload on promotion. This check cannot compare their rosters. Verify roster preservation during a leadership change with enrolled customer devices", standbys)}}
 	}
-	if first.count == 0 {
+	if len(first.identities) == 0 {
 		// ★ AGREEING ON NOTHING IS NOT AGREEMENT (2026-08-24, caught by reading the number this printed). Two
 		// empty control planes give the same answer as two that share their state, and this walk removes the
 		// device it enrolled before reaching here — so a pass with zero is a pass that could not have failed.
@@ -285,5 +314,5 @@ func verifyAuthorityPeersAgree(client *http.Client, peers []string, token string
 				len(answers))}}
 	}
 	return []verifyResult{{ok: true, name: "the control planes hold the same authority",
-		note: fmt.Sprintf("%d control plane(s) name the same %d enrolled device(s)", len(answers), first.count)}}
+		note: fmt.Sprintf("%d control plane(s) name the same %d enrolled device(s)", len(answers), len(first.identities))}}
 }

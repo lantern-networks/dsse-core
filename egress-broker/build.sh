@@ -20,7 +20,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-ENGINE_VERSION="${ENGINE_VERSION:-v2.2.2}"
+ENGINE_VERSION="${ENGINE_VERSION:-v2.2.3}"
 case "${ARCH:-$(uname -m)}" in
   arm64|aarch64) ARCH=arm64; LIBDIR=cgo-arm64; BIN=egress-broker-cgo; DOCKERFILE=Dockerfile.runtime ;;
   amd64|x86_64) ARCH=amd64; LIBDIR=cgo-amd64; BIN=egress-broker-amd64; DOCKERFILE=Dockerfile.runtime.amd64 ;;
@@ -28,7 +28,7 @@ case "${ARCH:-$(uname -m)}" in
 esac
 IMAGE="${IMAGE:-dsse-egress-broker:$ARCH}"
 ARCH="$ARCH" ENGINE_VERSION="$ENGINE_VERSION" bash ./fetch_engine.sh
-builder="${DSSE_GO_BUILDER_IMAGE:-golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b}"
+builder="${DSSE_GO_BUILDER_IMAGE:-golang:1.27.3-alpine3.24@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd}"
 
 if [ -n "${DSSE_GO_BUILDER_IMAGE:-}" ]; then
   expected="${DSSE_GO_BUILDER_IMAGE_ID:-}"
@@ -54,12 +54,17 @@ docker run --rm --platform "linux/$ARCH" -v "$PWD/..:/oss" -w /oss/egress-broker
   -e CGO_ENABLED=1 -e GOTOOLCHAIN=local \
   -e CGO_CFLAGS="-I/oss/egress-broker/cgo-deps/include" \
   -e CGO_LDFLAGS="-L/oss/egress-broker/$LIBDIR -lcurl-impersonate" \
-  "$builder" sh -ec 'update-ca-certificates >/dev/null; [ "$(go env GOVERSION)" = go1.27.1 ]; go build -trimpath -o "$1" .' sh "$BIN"
+  "$builder" sh -ec 'apk add --no-cache gcc musl-dev >/dev/null; update-ca-certificates >/dev/null; [ "$(go env GOVERSION)" = go1.27.3 ]; go build -trimpath -o "$1" .' sh "$BIN"
 [ -s "$BIN" ] || { echo "build.sh: $BIN missing or empty after a build that reported success" >&2; exit 1; }
 
 # --- 5. the runtime image ---------------------------------------------------------------------------------
 echo "==> packaging $IMAGE"
-docker build -q -f "$DOCKERFILE" -t "$IMAGE" . >/dev/null
+docker buildx build --platform "linux/$ARCH" --load -q -f "$DOCKERFILE" -t "$IMAGE" . >/dev/null
+[ "$(docker image inspect "$IMAGE" --format '{{.Architecture}}')" = "$ARCH" ] || {
+  echo "build.sh: packaged image architecture does not match $ARCH" >&2; exit 1;
+}
+docker run --rm --platform "linux/$ARCH" --entrypoint /bin/sh "$IMAGE" -ec \
+  'test ! -e /usr/local/share/ca-certificates/dsse-build-inspection.crt && test -x /usr/local/bin/egress-broker'
 
 # Say what was produced. The failure this script exists to prevent is a rebuild that nobody can tell happened.
 echo "==> egress-broker image ready: $IMAGE ($(docker image inspect "$IMAGE" --format '{{.Id}}' | cut -c8-19), engine $ENGINE_VERSION)"

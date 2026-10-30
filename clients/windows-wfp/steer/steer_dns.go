@@ -112,16 +112,14 @@ func (p *dnsProxy) resolve(query []byte) ([]byte, error) {
 		if p.failOpen {
 			var statusErr *edgeDNSStatusError
 			if errors.As(err, &statusErr) {
-				// A bad ANSWER, not an outage. Resolve this one upstream, but leave the circuit closed so
-				// enforcement stays on for every TCP flow. Name the question: without it these are just a
-				// count, and the Edge-side cause cannot be correlated to what was being looked up.
+				// The Edge answered: 401/403 can be device admission or policy denial, while 502 is
+				// an Edge-side resolution failure. None is a transport outage, so fail-open must not
+				// bypass that response by asking a plaintext upstream resolver directly.
 				p.health.recordSuccess()
-				q, ok := dnsQuestionKey(query)
-				if !ok {
-					q = "unparsed-question"
-				}
-				fmt.Printf("dns_edge_status: %v question=%s — answered upstream; the Edge answered, so the circuit stays CLOSED (enforcement unaffected)\n", err, q)
-			} else if opened := p.health.recordFailure(); opened {
+				fmt.Printf("dns_edge_status: %v — Edge answered; upstream bypass suppressed\n", err)
+				return nil, err
+			}
+			if opened := p.health.recordFailure(); opened {
 				fmt.Printf("dns_failopen: edge unreachable (%v) — circuit OPEN, forwarding DNS upstream for the cooldown (plaintext DNS leaves the box)\n", err)
 			}
 			return p.forwardUpstream(query)

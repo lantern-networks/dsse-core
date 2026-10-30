@@ -13,11 +13,9 @@ package main
 //	PG_PASSWORD             dsse-control-plane-a, dsse-control-plane-b, dsse-postgres-init
 //	PG_SUPERUSER_PASSWORD   dsse-postgres-a, dsse-postgres-init
 //	CLICKHOUSE_PASSWORD     dsse-clickhouse, dsse-control-plane-a, dsse-control-plane-b
-//	MINIO_ROOT_PASSWORD     dsse-archive, dsse-archive-init, dsse-control-plane-a, dsse-control-plane-b
 //
 // Not one of them is named by an Edge service or by start-edge.sh. Every Edge machine in every deployment
-// nevertheless holds the deployment's database superuser password and its object store's root credential —
-// read by nothing there, and reachable by anything that reaches that box.
+// nevertheless held database and archive credentials read by nothing there.
 //
 // ★★ THE SET IS DERIVED, NEVER LISTED. A hand-kept list of "what an Edge needs" is a second description of
 // the deployment that drifts from the first one silently, and the failure is a node that starts, cannot find
@@ -168,6 +166,19 @@ func valuesThisMachineReads(dir, compose string) map[string]bool {
 // cannot state its own description cannot be checked. ADMIN_TOKEN is not in this list — it is kept, on the
 // machines that keep it, because a start script there names it.
 var installerReadsFromDeploymentEnv = []string{
+	"DSSE_NODE_NAME",
+	"DSSE_IMAGE_REVISION",
+	// Keep the reviewed cohort in every carried deployment.env, including
+	// Edge-only nodes whose current Compose does not start a database.
+	"DSSE_ETCD_IMAGE",
+	"DSSE_POSTGRES_IMAGE",
+	"DSSE_PSQL_IMAGE",
+	"DSSE_POSTGRES_MAJOR",
+	"DSSE_AGENT_PUBLISHER",
+	planHostAliasesKey,
+	threeRegionPortalsKey,
+	"DSSE_NODE_ROLE",
+	"DSSE_TOPOLOGY_PROFILE",
 	"EDGE_HOST",
 	"DSSE_EDGE_REGION",
 	"DSSE_AGENT_PLANE_NAME",
@@ -197,7 +208,12 @@ var installerReadsFromDeploymentEnv = []string{
 // and cannot sign anything for it, which is the whole point of the split. The public halves beside it are
 // what an operator compares out loud to check a carry arrived intact.
 var installerReadsFromDeploymentDir = []string{
+	installPlanFile,
 	"root.crt",
+	// The installer verifies the Console's server-only leaf against this
+	// public issuer during joining-node preflight.  It is not mounted by a
+	// service, so the compose-derived carry list alone omits it.
+	"console-server-ca.crt",
 	"deployment-anchor.pem",
 	"agent-policy-signing.pub",
 	"bundle-signing.pub",

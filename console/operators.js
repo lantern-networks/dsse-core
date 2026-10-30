@@ -22,7 +22,10 @@ let _operatorTenantId = null;
 async function operatorTenantIdentity() {
   if (_operatorTenantId) return _operatorTenantId;
   const r = await apiFetch("GET", "/admin/tenants", undefined, "control");
-  const tenants = (r.ok && r.body && r.body.tenants) || [];
+  if (!r.ok || !r.body || !Array.isArray(r.body.tenants)) {
+    throw new Error(bl({ en: "The tenant registry could not be read.", ja: "テナント台帳を取得できません。" }));
+  }
+  const tenants = r.body.tenants;
   const operator = tenants.find((t) => t.is_operator);
   _operatorTenantId = operator ? operator.tenant_id : "";
   return _operatorTenantId;
@@ -34,7 +37,9 @@ async function operatorTenantIdentity() {
 // A deployment with no operator organization gets a refusal, not a call: without a name to send, the request
 // would be answered by whichever organization the caller is signed in to, which is never what was asked for.
 async function withOperatorTenant(fn) {
-  const tenant = await operatorTenantIdentity();
+  let tenant;
+  try { tenant = await operatorTenantIdentity(); }
+  catch (e) { return { ok: false, status: 0, lookupUnavailable: true, body: { error: String(e) } }; }
   if (!tenant) return { ok: false, status: 0, noOperatorTenant: true, body: {} };
   return fn(tenant);
 }
@@ -43,6 +48,7 @@ function renderOperatorsView(content) {
   content.innerHTML = "";
   const add = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "+ Add operator", ja: "+ オペレータを追加" }),
     onClick: () => openOperatorInvite(content) });
+  add.disabled = true;
   content.appendChild(el("div", { class: "ui-view-head" }, [
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Operators", ja: "オペレータ" }) }),
@@ -66,10 +72,12 @@ function renderOperatorsView(content) {
   // there is no name to send the invitation to, and the invitation lands in whichever organization the caller
   // is signed in to — a customer's, silently. The button says so instead of doing that.
   operatorTenantIdentity().then((t) => {
-    if (t) return;
-    add.disabled = true;
-    add.title = bl({ en: "This deployment has no operator tenant to add an operator to.",
-                     ja: "この配備にはオペレータテナントがないため、追加先がありません。" });
+    add.disabled = !t;
+    if (!t) add.title = bl({ en: "This deployment has no operator tenant to add an operator to.",
+                            ja: "この配備にはオペレータテナントがないため、追加先がありません。" });
+  }).catch(() => {
+    add.title = bl({ en: "The tenant registry could not be read. Retry before adding an operator.",
+                     ja: "テナント台帳を取得できません。追加する前に再試行してください。" });
   });
 }
 
@@ -80,6 +88,12 @@ async function renderOperatorList(host, content) {
   let tenantId = "";
   try {
     const r = await withOperatorTenant(async (t) => { tenantId = t; return apiFetch("GET", "/admin/admins", undefined, "control", undefined, t); });
+    if (r.lookupUnavailable) {
+      if (!current()) return;
+      uiState(host, "error", bl({ en: "The tenant registry could not be read.", ja: "テナント台帳を取得できません。" }),
+        { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderOperatorsView(content) });
+      return;
+    }
     if (!tenantId) {
       if (!current()) return;
       uiState(host, "empty", bl({
@@ -87,9 +101,9 @@ async function renderOperatorList(host, content) {
         ja: "この配備にはオペレータテナントがありません。コントロールプレーンを -operator-tenant-id 付きで起動してください。" }));
       return;
     }
-    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderOperatorList(host, content) }); return; }
+    if (!r.ok) { if (!current()) return; uiState(host, "error", "HTTP " + r.status, { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderOperatorsView(content) }); return; }
     admins = (r.body && r.body.admins) || [];
-  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderOperatorList(host, content) }); return; }
+  } catch (e) { if (!current()) return; uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderOperatorsView(content) }); return; }
 
   if (!admins.length) { if (!current()) return; uiState(host, "empty", bl({ en: "No operators yet.", ja: "オペレータがいません。" })); return; }
 

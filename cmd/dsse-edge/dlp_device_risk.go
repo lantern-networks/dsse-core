@@ -24,21 +24,24 @@ type deviceRiskMarker interface {
 // dlpDetectionRecord is one device's DLP detection: the identifier types found, where it was going, the
 // destination instance class, and when.
 type dlpDetectionRecord struct {
+	tenantID      string
 	types         []string
 	destination   string
 	instanceClass string // "" | corporate | personal
 	at            time.Time
+	retainUntil   time.Time
 }
+
+type dlpRiskOwner struct{ tenant, device string }
 
 type dlpDeviceRiskAggregator struct {
 	mu     sync.Mutex
-	hits   map[string][]dlpDetectionRecord // deviceID -> recent detection records
+	hits   map[dlpRiskOwner][]dlpDetectionRecord
 	marker deviceRiskMarker
-	maxAge time.Duration // prune records older than this (a cap ≥ the largest condition window)
 }
 
 func newDLPDeviceRiskAggregator(marker deviceRiskMarker) *dlpDeviceRiskAggregator {
-	return &dlpDeviceRiskAggregator{hits: map[string][]dlpDetectionRecord{}, marker: marker, maxAge: 24 * time.Hour}
+	return &dlpDeviceRiskAggregator{hits: map[dlpRiskOwner][]dlpDetectionRecord{}, marker: marker}
 }
 
 type dlpDeviceRiskResult struct {
@@ -52,21 +55,32 @@ type dlpDeviceRiskResult struct {
 // device id is empty, there are no conditions, or the record carries no types.
 func (a *dlpDeviceRiskAggregator) Record(deviceID string, rec dlpDetectionRecord, conditions []model.DLPDeviceRiskCondition, now time.Time) dlpDeviceRiskResult {
 	result := dlpDeviceRiskResult{}
-	if a == nil || deviceID == "" || len(conditions) == 0 || len(rec.types) == 0 {
+	tenant := strings.TrimSpace(rec.tenantID)
+	deviceID = strings.TrimSpace(deviceID)
+	if a == nil || tenant == "" || deviceID == "" || len(conditions) == 0 || len(rec.types) == 0 {
 		return result
 	}
 	rec.at = now
+	rec.types = append([]string(nil), rec.types...)
+	// Retain each detection for the longest window of the policy that
+	// produced it. A later short-window policy must not erase that history.
+	var retention time.Duration
+	for _, c := range conditions {
+		if window := deviceRiskWindow(c.WindowSeconds); window > retention {
+			retention = window
+		}
+	}
+	rec.retainUntil = now.Add(retention)
+	owner := dlpRiskOwner{tenant, deviceID}
 	a.mu.Lock()
-	// Append + prune this device's records to the cap window (bounded memory).
-	cutoff := now.Add(-a.maxAge)
-	kept := a.hits[deviceID][:0]
-	for _, r := range a.hits[deviceID] {
-		if r.at.After(cutoff) {
+	kept := a.hits[owner][:0]
+	for _, r := range a.hits[owner] {
+		if r.retainUntil.After(now) {
 			kept = append(kept, r)
 		}
 	}
 	kept = append(kept, rec)
-	a.hits[deviceID] = kept
+	a.hits[owner] = kept
 	records := append([]dlpDetectionRecord(nil), kept...)
 	marker := a.marker
 	a.mu.Unlock()
@@ -92,13 +106,10 @@ func (a *dlpDeviceRiskAggregator) Record(deviceID string, rec dlpDetectionRecord
 
 // evaluateDeviceRiskCondition reports the severity to set if the device's records satisfy the condition, else "".
 // A condition is an AND of: enough records (min_count) AND enough distinct types (min_distinct_types), within the
-// window, optionally only to personal/outside-org destinations, and — when same_destination — concentrated on a
+// window, optionally only to personal/outside-org or unverified destinations, and — when same_destination — concentrated on a
 // single destination.
 func evaluateDeviceRiskCondition(records []dlpDetectionRecord, c model.DLPDeviceRiskCondition, now time.Time) string {
-	window := time.Duration(c.WindowSeconds) * time.Second
-	if window <= 0 {
-		window = time.Hour
-	}
+	window := deviceRiskWindow(c.WindowSeconds)
 	cutoff := now.Add(-window)
 
 	// In-window records, honoring the destination-class filter.
@@ -107,7 +118,7 @@ func evaluateDeviceRiskCondition(records []dlpDetectionRecord, c model.DLPDevice
 		if !r.at.After(cutoff) {
 			continue
 		}
-		if c.DestinationClass == "personal" && r.instanceClass != "personal" {
+		if !dlpInstanceScopeApplies(c.DestinationClass, r.instanceClass) {
 			continue
 		}
 		inWindow = append(inWindow, r)
@@ -138,6 +149,19 @@ func evaluateDeviceRiskCondition(records []dlpDetectionRecord, c model.DLPDevice
 		return severity
 	}
 	return ""
+}
+
+func deviceRiskWindow(seconds int) time.Duration {
+	if seconds <= 0 {
+		return time.Hour
+	}
+	// Saturate at time.Duration's representable limit; never wrap a valid
+	// long configured window into the one-hour default.
+	const maxDuration = time.Duration(1<<63 - 1)
+	if uint64(seconds) > uint64(maxDuration/time.Second) {
+		return maxDuration
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func deviceRiskCountAndDiversityMet(records []dlpDetectionRecord, c model.DLPDeviceRiskCondition) bool {

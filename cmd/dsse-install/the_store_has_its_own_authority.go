@@ -29,6 +29,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -123,7 +124,16 @@ func issueStoreMember(sa *storeAuthority, memberName string, sans []string, now 
 		NotAfter:     now.AddDate(years, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
-		DNSNames:     sans,
+	}
+	for _, name := range sans {
+		if ip := net.ParseIP(name); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, name)
+		}
+	}
+	if tmpl.NotAfter.After(sa.Cert.NotAfter) {
+		tmpl.NotAfter = sa.Cert.NotAfter
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, sa.Cert, &key.PublicKey, sa.Key)
 	if err != nil {
@@ -145,7 +155,7 @@ func writeStoreMember(dir string, cert *x509.Certificate, key *ecdsa.PrivateKey)
 	if err := os.WriteFile(filepath.Join(dir, storeMemberFile), certPEM(cert), 0o644); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, storeMemberKeyFile), keyPEM(key), 0o600)
+	return publishPrivateInstallerKey(filepath.Join(dir, storeMemberKeyFile), keyPEM(key))
 }
 
 // storeMemberSANs is what a member's certificate has to be valid for: the name its peers dial it by. The
@@ -258,6 +268,9 @@ func storeMemberForPlanApply(dir string, values map[string]string, now time.Time
 }
 
 func validateExistingStoreMember(dir string, values map[string]string, now time.Time) error {
+	if err := checkPrivateInstallerKey(filepath.Join(dir, storeMemberKeyFile)); err != nil {
+		return err
+	}
 	certPEMBytes, err := os.ReadFile(filepath.Join(dir, storeMemberFile))
 	if err != nil {
 		return err
@@ -289,14 +302,8 @@ func validateExistingStoreMember(dir string, values map[string]string, now time.
 		return fmt.Errorf("store member identity differs from plan")
 	}
 	for _, want := range storeMemberSANs(reachable, name) {
-		found := false
-		for _, got := range cert.DNSNames {
-			if got == want {
-				found = true
-			}
-		}
-		if !found {
-			return fmt.Errorf("store member names differ from plan")
+		if err := cert.VerifyHostname(want); err != nil {
+			return fmt.Errorf("store member names differ from plan: %w", err)
 		}
 	}
 	caBytes, err := os.ReadFile(filepath.Join(dir, storeCAFile))

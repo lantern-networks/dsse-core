@@ -2,7 +2,6 @@ package grantstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"sync"
 	"testing"
@@ -62,8 +61,10 @@ func TestSharedGrantWritersPreservePeer(t *testing.T) {
 		}
 	}
 	raw, _ := p.Load()
-	var saved map[string]Grant
-	json.Unmarshal(raw, &saved)
+	saved, err := decodeShared(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(saved) != 2 {
 		t.Fatalf("stale writer lost peer: %d rows", len(saved))
 	}

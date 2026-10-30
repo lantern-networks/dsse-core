@@ -127,11 +127,17 @@ func TestTheSharedAnchorLeavesAnOrganizationsBundleOnlyOnACompleteAnswer(t *test
 			"exactly what the enrolment fold makes safe, and it must be allowed")
 	}
 
-	// And a report older than the shelf life is silence, whatever it says.
+	// And a device with only an old report is silent, whatever it says. Use
+	// a fresh observation store: a late old report must not replace the newer
+	// report already received above.
+	observed = newObservedExclusionStore(16)
+	b.config.ObservedExclusions = observed
+	report("mac-dev-1", 7)
 	observed.Record(observedExclusionEntry{
 		TenantID: "tenant_reference_lab", DeviceIdentity: "win-dev-1",
 		ReportedAt:              time.Now().Add(-2 * transportCAReportShelfLife),
 		PinnedTransportCASHA256: []string{fp}, AdoptedTrustSerial: 7,
+		TransportServerNameSent: own,
 	})
 	if b.sharedAnchorMayBeWithdrawn("tenant_reference_lab") {
 		t.Fatal("a device that has not been heard from in weeks counted as holding the anchor")

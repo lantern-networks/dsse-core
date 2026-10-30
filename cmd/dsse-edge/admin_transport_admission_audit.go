@@ -38,7 +38,7 @@ func transportAdmissionAuditLog(r *http.Request, tenantID, action, identity, rea
 		metadata["reason"] = reason
 	}
 	if caller, ok := adminIdentityFromRequest(r); ok && record.TenantID != "" &&
-		!strings.EqualFold(record.TenantID, strings.TrimSpace(caller.TenantID)) {
+		record.TenantID != strings.TrimSpace(caller.TenantID) {
 		stampOperatorActor(metadata, caller)
 	}
 	return record

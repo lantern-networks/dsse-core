@@ -76,7 +76,12 @@ func registerSteerAgentUpdateArtifactRoute(mux *http.ServeMux, config serverConf
 			http.Error(w, "platform and arch query parameters are required", http.StatusBadRequest)
 			return
 		}
-		u, ok := config.PublishedUpdates.forTarget(platform, arch)
+		tenant, bound := deviceUpdateTenantForRequest(r, config)
+		if !bound {
+			writeError(w, http.StatusForbidden, fmt.Errorf("the verified device certificate has no registered tenant CA"))
+			return
+		}
+		u, ok := config.PublishedUpdates.forTenantTarget(tenant, platform, arch)
 		if !ok {
 			http.Error(w, fmt.Sprintf("no agent update is published for %s/%s", platform, arch), http.StatusNotFound)
 			return
@@ -142,6 +147,10 @@ func registerSteerAgentUpdateArtifactRoute(mux *http.ServeMux, config serverConf
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", size))
+		// A cache hint for endpoint couriers, emitted only after this open file was
+		// verified against the published manifest. It never authorizes install:
+		// the updater checks the signed manifest and hashes the staged bytes again.
+		w.Header().Set(agentupdate.ArtifactSHA256Header, u.Manifest.ArtifactSHA256)
 		// ★ SAY WHICH VERSION THESE BYTES ARE (2026-08-11, from a device that downloaded the wrong ones).
 		//
 		// This URL does not name a version — deliberately, so that nothing a caller controls selects a file. The

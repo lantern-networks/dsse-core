@@ -21,6 +21,22 @@ const cpStatementCancelGrace = time.Second
 // ends it before the client fallback closes the leader's session.
 const cpStatementTimeoutReuse = 250 * time.Millisecond
 
+// A parent Done channel closes before cancellation necessarily reaches every
+// derived child. In particular a driver can return at the deadline while the
+// child's Err still reads nil. Check the original request and the actual
+// deadline, without waiting for propagation, before committing a state write.
+func cpWriteContextError(request, derived context.Context) error {
+	for _, ctx := range []context.Context{request, derived} {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return context.DeadlineExceeded
+		}
+	}
+	return nil
+}
+
 type cpStatementBudget struct {
 	request, sqlCtx context.Context
 	cancel          context.CancelFunc

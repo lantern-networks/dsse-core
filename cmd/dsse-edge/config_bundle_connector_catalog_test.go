@@ -97,7 +97,9 @@ func TestConnectorCatalogEmptyKeepsLocal(t *testing.T) {
 func TestConnectorCatalogGenerationIsChurnFree(t *testing.T) {
 	now := time.Date(2026, 6, 27, 0, 0, 0, 0, time.UTC)
 	reg := connector.NewRegistry()
-	_, _ = reg.Register(catalogConn("conn-x", "region-a", []string{"app.corp"}), now)
+	conn := catalogConn("conn-x", "region-a", []string{"app.corp"})
+	conn.Status = "healthy"
+	_, _ = reg.Register(conn, now)
 	g1 := reg.ConfigGeneration()
 
 	// A heartbeat must NOT bump the catalog generation.
@@ -109,13 +111,14 @@ func TestConnectorCatalogGenerationIsChurnFree(t *testing.T) {
 	}
 
 	// Re-registering identical catalog data must NOT bump.
-	_, _ = reg.Register(catalogConn("conn-x", "region-a", []string{"app.corp"}), now.Add(2*time.Second))
+	_, _ = reg.Register(conn, now.Add(2*time.Second))
 	if reg.ConfigGeneration() != g1 {
 		t.Fatalf("no-op re-register bumped generation %d -> %d", g1, reg.ConfigGeneration())
 	}
 
 	// A real catalog change (new route) MUST bump.
-	_, _ = reg.Register(catalogConn("conn-x", "region-a", []string{"app.corp", "db.corp"}), now.Add(3*time.Second))
+	conn.ReachableRoutes.FQDNDomains = []string{"app.corp", "db.corp"}
+	_, _ = reg.Register(conn, now.Add(3*time.Second))
 	if reg.ConfigGeneration() <= g1 {
 		t.Fatalf("catalog change did not bump generation (still %d)", reg.ConfigGeneration())
 	}

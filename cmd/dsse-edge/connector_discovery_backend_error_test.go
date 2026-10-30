@@ -28,6 +28,9 @@ type unavailableDiscoveryCatalog struct{ *appcatalog.Store }
 func (c unavailableDiscoveryCatalog) List(context.Context, string, appcatalog.ListOptions) (appcatalog.ListResponse, error) {
 	return appcatalog.ListResponse{}, errors.New("private database connection detail")
 }
+func (c unavailableDiscoveryCatalog) ListAll(context.Context, string, appcatalog.ListAllOptions) ([]appcatalog.Entry, error) {
+	return nil, errors.New("private database connection detail")
+}
 
 func TestConnectorDiscoveryBackendFailureIsServerError(t *testing.T) {
 	for _, backend := range []string{"registry", "catalog"} {

@@ -97,6 +97,47 @@ func TestDNSProxyFailOpenForwardsUpstream(t *testing.T) {
 	}
 }
 
+func TestDNSProxyFailOpenDoesNotBypassReachableEdgeRejection(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusBadGateway} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			edge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(status)
+			}))
+			defer edge.Close()
+			upstream, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer upstream.Close()
+			used := make(chan struct{}, 1)
+			go func() {
+				var buf [512]byte
+				for {
+					_, addr, err := upstream.ReadFrom(buf[:])
+					if err != nil {
+						return
+					}
+					used <- struct{}{}
+					_, _ = upstream.WriteTo([]byte{0x12, 0x34}, addr)
+				}
+			}()
+			p := newDNSProxy(transportConfig{}, edge.URL, true, newEdgeHealth(1, time.Second))
+			p.setFallback([]string{upstream.LocalAddr().String()})
+			if _, err := p.resolve([]byte{0x12, 0x34, 0x01, 0x00}); err == nil {
+				t.Fatalf("reachable Edge HTTP %d was bypassed through upstream DNS", status)
+			}
+			select {
+			case <-used:
+				t.Fatalf("reachable Edge HTTP %d reached upstream DNS", status)
+			default:
+			}
+			if !p.health.shouldTryEdge() {
+				t.Fatalf("reachable Edge HTTP %d incorrectly opened the transport circuit", status)
+			}
+		})
+	}
+}
+
 func TestDNSProxyQueryURL(t *testing.T) {
 	if p := newDNSProxy(transportConfig{}, "http://203.0.113.10:18090/", false, nil); p.queryURL != "http://203.0.113.10:18090/steer/dns-query" {
 		t.Fatalf("plaintext url: %s", p.queryURL)

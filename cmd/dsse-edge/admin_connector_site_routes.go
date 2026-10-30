@@ -548,6 +548,15 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		if strings.TrimSpace(request.EdgeURL) != "" {
 			enrollEdgeURL = strings.TrimSpace(request.EdgeURL)
 		}
+		// The bootstrap URL carries the first CSR, before the connector can poll a
+		// durable profile. Resolve it and the failover list from the same tenant-
+		// scoped region snapshot; reject an out-of-boundary override before the
+		// Site bootstrap secret is rotated.
+		enrollEdgeURL, enrollmentEndpoints, endpointErr := connectorEnrollmentMaterial(tenantID, enrollEdgeURL)
+		if endpointErr != nil {
+			writeError(w, http.StatusConflict, endpointErr)
+			return
+		}
 		// ★★★ A COMMAND WITH AN EMPTY FLAG IN IT IS NOT A COMMAND (2026-08-23, measured). Issued from the
 		// reference deployment's CONTROL PLANE — which is where an operator naturally is, because it holds the
 		// authority — this returned 200 and a command whose token carried edge_url:"" and no pinned CA. Run as
@@ -589,7 +598,7 @@ func registerConnectorSiteAdminRoutes(mux *http.ServeMux, adminEndpoint func(str
 		// nothing serves turns every dial into a verification failure. Both halves or neither.
 		params := enrollmentTokenParams{
 			EdgeURL:       enrollEdgeURL,
-			EdgeEndpoints: connectorEnrollmentEndpointList(tenantID),
+			EdgeEndpoints: enrollmentEndpoints,
 			StateDir:      strings.TrimSpace(config.ConnectorEnrollmentStateDir),
 			EdgeCAPEM:     config.ConnectorEnrollmentEdgeCAPEM,
 		}

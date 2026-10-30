@@ -126,7 +126,7 @@ func pkiPathsForTenant(paths []pkiPath, callerTenant string, inv []pkiCertificat
 		if o == "" {
 			return false
 		}
-		return !strings.EqualFold(o, callerTenant)
+		return o != callerTenant
 	}
 	// unplaceable is the fail-closed half: named material this node cannot attribute, on a node that attributes.
 	unplaceable := func(owner, subject string) bool {
@@ -137,7 +137,7 @@ func pkiPathsForTenant(paths []pkiPath, callerTenant string, inv []pkiCertificat
 	// a tenant that HAS its own root should see its own on its own path.
 	ownForRole := func(role string) *pkiCertificateItem {
 		for i := range inv {
-			if inv[i].Role == role && strings.EqualFold(strings.TrimSpace(inv[i].TenantID), callerTenant) {
+			if inv[i].Role == role && strings.TrimSpace(inv[i].TenantID) == callerTenant {
 				return &inv[i]
 			}
 		}

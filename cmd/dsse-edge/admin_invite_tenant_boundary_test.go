@@ -72,17 +72,18 @@ func TestInviteInTheSameTenantStillReissues(t *testing.T) {
 	}
 }
 
-// An address nobody has invited is free, and the comparison ignores case and padding the way an email does.
-func TestInviteAcceptsAFreeAddressAndNormalisesTheTenantComparison(t *testing.T) {
+// An address nobody has invited is free. Tenant IDs trim surrounding whitespace,
+// but unlike email addresses they remain case-sensitive.
+func TestInviteAcceptsAFreeAddressAndTrimsTenantPadding(t *testing.T) {
 	store := newLocalAdminCredentialStore("Lantern DSSE")
 	now := time.Now()
 
 	if _, err := store.Invite("new@corp.example", "tenant_a", "adm_1", []string{"admin"}, now); err != nil {
 		t.Fatalf("inviting a free address: %v", err)
 	}
-	// Same tenant, differently spelled. This must NOT read as a cross-tenant collision, or an operator whose
+	// Same tenant with padding. This must NOT read as a cross-tenant collision, or an operator whose
 	// header carries a stray space locks themselves out of their own organization.
-	if _, err := store.Invite("new@corp.example", " Tenant_A ", "adm_1", []string{"admin"}, now); err != nil {
-		t.Fatalf("same tenant with different spacing/case must be allowed: %v", err)
+	if _, err := store.Invite("new@corp.example", " tenant_a ", "adm_1", []string{"admin"}, now); err != nil {
+		t.Fatalf("same tenant with different spacing must be allowed: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -26,6 +27,9 @@ type Doer interface {
 type Syncer struct {
 	URL    string
 	PinHex string
+	// TenantID comes from the locally verified install profile, never from the
+	// response. One policy signer may sign policies for several tenants.
+	TenantID string
 	// Keys, when set, supplies the accepted signing keys for THIS fetch — the pin plus whatever the device has
 	// adopted. A callback rather than a slice because the set changes underneath a long-running Syncer: a device
 	// adopts the next key from a trust bundle mid-run, and a set captured at construction would still be the old
@@ -60,6 +64,10 @@ func (s Syncer) logf(format string, args ...interface{}) {
 // never wedge Run) in addition to any deadline on ctx. Returns an error on any failure (caller keeps current
 // settings).
 func (s Syncer) FetchOnce(ctx context.Context) error {
+	wantTenant := strings.TrimSpace(s.TenantID)
+	if wantTenant == "" {
+		return fmt.Errorf("agenttuning: no tenant in verified install profile")
+	}
 	timeout := s.FetchTimeout
 	if timeout <= 0 {
 		timeout = 15 * time.Second
@@ -88,6 +96,9 @@ func (s Syncer) FetchOnce(ctx context.Context) error {
 	}
 	if !verified {
 		return fmt.Errorf("agenttuning: policy not verified")
+	}
+	if strings.TrimSpace(policy.TenantID) != wantTenant {
+		return fmt.Errorf("agenttuning: signed policy tenant differs from verified install profile")
 	}
 	if s.Apply != nil {
 		s.Apply(policy)

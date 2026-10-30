@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 // Identity is the verified end-user identity extracted from a valid ID token.
 type Identity struct {
+	AuthTime      string   `json:"auth_time,omitempty"`
 	IdPID         string   `json:"idp_id"`
 	Issuer        string   `json:"issuer"`
 	Subject       string   `json:"subject"`
@@ -30,13 +32,16 @@ type Identity struct {
 
 // ValidateOptions carry the per-flow expectations + the IdP's keys for ID-token validation.
 type ValidateOptions struct {
-	JWKS             JWKS
-	ExpectedNonce    string        // must equal the token nonce (required when set)
-	ExpectedAudience string        // must be in aud; defaults to conn.ClientID
-	Now              time.Time     // defaults to time.Now().UTC()
-	ClockSkew        time.Duration // tolerance for exp/nbf; defaults to 60s
-	RequiredACR      string        // optional: token acr must equal this
-	RequiredAMR      []string      // optional: token amr must include all of these
+	JWKS                    JWKS
+	ExpectedNonce           string        // must equal the token nonce (required when set)
+	ExpectedAudience        string        // must be in aud; defaults to conn.ClientID
+	Now                     time.Time     // defaults to time.Now().UTC()
+	ClockSkew               time.Duration // tolerance for exp/nbf; defaults to 60s
+	RequiredACR             string        // optional: token acr must equal this
+	AuthenticationStartedAt time.Time     // trusted RP attempt start; required for max_age=0
+	AuthenticationNotBefore time.Time     // administrator revocation; independent of one-request semantics
+	MaxAgeSeconds           *int64        // a supplied maximum requires a valid, recent signed auth_time
+	RequiredAMR             []string      // optional: token amr must include all of these
 }
 
 // ValidateIDToken verifies an OIDC ID token end to end and returns the identity it asserts. It enforces
@@ -55,6 +60,9 @@ func ValidateIDToken(conn idpregistry.Connection, raw string, opts ValidateOptio
 	aud := strings.TrimSpace(opts.ExpectedAudience)
 	if aud == "" {
 		aud = conn.ClientID
+	}
+	if aud == "" || aud != conn.ClientID {
+		return Identity{}, fmt.Errorf("expected audience must match the registered client")
 	}
 
 	parts := strings.Split(raw, ".")
@@ -96,6 +104,24 @@ func ValidateIDToken(conn idpregistry.Connection, raw string, opts ValidateOptio
 	if !audienceContains(claims["aud"], aud) {
 		return Identity{}, fmt.Errorf("id token audience does not include %q", aud)
 	}
+	// OIDC Core requires rejecting additional audiences that this client has not
+	// explicitly trusted. Connection configuration has no such trust list, so an
+	// array may contain this client only (possibly repeated). azp is optional in
+	// Core errata set 2, but a supplied value is checked against our client ID.
+	if audiences, ok := claims["aud"].([]any); ok {
+		for _, additional := range audiences {
+			if additional != aud {
+				return Identity{}, fmt.Errorf("id token contains an untrusted additional audience")
+			}
+		}
+	}
+	azp, hasAZP := claims["azp"]
+	if hasAZP {
+		party, ok := azp.(string)
+		if !ok || party != conn.ClientID {
+			return Identity{}, fmt.Errorf("id token authorized party does not match this client")
+		}
+	}
 	if opts.ExpectedNonce != "" && claimString(claims, "nonce") != opts.ExpectedNonce {
 		return Identity{}, fmt.Errorf("id token nonce mismatch")
 	}
@@ -109,7 +135,11 @@ func ValidateIDToken(conn idpregistry.Connection, raw string, opts ValidateOptio
 	// Assurance claim names are configurable (conn.ACRClaim/AMRClaim), like hd/groups. The acr claim is read
 	// as a list so an IdP that carries assurance as an array (e.g. Entra Conditional Access "acrs") works as
 	// well as a scalar acr (Okta/Google); acr is a representative scalar for display + the grant.
-	acrClaim := firstNonBlank(conn.ACRClaim, "acr")
+	defaultACRClaim := "acr"
+	if conn.Type == "entra" {
+		defaultACRClaim = "acrs"
+	}
+	acrClaim := firstNonBlank(conn.ACRClaim, defaultACRClaim)
 	acrList := claimStringList(claims, acrClaim)
 	acr := claimString(claims, acrClaim)
 	if acr == "" && len(acrList) > 0 {
@@ -127,6 +157,35 @@ func ValidateIDToken(conn idpregistry.Connection, raw string, opts ValidateOptio
 		ACR:           acr,
 		AMR:           claimStringList(claims, firstNonBlank(conn.AMRClaim, "amr")),
 		Groups:        claimStringList(claims, firstNonBlank(conn.GroupsClaim, "groups")),
+	}
+
+	if strings.TrimSpace(id.Subject) == "" {
+		return Identity{}, fmt.Errorf("id token is missing subject")
+	}
+	authTime, authOK := claimTime(claims, "auth_time")
+	if _, present := claims["auth_time"]; present {
+		if !authOK || authTime.Unix() <= 0 || authTime.After(now.Add(skew)) {
+			return Identity{}, fmt.Errorf("invalid authentication time")
+		}
+		id.AuthTime = authTime.Format(time.RFC3339)
+	}
+	if opts.MaxAgeSeconds != nil {
+		age := *opts.MaxAgeSeconds
+		if age < 0 || age > 86400 || !authOK || authTime.Unix() <= 0 || authTime.After(now) {
+			return Identity{}, fmt.Errorf("authentication is missing or too old")
+		}
+		if age == 0 {
+			// Compare with this attempt, not callback time. NumericDate has second precision.
+			started := opts.AuthenticationStartedAt
+			if started.IsZero() || started.After(now) || authTime.Unix() < started.Unix() {
+				return Identity{}, fmt.Errorf("authentication did not occur during this attempt")
+			}
+		} else if now.After(authTime.Add(time.Duration(age) * time.Second)) {
+			return Identity{}, fmt.Errorf("authentication is missing or too old")
+		}
+	}
+	if err := ValidateAuthenticationAfter(id.AuthTime, opts.AuthenticationNotBefore, now); err != nil {
+		return Identity{}, err
 	}
 
 	if err := enforceDomain(conn, id); err != nil {
@@ -238,6 +297,9 @@ func claimStringList(claims map[string]any, key string) []string {
 func claimTime(claims map[string]any, key string) (time.Time, bool) {
 	switch v := claims[key].(type) {
 	case float64:
+		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) || v < 0 || v > 253402300799 {
+			return time.Time{}, false
+		}
 		return time.Unix(int64(v), 0).UTC(), true
 	case int64:
 		return time.Unix(v, 0).UTC(), true

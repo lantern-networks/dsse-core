@@ -19,8 +19,11 @@ import (
 // exactly the state of a grant minted here a moment ago. Replacing would delete the grant the ceremony just
 // earned, before the report carrying it had been answered.
 type grantBundle struct {
+	// Local receipt of the actual signed snapshot, not the earlier reference.
+	generation uint64
 	// Grants is every organization's. An Edge carries every organization's flows.
-	Grants []grantstore.Grant `json:"grants"`
+	Grants          []grantstore.Grant `json:"grants"`
+	ProtectedGrants []grantstore.Grant `json:"protected_grants,omitempty"`
 	// Complete says the control plane could read its whole store. It is carried for the same reason as the
 	// other sections, though a union already ignores an absence.
 	Complete bool `json:"complete"`
@@ -32,7 +35,8 @@ func grantBundleSection(store *grantstore.Store) *grantBundle {
 		return nil
 	}
 	rows, err := store.ListAllChecked()
-	return &grantBundle{Grants: rows, Complete: err == nil}
+	ordinary, protected := grantstore.SplitTransport(rows)
+	return &grantBundle{Grants: ordinary, ProtectedGrants: protected, Complete: err == nil}
 }
 
 // applyGrantBundleSection folds the authority's set into this Edge's. Returns what changed.
@@ -45,11 +49,19 @@ func applyGrantBundleSection(store *grantstore.Store, section *grantBundle, now 
 }
 
 func applyGrantBundleSectionChecked(store *grantstore.Store, section *grantBundle, now time.Time) (int, int, error) {
+	return applyGrantBundleEvidence(store, section, now, false)
+}
+
+func applyGrantBundleEvidence(store *grantstore.Store, section *grantBundle, now time.Time, signatureVerified bool) (int, int, error) {
 	if section == nil {
 		return 0, 0, nil
 	}
 	if store == nil || !section.Complete {
 		return 0, 0, fmt.Errorf("access grant bundle is unavailable or incomplete")
 	}
-	return store.MergeChecked(section.Grants, now)
+	rows := append(append([]grantstore.Grant(nil), section.Grants...), section.ProtectedGrants...)
+	if signatureVerified {
+		return store.MergeAuthorityEvidence(rows, now)
+	}
+	return store.MergeChecked(rows, now)
 }

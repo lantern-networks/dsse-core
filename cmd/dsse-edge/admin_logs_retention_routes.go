@@ -49,7 +49,37 @@ func adminLogReadScope(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return agentUpdateCatalogueScope, true
 }
 
-func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, adminHotStore hotstore.Store, decisionStore *accessdecision.Store, coldArchive archive.ColdArchive, legalHold *legalHoldStore, retentionOverride *retentionOverrideStore) {
+func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, adminHotStore hotstore.Store, decisionStore *accessdecision.Store, coldArchive archive.ColdArchive, legalHold *legalHoldStore, retentionOverride *retentionOverrideStore, monitors ...*coldArchiveHealthMonitor) {
+	var archiveHealth *coldArchiveHealthMonitor
+	if len(monitors) > 0 {
+		archiveHealth = monitors[0]
+	}
+	mux.HandleFunc("GET /admin/archive-health", adminEndpoint("admin.retention.read", func(w http.ResponseWriter, r *http.Request) {
+		if _, deployment := adminAnswerScope(r); !deployment {
+			writeError(w, http.StatusForbidden, fmt.Errorf("archive health is operator-only"))
+			return
+		}
+		if coldArchive == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"archive_enabled": false})
+			return
+		}
+		if archiveHealth == nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("shared archive health is unavailable"))
+			return
+		}
+		state, err := archiveHealth.read()
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("shared archive health is unavailable"))
+			return
+		}
+		delivery, err := archiveHealth.deliveryState(r.Context())
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("archive alert delivery state is unavailable"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"archive_enabled": true, "state": state, "delivery": delivery,
+			"webhook_configured": archiveHealth.outbox != nil && delivery.LastSuccess != nil && delivery.PendingCount == 0 && delivery.DeadCount == 0})
+	}))
 	// Advertise retention only when the running worker can enforce it on the
 	// configured hot store, including migrated insertion receipts.
 	unsupportedRetention := func(w http.ResponseWriter) bool {
@@ -81,7 +111,8 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		}
 		result, err := adminLogQuery(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
-			writeError(w, statusForAdminLogQueryError(err), err)
+			status, public := adminLogSearchResponseError(err)
+			writeError(w, status, public)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -93,7 +124,8 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		}
 		result, err := adminLogExport(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
-			writeError(w, statusForAdminLogQueryError(err), err)
+			status, public := adminLogSearchResponseError(err)
+			writeError(w, status, public)
 			return
 		}
 
@@ -119,7 +151,7 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		caller := strings.TrimSpace(adminTenantIDFromRequest(r))
 		mine := make([]legalHoldRecord, 0, 1)
 		for _, h := range all {
-			if strings.EqualFold(strings.TrimSpace(h.TenantID), caller) {
+			if strings.TrimSpace(h.TenantID) == caller {
 				mine = append(mine, h)
 			}
 		}
@@ -132,13 +164,13 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		rows, held, pending, err := legalHold.adminStatus(r.Context(), adminTenantIDFromRequest(r))
 		if err != nil {
 			status := http.StatusServiceUnavailable
-			if errors.Is(err, errTenantErasureInProgress) {
+			if errors.Is(err, errTenantErasureInProgress) || errors.Is(err, errManualHotLogDeleteInProgress) {
 				status = http.StatusConflict
 			}
 			writeError(w, status, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r, rows), "tenant_held": held, "pending_local_hold": pending})
+		writeJSON(w, http.StatusOK, map[string]any{"holds": holdsFor(r, rows), "tenant_held": held, "pending_local_hold": pending, "archive_enabled": coldArchive != nil})
 	}
 	mux.HandleFunc("GET /admin/legal-hold", adminEndpoint("admin.retention.read", writeHoldStatus))
 	mux.HandleFunc("POST /admin/legal-hold", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +212,12 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("no cold archive configured"))
 			return
 		}
-		res, err := verifyAuditChain(r.Context(), coldArchive, adminTenantIDFromRequest(r))
+		tenant := adminTenantIDFromRequest(r)
+		if !validArchivePathComponent(tenant) {
+			writeError(w, http.StatusForbidden, fmt.Errorf("valid tenant scope is required"))
+			return
+		}
+		res, err := verifyAuditChain(r.Context(), coldArchive, tenant)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, fmt.Errorf("verify audit chain: %w", err))
 			return
@@ -196,7 +233,11 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
+		if coldArchive == nil {
+			writeJSON(w, http.StatusOK, map[string]any{"archive_enabled": false, "overrides_days": retentionOverride.All()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"archive_enabled": true, "overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
 	}))
 	mux.HandleFunc("POST /admin/retention-config", adminEndpoint("admin.retention.write", func(w http.ResponseWriter, r *http.Request) {
 		if unsupportedRetention(w) {
@@ -233,6 +274,10 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("retention settings are unavailable"))
 			return
 		}
+		if coldArchive == nil && !req.Clear {
+			writeError(w, http.StatusConflict, fmt.Errorf("retention days cannot be applied without an external archive; local hot events are preserved"))
+			return
+		}
 		days := -1
 		if !req.Clear && req.Days == nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("retention days are required"))
@@ -252,6 +297,6 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("retention settings could not be saved"))
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
+		writeJSON(w, http.StatusOK, map[string]any{"archive_enabled": coldArchive != nil, "overrides_days": retentionOverride.All(), "pending_local_forever": retentionOverride.PendingForever()})
 	}))
 }

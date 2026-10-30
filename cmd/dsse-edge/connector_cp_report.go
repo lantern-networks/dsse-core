@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -152,19 +151,11 @@ func (c *connectorCPReporter) queue(rep connectorReport, cause error) {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(c.outboxPath), 0o700); err != nil && c.logf != nil {
-		c.logf("★ connector_report_lost connector=%q outbox_error=%q", rep.Registration.ID, err.Error())
-	}
-	f, err := os.OpenFile(c.outboxPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
+	if err := appendCPReportOutbox(c.outboxPath, line); err != nil {
 		if c.logf != nil {
 			c.logf("★ connector_report_lost connector=%q outbox_error=%q", rep.Registration.ID, err.Error())
 		}
 		return
-	}
-	defer f.Close()
-	if _, err := f.Write(append(line, '\n')); err != nil && c.logf != nil {
-		c.logf("★ connector_report_lost connector=%q write_error=%q", rep.Registration.ID, err.Error())
 	}
 }
 
@@ -187,21 +178,41 @@ func (c *connectorCPReporter) drainOnce(ctx context.Context) {
 	c.mu.Lock()
 	raw, err := os.ReadFile(c.outboxPath)
 	c.mu.Unlock()
-	if err != nil || len(raw) == 0 {
+	if err != nil {
+		if !os.IsNotExist(err) && c.logf != nil {
+			c.logf("connector_report_outbox_read_failed: %v — replay stopped; original outbox preserved", err)
+		}
 		return
 	}
-	kept := []connectorReport{}
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		if strings.TrimSpace(line) == "" {
+	if len(raw) == 0 {
+		return
+	}
+	type queued struct {
+		line []byte
+		rep  connectorReport
+	}
+	var pending []queued
+	// Do not post any prefix of a damaged queue: compacting it afterwards
+	// would permanently erase the unreadable obligation.
+	for _, line := range bytes.Split(raw, []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var rep connectorReport
-		if uerr := json.Unmarshal([]byte(line), &rep); uerr != nil {
-			continue // a line that is not a report is not an obligation
+		if uerr := decodeCPReportObject(line, &rep); uerr != nil {
+			if c.logf != nil {
+				c.logf("connector_report_outbox_unreadable: %v — replay stopped; original outbox preserved", uerr)
+			}
+			return
 		}
+		pending = append(pending, queued{line: line, rep: rep})
+	}
+	kept := [][]byte{}
+	for _, item := range pending {
+		rep := item.rep
 		if perr := c.post(ctx, rep); perr != nil {
 			if !isNotRetryable(perr) {
-				kept = append(kept, rep)
+				kept = append(kept, item.line)
 			}
 			continue
 		}
@@ -212,15 +223,30 @@ func (c *connectorCPReporter) drainOnce(ctx context.Context) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(kept) == 0 {
-		_ = os.Remove(c.outboxPath)
+	current, err := os.ReadFile(c.outboxPath)
+	if err != nil {
+		if c.logf != nil {
+			c.logf("connector_report_outbox_rewrite_failed error=%q", err.Error())
+		}
 		return
 	}
-	var buf bytes.Buffer
-	for _, rep := range kept {
-		if line, merr := json.Marshal(rep); merr == nil {
-			buf.Write(append(line, '\n'))
+	if !bytes.HasPrefix(current, raw) {
+		// Another writer changed the snapshot while it was being replayed. Keep
+		// the current file intact; replaying an already accepted report is safer
+		// than dropping a registration the control plane has not seen.
+		if c.logf != nil {
+			c.logf("connector_report_outbox_changed_during_replay=true")
 		}
+		return
 	}
-	_ = os.WriteFile(c.outboxPath, buf.Bytes(), 0o600)
+	var remaining []byte
+	if len(kept) > 0 {
+		remaining = append(bytes.Join(kept, []byte("\n")), '\n')
+	}
+	// queue() may have appended new obligations after the snapshot above. Keep
+	// that tail while removing only the records this replay actually handled.
+	remaining = append(remaining, current[len(raw):]...)
+	if err := replaceCPReportOutbox(c.outboxPath, remaining); err != nil && c.logf != nil {
+		c.logf("connector_report_outbox_rewrite_failed error=%q", err.Error())
+	}
 }

@@ -15,6 +15,7 @@ async function renderIncomingView(content) {
     if (!current()) return;
     uiState(content, "error", bl({ en: "The incoming default could not be verified. Retry before changing this policy.", ja: "受信接続の既定動作を確認できません。設定を変更する前に再試行してください。" }),
       { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => renderIncomingView(content) });
+    content.prepend(el("h2", { class: "ui-view-title", text: bl({ en: "Incoming Connections (server-initiated)", ja: "受信接続(サーバ発)" }) }));
     return;
   }
   if (!current()) return;

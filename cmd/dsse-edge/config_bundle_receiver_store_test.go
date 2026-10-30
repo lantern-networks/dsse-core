@@ -28,9 +28,10 @@ func TestPostgresConfiguredDLPReceiverAcceptsBundle(t *testing.T) {
 	if err := cp.policies.Upsert(model.DLPPolicyObject{ID: "protect", TenantID: "a", Name: "Protect", Identifiers: []string{"credit_card"}, OnMatch: "block", Status: "active"}); err != nil {
 		t.Fatal(err)
 	}
+	cp.rules.SetRules("a", []model.DLPRule{testDurableDLPRule("a")})
 
 	author := buildDLPRuntime(serverConfig{})
-	for _, p := range []blobstore.Persister{author.policyObjects.persister, author.classifiers.persister, author.fingerprints.persister, author.allowlist.persister} {
+	for _, p := range []blobstore.Persister{author.rules.persister, author.policyObjects.persister, author.classifiers.persister, author.fingerprints.persister, author.allowlist.persister} {
 		if !isDLPSharedPersister(p) {
 			t.Fatal("publishing CP lost shared authority")
 		}
@@ -46,13 +47,14 @@ func TestPostgresConfiguredDLPReceiverAcceptsBundle(t *testing.T) {
 				dir = t.TempDir()
 			}
 			config := serverConfig{ConfigSourceURL: "https://control.example.invalid"}
+			config.DLPRuleStorePath = configBundleStorePath(dir, config.ConfigSourceURL, "", "dlp_rules")
 			config.DLPPolicyObjectStorePath = configBundleStorePath(dir, config.ConfigSourceURL, "", "dlp_policy_objects")
 			config.DLPClassifierStorePath = configBundleStorePath(dir, config.ConfigSourceURL, "", "dlp_classifiers")
 			config.DLPFingerprintStorePath = configBundleStorePath(dir, config.ConfigSourceURL, "", "dlp_fingerprints")
 			config.DLPAllowlistStorePath = configBundleStorePath(dir, config.ConfigSourceURL, "", "dlp_allowlist")
 			config.VLANObjectStorePath = configBundleStorePath(dir, config.ConfigSourceURL, "", "vlan_objects")
 			runtime := buildDLPRuntime(config)
-			edge := &dlpConfigStores{runtime.policyObjects, runtime.classifiers, runtime.fingerprints, runtime.allowlist}
+			edge := &dlpConfigStores{rules: runtime.rules, policies: runtime.policyObjects, classifiers: runtime.classifiers, fingerprints: runtime.fingerprints, allowlist: runtime.allowlist}
 			networks := buildVLANBoundaryStore(config)
 			payload := configBundlePayload{DLP: cp.Snapshot(), VLAN: &vlanBoundaryBundle{Complete: true, Objects: []model.VLANObject{{ID: "network", TenantID: "a", Class: "server", CIDRs: []string{"10.0.0.0/24"}}}}}
 			if _, err := (configBundleSource{tenantID: "a"}).apply(payload, configApplyTargets{policyStore: policy.NewStore(nil), dlp: edge, vlan: networks}); err != nil {
@@ -61,10 +63,13 @@ func TestPostgresConfiguredDLPReceiverAcceptsBundle(t *testing.T) {
 			if p, ok := edge.policies.Get("a", "protect"); !ok || p.OnMatch != "block" {
 				t.Fatal("received DLP protection missing")
 			}
+			if len(edge.rules.RulesForTenant("a")) != 1 {
+				t.Fatal("received DLP rule missing")
+			}
 			if durable {
 				// DLP uses its existing periodic-flush contract. Confirm that flush and
 				// a fresh store load retain exactly the received detector library.
-				for _, p := range []interface{ PersistIfDirty() error }{runtime.policyObjects, runtime.classifiers, runtime.fingerprints, runtime.allowlist} {
+				for _, p := range []interface{ PersistIfDirty() error }{runtime.rules, runtime.policyObjects, runtime.classifiers, runtime.fingerprints, runtime.allowlist} {
 					if err := p.PersistIfDirty(); err != nil {
 						t.Fatal(err)
 					}
@@ -75,7 +80,7 @@ func TestPostgresConfiguredDLPReceiverAcceptsBundle(t *testing.T) {
 						SetPersister(blobstore.Persister) error
 					}
 					key string
-				}{{reloaded.policies, "dlp_policy_objects"}, {reloaded.classifiers, "dlp_classifiers"}, {reloaded.fingerprints, "dlp_fingerprints"}, {reloaded.allowlist, "dlp_allowlist"}} {
+				}{{reloaded.rules, "dlp_rules"}, {reloaded.policies, "dlp_policy_objects"}, {reloaded.classifiers, "dlp_classifiers"}, {reloaded.fingerprints, "dlp_fingerprints"}, {reloaded.allowlist, "dlp_allowlist"}} {
 					if err := item.store.SetPersister(blobstore.FilePersister{Path: filepath.Join(dir, item.key+".json")}); err != nil {
 						t.Fatal(err)
 					}
@@ -91,7 +96,7 @@ func TestPostgresConfiguredDLPReceiverAcceptsBundle(t *testing.T) {
 }
 
 func TestBundleReceiverRejectsExplicitSharedAuthority(t *testing.T) {
-	for _, key := range []string{"dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects", "admin_runtime_state"} {
+	for _, key := range []string{"dlp_rules", "dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects", "admin_runtime_state"} {
 		for _, value := range []string{"postgres", "postgres+import:local.json"} {
 			if _, err := configBundleStorePersister(value, "https://control.example.invalid", key); err == nil {
 				t.Fatalf("accepted receiver authority %s %s", key, value)
@@ -102,7 +107,7 @@ func TestBundleReceiverRejectsExplicitSharedAuthority(t *testing.T) {
 	sharedStateDSNConfigured = true
 	defer func() { sharedStateDSNConfigured = old }()
 	dir := t.TempDir()
-	for _, key := range []string{"dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects", "admin_runtime_state"} {
+	for _, key := range []string{"dlp_rules", "dlp_policy_objects", "dlp_classifiers", "dlp_fingerprints", "dlp_allowlist", "vlan_objects", "admin_runtime_state"} {
 		if got := configBundleStorePath(dir, "https://control.example.invalid", "", key); got != filepath.Join(dir, key+".json") {
 			t.Fatal("receiver selected shared authority", got)
 		}

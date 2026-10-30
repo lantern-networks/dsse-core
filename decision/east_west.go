@@ -1,6 +1,7 @@
 package decision
 
 import (
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -67,7 +68,8 @@ type EastWestRule struct {
 	// by DEVICE attestation instead: a verified mTLS device identity + a trusted posture tier. This is the
 	// machine-flow answer to the AD release gate. Default off keeps machine flows fail-closed (hold) unless a
 	// rule explicitly opts in for a destination/protocol where device-attested lateral is acceptable.
-	DeviceAttestedAuto bool
+	DeviceAttestedAuto          bool
+	RequiredWorkloadAttestation bool `json:",omitempty"`
 	// Step-up assurance the authenticate ceremony must satisfy (carried from the authored rule). RequiredIdPID
 	// names the IdP the step-up must use; RequiredAMR are methods the token must include (e.g.
 	// "phishing_resistant"); MinACR is an assurance floor; MaxAgeSeconds forces a recent auth. These make an
@@ -78,6 +80,8 @@ type EastWestRule struct {
 	MinACR        string
 	RequiredAMR   []string
 	MaxAgeSeconds int
+	// Distinguishes explicit zero (one held request) from an omitted legacy zero.
+	MaxAgeSecondsSet bool `json:",omitempty"`
 	// RiskSeverities gates the rule on the subject's CURRENT risk, matched against req.RiskStateSeverity.
 	// It is the authored rule's RiskAtLeast threshold ALREADY EXPANDED to "that level or higher" by the
 	// compiler (policyrule.RiskSeveritiesAtLeast) — the expansion lives there because policyrule imports
@@ -122,6 +126,28 @@ func eastWestSelectorMatches(selector []string, candidates ...string) bool {
 	return false
 }
 
+// IPv4-mapped IPv6 is the same destination as its IPv4 address. Windows
+// dual-stack sockets commonly report ::ffff:a.b.c.d while a Connector Access
+// endpoint is authored as a.b.c.d. Keep non-address tokens exact.
+func eastWestDestinationMatches(selector []string, candidates ...string) bool {
+	if eastWestSelectorMatches(selector, candidates...) {
+		return true
+	}
+	for _, s := range selector {
+		want, err := netip.ParseAddr(strings.TrimSpace(s))
+		if err != nil {
+			continue
+		}
+		for _, c := range candidates {
+			got, err := netip.ParseAddr(strings.TrimSpace(c))
+			if err == nil && want.Unmap() == got.Unmap() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r EastWestRule) matches(req model.DecisionRequest) bool {
 	// Source is a union of the selectors that are SET: users (UserID/SubjectUserID), groups (UserGroups), and
 	// devices (the AUTHORITATIVE device identity — transport-bound when present, so a flow cannot claim
@@ -136,7 +162,7 @@ func (r EastWestRule) matches(req model.DecisionRequest) bool {
 			return false
 		}
 	}
-	if !eastWestSelectorMatches(r.Destinations, req.Destination, req.ApplicationID, req.FQDN) {
+	if !eastWestDestinationMatches(r.Destinations, req.Destination, req.ApplicationID, req.FQDN) {
 		return false
 	}
 	if r.ServiceTransportPorts == nil && !eastWestSelectorMatches(r.Protocols, req.ServiceFamily) {
@@ -272,22 +298,35 @@ func (e Evaluator) eastWestDecisionFor(req model.DecisionRequest, now time.Time)
 			[]string{"east_west_warn"},
 			eastWestWarnActions(rule, req)
 	}
+	if matched && mode != EastWestModeDeny && rule.RequiredWorkloadAttestation && !workloadAttestationSatisfied(req.WorkloadAttestationState) {
+		return "require_workload_attestation", "East-west policy requires verified workload attestation.",
+			[]string{"east_west_workload_attestation_required"}, actionsForPolicyDecision("require_workload_attestation", req, model.Policy{ID: rule.ID})
+	}
 	switch mode {
 	case EastWestModeAllow:
 		return "allow", "East-west access permitted by per-hop policy.", []string{"east_west_policy_allow"}, nil
 	case EastWestModeAuthenticate:
-		if e.hasValidEastWestGrant(req, now) {
+		// Legacy grants and device attestation carry no IdP/factor/freshness or
+		// held-request evidence. They cannot satisfy an explicit human ceremony.
+		requiresFederatedProof := rule.MaxAgeSecondsSet || rule.MaxAgeSeconds != 0 ||
+			strings.TrimSpace(rule.RequiredIdPID) != "" || strings.TrimSpace(rule.MinACR) != "" || len(rule.RequiredAMR) != 0
+		if !requiresFederatedProof && e.hasValidEastWestGrant(req, now) {
 			return "allow", "East-west access released by a valid ephemeral grant.", []string{"east_west_grant_satisfied"}, nil
 		}
 		// Device-attested auto (opt-in): a machine/non-interactive flow that cannot do an OOB ceremony is
 		// allowed by its verified mTLS device identity + trusted posture, instead of holding forever.
-		if rule.DeviceAttestedAuto && eastWestDeviceAttestationEligible(req) {
+		if !requiresFederatedProof && rule.DeviceAttestedAuto && eastWestDeviceAttestationEligible(req) {
 			return "allow", "East-west access allowed by device attestation (verified mTLS device + trusted posture).", []string{"east_west_device_attested"}, nil
 		}
 		// Carry the matched rule's step-up assurance (required IdP + phishing-resistant acr floor + freshness) on a
 		// prompt_reauthentication action so the federated-auth gate requests the stronger factor AND rejects a
 		// weaker (e.g. password acr=1) grant — authStepUpRequirements reads required_idp_id / min_acr from here.
 		// Without this the east-west authenticate decision carried NO acr, so any presence-only grant satisfied it.
+		if cap := e.EastWestMaxGrantTTLSeconds; cap < 0 {
+			rule.MaxTTLSeconds = cap // propagate invalid configured limits to fail closed
+		} else if cap > 0 && (rule.MaxTTLSeconds == 0 || (rule.MaxTTLSeconds > 0 && cap < rule.MaxTTLSeconds)) {
+			rule.MaxTTLSeconds = cap
+		}
 		return "authenticate_required", "East-west access requires interactive authentication.", []string{"east_west_authentication_required"}, eastWestStepUpActions(rule)
 	default: // deny
 		if matched {
@@ -316,7 +355,13 @@ func eastWestStepUpActions(rule EastWestRule) []model.DecisionAction {
 	if len(rule.RequiredAMR) > 0 {
 		meta["required_amr"] = append([]string(nil), rule.RequiredAMR...)
 	}
+	if rule.MaxTTLSeconds != 0 {
+		meta["grant_ttl_seconds"] = rule.MaxTTLSeconds
+	}
 	a := model.DecisionAction{Type: "prompt_reauthentication", Metadata: meta}
+	if rule.MaxAgeSecondsSet || rule.MaxAgeSeconds != 0 {
+		a.Metadata["max_age_seconds"] = rule.MaxAgeSeconds
+	}
 	if rule.MaxAgeSeconds > 0 {
 		a.TTLSeconds = intPtr(rule.MaxAgeSeconds)
 	}
@@ -370,6 +415,16 @@ func (e Evaluator) isEastWestFlow(req model.DecisionRequest) bool {
 // recorded as lateral AND still excluded from the egress queue — in neither queue, which is worse than the
 // wrong one. One predicate, so the decision and the record cannot disagree about what a flow is.
 func IsEastWestFlow(req model.DecisionRequest, declared InternalNetworks) bool {
+	// A governed Connector route is a private-application flow regardless of the
+	// destination port. Restricting this plane to familiar service families sent
+	// custom TCP ports to Internet Access, where Connector Access rules could not
+	// enforce. The marker is Edge-derived and cannot arrive in request JSON.
+	// A customer may route globally routable address space through a Connector.
+	// The verified route takes precedence over the cached network declaration:
+	// an empty or stale declaration must not move that traffic to Internet Access.
+	if req.ConnectorRouteVerified {
+		return true
+	}
 	if !IsEastWestProtocol(req.ServiceFamily) {
 		return false
 	}

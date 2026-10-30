@@ -65,3 +65,24 @@ func TestTheInstallBundleNamesWhatAnInstallerMustSend(t *testing.T) {
 		t.Error("a bare prefix would be offered as a name no certificate carries")
 	}
 }
+
+func TestAgentConfigOrganizationKeepsCaseDistinctTransportAuthorities(t *testing.T) {
+	previous := agentConfigTransportAuthority
+	authority := newTenantTransportAuthority(nil, func([]byte) error { return nil }, nil)
+	agentConfigTransportAuthority = authority
+	t.Cleanup(func() { agentConfigTransportAuthority = previous })
+	if _, err := authority.EnsureCA("Acme", "upper.example.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.EnsureCA("acme", "lower.example.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	upper := agentConfigOrganization("Acme")
+	if upper["tenant_id"] != "Acme" || upper["transport_server_name"] != "upper.example.invalid" {
+		t.Fatalf("upper tenant received another tenant's transport name: %#v", upper)
+	}
+	lower := agentConfigOrganization("acme")
+	if lower["tenant_id"] != "acme" || lower["transport_server_name"] != "lower.example.invalid" {
+		t.Fatalf("lower tenant received another tenant's transport name: %#v", lower)
+	}
+}

@@ -98,6 +98,11 @@ func TestEveryDurableCPStoreIsCountedOrExcusedInWriting(t *testing.T) {
 		"idp_connections":       "end_user_idp_connections",
 		"high_risk_overlay":     "high_risk_marks",
 		"admission_revocations": "admission_kill_switches",
+		"dlp_allowlist":         "dlp_allowlist",
+		"dlp_classifiers":       "dlp_classifiers",
+		"dlp_fingerprints":      "dlp_fingerprints",
+		"dlp_policy_objects":    "dlp_policy_objects",
+		"dlp_rules":             "dlp_rules",
 	}
 
 	// ★ Excused, each with the reason it holds nothing a tenant could ask to have erased. An entry here is a
@@ -105,6 +110,8 @@ func TestEveryDurableCPStoreIsCountedOrExcusedInWriting(t *testing.T) {
 	// contents are rebuilt from configuration on every boot. Anything else belongs in the footprint with a
 	// count — including zero.
 	excused := map[string]string{
+		"fleet_tenant_erasure":  "minimal erasure evidence (tenant ID, reporting node, remaining count and observation time); retained so a CP restart or promotion cannot forget an offline participant and falsely certify completion. Contains no tenant payload or DLP configuration",
+		"auth_rollout_cache_v1": "deployment CP/Edge census and monotonic compatibility latch; provider baselines are opaque SHA-256 keys/digests, no tenant names, user identities or grants",
 
 		"audit_chain":               "the tamper-evidence chain over the audit log itself — erasing a tenant must not rewrite the evidence that the erasure happened",
 		"legal_hold":                "a legal hold is the one thing that must SURVIVE an erasure request; that is what it is for",
@@ -117,10 +124,6 @@ func TestEveryDurableCPStoreIsCountedOrExcusedInWriting(t *testing.T) {
 		"transport_anchor_acks":     "an operator's assertion that a named node holds one of the deployment's own transport anchors — a statement about the deployment's Edges, not about a tenant, and the record of who opened a withdrawal gate must survive a tenant's erasure for the same reason the audit chain does",
 		"transport_trust":           "the anchors THIS DEPLOYMENT distributes for its own Edges, with one serial for the whole fleet — a deployment-level document, not a per-tenant one. An organization's own transport authority is a separate store; erasing a tenant does not change which certificates devices verify an Edge with",
 		"inspection_posture":        "the deployment's decrypt posture — one mode and one allowlist for the node, not a per-tenant document; a tenant's erasure does not change which flows this Edge terminates",
-		"dlp_allowlist":             "DLP configuration objects; deployment-level, not per tenant",
-		"dlp_classifiers":           "DLP configuration objects; deployment-level, not per tenant",
-		"dlp_fingerprints":          "DLP configuration objects; deployment-level, not per tenant",
-		"dlp_policy_objects":        "DLP configuration objects; deployment-level, not per tenant",
 		"entitlements":              "licence entitlements, authored by the operator against a contract rather than held for a tenant to erase",
 		"tenant_device_authorities": "the device-identity authority this deployment enrols an organization's fleet with. It is removed with that organization by its own purge step, and erasing one customer must not touch another's",
 		"tenant_ca_registry":        "the CERTIFICATE of each organization's own device CA — the customer holds the key and this is the public half the deployment verifies against. It is removed with the organization's own registration, and erasing a customer must not remove another organization's authority",

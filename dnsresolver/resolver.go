@@ -134,6 +134,12 @@ type ConnectorDNS interface {
 	ResolveViaConnector(ctx context.Context, upstream string, raw []byte) ([]byte, error)
 }
 
+// TenantConnectorDNS carries the authenticated caller's tenant through private
+// DNS routing on a shared Edge. Legacy adapters may only serve the boot tenant.
+type TenantConnectorDNS interface {
+	ResolveViaConnectorForTenant(ctx context.Context, tenantID, upstream string, raw []byte) ([]byte, error)
+}
+
 // dnsNameMatches reports whether a queried name is the rule domain or a subdomain of it (domain-tree).
 func dnsNameMatches(qname, rule string) bool {
 	rule = NormalizeQName(rule)
@@ -242,12 +248,29 @@ func NormalizeQName(n string) string {
 	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(n)), ".")
 }
 
-// HandleQuery runs the DNS pipeline for one raw query and returns the raw response. Pure w.r.t. the
-// injected upstream/conntrack (testable). On an unparseable query it forwards as-is (fail-open).
+// HandleQuery runs the DNS pipeline for one raw, single-question QUERY. Reject
+// messages whose complete question cannot be inspected before choosing a policy
+// or a private-zone upstream.
 func (r *Resolver) HandleQuery(raw []byte, now time.Time) ([]byte, error) {
+	return r.HandleQueryForTenant(context.Background(), r.tenantID, raw, now)
+}
+
+// HandleQueryForTenant keeps query attribution and private Connector routing in
+// the authenticated tenant, without modifying the shared resolver's boot state.
+func (r *Resolver) HandleQueryForTenant(ctx context.Context, tenantID string, raw []byte, now time.Time) ([]byte, error) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return nil, fmt.Errorf("a DNS query tenant is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var q dnsmessage.Message
-	if err := q.Unpack(raw); err != nil || len(q.Questions) == 0 {
-		return r.upstream.Resolve(raw) // not a parseable single-question query; forward untouched
+	if err := q.Unpack(raw); err != nil {
+		return nil, fmt.Errorf("invalid DNS query: %w", err)
+	}
+	if len(q.Questions) != 1 || q.Response || q.OpCode != 0 {
+		return packResponse(q, dnsmessage.RCodeFormatError, nil)
 	}
 	qname := NormalizeQName(q.Questions[0].Name.String())
 	qtype := uint16(q.Questions[0].Type)
@@ -266,7 +289,7 @@ func (r *Resolver) HandleQuery(raw []byte, now time.Time) ([]byte, error) {
 					Header: dnsmessage.ResourceHeader{Name: q.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
 					Body:   &dnsmessage.AResource{A: *a},
 				}}
-				r.conntrack.Record(dns.ObservationRequest{TenantID: r.tenantID, FQDN: qname, ResolvedIPs: []string{sinkIP}, TTLSeconds: 60}, now)
+				r.conntrack.Record(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: []string{sinkIP}, TTLSeconds: 60}, now)
 				r.auditOf(qname, qtype, "sinkhole", false)
 				return packResponse(q, dnsmessage.RCodeSuccess, ans)
 			}
@@ -285,7 +308,7 @@ func (r *Resolver) HandleQuery(raw []byte, now time.Time) ([]byte, error) {
 					Header: dnsmessage.ResourceHeader{Name: q.Questions[0].Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 60},
 					Body:   &dnsmessage.AResource{A: *a},
 				}}
-				r.conntrack.Record(dns.ObservationRequest{TenantID: r.tenantID, FQDN: qname, ResolvedIPs: []string{ip}, TTLSeconds: 60}, now)
+				r.conntrack.Record(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: []string{ip}, TTLSeconds: 60}, now)
 				r.auditOf(qname, qtype, "stub", false)
 				return packResponse(q, dnsmessage.RCodeSuccess, ans)
 			}
@@ -303,7 +326,13 @@ func (r *Resolver) HandleQuery(raw []byte, now time.Time) ([]byte, error) {
 			r.auditOf(qname, qtype, "forward_connector_unavailable", false)
 			return packResponse(q, dnsmessage.RCodeServerFailure, nil)
 		}
-		resp, err = r.connectorDNS.ResolveViaConnector(context.Background(), fz.Upstream, raw)
+		if scoped, ok := r.connectorDNS.(TenantConnectorDNS); ok {
+			resp, err = scoped.ResolveViaConnectorForTenant(ctx, tenantID, fz.Upstream, raw)
+		} else if tenantID == strings.TrimSpace(r.tenantID) {
+			resp, err = r.connectorDNS.ResolveViaConnector(ctx, fz.Upstream, raw)
+		} else {
+			err = fmt.Errorf("private DNS adapter cannot route this tenant")
+		}
 		if err != nil {
 			r.auditOf(qname, qtype, "forward_connector_error", false)
 			return packResponse(q, dnsmessage.RCodeServerFailure, nil)
@@ -315,6 +344,9 @@ func (r *Resolver) HandleQuery(raw []byte, now time.Time) ([]byte, error) {
 			return nil, err
 		}
 	}
+	if err := validateDNSResponse(q, resp); err != nil {
+		return nil, err
+	}
 	// D2: ECH-strip.
 	echStripped := false
 	if pol.echStrip {
@@ -325,10 +357,27 @@ func (r *Resolver) HandleQuery(raw []byte, now time.Time) ([]byte, error) {
 	}
 	// D1: conntrack from the response's A/AAAA records.
 	if ips := ExtractResolvedIPs(resp); len(ips) > 0 {
-		r.conntrack.Record(dns.ObservationRequest{TenantID: r.tenantID, FQDN: qname, ResolvedIPs: ips, TTLSeconds: dns.ConntrackDefaultTTLSeconds}, now)
+		r.conntrack.Record(dns.ObservationRequest{TenantID: tenantID, FQDN: qname, ResolvedIPs: ips, TTLSeconds: dns.ConntrackDefaultTTLSeconds}, now)
 	}
 	r.auditOf(qname, qtype, decision, echStripped)
 	return resp, nil
+}
+
+// Do not return or cache an answer for a different transaction or question.
+// This applies to public upstreams and Connector-mediated private resolvers.
+func validateDNSResponse(query dnsmessage.Message, raw []byte) error {
+	var reply dnsmessage.Message
+	if err := reply.Unpack(raw); err != nil {
+		return fmt.Errorf("invalid upstream DNS response: %w", err)
+	}
+	if !reply.Response || reply.ID != query.ID || reply.OpCode != query.OpCode || len(reply.Questions) != 1 {
+		return fmt.Errorf("upstream DNS response does not match the query")
+	}
+	want, got := query.Questions[0], reply.Questions[0]
+	if NormalizeQName(got.Name.String()) != NormalizeQName(want.Name.String()) || got.Type != want.Type || got.Class != want.Class {
+		return fmt.Errorf("upstream DNS response question does not match the query")
+	}
+	return nil
 }
 
 // SetConnectorDNS wires the connector-mediated resolver used for internal forward zones. Safe to call once at
@@ -443,6 +492,9 @@ type Config struct {
 // New builds an Edge DNS resolver from Config, independent of any listener (shared by the DNS-over-tunnel
 // endpoint and the legacy UDP listener). Upstream defaults to 1.1.1.1:53. Always returns a usable resolver.
 func New(cfg Config) *Resolver {
+	if cfg.Conntrack == nil {
+		cfg.Conntrack = dns.NewConntrackStore()
+	}
 	pol := Policy{deny: map[string]bool{}, stubIPv4: map[string]string{}, echStrip: cfg.ECHStrip}
 	for _, d := range cfg.Deny {
 		if d = NormalizeQName(d); d != "" {
@@ -486,6 +538,9 @@ func defaultDNSQueryAudit(qname, qtype, decision string, ech bool) {
 // NewWithUpstream builds a resolver with an explicit upstream + empty policy — used by the DNS-over-tunnel
 // wiring and by tests that inject a fake upstream. Apply rules with SetPolicy.
 func NewWithUpstream(tenantID string, upstream UpstreamDNS, conntrack *dns.ConntrackStore) *Resolver {
+	if conntrack == nil {
+		conntrack = dns.NewConntrackStore()
+	}
 	return &Resolver{
 		tenantID:  tenantID,
 		upstream:  upstream,

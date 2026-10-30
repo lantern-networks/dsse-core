@@ -2,11 +2,11 @@
 # Fetch matching library, headers and CLI from an authenticated, checksum-pinned release.
 set -euo pipefail
 cd "$(dirname "$0")"
-ENGINE_VERSION="${ENGINE_VERSION:-v2.2.2}"
+ENGINE_VERSION="${ENGINE_VERSION:-v2.2.3}"
 checksums="${ENGINE_CHECKSUMS:-$PWD/engine-checksums.sha256}"
 case "${ARCH:-$(uname -m)}" in
-  arm64|aarch64) ARCH=arm64; triple=aarch64-linux-gnu; cli=cli ;;
-  amd64|x86_64) ARCH=amd64; triple=x86_64-linux-gnu; cli=cli-amd64 ;;
+  arm64|aarch64) ARCH=arm64; triple=aarch64-linux-musl; cli=cli ;;
+  amd64|x86_64) ARCH=amd64; triple=x86_64-linux-musl; cli=cli-amd64 ;;
   *) echo 'fetch_engine: unsupported architecture' >&2; exit 1 ;;
 esac
 cache="${ENGINE_DOWNLOAD_CACHE:-$PWD/.engine-downloads}"

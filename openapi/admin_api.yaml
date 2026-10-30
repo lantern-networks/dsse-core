@@ -7,13 +7,18 @@ info:
 
     Tenant scoping : every admin resource is scoped to the
     authenticated identity's own tenant. The single controlled exception is the optional `X-Operate-Tenant`
-    request header (see components/parameters/OperateTenantHeader): an operator holding the
-    `admin.tenant.admin` permission (super_admin / owner) may send it to "operate within" a selected tenant,
-    re-scoping all per-resource calls to that tenant. For any identity WITHOUT `admin.tenant.admin` the header
-    is silently ignored (not an error) and the request stays scoped to self — there is no cross-tenant reach.
+    request header (see components/parameters/OperateTenantHeader): an identity belonging to the configured
+    deployment operator organization and holding `admin.tenant.admin` may select a tenant. A customer's
+    super_admin or owner role alone grants no cross-organization authority. For identities without this
+    authority the header is ignored and the request stays scoped to self. Customer-side acts additionally
+    require that organization's delegation, and sensitive acts require an active elevation. The explicit
+    first-administrator bootstrap exception and legacy tenantless/lab modes retain their separate rules.
     An effective override on a mutating request (POST/PUT/PATCH/DELETE) is audited
     (`admin_operate_within_tenant`) with the operator principal and the target tenant; reads are not audited
     here. Tenant resolution is fail-closed: when no tenant can be resolved the request is denied.
+    The machine-only GET /admin/agent-updates/distribution is a separate, explicitly
+    authorized deployment-fleet exception. It requires its dedicated bearer-token
+    permission and never accepts X-Operate-Tenant or a customer session.
 servers:
   - url: https://{tenant_admin_host}
     variables:
@@ -44,14 +49,54 @@ components:
       required: false
       description: |
         Operator "operate within tenant" selector . Optional on every
-        admin endpoint. Honored ONLY when the authenticated identity holds the `admin.tenant.admin` permission
-        (operator roles super_admin / owner); for any other identity the header is silently ignored and the
-        request stays scoped to the caller's own tenant (no cross-tenant access). When honored, it re-scopes the
-        request to the named tenant. An effective override on a mutating request is audited
+        admin endpoint. In a tenant deployment it is honored only for an identity in the configured operator
+        organization that holds `admin.tenant.admin`; a customer super_admin or owner role is insufficient.
+        Otherwise the header is ignored and the request stays scoped to the caller's own tenant. When
+        honored, it selects the named tenant but does not bypass delegation, elevation, or API token scopes.
+        Explicit legacy tenantless/lab modes have separate operator-identity rules. An effective override is audited on a mutating request
         (`admin_operate_within_tenant`, operator principal + target tenant). Tenant resolution is fail-closed.
       schema:
         type: string
   schemas:
+    UpstreamTLSSettings:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, scope, mode, configurable]
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          description: The authenticated or explicitly selected organization to which this answer applies.
+        scope:
+          type: string
+          enum: [tenant]
+        mode:
+          $ref: "#/components/schemas/UpstreamTLSMode"
+        configurable:
+          type: boolean
+          description: >
+            Whether this caller and node can author the setting. Requires tenant policy-write authorization,
+            durable author storage and an authoritative control plane; config-sourced Edges and standby
+            control planes return false. A true value does not guarantee a later write will succeed.
+    UpstreamTLSMode:
+      type: string
+      enum: [browser_compatible, strict]
+      default: browser_compatible
+      description: >
+        browser_compatible (the default for an organization that has not chosen a mode) offers the TLS 1.2
+        cipher suites Chrome offers: the Go defaults plus static-RSA AES-128-GCM, AES-256-GCM,
+        AES-128-CBC-SHA and AES-256-CBC-SHA, when the upstream transport uses the default cipher policy.
+        strict offers only the Go defaults (ECDHE key exchange for TLS 1.2). TLS 1.3 and
+        certificate/hostname verification are retained in both. Static RSA lacks forward secrecy.
+        Explicit custom cipher policies and custom TLS engines remain authoritative. This is an upstream
+        TLS option, not a traffic or inspection bypass.
+    UpstreamTLSUpdate:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          $ref: "#/components/schemas/UpstreamTLSMode"
     AccessDecisionDetail:
       type: object
       required:
@@ -3745,21 +3790,51 @@ components:
           type: integer
           minimum: 0
     AdminSiteDetail:
-      allOf:
-        - $ref: "#/components/schemas/AdminSite"
-        - type: object
-          required:
-            - connectors
-          properties:
-            connectors:
-              type: array
-              items:
-                $ref: "#/components/schemas/AdminConnector"
-              description: Member connectors of the Site, using the secret-safe AdminConnector DTO.
-            failover:
-              $ref: "#/components/schemas/AdminSiteFailoverReadiness"
-            region:
-              $ref: "#/components/schemas/AdminSiteRegionInfo"
+      type: object
+      required:
+      - site_id
+      - connector_count
+      - online_count
+      - regions
+      - route_summary
+      - health
+      - connectors
+      properties:
+        site_id:
+          $ref: '#/components/schemas/AdminSite/properties/site_id'
+        connector_count:
+          $ref: '#/components/schemas/AdminSite/properties/connector_count'
+        online_count:
+          $ref: '#/components/schemas/AdminSite/properties/online_count'
+        regions:
+          $ref: '#/components/schemas/AdminSite/properties/regions'
+        route_summary:
+          $ref: '#/components/schemas/AdminSite/properties/route_summary'
+        health:
+          $ref: '#/components/schemas/AdminSite/properties/health'
+        last_heartbeat_at:
+          $ref: '#/components/schemas/AdminSite/properties/last_heartbeat_at'
+        managed:
+          $ref: '#/components/schemas/AdminSite/properties/managed'
+        name:
+          $ref: '#/components/schemas/AdminSite/properties/name'
+        expected_connector_count:
+          $ref: '#/components/schemas/AdminSite/properties/expected_connector_count'
+        routing_namespace:
+          $ref: '#/components/schemas/AdminSite/properties/routing_namespace'
+        deployment_type:
+          $ref: '#/components/schemas/AdminSite/properties/deployment_type'
+        ha_policy:
+          $ref: '#/components/schemas/AdminSite/properties/ha_policy'
+        connectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminConnector'
+        failover:
+          $ref: '#/components/schemas/AdminSiteFailoverReadiness'
+        region:
+          $ref: '#/components/schemas/AdminSiteRegionInfo'
+      additionalProperties: false
     AdminSiteFailoverReadiness:
       type: object
       description: Connector UX Slice 6. HA failover-readiness roll-up for a Site, surfaced only on the Site detail (additive). It reuses the expected→degraded rule — an online count below the expected count means failover capacity is below target — and reports the impacted apps/routes if the Site degrades or is lost. Multiple connectors fronting the same route are selected health-aware; there is no fixed active/standby role.
@@ -4566,6 +4641,11 @@ paths:
         "409":
           description: The device-trust CA set on this node is fixed at startup.
   /admin/device-client-cas/{sha256}:
+    parameters:
+      - name: sha256
+        in: path
+        required: true
+        schema: {type: string}
     delete:
       summary: Retire a CA from device trust — refused while any observed device still chains from it.
       description: >-
@@ -4581,6 +4661,11 @@ paths:
         "409":
           description: Still presented by named devices, or the set is startup-fixed.
   /admin/transport-trust-anchors/{sha256}:
+    parameters:
+      - name: sha256
+        in: path
+        required: true
+        schema: {type: string}
     delete:
       summary: Withdraw a certificate from what devices trust — refused unless the fleet is covered without it.
       description: >-
@@ -5245,6 +5330,73 @@ paths:
           description: Group id not found.
         "409":
           description: Group still has assigned devices, or the Edge config is CP-sourced (read-only).
+  /admin/dlp-retention-status:
+    get:
+      summary: Read this Edge process's streaming DLP retention resources.
+      description: >-
+        Requires admin.state.read and deployment-operator authorization. A scoped
+        operator Edge API token without cross-tenant administration authority also
+        needs admin.policy.read; customer administrators cannot read this process-wide
+        view. Tenant selectors do not narrow or grant access
+        to it. Returns the effective startup limits and current reservations for the
+        serving Edge process, shared across all its streaming Guards and tenants.
+        This is not a fleet aggregate, a tenant policy, a total-transfer quota, or
+        a measurement of all DLP/process memory. It excludes Observe scanners,
+        classifier metadata, and Office/PDF/multipart extraction. The response uses
+        Cache-Control no-store. CLI zero selects protected defaults, so effective
+        limits here are positive. See docs/dlp.md.
+      tags:
+        - AdminDLPPolicy
+      responses:
+        "200":
+          description: Effective process configuration and retained-resource reservations.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - per_stream_bytes
+                  - process_bytes
+                  - working_bytes_per_guard
+                  - used_bytes
+                  - active_guards
+                  - unreleased_bytes
+                properties:
+                  per_stream_bytes:
+                    type: integer
+                    format: int64
+                    minimum: 524288
+                    description: Per-upload reservation limit; default 67108864 bytes (64 MiB).
+                  process_bytes:
+                    type: integer
+                    format: int64
+                    minimum: 524288
+                    description: Shared process limit, at least per_stream_bytes; default 536870912 bytes (512 MiB).
+                  working_bytes_per_guard:
+                    type: integer
+                    format: int64
+                    enum: [524288]
+                    description: Conservative body working-buffer reservation per active Guard, in bytes.
+                  used_bytes:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                    description: Active working reservations plus charged ciphertext, including frame overhead and unreleased bytes.
+                  active_guards:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                    description: Guards currently holding a working-buffer reservation.
+                  unreleased_bytes:
+                    type: integer
+                    format: int64
+                    minimum: 0
+                    description: Ciphertext reservations retained after cleanup could not confirm reclamation; included in used_bytes.
+        "401":
+          description: Administrator authentication is required.
+        "403":
+          description: Caller lacks the required read permission or deployment-operator authorization.
   /admin/dlp-rules:
     get:
       summary: Read the tenant DLP rules (the egress-rule option).
@@ -5291,10 +5443,10 @@ paths:
                         type: string
                         enum: [any, corporate, personal]
                         description: >-
-                          Instance-aware action (the sovereign "here not there"): apply the rule only to the
-                          corporate (verified-domain) instance, only to a personal/outside-org account, or any
-                          (default). Corporate/personal are decided from the signed-in account domain; when it
-                          cannot be determined a scoped rule does not fire.
+                          Account scope; any is the default. Corporate and personal scopes both include
+                          unknown accounts. The current SWG has no independently verified, destination-bound
+                          SaaS account identity, so both scopes apply to their matched destinations. Request
+                          token hints, company domains and DSSE authentication do not create DLP exemptions.
       responses:
         "200":
           description: Rules applied; returns the new live rules.
@@ -5309,6 +5461,8 @@ paths:
         included; include_skipped is accepted for compatibility but has no effect.
         Rows contain identifier types and counts, action, destination, instance class,
         user/device context, access-decision ID and timestamp, without matched values.
+        A nonempty account is an unverified request hint; account_trust is
+        unverified_request_hint for current and historical hints, and empty without one.
         summary.total counts events before the response limit; returned counts rows in
         this response. Each by_identifier count is events containing that type, so adding
         these counts can count a multi-type event more than once. blocked counts block events.
@@ -5528,6 +5682,7 @@ paths:
                 instance_scope:
                   type: string
                   enum: [any, corporate, personal]
+                  description: Corporate and personal scopes both include unverified accounts. The current SWG does not verify the receiving SaaS account, so both scopes apply to matched destinations.
                 device_risk:
                   type: array
                   items:
@@ -5544,6 +5699,7 @@ paths:
                       destination_class:
                         type: string
                         enum: [any, personal]
+                        description: Personal includes unverified accounts; all other composite risk thresholds still apply.
                       severity:
                         type: string
       responses:
@@ -6580,6 +6736,62 @@ paths:
           description: An enforcing edge, changed/ambiguous publication scope, or a version older than the signing floor.
         "412":
           description: This control plane holds no update-signing key, or pins none.
+  /admin/agent-updates/distribution:
+    get:
+      summary: Read the active signed agent-update distribution for CP-to-Edge replication.
+      description: >-
+        Requires the dedicated deployment fleet API token with
+        admin.agent_updates.distribution.read. A browser session, ordinary
+        tenant administrator, tenant-scoped read token, or request carrying
+        X-Operate-Tenant is refused. The token must match the configured
+        deployment operator tenant (or the explicit tenantless operator mode).
+        This machine-only view contains all active publication scopes so each
+        Edge can select a release only after it knows the device's verified
+        tenant. It is never a device-facing or tenant-admin listing. A failed
+        shared publication read returns 503, not a stale partial set.
+      tags:
+        - AdminAgentRollout
+      security:
+        - AdminBearer: []
+      responses:
+        "200":
+          description: The deployment-wide active signed envelope map.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schema_version, tenant_id, envelopes]
+                properties:
+                  schema_version:
+                    type: string
+                    const: agent_update_distribution.v2
+                  tenant_id:
+                    type: string
+                    const: deployment
+                  envelopes:
+                    type: object
+                    description: >-
+                      Active envelopes keyed by tenant_id|platform/arch;
+                      deployment|platform/arch is the shared catalogue.
+                      Legacy pre-tenant platform/arch keys may also occur.
+                      Pending manifests are not included.
+                    additionalProperties:
+                      type: object
+                      required: [type, version, signing_key_id, created_at, payload_sha256, payload_b64, signature]
+                      properties:
+                        type: {type: string}
+                        version: {type: string}
+                        signing_key_id: {type: string}
+                        created_at: {type: string}
+                        payload_sha256: {type: string}
+                        payload_b64: {type: string}
+                        signature: {type: string}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: The shared publication authority could not be read.
   /admin/agent-update-sign-floor:
     get:
       summary: The minimum versions this control plane can sign, per target.
@@ -6713,6 +6925,41 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AgentQualitySummary"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+  /admin/auth-observed-accounts:
+    get:
+      summary: List observed device OS accounts for explicit IdP assignment.
+      description: >-
+        Requires admin.identity.read. Returns tenant-scoped device account candidates
+        observed on a tenant-verified agent transport. Names are agent-reported
+        hints, not proof of a person's identity; an administrator must explicitly
+        verify and assign an IdP subject. This endpoint never creates assignments.
+      tags:
+        - AdminIdentity
+      responses:
+        "200":
+          description: Observed account candidates for the authenticated tenant.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tenant_id, fleet_wide, accounts]
+                properties:
+                  tenant_id: {type: string}
+                  fleet_wide: {type: boolean}
+                  accounts:
+                    type: array
+                    items:
+                      type: object
+                      required: [device_id, os_principal, display_name, observed_at]
+                      properties:
+                        device_id: {type: string}
+                        os_principal: {type: string}
+                        display_name: {type: string}
+                        observed_at: {type: string}
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -7994,8 +8241,7 @@ paths:
                   type: string
                   description: Optional RFC3339 timestamp; a new expired feed is rejected.
                 metadata:
-                  type: object
-                  nullable: true
+                  type: [object, "null"]
                   additionalProperties: true
                 payload:
                   type: object
@@ -8013,15 +8259,14 @@ paths:
                         required: [id]
                         properties:
                           id: {type: string, minLength: 1}
-                          name: {type: string, nullable: true}
-                          vendor: {type: string, nullable: true}
-                          category: {type: string, nullable: true}
-                          risk: {type: string, nullable: true}
-                          description: {type: string, nullable: true}
+                          name: {type: [string, "null"]}
+                          vendor: {type: [string, "null"]}
+                          category: {type: [string, "null"]}
+                          risk: {type: [string, "null"]}
+                          description: {type: [string, "null"]}
                           patterns:
-                            type: array
-                            nullable: true
-                            items: {type: string, nullable: true}
+                            type: [array, "null"]
+                            items: {type: [string, "null"]}
       responses:
         "409":
           description: The authenticated organization does not match expected_tenant_id. Reload the page before continuing.
@@ -9282,10 +9527,142 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /admin/manual-hot-log-delete/preview:
+    post:
+      summary: Freeze a tenant and stream scoped preview of hot rows older than a UTC timestamp.
+      description: Requires admin.retention.write. tenant_id must match the effective organization, including an operator's explicit X-Operate-Tenant selection. No wildcard or whole-deployment delete is supported. Held tenants are refused. Event time (PostgreSQL occurred_at or ClickHouse ts) must precede the cutoff. PostgreSQL freezes row receipts; ClickHouse freezes an insertion-time predicate and a count without copying row receipts. Returns a durable job and confirmation digest. The archive is untouched.
+      tags:
+        - AdminRetention
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant_id, stream, before]
+              properties:
+                tenant_id: { type: string }
+                stream: { type: string }
+                before: { type: string, format: date-time, description: UTC timestamp ending in Z }
+      responses:
+        "200": { description: Durable snapshot and explicit archive-loss warning. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: "Shared journal, policy, or hot store is unavailable." }
+  /admin/manual-hot-log-delete:
+    get:
+      summary: List recent manual hot-log deletion jobs for the effective tenant.
+      description: Requires admin.retention.read. Returns at most 100 newest jobs scoped to the authenticated tenant or the operator's explicitly selected tenant.
+      tags:
+        - AdminRetention
+      responses:
+        "200": { description: Tenant-scoped deletion history. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: Shared deletion journal is unavailable. }
+  /admin/manual-hot-log-delete/all:
+    get:
+      summary: List recent manual hot-log deletion jobs across the deployment.
+      description: Requires admin.tenant.admin from the configured operator organization. Selecting a tenant with X-Operate-Tenant disables this deployment-wide view. Customer administrators cannot read other tenants' jobs.
+      tags:
+        - AdminRetention
+      responses:
+        "200": { description: At most 100 newest jobs across all tenants. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "503": { description: Shared deletion journal is unavailable. }
+  /admin/manual-hot-log-delete/{job_id}:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      summary: Read the progress or failure of one scoped hot-row deletion.
+      description: Requires admin.retention.read and the same effective tenant as the job. Completion means all frozen PostgreSQL receipts or ClickHouse predicate rows were confirmed absent. ClickHouse physical disk reclamation may lag.
+      tags:
+        - AdminRetention
+      responses:
+        "200": { description: Job status and confirmed absent row count. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Job is absent or outside the effective tenant. }
+  /admin/manual-hot-log-delete/{job_id}/confirm:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      summary: Confirm a frozen manual hot-row deletion.
+      description: Requires admin.retention.write. A matching preview_digest and confirm=true are mandatory. Legal hold, store identity, active CP, and the first preview's still-present row count are rechecked; a changed preview becomes stale and needs a new preview. Failed PostgreSQL jobs can be retried against their frozen receipts. Failed ClickHouse mutations require a new preview of the remaining rows. Returns queued status, not completion. S3 archive objects are never deleted.
+      tags:
+        - AdminRetention
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [preview_digest, confirm]
+              properties:
+                preview_digest: { type: string }
+                confirm: { type: boolean, const: true }
+      responses:
+        "202": { description: Job queued in the shared CP ledger. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Job is absent or outside the effective tenant. }
+        "409": { description: "Hold, store identity, digest, or job status changed." }
+  /admin/manual-hot-log-delete/{job_id}/cancel:
+    parameters:
+      - name: job_id
+        in: path
+        required: true
+        schema: {type: string}
+    post:
+      summary: Stop a running ClickHouse manual deletion mutation.
+      description: Requires an operator with admin.tenant.admin, explicit confirmation and an audit reason. The job stays fenced until the mutation is absent or its remaining rows are reconciled. Deletion already performed cannot be rolled back.
+      tags:
+        - AdminRetention
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm, reason]
+              properties:
+                confirm: { type: boolean, const: true }
+                reason: { type: string }
+      responses:
+        "202": { description: Cancellation requested; poll the job until reconciled. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: Job is absent. }
+        "409": { description: Job cannot be cancelled in its current state. }
+  /admin/archive-health:
+    get:
+      summary: Read deployment-wide external archive health.
+      description: Requires an operator acting outside a selected tenant and admin.retention.read. Reports persistent S3 failure or overdue hot-row backlog; excludes tenant content and archive object keys. Returns archive_enabled false when no external archive is configured.
+      tags:
+        - AdminRetention
+      responses:
+        "200":
+          description: Shared archive health, backlog count, oldest hot row time, and webhook configuration state.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: Shared archive health is unavailable.
   /admin/retention-config:
     get:
       summary: Read the admin-configured per-stream retention overrides.
-      description: Requires admin.retention.read. Returns the per-stream retention overrides (in days) that take precedence over the startup-flag defaults. A stream not listed uses the flag default. A failed persisted-settings load returns 503 and pauses retention until a clean reload.
+      description: Requires admin.retention.read. Returns archive_enabled and the per-stream retention overrides (in days). Without an external archive, local hot logs are not automatically deleted when a retention period passes; saved overrides are inactive. With an archive, overrides take precedence over startup-flag defaults and an unlisted stream uses its flag default. A failed persisted-settings load returns 503 and pauses retention until a clean reload.
       tags:
         - AdminRetention
       responses:
@@ -9304,7 +9681,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
     post:
       summary: Set (or clear) a per-stream retention override.
-      description: Requires admin.retention.write and deployment-wide administration. An unavailable store returns 503 without overwriting persisted settings. Sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default.
+      description: Requires admin.retention.write and deployment-wide administration. An unavailable store returns 503 without overwriting persisted settings. With an external archive, sets the retention (in days) for a log stream at runtime, overriding the startup flag without a redeploy; 0 days keeps the stream forever, and clear=true reverts to the flag default. Without an external archive, setting days returns 409 because local logs are not automatically deleted; clearing a previously saved inactive override remains available.
       tags:
         - AdminRetention
       requestBody:
@@ -9341,6 +9718,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Retention days cannot be applied without an external archive.
   /admin/audit-chain/verify:
     get:
       summary: Verify the audit cold-archive tamper-evident hash chain.
@@ -9881,8 +10260,7 @@ paths:
                       tenant_id:
                         type: string
                       hosts:
-                        type: array
-                        nullable: true
+                        type: [array, "null"]
                         items:
                           type: string
         "401":
@@ -9898,12 +10276,13 @@ paths:
         reporting now" and a node that is merely powered off drops out of it within one poll.
 
 
-        This reads the remembered answers instead: every node that has EVER answered about this tenant, with
+        This reads the answers remembered by this process: every node that has answered about this tenant, with
         its last answer, marked stale once it has gone quiet. complete=true requires all of them clean. A node
         that reported it still held data and then went silent keeps the erasure incomplete, because a machine
         that is switched off has not stopped holding what is on its disk. Nobody having answered is not
         completion either, and `coverage` says so in words rather than leaving it to be inferred from an empty
-        list.
+        list. These answers are currently held only in memory. Restart or leader replacement loses prior
+        participants and their evidence, so complete=true is not durable proof of fleet-wide erasure.
       tags:
         - AdminTenantModel
       parameters:
@@ -9914,7 +10293,7 @@ paths:
             type: string
       responses:
         "200":
-          description: Each node's last answer, and whether the erasure is complete across the fleet.
+          description: Each remembered node's last answer and completeness within this process's retained evidence; restart-safe fleet completeness is not established.
           content:
             application/json:
               schema:
@@ -10813,6 +11192,60 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /admin/auth-rollout:
+    get:
+      summary: Read the complete authentication rollout census and observations
+      description: Deployment operator only (admin.platform.write). Offline members remain present. Provider baselines contain digests only.
+      responses:
+        '200':
+          description: Persisted generation, monotonic completion, and verified member reports
+        '503':
+          description: Shared authority unavailable
+    put:
+      summary: Commit an explicit authentication rollout census generation
+      description: Deployment operator only. Requires a previous-generation compare-and-set. Removed members must remain as retired entries with reasons. A completed rollout cannot return to legacy acceptance.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [previous_generation, manifest]
+              properties:
+                previous_generation: {type: integer, minimum: 0}
+                manifest: {type: object}
+      responses:
+        '200':
+          description: Census durably committed
+        '400':
+          description: Invalid request
+        '409':
+          description: Stale generation, invalid census transition, or unconfirmed persistence
+  /admin/auth-rollout/activate:
+    post:
+      summary: Activate authentication capabilities after every expected CP and Edge has confirmed support
+      description: Deployment operator only (admin.platform.write). All non-retired members must have matching-generation authenticated reports received less than two minutes ago. Activation is also attempted after every member report; missing members never count as upgraded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [generation, features]
+              properties:
+                generation: {type: integer, minimum: 1}
+                features:
+                  type: array
+                  items:
+                    type: string
+                    enum: [grant-evidence-v1, single-request-v1]
+      responses:
+        '200':
+          description: Capabilities durably activated
+        '400':
+          description: Invalid or locally unsupported capability
+        '409':
+          description: Fleet incomplete, stale reports, or persistence not confirmed
   /admin/grants:
     get:
       summary: List the federated-auth grants minted by the clientless broker.
@@ -10837,7 +11270,7 @@ paths:
           $ref: "#/components/responses/Forbidden"
   /admin/grants/{id}/revoke:
     post:
-      summary: Revoke a federated-auth grant (continuous revocation).
+      summary: Revoke an approval; require fresh identity verification when activated fleet-wide.
       description: >-
         Requires admin.grants.write. Checks the exact caller tenant and grant under
         one lock. Revokes locally and attempts persistence; a save failure retains
@@ -10848,6 +11281,18 @@ paths:
         a Console storage warning. A completed replacement with unconfirmed flush
         returns partial 500 and remains pending for retry.
         The grant ID is a bearer credential; audit records use a SHA-256 reference.
+        Persists reauthenticate_after for the affected identity, device/account,
+        and resource. Replacement approvals must prove an IdP auth_time strictly
+        later than that boundary; a new token or approval issue time is not proof.
+        All declared authentication nodes must activate revocation-reauthentication-v1
+        for the stronger boundary. Before activation, ordinary per-approval revocation
+        remains available with fresh_identity_required=false and an explicit warning.
+        No boundary is added retroactively on activation. Boundary rows have no automatic
+        expiry. Beyond 4096 distinct effective selectors, boundaries are consolidated to a
+        stricter tenant-wide boundary at the latest cutoff; revocation is not refused.
+        reauthentication_scope=tenant warns that other approvals may require fresh verification.
+        Live and recent grant IDs remain as replay tombstones until expiry plus retention.
+        Natural expiry and single-request consumption do not create this boundary.
         See docs/idp.md for distribution and persistence limits.
       tags:
         - AdminGrants
@@ -10864,8 +11309,20 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, grant_id, tenant_id, audit_ref]
+                required: [status, grant_id, tenant_id, audit_ref, reauthenticate_after, fresh_identity_required]
                 properties:
+                  reauthentication_scope:
+                    type: string
+                    enum: [approval, tenant]
+                    description: Tenant means capacity consolidation widened fresh-verification requirements.
+                  fresh_identity_required:
+                    type: boolean
+                    description: False during mixed rollout when only this approval was revoked.
+                  warning:
+                    type: string
+                  reauthenticate_after:
+                    type: string
+                    description: RFC3339 boundary that replacement authentication must postdate; empty for ordinary mixed-rollout revocation.
                   persistence:
                     type: string
                     enum: [saved_non_atomic]
@@ -10886,8 +11343,17 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, applied, grant_id, tenant_id, audit_ref, persistence, error]
+                required: [status, applied, grant_id, tenant_id, audit_ref, persistence, error, reauthenticate_after, fresh_identity_required]
                 properties:
+                  reauthentication_scope:
+                    type: string
+                    enum: [approval, tenant]
+                    description: Tenant means capacity consolidation widened fresh-verification requirements.
+                  fresh_identity_required:
+                    type: boolean
+                  reauthenticate_after:
+                    type: string
+                    description: Locally applied RFC3339 boundary, or empty for ordinary revocation; retry persistence before restart.
                   status:
                     type: string
                     enum: [partial]
@@ -10911,6 +11377,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          description: Authority unavailable or Edge-only write refused.
   /admin/assets/endpoints:
     get:
       summary: List the tenant's endpoint catalog entries.
@@ -12184,6 +12652,10 @@ paths:
                 issuing_key_pem:
                   type: string
                   description: Its private key. Held by the control plane, never handed to an Edge as-is.
+                root_crl:
+                  type: string
+                  format: byte
+                  description: Signed root CRL, required when the issuing certificate carries a CRL distribution point.
       responses:
         "200":
           description: The delegation was accepted.
@@ -12195,7 +12667,7 @@ paths:
                   tenant_id: { type: string }
                   imported_at: { type: string }
                   applies_to: { type: string }
-        "400": { description: The chain does not link, the key does not match, or it is not a CA. }
+        "400": { description: "The chain does not link, the key does not match, or it is not a CA." }
         "403": { description: Naming another organization without the rights the envelope requires. }
 
     get:
@@ -12283,7 +12755,7 @@ paths:
                   anchor_pem: { type: string, description: What this organization's devices verify their Edge with. }
                   created_at: { type: string }
                   applies_to: { type: string }
-        "400": { description: No name was given, or it could not be created. }
+        "400": { description: "No name was given, or it could not be created." }
         "403": { description: Naming another organization without the rights the envelope requires. }
 
   /admin/tenant-transport-authority/rotate:
@@ -12331,8 +12803,8 @@ paths:
                   anchor_pem: { type: string }
                   created_at: { type: string }
                   applies_to: { type: string }
-        "403": { description: Not permitted for this organization, or the envelope refused it. }
-        "409": { description: A rotation is already in flight, or this organization has no authority to rotate. }
+        "403": { description: "Not permitted for this organization, or the envelope refused it." }
+        "409": { description: "A rotation is already in flight, or this organization has no authority to rotate." }
         "501": { description: This control plane holds no transport authorities. }
   /admin/tenant-transport-authority/retire-previous:
     post:
@@ -12370,7 +12842,7 @@ paths:
                   anchor_pem: { type: string }
                   created_at: { type: string }
                   applies_to: { type: string }
-        "403": { description: Not permitted for this organization, or the envelope refused it. }
+        "403": { description: "Not permitted for this organization, or the envelope refused it." }
         "409": { description: This organization is not moving to a new authority. }
         "501": { description: This control plane holds no transport authorities. }
   /admin/tenant-device-authority:
@@ -12618,6 +13090,54 @@ paths:
                   never_seen: { type: array, items: { type: string } }
                   may_retire_previous: { type: boolean }
                   note: { type: string }
+  /admin/tenant-interception-authority/root-crl:
+    post:
+      summary: Publish offline-root-signed interception revocation status.
+      description: >
+        Requires admin.enrollment.write or admin.tenant.admin and the organization PKI envelope.
+        Accepts signed DER only. The root private key stays with its offline custodian.
+        Status must be fresh, correctly signed and monotonically newer; existing revocations cannot be removed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [der]
+              properties:
+                tenant_id: { type: string }
+                der: { type: string, format: byte, description: Base64-encoded DER CRL. }
+      responses:
+        "204": { description: Signed status persisted. }
+        "400": { description: Invalid request. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: Unknown authority or invalid CRL update. }
+        "503": { description: CP consensus or durable authority storage unavailable. }
+  /admin/tenant-interception-authority/revoke-delegation:
+    post:
+      summary: Permanently revoke a recorded Edge interception CA.
+      description: >
+        Requires admin.enrollment.write or admin.tenant.admin and the organization PKI envelope.
+        Only a CA in the authority's durable issuance ledger may be revoked. A reason is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issuer_sha256, reason]
+              properties:
+                tenant_id: { type: string }
+                issuer_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+                reason: { type: string, minLength: 1, maxLength: 1000 }
+      responses:
+        "204": { description: Recorded delegation revoked. }
+        "400": { description: Invalid issuer fingerprint or reason. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: Unknown issued delegation or persistence conflict. }
+        "503": { description: CP consensus or durable authority storage unavailable. }
   /admin/tenant-interception-authority/promote:
     post:
       summary: Make the staged interception authority the one every Edge signs under.
@@ -13729,7 +14249,7 @@ paths:
                         access: { type: string, enum: [allow, deny, authenticate] }
                         inspection: { type: string, enum: [inspect, bypass] }
                         service_unresolved: { type: boolean, description: The named service is missing or invalid; the authored rule matches no traffic. }
-                        status: { type: string, enum: [active, disabled, off] }
+                        status: { type: string, enum: [active, disabled, "off"] }
                         editable: { type: boolean }
                         deletable: { type: boolean }
                         toggle_kind: { type: string, enum: [rule, policy_status, known_bypass_master, none] }
@@ -13772,6 +14292,89 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /admin/upstream-tls:
+    parameters:
+      - $ref: "#/components/parameters/OperateTenantHeader"
+    get:
+      summary: Read the selected organization's upstream TLS compatibility setting.
+      description: >
+        Requires admin.policy.read and an authenticated tenant context. An operator must select an
+        organization with X-Operate-Tenant; this endpoint does not return deployment-wide settings.
+        Unauthorized cross-tenant selectors are rejected. An unset mode is returned as browser_compatible, the default.
+        Shared author state is refreshed before answering; an unavailable authority returns 503.
+        The response identifies the answered tenant and whether this caller and node may configure it.
+        Reading the control-plane value does not establish that every Edge has already received it.
+      tags:
+        - AdminPolicy
+      responses:
+        "200":
+          description: Current tenant upstream TLS setting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamTLSSettings"
+        "400":
+          description: An operator has not selected an organization, or no tenant context is available.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Policy-read permission, API-token scope or tenant authorization is missing, or a query tenant_id conflicts with the authenticated tenant.
+        "500":
+          description: The administrative authentication store is unavailable.
+        "503":
+          description: Shared configuration or organization access authorization is unavailable; the setting was not read as fresh.
+    post:
+      summary: Set the selected organization's upstream TLS compatibility mode.
+      description: >
+        Requires admin.policy.write and any applicable API-token scope, tenant delegation and operator
+        elevation. Session-authenticated requests also require the existing X-CSRF-Token header.
+        The tenant comes from authenticated request context, with X-Operate-Tenant available only to an
+        authorized operator; tenant_id is not an accepted body field. The body must contain exactly one
+        JSON object naming a known, nonempty mode. Unknown fields and trailing JSON are rejected.
+        Config-sourced Edges reject local edits, and a standby control plane or unavailable write quorum
+        refuses the mutation. The shared durable save uses the accepted control-plane write lease before
+        publishing the local setting and advancing the configuration generation. The existing signed
+        bundle distributes this tenant's mode to Edges. A successful response is the saved setting, not
+        confirmation that every Edge has applied it. Storage failures return 503; reload after an
+        unconfirmed response before retrying, because an uncertain local durability result may already
+        be visible. A dedicated admin_upstream_tls_updated audit records the tenant, requested mode and
+        save outcome in addition to the common mutation audit. Changing modes selects that mode's separate
+        upstream connection pool for subsequent traffic; it does not retry HTTP requests or terminate active flows.
+        TLS verification, authentication, authorization and inspection remain enabled.
+      tags:
+        - AdminPolicy
+      parameters:
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          description: Required when authenticating with the admin_session cookie; not required for bearer-token authentication.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpstreamTLSUpdate"
+      responses:
+        "200":
+          description: Saved tenant upstream TLS setting; Edge convergence is asynchronous.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamTLSSettings"
+        "400":
+          description: Missing tenant selection, unknown or empty mode, malformed body, unknown fields, or trailing JSON.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Policy-write permission, API-token scope, CSRF token, delegation, elevation or tenant authorization is missing, or the query names another tenant.
+        "409":
+          description: This node pulls its configuration from an authority, or its policy store does not support upstream TLS authoring.
+        "500":
+          description: The administrative authentication store is unavailable.
+        "503":
+          description: This control plane is a standby, quorum or organization authorization is unavailable, durable author storage is not configured, or the save was not confirmed. Reload before retrying an uncertain write.
   /admin/inspection-posture:
     get:
       summary: Show the default inspection posture (mode + decrypt allowlist + known-bypass).
@@ -13997,14 +14600,25 @@ paths:
           $ref: "#/components/responses/Forbidden"
   /admin/config-bundle:
     get:
-      summary: Get the tenant config bundle (Phase 1 config distribution).
+      summary: Get the fleet config bundle for Edge distribution.
       description: >-
-        Requires admin.policy.read. Returns the control plane's versioned config bundle — a monotonic
-        generation plus the tenant's authoritative resources (slice 1: access policies) — that each Edge pulls
-        and applies atomically so a fleet enforces identically. See
-        docs/edge_config_distribution_phase1_design.md. Metadata-only; no raw credential/cert/payload material.
+        Requires admin.policy.read plus an operator identity or an operator-organization
+        Edge API token. Customer administrators and policy readers are forbidden.
+        Returns the control plane's versioned cross-tenant resources for trusted Edge
+        distribution, including IdP client secrets. Older Edges receive bearer grants
+        inline. Current Edges request grant_pages=grant-pages-v1 and receive a signed
+        reference, then fetch signed grant pages before applying the generation.
+        Treat the complete response as secret; do not expose or log it. It is not proxied by the Console.
+        See docs/idp.md.
       tags:
         - Admin
+      parameters:
+        - name: grant_pages
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [grant-pages-v1]
       responses:
         "200":
           description: The current config bundle (generation + resources).
@@ -14012,6 +14626,100 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /admin/grant-bundle-page:
+    get:
+      summary: Fetch one signed page of deployment-wide authentication grants.
+      description: >-
+        Control-plane management route for a trusted Edge with admin.policy.read and
+        an operator identity or operator-organization Edge API token. Customer
+        administrators are forbidden. The epoch and grant generation must match
+        the signed config-bundle reference. A changed snapshot returns 409; an Edge
+        must retry the bundle and must not acknowledge a partial grant generation.
+        The signed page includes bearer grants and revocation evidence across tenants;
+        never expose, proxy through the Console, or log the response.
+      tags:
+        - Admin
+      parameters:
+        - name: protocol
+          in: query
+          required: true
+          schema: { type: string, enum: [grant-pages-v1] }
+        - name: epoch
+          in: query
+          required: true
+          schema: { type: string }
+        - name: generation
+          in: query
+          required: true
+          schema: { type: integer, format: uint64 }
+        - name: offset
+          in: query
+          required: true
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: Signed page of grants bound to the requested epoch, generation and offset.
+        "400":
+          description: Invalid page request or an unencodable grant row.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          description: Authority changed or the control plane is not the leader.
+        "503":
+          description: Grant store or signing authority unavailable.
+  /admin/authentication-grants:
+    get:
+      summary: Get a signed, versioned snapshot of authentication grants.
+      description: >-
+        Requires admin.policy.read plus an operator identity or an operator-organization
+        Edge API token on the CP management listener. Customer readers are forbidden;
+        this machine-distribution endpoint is not proxied by the Console.
+        Returns grant evidence scoped to one tenant, device, and destination, including
+        protected revocation evidence. The signed authentication-grants-v2 payload binds
+        those selectors, a fresh request nonce, and a content version. Treat grants as
+        credentials; never expose or log this internal response.
+        No policy, PKI or other configuration stores are read. An unchanged version returns 304.
+      tags:
+        - Admin
+      parameters:
+        - name: tenant
+          in: query
+          required: true
+          schema: { type: string }
+        - name: device
+          in: query
+          required: true
+          schema: { type: string }
+        - name: scope
+          in: query
+          required: true
+          schema: { type: string }
+        - name: X-DSSE-Grant-Nonce
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[A-Za-z0-9_-]{32}$'
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Signed authentication-grants-v2 snapshot bound to the selectors and request nonce.
+        "304":
+          description: Grant content unchanged; no body.
+        "400":
+          description: Invalid or missing nonce.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: Grant storage or signing authority unavailable.
   /admin/config-sync-status:
     get:
       summary: Get this Edge's config-bundle puller status (fleet-health / staleness signal).
@@ -14314,6 +15022,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: The search failed for a reason other than the request or the log store. The response carries only `log search failed`; the detail is in the server log.
+        "502":
+          description: The log store answered with an error. The response carries only `log store request failed`; the store's message is in the server log.
+        "503":
+          description: The log store could not be reached, or no log store is configured. The response does not include the store's address or the search terms.
   /admin/logs/{stream}/export:
     get:
       summary: Preview an authorized log stream as bounded NDJSON.
@@ -14479,6 +15193,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: The search failed for a reason other than the request or the log store. The response carries only `log search failed`; the detail is in the server log.
+        "502":
+          description: The log store answered with an error. The response carries only `log store request failed`; the store's message is in the server log.
+        "503":
+          description: The log store could not be reached, or no log store is configured. The response does not include the store's address or the search terms.
   /admin/audit-writer/health:
     get:
       summary: Report observed primary audit-file write failures.
@@ -14538,7 +15258,7 @@ paths:
   /admin/hot-store/health:
     get:
       summary: Return Edge Hot Store mirror health.
-      description: Requires admin.logs.read. For PostgreSQL hot-store mirror mode, this endpoint reports best-effort mirror successes and latest failure state. In JSONL mode the status is unconfigured.
+      description: Requires admin.logs.read. For PostgreSQL hot-store mirror mode, this endpoint reports best-effort mirror successes and latest failure state. In JSONL mode the status is unconfigured. The hot store is shared by every organization, so its counters and last error are returned only to deployment-wide administration; an organization's administrator, or an operator who has entered an organization, receives only `status`.
       tags:
         - AdminLog
       responses:

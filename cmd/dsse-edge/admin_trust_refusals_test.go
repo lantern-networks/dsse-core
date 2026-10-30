@@ -130,9 +130,11 @@ func TestRefusalsSurviveAnEdgeRestart(t *testing.T) {
 	now := time.Now().UTC()
 
 	first := newTrustRefusalStore(path)
-	first.Merge("t", "mac-1", []observedTrustRefusal{
+	if _, err := first.Merge("t", "mac-1", []observedTrustRefusal{
 		{ServedSHA256: "bb22", Reason: "certificate is not trusted", FirstAt: now, LastAt: now, Count: 36},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	restarted := newTrustRefusalStore(path)
 	got := restarted.ForTenant("t")
@@ -141,15 +143,19 @@ func TestRefusalsSurviveAnEdgeRestart(t *testing.T) {
 	}
 
 	// And the empty report that follows acceptance must not erase it.
-	restarted.Merge("t", "mac-1", nil)
+	if _, err := restarted.Merge("t", "mac-1", nil); err != nil {
+		t.Fatal(err)
+	}
 	if again := newTrustRefusalStore(path).ForTenant("t"); len(again["mac-1"]) != 1 {
 		t.Fatalf("an empty report must not erase what was already recorded: %+v", again)
 	}
 
 	// A different tenant's devices are not visible here.
-	restarted.Merge("other", "win-9", []observedTrustRefusal{
+	if _, err := restarted.Merge("other", "win-9", []observedTrustRefusal{
 		{ServedSHA256: "cc33", Reason: "certificate has expired", FirstAt: now, LastAt: now, Count: 1},
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if got := restarted.ForTenant("t"); len(got) != 1 {
 		t.Fatalf("refusals are scoped to their tenant: %+v", got)
 	}

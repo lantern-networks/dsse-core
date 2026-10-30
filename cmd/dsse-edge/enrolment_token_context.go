@@ -23,3 +23,12 @@ func spendEnrolmentToken(ctx context.Context, tokens enrolltoken.Authority, id, 
 	}
 	return tokens.Spend(id, tenant, device, now)
 }
+
+func verifyEnrolmentToken(ctx context.Context, tokens enrolltoken.Authority, secret, tenant string, now time.Time) (enrolltoken.Token, error) {
+	if checked, ok := tokens.(interface {
+		VerifyContext(context.Context, string, string, time.Time) (enrolltoken.Token, error)
+	}); ok {
+		return checked.VerifyContext(ctx, secret, tenant, now)
+	}
+	return tokens.Verify(secret, tenant, now)
+}

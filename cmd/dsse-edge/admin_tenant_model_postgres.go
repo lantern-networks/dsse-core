@@ -38,6 +38,8 @@ var (
 	_ adminTenantModelAdminStore   = (*postgresAdminTenantModelStore)(nil)
 	_ adminTenantModelFleetCarrier = (*postgresAdminTenantModelStore)(nil)
 	_ adminTenantModelFleetCarrier = (*adminTenantModelStore)(nil)
+	_ adminTenantModelFleetReader  = (*postgresAdminTenantModelStore)(nil)
+	_ adminTenantModelFleetReader  = (*adminTenantModelStore)(nil)
 )
 
 // adminTenantModelColumns is the canonical column order shared by every SELECT/scan in this store. is_operator is
@@ -298,6 +300,78 @@ func (p *postgresAdminTenantModelStore) Put(ctx context.Context, tenant adminTen
 	return stampOperatorFlag(normalized, p.operatorTenantID), nil
 }
 
+// MutateExisting keeps the read, authorization decision and write under one
+// PostgreSQL row lock. Separate control-plane processes may receive operator
+// and customer requests at the same time, so a process-local mutex is not a
+// sufficient fence for delegation withdrawal or elevation approval.
+func (p *postgresAdminTenantModelStore) MutateExisting(ctx context.Context, tenantID string, now time.Time, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+	return p.mutateTenant(ctx, tenantID, now, false, edit)
+}
+
+func (p *postgresAdminTenantModelStore) MutateOrCreate(ctx context.Context, tenantID string, now time.Time, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+	return p.mutateTenant(ctx, tenantID, now, true, edit)
+}
+
+func (p *postgresAdminTenantModelStore) mutateTenant(ctx context.Context, tenantID string, now time.Time, createIfAbsent bool, edit func(adminTenantModel) (adminTenantModel, error)) (adminTenantModel, error) {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" || edit == nil {
+		return adminTenantModel{}, fmt.Errorf("tenant_id and edit are required")
+	}
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	defer tx.Rollback() //nolint:errcheck // commit below is the success path
+	if createIfAbsent {
+		// FOR UPDATE cannot lock a missing row. Creation and deletion use
+		// the same advisory fence before probing it.
+		if err := lockAdminTenantID(ctx, tx, tenantID); err != nil {
+			return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+		}
+	}
+	current, err := scanAdminTenantModelRow(tx.QueryRowContext(ctx,
+		"SELECT "+adminTenantModelColumns+" FROM admin_tenant_models WHERE tenant_id = $1 FOR UPDATE", tenantID).Scan)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !createIfAbsent {
+			return adminTenantModel{}, errAdminTenantModelMissing
+		}
+		var deleted bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM admin_tenant_model_deletions WHERE tenant_id = $1)", tenantID).Scan(&deleted); err != nil {
+			return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+		}
+		if deleted {
+			return adminTenantModel{}, errAdminTenantModelMissing
+		}
+		current = adminTenantModel{TenantID: tenantID, DisplayName: tenantID, Status: "active"}
+		err = nil
+	}
+	if err != nil {
+		return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	next, err := edit(stampOperatorFlag(current, p.operatorTenantID))
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	if next.CreatedAt == nil {
+		next.CreatedAt = copyStringPtr(current.CreatedAt)
+	}
+	normalized, err := normalizeAdminTenantModel(next, tenantID, now)
+	if err != nil {
+		return adminTenantModel{}, err
+	}
+	if err := p.upsertOn(ctx, tx, normalized); err != nil {
+		return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return adminTenantModel{}, fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
+	atomic.AddUint64(&p.gen, 1)
+	return stampOperatorFlag(normalized, p.operatorTenantID), nil
+}
+
 // Delete removes a tenant profile (cross-tenant / super-admin surface). Removing a non-existent tenant is an
 // idempotent success, matching the file store.
 func (p *postgresAdminTenantModelStore) Delete(ctx context.Context, tenantID string) error {
@@ -312,6 +386,9 @@ func (p *postgresAdminTenantModelStore) Delete(ctx context.Context, tenantID str
 		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
 	defer tx.Rollback()
+	if err := lockAdminTenantID(ctx, tx, tenantID); err != nil {
+		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM admin_tenant_models WHERE tenant_id = $1", tenantID); err != nil {
 		return fmt.Errorf("%w: %v", errAdminTenantSaveUnconfirmed, err)
 	}
@@ -336,13 +413,19 @@ func (p *postgresAdminTenantModelStore) Delete(ctx context.Context, tenantID str
 // removes a tenant because it was named, not because it was missing — the section UPSERTs, and inferring a
 // deletion from an absent entry would turn a truncated payload into a wipe.
 func (p *postgresAdminTenantModelStore) DeletedTenants() []tenantDeletion {
-	rows, err := p.db.QueryContext(context.Background(),
+	deletions, err := p.DeletedTenantsChecked(context.Background())
+	if err != nil {
+		log.Printf("tenant tombstones: reading admin_tenant_model_deletions failed: %v", err)
+		return nil
+	}
+	return deletions
+}
+
+func (p *postgresAdminTenantModelStore) DeletedTenantsChecked(ctx context.Context) ([]tenantDeletion, error) {
+	rows, err := p.db.QueryContext(ctx,
 		"SELECT tenant_id, deleted_at FROM admin_tenant_model_deletions ORDER BY tenant_id")
 	if err != nil {
-		// Publishing an empty list here means deletions stop propagating until the query works again. That is
-		// the safe direction (nothing is deleted that should not be), but it is silent, so it is logged.
-		log.Printf("tenant tombstones: reading admin_tenant_model_deletions failed, so this bundle carries NO deletions: %v", err)
-		return nil
+		return nil, fmt.Errorf("query tenant deletions: %w", err)
 	}
 	defer rows.Close()
 	out := []tenantDeletion{}
@@ -350,16 +433,17 @@ func (p *postgresAdminTenantModelStore) DeletedTenants() []tenantDeletion {
 		var tenantID string
 		var deletedAt time.Time
 		if err := rows.Scan(&tenantID, &deletedAt); err != nil {
-			log.Printf("tenant tombstones: scanning a deletion row failed: %v", err)
-			return nil
+			return nil, fmt.Errorf("scan tenant deletion: %w", err)
 		}
 		out = append(out, tenantDeletion{TenantID: tenantID, DeletedAt: deletedAt.UTC().Format(time.RFC3339)})
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("tenant tombstones: iterating deletions failed, so this bundle carries NO deletions: %v", err)
-		return nil
+		return nil, fmt.Errorf("iterate tenant deletions: %w", err)
 	}
-	return out
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close tenant deletions: %w", err)
+	}
+	return out, nil
 }
 
 // ConfigGeneration returns the monotonic tenant-registry config version, bumped on every write the bundle
@@ -398,13 +482,19 @@ func (p *postgresAdminTenantModelStore) OrderPurge(tenantID string, now time.Tim
 // offline when the order was given is only ever told by this list, and an order that disappears once "most"
 // nodes have acted is how one node quietly keeps a customer's data.
 func (p *postgresAdminTenantModelStore) PurgeOrders() []tenantPurgeOrder {
-	rows, err := p.db.QueryContext(context.Background(),
+	orders, err := p.PurgeOrdersChecked(context.Background())
+	if err != nil {
+		log.Printf("tenant purge orders: reading admin_tenant_model_purge_orders failed: %v", err)
+		return nil
+	}
+	return orders
+}
+
+func (p *postgresAdminTenantModelStore) PurgeOrdersChecked(ctx context.Context) ([]tenantPurgeOrder, error) {
+	rows, err := p.db.QueryContext(ctx,
 		"SELECT tenant_id, ordered_at FROM admin_tenant_model_purge_orders ORDER BY tenant_id")
 	if err != nil {
-		// Same direction as DeletedTenants: publishing an empty list stops orders propagating until the query
-		// works again, which erases nothing that should not be erased — but it is silent, so it is logged.
-		log.Printf("tenant purge orders: reading admin_tenant_model_purge_orders failed, so this bundle carries NO erasure orders: %v", err)
-		return nil
+		return nil, fmt.Errorf("query tenant purge orders: %w", err)
 	}
 	defer rows.Close()
 	out := []tenantPurgeOrder{}
@@ -412,16 +502,17 @@ func (p *postgresAdminTenantModelStore) PurgeOrders() []tenantPurgeOrder {
 		var tenantID string
 		var orderedAt time.Time
 		if err := rows.Scan(&tenantID, &orderedAt); err != nil {
-			log.Printf("tenant purge orders: scanning an order row failed: %v", err)
-			return nil
+			return nil, fmt.Errorf("scan tenant purge order: %w", err)
 		}
 		out = append(out, tenantPurgeOrder{TenantID: tenantID, OrderedAt: orderedAt.UTC().Format(time.RFC3339)})
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("tenant purge orders: iterating orders failed, so this bundle carries NO erasure orders: %v", err)
-		return nil
+		return nil, fmt.Errorf("iterate tenant purge orders: %w", err)
 	}
-	return out
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close tenant purge orders: %w", err)
+	}
+	return out, nil
 }
 
 // find loads a single tenant by id. ok=false (no error) when the row is absent.
@@ -443,6 +534,37 @@ func (p *postgresAdminTenantModelStore) find(ctx context.Context, tenantID strin
 
 // upsert writes a normalized tenant, preserving created_at on conflict and advancing updated_at.
 func (p *postgresAdminTenantModelStore) upsert(ctx context.Context, tenant adminTenantModel) error {
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck // commit below is the success path
+	if err := lockAdminTenantID(ctx, tx, tenant.TenantID); err != nil {
+		return err
+	}
+	if err := p.upsertOn(ctx, tx, tenant); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	atomic.AddUint64(&p.gen, 1)
+	return nil
+}
+
+// A missing tenant has no PostgreSQL row to lock. This key fence serializes
+// creation and deletion of that exact tenant; hash collisions only serialize
+// unrelated tenants and cannot merge their identities.
+func lockAdminTenantID(ctx context.Context, tx *sql.Tx, tenantID string) error {
+	var held int
+	return tx.QueryRowContext(ctx, "SELECT 1 FROM pg_advisory_xact_lock(hashtextextended($1, 0))", tenantID).Scan(&held)
+}
+
+type adminTenantModelSQLExecer interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (p *postgresAdminTenantModelStore) upsertOn(ctx context.Context, execer adminTenantModelSQLExecer, tenant adminTenantModel) error {
 	regions, err := json.Marshal(tenant.AllowedRegions)
 	if err != nil {
 		return err
@@ -452,10 +574,9 @@ func (p *postgresAdminTenantModelStore) upsert(ctx context.Context, tenant admin
 	// already paid for twice. nil marshals to "null", and a null column would make every read that decodes it
 	// carry a nil list from a row that says nothing — so an absent history is written as the empty list it is.
 	//
-	// Granting an elevation is therefore a read-modify-write of this column, and two grants racing would lose
-	// one. That is the file store's shape too, and the control plane is active/standby (§HA), so there is one
-	// writer — but it is a property of the choice rather than an accident, and a side table is the answer if
-	// the control plane ever writes from two nodes at once.
+	// Granting an elevation is a read-modify-write of this column. The dedicated
+	// operator route now holds a row lock through that operation, including when
+	// another control-plane process receives the concurrent request.
 	elevations, err := json.Marshal(tenant.OperatorElevations)
 	if err != nil {
 		return err
@@ -489,7 +610,7 @@ func (p *postgresAdminTenantModelStore) upsert(ctx context.Context, tenant admin
 		delegationChangedAt = parsed.UTC()
 	}
 	delegationChangedBy := derefStringPtr(tenant.OperatorDelegationChangedBy)
-	_, err = p.db.ExecContext(ctx, strings.Join([]string{
+	_, err = execer.ExecContext(ctx, strings.Join([]string{
 		"INSERT INTO admin_tenant_models",
 		"(" + adminTenantModelColumns + ")",
 		// ★ THE PLACEHOLDERS ARE PART OF THE COLUMN LIST (2026-08-20, found in one live call and in no test).
@@ -529,12 +650,7 @@ func (p *postgresAdminTenantModelStore) upsert(ctx context.Context, tenant admin
 	}
 	// A re-creation supersedes the deletion. Leaving the tombstone behind would put the tenant into the next
 	// bundle as both present and deleted, and the receiving Edge refuses that pair rather than guessing.
-	_, err = p.db.ExecContext(ctx, "DELETE FROM admin_tenant_model_deletions WHERE tenant_id = $1", tenant.TenantID)
-	if err == nil {
-		// Bumped here rather than in Put and Update separately, so no future write path can add itself to the
-		// registry without advancing the version the fleet uses to decide a bundle is worth applying.
-		atomic.AddUint64(&p.gen, 1)
-	}
+	_, err = execer.ExecContext(ctx, "DELETE FROM admin_tenant_model_deletions WHERE tenant_id = $1", tenant.TenantID)
 	return err
 }
 

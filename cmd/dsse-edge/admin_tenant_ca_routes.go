@@ -363,7 +363,7 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		remainingAfter, targetExists := 0, false
 		for _, fact := range registry.Facts(time.Now()) {
 			switch {
-			case !strings.EqualFold(fact.TenantID, tenantID):
+			case fact.TenantID != tenantID:
 			case strings.EqualFold(fact.SHA256, fingerprint):
 				targetExists = true
 			default:
@@ -526,7 +526,7 @@ func registerTenantCARoutes(mux *http.ServeMux, adminEndpoint func(string, http.
 		// view still does, so the merge would put them straight back. See TenantCARegistry.SaveTo.
 		gone := []string{}
 		for _, f := range registry.Facts(time.Now()) {
-			if strings.EqualFold(strings.TrimSpace(f.TenantID), tenantID) {
+			if strings.TrimSpace(f.TenantID) == tenantID {
 				gone = append(gone, f.SHA256)
 			}
 		}

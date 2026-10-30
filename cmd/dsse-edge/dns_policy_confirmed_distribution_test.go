@@ -32,10 +32,8 @@ func TestDNSPolicyRejectedSaveKeepsLiveAndRestart(t *testing.T) {
 	}
 	before := dnsresolver.PolicyToDTO(resolver.CurrentPolicy())
 	gen := resolver.ConfigGeneration()
-	// A directory at the staging-file path deterministically rejects writes without OS permission assumptions.
-	if err := os.Mkdir(path+".tmp", 0700); err != nil {
-		t.Fatal(err)
-	}
+	// Reject the persistence boundary independently of its staging filename.
+	store.write = func(string, []byte, os.FileMode) error { return os.ErrPermission }
 	r := put(`{"stub_ipv4":{"wiki.example.test":"192.0.2.25"}}`)
 	if r.Code != 503 {
 		t.Fatalf("rejected save returned %d: %s", r.Code, r.Body.String())
@@ -51,9 +49,7 @@ func TestDNSPolicyRejectedSaveKeepsLiveAndRestart(t *testing.T) {
 	if !reflect.DeepEqual(before, dnsresolver.PolicyToDTO(fresh.CurrentPolicy())) {
 		t.Fatal("restart lost prior DNS")
 	}
-	if err := os.Remove(path + ".tmp"); err != nil {
-		t.Fatal(err)
-	}
+	store.write = nil
 	if r := put(`{"stub_ipv4":{"wiki.example.test":"192.0.2.25"}}`); r.Code != 200 {
 		t.Fatal(r.Code, r.Body.String())
 	}

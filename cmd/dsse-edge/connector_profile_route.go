@@ -21,6 +21,8 @@ package main
 // a different blast radius, and a screen or a log that conflates them cannot say which one changed.
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -68,17 +70,31 @@ func connectorProfileNote(endpoints []string) string {
 	}
 }
 
-func registerConnectorProfileRoute(mux *http.ServeMux, authorize func(http.ResponseWriter, *http.Request, string) bool,
-	tenantID string, fallbackEdgeURL string, regions func(tenantID string) []regionEndpoint, siteOf func(connectorID string) string) {
+func registerConnectorProfileRoute(mux *http.ServeMux, authorize func(http.ResponseWriter, *http.Request, string) (string, bool),
+	fallbackEdgeURL string, regions func(context.Context, string) ([]regionEndpoint, error), siteOf func(connectorID string) string) {
 	mux.HandleFunc("GET /connectors/{connector_id}/profile", func(w http.ResponseWriter, r *http.Request) {
 		cid := r.PathValue("connector_id")
-		if !authorize(w, r, cid) {
+		tenantID, ok := authorize(w, r, cid)
+		if !ok {
+			return
+		}
+		if strings.TrimSpace(tenantID) == "" {
+			writeError(w, http.StatusForbidden, fmt.Errorf("connector tenant cannot be verified"))
 			return
 		}
 		site := ""
 		if siteOf != nil {
 			site = siteOf(cid)
 		}
-		writeJSON(w, http.StatusOK, connectorProfileFor(tenantID, site, fallbackEdgeURL, regions))
+		var resolved func(string) []regionEndpoint
+		if regions != nil {
+			endpoints, err := regions(r.Context(), tenantID)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("connector profile authority unavailable"))
+				return
+			}
+			resolved = func(string) []regionEndpoint { return endpoints }
+		}
+		writeJSON(w, http.StatusOK, connectorProfileFor(tenantID, site, fallbackEdgeURL, resolved))
 	})
 }

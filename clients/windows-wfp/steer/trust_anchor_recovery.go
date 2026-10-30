@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/lantern-networks/dsse-core/agentpolicy"
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // trust_anchor_recovery.go — anchor self-healing for the Windows agent, the same mechanism the macOS NE runs
@@ -40,8 +42,8 @@ import (
 // serial advances past the highest ever accepted.
 
 const (
-	// Same file names as the macOS store, deliberately: one runbook line ("look for trust_anchor_pointer.json
-	// next to the pinned CA") covers both platforms.
+	// The pointer name matches the macOS store. adoptedAnchorsFile is read only
+	// for split-file adoptions made by older Windows versions.
 	adoptedAnchorsFile = "trust_anchors_adopted.pem"
 	adoptedPointerFile = "trust_anchor_pointer.json"
 	// provisionedTransportCAFile is the anchor an MSI-installed device is born with, at a well-known name
@@ -57,15 +59,24 @@ const (
 	trustRecoveryRetryInterval = 15 * time.Minute
 )
 
-// adoptedTrustPointer records what was adopted and at which serial. Non-secret by construction: the serial,
-// fingerprints and a date — the anchors themselves are public certificates in the file beside it.
+var errAdoptedPointerVisibleNotDurable = errors.New("adopted trust record is visible but durability is unconfirmed")
+
+// These seams exercise the post-rename/failed-directory-flush boundary without
+// modifying the process's real filesystem in a fault-injection test.
+var adoptedPointerDurableWrite = durablefile.Write
+var adoptedPointerSyncDir = durablefile.SyncDir
+
+// adoptedTrustPointer records what was adopted and at which serial. New adoptions include their public CA
+// certificates in this same durable record, so an interrupted update cannot combine a new CA with an old
+// serial or new metadata with old CA material. Pre-existing split-file pointers remain readable.
 //
 // The serial is the point of persisting anything at all: replay protection is a comparison against the highest
 // bundle ever accepted, and forgetting it on restart would make an old bundle acceptable again — restoring a CA
-// the fleet withdrew. It lives in THIS file, not the anchors file, precisely so losing the anchors does not
-// lose the serial.
+// the fleet withdrew. It lives in this record even for legacy split-file adoptions, so losing legacy anchors
+// does not lose the serial.
 type adoptedTrustPointer struct {
-	Serial int64 `json:"serial"`
+	Serial         int64  `json:"serial"`
+	TransportCAPEM string `json:"transport_ca_pem,omitempty"`
 	// TenantID is the organization the adopted distribution belongs to.
 	//
 	// ★★★ SERIALS ARE PER-ORGANIZATION, SO COMPARING THEM ACROSS ONE MEANS NOTHING (2026-08-29, win-dev-1).
@@ -187,7 +198,7 @@ func trustSerialFloorForName(stateDir, tenantID, profileServerName string) int64
 func adoptedIsProvenForeign(p adoptedTrustPointer, tenantID, profileServerName string) (bool, string) {
 	adopted, want := strings.TrimSpace(p.TenantID), strings.TrimSpace(tenantID)
 	if adopted != "" && want != "" {
-		if !strings.EqualFold(adopted, want) {
+		if adopted != want {
 			return true, fmt.Sprintf("the adopted distribution belongs to %q and this device belongs to %q — "+
 				"a stranger is not a predecessor", adopted, want)
 		}
@@ -210,7 +221,7 @@ func adoptedIsProvenForeign(p adoptedTrustPointer, tenantID, profileServerName s
 
 // adoptedTrustAnchors returns the anchors this device adopted, or ok=false when there is nothing usable.
 //
-// ok=false — not an empty set — when the pointer exists but the anchor file is missing or yields nothing. An
+// ok=false — not an empty set — when the pointer exists but its anchor material is missing or yields nothing. An
 // empty set at the call site is indistinguishable from "trust nothing" and would fail the transport closed
 // forever; "nothing adopted" lets the caller fall back to the provisioned anchors, the state the device was
 // working in before.
@@ -219,23 +230,27 @@ func adoptedTrustAnchors(stateDir string) (pemBytes []byte, cas []*x509.Certific
 	if !pok {
 		return nil, nil, 0, false
 	}
-	raw, err := os.ReadFile(filepath.Join(stateDir, adoptedAnchorsFile))
-	if err != nil {
-		return nil, nil, 0, false
+	var raw []byte
+	if p.TransportCAPEM != "" {
+		raw = []byte(p.TransportCAPEM)
+	} else {
+		// Legacy pointers named a separate CA file. Keep that read path for an upgraded device;
+		// all new adoptions commit the CA and pointer as one record.
+		var err error
+		raw, err = os.ReadFile(filepath.Join(stateDir, adoptedAnchorsFile))
+		if err != nil {
+			return nil, nil, 0, false
+		}
 	}
 	parsed := parsePinnedCAs(raw)
 	if len(parsed) == 0 {
 		return nil, nil, 0, false
 	}
-	// The anchors file is written FIRST and the pointer SECOND, so a crash during a RE-adoption can leave the
-	// NEW anchors file beside the STILL-OLD pointer. The write order's stated guarantee — "a crash leaves the
-	// device on its provisioned anchors" — only holds for the very first adoption (no prior pointer); on a
-	// re-adoption the torn pair would otherwise be served as the new anchors under the OLD serial, weakening the
-	// monotonic replay guard (a withdrawn CA at an intermediate serial could then be re-adopted). The pointer
-	// records the fingerprints it was committed WITH, so a file that does not match them is exactly that torn
-	// pair: fall back to the provisioned anchors (the safe state the order is meant to give) and let the next
-	// recovery cycle re-adopt cleanly. Skipped for a pre-fingerprint pointer, which cannot be checked this way.
-	if len(p.Fingerprints) > 0 && !anchorsMatchFingerprints(parsed, p.Fingerprints) {
+	// Legacy split-file adoptions could leave new anchors beside an old pointer
+	// after a crash. The fingerprints detect that mismatch. An embedded CA set
+	// must always have matching fingerprints because its record is one commit.
+	if (p.TransportCAPEM != "" && len(p.Fingerprints) == 0) ||
+		(len(p.Fingerprints) > 0 && !anchorsMatchFingerprints(parsed, p.Fingerprints)) {
 		return nil, nil, 0, false
 	}
 	return raw, parsed, p.Serial, true
@@ -368,9 +383,8 @@ func appendUniqueKey(keys []string, k string) []string {
 // installTrustBundle writes a VERIFIED bundle's anchors. Refuses anything that would leave the device worse
 // off: an unusable anchor set, or a serial that does not advance past what is already installed.
 //
-// Write order is anchors first, pointer second. The pointer is what makes the anchors live, so a crash between
-// the two leaves the device on its provisioned anchors — the state it was already working in — rather than
-// pointing at a file that is not there yet.
+// The CA set and serial are one durable pointer replacement. A crash keeps either the previous complete
+// adoption or the new complete adoption. Legacy separate CA files are not modified by new adoptions.
 //
 // provedServerName is the organization's announced transport name AFTER this device has confirmed it can still
 // verify the Edge under it — "" when nothing was announced or the proof failed. It is a parameter rather than
@@ -389,11 +403,9 @@ func installTrustBundle(stateDir string, payload agentpolicy.TrustBundlePayload,
 		sum := sha256.Sum256(c.Raw)
 		fingerprints = append(fingerprints, hex.EncodeToString(sum[:]))
 	}
-	if err := writeFileAtomically(filepath.Join(stateDir, adoptedAnchorsFile), []byte(payload.TransportCAPEM)); err != nil {
-		return adoptedTrustPointer{}, fmt.Errorf("write adopted anchors: %w", err)
-	}
 	pointer := adoptedTrustPointer{
 		Serial:                  payload.Serial,
+		TransportCAPEM:          payload.TransportCAPEM,
 		TenantID:                strings.TrimSpace(payload.TenantID),
 		Fingerprints:            fingerprints,
 		AdoptedAt:               time.Now().UTC().Format(time.RFC3339),
@@ -411,20 +423,33 @@ func installTrustBundle(stateDir string, payload agentpolicy.TrustBundlePayload,
 	if err != nil {
 		return adoptedTrustPointer{}, err
 	}
-	if err := writeFileAtomically(filepath.Join(stateDir, adoptedPointerFile), raw); err != nil {
+	if err := writeAdoptedPointer(filepath.Join(stateDir, adoptedPointerFile), raw); err != nil {
+		if errors.Is(err, errAdoptedPointerVisibleNotDurable) {
+			return pointer, fmt.Errorf("commit adopted anchors: %w", err)
+		}
 		return adoptedTrustPointer{}, fmt.Errorf("commit adopted anchors: %w", err)
 	}
 	return pointer, nil
 }
 
-func writeFileAtomically(path string, data []byte) error {
-	tmp := path + ".tmp"
-	// 0644: anchors are public certificates and the pointer names only fingerprints. On Windows the mode is a
-	// no-op and the file inherits the (administrator-only) directory ACL, same as the renewal store beside it.
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+func writeAdoptedPointer(path string, data []byte) error {
+	// 0644: the pointer and its embedded CA are public. The Windows file inherits the
+	// administrator-only state-directory ACL, like the certificate store beside it.
+	err := adoptedPointerDurableWrite(path, data, 0o644)
+	if !errors.Is(err, durablefile.ErrReplacedNotFlushed) {
 		return err
 	}
-	return os.Rename(tmp, path)
+	// A Unix rename may have succeeded while the directory flush failed. Read back the
+	// exact new record and confirm its directory entry before reporting success. If that
+	// cannot be proved, leave the old live trust in force and report uncertainty.
+	readback, readErr := os.ReadFile(path)
+	if readErr != nil || !bytes.Equal(readback, data) {
+		return err
+	}
+	if syncErr := adoptedPointerSyncDir(filepath.Dir(path)); syncErr != nil {
+		return errors.Join(errAdoptedPointerVisibleNotDurable, err, syncErr)
+	}
+	return nil
 }
 
 // servedTransportChain fetches the certificate chain the Edge's TRANSPORT listener presents, without
@@ -575,8 +600,7 @@ func unverifiedChannelClient(timeout time.Duration) *http.Client {
 }
 
 type trustRecoveryConfig struct {
-	// stateDir is where adopted anchors + the pointer live — the directory of the provisioned pin file, so an
-	// operator finds both generations of trust material in one place.
+	// stateDir holds the adopted CA/serial record beside the provisioned pin.
 	stateDir string
 	// pinHex is the Ed25519 verification key (--agent-policy-pin). The bundle's whole authenticity rests on it.
 	pinHex string
@@ -605,6 +629,8 @@ type trustRecoveryConfig struct {
 //	adopted                — the device could NOT validate the Edge and recovered onto a newer bundle.
 //	adopted_while_healthy  — the device WAS fine and moved to a newer distribution anyway (routine catch-up,
 //	                         so an overlap-then-retire rotation can actually reach the overlap on healthy devices).
+//	adopted_unconfirmed    — the exact new CA/serial record is visible and in force, but a post-rename directory
+//	                         flush failed; persistence across a crash is not confirmed and a retry is scheduled.
 //	refused_would_strand   — a newer bundle was offered but its anchors do NOT validate the served chain, so
 //	                         adopting would cut this device off; it stays on working anchors and says so loudly.
 //	undetermined           — the Edge was unreachable; validity could not be judged.
@@ -673,6 +699,18 @@ func runTrustAnchorRecoveryOnce(tc *transportConfig, cfg trustRecoveryConfig) tr
 // device that cannot verify the Edge can still fetch this, because its authenticity is the SIGNATURE). The
 // verification is inside FetchVerifiedTrustBundle: pinned key, schema, and a serial strictly past the highest
 // this device ever accepted (so a bundle at or below it — a replay onto a withdrawn CA — is refused).
+// fetchOrganizationTrustBundle names the tenant from the verified profile even when
+// it uses shared transport and has no organization-specific server name. Legacy
+// configurations without a tenant retain the existing name-only fetch behavior.
+func fetchOrganizationTrustBundle(ctx context.Context, client *http.Client, baseURL, tenantID, serverName string,
+	pubKeyHexes []string, lastAcceptedSerial int64) (agentpolicy.TrustBundlePayload, error) {
+	if strings.TrimSpace(tenantID) != "" {
+		return agentpolicy.FetchVerifiedTrustBundleForOrganization(ctx, client, baseURL, tenantID, serverName,
+			pubKeyHexes, lastAcceptedSerial)
+	}
+	return agentpolicy.FetchVerifiedTrustBundleForName(ctx, client, baseURL, serverName, pubKeyHexes, lastAcceptedSerial)
+}
+
 func fetchVerifiedTrustBundleFor(tc *transportConfig, cfg trustRecoveryConfig, timeout time.Duration) (agentpolicy.TrustBundlePayload, error) {
 	baseURL := trustBundleBaseURL(cfg.bundleURL, tc.host)
 	if baseURL == "" {
@@ -696,7 +734,7 @@ func fetchVerifiedTrustBundleFor(tc *transportConfig, cfg trustRecoveryConfig, t
 	// The SERIAL is asked the same way. A distribution belonging to another organization is not a predecessor
 	// of this one, and this box proved what comparing them costs: it held tenant_default at serial 3 while its
 	// own organization published serial 3, so the correct distribution could never advance past the stranger.
-	return agentpolicy.FetchVerifiedTrustBundleForName(ctx, client, baseURL, tc.trustBundleServerName(),
+	return fetchOrganizationTrustBundle(ctx, client, baseURL, cfg.tenantID, tc.trustBundleServerName(),
 		policyVerificationKeys(cfg.pinHex, cfg.stateDir), trustSerialFloor(cfg.stateDir, cfg.tenantID))
 }
 
@@ -715,7 +753,7 @@ func adoptVerifiedBundle(tc *transportConfig, cfg trustRecoveryConfig, payload a
 	// Refused rather than reconciled: a device holding the wrong organization's anchors cannot verify its own
 	// door, and the failure it then produces names TLS rather than the adoption that caused it.
 	if want := strings.TrimSpace(cfg.tenantID); want != "" {
-		if got := strings.TrimSpace(payload.TenantID); got != "" && !strings.EqualFold(got, want) {
+		if got := strings.TrimSpace(payload.TenantID); got == "" || got != want {
 			log.Printf("trust_anchor_recovery REFUSED a distribution belonging to %q — this device belongs to %q. "+
 				"It is correctly signed; it is somebody else's. Nothing was adopted.", got, want)
 			return trustRecoveryOutcome{code: "refused_other_organization",
@@ -723,15 +761,26 @@ func adoptVerifiedBundle(tc *transportConfig, cfg trustRecoveryConfig, payload a
 		}
 	}
 	resolvedRecovery := resolveRecoveryEndpoint(payload.RenewalRecoveryEndpoint, tc.host)
-	// The anchors go in force FIRST: the name below is proved against them, and an organization's own
-	// certificate chains to the anchor that arrives in the same bundle. Proving the name against the outgoing
-	// anchor set would refuse exactly the certificate this step exists to move onto.
-	tc.setTrustAnchors([]byte(payload.TransportCAPEM), payload.Serial)
+	// The name proof explicitly checks the bundle's CA set; there is no reason to publish
+	// the new roots in live transport until the complete adoption is durable.
 	provedName, nameNote := proveAnnouncedServerName(tc, payload, timeout)
 	pointer, err := installTrustBundle(cfg.stateDir, payload, resolvedRecovery, provedName)
 	if err != nil {
+		if errors.Is(err, errAdoptedPointerVisibleNotDurable) && pointer.Serial == payload.Serial {
+			// The single-file snapshot is visible and matches this verified payload. Keeping
+			// the old live roots while its new serial gates re-fetch would strand this run.
+			// Adopt the visible set, but never call its durability confirmed.
+			tc.setTrustAnchors([]byte(payload.TransportCAPEM), payload.Serial)
+			tc.setAnnouncedNames(provedName, payload.RenewalRecoverySNI)
+			if cfg.liveRecovery != nil && resolvedRecovery != "" {
+				cfg.liveRecovery.Store(&resolvedRecovery)
+			}
+			return trustRecoveryOutcome{code: "adopted_unconfirmed",
+				detail: fmt.Sprintf("serial=%d visible CA/serial record is in force, but durable commit is unconfirmed: %v", payload.Serial, err)}, false
+		}
 		return trustRecoveryOutcome{code: "unrecovered", detail: fmt.Sprintf("adopting the verified bundle failed: %v", err)}, false
 	}
+	tc.setTrustAnchors([]byte(payload.TransportCAPEM), payload.Serial)
 	tc.setAnnouncedNames(provedName, payload.RenewalRecoverySNI)
 	if cfg.liveRecovery != nil && resolvedRecovery != "" {
 		cfg.liveRecovery.Store(&resolvedRecovery)
@@ -791,10 +840,14 @@ func retryOutstandingServerName(tc *transportConfig, cfg trustRecoveryConfig, ti
 	if merr != nil {
 		return ""
 	}
-	if werr := writeFileAtomically(filepath.Join(cfg.stateDir, adoptedPointerFile), raw); werr != nil {
+	werr := writeAdoptedPointer(filepath.Join(cfg.stateDir, adoptedPointerFile), raw)
+	if werr != nil && !errors.Is(werr, errAdoptedPointerVisibleNotDurable) {
 		return ""
 	}
 	tc.setAnnouncedNames(announced, p.RenewalRecoverySNI)
+	if werr != nil {
+		return fmt.Sprintf(" transport_server_name=%q(proved, record visible but durability unconfirmed)", announced)
+	}
 	return fmt.Sprintf(" transport_server_name=%q(proved on retry)", announced)
 }
 
@@ -818,7 +871,7 @@ func reReadAnnouncedNames(tc *transportConfig, cfg trustRecoveryConfig, timeout 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	payload, err := agentpolicy.FetchVerifiedTrustBundleForName(ctx, client, baseURL, tc.trustBundleServerName(),
+	payload, err := fetchOrganizationTrustBundle(ctx, client, baseURL, cfg.tenantID, tc.trustBundleServerName(),
 		policyVerificationKeys(cfg.pinHex, cfg.stateDir), p.Serial-1)
 	if err != nil {
 		return ""
@@ -828,8 +881,12 @@ func reReadAnnouncedNames(tc *transportConfig, cfg trustRecoveryConfig, timeout 
 	if strings.TrimSpace(p.RenewalRecoverySNI) == "" && strings.TrimSpace(payload.RenewalRecoverySNI) != "" {
 		p.RenewalRecoverySNI = strings.TrimSpace(payload.RenewalRecoverySNI)
 		if raw, merr := json.MarshalIndent(p, "", "  "); merr == nil {
-			if writeFileAtomically(filepath.Join(cfg.stateDir, adoptedPointerFile), raw) == nil {
+			werr := writeAdoptedPointer(filepath.Join(cfg.stateDir, adoptedPointerFile), raw)
+			if werr == nil || errors.Is(werr, errAdoptedPointerVisibleNotDurable) {
 				tc.setAnnouncedNames(tc.currentAnnouncedServerName(), p.RenewalRecoverySNI)
+				if werr != nil {
+					log.Printf("trust_anchor_recovery recovery SNI record visible but durability unconfirmed: %v", werr)
+				}
 			}
 		}
 	}
@@ -909,6 +966,9 @@ func adoptNewerWhileHealthy(tc *transportConfig, cfg trustRecoveryConfig, timeou
 	}
 	outcome, ok := adoptVerifiedBundle(tc, cfg, payload, timeout)
 	if !ok {
+		if outcome.code == "adopted_unconfirmed" {
+			return outcome
+		}
 		// The install failed — but the device is healthy, so stay quietly on the working anchors rather than
 		// reporting an outage.
 		return trustRecoveryOutcome{code: "anchors_valid", detail: outcome.detail}
@@ -921,6 +981,10 @@ func adoptNewerWhileHealthy(tc *transportConfig, cfg trustRecoveryConfig, timeou
 // fatal to it — the same rule as certificate renewal and for the same reason.
 func startTrustAnchorRecovery(tc *transportConfig, cfg trustRecoveryConfig) {
 	if tc == nil || !tc.enabled {
+		return
+	}
+	if strings.TrimSpace(cfg.tenantID) == "" {
+		log.Printf("trust_anchor_recovery disabled (no tenant in the verified install profile)")
 		return
 	}
 	if strings.TrimSpace(cfg.pinHex) == "" {
@@ -951,6 +1015,9 @@ func startTrustAnchorRecovery(tc *transportConfig, cfg trustRecoveryConfig) {
 			outcome := runTrustAnchorRecoveryOnce(tc, cfg)
 			next := trustRecoveryInterval
 			switch outcome.code {
+			case "adopted_unconfirmed":
+				log.Printf("trust_anchor_recovery ADOPTION DURABILITY UNCONFIRMED: %s", outcome.detail)
+				next = trustRecoveryRetryInterval
 			case "anchors_valid":
 				// The healthy path SAYS SO — same line as macOS, ~4/day at this interval. A silent healthy path
 				// reads identically to "feature off" and "feature broken", and for a mechanism whose whole job is

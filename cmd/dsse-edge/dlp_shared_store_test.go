@@ -14,6 +14,7 @@ type dlpPeerFixture struct {
 	attach  func(blobstore.Persister) error
 	write   func(string) error
 	present func(string) bool
+	remove  func(string) (int, error)
 	refresh func() error
 	flush   func() error
 	stage   func()
@@ -21,23 +22,31 @@ type dlpPeerFixture struct {
 
 func dlpPeerFactories() map[string]func() dlpPeerFixture {
 	return map[string]func() dlpPeerFixture{
+		"rules": func() dlpPeerFixture {
+			s := newDLPRuleRuntimeStore()
+			return dlpPeerFixture{s.SetPersister, func(t string) error {
+				return s.SetRulesContext(context.Background(), t, []model.DLPRule{{ID: "rule", TenantID: t, Identifiers: []string{"email"}, OnMatch: "block", Status: "active"}})
+			}, func(t string) bool { return len(s.RulesForTenant(t)) == 1 }, func(t string) (int, error) { return s.RemoveTenantContext(context.Background(), t) }, s.RefreshShared, s.PersistIfDirty, func() {
+				s.SetRules("staged", []model.DLPRule{{ID: "rule", TenantID: "staged", Identifiers: []string{"email"}, OnMatch: "block", Status: "active"}})
+			}}
+		},
 		"allowlist": func() dlpPeerFixture {
 			s := newDLPAllowlistRuntimeStore("salt")
-			return dlpPeerFixture{s.SetPersister, func(t string) error { return s.SetValuesDurable(t, []string{"safe-" + t}) }, func(t string) bool { return len(s.ValuesForTenant(t)) == 1 }, s.RefreshShared, s.PersistIfDirty, func() { s.SetValues("staged", []string{"safe"}) }}
+			return dlpPeerFixture{s.SetPersister, func(t string) error { return s.SetValuesDurable(t, []string{"safe-" + t}) }, func(t string) bool { return len(s.ValuesForTenant(t)) == 1 }, func(t string) (int, error) { return s.RemoveTenantContext(context.Background(), t) }, s.RefreshShared, s.PersistIfDirty, func() { s.SetValues("staged", []string{"safe"}) }}
 		},
 		"classifiers": func() dlpPeerFixture {
 			s := newDLPClassifierRuntimeStore()
-			return dlpPeerFixture{s.SetPersister, func(t string) error { return s.SetSpecsDurable(t, classifierFixtureSpecs(t)) }, func(t string) bool { return len(s.SpecsForTenant(t)) == 1 }, s.RefreshShared, s.PersistIfDirty, func() { s.SetSpecs("staged", classifierFixtureSpecs("staged")) }}
+			return dlpPeerFixture{s.SetPersister, func(t string) error { return s.SetSpecsDurable(t, classifierFixtureSpecs(t)) }, func(t string) bool { return len(s.SpecsForTenant(t)) == 1 }, func(t string) (int, error) { return s.RemoveTenantContext(context.Background(), t) }, s.RefreshShared, s.PersistIfDirty, func() { s.SetSpecs("staged", classifierFixtureSpecs("staged")) }}
 		},
 		"fingerprints": func() dlpPeerFixture {
 			s := newDLPFingerprintRuntimeStore("salt")
-			return dlpPeerFixture{s.SetPersister, func(t string) error { _, e := s.SetDatasetDurable(t, "dataset", []string{"sample-" + t}); return e }, func(t string) bool { return len(s.DatasetsForTenant(t)) == 1 }, s.RefreshShared, s.PersistIfDirty, func() { s.SetDataset("staged", "dataset", []string{"sample-staged"}) }}
+			return dlpPeerFixture{s.SetPersister, func(t string) error { _, e := s.SetDatasetDurable(t, "dataset", []string{"sample-" + t}); return e }, func(t string) bool { return len(s.DatasetsForTenant(t)) == 1 }, func(t string) (int, error) { return s.RemoveTenantContext(context.Background(), t) }, s.RefreshShared, s.PersistIfDirty, func() { s.SetDataset("staged", "dataset", []string{"sample-staged"}) }}
 		},
 		"policies": func() dlpPeerFixture {
 			s := newDLPPolicyObjectStore()
 			return dlpPeerFixture{s.SetPersister, func(t string) error {
 				return s.UpsertDurable(model.DLPPolicyObject{ID: "policy", TenantID: t, Name: t, Identifiers: []string{"email"}, OnMatch: "observe"})
-			}, func(t string) bool { _, ok := s.Get(t, "policy"); return ok }, s.RefreshShared, s.PersistIfDirty, func() {
+			}, func(t string) bool { _, ok := s.Get(t, "policy"); return ok }, func(t string) (int, error) { return s.RemoveTenantContext(context.Background(), t) }, s.RefreshShared, s.PersistIfDirty, func() {
 				s.Upsert(model.DLPPolicyObject{ID: "policy", TenantID: "staged", Name: "Staged", Identifiers: []string{"email"}, OnMatch: "observe"})
 			}}
 		},

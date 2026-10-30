@@ -24,6 +24,7 @@ import (
 
 	"github.com/lantern-networks/dsse-core/model"
 	"github.com/lantern-networks/dsse-core/neflowcopy"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"github.com/lantern-networks/dsse-core/tunnel"
 )
 
@@ -41,6 +42,9 @@ const (
 )
 
 func main() {
+	if err := runtimequota.ValidateEnvironment(); err != nil {
+		log.Fatal(err)
+	}
 	listen := flag.String("listen", "127.0.0.1:18090", "connector private app listen address")
 	privateBaseURLOverride := flag.String("private-base-url", "", "optional connector private base URL registered with Edge; defaults to http://<listen>")
 	edgeURL := flag.String("edge-url", "https://127.0.0.1:443", "edge base URL (HTTPS; mTLS pinned via --edge-transport-ca outside --dev-mode)")
@@ -96,7 +100,23 @@ func main() {
 		"renew this connector's identity certificate immediately and exit, instead of running. Requires --state-dir "+
 			"and an already-enrolled connector; used to verify the renewal path without waiting for expiry")
 	stateDir := flag.String("state-dir", "", "directory where the connector persists its identity after enrolling from --token; every later start reconnects from it with NO token and NO coordinate flags")
+	heartbeatInterval := flag.Duration("heartbeat-interval", 5*time.Second, "Connector health heartbeat cadence (positive; independent of data-stream idle policy)")
+	heartbeatTimeout := flag.Duration("heartbeat-timeout", 5*time.Second, "Connector heartbeat/runtime-registration deadline (positive; other management calls retain their own timeout)")
 	flag.Parse()
+	identitySuppliedByOperator := strings.TrimSpace(*connectorClientCert) != "" || strings.TrimSpace(*connectorClientKey) != ""
+	if *heartbeatInterval <= 0 || *heartbeatTimeout <= 0 {
+		log.Fatal("heartbeat interval and timeout must be positive")
+	}
+	connectionLimit, err := parseConnectorTCPConnectionLimit(os.Getenv("DSSE_CONNECTOR_MAX_TCP_CONNECTIONS"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	tcpDialer := &connectorTCPAdmission{base: connectorTCPNetDialer{}, limit: connectionLimit}
+	if connectionLimit == 0 {
+		log.Printf("Connector TCP admission: no connection-count limit configured; OS and backend resource limits still apply")
+	} else {
+		log.Printf("Connector TCP admission: operator-configured process-wide limit=%d", connectionLimit)
+	}
 
 	// edgeServerName is the organization's own door name, resolved from the token or the saved state below.
 	// It is not a flag: an operator running the connector by hand against their own PKI passes --edge-url and
@@ -126,6 +146,12 @@ func main() {
 		}
 	}
 
+	// First-run identity issuance uses the enrolled Edge URL before the normal
+	// transport client is built. Validate it before sending the bootstrap proof.
+	if err := validateConnectorDoorURLs(parseConnectorEndpoints(*edgeURL), strings.TrimSpace(*edgeTransportCA) != ""); err != nil {
+		log.Fatalf("connector enrollment Edge URL: %v", err)
+	}
+
 	// ★ AND THE CERTIFICATE THE EDGE REQUIRES. Enrolment used to stop at the state file, so the printed command
 	// brought a connector up to the point of refusing to start for want of an identity — see identity.go.
 	if issued, ierr := func() (bool, error) {
@@ -135,20 +161,15 @@ func main() {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		return ensureConnectorIdentity(ctx, *stateDir, st, *connectorBootstrapSecret, connectorClientCert, connectorClientKey)
-	}(); ierr != nil {
-		// ★ AND A FAILED FIRST RUN LEAVES NOTHING BEHIND (2026-08-23). Enrollment writes the state file BEFORE
-		// the certificate is obtained, so a first run that could not obtain one left a state dir holding an
-		// identity with no certificate and no way to get one: the next start has no --token to present, and
-		// this connector could never come up again in that directory. The operator's obvious move — run the
-		// same command again — is now the right one, because the bootstrap secret was not consumed by the
-		// attempt and there is no half-enrolled state to trip over.
-		if strings.TrimSpace(*enrollmentToken) != "" && strings.TrimSpace(*stateDir) != "" {
-			if rerr := os.Remove(filepath.Join(strings.TrimSpace(*stateDir), "connector-state.json")); rerr == nil {
-				log.Printf("connector identity: rolled back this first-run enrollment, so running the same " +
-					"command again starts clean")
-			}
+		bootstrap := *connectorBootstrapSecret
+		if st.DoorListWithdrawn {
+			bootstrap = "" // profile-only state cannot POST /enroll on the old data door
 		}
+		return ensureConnectorIdentity(ctx, *stateDir, st, bootstrap, connectorClientCert, connectorClientKey)
+	}(); ierr != nil {
+		// Keep the pending bootstrap and connector ID on disk. A restart can resume
+		// issuance instead of silently discarding the only credential that can do it.
+
 		log.Fatalf("connector identity: %v", ierr)
 	} else if issued {
 		log.Printf("connector identity issued by this organization's device CA and stored in %s", *stateDir)
@@ -165,27 +186,39 @@ func main() {
 	if err != nil {
 		log.Fatalf("connector transport TLS: %v", err)
 	}
-	if edgeTLSConfig != nil && !strings.HasPrefix(strings.ToLower(strings.TrimSpace(*edgeURL)), "https://") {
-		log.Fatalf("connector transport TLS is configured but --edge-url %q is not https", *edgeURL)
-	}
 	// ★★★ THE DOORS THIS CONNECTOR MAY USE, in order. See region_failover.go: a connector had exactly one and
 	// retried it for ever, so one region being away took everything behind that connector with it.
-	doors := parseConnectorEndpoints(*edgeEndpoints)
-	if doors.count() == 0 {
-		doors = parseConnectorEndpoints(*edgeURL)
+	doors, err := initialConnectorDoors(*edgeEndpoints, *edgeURL, *stateDir, edgeTLSConfig != nil)
+	if err != nil {
+		log.Fatalf("connector Edge doors: %v", err)
 	}
 	if doors.count() > 1 {
 		log.Printf("connector: %d Edge door(s) configured; starting at %s%s", doors.count(), doors.current(),
 			regionSuffix(doors.currentRegion()))
 	}
 	edgeHTTPClient := newConnectorEdgeHTTPClient(edgeTLSConfig)
+	// Resolve any authoritative withdrawal before renewal as well as before
+	// registration/tunnels. A failed read retains the last verified decision.
+	if *enableTunnel || *renewNow {
+		if err := refreshConnectorProfile(context.Background(), edgeHTTPClient, doors, *stateDir,
+			*connectorID, *connectorSecret, *tenantID, edgeTLSConfig != nil); err != nil {
+			log.Printf("connector startup profile preflight: %v", err)
+		}
+	}
+	managedIdentity := !identitySuppliedByOperator && connectorUsesManagedIdentity(*stateDir, *connectorClientCert, *connectorClientKey)
 	if *renewNow {
+		if !managedIdentity {
+			log.Fatalf("--renew-identity-now requires the DSSE-managed identity in --state-dir; operator-supplied identities are renewed by their owner")
+		}
 		st, ok, lerr := loadConnectorState(filepath.Join(strings.TrimSpace(*stateDir), "connector-state.json"))
 		if !ok || lerr != nil || edgeTLSConfig == nil {
 			log.Fatalf("--renew-identity-now needs an enrolled --state-dir and a pinned transport")
 		}
-		if err := renewConnectorIdentityIfDue(context.Background(), *stateDir, st, edgeTLSConfig,
-			true, log.Printf); err != nil {
+		if st.DoorListWithdrawn {
+			log.Fatalf("--renew-identity-now is unavailable while the deployment has withdrawn every data door")
+		}
+		if err := renewConnectorIdentityAtSelectedDoor(context.Background(), *stateDir, st, edgeTLSConfig,
+			doors, true, log.Printf); err != nil {
 			log.Fatalf("connector identity renewal: %v", err)
 		}
 		log.Printf("connector identity renewal completed")
@@ -196,8 +229,8 @@ func main() {
 	// that never renews takes its whole Site dark on day 60 — and every connector installed the same week goes
 	// dark within the same hour. See identity.go.
 	if st, ok, lerr := loadConnectorState(filepath.Join(strings.TrimSpace(*stateDir), "connector-state.json")); ok &&
-		lerr == nil && strings.TrimSpace(*stateDir) != "" && edgeTLSConfig != nil {
-		go renewConnectorIdentityLoop(context.Background(), *stateDir, st, edgeTLSConfig, log.Printf)
+		lerr == nil && managedIdentity && edgeTLSConfig != nil {
+		go renewConnectorIdentityLoop(context.Background(), *stateDir, st, edgeTLSConfig, doors, log.Printf)
 	}
 	if edgeTLSConfig != nil {
 		log.Printf("connector↔edge transport: TLS pinned (mTLS=%t)", len(edgeTLSConfig.Certificates) > 0)
@@ -233,6 +266,7 @@ func main() {
 			"status":        "ok",
 			"connector_id":  *connectorID,
 			"identity_sync": identitySyncMonitor.Snapshot(identitySyncConfigured),
+			"tcp_admission": tcpDialer.snapshot(),
 		})
 	})
 	mux.HandleFunc("GET /identity-sync/status", func(w http.ResponseWriter, r *http.Request) {
@@ -287,7 +321,7 @@ func main() {
 	mux.HandleFunc(runtimeCopyRoundTripPath, runtimeCopyRoundTripHandler(runtimeCopyRoundTripHandlerConfig{
 		TenantID: *tenantID,
 		Routes:   tcpRoutes,
-		Dialer:   connectorTCPNetDialer{},
+		Dialer:   tcpDialer,
 	}))
 	go func() {
 		log.Printf("connector private app listening on %s", *listen)
@@ -319,6 +353,7 @@ func main() {
 				"runtime_secret_hash": connectorRuntimeSecretHash(*connectorSecret),
 			},
 		}
+		heartbeatClient := connectorHeartbeatHTTPClient(edgeHTTPClient, *heartbeatTimeout)
 		bootstrapSecret := strings.TrimSpace(*connectorBootstrapSecret)
 		if bootstrapSecret == "" {
 			bootstrapSecret = *connectorSecret
@@ -339,8 +374,16 @@ func main() {
 		registerWithRetry := func() {
 			delay := time.Second
 			for attempt := 1; ; attempt++ {
-				err := postJSON(edgeHTTPClient, doors.current()+"/connectors/register", registration, bootstrapSecret)
+				selected := doors.selection()
+				if selected.url == "" {
+					return // authority withdrew every data door; profile GET alone may resume it
+				}
+				err := postJSON(heartbeatClient, selected.url+"/connectors/register", registration, bootstrapSecret)
 				if err == nil {
+					if err := completeConnectorBootstrap(*stateDir); err != nil {
+						log.Fatalf("persist completed connector bootstrap: %v", err)
+					}
+					bootstrapSecret = *connectorSecret
 					if attempt > 1 {
 						log.Printf("connector registered after %d attempts", attempt)
 					}
@@ -359,7 +402,7 @@ func main() {
 				// Third attempt, not the first: one failure is an Edge restarting, and moving on that would
 				// walk the door list every time a region bounced.
 				if attempt%3 == 0 && doorIsUnreachable(err) {
-					doors.advance(err)
+					doors.advanceIfSelected(selected, err)
 				}
 				time.Sleep(delay)
 				if delay < 30*time.Second {
@@ -367,69 +410,29 @@ func main() {
 				}
 			}
 		}
-		registerWithRetry()
-		// The first heartbeat is best-effort for the same reason the ticker below is: the loop sends another in
-		// ten seconds, and killing the process over one of them is what this whole block exists to stop.
-		if err := sendHeartbeat(edgeHTTPClient, doors.current(), *connectorID, *connectorSecret, *tenantID, *policyBundleID, *policyBundleVersion, identitySyncConfigured, identitySyncMonitor); err != nil {
-			log.Printf("send connector heartbeat (the ticker will retry): %v", err)
+		heartbeat := func(at string) error {
+			return sendHeartbeat(heartbeatClient, at, *connectorID, *connectorSecret, *tenantID, *policyBundleID, *policyBundleVersion, identitySyncConfigured, identitySyncMonitor)
 		}
-
-		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			// ★ CONSECUTIVE FAILURES MEAN RE-REGISTER, NOT JUST COMPLAIN (2026-08-13). A heartbeat names a
-			// connector the Edge is supposed to already know. An Edge that restarted without this connector in
-			// its store answers every heartbeat the same way for ever, and the connector goes on sending them
-			// into a fleet that does not list it — reachable-looking from here, absent over there. Re-registering
-			// is idempotent and is what a human would do.
-			//
-			// Three, not one: a single failure is an Edge that is restarting, and re-registering on every blip
-			// would replace a heartbeat storm with a registration storm.
-			consecutive := 0
-			for range ticker.C {
-				if err := sendHeartbeat(edgeHTTPClient, doors.current(), *connectorID, *connectorSecret, *tenantID, *policyBundleID, *policyBundleVersion, identitySyncConfigured, identitySyncMonitor); err != nil {
-					consecutive++
-					log.Printf("send connector heartbeat (%d in a row): %v", consecutive, err)
-					if consecutive >= 3 {
-						log.Printf("★ re-registering: %d heartbeats in a row were refused, so this edge may no "+
-							"longer know this connector — until it does, every private application behind it is "+
-							"unreachable and nothing else says so", consecutive)
-						// ★★★ AND THE DOOR IS TOLD, BECAUSE THIS IS THE FIRST THING THAT KNOWS (2026-09-02,
-						// measured during a region blackhole). The heartbeat concluded the door was gone at
-						// +92s and said so in those words — and then nothing acted on it. The door was only
-						// changed at +141s, when the TUNNEL's own TCP read finally timed out, which is the
-						// kernel's clock and not ours: on a network that drops silently for longer, the wait
-						// is longer, and on one that resets immediately it never happens at all.
-						//
-						// Three consecutive refusals of an authenticated call is the same evidence the tunnel
-						// eventually produces, 49 seconds earlier. A connector that has already told its log
-						// that everything behind it is unreachable should not then wait for a second opinion.
-						//
-						// It only counts when the failure is REACHING the door. A door that answers and
-						// refuses is a different fault — the connector is unknown there, which re-registering
-						// is exactly the fix for — and moving to another region would hide it.
-						if doorIsUnreachable(err) {
-							doors.advance(err)
-						}
-						registerWithRetry()
-						consecutive = 0
-					}
-					continue
-				}
-				consecutive = 0
+		if doors.count() > 0 {
+			registerWithRetry()
+			if err := heartbeat(doors.current()); err != nil {
+				log.Printf("initial connector heartbeat: %v", err)
 			}
-		}()
+			log.Printf("connector registered to %s%s", doors.current(), regionSuffix(doors.currentRegion()))
+		} else {
+			log.Printf("connector has no authorized data doors; only authenticated profile GET is enabled")
+		}
+		go runConnectorHeartbeats(context.Background(), doors, heartbeat, registerWithRetry, *heartbeatInterval)
 
 		if *enableTunnel {
-			go spreadConnectorOverTheFleet(context.Background(), doors, *connectorID, *connectorSecret, privateBaseURL, tcpRoutes, connectorTCPNetDialer{}, edgeTLSConfig)
+			go spreadConnectorOverTheFleet(context.Background(), doors, *connectorID, *connectorSecret, privateBaseURL, tcpRoutes, tcpDialer, edgeTLSConfig)
 			// ★ AND THE DEPLOYMENT'S OWN ANSWER ABOUT ITS DOORS, RE-READ. See profile_poll.go: what the token
 			// carried was true on the day it was issued and not afterwards.
-			pollConnectorProfile(context.Background(), doors, *stateDir, *connectorID, *connectorSecret, edgeTLSConfig)
+			pollConnectorProfile(context.Background(), doors, *stateDir, *connectorID, *connectorSecret, *tenantID, edgeTLSConfig)
 		}
 		if identitySyncConfigured {
-			go identitySyncLoop(context.Background(), edgeHTTPClient, doors.current(), *connectorID, *connectorSecret, *identitySyncSource, *identitySyncFile, *identitySyncStateFile, *identitySyncInterval, identitySyncMonitor)
+			go identitySyncLoop(context.Background(), edgeHTTPClient, doors, *connectorID, *connectorSecret, *identitySyncSource, *identitySyncFile, *identitySyncStateFile, *identitySyncInterval, identitySyncMonitor)
 		}
-		log.Printf("connector registered to %s%s", doors.current(), regionSuffix(doors.currentRegion()))
 	}
 	select {}
 }
@@ -515,8 +518,16 @@ const connectorFailbackAfter = 60 * time.Second
 func connectTunnelLoop(ctx context.Context, doors *connectorEndpoints, attachments *connectorFleetAttachments, primary bool, connectorID, connectorSecret, privateBaseURL string, tcpRoutes []connectorTCPRoute, tcpDialer connectorTCPConnectionDialer, tlsConfig *tls.Config) {
 	duplicates := 0
 	for {
-		door := doors.current()
-		region := doors.currentRegion()
+		selected, dataCtx := doors.selectionForData()
+		if dataCtx == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+		door, region := selected.url, selected.region
 		if primary {
 			// ★ THE PRIMARY DECIDES WHERE THIS CONNECTOR LIVES. Anything still attached through a region it has
 			// moved away from is let go, so the deployment gets one answer to "where is this connector" instead
@@ -527,7 +538,11 @@ func connectTunnelLoop(ctx context.Context, doors *connectorEndpoints, attachmen
 			}
 		}
 		started := time.Now()
-		node, displaced, err := connectTunnelOnce(ctx, door, region, connectorID, connectorSecret, privateBaseURL, tcpRoutes, tcpDialer, tlsConfig, attachments)
+		attemptCtx, cancelAttempt := context.WithCancel(ctx)
+		stopOnWithdrawal := context.AfterFunc(dataCtx, cancelAttempt)
+		node, displaced, err := connectTunnelOnce(attemptCtx, door, region, connectorID, connectorSecret, privateBaseURL, tcpRoutes, tcpDialer, tlsConfig, attachments)
+		stopOnWithdrawal()
+		cancelAttempt()
 		held := time.Since(started)
 		if displaced {
 			// ★★★ THIS CONNECTOR'S OWN PROBE ENDED THIS TUNNEL, SO THE DOOR IS NOT ON TRIAL (2026-08-26,
@@ -571,7 +586,7 @@ func connectTunnelLoop(ctx context.Context, doors *connectorEndpoints, attachmen
 		if node != "" {
 			log.Printf("connector no longer holds a tunnel on Edge node %s; now on %s", node, attachments.coverage())
 		}
-		if primary && doors.current() != door {
+		if primary && doors.selection() != selected {
 			// ★★★ THE DOOR ALREADY MOVED, AND THIS TUNNEL BELONGS TO THE OLD ONE (2026-09-02, measured within
 			// a minute of adding the heartbeat-driven decision). The heartbeat concluded the region was gone
 			// and advanced to the next door; the long-held tunnel to the DEAD door then ended and was judged
@@ -607,9 +622,9 @@ func connectTunnelLoop(ctx context.Context, doors *connectorEndpoints, attachmen
 			//   away from home + it held  -> go home
 			//   at home, or it did not hold -> move on
 			if held >= connectorFailbackAfter && !doors.atPreferred() {
-				doors.resetToPreferred()
+				doors.resetToPreferredIfSelected(&selected)
 			} else {
-				doors.advance(err)
+				doors.advanceIfSelected(selected, err)
 			}
 		}
 		select {
@@ -634,6 +649,7 @@ func connectTunnelOnce(ctx context.Context, edgeURL, region, connectorID, connec
 	}
 	headers := http.Header{}
 	headers.Set(connectorSecretHeader, connectorSecret)
+	headers.Set(tunnel.TCPQuotaCapabilityHeader, tunnel.TCPQuotaCapabilityV1)
 	// ★ DECLARE BEFORE DIALLING. An Edge registers a tunnel the moment the upgrade completes, replacing and
 	// closing whatever this connector had on that node — so a probe that decides AFTER the handshake kills the
 	// tunnel it was probing. Saying what is already held lets the node refuse without registering anything.
@@ -653,6 +669,11 @@ func connectTunnelOnce(ctx context.Context, edgeURL, region, connectorID, connec
 		return "", false, err
 	}
 	defer conn.Close()
+	stopOnCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopOnCancel()
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
 	node := ""
 	if conn.ResponseHeader != nil {
 		node = strings.TrimSpace(conn.ResponseHeader.Get(tunnel.EdgeNodeHeader))
@@ -763,12 +784,13 @@ func pollEffectiveRoutes(ctx context.Context, edgeURL, connectorID, connectorSec
 			log.Printf("connector effective-routes decode error: %v", err)
 			return
 		}
-		if len(eff.CIDRs) > 0 || len(eff.FQDNDomains) > 0 {
-			dispatcher.SetReachableRoutes(eff)
-			if sig := fmt.Sprintf("%v|%v|%s", eff.CIDRs, eff.FQDNDomains, eff.Namespace); sig != lastSig {
-				lastSig = sig
-				log.Printf("connector effective-routes applied: cidrs=%v fqdns=%d ns=%q", eff.CIDRs, len(eff.FQDNDomains), eff.Namespace)
-			}
+		// An authenticated 200 response is the authority's complete current
+		// answer. An empty set withdraws the previously pushed routes; only a
+		// failed fetch or invalid response retains the last verified answer.
+		dispatcher.SetReachableRoutes(eff)
+		if sig := fmt.Sprintf("%v|%v|%s", eff.CIDRs, eff.FQDNDomains, eff.Namespace); sig != lastSig {
+			lastSig = sig
+			log.Printf("connector effective-routes applied: cidrs=%v fqdns=%d ns=%q", eff.CIDRs, len(eff.FQDNDomains), eff.Namespace)
 		}
 	}
 	fetch()
@@ -812,6 +834,7 @@ func handleConnectorTunnelConn(ctx context.Context, conn connectorTunnelJSONConn
 	responseWriter := &connectorTunnelResponseWriter{conn: conn}
 	if tcpDispatcher != nil {
 		tcpDispatcher.SetResponseWriter(responseWriter.WriteFrames)
+		defer tcpDispatcher.CloseAll()
 	}
 	for {
 		var frame tunnel.Frame

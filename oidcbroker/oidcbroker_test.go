@@ -159,6 +159,53 @@ func TestValidateRejections(t *testing.T) {
 	}
 }
 
+func TestValidateAudienceAndAuthorizedParty(t *testing.T) {
+	key, jwks := testKeyAndJWKS(t)
+	now := time.Now().UTC()
+	opts := ValidateOptions{JWKS: jwks, ExpectedNonce: "NONCE", Now: now}
+	for _, tc := range []struct {
+		name string
+		aud  any
+		azp  any
+		pass bool
+	}{
+		{name: "single audience without azp", aud: "client-1", pass: true},
+		{name: "single audience array without azp", aud: []string{"client-1"}, pass: true},
+		{name: "single audience with matching azp", aud: "client-1", azp: "client-1", pass: true},
+		{name: "multiple audiences including this client", aud: []string{"client-1", "other-rp"}, azp: "client-1"},
+		{name: "multiple audiences for another client", aud: []string{"client-1", "other-rp"}, azp: "other-rp"},
+		{name: "multiple audiences without azp", aud: []string{"client-1", "other-rp"}},
+		{name: "single audience with mismatched azp", aud: "client-1", azp: "other-rp"},
+		{name: "non-string azp", aud: "client-1", azp: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			claims := baseClaims(now)
+			claims["aud"] = tc.aud
+			if tc.azp != nil {
+				claims["azp"] = tc.azp
+			}
+			_, err := ValidateIDToken(sampleConn(), signJWT(t, key, claims), opts)
+			if (err == nil) != tc.pass {
+				t.Fatalf("pass=%v err=%v", tc.pass, err)
+			}
+		})
+	}
+	for _, provider := range []string{"google", "okta", "entra"} {
+		t.Run(provider+" ordinary ID token", func(t *testing.T) {
+			conn := sampleConn()
+			conn.Type = provider
+			claims := baseClaims(now)
+			if provider == "google" {
+				claims["hd"] = "example.com"
+				conn.DomainMode = "google_hd"
+			}
+			if _, err := ValidateIDToken(conn, signJWT(t, key, claims), opts); err != nil {
+				t.Fatalf("ordinary %s ID token rejected: %v", provider, err)
+			}
+		})
+	}
+}
+
 func TestValidateGoogleHostedDomain(t *testing.T) {
 	key, jwks := testKeyAndJWKS(t)
 	now := time.Now().UTC()

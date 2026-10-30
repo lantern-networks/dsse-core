@@ -45,7 +45,7 @@ func connectorMTLSIdentityBoundToTenant(r *http.Request, connectorID, connectorT
 	if !ok {
 		return false, identity, true
 	}
-	return strings.EqualFold(strings.TrimSpace(certTenant), expected), identity, true
+	return strings.TrimSpace(certTenant) == expected, identity, true
 }
 
 // connectorMTLSNotRequiredFlag is the declared exception to certificate presentation. It lives beside the

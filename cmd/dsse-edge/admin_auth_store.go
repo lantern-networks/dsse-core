@@ -194,7 +194,9 @@ func (s *adminAuthStore) UpsertPrincipal(principal adminPrincipal) {
 	s.principals[principal.ID] = principal
 }
 
-// PrincipalIDForSubject answers "does this organization already know this person, and by what id".
+// PrincipalIDForSubject resolves a first-party account's email within its own
+// organization and identity provider. A federated subject with the same text
+// names a different person and must never be adopted by local account login.
 //
 // ★ THE PERSON IS (ORGANIZATION, IdP, SUBJECT) — the database says so with a unique index on those three, and
 // the id is a label chosen once. Sign-in asks this so that a credential whose label drifted (a re-invite used
@@ -212,7 +214,7 @@ func (s *adminAuthStore) PrincipalIDForSubject(tenantID, subject string) (string
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, p := range s.principals {
-		if !strings.EqualFold(strings.TrimSpace(p.TenantID), tenant) {
+		if strings.TrimSpace(p.TenantID) != tenant || p.IDPID != "first_party" {
 			continue
 		}
 		if strings.ToLower(strings.TrimSpace(p.Subject)) == want {
@@ -360,7 +362,7 @@ func (s *adminAuthStore) IdentityForSession(sessionID, tenantID string, now time
 		return adminIdentity{}, false
 	}
 	principal, ok := s.principals[session.AdminPrincipalID]
-	if !ok || principal.Status != "active" {
+	if !ok || principal.TenantID != session.TenantID || principal.Status != "active" {
 		return adminIdentity{}, false
 	}
 	session.LastActiveAt = now.UTC().Format(time.RFC3339)
@@ -482,7 +484,7 @@ func (s *adminAuthStore) RevokeAllForTenant(_ context.Context, tenantID string, 
 	defer s.mu.Unlock()
 	stamp := now.UTC().Format(time.RFC3339)
 	for id, session := range s.sessions {
-		if !strings.EqualFold(strings.TrimSpace(session.TenantID), tenantID) || session.Status == "revoked" {
+		if strings.TrimSpace(session.TenantID) != tenantID || session.Status == "revoked" {
 			continue
 		}
 		session.Status = "revoked"
@@ -491,7 +493,7 @@ func (s *adminAuthStore) RevokeAllForTenant(_ context.Context, tenantID string, 
 		sessions++
 	}
 	for id, token := range s.apiTokens {
-		if !strings.EqualFold(strings.TrimSpace(token.TenantID), tenantID) || token.Status == "revoked" {
+		if strings.TrimSpace(token.TenantID) != tenantID || token.Status == "revoked" {
 			continue
 		}
 		token.Status = "revoked"
@@ -725,15 +727,18 @@ var adminPermissionsByRole = map[string]map[string]bool{
 		// list, sinkholes, stub answers — with no tenant in it anywhere. A customer could sinkhole a domain
 		// for every organization on the Edge, or deny one. admin.dns.READ stays: seeing the DNS policy that
 		// applies to you is not the same as writing it.
-		"admin.dlp.read":         true,
-		"admin.dlp.write":        true,
-		"admin.agents.read":      true,
-		"admin.agents.write":     true,
-		"admin.enrollment.read":  true,
-		"admin.enrollment.write": true,
-		"admin.steering.read":    true,
-		"admin.steering.write":   true,
-		"admin.certs.read":       true,
+		"admin.dlp.read":    true,
+		"admin.dlp.write":   true,
+		"admin.agents.read": true,
+		// Cross-tenant release replication still requires the fleet token's dedicated scope and an exact
+		// operator-tenant home check in its handler; ordinary tenant readers cannot use it.
+		"admin.agent_updates.distribution.read": true,
+		"admin.agents.write":                    true,
+		"admin.enrollment.read":                 true,
+		"admin.enrollment.write":                true,
+		"admin.steering.read":                   true,
+		"admin.steering.write":                  true,
+		"admin.certs.read":                      true,
 		// ★★ admin.certs.WRITE IS NOT HERE, AND WAS (2026-08-17, measured as a customer administrator).
 		// Every route that requires it is DEPLOYMENT material, not this organization's: PUT /admin/certs/{name}
 		// and its rollback replace the certificate this node serves to every device of every organization, and
@@ -943,7 +948,7 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			writeError(w, http.StatusBadRequest, fmt.Errorf("invalid request body"))
 			return
 		}
-		if body := strings.TrimSpace(req.TenantID); body != "" && !strings.EqualFold(body, strings.TrimSpace(adminTenantIDFromRequest(r))) {
+		if body := strings.TrimSpace(req.TenantID); body != "" && body != strings.TrimSpace(adminTenantIDFromRequest(r)) {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("this invitation would go to organization %q, not %q — the organization comes from the one you are operating in, so switch to it and invite again",
 				adminTenantIDFromRequest(r), body))
 			return
@@ -983,21 +988,14 @@ func registerAdminAccountRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		// Note that Get() cannot answer this: for an unknown id it SYNTHESISES a default tenant (display name
 		// = the id, status active) rather than reporting absence. Existence is only answerable against the
 		// list, which is why this asks the admin store for it.
-		if adminStore, ok := config.TenantModelStore.(adminTenantModelAdminStore); ok {
-			tenants, terr := adminStore.List(r.Context())
-			if terr == nil {
-				known := false
-				for _, t := range tenants {
-					if strings.EqualFold(strings.TrimSpace(t.TenantID), strings.TrimSpace(inviteTenantID)) {
-						known = true
-						break
-					}
-				}
-				if !known {
-					writeError(w, http.StatusNotFound, fmt.Errorf("organization %q does not exist; create it before inviting an administrator into it", inviteTenantID))
-					return
-				}
-			}
+		known, registryErr := adminTenantExists(r.Context(), config.TenantModelStore, inviteTenantID)
+		if registryErr != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("organization registry is unavailable; invitation was not created"))
+			return
+		}
+		if !known {
+			writeError(w, http.StatusNotFound, fmt.Errorf("organization %q does not exist; create it before inviting an administrator into it", inviteTenantID))
+			return
 		}
 		principalID := randomEdgeID("adm_", time.Now())
 		token, err := config.LocalCredentials.Invite(req.Email, inviteTenantID, principalID, roles, time.Now())

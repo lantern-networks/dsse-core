@@ -235,7 +235,7 @@ func decideRollout(p RolloutPlan, path string, now time.Time, exp RolloutExpecta
 	// down, which is the whole asymmetry this file is built on.
 	addressedElsewhere := (p.DeviceIdentity != "" && exp.DeviceIdentity != "" &&
 		!strings.EqualFold(p.DeviceIdentity, exp.DeviceIdentity)) ||
-		(p.TenantID != "" && exp.TenantID != "" && !strings.EqualFold(p.TenantID, exp.TenantID))
+		(p.TenantID != "" && exp.TenantID != "" && p.TenantID != exp.TenantID)
 
 	// ★ REPLAY. A correctly signed plan older than one this device already accepted is not a stale copy — a
 	// stale copy is what the courier keeps when a fetch fails, and that one is not OLDER than what was accepted,
@@ -275,7 +275,7 @@ func decideRollout(p RolloutPlan, path string, now time.Time, exp RolloutExpecta
 		out.WaveWithheld = fmt.Sprintf("this plan is addressed to %s and this device is %s — a plan issued for "+
 			"another device cannot open this one's wave, however validly it was signed", p.DeviceIdentity,
 			exp.DeviceIdentity)
-	case p.TenantID != "" && exp.TenantID != "" && !strings.EqualFold(p.TenantID, exp.TenantID):
+	case p.TenantID != "" && exp.TenantID != "" && p.TenantID != exp.TenantID:
 		out.WaveWithheld = fmt.Sprintf("this plan belongs to tenant %s and this device belongs to %s",
 			p.TenantID, exp.TenantID)
 	case strings.TrimSpace(exp.Version) == "":

@@ -333,6 +333,22 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 		if serverInitiated < 0 {
 			serverInitiated = 0
 		}
+		// A 2xx response makes both endpoint agents clear the only copy of these refusals.
+		// Keep the telemetry report retryable until each refusal journal is durably saved.
+		mergedTrustRefusals, err := trustRefusals.Merge(tenantID, identity,
+			normalizeReportedTrustRefusals(body.TrustRefusals))
+		if err != nil {
+			logErrorf("trust refusal journal save failed: %v", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("trust refusal journal unavailable; retry the report"))
+			return
+		}
+		mergedInterceptionRefusals, err := interceptionRefusals.Merge(tenantID, identity,
+			normalizeReportedInterceptionRefusals(body.InterceptionRefusals))
+		if err != nil {
+			logErrorf("interception refusal journal save failed: %v", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("interception refusal journal unavailable; retry the report"))
+			return
+		}
 		// Built once and used twice: recorded in this node's own view, and SHIPPED to the control plane where
 		// the durable copy lives. The Edge used to write this straight into Postgres — one of the six reasons
 		// an enforcement node held a database connection. See observed_exclusion_ship.go.
@@ -369,14 +385,12 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 			InterceptionRootPinSHA256: firstOrEmpty(normalizeReportedFingerprints([]string{body.InterceptionRootPin})),
 			// Merged, never replaced: the device clears its journal once we accept it, so its next report
 			// carries none and a straight overwrite would erase the evidence we just received.
-			TrustRefusals: trustRefusals.Merge(tenantID, identity,
-				normalizeReportedTrustRefusals(body.TrustRefusals)),
+			TrustRefusals: mergedTrustRefusals,
 			// Merged on its own key, never folded into the transport refusals: "the Edge's certificate was
 			// refused" and "the certificate interception served is refused" are different failures with
 			// different fixes, and one list would make them indistinguishable — which is the confusion the
 			// device-side journal was built to end.
-			InterceptionRefusals: interceptionRefusals.Merge(tenantID, identity,
-				normalizeReportedInterceptionRefusals(body.InterceptionRefusals)),
+			InterceptionRefusals:     mergedInterceptionRefusals,
 			ServerInitiatedRuleCount: serverInitiated,
 			// Parse-validated and re-encoded, never stored verbatim. Empty = the agent did not say, which
 			// the retire gate treats as "no additional constraint" — older agents keep working unchanged.
@@ -395,7 +409,10 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 			// verifier accepts, so a malformed entry cannot inflate apparent readiness.
 			AgentPolicyPublicKeys: normalizeReportedPolicyKeys(body.AgentPolicyPublicKeys),
 		}
-		config.ObservedExclusions.Record(reportEntry)
+		if err := config.ObservedExclusions.Record(reportEntry); err != nil {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observed report persistence unavailable"))
+			return
+		}
 		shipObservedExclusion(writer, reportEntry)
 		// ★★★ "THERE IS A NEWER ONE" — A HINT, NOT AN INSTRUCTION (2026-08-20, asked for from the Windows side
 		// after two fleet operations in one day were rate-limited by a device's six-hour adoption tick).
@@ -816,10 +833,13 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 		var allowed []string
 		var home string
 		if tenantModelStore != nil {
-			if tenant, terr := tenantModelStore.Get(r.Context(), tenantID); terr == nil {
-				allowed = tenant.AllowedRegions
-				home = tenant.HomeRegion
+			tenant, terr := tenantModelStore.Get(r.Context(), tenantID)
+			if terr != nil || strings.TrimSpace(tenant.TenantID) != tenantID {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("organization region placement is unavailable; retry"))
+				return
 			}
+			allowed = tenant.AllowedRegions
+			home = tenant.HomeRegion
 		}
 		payload := map[string]any{
 			"schema_version":           "dsse.region-endpoints.v1",
@@ -880,10 +900,15 @@ func registerSteerAgentPolicyRoutes(mux *http.ServeMux, config serverConfig, eva
 			writeError(w, http.StatusUnauthorized, fmt.Errorf("a verified device transport identity is required"))
 			return
 		}
+		tenantID := steerDeviceTenant(r, config, identity, evaluator.PolicyBundle.TenantID)
+		if strings.TrimSpace(tenantID) == "" {
+			writeError(w, http.StatusForbidden, fmt.Errorf("the verified device has no attributable tenant"))
+			return
+		}
 		p := config.SteerPosture.normalized()
 		payload := map[string]any{
 			"schema_version":        agentpolicy.SteeringPostureSchema,
-			"tenant_id":             evaluator.PolicyBundle.TenantID,
+			"tenant_id":             tenantID,
 			"device_identity":       identity,
 			"fail_open_mode":        p.FailOpenMode,
 			"fail_open_cooldown_ms": p.FailOpenCooldownMS,

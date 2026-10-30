@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +14,76 @@ import (
 	"testing"
 	"time"
 )
+
+// A complete malformed record is not a torn append. Skipping it and later compacting the
+// replay queue would permanently remove that record from the shipper's durable backlog.
+func TestShipSpoolCompletedCorruptLineBlocksReplayWithoutChangingFile(t *testing.T) {
+	valid, err := json.Marshal(spoolRecord{S: "audit.log.jsonl", R: []byte(`{"event":"retained"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, suffix := range []string{"middle", "last"} {
+		t.Run(suffix, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "spool.ndjson")
+			original := append(append([]byte{}, valid...), '\n')
+			original = append(original, []byte("{malformed completed record}\n")...)
+			if suffix == "middle" {
+				original = append(original, valid...)
+				original = append(original, '\n')
+			}
+			if err := os.WriteFile(path, original, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			spool, replay, err := newShipSpool(path, 4096)
+			if err == nil || spool != nil || replay != nil {
+				if spool != nil {
+					spool.close()
+				}
+				t.Fatalf("complete corrupt line must block replay, got spool=%v replay=%v err=%v", spool, replay, err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(after, original) {
+				t.Fatal("corrupt spool was modified despite failed replay")
+			}
+		})
+	}
+}
+
+// A complete JSON object without its delimiter must be repaired before append:
+// otherwise the next record would join it into one malformed line on disk.
+func TestShipSpoolUnterminatedValidFinalLineRepairedBeforeAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "spool.ndjson")
+	original, err := json.Marshal(spoolRecord{S: "audit.log.jsonl", R: []byte(`{"event":"pending"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	spool, replay, err := newShipSpool(path, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay) != 1 || string(replay[0].record) != `{"event":"pending"}` {
+		t.Fatalf("complete final record was lost: %+v", replay)
+	}
+	spool.append(auditShipItem{stream: "audit.log.jsonl", record: []byte(`{"event":"next"}`)})
+	spool.close()
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(after, original) {
+		t.Fatal("unterminated spool was not repaired before append")
+	}
+	replay, err = readShipSpool(path)
+	if err != nil || len(replay) != 2 || string(replay[0].record) != `{"event":"pending"}` || string(replay[1].record) != `{"event":"next"}` {
+		t.Fatalf("replay after repair and append = %+v, %v", replay, err)
+	}
+}
 
 // A disabled (empty-path) spool is a nil *shipSpool whose every method is a safe no-op.
 func TestShipSpoolDisabledIsNilNoop(t *testing.T) {
@@ -108,6 +180,12 @@ func TestShipSpoolTornLineSkipped(t *testing.T) {
 	defer reopened.close()
 	if len(replay) != 1 || string(replay[0].record) != `{"ok":1}` {
 		t.Fatalf("torn line should be skipped, leaving the 1 good record; got %+v", replay)
+	}
+	reopened.append(auditShipItem{stream: "audit.log.jsonl", record: []byte(`{"after":"repair"}`)})
+	reopened.close()
+	replay, err = readShipSpool(path)
+	if err != nil || len(replay) != 2 || string(replay[1].record) != `{"after":"repair"}` {
+		t.Fatalf("append after torn tail repair = %+v, %v", replay, err)
 	}
 }
 

@@ -2,6 +2,7 @@ package configstore
 
 import (
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +11,24 @@ import (
 	"github.com/lantern-networks/dsse-core/agentpolicy"
 	"github.com/lantern-networks/dsse-core/installprofile"
 )
+
+type unreadableEnvelopeBackend struct {
+	*MemoryBackend
+	failRead bool
+	writes   int
+}
+
+func (b *unreadableEnvelopeBackend) Get(name string) (string, bool, error) {
+	if b.failRead && name == valEnvelope {
+		return "", false, errors.New("registry read failed")
+	}
+	return b.MemoryBackend.Get(name)
+}
+
+func (b *unreadableEnvelopeBackend) Set(name, value string) error {
+	b.writes++
+	return b.MemoryBackend.Set(name, value)
+}
 
 func signProfile(t *testing.T, p installprofile.InstallProfile) (envJSON []byte, pubHex string) {
 	t.Helper()
@@ -321,6 +340,28 @@ func TestApply_TheFloorComesFromTheSignedEnvelopeNotTheRegistryValue(t *testing.
 	}
 	if _, err := Apply(b2, older, pub, "path", "t2"); err != nil {
 		t.Fatalf("a store holding junk must not be able to refuse the profile repairing it: %v", err)
+	}
+}
+
+func TestApply_RefusesWhenStoredEnvelopeCannotBeRead(t *testing.T) {
+	b := &unreadableEnvelopeBackend{MemoryBackend: NewMemoryBackend()}
+	s, pub := oneSigner(t)
+	newer := signWith(t, s, installprofile.InstallProfile{Version: 3, TenantID: "acme", IssuedAt: "2026-08-17T03:00:00Z"})
+	older := signWith(t, s, installprofile.InstallProfile{Version: 3, TenantID: "acme", IssuedAt: "2026-08-16T03:00:00Z"})
+	if _, err := Apply(b, newer, pub, "bundled", "t1"); err != nil {
+		t.Fatalf("seed newer profile: %v", err)
+	}
+	writesBefore := b.writes
+	b.failRead = true
+	if _, err := Apply(b, older, pub, "bundled", "t2"); err == nil || !strings.Contains(err.Error(), "anti-rollback floor") {
+		t.Fatalf("stored-envelope read failure must refuse application: %v", err)
+	}
+	if b.writes != writesBefore {
+		t.Fatal("application wrote data despite an unknown anti-rollback floor")
+	}
+	b.failRead = false
+	if _, meta, err := Load(b, pub); err != nil || meta.IssuedAt != "2026-08-17T03:00:00Z" {
+		t.Fatalf("stored profile changed after refused application: meta=%+v err=%v", meta, err)
 	}
 }
 

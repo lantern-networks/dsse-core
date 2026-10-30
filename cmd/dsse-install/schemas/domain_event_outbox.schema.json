@@ -49,7 +49,8 @@
         "inspection_events",
         "access_logs",
         "decision_traces",
-        "connector_logs"
+        "connector_logs",
+        "cold_archive_health_events"
       ]
     },
     "event_type": {

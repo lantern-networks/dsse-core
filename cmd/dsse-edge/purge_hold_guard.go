@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/lantern-networks/dsse-core/logs"
 )
+
+var errTenantHeld = errors.New("tenant is held")
 
 // Protect one destructive step, not the entire multi-store purge. Holding a CP
 // transaction across nested store mutations would deadlock their CP writers.
@@ -53,7 +56,7 @@ func beginTenantPurgeHoldGuardWithBudget(budget *cpStatementBudget, holds *legal
 		return fail(fmt.Errorf("legal_hold: state unavailable"))
 	}
 	if !allowed {
-		return fail(fmt.Errorf("legal_hold: tenant is held"))
+		return fail(fmt.Errorf("legal_hold: %w", errTenantHeld))
 	}
 	if err := ctx.Err(); err != nil {
 		return fail(err)

@@ -182,7 +182,7 @@ func loadTrackAOperatorResolver(t *testing.T, config HarnessConfig) OperatorMana
 	t.Helper()
 	opPath := "testdata/swg_tenant_restriction_operator_config.json"
 	if _, statErr := os.Stat(opPath); statErr != nil {
-		t.Skipf("fixture not shipped with the dsse-core module (monorepo-only): %s", opPath)
+		t.Fatalf("read required package fixture %s: %v", opPath, statErr)
 	}
 	resolver, err := LoadOperatorManagedHeaderValueResolver(opPath, config.PolicyBundle)
 	if err != nil {

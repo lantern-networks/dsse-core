@@ -88,6 +88,64 @@ func TestDeviceAdmissionMaterialFollowsDurableBYORegistrationAndWithdrawal(t *te
 	}
 }
 
+func TestDeviceCARegistrationsKeepCaseDistinctOrganizationsSeparate(t *testing.T) {
+	_, upperPEM, _ := deviceAdmissionTestCA(t, "upper tenant")
+	_, lowerPEM, _ := deviceAdmissionTestCA(t, "lower tenant")
+	reg := tenantca.NewTenantCARegistry()
+	if _, err := reg.Register("TenantA", upperPEM); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reg.Register("tenanta", lowerPEM); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := reg.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := decodeDeviceCARegistrations(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(snapshot["TenantA"], string(upperPEM)) || strings.Contains(snapshot["TenantA"], string(lowerPEM)) ||
+		!strings.Contains(snapshot["tenanta"], string(lowerPEM)) || strings.Contains(snapshot["tenanta"], string(upperPEM)) {
+		t.Fatal("case-distinct organizations were merged in device CA admission")
+	}
+}
+
+func TestDeviceMaterialUsesExactOrganizationForManagedAdmission(t *testing.T) {
+	previous := tenantCARegistryShared
+	tenantCARegistryShared = &authorityMemoryCAS{}
+	t.Cleanup(func() { tenantCARegistryShared = previous })
+	transport := newTenantTransportAuthority(nil, nil, time.Now)
+	device := newTenantDeviceAuthority(nil, nil, time.Now)
+	if _, err := transport.EnsureCA("TenantA", "a.dsse.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	managed, err := device.EnsureCA("TenantA", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	registerTenantTransportMaterialRoute(mux, transport, nil, device, "test-token", time.Hour,
+		tenantca.NewTenantCARegistry(), true)
+	req := httptest.NewRequest(http.MethodPost, "/tenant-edge-material", strings.NewReader(`{"tenants":["TenantA"]}`))
+	req.Header.Set("Authorization", "Bearer test-token")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("material status = %d", w.Code)
+	}
+	var response struct {
+		DeviceIdentity []tenantDeviceMaterial `json:"device_identity"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.DeviceIdentity) != 1 || !strings.Contains(response.DeviceIdentity[0].AdmissionCAPEM, managed.CACertPEM) {
+		t.Fatal("managed CA disappeared from exact-case organization's admission material")
+	}
+}
+
 func TestPKIDeviceGateRetainsBYOButNeverAnExplicitlyRegisteredRetiredManagedCA(t *testing.T) {
 	_, de, _ := pkiTestAuthorities(t)
 	before := copyAuthority(de.cas["tenant_a"])

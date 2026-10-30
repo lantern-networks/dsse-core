@@ -117,11 +117,14 @@ func TestTheDNSResidueFilenameMatchesWhatTheAgentWrites(t *testing.T) {
 		t.Error("the DNS backup is no longer written beside the agent binary; the watchdog resolves it from " +
 			"the agent's directory and would silently stop finding it")
 	}
-	// The residue is only meaningful because it is CONSUMED on restore. If the agent stopped deleting it, the
-	// watchdog would see residue forever and recover healthy boxes.
-	if !strings.Contains(agent, "os.Remove(backup)") {
-		t.Error("restoreResolverFromBackup no longer deletes the backup; its presence would stop meaning " +
-			"'DNS was taken over and not restored', and the watchdog would act on healthy boxes")
+	// The residue is only meaningful because it is CONSUMED after a verified restore. The steer package's
+	// behavior tests cover saving before DNS changes and retaining the backup when restore verification fails.
+	// This cross-package guard only checks that the recovery path still invokes that protected removal.
+	if !strings.Contains(agent, "func restoreResolverAt(") ||
+		!strings.Contains(agent, "if err := m.removeSnapshot(); err != nil") ||
+		!strings.Contains(agent, "os.Remove(m.backup)") {
+		t.Error("restoreResolverAt no longer uses protected backup removal; the watchdog could treat " +
+			"a healthy box as one with unfinished DNS takeover")
 	}
 }
 

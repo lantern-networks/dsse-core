@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // bootstrap.go — creating the deployment's first administrator, and closing the circle that let it be created.
@@ -45,10 +47,11 @@ type bootstrapResult struct {
 	Email         string   `json:"email"`
 	TOTPSecret    string   `json:"totp_secret"`
 	RecoveryCodes []string `json:"recovery_codes"`
-	// OperatorToken is the named API credential that replaces the break-glass one for everything asked over
-	// the API. Shown once, like the rest; never written to deployment.env, because it is a credential and
-	// deployment.env is configuration a deployment reads at every start.
-	OperatorToken string `json:"-"`
+	// OperatorToken replaces the break-glass API credential. Saved only to the
+	// explicitly requested private output file, or shown once in captured output;
+	// never written to deployment.env or a runtime-node carry.
+	OperatorToken        string `json:"-"`
+	InstallReadTokenFile string `json:"-"`
 }
 
 // bootstrapFirstAdministrator invites, activates and proves the deployment's first named administrator.
@@ -70,6 +73,25 @@ func bootstrapFirstAdministrator(dir, cpAdmin, email, password string) (*bootstr
 		return nil, fmt.Errorf("deployment.env carries no ADMIN_TOKEN, so the break-glass credential cannot be used")
 	}
 	cpAdmin = strings.TrimRight(cpAdmin, "/")
+	// Reserve the issuer-only read credential before changing the authority.
+	// Existing deployments use a named administrator to provision a replacement;
+	// never re-arm bootstrap or issue a token using another API token.
+	var readOutput *os.File
+	readSaved := false
+	readPath := ""
+	if plan, planErr := loadInstallPlan(dir, ""); planErr == nil && declaredNodeMapProfile(plan.Profile) {
+		readPath = privateInstallReadTokenDestination(dir)
+		readOutput, err = os.OpenFile(readPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return nil, fmt.Errorf("reserve private installation read token before bootstrap (never overwrite): %w", err)
+		}
+		defer func() {
+			readOutput.Close()
+			if !readSaved {
+				os.Remove(readPath)
+			}
+		}()
+	}
 
 	// 1. Invite. This is the call that needs the break-glass credential armed.
 	body, _ := json.Marshal(map[string]any{"email": email, "roles": []string{"admin", "super_admin"}})
@@ -94,6 +116,9 @@ func bootstrapFirstAdministrator(dir, cpAdmin, email, password string) (*bootstr
 			runtimePath(dir, adminBootstrappedMarker))
 	}
 	if code == 503 {
+		if bootstrapAuthorityUnavailable(code, raw) {
+			return nil, fmt.Errorf("the control plane did not become able to admit writes within %s: %s", adminLeadershipWait, first(raw, 200))
+		}
 		return nil, fmt.Errorf("the control plane answered 503: first-party admin accounts are not enabled. " +
 			"The generated start script passes -first-party-accounts; a control plane started another way needs it")
 	}
@@ -190,6 +215,22 @@ func bootstrapFirstAdministrator(dir, cpAdmin, email, password string) (*bootstr
 			"(%w) — once the break-glass credential is closed, nothing could ask it a deployment-wide "+
 			"question", oerr)
 	}
+	if readOutput != nil {
+		readToken, err := mintInstallationReadToken(client, cpAdmin, session)
+		if err != nil {
+			return nil, fmt.Errorf("administrator exists but installation read credential was not provisioned: %w", err)
+		}
+		if _, err = readOutput.WriteString(readToken + "\n"); err == nil {
+			err = readOutput.Sync()
+		}
+		if err == nil {
+			err = readOutput.Close()
+		}
+		if err != nil {
+			return nil, fmt.Errorf("administrator exists but installation read credential could not be saved: %w", err)
+		}
+		readSaved = true
+	}
 	// 5. Close the circle. The marker is what stops the start script arming the break-glass credential again,
 	// so the closing happens on the next restart whether or not anybody remembered.
 	marker := fmt.Sprintf("%s created the first administrator (%s) at %s.\n"+
@@ -201,7 +242,7 @@ func bootstrapFirstAdministrator(dir, cpAdmin, email, password string) (*bootstr
 			"break-glass credential would be armed again on the next restart", err)
 	}
 	return &bootstrapResult{Email: email, TOTPSecret: secret, RecoveryCodes: completed.RecoveryCodes,
-		OperatorToken: operatorToken}, nil
+		OperatorToken: operatorToken, InstallReadTokenFile: readPath}, nil
 }
 
 // postJSON is post() with the body marshalled and no bearer: from the password step onward the INVITATION is
@@ -269,6 +310,10 @@ func totpNow(secret string) (string, error) {
 
 // runBootstrapAdmin drives the bootstrap and reports what an operator has to keep.
 func runBootstrapAdmin(dir, cpAdmin, email, password string) error {
+	return runBootstrapAdminWithTokenFile(dir, cpAdmin, email, password, "")
+}
+
+func runBootstrapAdminWithTokenFile(dir, cpAdmin, email, password, tokenFile string) error {
 	dir, cpAdmin, email = strings.TrimSpace(dir), strings.TrimSpace(cpAdmin), strings.TrimSpace(email)
 	if dir == "" || cpAdmin == "" || email == "" {
 		return fmt.Errorf("-dir, -control-plane and -admin-email are all required")
@@ -289,6 +334,21 @@ func runBootstrapAdmin(dir, cpAdmin, email, password string) error {
 			"credential is no longer armed, so sign in as them instead",
 			runtimePath(dir, adminBootstrappedMarker))
 	}
+	var tokenOutput *os.File
+	tokenSaved := false
+	if tokenFile != "" {
+		var err error
+		tokenOutput, err = os.OpenFile(tokenFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err != nil {
+			return fmt.Errorf("reserve private operator token file before bootstrap (never overwrite): %w", err)
+		}
+		defer func() {
+			tokenOutput.Close()
+			if !tokenSaved {
+				os.Remove(tokenFile)
+			}
+		}()
+	}
 	// ★★★ SAID BEFORE ANYTHING IS MINTED, NOT AFTER (2026-08-26, learned by losing them). This command prints
 	// a password, a second factor, recovery codes and an API token exactly once and stores none of them —
 	// deliberately, because that is what makes them credentials rather than configuration.
@@ -304,9 +364,10 @@ func runBootstrapAdmin(dir, cpAdmin, email, password string) error {
 	// and a property this large — write access to one directory is owner-level access to the deployment —
 	// was hidden behind a sentence claiming the opposite. It is stated here and in the threat model, and the
 	// recovery is described so that whoever needs it does not invent a worse one.
-	fmt.Printf("★ CAPTURE THIS OUTPUT. What follows is shown ONCE and is stored nowhere — not by this\n")
-	fmt.Printf("  installer, not in the deployment directory. If you are not capturing, stop now and run it\n")
-	fmt.Printf("  again as:  dsse-install -bootstrap-admin … 2>&1 | tee credentials.txt\n\n")
+	fmt.Printf("★ CAPTURE THIS OUTPUT. Password, second factor and recovery codes are shown ONCE.\n")
+	fmt.Printf("  Only API token files are saved: the requested operator file and, for shared fleets, the\n")
+	fmt.Printf("  issuer-only installation reader. If not capturing the other credentials, stop and run it\n")
+	fmt.Printf("  again as:  (umask 077; set -C; dsse-install -bootstrap-admin … > credentials.txt 2>&1)\n\n")
 	fmt.Printf("  ★★ IF YOU LOSE THEM, the way back is on the control plane's machine and it is not a nice\n")
 	fmt.Printf("  one: move %s aside, restart the control plane, and the\n", runtimePath("<dir>", adminBootstrappedMarker))
 	fmt.Printf("  break-glass credential in deployment.env is armed again — owner-level, with every act\n")
@@ -316,7 +377,12 @@ func runBootstrapAdmin(dir, cpAdmin, email, password string) error {
 
 	generated := false
 	if strings.TrimSpace(password) == "" {
-		password, generated = randomSecret(), true
+		var err error
+		password, err = randomSecret()
+		if err != nil {
+			return fmt.Errorf("generate administrator password: %w", err)
+		}
+		generated = true
 	}
 
 	result, err := bootstrapFirstAdministrator(dir, cpAdmin, email, password)
@@ -333,13 +399,34 @@ func runBootstrapAdmin(dir, cpAdmin, email, password string) error {
 		fmt.Printf("  recovery codes  %s\n", strings.Join(result.RecoveryCodes, " "))
 	}
 	if strings.TrimSpace(result.OperatorToken) != "" {
-		fmt.Printf("  api token       %s\n", result.OperatorToken)
-		fmt.Printf("                  (named \"deployment-operator\" — this is what -verify -admin-token and\n")
-		fmt.Printf("                   -who-depends take, once the break-glass credential is closed)\n")
+		if tokenOutput != nil {
+			_, saveErr := tokenOutput.WriteString(result.OperatorToken + "\n")
+			if saveErr == nil {
+				saveErr = tokenOutput.Sync()
+			}
+			if saveErr == nil {
+				saveErr = tokenOutput.Close()
+			}
+			if saveErr != nil {
+				// The account already exists. Preserve recoverability in the
+				// explicitly captured credentials output instead of losing it.
+				fmt.Printf("  api token       %s\n", result.OperatorToken)
+				return fmt.Errorf("administrator exists but operator token file could not be saved; retain the captured credentials: %w", saveErr)
+			}
+			tokenSaved = true
+			fmt.Printf("  operator token saved in private file %s\n", tokenFile)
+		} else {
+			fmt.Printf("  api token       %s\n", result.OperatorToken)
+			fmt.Printf("                  (named \"deployment-operator\" — this is what -verify -admin-token and\n")
+			fmt.Printf("                   -who-depends take, once the break-glass credential is closed)\n")
+		}
+	}
+	if result.InstallReadTokenFile != "" {
+		fmt.Printf("  installation read token saved in private file %s (admin.state.read only)\n", result.InstallReadTokenFile)
 	}
 	reportConsoleFirstVisit(dir, consoleURLForFirstVisit(dir))
-	fmt.Printf("\n  ★ THIS IS THE ONLY TIME THESE ARE SHOWN. They are not stored anywhere this installer can\n")
-	fmt.Printf("  read them back, which is what makes them credentials rather than configuration.\n")
+	fmt.Printf("\n  ★ Password, second factor and recovery codes cannot be read back from this installer.\n")
+	fmt.Printf("  An operator token file, when requested, remains a secret: keep it off runtime nodes and carries.\n")
 	fmt.Printf("\n  ★★★ AND CARRY TWO THINGS TO EVERY OTHER REGION'S DIRECTORY (2026-08-25, measured on a\n")
 	fmt.Printf("  two-region deployment). What just happened is a fact about the DEPLOYMENT — the break-glass\n")
 	fmt.Printf("  credential stops working and the fleet gets its own — but it was recorded in ONE directory.\n")
@@ -425,6 +512,9 @@ func mintFleetToken(client *http.Client, cpAdmin string, session adminSession) (
 			// which is also what a deployment that has published nothing says. The two are indistinguishable
 			// from the device, and neither the Edge nor the screen said a scope was missing.
 			"admin.agents.read",
+			// The Edge must receive all tenant-scoped canaries as well as the catalogue. The CP route accepts
+			// this scope only from a token belonging to the deployment operator's organization.
+			"admin.agent_updates.distribution.read",
 		},
 	})
 	code, raw, err := postAsAdministrator(client, strings.TrimRight(cpAdmin, "/")+"/admin/api-tokens", session, body)
@@ -471,13 +561,17 @@ func replaceEnvValue(path, name, value string) error {
 	if !replaced {
 		lines = append(lines, name+"="+value)
 	}
-	return os.WriteFile(path, []byte(withTrailingNewline(strings.Join(lines, "\n"))), 0o600)
+	// This file contains live credentials. Publish a complete private replacement;
+	// never truncate the currently usable configuration before the new bytes exist.
+	// A post-rename flush failure remains an error and must not be retried by
+	// truncating the destination.
+	return durablefile.Write(path, []byte(withTrailingNewline(strings.Join(lines, "\n"))), 0o600)
 }
 
 // mintOperatorToken creates the named API credential the deployment's operator asks questions with.
 //
-// ★ THE ROLES, NOT A SCOPE LIST. The fleet token beside it is deliberately scoped to two reads, because an
-// Edge only ever reads. This one replaces a person's reach, and the questions it exists for — is this
+// ★ THE ROLES, NOT A SCOPE LIST. The fleet token enumerates the Edge's required
+// scopes, while the installation reader has only admin.state.read. This one replaces a person's reach, and the questions it exists for — is this
 // deployment one deployment, who trusts it, is anything about to be stranded — are answered only to a caller
 // the control plane recognises as operating the whole deployment. Narrowing it to a scope list produced a
 // token that authenticated and was then answered with the customer projection, which reads as "everything is
@@ -509,7 +603,31 @@ func mintOperatorToken(client *http.Client, cpAdmin string, session adminSession
 	return "", fmt.Errorf("the control plane returned a token record but no token value")
 }
 
-// waitForALeaderToExist retries an administrative write while the control plane answers 409.
+// This credential can inspect state, but cannot activate features, change
+// policy, issue credentials or manage tenants. It is held only by the issuer,
+// never in deployment.env/carries. Its expiry follows the existing API policy.
+func mintInstallationReadToken(client *http.Client, cpAdmin string, session adminSession) (string, error) {
+	body, _ := json.Marshal(map[string]any{
+		"name": "installation-state-read", "roles": []string{"admin"}, "scopes": []string{"admin.state.read"},
+	})
+	code, raw, err := postAsAdministrator(client, strings.TrimRight(cpAdmin, "/")+"/admin/api-tokens", session, body)
+	if err != nil {
+		return "", fmt.Errorf("create installation read credential failed")
+	}
+	if code != http.StatusCreated && code != http.StatusOK {
+		return "", fmt.Errorf("create installation read credential refused (HTTP %d)", code)
+	}
+	var minted struct {
+		RawToken string `json:"raw_token"`
+	}
+	if json.Unmarshal(raw, &minted) != nil || strings.TrimSpace(minted.RawToken) == "" {
+		return "", fmt.Errorf("authority returned no installation read credential")
+	}
+	return strings.TrimSpace(minted.RawToken), nil
+}
+
+// waitForALeaderToExist retries temporary authority refusals (503), retaining
+// compatibility with the previous server's 409 routing refusal.
 //
 // ★★★ A STEP MAY NOT REQUIRE ITS READER TO ALREADY KNOW TO WAIT (2026-09-01, measured while walking the
 // printed order end to end). -bootstrap-admin's stated precondition is "the control plane answering", and it
@@ -524,7 +642,7 @@ func mintOperatorToken(client *http.Client, cpAdmin string, session adminSession
 // ★ AND THE WAIT IS BOUNDED, because a wait without one is a step that hangs and says nothing.
 func waitForALeaderToExist(code int, raw []byte, again func() (int, []byte, error)) (int, []byte, error) {
 	var err error
-	for waited := time.Duration(0); code == 409 && waited < adminLeadershipWait; waited += adminLeadershipPoll {
+	for waited := time.Duration(0); bootstrapAuthorityUnavailable(code, raw) && waited < adminLeadershipWait; waited += adminLeadershipPoll {
 		if waited == 0 {
 			fmt.Printf("  the control plane answers and has not elected a leader yet — waiting up to %s.\n",
 				adminLeadershipWait)
@@ -536,6 +654,27 @@ func waitForALeaderToExist(code int, raw []byte, again func() (int, []byte, erro
 		}
 	}
 	return code, raw, nil
+}
+
+func bootstrapAuthorityUnavailable(code int, raw []byte) bool {
+	if code == 409 {
+		return true
+	}
+	if code != 503 {
+		return false
+	}
+	var response struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(raw, &response) != nil {
+		return false
+	}
+	for _, reason := range []string{"this control plane does not hold leadership", "control-plane consensus is unavailable", "no accepting control-plane is available"} {
+		if strings.HasPrefix(response.Error, reason) {
+			return true
+		}
+	}
+	return false
 }
 
 // How long an administrative write waits for a leader, and how often it asks. A deployment that has just

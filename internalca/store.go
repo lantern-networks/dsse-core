@@ -229,6 +229,9 @@ func (s *Store) ReplaceTenant(tenantID string, authorities []Authority) error {
 	tenantID = strings.TrimSpace(tenantID)
 	copied := append([]Authority(nil), authorities...)
 	for i := range copied {
+		if owner := strings.TrimSpace(copied[i].TenantID); owner != "" && owner != tenantID {
+			return fmt.Errorf("internal authority belongs to a different organization")
+		}
 		copied[i].TenantID = tenantID
 	}
 	next, err := validatedAuthorities(copied)

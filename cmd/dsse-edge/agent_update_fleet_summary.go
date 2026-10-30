@@ -172,7 +172,7 @@ func agentUpdateEventFromAuditRow(row map[string]any, tenantID string) (model.Ag
 	// same-payload check rejected the live one as "a different event with the same id". Two decoders for one
 	// format is the same class as the two derivations of a key id, and it arrives the same way.
 	return agentUpdateEventFromAuditMetadata(id, tenantID, device, metadata),
-		strings.ToLower(tenantID) + "\x00" + device + "\x00" + id, true
+		strings.TrimSpace(tenantID) + "\x00" + device + "\x00" + id, true
 }
 
 // agentUpdateEventFromAuditMetadata is THE decoder for a shipped agent-update audit record. The ingest

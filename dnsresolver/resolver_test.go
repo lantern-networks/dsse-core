@@ -203,7 +203,20 @@ func (f *fakeConnectorDNS) ResolveViaConnector(_ context.Context, upstream strin
 func TestDNSResolverForwardZone(t *testing.T) {
 	now := time.Now()
 	ct := dns.NewConntrackStore()
-	conn := &fakeConnectorDNS{resp: dnsAplusHTTPSEch(t, "dc01.corp.example.com.", [4]byte{10, 10, 0, 10})}
+	// The private resolver must answer the actual SRV question, not an unrelated
+	// A question: runtime validation now verifies transaction and question fields.
+	privateName := dnsmessage.MustNewName("_ldap._tcp.dc._msdcs.corp.example.com.")
+	privateResponse := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: 0x4242, Response: true},
+		Questions: []dnsmessage.Question{{Name: privateName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET}},
+		Answers: []dnsmessage.Resource{{Header: dnsmessage.ResourceHeader{Name: privateName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET, TTL: 60},
+			Body: &dnsmessage.SRVResource{Port: 389, Target: dnsmessage.MustNewName("dc01.corp.example.com.")}}},
+	}
+	privateRaw, err := privateResponse.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &fakeConnectorDNS{resp: privateRaw}
 	r := &Resolver{
 		tenantID:     "t",
 		upstream:     fakeUpstream{resp: dnsAplusHTTPSEch(t, "www.example.com.", [4]byte{203, 0, 113, 7})},

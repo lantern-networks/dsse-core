@@ -47,10 +47,10 @@ func TestUninstallTakesBackWhatProvisioningTrusted(t *testing.T) {
 		t.Skip("the package file is not here")
 	}
 	w := string(wxs)
-	if !strings.Contains(w, `Action="RemoveProvisionedAnchors"`) {
+	if !strings.Contains(w, `Action="UninstallMachineState"`) {
 		t.Fatal("the package never runs the removal")
 	}
-	i := strings.Index(w, `<Custom Action="RemoveProvisionedAnchors"`)
+	i := strings.Index(w, `<Custom Action="UninstallMachineState"`)
 	if j := strings.LastIndex(w[:i], "<?ifdef"); j >= 0 {
 		if k := strings.LastIndex(w[:i], "<?endif?>"); k < j {
 			t.Error("the removal is inside a build-time conditional again — that is exactly what left the " +
@@ -60,7 +60,7 @@ func TestUninstallTakesBackWhatProvisioningTrusted(t *testing.T) {
 	if !strings.Contains(w[i:i+220], `REMOVE~=&quot;ALL&quot;`) {
 		t.Error("the removal is not conditioned on a full uninstall")
 	}
-	if !strings.Contains(w[i:i+220], `Before="RemoveFiles"`) {
+	if !strings.Contains(w[i:i+220], `Before="DeleteServices"`) {
 		t.Error("the removal runs after the artefacts it reads have been deleted, so it can name nothing")
 	}
 }

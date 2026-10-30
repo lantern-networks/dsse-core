@@ -14,20 +14,19 @@ func TestARenamedRootFileIsStillFoundAndReused(t *testing.T) {
 	dir := t.TempDir()
 	legacy := filepath.Join(dir, "domestic_sse_lab_tls_root_ca.pem")
 
-	// Stand up a root under the previous name by letting the Edge create one, then renaming both halves.
-	first, err := NewNetworkExtensionLabTLSInterceptionWithPersistentRoot([]string{"example.com"}, time.Now,
-		filepath.Join(dir, NetworkExtensionLabTLSRootCertFilename))
+	// A legacy deployment predates the authoritative snapshot. Seed its valid
+	// two-file pair under the previous name and migrate it without minting a
+	// second root under the current name.
+	material, err := GenerateNetworkExtensionLabTLSRootMaterial(time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	before := string(first.rootCertPEM)
-	for from, to := range map[string]string{
-		filepath.Join(dir, NetworkExtensionLabTLSRootCertFilename):                                    legacy,
-		NetworkExtensionLabTLSRootKeyPath(filepath.Join(dir, NetworkExtensionLabTLSRootCertFilename)): NetworkExtensionLabTLSRootKeyPath(legacy),
-	} {
-		if err := os.Rename(from, to); err != nil {
-			t.Fatal(err)
-		}
+	before := string(material.CertPEM)
+	if err := os.WriteFile(legacy, material.CertPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(NetworkExtensionLabTLSRootKeyPath(legacy), material.KeyPEM, 0600); err != nil {
+		t.Fatal(err)
 	}
 
 	// Point at the DIRECTORY, as the exposed deployment shape does.

@@ -46,6 +46,9 @@ func carryPlanMachine(plan *Plan, dir, dest, machineName string) error {
 		return err
 	}
 	defer os.RemoveAll(staged)
+	if err := writeInstallPlan(staged, plan); err != nil {
+		return err
+	}
 	carried, withheld, err := carryDeploymentFor(staged, dest, shape, region.ID, values)
 	if err != nil {
 		return err
@@ -76,7 +79,7 @@ func (p *Plan) MachineNames() []string {
 // shapeOf turns what a machine HOLDS and what its region holds into the shape the rest of this installer
 // already speaks. There is no second vocabulary: a plan produces the same machines the flags do.
 // ★★★ AND THE TWO AXES ARE NOT ONE (2026-08-28, measured: the Edge machine came up running Postgres, etcd,
-// ClickHouse and the archive, and no Edges at all). holds is what the REGION holds; edges is whether THIS
+// ClickHouse but no object-storage server, and no Edges at all). holds is what the REGION holds; edges is whether THIS
 // MACHINE runs the Edge processes. Reading the region's holding onto every machine of it gives the state
 // services to a machine whose job is to serve traffic — which is the co-location one component per machine
 // exists to end, arrived at from the other direction.
@@ -94,7 +97,7 @@ func (p *Plan) shapeOf(region PlanRegion, machine PlanMachine) machineShape {
 	// pass it as well is asking them to restate something the plan already says — and the printed order did
 	// not pass it, so the founding machine rendered three members in one place while its environment named
 	// one. The environment and the file it configures disagreed, and nothing said so.
-	spans := len(p.stateBearingRegions()) > 1
+	spans := len(p.stateBearingRegions()) > 1 || p.oneRegionThreeNodes()
 
 	if !machine.Holds.has("control-plane") {
 		// A machine that runs Edges runs Edges. What its region holds is the control-plane machine's business.
@@ -104,6 +107,12 @@ func (p *Plan) shapeOf(region PlanRegion, machine PlanMachine) machineShape {
 		// not exist as a role: a region could only be widened by putting whole doorways beside each other,
 		// each in front of its own Edge.
 		return machineShape{holds: regionShapeEdgesOnly, edges: edges, behindDoorway: edges}
+	}
+	if p.oneRegionThreeNodes() {
+		if machine.Name == region.controlPlane().Name {
+			return machineShape{holds: regionShapeStateBearing, edges: true, storeSpansRegions: true}
+		}
+		return machineShape{holds: regionShapeStateBearingJoin, edges: true, storeSpansRegions: true}
 	}
 	switch {
 	case region.Founding:
@@ -130,6 +139,12 @@ func stageForMachine(dir string, values map[string]string) (string, error) {
 	if out, cerr := exec.Command("cp", "-pR", dir+string(filepath.Separator)+".", staged).CombinedOutput(); cerr != nil {
 		os.RemoveAll(staged)
 		return "", fmt.Errorf("stage %s: %v: %s", dir, cerr, out)
+	}
+	// An existing authority directory may contain launchers from an older installer.
+	// Render the current flag wiring in the staged copy, without changing authorities.
+	if err := writeLaunchScripts(staged); err != nil {
+		os.RemoveAll(staged)
+		return "", err
 	}
 	envPath := filepath.Join(staged, "deployment.env")
 	body, rerr := os.ReadFile(envPath)

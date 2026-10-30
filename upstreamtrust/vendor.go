@@ -69,6 +69,22 @@ type cacheKey struct {
 
 var transports sync.Map
 
+// CloseIdleConnectionsForTransport closes only idle pools derived from this
+// exact base trust/TLS profile. Active responses and other tenants are untouched.
+// The immutable profiles and host wrappers remain reusable under their own mode.
+func CloseIdleConnectionsForTransport(base *http.Transport) {
+	if base == nil {
+		return
+	}
+	transports.Range(func(key, value any) bool {
+		if key.(cacheKey).base == base {
+			value.(*hostTransport).transport.CloseIdleConnections()
+		}
+		return true
+	})
+	base.CloseIdleConnections()
+}
+
 // ForHost augments only the listed service's HTTPS transport. It keeps the normal
 // Go TLS verifier, existing anchors, dialer, callbacks and HTTP/2 configuration.
 // It never writes the system trust store or learns an authority from a peer/AIA URL.

@@ -67,6 +67,79 @@ test('unavailable legal hold never renders Off or a mutation button', async () =
   }
 });
 
+test('local-only retention explains preservation without offering an ineffective save', async () => {
+  const texts=[];
+  const host={appendChild(){},innerHTML:''};
+  const context=vm.createContext({host,freshRender:()=>()=>true,bl:v=>v.en,
+    apiFetch:async()=>({ok:true,body:{archive_enabled:false,overrides_days:{}}}),
+    uiField:()=>{throw new Error('local-only retention must not render inputs');},
+    el:(tag,props)=>{if(tag==='button')throw new Error('local-only retention must not render save');if(props?.text)texts.push(props.text);return {};}});
+  vm.runInContext(source,context);
+  await vm.runInContext('laRetentionConfig(host)',context);
+  assert.ok(texts.some(v=>v.includes('not deleted when a retention period passes')));
+});
+
+test('archive health shows only deployment status, backlog and webhook readiness', async () => {
+  const texts=[];
+  const host={appendChild(){},innerHTML:''};
+  const context=vm.createContext({host,freshRender:()=>()=>true,bl:v=>v.en,
+    apiFetch:async()=>({ok:true,body:{archive_enabled:true,webhook_configured:false,state:{status:'degraded',reason:'put_failed',backlog:9,oldest_at:'2026-10-20T00:00:00Z',pending:[{sequence:1}]}}}),
+    uiState:()=>{},el:(tag,props)=>{if(props?.text)texts.push(props.text);return {};}});
+  vm.runInContext(source,context);
+  await vm.runInContext('laArchiveHealth(host)',context);
+  assert.ok(texts.some(v=>v.includes('Attention required')));
+  assert.ok(texts.some(v=>v.includes('Rows due for archival: 9')));
+  assert.ok(!texts.some(v=>v.includes('2026-10-20T00:00:00Z')));
+  assert.ok(texts.some(v=>v.includes('Signed webhook delivery has not been verified')));
+  assert.ok(!texts.some(v=>v.includes('bucket') || v.includes('endpoint')));
+});
+
+test('manual hot deletion previews exact scope before a separate explicit confirmation', async () => {
+  const calls=[], buttons=[], confirmations=[], messages=[];
+  const values={stream:'access',before:'2026-10-19'};
+  const host={appendChild(){},innerHTML:''};
+  const context=vm.createContext({host,bl:v=>v.en,operateTenant:'tenant_a',
+    uiField:opts=>({el:{},get:()=>values[opts.name]}),
+    el:(tag,props={})=>{
+      const node={textContent:props.text||'',appendChild(){},addEventListener:(event,fn)=>{if(tag==='button')buttons.push(fn);}};
+      if(props.text)messages.push(props.text);
+      return node;
+    },
+    uiToast:()=>{},uiConfirm:async opts=>{confirmations.push(opts);return true;},
+    apiFetch:async(method,path,body)=>{
+      calls.push({method,path,body});
+      if(path==='/admin/manual-hot-log-delete')return {ok:true,body:{jobs:[]}};
+      if(path.endsWith('/preview'))return {ok:true,body:{job:{job_id:'job_a',tenant_id:'tenant_a',stream:'access',before:values.before,preview_count:2,preview_digest:'sha256:abc'}}};
+      if(path.endsWith('/confirm'))return {ok:true,body:{status:'queued'}};
+      return {ok:true,body:{status:'completed',job_id:'job_a',preview_count:2,confirmed_absent_count:2}};
+    }});
+  vm.runInContext(source,context);
+  vm.runInContext('laManualHotLogDelete(host)',context);
+  assert.equal(calls.filter(v=>v.method==='POST').length,0);
+  await buttons[0]();
+  assert.equal(calls.filter(v=>v.method==='POST').length,1);
+  assert.equal(calls.find(v=>v.path.endsWith('/preview')).body.tenant_id,'tenant_a');
+  assert.equal(confirmations.length,0);
+  await buttons[1]();
+  assert.equal(confirmations.length,1);
+  assert.match(confirmations[0].body,/Unarchived rows will be lost/);
+  assert.deepEqual(calls.filter(v=>v.method==='POST').map(v=>v.method),['POST','POST']);
+  assert.equal(calls.find(v=>v.path.endsWith('/confirm')).body.preview_digest,'sha256:abc');
+});
+
+test('a retrying ClickHouse mutation is shown as requiring operator attention', async () => {
+  const host={appendChild(){},innerHTML:''};
+  const nodes=[];
+  const context=vm.createContext({host,bl:v=>v.en,operateTenant:'tenant_a',
+    uiField:()=>({el:{},get:()=>''}),
+    el:(tag,props={})=>{const node={textContent:props.text||'',appendChild(){},addEventListener(){}};nodes.push(node);return node;},
+    apiFetch:async()=>({ok:true,body:{jobs:[{stream:'access',status:'running',failure_code:'mutation_retrying',confirmed_absent_count:0,preview_count:1}]}})});
+  vm.runInContext(source,context);
+  vm.runInContext('laManualHotLogDelete(host)',context);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.ok(nodes.some(node=>node.textContent.includes('requires operator attention')));
+});
+
 test('regional coverage distinguishes zero from unavailable', () => {
   const context=vm.createContext({bl:v=>v.en});vm.runInContext(source,context);
   for(const value of [undefined,{status:'unavailable',unknown_region_count:null},{status:'available',unknown_region_count:null},{status:'available',unknown_region_count:-1}]){
@@ -90,7 +163,7 @@ test('failed hold mutations reload authoritative state and handle network errors
       el:(tag)=>({addEventListener:(event,handler)=>{if(tag==='button')click=handler;}}),
       apiFetch:async(method)=>{
         calls.push(method);
-        if(calls.length===1)return {ok:true,body:{tenant_held:true}};
+        if(calls.length===1)return {ok:true,body:{tenant_held:true,archive_enabled:true}};
         if(method==='POST'){if(failure instanceof Error)throw failure;return failure;}
         return {ok:false,status:503,body:{error:'unavailable'}};
       }});
@@ -149,6 +222,18 @@ function retentionHarness(api) {
  return {calls,states,toasts,buttons,fields,render:()=>vm.runInContext('laRetentionConfig(host)',context)};
 }
 
+test('local-only mode permits clearing a saved override but not setting days',async()=>{
+ const h=retentionHarness(async(method)=>({ok:true,body:{archive_enabled:false,overrides_days:method==='GET' && h.calls.length===1?{audit:30}:{}}}));
+ await h.render();
+ assert.equal(h.buttons.length,1);
+ assert.equal(h.fields.d,undefined);
+ await h.buttons[0].click();
+ const posts=h.calls.filter(c=>c[0]==='POST');
+ assert.equal(posts.length,1);
+ assert.equal(posts[0][2].stream,'audit');
+ assert.equal(posts[0][2].clear,true);
+});
+
 test('unavailable retention never masquerades as defaults or offers mutation controls',async()=>{
  for(const response of [{ok:false,status:501,body:{error:'log retention and legal hold are not enforced for ClickHouse'}},{ok:false,status:503},{ok:true,body:{}},{ok:true,body:{overrides_days:null}},{ok:true,body:{overrides_days:{audit:-1}}},new Error('offline')]){
   const h=retentionHarness(async()=>{if(response instanceof Error)throw response;return response;});
@@ -158,7 +243,7 @@ test('unavailable retention never masquerades as defaults or offers mutation con
 
 test('retention day entry rejects truncation and preserves explicit zero',async()=>{
  for(const value of ['', '0.5', '1.9', '2oops', '-1', '106752', '9007199254740993', '0','365','106751']){
-  const h=retentionHarness(async()=>({ok:true,body:{overrides_days:{audit:0}}}));
+  const h=retentionHarness(async()=>({ok:true,body:{archive_enabled:true,overrides_days:{audit:0}}}));
   await h.render();h.fields.d.value=value;await h.buttons[0].click();
   const posts=h.calls.filter(c=>c[0]==='POST');
   if(['0','365','106751'].includes(value)){assert.equal(posts.length,1);assert.equal(posts[0][2].days,Number(value));}
@@ -172,7 +257,7 @@ test('retention mutations disable both actions and reload after HTTP or network 
   const pending=new Promise(resolve=>{finish=resolve;});
   let reads=0;
   const h=retentionHarness(async(method)=>{
-   if(method==='GET'){reads++;return reads===1?{ok:true,body:{overrides_days:{audit:0}}}:{ok:false,status:503};}
+   if(method==='GET'){reads++;return reads===1?{ok:true,body:{archive_enabled:true,overrides_days:{audit:0}}}:{ok:false,status:503};}
    await pending;if(failure instanceof Error)throw failure;return failure;
   });
   await h.render();h.fields.d.value='90';
@@ -274,7 +359,8 @@ function volumeHarness(fetch) {
   vm.runInContext(source,context);
   vm.runInContext(`laLegalHold=h=>controls.push(['hold',h]);
     laAuditChain=h=>controls.push(['chain',h]);
-    laRetentionConfig=h=>controls.push(['retention',h]);`,context);
+    laRetentionConfig=h=>controls.push(['retention',h]);
+    laManualHotLogDelete=h=>controls.push(['manual-delete',h]);`,context);
   return {host,states,controls,nodes,render:()=>vm.runInContext('laVolume(host)',context)};
 }
 
@@ -283,13 +369,13 @@ test('volume request failure or a pending request cannot hide retention and audi
   const pending=new Promise(resolve=>{finish=resolve;});
   const h=volumeHarness(async(method,path)=>path.startsWith('/admin/logs/')?pending:{ok:true,body:{identities:[]}});
   const rendering=h.render();
-  assert.deepEqual(h.controls.map(c=>c[0]),['hold','chain','retention']);
-  assert.equal(h.host.children.length,4);
+  assert.deepEqual(h.controls.map(c=>c[0]),['hold','chain','retention','manual-delete']);
+  assert.equal(h.host.children.length,5);
   finish({ok:false,status:503});await rendering;
   const failure=h.states.find(s=>s[1]==='error');
   assert.equal(failure[0],h.host.children[0]);
   assert.match(failure[2],/503/);
-  assert.equal(h.host.children.length,4);
+  assert.equal(h.host.children.length,5);
 });
 
 test('volume count validates numeric data and retries only the failed estimate',async()=>{
@@ -315,7 +401,7 @@ test('volume transport failure remains local to the estimate',async()=>{
   const h=volumeHarness(async()=>{throw new Error('offline');});
   await h.render();
   assert.match(h.states.find(s=>s[1]==='error')[2],/offline/);
-  assert.equal(h.controls.length,3);
+  assert.equal(h.controls.length,4);
 });
 
 test('access decision summary never labels other streams with an allow rate',()=>{
@@ -554,9 +640,25 @@ test('unconfirmed local hold retries placement instead of releasing it', async()
  const c=vm.createContext({host,freshRender:()=>()=>true,bl:v=>v.en,
   uiConfirm:async()=>true,uiBadge:(text)=>{texts.push(text);return {};},uiToast(){},uiState(){},
   el:(tag,props)=>{texts.push(props?.text);return {addEventListener:(_,handler)=>{if(tag==='button')click=handler;}};},
-  apiFetch:async(method,path,body)=>{calls.push({method,body});return {ok:true,body:{tenant_held:true,pending_local_hold:method==='GET'}};}});
+  apiFetch:async(method,path,body)=>{calls.push({method,body});return {ok:true,body:{tenant_held:true,pending_local_hold:method==='GET',archive_enabled:true}};}});
  vm.runInContext(source,c);await vm.runInContext('laLegalHold(host)',c);await click();
  assert.equal(calls.find(x=>x.method==='POST').body.active,true);
  assert.ok(texts.includes('Save unconfirmed'));
  assert.ok(texts.some(x=>typeof x==='string' && x.includes('only in this process')));
+});
+
+test('a search the log store cannot answer says so instead of showing a status code', async () => {
+  for (const [status, want] of [[503, 'Cannot reach the log store'], [502, 'Cannot reach the log store'], [500, 'HTTP 500']]) {
+    const states = [];
+    const host = {isConnected: true};
+    const context = vm.createContext({host, freshRender: () => () => true, bl: v => v.en, URLSearchParams,
+      apiFetch: async () => ({ok: false, status, body: {error: 'log store unavailable'}}),
+      uiState: (...args) => states.push(args), el: () => ({})});
+    vm.runInContext(source, context);
+    await vm.runInContext('laLoadStream(host, null, null, false)', context);
+    const error = states.find(s => s[1] === 'error');
+    assert.ok(error, `status ${status} did not reach the error state`);
+    assert.ok(String(error[2]).includes(want), `status ${status} showed ${error[2]}`);
+    if (status !== 500) assert.ok(!String(error[2]).includes('HTTP'), `status ${status} still shows a code: ${error[2]}`);
+  }
 });

@@ -29,6 +29,26 @@ type connectorOrBrokerRoundTripper struct {
 	broker    http.RoundTripper // browser-faithful re-origination for the public web
 }
 
+// TenantConnectorTransport exposes only the connector leg for per-tenant transport
+// scoping. A shared HTTP connection skips DialContext, where connector routing
+// reads the tenant, so the connector leg must have a separate idle pool per tenant.
+// The broker leg is independent and remains unchanged.
+type TenantConnectorTransport interface {
+	ConnectorTransport() http.RoundTripper
+	WithTenantConnectorTransport(tenantID string, connector http.RoundTripper) http.RoundTripper
+}
+
+func (c *connectorOrBrokerRoundTripper) ConnectorTransport() http.RoundTripper {
+	return c.connector
+}
+
+func (c *connectorOrBrokerRoundTripper) WithTenantConnectorTransport(tenantID string, connector http.RoundTripper) http.RoundTripper {
+	clone := *c
+	clone.tenantID = tenantID
+	clone.connector = connector
+	return &clone
+}
+
 // NewConnectorOrBrokerRoundTripper routes connector-fronted destinations through connectorTransport and
 // everything else through brokerTransport. Self-gating: with no resolver (or none configured for the tenant)
 // every destination goes to the broker, which is the behaviour of a deployment that publishes no private apps.
@@ -41,9 +61,13 @@ func NewConnectorOrBrokerRoundTripper(resolve ConnectorResolveFunc, tenantID str
 
 func (c *connectorOrBrokerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	host := req.URL.Hostname()
+	tenantID := FlowTenantFromContext(req.Context())
+	if tenantID == "" {
+		tenantID = c.tenantID
+	}
 	// Same call shape as the connector egress dialer (host without port, empty namespace), so the selector and
 	// the dialer can never disagree about what "fronted by a connector" means.
-	_, fronted, err := c.resolve(req.Context(), c.tenantID, host, "")
+	_, fronted, err := c.resolve(req.Context(), tenantID, host, "")
 	switch {
 	case err != nil:
 		// Treat an unresolvable route layer as "no connector", matching ConnectorEgressDialContext. The request

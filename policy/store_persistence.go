@@ -21,6 +21,7 @@ import (
 // Contains policy configuration and non-secret SaaS allowlists; never credentials.
 // Legacy startup-file restriction values remain in the operator value store.
 type adminPolicyRuntimeStateFile struct {
+	UpstreamTLSModes            map[string]string                               `json:"upstream_tls_modes,omitempty"`
 	SaaSTenantRestrictions      map[string]map[string]tenantrestriction.Setting `json:"saas_tenant_restrictions,omitempty"`
 	SchemaVersion               string                                          `json:"schema_version"`
 	TenantRestrictionRuleStatus map[string]string                               `json:"tenant_restriction_rule_status,omitempty"`

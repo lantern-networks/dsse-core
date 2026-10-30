@@ -2,8 +2,12 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
+	"sync"
 	"sync/atomic"
+
+	"github.com/lantern-networks/dsse-core/blobstore"
 
 	"github.com/lantern-networks/dsse-core/decision"
 	"github.com/lantern-networks/dsse-core/dlp"
@@ -39,7 +43,12 @@ type dlpRuleRuntimeReader interface {
 // or restart. These are model.DLPRules WITH a selector (the removed tenant-wide store had none), so
 // runtime authoring gets the same per-destination scoping the bundle rules have.
 type dlpRuleRuntimeStore struct {
-	rules atomic.Pointer[map[string][]model.DLPRule]
+	mu          sync.Mutex
+	rules       atomic.Pointer[map[string][]model.DLPRule]
+	persister   blobstore.Persister
+	dirty       bool
+	generation  uint64
+	sharedKnown bool
 }
 
 func newDLPRuleRuntimeStore() *dlpRuleRuntimeStore {
@@ -55,21 +64,38 @@ func (s *dlpRuleRuntimeStore) RulesForTenant(tenantID string) []model.DLPRule {
 		return nil
 	}
 	if m := s.rules.Load(); m != nil {
-		return (*m)[tenantID]
+		return cloneDLPRules((*m)[tenantID])
 	}
 	return nil
 }
 
 // SetRules atomically replaces one tenant's DLP rules (copy-on-write swap of the whole map).
 func (s *dlpRuleRuntimeStore) SetRules(tenantID string, rules []model.DLPRule) {
-	next := map[string][]model.DLPRule{}
-	if old := s.rules.Load(); old != nil {
-		for k, v := range *old {
-			next[k] = v
+	// Own the caller's nested values before publishing. Only this tenant's
+	// slice is replaced; all other map values remain immutable across swaps.
+	rules = cloneDLPRules(rules)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	next := s.snapshotLocked()
+	if len(rules) == 0 {
+		delete(next.Rules, tenantID)
+	} else {
+		next.Rules[tenantID] = rules
+	}
+	s.rules.Store(&next.Rules)
+	s.dirty = true
+	s.generation++
+}
+
+func cloneDLPRules(rules []model.DLPRule) []model.DLPRule {
+	out := slices.Clone(rules)
+	for i := range out {
+		out[i].Identifiers = slices.Clone(out[i].Identifiers)
+		if out[i].Metadata != nil {
+			out[i].Metadata = cloneDLPPolicyJSON(out[i].Metadata).(map[string]any)
 		}
 	}
-	next[tenantID] = rules
-	s.rules.Store(&next)
+	return out
 }
 
 // Tenants returns the tenant ids that have rules, ordered (for admin listing).

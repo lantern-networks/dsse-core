@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/lantern-networks/dsse-core/durablefile"
 )
 
 // shipSpool is the audit shipper's durable, bounded, restart-surviving buffer of un-acked records — the design's
@@ -54,9 +57,17 @@ func newShipSpool(path string, compactAt int) (*shipSpool, []auditShipItem, erro
 			return nil, nil, fmt.Errorf("create audit ship spool dir: %w", err)
 		}
 	}
-	replay, err := readShipSpool(path)
+	replay, unterminatedTail, err := readShipSpoolForStartup(path)
 	if err != nil {
 		return nil, nil, err
+	}
+	if unterminatedTail {
+		// Opening O_APPEND against a tail with no delimiter would concatenate the next record to it. Rewrite
+		// only the parsed records before opening the append handle; a failed repair blocks startup and leaves
+		// the original spool available for diagnosis.
+		if err := repairUnterminatedShipSpool(path, replay); err != nil {
+			return nil, nil, fmt.Errorf("repair unterminated audit ship spool before append: %w", err)
+		}
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
@@ -68,32 +79,107 @@ func newShipSpool(path string, compactAt int) (*shipSpool, []auditShipItem, erro
 	return &shipSpool{path: path, tmp: path + ".tmp", f: f, compactAt: compactAt}, replay, nil
 }
 
-// readShipSpool decodes every record currently in the spool file (empty if the file is absent). A torn final line
-// (a crash mid-append) is skipped rather than fatal — the record is still in the canonical jsonl.
+// readShipSpool decodes records for inspection without changing the file. The startup caller also receives
+// whether the final line lacks its delimiter, so it can repair that tail before opening the append handle.
 func readShipSpool(path string) ([]auditShipItem, error) {
+	out, _, err := readShipSpoolForStartup(path)
+	return out, err
+}
+
+// A torn final line (a crash mid-append) is skipped; a complete JSON record missing only the delimiter is
+// retained. Both forms require an atomic rewrite before append. A malformed newline-terminated line is not a
+// torn append: refuse replay and preserve the file rather than silently deleting a record at compaction.
+func readShipSpoolForStartup(path string) ([]auditShipItem, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("open audit ship spool for replay: %w", err)
+		return nil, false, fmt.Errorf("open audit ship spool for replay: %w", err)
 	}
 	defer f.Close()
 	var out []auditShipItem
+	var unterminatedTail bool
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+	// Unlike ScanLines, retain the newline in each token so a completed corrupt record is distinguishable from
+	// the single unterminated record that a crash can leave at EOF. Keep Scanner's existing per-record size cap.
+	sc.Split(func(data []byte, atEOF bool) (int, []byte, error) {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			return i + 1, data[:i+1], nil
+		}
+		if atEOF && len(data) > 0 {
+			return len(data), data, nil
+		}
+		return 0, nil, nil
+	})
+	lineNumber := 0
 	for sc.Scan() {
+		lineNumber++
 		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
+		terminated := line[len(line)-1] == '\n'
+		if !terminated {
+			unterminatedTail = true
 		}
 		var rec spoolRecord
 		if err := json.Unmarshal(line, &rec); err != nil {
-			continue // torn/partial line from a crash mid-append; canonical jsonl still holds it
+			if !terminated {
+				continue // torn final append; canonical jsonl still holds it
+			}
+			return nil, false, fmt.Errorf("audit ship spool replay stopped at malformed completed line %d: %w", lineNumber, err)
 		}
 		out = append(out, auditShipItem{stream: rec.S, record: rec.R})
 	}
-	return out, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, false, fmt.Errorf("audit ship spool replay read: %w", err)
+	}
+	return out, unterminatedTail, nil
+}
+
+// repairUnterminatedShipSpool writes a complete, newline-delimited spool before appending can resume. The
+// original path is not truncated or removed on staging failure. The canonical local JSONL still retains any
+// incomplete final record that cannot be replayed here.
+func repairUnterminatedShipSpool(path string, replay []auditShipItem) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".repair-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	w := bufio.NewWriter(tmp)
+	for _, item := range replay {
+		line, err := json.Marshal(spoolRecord{S: item.stream, R: item.record})
+		if err != nil {
+			_ = tmp.Close()
+			return err
+		}
+		if _, err := w.Write(line); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+		if err := w.WriteByte('\n'); err != nil {
+			_ = tmp.Close()
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), info.Mode().Perm()); err != nil {
+		return err
+	}
+	return durablefile.Replace(tmp.Name(), path)
 }
 
 // append durably records one queued item (best-effort: on a write error the canonical jsonl still holds the record).

@@ -23,6 +23,9 @@
 //	                              else gate off (back-compat; logged).
 //	ADMIN_SESSION_VALIDATE_CA     PEM CA used to verify upstream TLS on the validation + proxy calls (lab:
 //	                              the reference edge.crt, whose SANs cover edge + controlplane). Empty => roots.
+//	DSSE_CONSOLE_LOCAL_CP_LEADER_URL  Direct local CP /leader URL for the three-Node profile.
+//	DSSE_CONSOLE_LOCAL_CP_LEADER_NAME TLS name on that CP certificate; required with the URL.
+//	DSSE_CONSOLE_LEADER_ROUTING     JSON deployment CP probes and approved public Console origins.
 //
 // Same-origin admin front door (production topology — see docs/admin_console_production_topology_design.md):
 // to make the server-side gate hold across SEPARATE hosts, the console-server is the single public origin and
@@ -39,6 +42,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"io"
 	"log"
 	"net"
@@ -63,7 +67,7 @@ var publicAssets = map[string]bool{
 	"/i18n.js":                  true,
 	"/styles.css":               true,
 	"/brand/lantern-symbol.svg": true,
-	"/vendor/qrcode.min.js":     true,
+	"/vendor/qr.js":             true,
 	"/favicon.ico":              true,
 }
 
@@ -145,7 +149,12 @@ func validateSession(r *http.Request, validateURL string, client *http.Client) s
 	}
 	req.Header.Set("Cookie", cookie)
 	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
+	// The session authority's own 200 is the only success verdict. Following a
+	// redirect can turn an expired session's 302 to a public login page into a
+	// final 200 and incorrectly release protected Console assets.
+	validationClient := *client
+	validationClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := validationClient.Do(req)
 	if err != nil {
 		return sessionUnverifiable
 	}
@@ -215,7 +224,76 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
+// consoleReadyHandler admits only the Console colocated with the current CP
+// leader. All region doorways probe each Console through this endpoint, so a
+// doorway change cannot silently select a different management authority.
+// The probe carries no browser cookies or credentials to the CP.
+func consoleReadyHandler(leaderURL string, client *http.Client) http.Handler {
+	return &consoleReadiness{leaderURL: leaderURL, client: client, now: time.Now}
+}
+
+type consoleReadiness struct {
+	leaderURL  string
+	client     *http.Client
+	now        func() time.Time
+	mu         sync.Mutex
+	status     int
+	validUntil time.Time
+}
+
+func (p *consoleReadiness) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if p.leaderURL == "" || p.client == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	// Share both the in-flight probe and its result for one second. Anonymous
+	// bursts must not create a matching burst of internal CP requests. This is
+	// routing readiness, not write fencing; CP writes still check leadership.
+	p.mu.Lock()
+	if r.Context().Err() != nil {
+		p.mu.Unlock()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if !p.now().Before(p.validUntil) {
+		p.status = p.probe()
+		p.validUntil = p.now().Add(time.Second)
+	}
+	status := p.status
+	p.mu.Unlock()
+	w.WriteHeader(status)
+}
+
+func (p *consoleReadiness) probe() int {
+	// The result is shared with other callers. A disconnected caller must not
+	// cancel this work and cache a false failure for the whole Console.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.leaderURL, nil)
+	if err != nil {
+		return http.StatusServiceUnavailable
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return http.StatusServiceUnavailable
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode != http.StatusOK {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusOK
+}
+
 func main() {
+	if err := runtimequota.ValidateEnvironment(); err != nil {
+		log.Fatal(err)
+	}
 	dir := env("CONSOLE_DIR", "/console")
 	addr := env("LISTEN", ":8443")
 	certFile := os.Getenv("TLS_CERT")
@@ -257,6 +335,27 @@ func main() {
 	// the reverse proxies.
 	upstreamTLS := upstreamTLSConfig(os.Getenv("ADMIN_SESSION_VALIDATE_CA"))
 	validateClient := &http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{TLSClientConfig: upstreamTLS}}
+	navigation, err := newConsoleLeaderRouting(os.Getenv(consoleLeaderRoutingEnv), upstreamTLS)
+	if err != nil {
+		log.Fatal(err)
+	}
+	leaderURL := os.Getenv("DSSE_CONSOLE_LOCAL_CP_LEADER_URL")
+	leaderName := os.Getenv("DSSE_CONSOLE_LOCAL_CP_LEADER_NAME")
+	var leaderClient *http.Client
+	if leaderURL != "" {
+		parsed, err := url.Parse(leaderURL)
+		if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path != "/leader" ||
+			parsed.RawQuery != "" || parsed.User != nil || leaderName == "" {
+			log.Fatal("invalid local CP leader probe configuration")
+		}
+		leaderTLS := upstreamTLS.Clone()
+		leaderTLS.ServerName = leaderName
+		leaderClient = &http.Client{
+			Timeout:       2 * time.Second,
+			Transport:     &http.Transport{TLSClientConfig: leaderTLS},
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+	}
 
 	// Same-origin front door: proxy the admin API so the session cookie is always in scope. Routing splits the
 	// management surface across the two backends (docs/admin_auth_centralization_design.md):
@@ -278,6 +377,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
+	mux.Handle("/ready", consoleReadyHandler(leaderURL, leaderClient))
 	var edgeProxy http.Handler
 	if adminUpstream != "" {
 		edgeProxy = newReverseProxy(adminUpstream, upstreamTLS)
@@ -306,22 +406,22 @@ func main() {
 
 	srv := &http.Server{
 		Addr:      addr,
-		Handler:   securityHeaders(mux),
+		Handler:   securityHeaders(rejectMisdirectedConsoleRequest(withoutFleetConfigurationProxy(navigation.navigation(mux)))),
 		TLSConfig: tlsCfg,
 		// Public front-door hardening: bound the time to read request headers (Slowloris) + reap idle keep-alives
 		// + cap header size. ReadTimeout/WriteTimeout are deliberately unset: this reverse-proxies long admin
 		// calls (e.g. the AI-Ops LLM answer with its keepalive heartbeat) and must not time-bound the body.
 		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
+		IdleTimeout:       runtimequota.SecondsDefault("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", 120*time.Second),
 		MaxHeaderBytes:    1 << 20, // 1 MiB
 	}
-	// Cap concurrent connections so a fan-out / connection-exhaustion flood cannot run the public front door out
-	// of file descriptors (the timeouts above bound per-connection cost; this bounds the count). 0 = unlimited.
+	// Preserve the public Console's connection-exhaustion protection. An
+	// explicit administrator setting may size or disable it; unset retains it.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", addr, err)
 	}
-	if maxConns := envInt("CONSOLE_MAX_CONNECTIONS", 4096); maxConns > 0 {
+	if maxConns := runtimequota.CountDefault("CONSOLE_MAX_CONNECTIONS", 4096); maxConns > 0 {
 		ln = newLimitListener(ln, maxConns)
 		log.Printf("admin console: concurrent connection cap = %d (CONSOLE_MAX_CONNECTIONS)", maxConns)
 	}

@@ -135,7 +135,7 @@ runs one Edge on loopback. It is **not a deployment** and does not install an en
 | [Agent updates](docs/agent-updates.md) | Publish signed packages to enrolled devices |
 | [Operations](docs/operations.md) | Routine checks, change control, state, and recovery preparation |
 | [Troubleshooting](docs/troubleshooting.md) | Diagnose deployment, endpoint, policy, and update failures |
-| [Egress broker](egress-broker/README.md) | Optional curl-impersonate transport; the standard deployment uses Go HTTP/TLS |
+| [Egress broker](egress-broker/README.md) | Experimental source, not packaged or qualified in the proposed 0.4.0 distribution; the standard deployment uses Go HTTP/TLS |
 
 The policy evaluator is default-deny. The Console's initial organization policy can
 explicitly allow and inspect all traffic, and connector access starts in OBSERVE mode;
@@ -157,7 +157,8 @@ go test ./...
 ```
 
 The [egress broker](egress-broker/README.md) is a nested module with native dependencies;
-these commands do not build or test it. Platform-specific endpoint builds are described
+these commands do not build or test it, and 0.4.0 does not distribute its executable or
+image. Platform-specific endpoint builds are described
 in [Building](docs/building.md).
 
 ## Contributing and security

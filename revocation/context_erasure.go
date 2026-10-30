@@ -31,9 +31,10 @@ func (a *AdmissionRevocations) RemoveDevicesContext(ctx context.Context, ids []s
 			if err != nil {
 				return nil, err
 			}
-		} else if a.generation.Load() != 0 {
+		} else if a.generation.Load() != 0 && !a.originInitialPending && !a.meshInitialPending {
 			return nil, ErrAdmissionLoad
 		}
+		a.mergePendingAdmissionBlocks(&candidate)
 		for _, id := range ids {
 			id = normalizeIdentity(id)
 			if _, ok := candidate.Revoked[id]; ok {
@@ -52,6 +53,10 @@ func (a *AdmissionRevocations) RemoveDevicesContext(ctx context.Context, ids []s
 		a.generation.Add(1)
 	}
 	a.revoked, a.meshReceived = candidate.Revoked, candidate.MeshReceived
+	a.originPending = nil
+	a.originInitialPending = false
+	a.meshInitialPending = false
+	a.meshPending = nil
 	return n, nil
 }
 

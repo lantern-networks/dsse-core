@@ -12,7 +12,7 @@ it** — `go list -deps`, `go-licenses`, an SBOM built from `go.mod`. This file 
 | The `dsse-egress-broker` container image | **Yes.** `libcurl-impersonate.so*` and the `curl_*` CLI binaries are copied in by `Dockerfile.runtime*` |
 
 The runtime images carry both the checked-in notices and the upstream `LICENSE*` files
-from the verified native-library archive. Release v2.2.2 includes these upstream notices;
+from the verified native-library archive. Release v2.2.3 includes these upstream notices;
 the older v2.0.0 archive did not.
 
 The archive checksums are fixed in `engine-checksums.sha256`. The shared library and CLI
@@ -22,7 +22,7 @@ any distributed native binary.
 
 ## Components
 
-Pinned engine: `lexiforest/curl-impersonate` **v2.2.2**, reporting `libcurl/8.21.0-IMPERSONATE`.
+Pinned musl engine: `lexiforest/curl-impersonate` **v2.2.3**, reporting `libcurl/8.22.0-IMPERSONATE`.
 
 | Component | Licence | Text |
 |---|---|---|

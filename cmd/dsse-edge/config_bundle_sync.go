@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/lantern-networks/dsse-core/authrollout"
 	"github.com/lantern-networks/dsse-core/inspectionposture"
 	"io"
 	"log"
@@ -97,13 +98,15 @@ type configBundleSyncStatus struct {
 	// published. Without the epoch beside it, a reader comparing the numbers alone declares the Edge ahead of
 	// the control plane and calls distribution broken — which is exactly what the lab's posture check did for
 	// one poll cycle after every control-plane restart.
-	lastAppliedEpoch string
-	lastAppliedCount int
-	haveApplied      bool
-	lastAppliedAt    time.Time
-	lastError        string
-	lastErrorAt      time.Time
-	lastPollAt       time.Time
+	lastAppliedEpoch    string
+	lastGrantEpoch      string
+	lastGrantGeneration uint64
+	lastAppliedCount    int
+	haveApplied         bool
+	lastAppliedAt       time.Time
+	lastError           string
+	lastErrorAt         time.Time
+	lastPollAt          time.Time
 }
 
 func (s *configBundleSyncStatus) recordApplied(generation uint64, epoch string, count int, at time.Time) {
@@ -121,6 +124,20 @@ func (s *configBundleSyncStatus) recordApplied(generation uint64, epoch string, 
 	s.lastError = ""
 }
 
+// A newly started enforcing Edge must not serve traffic from its empty local
+// rule store while the first authoritative bundle is still in flight.
+func configBundleReadyForTraffic(source *configBundleSource, status *configBundleSyncStatus) bool {
+	if source == nil {
+		return true // authoritative-local node
+	}
+	if status == nil {
+		return false
+	}
+	status.mu.RLock()
+	defer status.mu.RUnlock()
+	return status.haveApplied
+}
+
 // recordPoll marks a successful poll that produced no apply (already at/ahead of the CP generation).
 func (s *configBundleSyncStatus) recordPoll(at time.Time) {
 	if s == nil {
@@ -130,6 +147,15 @@ func (s *configBundleSyncStatus) recordPoll(at time.Time) {
 	defer s.mu.Unlock()
 	s.lastPollAt = at
 	s.lastError = ""
+}
+
+func (s *configBundleSyncStatus) recordGrantSnapshot(epoch string, generation uint64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.lastGrantEpoch, s.lastGrantGeneration = epoch, generation
+	s.mu.Unlock()
 }
 
 func (s *configBundleSyncStatus) recordError(err error, at time.Time) {
@@ -145,10 +171,12 @@ func (s *configBundleSyncStatus) recordError(err error, at time.Time) {
 
 // snapshot returns the status as a JSON-serializable map for the admin/healthz surface.
 func (s *configBundleSyncStatus) snapshot() map[string]any {
-	out := map[string]any{"enabled": true}
 	if s == nil {
 		return map[string]any{"enabled": false}
 	}
+	// Public health uses only this in-memory pull status. Durable rollout
+	// evidence is assembled after authentication in config-sync-status.
+	out := map[string]any{"enabled": true}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out["source"] = s.source
@@ -156,6 +184,8 @@ func (s *configBundleSyncStatus) snapshot() map[string]any {
 	out["have_applied"] = s.haveApplied
 	out["last_applied_generation"] = s.lastAppliedGeneration
 	out["last_applied_epoch"] = s.lastAppliedEpoch
+	out["last_grant_epoch"] = s.lastGrantEpoch
+	out["last_grant_generation"] = s.lastGrantGeneration
 	out["last_applied_count"] = s.lastAppliedCount
 	if !s.lastAppliedAt.IsZero() {
 		out["last_applied_at"] = s.lastAppliedAt.UTC().Format(time.RFC3339)
@@ -173,6 +203,10 @@ func (s *configBundleSyncStatus) snapshot() map[string]any {
 // configBundlePayload is the wire shape served by GET /admin/config-bundle. generation is the control
 // plane's monotonic config version; an Edge applies a bundle only when it is newer than the last applied.
 type configBundlePayload struct {
+	AuthRollout *authrollout.Distribution `json:"auth_rollout,omitempty"`
+	// A current Edge requests signed grant pages instead of embedding the entire
+	// fleet's grants in the configuration response. Older Edges still receive Grants.
+	GrantPages   *grantBundleReference     `json:"grant_pages,omitempty"`
 	Applications *applicationCatalogBundle `json:"applications,omitempty"`
 	DLP          *dlpConfigBundle          `json:"dlp,omitempty"`
 	Generation   uint64                    `json:"generation"`
@@ -604,7 +638,7 @@ func (s configBundleSource) fetch(ctx context.Context) (configBundlePayload, err
 	if strings.TrimSpace(base) == "" {
 		return configBundlePayload{}, fmt.Errorf("no in-boundary control plane reachable (keeping last config)")
 	}
-	url := strings.TrimRight(base, "/") + "/admin/config-bundle"
+	url := strings.TrimRight(base, "/") + "/admin/config-bundle?grant_pages=" + grantPageProtocol
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return configBundlePayload{}, err
@@ -679,6 +713,22 @@ func (s configBundleSource) fetch(ctx context.Context) (configBundlePayload, err
 // generation is never retried, so an operator who DISABLED a device saw the Edge report itself current while
 // that device stayed admitted. Reporting a generation as applied is a claim about every section in it.
 func (s configBundleSource) apply(payload configBundlePayload, t configApplyTargets) (int, error) {
+	if payload.GrantPages != nil && payload.Grants == nil {
+		return 0, fmt.Errorf("signed grant pages have not been fetched")
+	}
+	// Reject malformed tenant controls before mutating any bundle section.
+	if payload.TenantConfig != nil {
+		if err := policy.ValidateTenantConfig(*payload.TenantConfig); err != nil {
+			return 0, err
+		}
+	}
+	for _, section := range payload.TenantPolicies {
+		if section.Config != nil {
+			if err := policy.ValidateTenantConfig(*section.Config); err != nil {
+				return 0, err
+			}
+		}
+	}
 	// criticalErr is set by any section whose failure must NOT be reported as an applied generation.
 	//
 	// ★ THE RULE EXISTED FOR ONE SECTION AND THE INCIDENT IT CAME FROM WAS ABOUT ANOTHER (2026-08-13,
@@ -690,23 +740,12 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// The test is not "is this section important" but "can the Edge converge without being asked again". A
 	// refused write cannot: nothing re-offers it. So refusals join here and the generation stays unapplied.
 	var criticalErr error
+	theAuthRollout.Load().receive(payload.AuthRollout, payload.signatureVerified, time.Now())
 	if s.requireSigned && payload.Applications != nil && !payload.signatureVerified {
 		return 0, fmt.Errorf("application catalog requires a verified config bundle")
 	}
 	if err := applyApplicationBundle(t.applications, payload.Applications); err != nil {
 		criticalErr = errors.Join(criticalErr, fmt.Errorf("application catalog: %w", err))
-	}
-	if payload.TenantConfig != nil {
-		if err := policy.ValidateTenantRestrictions(payload.TenantConfig.SaaSTenantRestrictions); err != nil {
-			return 0, err
-		}
-	}
-	for _, section := range payload.TenantPolicies {
-		if section.Config != nil {
-			if err := policy.ValidateTenantRestrictions(section.Config.SaaSTenantRestrictions); err != nil {
-				return 0, err
-			}
-		}
 	}
 	if payload.DLP != nil {
 		if err := t.dlp.Apply(payload.DLP); err != nil {
@@ -752,7 +791,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// impossible to express.
 	for _, section := range payload.TenantPolicies {
 		tenantID := strings.TrimSpace(section.TenantID)
-		if tenantID == "" || strings.EqualFold(tenantID, strings.TrimSpace(s.tenantID)) {
+		if tenantID == "" || tenantID == strings.TrimSpace(s.tenantID) {
 			continue
 		}
 		applied := 0
@@ -1048,7 +1087,7 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	// What the fleet has already approved out of band, so a flow held on a node that did not run the
 	// ceremony is released by the grant that ceremony earned.
 	if payload.Grants != nil {
-		added, updated, err := applyGrantBundleSectionChecked(theGrantStore.Load(), payload.Grants, time.Now().UTC())
+		added, updated, err := applyGrantBundleEvidence(theGrantStore.Load(), payload.Grants, time.Now().UTC(), payload.signatureVerified)
 		if err != nil {
 			criticalErr = errors.Join(criticalErr, fmt.Errorf("access grants: %w", err))
 		}
@@ -1181,8 +1220,10 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 			removed, aerr := t.assets.ReplaceAuthored(payload.Rules.Endpoints, payload.Rules.Groups, payload.Rules.Services)
 			if aerr != nil {
 				assetsReady = false
-				criticalErr = errors.Join(criticalErr, fmt.Errorf("authored assets: %w", aerr))
-				log.Printf("config-bundle sync: the control plane's asset catalog was REFUSED, keeping the last good one: %v", aerr)
+				// Persistence errors may contain backend connection details. The
+				// returned error also reaches health status and the poller's log.
+				criticalErr = errors.Join(criticalErr, errors.New("authored asset catalog was not confirmed persisted"))
+				log.Printf("config-bundle sync: the control plane's asset catalog was REFUSED, keeping the last good assets and rules")
 			} else if len(removed) > 0 {
 				log.Printf("config-bundle sync: removed %d asset(s) the control plane does not author: %s",
 					len(removed), strings.Join(removed, ", "))
@@ -1248,6 +1289,16 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 	var lastApplied uint64
 	var lastEpoch string
 	haveApplied := false
+	var lastGrantGeneration uint64
+	var lastGrantEpoch string
+	haveGrants := false
+	recordGrants := func(payload configBundlePayload) {
+		if payload.GrantPages != nil && payload.Grants != nil {
+			lastGrantEpoch, lastGrantGeneration = payload.GrantPages.Epoch, payload.Grants.generation
+			haveGrants = true
+			s.status.recordGrantSnapshot(lastGrantEpoch, lastGrantGeneration)
+		}
+	}
 	pull := func(initial bool) {
 		payload, err := s.fetch(ctx)
 		if err != nil {
@@ -1259,7 +1310,30 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 			s.status.recordError(err, time.Now().UTC())
 			return
 		}
-		if !shouldApplyBundle(haveApplied, lastEpoch, lastApplied, payload) {
+		applyConfiguration := shouldApplyBundle(haveApplied, lastEpoch, lastApplied, payload)
+		// Grant changes deliberately do not advance the configuration generation.
+		// Fetch their independent snapshot even when policy is already current.
+		if ref := payload.GrantPages; ref != nil && (applyConfiguration || !haveGrants ||
+			ref.Epoch != lastGrantEpoch || ref.Generation > lastGrantGeneration) {
+			if !payload.signatureVerified {
+				err = fmt.Errorf("grant page reference is not signed")
+			} else {
+				payload.Grants, err = s.fetchGrantPages(ctx, *ref)
+			}
+			if err != nil {
+				log.Printf("config-bundle sync: grant pages unavailable; keeping generation unapplied: %v", err)
+				s.status.recordError(err, time.Now().UTC())
+				return
+			}
+		}
+		if !applyConfiguration {
+			if payload.GrantPages != nil && payload.Grants != nil {
+				if _, _, err := applyGrantBundleEvidence(theGrantStore.Load(), payload.Grants, time.Now().UTC(), payload.signatureVerified); err != nil {
+					s.status.recordError(err, time.Now().UTC())
+					return
+				}
+				recordGrants(payload)
+			}
 			// ★★★ RUNTIME FACTS RIDE EVERY POLL, BECAUSE THE VERSION DELIBERATELY DOES NOT MOVE FOR THEM
 			// (2026-08-26, measured: the deployment's database knew the connector had failed over to
 			// region-a, the node holding its tunnel knew, and the two Edges of the region it LEFT went on
@@ -1273,6 +1347,7 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 			// authority: it adds nothing, removes nothing, and only says where something already in the
 			// catalog is answering right now.
 			applyConnectorRuntimeFacts(payload, targets)
+			theAuthRollout.Load().receive(payload.AuthRollout, payload.signatureVerified, time.Now())
 			s.status.recordPoll(time.Now().UTC()) // already at/ahead: still a healthy, up-to-date poll
 			return
 		}
@@ -1294,6 +1369,7 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 		lastApplied = payload.Generation
 		lastEpoch = payload.Epoch
 		haveApplied = true
+		recordGrants(payload)
 		s.status.recordApplied(payload.Generation, payload.Epoch, n, time.Now().UTC())
 		log.Printf("config-bundle sync: applied generation %d (%d policy(ies)) from the control plane", payload.Generation, n)
 	}
@@ -1322,7 +1398,7 @@ func (s configBundleSource) run(ctx context.Context, targets configApplyTargets)
 				targets.localCredentials, targets.enrolled, targets.rules, targets.deviceCAs, targets.vlan,
 				// Only what this node has. The rest are named in NotCounted rather than assumed empty — a
 				// footprint that omits a store it cannot reach reads as "there was nothing there".
-				adminTenantExtraStores{DelegatedGrants: targets.delegatedGrants,
+				adminTenantExtraStores{DelegatedGrants: targets.delegatedGrants, DLP: targets.dlp,
 					DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, targets.enrolled, tenantID).DeviceIDs},
 				time.Now())
 			rep.Erasures = append(rep.Erasures, fleetTenantErasure{
@@ -1453,7 +1529,7 @@ func applyCarriedTenantPurges(ctx context.Context, t configApplyTargets, payload
 		}
 		result := purgeAdminTenantData(ctx, node, tenantID, t.purgeDB, t.logWriter, t.localCredentials, t.enrolled, t.rules,
 			t.deviceCAs, t.deviceCARegistryPath, t.deviceTrust, t.vlan,
-			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants,
+			adminTenantExtraStores{DelegatedGrants: t.delegatedGrants, DLP: t.dlp,
 				DeviceIDs: tenantExtraStoresFor(adminTenantExtraStores{}, t.enrolled, tenantID).DeviceIDs},
 			nil, now) // The signed CP order already passed the authoritative hold check.
 		if len(result.Erased) == 0 && result.Complete {

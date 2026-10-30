@@ -186,7 +186,7 @@ func TestPostgresArchiveWriteFailuresPreserveHotRows(t *testing.T) {
 		t.Fatal("Console-only pruner not enabled")
 	}
 	runRetentionPrune(ctx, db, cfg)
-	if count("success") != 0 {
-		t.Fatal("Console-only override ignored")
+	if count("success") != 1 {
+		t.Fatal("Console-only override deleted a row without a configured archive")
 	}
 }

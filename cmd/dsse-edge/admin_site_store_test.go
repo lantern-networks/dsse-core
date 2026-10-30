@@ -250,10 +250,11 @@ func TestAdminSiteAPISecretSafeAndLabInvariant(t *testing.T) {
 	registry := seedAdminSiteRegistry(t)
 	siteStore := newAdminSiteStore()
 	handler := newServerWithConfig(serverConfig{
-		Evaluator: testEvaluator(),
-		Registry:  registry,
-		SiteStore: siteStore,
-		AdminAuth: newAdminAuthStore(),
+		Evaluator:                  testEvaluator(),
+		Registry:                   registry,
+		SiteStore:                  siteStore,
+		AdminAuth:                  newAdminAuthStore(),
+		ConnectorEnrollmentEdgeURL: "https://edge.example.com",
 		// An enrollment command is refused unless this node knows the Edge transport CA a connector should
 		// pin — a connector's first act is handing a CSR to something claiming to be its Edge, so an unpinned
 		// first connection is the one that matters most. Set here because the node under test issues one.

@@ -58,8 +58,8 @@ func reportPersistError(err error) {
 func (s *Store) SetPersister(p blobstore.Persister) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.persister = p
 	if p == nil {
+		s.persister = nil
 		return nil
 	}
 	data, err := p.Load()
@@ -67,18 +67,27 @@ func (s *Store) SetPersister(p blobstore.Persister) error {
 		return err
 	}
 	if len(data) == 0 {
+		s.persister = p
 		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if len(fields["devices"]) == 0 || strings.TrimSpace(string(fields["devices"])) == "null" ||
+		len(fields["posture_policy"]) == 0 || strings.TrimSpace(string(fields["posture_policy"])) == "null" {
+		return fmt.Errorf("device inventory snapshot is missing devices or posture_policy")
 	}
 	var snap devicePersistSnapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return err
 	}
-	if snap.Devices != nil {
-		s.devices = snap.Devices
+	if snap.Devices == nil {
+		return fmt.Errorf("device inventory snapshot has no devices map")
 	}
-	if snap.PosturePolicy != (PosturePolicy{}) {
-		s.posturePolicy = snap.PosturePolicy
-	}
+	s.devices = snap.Devices
+	s.posturePolicy = snap.PosturePolicy
+	s.persister = p
 	return nil
 }
 
@@ -166,9 +175,8 @@ func (s *Store) Register(dev model.Device, policyBundle model.PolicyBundle, now 
 	if dev.LastSeenAt == "" {
 		dev.LastSeenAt = dev.RegisteredAt
 	}
-	if dev.Metadata == nil {
-		dev.Metadata = map[string]any{}
-	}
+	dev.Metadata = SelfReportedMetadata(dev.Metadata)
+	dev.Posture = cloneDevicePosture(dev.Posture)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -177,8 +185,13 @@ func (s *Store) Register(dev model.Device, policyBundle model.PolicyBundle, now 
 	// signals in the registration derive the level exactly as a heartbeat would; without them the device
 	// starts "unknown" until its first posture report.
 	if dev.Posture != nil {
-		derived, _, _ := DerivePostureTrustLevel(dev.Posture, s.posturePolicy)
+		derived, compliant, reasons := DerivePostureTrustLevel(dev.Posture, s.posturePolicy)
 		dev.DeviceTrustLevel = derived
+		dev.Metadata["posture_compliant"] = compliant
+		dev.Metadata["posture_trust_source"] = "edge_derived_from_signals"
+		if len(reasons) > 0 {
+			dev.Metadata["posture_failed_signals"] = reasons
+		}
 	} else {
 		dev.DeviceTrustLevel = "unknown"
 	}
@@ -188,8 +201,14 @@ func (s *Store) Register(dev model.Device, policyBundle model.PolicyBundle, now 
 	// transport certificate and clear the revocation by whole-value assignment, silently and
 	// indistinguishably from a first registration. The device drives that call; the revocation is the
 	// operator's, and un-revoking stays an administrator action on the admin route.
-	if prev, ok := s.devices[dev.ID]; ok && strings.EqualFold(strings.TrimSpace(prev.Status), "revoked") {
-		dev.Status = prev.Status
+	if prev, ok := s.devices[dev.ID]; ok {
+		if prev.TenantID != dev.TenantID {
+			return model.Device{}, fmt.Errorf("device %s belongs to another tenant", dev.ID)
+		}
+		if strings.EqualFold(strings.TrimSpace(prev.Status), "revoked") {
+			dev.Status = prev.Status
+		}
+		retainAuthorityOwnedMetadata(dev.Metadata, prev.Metadata)
 	}
 	s.devices[dev.ID] = dev
 	if err := s.persistLocked(); err != nil {
@@ -228,7 +247,7 @@ func (s *Store) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.Po
 		// NOT trusted when signals are present, so a compromised endpoint cannot just claim "managed"
 		//. The non-secret compliance verdict is written AFTER the client metadata merge
 		// below so the client cannot spoof the audit verdict either.
-		dev.Posture = heartbeat.Posture
+		dev.Posture = cloneDevicePosture(heartbeat.Posture)
 		derived, compliant, reasons := DerivePostureTrustLevel(heartbeat.Posture, s.posturePolicy)
 		dev.DeviceTrustLevel = derived
 		postureApplied = true
@@ -268,14 +287,7 @@ func (s *Store) Heartbeat(heartbeat model.DeviceHeartbeat, policyBundle model.Po
 	if dev.Metadata == nil {
 		dev.Metadata = map[string]any{}
 	}
-	for key, value := range heartbeat.Metadata {
-		if key == "device_group" {
-			// device_group is CP-AUTHORITATIVE (assigned at enrollment in the enrolled ledger). A device must
-			// not self-assert its group via heartbeat — group selects enforcement/tuning scope, so honoring a
-			// client-supplied value would let a device pick its own group. Group-scoped resolution reads the
-			// ledger (cpAuthoritativeGroup), never this map; drop the key here so nothing can pick it up.
-			continue
-		}
+	for key, value := range SelfReportedMetadata(heartbeat.Metadata) {
 		dev.Metadata[key] = value
 	}
 	delete(dev.Metadata, "device_group") // clear any value a prior (pre-hardening) heartbeat may have persisted
@@ -345,19 +357,12 @@ func (s *Store) ApplyRiskSignal(deviceID string, sig model.RiskSignal, now time.
 	return detachMetadata(dev), true, high, err
 }
 
-// detachMetadata returns dev with its Metadata map copied. Every Device handed OUT of the store must go
-// through this: the store's mutators (Heartbeat, ApplyRiskSignal) write into the stored device's Metadata
-// map in place, so returning the internal map by reference lets a caller's read race a concurrent
-// heartbeat — a Go-fatal concurrent map read/write that crashes the Edge, not just a stale read. Values
-// are not deep-copied: mutators always assign fresh values per key, never mutate a stored value in place.
+// detachMetadata copies mutable metadata and posture before a Device leaves the store.
+// Returning an internal map would let a caller's read race a concurrent heartbeat,
+// and nested values or posture pointers would allow unsaved changes through an alias.
 func detachMetadata(dev model.Device) model.Device {
-	if dev.Metadata != nil {
-		meta := make(map[string]any, len(dev.Metadata))
-		for k, v := range dev.Metadata {
-			meta[k] = v
-		}
-		dev.Metadata = meta
-	}
+	dev.Metadata = cloneDeviceMetadata(dev.Metadata)
+	dev.Posture = cloneDevicePosture(dev.Posture)
 	return dev
 }
 

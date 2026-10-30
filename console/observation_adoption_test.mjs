@@ -28,3 +28,41 @@ test('adoption uses refreshed destination and TCP service rather than stale row 
   assert.equal(f.editors[0][3].destination[0],'fresh-host'); assert.equal(f.editors[0][3].service_id,'tcp'); assert.equal(f.editors[0][3].name,'Adopted: fresh.example:22');
   assert.ok(f.calls.every(x=>x[0]!=='POST'));
 });
+
+test('cancel reports an unconfirmed dependency deletion instead of silently leaving an endpoint', async () => {
+  const calls = [], errors = [], editors = [];
+  const c = vm.createContext({
+    SUBJECT_ANY: '*', bl: x => x.en,
+    apiFetch: async (...args) => {
+      calls.push(args);
+      if (args[0] === 'GET') return {ok:true, body:{observations:[{observation_id:'o',destination:'new.example',port:22,covered:false}]}};
+      if (args[0] === 'POST') return {ok:true,body:{id:'new-endpoint'}};
+      if (args[0] === 'DELETE') return {ok:false,status:503};
+    },
+    loadList: async path => path.endsWith('services') ? [] : [],
+    uiPrompt: async () => 'New endpoint',
+    uiToast: (...args) => errors.push(args),
+    openRuleEditor: (...args) => editors.push(args),
+  });
+  vm.runInContext(source, c);
+  await vm.runInContext("adoptFlowIntoRule({observation_id:'o'}, {})", c);
+  assert.equal(editors.length, 1);
+  await editors[0][4]();
+  assert.equal(calls.filter(x => x[0] === 'DELETE').length, 1);
+  assert.equal(errors.at(-1)?.[1], 'err');
+  assert.match(errors.at(-1)?.[0] || '', /endpoint/i);
+});
+
+test('rule editor setup failure calls dependency cleanup before returning', async () => {
+  const notices = [], calls = [];
+  const c = vm.createContext({
+    bl: x => x.en,
+    apiFetch: async (...args) => { calls.push(args); return {ok:false,status:503}; },
+    uiToast: (...args) => notices.push(args),
+  });
+  vm.runInContext(readFileSync(new URL('./rules.js', import.meta.url), 'utf8'), c);
+  let cleaned = 0;
+  await c.openRuleEditor('east_west', 'outbound', () => {}, {}, async () => { cleaned++; });
+  assert.equal(cleaned, 1);
+  assert.equal(notices.at(-1)?.[1], 'err');
+});

@@ -27,7 +27,7 @@ func TestPKIPopulationReadsDurableStateAndReturnsFailures(t *testing.T) {
 		t.Fatalf("%v %v", entries, err)
 	}
 	// A later shared enrolment must be seen even when it was never loaded into this process.
-	state := stateFile{Entries: map[string]Entry{"windows": {Identity: "windows", TenantID: "tenant_a", Enabled: true}}}
+	state := stateFile{SchemaVersion: enrolledInventoryStateSchemaVersion, Entries: map[string]Entry{"windows": {Identity: "windows", TenantID: "tenant_a", Enabled: true}}}
 	store.raw, _ = json.Marshal(state)
 	entries, err = ledger.ListForPKI()
 	if err != nil || len(entries) != 1 || entries[0].Identity != "windows" {
@@ -42,6 +42,18 @@ func TestPKIPopulationReadsDurableStateAndReturnsFailures(t *testing.T) {
 		store.raw = []byte(raw)
 		if _, err := ledger.ListForPKI(); err == nil {
 			t.Fatalf("corrupt snapshot %s passed", raw)
+		}
+	}
+	// PKI transitions must not interpret a malformed shared snapshot as a
+	// smaller enrolled population; the normal inventory loader rejects these.
+	for _, raw := range []string{
+		`{"entries":{"mac":{"identity":"other","tenant_id":"tenant_a","enabled":true}}}`,
+		`{"entries":{"mac":null}}`,
+		`{"schema_version":999,"entries":{}}`,
+		`{"entries":{"mac":{"identity":"mac","enabled":true}},"entries":{}}`,
+	} {
+		if _, err := DecodePKIPopulation([]byte(raw)); err == nil {
+			t.Fatalf("incomplete PKI population accepted: %s", raw)
 		}
 	}
 	if _, err := NewLedger().ListForPKI(); err == nil {

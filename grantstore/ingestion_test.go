@@ -5,6 +5,7 @@ import (
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -184,5 +185,27 @@ func TestIngestionCopiesClaimsAndSerializesRevoke(t *testing.T) {
 	wg.Wait()
 	if s.Valid("cookie", now) {
 		t.Fatal("concurrent stale merge revived access")
+	}
+}
+
+func TestProviderBindingIsImmutableAndRequiredTogether(t *testing.T) {
+	now := time.Now().UTC()
+	s := NewStore()
+	g := grantFixture("provider", now)
+	g.Issuer = "https://idp.example"
+	if _, err := s.Mint(g, time.Hour, now); err == nil {
+		t.Fatal("partial provider binding accepted")
+	}
+	g.ProviderConfigSHA256 = strings.Repeat("a", 64)
+	minted, err := s.Mint(g, time.Hour, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, change := range []func(*Grant){func(g *Grant) { g.Issuer = "https://other.example" }, func(g *Grant) { g.ProviderConfigSHA256 = strings.Repeat("b", 64) }} {
+		altered := minted
+		change(&altered)
+		if _, _, err := s.MergeChecked([]Grant{altered}, now); err == nil {
+			t.Fatal("provider binding overwritten")
+		}
 	}
 }

@@ -194,12 +194,18 @@ func TestAdminSurfaceSeparationMiddleware(t *testing.T) {
 	if get(adminOnly, "/steer") != http.StatusNotFound || get(adminOnly, "/connectors/register") != http.StatusNotFound {
 		t.Fatal("admin listener must 404 the data plane")
 	}
+	if get(adminOnly, "/auth-flow-results") != http.StatusOK || get(adminOnly, "/auth-flow-results/query") != http.StatusOK {
+		t.Fatal("authentication result machine API must be reachable on the management listener")
+	}
 	// data-plane listener: data plane allowed, admin/auth 404.
 	if get(dataOnly, "/steer") != http.StatusOK || get(dataOnly, "/clientless/apps/x") != http.StatusOK {
 		t.Fatal("data-plane listener must serve the data plane")
 	}
 	if get(dataOnly, "/admin/state") != http.StatusNotFound || get(dataOnly, "/auth/oidc/login") != http.StatusNotFound {
 		t.Fatal("data-plane listener must 404 the admin surface")
+	}
+	if get(dataOnly, "/auth-flow-results") != http.StatusNotFound || get(dataOnly, "/auth-flow-results/query") != http.StatusNotFound {
+		t.Fatal("authentication result machine API must not be reachable on the data plane")
 	}
 }
 
@@ -281,14 +287,23 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 
 // the hardened server sets Slowloris-safe timeouts and leaves streaming bodies unbounded.
 func TestHardenedHTTPServerTimeouts(t *testing.T) {
+	t.Setenv("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", "")
 	srv := hardenedHTTPServer(":0", "test", http.NewServeMux())
 	if srv.ReadHeaderTimeout != edgeReadHeaderTimeout {
 		t.Fatalf("ReadHeaderTimeout = %v, want %v", srv.ReadHeaderTimeout, edgeReadHeaderTimeout)
 	}
-	if srv.IdleTimeout != edgeIdleTimeout {
-		t.Fatalf("IdleTimeout = %v, want %v", srv.IdleTimeout, edgeIdleTimeout)
+	if srv.IdleTimeout != 120*time.Second {
+		t.Fatalf("unconfigured IdleTimeout = %v, want resource protection retained", srv.IdleTimeout)
 	}
 	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 {
 		t.Fatalf("Read/Write timeouts must be 0 for streaming; got read=%v write=%v", srv.ReadTimeout, srv.WriteTimeout)
+	}
+	t.Setenv("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", "172800")
+	if configured := hardenedHTTPServer(":0", "test", http.NewServeMux()); configured.IdleTimeout != 48*time.Hour {
+		t.Fatal("operator idle quota was clamped to the former 120-second value")
+	}
+	t.Setenv("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", "0")
+	if configured := hardenedHTTPServer(":0", "test", http.NewServeMux()); configured.IdleTimeout != 0 {
+		t.Fatal("explicit administrator idle opt-out was ignored")
 	}
 }

@@ -32,6 +32,7 @@ import (
 
 	"github.com/lantern-networks/dsse-core/agentpolicy"
 	"github.com/lantern-networks/dsse-core/agentupdate"
+	"github.com/lantern-networks/dsse-core/internal/strictjson"
 )
 
 func main() {
@@ -76,10 +77,8 @@ func main() {
 	// Strict decode, matching what every endpoint will do to it. A field this build does not know is refused
 	// here rather than signed into an artefact the fleet then rejects for a reason nobody can see from the
 	// release side.
-	dec := json.NewDecoder(strings.NewReader(string(raw)))
-	dec.DisallowUnknownFields()
-	var m agentupdate.Manifest
-	if derr := dec.Decode(&m); derr != nil {
+	m, derr := decodeManifest(raw)
+	if derr != nil {
 		fail("%s is not a manifest: %v", *manifestPath, derr)
 	}
 
@@ -121,6 +120,20 @@ func main() {
 	fmt.Fprintf(os.Stderr, "dsse-signupdate: wrote %s\n", *out)
 }
 
+func decodeManifest(raw []byte) (agentupdate.Manifest, error) {
+	if err := strictjson.RejectDuplicateKeys(raw); err != nil {
+		return agentupdate.Manifest{}, err
+	}
+	if err := strictjson.RejectUnknownFields(raw, agentupdate.Manifest{}); err != nil {
+		return agentupdate.Manifest{}, err
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	var m agentupdate.Manifest
+	err := dec.Decode(&m)
+	return m, err
+}
+
 // generateKey creates a new signing key, and refuses to overwrite one.
 //
 // Refusing rather than prompting: overwriting this file orphans every endpoint that pinned the old public key,
@@ -138,7 +151,20 @@ func generateKey(path string) error {
 	}
 	// 0600, and the seed only. Storing the full private key would put the public half in the same file for no
 	// benefit; the seed is what the signer needs and it is 32 bytes.
-	return os.WriteFile(path, []byte(hex.EncodeToString(priv.Seed())+"\n"), 0o600)
+	// The check above gives a useful error, but only exclusive creation makes
+	// concurrent invocations and a pre-existing dangling symlink safe.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create new signing key: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write([]byte(hex.EncodeToString(priv.Seed()) + "\n")); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 func loadSigner(path string) (*agentpolicy.Signer, error) {

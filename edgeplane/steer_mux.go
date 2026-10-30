@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -55,21 +56,30 @@ func SteerMuxWarnNoticePayload(dec model.AccessDecision) ([]byte, bool) {
 //   CLOSE  (both):     payload empty. Half/full close of the flow.
 //   STEPUP (Edge->NE):  payload = a step-up portal URL. The flow's decision is authenticate/reauth and the
 //                       device has no live grant; a native TCP client can't follow a 302, so the Edge asks the
-//                       agent to open the URL out-of-band in a browser. The flow is then closed; once the user
-//                       completes step-up a device grant is minted and the RETRIED flow (new OPEN) is allowed.
+//                       agent to open the URL out-of-band in a browser. The native flow is held for a bounded
+//                       wait; if authorization and upstream connection succeed it resumes, otherwise it closes
+//                       and the original application must reconnect.
 //                       (Mirrors the single-flow /steer path's X-Dsse-Stepup-Url header.)
 //   WARN   (Edge->NE):  payload = a small JSON notice {message, destination, service}. NON-HOLDING: the flow is
 //                       ALLOWED and forwarded normally; this frame only asks the agent to surface a PASSIVE
 //                       "this connection is monitored; authentication will soon be required" message (the agent
 //                       coalesces it once per session). It is the learning-lifecycle Warn stage (S3) — a dry-run
 //                       notice before a rule flips to Enforce. Unlike STEPUP it never closes or holds the flow.
+//   AUTH_RESULT (Edge->NE): payload = {request_id,result}, with result "resumed" only after the held
+//                       flow passes current authorization, leaves the hold, and establishes its upstream TCP
+//                       connection, or "not_resumed" before it is dropped.
+//                       It reports this flow's outcome over the authenticated mux, never an IdP identity.
+//   AUTH_QUERY (NE->Edge): flowID=0, payload = {request_id,os_principal,os_session}. The Edge answers
+//                       with AUTH_RESULT on flowID=0 only for an exact match in the shared final-result ledger.
 
 const (
-	muxFrameOpen   uint8 = 0
-	muxFrameData   uint8 = 1
-	muxFrameClose  uint8 = 2
-	muxFrameStepUp uint8 = 3
-	muxFrameWarn   uint8 = 4
+	muxFrameOpen       uint8 = 0
+	muxFrameData       uint8 = 1
+	muxFrameClose      uint8 = 2
+	muxFrameStepUp     uint8 = 3
+	muxFrameWarn       uint8 = 4
+	muxFrameAuthResult uint8 = 5
+	muxFrameAuthQuery  uint8 = 6
 
 	muxHeaderLen      = 9
 	muxMaxFrameLen    = 1 << 20 // 1 MiB per frame — a defensive bound on a single DATA payload.
@@ -88,6 +98,11 @@ type MuxVirtualConn struct {
 
 func (c *MuxVirtualConn) Read(p []byte) (int, error) { return c.inbound.Read(p) }
 
+// BeginAuthWait bounds pre-authentication data without blocking the mux reader.
+// A false result requires the caller to close the flow without forwarding.
+func (c *MuxVirtualConn) BeginAuthWait() bool { return c.inbound.setAuthLimit(16*1024, true) }
+func (c *MuxVirtualConn) EndAuthWait() bool   { return c.inbound.setAuthLimit(muxVirtualConnCap, false) }
+
 func (c *MuxVirtualConn) Write(p []byte) (int, error) {
 	if err := c.mux.writeFrame(c.flowID, muxFrameData, p); err != nil {
 		return 0, err
@@ -97,18 +112,36 @@ func (c *MuxVirtualConn) Write(p []byte) (int, error) {
 
 // Close sends a CLOSE frame to the peer and tears down the local half. Idempotent.
 func (c *MuxVirtualConn) Close() error {
-	c.closeOnce.Do(func() {
-		_ = c.mux.writeFrame(c.flowID, muxFrameClose, nil)
-		c.inbound.Close()
-		c.mux.removeFlow(c.flowID)
-		close(c.closed)
-	})
+	if c.closeLocalOnly() {
+		return c.mux.writeFrame(c.flowID, muxFrameClose, nil)
+	}
 	return nil
 }
 
 // sendStepUp asks the peer (NE agent) to open a step-up portal URL out-of-band in a browser for this flow.
 func (c *MuxVirtualConn) SendStepUp(url string) error {
 	return c.mux.writeFrame(c.flowID, muxFrameStepUp, []byte(url))
+}
+
+// SendAuthResult reports the fate of the same held flow. A result is advisory
+// for the UI; authorization still depends on the server's current policy check.
+func (c *MuxVirtualConn) SendAuthResult(requestID, result string) error {
+	if len(requestID) != 32 || (result != "resumed" && result != "not_resumed") {
+		return errors.New("invalid authentication result")
+	}
+	for _, ch := range requestID {
+		if !((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_') {
+			return errors.New("invalid authentication result")
+		}
+	}
+	payload, err := json.Marshal(struct {
+		RequestID string `json:"request_id"`
+		Result    string `json:"result"`
+	}{requestID, result})
+	if err != nil {
+		return err
+	}
+	return c.mux.writeFrame(c.flowID, muxFrameAuthResult, payload)
 }
 
 // sendWarnNotice asks the peer (NE agent) to surface a PASSIVE "monitored; auth soon required" notice for this
@@ -119,12 +152,15 @@ func (c *MuxVirtualConn) SendWarnNotice(payload []byte) error {
 }
 
 // closeLocalOnly tears down the local half WITHOUT sending a CLOSE frame (used when the peer already sent one).
-func (c *MuxVirtualConn) closeLocalOnly() {
+func (c *MuxVirtualConn) closeLocalOnly() bool {
+	closed := false
 	c.closeOnce.Do(func() {
 		c.inbound.Close()
 		c.mux.removeFlow(c.flowID)
 		close(c.closed)
+		closed = true
 	})
+	return closed
 }
 
 type muxAddr struct{}
@@ -199,9 +235,28 @@ func (m *steerMux) lookup(flowID uint32) *MuxVirtualConn {
 
 // run reads frames until the mux connection ends, dispatching OPEN to handleOpen (in its own goroutine so
 // slow interception setup on one flow never blocks the demux of others) and routing DATA/CLOSE to flows.
-func (m *steerMux) Run(handleOpen func(flowID uint32, authority string, vc *MuxVirtualConn)) {
+func (m *steerMux) Run(handleOpen func(flowID uint32, authority string, vc *MuxVirtualConn), handleAuthQuery ...func([]byte) []byte) {
 	r := bufio.NewReaderSize(m.conn, 64*1024)
 	defer m.closeAll()
+	// One bounded worker reports local rejections without blocking DATA dispatch
+	// for unrelated flows. A peer that will not read cannot accumulate goroutines.
+	closeNotices := make(chan uint32, 64)
+	querySlots := make(chan struct{}, 8)
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case id := <-closeNotices:
+				if err := m.writeFrame(id, muxFrameClose, nil); err != nil {
+					_ = m.conn.Close()
+					return
+				}
+			}
+		}
+	}()
 	var hdr [muxHeaderLen]byte
 	for {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
@@ -222,9 +277,34 @@ func (m *steerMux) Run(handleOpen func(flowID uint32, authority string, vc *MuxV
 			}
 		}
 		switch typ {
+		case muxFrameAuthQuery:
+			if flowID != 0 || length > 256 || len(handleAuthQuery) != 1 || handleAuthQuery[0] == nil {
+				continue
+			}
+			select {
+			case querySlots <- struct{}{}:
+				go func(payload []byte) {
+					defer func() { <-querySlots }()
+					if response := handleAuthQuery[0](payload); len(response) > 0 && len(response) <= 256 {
+						_ = m.writeFrame(0, muxFrameAuthResult, response)
+					}
+				}(payload)
+			default:
+				// Bounded control work. The next periodic query can retry.
+			}
 		case muxFrameOpen:
+			if flowID == 0 {
+				continue
+			} // control flow is reserved for result requery
 			vc := &MuxVirtualConn{flowID: flowID, mux: m, inbound: NewBufferedPipeHalf(muxVirtualConnCap), closed: make(chan struct{})}
 			m.flowsMu.Lock()
+			if m.flows[flowID] != nil {
+				m.flowsMu.Unlock()
+				// Replacing a live flow loses the original virtual connection, so
+				// tear down this malformed transport and close every active flow.
+				log.Printf("steer_mux_duplicate_open flow=%d", flowID)
+				return
+			}
 			m.flows[flowID] = vc
 			m.flowsMu.Unlock()
 			go handleOpen(flowID, string(payload), vc)
@@ -233,7 +313,14 @@ func (m *steerMux) Run(handleOpen func(flowID uint32, authority string, vc *MuxV
 				// Writes block only when THIS flow's inbound buffer is full (its interception reader is slow);
 				// the interception drains it continuously, so handshake-sized bursts never block.
 				if _, err := vc.inbound.Write(payload); err != nil {
-					vc.closeLocalOnly()
+					if !vc.closeLocalOnly() {
+						continue
+					}
+					select {
+					case closeNotices <- flowID:
+					default:
+						return // transport teardown bounds an unresponsive peer
+					}
 				}
 			}
 		case muxFrameClose:

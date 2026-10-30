@@ -2,9 +2,29 @@ package main
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestGeneratedControlPlaneUsesSharedApplicationCatalogAndImportsPriorLocalRows(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeLaunchScripts(dir); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "start-control-plane.sh")
+	data, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `-application-catalog-store="postgres+import:${DSSE_CP_STATE_DIR:-$here/cp-state}/application_catalog.json"`) {
+		t.Fatal("generated CP launcher omits the shared catalog or its legacy local-file import")
+	}
+	if out, err := exec.Command("sh", "-n", script).CombinedOutput(); err != nil {
+		t.Fatalf("generated CP launcher is not valid shell: %v: %s", err, out)
+	}
+}
 
 // ★★★ A CONTROL-PLANE PAIR HELD TWO DIFFERENT ANSWERS (2026-08-29, measured on a two-region deployment: an
 // operator authored a steering exclusion in the Console, the control planes were recreated, and one of them
@@ -45,6 +65,7 @@ func TestTheGeneratedControlPlaneNamesEveryStoreItMustShare(t *testing.T) {
 	// the symptom is a screen that answers differently on refresh.
 	mustShare := map[string]string{
 		"site-store":                          "a site's connectors, which the Sites page reads",
+		"application-catalog-store":           "operator-authored applications and their published routes",
 		"admin-auth-store":                    "who may sign in",
 		"enrolled-inventory-store":            "which devices this deployment has admitted",
 		"inspection-posture-store":            "what this deployment decrypts",
@@ -68,5 +89,8 @@ func TestTheGeneratedControlPlaneNamesEveryStoreItMustShare(t *testing.T) {
 			t.Errorf("the generated control plane does not set -%s=postgres — %s would live on whichever node "+
 				"served the write, and the Console reads whichever node answers", flag, why)
 		}
+	}
+	if !strings.Contains(cp, `-application-catalog-store="postgres+import:${DSSE_CP_STATE_DIR:-$here/cp-state}/application_catalog.json"`) {
+		t.Fatal("CP application catalog must use shared Postgres and carry existing authored local rows on first start")
 	}
 }

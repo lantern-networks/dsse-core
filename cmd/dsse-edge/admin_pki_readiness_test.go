@@ -70,7 +70,7 @@ func TestRenewalIsNotDemandedBeforeAnythingIsIssued(t *testing.T) {
 	}
 }
 
-// A fully configured deployment must come out clean, or the view is noise.
+// Configured key custody and renewal are safe, but strict inspection compatibility is still open.
 func TestAFullyConfiguredDeploymentIsProductionSafe(t *testing.T) {
 	report := assessPKIReadiness(pkiReadinessInput{
 		KeyCustody: "pkcs11", KeyCustodyChecked: true, KeyCustodyHealthy: true,
@@ -80,8 +80,12 @@ func TestAFullyConfiguredDeploymentIsProductionSafe(t *testing.T) {
 	if !report.ProductionSafe {
 		t.Fatalf("a fully configured deployment was not production-safe: %+v", report)
 	}
-	if report.Missing != 0 || report.Attention != 0 {
-		t.Fatalf("clean deployment still reports attention=%d missing=%d", report.Attention, report.Missing)
+	if report.Missing != 0 || report.Attention != 1 {
+		t.Fatalf("want only the unresolved inspection compatibility warning, got attention=%d missing=%d", report.Attention, report.Missing)
+	}
+	item := pkiReadinessItemByID(t, report, "interception_leaf_revocation")
+	if item.Status != "attention" {
+		t.Fatalf("strict inspection compatibility was reported as %q", item.Status)
 	}
 }
 

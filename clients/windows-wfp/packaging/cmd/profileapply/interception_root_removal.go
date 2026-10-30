@@ -17,10 +17,10 @@ package main
 // in the package's own artifact: the same file the install read.
 //
 // ★ AND A MISSING FILE IS NOT A FAILURE. An uninstall runs when things are already partly gone. If the
-// artifact cannot be read there is nothing this package can prove it installed, and refusing to uninstall
-// over that would strand the machine with the agent AND the root. It says so and continues.
+// artifact is absent there is nothing this package can prove it installed. Other read errors must fail.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -57,10 +57,13 @@ func planRootRemoval(existing, ours []parsedRoot) rootRemovalPlan {
 
 // readOurRoots reads the package's own interception-root artifact for the removal.
 //
-// A missing or unreadable file returns (nil, nil): see the note above. The caller reports it and continues.
+// Only an absent file returns (nil, nil). Permission and malformed-content errors remain failures.
 func readOurRoots(path string) ([]parsedRoot, error) {
 	if _, err := os.Stat(path); err != nil {
-		return nil, nil
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat root artifact: %w", err)
 	}
 	roots, err := readInterceptionRoots(path)
 	if err != nil {
@@ -69,4 +72,27 @@ func readOurRoots(path string) ([]parsedRoot, error) {
 			"fingerprint by hand", path, err)
 	}
 	return roots, nil
+}
+
+// Each deletion is attempted, then read back. This catches deletion APIs that
+// return success without removing the target and supports retry after a partial
+// failure without touching a different certificate with the same subject.
+func removeRootsVerified(ours []parsedRoot, list func() ([]parsedRoot, error), remove func(parsedRoot) error) error {
+	existing, err := list()
+	if err != nil {
+		return err
+	}
+	var steps []cleanupStep
+	for _, root := range planRootRemoval(existing, ours).Remove {
+		steps = append(steps, cleanupStep{root.SHA256, func() error { return remove(root) }})
+	}
+	deleteErr := runCleanup(steps...)
+	existing, err = list()
+	if err != nil {
+		return errors.Join(deleteErr, fmt.Errorf("readback: %w", err))
+	}
+	for _, root := range planRootRemoval(existing, ours).Remove {
+		deleteErr = errors.Join(deleteErr, fmt.Errorf("%s still trusted after deletion", root.SHA256))
+	}
+	return deleteErr
 }

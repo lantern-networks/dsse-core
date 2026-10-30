@@ -23,10 +23,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,11 +77,13 @@ func main() {
 	}
 
 	u := &updater{
-		manifestPath: filepath.Join(updateplatform.DataRoot, "update-manifest.json"),
-		planPath:     filepath.Join(updateplatform.DataRoot, "update-plan.json"),
-		journalPath:  filepath.Join(updateplatform.DataRoot, "update", "journal.json"),
-		updateKeys:   splitKeys(*updatePin),
-		planKeys:     splitKeys(*planPin),
+		manifestPath:       filepath.Join(updateplatform.DataRoot, "update-manifest.json"),
+		planPath:           filepath.Join(updateplatform.DataRoot, "update-plan.json"),
+		journalPath:        filepath.Join(updateplatform.DataRoot, "update", "journal.json"),
+		updateKeys:         splitKeys(*updatePin),
+		planKeys:           splitKeys(*planPin),
+		followPlanRotation: len(splitKeys(*planPin)) == 0,
+		planPointerPath:    updateplatform.TrustAnchorPointerPath(),
 		// The SAME configuration --status reports from, or the screen and the gate describe different files.
 		platform:   &updateplatform.Platform{ConfigPath: *configPath},
 		dryRun:     *dryRun,
@@ -124,12 +129,7 @@ func main() {
 	// both means the party a halt exists to stop is the party who signs the halt.
 	//
 	// Here, after both sets are resolved, is the only place that sees every lane.
-	if kept, refused := agentupdate.SeparatePlanKeys(u.updateKeys, u.planKeys); len(refused) > 0 {
-		u.planKeys = kept
-		u.planSource = fmt.Sprintf("★ REFUSED %d plan key(s) that are also this device's UPDATE-signing key: one "+
-			"key signing both the release and the halt means a compromised release key can also unfreeze the "+
-			"fleet (was: %s)", len(refused), u.planSource)
-	}
+	u.separateInitialPlanTrust()
 
 	switch {
 	case *reportAgain:
@@ -150,6 +150,18 @@ func main() {
 	}
 }
 
+func (u *updater) separateInitialPlanTrust() {
+	if kept, refused := agentupdate.SeparatePlanKeys(u.updateKeys, u.planKeys); len(refused) > 0 {
+		u.planKeys = kept
+		u.planSource = fmt.Sprintf("★ REFUSED %d plan key(s) that are also this device's UPDATE-signing key: one "+
+			"key signing both the release and the halt means a compromised release key can also unfreeze the "+
+			"fleet (was: %s)", len(refused), u.planSource)
+		if len(kept) == 0 {
+			u.planTrustError = "configured plan-signing keys all conflict with the update-signing authority"
+		}
+	}
+}
+
 // lockPath is the device-wide update lock. Beside the journal, because it guards the same thing the journal
 // records — and because a lock in a temp directory is a lock that vanishes with a reboot cleanup and stops
 // excluding anything.
@@ -165,16 +177,111 @@ func (u *updater) addressing() (string, string) {
 func (u *updater) lockPath() string { return filepath.Join(filepath.Dir(u.journalPath), "update.lock") }
 
 type updater struct {
-	manifestPath string
-	planPath     string
-	journalPath  string
-	updateKeys   []string
-	planKeys     []string
-	platform     agentupdate.Platform
-	dryRun       bool
-	configPath   string // the agent configuration, kept so the publisher requirement can be stated at start
-	pinSource    string // where the update key came from, so "unpinned" is never mistaken for "unconfigured"
-	planSource   string // and where the plan key came from, which is a different place on purpose
+	manifestPath       string
+	planPath           string
+	journalPath        string
+	updateKeys         []string
+	planKeys           []string
+	followPlanRotation bool
+	planPointerPath    string
+	platform           agentupdate.Platform
+	dryRun             bool
+	configPath         string // the agent configuration, kept so the publisher requirement can be stated at start
+	pinSource          string // where the update key came from, so "unpinned" is never mistaken for "unconfigured"
+	planSource         string // and where the plan key came from, which is a different place on purpose
+	planTrustError     string // a rejected explicit pin must never become an unverified rollout
+}
+
+// The LaunchDaemon remains alive while the extension adopts trust bundles. Read
+// the plan authority on each pass so rotation does not require reinstalling it.
+// A CLI pin remains an explicit override. Once pinned, missing/unusable material
+// must not turn the next plan into an unverified plan.
+func (u *updater) refreshPlanTrust() error {
+	if u.planTrustError != "" {
+		return fmt.Errorf("plan-signing trust rejected: %s", u.planTrustError)
+	}
+	if !u.followPlanRotation {
+		return nil
+	}
+	keys, source := updateplatform.PlanKeys(u.planPointerPath, u.configPath, u.updateKeys)
+	keys, refused := agentupdate.SeparatePlanKeys(u.updateKeys, keys)
+	if len(keys) == 0 && (len(u.planKeys) > 0 || len(refused) > 0 ||
+		planSigningMaterialDeclared(u.configPath, u.planPointerPath)) {
+		return fmt.Errorf("plan-signing trust could not be refreshed; preserving the previous authority and refusing an unverified plan")
+	}
+	u.planKeys = keys
+	u.planSource = source
+	return nil
+}
+
+// A missing plan authority is the legacy opt-out. A declared but unusable
+// authority is not: PlanKeys may have rejected it before returning any keys.
+// Inspect only the two known plan-key fields, without interpreting a diagnostic
+// string as a security decision. Unreadable existing material is also unsafe.
+func planSigningMaterialDeclared(configPath, pointerPath string) bool {
+	for _, source := range []struct {
+		path, field string
+	}{
+		{configPath, "network_extension_agent_policy_signing_public_key"},
+		{pointerPath, "agent_policy_public_keys"},
+	} {
+		if source.path == "" {
+			continue
+		}
+		raw, err := os.ReadFile(source.path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return true
+			}
+			continue
+		}
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		start, err := decoder.Token()
+		if err != nil || start != json.Delim('{') {
+			return true
+		}
+		seen := false
+		for decoder.More() {
+			name, err := decoder.Token()
+			if err != nil {
+				return true
+			}
+			var value json.RawMessage
+			if err := decoder.Decode(&value); err != nil {
+				return true
+			}
+			key, ok := name.(string)
+			if !ok || !strings.EqualFold(key, source.field) {
+				continue
+			}
+			if seen { // duplicate fields and case aliases are not an opt-out
+				return true
+			}
+			seen = true
+			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+				return true
+			}
+			if source.field == "agent_policy_public_keys" {
+				var keys []string
+				if err := json.Unmarshal(value, &keys); err != nil || len(keys) > 0 {
+					return true
+				}
+				continue
+			}
+			var pin string
+			if err := json.Unmarshal(value, &pin); err != nil || strings.TrimSpace(pin) != "" {
+				return true
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return true
+		}
+		var trailing json.RawMessage
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return true
+		}
+	}
+	return false
 }
 
 // run is the LaunchDaemon's loop. The first pass happens immediately: a machine that has just booted is the
@@ -350,6 +457,9 @@ func (u *updater) pass(now time.Time) result {
 	}
 
 	// 3. The plan: the freeze, and this device's wave.
+	if err := u.refreshPlanTrust(); err != nil {
+		return result{action: "blocked", reason: err.Error(), notes: notes}
+	}
 	// ★ The plan is judged against what this device is actually being offered, and against the newest plan it
 	// has already accepted. Blind application let an old plan's open wave authorise a release it was never
 	// computed for, and let a replayed pre-halt plan lift a freeze — see RolloutExpectation.
@@ -706,6 +816,7 @@ func (u *updater) classifyManifestFailure(err error, notes []string) result {
 // printStatus answers the question actually asked about a device that has not updated, which is never "what
 // version is it" but "what is this box waiting for".
 func (u *updater) printStatus() {
+	planTrustErr := u.refreshPlanTrust()
 	fmt.Printf("dsse-updater %s+%s (uid=%d)\n", buildVersion, buildCommit, os.Geteuid())
 	fmt.Printf("  manifest        : %s\n", u.describeManifest())
 	fmt.Printf("  pinned keys     : update=%d plan=%d\n", len(u.updateKeys), len(u.planKeys))
@@ -714,6 +825,9 @@ func (u *updater) printStatus() {
 	// the fix for those two is not the same.
 	fmt.Printf("  update key from : %s\n", u.pinSource)
 	fmt.Printf("  plan key from   : %s\n", u.planSource)
+	if planTrustErr != nil {
+		fmt.Printf("  ★ PLAN BLOCKED  : %v\n", planTrustErr)
+	}
 	// ★ The OTHER key, the one this device does not hold: who signed the package itself. A device may be
 	// perfectly pinned for manifests and still install anything the manifest names, which is the state every
 	// Mac was in until 2026-08-13.
@@ -759,6 +873,9 @@ func (u *updater) printStatus() {
 	src := updateplatform.FileManifestSource{Path: u.manifestPath, TrustedKeys: u.updateKeys}
 	if m, merr := src.Fetch(context.Background(), time.Now()); merr == nil {
 		statusExp.Version = m.Version
+	}
+	if planTrustErr != nil {
+		return
 	}
 	r, rerr := updateplatform.LoadRollout(u.planPath, u.planKeys, time.Now(), statusExp)
 	fmt.Printf("  rollout plan    : %s\n", r.Source)

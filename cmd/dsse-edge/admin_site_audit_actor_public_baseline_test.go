@@ -35,7 +35,7 @@ func TestSiteLifecycleAuditsUseAuthenticatedActorPublicBaseline(t *testing.T) {
 				t.Fatal(err)
 			}
 			outbox := &recordingAdminAuditOutboxDeadReader{}
-			h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: auth, OperatorTenantID: owner, SiteStore: newDurableAdminSiteStore(filepath.Join(dir, "sites.json")), Writer: writer, AdminAuditOutbox: outbox, ConnectorEnrollmentEdgeURL: "https://edge.example.test", ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ntest-anchor\n-----END CERTIFICATE-----\n"})
+			h := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), AdminAuth: auth, OperatorTenantID: owner, TenantModelStore: connectorTestTenantModel(t, target), SiteStore: newDurableAdminSiteStore(filepath.Join(dir, "sites.json")), Writer: writer, AdminAuditOutbox: outbox, ConnectorEnrollmentEdgeURL: "https://edge.example.test", ConnectorEnrollmentEdgeCAPEM: "-----BEGIN CERTIFICATE-----\ntest-anchor\n-----END CERTIFICATE-----\n"})
 			request := func(method, path, body string) *httptest.ResponseRecorder {
 				req := httptest.NewRequest(method, path, strings.NewReader(body))
 				if mode == "token-own" {

@@ -4,7 +4,7 @@
 // tunnel and NO plaintext DNS leaves the endpoint (the LAN/ISP never see domain names). This is the Windows
 // analog of the macOS agent setup pointing the system resolver at its localhost DNS proxy: the proxy itself
 // (startDNSProxy) mirrors the macOS DsseDNSTunnelProxy, and this file is the "agent setup repoints the
-// resolver" half that macOS does outside its NE. We snapshot each active interface's IPv4 DNS servers
+// resolver" half that macOS does outside its NE. We snapshot each active interface's DNS servers
 // (persisted to disk so restore survives a service restart/crash), set them to the proxy loopback address,
 // and restore them on clean stop.
 //
@@ -15,8 +15,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -94,6 +97,9 @@ type resolverManager struct {
 	loopFor map[string]string // family ("IPv4"/"IPv6") -> loopback to point at
 	entries []resolverEntry   // authoritative taken-over set (keyed by ifIndex|family)
 	backup  string
+	// backupData is the exact last version read or published by this manager.
+	// Mismatch checks detect stale writers but are not a cross-process CAS.
+	backupData []byte
 }
 
 func newResolverManager(bound []string) *resolverManager {
@@ -105,12 +111,105 @@ func newResolverManager(bound []string) *resolverManager {
 	return &resolverManager{bound: bound, loopFor: loopFor, backup: resolverBackupPath()}
 }
 
-func (m *resolverManager) persist() {
-	if data, err := json.MarshalIndent(resolverSnapshot{Entries: m.entries}, "", "  "); err == nil {
-		if err := os.WriteFile(m.backup, data, 0o600); err != nil {
-			fmt.Printf("dns_resolver: WARNING could not persist DNS backup to %s: %v\n", m.backup, err)
+func decodeResolverBackup(data []byte) ([]resolverEntry, error) {
+	var snap resolverSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, fmt.Errorf("invalid DNS backup: %w", err)
+	}
+	if len(snap.Entries) == 0 {
+		return nil, errors.New("invalid DNS backup: no captured interfaces")
+	}
+	seen := make(map[string]bool, len(snap.Entries))
+	for _, e := range snap.Entries {
+		loop := net.ParseIP(e.Loopback)
+		if idxU32(e.IfIndex) == 0 || (e.Family != "IPv4" && e.Family != "IPv6") ||
+			strings.TrimSpace(e.Servers) == "" || loop == nil || !loop.IsLoopback() ||
+			(e.Family == "IPv4" && loop.To4() == nil) ||
+			(e.Family == "IPv6" && loop.To4() != nil) {
+			return nil, errors.New("invalid DNS backup: malformed interface")
+		}
+		key := e.IfIndex + "|" + e.Family
+		if seen[key] {
+			return nil, errors.New("invalid DNS backup: duplicate interface")
+		}
+		seen[key] = true
+	}
+	return snap.Entries, nil
+}
+
+// publishSnapshot writes a complete new file alongside the backup and then
+// publishes it in one filesystem operation. First publication is no-replace:
+// a stale or concurrently created original must never be silently overwritten.
+// Later versions refuse an already-observed mismatch with the last version
+// this manager read. Recovery must stop the service before running: a separate
+// process could still change the file between this check and Rename.
+func (m *resolverManager) publishSnapshot(entries []resolverEntry) error {
+	if len(entries) == 0 {
+		return errors.New("refusing to publish an empty DNS backup")
+	}
+	data, err := json.MarshalIndent(resolverSnapshot{Entries: entries}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := decodeResolverBackup(data); err != nil {
+		return err
+	}
+	if m.backupData != nil {
+		current, err := os.ReadFile(m.backup)
+		if err != nil || !bytes.Equal(current, m.backupData) {
+			return errors.New("DNS backup changed or disappeared; refusing replacement")
+		}
+		if bytes.Equal(data, current) {
+			return nil
 		}
 	}
+	tmp, err := os.CreateTemp(filepath.Dir(m.backup), ".dsse-dns-backup-*")
+	if err != nil {
+		return fmt.Errorf("prepare DNS backup: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return fmt.Errorf("protect DNS backup: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write DNS backup: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("sync DNS backup: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close DNS backup: %w", err)
+	}
+	if m.backupData == nil {
+		if err := os.Link(tmp.Name(), m.backup); err != nil {
+			return fmt.Errorf("publish new DNS backup without replacement: %w", err)
+		}
+	} else if err := os.Rename(tmp.Name(), m.backup); err != nil {
+		return fmt.Errorf("replace DNS backup atomically: %w", err)
+	}
+	m.backupData = data
+	return nil
+}
+
+func (m *resolverManager) removeSnapshot() error {
+	if m.backupData == nil {
+		if _, err := os.Stat(m.backup); errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.New("DNS backup exists without manager ownership")
+	}
+	current, err := os.ReadFile(m.backup)
+	if err != nil || !bytes.Equal(current, m.backupData) {
+		return errors.New("DNS backup changed or disappeared; refusing removal")
+	}
+	if err := os.Remove(m.backup); err != nil {
+		return fmt.Errorf("remove restored DNS backup: %w", err)
+	}
+	m.backupData = nil
+	return nil
 }
 
 // start loads any persisted backup (the captured originals, needed to recover an interface that is currently on
@@ -118,12 +217,24 @@ func (m *resolverManager) persist() {
 // servers (for the --fail-open fallback).
 func (m *resolverManager) start() ([]string, error) {
 	m.mu.Lock()
-	var snap resolverSnapshot
-	if b, err := os.ReadFile(m.backup); err == nil && json.Unmarshal(b, &snap) == nil && len(snap.Entries) > 0 {
-		fmt.Printf("dns_resolver: loaded persisted DNS backup (%d interface(s)) from %s\n", len(snap.Entries), m.backup)
-		m.entries = snap.Entries
-	}
+	err := withDNSBackupLock(m.backup, func() error {
+		if b, err := os.ReadFile(m.backup); err == nil {
+			entries, err := decodeResolverBackup(b)
+			if err != nil {
+				return err // preserve an unreadable original; never overwrite it
+			}
+			fmt.Printf("dns_resolver: loaded persisted DNS backup (%d interface(s)) from %s\n", len(entries), m.backup)
+			m.entries = entries
+			m.backupData = bytes.Clone(b)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("read DNS backup: %w", err)
+		}
+		return nil
+	})
 	m.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	if _, err := m.converge(); err != nil {
 		return nil, err
 	}
@@ -138,33 +249,99 @@ func (m *resolverManager) start() ([]string, error) {
 // loopback that only resolves over a tunnel for traffic it isn't carrying). Idempotent and quiet in steady
 // state. Returns true if it changed anything (so the caller can refresh the fail-open upstream list).
 func (m *resolverManager) converge() (changed bool, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	err = withDNSBackupLock(m.backup, func() error {
+		var inner error
+		changed, inner = m.convergeLocked()
+		return inner
+	})
+	return changed, err
+}
+
+func (m *resolverManager) convergeLocked() (changed bool, err error) {
 	state, err := egressDNSState(m.bound)
 	if err != nil {
 		return false, err
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	captured := map[string]resolverEntry{}
 	for _, e := range m.entries {
 		captured[e.IfIndex+"|"+e.Family] = e
 	}
 	toLoopback, toRestore, keep := planConverge(state, m.loopFor, captured)
 	if len(toLoopback) == 0 && len(toRestore) == 0 {
-		m.entries = keep // keep the tracked set in sync even when no DNS write is needed
+		// An interface can already have left loopback (for example after an
+		// external network reconfiguration). Do not forget its in-memory
+		// original while a stale backup is still on disk.
+		if len(keep) != len(m.entries) {
+			if len(keep) == 0 {
+				if err := m.removeSnapshot(); err != nil {
+					return false, err
+				}
+			} else if err := m.publishSnapshot(keep); err != nil {
+				return false, err
+			}
+		}
+		m.entries = keep
 		return false, nil
 	}
+	// Include every original that may be changed in a crash-recoverable backup
+	// BEFORE touching any interface. A write failure leaves system DNS alone.
+	pending := append([]resolverEntry(nil), m.entries...)
+	seen := make(map[string]bool, len(pending))
+	for _, e := range pending {
+		seen[e.IfIndex+"|"+e.Family] = true
+	}
+	for _, e := range append(append([]resolverEntry(nil), toLoopback...), toRestore...) {
+		key := e.IfIndex + "|" + e.Family
+		if !seen[key] {
+			pending = append(pending, e)
+			seen[key] = true
+		}
+	}
+	if err := m.publishSnapshot(pending); err != nil {
+		return false, fmt.Errorf("DNS backup required before resolver change: %w", err)
+	}
+	m.entries = pending // also retain originals in memory if an OS write fails
+	var applyErr error
 	if len(toLoopback) > 0 {
 		if err := applyDNS(toLoopback, func(e resolverEntry) string { return e.Loopback }); err != nil {
-			fmt.Printf("dns_resolver: converge takeover apply failed: %v\n", err)
+			applyErr = fmt.Errorf("DNS takeover apply: %w", err)
 		}
 	}
 	if len(toRestore) > 0 {
 		if err := applyDNS(toRestore, func(e resolverEntry) string { return e.Servers }); err != nil {
-			fmt.Printf("dns_resolver: converge restore apply failed: %v\n", err)
+			if applyErr == nil {
+				applyErr = fmt.Errorf("DNS restore apply: %w", err)
+			}
+			// Retain the original resolver values until a later successful restore.
+			// Some interfaces may already have been restored; the next pass drops those.
+			keep = append(keep, toRestore...)
 		}
 	}
+	if applyErr != nil {
+		return true, applyErr
+	}
+	if err := verifyResolverEntries(append(toLoopback, toRestore...), func(e resolverEntry) string {
+		for _, taken := range toLoopback {
+			if taken.IfIndex == e.IfIndex && taken.Family == e.Family {
+				return e.Loopback
+			}
+		}
+		return e.Servers
+	}); err != nil {
+		return true, fmt.Errorf("DNS change is not confirmed: %w", err)
+	}
+	// Only now may restored interfaces leave the backup. The pre-change
+	// snapshot remains intact if the final publication/removal fails.
+	if len(keep) == 0 {
+		if err := m.removeSnapshot(); err != nil {
+			return true, err
+		}
+	} else if err := m.publishSnapshot(keep); err != nil {
+		return true, err
+	}
 	m.entries = keep
-	m.persist()
 	fmt.Printf("dns_resolver: network change — %d interface(s) taken over (now egress), %d restored (no longer egress); DNS follows the active default-route link\n", len(toLoopback), len(toRestore))
 	return true, nil
 }
@@ -172,33 +349,121 @@ func (m *resolverManager) converge() (changed bool, err error) {
 // reconcile is the periodic driver of converge (one tick of the default-route follower).
 func (m *resolverManager) reconcile() (bool, error) { return m.converge() }
 
+func canonicalDNSList(s string) string {
+	var servers []string
+	for _, item := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' || r == ' ' }) {
+		if ip := net.ParseIP(strings.TrimSpace(item)); ip != nil {
+			servers = append(servers, ip.String())
+		} else if item != "" {
+			servers = append(servers, strings.ToLower(strings.TrimSpace(item)))
+		}
+	}
+	return strings.Join(servers, ",")
+}
+
+// A successful SetInterfaceDnsSettings call alone does not prove that the
+// original was restored. Keep the recovery copy until the OS readback agrees.
+func verifyResolverEntries(entries []resolverEntry, expected func(resolverEntry) string) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	var families []string
+	for _, e := range entries {
+		families = append(families, e.Loopback)
+	}
+	state, err := enumInterfaceDNS(families)
+	if err != nil {
+		return err
+	}
+	actual := make(map[string]string, len(state))
+	for _, s := range state {
+		actual[s.IfIndex+"|"+s.Family] = canonicalDNSList(s.Servers)
+	}
+	for _, e := range entries {
+		key := e.IfIndex + "|" + e.Family
+		want := canonicalDNSList(expected(e))
+		if got, ok := actual[key]; !ok || got != want {
+			return fmt.Errorf("resolver readback mismatch for interface %s family %s", e.IfIndex, e.Family)
+		}
+	}
+	return nil
+}
+
+func verifyNoResolverLoopback(loopbacks []string) error {
+	state, err := enumInterfaceDNS(loopbacks)
+	if err != nil {
+		return err
+	}
+	wanted := make(map[string]bool, len(loopbacks))
+	for _, loop := range loopbacks {
+		wanted[canonicalDNSList(loop)] = true
+	}
+	for _, s := range state {
+		for _, srv := range strings.Split(canonicalDNSList(s.Servers), ",") {
+			if wanted[srv] {
+				return fmt.Errorf("resolver still points at loopback on interface %s family %s", s.IfIndex, s.Family)
+			}
+		}
+	}
+	return nil
+}
+
 // restoreToAutomatic resets every taken-over interface to AUTOMATIC (DHCP-sourced) DNS — not the captured
 // static servers — flushes the cache, deletes the backup, and clears the tracked set. Used on DISARM: disarm
 // means steering failed and the box is going native, and it may now be on a DIFFERENT network than when we
 // captured (a Wi-Fi roam to another SSID/subnet) — so the OLD static servers would be unreachable and leave DNS
 // dead. Resetting to automatic lets the CURRENT network's DHCP resolver take over, which is what makes a network
 // switch recover instead of staying dark. On re-arm, converge re-captures fresh from the live config.
-func (m *resolverManager) restoreToAutomatic() {
-	if err := resetAllResolvers(); err != nil {
-		fmt.Printf("dns_resolver: reset-to-automatic failed: %v\n", err)
-	}
+func (m *resolverManager) restoreToAutomatic() error {
 	m.mu.Lock()
-	n := len(m.entries)
-	m.entries = nil // re-arm's converge will re-capture from the (possibly new) network's DHCP DNS
-	m.mu.Unlock()
-	_ = os.Remove(m.backup)
-	fmt.Printf("dns_resolver: reset %d interface(s) to automatic DNS — the native network's resolver is now in effect\n", n)
+	defer m.mu.Unlock()
+	return withDNSBackupLock(m.backup, m.restoreToAutomaticLocked)
 }
 
-// restore returns every taken-over interface to its captured servers and deletes the backup (clean stop).
+func (m *resolverManager) restoreToAutomaticLocked() error {
+	if err := resetAllResolvers(); err != nil {
+		// Keep the persisted originals and tracked interfaces for recovery. A
+		// partial reset must not be reported as a verified native DNS posture.
+		return fmt.Errorf("reset DNS to automatic: %w", err)
+	}
+	if err := verifyNoResolverLoopback(append([]string{"127.0.0.1", "::1"}, m.bound...)); err != nil {
+		return fmt.Errorf("automatic DNS readback is unverified: %w", err)
+	}
+	n := len(m.entries)
+	if err := m.removeSnapshot(); err != nil {
+		return err
+	}
+	m.entries = nil // re-arm's converge will re-capture from the (possibly new) network's DHCP DNS
+	fmt.Printf("dns_resolver: reset %d interface(s) to automatic DNS — the native network's resolver is now in effect\n", n)
+	return nil
+}
+
+// restore returns every taken-over interface to its captured servers. A failed
+// write or readback retains the backup for standalone recovery.
 func (m *resolverManager) restore() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := applyDNS(m.entries, func(e resolverEntry) string { return e.Servers }); err != nil {
-		fmt.Printf("dns_resolver: restore failed: %v\n", err)
+	if err := withDNSBackupLock(m.backup, m.restoreLocked); err != nil {
+		fmt.Printf("dns_resolver: restore failed, backup retained: %v\n", err)
 	}
-	_ = os.Remove(m.backup)
+}
+
+func (m *resolverManager) restoreLocked() error {
+	if len(m.entries) == 0 {
+		return nil
+	}
+	if err := applyDNS(m.entries, func(e resolverEntry) string { return e.Servers }); err != nil {
+		return fmt.Errorf("restore: %w", err)
+	}
+	if err := verifyResolverEntries(m.entries, func(e resolverEntry) string { return e.Servers }); err != nil {
+		return fmt.Errorf("restore is unverified: %w", err)
+	}
+	if err := m.removeSnapshot(); err != nil {
+		return fmt.Errorf("restored DNS but backup retained: %w", err)
+	}
 	fmt.Printf("dns_resolver: system DNS restored on %d interface(s)\n", len(m.entries))
+	m.entries = nil
+	return nil
 }
 
 // upstreams returns the current captured upstream resolver(s) for the --fail-open fallback (refreshed as
@@ -296,20 +561,42 @@ func upstreamServers(entries []resolverEntry) []string {
 // exists (clean state, or it was already consumed), it returns (0, nil) and the caller falls back to
 // resetAllResolvers so a wedged box still recovers to automatic DNS.
 func restoreResolverFromBackup() (int, error) {
-	backup := resolverBackupPath()
+	return restoreResolverAt(resolverBackupPath())
+}
+
+func restoreResolverAt(backup string) (int, error) {
+	var restored int
+	err := withDNSBackupLock(backup, func() error {
+		var err error
+		restored, err = restoreResolverAtLocked(backup)
+		return err
+	})
+	return restored, err
+}
+
+func restoreResolverAtLocked(backup string) (int, error) {
 	b, err := os.ReadFile(backup)
 	if err != nil {
-		return 0, nil // no backup -> nothing to restore from here
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil // no backup -> caller may reset to automatic
+		}
+		return 0, fmt.Errorf("read DNS backup: %w", err)
 	}
-	var snap resolverSnapshot
-	if json.Unmarshal(b, &snap) != nil || len(snap.Entries) == 0 {
-		return 0, nil
+	entries, err := decodeResolverBackup(b)
+	if err != nil {
+		return 0, err // never discard an unreadable original
 	}
-	if err := applyDNS(snap.Entries, func(e resolverEntry) string { return e.Servers }); err != nil {
+	if err := applyDNS(entries, func(e resolverEntry) string { return e.Servers }); err != nil {
 		return 0, fmt.Errorf("restore from backup: %w", err)
 	}
-	_ = os.Remove(backup)
-	return len(snap.Entries), nil
+	if err := verifyResolverEntries(entries, func(e resolverEntry) string { return e.Servers }); err != nil {
+		return 0, fmt.Errorf("restore from backup unverified: %w", err)
+	}
+	m := &resolverManager{backup: backup, backupData: b}
+	if err := m.removeSnapshot(); err != nil {
+		return 0, err
+	}
+	return len(entries), nil
 }
 
 // resetAllResolvers returns every interface to automatic (DHCP/RA-sourced) DNS and flushes the cache. This is

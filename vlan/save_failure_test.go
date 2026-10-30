@@ -131,3 +131,29 @@ func TestNetworkMutationsRequireConfirmedSave(t *testing.T) {
 		}
 	}
 }
+
+func TestAbsentNetworkDeletionConfirmsEarlierUncertainWrite(t *testing.T) {
+	p := &saveOutcome{file: blobstore.FilePersister{Path: filepath.Join(t.TempDir(), "networks.json")}, write: true}
+	s := NewStore()
+	if err := s.SetPersister(p); err != nil {
+		t.Fatal(err)
+	}
+	p.result = blobstore.ErrDurabilityUnconfirmed
+	if _, err := s.UpsertObject(model.VLANObject{ID: "uncertain", TenantID: "own", Class: "server", CIDRs: []string{"10.0.0.0/24"}}); !errors.Is(err, ErrPersistence) {
+		t.Fatalf("want uncertain save: %v", err)
+	}
+	if _, ok := s.GetObject("uncertain"); ok {
+		t.Fatal("uncertain object published")
+	}
+	p.result = nil
+	if _, err := s.DeleteObject("uncertain"); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := NewStore()
+	if err := reloaded.SetPersister(p.file); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.GetObject("uncertain"); ok {
+		t.Fatal("acknowledged absence resurrected uncertain object after reload")
+	}
+}

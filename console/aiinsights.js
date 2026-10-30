@@ -129,14 +129,16 @@ async function loadAiUsage(host, period = _aiUsagePeriod) {
   const acts = d.by_activity || [];
   if (acts.length) {
     host.appendChild(el("h3", { class: "ui-field-label", style: "margin-top:20px", text: bl({ en: "Who is using which AI", ja: "誰がどの AI を使っているか" }) }));
+    host.appendChild(el("p", { class: "ui-view-desc", text: bl({ en: "AI names and emails are unverified request hints. They do not prove the signed-in SaaS account or exempt traffic from DLP.", ja: "AI の名前とメールはリクエスト由来の未検証情報です。SaaS のログインアカウントの証明や DLP の適用除外には使いません。" }) }));
     let prevWho = null;
     host.appendChild(simpleTable(
-      [bl({ en: "Logged-in user", ja: "ログインユーザー" }), bl({ en: "Device", ja: "デバイス" }), bl({ en: "App", ja: "アプリ" }), bl({ en: "AI name", ja: "AI 名前" }), bl({ en: "AI email", ja: "AI メール" }), bl({ en: "AI service", ja: "AI サービス" }), bl({ en: "Sessions", ja: "セッション" }), bl({ en: "Sent", ja: "送信" }), bl({ en: "Received", ja: "受信" })],
+      [bl({ en: "Logged-in user", ja: "ログインユーザー" }), bl({ en: "Device", ja: "デバイス" }), bl({ en: "App", ja: "アプリ" }), bl({ en: "AI name hint", ja: "AI 名前（未検証）" }), bl({ en: "AI email hint", ja: "AI メール（未検証）" }), bl({ en: "AI service", ja: "AI サービス" }), bl({ en: "Sessions", ja: "セッション" }), bl({ en: "Sent", ja: "送信" }), bl({ en: "Received", ja: "受信" })],
       acts.map((a) => {
-        const who = a.corporate_user || a.identity || "—";
+        // identity can be an unverified token-derived account. Only corporate_user may identify a directory user.
+        const who = a.corporate_user || "—";
         const showWho = who !== prevWho; prevWho = who;
         // P2: show the directory display name (+ department) for the corporate_user; keep the raw id as a tooltip.
-        const hit = dir.get(String(who).toLowerCase());
+        const hit = a.corporate_user ? dir.get(String(a.corporate_user).toLowerCase()) : null;
         const whoCell = !showWho ? el("span", {})
           : hit ? el("span", { title: who }, [el("strong", { text: hit.name })].concat(hit.dept ? [el("span", { class: "ui-view-desc", style: "margin-left:6px", text: hit.dept })] : []))
           : el("strong", { text: who });
@@ -147,7 +149,7 @@ async function loadAiUsage(host, period = _aiUsagePeriod) {
         // conveyed by a paragraph telling the reader to look for an "@gmail"-shaped address. Mark the row instead.
         const emailCell = el("span", { class: "ui-mono", text: aiEmail });
         const accountCell = a.identity_type === "user_personal"
-          ? el("span", {}, [emailCell, el("span", { style: "margin-left:8px" }, [uiBadge(bl({ en: "Shadow AI", ja: "シャドーAI" }), "warn")])])
+          ? el("span", {}, [emailCell, el("span", { style: "margin-left:8px" }, [uiBadge(bl({ en: "Possible shadow AI", ja: "シャドーAI の可能性" }), "warn")])])
           : emailCell;
         return [
           whoCell,

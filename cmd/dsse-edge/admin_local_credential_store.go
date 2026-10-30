@@ -329,7 +329,7 @@ func (s *localAdminCredentialStore) Invite(email, tenantID, principalID string, 
 	// Refused HERE rather than in the route, because the route is not the only way in and the next caller
 	// would open the same hole again. Re-inviting an address that is already in THIS tenant stays allowed —
 	// that is how a lost activation link is reissued.
-	if cred != nil && cred.TenantID != "" && !strings.EqualFold(strings.TrimSpace(cred.TenantID), strings.TrimSpace(tenantID)) {
+	if cred != nil && cred.TenantID != "" && strings.TrimSpace(cred.TenantID) != strings.TrimSpace(tenantID) {
 		return "", errCredentialBelongsToAnotherTenant
 	}
 	if cred == nil {
@@ -533,6 +533,17 @@ func (s *localAdminCredentialStore) VerifyPassword(email, password string, now t
 // VerifyTOTP performs the second login factor (a TOTP code or a one-time recovery code). On repeated failure
 // it locks the account.
 func (s *localAdminCredentialStore) VerifyTOTP(email, code string, now time.Time) (*localAdminCredential, error) {
+	return s.verifyTOTP(email, code, "", now)
+}
+
+func (s *localAdminCredentialStore) VerifyLoginChallenge(challenge loginChallenge, code string, now time.Time) (*localAdminCredential, error) {
+	if challenge.credentialBinding == "" {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+	return s.verifyTOTP(challenge.email, code, challenge.credentialBinding, now)
+}
+
+func (s *localAdminCredentialStore) verifyTOTP(email, code, binding string, now time.Time) (*localAdminCredential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.refreshLoginCredentialLocked(email); err != nil {
@@ -540,6 +551,9 @@ func (s *localAdminCredentialStore) VerifyTOTP(email, code string, now time.Time
 	}
 	cred := s.byEmail[credentialEmailKey(email)]
 	if cred == nil || cred.Status != credentialStatusActive || !cred.TOTPEnrolled {
+		return nil, fmt.Errorf("invalid credentials")
+	}
+	if binding != "" && binding != loginCredentialBinding(cred) {
 		return nil, fmt.Errorf("invalid credentials")
 	}
 	if cred.locked(now) {
@@ -774,7 +788,7 @@ func (s *localAdminCredentialStore) DeleteAllForTenant(tenantID string) ([]strin
 	removed := []string{}
 	var saveErr error
 	for key, cred := range s.byEmail {
-		if cred == nil || !strings.EqualFold(strings.TrimSpace(cred.TenantID), tenantID) {
+		if cred == nil || strings.TrimSpace(cred.TenantID) != tenantID {
 			continue
 		}
 		if err := s.deleteLocked(cred); err != nil {

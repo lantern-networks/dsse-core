@@ -41,7 +41,9 @@ final class DsseAgentPolicyPollerTests: XCTestCase {
     // verify-from-bytes (the path the poller uses on the network response).
     func testVerifyFromEnvelopeData() {
         let data = envelopeJSON.data(using: .utf8)!
-        XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(envelopeData: data, pinnedPublicKeyHex: pubKeyHex),
+        XCTAssertEqual(DsseSignedAgentPolicy.verifiedServerExclusions(
+            envelopeData: data, pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant_track_a_uc03a_lab"),
                        ["com.corp.vpnclient", "com.example.devtool"])
         XCTAssertNil(DsseSignedAgentPolicy.verifiedServerExclusions(
             envelopeData: data, pinnedPublicKeyHex: "00000000000000000000000000000000000000000000000000000000000000ff"))
@@ -51,9 +53,30 @@ final class DsseAgentPolicyPollerTests: XCTestCase {
         StubAgentPolicyURLProtocol.statusCode = 200
         StubAgentPolicyURLProtocol.responseData = envelopeJSON.data(using: .utf8)
         let poller = DsseAgentPolicyPoller(
-            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!, pinnedPublicKeyHex: pubKeyHex)
+            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!,
+            pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant_track_a_uc03a_lab")
         XCTAssertEqual(fetchSync(poller), ["com.corp.vpnclient", "com.example.devtool"],
                        "the poller must fetch + verify the signed policy over the transport")
+    }
+
+    func testPollerRejectsSignedPolicyForAnotherVerifiedDevice() {
+        StubAgentPolicyURLProtocol.statusCode = 200
+        StubAgentPolicyURLProtocol.responseData = envelopeJSON.data(using: .utf8)
+        let poller = DsseAgentPolicyPoller(
+            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!,
+            pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-2")
+        XCTAssertNil(fetchSync(poller), "a valid deployment signature cannot transfer mac-dev-1's exclusions to mac-dev-2")
+    }
+
+    func testPollerRejectsSignedPolicyForAnotherTenantWithSameDeviceName() {
+        StubAgentPolicyURLProtocol.statusCode = 200
+        StubAgentPolicyURLProtocol.responseData = envelopeJSON.data(using: .utf8)
+        let poller = DsseAgentPolicyPoller(
+            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!,
+            pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant-other")
+        XCTAssertNil(fetchSync(poller), "the deployment key and CN are shared across tenant material")
     }
 
     func testPollerRejectsWrongPin() {
@@ -101,7 +124,9 @@ final class DsseAgentPolicyPollerTests: XCTestCase {
         StubAgentPolicyURLProtocol.statusCode = 200
         StubAgentPolicyURLProtocol.responseData = envelopeJSON.data(using: .utf8)
         let poller = DsseAgentPolicyPoller(
-            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!, pinnedPublicKeyHex: pubKeyHex)
+            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!,
+            pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant_track_a_uc03a_lab")
         final class Box: @unchecked Sendable { var last: [String]? }
         let box = Box()
         let sem = DispatchSemaphore(value: 0)
@@ -165,7 +190,9 @@ final class DsseAgentPolicyPollerFailureReportingTests: XCTestCase {
         StubAgentPolicyURLProtocol.statusCode = 503
         StubAgentPolicyURLProtocol.responseData = Data("nope".utf8)
         let poller = DsseAgentPolicyPoller(
-            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!, pinnedPublicKeyHex: pubKeyHex)
+            session: stubSession(), url: URL(string: "https://edge.test/steer/agent-policy")!,
+            pinnedPublicKeyHex: pubKeyHex, expectedDeviceIdentity: "mac-dev-1",
+            expectedTenantID: "tenant_track_a_uc03a_lab")
         fetchSync(poller)
         XCTAssertNotNil(poller.lastFailureReason)
 

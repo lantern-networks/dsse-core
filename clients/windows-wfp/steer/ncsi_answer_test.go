@@ -89,6 +89,25 @@ func TestIsNCSIWebProbe(t *testing.T) {
 	if isNCSIWebProbe(post) {
 		t.Fatal("only GET is an NCSI probe")
 	}
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"default_port", "GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com:80\r\n\r\n", true},
+		{"other_port", "GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com:8080\r\n\r\n", false},
+		{"host_suffix", "GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com.attacker.test\r\n\r\n", false},
+		{"other_path", "GET /private.txt HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n", false},
+		{"path_query", "GET /connecttest.txt?target=other HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n", false},
+		{"absolute_proxy_request", "GET http://www.msftconnecttest.com/connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n", false},
+		{"other_ncsi_path", "GET /connecttest.txt HTTP/1.1\r\nHost: www.msftncsi.com\r\n\r\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isNCSIWebProbe([]byte(tc.raw)); got != tc.want {
+				t.Fatalf("probe match = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestAnswerNCSIWebProbeOverPipe(t *testing.T) {

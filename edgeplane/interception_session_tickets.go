@@ -2,7 +2,10 @@ package edgeplane
 
 import (
 	"crypto/hkdf"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -36,9 +39,10 @@ const (
 
 // fleetSessionTicketKeys derives the ticket keys every Edge sharing `secret` will independently arrive at.
 //
-// Returns (nil, false) when no secret is configured: the caller then keeps the existing per-process random
-// key, which is correct for a single Edge and merely loses cross-node resumption. Silently deriving from an
-// empty secret would be far worse — every deployment on earth would share a predictable ticket key.
+// Returns (nil, false) when no secret is supplied. The engine constructor
+// supplies a distinct random secret per process when no fleet secret is
+// configured. Silently deriving from an empty secret would be far worse:
+// every deployment would share a predictable ticket key.
 func fleetSessionTicketKeys(secret string, now time.Time) ([][32]byte, bool) {
 	secret = strings.TrimSpace(secret)
 	if secret == "" {
@@ -75,4 +79,29 @@ func deriveSessionTicketKey(secret string, epoch int64) ([32]byte, error) {
 // to every user on the host — it is a key-derivation secret, not a tuning knob.
 func interceptionSessionTicketSecret() string {
 	return strings.TrimSpace(os.Getenv("DSSE_INTERCEPTION_SESSION_TICKET_SECRET"))
+}
+
+// Keep one stable secret per process when the fleet secret is absent. Keys are
+// derived from the current epoch on each connection, so a long-lived Edge
+// rotates them without requiring a restart.
+func newInterceptionTicketSecret() (secret string, fleetWide bool, err error) {
+	if secret = interceptionSessionTicketSecret(); secret != "" {
+		return secret, true, nil
+	}
+	var entropy [32]byte
+	if _, err := rand.Read(entropy[:]); err != nil {
+		return "", false, fmt.Errorf("generate per-process session ticket secret: %w", err)
+	}
+	return hex.EncodeToString(entropy[:]), false, nil
+}
+
+func (interception *NetworkExtensionLabTLSInterception) ticketKeysForConnection() [][32]byte {
+	if interception == nil || interception.sessionTicketSecret == "" {
+		return nil
+	}
+	keys, ok := fleetSessionTicketKeys(interception.sessionTicketSecret, interception.now())
+	if !ok {
+		return nil
+	}
+	return keys
 }

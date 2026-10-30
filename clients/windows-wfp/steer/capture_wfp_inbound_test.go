@@ -76,6 +76,9 @@ func TestBuildWFPInboundPolicy_DefaultActionAllowStopsManaging(t *testing.T) {
 	if p.NumRules != 0 {
 		t.Fatalf("NumRules=%d, want 0 (no rules when not managing)", p.NumRules)
 	}
+	if !inboundPolicyAllows(&p, net.ParseIP("203.0.113.99"), 3389, ipProtoTCP) {
+		t.Fatal("allow-by-default must permit an unmatched inbound TCP flow")
+	}
 }
 
 func TestBuildWFPInboundPolicy_GroupFilterAndDenyDropped(t *testing.T) {

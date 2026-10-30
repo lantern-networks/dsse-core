@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -33,7 +32,7 @@ func setupEdgeWorkloadAttestationNonceStore(ctx context.Context, config edgeWork
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("workload-attestation-nonce-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}

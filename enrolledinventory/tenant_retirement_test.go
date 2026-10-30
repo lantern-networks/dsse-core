@@ -65,7 +65,7 @@ func TestTenantRetirementAndErasureSaveOutcomes(t *testing.T) {
 				p.err, p.retain = tc.err, tc.retain
 				mutate := func() (int, error) {
 					if action == "retire" {
-						return l.RetireTenantChecked(" TENANT_A ", stamp)
+						return l.RetireTenantChecked(" tenant_a ", stamp)
 					}
 					ids, err := l.RemoveTenantChecked("tenant_a")
 					return len(ids), err

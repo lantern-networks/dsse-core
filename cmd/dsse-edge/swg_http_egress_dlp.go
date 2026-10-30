@@ -109,13 +109,12 @@ func dlpDeviceRiskConditionsFromDecision(dec model.AccessDecision, resolver dlpP
 	return nil
 }
 
-// dlpInstanceClassFor classifies the decision's destination instance from the signed-in account + the tenant's
-// verified corporate domains, for instance-aware DLP action. "" when it cannot be determined.
-func dlpInstanceClassFor(config edgeSWGHTTPEgressHandlerConfig, dec model.AccessDecision) string {
-	if config.CorporateDomains == nil {
-		return ""
-	}
-	return dlpInstanceClass(dlpDecisionAccountEmail(dec), config.CorporateDomains(dec.TenantID))
+// dlpInstanceClassFor deliberately returns unknown until the SWG has independently verified, destination-bound
+// SaaS account evidence. ai_email/ai_account only decode request tokens; neither their claims, metadata flags,
+// organization domains nor the authenticated DSSE user/device prove which SaaS account receives this upload.
+// Unknown retains both corporate- and personal-scoped inspection. Do not add a metadata-based trust bypass.
+func dlpInstanceClassFor(_ edgeSWGHTTPEgressHandlerConfig, _ model.AccessDecision) string {
+	return ""
 }
 
 func dlpMetaString(m map[string]any, key string) string {
@@ -194,6 +193,7 @@ type edgeSWGHTTPEgressDLPHook struct {
 	// fileUninspectable: the block fired because the file could NOT be extracted (encrypted/corrupt) under
 	// DLPBlockUninspectableFiles — the deny response explains "could not be inspected", not "contains X".
 	fileUninspectable bool
+	resourceReported  bool
 }
 
 // edgeSWGHTTPEgressFileInspectCap bounds how much of a file upload is buffered for extraction. A larger file is
@@ -217,7 +217,7 @@ func isEdgeSWGHTTPEgressFileUpload(contentType string) bool {
 // only the rule's chosen detectors run — not every tenant detector. The allowlist (slice F) is global tuning and
 // always applies. All are nil-safe. `selected` is the rule's identifier list (built-in + custom + EDM names).
 func dlpScanOptionsFor(config edgeSWGHTTPEgressHandlerConfig, tenantID string, selected []string) dlp.Options {
-	var opts dlp.Options
+	opts := dlp.Options{RetentionBudget: config.DLPRetentionBudget}
 	if config.DLPClassifiers != nil {
 		opts.Classifiers = config.DLPClassifiers.ClassifierSetForTenant(tenantID).Subset(selected)
 	}
@@ -322,7 +322,9 @@ func installEdgeSWGHTTPEgressDLP(req *http.Request, config edgeSWGHTTPEgressHand
 	opts := dlpScanOptionsFor(config, dec.TenantID, dlpSelectedIdentifiers(h.policy))
 	if h.policy.Interrupts() {
 		h.guard = dlp.NewGuardReaderWithOptions(req.Body, h.policy.TripThresholds(), opts)
-		req.Body = teeReadCloser{Reader: h.guard, closer: req.Body}
+		// The guard owns pending encrypted spill as well as the original body.
+		// Closing only the source would leave that pending data behind on abort.
+		req.Body = h.guard
 	} else {
 		h.scanner = dlp.NewScannerWithOptions(opts)
 		req.Body = teeReadCloser{Reader: io.TeeReader(req.Body, h.scanner), closer: req.Body}
@@ -400,12 +402,41 @@ func (h *edgeSWGHTTPEgressDLPHook) blocked() bool {
 	if h.fileTripped {
 		return true
 	}
-	return h.guard != nil && h.guard.Tripped()
+	return h.guard != nil && (h.guard.Tripped() || h.guard.ResourceLimited())
+}
+
+func (h *edgeSWGHTTPEgressDLPHook) closeGuard() {
+	if h != nil && h.guard != nil {
+		if err := h.guard.Close(); err != nil {
+			log.Printf("dlp_guard_cleanup result=failed")
+		}
+	}
+}
+
+func (h *edgeSWGHTTPEgressDLPHook) reportResourceRefusal(ctx context.Context) {
+	if h.resourceReported {
+		return
+	}
+	h.resourceReported = true
+	emitEdgeSWGHTTPEgressDLPEvent(ctx, h.config, h.dec, "dlp_inspection_resource_exhausted", "warning",
+		map[string]any{"dlp_metadata_scope": "non_secret", "dlp_action": "block", "reason": "undecided_body_retention_limit"}, time.Now())
 }
 
 // respondBlocked emits the dlp_match (with the enforced action) and writes the deny response: 403 for block,
 // 401 for authenticate (step-up required). The detected secret was never forwarded.
 func (h *edgeSWGHTTPEgressDLPHook) respondBlocked(w http.ResponseWriter, r *http.Request) {
+	if h.guard != nil && h.guard.ResourceLimited() {
+		// A capacity refusal is not evidence of a secret and reauthentication
+		// cannot make undecided bytes safe. Never turn this into a DLP match.
+		h.reportResourceRefusal(r.Context())
+		setSWGHTTPEgressOutcome(w, edgeplane.EdgeSWGHTTPEgressOutcomePolicyDenied)
+		if wantsHTMLResponse(r) {
+			writeCeremonyDeniedHTML(w, http.StatusForbidden, "Upload could not be inspected", "This upload was stopped because inspection could not safely retain its undecided data. Retry later or contact your administrator.", r)
+		} else {
+			writeJSON(w, http.StatusForbidden, map[string]any{"decision": "dlp_inspection_resource_exhausted", "reason": "undecided_body_retention_limit", "dlp_action": "block"})
+		}
+		return
+	}
 	findings := h.fileFindings // already scoped in inspectFile
 	if h.guard != nil {
 		findings = dlpFilterFindingsToSelected(h.guard.Findings(), dlpSelectedIdentifiers(h.policy))
@@ -437,7 +468,7 @@ func (h *edgeSWGHTTPEgressDLPHook) respondBlocked(w http.ResponseWriter, r *http
 		if h.fileUninspectable {
 			detail = "This file could not be inspected (it may be encrypted or corrupted), and your organization requires this destination's uploads to be inspected. Contact your administrator if you believe this is a mistake."
 		}
-		writeCeremonyDeniedHTML(w, status, title, detail)
+		writeCeremonyDeniedHTML(w, status, title, detail, r)
 		return
 	}
 	body := map[string]any{"decision": decision, "dlp_action": string(action), "dlp_findings": findings}
@@ -486,6 +517,13 @@ func dlpHumanIdentifierList(findings []dlp.Finding) string {
 // no-op — respondBlocked already emitted the enforcing event.
 func (h *edgeSWGHTTPEgressDLPHook) finalizeObserve(ctx context.Context) {
 	if h == nil {
+		return
+	}
+	if h.guard != nil && h.guard.ResourceLimited() {
+		// An origin may already have sent response headers on a duplex upload.
+		// The Guard still refuses undecided bytes; record the refusal even when
+		// those already-sent headers can no longer be replaced by our 403.
+		h.reportResourceRefusal(ctx)
 		return
 	}
 	if h.skipReason != "" {
@@ -572,7 +610,7 @@ func appendEdgeSWGHTTPEgressDLPMatch(ctx context.Context, config edgeSWGHTTPEgre
 	// DLP Policy's COMPOSITE conditions; the device is flagged only when a condition is fully satisfied
 	// (enough distinct types + concentration + burst), and existing risk-based policy then acts.
 	if config.DLPDeviceRisk != nil && len(deviceRiskConditions) > 0 {
-		rec := dlpDetectionRecord{types: types, destination: destination, instanceClass: instanceClass}
+		rec := dlpDetectionRecord{tenantID: dec.TenantID, types: types, destination: destination, instanceClass: instanceClass}
 		outcome := config.DLPDeviceRisk.Record(derefStringPtr(dec.DeviceID), rec, deviceRiskConditions, now)
 		if outcome.ConditionSeverity != "" {
 			result := "success"
@@ -609,7 +647,7 @@ func emitEdgeSWGHTTPEgressDLPEvent(ctx context.Context, config edgeSWGHTTPEgress
 	}
 	// Carry the SOURCE (who/where the upload came from) onto the finding so the operator sees not just what was
 	// detected and where it was going, but WHO sent it — the corporate identity, the device, and (from the
-	// decision metadata) the OS/corporate user, the originating app, and the signed-in account. Non-secret.
+	// decision metadata) the OS/corporate user, originating app, and unverified destination-account hint.
 	if metadata != nil {
 		if v := derefStringPtr(dec.SourceIP); v != "" {
 			metadata["dlp_source_ip"] = v
@@ -621,9 +659,12 @@ func emitEdgeSWGHTTPEgressDLPEvent(ctx context.Context, config edgeSWGHTTPEgress
 			metadata["dlp_corporate_user"] = v // the OS/corporate user mapped from the NE OS user
 		}
 		if v := stringMetadata(dec.Metadata, "ai_email"); v != "" {
-			metadata["dlp_account"] = v // the signed-in account (email) the data was sent under
+			metadata["dlp_account"] = v // visibility hint, not verified receiving-account evidence
 		} else if v := stringMetadata(dec.Metadata, "ai_account"); v != "" {
 			metadata["dlp_account"] = v
+		}
+		if stringMetadata(metadata, "dlp_account") != "" {
+			metadata["dlp_account_trust"] = "unverified_request_hint"
 		}
 	}
 	event := model.InspectionEvent{

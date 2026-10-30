@@ -61,7 +61,7 @@ func TestTenantFootprintCoversEveryTenantKeyedTable(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read %s: %v", name, err)
 			}
-			for _, table := range tenantKeyedTablesIn(string(raw)) {
+			for _, table := range tenantKeyedTablesIn(string(raw), strings.HasSuffix(name, ".go")) {
 				found[table] = filepath.Join(root, name)
 			}
 		}
@@ -93,28 +93,32 @@ var (
 )
 
 // tenantKeyedTablesIn returns the tables in one schema source that carry a tenant_id column.
-func tenantKeyedTablesIn(source string) []string {
+func tenantKeyedTablesIn(source string, isGo bool) []string {
 	out := map[string]bool{}
 	for _, match := range createTablePattern.FindAllStringSubmatch(source, -1) {
 		if strings.Contains(strings.ToLower(match[2]), "tenant_id") {
 			out[strings.ToLower(match[1])] = true
 		}
 	}
-	// The Go-built definitions: take a window after the table name, since the body is spread across string
-	// fragments and the regexp above cannot see a closing paren in the same literal.
-	for _, loc := range createTableGoPattern.FindAllStringSubmatchIndex(source, -1) {
-		name := strings.ToLower(source[loc[2]:loc[3]])
-		end := loc[1] + 4000
-		if end > len(source) {
-			end = len(source)
-		}
-		window := strings.ToLower(source[loc[1]:end])
-		// Stop at the next CREATE TABLE so one definition's columns are not attributed to the previous table.
-		if next := strings.Index(window, "create table"); next >= 0 {
-			window = window[:next]
-		}
-		if strings.Contains(window, "tenant_id") {
-			out[name] = true
+	if isGo {
+		// The Go-built definitions are spread across string fragments, so the
+		// parser needs a following window. SQL files have complete statements:
+		// scanning beyond their closing semicolon can attribute a later trigger's
+		// tenant_id reference to a child table with no tenant_id column.
+		for _, loc := range createTableGoPattern.FindAllStringSubmatchIndex(source, -1) {
+			name := strings.ToLower(source[loc[2]:loc[3]])
+			end := loc[1] + 4000
+			if end > len(source) {
+				end = len(source)
+			}
+			window := strings.ToLower(source[loc[1]:end])
+			// Stop at the next CREATE TABLE so one definition's columns are not attributed to the previous table.
+			if next := strings.Index(window, "create table"); next >= 0 {
+				window = window[:next]
+			}
+			if strings.Contains(window, "tenant_id") {
+				out[name] = true
+			}
 		}
 	}
 	for _, match := range alterAddTenantColumn.FindAllStringSubmatch(source, -1) {
@@ -126,6 +130,18 @@ func tenantKeyedTablesIn(source string) []string {
 	}
 	sort.Strings(tables)
 	return tables
+}
+
+func TestTenantKeyedSQLScanDoesNotAttributeTriggerReferencesToChildTable(t *testing.T) {
+	source := `CREATE TABLE jobs (job_id text PRIMARY KEY, tenant_id text NOT NULL);
+CREATE TABLE candidates (job_id text REFERENCES jobs(job_id), receipt text);
+CREATE FUNCTION guard() RETURNS trigger AS $$ BEGIN
+  PERFORM 1 FROM jobs WHERE tenant_id = 'example'; RETURN NEW;
+END; $$ LANGUAGE plpgsql;`
+	got := tenantKeyedTablesIn(source, false)
+	if len(got) != 1 || got[0] != "jobs" {
+		t.Fatalf("tenant-keyed SQL tables = %v, want [jobs]", got)
+	}
 }
 
 // devTreeMigrations is where the migrations sit in the development tree, one level below the root. Named

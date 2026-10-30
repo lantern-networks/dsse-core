@@ -36,6 +36,11 @@ import (
 var trustAnchorPin string
 
 func main() {
+	uninstall := flag.Bool("uninstall", false, "remove machine state with checked recovery and aggregate cleanup; failure leaves services disabled for retry")
+	rollbackFresh := flag.Bool("rollback-fresh-install", false, "MSI fresh-install rollback: stop/recover before removing its new driver")
+	prepareReplacement := flag.Bool("prepare-driver-replacement", false, "stop services and verify network recovery before an MSI upgrade unloads the old driver")
+	holdUninstall := flag.Bool("hold-incomplete-uninstall", false, "MSI rollback: hold the restored services disabled and recover networking without restoring removed trust")
+	installDir := flag.String("install-dir", "", "installed helper directory; required for the MSI embedded rollback helper")
 	apply := flag.Bool("apply", false, "verify + persist the signed install profile to the config store")
 	clear := flag.Bool("clear", false, "remove the persisted profile from the config store (uninstall)")
 	status := flag.Bool("status", false, "print the config-store profile state")
@@ -58,10 +63,39 @@ func main() {
 		"uninstall: take back every anchor this machine was given at provisioning time — the organization's "+
 			"interception root and, where this deployment's step-up portal is on a certificate it issued "+
 			"itself, that authority. Matched BY FINGERPRINT against the artefacts provisioning wrote, so a "+
-			"root another deployment put there is never touched. Never fails an uninstall.")
-	removeRoot := flag.String("remove-interception-root", "", "uninstall: remove the interception root THIS package installed, named by the same artifact the install read, matched BY FINGERPRINT. Never by subject — another deployment can hold a root with the same name (a rotation in flight, a device moved between organizations) and taking that one is an outage. It never fails the uninstall: an uninstall that refuses leaves the machine holding both the agent and the root.")
+			"root another deployment put there is never touched. Returns nonzero on incomplete removal.")
+	removeRoot := flag.String("remove-interception-root", "", "uninstall: remove the root named by the artifact, matched by fingerprint, and return nonzero on incomplete removal")
 	installRoot := flag.String("install-interception-root", "", "install the organization's interception root (a PEM, possibly carrying a rotation's old+new pair) into LocalMachine\\Root. Embedded in the package so the FIRST trust decision does not have to be learned from the network. Adding a certificate already present is a no-op; adding a DIFFERENT certificate under a subject already in the store is REFUSED, because a trust store shows only the name and two authorities sharing one has taken this product down twice.")
 	flag.Parse()
+	if *uninstall || *holdUninstall || *rollbackFresh || *prepareReplacement {
+		dir := *installDir
+		if dir == "" && (*uninstall || *prepareReplacement) {
+			exe, err := os.Executable()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			dir = filepath.Dir(exe)
+		}
+		var err error
+		if *prepareReplacement {
+			err = prepareDriverReplacement(dir)
+		} else if *rollbackFresh {
+			err = doRollbackFreshMachine(dir)
+		} else if *holdUninstall {
+			err = doHoldIncompleteUninstall(dir)
+		} else {
+			err = doUninstallMachine(dir)
+		}
+		if !*prepareReplacement {
+			reportWhatUninstallLeaves(os.Stdout)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "profileapply: INCOMPLETE installer operation: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	pin := trustAnchorPin
 	if *pinOverride != "" {
@@ -96,18 +130,22 @@ func main() {
 		}
 		return
 	}
-	// ★ The counterpart the installer never had. It returns nil on everything it cannot do — an uninstall
-	// that refuses leaves the machine holding the agent AND a CA trusted for every name on the internet,
-	// which is strictly worse than either. See interception_root_removal.go.
+	// Removal failures propagate; a trusted root left behind is not a successful uninstall.
 	if *removeTrusted {
 		// ★ THE UNINSTALL PATH THAT THE SHIPPED LANE ACTUALLY HAS. See
 		// everything_provisioning_trusted_comes_back_out.go: -remove-interception-root only exists in a
 		// package built WITH a root, and the lane this product ships installs it from a signed profile.
-		doRemoveEverythingProvisioningTrusted(escrowDir())
+		if err := doRemoveEverythingProvisioningTrusted(escrowDir()); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		return
 	}
 	if *removeRoot != "" {
-		_ = doRemoveInterceptionRoot(*removeRoot)
+		if err := doRemoveInterceptionRoot(*removeRoot); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -239,7 +277,8 @@ func main() {
 	case *clear:
 		// The persisted profile is written OUTSIDE MSI component tracking (configstore.Apply), so uninstall must
 		// scrub it explicitly, or the envelope would linger after removal.
-		if err := configstore.Clear(be); err != nil {
+		if err := runCleanup(cleanupStep{"clear profile", func() error { return configstore.Clear(be) }},
+			cleanupStep{"clear adopted verifier", clearAdoptedVerifier}); err != nil {
 			fmt.Fprintf(os.Stderr, "profileapply: clear: %v\n", err)
 			os.Exit(1)
 		}
@@ -251,16 +290,9 @@ func main() {
 		// restore a previous deployment's key with nobody having placed it. That defeats the rule the whole
 		// artefact exists to keep: adopting an authority is an explicit act (signing_key_artefact.go).
 		//
-		// This branch is reached on genuine uninstall only — ClearProfile is conditioned REMOVE="ALL" AND NOT
-		// UPGRADINGPRODUCTCODE — so a MajorUpgrade's RemoveExistingProducts never gets here.
-		if err := clearAdoptedVerifier(); err != nil {
-			// Non-fatal, like everything else on this path: an uninstall that refuses leaves the machine holding
-			// the product AND the record. Loud, because a silently retained authority is the failure above.
-			fmt.Fprintf(os.Stderr, "profileapply: WARNING - the adopted verifier could NOT be removed (%v). "+
-				"This machine still records which authority it verified configuration against.\n", err)
-		} else {
-			fmt.Println("profileapply: the adopted verifier record was removed")
-		}
+		// This explicit CLI mode clears the same state as the aggregate uninstall.
+		// The MSI invokes neither mode during old-product removal in an upgrade.
+		fmt.Println("profileapply: the adopted verifier record was removed")
 		// ★★★ AND SAY WHAT IS BEING LEFT (2026-09-07, found on both platforms on the same day). Clearing the
 		// store stops this machine acting on a profile. It does not collect the artefacts on disk that NAME
 		// the deployment it belonged to, and the next thing to read one adopts that deployment — measured on

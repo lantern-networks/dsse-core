@@ -109,7 +109,7 @@ func deviceHeartbeatBody(cfg heartbeatConfig, now time.Time, agentHealthy bool) 
 //  1. the control device \\.\DsseWfp opens -> the driver is LOADED (the device exists only between
 //     DriverEntry and unload, so a service-stop / driver-unload makes this fail);
 //  2. a read-only stats IOCTL answers -> the driver is RESPONSIVE (not a wedged/zombie handle);
-//  3. all six WFP filters are installed -> the driver's filters were not individually deleted while it stays
+//  3. all required WFP filters are installed -> the driver's filters were not individually deleted while it stays
 //     loaded (an admin tamper that 1+2 alone would miss).
 //
 // Any failure => unhealthy => the Edge's W-3 posture path degrades trust and revokes east-west grants. A

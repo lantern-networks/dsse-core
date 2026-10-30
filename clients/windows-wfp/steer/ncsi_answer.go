@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -89,32 +92,41 @@ func ncsiDNSReply(query []byte) ([]byte, bool) {
 	return out, true
 }
 
-// ncsiWebHosts are the hosts Windows NCSI hits for its active HTTP connectivity probe.
-var ncsiWebHosts = []string{"msftconnecttest.com", "msftncsi.com"}
+// Only these exact host/path pairs are connectivity probes. A substring match on Host would consume
+// unrelated application traffic (including a hostname ending in .attacker.example) and forge a local 200.
+var ncsiWebProbes = map[string]string{
+	"www.msftconnecttest.com": "/connecttest.txt",
+	"msftconnecttest.com":     "/connecttest.txt",
+	"www.msftncsi.com":        "/ncsi.txt",
+	"msftncsi.com":            "/ncsi.txt",
+}
 
-// isNCSIWebProbe reports whether the buffered HTTP request bytes are an NCSI connectivity probe (a GET to one
-// of the msftconnecttest/msftncsi hosts). Matches on the request line + Host header; tolerant of exact path.
+// isNCSIWebProbe reports whether the buffered HTTP request bytes are one exact Windows connectivity probe.
+// A normal HTTP request to an unrelated host or path must continue to the Edge unchanged.
 func isNCSIWebProbe(reqBytes []byte) bool {
-	// First line must be a GET.
-	nl := bytes.IndexByte(reqBytes, '\n')
-	if nl < 0 || !bytes.HasPrefix(reqBytes, []byte("GET ")) {
+	if !bytes.Contains(reqBytes, []byte("\r\n\r\n")) {
 		return false
 	}
-	lower := bytes.ToLower(reqBytes)
-	hostIdx := bytes.Index(lower, []byte("\nhost:"))
-	if hostIdx < 0 {
+	req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(reqBytes)))
+	if err != nil {
 		return false
 	}
-	host := lower[hostIdx+len("\nhost:"):]
-	if end := bytes.IndexByte(host, '\n'); end >= 0 {
-		host = host[:end]
+	defer req.Body.Close()
+	if req.Method != http.MethodGet || req.URL.IsAbs() {
+		return false
 	}
-	for _, h := range ncsiWebHosts {
-		if bytes.Contains(host, []byte(h)) {
-			return true
+	host := strings.TrimSpace(strings.ToLower(req.Host))
+	if strings.Contains(host, ":") {
+		h, p, err := net.SplitHostPort(host)
+		port, perr := strconv.Atoi(p)
+		if err != nil || perr != nil || port != 80 {
+			return false
 		}
+		host = h
 	}
-	return false
+	host = strings.TrimSuffix(host, ".")
+	path, ok := ncsiWebProbes[host]
+	return ok && req.RequestURI == path
 }
 
 // answerNCSIWebProbe peeks a port-80 flow's first request and, if it is an NCSI web probe, replies locally with

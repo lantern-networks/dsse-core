@@ -66,6 +66,7 @@ type Store struct {
 	// effect on the live decision path without a restart.
 	tenantRestrictionRuleStatus map[string]string
 	tenantRestrictions          map[string]map[string]tenantrestriction.Setting
+	upstreamTLSModes            map[string]string
 	// policyStatusOverride maps tenant id -> policy id -> status ("active"/"disabled"): a runtime enable/disable
 	// of an individual policy (incl. a built-in seeded one). Persisted, so a disable survives a restart even
 	// though the policy re-seeds from the config source. Applied onto the policies on set + on load.
@@ -119,6 +120,7 @@ func NewStore(seed []model.Policy) *Store {
 	store := &Store{
 		policies:                    map[string]map[string]model.Policy{},
 		tenantRestrictions:          map[string]map[string]tenantrestriction.Setting{},
+		upstreamTLSModes:            map[string]string{},
 		tenantRestrictionRuleStatus: map[string]string{},
 		policyStatusOverride:        map[string]map[string]string{},
 		eastWestEnabled:             map[string]bool{},
@@ -319,6 +321,9 @@ func (store *Store) ReplaceTenant(tenantID string, policies []model.Policy, now 
 // config distribution: the Edge pulls the whole tenant bundle from the control plane and swaps it in). Returns
 // the policy count applied.
 func (store *Store) ApplyBundle(tenantID string, policies []model.Policy, cfg TenantConfigBundle, now time.Time) int {
+	if ValidateTenantConfig(cfg) != nil {
+		return 0
+	}
 	tenantID = strings.TrimSpace(tenantID)
 	if store == nil || tenantID == "" {
 		return 0
@@ -382,6 +387,10 @@ func (store *Store) reapplyRuntimeOverlaysLocked(tenantID string) {
 // the bundle ships wholesale (only replaced when the CP included it). Risk activation/scopes are NOT
 // here (node-local auto-activation must survive a pull — see configBundlePayload.TenantConfig).
 func (store *Store) applyTenantConfigLocked(tenantID string, cfg TenantConfigBundle) {
+	if store.upstreamTLSModes == nil {
+		store.upstreamTLSModes = map[string]string{}
+	}
+	store.upstreamTLSModes[tenantID] = EffectiveUpstreamTLSMode(cfg.UpstreamTLSMode)
 	if cfg.SaaSTenantRestrictions != nil {
 		store.tenantRestrictions[tenantID] = tenantrestriction.Copy(cfg.SaaSTenantRestrictions)
 	}
@@ -429,6 +438,7 @@ func (store *Store) SnapshotTenantConfig(tenantID string) TenantConfigBundle {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	cfg.SaaSTenantRestrictions = tenantrestriction.Copy(store.tenantRestrictions[tenantID])
+	cfg.UpstreamTLSMode = EffectiveUpstreamTLSMode(store.upstreamTLSModes[tenantID])
 	cfg.EastWestEnabled = store.eastWestEnabled[tenantID]
 	cfg.EastWestAllowUnmatched = store.eastWestAllowUnmatched[tenantID]
 	cfg.EastWestRules = append([]decision.EastWestRule(nil), store.eastWestRules[tenantID]...)
@@ -573,18 +583,19 @@ func (store *Store) RuntimeEvaluator(base decision.Evaluator) decision.Evaluator
 			total += len(compiled)
 		}
 		if total > 0 {
-			present := make(map[string]bool, len(base.Policies))
+			type policyKey struct{ tenantID, id string }
+			present := make(map[policyKey]bool, len(base.Policies))
 			for _, policy := range base.Policies {
-				present[policy.ID] = true
+				present[policyKey{policy.TenantID, policy.ID}] = true
 			}
 			merged := make([]model.Policy, 0, len(base.Policies)+total)
 			merged = append(merged, base.Policies...)
 			for _, owner := range sortedCompiledTenants(store.compiledPolicies) {
 				for _, policy := range store.compiledPolicies[owner] {
-					if present[policy.ID] {
+					if present[policyKey{policy.TenantID, policy.ID}] {
 						continue
 					}
-					present[policy.ID] = true
+					present[policyKey{policy.TenantID, policy.ID}] = true
 					merged = append(merged, policy)
 				}
 			}
@@ -604,6 +615,7 @@ func (store *Store) RuntimeEvaluator(base decision.Evaluator) decision.Evaluator
 	base.EastWestInternalNetworks = store.eastWestInternalNetworks[tenantID]
 	// Partial Enforce (S4): enabled rules bite but unmatched flows are allowed (not default-denied).
 	base.EastWestAllowUnmatched = store.eastWestAllowUnmatched[tenantID]
+	base.EastWestMaxGrantTTLSeconds = store.eastWestMaxGrantTTL[tenantID]
 	// Union the legacy admin rules with the rules compiled from the authored-rule model. Enablement is NOT
 	// implied by having rules — it stays under the existing posture toggle (observe → enforce), so authoring
 	// a rule never silently turns on east-west default-deny.
@@ -1155,6 +1167,7 @@ func (store *Store) LegacyExceptionsFor(tenantID string) []model.LegacyException
 // TenantConfigBundle is the distributed, CP-authoritative slice of the admin policy store's per-tenant
 // config toggles. Applied atomically with the policies under one lock (ApplyBundle).
 type TenantConfigBundle struct {
+	UpstreamTLSMode             string                               `json:"upstream_tls_mode,omitempty"`
 	SaaSTenantRestrictions      map[string]tenantrestriction.Setting `json:"saas_tenant_restrictions"`
 	EastWestEnabled             bool                                 `json:"east_west_enabled"`
 	EastWestAllowUnmatched      bool                                 `json:"east_west_allow_unmatched"`
@@ -1195,6 +1208,9 @@ func (store *Store) Tenants() []string {
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	seen := map[string]bool{}
+	for tenantID := range store.upstreamTLSModes {
+		seen[tenantID] = true
+	}
 	for tenantID := range store.tenantRestrictions {
 		seen[tenantID] = true
 	}

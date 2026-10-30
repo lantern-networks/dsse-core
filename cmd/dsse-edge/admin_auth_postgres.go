@@ -33,7 +33,7 @@ func (p postgresAdminAuthStore) PrincipalIDForSubject(tenantID, subject string) 
 	defer cancel()
 	var id string
 	err := p.DB.QueryRowContext(ctx,
-		"SELECT admin_principal_id FROM admin_principals WHERE tenant_id = $1 AND lower(subject) = $2 LIMIT 1",
+		"SELECT admin_principal_id FROM admin_principals WHERE tenant_id = $1 AND idp_id = 'first_party' AND lower(subject) = $2 LIMIT 1",
 		strings.TrimSpace(tenantID), want).Scan(&id)
 	if err != nil || strings.TrimSpace(id) == "" {
 		return "", false
@@ -274,15 +274,23 @@ func (store postgresAdminAuthStore) RevokeAllForTenant(ctx context.Context, tena
 		return 0, 0, fmt.Errorf("postgres admin auth db is not configured")
 	}
 	stamp := now.UTC()
+	// The indexed status and JSON representation must change together. Token
+	// rotation and management reads deserialize payload, while authentication
+	// checks the indexed columns.
 	sessions, err := store.DB.ExecContext(ctx,
-		"UPDATE admin_sessions SET status = 'revoked', last_active_at = $2 WHERE tenant_id = $1 AND status <> 'revoked'",
-		tenantID, stamp)
+		`UPDATE admin_sessions SET status = 'revoked', last_active_at = $2,
+		payload = payload || jsonb_build_object('status', 'revoked', 'last_active_at', $3::text)
+		WHERE tenant_id = $1 AND status <> 'revoked'`,
+		tenantID, stamp, stamp.Format(time.RFC3339))
 	if err != nil {
 		return 0, 0, fmt.Errorf("revoke sessions for tenant %q: %w", tenantID, err)
 	}
 	tokens, err := store.DB.ExecContext(ctx,
-		"UPDATE admin_api_tokens SET status = 'revoked' WHERE tenant_id = $1 AND status <> 'revoked'",
-		tenantID)
+		`UPDATE admin_api_tokens SET status = 'revoked',
+		payload = payload || jsonb_build_object('status', 'revoked', 'metadata',
+		COALESCE(NULLIF(payload->'metadata', 'null'::jsonb), '{}'::jsonb) || jsonb_build_object('revoked_at', $2::text))
+		WHERE tenant_id = $1 AND status <> 'revoked'`,
+		tenantID, stamp.Format(time.RFC3339))
 	if err != nil {
 		return 0, 0, fmt.Errorf("revoke api tokens for tenant %q: %w", tenantID, err)
 	}

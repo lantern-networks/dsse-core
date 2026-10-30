@@ -1,6 +1,7 @@
 package edgeplane
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	interception "github.com/lantern-networks/dsse-core/interception"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 )
 
 // Full-duplex runtime-copy tunnel.
@@ -36,33 +38,31 @@ import (
 
 const NetworkExtensionRuntimeCopyTunnelPath = "/network-extension/runtime-copy/tunnel"
 
-// A per-flow idle safety net. Only a flow with no bytes in EITHER direction for this long is torn down: one
-// direction going quiet while the other still carries is not idle. It exists to bound the flows that pile up
-// when a peer half-closes and then never speaks and never closes, and it is a tunable safety net rather than
-// a policy. Generous, so that a legitimately idle-but-alive connection — an interactive SSH session, a pooled
-// database connection — is not cut by mistake.
+// The idle safety net: a flow with no bytes in EITHER direction for this long is
+// torn down. One direction going quiet while the other still carries is not idle.
 //
-// ★ Under steer-all with decrypt-all, EVERY flow makes a tunnel connection, including macOS's background
-// ones. A reaper set too long lets idle connections accumulate toward the network extension's own limit of
-// 1024 concurrent connections, which then becomes the error. DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS shortens it;
-// zero or an invalid value means the default.
+// It is resource protection, not a performance quota. The Windows agent does not
+// tell the Edge when its application closes a connection (its mux has no
+// half-close frame), and macOS flows were observed to stay open as well, so a
+// flow the application abandoned stays open until the destination closes it, and
+// many destinations never do. Without this bound the
+// flows pile up on every Edge and endpoint without limit: on 2026-10-30, with the
+// default unset, two Edges held about 1,200 open flows from two endpoints after
+// 90 minutes and gained about 70 more every 3 minutes, while the Windows agent
+// accumulated CLOSE_WAIT sockets. The 2026-10-18 change that made performance
+// quotas opt-in had removed this default by classifying it as one.
+//
+// 180 s is the value it had before that change: generous enough that SSE and
+// long-poll normally carry something inside it. A connection that is idle in both
+// directions for longer (an interactive SSH session without keepalives) is closed.
+// DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS sets another value; an explicit 0 disables
+// the safety net and accepts the unbounded growth described above.
+const networkExtensionRuntimeCopyTunnelDefaultIdle = 180 * time.Second
+
 var networkExtensionRuntimeCopyTunnelIdleTimeout = resolveNetworkExtensionRuntimeCopyTunnelIdleTimeout()
 
 func resolveNetworkExtensionRuntimeCopyTunnelIdleTimeout() time.Duration {
-	// 180s by default: the Edge independently tears down a flow with no bytes either way for that long, so the
-	// leak is bounded here as well as by the extension's own 120s reaper. SSE and long-poll normally carry
-	// something inside 180s, so they are unlikely to be cut. The previous default of thirty minutes was long
-	// enough to be a cause of the leak rather than a bound on it.
-	const fallback = 180 * time.Second
-	raw := strings.TrimSpace(os.Getenv("DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS"))
-	if raw == "" {
-		return fallback
-	}
-	secs, err := strconv.Atoi(raw)
-	if err != nil || secs <= 0 {
-		return fallback
-	}
-	return time.Duration(secs) * time.Second
+	return runtimequota.SecondsDefault("DSSE_NE_TUNNEL_IDLE_TIMEOUT_SECONDS", networkExtensionRuntimeCopyTunnelDefaultIdle)
 }
 
 const (
@@ -134,10 +134,14 @@ func NewNetworkExtensionRuntimeCopyTunnelHandler(config NetworkExtensionRuntimeC
 			refuse(http.StatusInternalServerError, "hijack_unsupported", fmt.Errorf("network extension runtime-copy tunnel response writer does not support hijack"))
 			return
 		}
-		var clientConn net.Conn
-		clientConn, _, err = hijacker.Hijack()
+		clientConn, buffered, err := hijacker.Hijack()
 		if err != nil {
 			log.Printf("network_extension_runtime_copy_tunnel hijack failed: %v", err)
+			return
+		}
+		clientConn, err = preserveBufferedTunnelInput(clientConn, buffered.Reader)
+		if err != nil {
+			_ = clientConn.Close()
 			return
 		}
 		if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
@@ -170,6 +174,20 @@ func NewNetworkExtensionRuntimeCopyTunnelHandler(config NetworkExtensionRuntimeC
 	}
 }
 
+// net/http may already have read tunnel bytes with the request headers. Hijack
+// transfers ownership of that buffered input too; reading only the raw socket
+// loses the first bytes of the tunneled protocol.
+func preserveBufferedTunnelInput(conn net.Conn, reader *bufio.Reader) (net.Conn, error) {
+	if reader == nil || reader.Buffered() == 0 {
+		return conn, nil
+	}
+	prefix := make([]byte, reader.Buffered())
+	if _, err := io.ReadFull(reader, prefix); err != nil {
+		return conn, err
+	}
+	return &NetworkExtensionLabTLSPrefixedConn{Conn: conn, Prefix: prefix}, nil
+}
+
 // BridgeNetworkExtensionRuntimeCopyTunnel copies bytes in both directions
 // concurrently. When one direction reaches EOF it half-closes only the write
 // side of the peer (CloseWrite), so the still-active reverse direction keeps
@@ -190,7 +208,8 @@ func bridgeNetworkExtensionRuntimeCopyTunnelWithIdleTimeout(ctx context.Context,
 // half-close linger, so the two can be set independently. An interactive East-West flow (ssh) passes idleTimeout=0
 // (the full-duplex idle window is UNLIMITED — a live session at a prompt is never reaped) together with a finite
 // halfCloseLinger (an ABANDONED half-closed flow is still reclaimed — the leak countermeasure is preserved). The
-// default callers pass linger = idleTimeout/8, byte-identical to the prior behavior.
+// default callers retain the former 180-second idle window's 22.5-second cleanup
+// independently of the healthy full-duplex idle setting.
 func BridgeNetworkExtensionRuntimeCopyTunnelWithIdleAndLinger(ctx context.Context, clientConn io.ReadWriteCloser, upstreamConn io.ReadWriteCloser, idleTimeout, halfCloseLinger time.Duration) {
 	// ★★ COUNTED HERE BECAUSE HERE IS WHERE EVERY PATH MEETS (2026-08-18). The first version of these counters
 	// sat in the runtime-copy HTTP handler, which is ONE of three entry points — steer.go bridges directly for
@@ -207,6 +226,8 @@ func BridgeNetworkExtensionRuntimeCopyTunnelWithIdleAndLinger(ctx context.Contex
 			_ = upstreamConn.Close()
 		})
 	}
+	stopContext := context.AfterFunc(ctx, closeBoth)
+	defer stopContext()
 	// An activity counter incremented by reads in both directions; the watchdog uses it to find an idle flow.
 	var activity uint64
 	// Whether one direction has finished (half-closed). For the log.
@@ -285,6 +306,9 @@ func copyNetworkExtensionRuntimeCopyTunnelTrackingActivity(dst io.Writer, src io
 			if writeErr != nil {
 				return total, writeErr
 			}
+			if written != n {
+				return total, io.ErrShortWrite
+			}
 		}
 		if readErr != nil {
 			if readErr == io.EOF {
@@ -301,8 +325,12 @@ func copyNetworkExtensionRuntimeCopyTunnelTrackingActivity(dst io.Writer, src io
 // tab. Reaping it at about idleTimeout/8 rather than the full window bounds the accumulation of half-dead
 // bridges, which is a goroutine and heap leak and shows up as GC CPU. Any progress resets the idle clock, so a
 // flow streaming a response after its request completed — a large download — is not cut.
-func networkExtensionRuntimeCopyTunnelHalfCloseLinger(idleTimeout time.Duration) time.Duration {
-	return idleTimeout / 8
+func networkExtensionRuntimeCopyTunnelHalfCloseLinger(_ time.Duration) time.Duration {
+	const name = "DSSE_NE_ABANDONED_HALF_CLOSE_LINGER_MILLISECONDS"
+	if strings.TrimSpace(os.Getenv(name)) == "" {
+		return 22500 * time.Millisecond
+	}
+	return runtimequota.Milliseconds(name)
 }
 
 // watchNetworkExtensionRuntimeCopyTunnelIdle samples the activity counter at a fine interval and tears the

@@ -2,11 +2,37 @@ package main
 
 import (
 	"fmt"
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"net"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
+
+// No DSSE-authored connection-count or established-session idle quota is emitted
+// unless the operator chooses one at rendering time. HAProxy then derives its
+// inherent capacity from OS descriptor/memory limits; this is not infinite RAM.
+func frontDoorResourceSettings(body string, configName ...string) string {
+	max := runtimequota.Count("DSSE_HAPROXY_MAX_CONNECTIONS")
+	line := "    # No DSSE connection quota: HAProxy computes capacity from OS resources."
+	if max > 0 {
+		line = fmt.Sprintf("    maxconn %d", max)
+	}
+	body = strings.ReplaceAll(body, "__DSSE_HAPROXY_CONNECTION_QUOTA__", line)
+	name := "haproxy.cfg"
+	if len(configName) == 1 {
+		name = filepath.Base(configName[0])
+	}
+	body = strings.Replace(body, "global\n", "global\n    stats socket /tmp/dsse-"+name+".sock mode 600 level user\n", 1)
+	body = strings.Replace(body, "defaults\n", "defaults\n    option clitcpka\n    option srvtcpka\n", 1)
+	idle := runtimequota.Seconds("DSSE_HAPROXY_SESSION_IDLE_TIMEOUT_SECONDS")
+	body = regexp.MustCompile(`(?m)^    timeout (client|server|tunnel) +[0-9]+[a-z]*$`).ReplaceAllStringFunc(body, func(s string) string {
+		fields := strings.Fields(s)
+		return fmt.Sprintf("    timeout %s %dms", fields[1], idle.Milliseconds())
+	})
+	return body
+}
 
 // frontdoor.go — the control plane's front door, and why a deployment has two control planes.
 //
@@ -62,7 +88,7 @@ func writeFrontDoorConfig(dir string) error {
 # deployment did not issue in front of the authority, and everything that pins the anchor would refuse it.
 global
     log stdout format raw local0 info
-    maxconn 4096
+__DSSE_HAPROXY_CONNECTION_QUOTA__
 
 # ★★★ RESOLVE NAMES AT RUNTIME, NOT AT PARSE TIME (found by running it). By default HAProxy
 # resolves every backend address while reading this file and REFUSES TO START if one does not resolve. A
@@ -144,7 +170,7 @@ backend cp_data_backend
     server cp-a dsse-control-plane-a:8443 check check-ssl verify none port 9443 resolvers containers init-addr last,libc,none resolve-prefer ipv4
 ` + peerControlPlaneDataServers(dir) + `
 `
-	return writeContainerReadableFile(path, []byte(body))
+	return writeContainerReadableFile(path, []byte(frontDoorResourceSettings(body, filepath.Base(path))))
 }
 
 // writeDatabaseFrontDoorConfig writes the front door for the database cluster.
@@ -162,7 +188,7 @@ func writeDatabaseFrontDoorConfig(dir string) error {
 # ★ THE PLAIN NAME IS THIS DOOR, and the nodes are -a and -b. Which of them is primary changes; the name
 # everything connects to does not.
 global
-    maxconn 2048
+__DSSE_HAPROXY_CONNECTION_QUOTA__
 
 defaults
     mode    tcp
@@ -189,10 +215,13 @@ frontend pg
 backend pg_primary
     option httpchk GET /primary
     http-check expect status 200
+    # A former primary can keep TCP sessions open through a network partition. Close those sessions when
+    # Patroni withdraws primary readiness, so pooled clients and the CP advisory lock reach the new primary.
+    default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions
     server pg-a dsse-postgres-a:5432 check port 8008 resolvers containers init-addr last,libc,none resolve-prefer ipv4
 ` + databaseFrontDoorPeers(dir) + `
 `
-	return writeContainerReadableFile(path, []byte(body))
+	return writeContainerReadableFile(path, []byte(frontDoorResourceSettings(body, filepath.Base(path))))
 }
 
 // ★★★ AND THE AGENT PLANE HAS ONE TOO, FOR A DIFFERENT REASON. The control plane's front door exists to find
@@ -281,6 +310,9 @@ func planeNamesFor(host string) planeNames {
 
 // writeRegionFrontDoorConfig writes the ONE door this deployment presents, on 443.
 func writeRegionFrontDoorConfig(dir string, names planeNames) error {
+	if e := readDeploymentEnv(dir); dedicatedMultiEdgeProfile(e["DSSE_TOPOLOGY_PROFILE"]) && e["DSSE_NODE_ROLE"] == "edge" {
+		return nil
+	}
 	// ★ THE OTHER REGIONS' CONTROL PLANES. See the_edges_door_must_reach_the_other_regions.go: without them
 	// this door can only find a leader that happens to be in this region.
 	peers := controlPlanePeers(dir)
@@ -298,6 +330,99 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 	// ★ WHERE THIS REGION'S EDGES ACTUALLY ARE. On one host they are compose service names; on a deployment
 	// with one component per machine they are real hosts, and only the operator knows what they are called.
 	edgeBackends := edgeFleetBackends(dir)
+	localShape, shapeKnown := regionShapeFromCompose(dir)
+	hasLocalEdge := shapeKnown && localShape.runsEdges()
+	edgeBalance := "    balance source\n    hash-type consistent"
+	edgeHealthDefaults := ""
+	frontEnv := readDeploymentEnv(dir)
+	unavailableRouting, unavailableBackend := "", ""
+	portalRoutes, portalBackends := portalRouting(frontEnv), portalBackend(frontEnv)
+	portalIngressReject := ""
+	cpAdminServers := "    server cp-a dsse-control-plane-a:9443 check check-ssl verify none resolvers containers init-addr last,libc,none resolve-prefer ipv4\n" + peerControlPlaneServers(peers)
+	cpDataServers := "    server cp-a dsse-control-plane-a:8443 check check-ssl verify none port 9443 resolvers containers init-addr last,libc,none resolve-prefer ipv4\n" + peerControlPlaneDataServers(dir)
+	cpDataHealth := "    option httpchk GET /leader\n    http-check expect status 200\n"
+	cpServerDefaults := "    default-server on-marked-down shutdown-sessions\n"
+	consoleServers := "    server console dsse-console:8443 check check-ssl verify none resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
+	if frontEnv["DSSE_TOPOLOGY_PROFILE"] == "one-region-three-nodes" {
+		// Withdraw new connections before the generated Edge's 10s drain ends.
+		// A silent check is bounded too; inherited 5s/fall=3 can outlive drain.
+		edgeHealthDefaults = "    timeout check 2s\n    default-server inter 1s fall 2 rise 2\n"
+		// Each doorway lists its local CP first. Keep roundrobin explicit rather
+		// than giving a stale local candidate priority during leader transitions.
+		cpServerDefaults = "    balance roundrobin\n" + oneRegionThreeNodesManagementServerDefaults
+		var err error
+		regionAdminName := "admin." + frontEnv["DSSE_EDGE_REGION"] + "." + names.BareHost
+		unavailableRouting = "    use_backend cp_admin_unavailable if { req.ssl_sni -i " + names.Admin + " " + regionAdminName + " } { nbsrv(cp_admin_plane) eq 0 }\n"
+		unavailableBackend = "backend cp_admin_unavailable\n" +
+			"    # TLS handshake check only; this passive endpoint always answers HTTP 503.\n" +
+			"    server unavailable dsse-cp-unavailable:9443 check check-ssl check-sni " + regionAdminName + " verify required ca-file /deployment/deployment-anchor.pem verifyhost " + regionAdminName + " resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
+		cpAdminServers, cpDataServers, err = oneRegionThreeNodesControlPlaneBackends(peers, controlPlaneDataPeers(dir), regionAdminName, frontEnv["DSSE_CP_A_BIND"])
+		if err != nil {
+			return err
+		}
+		cpDataHealth = oneRegionThreeNodesCPDataHealth(regionAdminName)
+		consoleServers, err = oneRegionThreeNodesConsoleBackends(frontEnv["DSSE_CONSOLE_BACKENDS"], names.Console)
+		if err != nil {
+			return err
+		}
+		portalRoutes, portalBackends, err = oneRegionThreeNodesPortalRoutes(frontEnv)
+		if err != nil {
+			return err
+		}
+		if _, err = readPlanNodeAdminTargets(frontEnv); err != nil {
+			return err
+		}
+	}
+	if frontEnv["DSSE_TOPOLOGY_PROFILE"] == "three-regions-multi-edge" {
+		edgeHealthDefaults = "    timeout check 2s\n    default-server inter 1s fall 2 rise 2\n"
+		cpServerDefaults = "    balance roundrobin\n" + oneRegionThreeNodesManagementServerDefaults
+		var err error
+		cpAdminServers, cpDataServers, err = oneRegionThreeNodesControlPlaneBackends(peers, controlPlaneDataPeers(dir), names.Admin, frontEnv["DSSE_CP_A_BIND"])
+		if err != nil {
+			return err
+		}
+		cpDataHealth = oneRegionThreeNodesCPDataHealth(names.Admin)
+		consoleServers, err = oneRegionThreeNodesConsoleBackends(frontEnv["DSSE_CONSOLE_BACKENDS"], names.Console)
+		if err != nil {
+			return err
+		}
+		portalRoutes, portalBackends, err = sharedRegionPortalRoutes(frontEnv)
+		if err != nil {
+			return err
+		}
+		portalIngressReject, err = regionalForeignPortalRejectRules(frontEnv)
+		if err != nil {
+			return err
+		}
+		if _, err = readPlanNodeAdminTargets(frontEnv); err != nil {
+			return err
+		}
+		unavailableRouting = "    use_backend cp_admin_unavailable if { req.ssl_sni -i " + names.Admin + " admin." + frontEnv["DSSE_EDGE_REGION"] + "." + names.BareHost + " } { nbsrv(cp_admin_plane) eq 0 }\n"
+		unavailableBackend = "backend cp_admin_unavailable\n    server unavailable dsse-cp-unavailable:9443 check check-ssl check-sni " + names.Admin + " verify required ca-file /deployment/deployment-anchor.pem verifyhost " + names.Admin + " resolvers containers init-addr last,libc,none resolve-prefer ipv4\n"
+	}
+	if frontEnv["DSSE_TOPOLOGY_PROFILE"] == "one-region-multi-edge" {
+		var err error
+		edgeHealthDefaults = "    timeout check 2s\n    default-server inter 1s fall 2 rise 2\n"
+		cpServerDefaults = oneRegionThreeNodesManagementServerDefaults
+		cpAdminServers, cpDataServers, consoleServers, err = singleCPMultiEdgeBackends(frontEnv, names.Admin, names.Console)
+		if err != nil {
+			return err
+		}
+		cpDataHealth = oneRegionThreeNodesCPDataHealth(names.Admin)
+		portalRoutes, portalBackends, err = sharedRegionPortalRoutes(frontEnv)
+		if err != nil {
+			return err
+		}
+		if _, err = readPlanNodeAdminTargets(frontEnv); err != nil {
+			return err
+		}
+	}
+	if frontEnv["DSSE_EDGE_BALANCE"] == "leastconn" {
+		if frontEnv["DSSE_STEER_MUX_ONLY"] != "true" {
+			return fmt.Errorf("DSSE_EDGE_BALANCE=leastconn requires DSSE_STEER_MUX_ONLY=true; legacy session follow-ups need their owning Edge")
+		}
+		edgeBalance = "    balance leastconn"
+	}
 	path := filepath.Join(dir, "haproxy-edge.cfg")
 	if keepWhatIsThere(path) {
 		return nil
@@ -309,6 +434,8 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 			"    # the name out of the ClientHello, which is plaintext and arrives before any key exchange. The\n" +
 			"    # connection is still passed through byte for byte, so the device certificate the Edge admits\n" +
 			"    # on survives — an L7 proxy that terminated here would destroy it.\n" +
+			portalRoutes +
+			unavailableRouting +
 			"    use_backend cp_admin_plane if { req.ssl_sni -i " + names.Admin + " }\n" +
 			"    use_backend cp_data_plane  if { req.ssl_sni -i " + names.Authority + " }\n" +
 			"    use_backend console_plane  if { req.ssl_sni -i " + names.Console + " }\n" +
@@ -331,7 +458,7 @@ func writeRegionFrontDoorConfig(dir string, names planeNames) error {
 # it, and every decision about who a device is would become "the front door said so".
 global
     log stdout format raw local0 info
-    maxconn 65536
+__DSSE_HAPROXY_CONNECTION_QUOTA__
 
 resolvers containers
     nameserver docker 127.0.0.11:53
@@ -362,28 +489,24 @@ frontend region
     # Wait for the ClientHello so the name is readable. A connection that sends nothing is not a client of
     # this deployment, and the delay costs it rather than everybody else.
     tcp-request inspect-delay 5s
-    tcp-request content accept if { req_ssl_hello_type 1 }
+` + portalIngressReject + `    tcp-request content accept if { req_ssl_hello_type 1 }
 ` + routing + `
+frontend inspection_crl
+    bind :8088
+    default_backend inspection_crl_local
+
+backend inspection_crl_local
+    # Only the read-only DER listener is reachable here. It verifies every
+    # signed CRL before responding, including on a CP standby.
+    server cp-a dsse-control-plane-a:8088 check resolvers containers init-addr last,libc,none resolve-prefer ipv4
+
 backend edge_fleet
-    # ★★★ A DEVICE MUST COME BACK TO THE NODE THAT IS HOLDING ITS SESSION (measured on a real Mac
-    # against a two-Edge region). The agent's runtime-copy path opens a SESSION — a live TCP connection to the
-    # destination, held open in ONE Edge process's memory — and then sends each exchange as a separate request
-    # on a NEW connection. With leastconn those follow-ups went to the other Edge, which had never heard of the
-    # session and answered, correctly, with session_not_found. Roughly half of every steered flow died, and the
-    # device had no network.
-    #
-    # This is not fixable by sharing state: a session IS an open socket to somewhere else, and an open socket
-    # cannot be handed to another process. The door has to send the device back where it came from.
-    #
-    # So: source affinity. All of one device's connections land on one Edge, which is also what the tunnel path
-    # already needs and got by accident from holding a single connection. leastconn is kept as the tie-break
-    # inside the hash so a node that is down is skipped rather than black-holing the devices hashed to it.
-    #
-    # ★ WHAT THIS COSTS, SAID OUT LOUD. Devices behind one NAT share a source address and land on one node, so
-    # a region's balance is by SITE and not by device. That is the price of the datapath holding live sockets,
-    # and it is the honest trade rather than a silent one — the alternative measured worse: it did not work.
-    balance source
-    hash-type consistent
+    # Legacy runtime-copy sessions hold an upstream socket in one Edge and send follow-ups on new HTTP
+    # connections. Existing deployments keep source affinity so those follow-ups reach their owner.
+    # The one-region-three-nodes profile refuses that legacy API and balances independent steer-mux
+    # connections by leastconn. Every frame of one mux connection remains on its owning Edge.
+` + edgeBalance + `
+` + edgeHealthDefaults + `
     option httpchk GET /healthz
     http-check expect status 200
     # ★★★ send-proxy IS WHAT KEEPS THE DEVICE'S ADDRESS. Without it every device in this region arrives from
@@ -392,8 +515,10 @@ backend edge_fleet
     # why these containers have fixed addresses in the compose file.
     #
     # The check is on the ADMIN port while the traffic is on the agent one: health is a property of the node.
-` + edgeFleetServers(edgeBackends) + `
+` + edgeFleetServersOnMachine(edgeBackends, frontEnv["DSSE_EDGE_CHECK_TLS_NAME"], hasLocalEdge) + `
+` + portalBackends + `
 ` + perNodeAdminBackends(dir, names) + `
+` + unavailableBackend + `
 backend cp_admin_plane
     # Whichever control plane is the LEADER. No send-proxy: this is not the agent plane, and the control
     # plane's callers are authenticated by session or token rather than by address.
@@ -406,25 +531,20 @@ backend cp_admin_plane
     # on a two-region deployment: each control plane held HALF the fleet and neither could see the
     # other's, so /admin/fleet/config-status answered a different fleet depending on which process the
     # front door happened to pick — and every view of it looked complete.
-    default-server on-marked-down shutdown-sessions
-    server cp-a dsse-control-plane-a:9443 check check-ssl verify none resolvers containers init-addr last,libc,none resolve-prefer ipv4
-    # ★★★ AND THE CONTROL PLANES IN THE OTHER REGIONS (measured the first time leadership landed
-    # elsewhere). This backend knew only the two control planes on its own compose network — so when the leader
-    # was in another region, the Edges HERE had no route to the authority at all, and the walk stopped with
-    # "the door the Edges use never routed to a leader". The canonical says an Edge probes every control plane
-    # and takes configuration from whichever region holds leadership; the flag-based path does that and this
-    # door did not, so a deployment had two mechanisms and only one of them crossed a region.
-    #
-    # ★ EMPTY IS THE ORDINARY CASE for a deployment with one region, and the file says so rather than leaving
-    # a reader to wonder whether something is missing.
-` + peerControlPlaneServers(peers) + `
+` + cpServerDefaults + `
+    # A three-Node Region probes each peer's direct private CP port, not that
+    # Node's 443 doorway. A doorway can forward to any leader and thus cannot
+    # report its own CP's role. Other profiles may use remote region doorways.
+` + cpAdminServers + `
 backend cp_data_plane
     # ★★★ WHERE A NODE WRITES TO THE AUTHORITY. Shipping what an Edge recorded, reporting an enrolment,
     # reporting a connector that joined — all of it goes to whichever control plane is the LEADER, and a
     # region that is not the leader's has no other way to reach it. Same leader check as the admin plane: a
     # standby must not receive writes, because two nodes taking them is worse than one.
-    option httpchk GET /leader
-    http-check expect status 200
+    # First establish leadership on this Node's direct admin listener. Then
+    # exercise the actual data listener; an admin-only check would keep routing
+    # authority traffic to a Node whose data port is wedged.
+` + cpDataHealth + `
     # ★★★ AND A NODE THAT STOPS LEADING LOSES THE CONNECTIONS IT ALREADY HAS (measured).
     # The health check decides where NEW connections go. Established ones stay where they are — so an
     # Edge that connected while this node led goes on talking to it after leadership moves, for as long
@@ -432,13 +552,98 @@ backend cp_data_plane
     # on a two-region deployment: each control plane held HALF the fleet and neither could see the
     # other's, so /admin/fleet/config-status answered a different fleet depending on which process the
     # front door happened to pick — and every view of it looked complete.
-    default-server on-marked-down shutdown-sessions
-    server cp-a dsse-control-plane-a:8443 check check-ssl verify none port 9443 resolvers containers init-addr last,libc,none resolve-prefer ipv4
-` + peerControlPlaneDataServers(dir) + `
+` + cpServerDefaults + cpDataServers + `
 backend console_plane
-    server console dsse-console:8443 check check-ssl verify none resolvers containers init-addr last,libc,none resolve-prefer ipv4
+` + consoleServers + `
 `
-	return writeContainerReadableFile(path, []byte(body))
+	if !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	return writeContainerReadableFile(path, []byte(frontDoorResourceSettings(body, filepath.Base(path))))
+}
+
+// Override the slower Edge defaults explicitly on all three management planes.
+const oneRegionThreeNodesManagementServerDefaults = "    default-server inter 2s fall 2 rise 1 on-marked-down shutdown-sessions\n"
+
+// One health sequence belongs to each authority backend server. The first
+// request proves this Node holds CP leadership on its direct admin listener;
+// the second proves the same Node's actual data listener answers HTTPS.
+func oneRegionThreeNodesCPDataHealth(adminName string) string {
+	return "    option httpchk\n" +
+		"    http-check connect port 19543 ssl sni " + adminName + "\n" +
+		"    http-check send meth GET uri /leader ver HTTP/1.1 hdr Host " + adminName + "\n" +
+		"    http-check expect status 200\n" +
+		"    http-check connect ssl sni " + adminName + "\n" +
+		"    http-check send meth GET uri /healthz ver HTTP/1.1 hdr Host " + adminName + "\n" +
+		"    http-check expect status 200\n"
+}
+
+// In a three-Node Region, a leader probe must reach that Node's CP rather than
+// another doorway. The doorway itself can proxy to any CP, so probing it cannot
+// establish which Node is the leader and can make the doorways forward in a loop.
+func oneRegionThreeNodesControlPlaneBackends(adminPeers, dataPeers []string, adminName, localBind string) (string, string, error) {
+	if !validPlanDNSName(adminName) || len(adminPeers) != 2 || len(dataPeers) != 2 {
+		return "", "", fmt.Errorf("one-region-three-nodes needs one admin name and two direct CP peers per plane")
+	}
+	localHost := strings.TrimSuffix(localBind, ":")
+	if localBind != localHost+":" || net.ParseIP(localHost).To4() == nil {
+		return "", "", fmt.Errorf("one-region-three-nodes needs the local CP's direct IPv4 bind address")
+	}
+	checkTLS := "check-ssl check-sni " + adminName + " verify required ca-file /deployment/deployment-anchor.pem verifyhost " + adminName
+	// Both local planes use the host's published ports, just like their peers.
+	// This also lets the backend-wide data check reach the local admin listener.
+	admin := fmt.Sprintf("    server cp-a %s:%d check %s\n", localHost, planCPAdminPortA, checkTLS)
+	data := fmt.Sprintf("    server cp-a %s:%d check %s\n", localHost, planCPDataPortA, checkTLS)
+	adminHosts := map[string]bool{}
+	for i, peer := range adminPeers {
+		name, address, ok := strings.Cut(peer, "@")
+		host, port, err := net.SplitHostPort(address)
+		if !ok || err != nil || name != adminName || net.ParseIP(host).To4() == nil || port != fmt.Sprint(planCPAdminPortA) || host == localHost || adminHosts[host] {
+			return "", "", fmt.Errorf("one-region-three-nodes admin peer %d must name %s at a direct CP admin port; got %q", i+1, adminName, peer)
+		}
+		adminHosts[host] = true
+		admin += fmt.Sprintf("    server cp-peer-%d %s check %s\n", i+1, address, checkTLS)
+	}
+	dataHosts := map[string]bool{}
+	for i, peer := range dataPeers {
+		parts := strings.Split(peer, ":")
+		if len(parts) != 3 || net.ParseIP(parts[0]).To4() == nil || !adminHosts[parts[0]] || dataHosts[parts[0]] ||
+			parts[1] != fmt.Sprint(planCPDataPortA) || parts[2] != fmt.Sprint(planCPAdminPortA) {
+			return "", "", fmt.Errorf("one-region-three-nodes data peer %d must name direct CP data and admin ports", i+1)
+		}
+		dataHosts[parts[0]] = true
+		data += fmt.Sprintf("    server cp-data-peer-%d %s:%s check %s\n", i+1, parts[0], parts[1], checkTLS)
+	}
+	return admin, data, nil
+}
+
+// Every doorway uses the same three Console candidates. Each Console's /ready
+// consults its *local* CP /leader, so only the Console on the elected CP is
+// eligible. This is not a second, independent Console leader election.
+// During health-check overlap, the shared order selects one eligible Console
+// instead of distributing new connections across old and new candidates.
+func oneRegionThreeNodesConsoleBackends(raw, consoleName string) (string, error) {
+	backends := strings.Split(raw, ",")
+	if len(backends) != 3 || !validPlanDNSName(consoleName) {
+		return "", fmt.Errorf("one-region-three-nodes needs three Console backends and a Console TLS name")
+	}
+	sort.Strings(backends)
+	seen := map[string]bool{}
+	var servers strings.Builder
+	servers.WriteString("    balance first\n    option httpchk GET /ready\n    http-check expect status 200\n")
+	servers.WriteString(oneRegionThreeNodesManagementServerDefaults)
+	for i, address := range backends {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil || net.ParseIP(host).To4() == nil || port != fmt.Sprint(planConsolePortA) || seen[host] {
+			return "", fmt.Errorf("one-region-three-nodes Console backend %d must use a distinct direct Node address and port %d", i+1, planConsolePortA)
+		}
+		seen[host] = true
+		// The Console may use an operator-provided certificate rather than the
+		// deployment CA. The health probe checks readiness; the browser verifies
+		// the actual end-to-end TLS connection through this TCP-only doorway.
+		fmt.Fprintf(&servers, "    server console-%d %s check check-ssl check-sni %s verify none\n", i+1, address, consoleName)
+	}
+	return servers.String(), nil
 }
 
 // writeStandbyFrontDoorConfig writes the internal control-plane door for a region that runs a WARM STANDBY.
@@ -502,7 +707,7 @@ backend cp_data_backend
     # the NODE, not of a listener.
     server cp-a dsse-control-plane-a:8443 check check-ssl verify none port 9443 resolvers containers init-addr last,libc,none resolve-prefer ipv4
 `
-	return writeContainerReadableFile(filepath.Join(dir, "haproxy-standby.cfg"), []byte(body))
+	return writeContainerReadableFile(filepath.Join(dir, "haproxy-standby.cfg"), []byte(frontDoorResourceSettings(body, "haproxy-standby.cfg")))
 }
 
 // ★★★ A NAME THAT REACHES ONE NODE, ON 443 (2026-08-28, decided by the operator: "443").
@@ -541,6 +746,11 @@ func perNodeAdminBackends(dir string, names planeNames) string {
 	}
 	out := ""
 	for _, n := range nodes {
+		if n.address != "" {
+			ownerName := n.node + ".admin." + names.BareHost
+			out += fmt.Sprintf("\nbackend node_%s\n    option httpchk GET /healthz\n    http-check expect status 200\n    server owner %s check check-ssl check-sni %s verify required ca-file /deployment/deployment-anchor.pem verifyhost %s\n", n.backend, n.address, ownerName, ownerName)
+			continue
+		}
 		out += fmt.Sprintf(`
 backend node_%s
     # ★ ONE SERVER, DELIBERATELY. The point of this name is that it reaches THIS node — a second server here
@@ -561,11 +771,22 @@ backend node_%s
 	return out
 }
 
-type perNodeAdmin struct{ node, backend, host string }
+type perNodeAdmin struct{ node, backend, host, address, machine, role string }
 
 // perNodeAdminTargets is every node this machine runs, by the name that will reach it.
 func perNodeAdminTargets(dir string) []perNodeAdmin {
 	out := []perNodeAdmin{}
+	env := readDeploymentEnv(dir)
+	if declaredNodeMapProfile(env["DSSE_TOPOLOGY_PROFILE"]) {
+		targets, err := readPlanNodeAdminTargets(env)
+		if err != nil {
+			return nil // The front-door writer rejects this before preserving or writing a config.
+		}
+		for _, t := range targets {
+			out = append(out, perNodeAdmin{node: t.Label, backend: strings.ReplaceAll(t.Label, "-", "_"), address: t.Address, machine: t.Machine, role: t.Role})
+		}
+		return out
+	}
 	seen := map[string]bool{}
 	add := func(host string) {
 		host = strings.TrimSpace(host)

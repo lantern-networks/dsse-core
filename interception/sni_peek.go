@@ -22,8 +22,8 @@ const maxClientHelloRecord = 16640 // one TLS record (16 KiB) plus room for the 
 // it returns buffered and an empty SNI, so the caller chooses its own default rather than inheriting one.
 func PeekClientHelloSNI(r io.Reader) (sni string, buffered []byte, err error) {
 	header := make([]byte, 5)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return "", header, err
+	if n, err := io.ReadFull(r, header); err != nil {
+		return "", header[:n], err
 	}
 	// TLS record: type(1)=0x16 handshake, version(2), length(2)
 	if header[0] != 0x16 {
@@ -34,8 +34,8 @@ func PeekClientHelloSNI(r io.Reader) (sni string, buffered []byte, err error) {
 		return "", header, errNotClientHello
 	}
 	record := make([]byte, recordLen)
-	if _, err := io.ReadFull(r, record); err != nil {
-		return "", append(header, record...), err
+	if n, err := io.ReadFull(r, record); err != nil {
+		return "", append(header, record[:n]...), err
 	}
 	buffered = append(header, record...)
 	sni = parseClientHelloSNI(record)

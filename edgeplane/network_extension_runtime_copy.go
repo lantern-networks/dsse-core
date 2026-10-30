@@ -26,8 +26,6 @@ const (
 	networkExtensionRuntimeCopyRoundTripMaxRequestBodyBytes = 1 << 20
 	networkExtensionRuntimeCopyRoundTripDefaultTimeout      = 5 * time.Second
 	networkExtensionRuntimeCopyRoundTripDefaultReadBytes    = 64 << 10
-	networkExtensionRuntimeCopySessionDefaultIdleTimeout    = 2 * time.Minute
-	networkExtensionRuntimeCopySessionDefaultMaxSessions    = 1024
 	NetworkExtensionRuntimeCopySessionEmptyDownstreamWait   = 500 * time.Millisecond
 	networkExtensionRuntimeCopySessionDownstreamSignalWait  = 1 * time.Second
 	networkExtensionRuntimeCopySessionCloseSignalWait       = 100 * time.Millisecond
@@ -185,37 +183,44 @@ type networkExtensionRuntimeCopySessionExchangeResult struct {
 
 type NetworkExtensionRuntimeCopySessionManager struct {
 	mu          sync.Mutex
-	sessions    map[string]*NetworkExtensionRuntimeCopySession
+	sessions    map[networkExtensionRuntimeCopySessionKey]*NetworkExtensionRuntimeCopySession
 	idleTimeout time.Duration
 	maxSessions int
 	now         func() time.Time
 }
 
+// A request ID is only unique within the verified owner. Keeping the owner in
+// the map key prevents one device from occupying or finding another device’s
+// request ID in the process-wide manager.
+type networkExtensionRuntimeCopySessionKey struct {
+	tenantID       string
+	deviceIdentity string
+	requestID      string
+}
+
 type NetworkExtensionRuntimeCopySession struct {
-	RequestID     string
-	tenantID      string
-	applicationID string
-	route         NetworkExtensionRuntimeCopyTCPRoute
-	conn          io.ReadWriteCloser
-	mu            sync.Mutex
-	openedAt      time.Time
-	lastUsedAt    time.Time
-	bytesUp       int64
-	bytesDown     int64
+	RequestID      string
+	tenantID       string
+	deviceIdentity string
+	applicationID  string
+	route          NetworkExtensionRuntimeCopyTCPRoute
+	conn           io.ReadWriteCloser
+	mu             sync.Mutex
+	openedAt       time.Time
+	lastUsedAt     time.Time
+	bytesUp        int64
+	bytesDown      int64
 }
 
 func NewNetworkExtensionRuntimeCopySessionManager(idleTimeout time.Duration, maxSessions int, now func() time.Time) *NetworkExtensionRuntimeCopySessionManager {
-	if idleTimeout <= 0 {
-		idleTimeout = networkExtensionRuntimeCopySessionDefaultIdleTimeout
-	}
-	if maxSessions <= 0 {
-		maxSessions = networkExtensionRuntimeCopySessionDefaultMaxSessions
+	if idleTimeout < 0 || maxSessions < 0 {
+		panic("runtime-copy session limits cannot be negative; 0 disables the quota")
 	}
 	if now == nil {
 		now = time.Now
 	}
 	return &NetworkExtensionRuntimeCopySessionManager{
-		sessions:    map[string]*NetworkExtensionRuntimeCopySession{},
+		sessions:    map[networkExtensionRuntimeCopySessionKey]*NetworkExtensionRuntimeCopySession{},
 		idleTimeout: idleTimeout,
 		maxSessions: maxSessions,
 		now:         now,
@@ -230,26 +235,28 @@ func (manager *NetworkExtensionRuntimeCopySessionManager) Open(req networkExtens
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	manager.reapExpiredLocked(now)
-	if _, exists := manager.sessions[req.RequestID]; exists {
+	key := networkExtensionRuntimeCopySessionKey{req.TenantID, route.DeviceIdentity, req.RequestID}
+	if _, exists := manager.sessions[key]; exists {
 		return nil, networkExtensionRuntimeCopyRoundTripFailure{status: http.StatusConflict, category: "session_already_open", routeGate: "session_request_rejected"}
 	}
-	if len(manager.sessions) >= manager.maxSessions {
+	if manager.maxSessions > 0 && len(manager.sessions) >= manager.maxSessions {
 		return nil, networkExtensionRuntimeCopyRoundTripFailure{status: http.StatusTooManyRequests, category: "session_cap_exceeded", routeGate: "session_request_rejected"}
 	}
 	session := &NetworkExtensionRuntimeCopySession{
-		RequestID:     req.RequestID,
-		tenantID:      req.TenantID,
-		applicationID: req.ApplicationID,
-		route:         route,
-		conn:          conn,
-		openedAt:      now,
-		lastUsedAt:    now,
+		RequestID:      req.RequestID,
+		tenantID:       req.TenantID,
+		deviceIdentity: route.DeviceIdentity,
+		applicationID:  req.ApplicationID,
+		route:          route,
+		conn:           conn,
+		openedAt:       now,
+		lastUsedAt:     now,
 	}
-	manager.sessions[req.RequestID] = session
+	manager.sessions[key] = session
 	return session, networkExtensionRuntimeCopyRoundTripFailure{}
 }
 
-func (manager *NetworkExtensionRuntimeCopySessionManager) Get(RequestID, applicationID string) (*NetworkExtensionRuntimeCopySession, networkExtensionRuntimeCopyRoundTripFailure) {
+func (manager *NetworkExtensionRuntimeCopySessionManager) Get(tenantID, deviceIdentity, requestID, applicationID string) (*NetworkExtensionRuntimeCopySession, networkExtensionRuntimeCopyRoundTripFailure) {
 	if manager == nil {
 		return nil, networkExtensionRuntimeCopyRoundTripFailure{status: http.StatusBadGateway, category: "session_manager_missing", routeGate: "session_manager_missing"}
 	}
@@ -257,7 +264,7 @@ func (manager *NetworkExtensionRuntimeCopySessionManager) Get(RequestID, applica
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	manager.reapExpiredLocked(now)
-	session, ok := manager.sessions[RequestID]
+	session, ok := manager.sessions[networkExtensionRuntimeCopySessionKey{tenantID, deviceIdentity, requestID}]
 	if !ok {
 		return nil, networkExtensionRuntimeCopyRoundTripFailure{status: http.StatusNotFound, category: "session_not_found", routeGate: "session_not_open"}
 	}
@@ -267,14 +274,17 @@ func (manager *NetworkExtensionRuntimeCopySessionManager) Get(RequestID, applica
 	return session, networkExtensionRuntimeCopyRoundTripFailure{}
 }
 
-func (manager *NetworkExtensionRuntimeCopySessionManager) Close(RequestID string) bool {
+func (manager *NetworkExtensionRuntimeCopySessionManager) Close(tenantID, deviceIdentity, requestID, applicationID string) bool {
 	if manager == nil {
 		return false
 	}
+	key := networkExtensionRuntimeCopySessionKey{tenantID, deviceIdentity, requestID}
 	manager.mu.Lock()
-	session, ok := manager.sessions[RequestID]
-	if ok {
-		delete(manager.sessions, RequestID)
+	session, ok := manager.sessions[key]
+	if ok && session.applicationID == applicationID {
+		delete(manager.sessions, key)
+	} else {
+		ok = false
 	}
 	manager.mu.Unlock()
 	if ok && session.conn != nil {
@@ -283,15 +293,40 @@ func (manager *NetworkExtensionRuntimeCopySessionManager) Close(RequestID string
 	return ok
 }
 
+// CloseIfCurrent handles an asynchronous exchange completing after the client
+// has closed and reopened the same request ID. Pointer comparison and deletion
+// occur under one lock, so that stale completion cannot close the replacement.
+func (manager *NetworkExtensionRuntimeCopySessionManager) CloseIfCurrent(session *NetworkExtensionRuntimeCopySession) bool {
+	if manager == nil || session == nil {
+		return false
+	}
+	key := networkExtensionRuntimeCopySessionKey{session.tenantID, session.deviceIdentity, session.RequestID}
+	manager.mu.Lock()
+	current := manager.sessions[key]
+	if current != session {
+		manager.mu.Unlock()
+		return false
+	}
+	delete(manager.sessions, key)
+	manager.mu.Unlock()
+	if session.conn != nil {
+		_ = session.conn.Close()
+	}
+	return true
+}
+
 func (manager *NetworkExtensionRuntimeCopySessionManager) reapExpiredLocked(now time.Time) {
-	for RequestID, session := range manager.sessions {
+	if manager.idleTimeout == 0 {
+		return
+	}
+	for key, session := range manager.sessions {
 		session.mu.Lock()
-		expired := now.Sub(session.lastUsedAt) > manager.idleTimeout
+		expired := manager.idleTimeout > 0 && now.Sub(session.lastUsedAt) > manager.idleTimeout
 		session.mu.Unlock()
 		if !expired {
 			continue
 		}
-		delete(manager.sessions, RequestID)
+		delete(manager.sessions, key)
 		if session.conn != nil {
 			_ = session.conn.Close()
 		}
@@ -485,9 +520,28 @@ func NewNetworkExtensionRuntimeCopySessionHandler(config NetworkExtensionRuntime
 			writeNetworkExtensionRuntimeCopySessionError(w, http.StatusBadRequest, "invalid_session_operation", req, runtimeTenantID, "session_request_rejected")
 			return
 		}
+		// The production resolver reads the verified transport client certificate.
+		// An explicit resolver that cannot prove a device never falls back to a
+		// process-wide or tenant-wide session owner. The nil-resolver single-tenant
+		// test configuration retains its historical empty-device scope.
+		deviceIdentity := ""
+		if config.TransportIdentity != nil {
+			id, verified := resolveTransportIdentity(config.TransportIdentity, r)
+			deviceIdentity = strings.TrimSpace(id)
+			if !verified || deviceIdentity == "" {
+				writeNetworkExtensionRuntimeCopySessionError(w, http.StatusUnauthorized, "transport_identity_unverified", req, runtimeTenantID, "session_owner_rejected")
+				return
+			}
+		} else if deviceTenant != nil {
+			writeNetworkExtensionRuntimeCopySessionError(w, http.StatusUnauthorized, "transport_identity_unavailable", req, runtimeTenantID, "session_owner_rejected")
+			return
+		}
 
 		if req.Operation == networkExtensionRuntimeCopySessionOperationClose || req.ClientEOF {
-			manager.Close(req.RequestID)
+			if !manager.Close(runtimeTenantID, deviceIdentity, req.RequestID, req.ApplicationID) {
+				writeNetworkExtensionRuntimeCopySessionError(w, http.StatusNotFound, "session_not_found", req, runtimeTenantID, "session_not_open")
+				return
+			}
 			writeJSON(w, http.StatusOK, networkExtensionRuntimeCopySessionResponse{
 				SchemaVersion:            NetworkExtensionRuntimeCopySessionResponseSchema,
 				Status:                   "ok",
@@ -546,9 +600,7 @@ func NewNetworkExtensionRuntimeCopySessionHandler(config NetworkExtensionRuntime
 			// Carry the verified (T) transport device identity into the route so the decrypt-all egress + the
 			// federated-auth gate can bind/check a grant per-device (this runtime-copy session IS the Mac NE
 			// decrypt path; without this the device is empty and grants would be tenant-wide).
-			if id, verified := resolveTransportIdentity(config.TransportIdentity, r); verified {
-				route.DeviceIdentity = id
-			}
+			route.DeviceIdentity = deviceIdentity
 			route.TenantID = runtimeTenantID
 			conn, err := dialer.OpenTCPConnection(ctx, route)
 			if err != nil {
@@ -572,7 +624,7 @@ func NewNetworkExtensionRuntimeCopySessionHandler(config NetworkExtensionRuntime
 			}
 		} else {
 			var failure networkExtensionRuntimeCopyRoundTripFailure
-			session, failure = manager.Get(req.RequestID, req.ApplicationID)
+			session, failure = manager.Get(runtimeTenantID, deviceIdentity, req.RequestID, req.ApplicationID)
 			if failure.category != "" {
 				writeNetworkExtensionRuntimeCopySessionError(w, failure.status, failure.category, req, runtimeTenantID, failure.routeGate)
 				return
@@ -581,7 +633,7 @@ func NewNetworkExtensionRuntimeCopySessionHandler(config NetworkExtensionRuntime
 
 		exchange, err := runNetworkExtensionRuntimeCopySessionExchange(ctx, session, upstream)
 		if err != nil {
-			manager.Close(req.RequestID)
+			manager.CloseIfCurrent(session)
 			var typedFailure networkExtensionRuntimeCopyRoundTripFailure
 			if errors.As(err, &typedFailure) {
 				writeNetworkExtensionRuntimeCopySessionError(w, typedFailure.status, typedFailure.category, req, runtimeTenantID, typedFailure.routeGate)
@@ -591,7 +643,7 @@ func NewNetworkExtensionRuntimeCopySessionHandler(config NetworkExtensionRuntime
 			return
 		}
 		if exchange.sessionClosed {
-			manager.Close(req.RequestID)
+			manager.CloseIfCurrent(session)
 		}
 		writeJSON(w, http.StatusOK, networkExtensionRuntimeCopySessionResponse{
 			SchemaVersion:            NetworkExtensionRuntimeCopySessionResponseSchema,
@@ -994,8 +1046,9 @@ type TransportIdentityFunc func(r *http.Request) (string, bool)
 // The certificate is the authority, which is what steerDeviceTenant already says for the /steer routes — and
 // says it by pointing AT the data path as the model. The data path was the one place not doing it.
 //
-// nil, or an answer of ("", false), leaves the node's own tenant in force: that is a single-tenant deployment,
-// and it is the behaviour every existing caller has.
+// A nil resolver retains the explicit single-tenant node default. An installed
+// resolver that cannot attribute the device must return an empty tenant and
+// fail closed instead of silently promoting the node's tenant.
 type DeviceTenantFunc func(r *http.Request) (string, bool)
 
 // tenantForRequest is the tenant this request is allowed to act as. Named so the two handlers cannot drift.
@@ -1006,6 +1059,7 @@ func tenantForRequest(fn DeviceTenantFunc, r *http.Request, nodeTenant string) s
 				return trimmed
 			}
 		}
+		return ""
 	}
 	return nodeTenant
 }

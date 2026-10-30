@@ -106,7 +106,7 @@ func TestMeshDiagnosticRejectsUnscopedOrNonlocalRequests(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := base
 			tc.change(&f)
-			_, err := meshConnectorProber(reg, m, tc.region, func(string) []string { return []string{"region-x"} })(context.Background(), f)
+			_, err := meshConnectorProber(reg, m, tc.region, func(string) ([]string, error) { return []string{"region-x"}, nil })(context.Background(), f)
 			if err == nil {
 				t.Fatal("request accepted")
 			}

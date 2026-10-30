@@ -29,8 +29,14 @@ func TestAuthorizationSnapshotStartupValidation(t *testing.T) {
 			{"wrong stored key", `{"wrong":{"tenant_id":"tenant_lab_001","id":"right","status":"active","approval_result":"approved"}}`, "invalid saved"},
 		} {
 			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				data := tc.data
+				if kind == "approval" && tc.name == "wrong stored key" {
+					// Use an actual approval row so this case reaches saved-key validation,
+					// rather than the stricter unknown-field gate.
+					data = `{"wrong":{"tenant_id":"tenant_lab_001","id":"right","approval_source":"manual","approval_result":"approved"}}`
+				}
 				path := filepath.Join(t.TempDir(), "state.json")
-				if e := os.WriteFile(path, []byte(tc.data), 0600); e != nil {
+				if e := os.WriteFile(path, []byte(data), 0600); e != nil {
 					t.Fatal(e)
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -50,7 +56,7 @@ func TestAuthorizationSnapshotStartupValidation(t *testing.T) {
 					t.Fatalf("wrong startup refusal: %s", output)
 				}
 				after, e := os.ReadFile(path)
-				if e != nil || string(after) != tc.data {
+				if e != nil || string(after) != data {
 					t.Fatal("startup modified invalid snapshot")
 				}
 			})

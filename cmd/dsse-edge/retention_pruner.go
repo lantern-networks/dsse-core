@@ -19,11 +19,13 @@ import (
 // Retention pruning (W4, docs/feature_inventory_and_production_readiness.md A-1). The postgres log/outbox
 // tables (hot_events, admin_audit_outbox, domain_event_outbox) had no retention — published/dead rows and
 // mirrored events accumulate forever, bloating storage + degrading queries. This periodically deletes rows
-// past their TTL. Runs only where the durable tables live (the control plane, -postgres-dsn set). Pending /
+// past their TTL after successful archival. Runs only where the durable tables live (the control plane, -postgres-dsn set). Pending /
 // publishing outbox rows are NEVER pruned (only published + dead, which are terminal).
 
 type retentionConfig struct {
-	clickhouse *clickhouseRetentionLifecycle
+	clickhouse      *clickhouseRetentionLifecycle
+	archiveHealth   *coldArchiveHealthMonitor
+	observedArchive *observedColdArchive
 	// sweepLimit bounds admission of new batches; an admitted batch keeps its own I/O budget.
 	sweepLimit      time.Duration
 	interval        time.Duration
@@ -32,7 +34,7 @@ type retentionConfig struct {
 	outboxDead      time.Duration // delete dead outbox rows older than this (0 = keep)
 	// archive, when set, turns hot_events pruning into TIER-TO-COLD: aged rows are written (per tenant+stream,
 	// gzip NDJSON) to the sovereign cold archive BEFORE they are deleted — long-term compliance/DFIR retention
-	// on a sovereign store, not a hard delete. nil = delete-only (previous behaviour).
+	// on an operator-managed S3 store, not a hard delete. nil = preserve local hot rows.
 	archive archive.ColdArchive
 	// auditColdRetain, when set, WORM-locks (object-lock) the archived AUDIT-stream segments for this long from
 	// archive time — tamper-proof compliance retention for the audit trail. 0 = no lock.
@@ -59,7 +61,15 @@ func (c retentionConfig) sweepBudget() time.Duration {
 }
 
 func (c retentionConfig) enabled() bool {
-	return c.interval > 0 && (c.hotEvents > 0 || len(c.perStream) > 0 || c.override != nil || c.outboxPublished > 0 || c.outboxDead > 0)
+	return (c.interval > 0 && (c.hotEvents > 0 || len(c.perStream) > 0 || c.override != nil || c.outboxPublished > 0 || c.outboxDead > 0)) || c.archiveHealth != nil
+}
+
+func (c retentionConfig) pollInterval() time.Duration {
+	if c.interval > 0 {
+		return c.interval
+	}
+	// Disabling pruning must not also disable external-store health checks.
+	return time.Hour
 }
 
 // retentionForStream is the hot-events retention for a stream. Precedence: admin Console override (runtime) >
@@ -77,7 +87,7 @@ func (c retentionConfig) retentionForStream(stream string) time.Duration {
 }
 
 func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) (func() error, error) {
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +97,7 @@ func startRetentionPruner(ctx context.Context, dsn string, cfg retentionConfig) 
 	}
 	go func() {
 		runRetentionPrune(ctx, db, cfg) // initial sweep
-		t := time.NewTicker(cfg.interval)
+		t := time.NewTicker(cfg.pollInterval())
 		defer t.Stop()
 		for {
 			select {
@@ -119,7 +129,18 @@ func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
 		return
 	}
 	now := time.Now()
-	if cfg.hotEvents > 0 || len(cfg.perStream) > 0 || cfg.override != nil {
+	probeOK := true
+	if cfg.observedArchive != nil {
+		cfg.observedArchive.reset()
+		probeCtx, cancel := context.WithTimeout(ctx, cpStateBlobDBTimeout)
+		_, err := cfg.archive.List(probeCtx, "", 1)
+		cancel()
+		if err != nil {
+			probeOK = false
+			log.Printf("cold-archive health probe failed; hot rows retained")
+		}
+	}
+	if cfg.interval > 0 && probeOK && cfg.archive != nil && (cfg.hotEvents > 0 || len(cfg.perStream) > 0 || cfg.override != nil) {
 		if cfg.clickhouse != nil {
 			if err := cfg.clickhouse.sweep(ctx, now); err != nil {
 				log.Printf("ClickHouse retention paused: %v", err)
@@ -127,6 +148,24 @@ func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
 		} else {
 			pruneHotEventsPerStream(ctx, db, cfg, now)
 		}
+	}
+	if cfg.archiveHealth != nil {
+		reason := ""
+		if cfg.observedArchive != nil {
+			reason = cfg.observedArchive.failed()
+		}
+		measureCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		backlog, err := measureColdArchiveBacklog(measureCtx, db, cfg, now)
+		cancel()
+		if err != nil && reason == "" {
+			reason = "backlog_query_failed"
+		}
+		if err := cfg.archiveHealth.observe(ctx, now, coldArchiveHealthReasonOrEmpty(reason), backlog.Count, backlog.Oldest, backlog.OldestDue); err != nil {
+			log.Printf("cold-archive health save/notification failed: %v", err)
+		}
+	}
+	if cfg.interval <= 0 {
+		return
 	}
 	for _, tbl := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		if cfg.outboxPublished > 0 {
@@ -138,10 +177,22 @@ func runRetentionPrune(ctx context.Context, db *sql.DB, cfg retentionConfig) {
 	}
 }
 
+func coldArchiveHealthReasonOrEmpty(reason string) string {
+	if reason == "" {
+		return ""
+	}
+	return coldArchiveHealthReason(reason)
+}
+
 // pruneHotEventsPerStream applies each stream's own retention (audit/deny kept longer than allow/access) to the
-// hot_events table. Per (tenant, stream): compute the stream's cutoff, then either TIER-to-cold-then-delete
-// (when a cold archive is configured) or delete-only. A per-stream retention of 0 keeps that stream forever.
+// hot_events table. Per (tenant, stream): compute the stream's cutoff, then
+// archive-before-delete. Without an archive, keep the durable hot rows and report
+// the stalled tier; an unavailable external store must not turn into delete-only.
 func pruneHotEventsPerStream(ctx context.Context, db *sql.DB, cfg retentionConfig, now time.Time) {
+	if cfg.archive == nil {
+		log.Printf("cold-archive unavailable: preserving local hot_events until an external S3 archive is configured")
+		return
+	}
 	rows, err := db.QueryContext(ctx, "SELECT DISTINCT tenant_id, stream FROM hot_events")
 	if err != nil {
 		log.Printf("retention: list hot_events streams: %v", err)
@@ -165,15 +216,12 @@ func pruneHotEventsPerStream(ctx context.Context, db *sql.DB, cfg retentionConfi
 			continue // keep this stream in hot forever
 		}
 		cutoff := now.Add(-ret)
-		if cfg.archive != nil {
-			archiveThenPruneStream(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
-		} else {
-			deleteHotStreamOlderThan(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
-		}
+		archiveThenPruneStream(ctx, db, cfg, p.tenant, p.stream, cutoff, now)
 	}
 }
 
-// deleteHotStreamOlderThan is the delete-only path (no cold archive configured) for one stream.
+// deleteHotStreamOlderThan is retained for isolated legacy tests; production pruning
+// never calls it when no archive is configured.
 func deleteHotStreamOlderThan(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) {
 	deleteRetentionRows(ctx, db, cfg, "hot_events", "received_at < $2 AND stream=$3", tenant, stream, cutoff, now)
 }
@@ -194,6 +242,10 @@ func archiveThenPruneStream(ctx context.Context, db *sql.DB, cfg retentionConfig
 }
 
 func archiveRetentionBatch(ctx context.Context, db *sql.DB, cfg retentionConfig, tenant, stream string, cutoff, now time.Time) int {
+	if !validArchivePathComponent(tenant) || !validArchivePathComponent(stream) {
+		log.Printf("cold-archive paused: invalid tenant or stream archive key component")
+		return 0
+	}
 	ctx = retentionWriteContext(ctx)
 	// Share one request budget across SQL and object-store work. PostgreSQL
 	// expires data statements before the later client fallback can discard the
@@ -311,10 +363,17 @@ func archiveRetentionBatch(ctx context.Context, db *sql.DB, cfg retentionConfig,
 	// Keep this check inside the same head transaction as PUT: moving it
 	// outside would miss an orphan left by a competing failed archive.
 	if chained {
-		objects, err := cfg.archive.List(archiveCtx, "hot_events/"+tenant+"/audit/", 0)
+		prefix := "hot_events/" + tenant + "/audit/"
+		objects, err := cfg.archive.List(archiveCtx, prefix, 0)
 		if err != nil {
 			log.Printf("cold-archive paused tenant=%q: archive listing failed; retry on a later sweep: %v", tenant, err)
 			return 0
+		}
+		for _, obj := range objects {
+			if !strings.HasPrefix(obj.Key, prefix) {
+				log.Printf("cold-archive paused tenant=%q: archive listing escaped tenant scope", tenant)
+				return 0
+			}
 		}
 		if len(objects) != chainSeq {
 			log.Printf("cold-archive paused tenant=%q: archive count mismatch expected=%d actual=%d; reconcile archive objects and saved chain state", tenant, chainSeq, len(objects))

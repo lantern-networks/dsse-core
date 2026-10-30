@@ -1,9 +1,9 @@
 package main
 
 import (
-	"os"
-	"strings"
+	"errors"
 	"testing"
+	"time"
 )
 
 // ★★★ AN EDGE THAT HELD NOTHING WAITED AN HOUR, AND THAT IS THE HOUR A DEPLOYMENT IS SET UP IN (2026-08-28,
@@ -22,29 +22,18 @@ import (
 // ★ THE CHEAP QUESTION IS WHAT MAKES ASKING OFTEN SAFE: known_generation is compared first and an unchanged
 // answer mints nothing. There was never a cost to pay here.
 func TestAnEdgeHoldingNoMaterialStillAsksOften(t *testing.T) {
-	body, err := os.ReadFile("tenant_transport_material_fetch.go")
-	if err != nil {
-		t.Fatal(err)
+	now := time.Now()
+	empty := &tenantTransportMaterialFetcher{}
+	for _, err := range []error{nil, errors.New("unavailable")} {
+		if wait := empty.nextFetchWait(now, err); wait != 10*time.Second {
+			t.Errorf("empty Edge retry = %s, want 10s (error %v)", wait, err)
+		}
 	}
-	source := string(body)
-	if strings.Contains(source, "wait = time.Hour") {
-		t.Error("an Edge that holds no organization material still backs off to an hour — which is the hour " +
-			"an operator spends creating those organizations, and nothing tells them why their customer's " +
-			"root is not being used")
+	held := &tenantTransportMaterialFetcher{expiry: now.Add(12 * time.Hour)}
+	if wait := held.nextFetchWait(now, nil); wait != time.Minute {
+		t.Errorf("ordinary refresh = %s", wait)
 	}
-	// ★★ THE CONTROL, AND IT IS WHAT KEEPS THIS FROM BEING "ASK CONSTANTLY": a FAILING fetch still backs off.
-	// Asking often is safe because the answer is cheap; a control plane that is refusing or unreachable is
-	// not made better by being asked every minute.
-	//
-	// ★ THE TEN MINUTES IS NOW A CEILING, NOT THE INTERVAL (2026-09-08). backoffAfterFailure shortens it
-	// when the material this node holds would end first — see the test beside it — so what this control
-	// asserts is that a failure still backs off AT ALL, and that the ordinary back-off is still ten
-	// minutes when there is room for it.
-	if !strings.Contains(source, "wait = f.backoffAfterFailure(time.Now(), 10*time.Minute)") {
-		t.Error("a failing fetch no longer backs off — the cheap-question argument covers an answer, not an " +
-			"error, and hammering an unreachable control plane helps nobody")
-	}
-	if !strings.Contains(source, "wait := time.Minute") {
-		t.Error("the ordinary cadence is no longer a minute")
+	if wait := held.nextFetchWait(now, errors.New("unavailable")); wait != 10*time.Second {
+		t.Errorf("ordinary failure backoff = %s", wait)
 	}
 }

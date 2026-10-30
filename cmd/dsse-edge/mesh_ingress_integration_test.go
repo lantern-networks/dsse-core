@@ -140,7 +140,7 @@ func TestMeshOutOfBoundaryDeniedBeforeReachingPeer(t *testing.T) {
 		Tunnels:          tunnel.NewManager(),
 		TenantID:         "tenant-a",
 		LocalRegion:      "region-y",
-		Residency:        edgeplane.ResidencyResolver(func(string) []string { return []string{"region-y", "region-z"} }), // region-x NOT allowed
+		Residency:        edgeplane.ResidencyResolver(func(string) ([]string, error) { return []string{"region-y", "region-z"}, nil }), // region-x NOT allowed
 		PeerEdges:        peerReg,
 		MeshEligible:     func(string) bool { return true },
 		Direct:           yDirect,

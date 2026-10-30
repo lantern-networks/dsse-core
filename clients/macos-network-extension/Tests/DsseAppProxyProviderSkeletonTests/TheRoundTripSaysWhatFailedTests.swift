@@ -21,14 +21,19 @@ final class TheRoundTripSaysWhatFailedTests: XCTestCase {
                        "if Foundation now carries the reason, this log no longer needs its own formatting")
     }
 
-    func testTheCallSiteAsksTheErrorAndNotFoundation() throws {
+    func testTheCallSiteUsesTheNonsecretErrorClassifier() throws {
+        let classified = providerNonsecretErrorDetail(
+            DsseSingleRequestError.transport("connection refused at https://internal.example/path?token=secret"))
+        XCTAssertTrue(classified.contains("refused"), "the operator still needs the failure category")
+        XCTAssertFalse(classified.contains("internal.example"), "the diagnostic must not expose the route")
+        XCTAssertFalse(classified.contains("token="), "the diagnostic must not expose URL query values")
         let source = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/DsseAppProxyProviderSkeleton/DsseRuntimeCopyOverNW.swift")
         let text = try String(contentsOf: source, encoding: .utf8)
-        XCTAssertTrue(text.contains("(error as? DsseSingleRequestError)?.description"),
-                      "edge_round_trip_failed is back to printing Foundation's generic description, which is "
-                      + "the same string for every distinct failure on this path")
+        XCTAssertTrue(text.contains("reason=\\(providerNonsecretErrorDetail(error))"),
+                      "edge_round_trip_failed must call the tested nonsecret classifier, not print "
+                      + "Foundation's generic error or a potentially sensitive raw network message")
     }
 }
 

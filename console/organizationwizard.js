@@ -96,36 +96,16 @@ async function openOrganizationWizard(content) {
     placeholder: "admin@acme.example",
     hint: bl({ en: "Optional here — you will be given a link to hand over, nothing is emailed.", ja: "任意です。手渡し用のリンクが出ます。メールは送信されません。" }) });
 
-  // ★★★ THE ONE MOMENT THIS COSTS NOTHING (2026-08-28). The Edge picks an organization's certificate by the
-  // name a device sends, and a device that sends none is served the deployment's shared one. Giving an
-  // organization its own name LATER is a movement — announce it, wait for every device to adopt it, serve both
-  // until they have. Here there are no devices, and that is the only time that sentence is empty.
-  //
-  // ★ IT IS NOT THE THING THE HEADER SAYS A WIZARD MUST NOT INVENT. That is the INTERCEPTION root, which is
-  // the customer's and arrives out of band. This one is minted by the deployment from the organization's own
-  // issued id — nothing is invented and nothing is typed, which is also why no name is asked for here: the id
-  // is unguessable and the company's own name on a plaintext SNI is what that protects against.
-  const doorBox = el("input", { type: "checkbox" });
-  doorBox.checked = true;
-  const doorF = el("div", { class: "ui-field" }, [
-    el("label", { class: "ui-check" }, [doorBox, document.createTextNode(" " + bl({
-      en: "Give them their own address on the Edges",
-      ja: "この組織専用の入口アドレスを与える" }))]),
-    el("div", { class: "ui-field-hint", text: bl({
-      en: "Their devices then verify this deployment with nothing but their own organization's certificate, " +
-          "and no other tenant's name is offered to them. Every Edge picks it up on its next fetch. " +
-          "Doing it later means moving devices onto a new name; doing it now does not, because they have none.",
-      ja: "以後この組織の端末は、自組織の証明書だけでこの配備を検証します。他テナントの名前は提示されません。" +
-          "各 Edge は次回の取得で反映します。後から行うと端末を新しい名前へ移す作業になりますが、" +
-          "いまはまだ端末が無いので、その必要がありません。" }) }),
-  ]);
+  // Every tenant uses the deployment's published Edge name. Tenant separation remains in the
+  // signed profile, device identity, interception authority, Connector and policy. Do not ask
+  // the wizard to mint an extra DNS/SNI name for each new tenant.
 
   const status = el("p", { class: "ui-view-desc" });
   const submit = el("button", { class: "ui-btn ui-btn-primary", text: bl({ en: "Create tenant", ja: "テナントを作成" }) });
 
   const m = uiModal({
     title: bl({ en: "Add a tenant", ja: "テナントを追加" }),
-    body: [nameF.el, zoneF.el, homeF.el, regionsF.el, doorF, runF.el, adminF.el, status],
+    body: [nameF.el, zoneF.el, homeF.el, regionsF.el, runF.el, adminF.el, status],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],
   });
 
@@ -138,11 +118,12 @@ async function openOrganizationWizard(content) {
       // 1. The organization itself.
       say(bl({ en: "Creating the tenant…", ja: "テナントを作成しています…" }));
       const chosenRegions = regionsF.get();
-      const created = await apiFetch("POST", "/admin/tenants", {
+      const created = await saveTenantWithFleetConfirmation("/admin/tenants", {
         display_name: nameF.get(), status: "active",
         timezone: zoneF.get(), home_region: homeF.get(), allowed_regions: chosenRegions,
-        transport_authority: doorBox.checked,
+        transport_authority: false,
       });
+      if (created.cancelled) {submit.disabled = false; say(""); return;}
       if (!created.ok) {
         submit.disabled = false;
         const msg = (created.body && (created.body.error || created.body.message)) || ("HTTP " + created.status);
@@ -151,17 +132,11 @@ async function openOrganizationWizard(content) {
       state.created = true;
       // The identifier the server issued — everything after this point acts inside it by name.
       const tenantId = (created.body && created.body.tenant_id) || "";
-      // ★ SAID, NOT ASSUMED. The organization exists either way; whether it got its own address is a separate
-      // outcome and the answer carries it. A wizard that ticked a box and reported nothing is how the previous
-      // four joins in this chain stayed unnoticed.
-      if (doorBox.checked) {
-        const own = (created.body && created.body.transport_server_name) || "";
-        const why = (created.body && created.body.transport_authority_note) || "";
-        if (own) {
-          say(bl({ en: "Their own address: ", ja: "この組織の入口アドレス: " }) + own);
-        } else if (why) {
-          uiToast(bl({ en: "Created, without its own address: ", ja: "作成しましたが、専用アドレスはありません: " }) + why, "err");
-        }
+      if (created.body && created.body.transport_server_name) {
+        submit.disabled = false;
+        uiToast(bl({ en: "This tenant unexpectedly received a separate Edge address; stop setup and review the deployment.",
+                     ja: "想定外のテナント専用入口が作成されました。設定を止めて配備を確認してください。" }), "err");
+        return;
       }
       // ★ AND WHETHER IT CAN CARRY TRAFFIC AT ALL. An organization created with no starting posture denies
       // every flow of every one of its devices while its own Internet Access screen says everything is

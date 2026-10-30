@@ -121,9 +121,24 @@ func (monitor *connectorIdentitySyncMonitor) Snapshot(configured bool) connector
 	return snapshot
 }
 
-func identitySyncLoop(ctx context.Context, client *http.Client, edgeURL, connectorID, connectorSecret, source, importFile, stateFile string, interval time.Duration, monitor *connectorIdentitySyncMonitor) {
+func identitySyncLoop(ctx context.Context, client *http.Client, doors *connectorEndpoints, connectorID, connectorSecret, source, importFile, stateFile string, interval time.Duration, monitor *connectorIdentitySyncMonitor) {
 	for {
 		now := time.Now().UTC()
+		// Resolve the selected door on every cycle. Heartbeats and tunnels may
+		// have moved to another Region since the previous identity import.
+		edgeURL := doors.current()
+		if edgeURL == "" {
+			// An authoritative empty door list permits only the profile GET.
+			if interval <= 0 {
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(interval):
+			}
+			continue
+		}
 		result, err := syncHumanIdentitiesFromFile(ctx, client, edgeURL, connectorID, connectorSecret, source, importFile, now)
 		if err != nil {
 			monitor.RecordError(err, now)

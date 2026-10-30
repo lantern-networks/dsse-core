@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"sync"
 	"testing"
+	"time"
 )
 
 func ap(t *testing.T, s string) netip.AddrPort {
@@ -13,6 +14,63 @@ func ap(t *testing.T, s string) netip.AddrPort {
 		t.Fatalf("parse %q: %v", s, err)
 	}
 	return v
+}
+
+func TestEdgeRefreshPreservesActivePassthroughDestinations(t *testing.T) {
+	d := newLiveDests([]netip.AddrPort{ap(t, "127.0.0.1:18090")})
+	console := ap(t, "203.0.113.20:443")
+	d.setPassthrough([]netip.AddrPort{console})
+	var pushed []netip.AddrPort
+	d.register(func(now []netip.AddrPort) { pushed = append([]netip.AddrPort(nil), now...) })
+	edge := ap(t, "192.0.2.10:18543")
+	d.setEdge(edge)
+	if !has(pushed, console) || !has(pushed, edge) {
+		t.Fatalf("Edge refresh dropped an active passthrough or Edge guard: %v", pushed)
+	}
+}
+
+func TestConcurrentBypassRefreshCannotApplyAnOlderSnapshotLast(t *testing.T) {
+	d := newLiveDests(nil)
+	edge := ap(t, "192.0.2.10:18543")
+	console := ap(t, "203.0.113.20:443")
+	firstEntered := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var mu sync.Mutex
+	var applied []netip.AddrPort
+	first := true
+	d.register(func(now []netip.AddrPort) {
+		mu.Lock()
+		block := first
+		first = false
+		mu.Unlock()
+		if block {
+			close(firstEntered)
+			<-releaseFirst
+		}
+		mu.Lock()
+		applied = append([]netip.AddrPort(nil), now...)
+		mu.Unlock()
+	})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() { defer wg.Done(); d.setEdge(edge) }()
+	select {
+	case <-firstEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first bypass apply did not begin")
+	}
+	wg.Add(1)
+	go func() { defer wg.Done(); d.setPassthrough([]netip.AddrPort{console}) }()
+	// Give the second refresh an opportunity to overtake the blocked callback.
+	time.Sleep(30 * time.Millisecond)
+	close(releaseFirst)
+	wg.Wait()
+	mu.Lock()
+	got := append([]netip.AddrPort(nil), applied...)
+	mu.Unlock()
+	if !has(got, edge) || !has(got, console) {
+		t.Fatalf("last applied bypass snapshot lost a concurrent update: %v", got)
+	}
 }
 
 func has(set []netip.AddrPort, want netip.AddrPort) bool {
@@ -92,6 +150,27 @@ func TestAMovedEdgeReplacesTheRuleRatherThanAccumulating(t *testing.T) {
 	}
 	if !has(got, moved) || len(got) != 2 {
 		t.Fatalf("want exactly the loopback plus the new Edge, got %v", got)
+	}
+}
+
+func TestAllPinnedEdgeAddressesReachLoopGuardAndRetiredAddressesLeave(t *testing.T) {
+	d := newLiveDests([]netip.AddrPort{ap(t, "127.0.0.1:18090")})
+	first := []netip.AddrPort{ap(t, "192.0.2.10:18543"), ap(t, "[2001:db8::10]:18543")}
+	var applied [][]netip.AddrPort
+	d.register(func(now []netip.AddrPort) {
+		applied = append(applied, append([]netip.AddrPort(nil), now...))
+	})
+	if !d.setEdges(first) || !has(d.effective(), first[0]) || !has(d.effective(), first[1]) {
+		t.Fatalf("not every round-robin Edge dial target was guarded: %v", d.effective())
+	}
+	if d.setEdges([]netip.AddrPort{first[1], first[0]}) {
+		t.Fatal("reordered Edge answers must not republish the kernel policy")
+	}
+	if !d.setEdges([]netip.AddrPort{first[1]}) || has(d.effective(), first[0]) {
+		t.Fatalf("retired Edge destination was not removed: %v", d.effective())
+	}
+	if len(applied) != 2 || !has(applied[0], first[0]) || !has(applied[0], first[1]) || has(applied[1], first[0]) {
+		t.Fatalf("incorrect live backend publications: %v", applied)
 	}
 }
 

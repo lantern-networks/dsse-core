@@ -38,7 +38,7 @@ func TestVerifyNoWaitRejectsAnAbsentDeployment(t *testing.T) {
 	}
 	// Exercise the entire orchestration too: it must not enter the separate fleet
 	// startup wait after the first tier has already reported an absent authority.
-	if err := runVerify(dir, url, url, url, "", "", "", true); err == nil || !strings.Contains(err.Error(), "check(s) failed") {
+	if err := runVerify(dir, url, url, url, "", "", "", true, ""); err == nil || !strings.Contains(err.Error(), "check(s) failed") {
 		t.Fatalf("expected a completed failed verdict, got %v", err)
 	}
 	if elapsed := time.Since(started); elapsed > 5*time.Second {

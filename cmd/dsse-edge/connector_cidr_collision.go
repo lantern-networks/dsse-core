@@ -48,11 +48,11 @@ func publishedCIDRRoutes(ctx context.Context, catalog appcatalog.RuntimeStore, r
 	excludeApplicationID = strings.TrimSpace(excludeApplicationID)
 	routes := []connector.CIDRRoute{}
 	if catalog != nil && tenantID != "" {
-		resp, err := catalog.List(ctx, tenantID, appcatalog.ListOptions{ApplicationType: "private_app", Limit: 1000})
+		entries, err := catalog.ListAll(ctx, tenantID, appcatalog.ListAllOptions{ApplicationType: "private_app"})
 		if err != nil {
 			return nil, err
 		}
-		for _, entry := range resp.Applications {
+		for _, entry := range entries {
 			if !entry.Published || entry.ApplicationID == excludeApplicationID {
 				continue
 			}

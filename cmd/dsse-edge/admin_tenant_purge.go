@@ -391,7 +391,7 @@ func purgeTenantDeviceCAs(registry *tenantca.TenantCARegistry, registryPath stri
 	trust transportTrustAnchorStore, tenantID string) (int, error) {
 	fingerprints := []string{}
 	for _, fact := range registry.Facts(time.Now()) {
-		if strings.EqualFold(strings.TrimSpace(fact.TenantID), strings.TrimSpace(tenantID)) {
+		if strings.TrimSpace(fact.TenantID) == strings.TrimSpace(tenantID) {
 			fingerprints = append(fingerprints, fact.SHA256)
 		}
 	}
@@ -458,6 +458,22 @@ func executeTenantPurgeBatch(ctx context.Context, db *sql.DB, table, statement, 
 	result, err := budget.exec(tx, statement, tenantID, adminTenantPurgeBatchSize)
 	if err != nil {
 		return nil, err
+	}
+	if table == "connector_registrations" {
+		removed, err := result.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("confirm connector purge batch: %w", err)
+		}
+		if removed > 0 {
+			bump, err := budget.exec(tx, "UPDATE connector_registry_generation SET generation = generation + 1 WHERE singleton = true")
+			if err != nil {
+				return nil, fmt.Errorf("advance connector catalog generation after purge: %w", err)
+			}
+			updated, err := bump.RowsAffected()
+			if err != nil || updated != 1 {
+				return nil, fmt.Errorf("connector catalog generation was not advanced after purge: rows=%d err=%v", updated, err)
+			}
+		}
 	}
 	if err := budget.commit(tx); err != nil {
 		return nil, err

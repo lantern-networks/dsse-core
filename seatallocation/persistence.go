@@ -82,7 +82,7 @@ func decodeAllocations(data []byte) (map[string]Allocation, error) {
 		return nil, errors.New("invalid seat allocation snapshot")
 	}
 	for key, a := range state.Allocations {
-		if key == "" || strings.ToLower(strings.TrimSpace(a.TenantID)) != key || a.Seats < 0 {
+		if key == "" || strings.TrimSpace(a.TenantID) != key || a.Seats < 0 {
 			return nil, errors.New("invalid seat allocation entry")
 		}
 	}

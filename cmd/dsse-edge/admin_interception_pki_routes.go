@@ -570,7 +570,7 @@ func registerInterceptionPKIRoutes(mux *http.ServeMux, adminEndpoint func(string
 		covered := config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates()
 		durable := false
 		for _, row := range covered {
-			if strings.EqualFold(row.Tenant, target) {
+			if row.Tenant == target {
 				durable = row.Durable
 			}
 		}
@@ -697,15 +697,15 @@ func tenantsWithoutTheirOwnInterceptionIssuer(config serverConfig) []string {
 	}
 	own := map[string]bool{}
 	for _, issuer := range config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates() {
-		own[strings.ToLower(strings.TrimSpace(issuer.Tenant))] = true
+		own[strings.TrimSpace(issuer.Tenant)] = true
 	}
 	known := map[string]bool{}
 	if reg := config.TenantCARegistry; reg != nil {
 		for tenant := range reg.Registrations() {
-			known[strings.ToLower(strings.TrimSpace(tenant))] = true
+			known[strings.TrimSpace(tenant)] = true
 		}
 	}
-	if t := strings.ToLower(strings.TrimSpace(config.TenantIDForTrust)); t != "" {
+	if t := strings.TrimSpace(config.TenantIDForTrust); t != "" {
 		known[t] = true
 	}
 	out := []string{}

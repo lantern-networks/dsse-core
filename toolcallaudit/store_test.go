@@ -66,3 +66,25 @@ func TestStoreListIsTenantScoped(t *testing.T) {
 		t.Fatal("empty tenant_id must be rejected")
 	}
 }
+
+func TestStoreSameEventIDCannotOverwriteAnotherTenant(t *testing.T) {
+	s := NewStore()
+	ctx := context.Background()
+	now := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		event := model.ToolCallEvent{ID: "shared-id", TenantID: tenant, ActorNHIID: "nhi1", ToolID: "tool1", ActionType: "exec"}
+		if _, err := s.Upsert(ctx, event, tenant, now); err != nil {
+			t.Fatalf("upsert %s: %v", tenant, err)
+		}
+	}
+	for _, tenant := range []string{"tenant-a", "tenant-b"} {
+		event, ok, err := s.Get(ctx, tenant, "shared-id")
+		if err != nil || !ok || event.TenantID != tenant {
+			t.Fatalf("get %s: event=%+v ok=%v err=%v", tenant, event, ok, err)
+		}
+		rows, err := s.List(ctx, tenant, ListOptions{})
+		if err != nil || rows.Count != 1 || len(rows.Events) != 1 || rows.Events[0].TenantID != tenant {
+			t.Fatalf("list %s: rows=%+v err=%v", tenant, rows, err)
+		}
+	}
+}

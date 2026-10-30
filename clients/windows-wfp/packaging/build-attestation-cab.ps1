@@ -9,13 +9,11 @@
   machine in `bcdedit /set testsigning on`, which is fine for a lab and disqualifying
   everywhere else.
 
-  WHAT GOES IN, AND WHY IT IS ONLY TWO FILES.
-  Microsoft is changing the policy on files in a driver package that the INF does not
-  reference (https://aka.ms/UnreferencedInfFiles). dsse-wfp.inf references exactly one
-  payload file, dsse-wfp.sys, so the CAB carries the INF and that .sys and nothing else.
-  In particular NO SYMBOLS: the comment at the top of dsse-wfp.inf still says a submission
-  holds "the .sys, its symbols, and an INF", which was true when it was written and is the
-  thing this policy change is about. Symbols belong in a symbol store, not in the package.
+  The submission includes SYS, INF, the matching build PDB, and a locally generated CAT.
+  Microsoft uses the PDB for crash analysis. Symbols do not need an INF reference:
+  https://learn.microsoft.com/windows-hardware/drivers/dashboard/code-signing-attestation
+  https://aka.ms/UnreferencedInfFiles (HDC FAQ Q8).
+  The PDB is submission evidence, not a payload installed on the endpoint.
 
   THE TEST SIGNATURE IS REMOVED BEFORE PACKING.
   The built .sys carries `CN=Dsse Test Driver`, a self-signed cert from a CA nobody trusts.
@@ -40,6 +38,8 @@ param(
   # Where the built driver is. Defaults to the tree's own output directory.
   [string] $SysPath,
   [string] $InfPath,
+  [string] $PdbPath,
+  [string] $TargetOS = '10_X64',
   [string] $OutDir,
 
   # 'evtoken' signs the CAB with the EV certificate. 'none' builds it and stops, which is
@@ -59,18 +59,25 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$repo = (Resolve-Path (Join-Path $here '..\..\..\..\..')).Path
+$here = $PSScriptRoot
+$repo = (Resolve-Path (Join-Path $here '..\..\..')).Path
+if (-not (Test-Path (Join-Path $repo 'go.mod') -PathType Leaf) -or
+    -not (Test-Path (Join-Path $repo 'VERSION') -PathType Leaf)) {
+  throw 'Cannot identify the OSS source root beside the packaging script.'
+}
 
 if (-not $SysPath) { $SysPath = Join-Path $repo 'outputs\windows\dsse-wfp.sys' }
 if (-not $InfPath) { $InfPath = Join-Path $here '..\driver\dsse-wfp.inf' }
+if (-not $PdbPath) { $PdbPath = [IO.Path]::ChangeExtension($SysPath, '.pdb') }
 if (-not $OutDir)  { $OutDir  = Join-Path $repo 'outputs\windows\attestation' }
 
-foreach ($p in @($SysPath, $InfPath)) {
-  if (-not (Test-Path $p)) { throw "not found: $p" }
+foreach ($p in @($SysPath, $InfPath, $PdbPath)) {
+  if (-not (Test-Path $p -PathType Leaf)) { throw "not found: $p" }
 }
 $SysPath = (Resolve-Path $SysPath).Path
 $InfPath = (Resolve-Path $InfPath).Path
+$PdbPath = (Resolve-Path $PdbPath).Path
+$OutDir = [IO.Path]::GetFullPath($OutDir)
 
 # The folder name inside the CAB. Microsoft unpacks the CAB and expects the driver package
 # to sit in a directory rather than at the root.
@@ -118,6 +125,12 @@ function Resolve-KitTool([string] $name) {
            Where-Object { $_.FullName -match '\\x64\\' } |
            Sort-Object FullName -Descending | Select-Object -First 1
     if ($hit) { return $hit.FullName }
+    if ($name -eq 'Inf2Cat.exe') {
+      $hit = Get-ChildItem -Path $r -Recurse -Filter $name -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '\\x86\\' } |
+        Sort-Object FullName -Descending | Select-Object -First 1
+      if ($hit) { return $hit.FullName }
+    }
   }
   return $null
 }
@@ -152,9 +165,19 @@ if (-not $SkipInfVerif) {
     }
     Write-Host 'InfVerif: pass'
   } else {
-    Write-Warning 'infverif.exe not found — the INF is going up unchecked. Install the WDK to close this gap.'
+    throw 'infverif.exe not found — install the WDK before preparing a submission.'
   }
 }
+
+# Catalog hashes must describe the staged (possibly stripped) driver, not its original signature.
+$inf2cat = Resolve-KitTool 'Inf2Cat.exe'
+if (-not $inf2cat) { throw 'Inf2Cat.exe not found — install the WDK before preparing a submission.' }
+& $inf2cat "/driver:$stage" "/os:$TargetOS"
+if ($LASTEXITCODE -ne 0) { throw "Inf2Cat rejected the staged driver package ($LASTEXITCODE)" }
+$cat = Join-Path $stage 'dsse-wfp.cat'
+if (-not (Test-Path $cat -PathType Leaf)) { throw 'Inf2Cat did not create dsse-wfp.cat.' }
+# Symbols are supplied to Microsoft for crash analysis, not installed by the INF.
+Copy-Item $PdbPath (Join-Path $stage 'dsse-wfp.pdb') -Force
 
 # ----------------------------------------------------------------- pack
 # makecab needs a DDF. .Set DestinationDir is what preserves the folder inside the CAB;
@@ -171,6 +194,8 @@ $ddf = Join-Path $OutDir 'dsse-wfp.ddf'
 .Set DestinationDir=$pkgName
 "$stage\dsse-wfp.inf"
 "$stage\dsse-wfp.sys"
+"$stage\dsse-wfp.pdb"
+"$stage\dsse-wfp.cat"
 "@ | Set-Content -Path $ddf -Encoding ASCII
 
 if (Test-Path $cabPath) { Remove-Item $cabPath -Force }
@@ -214,6 +239,5 @@ Write-Host "signer : $($final.SignerCertificate.Subject)"
 Write-Host "digest : $($final.SignerCertificate.SignatureAlgorithm.FriendlyName)"
 Write-Host ''
 Write-Host 'Submit at https://partner.microsoft.com/dashboard/hardware/driver/New'
-Write-Host 'If it is refused at Package Acceptance or Validation, capture the exact message:'
-Write-Host 'the EV certificate is ECC P-384, and whether Partner Center accepts that is the'
-Write-Host 'open question this submission answers.'
+Write-Host 'Submission is a separate operator action; this script never uploads artifacts.'
+Write-Host 'Retain this CAB, matching SYS/PDB, source identity, hashes and the returned signing report.'

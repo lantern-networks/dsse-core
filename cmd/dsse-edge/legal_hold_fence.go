@@ -15,6 +15,7 @@ import (
 )
 
 var errTenantErasureInProgress = errors.New("tenant erasure is in progress or requires recovery")
+var errManualHotLogDeleteInProgress = errors.New("manual hot-log deletion is in progress or requires recovery")
 
 type tenantErasureFence struct {
 	ID        string `json:"id"`

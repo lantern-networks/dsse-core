@@ -21,68 +21,52 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
-	"os/exec"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/lantern-networks/dsse-core/clients/windows-wfp/winbin"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
-// runBounded runs a prepared command with a hard timeout and kills it if it overruns (review C-2). recover's
-// child processes (netsh, powershell) can hang on CLR/module init in a session-0 MSI custom-action context; a
-// hung child would otherwise block the whole msiexec transaction indefinitely. Best-effort: errors/timeouts are
-// swallowed (recover is idempotent and already best-effort per step).
-func runBounded(c *exec.Cmd, d time.Duration) {
-	if c == nil {
-		return
-	}
-	if err := c.Start(); err != nil {
-		return
-	}
-	done := make(chan error, 1)
-	go func() { done <- c.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(d):
-		if c.Process != nil {
-			_ = c.Process.Kill()
-		}
-		<-done // reap
-	}
-}
-
-// stopServiceIfPresent stops a Windows service by name (best-effort, locale-independent). Returns true if the
-// service existed and a stop was issued. Stopping a not-installed/already-stopped service is treated as success.
+// stopServiceIfPresent stops a Windows service and waits for an observed STOPPED state. A successful STOP
+// request is not enough: the running agent can still republish DNS during its stop-pending cleanup.
 func stopServiceIfPresent(name string) (issued bool, err error) {
-	// ★ sc.exe FROM THE SYSTEM DIRECTORY, and a resolution failure is an ERROR rather than "nothing to stop".
-	// The old line resolved it through %PATH% and folded every query failure into `return false, nil` — so on a
-	// box where the lookup failed (measured for msiexec on win-dev-1, 2026-08-11; see package winbin) this
-	// reported a successful disarm without having asked anything. It is called before handing an endpoint to an
-	// installer, and answering "steering is down" when nothing was stopped is the worst direction to be wrong in.
-	sc, perr := winbin.System("sc.exe")
-	if perr != nil {
-		return false, perr
+	scm, err := mgr.Connect()
+	if err != nil {
+		return false, fmt.Errorf("connect to SCM: %w", err)
 	}
-	out, qerr := exec.Command(sc, "query", name).CombinedOutput()
-	if strings.Contains(string(out), "1060") { // 1060 = service does not exist
+	defer scm.Disconnect()
+	service, err := scm.OpenService(name)
+	if errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
 		return false, nil
 	}
-	if qerr != nil && !strings.Contains(string(out), "RUNNING") && !strings.Contains(string(out), "STOPPED") &&
-		!strings.Contains(string(out), "PENDING") {
-		// A query that could not run, as opposed to one that ran and described a service. sc exits non-zero for
-		// an absent service too, which the 1060 check above has already taken.
-		return false, fmt.Errorf("sc query %s: %v: %s", name, qerr, strings.TrimSpace(string(out)))
+	if err != nil {
+		return false, fmt.Errorf("open service %s: %w", name, err)
 	}
-	if !strings.Contains(string(out), "RUNNING") && !strings.Contains(string(out), "PENDING") {
-		return false, nil // installed but not running -> nothing to stop
+	defer service.Close()
+	status, err := service.Query()
+	if err != nil {
+		return false, fmt.Errorf("query service %s: %w", name, err)
 	}
-	c := exec.Command(sc, "stop", name)
-	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	o, serr := c.CombinedOutput()
-	if serr != nil {
-		return true, fmt.Errorf("sc stop %s: %v: %s", name, serr, strings.TrimSpace(string(o)))
+	if status.State == svc.Stopped {
+		return false, nil
+	}
+	if status.State != svc.StopPending {
+		if _, err := service.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+			return true, fmt.Errorf("stop service %s: %w", name, err)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := waitForServiceStopped(ctx, func() (uint32, error) {
+		state, err := service.Query()
+		return uint32(state.State), err
+	}, uint32(svc.Stopped)); err != nil {
+		return true, fmt.Errorf("confirm service %s stopped: %w", name, err)
 	}
 	return true, nil
 }
@@ -95,42 +79,38 @@ func runRecover(keepServices bool) error {
 	fmt.Println("recover: restoring the box to a clean network state (idempotent; run elevated)...")
 	var problems []string
 
-	// 1. Stop the agent + driver first so they can't re-apply the DNS/QUIC/redirect mutations after we undo
-	//    them. The WFP driver unload is also what tears down the connect-redirect filters that point TCP at the
-	//    dead local terminator — without this, outbound TCP stays broken even after DNS is fixed.
+	// Stop the agent first. Never unload the driver as an implicit way to
+	// bypass an active captive deadline: explicit recovery and readback must
+	// succeed while its admission filters are still present.
 	if !keepServices {
-		for _, svc := range []string{serviceName, "DsseWfp"} { // DsseSteer (agent) then DsseWfp (driver)
-			issued, err := stopServiceIfPresent(svc)
-			switch {
-			case err != nil:
-				problems = append(problems, fmt.Sprintf("stop %s: %v", svc, err))
-			case issued:
-				fmt.Printf("recover: stopped service %s\n", svc)
-			default:
-				fmt.Printf("recover: service %s not running (skip)\n", svc)
-			}
+		if _, err := stopServiceIfPresent(serviceName); err != nil {
+			return fmt.Errorf("recover cannot safely restore DNS while %s may still run: %w", serviceName, err)
 		}
 	} else {
-		fmt.Println("recover: --recover-keep-services set; leaving DsseSteer/DsseWfp as-is")
+		fmt.Println("recover: --recover-keep-services set; service lifecycle belongs to the caller")
 	}
-
-	// 1b. Clear the redirect policy EXPLICITLY, and verify it cleared.
-	//
-	// This was missing, and it mattered most in the mode that needs it most. With services stopped, the
-	// driver unloads and takes its filters with it, so the redirect goes away as a side effect. With
-	// --recover-keep-services the driver stays loaded — and nothing here cleared g_policyValid, so the box
-	// went on refusing every connection while this function printed "WFP redirect mutations reversed. Network
-	// should be back." In the MSI uninstall sequence a later action removes the driver, so the gap is
-	// invisible there; as the standalone panic button after a crash, and as the deliberate pre-update disarm,
-	// it is the whole job. A recovery path that reports success without doing the recovery is worse than one
-	// that is absent, because it stops the search.
-	//
-	// Idempotent and correct in both modes: clearing a policy that is already gone is a no-op, and a driver
-	// that is not loaded reports its absence rather than a false success.
-	if v := removePolicyVerified(); !v.Verified {
-		problems = append(problems, "wfp redirect: "+v.Reason)
-	} else {
-		fmt.Printf("recover: WFP redirect policy cleared and confirmed clear (%s)\n", v.State)
+	var unload func() error
+	if !keepServices {
+		unload = func() error {
+			_, err := stopServiceIfPresent("DsseWfp")
+			return err
+		}
+	}
+	recovered, err := recoverBeforeDriverUnload(func() error {
+		v := recoverWFPNetworkVerified()
+		if !v.Verified {
+			return fmt.Errorf("WFP recovery unverified: %s", v.Reason)
+		}
+		fmt.Printf("recover: WFP redirect and captive deadline confirmed clear (%s)\n", v.State)
+		return nil
+	}, unload)
+	if err != nil {
+		if !recovered {
+			return err
+		}
+		// The guard is verified clear. A refused driver stop is still an error,
+		// but must not leave the stopped agent's loopback DNS/firewall/NCSI state.
+		problems = append(problems, err.Error())
 	}
 
 	// 2. DNS: restore the captured servers from the persisted backup; if there is none, pull every resolver off
@@ -148,18 +128,27 @@ func runRecover(keepServices bool) error {
 	}
 
 	// 3. QUIC: drop the outbound UDP:443 firewall block (no-op if absent).
-	removeQUICBlock()
-	fmt.Println("recover: removed the QUIC (UDP:443) firewall block if present")
+	if err := removeQUICBlock(); err != nil {
+		problems = append(problems, fmt.Sprintf("QUIC firewall cleanup: %v", err))
+	} else {
+		fmt.Println("recover: confirmed the QUIC (UDP:443) firewall block absent")
+	}
 
 	// 3b. Server-initiated inbound: drop the DSSE Windows Firewall rule group left by a force-killed
 	//     firewall-backend inbound agent (no-op if absent). inbound_netsh_windows.go
-	removeDSSEFirewallRules()
-	fmt.Printf("recover: removed the %q Windows Firewall rule group if present\n", "DSSE Server-Initiated")
+	if err := removeDSSEFirewallRules(); err != nil {
+		problems = append(problems, fmt.Sprintf("inbound firewall cleanup: %v", err))
+	} else {
+		fmt.Printf("recover: confirmed the %q Windows Firewall rule group absent\n", dsseFirewallGroup)
+	}
 
 	// 4. NCSI: restore the active connectivity test (undo NoActiveProbe=1) to its pre-steer value from the
 	//    persisted snapshot, so the OS resumes its own connectivity assessment on the native network.
-	restoreNCSIActiveProbe()
-	fmt.Println("recover: restored the NCSI active connectivity test (NoActiveProbe) to its pre-steer value")
+	if err := restoreNCSIActiveProbe(); err != nil {
+		problems = append(problems, fmt.Sprintf("NCSI active probe restore: %v", err))
+	} else {
+		fmt.Println("recover: restored the NCSI active connectivity test (NoActiveProbe) to its pre-steer value")
+	}
 
 	if len(problems) > 0 {
 		return fmt.Errorf("recover completed with %d problem(s): %s", len(problems), strings.Join(problems, "; "))

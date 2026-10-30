@@ -47,7 +47,8 @@ func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool 
 		// ordinary shape of a small deployment and must keep working exactly as it did.
 		return false
 	}
-	writeError(w, http.StatusConflict, fmt.Errorf(
+	w.Header().Set("Retry-After", "1")
+	writeError(w, http.StatusServiceUnavailable, fmt.Errorf(
 		"this control plane does not hold leadership, and an administrative change written here would be "+
 			"accepted and then discarded — the deployment's authored state belongs to the node that leads, and "+
 			"this one re-reads it. Send this to the leader: the Console reaches it through the front door, and "+
@@ -60,20 +61,24 @@ func adminWriteRefusedOnAStandby(w http.ResponseWriter, permission string) bool 
 // only the node's configured audit scope and the server-registered permission are
 // known. Deliberately accept no request, so bodies, paths, credentials, user-agent,
 // forwarded addresses and claimed tenant/actor cannot enter this record.
-func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator, permission string, now, first, last time.Time, count uint64) {
+func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator, permission string, now, first, last time.Time, count uint64, reasons ...string) {
+	reason, event := "not_leader", "admin_write_refused_on_standby"
+	if len(reasons) > 0 && reasons[0] == "quorum_unavailable" {
+		reason, event = "quorum_unavailable", "admin_write_refused_without_quorum"
+	}
 	if writer == nil {
 		logErrorf("admin_audit_write_failed event=%q: audit writer is not configured", "admin_write_refused_on_standby")
 		logErrorf("standby audit summary unconfirmed permission=%q request_count=%d", permission, count)
 		return
 	}
 	audit := model.AuditLog{
-		ID:            randomEdgeID("audit_admin_write_refused_on_standby_", now),
+		ID:            randomEdgeID("audit_"+event+"_", now),
 		TenantID:      evaluator.PolicyBundle.TenantID,
-		EventType:     "admin_write_refused_on_standby",
+		EventType:     event,
 		TargetType:    stringPtr("admin_endpoint"),
 		Action:        stringPtr("admin_route"),
 		Result:        stringPtr("refused"),
-		Reason:        stringPtr("not_leader"),
+		Reason:        stringPtr(reason),
 		EdgeRegionID:  &evaluator.EdgeRegionID,
 		EdgeClusterID: &evaluator.EdgeClusterID,
 		Timestamp:     now.UTC().Format(time.RFC3339Nano),
@@ -82,7 +87,8 @@ func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator
 			"authentication":      "not_evaluated",
 			"request_tenant":      "not_evaluated",
 			"required_permission": permission,
-			"http_status":         http.StatusConflict,
+			"http_status":         http.StatusServiceUnavailable,
+			"retry_after_seconds": 1,
 			"aggregation":         "permission_window",
 			"request_count":       count,
 			"first_seen":          first.UTC().Format(time.RFC3339Nano),
@@ -92,7 +98,7 @@ func recordAdminStandbyRefusal(writer *logs.Writer, evaluator decision.Evaluator
 	}
 	// No synchronous authority/outbox call on this pre-authentication path. The
 	// node-local JSONL and its configured append hooks remain in use. Local failure
-	// is reported by the shared writer health/error path and cannot undo the 409.
+	// is reported by the shared writer health/error path and cannot undo the 503.
 	if err := appendAdminAudit(context.Background(), writer, nil, audit, now); err != nil {
 		logErrorf("standby audit summary unconfirmed permission=%q request_count=%d first_seen=%s last_seen=%s", permission, count, first.UTC().Format(time.RFC3339Nano), last.UTC().Format(time.RFC3339Nano))
 	}

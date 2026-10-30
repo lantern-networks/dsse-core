@@ -56,7 +56,7 @@ func TestPostgresArchiveRechecksRetentionAtDeleteBoundary(t *testing.T) {
 	}
 }
 
-func TestPostgresDeleteOnlyPrunerProtectsHeldOutboxesAndOldTerms(t *testing.T) {
+func TestPostgresPrunerPreservesHotRowsWithoutArchiveAndProtectsHeldOutboxes(t *testing.T) {
 	p, leader, peer := blobWriterPostgresFixture(t)
 	p.key = "legal_hold"
 	h := newLegalHoldStore(p)
@@ -82,7 +82,7 @@ func TestPostgresDeleteOnlyPrunerProtectsHeldOutboxesAndOldTerms(t *testing.T) {
 			}
 		}
 	}
-	cfg := retentionConfig{hotEvents: time.Hour, outboxPublished: time.Hour, outboxDead: time.Hour, legalHold: h}
+	cfg := retentionConfig{interval: time.Hour, hotEvents: time.Hour, outboxPublished: time.Hour, outboxDead: time.Hour, legalHold: h}
 	stale := retentionWriteContext(context.Background())
 	leader.release()
 	peer.tick()
@@ -106,7 +106,7 @@ func TestPostgresDeleteOnlyPrunerProtectsHeldOutboxesAndOldTerms(t *testing.T) {
 	}
 	runRetentionPrune(context.Background(), p.db, cfg)
 	assertCount("hot_events", "held", 1)
-	assertCount("hot_events", "free", 0)
+	assertCount("hot_events", "free", 1) // no external S3: retain local hot rows
 	for _, table := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		assertCount(table, "held", 4)
 		assertCount(table, "free", 2)
@@ -115,7 +115,7 @@ func TestPostgresDeleteOnlyPrunerProtectsHeldOutboxesAndOldTerms(t *testing.T) {
 		t.Fatal(err)
 	}
 	runRetentionPrune(context.Background(), p.db, cfg)
-	assertCount("hot_events", "held", 0)
+	assertCount("hot_events", "held", 1)
 	for _, table := range []string{"admin_audit_outbox", "domain_event_outbox"} {
 		assertCount(table, "held", 2)
 	}

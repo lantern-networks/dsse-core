@@ -139,14 +139,27 @@ func TestSharedInspectionPendingIsIdempotentAndTenantBound(t *testing.T) {
 	if s.Count() != 1 {
 		t.Fatal("duplicate retry")
 	}
-	before, _ := p.Load()
 	s.Upsert(model.InspectionEvent{ID: "same", TenantID: "b"})
-	if s.PersistIfDirty() == nil {
-		t.Fatal("event ownership changed")
+	if err := s.PersistIfDirty(); err != nil {
+		t.Fatal(err)
 	}
-	after, _ := p.Load()
-	if string(before) != string(after) {
-		t.Fatal("foreign finding overwritten")
+	for _, tenant := range []string{"a", "b"} {
+		got, ok := s.GetForTenant(tenant, "same")
+		if !ok || got.TenantID != tenant {
+			t.Fatalf("%s event missing after same-ID write: %+v", tenant, got)
+		}
+	}
+	if _, ok := s.Get("same"); ok {
+		t.Fatal("ambiguous unscoped lookup must refuse")
+	}
+	fresh := NewStore(0)
+	if err := fresh.SetPersister(p, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, tenant := range []string{"a", "b"} {
+		if _, ok := fresh.GetForTenant(tenant, "same"); !ok {
+			t.Fatalf("%s event missing after reload", tenant)
+		}
 	}
 }
 func TestSharedInspectionDoesNotResurrectCachedPeer(t *testing.T) {

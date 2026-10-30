@@ -1,0 +1,20 @@
+{
+  "profile": "one-region-three-nodes",
+  "deployment": "example.test",
+  "agent_publisher": "",
+  "image_revision": "",
+  "service_image": "dsse:release",
+  "console_image": "dsse-console:release",
+  "regions": [
+    {
+      "id": "kiri",
+      "founding": true,
+      "holds_state": true,
+      "machines": [
+        {"name":"node-a","portal":"portal-a.example.test","failure_domain":"rack-a","holds":["control-plane","edges"],"addresses":["10.20.0.1"],"reachable":"node-a.example.test","reachable_address":"10.20.0.1"},
+        {"name":"node-b","portal":"portal-b.example.test","failure_domain":"rack-b","holds":["control-plane","edges"],"addresses":["10.20.0.2"],"reachable":"node-b.example.test","reachable_address":"10.20.0.2"},
+        {"name":"node-c","portal":"portal-c.example.test","failure_domain":"rack-c","holds":["control-plane","edges"],"addresses":["10.20.0.3"],"reachable":"node-c.example.test","reachable_address":"10.20.0.3"}
+      ]
+    }
+  ]
+}

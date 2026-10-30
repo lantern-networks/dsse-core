@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/enrolledinventory"
 )
 
 // Rehydrating the device-runtime view from the control plane on startup.
@@ -47,9 +49,9 @@ type deviceRuntimeHydrateSource struct {
 	client   *http.Client
 }
 
-// hydrate seeds the in-memory runtime view from the control plane's device_state history. Returns the number of
-// devices restored. Rows arrive newest-first, so the FIRST row seen for a device is the one that wins — later
-// rows are older history and must not overwrite it.
+// hydrate seeds the in-memory runtime view from the control plane's compact
+// device-state projection and returns the number of newly restored devices.
+// Original field clocks protect newer observations that arrive during the fetch.
 func (s deviceRuntimeHydrateSource) hydrate(ctx context.Context, store *endpointRuntimeStore) (int, error) {
 	if store == nil {
 		return 0, fmt.Errorf("device runtime store is nil")
@@ -113,19 +115,17 @@ func (s deviceRuntimeHydrateSource) hydrate(ctx context.Context, store *endpoint
 	return store.seedFromHistory(rows), nil
 }
 
-// seedFromHistory fills empty entries from newest-first history rows. It NEVER overwrites a device the live
-// transport has already reported: a CONNECT that landed while this was in flight is current, and history is not.
+// seedFromHistory restores compact fleet observations. A live heartbeat arriving
+// during the fetch must not hide those facts, while newer live observations and
+// entries belonging to a different tenant always remain authoritative.
 func (s *endpointRuntimeStore) seedFromHistory(rows []map[string]any) int {
 	restored := 0
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, row := range rows {
-		deviceID := strings.TrimSpace(stringFromRow(row, "device_id"))
+		deviceID := enrolledinventory.NormalizeIdentity(stringFromRow(row, "device_id"))
 		if deviceID == "" {
 			continue
-		}
-		if _, live := s.m[deviceID]; live {
-			continue // already known — from a live CONNECT, or from a newer row in this same pass
 		}
 		seen, ok := aiUsageRowTime(row)
 		if !ok {
@@ -133,6 +133,7 @@ func (s *endpointRuntimeStore) seedFromHistory(rows []map[string]any) int {
 		}
 		e := &deviceRuntimeInfo{
 			tenant:        strings.TrimSpace(stringFromRow(row, "tenant_id")),
+			observedAt:    runtimeTimesFromRow(row),
 			os:            strings.TrimSpace(stringFromRow(row, "os")),
 			loggedInUsers: map[string]bool{},
 			lastSeen:      seen.UTC(),
@@ -144,12 +145,24 @@ func (s *endpointRuntimeStore) seedFromHistory(rows []map[string]any) int {
 				}
 			}
 		}
-		if v, ok := row["disk_encryption_enabled"].(bool); ok {
+		e.authAccounts = parseObservedAuthAccountRows(row["auth_accounts"])
+		e.authAccountOrder = parseObservedAuthAccountOrder(row["auth_account_order"], e.authAccounts)
+		posture := row
+		if nested, ok := row["posture"].(map[string]any); ok {
+			posture = nested
+		}
+		if v, ok := posture["disk_encryption_enabled"].(bool); ok {
 			e.posture.DiskEncryptionEnabled = &v
 		}
-		if v, ok := row["firewall_enabled"].(bool); ok {
+		if v, ok := posture["firewall_enabled"].(bool); ok {
 			e.posture.FirewallEnabled = &v
 		}
+		if v, ok := posture["enforcement_agent_healthy"].(bool); ok {
+			e.posture.EnforcementAgentHealthy = &v
+		}
+		e.posture.CollectedAt = firstNonEmptyString(posture["collected_at"], row["posture_collected_at"])
+		e.posture.Source = firstNonEmptyString(posture["source"], row["posture_source"])
+		e.posture.CollectedAt = postureCollectedAt(e.posture, e.observedAt)
 		// ★ WHERE IT WAS STEERING, AND THAT IT WAS (2026-08-14). Restoring the state without these makes the
 		// first CONNECT after a restart look like a device that just STARTED steering — a transition, and an
 		// event shipped as history that did not happen. It also loses the one fact a fleet-wide view exists to
@@ -165,6 +178,32 @@ func (s *endpointRuntimeStore) seedFromHistory(rows []map[string]any) int {
 		// Seed the change signature from what was restored, so the first live report of the SAME state does not
 		// look like a transition and emit a spurious change event.
 		e.lastSig = e.changeSignature()
+		if live, exists := s.m[deviceID]; exists {
+			if live.tenant != e.tenant {
+				continue
+			}
+			// Compare the original field clocks; the newer heartbeat/presence
+			// clock says nothing about the age of its absent OS or posture.
+			now := live.lastSeen
+			if e.lastSeen.After(now) {
+				now = e.lastSeen
+			}
+			merged := mergeRuntimeViews(live.runtimeView(now), e.runtimeView(now))
+			if runtimeTime(e.observedAt["users"]).After(runtimeTime(live.observedAt["users"])) {
+				if _, present := row["auth_accounts"]; present {
+					live.authAccounts, live.authAccountOrder = e.authAccounts, e.authAccountOrder
+				}
+			}
+			live.os, live.posture, live.sourceIP, live.edge = merged.OS, merged.Posture, merged.SourceIP, merged.Edge
+			live.loggedInUsers = map[string]bool{}
+			for _, user := range merged.LoggedInUsers {
+				live.loggedInUsers[user] = true
+			}
+			live.lastSeen, live.lastSteered = runtimeTime(merged.LastSeen), runtimeTime(merged.LastSteered)
+			live.steering, live.observedAt = merged.SteerActive, merged.ObservedAt
+			live.lastSig = live.changeSignature()
+			continue
+		}
 		s.m[deviceID] = e
 		restored++
 	}

@@ -47,6 +47,7 @@ func humanIdentityDirectoryListOptionsFromRequest(r *http.Request) (humanidentit
 // newServerWithConfig (Phase 2 route-registration split). Parameter names match the
 // constructor's locals so the handler bodies are untouched.
 func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, http.HandlerFunc) http.HandlerFunc, evaluator decision.Evaluator, writer *logs.Writer, humanIdentities humanidentity.HumanIdentityDirectoryRuntimeStore, adminAuditOutbox adminAuditOutboxDeadReader, registry connectorRegistryStore, connectorSecret string, devMode bool, requireConnectorRuntimeSecret bool, configSourceURL string, directoryReporter *directoryCPReporter, tenantCAs *tenantca.TenantCARegistry) {
+	registerDirectoryMachineReportRoute(mux, humanIdentities, registry, tenantCAs, configSourceURL, evaluator, writer, adminAuditOutbox)
 	mux.HandleFunc("GET /admin/human-identities", adminEndpoint("admin.identity.read", func(w http.ResponseWriter, r *http.Request) {
 		options, err := humanIdentityDirectoryListOptionsFromRequest(r)
 		if err != nil {
@@ -200,7 +201,8 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, result)
 	}))
 	mux.HandleFunc("GET /identity-sources/due", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, tenantCAs) {
+		tenantID, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, tenantCAs)
+		if !authorized {
 			return
 		}
 		connectorID := strings.TrimSpace(r.Header.Get(connectorIDHeader))
@@ -208,7 +210,7 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusBadRequest, fmt.Errorf("connector id is required"))
 			return
 		}
-		result, err := humanidentity.HumanIdentityDirectorySourceDueList(r.Context(), humanIdentities, evaluator.PolicyBundle.TenantID, time.Now())
+		result, err := humanidentity.HumanIdentityDirectorySourceDueList(r.Context(), humanIdentities, tenantID, time.Now())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("human identity directory is unavailable"))
 			return
@@ -217,7 +219,15 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("POST /identity-sources/import", func(w http.ResponseWriter, r *http.Request) {
-		if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, tenantCAs) {
+		// A connector advances its checkpoint after a successful response. If this
+		// Edge follows a CP but has no verified machine report channel, accepting
+		// the import locally would silently strand those identities on one Edge.
+		if strings.TrimSpace(configSourceURL) != "" && (directoryReporter == nil || strings.TrimSpace(directoryReporter.url) == "" || directoryReporter.client == nil) {
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("directory authority report channel is unavailable"))
+			return
+		}
+		tenantID, authorized := runtimeConnectorTenant(w, r, connectorSecret, devMode, registry, evaluator.PolicyBundle.TenantID, requireConnectorRuntimeSecret, tenantCAs)
+		if !authorized {
 			return
 		}
 		connectorID := strings.TrimSpace(r.Header.Get(connectorIDHeader))
@@ -240,24 +250,44 @@ func registerHumanIdentityRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 			writeError(w, http.StatusBadRequest, fmt.Errorf("decode human identity import: %w", err))
 			return
 		}
-		if allowed, err := humanidentity.HumanIdentityDirectorySourceAllowedForConnector(r.Context(), humanIdentities, evaluator.PolicyBundle.TenantID, request.Source, connectorID); err != nil {
+		if allowed, err := humanidentity.HumanIdentityDirectorySourceAllowedForConnector(r.Context(), humanIdentities, tenantID, request.Source, connectorID); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Errorf("human identity source policy is unavailable"))
 			return
 		} else if !allowed {
 			writeError(w, http.StatusForbidden, fmt.Errorf("human identity source %q is not assigned to connector %q", request.Source, connectorID))
 			return
 		}
+		if strings.TrimSpace(configSourceURL) != "" {
+			// A CP-bound machine import must have a source explicitly assigned
+			// to this connector. Otherwise the Edge could acknowledge a sync
+			// that the authority can never accept.
+			policy, found, err := humanidentity.HumanIdentityDirectorySourcePolicyForSource(r.Context(), humanIdentities, tenantID, request.Source)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("human identity source policy is unavailable"))
+				return
+			}
+			assigned, _ := policy.Metadata["connector_id"].(string)
+			if !found || !policy.Enabled || strings.TrimSpace(assigned) != connectorID {
+				writeError(w, http.StatusForbidden, fmt.Errorf("human identity source is not assigned to this connector"))
+				return
+			}
+		}
 		now := time.Now()
-		result, err := humanidentity.HumanIdentityDirectoryImport(r.Context(), humanIdentities, request, evaluator.PolicyBundle.TenantID, now)
+		result, err := humanidentity.HumanIdentityDirectoryImport(r.Context(), humanIdentities, request, tenantID, now)
 		if err != nil {
-			humanidentity.HumanIdentityDirectoryRecordSourceImportError(r.Context(), humanIdentities, request, evaluator.PolicyBundle.TenantID, err, now)
+			humanidentity.HumanIdentityDirectoryRecordSourceImportError(r.Context(), humanIdentities, request, tenantID, err, now)
 			writeHumanIdentityMutationError(w, err)
 			return
 		}
 		_ = appendAdminAudit(r.Context(), writer, adminAuditOutbox, humanIdentityImportAuditLog(result, r, evaluator, now), now)
 		// Carry it to the authority. Applied above so it is already enforcing here; reported here so the
 		// control plane, and through it every other Edge and the Console, hold the same people.
-		directoryReporter.Report(directoryImportReport{Request: request, TenantID: evaluator.PolicyBundle.TenantID})
+		if directoryReporter != nil {
+			if err := directoryReporter.Report(directoryImportReport{Request: request, TenantID: tenantID, ConnectorID: connectorID}); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("directory report was not durably accepted"))
+				return
+			}
+		}
 		writeJSON(w, http.StatusOK, result)
 	})
 }

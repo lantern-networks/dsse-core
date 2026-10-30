@@ -98,10 +98,10 @@ func anyClientlessGroupMatches(allowed, have []string) bool {
 
 // clientlessPublishedAppFromCatalogEntry maps an application-catalog entry to the clientless view, and
 // reports whether it is publishable over the clientless front door at all. Only a private_app with
-// status=active is "published behind a connector"; a SaaS entry or an inactive app is not. A high-sensitivity
+// status=active and an explicit publish operation is "published behind a connector"; a SaaS entry or an inactive app is not. A high-sensitivity
 // app is managed-device-only (reduced-trust clientless cannot reach it).
 func clientlessPublishedAppFromCatalogEntry(e appcatalog.Entry) (clientlessPublishedApp, bool) {
-	if e.ApplicationType != "private_app" || strings.ToLower(strings.TrimSpace(e.Status)) != "active" {
+	if e.ApplicationType != "private_app" || strings.ToLower(strings.TrimSpace(e.Status)) != "active" || !e.Published {
 		return clientlessPublishedApp{}, false
 	}
 	return clientlessPublishedApp{

@@ -436,7 +436,7 @@ func (d *tenantTrustDistributor) adopted(pop []enrolledinventory.Entry, reports 
 	for _, id := range known {
 		ready := false
 		for _, r := range reports {
-			if !strings.EqualFold(r.TenantID, tenant) || !strings.EqualFold(r.DeviceIdentity, id) {
+			if strings.TrimSpace(r.TenantID) != strings.TrimSpace(tenant) || !strings.EqualFold(r.DeviceIdentity, id) {
 				continue
 			}
 			if r.ReportedAt.IsZero() || r.ReportedAt.After(now) || now.Sub(r.ReportedAt) > pkiAdoptionFreshFor || r.ReportedAt.Before(since) || r.AdoptedTrustSerial <= 0 || (serial > 0 && r.AdoptedTrustSerial != serial) || !strings.EqualFold(r.TransportServerNameSent, name) {

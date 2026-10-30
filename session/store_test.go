@@ -62,3 +62,22 @@ func TestCreateFromAuthenticationEventRejectsTenantMismatch(t *testing.T) {
 		t.Fatal("CreateFromAuthenticationEvent returned nil error, want tenant mismatch")
 	}
 }
+
+func TestCreateFromAuthenticationEventRejectsCrossTenantSessionIDCollision(t *testing.T) {
+	store := NewStore()
+	now := time.Now()
+	first, err := store.CreateFromAuthenticationEvent(model.AuthenticationEvent{
+		ID: "auth-a", TenantID: "tenant-a", UserID: "user-a", SessionID: "shared-id", Result: "success",
+	}, "bundle-a", "tenant-a", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateFromAuthenticationEvent(model.AuthenticationEvent{
+		ID: "auth-b", TenantID: "tenant-b", UserID: "user-b", SessionID: "shared-id", Result: "success",
+	}, "bundle-b", "tenant-b", now); err == nil {
+		t.Fatal("cross-tenant session ID collision replaced the original session")
+	}
+	if got, ok := store.GetActiveAt("shared-id", now); !ok || got.TenantID != first.TenantID || got.UserID != first.UserID || got.AuthenticationEventID != first.AuthenticationEventID {
+		t.Fatalf("original session was replaced: %+v, active=%v", got, ok)
+	}
+}

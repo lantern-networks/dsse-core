@@ -45,7 +45,7 @@ func TestJSONLStoreSearchScopesTenantAndTimeRange(t *testing.T) {
 		t.Fatalf("Search returned error: %v", err)
 	}
 
-	if result.TotalScanned != 4 || result.TotalMatches != 1 || len(result.Rows) != 1 {
+	if result.TotalScanned != 3 || result.TotalMatches != 1 || len(result.Rows) != 1 {
 		t.Fatalf("result = %#v", result)
 	}
 	if result.Rows[0]["id"] != "match" {
@@ -109,7 +109,7 @@ func TestJSONLStoreExportRowsStreamsTenantScopedMatches(t *testing.T) {
 		t.Fatalf("ExportRows returned error: %v", err)
 	}
 
-	if result.TotalScanned != 4 || result.TotalMatches != 2 || result.RowsExported != 1 {
+	if result.TotalScanned != 3 || result.TotalMatches != 2 || result.RowsExported != 1 {
 		t.Fatalf("result = %#v", result)
 	}
 	if len(exported) != 1 || exported[0] != "match_002" {

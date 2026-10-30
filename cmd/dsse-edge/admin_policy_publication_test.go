@@ -209,10 +209,10 @@ func TestAdminPolicyRealPublisherPartialFilesAreUnconfirmed(t *testing.T) {
 		t.Fatalf("outcome: %d %s", rec.Code, rec.Body.String())
 	}
 	// The real publisher writes the agent config even when there are no eligible steering rules.
-	if _, err := os.Stat(filepath.Join(dir, networkExtensionSnapshotAgentConfigRef)); err != nil {
+	if _, err := os.Stat(filepath.Join(pub.tenantOutputDir("tenant_lab_001"), networkExtensionSnapshotAgentConfigRef)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, networkExtensionSnapshotRulesRef)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(pub.tenantOutputDir("tenant_lab_001"), networkExtensionSnapshotRulesRef)); !os.IsNotExist(err) {
 		t.Fatalf("unexpected rules file: %v", err)
 	}
 	rows := readConnectorManagementAudits(t, writer)

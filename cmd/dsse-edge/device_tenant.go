@@ -66,7 +66,7 @@ func deviceGroupVisibleToTenant(groupTenant, callerTenant string) bool {
 	if c == "" {
 		return true
 	}
-	return g != "" && strings.EqualFold(g, c)
+	return g != "" && g == c
 }
 
 // steerDeviceTenant answers WHOSE material this device is entitled to receive, on the routes an endpoint agent
@@ -206,7 +206,7 @@ func adminResolveTenantPathTarget(r *http.Request, target string) (string, error
 func adminTenantPKITargetAllowed(r *http.Request, targetTenant, act string) error {
 	target := strings.TrimSpace(targetTenant)
 	caller := strings.TrimSpace(adminTenantIDFromRequest(r))
-	if target == "" || strings.EqualFold(target, caller) {
+	if target == "" || target == caller {
 		return nil
 	}
 	if adminCallerIsOperator(r) {
@@ -230,7 +230,7 @@ func adminOperatorWriteTargetAllowed(r *http.Request, target, act string) error 
 		return nil
 	}
 	selected, _ := adminOperateTenant(r, identity)
-	if target == "" || strings.EqualFold(strings.TrimSpace(target), strings.TrimSpace(selected)) {
+	if target == "" || strings.TrimSpace(target) == strings.TrimSpace(selected) {
 		return nil
 	}
 	return fmt.Errorf("%s organization %q requires selecting that organization first; the request is operating in %q", act, target, selected)

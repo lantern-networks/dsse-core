@@ -59,7 +59,62 @@ test('Overview treats unavailable required reads as unknown, including transport
  assert.equal(c.ovDenied({ok:true,status:200,body:{}},{ok:false,status:503}),true);
 });
 
+test('Overview Connector details distinguish an unreported CP tunnel from an Edge observation', () => {
+  const c = vm.createContext({bl: value => value.en});
+  vm.runInContext(source('./overview.js'), c);
+  // The CP can establish online from a fresh heartbeat without holding a tunnel itself.
+  const cp = {online: true, status: 'healthy', last_heartbeat_at: '2026-10-21T04:55:37Z'};
+  assert.equal(c.ovConnectorTunnelView(cp).text, 'not reported');
+  assert.equal(c.ovConnectorTunnelView(cp).tone, 'off');
+  assert.equal(c.ovConnectorNetworkRoutes(cp), 'not reported');
+  assert.equal(c.ovConnectorTunnelView({tunnel_connected: true}).text, 'up');
+  assert.equal(c.ovConnectorTunnelView({tunnel_connected: false}).text, 'down');
+  assert.equal(c.ovConnectorNetworkRoutes({reachable_routes: {cidr_count: 0, fqdn_domain_count: 0}}), '0 routes');
+  assert.equal(c.ovConnectorNetworkRoutes({reachable_routes: {cidr_count: 2, fqdn_domain_count: 1}}), '3 routes');
+  assert.equal(c.ovConnectorNetworkRoutes({reachable_routes: {cidr_count: 2}}), 'not reported');
+});
+
 test('an unreadable tenant inventory never falls back to an operator own-tenant list',async()=>{
  const el=(tag,props={})=>({...props,children:[],appendChild(n){this.children.push(n)}}),t=el('div'),r=el('div');let more;
  const c=vm.createContext({el,bl:x=>x.en,answeringForTheDeployment:()=>true,apiFetch:async(m,p)=>p==='/admin/tenants'?{ok:false,status:503}:{ok:true,status:200,body:{tenant_id:'operator'}}});vm.runInContext(source('./overview.js'),c);await c.ovLoadTenantsRegions(t,v=>more=v,r);assert.equal(more,'');assert.equal(t.children[0].text,'not readable here');assert.equal(r.children[0].text,'not readable here');
+});
+
+test('Overview does not call devices normal when risk reads fail', async () => {
+  const context = vm.createContext({
+    byDeviceIdentity: () => ({}), deviceKey: value => value,
+    apiFetch: async (_, path) => {
+      if (path === '/admin/enrolled-devices') return {ok:true, body:{devices:[
+        {identity:'server-known', enabled:true, effective_risk:'high'},
+        {identity:'unresolved', enabled:true},
+      ]}};
+      if (path === '/admin/device-runtime') return {ok:true, body:{devices:{'server-known':{steer_active:true}}}};
+      if (path === '/admin/risk-signals' || path === '/admin/device-groups') return {ok:false, status:503};
+      return {ok:true, body:{}};
+    },
+  });
+  vm.runInContext(source('./overview.js'), context);
+  const aggregate = await context.ovDeviceAggregate();
+  assert.equal(aggregate.risk.high, 1);
+  assert.equal(aggregate.risk.unknown, 1);
+  assert.equal(aggregate.risk.none, 0);
+  assert.equal(aggregate.reporting, 1);
+});
+
+test('Overview separates unavailable config sync from a verified disabled state', async () => {
+  const texts = [];
+  const el = (_, attrs = {}, children = []) => ({attrs, children: [children].flat(Infinity), appendChild(child) {this.children.push(child);}});
+  const strip = {innerHTML:'', appendChild(node) {texts.push(node.children.at(-1));}};
+  let config = {ok:false, status:503};
+  const context = vm.createContext({el, document:{createTextNode: value => value}, bl: value => value.en,
+    apiFetch: async (_, path) => path === '/admin/config-sync-status' ? config : {ok:false, status:503},
+    fleetStripChip: () => null,
+  });
+  vm.runInContext(source('./overview.js'), context);
+  await context.ovLoadStrip(strip, null);
+  assert.ok(texts.some(value => typeof value === 'string' && value.includes('unavailable')));
+  assert.ok(!texts.some(value => typeof value === 'string' && value.includes(' · off')));
+  texts.length = 0;
+  config = {ok:true, body:{enabled:false}};
+  await context.ovLoadStrip(strip, null);
+  assert.ok(texts.some(value => typeof value === 'string' && value.includes(' · off')));
 });

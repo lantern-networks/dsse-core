@@ -11,16 +11,19 @@
 // _grantsShowAll: list filter state — false (default) shows only live approvals; true includes history.
 let _grantsShowAll = false;
 
-function grantExpiryTime(g) {
-  const m = typeof g.expires_at === "string" && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.exec(g.expires_at);
+function grantRFC3339Time(value) {
+  const m = typeof value === "string" && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.exec(value);
   if (!m) return NaN;
   const [year,month,day,hour,minute,second] = m.slice(1).map(Number);
   const days = new Date(Date.UTC(2000 + year % 400,month,0)).getUTCDate();
   if (month < 1 || month > 12 || day < 1 || day > days || hour > 23 || minute > 59 || second > 59) return NaN;
-  return Date.parse(g.expires_at);
+  return Date.parse(value);
 }
+function grantExpiryTime(g) { return grantRFC3339Time(g.expires_at); }
 
 function grantStatus(g, nowMs) {
+	if (g.revoked && g.reauthenticate_after) return { label: { en: "Revoked", ja: "失効" }, kind: "off" };
+  if (g.revoked && g.consumed_at) return { label: { en: "Used", ja: "使用済み" }, kind: "off" };
   if (g.revoked) return { label: { en: "Revoked", ja: "失効" }, kind: "off" };
   const exp = grantExpiryTime(g);
   if (!Number.isFinite(exp)) return { label: { en: "Unknown expiry", ja: "期限不明" }, kind: "warn" };
@@ -89,8 +92,8 @@ function renderGrantsView(content) {
     el("div", {}, [
       el("h2", { class: "ui-view-title", text: bl({ en: "Access Approvals", ja: "アクセス承認" }) }),
       el("p", { class: "ui-view-desc", text: bl({
-        en: "Access granted to people after they sign in through your identity provider. Revocation takes effect on this server; other servers must receive the configuration update.",
-        ja: "ユーザーが ID プロバイダでサインインした後に付与されるアクセスです。失効はこのサーバーで反映されます。他のサーバーには設定の配布が必要です。",
+        en: "Access granted after identity-provider sign-in. Revoking an approval requires a new identity verification before access can be granted again. Other servers must receive the update.",
+        ja: "ID プロバイダでの本人確認後に付与されるアクセスです。失効後の再許可には、新しい本人確認が必要です。他のサーバーには更新の配布が必要です。",
       }) }),
     ]),
     el("button", { class: "ui-btn ui-btn-sm", text: bl({ en: "Reload", ja: "再読込" }), onClick: () => renderGrantsList(host) }),
@@ -238,7 +241,7 @@ async function renderGrantsList(host) {
     }),
     el("button", {
       class: "ui-btn ui-btn-sm" + (showAll ? " ui-btn-primary" : ""),
-      text: bl({ en: "All (incl. revoked/expired)", ja: "すべて（失効・期限切れ含む）" }) + " (" + grants.length + ")",
+      text: bl({ en: "All (incl. used/revoked/expired)", ja: "すべて（使用済み・失効・期限切れ含む）" }) + " (" + grants.length + ")",
       onClick: () => { _grantsShowAll = true; renderGrantsList(host); },
     }),
   ]);
@@ -258,6 +261,8 @@ function validatedAccessGrants(body, tenant) {
   for (const g of body.grants) {
     if (!accessGrantObject(g) || !accessGrantText(g.grant_id) || g.tenant_id !== tenant.tenant_id || ids.has(g.grant_id) ||
         (g.revoked !== undefined && typeof g.revoked !== "boolean") ||
+		(g.reauthenticate_after !== undefined && (!Number.isFinite(grantRFC3339Time(g.reauthenticate_after)) || !g.revoked)) ||
+        (g.consumed_at !== undefined && (!Number.isFinite(grantRFC3339Time(g.consumed_at)) || !g.revoked || !g.authentication_request_id)) ||
         ["user_id","user_email","username","user_display_name","device_id","idp_id","acr","scope","issued_at","expires_at"].some(k => g[k] !== undefined && typeof g[k] !== "string") ||
         (g.amr !== undefined && (!Array.isArray(g.amr) || g.amr.some(v => typeof v !== "string")))) throw new Error("Invalid access approval record");
     ids.add(g.grant_id);
@@ -267,9 +272,13 @@ function validatedAccessGrants(body, tenant) {
 function grantUnconfirmed() { return bl({en:"The revocation outcome is unconfirmed. Check the approval and retry revocation.",ja:"失効の結果を確認できません。承認の状態を確認し、失効を再試行してください。"}); }
 function grantRevokeOutcome(r, g) {
   const b = r?.body;
-  const same = accessGrantObject(b) && b.grant_id === g.grant_id && b.tenant_id === g.tenant_id;
-  if (r?.ok && r.status === 200 && same && b.status === "revoked" && (b.persistence === undefined || b.persistence === "saved_non_atomic")) return {partial:false,nonAtomic:b.persistence === "saved_non_atomic"};
-  if (!r?.ok && r?.status === 500 && same && b.status === "partial" && b.applied === true && b.persistence === "unconfirmed") return {partial:true};
+  const boundary = accessGrantObject(b) && Number.isFinite(grantRFC3339Time(b.reauthenticate_after));
+  const legacy = accessGrantObject(b) && b.fresh_identity_required === false && !b.reauthenticate_after;
+  const widened = accessGrantObject(b) && b.reauthentication_scope === "tenant" && boundary;
+  if (accessGrantObject(b) && b.reauthentication_scope !== undefined && !["approval","tenant"].includes(b.reauthentication_scope)) throw new Error(grantUnconfirmed());
+  const same = accessGrantObject(b) && b.grant_id === g.grant_id && b.tenant_id === g.tenant_id && (boundary || legacy) && !(boundary && b.fresh_identity_required === false);
+  if (r?.ok && r.status === 200 && same && b.status === "revoked" && (b.persistence === undefined || b.persistence === "saved_non_atomic")) return {partial:false,nonAtomic:b.persistence === "saved_non_atomic",legacy,widened};
+  if (!r?.ok && r?.status === 500 && same && b.status === "partial" && b.applied === true && b.persistence === "unconfirmed") return {partial:true,legacy,widened};
   if (r?.ok || (accessGrantObject(b) && b.status === "partial")) throw new Error(grantUnconfirmed());
   throw new Error(accessGrantText(b?.error) ? b.error : grantUnconfirmed());
 }
@@ -296,7 +305,7 @@ async function revokeGrant(g, host, label, retry = false) {
   try {
     if (!retry && !await uiConfirm({
       title:bl({en:"Revoke this access?",ja:"このアクセスを失効?"}),
-      body:bl({en:"Revoke this approval on this server. Other servers must receive the update. This cannot be undone.",ja:"このサーバーで承認を失効します。他のサーバーには更新の配布が必要です。この操作は取り消せません。"}),
+      body:bl({en:"Revoke this approval. When fresh identity verification is activated fleet-wide, a new identity verification is required before access can be granted again. During an upgrade, only this approval is revoked; the result will show whether fresh verification is enforced. If revocation protection requires consolidation, other approvals in this organization may also require fresh verification. Other servers must receive the update. This cannot be undone.",ja:"この承認を失効します。全認証ノードで新しい本人確認の要求が有効な場合、再許可には新しい本人確認が必要です。更新途中はこの承認だけを失効します。新しい本人確認が要求されるかは結果に表示します。失効の保護を維持するため境界を集約した場合、この組織の他の承認にも新しい本人確認を求める場合があります。他のサーバーには更新の配布が必要です。この操作は取り消せません。"}),
       confirmLabel:bl({en:"Revoke",ja:"失効"}),danger:true,
     })) return;
     let r;
@@ -304,7 +313,11 @@ async function revokeGrant(g, host, label, retry = false) {
     catch (_) { throw new Error(grantUnconfirmed()); }
     const outcome = grantRevokeOutcome(r,g);
     if (outcome.partial) {
-      notices.set(key,{grant:g,label,partial:true,message:bl({en:"Revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",ja:"このサーバーでは失効済みですが、保存を確認できません。保存先を復旧し、再起動前に失効の保存を再試行してください。"})});
+      notices.set(key,{grant:g,label,partial:true,message:bl({en:"Revoked on this server, but persistence is unconfirmed. Restore storage and retry saving this revocation before restarting.",ja:"このサーバーでは失効済みですが、保存を確認できません。保存先を復旧し、再起動前に失効の保存を再試行してください。"}) + (outcome.legacy ? " " + bl({en:"Fresh identity verification is not yet enforced across the fleet.",ja:"全ノードでの新しい本人確認の要求はまだ有効ではありません。"}) : "") + (outcome.widened ? " " + bl({en:"Revocation boundaries were consolidated. Other approvals in this organization also require fresh identity verification.",ja:"失効の境界を組織全体へ集約しました。この組織の他の承認にも新しい本人確認が必要です。"}) : "")});
+    } else if (outcome.legacy) {
+      notices.set(key,{grant:g,label,retry:false,message:bl({en:"Approval revoked. Fresh identity verification is not yet enforced across the fleet; an existing identity-provider sign-in may authorize a new approval.",ja:"承認を失効しました。全ノードでの新しい本人確認の要求はまだ有効でなく、既存の ID プロバイダのログインで新たに承認される場合があります。"}) + (outcome.nonAtomic ? " " + bl({en:"Saved without atomic replacement.",ja:"原子的な置き換えなしで保存しました。"}) : "")});
+    } else if (outcome.widened) {
+      notices.set(key,{grant:g,label,retry:false,message:bl({en:"Approval revoked. Revocation boundaries were consolidated for this organization. Other approvals may also require fresh identity verification.",ja:"承認を失効しました。失効の境界をこの組織全体へ集約したため、他の承認にも新しい本人確認を求める場合があります。"}) + (outcome.nonAtomic ? " " + bl({en:"Saved without atomic replacement.",ja:"原子的な置き換えなしで保存しました。"}) : "")});
     } else if (outcome.nonAtomic) {
       notices.set(key,{grant:g,label,retry:false,message:bl({en:"Revoked and saved without atomic replacement. This save completed, but interrupted future writes could damage the snapshot. Use storage that supports atomic replacement.",ja:"失効を保存しましたが、原子的な置き換えはできませんでした。今回の保存は完了しています。今後の書き込み中断による破損を避けるため、原子的な置き換えが可能な保存先を使用してください。"})});
     } else { notices.delete(key); if (host.isConnected !== false) uiToast((label || bl({en:"Access approval",ja:"アクセス承認"})) + ": " + bl({en:"Revocation accepted.",ja:"失効を受け付けました。"}),"ok"); }

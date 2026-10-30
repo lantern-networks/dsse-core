@@ -67,8 +67,8 @@ func TestTheWxsLaunchConditionUsesTheRollbackPropertyTheUpdaterPasses(t *testing
 	// Hand-authored upgrade rows do NOT schedule RemoveExistingProducts; MajorUpgrade did. Losing it means an
 	// upgrade installs alongside the old product instead of replacing it, which is invisible until a box is
 	// running two agents.
-	if !strings.Contains(wxs, `<RemoveExistingProducts After="InstallValidate" />`) {
-		t.Fatal("RemoveExistingProducts is not scheduled after InstallValidate — with MajorUpgrade gone nothing " +
+	if !strings.Contains(wxs, `<RemoveExistingProducts After="InstallInitialize" />`) {
+		t.Fatal("RemoveExistingProducts is not scheduled after InstallInitialize — with MajorUpgrade gone nothing " +
 			"else schedules it, and every upgrade would install beside the old product")
 	}
 }

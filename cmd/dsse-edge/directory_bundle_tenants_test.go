@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,14 +13,14 @@ import (
 func TestTheDirectorySectionIsBuiltForEveryOrganization(t *testing.T) {
 	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
 	store := newAdminTenantModelStore(model.PolicyBundle{TenantID: "tenant_reference_lab"}, now)
-	for _, id := range []string{"tenant_northwind", "tenant_acme"} {
+	for _, id := range []string{"tenant_northwind", "tenant_acme", "Tenant_Acme"} {
 		if _, err := store.Put(context.Background(), adminTenantModel{TenantID: id}, now); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
 		}
 	}
 
 	got := directoryBundleTenants(context.Background(), store, "tenant_reference_lab")
-	for _, want := range []string{"tenant_reference_lab", "tenant_northwind", "tenant_acme"} {
+	for _, want := range []string{"tenant_reference_lab", "tenant_northwind", "tenant_acme", "Tenant_Acme"} {
 		if !directoryTenantsInclude(got, want) {
 			t.Fatalf("the directory section would be built for %v — %s is missing, so the Edge that enforces "+
 				"for it would hold none of its people", got, want)
@@ -44,7 +43,7 @@ func TestTheDirectorySectionIsBuiltForEveryOrganization(t *testing.T) {
 
 func directoryTenantsInclude(list []string, want string) bool {
 	for _, item := range list {
-		if strings.EqualFold(item, want) {
+		if item == want {
 			return true
 		}
 	}
@@ -61,4 +60,10 @@ func (unlistableTenantStore) Get(context.Context, string) (adminTenantModel, err
 
 func (unlistableTenantStore) Update(context.Context, adminTenantModel, string, time.Time) (adminTenantModel, error) {
 	return adminTenantModel{}, nil
+}
+
+func TestDirectoryTenantAssertionRejectsCaseDistinctOwner(t *testing.T) {
+	if directoryTenantsInclude([]string{"Tenant_Acme"}, "tenant_acme") {
+		t.Fatal("test assertion accepted a different tenant owner")
+	}
 }

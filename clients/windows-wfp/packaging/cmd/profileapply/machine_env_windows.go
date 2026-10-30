@@ -22,6 +22,8 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -29,6 +31,37 @@ import (
 )
 
 const machineEnvKey = `SYSTEM\CurrentControlSet\Control\Session Manager\Environment`
+
+// Remove only the pointer this deployment wrote. A later operator-owned value
+// must survive uninstall; inability to read/delete/confirm ours is a failure.
+func unsetOwnedMachineEnv(name, ownedPath string) error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, machineEnvKey, registry.QUERY_VALUE|registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	value, _, err := k.GetStringValue(name)
+	if err == registry.ErrNotExist {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(filepath.Clean(value), filepath.Clean(ownedPath)) {
+		return nil
+	}
+	if err := k.DeleteValue(name); err != nil && err != registry.ErrNotExist {
+		return err
+	}
+	if _, _, err := k.GetStringValue(name); err != registry.ErrNotExist {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("environment pointer %s still present after deletion", name)
+	}
+	broadcastEnvironmentChange()
+	return nil
+}
 
 // setMachineEnv sets a machine-wide environment variable, or deletes it when value is empty.
 func setMachineEnv(name, value string) error {

@@ -1,12 +1,12 @@
 # Building
 
-Run these commands at the root of a checkout of `dsse-core`. For a complete installation,
+Run these commands at the root of the selected `dsse-core` source directory. For a complete installation,
 start with [Deployment](deployment.md); this page describes the build inputs and outputs.
 
 ## Prerequisites
 
 - Git and a patched Go toolchain. The language minimum in [go.mod](../go.mod) is
-  Go 1.26; use Go 1.27.1 for the release build. Set `GOTOOLCHAIN=go1.27.1` for the
+  Go 1.26; use Go 1.27.3 for the release build. Set `GOTOOLCHAIN=go1.27.3` for the
   commands below so an older local toolchain does not reintroduce fixed standard-library vulnerabilities.
 - Docker with the Compose v2 plugin for deployment images. Build Linux images matching
   the nodes' CPU architecture, either on a matching host or with a configured cross-build runtime.
@@ -15,24 +15,73 @@ start with [Deployment](deployment.md); this page describes the build inputs and
 Endpoint packaging has additional prerequisites described below. A service-image build
 does not produce signed endpoint installers.
 
+## Choose the source identity first
+
+For a clean public Git checkout, set `DSSE_REVISION` to that public commit:
+
+```sh
+export DSSE_REVISION="$(git rev-parse HEAD)"
+```
+
+For a source archive, **do not run Git in or above the extracted directory**.
+It has no Git history; an enclosing checkout can report an unrelated revision.
+Set `DSSE_REVISION` to the exact public commit recorded with the archive, or the
+`source-<content-sha256>` identifier in an unpublished candidate's tools README.
+Use that same value as `image_revision` in the installation plan. Do not use
+`unknown`, a private repository commit, or a new timestamp as source identity.
+
 ## Build the service images
 
 ```sh
-docker build --build-arg DSSE_REVISION="$(git rev-parse --short HEAD)" \
+docker build --build-arg DSSE_REVISION="${DSSE_REVISION:?set the reviewed source identity first}" \
   -f deploy/Dockerfile -t dsse:release .
-docker build --build-arg DSSE_REVISION="$(git rev-parse --short HEAD)" \
+docker build --build-arg DSSE_REVISION="${DSSE_REVISION:?set the reviewed source identity first}" \
   -f deploy/Dockerfile.console -t dsse-console:release .
 ```
 
-Use a clean checkout of the selected release revision. `DSSE_REVISION` stamps the binaries
-so `dsse-install -verify` can compare the fleet. For a source archive, pass the exact commit
-identified by the release in place of `git rev-parse`; `unknown` cannot identify a build.
+Use the selected clean source. `DSSE_REVISION` stamps the service binaries and
+both first-party images' OCI revision labels. Local `-preflight` compares those
+labels, the actual service binary and the plan before startup; full `-verify`
+compares the running fleet later. Matching labels alone do not attest image
+provenance: build from the reviewed source and verify distribution hashes.
 
 The generated `deployment.env` selects `DSSE_IMAGE=dsse:release` and
-`DSSE_CONSOLE_IMAGE=dsse-console:release`. If using a registry, set **both** to the intended
-image references, preferably immutable digests, on every node before starting Compose.
+`DSSE_CONSOLE_IMAGE=dsse-console:release`. For a shared-fleet plan, set `service_image` and `console_image`
+to the intended references (immutable registry digests for a release candidate), and `image_revision`
+to the source identity above. Generate each node from that complete plan; do not
+hand-edit image references into generated files. Unspecified image references
+retain the local tags above; `image_revision` is required by setup preflight.
+The final image gate compares both completed supported installation plans with
+the exact five scanned image digests; local tags are not release evidence.
 
-For nodes with the same architecture, build once and copy both images:
+Every PostgreSQL 18 installation plan must select one immutable data-layer
+cohort before `-preflight` or `-start-node`. Use the images published with the
+release (see the [0.4.0 release README](releases/0.4.0/README.md#server-container-images))
+or images you built:
+
+```json
+"data_layer": {
+  "etcd_image": "registry.example/etcd@sha256:<64 hex digits>",
+  "postgres_image": "registry.example/spilo@sha256:<64 hex digits>",
+  "postgres_tools_image": "registry.example/postgres-tools@sha256:<64 hex digits>",
+  "postgres_major": 18
+}
+```
+
+Replace these placeholders with the reviewed digests. The installer carries all
+four settings to every node. Its generated Compose uses the same Spilo image for
+the server and TLS init service, sets `PGVERSION=18`, and uses the selected
+PostgreSQL tools image for database initialization. Local `-preflight` checks
+the parsed service images and runs `postgres --version` from the selected Spilo
+image with no network and a read-only filesystem; it refuses a major mismatch.
+Preflight refuses a plan that omits `data_layer`. Generated Compose also refuses
+to interpolate its etcd, Spilo, and PostgreSQL tools services without explicit
+image references; it has no legacy fallback for these images. Use `-preflight`
+and `-start-node` to check the actual image contents before starting services.
+The published 0.4.0 images were installed fresh on Linux hosts in a three-Region
+layout; see the release acceptance record for what that installation covered.
+
+For nodes with the same architecture, build once and copy both first-party images:
 
 ```sh
 docker save -o dsse-images.tar dsse:release dsse-console:release
@@ -40,32 +89,44 @@ docker save -o dsse-images.tar dsse:release dsse-console:release
 docker load -i dsse-images.tar
 ```
 
+DSSE does not build or bundle an object-storage server. S3 archival is optional:
+without an `archive` plan entry, aged hot events remain in the persistent local
+store, whose capacity and backups the operator must manage. If archival is selected,
+provision an external S3-compatible bucket before setup, enable versioning and
+Object Lock, and declare its endpoint, bucket, region and authentication mode in
+the plan. Static credentials belong only in each control plane's private
+`deployment.env`; IAM workload identity is also supported. See [Deployment](deployment.md).
+
 `dsse-install -carry` packages configuration and credentials; it does **not** carry images.
 Compose also uses third-party service images. Preload those as well if the nodes cannot
 reach their registries. Inspect the generated Compose configuration for their exact references.
 
 For the native curl-impersonate upstream transport, follow the separate
-[egress broker build and integration guide](../egress-broker/README.md). The two builds
-above do not compile that nested native module.
+[egress broker build and integration guide](../egress-broker/README.md). These service builds
+do not compile that nested native module. The proposed 0.4.0 distribution does not
+include or qualify a broker executable or image.
 
 ## Build operator tools and native binaries
 
 ```sh
-export GOTOOLCHAIN=go1.27.1
+export GOTOOLCHAIN=go1.27.3
 mkdir -p bin
-go build -o bin/dsse-install ./cmd/dsse-install
-go build -o bin/dsse-profileverify ./cmd/dsse-profileverify
-go build -o bin/dsse-signupdate ./cmd/dsse-signupdate
+go build -buildvcs=false -trimpath -o bin/dsse-install ./cmd/dsse-install
+go build -buildvcs=false -trimpath -o bin/dsse-profileverify ./cmd/dsse-profileverify
+go build -buildvcs=false -trimpath -o bin/dsse-deployment-crl ./cmd/dsse-deployment-crl
+go build -buildvcs=false -trimpath -o bin/dsse-signupdate ./cmd/dsse-signupdate
 export PATH="$PWD/bin:$PATH"
 ```
 
-These binaries target the machine running `go build`. Use the corresponding Linux
-architecture when building binaries to copy to a deployment host. `go build ./...` builds
+These binaries target the machine running `go build`. The deployment CRL signer and
+keyless publisher run on Linux hosts and require the reviewed Linux binary from the
+same source as the installer; check its architecture and hash before installation.
+Use the corresponding Linux architecture when building binaries to copy to a deployment host. `go build ./...` builds
 the main module; see [CONTRIBUTING.md](../CONTRIBUTING.md) for checks.
 
 ## Windows packages
 
-Build on Windows with Go, a .NET SDK, WiX 5, and the Windows SDK signing tools. Driver
+Build on Windows with Go, a .NET SDK, WiX 7.0.0, and the Windows SDK signing tools. Driver
 source builds also need the WDK. See the [packaging guide](../clients/windows-wfp/packaging/README.md)
 for the actual commands and [Windows installation](windows-agent.md) for provisioning.
 
@@ -103,4 +164,4 @@ DSSE_TRUSTED_FRONT_DOORS=10.78.0.5
 The front door has a fixed address because Edges restrict which peers may supply a
 PROXY protocol header. Update any diagnostic `--add-host` arguments to match it.
 
-Release image builds pin Go 1.27.1. For matching local builds, set `GOTOOLCHAIN=go1.27.1` before running the Go commands.
+Release image builds pin Go 1.27.3. For matching local builds, set `GOTOOLCHAIN=go1.27.3` before running the Go commands.

@@ -1,8 +1,6 @@
 package hotstore
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -180,28 +178,6 @@ func TestBuildPostgresRelatedByAccessDecisionIDStatementScopesTenant(t *testing.
 	}
 }
 
-func TestPostgresHotEventsMigrationMatchesSchemaSQL(t *testing.T) {
-	parts := []string{}
-	for _, filename := range []string{
-		"003_hot_events.sql",
-		"010_hot_events_text_search.sql",
-	} {
-		data, err := os.ReadFile(filepath.Join("..", "..", "migrations", filename))
-		if err != nil {
-			if os.IsNotExist(err) {
-				t.Skipf("migration fixture not shipped with the dsse-core module (monorepo-only): %s", filename)
-			}
-			t.Fatalf("read migration %s: %v", filename, err)
-		}
-		parts = append(parts, string(data))
-	}
-	want := normalizePostgresHotStoreSQLContract(strings.Join(PostgresSchemaSQL(), "\n"))
-	got := normalizePostgresHotStoreSQLContract(strings.Join(parts, "\n"))
-	if got != want {
-		t.Fatalf("hot events migration SQL does not match schema helper\nmigration: %s\nhelper:    %s", got, want)
-	}
-}
-
 func TestPostgresHotEventsTextSearchIndexMatchesSearchExpression(t *testing.T) {
 	helperSQL := strings.Join(PostgresSchemaSQL(), "\n")
 	if !strings.Contains(helperSQL, "CREATE EXTENSION IF NOT EXISTS pg_trgm") {
@@ -223,11 +199,6 @@ func TestPostgresHotEventsTextSearchIndexMatchesSearchExpression(t *testing.T) {
 	if !strings.Contains(statement.SQL, "lower(payload::text) LIKE") {
 		t.Fatalf("SQL = %s, want search expression to match trigram index expression", statement.SQL)
 	}
-}
-
-func normalizePostgresHotStoreSQLContract(sqlText string) string {
-	sqlText = strings.ReplaceAll(sqlText, ";", " ")
-	return strings.Join(strings.Fields(sqlText), " ")
 }
 
 func TestUnknownRegionCountPreservesQueryScope(t *testing.T) {

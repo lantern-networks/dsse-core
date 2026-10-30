@@ -205,10 +205,16 @@ async function renderOperatorDistribution(host) {
     if (!row) continue;
     let live = null, waiting = null, note = null;
     try {
-      const r = await apiFetch("GET", "/admin/agent-updates", undefined, "control", undefined, t.tenant_id);
+      const r = await apiFetch("GET", "/admin/agent-updates?expected_tenant_id=" + encodeURIComponent(t.tenant_id), undefined, "control", undefined, t.tenant_id);
       if (r.ok) {
-        live = Object.keys((r.body && r.body.envelopes) || {});
-        waiting = Object.keys((r.body && r.body.pending) || {});
+        const b = r.body;
+        const catalogue = value => value && typeof value === "object" && !Array.isArray(value);
+        if (!b || b.schema_version !== "admin_agent_updates.v1" || b.tenant_id !== t.tenant_id ||
+            b.request_tenant_id !== t.tenant_id || !catalogue(b.envelopes) || !catalogue(b.pending)) {
+          throw new Error("Invalid tenant release catalogue");
+        }
+        live = Object.keys(b.envelopes);
+        waiting = Object.keys(b.pending);
       } else if (r.status === 403) {
         note = bl({ en: "not delegated", ja: "委任なし" });
         undelegated += 1;

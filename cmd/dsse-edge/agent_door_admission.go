@@ -81,6 +81,10 @@ func setAgentDoorAdmission(reg *tenantca.TenantCARegistry, ledger *enrolledinven
 			log.Printf("agent_door_denied reason=blocked identity=%q", id)
 			return fmt.Errorf("agent door: identity %q is blocked", id)
 		}
+		if err := knownEnrolledOwnerMatchesCertificateTenant(cs.VerifiedChains, id, reg, ledger); err != nil {
+			log.Printf("agent_door_denied reason=tenant_owner_mismatch identity=%q", id)
+			return fmt.Errorf("agent door: %w", err)
+		}
 		return nil
 	}
 	// ★★★ AND THE SAME JUDGEMENT, ASKABLE WITHOUT A NEW HANDSHAKE (2026-08-25, measured on a real endpoint).

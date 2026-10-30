@@ -428,6 +428,7 @@ const CP_AUTHORED_WRITES = [
   "POST /admin/idp-connections",
   "POST /admin/idp-connections/{id}/default",
   "POST /admin/inspection-posture",
+  "POST /admin/upstream-tls",
   "POST /admin/legacy-exceptions",
   "POST /admin/non-human-identities",
   "POST /admin/operator-elevations",
@@ -569,6 +570,7 @@ const CP_AUTHORED_READS = [
   "GET /admin/dlp-fingerprints",
   "GET /admin/tenants",
   "GET /admin/tenant",
+  "GET /admin/upstream-tls",
   "GET /admin/enrolment-tokens",
   "GET /admin/usage/summary",
   "GET /admin/usage/health",
@@ -679,6 +681,9 @@ async function apiFetch(method, path, body, plane, signal, tenantOverride, retri
   let parsed;
   try { parsed = JSON.parse(text); } catch (e) { parsed = text; }
   const answer = { status: res.status, ok: res.ok, body: parsed };
+	// The operator may switch organizations while a response is in flight. An automatic retry must
+	// never read that new selection and replay the earlier request in another organization.
+  if (tenantOverride === undefined && operateTenant !== actingTenant) return answer;
 
   // ★★ THE SCREEN USED TO PRINT A curl COMMAND (2026-08-21, read while finishing a certificate rotation).
   // Some acts inside a customer's organization need time the operator has been granted, and when none was
@@ -693,8 +698,9 @@ async function apiFetch(method, path, body, plane, signal, tenantOverride, retri
   // The retry happens exactly once: a second refusal after time was granted is a real refusal, and asking
   // again would be a loop that keeps opening elevations the organization then has to read.
   if (res.status === 403 && parsed && parsed.elevation_required && !retriedAfterElevation) {
-    const granted = await offerOperatorElevation(parsed.elevation_required, plane);
-    if (granted) return apiFetch(method, path, body, plane, signal, tenantOverride, true, retriedOnControl);
+    const granted = await offerOperatorElevation(parsed.elevation_required, plane, actingTenant, tenantOverride === undefined);
+    if (granted && (tenantOverride !== undefined || operateTenant === actingTenant))
+      return apiFetch(method, path, body, plane, signal, actingTenant, true, retriedOnControl);
   }
 
   // ★★★ AND A NODE THAT SAYS "ASK THE AUTHORITY" IS ASKED (2026-09-06, found by pressing "Download everything
@@ -716,15 +722,15 @@ async function apiFetch(method, path, body, plane, signal, tenantOverride, retri
   // itself: a second refusal there is a real one.
   if ((res.status === 409 || res.status === 501) && plane !== "control" && !retriedOnControl &&
       /control plane/i.test(String((parsed && (parsed.error || parsed.message)) || ""))) {
-    return apiFetch(method, path, body, "control", signal, tenantOverride, retriedAfterElevation, true);
+    return apiFetch(method, path, body, "control", signal, actingTenant, retriedAfterElevation, true);
   }
   return answer;
 }
 
 // offerOperatorElevation asks the operator whether to take the time this act needs, and takes it if they say
 // so. Returns true when the act may now be retried.
-async function offerOperatorElevation(need, plane) {
-  const org = operatingOrganizationName || (need && need.tenant_id) || "";
+async function offerOperatorElevation(need, plane, targetTenant, selectionIsImplicit) {
+  const org = (need && need.tenant_id) || operatingOrganizationName || "";
   // ★★★ IT USED TO ASK FOR A REASON AND SAY "THIS ORGANIZATION SEES IT" (2026-08-22, measured — the Edge was
   // logging the field being dropped on every grant).
   //
@@ -747,7 +753,8 @@ async function offerOperatorElevation(need, plane) {
     confirmLabel: bl({ en: "Ask for 20 minutes", ja: "20分もらう" }),
   });
   if (!ok) return false;
-  const r = await apiFetch("POST", "/admin/operator-elevations", { minutes: 20 }, plane);
+  if (selectionIsImplicit && operateTenant !== targetTenant) return false;
+  const r = await apiFetch("POST", "/admin/operator-elevations", { minutes: 20 }, plane, undefined, targetTenant);
   if (!r.ok) {
     uiToast(bl({ en: "Not granted", ja: "受け取れません" }) + ": " + ((r.body && r.body.error) || ("HTTP " + r.status)), "err");
     return false;
@@ -877,18 +884,37 @@ window.dsseFormatTime = function (value, options) {
 // tenant setting stores an IANA name rather than an offset.
 window.dsseTenantDayRange = function (daysAgo) {
   const zone = window.dsseTenantTimezone || "UTC";
-  const now = new Date();
-  const parts = new Intl.DateTimeFormat("en-CA", {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit",
-  }).formatToParts(new Date(now.getTime() - (daysAgo || 0) * 86400000));
-  const get = (type) => (parts.find((p) => p.type === type) || {}).value;
-  const dayStart = `${get("year")}-${get("month")}-${get("day")}T00:00:00`;
-  // Resolve that wall-clock time in the tenant's zone back to an instant.
-  const guess = new Date(dayStart + "Z");
-  const shown = new Date(guess.toLocaleString("en-US", { timeZone: zone }));
-  const local = new Date(guess.toLocaleString("en-US", { timeZone: "UTC" }));
-  const start = new Date(guess.getTime() + (local.getTime() - shown.getTime()));
-  return { from: start.toISOString(), to: new Date(start.getTime() + 86400000).toISOString() };
+  });
+  const localDay = (instant) => {
+    const parts = fmt.formatToParts(new Date(instant));
+    const get = (type) => Number((parts.find((p) => p.type === type) || {}).value);
+    return get("year") * 10000 + get("month") * 100 + get("day");
+  };
+  // Move calendar dates in UTC, then resolve each local midnight separately. Subtracting 24 hours from an
+  // instant can skip a local date; adding 24 hours to a midnight is wrong on 23- and 25-hour DST days.
+  const todayParts = fmt.formatToParts(new Date());
+  const getToday = (type) => Number((todayParts.find((p) => p.type === type) || {}).value);
+  const calendarDay = new Date(Date.UTC(getToday("year"), getToday("month") - 1, getToday("day") - (daysAgo || 0)));
+  const midnight = (calendarDate) => {
+    const y = calendarDate.getUTCFullYear(), m = calendarDate.getUTCMonth(), d = calendarDate.getUTCDate();
+    const target = y * 10000 + (m + 1) * 100 + d;
+    let low = Date.UTC(y, m, d) - 48 * 3600000;
+    let high = Date.UTC(y, m, d) + 48 * 3600000;
+    // The first instant bearing this calendar date is its local midnight, including days whose offset
+    // changes at midnight. The 96-hour bracket covers every IANA offset from UTC-12 to UTC+14.
+    while (low < high) {
+      const mid = low + Math.floor((high - low) / 2);
+      if (localDay(mid) < target) low = mid + 1;
+      else high = mid;
+    }
+    return new Date(low);
+  };
+  return {
+    from: midnight(calendarDay).toISOString(),
+    to: midnight(new Date(Date.UTC(calendarDay.getUTCFullYear(), calendarDay.getUTCMonth(), calendarDay.getUTCDate() + 1))).toISOString(),
+  };
 };
 const DLP_NAV_IDS = ["dlp-findings", "sensitive-data", "dlp-policies"];
 
@@ -962,8 +988,11 @@ function warnIfViewsMissing() {
       el("button", { class: "ui-btn", text: bl({ en: "Reload", ja: "再読込" }),
         onClick: () => location.reload() })),
   ]);
-  const content = document.getElementById("content");
-  if (content && content.parentNode) content.parentNode.insertBefore(banner, content);
+  // The layout is a horizontal flex row (navigation + content). Inserting the
+  // warning between those two children squeezes the real page into a narrow
+  // third column exactly when an asset failed to load. Keep it above the row.
+  const layout = document.getElementById("console-layout");
+  if (layout && layout.parentNode) layout.parentNode.insertBefore(banner, layout);
 }
 
 function buildNav() {
@@ -1047,6 +1076,9 @@ const CUSTOM_VIEWS = {
   aiserviceusage: "renderAiServiceUsageView",
   logsaudit: "renderLogsAuditView",
   pinned: "renderPinnedSitesView",
+  tenantSettings: "renderTenantSettingsView",
+  enrolmentTokens: "renderEnrolmentTokensView",
+  agentProfile: "renderAgentProfileView",
 };
 
 function renderGroup(groupId) {

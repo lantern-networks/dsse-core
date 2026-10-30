@@ -13,7 +13,12 @@ function fixture(replies,lang){
   for(const n of [children].flat(Infinity))node.appendChild(n);return node;
  }
  const host=el('div'),c=vm.createContext({el,bl:x=>x[lang],freshRender:()=>()=>true,uiState(){},uiBadge:text=>el('span',{text}),
- apiFetch:async(method,path,body,plane,signal,tenant)=>{calls.push({path,tenant});return path==='/admin/tenants'?{ok:true,body:{tenants:replies.map((_,i)=>({tenant_id:'t'+i}))}}:replies[Number(tenant.slice(1))];}});
+ apiFetch:async(method,path,body,plane,signal,tenant)=>{
+  calls.push({path,tenant});
+  if(path==='/admin/tenants')return {ok:true,body:{tenants:replies.map((_,i)=>({tenant_id:'t'+i}))}};
+  const reply=replies[Number(tenant.slice(1))];
+  return reply.ok?{...reply,body:{schema_version:'admin_agent_updates.v1',tenant_id:tenant,request_tenant_id:tenant,...reply.body}}:reply;
+ }});
  vm.runInContext(source,c);const text=n=>[n.textContent,...n.children.map(text)].join(' ');
  return {c,host,calls,text:()=>text(host)};
 }
@@ -33,3 +38,18 @@ for(const lang of ['en','ja']){
   const f=fixture([empty,empty],lang);await f.c.renderOperatorDistribution(f.host);assert.match(f.text(),lang==='en'?/No tenant has/:/どのテナントにも/);
  });
 }
+
+test('operator distribution does not label another tenant release as the requested tenant',async()=>{
+ const f=fixture([{ok:true,body:{tenant_id:'t1',envelopes:{'windows/amd64':{}},pending:{}}},empty],'en');
+ await f.c.renderOperatorDistribution(f.host);
+ assert.doesNotMatch(f.text(),/windows\/amd64/);
+ assert.match(f.text(),/Unreadable: 1/);
+ assert.equal(f.calls[1].path,'/admin/agent-updates?expected_tenant_id=t0');
+});
+
+test('operator distribution treats incomplete success as unknown',async()=>{
+ const f=fixture([{ok:true,body:{envelopes:null,pending:{}}},empty],'en');
+ await f.c.renderOperatorDistribution(f.host);
+ assert.match(f.text(),/Unreadable: 1/);
+ assert.doesNotMatch(f.text(),/No tenant has a published release/);
+});

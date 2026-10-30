@@ -17,7 +17,7 @@ import (
 //
 // ★ IT NEVER APPEARED ON THE DEVELOPMENT MACHINE, because Docker Desktop and colima hand containers a very
 // large limit. That is what a one-host lab certifies: that it works on the machine it was written on.
-func TestEveryFrontDoorDeclaresTheDescriptorsItNeeds(t *testing.T) {
+func TestEveryFrontDoorInheritsPlatformDescriptors(t *testing.T) {
 	compose := composeTemplateForTest(t)
 	lines := strings.Split(compose, "\n")
 
@@ -33,7 +33,7 @@ func TestEveryFrontDoorDeclaresTheDescriptorsItNeeds(t *testing.T) {
 		}
 		if imageLine.MatchString(l) {
 			doorways = append(doorways, current)
-			// The limit must be declared within this service's block, before the next service starts.
+			// Inspect only this service; a different component may have its own resource configuration.
 			for j := i; j < len(lines); j++ {
 				if j > i && svcDecl.MatchString(lines[j]) {
 					break
@@ -49,9 +49,8 @@ func TestEveryFrontDoorDeclaresTheDescriptorsItNeeds(t *testing.T) {
 		t.Fatal("no front door was found, so this check measured nothing")
 	}
 	for _, d := range doorways {
-		if !declares[d] {
-			t.Fatalf("%q is a front door and declares no descriptor limit — on an ordinary host it exits at "+
-				"start-up, and the region looks entirely down", d)
+		if declares[d] {
+			t.Fatalf("%q imposes a DSSE-authored descriptor ceiling instead of inheriting platform resources", d)
 		}
 	}
 }

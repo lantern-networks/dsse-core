@@ -107,15 +107,15 @@ sequenceDiagram
     participant N as Native application
     participant A as Endpoint agent
     participant E as Edge
-    participant B as Agent WebView and portal
+    participant B as Default browser and portal
     participant I as IdP
     N->>A: Connect to internal service
     A->>E: Steered connection with device identity
     E-->>A: STEPUP URL; hold upstream connection
-    A->>B: Open authentication window after OS-specific prompt
+    A->>B: Open signed Portal link in the originating user's browser
     B->>I: OIDC authorization request
     I-->>B: Callback with authorization code
-    B->>E: Broker exchanges and validates token
+    E->>I: Broker exchanges and validates token
     E->>E: Record federated grant
     E-->>N: Resume when the grant is recognized, or require retry
 ```
@@ -142,62 +142,35 @@ For HTTP browsers the shared path can use a redirect; non-browser HTTP gets an
 authentication response and possibly `X-Dsse-Stepup-Url`. That header is not the
 mux STEPUP frame and is not, by itself, automatic agent browser mediation.
 
-### Windows and macOS authentication windows
+### Windows and macOS authentication
 
-The normal packaged native OOB experience uses a **DSSE-owned WebView window**.
-It loads the portal and then the actual customer's IdP sign-in page. The application
-being protected remains the original SSH/RDP/SMB client; the WebView supplies the
-separate interactive sign-in surface.
+For native SSH, RDP, SMB, and similar traffic, DSSE holds or denies the original
+connection and sends an authentication request to the endpoint agent. The agent
+opens the signed, short-lived Portal link in the **originating user's default
+browser**. The Portal redirects to the configured IdP and validates the response.
+An embedded WKWebView or WebView2 is not an IdP sign-in surface; the Windows
+WebView2 helper is not part of the installer. This also permits IdPs that reject
+embedded OAuth user agents.
 
-| | Windows | macOS |
-|---|---|---|
-| WebView | WebView2 in `dsse-stepup-window.exe` | WKWebView in the resident agent's `StepUpAuthWindow` |
-| How it opens | The steering service launches the helper in the active console user's session | The agent shows a notification and arms its menu-bar item; click the notification/action or the menu's authentication-window command |
-| If notifications are unavailable | The normal helper path opens directly without requiring a notification click | When notification authorization is unavailable, the controller automatically opens the window |
-| What the user sees | DSSE header, customer IdP page, and destination/status footer | DSSE header, customer IdP page, and destination/status footer |
-| Success | Recognized approval page updates the status; window closes after about two seconds | Same approval/status behavior; window is hidden and its page cleared after about two seconds |
-| Failure or manual close | A denial remains visible; closing before completion does not approve access | Denial or navigation failure remains visible; closing stops the page load and does not approve access |
+The endpoint checks the Portal origin against its signed profile before opening
+it. The Portal validates the signed request and expiry. On Windows, the agent
+uses the WFP flow owner's SID, session, and logon identity; an unknown owner does
+not fall back to SYSTEM or the active console. On macOS, the Network Extension
+passes a protected request to the same login session's menu-bar app. A passive
+notification does not itself authorize a connection.
 
-On macOS, the notification's action corresponds to **Authenticate and connect**;
-the menu command corresponds to **Open authentication window**. The current UI
-labels are localized in Japanese. The resident agent must be running in the user's
-session; a working Network Extension alone does not provide this interactive UI.
+After IdP sign-in, the Edge checks the verified identity, required assurance,
+current policy, device, OS-session binding, and destination. A held connection
+resumes only if its upstream connection succeeds. The agent can receive a
+`resumed` or `not_resumed` result; a missing result must never be read as success.
+If the application connection has already timed out, reconnect from that
+application. The agent does not replay its traffic automatically.
 
-The Windows helper needs the WebView2 Runtime. If the helper executable is missing
-or the agent cannot launch it, the launcher falls back to the user's default browser
-with a tray notification. This fallback is not guaranteed after the helper has
-already started: failure to embed WebView2 inside that process exits the helper.
-Check the helper and Runtime when no usable window appears. The macOS controller
-opens WKWebView; it does not implement the same external-browser fallback.
-
-For the person making the connection:
-
-1. Start the intended internal connection. When authentication is requested, check
-   the destination shown by DSSE; on macOS, open the window from the notification
-   or menu bar if it has not opened automatically.
-2. Complete the customer's IdP sign-in and the required factor in that window.
-   A DSSE logo or a displayed login page alone does not establish the achieved
-   assurance; the Edge must validate the returned claims.
-3. After approval, return to the original application and check that the operation
-   proceeds. The window's success status and automatic close describe the portal
-   result, not proof that the held connection resumed. Retry the connection if it
-   timed out or encountered the customer-scope limitation described above.
-4. If denied, cancelled, or unable to load the IdP, do not count the attempt as
-   successful authentication. Resolve the error and start a fresh connection when
-   a new ceremony is needed.
-
-Both windows normally verify HTTPS. Windows uses WebView2's certificate validation;
-macOS can additionally validate the portal host against the portal anchor supplied
-in the applied profile, while other hosts retain default trust handling. The IdP
-connection's server-side `ca_pem` does not configure WebView trust. Diagnose the
-portal certificate, IdP certificate, and hostname separately.
-
-Verify the actual sign-in method inside each shipped WebView, including any
-passkey/security-key ceremony. Password sign-in in a WebView, or success in a
-standalone browser, does not establish passkey support in that packaged app.
-Provider restrictions on embedded sign-in and the app's platform configuration
-can affect the result. Record the OS, agent package, WebView2 Runtime when relevant,
-IdP, method, window outcome, and original connection outcome in the test evidence.
+For troubleshooting, check the signed Portal origin and expiry, the default
+browser's certificate validation, the IdP response, the Edge's current policy,
+and the original application's result separately. The IdP's server-side `ca_pem`
+does not configure browser trust. A passkey or security-key flow must be tested
+with the actual browser and IdP; a password-only test does not establish it.
 
 ## Grants and assurance boundaries
 
@@ -209,12 +182,13 @@ Two mechanisms exist and their controls must not be confused:
 | East-West challenge/grant API | Challenge default five minutes; grants bind user/device/destination/protocol, with a default requested lifetime of 24 hours capped by configured tenant/rule TTLs; supports idle TTL on applicable grants |
 
 The second mechanism's per-hop and idle limits do not automatically govern the
-first. The federated gate does not compare provider ID, AMR, authentication age,
-or destination scope, and an unbound grant can satisfy its device check. Its
-request path does not carry AMR/freshness requirements through to token validation.
-The outbound compiler carrying a field and the Console displaying it are not proof
-that every grant-consumption path enforces it. Required ACR matching is exact;
-it is not a universal ranking of authentication methods.
+first. The federated gate checks the required provider, AMR, authentication age,
+exact destination scope, device, and applicable OS-session ownership before
+using a grant. Required ACR matching is exact; it is not a universal ranking
+of authentication methods. A grant for one destination is not permission for
+another. A `max_age=0` native grant is limited to one authenticated request.
+Browser redirect paths reject that setting because the original request cannot
+be resumed after the redirect.
 
 Grant revocation or expiry affects subsequent checks. Do not assume every existing
 TCP session terminates immediately: test new and already-established sessions
@@ -260,10 +234,8 @@ Implementation references: [classification](../decision/locality.go),
 [challenge grants](../eastwest/grant.go), and
 [admin routes](../cmd/dsse-edge/admin_east_west_routes.go).
 
-Endpoint UI references: [Windows launcher](../clients/windows-wfp/steer/steer_stepup_windows.go),
-[Windows WebView2 host](../clients/windows-wfp/stepupwindow/main.go),
-[macOS notifications and menu](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpStatusController.swift),
-and [macOS WKWebView window](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpAuthWindow.swift).
+Endpoint UI references: [Windows browser launcher](../clients/windows-wfp/steer/steer_stepup_owner_windows.go)
+and [macOS notifications and menu](../clients/macos-network-extension/Sources/DsseAgentAppExecutable/StepUpStatusController.swift).
 
 ## Editing incoming exceptions
 

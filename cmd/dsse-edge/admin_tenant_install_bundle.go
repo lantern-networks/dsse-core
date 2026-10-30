@@ -69,7 +69,7 @@ func registerTenantInstallBundleRoute(mux *http.ServeMux, adminEndpoint func(str
 		interceptionRootPEM, interceptionCN := "", ""
 		if config.NetworkExtensionLabTLS != nil {
 			for _, issuer := range config.NetworkExtensionLabTLS.ListOfflineTenantIntermediates() {
-				if strings.EqualFold(strings.TrimSpace(issuer.Tenant), target) {
+				if strings.TrimSpace(issuer.Tenant) == target {
 					interceptionRootPEM, interceptionCN = issuer.RootPEM, issuer.RootCommonName
 				}
 			}

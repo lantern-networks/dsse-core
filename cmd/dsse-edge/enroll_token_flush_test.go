@@ -40,10 +40,15 @@ func TestEnrolmentDoesNotIssueIdentityAfterUnconfirmedTokenSpend(t *testing.T) {
 				}
 			}
 			// Restoring storage alone cannot authorize a second device, including
-			// after a completed in-place spend. Both refusals use the generic message.
+			// after a completed in-place spend. Compare with an unknown credential
+			// at the same authority state: an unconfirmed save latches the store
+			// unavailable, so even an unknown token receives the availability
+			// response instead of its earlier invalid-token response.
 			p.saveErr = nil
+			unknownCode, unknownAfter := enrolPost(t, mux, "unknown-after-save", "never-issued")
 			code, resp = enrolPost(t, mux, "second-device", secret)
-			if code != http.StatusForbidden || resp.CertPEM != "" || ledger.IsAdmitted("second-device") || resp.Error != unknown.Error {
+			if code != http.StatusForbidden || unknownCode != code || resp != unknownAfter ||
+				resp.CertPEM != "" || ledger.IsAdmitted("second-device") || ledger.IsAdmitted("unknown-after-save") {
 				t.Fatal("retry admitted second device or exposed validity")
 			}
 			// This fake retained the new bytes; reopening sees the spend even

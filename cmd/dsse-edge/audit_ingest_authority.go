@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/lantern-networks/dsse-core/tenantca"
 )
@@ -31,6 +32,39 @@ type auditIngestAuthority struct {
 }
 
 var auditIngestAuthorityMap *auditIngestAuthority
+
+// Keep the operator Edge issuer separate from the listener's combined client
+// CA pool. The latter can also include tenant device CAs and the Console CA;
+// an identity named in the Edge-to-tenant map is not proof of the Edge role.
+var auditIngestOperatorRoots atomic.Pointer[x509.CertPool]
+
+func setAuditIngestOperatorCAPEM(pem []byte) bool {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return false
+	}
+	auditIngestOperatorRoots.Store(pool)
+	return true
+}
+
+func operatorEdgeShipperFrom(r *http.Request, reg *tenantca.TenantCARegistry) (auditIngestShipper, bool) {
+	shipper, verified := auditIngestShipperFrom(r, reg)
+	roots := auditIngestOperatorRoots.Load()
+	if !verified || roots == nil || r.TLS == nil || len(r.TLS.PeerCertificates) == 0 || shipper.CertTenant != "" {
+		return auditIngestShipper{}, false
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range r.TLS.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := r.TLS.PeerCertificates[0].Verify(x509.VerifyOptions{
+		Roots: roots, Intermediates: intermediates,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}); err != nil {
+		return auditIngestShipper{}, false
+	}
+	return shipper, true
+}
 
 // LoadAuditIngestAuthority reads the edge→tenants map. Absent is not an error: a deployment with one tenant
 // per Edge needs none, and the certificate's own CA answers for it.
@@ -86,13 +120,13 @@ func auditIngestShipperFrom(r *http.Request, reg *tenantca.TenantCARegistry) (au
 // With a map configured, the edge's identity must list the tenant (or "*"). Without one, the certificate must
 // chain to that tenant's registered CA — the single-tenant deployment, unchanged.
 func edgeMayShipForTenant(shipper auditIngestShipper, tenantID string) bool {
-	tenantID = strings.ToLower(strings.TrimSpace(tenantID))
+	tenantID = strings.TrimSpace(tenantID)
 	if strings.TrimSpace(shipper.Identity) == "" || tenantID == "" {
 		return false
 	}
 	if auditIngestAuthorityMap != nil {
 		for _, allowed := range auditIngestAuthorityMap.byEdge[strings.TrimSpace(shipper.Identity)] {
-			allowed = strings.ToLower(strings.TrimSpace(allowed))
+			allowed = strings.TrimSpace(allowed)
 			if allowed == "*" || allowed == tenantID {
 				return true
 			}
@@ -102,7 +136,7 @@ func edgeMayShipForTenant(shipper auditIngestShipper, tenantID string) bool {
 	// No map: the certificate speaks for its own tenant and no other. That is the single-tenant deployment,
 	// and a MULTI-tenant Edge needs the map — which is why its absence is reported at startup rather than
 	// discovered as a wall of 403s.
-	return strings.EqualFold(shipper.CertTenant, tenantID)
+	return strings.TrimSpace(shipper.CertTenant) == tenantID
 }
 
 func chainsToTenant(chains [][]*x509.Certificate, reg *tenantca.TenantCARegistry) (string, bool) {

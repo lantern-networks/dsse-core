@@ -213,3 +213,28 @@ func TestTheDoorDevicesArriveAtServesAnOrganizationsOwnCertificate(t *testing.T)
 		t.Fatalf("a name no organization carries was not served the shared certificate (%d)", sharedCalled)
 	}
 }
+
+func TestColdTenantHandshakeDoesNotReceiveDeploymentCertificate(t *testing.T) {
+	useEmptyTenantCertificateIndex(t)
+	dir := t.TempDir()
+	writeTenantCert(t, dir, "deployment", "agents.example.test")
+	shared, err := tls.LoadX509KeyPair(filepath.Join(dir, "deployment.crt"), filepath.Join(dir, "deployment.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	get := transportCertificateForClientHello(func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &shared, nil })
+	if cert, err := get(&tls.ClientHelloInfo{ServerName: "new-tenant.example.test"}); err == nil || cert != nil {
+		t.Fatal("cold tenant received a mismatched deployment identity")
+	}
+	if _, err := get(&tls.ClientHelloInfo{ServerName: "agents.example.test"}); err != nil {
+		t.Fatal("declared deployment name stopped working")
+	}
+	ownDir := t.TempDir()
+	writeTenantCert(t, ownDir, "new-tenant", "new-tenant.example.test")
+	if _, err := loadTransportTenantCertificates(ownDir); err != nil {
+		t.Fatal(err)
+	}
+	if cert, err := get(&tls.ClientHelloInfo{ServerName: "new-tenant.example.test"}); err != nil || cert == &shared {
+		t.Fatal("tenant did not recover after material installation without listener restart")
+	}
+}

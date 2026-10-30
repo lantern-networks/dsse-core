@@ -27,7 +27,7 @@ import (
 
 // StatsVersion is the DSSE_STATS revision this package understands. Must equal DSSE_STATS_VERSION in
 // driver/dsse_wfp.h. Version 3 appended the state block; the counters before it are unchanged.
-const StatsVersion = 3
+const StatsVersion = 4
 
 // Offsets into DSSE_STATS. The struct sits inside #include <pshpack1.h>, so it is byte-packed and every
 // offset is the plain running sum of the preceding fields: fourteen 32-bit counters (Version through
@@ -47,6 +47,11 @@ const (
 	OffOwnerPresent      = 68
 	OffOwnerDisarmOnExit = 72
 	StatsV3Size          = 76
+	OffCaptiveActive     = 76
+	OffCaptiveExpired    = 80
+	OffCaptiveGeneration = 84
+	OffCaptiveDeadline   = 92
+	StatsV4Size          = 100
 )
 
 // State is the answer to "is this box steering, and is anyone behind it".
@@ -62,9 +67,14 @@ type State struct {
 	// DisarmOnExit: the driver will clear the policy when the owner handle closes. This is the endpoint's
 	// install-time posture, not a runtime choice — false means this endpoint was installed fail-closed and is
 	// SUPPOSED to stop passing traffic when its agent dies.
-	DisarmOnExit bool
-	ProxyPID     uint32
-	LocalPort    uint16
+	DisarmOnExit         bool
+	ProxyPID             uint32
+	LocalPort            uint16
+	CaptiveSupported     bool
+	CaptiveActive        bool
+	CaptiveExpired       bool
+	CaptiveGeneration    uint64
+	CaptiveDeadline100ns uint64
 }
 
 // Parse decodes an IOCTL_DSSE_GET_STATS reply.
@@ -78,24 +88,41 @@ func Parse(buf []byte) (State, error) {
 		return State{}, fmt.Errorf("wfp stats: reply is %d bytes, too short to carry a version", len(buf))
 	}
 	version := binary.LittleEndian.Uint32(buf[OffVersion:])
-	if version < StatsVersion {
+	if version < 3 {
 		return State{}, fmt.Errorf("wfp stats: driver reports version %d, this agent needs %d "+
 			"(the loaded driver predates the arming-state block — it cannot say whether it is redirecting)",
-			version, StatsVersion)
+			version, 3)
 	}
 	// A NEWER driver is accepted: the struct grows append-only, so the fields below are still where they are.
 	if len(buf) < StatsV3Size {
 		return State{}, fmt.Errorf("wfp stats: reply is %d bytes, need %d for the state block",
 			len(buf), StatsV3Size)
 	}
-	return State{
+	state := State{
 		Armed:        binary.LittleEndian.Uint32(buf[OffPolicyArmed:]) != 0,
 		ProxyPID:     binary.LittleEndian.Uint32(buf[OffPolicyProxyPID:]),
 		LocalPort:    binary.LittleEndian.Uint16(buf[OffPolicyLocalPort:]),
 		ObserveOnly:  binary.LittleEndian.Uint16(buf[OffPolicyObserveOnly:]) != 0,
 		OwnerPresent: binary.LittleEndian.Uint32(buf[OffOwnerPresent:]) != 0,
 		DisarmOnExit: binary.LittleEndian.Uint32(buf[OffOwnerDisarmOnExit:]) != 0,
-	}, nil
+	}
+	if version >= 4 {
+		if len(buf) < StatsV4Size {
+			return State{}, fmt.Errorf("wfp stats: truncated captive state: %d bytes, need %d", len(buf), StatsV4Size)
+		}
+		state.CaptiveSupported = true
+		state.CaptiveActive = binary.LittleEndian.Uint32(buf[OffCaptiveActive:]) != 0
+		state.CaptiveExpired = binary.LittleEndian.Uint32(buf[OffCaptiveExpired:]) != 0
+		state.CaptiveGeneration = binary.LittleEndian.Uint64(buf[OffCaptiveGeneration:])
+		state.CaptiveDeadline100ns = binary.LittleEndian.Uint64(buf[OffCaptiveDeadline:])
+		if state.CaptiveActive && (state.CaptiveGeneration == 0 || state.CaptiveDeadline100ns == 0) {
+			return State{}, fmt.Errorf("wfp stats: invalid active captive deadline")
+		}
+		if state.CaptiveExpired && !state.CaptiveActive {
+			return State{}, fmt.Errorf("wfp stats: expired captive deadline without active guard")
+		}
+	}
+	return state, nil
 }
 
 // BlackHole reports the one state that takes a machine off the network without anyone deciding to: the driver
@@ -109,6 +136,8 @@ func (s State) BlackHole() bool {
 // String is what an operator reads in a log line, so it names the situation rather than dumping fields.
 func (s State) String() string {
 	switch {
+	case s.CaptiveActive:
+		return fmt.Sprintf("wfp_state=captive_deadline active=true expired=%t generation=%d owner_present=%t (new direct flows denied after monotonic deadline; established flows retained)", s.CaptiveExpired, s.CaptiveGeneration, s.OwnerPresent)
 	case !s.Armed:
 		return "wfp_state=disarmed (not steering; traffic goes direct)"
 	case s.ObserveOnly:
@@ -153,6 +182,9 @@ func VerifyDisarmed(state State, readErr error) DisarmVerification {
 			Reason: "could not read the driver's state after disarming, so it is unknown whether the " +
 				"redirect is still in force: " + readErr.Error(),
 		}
+	}
+	if state.CaptiveActive {
+		return DisarmVerification{Reason: "independent captive deadline remains active: " + state.String(), State: state}
 	}
 	if state.Armed {
 		return DisarmVerification{

@@ -100,7 +100,11 @@ func Apply(b Backend, envelopeJSON []byte, pinHex, source, now string) (installp
 	// Scope, stated so it is not mistaken for more than it is: this is the APPLY path. Runtime replay by an
 	// admin writing the registry directly is still only bounded by the signature — installprofile.Load has no
 	// not_after — and closing that needs an expiry in the schema plus a clock the agent trusts.
-	if cur := storedIssuedAt(b, pinHex); cur != "" {
+	cur, err := storedIssuedAt(b, pinHex)
+	if err != nil {
+		return prof, fmt.Errorf("configstore: cannot establish the applied profile's anti-rollback floor: %w", err)
+	}
+	if cur != "" {
 		curAt, e := time.Parse(time.RFC3339, cur)
 		if e != nil {
 			return prof, fmt.Errorf("configstore: the applied profile's issued_at %q is not RFC3339, so rollback cannot be judged: %w", cur, e)
@@ -172,16 +176,19 @@ func Load(b Backend, pinHex string) (installprofile.InstallProfile, Meta, error)
 // storedIssuedAt is the anti-rollback floor: the issued_at of the currently stored profile, taken from a
 // re-verification against the caller's anchor. Anything that does not verify has no say in what may replace
 // it — a store holding junk must not be able to refuse the good profile sent to repair it.
-func storedIssuedAt(b Backend, pinHex string) string {
+func storedIssuedAt(b Backend, pinHex string) (string, error) {
 	env, present, err := b.Get(valEnvelope)
-	if err != nil || !present || env == "" {
-		return ""
+	if err != nil {
+		return "", err
+	}
+	if !present || env == "" {
+		return "", nil
 	}
 	prof, verified, _ := installprofile.Load([]byte(env), pinHex)
 	if !verified {
-		return ""
+		return "", nil
 	}
-	return strings.TrimSpace(prof.IssuedAt)
+	return strings.TrimSpace(prof.IssuedAt), nil
 }
 
 // Clear removes the stored profile (uninstall). Best-effort per the backend.

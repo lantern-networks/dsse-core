@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/runtimequota"
 	"golang.org/x/net/http2"
 )
 
@@ -339,9 +340,10 @@ func (e *Engine) leafFor(host string) (*tls.Certificate, error) {
 
 // oneShotListener serves a single already-accepted connection through http.Server.Serve.
 type oneShotListener struct {
-	conn net.Conn
-	once sync.Once
-	done chan struct{}
+	conn      net.Conn
+	once      sync.Once
+	closeOnce sync.Once
+	done      chan struct{}
 }
 
 func (l *oneShotListener) Accept() (net.Conn, error) {
@@ -355,14 +357,23 @@ func (l *oneShotListener) Accept() (net.Conn, error) {
 	return nil, net.ErrClosed
 }
 func (l *oneShotListener) Close() error {
-	select {
-	case <-l.done:
-	default:
-		close(l.done)
-	}
+	l.closeOnce.Do(func() { close(l.done) })
 	return nil
 }
 func (l *oneShotListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+// Notify the listener when its sole connection ends, including when a handler
+// hijacks it. Wrap below tls.Conn so net/http still sees the TLS connection and
+// populates Request.TLS. Without this, the second Accept waits forever.
+type closeNotifyingConn struct {
+	net.Conn
+	onClose func()
+}
+
+func (c *closeNotifyingConn) Close() error {
+	defer c.onClose()
+	return c.Conn.Close()
+}
 
 // Intercept terminates the client's TLS on clientConn with a leaf for the route, then serves the
 // decrypted HTTP through the FlowHandler (policy + rewrite + forward). It blocks until the flow ends.
@@ -381,7 +392,9 @@ func (e *Engine) Intercept(clientConn net.Conn, route Route) {
 			return e.leafFor(h)
 		},
 	}
-	tlsConn := tls.Server(clientConn, cfg)
+	ln := &oneShotListener{done: make(chan struct{})}
+	tlsConn := tls.Server(&closeNotifyingConn{Conn: clientConn, onClose: func() { _ = ln.Close() }}, cfg)
+	ln.conn = tlsConn
 	handshakeErr := tlsConn.Handshake()
 	// Cert-pinning detection: report a repeatedly-failing host so it can be PROPOSED as a bypass
 	// candidate (never auto-bypassed here).
@@ -402,17 +415,15 @@ func (e *Engine) Intercept(clientConn net.Conn, route Route) {
 	})
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
 		// Serve the already-terminated TLS connection as HTTP/2 (multiplexed streams -> the handler).
-		// Bound idle/read time and concurrent streams (review #22): the bare http2.Server had NO timeouts,
-		// unlike the h1 path below, so a stalled or slow-loris browser leaked the serving goroutine and its
-		// streams indefinitely, and an unbounded stream count let one connection fan out arbitrarily.
+		// Preserve the reviewed resource-exhaustion protection: bounded idle time
+		// and per-connection fan-out. Explicit operator overrides remain available.
 		(&http2.Server{
-			IdleTimeout:          120 * time.Second, // drop a connection idle this long (goroutine reclaim)
-			ReadIdleTimeout:      30 * time.Second,  // PING-probe a silent peer; tear down if unanswered
-			MaxConcurrentStreams: 250,               // cap simultaneous streams per connection
+			IdleTimeout:          runtimequota.SecondsDefault("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", 120*time.Second),
+			ReadIdleTimeout:      30 * time.Second, // PING-probe a silent peer; tear down if unanswered
+			MaxConcurrentStreams: runtimequota.HTTP2StreamsDefault("DSSE_HTTP2_MAX_CONCURRENT_STREAMS", 250),
 		}).ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
 		return
 	}
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second}
-	ln := &oneShotListener{conn: tlsConn, done: make(chan struct{})}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: runtimequota.SecondsDefault("DSSE_HTTP_IDLE_TIMEOUT_SECONDS", 120*time.Second)}
 	_ = srv.Serve(ln)
 }

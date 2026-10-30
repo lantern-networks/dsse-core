@@ -16,6 +16,7 @@ package agentupdate
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 )
@@ -93,7 +94,9 @@ func DecodeRolloutPlan(payload []byte) (RolloutPlan, error) {
 	if err := dec.Decode(&p); err != nil {
 		return RolloutPlan{}, fmt.Errorf("rollout plan is malformed: %w", err)
 	}
-	if dec.More() {
+	// More is for elements inside an array/object and misses stray top-level
+	// closing delimiters. Require EOF after the one signed plan object.
+	if err := dec.Decode(new(any)); err != io.EOF {
 		return RolloutPlan{}, fmt.Errorf("rollout plan has trailing content")
 	}
 	if p.SchemaVersion != RolloutPlanSchema {

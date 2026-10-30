@@ -117,9 +117,26 @@ func registerAgentProfileRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 			return
 		}
 
-		endpoints := req.TransportEndpoints
-		if len(endpoints) == 0 {
-			endpoints = agentProfileEndpoints(agentPlaneURL, tenant, regions)
+		published := agentProfileEndpoints(agentPlaneURL, tenant, regions)
+		endpoints := published
+		if len(req.TransportEndpoints) > 0 {
+			allowed := make(map[string]bool, len(published))
+			for _, endpoint := range published {
+				allowed[endpoint] = true
+			}
+			endpoints = make([]string, 0, len(req.TransportEndpoints))
+			seen := make(map[string]bool)
+			for _, candidate := range req.TransportEndpoints {
+				endpoint := strings.TrimSpace(candidate)
+				if !allowed[endpoint] {
+					writeError(w, http.StatusBadRequest, fmt.Errorf("transport endpoint is not published for this organization"))
+					return
+				}
+				if !seen[endpoint] {
+					endpoints = append(endpoints, endpoint)
+					seen[endpoint] = true
+				}
+			}
 		}
 		if len(endpoints) == 0 {
 			writeError(w, http.StatusServiceUnavailable, fmt.Errorf(
@@ -234,6 +251,11 @@ func registerAgentProfileRoutes(mux *http.ServeMux, adminEndpoint func(string, h
 		// between regions). See a_profile_missing_the_organizations_authorities.go: a profile that omits the
 		// organization's own authorities is signed, valid, and installs a device that cannot work.
 		facts := deploymentFactsFor(config, tenant)
+		if err := installprofile.ValidateExactHTTPSPassthroughAgainstBroadDomains(
+			facts.ExactHTTPSPassthroughEndpoints, facts.PassthroughDomains); err != nil {
+			writeError(w, http.StatusConflict, err)
+			return
+		}
 		if missing := organizationAuthoritiesUnavailable(config, tenant, facts); missing != "" {
 			writeError(w, http.StatusConflict, refuseTheProfileThisNodeCannotComplete(tenant, missing))
 			return
@@ -324,7 +346,11 @@ func agentProfileEndpoints(agentPlaneURL, tenantID string, regions func(tenantID
 	if regions != nil {
 		for _, e := range regions(tenantID) {
 			region, endpoint := strings.TrimSpace(e.Region), strings.TrimSpace(e.Endpoint)
-			if region == "" || endpoint == "" {
+			if endpoint == "" {
+				continue
+			}
+			if region == "" {
+				out = append(out, endpoint)
 				continue
 			}
 			// "region=URL" is the shape the agent's bootstrap seed already takes, so the profile carries it
@@ -332,7 +358,9 @@ func agentProfileEndpoints(agentPlaneURL, tenantID string, regions func(tenantID
 			out = append(out, region+"="+endpoint)
 		}
 	}
-	if len(out) == 0 {
+	// A configured resolver is authoritative, including an empty result. Only an
+	// absent resolver may use the legacy single-region address.
+	if regions == nil {
 		if u := strings.TrimSpace(agentPlaneURL); u != "" {
 			out = append(out, u)
 		}

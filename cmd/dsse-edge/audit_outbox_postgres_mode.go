@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -62,7 +61,7 @@ func runPostgresAuditOutboxPublisher(ctx context.Context, config postgresAuditOu
 			return err
 		}
 	}
-	db, err := sql.Open("postgres", dsn)
+	db, err := openPostgresBounded(dsn)
 	if err != nil {
 		return err
 	}

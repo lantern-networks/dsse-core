@@ -222,7 +222,7 @@ func (a *tenantInterceptionAuthority) materialSnapshot() (*tenantInterceptionAut
 	if err := a.refreshLocked(); err != nil {
 		return nil, fmt.Errorf("%w: %v", errAuthorityNotAsked, err)
 	}
-	return &tenantInterceptionAuthority{issuers: copyAuthority(a.issuers), now: a.now, generation: a.generation}, nil
+	return &tenantInterceptionAuthority{issuers: copyAuthority(a.issuers), now: a.now, generation: a.generation, snapshotOnly: true}, nil
 }
 
 // Constructors retain a valid rollback snapshot even when used with legacy seed

@@ -1956,9 +1956,11 @@ function tenantDeviceCAControl(host) {
     // GET /admin/tenant-cas answers a customer with their own registrations only; a filter that does nothing
     // is still worth removing, because the next reader will believe it is what makes this list safe.
     //
-    // Kept for the operator, who legitimately receives every organization's and is looking at one.
+    // Kept for the operator, who can receive more than one organization's
+    // registrations. Tenant IDs are case-sensitive and an unattributed row is
+    // not evidence that it belongs to the selected organization.
     const mine = operateTenant
-      ? rows.filter((x) => !x.tenant_id || String(x.tenant_id).toLowerCase() === String(operateTenant).toLowerCase())
+      ? rows.filter((x) => x.tenant_id === operateTenant)
       : rows;
     if (!mine.length) return card;
     card.appendChild(el("div", { class: "ui-view-desc", style: "margin-top:6px" },

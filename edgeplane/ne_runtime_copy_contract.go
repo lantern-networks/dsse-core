@@ -17,8 +17,9 @@ import (
 )
 
 type NetworkExtensionRuntimeCopyTCPRoute struct {
-	Host string
-	Port int
+	TransportServerName string `json:"-"` // trusted outer TLS entrance, not client JSON
+	Host                string
+	Port                int
 	// The tunnel handler sets SNI by peeking at the ClientHello; empty means it was not obtained. On a
 	// connect-by-IP flow (Chrome, IPv6) Host is an address while the SNI is still a hostname, so any decision
 	// that needs a name uses this.
@@ -31,7 +32,8 @@ type NetworkExtensionRuntimeCopyTCPRoute struct {
 	// reads the flow's sourceAppAuditToken -> UID -> username). Unlike DeviceIdentity (one per tunnel/device), a
 	// device can be shared by several users, so this is the only per-user signal that says WHO acted. Carried to
 	// the egress decision as req.UserID. Empty when the agent did not report it.
-	OSUser string
+	OSUser    string
+	AuthOwner AuthOwner
 	// SourceApp is the app/process that ORIGINATED this flow, reported per-flow by the endpoint agent (macOS
 	// signing identifier / Windows image identity) in the steer OPEN frame ("a="). Distinguishes a human in a
 	// browser from a CLI / script / AI agent hitting the assistant. Carried to the access log as ai_app metadata.

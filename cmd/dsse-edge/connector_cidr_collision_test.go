@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +15,34 @@ import (
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
 )
+
+func TestCIDRCollisionSeesPublishedRouteBeyondFirstThousand(t *testing.T) {
+	ctx := context.Background()
+	const tenant = "tenant_lab_001"
+	catalog := appcatalog.NewStore()
+	now := time.Now()
+	for i := 0; i < 1000; i++ {
+		if _, err := catalog.Upsert(ctx, appcatalog.Entry{
+			ApplicationID: fmt.Sprintf("a%04d", i), ApplicationType: "private_app",
+			Status: "active", Published: true, Destination: "ordinary.example.test",
+			DestinationPort: 443, PublishProtocol: "web",
+		}, tenant, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := catalog.Upsert(ctx, appcatalog.Entry{
+		ApplicationID: "zzzz", ApplicationType: "private_app", Status: "active",
+		Published: true, Destination: "10.0.0.0/8", PublishProtocol: "network",
+		RoutingNamespace: "tokyo", ConnectorGroupID: "site-tokyo",
+	}, tenant, now); err != nil {
+		t.Fatal(err)
+	}
+	collisions, err := detectPublishCIDRCollisions(ctx, catalog, connector.NewRegistry(), tenant, "new",
+		"10.10.0.0/16", "tokyo", "site-tokyo")
+	if err != nil || len(collisions) != 1 || collisions[0].Source != "published_app:zzzz" {
+		t.Fatalf("late published CIDR bypassed collision guard: %+v %v", collisions, err)
+	}
+}
 
 // seedCIDRConnector registers a connector that fronts a CIDR range (Slice 5 collision fixture).
 func seedCIDRConnector(t *testing.T, registry *connector.Registry, id, tenant, site, namespace, cidr string) {

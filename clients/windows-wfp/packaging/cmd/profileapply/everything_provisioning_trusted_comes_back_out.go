@@ -34,30 +34,30 @@ import (
 // name — a rotation in flight, a device moved between organizations — and taking that one is an outage rather
 // than a cleanup. A file that is not there means this machine was never given that anchor, which is not an
 // error.
-func doRemoveEverythingProvisioningTrusted(dataDir string) {
-	// The artefacts provisioning writes when it trusts something. transport_ca.pem is deliberately NOT here:
-	// it is written for the agent to verify the Edge with and is never put in the machine's trust store.
+func doRemoveEverythingProvisioningTrusted(dataDir string) error {
+	var steps []cleanupStep
 	for _, name := range []string{
-		"interception-root.pem", // the organization's inspection authority
-		"step_up_portal_ca.pem", // whoever serves this deployment's step-up portal
+		"interception-root.pem", // provisioned inspection authority
+		"interception_root.pem", // the optional MSI-bundled authority
+		"step_up_portal_ca.pem", // provisioned portal authority
 	} {
 		path := filepath.Join(dataDir, name)
-		if _, err := os.Stat(path); err != nil {
-			// Never installed on this machine, or already taken back. Both are silence, not failure.
-			continue
-		}
-		fmt.Printf("profileapply: taking back what provisioning trusted from %s\n", path)
-		_ = doRemoveInterceptionRoot(path)
+		steps = append(steps, cleanupStep{name, func() error {
+			fmt.Printf("profileapply: taking back trust named by %s\n", path)
+			return doRemoveInterceptionRoot(path)
+		}})
 	}
-
-	// ★ And the bundle this package wrote, plus the variables it pointed at it. Left in place they are a
-	// deployment's inspection authority still trusted by every openssl-linked program on the machine, on a box
-	// that no longer runs the agent and may belong to a deployment that no longer exists.
-	//
-	// It rewrites rather than deletes, for a reason that has already cost this project an afternoon: every
-	// shell and daemon started while the agent ran is holding that path, and removing the file takes TLS from
-	// all of them at once. Rewriting it without our root leaves them verifying the public internet exactly as
-	// before, and no longer trusting us.
-	rootPEM, _ := os.ReadFile(filepath.Join(dataDir, "interception-root.pem"))
-	removeCABundlePointers(dataDir, rootPEM)
+	steps = append(steps, cleanupStep{"CA bundle and environment", func() error {
+		var rootPEM []byte
+		for _, name := range []string{"interception-root.pem", "interception_root.pem", "step_up_portal_ca.pem"} {
+			b, err := os.ReadFile(filepath.Join(dataDir, name))
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			rootPEM = append(rootPEM, b...)
+			rootPEM = append(rootPEM, '\n')
+		}
+		return removeCABundlePointers(dataDir, rootPEM)
+	}})
+	return runCleanup(steps...)
 }

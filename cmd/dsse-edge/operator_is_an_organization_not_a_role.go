@@ -42,7 +42,7 @@ var operatorTenantlessMode atomic.Bool
 
 // declareOperatorTenant records which organization operates this deployment. Called once, at start-up.
 func declareOperatorTenant(tenantID string, tenantModelInUse bool) {
-	id := strings.ToLower(strings.TrimSpace(tenantID))
+	id := strings.TrimSpace(tenantID)
 	operatorTenantAuthority.Store(id)
 	operatorTenantlessMode.Store(!tenantModelInUse)
 	switch {
@@ -81,7 +81,7 @@ func adminIdentityMayActAcrossOrganizations(identity adminIdentity) bool {
 	}
 	// A missing tenant claim does not prove that the deployment has no tenant model.
 	// Retain the legacy single-tenant behavior only when startup actually declared that mode.
-	home := strings.ToLower(strings.TrimSpace(identity.TenantID))
+	home := strings.TrimSpace(identity.TenantID)
 	if home == "" {
 		return operatorTenantlessMode.Load() || strings.EqualFold(strings.TrimSpace(identity.AuthMethod), adminLabBypassAuthMethod)
 	}

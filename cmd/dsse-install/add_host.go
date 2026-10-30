@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lantern-networks/dsse-core/deploymentcrl"
 )
 
 // add_host.go — a deployment learns another name it answers on, WITHOUT re-minting.
@@ -109,7 +111,24 @@ func addHostsToDeployment(dir, hosts string) error {
 		return fmt.Errorf("refusing to narrow this deployment's certificate")
 	}
 
-	if err := issueServerCertificates(dir, auth, names, ips, time.Now().UTC()); err != nil {
+	portals, err := readBrowserPortalNames(dir)
+	if err != nil {
+		return err
+	}
+	// Preserve the original issuer-bound CDP when reissuing a leaf. Dropping it
+	// here would turn a name-only update into an Online revocation failure.
+	var crlOrigins []string
+	oldTransport, err := readCertificate(filepath.Join(dir, "transport.crt"))
+	if err != nil {
+		return err
+	}
+	if len(oldTransport.CRLDistributionPoints) > 0 {
+		crlOrigins, err = deploymentcrl.DistributionPointsFromCertificate(oldTransport, auth.RootCert, auth.TransCA)
+		if err != nil {
+			return fmt.Errorf("existing transport CDP is invalid: %w", err)
+		}
+	}
+	if err := issueServerCertificatesWithCDP(dir, auth, names, ips, time.Now().UTC(), crlOrigins, portals...); err != nil {
 		return err
 	}
 	fmt.Printf("dsse-install: this deployment now answers on %d name(s) and %d address(es).\n\n", len(names), len(ips))
@@ -140,18 +159,32 @@ func loadAuthorities(dir string) (*deploymentAuthorities, error) {
 	}{
 		{"root.crt", "root.key", &a.RootCert, &a.RootKey},
 		{"management-ca.crt", "management-ca.key", &a.AdminCA, &a.AdminKey},
+		{"console-server-ca.crt", "console-server-ca.key", &a.ConsoleCA, &a.ConsoleKey},
 		{"transport-ca.crt", "transport-ca.key", &a.TransCA, &a.TransKey},
 		{"device-ca.crt", "device-ca.key", &a.DeviceCA, &a.DeviceKey},
 	} {
-		cert, err := readCertificate(filepath.Join(dir, item.certFile))
-		if err != nil {
-			return nil, err
-		}
 		// ★ THE PRIVATE HALF MAY HAVE MOVED. The CA keys live under authority/ so that nothing running is ever
 		// handed them; the certificates stay where every reader expects them, because they are public.
 		keyPath := filepath.Join(dir, item.keyFile)
 		if isAuthorityFile(item.keyFile) {
 			keyPath = authorityPathForReading(dir, item.keyFile)
+		}
+		if item.certFile == "console-server-ca.crt" {
+			_, certErr := os.Stat(filepath.Join(dir, item.certFile))
+			_, keyErr := os.Stat(keyPath)
+			if os.IsNotExist(certErr) && os.IsNotExist(keyErr) {
+				continue // Existing deployments retain their management leaf until an explicit rotation.
+			}
+			if certErr != nil {
+				return nil, certErr
+			}
+			if keyErr != nil {
+				return nil, keyErr
+			}
+		}
+		cert, err := readCertificate(filepath.Join(dir, item.certFile))
+		if err != nil {
+			return nil, err
 		}
 		key, err := readECKey(keyPath)
 		if err != nil {

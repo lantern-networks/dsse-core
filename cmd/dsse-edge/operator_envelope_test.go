@@ -223,6 +223,20 @@ func TestAnElevationAwaitingApprovalAuthorisesNothing(t *testing.T) {
 	}
 }
 
+func TestExpiredUnapprovedElevationDisplaysExpired(t *testing.T) {
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	pending := operatorElevation{
+		GrantedTo: "adm_operator", StartedAt: now.Add(-2 * time.Hour).Format(time.RFC3339),
+		ExpiresAt: now.Add(-time.Hour).Format(time.RFC3339), ApprovalRequired: true,
+	}
+	if got := pending.state(now); got != "expired" {
+		t.Fatalf("expired unapproved elevation displayed %q", got)
+	}
+	if pending.active(now) || !pending.finished(now) {
+		t.Fatal("expired elevation authorization changed while correcting its display")
+	}
+}
+
 // ★ THE ORGANIZATION CAN SEE WHAT WAS DONE TO IT WITHOUT ASKING THE OPERATOR. This is the half of the envelope design the
 // user agreed with before the reason field was dropped, and it is the part that carries the accountability a
 // free-text justification only appeared to.

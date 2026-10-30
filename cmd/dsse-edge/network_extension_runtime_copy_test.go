@@ -35,7 +35,12 @@ import (
 )
 
 func TestNetworkExtensionRuntimeCopyRoundTripReturnsTypedDefaultDenyForCurrentRequestSchema(t *testing.T) {
-	handler := newNetworkExtensionRuntimeCopyTestHandler(t)
+	// Exercise the explicit single-tenant handler contract. The production
+	// composition root supplies a certificate tenant resolver and now refuses
+	// this fixture's unattributed/plaintext request before route validation.
+	handler := edgeplane.NewNetworkExtensionRuntimeCopyRoundTripHandler(edgeplane.NetworkExtensionRuntimeCopyRoundTripHandlerConfig{
+		TenantID: "tenant_lab_001",
+	})
 	body := `{
 		"schema_version":"network_extension_runtime_copy_round_trip_request.v1",
 		"tenant_id":"tenant_lab_001",
@@ -66,6 +71,15 @@ func TestNetworkExtensionRuntimeCopyRoundTripReturnsTypedDefaultDenyForCurrentRe
 	if audit["metadata_only"] != true || audit["tenant_id"] != "tenant_lab_001" || audit["application_id"] != "default_network_extension_tunnel" {
 		t.Fatalf("audit = %+v, want metadata-only tenant/application audit", audit)
 	}
+}
+
+func TestNetworkExtensionRuntimeCopyProductionRouteRejectsUnattributedTenant(t *testing.T) {
+	handler := newNetworkExtensionRuntimeCopyTestHandler(t)
+	body := `{"schema_version":"network_extension_runtime_copy_round_trip_request.v1","tenant_id":"tenant_lab_001","request_id":"unattributed","application_id":"app","upstream_payload_b64":"QQ=="}`
+	req := httptest.NewRequest(http.MethodPost, edgeplane.NetworkExtensionRuntimeCopyRoundTripPath, strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	assertNetworkExtensionRuntimeCopyStatus(t, rec, http.StatusBadGateway, "tenant_scope_mismatch")
 }
 
 func TestNetworkExtensionRuntimeCopyRoundTripUsesDestinationAuthorityForTCPRoundTrip(t *testing.T) {
@@ -319,7 +333,7 @@ func TestNetworkExtensionLabTLSInterceptionAcceptsPersistentRootDirectoryPath(t 
 	}
 }
 
-func TestNetworkExtensionLabTLSInterceptionRotatesIncompletePersistentRootMaterial(t *testing.T) {
+func TestNetworkExtensionLabTLSInterceptionRejectsIncompletePersistentRootMaterial(t *testing.T) {
 	certPath := filepath.Join(t.TempDir(), "lantern_dsse_interception_root_ca.pem")
 	material, err := edgeplane.GenerateNetworkExtensionLabTLSRootMaterial(func() time.Time {
 		return time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
@@ -331,18 +345,19 @@ func TestNetworkExtensionLabTLSInterceptionRotatesIncompletePersistentRootMateri
 		t.Fatalf("write cert fixture: %v", err)
 	}
 	interception, err := edgeplane.NewNetworkExtensionLabTLSInterceptionWithPersistentRoot([]string{"example.com"}, time.Now, certPath)
-	if err != nil {
-		t.Fatalf("persistent root interception returned error: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "incomplete") || interception != nil {
+		t.Fatalf("incomplete persistent root accepted=%t error=%v, want fail-closed rejection", interception != nil, err)
 	}
-	if bytes.Equal(interception.RootCertificatePEM(), material.CertPEM) {
-		t.Fatal("incomplete persistent root certificate was reused, want rotated material")
+	remainingCert, err := os.ReadFile(certPath)
+	if err != nil || !bytes.Equal(remainingCert, material.CertPEM) {
+		t.Fatalf("incomplete root certificate was replaced or lost: read error=%v", err)
 	}
-	if _, err := os.Stat(edgeplane.NetworkExtensionLabTLSRootKeyPath(certPath)); err != nil {
-		t.Fatalf("rotated persistent root key missing: %v", err)
+	if _, err := os.Stat(edgeplane.NetworkExtensionLabTLSRootKeyPath(certPath)); !os.IsNotExist(err) {
+		t.Fatalf("incomplete root unexpectedly acquired a new key: stat error=%v", err)
 	}
 }
 
-func TestNetworkExtensionLabTLSInterceptionRotatesPersistentRootNearExpiry(t *testing.T) {
+func TestNetworkExtensionLabTLSInterceptionKeepsTrustedPersistentRootNearExpiry(t *testing.T) {
 	certPath := filepath.Join(t.TempDir(), "lantern_dsse_interception_root_ca.pem")
 	certNow := time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC)
 	first, err := edgeplane.NewNetworkExtensionLabTLSInterceptionWithPersistentRoot([]string{"example.com"}, func() time.Time {
@@ -355,10 +370,10 @@ func TestNetworkExtensionLabTLSInterceptionRotatesPersistentRootNearExpiry(t *te
 		return certNow.Add(edgeplane.NetworkExtensionLabTLSRootValidity - edgeplane.NetworkExtensionLabTLSRootRotateBefore + time.Second)
 	}, certPath)
 	if err != nil {
-		t.Fatalf("rotated persistent root interception returned error: %v", err)
+		t.Fatalf("reusing persistent root near expiry returned error: %v", err)
 	}
-	if bytes.Equal(first.RootCertificatePEM(), second.RootCertificatePEM()) {
-		t.Fatal("persistent root certificate was reused near expiry, want rotation")
+	if !bytes.Equal(first.RootCertificatePEM(), second.RootCertificatePEM()) {
+		t.Fatal("startup replaced the root still trusted by enrolled devices")
 	}
 }
 

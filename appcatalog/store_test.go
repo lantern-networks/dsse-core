@@ -49,6 +49,32 @@ func TestUpsertAndListScopeTenant(t *testing.T) {
 	}
 }
 
+func TestListAllIsTenantScopedWhilePublicListRemainsBounded(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := store.Upsert(ctx, Entry{ApplicationID: id, ApplicationType: "private_app", Status: "active"}, "own", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Upsert(ctx, Entry{ApplicationID: "foreign", ApplicationType: "private_app", Status: "active"}, "other", now); err != nil {
+		t.Fatal(err)
+	}
+	bounded, err := store.List(ctx, "own", ListOptions{ApplicationType: "private_app", Limit: 1})
+	if err != nil || bounded.Count != 3 || len(bounded.Applications) != 1 {
+		t.Fatalf("bounded List changed: %+v %v", bounded, err)
+	}
+	all, err := store.ListAll(ctx, "own", ListAllOptions{ApplicationType: "private_app"})
+	if err != nil || len(all) != 3 || all[0].ApplicationID != "a" || all[2].ApplicationID != "c" {
+		t.Fatalf("trusted full list incomplete: %+v %v", all, err)
+	}
+	foreign, err := store.ListAll(ctx, "other", ListAllOptions{})
+	if err != nil || len(foreign) != 1 || foreign[0].ApplicationID != "foreign" {
+		t.Fatalf("ListAll crossed tenant boundary: %+v %v", foreign, err)
+	}
+}
+
 // TestServiceFamilyDerivedFromPort verifies a published private app on a well-known lateral-protocol port is
 // classified into the matching service family (so decision.IsEastWestProtocol engages), instead of defaulting
 // to "https" — the bug that made Console-authored East-West rules silently not enforce on SSH/RDP/SMB apps.

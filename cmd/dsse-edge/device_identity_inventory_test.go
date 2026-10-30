@@ -88,6 +88,49 @@ func TestRuntimeIdentityJoinKeepsRecentVersionAndTenantBoundary(t *testing.T) {
 	}
 }
 
+func TestConsoleOnControlPlaneShowsEdgeHeartbeatVersion(t *testing.T) {
+	ledger := enrolledinventory.NewLedger()
+	mustEnroll(t, ledger, "shinnomac-mini", "tenant_a")
+	writer, err := logs.NewWriter(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior := fleetDeviceProjectionStore
+	fleetDeviceProjectionStore = newFleetDeviceProjection()
+	defer func() { fleetDeviceProjectionStore = prior }()
+	fleetDeviceProjectionStore.Fold(map[string]any{
+		"tenant_id": "tenant_a", "device_id": "ShinnoMac-mini",
+		"agent_version": "0.4.0+edge", "agent_version_reported_at": "2026-10-21T05:00:00Z",
+		"timestamp": "2026-10-21T05:00:00Z",
+	})
+	// A control plane has the authoritative enrollment ledger but no endpoint
+	// heartbeat in its node-local deviceStore. This is the observed AWS shape.
+	handler := newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer,
+		Registry: connector.NewRegistry(), EnrolledLedger: ledger, DeviceStore: device.NewStore(),
+		AdminAuth: newAdminAuthStore(), OperatorTenantID: "tenant_lab_001"})
+	req := httptest.NewRequest(http.MethodGet, "/admin/enrolled-devices", nil)
+	req.Header.Set("X-Operate-Tenant", "tenant_a")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("control plane inventory: %d", rec.Code)
+	}
+	var body struct {
+		Devices []struct {
+			Identity     string `json:"identity"`
+			AgentVersion string `json:"agent_version"`
+			LastSeenAt   string `json:"last_seen_at"`
+		} `json:"devices"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Devices) != 1 || body.Devices[0].Identity != "shinnomac-mini" ||
+		body.Devices[0].AgentVersion != "0.4.0+edge" || body.Devices[0].LastSeenAt != "2026-10-21T05:00:00Z" {
+		t.Fatalf("control plane lost Edge heartbeat version: %+v", body.Devices)
+	}
+}
+
 func TestUpdateIdentityJoinSelectsLatestOutcome(t *testing.T) {
 	events := map[string]model.AgentUpdateEvent{
 		"ShinnoMac-mini": {ID: "old", Timestamp: "2026-09-09T05:00:00Z", UpdateStatus: "installed"},

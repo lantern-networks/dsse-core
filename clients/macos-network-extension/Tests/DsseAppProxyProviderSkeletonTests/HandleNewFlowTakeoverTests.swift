@@ -60,8 +60,8 @@ final class HandleNewFlowTakeoverTests: XCTestCase {
         XCTAssertFalse(guardSkeleton.copyEnablementReady)
         XCTAssertFalse(guardSkeleton.acceptFlowBeforeGuardReady)
         XCTAssertTrue(guardSkeleton.connectionRegistryRequired)
-        XCTAssertTrue(guardSkeleton.byteCapRequired)
-        XCTAssertTrue(guardSkeleton.idleTimeoutRequired)
+        XCTAssertFalse(guardSkeleton.byteCapRequired)
+        XCTAssertFalse(guardSkeleton.idleTimeoutRequired)
         XCTAssertTrue(guardSkeleton.closeCleanupRequired)
         XCTAssertTrue(guardSkeleton.backpressureRequired)
         XCTAssertTrue(guardSkeleton.tenantScopeRequired)
@@ -1626,6 +1626,35 @@ final class HandleNewFlowTakeoverTests: XCTestCase {
         ])
     }
 
+    func testSessionExchangeQuotaIsDisabledUnlessExplicitlySelected() throws {
+        for quota in [0, 7] {
+            let payloads = (0..<300).map { Data("chunk-\($0)".utf8) }
+            let flow = MultiReadProviderTCPFlowCopyIO(upstreamPayloads: payloads)
+            let closed = expectation(description: "quota \(quota) transport released")
+            let completed = expectation(description: "quota \(quota) flow completed")
+            let transport = RecordingSessionRuntimeCopyTransport(downstreamPayloads: payloads) {
+                closed.fulfill()
+            }
+            let resultBox = RuntimeCopyResultBox()
+            let metadata = DsseLocalRuntimeCopyMetadata(
+                tenantID: "tenant", requestID: "session-budget-\(quota)", applicationID: "app",
+                destinationHost: "fixture.local", destinationPort: 5432
+            )
+            DsseLocalRuntimeCopyDriver(maxSessionExchangeCount: quota).driveLiveTakeover(
+                flow: flow, metadata: metadata, transport: transport
+            ) { result in
+                resultBox.result = result
+                completed.fulfill()
+            }
+            wait(for: [completed, closed], timeout: 5)
+            _ = try XCTUnwrap(resultBox.result).get()
+            XCTAssertEqual(transport.seenPayloads.count, quota == 0 ? 300 : quota)
+            XCTAssertEqual(flow.writtenPayloads.count, quota == 0 ? 300 : quota)
+            XCTAssertTrue(flow.closedRead)
+            XCTAssertTrue(flow.closedWrite)
+        }
+    }
+
     func testLiveRuntimeCopyDriverUsesSessionTransportForMultipleFlowChunks() throws {
         let upstreamPayloads = [
             Data("synthetic-client-chunk-1".utf8),
@@ -2974,8 +3003,8 @@ final class HandleNewFlowTakeoverTests: XCTestCase {
     }
 
     // Apple Developer ID leaf certs have NO Subject O= field — the org is embedded in the leaf Common Name,
-    // e.g. "Developer ID Application: Google LLC (EQHXZ8M8AV)". So `subject:Google LLC` must match via a
-    // case-insensitive contains against the CN, making one shared subject: entry work on macOS too.
+    // e.g. "Developer ID Application: Google LLC (EQHXZ8M8AV)". `subject:Google LLC` matches the
+    // publisher portion exactly, so another signed organization's similar name cannot bypass steering.
     func testSelfExclusionSubjectMatchesViaLeafCommonNameWhenNoOrganizationField() throws {
         let policy = DsseSelfExclusionPolicy(appIDs: ["subject:Google LLC"])
         XCTAssertEqual(policy.subjectOrganizations, ["google llc"])
@@ -2999,6 +3028,22 @@ final class HandleNewFlowTakeoverTests: XCTestCase {
                 leafSha256: nil
             )
         ))
+        for (name, team) in [
+            ("Developer ID Application: NotGoogle LLC (AAAA111111)", "AAAA111111"),
+            ("Developer ID Application: Google LLC Subsidiary (AAAA111111)", "AAAA111111"),
+            ("Unrelated certificate containing Google LLC (AAAA111111)", "AAAA111111"),
+            ("Developer ID Application: Google LLC (WRONGTEAM)", "AAAA111111"),
+        ] {
+            XCTAssertFalse(policy.excludes(
+                sourceAppSigningIdentifier: "com.other.app",
+                signerIdentity: DsseSourceAppSignerIdentity(
+                    teamIdentifier: team,
+                    subjectOrganization: nil,
+                    subjectCommonName: name,
+                    leafSha256: nil
+                )
+            ), "a different signed publisher must not match the exclusion: \(name)")
+        }
     }
 
     func testSelfExclusionTypedThumbprintMatchesLeafSha256NormalizedCaseAndSeparators() throws {

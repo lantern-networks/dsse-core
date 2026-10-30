@@ -263,7 +263,9 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 				"the control plane instead"))
 			return
 		}
-		target, terr := connectorProgramTarget(r.URL.Query().Get("platform"), r.URL.Query().Get("arch"))
+		platform := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("platform")))
+		arch := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("arch")))
+		target, terr := connectorProgramTarget(platform, arch)
 		if terr != nil {
 			writeError(w, http.StatusBadRequest, terr)
 			return
@@ -316,7 +318,6 @@ func registerConnectorProgramRoutes(mux *http.ServeMux, adminEndpoint func(strin
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
-		platform, arch, _ := strings.Cut(target, "-")
 		meta := connectorProgramMeta{
 			Platform: platform, Arch: arch,
 			FileName:    connectorProgramFileName(r.Header.Get("x-artifact-filename"), target),

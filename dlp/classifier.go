@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"fmt"
 	"regexp"
+	"regexp/syntax"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Operator-defined custom classifiers (slice C). An operator can teach the engine tenant-specific identifiers —
@@ -132,6 +135,17 @@ func CompileClassifier(spec ClassifierSpec) (compiledClassifier, error) {
 		if loc := re.FindStringIndex(""); loc != nil {
 			return compiledClassifier{}, fmt.Errorf("dlp: regex classifier %q matches the empty string (too broad)", name)
 		}
+		parsed, err := syntax.Parse(pat, syntax.Perl)
+		if err != nil {
+			return compiledClassifier{}, fmt.Errorf("dlp: regex classifier %q: %w", name, err)
+		}
+		width, err := maximumRegexMatchBytes(parsed)
+		if err != nil {
+			return compiledClassifier{}, fmt.Errorf("dlp: regex classifier %q: %w", name, err)
+		}
+		if width > maxCustomMatchLen {
+			return compiledClassifier{}, fmt.Errorf("dlp: regex classifier %q can match more than %d bytes; streaming detection cannot enforce it", name, maxCustomMatchLen)
+		}
 		c := compiledClassifier{typ: IdentifierType(name), kind: ClassifierRegex, re: re}
 		if prefix, _ := re.LiteralPrefix(); len(prefix) >= minGateLiteral {
 			c.lits = [][]byte{[]byte(prefix)}
@@ -160,6 +174,103 @@ func CompileClassifier(spec ClassifierSpec) (compiledClassifier, error) {
 		return compiledClassifier{typ: IdentifierType(name), kind: ClassifierKeyword, lits: lits}, nil
 	default:
 		return compiledClassifier{}, fmt.Errorf("dlp: classifier %q has unknown kind %q (want regex|keyword)", name, spec.Kind)
+	}
+}
+
+// maximumRegexMatchBytes computes a conservative upper bound in UTF-8 bytes,
+// capped at maxCustomMatchLen+1. A pattern accepted here can be detected in the
+// streaming carry and never silently discarded by scan for being too long.
+// Position assertions are not valid in a sliding window: its beginning/end is
+// usually not the beginning/end of the upload, including at a line/word edge.
+func maximumRegexMatchBytes(re *syntax.Regexp) (int, error) {
+	if re == nil {
+		return 0, fmt.Errorf("empty regex syntax tree")
+	}
+	capWidth := func(n int) int {
+		if n > maxCustomMatchLen {
+			return maxCustomMatchLen + 1
+		}
+		return n
+	}
+	switch re.Op {
+	case syntax.OpNoMatch, syntax.OpEmptyMatch:
+		return 0, nil
+	case syntax.OpLiteral:
+		width := 0
+		for _, r := range re.Rune {
+			charWidth := utf8.RuneLen(r)
+			if charWidth < 0 {
+				return 0, fmt.Errorf("invalid Unicode literal")
+			}
+			if re.Flags&syntax.FoldCase != 0 {
+				for folded := unicode.SimpleFold(r); folded != r; folded = unicode.SimpleFold(folded) {
+					if n := utf8.RuneLen(folded); n > charWidth {
+						charWidth = n
+					}
+				}
+			}
+			width = capWidth(width + charWidth)
+		}
+		return width, nil
+	case syntax.OpCharClass:
+		width := 0
+		for i := 1; i < len(re.Rune); i += 2 {
+			if n := utf8.RuneLen(re.Rune[i]); n > width {
+				width = n
+			}
+		}
+		if width == 0 {
+			return 0, fmt.Errorf("invalid Unicode character class")
+		}
+		return width, nil
+	case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+		return utf8.UTFMax, nil
+	case syntax.OpBeginText, syntax.OpEndText, syntax.OpBeginLine, syntax.OpEndLine,
+		syntax.OpWordBoundary, syntax.OpNoWordBoundary:
+		return 0, fmt.Errorf("position anchors and word boundaries are unsupported in streaming classifiers")
+	case syntax.OpCapture, syntax.OpQuest:
+		return maximumRegexMatchBytes(re.Sub[0])
+	case syntax.OpStar, syntax.OpPlus:
+		return 0, fmt.Errorf("unbounded repetition is unsupported in streaming classifiers")
+	case syntax.OpRepeat:
+		if re.Max < 0 {
+			return 0, fmt.Errorf("unbounded repetition is unsupported in streaming classifiers")
+		}
+		child, err := maximumRegexMatchBytes(re.Sub[0])
+		if err != nil {
+			return 0, err
+		}
+		if child == 0 || re.Max == 0 {
+			return 0, nil
+		}
+		if re.Max > maxCustomMatchLen/child {
+			return maxCustomMatchLen + 1, nil
+		}
+		return capWidth(child * re.Max), nil
+	case syntax.OpConcat:
+		width := 0
+		for _, sub := range re.Sub {
+			n, err := maximumRegexMatchBytes(sub)
+			if err != nil {
+				return 0, err
+			}
+			width = capWidth(width + n)
+		}
+		return width, nil
+	case syntax.OpAlternate:
+		width := 0
+		for _, sub := range re.Sub {
+			n, err := maximumRegexMatchBytes(sub)
+			if err != nil {
+				return 0, err
+			}
+			if n > width {
+				width = n
+			}
+		}
+		return width, nil
+	default:
+		return 0, fmt.Errorf("unsupported regex syntax operator")
 	}
 }
 

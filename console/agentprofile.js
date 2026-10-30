@@ -52,7 +52,20 @@ async function loadAgentProfileForm(host) {
         { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadAgentProfileForm(host) });
       return;
     }
-    body = r.body || {};
+    const tenant = await apiFetch("GET", "/admin/tenant", undefined, _PROFILE_PLANE);
+    body = r.body;
+    const selected = (typeof operateTenant === "string" && operateTenant) ||
+      (typeof idpSession !== "undefined" && idpSession && idpSession.tenant_id) || "";
+    const rows = value => Array.isArray(value);
+    if (!tenant || !tenant.ok || !tenant.body || typeof tenant.body.tenant_id !== "string" ||
+        !tenant.body.tenant_id || !body || body.tenant_id !== tenant.body.tenant_id ||
+        (selected && selected !== body.tenant_id) ||
+        !rows(body.transport_endpoints) || !body.transport_endpoints.every(e => typeof e === "string" && e) ||
+        !rows(body.transport_endpoints_unreachable) || !body.transport_endpoints_unreachable.every(e => typeof e === "string") ||
+        !rows(body.device_groups) || !body.device_groups.every(g => g && typeof g.name === "string") ||
+        !rows(body.bypass_catalog) || !body.bypass_catalog.every(e => e && typeof e.id === "string")) {
+      throw new Error("Invalid device configuration options or organization response");
+    }
   } catch (e) {
     if (!current()) return;
     uiState(host, "error", String(e), { label: bl({ en: "Retry", ja: "再試行" }), onClick: () => loadAgentProfileForm(host) });
@@ -83,6 +96,7 @@ function profileEndpointParts(raw) {
 
 function renderAgentProfileForm(host) {
   const opts = _profileOptions || {};
+  const profileContext = agentProfileContextSnapshot();
 
   // Which devices. A group is chosen, never typed: the registry is the deployment's, and a name that does not
   // match one silently puts a device in a group nothing governs.
@@ -244,6 +258,12 @@ function renderAgentProfileForm(host) {
 
   submit.addEventListener("click", async () => {
     if (submit.disabled) return;
+    if (!agentProfileContextCurrent(profileContext) ||
+        (profileContext.operateTenant && opts.tenant_id && profileContext.operateTenant !== opts.tenant_id)) {
+      uiToast(bl({ en: "The selected organization or sign-in changed. Reload the configuration form.",
+        ja: "操作中の組織またはサインインが変わりました。設定画面を再読込してください。" }), "err");
+      return;
+    }
     errHost.innerHTML = "";
     const chosen = _profileEndpoints.filter((e) => e.on).map((e) => e.value);
     if (!chosen.length) {
@@ -280,7 +300,12 @@ function renderAgentProfileForm(host) {
         uiToast(msg, "err");
         return;
       }
-      showAgentProfileMade(r.body, group);
+      if (!agentProfileContextCurrent(profileContext)) {
+        uiToast(bl({ en: "The selected organization or sign-in changed. Reload the configuration form.",
+          ja: "操作中の組織またはサインインが変わりました。設定画面を再読込してください。" }), "err");
+        return;
+      }
+      showAgentProfileMade(r.body, group, profileContext);
     } catch (e) {
       submit.disabled = false;
       uiToast(String(e), "err");
@@ -421,7 +446,21 @@ function downloadAgentProfile(envelope) {
 // ★★ THE SCREEN MUST NOT HAND OVER ONLY HALF. This file says where and how to connect; it deliberately carries
 // no certificate, because it is reused across a group and a device's identity is one machine's. An operator
 // who leaves with only this cannot enrol anything — so the same act offers the group's tokens.
-function showAgentProfileMade(envelope, group) {
+function agentProfileContextSnapshot() {
+  return {
+    operateTenant: typeof operateTenant === "string" ? operateTenant : "",
+    session: typeof idpSession === "undefined" ? null : idpSession,
+    token: typeof localStorage === "undefined" ? "" : (localStorage.getItem("adminToken") || ""),
+  };
+}
+
+function agentProfileContextCurrent(snapshot) {
+  const current = agentProfileContextSnapshot();
+  return current.operateTenant === snapshot.operateTenant && current.session === snapshot.session &&
+    current.token === snapshot.token;
+}
+
+function showAgentProfileMade(envelope, group, profileContext = agentProfileContextSnapshot()) {
   const dl = el("button", { class: "ui-btn ui-btn-primary",
     text: bl({ en: "Download", ja: "ダウンロード" }) });
   const dlKey = el("button", { class: "ui-btn",
@@ -558,15 +597,26 @@ function showAgentProfileMade(envelope, group) {
 
   bundle.addEventListener("click", async () => {
     if (bundle.__bundlePending) return;
+    if (!agentProfileContextCurrent(profileContext)) {
+      uiToast(bl({ en: "The selected organization or sign-in changed. Make a new device configuration.",
+        ja: "操作中の組織またはサインインが変わりました。新しい端末設定を作成してください。" }), "err");
+      return;
+    }
     const [platform, arch] = String(platformF.get() || guessedPlatform).split("/");
     const select = platformF.el.querySelector("select");
     if (select) select.disabled = true;
-    try { await downloadDeviceBundle(envelope, group, platform, arch, bundle); }
+    try { await downloadDeviceBundle(envelope, group, platform, arch, bundle,
+      profileContext.operateTenant, () => agentProfileContextCurrent(profileContext)); }
     finally { if (select) select.disabled = false; }
   });
 
   makeTokens.addEventListener("click", async () => {
     if (makeTokens.disabled) return;
+    if (!agentProfileContextCurrent(profileContext)) {
+      uiToast(bl({ en: "The selected organization or sign-in changed. Make a new device configuration.",
+        ja: "操作中の組織またはサインインが変わりました。新しい端末設定を作成してください。" }), "err");
+      return;
+    }
     const count = enrolTokenCount(countF);
     if (count === null) return;
     tokenError.style.display = "none";
@@ -580,7 +630,7 @@ function showAgentProfileMade(envelope, group) {
       const r = await apiFetch("POST", "/admin/enrolment-tokens", {
         label: group ? group : bl({ en: "Device configuration", ja: "端末の設定" }),
         group, expires_in_hours: 168, count,
-      }, _PROFILE_PLANE);
+      }, _PROFILE_PLANE, undefined, profileContext.operateTenant || undefined);
       if (!r.ok && r.status === 409 && r.body && r.body.partial === true &&
           Array.isArray(r.body.tokens) && r.body.tokens.length > 0 && enrolTokenRowsValid(r.body.tokens)) {
         showError(enrolTokenResponseWarning());

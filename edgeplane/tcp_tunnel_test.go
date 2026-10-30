@@ -1,6 +1,7 @@
 package edgeplane
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,9 +11,66 @@ import (
 	"github.com/lantern-networks/dsse-core/tunnel"
 )
 
+// Exercise admission with both production open-frame builders. Short, completed
+// requests would not expose a limit that incorrectly rejects the 33rd live flow.
+func TestProductionConnectorOpensDoNotImposeLegacyConcurrencyLimit(t *testing.T) {
+	for name, limits := range map[string]EdgeTCPConnectLimits{
+		"published application": defaultEdgeTCPConnectLimits(),
+		"steered and relayed":   InteractiveEastWestEdgeTCPConnectLimits(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			registry := tunnel.NewTCPConnectionRegistry()
+			now := time.Now()
+			makeFrame := func(index int) tunnel.Frame {
+				t.Helper()
+				frame, err := EdgeTCPOpenFrameForTarget(fmt.Sprintf("held-%d", index), EdgeTCPConnectTarget{ApplicationID: "app", Host: "private.internal", Port: 443}, limits)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return frame
+			}
+			const simultaneous = 2048
+			for i := 0; i < simultaneous; i++ {
+				if err := registry.Open(makeFrame(i), now); err != nil {
+					t.Fatalf("stream %d hit an implicit capacity limit: %v", i+1, err)
+				}
+			}
+			if registry.Count() != simultaneous {
+				t.Fatal("not all streams were held together")
+			}
+			if _, err := registry.Close("held-0", tunnel.TCPDirectionLocal, tunnel.TCPCloseReasonEOF, now); err != nil {
+				t.Fatal(err)
+			}
+			if err := registry.Open(makeFrame(simultaneous), now); err != nil {
+				t.Fatalf("closed slot was not reusable: %v", err)
+			}
+		})
+	}
+}
+
+func TestConnectorStreamBudgetsRequireExplicitOperatorConfiguration(t *testing.T) {
+	for _, name := range []string{"DSSE_TCP_STREAM_MAX_BYTES", "DSSE_TCP_STREAM_MAX_LIFETIME_SECONDS", "DSSE_TCP_STREAM_IDLE_TIMEOUT_SECONDS"} {
+		t.Setenv(name, "")
+	}
+	limits := InteractiveEastWestEdgeTCPConnectLimits()
+	if limits.ByteCap != 0 || limits.IdleTimeoutMillis != 0 || limits.MaxConnectionLifetimeMillis != 0 {
+		t.Fatal("default stream quotas must be disabled")
+	}
+	t.Setenv("DSSE_TCP_STREAM_MAX_BYTES", "8589934592")
+	t.Setenv("DSSE_TCP_STREAM_MAX_LIFETIME_SECONDS", "86400")
+	t.Setenv("DSSE_TCP_STREAM_IDLE_TIMEOUT_SECONDS", "7200")
+	limits = InteractiveEastWestEdgeTCPConnectLimits()
+	if limits.ByteCap != 8<<30 || limits.MaxConnectionLifetimeMillis != 86400000 || limits.IdleTimeoutMillis != 7200000 {
+		t.Fatal("explicit operator values were clamped")
+	}
+	if _, err := EdgeTCPOpenFrameForTarget("operator", EdgeTCPConnectTarget{ApplicationID: "app", Host: "private.internal", Port: 443}, limits); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEdgeTCPOpenFrameForTargetRejectsMissingLimits(t *testing.T) {
 	limits := validEdgeTCPConnectLimits()
-	limits.ByteCap = 0
+	limits.ByteCap = -1
 	_, err := EdgeTCPOpenFrameForTarget("req_tcp_001", EdgeTCPConnectTarget{
 		ApplicationID: "app_dummy_https",
 		Host:          "route-profile.internal",

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -140,7 +141,7 @@ func (store *JSONLStore) Search(ctx context.Context, query SearchQuery) (SearchR
 	if err != nil {
 		return SearchResult{}, err
 	}
-	rows, err := store.writer.ReadJSONL(filename)
+	rows, err := store.writer.ReadJSONLForTenant(tenantID, filename)
 	if err != nil {
 		return SearchResult{}, err
 	}
@@ -207,7 +208,7 @@ func (store *JSONLStore) ExportRows(ctx context.Context, query SearchQuery, yiel
 	}
 	// Phase 1 JSONL export keeps the adapter simple and reads the lab log file in memory.
 	// Alpha PostgreSQL exports stream database rows through this same callback boundary.
-	rows, err := store.writer.ReadJSONL(filename)
+	rows, err := store.writer.ReadJSONLForTenant(tenantID, filename)
 	if err != nil {
 		return ExportResult{}, err
 	}
@@ -297,7 +298,7 @@ func (store *JSONLStore) RelatedByAccessDecisionID(ctx context.Context, query Re
 		if err := ctx.Err(); err != nil {
 			return RelatedLogResult{}, err
 		}
-		rows, err := store.writer.ReadJSONL(store.streams[stream])
+		rows, err := store.writer.ReadJSONLForTenant(tenantID, store.streams[stream])
 		if err != nil {
 			return RelatedLogResult{}, err
 		}
@@ -315,23 +316,23 @@ func decodeSearchCursorOffset(query SearchQuery) (int, error) {
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(rawCursor)
 	if err != nil {
-		return 0, fmt.Errorf("decode search cursor: %w", err)
+		return 0, invalidQuery(fmt.Errorf("decode search cursor: %w", err))
 	}
 	var cursor searchCursor
 	if err := json.Unmarshal(decoded, &cursor); err != nil {
-		return 0, fmt.Errorf("parse search cursor: %w", err)
+		return 0, invalidQuery(fmt.Errorf("parse search cursor: %w", err))
 	}
 	if cursor.Version != 1 {
-		return 0, fmt.Errorf("unsupported search cursor version %d", cursor.Version)
+		return 0, invalidQuery(fmt.Errorf("unsupported search cursor version %d", cursor.Version))
 	}
 	if cursor.Offset < 0 {
-		return 0, fmt.Errorf("search cursor offset must be non-negative")
+		return 0, invalidQuery(errors.New("search cursor offset must be non-negative"))
 	}
 	if cursor.QueryChecksum != searchCursorChecksum(query) {
-		return 0, fmt.Errorf("search cursor does not match query")
+		return 0, invalidQuery(errors.New("search cursor does not match query"))
 	}
 	if !searchCursorSignatureValid(cursor) {
-		return 0, fmt.Errorf("search cursor signature is invalid")
+		return 0, invalidQuery(errors.New("search cursor signature is invalid"))
 	}
 	return cursor.Offset, nil
 }

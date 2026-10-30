@@ -145,12 +145,12 @@ func rollbackTargetFromJournal() string {
 // RemoveFiles never sees it. The difference is the size of what would be left behind — tens of megabytes per
 // retained version, in a directory nobody would think to look in after the product is gone.
 //
-// Prune(0) with nothing protected is the whole operation: it removes exactly the files this package wrote and
+// Checked removal includes torn packages and orphan markers. It removes only our canonical filenames and
 // leaves anything else alone, which matters because %ProgramData%\DSSE is shared with other DSSE state and a
 // blanket RemoveAll there would take more than ours.
 func doClearRollbackStore() error {
 	store := rollbackstore.New(rollbackstore.DefaultRoot())
-	if err := store.Prune(0); err != nil {
+	if err := clearRollbackPackages(store.Root()); err != nil {
 		return err
 	}
 	// Best-effort, and only succeeds when the directory is empty — which is the point. A leftover file means

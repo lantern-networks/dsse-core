@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -35,19 +36,23 @@ const (
 	// WARN(4): Edge->client, payload = JSON {"message","destination","service"} — a passive "this internal
 	// connection is monitored; authentication will soon be required" notice for a Warn-staged East-West rule
 	// (S3, dry-run). The flow is ALREADY allowed + forwarded; the frame is fire-and-forget and NEVER holds it.
-	muxFrameWarn uint8 = 4
+	muxFrameWarn       uint8 = 4
+	muxFrameAuthResult uint8 = 5
+	muxFrameAuthQuery  uint8 = 6
 
 	muxHeaderLen   = 9       // flowID(4) + type(1) + length(4)
 	muxMaxFrameLen = 1 << 20 // 1 MiB — defensive bound on a single DATA payload; a larger frame ends the mux.
-	muxFlowBufCap  = 1 << 20 // per-flow inbound buffer before the demux loop backpressures THAT flow only.
+	muxFlowBufCap  = 1 << 20 // per-flow inbound buffer; a stalled reader must not block the shared demux.
 )
 
 var errMuxClosed = errors.New("steer mux connection closed")
+var errMuxEndpointChanged = errors.New("steer mux endpoint changed")
+var errMuxFlowBackpressure = errors.New("steer mux flow inbound buffer full")
+var muxConnectionCounter atomic.Uint64
+var authResultQueryLeader atomic.Pointer[steerMuxClient]
 
-// muxPipe is a bounded, blocking byte pipe feeding one flow's inbound side. The demux loop Writes DATA payloads
-// into it; the flow's Read (driven by pipe()) drains them. Write blocks only when THIS flow's buffer is full
-// (its reader is slow), so a slow flow backpressures itself without the single demux loop buffering unbounded
-// memory, and never blocks OTHER flows beyond one buffered frame. A read offset + amortized compaction keeps
+// muxPipe is a bounded byte pipe feeding one flow's inbound side. The demux loop uses TryWrite: a slow reader
+// closes only its own flow rather than blocking every other flow on the shared mux. A read offset + amortized compaction keeps
 // the drain O(n), never O(n^2): a large download must not stall the shared demux loop copying its whole buffer
 // on every frame (the failure that skeletoned heavy pages on the macOS side).
 type muxPipe struct {
@@ -78,6 +83,24 @@ func (p *muxPipe) Write(b []byte) (int, error) {
 	if p.closed {
 		return 0, io.ErrClosedPipe
 	}
+	return p.appendLocked(b), nil
+}
+
+// TryWrite is the demux path. A full pipe is a per-flow failure, not a reason
+// to stop reading other flows' frames from the same transport connection.
+func (p *muxPipe) TryWrite(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if p.size() >= p.cap {
+		return 0, errMuxFlowBackpressure
+	}
+	return p.appendLocked(b), nil
+}
+
+func (p *muxPipe) appendLocked(b []byte) int {
 	// Reclaim the consumed prefix before appending only when it is worth it (consumed >= remaining), so the
 	// backing array cannot grow unboundedly yet we don't memmove on every write.
 	if p.off > 0 && p.off >= p.size() {
@@ -86,7 +109,7 @@ func (p *muxPipe) Write(b []byte) (int, error) {
 	}
 	p.buf = append(p.buf, b...)
 	p.cond.Broadcast()
-	return len(b), nil
+	return len(b)
 }
 
 func (p *muxPipe) Read(b []byte) (int, error) {
@@ -123,7 +146,13 @@ type muxFlowConn struct {
 	mux       *steerMuxClient
 	inbound   *muxPipe
 	closeOnce sync.Once
+	owner     stepUpOwner
 	authority string // the destination "host:port" this flow OPENed — used as the step-up "resource" label.
+	openedAt  time.Time
+	// These are elapsed monotonic times, not payloads. They distinguish a stalled
+	// Edge reply from a reply that reached the agent before the application timed out.
+	firstAppDataNS  atomic.Int64
+	firstEdgeDataNS atomic.Int64
 	// #28 measurement: what the demux actually received FOR THIS FLOW, so a missing reply can be attributed.
 	// Without it, "the app never saw the answer" cannot be told apart from "the Edge never sent one".
 	inFrames   atomic.Int64
@@ -137,7 +166,17 @@ func (c *muxFlowConn) Write(p []byte) (int, error) {
 	if err := c.mux.writeFrame(c.flowID, muxFrameData, p); err != nil {
 		return 0, err
 	}
+	if len(p) > 0 {
+		c.firstAppDataNS.CompareAndSwap(0, max(1, time.Since(c.openedAt).Nanoseconds()))
+	}
 	return len(p), nil
+}
+
+func firstFlowDataMS(elapsedNS int64) int64 {
+	if elapsedNS == 0 {
+		return -1 // No data observed in this direction.
+	}
+	return elapsedNS / int64(time.Millisecond)
 }
 
 // CloseWrite accepts the app->edge half-close WITHOUT tearing the flow down. The mux protocol has only
@@ -180,13 +219,20 @@ func (c *muxFlowConn) SetWriteDeadline(t time.Time) error { return nil }
 // steerMuxClient owns ONE transport connection and multiplexes many flows over it. flowID is client-assigned
 // and monotonic — the Edge only ever creates flows from client OPENs, never the reverse.
 type steerMuxClient struct {
-	conn     net.Conn
-	writeMu  sync.Mutex
-	flowsMu  sync.Mutex
-	flows    map[uint32]*muxFlowConn
-	nextID   uint32
-	dead     chan struct{}
-	deadOnce sync.Once
+	conn net.Conn
+	id   uint64 // local connection ID; flow IDs alone are only unique within one mux
+	peer string // actual TCP peer, for distinguishing old/new entrance in failover diagnostics
+	// endpoint is the immutable failover target captured before this connection was dialled. A live endpoint
+	// switch must not put new flows on a still-open mux to the previous entrance.
+	endpoint         *activeEndpoint
+	active           *atomic.Pointer[activeEndpoint]
+	transportFailure chan<- struct{}
+	writeMu          sync.Mutex
+	flowsMu          sync.Mutex
+	flows            map[uint32]*muxFlowConn
+	nextID           uint32
+	dead             chan struct{}
+	deadOnce         sync.Once
 	// stepUp opens the Edge-issued step-up portal in a browser when a held East-West "authenticate" flow
 	// receives a STEPUP frame. Same coordinator the per-flow /steer path uses (coalesced per resource); nil
 	// when step-up mediation is disabled (--stepup-portal=false) -> a STEPUP frame is then a no-op.
@@ -239,20 +285,34 @@ func (m *steerMuxClient) healthy() bool {
 }
 
 // openFlow registers a new flow, sends OPEN(authority), and returns its net.Conn.
-func (m *steerMuxClient) openFlow(authority string) (*muxFlowConn, error) {
+func (m *steerMuxClient) openFlow(authority string, owners ...stepUpOwner) (*muxFlowConn, error) {
 	m.flowsMu.Lock()
+	if m.active != nil && m.active.Load() != m.endpoint {
+		m.flowsMu.Unlock()
+		return nil, errMuxEndpointChanged
+	}
 	if !m.healthy() {
 		m.flowsMu.Unlock()
 		return nil, errMuxClosed
 	}
 	m.nextID++
 	id := m.nextID
-	fc := &muxFlowConn{flowID: id, mux: m, inbound: newMuxPipe(muxFlowBufCap), authority: authority}
+	fc := &muxFlowConn{flowID: id, mux: m, inbound: newMuxPipe(muxFlowBufCap), authority: authority, openedAt: time.Now()}
+	if len(owners) == 1 {
+		fc.owner = owners[0]
+		authority = authorityWithAuthOwner(authority, fc.owner)
+	}
 	m.flows[id] = fc
 	m.flowsMu.Unlock()
 	if err := m.writeFrame(id, muxFrameOpen, []byte(authority)); err != nil {
 		fc.closeLocalOnly()
 		return nil, err
+	}
+	if m.active != nil && m.active.Load() != m.endpoint {
+		// A switch may race with the frame write. Do not hand that flow to the application as a success;
+		// the manager closes this old mux and retries against the current entrance.
+		fc.closeLocalOnly()
+		return nil, errMuxEndpointChanged
 	}
 	return fc, nil
 }
@@ -264,30 +324,41 @@ func (m *steerMuxClient) readLoop(r *bufio.Reader) {
 	var hdr [muxHeaderLen]byte
 	for {
 		if _, err := io.ReadFull(r, hdr[:]); err != nil {
+			m.signalUnexpectedTransportLoss()
 			return
 		}
 		flowID := binary.BigEndian.Uint32(hdr[0:4])
 		typ := hdr[4]
 		length := binary.BigEndian.Uint32(hdr[5:9])
 		if length > muxMaxFrameLen {
+			m.signalUnexpectedTransportLoss()
 			return
 		}
 		var payload []byte
 		if length > 0 {
 			payload = make([]byte, length)
 			if _, err := io.ReadFull(r, payload); err != nil {
+				m.signalUnexpectedTransportLoss()
 				return
 			}
 		}
 		switch typ {
 		case muxFrameData:
 			if fc := m.lookup(flowID); fc != nil {
+				if len(payload) > 0 {
+					fc.firstEdgeDataNS.CompareAndSwap(0, max(1, time.Since(fc.openedAt).Nanoseconds()))
+				}
 				fc.inFrames.Add(1)
 				fc.inBytes.Add(int64(len(payload)))
-				// Blocks only when THIS flow's buffer is full; its pipe() reader drains it continuously, so a
-				// handshake-sized burst never blocks and one slow flow cannot wedge the others.
-				if _, err := fc.inbound.Write(payload); err != nil {
-					fc.closeLocalOnly()
+				if _, err := fc.inbound.TryWrite(payload); err != nil {
+					// A stalled application cannot hold the demultiplexer or grow the
+					// shared connection's memory indefinitely. Tell the Edge that this
+					// flow ended; unrelated flows keep their own buffered data.
+					if errors.Is(err, errMuxFlowBackpressure) {
+						_ = fc.Close()
+					} else {
+						fc.closeLocalOnly()
+					}
 				}
 			}
 		case muxFrameClose:
@@ -298,24 +369,51 @@ func (m *steerMuxClient) readLoop(r *bufio.Reader) {
 		case muxFrameStepUp:
 			// East-West "authenticate" mediation over the mux: the Edge held this flow and sent the step-up
 			// portal URL. Open it OOB in the logged-in user's browser (coalesced per resource) — mirrors the
-			// macOS NE. The flow stays held (no DATA) until a grant is minted and the connection is retried.
+			// macOS NE. The flow stays held (no DATA) until current authorization and upstream connection succeed,
+			// or the wait fails and the originating app must reconnect.
 			if m.stepUp != nil {
 				if fc := m.lookup(flowID); fc != nil {
-					m.stepUp.Trigger(fc.authority, string(payload))
+					m.stepUp.TriggerForOwner(fc.authority, string(payload), fc.owner)
 				}
 			}
 		case muxFrameWarn:
 			// Warn stage (S3): the flow is already allowed + forwarded; show a passive "monitored; auth soon
-			// required" notice (coalesced per service|destination). Never held, never opened.
-			m.warn.Notify(payload)
+			// required" notice only to the originating user. Never held, never opened.
+			if fc := m.lookup(flowID); fc != nil {
+				m.warn.NotifyForOwner(payload, fc.owner)
+			}
+		case muxFrameAuthResult:
+			if m.stepUp == nil || len(payload) > 256 {
+				break
+			}
+			var result map[string]string
+			if err := json.Unmarshal(payload, &result); err != nil || len(result) != 2 {
+				break
+			}
+			if flowID == 0 {
+				m.stepUp.HandleQueriedResult(result["request_id"], result["result"])
+			} else if fc := m.lookup(flowID); fc != nil {
+				m.stepUp.HandleResultForOwner(fc.authority, result["request_id"], result["result"], fc.owner)
+			}
 		case muxFrameOpen:
 			// The Edge never initiates OPEN; ignore.
 		}
 	}
 }
 
+func (m *steerMuxClient) signalUnexpectedTransportLoss() {
+	if m.transportFailure == nil || !m.healthy() || (m.active != nil && m.active.Load() != m.endpoint) {
+		return // intentional close, already-switched entrance, or no region selector
+	}
+	select {
+	case m.transportFailure <- struct{}{}:
+	default: // coalesce simultaneous mux closures during the same fault
+	}
+}
+
 func (m *steerMuxClient) teardown() {
 	m.deadOnce.Do(func() {
+		fmt.Printf("steer_mux_closed mux=%d peer=%s\n", m.id, m.peer)
 		close(m.dead)
 		_ = m.conn.Close()
 		m.flowsMu.Lock()
@@ -338,7 +436,17 @@ func openSteerMux(cfg edgeConfig, dialTimeout time.Duration) (*steerMuxClient, e
 	}
 	var conn net.Conn
 	var host string
+	var endpoint *activeEndpoint
+	active := cfg.transport.active
 	if cfg.transport.enabled {
+		if active != nil {
+			// Freeze both dial target and TLS name for this handshake. Otherwise a switch between dialTarget()
+			// and tlsConfig() can combine the old address with the new region's certificate name.
+			endpoint = active.Load()
+			frozen := &atomic.Pointer[activeEndpoint]{}
+			frozen.Store(endpoint)
+			cfg.transport.active = frozen
+		}
 		host = cfg.transport.host
 		c, err := cfg.transport.dial(dialTimeout)
 		if err != nil {
@@ -360,12 +468,15 @@ func openSteerMux(cfg edgeConfig, dialTimeout time.Duration) (*steerMuxClient, e
 	}
 	// The per-device signal headers (OS + posture) ride on this CONNECT — per-connection ≈ per-device, the right
 	// granularity (the per-flow who/what goes on the OPEN frames instead).
+	// TCP/TLS dial timeouts do not cover the Edge's CONNECT exchange.
+	_ = conn.SetDeadline(time.Now().Add(dialTimeout))
 	req := fmt.Sprintf("CONNECT /steer-mux HTTP/1.1\r\nHost: %s\r\n%s\r\n", host, deviceConnectHeaders())
 	if _, err := io.WriteString(conn, req); err != nil {
 		conn.Close()
 		return nil, err
 	}
 	reader := bufio.NewReaderSize(conn, 64*1024)
+	// A half-open entrance must not pin a flow here indefinitely after a switch.
 	status, _, err := readCONNECTStatus(reader)
 	if err != nil {
 		conn.Close()
@@ -375,11 +486,46 @@ func openSteerMux(cfg edgeConfig, dialTimeout time.Duration) (*steerMuxClient, e
 		conn.Close()
 		return nil, fmt.Errorf("steer-mux CONNECT status %d", status)
 	}
-	m := &steerMuxClient{conn: conn, flows: make(map[uint32]*muxFlowConn), dead: make(chan struct{}), stepUp: cfg.stepUp, warn: cfg.warn}
+	_ = conn.SetDeadline(time.Time{})
+	m := &steerMuxClient{conn: conn, id: muxConnectionCounter.Add(1), peer: conn.RemoteAddr().String(), endpoint: endpoint, active: active, transportFailure: cfg.transportFailure, flows: make(map[uint32]*muxFlowConn), dead: make(chan struct{}), stepUp: cfg.stepUp, warn: cfg.warn}
+	fmt.Printf("steer_mux_connected mux=%d peer=%s\n", m.id, m.peer)
 	// Any bytes the Edge already sent past the CONNECT header are the first mux frames; readCONNECTStatus left
 	// them buffered in `reader`, and the demux loop reads from that same reader, so they are not lost.
 	go m.readLoop(reader)
+	if m.stepUp != nil {
+		go m.requeryAuthResults()
+	}
 	return m, nil
+}
+
+func (m *steerMuxClient) requeryAuthResults() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	defer authResultQueryLeader.CompareAndSwap(m, nil)
+	for {
+		leader := authResultQueryLeader.Load()
+		if leader == nil || !leader.healthy() {
+			if authResultQueryLeader.CompareAndSwap(leader, m) {
+				leader = m
+			}
+		}
+		if leader == m {
+			for _, query := range m.stepUp.pendingResultQueries() {
+				payload, err := json.Marshal(query)
+				if err != nil || len(payload) > 256 {
+					continue
+				}
+				if err := m.writeFrame(0, muxFrameAuthQuery, payload); err != nil {
+					return
+				}
+			}
+		}
+		select {
+		case <-m.dead:
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // load reports this connection's current active flow count (used by the pool to pick the least-loaded conn and
@@ -402,14 +548,15 @@ func (m *steerMuxClient) load() int {
 // background; idle (zero-flow) surplus connections are closed on the next acquire. maxConns==1 is exactly the
 // old single-connection behaviour (backward compatible).
 type muxManager struct {
-	cfg          edgeConfig
-	dialTimeout  time.Duration
-	flowsPerConn int
-	maxConns     int
-	mu           sync.Mutex
-	cond         *sync.Cond
-	pool         []*steerMuxClient
-	opening      int // background/first opens in flight (counted so acquire does not over-grow)
+	cfg           edgeConfig
+	dialTimeout   time.Duration
+	flowsPerConn  int
+	maxConns      int
+	mu            sync.Mutex
+	cond          *sync.Cond
+	pool          []*steerMuxClient
+	opening       int // dials in flight for endpointEpoch; old-entrance dials must not delay a new entrance
+	endpointEpoch *activeEndpoint
 }
 
 func newMuxManager(cfg edgeConfig, dialTimeout time.Duration, flowsPerConn, maxConns int) *muxManager {
@@ -441,6 +588,7 @@ func (mm *muxManager) acquire() (*steerMuxClient, error) {
 	mm.mu.Lock()
 	defer mm.mu.Unlock()
 	for {
+		mm.refreshEndpointLocked()
 		mm.pruneLocked()
 		active := mm.activeLocked()
 		desired := clampInt(1+active/mm.flowsPerConn, 1, mm.maxConns)
@@ -449,24 +597,54 @@ func (mm *muxManager) acquire() (*steerMuxClient, error) {
 			best := mm.leastLoadedLocked()
 			if len(mm.pool)+mm.opening < desired {
 				mm.opening++
-				go mm.growOne()
+				go mm.growOne(mm.endpointEpoch)
 			}
 			return best, nil
 		}
 		// Pool empty. If someone is already opening the first connection, wait for it instead of piling on more
 		// dials (cold-start coalescing); otherwise open it ourselves.
 		if mm.opening > 0 {
-			mm.cond.Wait()
+			if mm.cfg.transport.active == nil {
+				mm.cond.Wait()
+			} else {
+				// A region switch cannot signal this condition variable. Recheck the atomic endpoint soon
+				// instead of waiting for an old-entrance TCP timeout before the first new-entrance dial.
+				mm.mu.Unlock()
+				time.Sleep(25 * time.Millisecond)
+				mm.mu.Lock()
+			}
 			continue
 		}
 		mm.opening++
+		epoch := mm.endpointEpoch
 		mm.mu.Unlock()
-		m, err := openSteerMux(mm.cfg, mm.dialTimeout)
+		m, err, abandoned := mm.openFirstForEpoch(epoch, openSteerMux)
 		mm.mu.Lock()
+		mm.refreshEndpointLocked()
+		if abandoned {
+			// The old entrance's dial is still finishing in the background. It will
+			// close its own result; retry this caller against the new entrance now.
+			continue
+		}
+		if epoch != mm.endpointEpoch {
+			if m != nil {
+				fmt.Printf("steer_mux_discarded_after_switch mux=%d peer=%s\n", m.id, m.peer)
+				go m.teardown()
+			}
+			mm.cond.Broadcast()
+			continue
+		}
 		mm.opening--
 		if err != nil {
 			mm.cond.Broadcast()
 			return nil, err
+		}
+		if !mm.currentEndpoint(m) {
+			// The dial began before failover and completed afterwards. Never publish that old connection.
+			fmt.Printf("steer_mux_discarded_after_switch mux=%d peer=%s\n", m.id, m.peer)
+			go m.teardown()
+			mm.cond.Broadcast()
+			continue
 		}
 		mm.pool = append(mm.pool, m)
 		mm.cond.Broadcast()
@@ -474,10 +652,93 @@ func (mm *muxManager) acquire() (*steerMuxClient, error) {
 	}
 }
 
+// openFirstForEpoch lets an in-flight cold-pool dial be abandoned when the signed
+// selector moves to another entrance. The old dial remains bounded by its TCP/TLS
+// and CONNECT deadlines, and closes its result; the waiting application flow starts
+// a new dial immediately instead of inheriting the old entrance's timeout.
+func (mm *muxManager) openFirstForEpoch(epoch *activeEndpoint, open func(edgeConfig, time.Duration) (*steerMuxClient, error)) (*steerMuxClient, error, bool) {
+	if mm.cfg.transport.active == nil {
+		m, err := open(mm.cfg, mm.dialTimeout)
+		return m, err, false
+	}
+	type result struct {
+		m   *steerMuxClient
+		err error
+	}
+	resultCh := make(chan result)
+	abandoned := make(chan struct{})
+	go func() {
+		m, err := open(mm.cfg, mm.dialTimeout)
+		select {
+		case resultCh <- result{m: m, err: err}:
+		case <-abandoned:
+			if m != nil {
+				m.teardown()
+			}
+		}
+	}()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case r := <-resultCh:
+			return r.m, r.err, false
+		case <-tick.C:
+			if mm.cfg.transport.active.Load() != epoch {
+				close(abandoned)
+				return nil, nil, true
+			}
+		}
+	}
+}
+
+func (mm *muxManager) refreshEndpointLocked() {
+	var current *activeEndpoint
+	if mm.cfg.transport.active != nil {
+		current = mm.cfg.transport.active.Load()
+	}
+	if current != mm.endpointEpoch {
+		mm.endpointEpoch = current
+		// Dials started for the prior endpoint may still be blocked in TCP/TLS. They will discard their
+		// results when they return; do not count them against this endpoint's cold-start/growth slots.
+		mm.opening = 0
+	}
+}
+
+func (mm *muxManager) currentEndpoint(m *steerMuxClient) bool {
+	return m.active == nil || m.active.Load() == m.endpoint
+}
+
+// openFlow retries only the harmless acquire/open race in which failover changes the endpoint between the
+// pool selection and the OPEN frame. Ordinary transport and policy errors still reach the caller unchanged.
+func (mm *muxManager) openFlow(authority string, owners ...stepUpOwner) (*muxFlowConn, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		m, err := mm.acquire()
+		if err != nil {
+			return nil, err
+		}
+		fc, err := m.openFlow(authority, owners...)
+		if errors.Is(err, errMuxEndpointChanged) {
+			mm.invalidate(m)
+			continue
+		}
+		if err != nil {
+			mm.invalidate(m)
+		}
+		return fc, err
+	}
+	return nil, errMuxEndpointChanged
+}
+
 func (mm *muxManager) pruneLocked() {
 	kept := mm.pool[:0]
 	for _, m := range mm.pool {
-		if m.healthy() {
+		if !mm.currentEndpoint(m) {
+			// Existing flows cannot migrate between mux sockets. Close them promptly so applications retry;
+			// keeping the old socket in the pool would also send every new flow to the failed entrance.
+			fmt.Printf("steer_mux_retired_after_switch mux=%d peer=%s\n", m.id, m.peer)
+			go m.teardown()
+		} else if m.healthy() {
 			kept = append(kept, m)
 		}
 	}
@@ -526,13 +787,18 @@ func (mm *muxManager) shrinkIdleLocked(desired int) {
 
 // growOne opens one more connection in the background and adds it to the pool (best-effort; a failed dial just
 // leaves the pool as-is and the next acquire retries).
-func (mm *muxManager) growOne() {
+func (mm *muxManager) growOne(epoch *activeEndpoint) {
 	m, err := openSteerMux(mm.cfg, mm.dialTimeout)
 	mm.mu.Lock()
-	mm.opening--
-	if err == nil {
+	mm.refreshEndpointLocked()
+	if epoch == mm.endpointEpoch {
+		mm.opening--
+	}
+	if err == nil && epoch == mm.endpointEpoch && mm.currentEndpoint(m) {
 		mm.pool = append(mm.pool, m)
 		fmt.Printf("steer_mux_pool grew to %d conns (load)\n", len(mm.pool))
+	} else if m != nil {
+		go m.teardown()
 	}
 	mm.cond.Broadcast()
 	mm.mu.Unlock()
@@ -588,16 +854,14 @@ func muxAuthority(dst, osUser, app string) string {
 // the macOS NE muxFrameStepUp). So agent-mediated step-up now works over the mux too; the flow stays held until
 // a grant is minted and the connection is retried (a still-denied retry closes with no bytes as before).
 func (s edgeSteerer) handleFlowMux(flow SteeredFlow, origDst netip.AddrPort) {
-	mux, err := s.mux.acquire()
-	if err != nil {
-		s.muxUnreachable(flow, origDst, err)
-		return
-	}
 	osUser := osUserForPID(flow.PID)
 	app := osAppForPID(flow.PID)
-	fc, err := mux.openFlow(muxAuthority(origDst.String(), osUser, app))
+	clientPort := 0
+	if addr, ok := flow.Conn.RemoteAddr().(*net.TCPAddr); ok {
+		clientPort = addr.Port
+	}
+	fc, err := s.mux.openFlow(muxAuthority(origDst.String(), osUser, app), captureStepUpOwner(flow.PID))
 	if err != nil {
-		s.mux.invalidate(mux)
 		s.muxUnreachable(flow, origDst, err)
 		return
 	}
@@ -606,13 +870,14 @@ func (s edgeSteerer) handleFlowMux(flow SteeredFlow, origDst netip.AddrPort) {
 	// signed:/publisher:/subject:/thumbprint: rule, its exact image path belongs in the kernel's verified table
 	// and is evidently not there yet. Non-blocking and no-op when no such rule is active.
 	noteSteeredPID(flow.PID)
-	fmt.Printf("steer_mux_forwarded dst_port=%d flow=%d user=%q app=%q\n", origDst.Port(), fc.flowID, osUser, app)
+	fmt.Printf("steer_mux_forwarded mux=%d peer=%s dst_port=%d flow=%d client_port=%d user=%q app=%q\n", fc.mux.id, fc.mux.peer, origDst.Port(), fc.flowID, clientPort, osUser, app)
 	toEdge, toApp := pipe(flow.Conn, fc, fmt.Sprintf("flow=%d app=%q dst=%s", fc.flowID, app, origDst))
 	// #28: mux_in_* is what the Edge actually delivered to this client for this flow; edge_to_app is what
 	// reached the application socket. Comparing them splits "the Edge never sent the reply" from "we received
 	// it and could not hand it over".
-	fmt.Printf("steer_flow_end flow=%d app=%q dst=%s app_to_edge=%d edge_to_app=%d mux_in_frames=%d mux_in_bytes=%d edge_sent_close=%t\n",
-		fc.flowID, app, origDst, toEdge, toApp, fc.inFrames.Load(), fc.inBytes.Load(), fc.edgeClosed.Load())
+	fmt.Printf("steer_flow_end mux=%d peer=%s flow=%d client_port=%d app=%q dst=%s app_to_edge=%d edge_to_app=%d mux_in_frames=%d mux_in_bytes=%d first_app_data_ms=%d first_edge_data_ms=%d edge_sent_close=%t\n",
+		fc.mux.id, fc.mux.peer, fc.flowID, clientPort, app, origDst, toEdge, toApp, fc.inFrames.Load(), fc.inBytes.Load(),
+		firstFlowDataMS(fc.firstAppDataNS.Load()), firstFlowDataMS(fc.firstEdgeDataNS.Load()), fc.edgeClosed.Load())
 	// One pointer store, and deliberately nothing more. The interception watch needs somewhere this device
 	// actually talks to in order to probe it; judging the flow itself was tried and the box's own log refuted it
 	// (see the note at the top of interception_observation.go).

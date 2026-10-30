@@ -29,16 +29,12 @@ const (
 func TestSWGEdgeSWGProductionProcessEgressReadinessMatrixSmoke(t *testing.T) {
 	postgresDSN := strings.TrimSpace(os.Getenv(sWGEdgeRuntimeProductionProcessEgressReadinessMatrixSmokeDSNEnv))
 	if postgresDSN == "" {
-		t.Skipf("%s is required for production-mode cmd/edge process egress readiness matrix smoke", sWGEdgeRuntimeProductionProcessEgressReadinessMatrixSmokeDSNEnv)
+		t.Skipf("%s is required for production-mode cmd/dsse-edge process egress readiness matrix smoke", sWGEdgeRuntimeProductionProcessEgressReadinessMatrixSmokeDSNEnv)
 	}
 
 	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatalf("resolve module root: %v", err)
-	}
-	repoRoot, err := filepath.Abs(filepath.Join(moduleRoot, ".."))
-	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
 	}
 
 	workDir := t.TempDir()
@@ -46,20 +42,19 @@ func TestSWGEdgeSWGProductionProcessEgressReadinessMatrixSmoke(t *testing.T) {
 
 	binaryPath := filepath.Join(workDir, "edge-process-egress-readiness-matrix-smoke")
 	build := exec.Command("go", "build", "-o", binaryPath, ".")
-	build.Dir = filepath.Join(moduleRoot, "cmd", "edge")
+	build.Dir = filepath.Join(moduleRoot, "cmd", "dsse-edge")
 	build.Env = os.Environ()
 	build.Stdout = io.Discard
 	var buildErr bytes.Buffer
 	build.Stderr = &buildErr
 	if err := build.Run(); err != nil {
-		t.Fatalf("build cmd/edge failed: %v; stderr redacted=%s", err, m1600RedactedLine(buildErr.String()))
+		t.Fatalf("build cmd/dsse-edge failed: %v; stderr redacted=%s", err, m1600RedactedLine(buildErr.String()))
 	}
 
 	proxy := m1602StartLocalCaptureProxy(t)
 	operatorConfigPath := filepath.Join(moduleRoot, "swghttprewrite", "testdata", "swg_tenant_restriction_operator_config.json")
 	common := m1602ProcessEgressInputs{
 		ModuleRoot:         moduleRoot,
-		RepoRoot:           repoRoot,
 		WorkDir:            workDir,
 		BinaryPath:         binaryPath,
 		PolicyPaths:        policyPaths,
@@ -185,7 +180,6 @@ func TestSWGEdgeSWGProductionProcessEgressReadinessMatrixSmoke(t *testing.T) {
 
 type m1602ProcessEgressInputs struct {
 	ModuleRoot         string
-	RepoRoot           string
 	WorkDir            string
 	BinaryPath         string
 	PolicyPaths        []string
@@ -299,7 +293,7 @@ func m1602RunProcessEgressCase(t *testing.T, inputs m1602ProcessEgressInputs, pr
 		"-listen", listen,
 		"-policy", strings.Join(inputs.PolicyPaths, ","),
 		"-bundle", inputs.BundlePath,
-		"-schema-dir", filepath.Join(inputs.RepoRoot, "schemas"),
+		"-schema-dir", filepath.Join(inputs.ModuleRoot, "schemas"),
 		"-migration-dir", filepath.Join(inputs.ModuleRoot, "migrations"),
 		"-log-dir", logDir,
 		"-lab-mode=false",
@@ -332,7 +326,7 @@ func m1602RunProcessEgressCase(t *testing.T, inputs m1602ProcessEgressInputs, pr
 	var processErr bytes.Buffer
 	cmd.Stderr = &processErr
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start cmd/edge process for %s: %v", processCase.Name, err)
+		t.Fatalf("start cmd/dsse-edge process for %s: %v", processCase.Name, err)
 	}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
@@ -357,7 +351,7 @@ func m1602DoEgressRequest(t *testing.T, client *http.Client, baseURL, connectorA
 	select {
 	case err := <-waitCh:
 		waitCh <- err
-		t.Fatalf("cmd/edge exited before egress request %s: %v; stderr redacted=%s", requestCase.Name, err, m1600RedactedLine(processErr.String()))
+		t.Fatalf("cmd/dsse-edge exited before egress request %s: %v; stderr redacted=%s", requestCase.Name, err, m1600RedactedLine(processErr.String()))
 	default:
 	}
 

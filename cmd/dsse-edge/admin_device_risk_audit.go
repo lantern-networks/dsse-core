@@ -37,7 +37,7 @@ func deviceRiskAuditLog(r *http.Request, tenantID string, response adminRiskSign
 		Metadata:       metadata,
 	}
 	if caller, ok := adminIdentityFromRequest(r); ok && record.TenantID != "" &&
-		!strings.EqualFold(record.TenantID, strings.TrimSpace(caller.TenantID)) {
+		record.TenantID != strings.TrimSpace(caller.TenantID) {
 		stampOperatorActor(metadata, caller)
 	}
 	return record

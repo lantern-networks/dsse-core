@@ -23,16 +23,19 @@ import (
 	"sync"
 )
 
-// liveDests is a fixed base set plus ONE replaceable Edge slot.
+// liveDests is a fixed base set plus one replaceable Edge address set.
 //
 // The split is the point. The base -- packaged --bypass-dest entries, the profile's, the local mux -- is
 // decided once and does not move. The Edge entry is the only one derived from a name that can resolve late,
 // resolve differently, or fail; modelling it as its own slot is what lets a later resolution fill or correct
 // it without disturbing anything an operator configured.
 type liveDests struct {
-	mu   sync.Mutex
-	base []netip.AddrPort
-	edge *netip.AddrPort // nil until resolved; nil is the honest state, not an empty rule
+	// Serialize backend publications while leaving effective() free to read the latest
+	// state. Otherwise an older slow kernel update can finish after a newer one.
+	applyMu sync.Mutex
+	mu      sync.Mutex
+	base    []netip.AddrPort
+	edge    []netip.AddrPort // nil until resolved; every address the transport may dial belongs here
 	// passthrough are the addresses of the deployment's own PASSTHROUGH DOMAINS -- the names the profile says
 	// must reach the customer's network untouched, its own Console above all.
 	//
@@ -60,15 +63,15 @@ func (l *liveDests) effective() []netip.AddrPort {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	out := append([]netip.AddrPort(nil), l.base...)
-	if l.edge != nil {
-		out = append(out, *l.edge)
-	}
+	out = append(out, l.edge...)
 	out = append(out, l.passthrough...)
 	return out
 }
 
 // register installs the active backend's updater; the latest (post-restart) backend replaces the previous.
 func (l *liveDests) register(fn func([]netip.AddrPort)) {
+	l.applyMu.Lock()
+	defer l.applyMu.Unlock()
 	l.mu.Lock()
 	l.onApply = fn
 	l.mu.Unlock()
@@ -81,16 +84,23 @@ func (l *liveDests) register(fn func([]netip.AddrPort)) {
 // onApply runs OUTSIDE the lock: it issues a kernel IOCTL, and holding a mutex across that would let a slow
 // driver call block effective() on the arm path.
 func (l *liveDests) setEdge(ap netip.AddrPort) (changed bool) {
+	return l.setEdges([]netip.AddrPort{ap})
+}
+
+// setEdges replaces the entire current dial set, including retired addresses.
+// A hostname or region may have multiple A/AAAA answers, and the transport
+// round-robins all of them; guarding only the first leaves the others steerable.
+func (l *liveDests) setEdges(addrs []netip.AddrPort) (changed bool) {
+	l.applyMu.Lock()
+	defer l.applyMu.Unlock()
 	l.mu.Lock()
-	if l.edge != nil && *l.edge == ap {
+	if sameAddrPorts(l.edge, addrs) {
 		l.mu.Unlock()
 		return false
 	}
-	cp := ap
-	l.edge = &cp
+	l.edge = append([]netip.AddrPort(nil), addrs...)
 	fn := l.onApply
-	out := append([]netip.AddrPort(nil), l.base...)
-	out = append(out, cp)
+	out := l.effectiveLocked()
 	l.mu.Unlock()
 	if fn != nil {
 		fn(out)
@@ -103,7 +113,7 @@ func (l *liveDests) setEdge(ap netip.AddrPort) (changed bool) {
 func (l *liveDests) hasEdge() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.edge != nil
+	return len(l.edge) != 0
 }
 
 // setPassthrough replaces the resolved addresses of the profile's passthrough domains, and reports whether
@@ -115,6 +125,8 @@ func (l *liveDests) hasEdge() bool {
 // domains=N addresses=M every time is what makes the second case a single line instead of a 502 nobody can
 // explain.
 func (l *liveDests) setPassthrough(addrs []netip.AddrPort) bool {
+	l.applyMu.Lock()
+	defer l.applyMu.Unlock()
 	l.mu.Lock()
 	changed := !sameAddrPorts(l.passthrough, addrs)
 	if changed {
@@ -131,9 +143,7 @@ func (l *liveDests) setPassthrough(addrs []netip.AddrPort) bool {
 // effectiveLocked is effective() for callers that already hold the lock.
 func (l *liveDests) effectiveLocked() []netip.AddrPort {
 	out := append([]netip.AddrPort(nil), l.base...)
-	if l.edge != nil {
-		out = append(out, *l.edge)
-	}
+	out = append(out, l.edge...)
 	return append(out, l.passthrough...)
 }
 
@@ -154,4 +164,15 @@ func sameAddrPorts(a, b []netip.AddrPort) bool {
 		}
 	}
 	return true
+}
+
+// captiveEdges returns only transport pins derived from the verified profile.
+// Native recovery must not inherit general administrator/app bypass entries.
+func (l *liveDests) captiveEdges() []netip.AddrPort {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]netip.AddrPort(nil), l.edge...)
 }

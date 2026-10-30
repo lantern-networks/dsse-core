@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -102,13 +103,12 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 			// partition, which is the one place a record belongs to nobody and everybody reads.
 			//
 			// A verified shipment must name a tenant, and it must be the one its certificate proves.
-			var claimed map[string]any
-			if json.Unmarshal(body, &claimed) != nil {
+			want, err := auditIngestCanonicalTenant(body)
+			if err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("audit-ingest: a shipped record must be a JSON "+
-					"object naming the tenant it belongs to"))
+					"object with one unambiguous tenant_id: %w", err))
 				return
 			}
-			want := strings.TrimSpace(stringValue(claimed["tenant_id"]))
 			if want == "" {
 				writeError(w, http.StatusForbidden, fmt.Errorf("audit-ingest: this record names no tenant, and a "+
 					"shipment from an identified edge cannot be filed under none"))
@@ -155,7 +155,11 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 		recordShippedAgentUpdate(r.Context(), agentTelemetry, stream, body)
 		// A device's own report of what it is applying, folded into THIS node's observed-exclusion store — on
 		// the control plane, that is the deployment's durable copy. See observed_exclusion_ship.go.
-		recordShippedObservedExclusion(observedExclusions, stream, body)
+		if err := recordShippedObservedExclusion(observedExclusions, stream, body); err != nil {
+			log.Printf("audit-ingest: observed report not committed: %v", err)
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("observed report persistence unavailable"))
+			return
+		}
 		// Which certificate a device is presenting, as an Edge saw it. The device-CA withdrawal gate reads this,
 		// and a control plane observes no handshakes of its own — see device_certificate_fact_ship.go.
 		recordShippedDeviceCertificateFact(stream, body)
@@ -166,6 +170,50 @@ func registerAuditIngestReceiver(mux *http.ServeMux, writer *logs.Writer, token 
 		recordShippedDeviceState(fleetDeviceProjectionStore, stream, body)
 		w.WriteHeader(http.StatusAccepted)
 	})
+}
+
+// auditIngestCanonicalTenant checks the bytes that will be persisted, not a
+// differently decoded copy. Go's struct JSON decoder accepts case-insensitive
+// field aliases while a map lookup does not: tenant_id=Acme followed by
+// TENANT_ID=other previously passed the map-based certificate check but was
+// filed under other by logs.Writer's struct decoder. Duplicate top-level keys
+// are rejected as well so downstream readers cannot disagree about a record.
+func auditIngestCanonicalTenant(body []byte) (string, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	start, err := decoder.Token()
+	if err != nil || start != json.Delim('{') {
+		return "", fmt.Errorf("record is not an object")
+	}
+	seen := make(map[string]struct{})
+	var tenantID string
+	for decoder.More() {
+		keyValue, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		key, ok := keyValue.(string)
+		if !ok {
+			return "", fmt.Errorf("record field name is invalid")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return "", fmt.Errorf("duplicate record field")
+		}
+		seen[key] = struct{}{}
+		if strings.EqualFold(key, "tenant_id") && key != "tenant_id" {
+			return "", fmt.Errorf("ambiguous tenant_id field")
+		}
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return "", err
+		}
+		if key == "tenant_id" && json.Unmarshal(raw, &tenantID) != nil {
+			return "", fmt.Errorf("tenant_id must be a string")
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(tenantID), nil
 }
 
 // recordShippedAgentUpdate folds an update outcome shipped by an Edge into THIS process's fleet view.

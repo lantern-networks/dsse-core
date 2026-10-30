@@ -24,7 +24,7 @@ func (r *TenantCARegistry) beginWithdrawal(tenant, fingerprint string, trustRequ
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	key := strings.ToLower(strings.TrimSpace(fingerprint))
-	if owner, ok := r.byAnchorKey[key]; ok && strings.EqualFold(owner, tenant) {
+	if owner, ok := r.byAnchorKey[key]; ok && owner == tenant {
 		if r.pendingWithdrawals == nil {
 			r.pendingWithdrawals = map[string]string{}
 		}
@@ -43,7 +43,7 @@ func (r *TenantCARegistry) PendingWithdrawals(tenant string) []string {
 	defer r.mu.RUnlock()
 	out := []string{}
 	for key, owner := range r.pendingWithdrawals {
-		if tenant == "" || strings.EqualFold(owner, tenant) {
+		if tenant == "" || owner == tenant {
 			out = append(out, key)
 		}
 	}
@@ -55,7 +55,7 @@ func (r *TenantCARegistry) CompleteWithdrawal(tenant string, fingerprints ...str
 	defer r.mu.Unlock()
 	for _, key := range fingerprints {
 		key = strings.ToLower(strings.TrimSpace(key))
-		if strings.EqualFold(r.pendingWithdrawals[key], tenant) {
+		if r.pendingWithdrawals[key] == tenant {
 			delete(r.pendingWithdrawals, key)
 			delete(r.pendingTrustWithdrawals, key)
 		}
@@ -69,7 +69,7 @@ func (r *TenantCARegistry) WithdrawalRetryAllowed(tenant, fingerprint string, wh
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for key, owner := range r.pendingWithdrawals {
-		if !strings.EqualFold(owner, tenant) {
+		if owner != tenant {
 			return false
 		}
 		if whole {

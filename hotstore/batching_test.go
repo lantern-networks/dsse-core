@@ -398,6 +398,41 @@ func TestAnUnwritableSpoolIsReported(t *testing.T) {
 	}
 }
 
+func TestUnreadableStartupSpoolIsPreservedAcrossNewFailuresAndShutdown(t *testing.T) {
+	spool := filepath.Join(t.TempDir(), "spool.json")
+	original := []byte(`[[{"stream":"audit","row":{"tenant_id":"acme"}}]`)
+	if err := os.WriteFile(spool, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	var mu sync.Mutex
+	var reported []string
+	ingestor := NewBatchIngestor(NewClickHouseStore(server.URL, "", "", "dsse", "events"),
+		BatchIngestorConfig{QueueSize: 4, MaxRows: 1, FlushInterval: time.Millisecond, SpoolPath: spool,
+			OnFlushError: func(err error, _ int) {
+				mu.Lock()
+				reported = append(reported, err.Error())
+				mu.Unlock()
+			}})
+	ingestor.Add(IngestRecord{Stream: "audit", Row: map[string]any{"tenant_id": "acme", "id": "new"}, ReceivedAt: time.Now()})
+	if err := ingestor.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(spool)
+	if err != nil || string(got) != string(original) {
+		t.Fatalf("startup spool was replaced after load failure: %q, %v", got, err)
+	}
+	mu.Lock()
+	message := strings.Join(reported, "|")
+	mu.Unlock()
+	if !strings.Contains(message, "preserved") || !strings.Contains(message, "memory-only") {
+		t.Fatalf("unrecoverable mirror gap was not reported: %s", message)
+	}
+}
+
 // Random server retention receipts must not change keyless retry identity.
 func TestKeylessBatchContentTokensPreserveDistinctRecordsAndRetries(t *testing.T) {
 	var got []map[string]string

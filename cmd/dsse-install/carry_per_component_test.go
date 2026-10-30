@@ -22,20 +22,40 @@ func TestAnEdgeMachineIsNotGivenTheControlPlanesCredentials(t *testing.T) {
 	if err := run(dir, "dsse.example", "Test Deployment", 10, false); err != nil {
 		t.Fatalf("install: %v", err)
 	}
+	f, err := os.OpenFile(filepath.Join(dir, "deployment.env"), os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString("\nDSSE_ARCHIVE_ACCESS_KEY='fixture-key'\nDSSE_ARCHIVE_SECRET_KEY='fixture-secret'\nDSSE_ARCHIVE_AWS_ACCESS_KEY_ID='fixture-iam-id'\nDSSE_ARCHIVE_AWS_SECRET_ACCESS_KEY='fixture-iam-secret'\nDSSE_ARCHIVE_AWS_SESSION_TOKEN='fixture-iam-token'\n")
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	dest := filepath.Join(t.TempDir(), "edge.tar.gz")
-	_, _, err := carryDeploymentFor(dir, dest, machineShape{holds: regionShapeEdgesOnly, edges: true}, "", nil)
+	_, _, err = carryDeploymentFor(dir, dest, machineShape{holds: regionShapeEdgesOnly, edges: true}, "", nil)
 	if err != nil {
 		t.Fatalf("carry: %v", err)
 	}
 	env := fileFromCarry(t, dest, "deployment.env")
 
 	for _, credential := range []string{
-		"PG_PASSWORD", "PG_SUPERUSER_PASSWORD", "CLICKHOUSE_PASSWORD", "MINIO_ROOT_PASSWORD",
+		"PG_PASSWORD", "PG_SUPERUSER_PASSWORD", "CLICKHOUSE_PASSWORD", "DSSE_ARCHIVE_ACCESS_KEY", "DSSE_ARCHIVE_SECRET_KEY",
+		"DSSE_ARCHIVE_AWS_ACCESS_KEY_ID", "DSSE_ARCHIVE_AWS_SECRET_ACCESS_KEY", "DSSE_ARCHIVE_AWS_SESSION_TOKEN",
 	} {
 		for _, line := range strings.Split(env, "\n") {
 			if strings.HasPrefix(line, credential+"=") {
 				t.Errorf("an Edge machine is given %s, which nothing on it reads: %q", credential, line)
 			}
+		}
+	}
+	cp := filepath.Join(t.TempDir(), "cp.tar.gz")
+	if _, _, err := carryDeploymentFor(dir, cp, machineShape{holds: regionShapeStateBearing, edges: false}, "", nil); err != nil {
+		t.Fatalf("control-plane carry: %v", err)
+	}
+	cpEnv := fileFromCarry(t, cp, "deployment.env")
+	for _, key := range []string{"DSSE_ARCHIVE_ACCESS_KEY='fixture-key'", "DSSE_ARCHIVE_SECRET_KEY='fixture-secret'", "DSSE_ARCHIVE_AWS_ACCESS_KEY_ID='fixture-iam-id'", "DSSE_ARCHIVE_AWS_SECRET_ACCESS_KEY='fixture-iam-secret'", "DSSE_ARCHIVE_AWS_SESSION_TOKEN='fixture-iam-token'"} {
+		if !strings.Contains(cpEnv, key) {
+			t.Fatal("control plane lost its external archive credential")
 		}
 	}
 

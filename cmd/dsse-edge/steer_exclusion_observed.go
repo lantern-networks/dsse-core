@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -278,17 +279,24 @@ func observedExclusionKey(tenantID, deviceIdentity string) string {
 // Record stores (overwriting) a device's latest report. Identity+tenant are caller-supplied from the proven
 // mTLS context, never from the request body. When the store is at capacity and this is a new device, the
 // oldest-reporting device is evicted so a churn of devices cannot grow memory without bound.
-func (s *observedExclusionStore) Record(e observedExclusionEntry) {
+func (s *observedExclusionStore) Record(e observedExclusionEntry) error {
 	if s == nil {
-		return
+		return fmt.Errorf("observed exclusion store is unavailable")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := observedExclusionKey(e.TenantID, e.DeviceIdentity)
+	if e.ReportedAt.IsZero() {
+		e.ReportedAt = time.Now().UTC()
+	}
+	if current, exists := s.byKey[key]; exists && !e.ReportedAt.After(current.ReportedAt) {
+		return nil
+	}
 	if _, exists := s.byKey[key]; !exists && s.capacity > 0 && len(s.byKey) >= s.capacity {
 		s.evictOldestLocked()
 	}
 	s.byKey[key] = e
+	return nil
 }
 
 func (s *observedExclusionStore) evictOldestLocked() {
@@ -363,7 +371,7 @@ type observedByAppResult struct {
 // observedExclusionStoreAPI is the read/record surface the admin handlers use, so an in-memory cache and a
 // durable Postgres backend are interchangeable (Phase 3).
 type observedExclusionStoreAPI interface {
-	Record(observedExclusionEntry)
+	Record(observedExclusionEntry) error
 	Query(tenantID string, f observedQueryFilter) observedQueryResult
 	ByApp(tenantID string, limit int) observedByAppResult
 	// Readiness for a transport-CA rotation: which enrolled devices already hold the CA about to be deployed.

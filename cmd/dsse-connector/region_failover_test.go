@@ -24,6 +24,7 @@ func TestAConnectorMovesToTheNextDoorAndBack(t *testing.T) {
 
 	// ★ AND IT COMES BACK. A connector that fails over and stays there leaves every flow crossing the mesh for
 	// ever — correct, and slower and more fragile than it needs to be.
+	oldSelection := doors.selection()
 	doors.resetToPreferred()
 	if doors.current() != "https://a.example" {
 		t.Fatalf("it did not return to the first door: %q", doors.current())
@@ -34,7 +35,7 @@ func TestAConnectorMovesToTheNextDoorAndBack(t *testing.T) {
 	// every three minutes and reconnected to the region it was leaving, because tearing the old tunnel down
 	// was read as the new door failing. This line used to be part of the wrap below, which is why the loop
 	// was possible to write.
-	doors.advance(errors.New("use of closed network connection"))
+	doors.advanceIfSelected(oldSelection, errors.New("use of closed network connection"))
 	if doors.current() != "https://a.example" {
 		t.Fatalf("the tunnel that going home ended was counted against home: %q", doors.current())
 	}
@@ -67,5 +68,27 @@ func TestTheOrderTheOperatorWroteIsTheOrderTried(t *testing.T) {
 			t.Fatalf("door %d is %q, want %q", i, got, w)
 		}
 		doors.advance(errors.New("x"))
+	}
+}
+
+func TestPinnedConnectorTransportValidatesEveryEffectiveDoor(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		pinned    bool
+		wantError bool
+	}{
+		{"pinned HTTPS failover", "a=https://a.example;b=https://b.example", true, false},
+		{"pinned plaintext failover", "a=https://a.example;b=http://b.example", true, true},
+		{"pinned plaintext primary", "a=http://a.example;b=https://b.example", true, true},
+		{"pinned userinfo", "a=https://user:password@a.example", true, true},
+		{"pinned missing host", "a=https://", true, true},
+		{"dev plaintext", "a=http://a.example", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateConnectorDoorURLs(parseConnectorEndpoints(tc.raw), tc.pinned)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("validation error=%v, wantError=%t", err, tc.wantError)
+			}
+		})
 	}
 }

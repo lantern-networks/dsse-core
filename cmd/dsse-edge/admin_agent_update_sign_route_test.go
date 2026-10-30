@@ -54,7 +54,7 @@ func newSignRouteHarness(t *testing.T, signer *agentpolicy.Signer) *signRouteHar
 	}
 	registerAgentUpdatePublishRoutes(h.mux, func(_ string, fn http.HandlerFunc) http.HandlerFunc { return fn },
 		h.store, keys, false, writer, decision.Evaluator{}, filepath.Join(dir, "artifacts"), &publishedUpdates{byTarget: map[string]publishedUpdate{}},
-		signer, h.ratchet)
+		signer, h.ratchet, "")
 	return h
 }
 

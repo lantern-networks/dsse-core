@@ -52,13 +52,17 @@ func frontDoorTarget(door string) (dial, verifyName string) {
 
 // verifyFrontDoorPair asks each of the region's front doors whether it leads to an Edge of this deployment.
 func verifyFrontDoorPair(client *http.Client, doors []string) []verifyResult {
+	return verifyFrontDoors(client, doors, 2)
+}
+
+func verifyFrontDoors(client *http.Client, doors []string, required int) []verifyResult {
 	live := []string{}
 	for _, d := range doors {
 		if d = strings.TrimRight(strings.TrimSpace(d), "/"); d != "" {
 			live = append(live, d)
 		}
 	}
-	if len(live) < 2 {
+	if len(live) < required {
 		return []verifyResult{{
 			name: "the region's doorway is not a single point",
 			note: "could not be checked: pass every front door to -edge, comma-separated. One door answering " +
@@ -100,7 +104,7 @@ func verifyFrontDoorPair(client *http.Client, doors []string) []verifyResult {
 		})
 	}
 	out = append(out, verifyResult{
-		ok:   reached >= 2,
+		ok:   reached >= required,
 		name: "the region's doorway is not a single point",
 		note: fmt.Sprintf("%d of %d front door(s) lead to this deployment. Delivering ONE address in front of "+
 			"them belongs to the layer below — the platform's layer-4 load balancer, or a virtual address on "+

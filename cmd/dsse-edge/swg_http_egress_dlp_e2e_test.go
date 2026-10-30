@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -13,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lantern-networks/dsse-core/connector"
 	"github.com/lantern-networks/dsse-core/decision"
+	"github.com/lantern-networks/dsse-core/dlp"
 	"github.com/lantern-networks/dsse-core/edgeplane"
 	"github.com/lantern-networks/dsse-core/logs"
 	"github.com/lantern-networks/dsse-core/model"
@@ -376,15 +379,13 @@ func TestSWGHTTPEgressDLPEndToEnd(t *testing.T) {
 		}
 	})
 
-	// INSTANCE-AWARE action (slice I, sovereign "here not there"): a personal-scoped block rule fires only when the
-	// signed-in account is NOT a corporate (verified-domain) one. Same rule + same secret; only the account differs.
-	// The account is carried in a real Bearer JWT the handler decodes (ai_account) and classified against the
-	// tenant's corporate domains — the exact runtime path proven live on the reference lab.
-	instanceCfg := func() edgeSWGHTTPEgressHandlerConfig {
+	// Request token claims are account hints, not proof of the destination SaaS account.
+	// Even an authenticated device cannot use an unverified hint to exempt a scoped DLP rule.
+	instanceCfg := func(scope, action string) edgeSWGHTTPEgressHandlerConfig {
 		bundleWithDLP := bundle
 		bundleWithDLP.DLPRules = []model.DLPRule{{
 			ID: "dlp-personal-only", TenantID: tenant, Status: "active",
-			Identifiers: []string{"my_number"}, OnMatch: "block", InstanceScope: "personal",
+			Identifiers: []string{"my_number"}, OnMatch: action, InstanceScope: scope,
 		}}
 		writer, werr := logs.NewWriter(t.TempDir())
 		if werr != nil {
@@ -403,47 +404,249 @@ func TestSWGHTTPEgressDLPEndToEnd(t *testing.T) {
 			LabMode:                      false,
 		}
 	}
-	// jwtFor builds a decodable (unsigned) JWT carrying an email claim — the handler decodes the middle segment.
-	jwtFor := func(email string) string {
+
+	jwtFor := func(algorithm, claims string) string {
 		b64 := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
-		return b64(`{"alg":"none","typ":"JWT"}`) + "." + b64(`{"email":"`+email+`"}`) + ".sig"
+		return b64(`{"alg":"`+algorithm+`","typ":"JWT"}`) + "." + b64(claims) + ".forged"
 	}
-	uploadReqAs := func(email string) *http.Request {
-		req := uploadReq()
-		req.Header.Set("Authorization", "Bearer "+jwtFor(email))
-		return req
+	corporate := jwtFor("none", `{"email":"bob@corp.example"}`)
+	personal := jwtFor("none", `{"email":"alice@gmail.com"}`)
+	hints := []struct {
+		name, authorization, cookie string
+		wantHint                    bool
+	}{
+		{"unsigned_corporate_bearer", "Bearer " + corporate, "", true},
+		{"unsigned_personal_bearer", "Bearer " + personal, "", true},
+		{"forged_signed_bearer", "Bearer " + jwtFor("RS256", `{"email":"bob@corp.example","iss":"https://trusted.example","aud":"saas"}`), "", true},
+		{"corporate_cookie", "", "session=" + corporate, true},
+		{"personal_cookie", "", "session=" + personal, true},
+		{"opaque_bearer_corporate_cookie", "Bearer opaque-token", "session=" + corporate, true},
+		{"personal_bearer_corporate_cookie", "Bearer " + personal, "session=" + corporate, true},
+		{"corporate_subject_fallback", "Bearer " + jwtFor("none", `{"sub":"bob@corp.example"}`), "", true},
+		{"opaque_bearer", "Bearer opaque-token", "", false},
+		{"opaque_cookie", "", "session=opaque-token", false},
+		{"malformed_jwt", "Bearer not.a.jwt", "", false},
+		{"no_token", "", "", false},
+	}
+	for _, scope := range []string{"personal", "corporate"} {
+		for _, action := range []string{"block", "authenticate"} {
+			for _, hint := range hints {
+				t.Run("unverified_instance/"+scope+"/"+action+"/"+hint.name, func(t *testing.T) {
+					setReceived("")
+					cfg := instanceCfg(scope, action)
+					req := uploadReq()
+					req.Header.Set("Authorization", hint.authorization)
+					req.Header.Set("Cookie", hint.cookie)
+					rec := httptest.NewRecorder()
+					newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, req)
+					wantStatus := http.StatusForbidden
+					if action == "authenticate" {
+						wantStatus = http.StatusUnauthorized
+					}
+					if rec.Code != wantStatus {
+						t.Fatalf("status=%d, want %d; body=%s", rec.Code, wantStatus, rec.Body.String())
+					}
+					if strings.Contains(getReceived(), secret) {
+						t.Fatal("secret reached upstream despite the instance-scoped rule")
+					}
+					ev := dlpEventByFindingType(cfg.InspectionEvents.ListByTenant(tenant), "dlp_match")
+					if ev == nil || ev.Metadata["dlp_action"] != action {
+						t.Fatalf("missing scoped DLP finding: %+v", ev)
+					}
+					if class, _ := ev.Metadata["dlp_instance_class"].(string); class != "" {
+						t.Fatalf("unverified account recorded as %q", class)
+					}
+					if hint.wantHint {
+						if ev.Metadata["dlp_account_trust"] != "unverified_request_hint" {
+							t.Fatalf("standalone finding must label the account hint unverified: %+v", ev.Metadata)
+						}
+						if ev.AccessDecisionID == nil {
+							t.Fatal("finding has no decision reference")
+						}
+						dec, ok := cfg.DecisionStore.Get(*ev.AccessDecisionID)
+						if !ok || dec.Metadata["ai_identity_trust"] != "unverified_request_hint" {
+							t.Fatalf("account hint must be labeled unverified: %+v", dec.Metadata)
+						}
+					}
+				})
+			}
+		}
+		for _, domains := range []string{"missing_resolver", "empty_domains"} {
+			t.Run("unverified_instance/"+scope+"/"+domains, func(t *testing.T) {
+				setReceived("")
+				cfg := instanceCfg(scope, "block")
+				cfg.CorporateDomains = nil
+				if domains == "empty_domains" {
+					cfg.CorporateDomains = func(string) []string { return nil }
+				}
+				req := uploadReq()
+				req.Header.Set("Authorization", "Bearer "+corporate)
+				rec := httptest.NewRecorder()
+				newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, req)
+				if rec.Code != http.StatusForbidden || strings.Contains(getReceived(), secret) {
+					t.Fatalf("missing domain evidence must not exempt DLP: status=%d upstream=%q", rec.Code, getReceived())
+				}
+			})
+		}
+		t.Run("unverified_instance/"+scope+"/benign_body", func(t *testing.T) {
+			setReceived("")
+			cfg := instanceCfg(scope, "block")
+			req := uploadReq()
+			req.Body = io.NopCloser(strings.NewReader(`{"note":"ordinary text"}`))
+			req.ContentLength = -1
+			req.Header.Set("Authorization", "Bearer "+corporate)
+			rec := httptest.NewRecorder()
+			newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK || getReceived() != `{"note":"ordinary text"}` {
+				t.Fatalf("unknown instance alone must not deny benign content: status=%d upstream=%q", rec.Code, getReceived())
+			}
+		})
 	}
 
-	t.Run("personal-scoped rule blocks a personal account", func(t *testing.T) {
-		setReceived("")
-		cfg := instanceCfg()
-		rec := httptest.NewRecorder()
-		newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, uploadReqAs("alice@gmail.com"))
-		if rec.Code != http.StatusForbidden {
-			t.Fatalf("personal account: status=%d, want 403 (block); body=%s", rec.Code, rec.Body.String())
+	t.Run("retention refusal is not a content match or authentication", func(t *testing.T) {
+		prior := dlp.DefaultRetentionBudget().Status()
+		budget, err := dlp.ConfigureProcessRetention(1<<20, 2<<20)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if strings.Contains(getReceived(), secret) {
-			t.Errorf("personal account: secret leaked to upstream despite block")
-		}
-		ev := dlpEventByFindingType(cfg.InspectionEvents.ListByTenant(tenant), "dlp_match")
-		if ev == nil || ev.Metadata["dlp_instance_class"] != "personal" {
-			t.Errorf("expected a dlp_match stamped instance_class=personal, got %+v", ev)
+		defer func() {
+			if _, err := dlp.ConfigureProcessRetention(prior.PerStreamBytes, prior.ProcessBytes); err != nil {
+				t.Error(err)
+			}
+		}()
+		for _, html := range []bool{false, true} {
+			setReceived("")
+			cfg := newConfigWithDLPRule(model.DLPRule{Identifiers: []string{"email"}, OnMatch: "authenticate"})
+			cfg.DLPRetentionBudget = budget
+			req := uploadReq()
+			req.Body = io.NopCloser(strings.NewReader("a@b" + strings.Repeat(".cc", 400000)))
+			req.ContentLength = -1
+			if html {
+				req.Header.Set("Accept", "text/html")
+				req.Header.Set("Accept-Language", "ja")
+			}
+			rec := httptest.NewRecorder()
+			newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden || strings.Contains(getReceived(), "a@b") {
+				t.Fatalf("resource refusal failed: status=%d", rec.Code)
+			}
+			if html && !strings.Contains(rec.Body.String(), "アップロードを検査できませんでした") {
+				t.Fatal("Japanese resource refusal was not rendered")
+			}
+			if !html && !strings.Contains(rec.Body.String(), "dlp_inspection_resource_exhausted") {
+				t.Fatal("missing non-secret refusal reason")
+			}
+			events := cfg.InspectionEvents.ListByTenant(tenant)
+			if dlpEventByFindingType(events, "dlp_match") != nil || dlpEventByFindingType(events, "dlp_inspection_resource_exhausted") == nil {
+				t.Fatal("resource refusal fabricated a DLP finding")
+			}
+			if budget.Status().UsedBytes != 0 {
+				t.Fatal("handler retained budget")
+			}
+			_ = cfg.Writer.Close()
 		}
 	})
 
-	t.Run("personal-scoped rule does NOT touch a corporate account", func(t *testing.T) {
-		setReceived("")
-		cfg := instanceCfg()
-		rec := httptest.NewRecorder()
-		newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, uploadReqAs("bob@corp.example"))
-		if rec.Code >= 400 {
-			t.Fatalf("corporate account: status=%d, want allowed (rule scoped to personal); body=%s", rec.Code, rec.Body.String())
-		}
-		if !strings.Contains(getReceived(), secret) {
-			t.Errorf("corporate account: upload should have been forwarded (rule does not apply), got %q", getReceived())
-		}
-	})
+	for _, lateLimit := range []bool{false, true} {
+		t.Run(map[bool]string{false: "early response preserves duplex upload", true: "late resource refusal stops undecided upload"}[lateLimit], func(t *testing.T) {
+			prior := dlp.DefaultRetentionBudget().Status()
+			budget, err := dlp.ConfigureProcessRetention(1<<20, 2<<20)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if _, err := dlp.ConfigureProcessRetention(prior.PerStreamBytes, prior.ProcessBytes); err != nil {
+					t.Error(err)
+				}
+			}()
+			cfg := newConfigWithDLPRule(model.DLPRule{Identifiers: []string{"email"}, OnMatch: "block"})
+			cfg.DLPRetentionBudget = budget
+			defer cfg.Writer.Close()
+			pr, pw := io.Pipe()
+			defer pr.Close()
+			defer pw.Close()
+			body := &dlpEnteredBody{ReadCloser: pr, entered: make(chan struct{})}
+			upload := "ordinary duplex body"
+			if lateLimit {
+				upload = "a@b" + strings.Repeat(".cc", 400000)
+			}
+			done := make(chan struct {
+				n   int64
+				err error
+			}, 1)
+			cfg.ProxyClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				go func() {
+					n, e := io.Copy(io.Discard, r.Body)
+					_ = r.Body.Close()
+					done <- struct {
+						n   int64
+						err error
+					}{n, e}
+				}()
+				<-body.entered
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: &dlpLazyResponse{Reader: strings.NewReader("ok"), start: func() {
+					go func() { _, _ = io.WriteString(pw, upload); _ = pw.Close() }()
+					select {
+					case result := <-done:
+						if lateLimit {
+							if result.n != 0 || !errors.Is(result.err, dlp.ErrRetentionLimit) {
+								t.Errorf("late refusal leaked or misclassified: %d %v", result.n, result.err)
+							}
+						} else if result.err != nil || result.n != int64(len(upload)) {
+							t.Errorf("successful early response cut upload: %d %v", result.n, result.err)
+						}
+					case <-time.After(3 * time.Second):
+						t.Error("duplex upload deadlocked")
+					}
+				}}}, nil
+			})}
+			req := uploadReq()
+			req.Body = body
+			req.ContentLength = -1
+			rec := httptest.NewRecorder()
+			finished := make(chan struct{})
+			go func() { defer close(finished); newEdgeSWGHTTPEgressHandler(cfg).ServeHTTP(rec, req) }()
+			select {
+			case <-finished:
+			case <-time.After(5 * time.Second):
+				_ = pr.Close()
+				_ = pw.Close()
+				<-finished
+				t.Fatal("early response waited for upload Read")
+			}
+			if rec.Code != 200 {
+				t.Fatalf("upstream early response changed: %d", rec.Code)
+			}
+			if budget.Status().UsedBytes != 0 {
+				t.Fatal("early-response handler leaked retention")
+			}
+			if lateLimit && dlpEventByFindingType(cfg.InspectionEvents.ListByTenant(tenant), "dlp_inspection_resource_exhausted") == nil {
+				t.Fatal("late resource refusal was not reported")
+			}
+		})
+	}
+
 }
+
+type dlpEnteredBody struct {
+	io.ReadCloser
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *dlpEnteredBody) Read(p []byte) (int, error) {
+	b.once.Do(func() { close(b.entered) })
+	return b.ReadCloser.Read(p)
+}
+
+type dlpLazyResponse struct {
+	io.Reader
+	start func()
+	once  sync.Once
+}
+
+func (b *dlpLazyResponse) Read(p []byte) (int, error) { b.once.Do(b.start); return b.Reader.Read(p) }
+func (*dlpLazyResponse) Close() error                 { return nil }
 
 // dlpMultipartDocx builds a multipart/form-data body whose file part is a minimal .docx (a ZIP with
 // word/document.xml) containing the given text. Returns (body, contentType).

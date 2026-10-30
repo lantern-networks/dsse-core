@@ -8,18 +8,11 @@ package main
 // recorded the conditions from the service arguments inside --reconcile-config-pin, and that step runs too
 // late to ever see them on the one box it was written for.
 //
-// DsseAgent.wxs schedules RemoveExistingProducts After="InstallValidate", which is BEFORE InstallInitialize.
-// The old product is therefore fully uninstalled — services deleted, arguments gone — before a single deferred
-// custom action of the new package runs. So on a real first upgrade of a box provisioned by an older generic
-// build, --reconcile-config-pin finds empty services and an empty store and correctly reports that there is
-// nothing to restore. It worked in testing only because the store had been filled by hand first, which is
-// precisely the case the acceptance forbids.
-//
-// ★ WHY THE SCHEDULING IS NOT MOVED INSTEAD. The comment above those rows explains that the hand-authored
-// Upgrade table reproduces what MajorUpgrade generates — "the before/after MSI tables were compared to confirm
-// the only difference is the launch condition" — and RemoveExistingProducts after InstallValidate is named as
-// the part a hand-authored Upgrade does not get for free. Rescheduling it would break the claim that whole
-// rewrite rests on, to fix something that can be fixed without touching it.
+// RemoveExistingProducts now runs after InstallInitialize, before any action that
+// generates execution script. The old service is still removed before the new
+// package's deferred actions, so its authorities must be captured immediately,
+// before removal. Transactional MSI file restoration does not reconstruct these
+// custom service arguments by itself.
 //
 // ★ SO THIS IS AN IMMEDIATE CUSTOM ACTION, with two consequences worth stating plainly.
 //
@@ -61,7 +54,13 @@ func doCaptureBeforeUpgrade() error {
 			continue
 		}
 		anyServiceFound = true
-		for name, value := range pinsInArgs(service, args) {
+		servicePins := pinsInArgs(service, args)
+		if service == "DsseUpdater" {
+			if publisher, ok := legacyPublisherForCapture(args); ok {
+				servicePins["Updater_Publisher"] = publisher
+			}
+		}
+		for name, value := range servicePins {
 			captured[name] = value
 		}
 	}

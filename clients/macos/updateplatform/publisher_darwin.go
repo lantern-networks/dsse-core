@@ -35,11 +35,15 @@ const publisherToolTimeout = 60 * time.Second
 // missing and what it costs — and the installer gate refuses to install a NEW configuration without the field,
 // so the population that can be in this state only shrinks.
 func VerifyPublisher(pkgPath string, req PublisherRequirement) (note string, err error) {
+	return verifyPublisherWithTool(pkgPath, req, runPublisherTool)
+}
+
+func verifyPublisherWithTool(pkgPath string, req PublisherRequirement, runTool func(string, ...string) (string, error)) (note string, err error) {
 	if !req.Configured() {
 		return RequirementMissingNote, nil
 	}
 
-	sigOut, sigErr := runPublisherTool("/usr/sbin/pkgutil", "--check-signature", pkgPath)
+	sigOut, sigErr := runTool("/usr/sbin/pkgutil", "--check-signature", pkgPath)
 	if sigOut == "" {
 		// No output at all means the tool did not run — a missing binary, a sandbox, a machine mid-upgrade. The
 		// answer is unknown, and unknown must not install.
@@ -49,14 +53,20 @@ func VerifyPublisher(pkgPath string, req PublisherRequirement) (note string, err
 	if err := parsePkgutilSignature(sigOut, req.TeamID); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrPublisherUntrusted, err)
 	}
+	if sigErr != nil {
+		return "", fmt.Errorf("%w: pkgutil signature verification did not complete successfully: %v", ErrPublisherUntrusted, sigErr)
+	}
 
-	assessOut, assessErr := runPublisherTool("/usr/sbin/spctl", "--assess", "--type", "install", "-vv", pkgPath)
+	assessOut, assessErr := runTool("/usr/sbin/spctl", "--assess", "--type", "install", "-vv", pkgPath)
 	if assessOut == "" {
 		return "", fmt.Errorf("%w: spctl --assess could not be run on %s (%v), so whether this package was "+
 			"notarized is unknown", ErrPublisherUntrusted, pkgPath, assessErr)
 	}
 	if err := parseSpctlAssessment(assessOut, req.TeamID); err != nil {
 		return "", fmt.Errorf("%w: %v", ErrPublisherUntrusted, err)
+	}
+	if assessErr != nil {
+		return "", fmt.Errorf("%w: spctl assessment did not complete successfully: %v", ErrPublisherUntrusted, assessErr)
 	}
 
 	return fmt.Sprintf("publisher verified: notarized Developer ID Installer, team %s", req.TeamID), nil
@@ -79,9 +89,8 @@ func VerifyPublisherFromConfig(configPath, pkgPath string) (note string, err err
 
 // runPublisherTool returns whatever the tool printed, whether or not it exited zero.
 //
-// ★ THE EXIT CODE IS NOT THE ANSWER, and using it would invert one of the two checks: `spctl --assess` exits
-// NON-ZERO precisely when it rejects a package, so a helper that discarded output on error would turn every
-// rejection into "the tool could not be run" — and if that were ever softened to a warning, into a pass.
+// Keep output on failure so the caller can report the specific rejection. A
+// successful exit and a trusted parsed verdict are both required for acceptance.
 func runPublisherTool(name string, args ...string) (string, error) {
 	// ★ CommandContext RATHER THAN A HAND-WRITTEN TIMEOUT (2026-08-13, thirtieth review #23). The first version
 	// ran CombinedOutput in a goroutine and raced a time.After against it. On a timeout it returned while that

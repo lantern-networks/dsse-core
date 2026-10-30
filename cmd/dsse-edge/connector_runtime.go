@@ -134,6 +134,13 @@ func authorizeConnectorRegistrationRequest(w http.ResponseWriter, r *http.Reques
 	// organization; that is the same authentication every other Edge accepts. See
 	// connector_is_a_fleet_client.go.
 	if fleet := connectorFleetIdentityFromRequest(r, connectorID, tenantCAs); fleet.authenticatesAnywhere(tenantCAs) {
+		// On first registration this Edge has no row to compare with. The
+		// requested owner must still be the certificate's issuer tenant.
+		if tenantCAs != nil && fleet.TenantID != tenantID {
+			writeError(w, http.StatusUnauthorized, fmt.Errorf(
+				"connector certificate belongs to a different organization than the requested tenant"))
+			return false
+		}
 		if !fleet.contradictsRegistry(connectorTenantFromRegistry(registry, connectorID)) {
 			return true
 		}
@@ -162,7 +169,14 @@ func authorizeConnectorRegistrationRequest(w http.ResponseWriter, r *http.Reques
 }
 
 func authorizeConnectorRuntimeRequest(w http.ResponseWriter, r *http.Request, connectorSecret string, registry connectorRegistryStore, connectorID, tenantID string, requireRuntimeSecret bool, tenantCAs *tenantca.TenantCARegistry) bool {
-	hash, knownConnector, tenantMatched, err := connectorRuntimeSecretHashForTenantConnector(r.Context(), registry, connectorID, tenantID)
+	fleet := connectorFleetIdentityFromRequest(r, connectorID, tenantCAs)
+	lookupTenant := tenantID
+	if fleet.authenticatesAnywhere(tenantCAs) && fleet.TenantID != "" {
+		// The route's seed tenant is not the connector's owner on a multi-tenant
+		// Edge. A known runtime credential must be checked for the certified owner.
+		lookupTenant = fleet.TenantID
+	}
+	hash, knownConnector, tenantMatched, err := connectorRuntimeSecretHashForTenantConnector(r.Context(), registry, connectorID, lookupTenant)
 	connectorTenant := connectorTenantFromRegistry(registry, connectorID)
 	if err != nil {
 		log.Printf("connector registry auth lookup failed: %v", err)
@@ -173,7 +187,6 @@ func authorizeConnectorRuntimeRequest(w http.ResponseWriter, r *http.Request, co
 	// ★★★ A CONNECTOR CONNECTS TO THE FLEET, NOT TO ONE EDGE (the operator's decision, 2026-08-26). Its
 	// certificate names it and names its organization; neither fact belongs to this node, and neither changes
 	// from Edge to Edge. See connector_is_a_fleet_client.go for what was measured.
-	fleet := connectorFleetIdentityFromRequest(r, connectorID, tenantCAs)
 	if fleet.authenticatesAnywhere(tenantCAs) {
 		if fleet.contradictsRegistry(connectorTenant) {
 			writeError(w, http.StatusUnauthorized, fmt.Errorf(
@@ -367,6 +380,28 @@ func authorizeEdgeRuntimeRequestForConnector(w http.ResponseWriter, r *http.Requ
 		return true
 	}
 	return authorizeConnectorRuntimeRequest(w, r, connectorSecret, registry, r.Header.Get(connectorIDHeader), tenantID, requireRuntimeSecret, tenantCAs)
+}
+
+// runtimeConnectorTenant binds a connector runtime request to the organization
+// proved by its verified client certificate. The connector gate admits a valid
+// fleet client on every Edge, including Edges seeded for another tenant; that
+// seed must never select the tenant of a subsequent read or write.
+func runtimeConnectorTenant(w http.ResponseWriter, r *http.Request, connectorSecret string, devMode bool, registry connectorRegistryStore, seedTenant string, requireRuntimeSecret bool, tenantCAs *tenantca.TenantCARegistry) (string, bool) {
+	if !authorizeEdgeRuntimeRequestForConnector(w, r, connectorSecret, devMode, registry, seedTenant, requireRuntimeSecret, tenantCAs) {
+		return "", false
+	}
+	if devMode {
+		return strings.TrimSpace(seedTenant), true
+	}
+	if tenantCAs != nil {
+		if tenant, ok := transportTenantFromRequest(r, tenantCAs); ok && strings.TrimSpace(tenant) != "" {
+			return strings.TrimSpace(tenant), true
+		}
+		writeError(w, http.StatusForbidden, fmt.Errorf("connector tenant cannot be verified"))
+		return "", false
+	}
+	// Single-tenant deployments without a Tenant CA registry retain their seed.
+	return strings.TrimSpace(seedTenant), true
 }
 
 // validateConnectorRuntimeSecretRequiredConfig refuses a deployment where connectors authenticate with ONE
@@ -580,7 +615,7 @@ func connectorsForDestination(ctx context.Context, registry connectorRegistrySto
 	for _, conn := range live {
 		byID[conn.ID] = conn
 	}
-	ordered := connector.ResolveConnectorsForHost(destination, live)
+	ordered := connector.ResolveConnectorsForDestination(destination, namespace, live)
 	if len(ordered) == 0 {
 		// The IP fallback stays single-answer: it is namespace-scoped and there is no HA question in it yet.
 		if conn, ok, ferr := connectorForDestination(ctx, registry, tenantID, destination, namespace); ferr == nil && ok {

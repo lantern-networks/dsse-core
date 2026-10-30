@@ -3,15 +3,14 @@
   Build the single-file Burn installer DsseAgentSetup.exe (roadmap M8.5) that wraps the DsseAgent MSI.
 
 .DESCRIPTION
-  Requires the MSI to be built first (build-msi.ps1 → outputs\windows\DsseAgent.msi). Chains an optional
-  WebView2 Evergreen prerequisite (-WithWebView2, only needed once the WebView2-based helper is packaged) then
+  Requires the MSI to be built first (build-msi.ps1 → outputs\windows\DsseAgent.msi). Chains
   the MSI. -Sign performs the full Burn signing sequence — detach the engine, sign it, reattach, sign the
   bundle — and then FAILS the build unless a re-detached engine and the bundle both verify. Signing only the
   finished exe (what this script did before 2026-08-06) leaves the engine unsigned while the bundle still
   reports Valid, and the engine is what Burn extracts to %TEMP% and elevates.
 
-  Needs the WiX Burn extensions:
-    wix extension add -g WixToolset.BootstrapperApplications.wixext WixToolset.Util.wixext
+  Needs the WiX Burn extension:
+    wix extension add -g WixToolset.BootstrapperApplications.wixext/7.0.0
 #>
 [CmdletBinding()]
 param(
@@ -20,28 +19,31 @@ param(
   # drift apart. Walks upward rather than using a fixed depth because this tree is ALSO mirrored to the public
   # dsse-core repo, where the root sits at a different level; there it finds that repo's own VERSION.
   #
-  # ★ RESOLVE IT FIRST (2026-08-22). $PSScriptRoot is only absolute when the script is invoked by an absolute
-  # path; invoked relatively it is that relative string, and the upward walk then runs off the top of it before
-  # reaching the repo root, silently yielding 0.0.0-unversioned. Same defect and same fix as build-msi.ps1.
-  [string] $Version = $(
-    $d = if ($PSScriptRoot) { (Resolve-Path -LiteralPath $PSScriptRoot).Path } else { (Get-Location).Path }
-    $found = $null
-    while ($d -and -not $found) {
-      $c = Join-Path $d "VERSION"
-      if (Test-Path $c) { $found = (Get-Content $c -Raw).Trim() }
-      $p = Split-Path $d -Parent; if ($p -eq $d) { break }; $d = $p
-    }
-    if ($found) { $found } else { "0.0.0-unversioned" }
-  ),
-  [switch] $WithWebView2,
+  # Resolved in the script body. A param() default runs in the caller's scope,
+  # where $PSScriptRoot may be empty even for an absolute script invocation.
+  [string] $Version = "",
   [switch] $Sign,
   [ValidateSet('test','trustedsigning','evtoken')][string] $SignBackend = 'test'
 )
 $ErrorActionPreference = 'Stop'
 
+# A param() default runs in the caller's scope, where $PSScriptRoot may be empty.
+# Resolve the same VERSION as build-msi.ps1 only after entering this script's body.
+if (-not $Version) {
+  $d = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+  while ($d -and -not $Version) {
+    $c = Join-Path $d "VERSION"
+    if (Test-Path $c) { $Version = (Get-Content $c -Raw).Trim() }
+    $up = Split-Path $d -Parent; if ($up -eq $d) { break }; $d = $up
+  }
+}
+if (-not $Version) {
+  throw "no VERSION file was found in or above $PSScriptRoot; pass -Version explicitly or build from a versioned tree"
+}
+
 $pkg  = $PSScriptRoot
 $oss  = (Resolve-Path "$pkg\..\..\..").Path
-$repo = (Resolve-Path "$oss\..\..").Path
+$repo = $oss # build-msi.ps1 writes to this OSS tree's outputs/windows
 $outDir = Join-Path $repo "outputs\windows"
 $msi = Join-Path $outDir "DsseAgent.msi"
 $setup = Join-Path $outDir "DsseAgentSetup.exe"
@@ -50,24 +52,19 @@ if (-not (Test-Path $msi)) { throw "MSI not found: $msi — run build-msi.ps1 fi
 
 $wix = Join-Path $env:USERPROFILE ".dotnet\tools\wix.exe"
 if (-not (Test-Path $wix)) { $wix = "wix" }
+$wixVersion = (& $wix --version).Trim()
+if ($LASTEXITCODE -or $wixVersion -notmatch '^7\.0\.0(?:\+.*)?$') {
+  throw "WiX 7.0.0 is required (found: $wixVersion)"
+}
 $env:DOTNET_ROOT = Join-Path $env:USERPROFILE ".dotnet"
 
 $defs = @("-d", "Version=$Version")
-if ($WithWebView2) {
-  $wv2 = Join-Path $outDir "MicrosoftEdgeWebview2Setup.exe"
-  if (-not (Test-Path $wv2)) {
-    Write-Host "== downloading WebView2 Evergreen bootstrapper =="
-    Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $wv2 -UseBasicParsing
-  }
-  $defs += @("-d", "WebView2=1")
-}
 
 Write-Host "== wix build (Burn bundle) -> $setup =="
 Push-Location $pkg
 try {
-  & $wix build DsseBundle.wxs `
-      -ext WixToolset.BootstrapperApplications.wixext `
-      -ext WixToolset.Util.wixext `
+  & $wix build -acceptEula wix7 DsseBundle.wxs `
+      -ext WixToolset.BootstrapperApplications.wixext/7.0.0 `
       -b $outDir -b $pkg @defs -o $setup
   if ($LASTEXITCODE) { throw "wix build (bundle) failed ($LASTEXITCODE)" }
 } finally { Pop-Location }

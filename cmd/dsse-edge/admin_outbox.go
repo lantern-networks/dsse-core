@@ -289,7 +289,7 @@ func adminAuditOutboxReplayAuditLog(result postgresAdminAuditOutboxReplayResult,
 	}
 	audit := model.AuditLog{
 		ID:            randomEdgeID("audit_admin_audit_outbox_replayed_", time.Now().UTC()),
-		TenantID:      evaluator.PolicyBundle.TenantID,
+		TenantID:      result.TenantID,
 		ActorUserID:   stringPtr(adminPrincipalID),
 		EventType:     "admin_audit_outbox_replayed",
 		TargetType:    stringPtr("admin_audit_outbox"),
@@ -326,7 +326,7 @@ func domainEventOutboxReplayAuditLog(result postgresDomainEventOutboxReplayResul
 	}
 	audit := model.AuditLog{
 		ID:            randomEdgeID("audit_domain_event_outbox_replayed_", time.Now().UTC()),
-		TenantID:      evaluator.PolicyBundle.TenantID,
+		TenantID:      result.TenantID,
 		ActorUserID:   stringPtr(adminPrincipalID),
 		EventType:     "admin_domain_event_outbox_replayed",
 		TargetType:    stringPtr("domain_event_outbox"),
@@ -366,7 +366,15 @@ func registerOutboxAdminRoutes(mux *http.ServeMux, adminEndpoint func(string, ht
 		writeJSON(w, http.StatusOK, writer.AuditHealth())
 	}))
 	mux.HandleFunc("GET /admin/hot-store/health", adminEndpoint("admin.logs.read", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, hotStoreMirror.Health(time.Now()))
+		health := hotStoreMirror.Health(time.Now())
+		// The hot store is shared by every organization. Its counters and last error describe the whole
+		// deployment and name internal hosts, so only deployment-wide administration reads them; an
+		// organization's administrator sees whether the store is healthy, which the Console needs.
+		if _, wholeDeployment := adminAnswerScope(r); !wholeDeployment {
+			writeJSON(w, http.StatusOK, map[string]string{"status": health.Status})
+			return
+		}
+		writeJSON(w, http.StatusOK, health)
 	}))
 	// Audit/persistence decoupling (docs/edge_audit_persistence_decoupling_design.md): the durable outbox
 	// delivery + management belongs to the separate audit/control plane, not the data-plane Edge. These

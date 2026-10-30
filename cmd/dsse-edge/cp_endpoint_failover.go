@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -149,6 +152,47 @@ func parseCPEndpoints(seed string) []regionfailover.RegionEndpoint {
 		out = append(out, regionfailover.RegionEndpoint{Region: region, Endpoint: endpoint})
 	}
 	return out
+}
+
+// validateCPEndpointSeed is the startup gate for a declared control channel.
+// parseCPEndpoints historically skips malformed entries for callers that only
+// inspect a list; an Edge must not boot with an empty or truncated authority
+// after treating the nonempty flag as proof that it has a control plane.
+func validateCPEndpointSeed(seed string) error {
+	regions := make(map[string]bool)
+	endpoints := make(map[string]bool)
+	for _, raw := range strings.Split(seed, ";") {
+		part := strings.TrimSpace(raw)
+		if part == "" {
+			continue
+		}
+		region, endpoint, ok := strings.Cut(part, "=")
+		region, endpoint = strings.TrimSpace(region), strings.TrimSpace(endpoint)
+		if !ok || region == "" || endpoint == "" {
+			return fmt.Errorf("invalid CP endpoint entry")
+		}
+		parsed, err := url.Parse(endpoint)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil ||
+			parsed.Opaque != "" || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.ForceQuery ||
+			parsed.Fragment != "" || parsed.RawFragment != "" || strings.ContainsAny(endpoint, "?#") {
+			return fmt.Errorf("CP endpoint for region %q must be an HTTPS origin", region)
+		}
+		if port := parsed.Port(); port != "" {
+			n, err := strconv.Atoi(port)
+			if err != nil || n < 1 || n > 65535 {
+				return fmt.Errorf("CP endpoint for region %q has an invalid port", region)
+			}
+		}
+		name := strings.ToLower(region)
+		if regions[name] || endpoints[strings.ToLower(parsed.Host)] {
+			return fmt.Errorf("duplicate CP region or endpoint")
+		}
+		regions[name], endpoints[strings.ToLower(parsed.Host)] = true, true
+	}
+	if len(regions) == 0 {
+		return fmt.Errorf("CP endpoint list is empty")
+	}
+	return nil
 }
 
 // controlChannelStateForReport is what this Edge says about where it takes configuration from, and whether it

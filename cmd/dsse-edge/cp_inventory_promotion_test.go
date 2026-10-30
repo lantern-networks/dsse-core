@@ -16,19 +16,26 @@ import (
 	"time"
 )
 
-func inventoryPromotionHandler(ledger *enrolledinventory.Ledger, writers ...*logs.Writer) http.Handler {
+func inventoryPromotionHandler(t *testing.T, ledger *enrolledinventory.Ledger, writers ...*logs.Writer) http.Handler {
 	var writer *logs.Writer
 	if len(writers) > 0 {
 		writer = writers[0]
 	}
+	t.Helper()
+	declareOperatorTenantForTest(t, "operator")
 	auth := newAdminAuthStore()
+	auth.UpsertPrincipal(adminPrincipal{ID: "fleet", TenantID: "operator", Roles: []string{"admin"}, Status: "active"})
+	auth.UpsertAPIToken(adminAPIToken{ID: "fleet", CreatedByAdminPrincipalID: "fleet", TenantID: "operator", TokenHash: adminTokenHash("inventory-fleet-token"), Roles: []string{"admin"}, Scopes: []string{"admin.policy.read"}, Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)})
 	auth.UpsertPrincipal(adminPrincipal{ID: "probe", TenantID: "tenant_lab_001", Email: "probe@example.invalid", Roles: []string{"admin"}, Status: "active"})
 	auth.UpsertAPIToken(adminAPIToken{ID: "probe", CreatedByAdminPrincipalID: "probe", TenantID: "tenant_lab_001", TokenHash: adminTokenHash("inventory-probe-token"), Roles: []string{"admin"}, Scopes: []string{"*"}, Status: "active", ExpiresAt: time.Now().Add(time.Hour).Format(time.RFC3339)})
-	return newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, EnrolledLedger: ledger})
+	return newServerWithConfig(serverConfig{Evaluator: testEvaluator(), Writer: writer, AdminAuth: auth, EnrolledLedger: ledger, OperatorTenantID: "operator"})
 }
 func inventoryPromotionRead(h http.Handler, path string) *httptest.ResponseRecorder {
 	q := httptest.NewRequest("GET", path, nil)
 	q.Header.Set("Authorization", "Bearer inventory-probe-token")
+	if path == "/admin/config-bundle" {
+		q.Header.Set("Authorization", "Bearer inventory-fleet-token")
+	}
 	r := httptest.NewRecorder()
 	h.ServeHTTP(r, q)
 	return r
@@ -57,7 +64,7 @@ func TestInventoryPromotionLoadsLatestAndClosesStandbyReads(t *testing.T) {
 				prepared := 0
 				e.prepareLeadership = func() error { prepared++; return nil }
 				configureInventoryPromotion(e, backend, candidate)
-				h := inventoryPromotionHandler(candidate)
+				h := inventoryPromotionHandler(t, candidate)
 				for _, path := range []string{"/admin/config-bundle", "/admin/enrolled-devices", "/admin/device-groups"} {
 					if r := inventoryPromotionRead(h, path); r.Code != 409 || strings.Contains(r.Body.String(), "owned-device") {
 						t.Fatalf("standby read %s: %d", path, r.Code)
@@ -206,7 +213,7 @@ func TestInventoryGroupAuditRecordsActorAndTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	ledger := enrolledinventory.NewLedger()
-	h := inventoryPromotionHandler(ledger, writer)
+	h := inventoryPromotionHandler(t, ledger, writer)
 	request := func(method, path, body string) *httptest.ResponseRecorder {
 		q := httptest.NewRequest(method, path, strings.NewReader(body))
 		q.Header.Set("Authorization", "Bearer inventory-probe-token")

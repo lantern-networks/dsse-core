@@ -91,7 +91,7 @@ func registerTenantAuthorityReadRoutes(mux *http.ServeMux,
 				writeError(w, http.StatusServiceUnavailable, err)
 				return
 			}
-			stored, known := snapshot.cas[strings.ToLower(tenant)]
+			stored, known := snapshot.cas[tenant]
 			var row storedTenantDeviceCA
 			if known && stored != nil {
 				row = copyAuthority(*stored)

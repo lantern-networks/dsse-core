@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -56,8 +59,8 @@ func TestTheBackoffAfterAFailedFetchNeverOutlivesTheMaterial(t *testing.T) {
 
 	// A node holding nothing has no life to be shorter than, and must not be pushed into a hot loop by this.
 	empty := &tenantTransportMaterialFetcher{}
-	if got := empty.backoffAfterFailure(now, ordinary); got != ordinary {
-		t.Errorf("a node holding no material backed off %s instead of the ordinary %s", got, ordinary)
+	if got := empty.backoffAfterFailure(now, ordinary); got != 10*time.Second {
+		t.Errorf("a node holding no material backed off %s instead of 10s", got)
 	}
 	// Past the end the interval is moot — reportFetchFailure is leaving — but it must still be finite.
 	past := &tenantTransportMaterialFetcher{expiry: now.Add(-time.Minute)}
@@ -84,5 +87,54 @@ func TestTheFailureLineNamesTheIntervalItActuallyChose(t *testing.T) {
 	}
 	if strings.Contains(joined, "backing off to 10m") {
 		t.Fatalf("the failure line still states the constant: %v", lines)
+	}
+}
+
+// Reproduce bootstrap's transient 503, followed by an empty deployment and then its first authority.
+// Both empty states must retry promptly; installing material resumes the normal refresh schedule.
+func TestBootstrapMaterialRecoversAfterUnavailableAndEmptyAnswers(t *testing.T) {
+	useEmptyTenantCertificateIndex(t)
+	authority := newTenantTransportAuthority(nil, nil, time.Now)
+	if _, err := authority.EnsureCA("tenant_bootstrap", "tenant_bootstrap.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	material, err := authority.IssueFor("tenant_bootstrap", "edge-a", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		switch calls {
+		case 1:
+			w.WriteHeader(http.StatusServiceUnavailable)
+		case 2:
+			json.NewEncoder(w).Encode(map[string]any{"materials": []tenantTransportMaterial{}, "generation": 1})
+		default:
+			json.NewEncoder(w).Encode(map[string]any{"materials": []tenantTransportMaterial{material}, "generation": 2})
+		}
+	}))
+	defer srv.Close()
+	f := &tenantTransportMaterialFetcher{endpoint: srv.URL, token: "test", client: srv.Client(), tenants: func() []string { return nil }, log: func(string, ...any) {}}
+	for attempt := 1; attempt <= 3; attempt++ {
+		expiry, err := f.FetchOnce()
+		if (attempt == 1) != (err != nil) {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+		if !expiry.IsZero() {
+			f.expiry = expiry
+		}
+		wait := f.nextFetchWait(time.Now(), err)
+		if attempt < 3 && wait != 10*time.Second {
+			t.Fatalf("empty attempt %d waits %s; recovery would be delayed", attempt, wait)
+		}
+		if attempt == 3 {
+			if expiry.IsZero() || f.installedTenants.Load() != 1 {
+				t.Fatal("first organization's material was not installed")
+			}
+			if wait != time.Minute {
+				t.Fatalf("installed material refresh waits %s", wait)
+			}
+		}
 	}
 }

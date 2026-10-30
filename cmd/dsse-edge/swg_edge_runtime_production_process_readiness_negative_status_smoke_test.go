@@ -24,16 +24,12 @@ const (
 func TestSWGEdgeSWGProductionProcessReadinessNegativeStatusSmoke(t *testing.T) {
 	postgresDSN := strings.TrimSpace(os.Getenv(sWGEdgeRuntimeProductionProcessReadinessNegativeStatusSmokeDSNEnv))
 	if postgresDSN == "" {
-		t.Skipf("%s is required for production-mode cmd/edge process readiness negative status smoke", sWGEdgeRuntimeProductionProcessReadinessNegativeStatusSmokeDSNEnv)
+		t.Skipf("%s is required for production-mode cmd/dsse-edge process readiness negative status smoke", sWGEdgeRuntimeProductionProcessReadinessNegativeStatusSmokeDSNEnv)
 	}
 
 	moduleRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
 		t.Fatalf("resolve module root: %v", err)
-	}
-	repoRoot, err := filepath.Abs(filepath.Join(moduleRoot, ".."))
-	if err != nil {
-		t.Fatalf("resolve repo root: %v", err)
 	}
 
 	workDir := t.TempDir()
@@ -41,19 +37,18 @@ func TestSWGEdgeSWGProductionProcessReadinessNegativeStatusSmoke(t *testing.T) {
 
 	binaryPath := filepath.Join(workDir, "edge-process-readiness-negative-status-smoke")
 	build := exec.Command("go", "build", "-o", binaryPath, ".")
-	build.Dir = filepath.Join(moduleRoot, "cmd", "edge")
+	build.Dir = filepath.Join(moduleRoot, "cmd", "dsse-edge")
 	build.Env = os.Environ()
 	build.Stdout = io.Discard
 	var buildErr bytes.Buffer
 	build.Stderr = &buildErr
 	if err := build.Run(); err != nil {
-		t.Fatalf("build cmd/edge failed: %v; stderr redacted=%s", err, m1600RedactedLine(buildErr.String()))
+		t.Fatalf("build cmd/dsse-edge failed: %v; stderr redacted=%s", err, m1600RedactedLine(buildErr.String()))
 	}
 
 	operatorConfigPath := filepath.Join(moduleRoot, "swghttprewrite", "testdata", "swg_tenant_restriction_operator_config.json")
 	common := m1601ProcessCaseInputs{
 		ModuleRoot:         moduleRoot,
-		RepoRoot:           repoRoot,
 		WorkDir:            workDir,
 		BinaryPath:         binaryPath,
 		PolicyPaths:        policyPaths,
@@ -96,7 +91,6 @@ func TestSWGEdgeSWGProductionProcessReadinessNegativeStatusSmoke(t *testing.T) {
 
 type m1601ProcessCaseInputs struct {
 	ModuleRoot         string
-	RepoRoot           string
 	WorkDir            string
 	BinaryPath         string
 	PolicyPaths        []string
@@ -139,7 +133,7 @@ func m1601RunProcessReadinessCase(t *testing.T, inputs m1601ProcessCaseInputs, r
 		"-listen", listen,
 		"-policy", strings.Join(inputs.PolicyPaths, ","),
 		"-bundle", inputs.BundlePath,
-		"-schema-dir", filepath.Join(inputs.RepoRoot, "schemas"),
+		"-schema-dir", filepath.Join(inputs.ModuleRoot, "schemas"),
 		"-migration-dir", filepath.Join(inputs.ModuleRoot, "migrations"),
 		"-log-dir", logDir,
 		"-lab-mode=false",
@@ -162,7 +156,7 @@ func m1601RunProcessReadinessCase(t *testing.T, inputs m1601ProcessCaseInputs, r
 	var processErr bytes.Buffer
 	cmd.Stderr = &processErr
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start cmd/edge process for %s: %v", readinessCase.Name, err)
+		t.Fatalf("start cmd/dsse-edge process for %s: %v", readinessCase.Name, err)
 	}
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"strings"
 
@@ -33,7 +32,7 @@ func setupEdgeConnectorRegistryStore(ctx context.Context, config edgeConnectorRe
 		if dsn == "" {
 			return nil, nil, fmt.Errorf("connector-registry-postgres-dsn is required")
 		}
-		db, err := sql.Open("postgres", dsn)
+		db, err := openPostgresBounded(dsn)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -56,6 +55,13 @@ func setupEdgeConnectorRegistryStore(ctx context.Context, config edgeConnectorRe
 				db.Close()
 				return nil, nil, fmt.Errorf("apply connector registry migrations: %w", err)
 			}
+		}
+		// A missing generation row would make catalog edits fail and make bundle reads report zero.
+		// Check it at startup even when an operator applies migrations separately.
+		var generation int64
+		if err := db.QueryRowContext(ctx, "SELECT generation FROM connector_registry_generation WHERE singleton = true").Scan(&generation); err != nil {
+			db.Close()
+			return nil, nil, fmt.Errorf("connector registry generation is unavailable (migration 060 required): %w", err)
 		}
 		return postgresConnectorRegistryStore{DB: db}, db.Close, nil
 	default:

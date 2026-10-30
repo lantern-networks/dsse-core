@@ -378,6 +378,7 @@ func (s TenantRestrictionStatusResponse) ForTenant(callerTenant string, keepAll 
 		return s
 	}
 	kept := make([]adminSWGTenantRestrictionRuleStatus, 0, len(s.Rules))
+	visibleRefs := make(map[string]bool)
 	active := 0
 	for _, rule := range s.Rules {
 		if !tenantRestrictionRuleVisible(rule.TenantID, callerTenant) {
@@ -387,8 +388,16 @@ func (s TenantRestrictionStatusResponse) ForTenant(callerTenant string, keepAll 
 			active++
 		}
 		kept = append(kept, rule)
+		visibleRefs[rule.HeaderValueRef] = true
+	}
+	refs := make([]string, 0, len(s.OperatorConfigRefs))
+	for _, ref := range s.OperatorConfigRefs {
+		if visibleRefs[ref] {
+			refs = append(refs, ref)
+		}
 	}
 	s.Rules = kept
+	s.OperatorConfigRefs = refs
 	s.RuleCount = len(kept)
 	s.ActiveRuleCount = active
 	s.TenantID = callerTenant
@@ -403,29 +412,35 @@ func (s TenantRestrictionStatusResponse) UpdateRefusal(req TenantRestrictionUpda
 		return ""
 	}
 	for saasID := range req.SaaSEnablement {
+		matched := false
 		for _, rule := range s.Rules {
 			if !strings.EqualFold(strings.TrimSpace(rule.SaaSApplicationID), strings.TrimSpace(saasID)) {
 				continue
 			}
-			if !tenantRestrictionRuleVisible(rule.TenantID, callerTenant) {
+			matched = true
+			if !tenantRestrictionRuleOwned(rule.TenantID, callerTenant) {
 				return saasID
 			}
 		}
+		if !matched {
+			return saasID
+		}
 	}
-	// A header value ref is configuration shared by whatever rules cite it. A caller who owns none of the
-	// citing rules must not be able to replace the value every one of them injects.
+	// A shared value affects every rule citing it. Tenant administrators may
+	// change it only when all citing rules belong exclusively to their tenant.
+	// Globally applicable rules remain visible but are operator-owned.
 	for ref := range req.HeaderValueUpdates {
-		owned, cited := false, false
+		cited := false
 		for _, rule := range s.Rules {
 			if !strings.EqualFold(strings.TrimSpace(rule.HeaderValueRef), strings.TrimSpace(ref)) {
 				continue
 			}
 			cited = true
-			if tenantRestrictionRuleVisible(rule.TenantID, callerTenant) {
-				owned = true
+			if !tenantRestrictionRuleOwned(rule.TenantID, callerTenant) {
+				return ref
 			}
 		}
-		if cited && !owned {
+		if !cited {
 			return ref
 		}
 	}
@@ -434,7 +449,12 @@ func (s TenantRestrictionStatusResponse) UpdateRefusal(req TenantRestrictionUpda
 
 func tenantRestrictionRuleVisible(ruleTenant, callerTenant string) bool {
 	owner := strings.TrimSpace(ruleTenant)
-	return owner == "" || strings.EqualFold(owner, strings.TrimSpace(callerTenant))
+	return owner == "" || owner == strings.TrimSpace(callerTenant)
+}
+
+func tenantRestrictionRuleOwned(ruleTenant, callerTenant string) bool {
+	owner := strings.TrimSpace(ruleTenant)
+	return owner != "" && owner == strings.TrimSpace(callerTenant)
 }
 
 // WithManagedProviders fills the built-in catalog for a new organization while

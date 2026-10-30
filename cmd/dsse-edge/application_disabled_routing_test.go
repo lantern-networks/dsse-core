@@ -33,7 +33,10 @@ func TestDisabledApplicationCannotSelectConnector(t *testing.T) {
 			}
 		}
 		base := map[string]edgeplane.ApplicationRouteProfile{"wiki": {Destination: "startup.example.test"}, "unrelated": {Destination: "other.example.test"}}
-		routes := edgeplane.RouteProfilesWithPublishedCatalog(base, catalog, tenant)
+		routes, err := edgeplane.RouteProfilesWithPublishedCatalog(ctx, base, catalog, tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
 		_, found := routes["wiki"]
 		if found != (status == "active") {
 			t.Errorf("status=%s effective route present=%v", status, found)

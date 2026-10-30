@@ -23,9 +23,23 @@ func TestCarriedMachineCanReapplyPlanWithoutIssuingAuthority(t *testing.T) {
 			if _, err := os.Stat(filepath.Join(dir, authorityDirName, storeCAKeyFile)); !os.IsNotExist(err) {
 				t.Fatal("signing authority must not travel")
 			}
+			if _, err := os.Stat(filepath.Join(dir, authorityDirName, databaseCAKeyFile)); !os.IsNotExist(err) {
+				t.Fatal("database CA private key travelled")
+			}
 			before := map[string][]byte{}
-			for _, file := range []string{storeMemberFile, storeMemberKeyFile, "deployment.env"} {
-				before[file], _ = os.ReadFile(filepath.Join(dir, file))
+			for _, file := range []string{storeMemberFile, storeMemberKeyFile, storeClientFile, storeClientKeyFile, databaseServerFile, databaseServerKeyFile, "deployment.env"} {
+				b, err := os.ReadFile(filepath.Join(dir, file))
+				runtimeMaterial := file == storeClientFile || file == storeClientKeyFile || file == databaseServerFile || file == databaseServerKeyFile
+				if name == "edge-b" && (runtimeMaterial || file == storeMemberFile || file == storeMemberKeyFile) {
+					if !os.IsNotExist(err) {
+						t.Fatal("Edge-only carry received runtime transport material: " + file)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				before[file] = b
 			}
 			for i := 0; i < 2; i++ {
 				if err := applyPlanToThisMachine(plan, dir, name); err != nil {
@@ -118,4 +132,29 @@ func beforeFile(t *testing.T, dir, name string) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestCarriedStateNodeRejectsDamagedTransportBeforeChangingEnvironment(t *testing.T) {
+	work := t.TempDir()
+	source := filepath.Join(work, "source")
+	plan := installFromPlan(t, writePlan(t, work), source)
+	archive := filepath.Join(work, "node.tar.gz")
+	if err := carryPlanMachine(plan, source, archive, "cp-b"); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{storeClientKeyFile, databaseServerKeyFile, databaseCAFile} {
+		t.Run(file, func(t *testing.T) {
+			dir := unpackCarry(t, archive)
+			before := beforeFile(t, dir, "deployment.env")
+			if err := os.Remove(filepath.Join(dir, file)); err != nil {
+				t.Fatal(err)
+			}
+			if err := applyPlanToThisMachine(plan, dir, "cp-b"); err == nil {
+				t.Fatal("damaged runtime transport accepted without issuer")
+			}
+			if !bytes.Equal(before, beforeFile(t, dir, "deployment.env")) {
+				t.Fatal("environment changed before transport rejection")
+			}
+		})
+	}
 }

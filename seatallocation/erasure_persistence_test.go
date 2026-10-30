@@ -20,8 +20,8 @@ func TestErasureRequiresConfirmedStorage(t *testing.T) {
 				}
 			}
 			before, gen := s.List(), s.Generation()
-			if s.CountForTenant("CUSTOMER") != 1 {
-				t.Fatal("mixed-case tenant footprint missing")
+			if s.CountForTenant("Customer") != 1 {
+				t.Fatal("exact tenant footprint missing")
 			}
 			var p *allocationFaultStore
 			switch kind {
@@ -44,7 +44,7 @@ func TestErasureRequiresConfirmedStorage(t *testing.T) {
 					s.SetPersister(&allocationSavedWarning{*p})
 				}
 			}
-			n, err := s.RemoveTenant(" CUSTOMER ")
+			n, err := s.RemoveTenant(" Customer ")
 			if kind != "confirmed-nonatomic" {
 				if n != 0 || !errors.Is(err, ErrPersistence) || !reflect.DeepEqual(s.List(), before) || s.Generation() != gen {
 					t.Fatalf("unconfirmed erasure accepted: %d %v", n, err)
@@ -59,13 +59,13 @@ func TestErasureRequiresConfirmedStorage(t *testing.T) {
 				} else {
 					s.persister = p
 				}
-				if n, err := s.RemoveTenant("customer"); n != 1 || err != nil {
+				if n, err := s.RemoveTenant("Customer"); n != 1 || err != nil {
 					t.Fatalf("retry: %d %v", n, err)
 				}
 			} else if n != 1 || err != nil {
 				t.Fatalf("confirmed save refused %d %v", n, err)
 			}
-			if s.Generation() != gen+1 || s.CountForTenant("customer") != 0 || s.SeatsFor("other") != 5 {
+			if s.Generation() != gen+1 || s.CountForTenant("Customer") != 0 || s.SeatsFor("other") != 5 {
 				t.Fatal("erasure state wrong")
 			}
 			reload := NewStore()
@@ -73,7 +73,7 @@ func TestErasureRequiresConfirmedStorage(t *testing.T) {
 			if !reflect.DeepEqual(reload.List(), s.List()) {
 				t.Fatal("erasure not durable")
 			}
-			if n, err := s.RemoveTenant("customer"); n != 0 || err != nil || s.Generation() != gen+1 {
+			if n, err := s.RemoveTenant("Customer"); n != 0 || err != nil || s.Generation() != gen+1 {
 				t.Fatal("absent erasure changed generation")
 			}
 		})

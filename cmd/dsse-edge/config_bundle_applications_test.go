@@ -69,7 +69,11 @@ func TestApplicationBundleSignedFleetPublicationAndDeletion(t *testing.T) {
 		if err != nil || !ok || entry.Destination != destination {
 			t.Fatalf("tenant route missing: %s %+v %v", tenant, entry, err)
 		}
-		profile := edgeplane.RouteProfilesWithPublishedCatalog(nil, edge, tenant)["same-app"]
+		profiles, err := edgeplane.RouteProfilesWithPublishedCatalog(context.Background(), nil, edge, tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		profile := profiles["same-app"]
 		if profile.Destination != destination || profile.DestinationPort != 18081 {
 			t.Fatalf("data plane still uses fallback: %+v", profile)
 		}
@@ -105,12 +109,8 @@ func TestApplicationBundleSignedFleetPublicationAndDeletion(t *testing.T) {
 		}
 	}
 	source.token, source.tenantID = "token-customer", "customer"
-	scoped, err := source.fetch(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if scoped.Applications == nil || scoped.Applications.Complete || len(scoped.Applications.Entries) != 1 || scoped.Applications.Entries["customer"] == nil {
-		t.Fatalf("tenant received fleet authority: %+v", scoped.Applications)
+	if _, err := source.fetch(context.Background()); err == nil {
+		t.Fatal("customer downloaded machine-only fleet snapshot")
 	}
 }
 

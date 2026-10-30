@@ -38,7 +38,7 @@ type EastWestResolver interface {
 func CompileEastWest(tenant string, rules []Rule, resolver EastWestResolver) []decision.EastWestRule {
 	out := make([]decision.EastWestRule, 0, len(rules))
 	for _, r := range rules {
-		if r.Plane != PlaneEastWest || r.Status != StatusActive || r.Direction != DirectionOutbound {
+		if (r.TenantID != "" && r.TenantID != tenant) || r.Plane != PlaneEastWest || r.Status != StatusActive || r.Direction != DirectionOutbound {
 			continue
 		}
 		// Source: explicit Any => wildcard (no device selector); otherwise the authored devices, with a
@@ -73,14 +73,18 @@ func CompileEastWest(tenant string, rules []Rule, resolver EastWestResolver) []d
 			RequiredIdPID: r.Action.RequiredIdPID,
 			MinACR:        r.Action.MinACR,
 			RequiredAMR:   append([]string(nil), r.Action.RequiredAMR...),
-			MaxAgeSeconds: r.Action.MaxAgeSeconds,
 			// "Sensitivity decides the mechanism": carry the machine/non-interactive opt-in so a device-attested
 			// (verified mTLS + trusted posture) flow can release a low-sensitivity hop without a human ceremony.
-			DeviceAttestedAuto: r.Action.DeviceAttestedAuto,
+			DeviceAttestedAuto:          r.Action.DeviceAttestedAuto,
+			RequiredWorkloadAttestation: r.Action.RequireWorkloadAttestation,
 			// Risk gate, expanded to "threshold or higher" — the SAME helper the egress compiler uses
 			// (compile_egress.go), so both planes read one authored RiskAtLeast identically. Previously dropped
 			// here, which silently turned an authored risk-gated east-west rule into an ungated one.
 			RiskSeverities: RiskSeveritiesAtLeast(r.RiskAtLeast),
+		}
+		if r.Action.MaxAgeSeconds != nil {
+			ew.MaxAgeSeconds = *r.Action.MaxAgeSeconds
+			ew.MaxAgeSecondsSet = true
 		}
 		if r.ServiceID != "" {
 			// Readers predating transport/port conditions must not decode this as

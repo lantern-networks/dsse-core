@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -200,6 +201,19 @@ func verifyOIDCIDToken(ctx context.Context, client *http.Client, config oidcConf
 	if !audienceContains(raw["aud"], config.ClientID) {
 		return oidcValidatedClaims{}, fmt.Errorf("OIDC audience mismatch")
 	}
+	// The registered client is the only audience this RP currently trusts. Core
+	// requires rejecting additional untrusted audiences; when azp is supplied,
+	// check the authorized party even for a single-audience token.
+	if audiences, ok := raw["aud"].([]any); ok {
+		for _, additional := range audiences {
+			if additional != config.ClientID {
+				return oidcValidatedClaims{}, fmt.Errorf("OIDC untrusted additional audience")
+			}
+		}
+	}
+	if party, present := raw["azp"]; present && party != config.ClientID {
+		return oidcValidatedClaims{}, fmt.Errorf("OIDC authorized party mismatch")
+	}
 	exp, ok := int64Claim(raw, "exp")
 	if !ok {
 		return oidcValidatedClaims{}, fmt.Errorf("OIDC exp claim is required")
@@ -367,10 +381,11 @@ func rsaPublicKeyFromJWK(key jwkKey) (*rsa.PublicKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode JWK exponent: %w", err)
 	}
-	exponent := int(new(big.Int).SetBytes(eBytes).Int64())
-	if exponent == 0 {
+	exponentValue := new(big.Int).SetBytes(eBytes)
+	if exponentValue.Cmp(big.NewInt(3)) < 0 || exponentValue.Cmp(big.NewInt(math.MaxInt32)) > 0 || exponentValue.Bit(0) == 0 {
 		return nil, fmt.Errorf("JWK exponent is invalid")
 	}
+	exponent := int(exponentValue.Int64())
 	return &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: exponent}, nil
 }
 

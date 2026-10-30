@@ -62,17 +62,13 @@ func doProvision(be configstore.Backend, configPath, tokenPath, pinFilePath, pin
 	if err != nil {
 		return fmt.Errorf("read profile %q: %w", configPath, err)
 	}
-	prof, err := configstore.Apply(be, env, pin, "path", time.Now().UTC().Format(time.RFC3339))
+	prof, plan, err := verifyPlanAndApplyProvision(be, env, pin, token, time.Now().UTC().Format(time.RFC3339))
 	if err != nil {
-		return fmt.Errorf("apply profile: %w", err)
+		return err
 	}
 	fmt.Printf("profileapply: applied version=%d tenant=%q posture=%q transport=%q\n",
 		prof.Version, prof.TenantID, prof.Posture, prof.TransportURL)
 
-	plan, err := planProvision(prof, token)
-	if err != nil {
-		return fmt.Errorf("provision: %w", err)
-	}
 	for _, n := range plan.Notes {
 		fmt.Println("profileapply: " + n)
 	}
@@ -92,11 +88,9 @@ func doProvision(be configstore.Backend, configPath, tokenPath, pinFilePath, pin
 	// ★★★ AND THE ORGANIZATION'S TRANSPORT ANCHOR IS TRUSTED BY THIS MACHINE, NOT JUST BY THE AGENT
 	// (2026-09-03, the operator's decision).
 	//
-	// The step-up portal is served by the Edge on the organization's own transport certificate, and the
-	// branded step-up window is a WebView2 that has no interstitial to click through. Until now the window
-	// answered that by setting --ignore-certificate-errors unconditionally — on the one surface where a user
-	// types their password and second factor — which also made the operator's decision that the portal's
-	// certificate is theirs to provide worth nothing, because nothing checked it.
+	// The step-up portal is served by the Edge on the organization's own transport certificate. The
+	// originating user's default browser must validate it before following the IdP redirect. An older
+	// embedded window used an insecure certificate bypass; that helper is retired and not packaged.
 	//
 	// So the organization's OWN transport anchor is laid into the machine store — the narrowest authority the
 	// profile carries, never a provider root that also vouches for other organizations. See

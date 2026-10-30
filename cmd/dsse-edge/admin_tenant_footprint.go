@@ -347,6 +347,10 @@ type adminTenantExtraStores struct {
 		CountTenantRestrictions(string) int
 		RemoveTenantRestrictionsContext(context.Context, string) (int, error)
 	}
+	UpstreamTLS interface {
+		CountUpstreamTLSSettings(string) int
+		RemoveUpstreamTLSSettingsContext(context.Context, string) (int, error)
+	}
 	TenantTrustDistributions *tenantTrustDistributor
 	DelegatedGrants          *delegatedgrant.Store
 	HumanApprovals           *humanapproval.Store
@@ -464,6 +468,11 @@ func (e adminTenantExtraStores) count(f *adminTenantFootprint) {
 	} else {
 		add("saas_tenant_restrictions", false, 0, "no managed SaaS configuration on this node")
 	}
+	if e.UpstreamTLS != nil {
+		add("upstream_tls_settings", true, e.UpstreamTLS.CountUpstreamTLSSettings(f.TenantID), "")
+	} else {
+		add("upstream_tls_settings", false, 0, "no upstream TLS settings on this node")
+	}
 	add("seat_allocation", e.SeatAllocations != nil, e.SeatAllocations.CountForTenant(f.TenantID), "no seat allocation store on this node")
 	if e.PolicyCandidates == nil {
 		add("policy_candidates", false, 0, "no policy candidate store on this node")
@@ -548,6 +557,9 @@ func (e adminTenantExtraStores) eraseContext(ctx context.Context, result *adminT
 		} else {
 			add("saas_tenant_restrictions", n)
 		}
+	}
+	if e.UpstreamTLS != nil {
+		eraseChecked("upstream_tls_settings", func(id string) (int, error) { return e.UpstreamTLS.RemoveUpstreamTLSSettingsContext(ctx, id) })
 	}
 	if e.DelegatedGrants != nil {
 		eraseChecked("delegated_access_grants", func(tenant string) (int, error) { return e.DelegatedGrants.RemoveTenantContext(ctx, tenant) })

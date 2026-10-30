@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -106,12 +107,18 @@ func (s *ClickHouseStore) execWithSettings(ctx context.Context, sql string, para
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return nil, err
+		// The transport error repeats the request URL, which carries the bound
+		// query parameters. Keep only the host and the underlying cause.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			err = urlErr.Err
+		}
+		return nil, unavailable("clickhouse "+u.Host, err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read clickhouse response: %w", err)
+		return nil, unavailable("clickhouse "+u.Host+" response", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &ClickHouseHTTPError{StatusCode: resp.StatusCode, Message: strings.TrimSpace(string(body))}

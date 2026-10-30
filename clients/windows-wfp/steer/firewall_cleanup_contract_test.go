@@ -21,6 +21,12 @@ func TestFirewallCleanupUsesExactOwnedSelectorAndReadback(t *testing.T) {
 			!strings.Contains(script, "$remaining.Count -ne 0") {
 			t.Fatalf("cleanup must select only owned rules and verify absence after deletion: %s", script)
 		}
+		// Listing costs time per rule on the machine: the readback belongs to the
+		// deletion branch, so an absent rule is listed once, not twice.
+		branch := strings.Index(script, "if ($matching.Count -gt 0) {")
+		if branch < 0 || strings.Index(script, "$remaining") < branch || !strings.Contains(script, "throw 'DSSE firewall cleanup could not verify absence' }\n}") {
+			t.Fatalf("absence readback must run only after a deletion: %s", script)
+		}
 	}
 	if _, err := firewallCleanupScript("Name; Remove-Item C:\\", "anything"); err == nil {
 		t.Fatal("unexpected selector must be rejected")

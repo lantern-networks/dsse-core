@@ -120,7 +120,7 @@ func adminLogSearch(store hotstore.Store, tenantID, stream string, query url.Val
 
 func adminLogSearchWithLimitBounds(store hotstore.Store, tenantID, stream string, query url.Values, defaultLimit, maxLimit int) (adminLogSearchResult, error) {
 	if store == nil {
-		return adminLogSearchResult{}, fmt.Errorf("hot store is not configured")
+		return adminLogSearchResult{}, errHotStoreNotConfigured
 	}
 	searchQuery, err := adminLogSearchQuery(tenantID, stream, query, defaultLimit, maxLimit)
 	if err != nil {
@@ -151,7 +151,7 @@ func adminLogSearchQuery(tenantID, stream string, query url.Values, defaultLimit
 	}
 	from, to, err := adminLogTimeRange(query)
 	if err != nil {
-		return hotstore.SearchQuery{}, err
+		return hotstore.SearchQuery{}, adminLogQueryInputError{err: err}
 	}
 	return hotstore.SearchQuery{
 		TenantID: tenantID,

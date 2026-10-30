@@ -519,15 +519,21 @@ func handleSWGHTTPEgress(w http.ResponseWriter, r *http.Request, config edgeSWGH
 	// authority only this organization knows. Widening happens per flow because the organization is per flow —
 	// see the_edge_is_a_client_to_the_private_asset.go. Public destinations are untouched.
 	upstreamClient := swgHTTPEgressProxyClient(config.ProxyClient, swgHTTPEgressNetworkExtensionRuntimeUsed(r))
-	if flowTenant := edgeplane.FlowTenantFromContext(rewritten.Context()); flowTenant != "" {
+	flowTenant := edgeplane.FlowTenantFromContext(rewritten.Context())
+	upstreamTLSMode := upstreamTLSModeForTenant(config.PolicyStore, flowTenant)
+	if flowTenant != "" {
 		upstreamClient.Transport = upstreamTransportTrustingTheOrganizationsPrivateAssets(
 			upstreamClient.Transport, config.InternalCAs, flowTenant, time.Now().UTC())
 	}
 	if rewritten.URL.Scheme == "https" {
+		upstreamClient.Transport = upstreamTransportForTenantTLSMode(upstreamClient.Transport, flowTenant, upstreamTLSMode)
 		upstreamClient.Transport = upstreamtrust.ForHost(upstreamClient.Transport, rewritten.URL.Hostname())
 		upstreamClient.Transport = outboundtls.WrapRoundTripper(upstreamClient.Transport)
 	}
 	resp, err := upstreamClient.Do(rewritten)
+	if err == nil {
+		logUpstreamTLSCompatibilityUse(flowTenant, rewritten.URL.Hostname(), upstreamTLSMode, resp)
+	}
 	// A successful response may precede a legitimate duplex upload's end.
 	// Only errors close now; success closes at handler exit. Guard refusal
 	// state is atomic so this check never waits behind a source Read.

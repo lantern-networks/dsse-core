@@ -36,6 +36,27 @@ Sampling was generally every five seconds. These are measured cases, not a unive
 trial took about seven seconds to observe all six Edges refusing the old grant; an API
 acknowledgment is not proof of simultaneous application everywhere.
 
+## Known issue: the audit hot store is not replicated between control planes
+
+Each control plane runs its own ClickHouse hot store, and the stores do not
+replicate to each other. Audit records are written to the ClickHouse of the
+control plane that holds leadership when they are ingested. Log search, export
+and manual hot-log deletion read only the current leader's ClickHouse.
+
+As a result, after leadership moves to another control plane:
+
+- Search and export do not return records that were written while the previous
+  leader held leadership. Those records remain on the previous leader's disk.
+- A manual deletion preview does not count those records, and a completed
+  deletion job does not remove them. A completed job is not proof that no copy
+  of the selected records remains.
+- If that control plane's disk is lost, the records written while it was leader
+  are lost. Without an external S3 archive, the hot store holds the only copy.
+
+Leadership changes when the leader control plane stops, restarts or loses its
+database lock, so this applies after maintenance as well as after failures.
+A later release will replicate the hot store across control planes.
+
 ## Required before publication
 
 | Gate | Required evidence |

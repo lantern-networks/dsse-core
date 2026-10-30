@@ -58,6 +58,45 @@ components:
       schema:
         type: string
   schemas:
+    UpstreamTLSSettings:
+      type: object
+      additionalProperties: false
+      required: [tenant_id, scope, mode, configurable]
+      properties:
+        tenant_id:
+          type: string
+          minLength: 1
+          description: The authenticated or explicitly selected organization to which this answer applies.
+        scope:
+          type: string
+          enum: [tenant]
+        mode:
+          $ref: "#/components/schemas/UpstreamTLSMode"
+        configurable:
+          type: boolean
+          description: >
+            Whether this caller and node can author the setting. Requires tenant policy-write authorization,
+            durable author storage and an authoritative control plane; config-sourced Edges and standby
+            control planes return false. A true value does not guarantee a later write will succeed.
+    UpstreamTLSMode:
+      type: string
+      enum: [browser_compatible, strict]
+      default: browser_compatible
+      description: >
+        browser_compatible (the default for an organization that has not chosen a mode) offers the TLS 1.2
+        cipher suites Chrome offers: the Go defaults plus static-RSA AES-128-GCM, AES-256-GCM,
+        AES-128-CBC-SHA and AES-256-CBC-SHA, when the upstream transport uses the default cipher policy.
+        strict offers only the Go defaults (ECDHE key exchange for TLS 1.2). TLS 1.3 and
+        certificate/hostname verification are retained in both. Static RSA lacks forward secrecy.
+        Explicit custom cipher policies and custom TLS engines remain authoritative. This is an upstream
+        TLS option, not a traffic or inspection bypass.
+    UpstreamTLSUpdate:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          $ref: "#/components/schemas/UpstreamTLSMode"
     AccessDecisionDetail:
       type: object
       required:
@@ -14253,6 +14292,89 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+  /admin/upstream-tls:
+    parameters:
+      - $ref: "#/components/parameters/OperateTenantHeader"
+    get:
+      summary: Read the selected organization's upstream TLS compatibility setting.
+      description: >
+        Requires admin.policy.read and an authenticated tenant context. An operator must select an
+        organization with X-Operate-Tenant; this endpoint does not return deployment-wide settings.
+        Unauthorized cross-tenant selectors are rejected. An unset mode is returned as browser_compatible, the default.
+        Shared author state is refreshed before answering; an unavailable authority returns 503.
+        The response identifies the answered tenant and whether this caller and node may configure it.
+        Reading the control-plane value does not establish that every Edge has already received it.
+      tags:
+        - AdminPolicy
+      responses:
+        "200":
+          description: Current tenant upstream TLS setting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamTLSSettings"
+        "400":
+          description: An operator has not selected an organization, or no tenant context is available.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Policy-read permission, API-token scope or tenant authorization is missing, or a query tenant_id conflicts with the authenticated tenant.
+        "500":
+          description: The administrative authentication store is unavailable.
+        "503":
+          description: Shared configuration or organization access authorization is unavailable; the setting was not read as fresh.
+    post:
+      summary: Set the selected organization's upstream TLS compatibility mode.
+      description: >
+        Requires admin.policy.write and any applicable API-token scope, tenant delegation and operator
+        elevation. Session-authenticated requests also require the existing X-CSRF-Token header.
+        The tenant comes from authenticated request context, with X-Operate-Tenant available only to an
+        authorized operator; tenant_id is not an accepted body field. The body must contain exactly one
+        JSON object naming a known, nonempty mode. Unknown fields and trailing JSON are rejected.
+        Config-sourced Edges reject local edits, and a standby control plane or unavailable write quorum
+        refuses the mutation. The shared durable save uses the accepted control-plane write lease before
+        publishing the local setting and advancing the configuration generation. The existing signed
+        bundle distributes this tenant's mode to Edges. A successful response is the saved setting, not
+        confirmation that every Edge has applied it. Storage failures return 503; reload after an
+        unconfirmed response before retrying, because an uncertain local durability result may already
+        be visible. A dedicated admin_upstream_tls_updated audit records the tenant, requested mode and
+        save outcome in addition to the common mutation audit. Changing modes selects that mode's separate
+        upstream connection pool for subsequent traffic; it does not retry HTTP requests or terminate active flows.
+        TLS verification, authentication, authorization and inspection remain enabled.
+      tags:
+        - AdminPolicy
+      parameters:
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          description: Required when authenticating with the admin_session cookie; not required for bearer-token authentication.
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpstreamTLSUpdate"
+      responses:
+        "200":
+          description: Saved tenant upstream TLS setting; Edge convergence is asynchronous.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamTLSSettings"
+        "400":
+          description: Missing tenant selection, unknown or empty mode, malformed body, unknown fields, or trailing JSON.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Policy-write permission, API-token scope, CSRF token, delegation, elevation or tenant authorization is missing, or the query names another tenant.
+        "409":
+          description: This node pulls its configuration from an authority, or its policy store does not support upstream TLS authoring.
+        "500":
+          description: The administrative authentication store is unavailable.
+        "503":
+          description: This control plane is a standby, quorum or organization authorization is unavailable, durable author storage is not configured, or the save was not confirmed. Reload before retrying an uncertain write.
   /admin/inspection-posture:
     get:
       summary: Show the default inspection posture (mode + decrypt allowlist + known-bypass).
@@ -14900,6 +15022,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: The search failed for a reason other than the request or the log store. The response carries only `log search failed`; the detail is in the server log.
+        "502":
+          description: The log store answered with an error. The response carries only `log store request failed`; the store's message is in the server log.
+        "503":
+          description: The log store could not be reached, or no log store is configured. The response does not include the store's address or the search terms.
   /admin/logs/{stream}/export:
     get:
       summary: Preview an authorized log stream as bounded NDJSON.
@@ -15065,6 +15193,12 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          description: The search failed for a reason other than the request or the log store. The response carries only `log search failed`; the detail is in the server log.
+        "502":
+          description: The log store answered with an error. The response carries only `log store request failed`; the store's message is in the server log.
+        "503":
+          description: The log store could not be reached, or no log store is configured. The response does not include the store's address or the search terms.
   /admin/audit-writer/health:
     get:
       summary: Report observed primary audit-file write failures.
@@ -15124,7 +15258,7 @@ paths:
   /admin/hot-store/health:
     get:
       summary: Return Edge Hot Store mirror health.
-      description: Requires admin.logs.read. For PostgreSQL hot-store mirror mode, this endpoint reports best-effort mirror successes and latest failure state. In JSONL mode the status is unconfigured.
+      description: Requires admin.logs.read. For PostgreSQL hot-store mirror mode, this endpoint reports best-effort mirror successes and latest failure state. In JSONL mode the status is unconfigured. The hot store is shared by every organization, so its counters and last error are returned only to deployment-wide administration; an organization's administrator, or an operator who has entered an organization, receives only `status`.
       tags:
         - AdminLog
       responses:

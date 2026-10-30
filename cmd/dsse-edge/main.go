@@ -1431,7 +1431,11 @@ func main() {
 	if handleVersionFlag() {
 		return
 	}
+	secretEnv := secretEnvFlag()
 	flag.Parse()
+	if err := applySecretEnv(flag.CommandLine, *secretEnv, os.LookupEnv, os.Unsetenv); err != nil {
+		log.Fatalf("%v", err)
+	}
 	dlpRetentionBudget, dlpRetentionErr := dlp.ConfigureProcessRetention(*dlpRetentionPerStream, *dlpRetentionProcess)
 	if dlpRetentionErr != nil {
 		log.Fatalf("DLP retention configuration: %v", dlpRetentionErr)
@@ -2307,6 +2311,21 @@ func main() {
 		}
 		if path := networkExtensionLabTLS.ActiveAnchorExportPath(); path != "" {
 			log.Printf("interception: active public anchor export=%q; distribute this certificate or the tenant install bundle", path)
+		}
+	}
+	// The generated deployment shares one root across its transport and interception
+	// issuing CAs. Pass the explicit trust bundle, not the interception CA itself,
+	// to bind leaf CRL locations to that deployment and the immediate signer.
+	if networkExtensionLabTLS != nil {
+		var deploymentRoots []byte
+		if path := strings.TrimSpace(*trustBundleCA); path != "" {
+			deploymentRoots, err = os.ReadFile(path)
+			if err != nil {
+				log.Fatalf("read deployment CRL trust anchors: %v", err)
+			}
+		}
+		if err := networkExtensionLabTLS.ConfigureDeploymentInterceptionCRL(deploymentRoots); err != nil {
+			log.Fatalf("configure deployment interception leaf CRL: %v", err)
 		}
 	}
 	// The agent configuration now carries the organization's own trusted authorities, so a device's trust is
@@ -6511,6 +6530,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 	registerSteerAgentUpdatePlanRoutes(mux, config, agentUpdatePlanTenant{id: evaluator.PolicyBundle.TenantID})
 	registerVLANRoutes(mux, adminEndpoint, vlanBoundary, configSourceURL)
 	registerSWGTenantRestrictionRoutes(mux, adminEndpoint, evaluator, writer, policyStore, swgRuntime, config.CPVersions, configSourceURL, adminAuditOutbox)
+	registerUpstreamTLSRoutes(mux, adminEndpoint, config, policyStore)
 	registerRiskServerInitiatedRoutes(mux, adminEndpoint, config, evaluator, writer, policyStore, deviceStore, configSourceURL)
 	registerLogsRetentionRoutes(mux, adminEndpoint, adminHotStore, decisionStore, config.ColdArchive, config.LegalHold, config.RetentionOverride, config.ArchiveHealth)
 	registerManualHotLogDeleteRoutes(mux, adminEndpoint, config.ManualHotLogDelete, evaluator, writer, config.AdminAuditOutbox)
@@ -6916,6 +6936,7 @@ func newServerWithConfig(config serverConfig) http.Handler {
 			AssetCatalog:       assetStore,
 			DLP:                config.DLPDistribution,
 			TenantRestrictions: managedTenantRestrictionStoreOrNil(policyStore),
+			UpstreamTLS:        managedTenantRestrictionStoreOrNil(policyStore),
 			DelegatedGrants:    config.DelegatedGrants,
 			HumanApprovals:     config.HumanApprovals,
 			ClientlessGrants:   clientlessGrants,
@@ -10591,6 +10612,7 @@ func writeError(w http.ResponseWriter, status int, err error) {
 		status = http.StatusServiceUnavailable
 		w.Header().Set("Retry-After", "1")
 	}
+	status, err = publicHotStoreError(status, err)
 	writeJSON(w, status, map[string]string{"error": err.Error()})
 }
 

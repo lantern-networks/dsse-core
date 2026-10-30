@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -79,6 +81,7 @@ func TestSharedFleetVerifierMeasuresEveryEntranceOriginAndRefusesBadTLS(t *testi
 func TestThreeRegionVerifierChecksOwnPortalAndRejectsForeignOrigins(t *testing.T) {
 	plan := threeRegionsMultiEdgePlan()
 	roots := x509.NewCertPool()
+	var approvedCAs []byte
 	addresses := map[string]string{}
 	var handshakes atomic.Int64
 	for _, region := range plan.Regions {
@@ -87,6 +90,7 @@ func TestThreeRegionVerifierChecksOwnPortalAndRejectsForeignOrigins(t *testing.T
 		if err != nil || !roots.AppendCertsFromPEM(ca) {
 			t.Fatal("regional certificate fixture:", err)
 		}
+		approvedCAs = append(approvedCAs, ca...)
 		server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 		server.Config.ErrorLog = log.New(io.Discard, "", 0)
 		server.TLS = &tls.Config{Certificates: []tls.Certificate{pair}, GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -108,8 +112,31 @@ func TestThreeRegionVerifierChecksOwnPortalAndRejectsForeignOrigins(t *testing.T
 		return (&net.Dialer{}).DialContext(ctx, network, target)
 	}
 	env := map[string]string{"DSSE_STEPUP_PORTAL_ORIGINS": "https://portal.region-a.dsse.example,https://portal.region-b.dsse.example,https://portal.region-c.dsse.example"}
+	// A dedicated CP has no clientless TLS pair or installed Portal trust.
+	// Explicit public verification trust must work without putting Edge keys
+	// there, while system trust alone must continue to reject our private CA.
+	cpDir := t.TempDir()
+	caPath := filepath.Join(t.TempDir(), "approved-browser-ca.pem")
+	if err := os.WriteFile(caPath, approvedCAs, 0600); err != nil {
+		t.Fatal(err)
+	}
+	systemOnly, err := portalVerificationRoots(cpDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := verifySharedFleetPortalTLS(plan, env, systemOnly, dial); result.ok {
+		t.Fatal("CP system trust unexpectedly accepted the unapproved private Portal CA")
+	}
+	roots, err = portalVerificationRoots(cpDir, caPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handshakes.Store(0)
 	if result := verifySharedFleetPortalTLS(plan, env, roots, dial); !result.ok || result.skipped || !strings.Contains(result.note, "3 serving entrance/Portal pairs and refusal on 6 foreign-Region pairs") || handshakes.Load() != 9 {
 		t.Fatalf("did not verify local TLS and foreign refusal: %+v handshakes=%d", result, handshakes.Load())
+	}
+	if _, err := os.Stat(filepath.Join(cpDir, "clientless")); !os.IsNotExist(err) {
+		t.Fatal("read-only Portal verification persisted trust or a browser TLS pair")
 	}
 	all := []string{plan.regionPortalName("region-a"), plan.regionPortalName("region-b"), plan.regionPortalName("region-c")}
 	cert, key, ca := installerPortalPair(t, all, false)
@@ -130,6 +157,23 @@ func TestThreeRegionVerifierChecksOwnPortalAndRejectsForeignOrigins(t *testing.T
 	delete(addresses, net.JoinHostPort(plan.Regions[1].controlPlane().reachableAt(), "443"))
 	if result := verifySharedFleetPortalTLS(plan, env, roots, dial); result.ok || result.skipped {
 		t.Fatal("missing Region entrance was accepted")
+	}
+}
+
+func TestExplicitPortalVerificationTrustFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "approved-ca.pem")
+	if _, err := portalVerificationRoots(dir, path); err == nil {
+		t.Fatal("missing explicitly approved CA was ignored")
+	}
+	cert, _, _ := installerPortalPair(t, []string{"portal.example.test"}, false)
+	for _, body := range [][]byte{nil, []byte("not PEM"), cert} {
+		if err := os.WriteFile(path, body, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := portalVerificationRoots(dir, path); err == nil {
+			t.Fatal("empty, malformed or non-CA verifier trust was accepted")
+		}
 	}
 }
 

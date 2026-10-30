@@ -59,9 +59,36 @@ func TestOneRegionThreeNodesConnectorEnrollmentUsesOwnedDoor(t *testing.T) {
 	}
 }
 
-func TestOtherTopologiesKeepPublishedAgentDoorDefault(t *testing.T) {
-	got, err := connectorURLFromLaunch(t, map[string]string{
+func TestThreeRegionMultiEdgeConnectorEnrollmentUsesOwnedDoor(t *testing.T) {
+	values := map[string]string{
 		"DSSE_TOPOLOGY_PROFILE": "three-regions-multi-edge",
+		"DSSE_REGION_ENDPOINTS": "a=https://agents.a.example.test;b=https://agents.b.example.test;c=https://agents.c.example.test",
+		"DSSE_AGENT_PLANE_NAME": "agents.example.test",
+		"DSSE_REGION_PORT":      "443",
+	}
+	got, err := connectorURLFromLaunch(t, values)
+	if err != nil || got != "https://agents.a.example.test" {
+		t.Fatalf("three-region default Connector URL = %q, %v", got, err)
+	}
+	values["DSSE_CONNECTOR_EDGE_URL"] = "https://agents.c.example.test"
+	got, err = connectorURLFromLaunch(t, values)
+	if err != nil || got != values["DSSE_CONNECTOR_EDGE_URL"] {
+		t.Fatalf("owned override = %q, %v", got, err)
+	}
+	values["DSSE_CONNECTOR_EDGE_URL"] = "https://agents.example.test"
+	if _, err = connectorURLFromLaunch(t, values); err == nil {
+		t.Fatal("three-region enrollment accepted the unowned deployment name")
+	}
+	delete(values, "DSSE_CONNECTOR_EDGE_URL")
+	delete(values, "DSSE_REGION_ENDPOINTS")
+	if _, err = connectorURLFromLaunch(t, values); err == nil {
+		t.Fatal("three-region enrollment accepted a missing region map")
+	}
+}
+
+func TestSingleRegionMultiEdgeKeepsPublishedAgentDoorDefault(t *testing.T) {
+	got, err := connectorURLFromLaunch(t, map[string]string{
+		"DSSE_TOPOLOGY_PROFILE": "one-region-multi-edge",
 		"DSSE_REGION_ENDPOINTS": "a=https://agents.a.example.test;b=https://agents.b.example.test",
 		"DSSE_AGENT_PLANE_NAME": "agents.a.example.test",
 		"DSSE_REGION_PORT":      "443",

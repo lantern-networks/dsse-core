@@ -893,6 +893,15 @@ const _LA_PAGE = 100; // page size (backend max 200). Older data is reached by p
 let _laRows = [];     // rows accumulated across pages for the active query
 let _laCursor = "";   // next_cursor from the last page ("" = no more / not loaded)
 let _laTotal = 0;     // total_matches for the active query (across the whole hot store, not just this page)
+// A search the server could not run because the log store is down reads as
+// that, not as a status code. Other failures keep the code for support.
+function laHttpError(r) {
+  if (r.status === 502 || r.status === 503) {
+    return new Error(bl({ en: "Cannot reach the log store. Retry in a moment.", ja: "ログの保存先に接続できません。しばらくしてから再試行してください。" }));
+  }
+  return new Error("HTTP " + r.status);
+}
+
 function laQueryString(cursor) {
   const p = new URLSearchParams();
   Object.keys(_laFilters).forEach((k) => { if (k.charAt(0) === "_") return; const v = _laFilters[k]; if (v) p.set(k, v); });
@@ -938,7 +947,7 @@ async function laLoadStream(host, filterHost, summaryHost, append) {
   try {
     const qs = laQueryString(append ? _laCursor : "");
     const r = await apiFetch("GET", "/admin/logs/" + encodeURIComponent(_laStream) + (qs ? "?" + qs : ""), undefined, laPlaneFor(_laStream));
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) throw laHttpError(r);
     if (!current()) return;
     const body = r.body;
     if (!body || !Array.isArray(body.rows) || body.rows.some(row => !row || typeof row !== "object" || Array.isArray(row)) ||
@@ -1034,7 +1043,7 @@ async function laRelatedRecords(host, decisionId) {
   let rel;
   try {
     const r = await apiFetch("GET", "/admin/access-decisions/" + encodeURIComponent(decisionId), undefined, _LA_PLANE);
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    if (!r.ok) throw laHttpError(r);
     const body = r.body;
     rel = body && body.related_logs;
     if (!body || body.access_decision_id !== decisionId || !rel || typeof rel !== "object" || Array.isArray(rel) ||

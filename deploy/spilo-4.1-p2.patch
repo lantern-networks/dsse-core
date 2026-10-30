@@ -4,7 +4,7 @@ index 6608483..bda95cf 100644
 +++ b/postgres-appliance/Dockerfile
 @@ -1 +1 @@
 -ARG BASE_IMAGE=ubuntu:22.04
-+ARG BASE_IMAGE=ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
++ARG BASE_IMAGE=ubuntu:22.04@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11
 @@ -8,9 +7,0 @@ ARG ADDITIONAL_LOCALES=
 -FROM ubuntu:18.04 as ubuntu-18
 -

@@ -9,7 +9,10 @@ const firewallCleanupComplete = "DSSE-FIREWALL-CLEANUP-COMPLETE"
 
 // Only the two fixed properties used by DSSE-owned rules are accepted. Listing
 // all rules makes an absent rule a verified no-op without relying on localized
-// netsh or PowerShell "not found" messages.
+// netsh or PowerShell "not found" messages. Listing costs time in proportion to
+// every rule on the machine (about 6 s for 974 rules on a lab PC), so the
+// second listing runs only after a deletion; when nothing matched, the first
+// listing is already the absence check.
 func firewallCleanupScript(property, value string) (string, error) {
 	if property != "DisplayName" && property != "Group" {
 		return "", fmt.Errorf("unsupported firewall rule selector")
@@ -20,9 +23,11 @@ func firewallCleanupScript(property, value string) (string, error) {
 	quoted := strings.ReplaceAll(value, "'", "''")
 	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'
 $matching = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.%s -ceq '%s' })
-if ($matching.Count -gt 0) { $matching | Remove-NetFirewallRule -ErrorAction Stop }
-$remaining = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.%s -ceq '%s' })
-if ($remaining.Count -ne 0) { throw 'DSSE firewall cleanup could not verify absence' }
+if ($matching.Count -gt 0) {
+  $matching | Remove-NetFirewallRule -ErrorAction Stop
+  $remaining = @(Get-NetFirewallRule -ErrorAction Stop | Where-Object { $_.%s -ceq '%s' })
+  if ($remaining.Count -ne 0) { throw 'DSSE firewall cleanup could not verify absence' }
+}
 Write-Output '%s'
 `, property, quoted, property, quoted, firewallCleanupComplete), nil
 }

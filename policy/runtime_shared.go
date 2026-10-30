@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 
 	"github.com/lantern-networks/dsse-core/blobstore"
 	"github.com/lantern-networks/dsse-core/decision"
@@ -30,6 +31,9 @@ func cloneRuntimePolicies(in map[string]map[string]model.Policy) map[string]map[
 }
 
 func normalizeRuntimeMaps(f *adminPolicyRuntimeStateFile) {
+	if f.UpstreamTLSModes == nil {
+		f.UpstreamTLSModes = map[string]string{}
+	}
 	if f.SaaSTenantRestrictions == nil {
 		f.SaaSTenantRestrictions = map[string]map[string]tenantrestriction.Setting{}
 	}
@@ -90,6 +94,11 @@ func decodeRuntimeState(raw []byte) (adminPolicyRuntimeStateFile, map[string]jso
 	if !known {
 		return f, nil, fmt.Errorf("runtime authority has no known fields")
 	}
+	for tenant, mode := range f.UpstreamTLSModes {
+		if tenant == "" || strings.TrimSpace(tenant) != tenant || !validAuthoredUpstreamTLSMode(mode) {
+			return f, nil, fmt.Errorf("invalid tenant upstream TLS mode")
+		}
+	}
 	for _, settings := range f.SaaSTenantRestrictions {
 		if err := ValidateTenantRestrictions(settings); err != nil {
 			return f, nil, err
@@ -99,15 +108,16 @@ func decodeRuntimeState(raw []byte) (adminPolicyRuntimeStateFile, map[string]jso
 	return f, document, nil
 }
 
-var runtimeFieldNames = []string{"schema_version", "saas_tenant_restrictions", "tenant_restriction_rule_status", "policy_status_override", "east_west_enabled", "east_west_allow_unmatched", "east_west_rules", "east_west_max_grant_ttl", "server_initiated_enabled", "legacy_exceptions", "admin_authored_policies"}
+var runtimeFieldNames = []string{"upstream_tls_modes", "schema_version", "saas_tenant_restrictions", "tenant_restriction_rule_status", "policy_status_override", "east_west_enabled", "east_west_allow_unmatched", "east_west_rules", "east_west_max_grant_ttl", "server_initiated_enabled", "legacy_exceptions", "admin_authored_policies"}
 
 func (s *Store) runtimeSnapshotLocked() adminPolicyRuntimeStateFile {
-	return adminPolicyRuntimeStateFile{SchemaVersion: adminPolicyRuntimeStateSchemaVersion, SaaSTenantRestrictions: s.tenantRestrictions, TenantRestrictionRuleStatus: s.tenantRestrictionRuleStatus, PolicyStatusOverride: s.policyStatusOverride, EastWestEnabled: s.eastWestEnabled, EastWestAllowUnmatched: s.eastWestAllowUnmatched, EastWestRules: s.eastWestRules, EastWestMaxGrantTTL: s.eastWestMaxGrantTTL, ServerInitiatedEnabled: s.serverInitiatedEnabled, LegacyExceptions: s.legacyExceptions, AdminAuthoredPolicies: s.adminAuthoredPolicies}
+	return adminPolicyRuntimeStateFile{SchemaVersion: adminPolicyRuntimeStateSchemaVersion, UpstreamTLSModes: s.upstreamTLSModes, SaaSTenantRestrictions: s.tenantRestrictions, TenantRestrictionRuleStatus: s.tenantRestrictionRuleStatus, PolicyStatusOverride: s.policyStatusOverride, EastWestEnabled: s.eastWestEnabled, EastWestAllowUnmatched: s.eastWestAllowUnmatched, EastWestRules: s.eastWestRules, EastWestMaxGrantTTL: s.eastWestMaxGrantTTL, ServerInitiatedEnabled: s.serverInitiatedEnabled, LegacyExceptions: s.legacyExceptions, AdminAuthoredPolicies: s.adminAuthoredPolicies}
 }
 
 // Adopt authored state while keeping bundle and compiled ownership separate.
 func (s *Store) adoptRuntimeLocked(f adminPolicyRuntimeStateFile) {
 	normalizeRuntimeMaps(&f)
+	s.upstreamTLSModes = f.UpstreamTLSModes
 	s.tenantRestrictions = f.SaaSTenantRestrictions
 	s.tenantRestrictionRuleStatus = f.TenantRestrictionRuleStatus
 	s.policyStatusOverride = f.PolicyStatusOverride

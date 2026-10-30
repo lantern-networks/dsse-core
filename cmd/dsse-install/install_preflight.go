@@ -358,7 +358,11 @@ func verifyPortalInsideImage(ctx context.Context, dir, image string, env map[str
 		return err
 	}
 	defer os.RemoveAll(staged)
-	public := map[string]string{"DSSE_NODE_PORTAL_NAME": env["DSSE_NODE_PORTAL_NAME"], "DSSE_STEPUP_PORTAL_ORIGINS": env["DSSE_STEPUP_PORTAL_ORIGINS"]}
+	public := map[string]string{
+		"DSSE_TOPOLOGY_PROFILE":      env["DSSE_TOPOLOGY_PROFILE"],
+		"DSSE_NODE_PORTAL_NAME":      env["DSSE_NODE_PORTAL_NAME"],
+		"DSSE_STEPUP_PORTAL_ORIGINS": env["DSSE_STEPUP_PORTAL_ORIGINS"],
+	}
 	if err := os.WriteFile(filepath.Join(staged, "deployment.env"), []byte(PlanEnvironmentFor("", public)), 0600); err != nil {
 		return err
 	}

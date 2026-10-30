@@ -82,10 +82,11 @@ jobs:
       - name: Start ClickHouse for irreversible deletion tests
         run: |
           docker run --detach --name dsse-ci-clickhouse \
+            --env CLICKHOUSE_DB=dsse \
             --env CLICKHOUSE_PASSWORD=ci_manual_delete \
             --env CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
             --publish 127.0.0.1:58124:8123 \
-            clickhouse/clickhouse-server:26.8.30.8-alpine@sha256:2ad322429c7965bde31e3a6389daa2df62db7e1898b1b91d50eb3a7bad716f1f
+            clickhouse/clickhouse-server:26.8.36.3-alpine@sha256:f5443f9ffa48f0154cdd50cab39fed732201762574a27f04f1f564bbba81832d
           for attempt in $(seq 1 30); do
             if curl --fail --silent --user default:ci_manual_delete 'http://127.0.0.1:58124/?query=SELECT%201' >/dev/null; then exit 0; fi
             sleep 1

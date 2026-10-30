@@ -17,7 +17,7 @@ func enrichSteerDeviceRequest(req model.DecisionRequest, connectTrust string, ru
 	var exists bool
 	var err error
 	if devices != nil {
-		device, exists, err = deviceForTenant(devices, req.TenantID, req.DeviceID)
+		device, exists, err = deviceForTenant(devices, req.TenantID, enrolledinventory.NormalizeIdentity(req.DeviceID))
 	}
 	if err != nil {
 		return req, err
@@ -27,22 +27,37 @@ func enrichSteerDeviceRequest(req model.DecisionRequest, connectTrust string, ru
 	// A two-axis heartbeat must not promote an OS-noncompliant device.
 	if connectTrust != "" {
 		var posture *model.DevicePostureSignals
+		var live *deviceRuntimeView
 		if runtime != nil {
 			runtime.mu.RLock()
-			if row := runtime.m[req.DeviceID]; row != nil && row.tenant == req.TenantID && row.posture.CollectedAt != "" {
-				p := row.posture
-				posture = &p
+			if row := runtime.m[enrolledinventory.NormalizeIdentity(req.DeviceID)]; row != nil && row.tenant == req.TenantID {
+				view := row.runtimeView(time.Now())
+				for _, field := range runtimePostureFields {
+					if !runtimeTime(view.ObservedAt[field]).IsZero() {
+						live = &view
+						break
+					}
+				}
 			}
 			runtime.mu.RUnlock()
 		}
+		if live != nil {
+			posture = &live.Posture
+		}
 		if err == nil && exists && device.Posture != nil {
-			at, parseErr := time.Parse(time.RFC3339, device.Posture.CollectedAt)
-			var previous time.Time
-			if posture != nil {
-				previous, _ = time.Parse(time.RFC3339, posture.CollectedAt)
-			}
-			if parseErr == nil && !at.Before(previous) {
-				posture = device.Posture
+			if at := runtimeTime(device.Posture.CollectedAt); !at.IsZero() {
+				// Inventory is a complete posture snapshot. Compare each live
+				// signal's original observation; a newer negative must not be
+				// hidden by another signal's older collection time. Inventory
+				// retains precedence on equal clocks, as before.
+				inventory := deviceRuntimeView{Posture: *device.Posture, ObservedAt: runtimeObservationTimes{}}
+				for _, field := range runtimePostureFields {
+					inventory.ObservedAt[field] = runtimeTimeString(at)
+				}
+				if live != nil {
+					inventory = mergeRuntimeViews(inventory, *live)
+				}
+				posture = &inventory.Posture
 			}
 		}
 		if posture != nil {

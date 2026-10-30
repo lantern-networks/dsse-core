@@ -20,7 +20,7 @@ import (
 // Configuration is a precondition, never evidence that a running peer authenticates.
 func verifyOneRegionThreeNodesReadiness(dir string, env map[string]string) []verifyResult {
 	return []verifyResult{verifyStoreConsumerAuthentication(dir, env), verifyDatabaseIdentity(dir, env),
-		verifySharedFleetPortalEntrances(dir, env)}
+		verifySharedFleetPortalEntrances(dir, env, "")}
 }
 
 func verifyStoreConsumerAuthentication(dir string, env map[string]string) verifyResult {

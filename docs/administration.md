@@ -35,6 +35,12 @@ still export data. Grant the smallest role set that covers the intended work.
 
 ## Editing organization settings
 
+Inspected HTTPS connections to origins offer the same cipher suites as Chrome by
+default; an organization can choose a strict profile instead. See
+[Upstream TLS compatibility](upstream-tls.md). The selection is an organization
+setting, separate from deployment-wide inspection posture, and both modes preserve
+certificate verification and traffic inspection.
+
 Updating an existing organization with `POST /admin/tenants`, or its own settings
 with `POST /admin/tenant`, preserves fields omitted from the request. Explicit
 empty values still clear editable settings. A display-name or status change does

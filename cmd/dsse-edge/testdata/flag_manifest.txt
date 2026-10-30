@@ -312,6 +312,7 @@ revocation-source-poll	Duration	2 * time.Second
 schema-dir	String	"../schemas"
 search-cursor-signing-secret	String	""
 seat-allocation-store	String	""
+secret-env	String	""
 site-store	String	""
 state-dir	String	""
 steer-exclusion-known-floor	String	"a.out,limactl-*"

@@ -436,6 +436,29 @@ The profile also publishes each Node's CP admin/data listeners on its plan addre
 Both peer leader probes and forwarded admin/authority traffic use those listeners directly;
 opening a peer doorway on 443 as the CP backend can produce false leader health and routing loops.
 
+## Secrets and the process command line
+
+Every local user can read a process's command line through `ps` or
+`/proc/<pid>/cmdline`. The control-plane, Edge and archive-publisher launch
+scripts that `dsse-install` generates therefore pass secrets through environment
+variables and name them with `-secret-env`, for example
+`-secret-env=admin-token=ADMIN_TOKEN,postgres-dsn=DSSE_POSTGRES_DSN`.
+`dsse-edge` reads each variable into its flag and then removes the variable from
+its own environment, so child processes do not inherit it.
+
+`-secret-env` accepts only these flags: `-admin-token`,
+`-audit-ingest-receiver-token`, `-audit-ingest-token`, `-connector-secret`,
+`-hot-store-clickhouse-password`, `-postgres-dsn`,
+`-steer-exclusion-source-token`, `-step-up-binding-secret` and
+`-workload-attestation-secret`. The process refuses to start when a listed
+variable is not set, when the same flag is also given on the command line, or
+when an entry names any other flag. Its error messages name flags and variables,
+never values. Use the same form if you start `dsse-edge` yourself.
+
+A generated launch script passes `-secret-env` only when `dsse-edge -help` lists
+it. A binary that predates the option receives the secrets as command-line
+arguments, as before.
+
 ## State, stopping, and restarting
 
 The control plane owns Postgres and ClickHouse and writes cold audit segments to an

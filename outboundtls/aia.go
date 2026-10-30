@@ -47,6 +47,20 @@ type roundTripper struct {
 
 var wrapped sync.Map // *http.Transport -> http.RoundTripper
 
+// CloseIdleConnectionsForTransport closes the existing AIA and original idle
+// pools without creating a wrapper or interrupting active responses. The caller
+// can reuse the same immutable TLS profile later; the cache identity is stable.
+func CloseIdleConnectionsForTransport(base *http.Transport) {
+	if base == nil {
+		return
+	}
+	if cached, ok := wrapped.Load(base); ok {
+		cached.(*roundTripper).CloseIdleConnections()
+		return
+	}
+	base.CloseIdleConnections()
+}
+
 // WrapRoundTripper completes missing public intermediates for DNS origins.
 // Numeric-IP origins keep the original transport because TLS does not send
 // their IP in SNI, and the verifier must never lose the requested IP name.

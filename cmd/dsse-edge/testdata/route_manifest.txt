@@ -203,6 +203,7 @@ GET /admin/transport-admission
 GET /admin/transport-ca-readiness
 GET /admin/transport-name-rename
 GET /admin/transport-trust-anchors
+GET /admin/upstream-tls
 GET /admin/usage/health
 GET /admin/usage/summary
 GET /admin/vlan-boundary-policies
@@ -394,6 +395,7 @@ POST /admin/transport-admission/restore
 POST /admin/transport-admission/revoke
 POST /admin/transport-trust-anchors
 POST /admin/transport-trust-anchors/{sha256}/acknowledge
+POST /admin/upstream-tls
 POST /admin/vlan-boundary-policies
 POST /admin/vlan-objects
 POST /audit-ingest

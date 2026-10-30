@@ -111,7 +111,8 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		}
 		result, err := adminLogQuery(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
-			writeError(w, statusForAdminLogQueryError(err), err)
+			status, public := adminLogSearchResponseError(err)
+			writeError(w, status, public)
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -123,7 +124,8 @@ func registerLogsRetentionRoutes(mux *http.ServeMux, adminEndpoint func(string, 
 		}
 		result, err := adminLogExport(adminHotStore, tenant, r.PathValue("stream"), r.URL.Query())
 		if err != nil {
-			writeError(w, statusForAdminLogQueryError(err), err)
+			status, public := adminLogSearchResponseError(err)
+			writeError(w, status, public)
 			return
 		}
 

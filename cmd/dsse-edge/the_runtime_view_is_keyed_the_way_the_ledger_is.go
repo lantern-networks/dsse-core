@@ -1,6 +1,8 @@
 package main
 
 import (
+	"sort"
+
 	"github.com/lantern-networks/dsse-core/enrolledinventory"
 )
 
@@ -34,15 +36,21 @@ func keyDeviceRuntimeTheWayTheLedgerDoes(devices map[string]deviceRuntimeView) m
 		return devices
 	}
 	keyed := make(map[string]deviceRuntimeView, len(devices))
-	for id, view := range devices {
+	identities := make([]string, 0, len(devices))
+	for id := range devices {
+		identities = append(identities, id)
+	}
+	sort.Strings(identities)
+	for _, id := range identities {
+		view := devices[id]
 		normalised := enrolledinventory.NormalizeIdentity(id)
 		if normalised == "" {
 			normalised = id // nothing to normalise to: keep what there is rather than dropping the device
 		}
-		// A collision means two spellings of one machine were being carried as two: fold them, newest wins, so
-		// the screen shows the live one rather than whichever the map happened to yield.
-		if held, clash := keyed[normalised]; clash && held.LastSeen > view.LastSeen {
-			continue
+		// Old history may still contain aliases. A newer version-only presence
+		// must not win over another alias's actual runtime observations.
+		if held, clash := keyed[normalised]; clash {
+			view = mergeRuntimeViews(held, view)
 		}
 		keyed[normalised] = view
 	}

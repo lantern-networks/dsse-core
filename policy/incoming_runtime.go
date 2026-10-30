@@ -16,6 +16,7 @@ func (s *Store) editIncomingRuntimeLocked(ctx context.Context, edit func(*adminP
 	}
 	current := adminPolicyRuntimeStateFile{
 		SchemaVersion:               adminPolicyRuntimeStateSchemaVersion,
+		UpstreamTLSModes:            s.upstreamTLSModes,
 		SaaSTenantRestrictions:      s.tenantRestrictions,
 		TenantRestrictionRuleStatus: s.tenantRestrictionRuleStatus,
 		PolicyStatusOverride:        s.policyStatusOverride,

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lantern-networks/dsse-core/enrolledinventory"
 	"github.com/lantern-networks/dsse-core/idpregistry"
 	"github.com/lantern-networks/dsse-core/model"
 )
@@ -42,7 +43,8 @@ const (
 )
 
 type deviceRuntimeInfo struct {
-	os string
+	os         string
+	observedAt runtimeObservationTimes
 	// The version is reported by a verified device heartbeat, not inferred from
 	// the installed package or a steer connection. It travels in the existing
 	// device_state shipment so the control plane can show it fleet-wide.
@@ -137,6 +139,7 @@ func (s *endpointRuntimeStore) entry(deviceID string) *deviceRuntimeInfo {
 // A reused identity must not carry OS, posture, activity, or provenance from its
 // previous tenant, including fields omitted by the new tenant's sparse report.
 func (s *endpointRuntimeStore) entryForTenant(deviceID, tenantID string) *deviceRuntimeInfo {
+	deviceID = enrolledinventory.NormalizeIdentity(deviceID)
 	e := s.entry(deviceID)
 	if tenantID != "" && e.tenant != tenantID {
 		e = &deviceRuntimeInfo{tenant: tenantID, loggedInUsers: map[string]bool{}}
@@ -148,7 +151,7 @@ func (s *endpointRuntimeStore) entryForTenant(deviceID, tenantID string) *device
 // ingestFromConnect reads the OS + posture headers off a steer-mux CONNECT and records them for deviceID, and
 // stamps last-seen. Returns the parsed posture (and whether posture was present) so the caller can log it.
 func (s *endpointRuntimeStore) ingestFromConnect(deviceID, tenantID string, h http.Header, sourceIP string, now time.Time) (model.DevicePostureSignals, bool) {
-	deviceID = strings.TrimSpace(deviceID)
+	deviceID = enrolledinventory.NormalizeIdentity(deviceID)
 	if deviceID == "" {
 		return model.DevicePostureSignals{}, false
 	}
@@ -161,27 +164,39 @@ func (s *endpointRuntimeStore) ingestFromConnect(deviceID, tenantID string, h ht
 	e.lastSeen = now
 	if sourceIP != "" {
 		e.sourceIP = sourceIP
+		e.observed("source_ip", now)
 	}
 	// A steer-mux CONNECT is the device opening its traffic channel, so it counts as steering — unlike the
 	// update courier, which speaks to the same Edge over the same transport and steers nothing.
 	e.lastSteered = now
+	e.observed("steering", now)
 	e.steering = true
 
 	if os != "" {
 		e.os = os
+		e.observed("os", now)
 	}
 	var ret model.DevicePostureSignals
 	present := false
 	if encOK || fwOK {
-		p := model.DevicePostureSignals{CollectedAt: now.UTC().Format(time.RFC3339), Source: sanitizeRuntimeField(h.Get(postureHeaderSource), 64)}
+		p := model.DevicePostureSignals{CollectedAt: now.UTC().Format(time.RFC3339Nano), Source: sanitizeRuntimeField(h.Get(postureHeaderSource), 64)}
 		if encOK {
 			p.DiskEncryptionEnabled = &enc
 		}
 		if fwOK {
 			p.FirewallEnabled = &fw
 		}
-		e.posture = p
 		ret, present = p, true
+		if encOK {
+			e.posture.DiskEncryptionEnabled = p.DiskEncryptionEnabled
+			e.observed("disk_encryption_enabled", now)
+		}
+		if fwOK {
+			e.posture.FirewallEnabled = p.FirewallEnabled
+			e.observed("firewall_enabled", now)
+		}
+		e.posture.Source = p.Source
+		e.posture.CollectedAt = postureCollectedAt(e.posture, e.observedAt)
 	}
 	event := s.changeEventLocked(e, deviceID)
 	s.mu.Unlock()
@@ -206,7 +221,7 @@ func (s *endpointRuntimeStore) ingestFromConnect(deviceID, tenantID string, h ht
 // disabled one need opposite responses, and collapsing them turns "we cannot see this machine" into "this
 // machine is non-compliant".
 func (s *endpointRuntimeStore) ingestFromReport(deviceID, tenantID, osName string, enc, fw *bool, source, sourceIP string, now time.Time) {
-	deviceID = strings.TrimSpace(deviceID)
+	deviceID = enrolledinventory.NormalizeIdentity(deviceID)
 	if deviceID == "" {
 		return
 	}
@@ -215,15 +230,18 @@ func (s *endpointRuntimeStore) ingestFromReport(deviceID, tenantID, osName strin
 	e.lastSeen = now
 	if sourceIP != "" {
 		e.sourceIP = sourceIP
+		e.observed("source_ip", now)
 	}
 
 	if o := sanitizeRuntimeField(osName, 64); o != "" {
 		e.os = o
+		e.observed("os", now)
 	}
 	if enc != nil || fw != nil {
 		p := model.DevicePostureSignals{
-			CollectedAt: now.UTC().Format(time.RFC3339),
-			Source:      sanitizeRuntimeField(source, 64),
+			CollectedAt:             now.UTC().Format(time.RFC3339Nano),
+			Source:                  sanitizeRuntimeField(source, 64),
+			EnforcementAgentHealthy: e.posture.EnforcementAgentHealthy,
 		}
 		// Carried forward individually: an agent that can read one signal and not the other must not erase the
 		// one it previously reported by reporting the other.
@@ -240,6 +258,13 @@ func (s *endpointRuntimeStore) ingestFromReport(deviceID, tenantID, osName strin
 			p.FirewallEnabled = e.posture.FirewallEnabled
 		}
 		e.posture = p
+		if enc != nil {
+			e.observed("disk_encryption_enabled", now)
+		}
+		if fw != nil {
+			e.observed("firewall_enabled", now)
+		}
+		e.posture.CollectedAt = postureCollectedAt(e.posture, e.observedAt)
 	}
 	event := s.changeEventLocked(e, deviceID)
 	s.mu.Unlock()
@@ -251,7 +276,7 @@ func (s *endpointRuntimeStore) ingestFromReport(deviceID, tenantID, osName strin
 // keeps the control-plane view current even while an endpoint is idle, without
 // shipping every 15-second heartbeat as a separate state event.
 func (s *endpointRuntimeStore) ingestAgentVersion(deviceID, tenantID, version string, now time.Time) {
-	deviceID = strings.TrimSpace(deviceID)
+	deviceID = enrolledinventory.NormalizeIdentity(deviceID)
 	version = strings.TrimSpace(version)
 	if deviceID == "" || tenantID == "" || version == "" {
 		return
@@ -321,9 +346,10 @@ func (s *endpointRuntimeStore) changeEventLocked(e *deviceRuntimeInfo, deviceID 
 		"tenant_id":                 e.tenant,
 		"device_id":                 deviceID,
 		"event":                     "device_state_changed",
+		"runtime_observed_at":       e.observedAt.clone(),
 		"os":                        e.os,
 		"agent_version":             e.agentVersion,
-		"agent_version_reported_at": rfc3339OrEmpty(e.agentVersionReportedAt),
+		"agent_version_reported_at": runtimeTimeString(e.agentVersionReportedAt),
 		// Where it reached us from, so a fleet-wide view can answer it for a device steering through another
 		// node. A reader that does not know this field is the failure this repository has hit twice; both
 		// restore paths below read it.
@@ -349,8 +375,8 @@ func (s *endpointRuntimeStore) changeEventLocked(e *deviceRuntimeInfo, deviceID 
 		// The region on its own, beside the "<region>/<cluster>" identity above. A reader that wants the
 		// region should not have to know how another field is punctuated.
 		"edge_region_id": edgeRuntimeRegionID,
-		"last_steered":   rfc3339OrEmpty(e.lastSteered),
-		"timestamp":      e.lastSeen.UTC().Format(time.RFC3339),
+		"last_steered":   runtimeTimeString(e.lastSteered),
+		"timestamp":      e.lastSeen.UTC().Format(time.RFC3339Nano),
 	}
 }
 
@@ -373,7 +399,7 @@ func (s *endpointRuntimeStore) recordSteeredFlow(deviceID, tenantID, osUser stri
 }
 
 func (s *endpointRuntimeStore) recordSteeredFlowWithOwner(deviceID, tenantID, osUser, principal string, now time.Time) {
-	deviceID = strings.TrimSpace(deviceID)
+	deviceID = enrolledinventory.NormalizeIdentity(deviceID)
 	if deviceID == "" {
 		return
 	}
@@ -382,10 +408,12 @@ func (s *endpointRuntimeStore) recordSteeredFlowWithOwner(deviceID, tenantID, os
 	e.lastSeen = now
 	// A flow OPEN is steering: this is traffic being carried, not a device asking a question.
 	e.lastSteered = now
+	e.observed("steering", now)
 	e.steering = true
 
 	if u := sanitizeRuntimeField(osUser, 128); u != "" {
 		e.loggedInUsers[u] = true
+		e.observed("users", now)
 		if idpregistry.ValidOSPrincipal(principal) {
 			e.observeAuthAccount(principal, u)
 		}
@@ -406,10 +434,11 @@ func rfc3339OrEmpty(t time.Time) string {
 
 // deviceRuntimeView is the JSON shape GET /admin/device-runtime returns per device.
 type deviceRuntimeView struct {
-	OS            string   `json:"os"`
-	LoggedInUsers []string `json:"logged_in_users"`
-	LastSeen      string   `json:"last_seen"`
-	SteerActive   bool     `json:"steer_active"`
+	ObservedAt    runtimeObservationTimes `json:"observed_at"`
+	OS            string                  `json:"os"`
+	LoggedInUsers []string                `json:"logged_in_users"`
+	LastSeen      string                  `json:"last_seen"`
+	SteerActive   bool                    `json:"steer_active"`
 	// LastSteered is when this device last actually steered traffic. Empty means this Edge has never seen it
 	// steer, which is a different statement from "not steering now" and both are different from "offline".
 	LastSteered string `json:"last_steered,omitempty"`
@@ -444,27 +473,31 @@ func (s *endpointRuntimeStore) snapshot(now time.Time) map[string]deviceRuntimeV
 	defer s.mu.RUnlock()
 	out := make(map[string]deviceRuntimeView, len(s.m))
 	for id, e := range s.m {
-		users := make([]string, 0, len(e.loggedInUsers))
-		for u := range e.loggedInUsers {
-			users = append(users, u)
-		}
-		sort.Strings(users)
-		last := ""
-		if !e.lastSeen.IsZero() {
-			last = e.lastSeen.UTC().Format(time.RFC3339)
-		}
-		out[id] = deviceRuntimeView{
-			OS:            e.os,
-			LoggedInUsers: users,
-			LastSeen:      last,
-			SteerActive:   !e.lastSteered.IsZero() && now.Sub(e.lastSteered) < steerActiveWindow,
-			LastSteered:   rfc3339OrEmpty(e.lastSteered),
-			Edge:          e.edge,
-			SourceIP:      e.sourceIP,
-			Posture:       e.posture,
-		}
+		out[id] = e.runtimeView(now)
 	}
 	return out
+}
+
+func (e *deviceRuntimeInfo) runtimeView(now time.Time) deviceRuntimeView {
+	users := make([]string, 0, len(e.loggedInUsers))
+	for u := range e.loggedInUsers {
+		users = append(users, u)
+	}
+	sort.Strings(users)
+	return deviceRuntimeView{
+		ObservedAt: e.observedAt.clone(), OS: e.os, LoggedInUsers: users,
+		LastSeen:    runtimeTimeString(e.lastSeen),
+		SteerActive: !e.lastSteered.IsZero() && !e.lastSteered.After(now) && now.Sub(e.lastSteered) < steerActiveWindow,
+		LastSteered: runtimeTimeString(e.lastSteered), Edge: e.edge, SourceIP: e.sourceIP, Posture: e.posture,
+	}
+}
+
+// Runtime field clocks preserve ordering between observations in the same second.
+func runtimeTimeString(at time.Time) string {
+	if at.IsZero() {
+		return ""
+	}
+	return at.UTC().Format(time.RFC3339Nano)
 }
 
 func boolPtrLog(b *bool) string {

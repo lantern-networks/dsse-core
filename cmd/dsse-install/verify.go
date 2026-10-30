@@ -815,7 +815,7 @@ func initialReadinessWait(normal time.Duration, noWait bool) time.Duration {
 // ★ EVERY RESULT, NOT JUST THE FAILURES. An operator reading this is deciding whether to hand the deployment
 // to somebody; a list of what was actually established is the thing that decision needs. And the exit status
 // is what a script reads, so the two cannot disagree.
-func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, cpPeers string, noWait bool) error {
+func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, cpPeers string, noWait bool, portalCA string) error {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
 		return fmt.Errorf("-dir is required: the checks read this deployment's own anchor and credentials")
@@ -999,7 +999,7 @@ func runVerify(dir, cpAdmin, edgeAdmin, edgeTransport, adminToken, consoleURL, c
 			results = append(results, verifyTheStoreCanLoseAPlace(dir, storeEnv)...)
 			if storeEnv["DSSE_TOPOLOGY_PROFILE"] == "three-regions-multi-edge" {
 				results = append(results, verifyOneRegionThreeNodesSync(storeEnv), verifyStoreConsumerAuthentication(dir, storeEnv), verifyDatabaseIdentity(dir, storeEnv))
-				results = append(results, verifySharedFleetPortalEntrances(dir, storeEnv), unmeasuredSharedFleetAcceptance())
+				results = append(results, verifySharedFleetPortalEntrances(dir, storeEnv, portalCA), unmeasuredSharedFleetAcceptance())
 			}
 			if storeEnv["DSSE_TOPOLOGY_PROFILE"] == "one-region-three-nodes" {
 				results = append(results, verifyNodeAdminOwners(client, storeEnv, planeNamesFor(deploymentHostFor(dir)).BareHost, edgeAdmins, cpPeers))

@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
-	"time"
 
 	"github.com/lantern-networks/dsse-core/clients/windows-wfp/winbin"
 )
@@ -51,5 +50,5 @@ func addQUICBlock() error {
 // removeQUICBlock confirms that the exact DSSE rule is absent. A rule that
 // outlives the agent blocks native UDP:443, so callers must report failures.
 func removeQUICBlock() error {
-	return removeOwnedFirewallRules("DisplayName", quicBlockRuleName, 15*time.Second)
+	return removeOwnedFirewallRules("DisplayName", quicBlockRuleName)
 }

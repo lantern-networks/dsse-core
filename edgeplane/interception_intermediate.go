@@ -30,8 +30,9 @@ type InterceptionIssuer struct {
 	// Only a tenant-delegated issuer participates in the authenticated Edge-to-CP
 	// leaf CRL publisher. A deployment CA's own CDP points to the parent
 	// issuer's CRL covering that CA; it does not enable the tenant protocol.
-	requiresTenantLeafCRL bool
-	leafCRLReadyUntil     atomic.Int64 // publication acknowledged by CP; zero until then
+	deploymentLeafCRLPoints []string // immutable deployment publisher URLs for signingCert
+	requiresTenantLeafCRL   bool
+	leafCRLReadyUntil       atomic.Int64 // publication acknowledged by CP; zero until then
 
 	// The validity window of the whole PRESENTED path, computed once. See usableAt.
 	pathOnce  sync.Once

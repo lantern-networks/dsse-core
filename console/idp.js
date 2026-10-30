@@ -294,7 +294,7 @@ function openIdpForm(content, existing) {
   const addBindingRow = (binding = {}) => {
     const device = uiField({name:"binding-device",label:bl({en:"Device ID",ja:"端末ID"}),required:true,value:binding.device_id || ""});
     const principal = uiField({name:"binding-principal",label:bl({en:"OS account ID",ja:"OSアカウントID"}),required:true,value:binding.os_principal || "",placeholder:"windows:S-1-5-21-… / macos:xxxxxxxx-…"});
-    const subject = uiField({name:"binding-subject",label:bl({en:"OIDC subject (sub)",ja:"OIDC subject (sub)"}),required:true,value:binding.subject || ""});
+    const subject = uiField({name:"binding-subject",label:bl({en:"OIDC subject (sub)",ja:"OIDCの利用者識別子（sub）"}),required:true,value:binding.subject || ""});
     const row = {device,principal,subject,provider:binding.provider_id || ""};
     const remove = el("button",{class:"ui-btn ui-btn-sm ui-btn-danger",text:bl({en:"Remove assignment",ja:"割当を削除"}),onClick:()=>{
       const index = bindingRows.indexOf(row);
@@ -354,7 +354,7 @@ function openIdpForm(content, existing) {
       idF.el, nameF.el, typeF.el, issuerF.el, authzF.el, tokenF.el, jwksF.el, clientF.el, secretF.el, domainsF.el, domainModeF.el, pkceF.el,
       el("p", { class: "ui-view-desc", text: bl({ en: "Advanced claim mapping", ja: "詳細: クレームマッピング" }) }),
       acrF.el, amrF.el, groupsF.el, hdF.el, caF.el,
-      el("p", { class: "ui-view-desc", text: bl({en:"Device users are assigned to an exact OIDC sub. Use the endpoint's OS UUID or SID, never an email or display name. Removing an assignment invalidates its previous approvals.",ja:"端末利用者を正確なOIDC subに割り当てます。OSのUUIDまたはSIDを使い、メールアドレスや表示名は使わないでください。割当を削除すると以前の承認は無効になります。"}) }),
+      el("p", { class: "ui-view-desc", text: bl({en:"Device users are assigned to an exact OIDC sub. Use the endpoint's OS UUID or SID, never an email or display name. Removing an assignment invalidates its previous approvals.",ja:"端末利用者をOIDCの利用者識別子（sub）に割り当てます。OSのUUIDまたはSIDを使い、メールアドレスや表示名は使わないでください。割当を削除すると以前の承認は無効になります。"}) }),
       bindingsHost, guidedButton, guidedHost, addBinding, error,
     ],
     footer: [el("button", { class: "ui-btn", text: bl({ en: "Cancel", ja: "キャンセル" }), onClick: () => m.close() }), submit],

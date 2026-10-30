@@ -49,4 +49,6 @@ grep -Fq 'go1.27.3' <<< "$build_info"
 grep -Eq 'golang.org/x/net[[:space:]]+v0\.61\.0' <<< "$build_info"
 grep -Eq 'google.golang.org/grpc[[:space:]]+v1\.84\.0' <<< "$build_info"
 grep -Eq 'go.opentelemetry.io/otel/sdk[[:space:]]+v1\.47\.0' <<< "$build_info"
+# CVE-2026-116587: JWK parsing DoS fixed in go-jose v4.1.6.
+grep -Eq 'github.com/go-jose/go-jose/v4[[:space:]]+v4\.1\.6' <<< "$build_info"
 echo "WAL-G v3.0.9 built from pinned source with Go 1.27.3 for $platform"

@@ -716,6 +716,19 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	if payload.GrantPages != nil && payload.Grants == nil {
 		return 0, fmt.Errorf("signed grant pages have not been fetched")
 	}
+	// Reject malformed tenant controls before mutating any bundle section.
+	if payload.TenantConfig != nil {
+		if err := policy.ValidateTenantConfig(*payload.TenantConfig); err != nil {
+			return 0, err
+		}
+	}
+	for _, section := range payload.TenantPolicies {
+		if section.Config != nil {
+			if err := policy.ValidateTenantConfig(*section.Config); err != nil {
+				return 0, err
+			}
+		}
+	}
 	// criticalErr is set by any section whose failure must NOT be reported as an applied generation.
 	//
 	// ★ THE RULE EXISTED FOR ONE SECTION AND THE INCIDENT IT CAME FROM WAS ABOUT ANOTHER (2026-08-13,
@@ -733,18 +746,6 @@ func (s configBundleSource) apply(payload configBundlePayload, t configApplyTarg
 	}
 	if err := applyApplicationBundle(t.applications, payload.Applications); err != nil {
 		criticalErr = errors.Join(criticalErr, fmt.Errorf("application catalog: %w", err))
-	}
-	if payload.TenantConfig != nil {
-		if err := policy.ValidateTenantRestrictions(payload.TenantConfig.SaaSTenantRestrictions); err != nil {
-			return 0, err
-		}
-	}
-	for _, section := range payload.TenantPolicies {
-		if section.Config != nil {
-			if err := policy.ValidateTenantRestrictions(section.Config.SaaSTenantRestrictions); err != nil {
-				return 0, err
-			}
-		}
 	}
 	if payload.DLP != nil {
 		if err := t.dlp.Apply(payload.DLP); err != nil {

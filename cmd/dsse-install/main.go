@@ -68,7 +68,7 @@ func main() {
 	portalCertificate := flag.Bool("verify-portal-certificate", false, "read-only: verify this Edge browser TLS pair, system trust, expiry and every Portal name served by this Edge; use -dir on each Edge host")
 	installPortal := flag.String("install-portal-certificate", "", "provision a verified full-chain browser certificate on this Edge; requires -portal-key and -dir; use before service startup")
 	portalKey := flag.String("portal-key", "", "private key paired with -install-portal-certificate; never copied to CP-only hosts")
-	portalCA := flag.String("portal-ca", "", "optional explicitly approved PEM CA bundle for a private browser certificate; provision this trust separately on endpoint browsers")
+	portalCA := flag.String("portal-ca", "", "explicitly approved public PEM CA bundle for browser certificate installation or Portal TLS checks with -verify; verifier-only trust is not installed, and endpoint browser trust is provisioned separately")
 	activateAuth := flag.Bool("activate-auth", false, "activate shared-fleet authentication through the existing CP authority and wait for every declared Edge to apply it")
 	authFeatures := flag.String("auth-features", "", "with -activate-auth: optional device-user-session-v1 after endpoint and administrator-assignment preparation; existing features are always retained")
 	adminTokenFile := flag.String("admin-token-file", "", "private operator token file: with -bootstrap-admin create it without overwrite; with -activate-auth/-verify/-who-depends read it without putting the token in argv")
@@ -237,7 +237,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "select only one installer operation")
 		os.Exit(1)
 	}
-	if (*portalKey != "" || *portalCA != "") && *installPortal == "" || *authFeatures != "" && !*activateAuth {
+	if *portalKey != "" && *installPortal == "" || *portalCA != "" && *installPortal == "" && !*verify || *authFeatures != "" && !*activateAuth {
 		fmt.Fprintln(os.Stderr, "certificate and feature options require their corresponding setup operation")
 		os.Exit(1)
 	}
@@ -533,7 +533,7 @@ func main() {
 	}
 
 	if *verify {
-		if err := runVerify(*dir, *cpAdmin, *edgeAdmin, *edgeTransport, *verifyAdminToken, *consoleURL, *cpPeers, *verifyNoWait); err != nil {
+		if err := runVerify(*dir, *cpAdmin, *edgeAdmin, *edgeTransport, *verifyAdminToken, *consoleURL, *cpPeers, *verifyNoWait, *portalCA); err != nil {
 			fmt.Fprintf(os.Stderr, "dsse-install: %v\n", err)
 			os.Exit(1)
 		}

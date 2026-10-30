@@ -202,6 +202,13 @@
 
         <Component Id="SteerExe" Bitness="always64">
           <File Id="dsse_steer.exe" Source="dsse-steer.exe" KeyPath="yes" />
+          <!-- Runtime files the agent writes beside its executable. MSI does not own them, so without these rows
+               an uninstall that succeeded left C:\Program Files\DSSE behind with them (measured 2026-10-30).
+               RemoveFiles runs after UninstallMachineState has restored DNS, so the lock is no longer needed.
+               The DNS and NCSI backups themselves are deliberately NOT removed: they hold the user's original
+               settings, and one that is still present after a successful recover is evidence to keep. -->
+          <RemoveFile Id="RemoveSteerLog" Name="dsse-steer.log" On="uninstall" />
+          <RemoveFile Id="RemoveDnsBackupLock" Name="dsse_dns_resolver_backup.json.lock" On="uninstall" />
           <!-- LocalSystem service; binPath = this exe plus the service-run argument (config comes from the
                config store, NOT a giant binPath flag list). It DEPENDS on the DsseWfp driver.
                Start=DEMAND (manual), NOT auto (review finding S4): DsseSteer with no applied profile is
@@ -295,6 +302,7 @@
              demand-start because starting it unenrolled would black-hole the box). -->
         <Component Id="WatchdogExe" Bitness="always64">
           <File Id="dsse_watchdog.exe" Source="dsse-watchdog.exe" KeyPath="yes" />
+          <RemoveFile Id="RemoveWatchdogLog" Name="dsse-watchdog.log" On="uninstall" />
           <ServiceInstall Id="DsseWatchdogSvc"
                           Name="DsseWatchdog"
                           DisplayName="Lantern DSSE Network Watchdog"
@@ -331,6 +339,7 @@
              this device can never update rather than pretending otherwise. -->
         <Component Id="UpdaterExe" Bitness="always64">
           <File Id="dsse_updater.exe" Source="dsse-updater.exe" KeyPath="yes" />
+          <RemoveFile Id="RemoveUpdaterLog" Name="dsse-updater.log" On="uninstall" />
           <!-- The two pins are independent, so writing one ServiceInstall per combination would be four
                near-identical blocks and four chances to mistype one. The preprocessor builds the argument
                string instead, and the ServiceInstall below exists once.

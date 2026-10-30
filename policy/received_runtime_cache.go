@@ -23,6 +23,9 @@ func (store *Store) ApplyReceivedBundle(tenant string, policies []model.Policy, 
 	if store == nil || tenant == "" {
 		return 0, fmt.Errorf("received bundle tenant is required")
 	}
+	if err := ValidateTenantConfig(cfg); err != nil {
+		return 0, err
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	switch store.runtimeStatePersister.(type) {

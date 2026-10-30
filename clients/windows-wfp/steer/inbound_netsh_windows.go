@@ -283,7 +283,7 @@ func runInboundNetsh(cfg inboundRuntimeConfig) (result error) {
 // removeDSSEFirewallRules confirms all DSSE-group rules are absent. These may
 // include inbound ALLOW rules, so an uncertain result must be visible to recovery.
 func removeDSSEFirewallRules() error {
-	return removeOwnedFirewallRules("Group", dsseFirewallGroup, 20*time.Second)
+	return removeOwnedFirewallRules("Group", dsseFirewallGroup)
 }
 
 // sanitizePSName / sanitizePSValue strip single quotes (and control chars) so an id/address cannot break out of

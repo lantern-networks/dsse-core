@@ -185,18 +185,18 @@ fi
 # identity enrolment reads the token's single edge_url. So the port belongs here, at the one place that knows
 # it. 443 is left implicit, because a URL that says :443 is a URL somebody eventually copies somewhere it is
 # wrong.
-# ★ IN THE THREE-NODE LAYOUT THE DEPLOYMENT NAME IS NOT ONE OF THE THREE PUBLIC DOORS. The generated
-# DSSE_AGENT_PLANE_NAME is agents.<deployment>, while DSSE_REGION_ENDPOINTS names agents.node-a/b/c.
+# In the three-node and three-region multi-edge layouts the deployment name is not one of the public
+# doors. DSSE_AGENT_PLANE_NAME may be agents.<deployment>, while DSSE_REGION_ENDPOINTS owns the actual doors.
 # Console's Add Connector sends an empty request body, so its one-use token otherwise carries an unreachable
 # initial enrolment URL even though the token also lists the three working failover doors. Choose one of those
 # exact doors for the first CSR. An explicit override is accepted only when it names an owned listed door.
-if [ "${DSSE_TOPOLOGY_PROFILE:-}" = "one-region-three-nodes" ]; then
+if [ "${DSSE_TOPOLOGY_PROFILE:-}" = "one-region-three-nodes" ] || [ "${DSSE_TOPOLOGY_PROFILE:-}" = "three-regions-multi-edge" ]; then
   connector_doors="${DSSE_REGION_ENDPOINTS:-}"
-  [ -n "$connector_doors" ] || { echo 'three-node Connector enrollment needs the owned region doors' >&2; exit 1; }
+  [ -n "$connector_doors" ] || { echo 'Connector enrollment needs the owned region doors' >&2; exit 1; }
   connector_first_entry="${connector_doors%%;*}"
   case "$connector_first_entry" in
     *=https://?*) connector_first_url="${connector_first_entry#*=}" ;;
-    *) echo 'three-node Connector enrollment has no valid first HTTPS door' >&2; exit 1 ;;
+    *) echo 'Connector enrollment has no valid first HTTPS door' >&2; exit 1 ;;
   esac
   DSSE_CONNECTOR_EDGE_URL="${DSSE_CONNECTOR_EDGE_URL:-$connector_first_url}"
   connector_owned=false
@@ -366,6 +366,21 @@ if [ -f "$here/auth-rollout-census.json" ]; then
   AUTH_ROLLOUT="$AUTH_ROLLOUT -auth-rollout-report-url=${DSSE_AUTHORITY_ORIGIN:?set DSSE_AUTHORITY_ORIGIN}/fleet-capabilities/report"
 fi
 
+# ★★★ SECRETS GO THROUGH THE ENVIRONMENT, NEVER THE COMMAND LINE (2026-10-29). Every local user on the host
+# can read a process's arguments (ps, /proc/<pid>/cmdline); only its owner and root can read its environment.
+# The program is given the variable NAMES and removes the variables once it has read them. A binary older than
+# -secret-env does not list it in -help and still gets the old arguments, so nodes upgraded one at a time keep
+# starting.
+export ADMIN_TOKEN CONNECTOR_SECRET WORKLOAD_SECRET AUDIT_INGEST_TOKEN CLICKHOUSE_PASSWORD DSSE_POSTGRES_DSN
+if "$DSSE_EDGE_BINARY" -help 2>&1 | grep -q -- '-secret-env'; then
+  set -- -secret-env=admin-token=ADMIN_TOKEN,connector-secret=CONNECTOR_SECRET,workload-attestation-secret=WORKLOAD_SECRET,audit-ingest-token=AUDIT_INGEST_TOKEN,audit-ingest-receiver-token=AUDIT_INGEST_TOKEN,hot-store-clickhouse-password=CLICKHOUSE_PASSWORD,postgres-dsn=DSSE_POSTGRES_DSN "$@"
+else
+  set -- -admin-token="$ADMIN_TOKEN" -connector-secret="$CONNECTOR_SECRET" \
+    -workload-attestation-secret="$WORKLOAD_SECRET" -audit-ingest-token="$AUDIT_INGEST_TOKEN" \
+    -audit-ingest-receiver-token="$AUDIT_INGEST_TOKEN" -hot-store-clickhouse-password="$CLICKHOUSE_PASSWORD" \
+    -postgres-dsn="$DSSE_POSTGRES_DSN" "$@"
+fi
+
 exec "$DSSE_EDGE_BINARY" -control-plane \
   $DOMAIN_EVENT_OUTBOX \
   $AUTH_ROLLOUT \
@@ -381,7 +396,6 @@ exec "$DSSE_EDGE_BINARY" -control-plane \
   -state-dir="${DSSE_CP_STATE_DIR:-$here/cp-state}" \
   -agent-update-manifest-dir="${DSSE_CP_STATE_DIR:-$here/cp-state}/agent-updates" \
   -log-dir="${DSSE_CP_STATE_DIR:-$here/cp-state}/logs" \
-  -postgres-dsn="$DSSE_POSTGRES_DSN" \
   -migration-dir="$DSSE_MIGRATION_DIR" -postgres-run-migrations \
   -site-store=postgres \
   -admin-export-job-store=postgres \
@@ -407,23 +421,18 @@ exec "$DSSE_EDGE_BINARY" -control-plane \
   -agent-rollout-store=postgres \
   -steer-exclusion-store=postgres \
   $CONSOLE_ORIGIN $CONSOLE_ORIGINS $STEPUP_PORTAL_ORIGINS \
-  -admin-token="$ADMIN_TOKEN" \
-  -connector-secret="$CONNECTOR_SECRET" \
-  -workload-attestation-secret="$WORKLOAD_SECRET" \
-  -audit-ingest-token="$AUDIT_INGEST_TOKEN" \
   -connector-runtime-secret-required \
   -enrol-claim-fresh-deployment \
   -transport-tenant-ca-registry=postgres \
   -transport-tenant-ca-registry-carried-from="$here/device-ca-registry.json" \
   -hot-store-clickhouse-endpoint="$DSSE_CLICKHOUSE_ENDPOINT" \
-  -hot-store-clickhouse-user=dsse -hot-store-clickhouse-password="$CLICKHOUSE_PASSWORD" \
+  -hot-store-clickhouse-user=dsse \
   -cold-archive-endpoint="$DSSE_ARCHIVE_ENDPOINT" -cold-archive-bucket="$DSSE_ARCHIVE_BUCKET" \
   -cold-archive-region="${DSSE_ARCHIVE_REGION:-}" -cold-archive-auth-mode="$DSSE_ARCHIVE_AUTH_MODE" \
   -cold-archive-use-ssl \
   -audit-chain-store="postgres+import:$DSSE_CP_STATE_DIR/audit_chain.json" \
   -legal-hold-store="postgres+import:$DSSE_CP_STATE_DIR/legal_holds.json" \
   -retention-override-store="postgres+import:$DSSE_CP_STATE_DIR/retention_overrides.json" \
-  -audit-ingest-receiver-token="$AUDIT_INGEST_TOKEN" \
   -audit-ingest-client-ca="$here/management-ca.crt" \
   -audit-ingest-authority="$here/audit-ingest-authority.json" \
   $REGION_MAP $REGION_FAILOVER \
@@ -688,7 +697,7 @@ fi
 # in this deployment and the Edge uses it; after, the Edge has its own, read-scoped one.
 FLEET_TOKEN=""
 if [ -f "$here/runtime/admin-bootstrapped" ]; then
-  FLEET_TOKEN="-steer-exclusion-source-token=$EDGE_CP_TOKEN"
+  FLEET_TOKEN=yes
 fi
 
 # ★★★ WHICH REGION THIS EDGE IS IN, AND WHICH REGIONS THE DEPLOYMENT HAS. Both are read from deployment.env
@@ -1044,6 +1053,29 @@ if [ -f "$here/auth-rollout-census.json" ]; then
   AUTH_ROLLOUT="$AUTH_ROLLOUT -auth-rollout-report-url=$DSSE_CONTROL_PLANE_DATA/fleet-capabilities/report"
 fi
 
+# ★★★ SECRETS GO THROUGH THE ENVIRONMENT, NEVER THE COMMAND LINE (2026-10-29). Every local user on the host
+# can read a process's arguments (ps, /proc/<pid>/cmdline); only its owner and root can read its environment.
+# The program is given the variable NAMES and removes the variables once it has read them. A binary older than
+# -secret-env does not list it in -help and still gets the old arguments, so nodes upgraded one at a time keep
+# starting.
+STEPUP_BINDING_SECRET="${STEPUP_BINDING_SECRET:-$CONNECTOR_SECRET}"
+export ADMIN_TOKEN CONNECTOR_SECRET WORKLOAD_SECRET STEPUP_BINDING_SECRET AUDIT_INGEST_TOKEN
+if "$DSSE_EDGE_BINARY" -help 2>&1 | grep -q -- '-secret-env'; then
+  SECRET_ENV=admin-token=ADMIN_TOKEN,connector-secret=CONNECTOR_SECRET,workload-attestation-secret=WORKLOAD_SECRET,step-up-binding-secret=STEPUP_BINDING_SECRET,audit-ingest-token=AUDIT_INGEST_TOKEN
+  if [ -n "$FLEET_TOKEN" ]; then
+    export EDGE_CP_TOKEN
+    SECRET_ENV="$SECRET_ENV,steer-exclusion-source-token=EDGE_CP_TOKEN"
+  fi
+  set -- -secret-env="$SECRET_ENV" "$@"
+else
+  if [ -n "$FLEET_TOKEN" ]; then
+    set -- -steer-exclusion-source-token="$EDGE_CP_TOKEN" "$@"
+  fi
+  set -- -admin-token="$ADMIN_TOKEN" -connector-secret="$CONNECTOR_SECRET" \
+    -workload-attestation-secret="$WORKLOAD_SECRET" -step-up-binding-secret="$STEPUP_BINDING_SECRET" \
+    -audit-ingest-token="$AUDIT_INGEST_TOKEN" "$@"
+fi
+
 exec "$DSSE_EDGE_BINARY" \
   $AUTH_ROLLOUT \
   $TRUST_BUNDLE $LICENCE $DRAIN \
@@ -1069,13 +1101,7 @@ exec "$DSSE_EDGE_BINARY" \
   -agent-rollout-source-url="$DSSE_CONTROL_PLANE" \
   -admin-session-authority-url="$DSSE_CONTROL_PLANE/admin/session" \
   -admin-session-authority-ca="$here/deployment-anchor.pem" \
-  $FLEET_TOKEN \
   $REGION $REGION_MAP $REGION_FAILOVER $FRONT_DOORS $RECOVERY_SNI $CONSOLE_ORIGIN $CONSOLE_ORIGINS $STEPUP_PORTAL_ORIGINS $MESH $MESH_HOSTS $CP_ENDPOINTS $INTERCEPT $CLIENTLESS \
-  -admin-token="$ADMIN_TOKEN" \
-  -connector-secret="$CONNECTOR_SECRET" \
-  -workload-attestation-secret="$WORKLOAD_SECRET" \
-  -step-up-binding-secret="${STEPUP_BINDING_SECRET:-$CONNECTOR_SECRET}" \
-  -audit-ingest-token="$AUDIT_INGEST_TOKEN" \
   -connector-runtime-secret-required \
   -workload-attestation-nonce-store=memory -allow-ephemeral-attestation-nonce-store \
   "$@"
@@ -1151,12 +1177,20 @@ set -eu
 : "${DSSE_ARCHIVE_WEBHOOK_URL:?set the HTTPS alert receiver in the plan}"
 : "${DSSE_ARCHIVE_WEBHOOK_SIGNING_SECRET:?set the private webhook signing secret}"
 export DSSE_DOMAIN_EVENT_PUBLISHER_WEBHOOK_SIGNING_SECRET="$DSSE_ARCHIVE_WEBHOOK_SIGNING_SECRET"
+# The database DSN carries its password: environment, not command line (see start-control-plane.sh).
+export DSSE_POSTGRES_DSN
+if "$DSSE_EDGE_BINARY" -help 2>&1 | grep -q -- '-secret-env'; then
+  set -- -secret-env=postgres-dsn=DSSE_POSTGRES_DSN "$@"
+else
+  set -- -postgres-dsn="$DSSE_POSTGRES_DSN" "$@"
+fi
 exec "$DSSE_EDGE_BINARY" -mode=postgres-domain-event-publisher \
-  -postgres-dsn="$DSSE_POSTGRES_DSN" -postgres-run-migrations=false \
+  -postgres-run-migrations=false \
   -worker-tenant-id=deployment -domain-event-publisher-plane=domain \
   -domain-event-publisher-id="archive-alert-${DSSE_NODE_NAME:?set this machine name}" \
   -domain-event-publisher-delivery=webhook \
-  -domain-event-publisher-webhook-url="$DSSE_ARCHIVE_WEBHOOK_URL"
+  -domain-event-publisher-webhook-url="$DSSE_ARCHIVE_WEBHOOK_URL" \
+  "$@"
 `
 
 	for name, body := range map[string]string{"start-control-plane.sh": cp, "start-edge.sh": edge, "start-archive-alert-publisher.sh": archivePublisher} {

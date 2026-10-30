@@ -646,3 +646,19 @@ test('unconfirmed local hold retries placement instead of releasing it', async()
  assert.ok(texts.includes('Save unconfirmed'));
  assert.ok(texts.some(x=>typeof x==='string' && x.includes('only in this process')));
 });
+
+test('a search the log store cannot answer says so instead of showing a status code', async () => {
+  for (const [status, want] of [[503, 'Cannot reach the log store'], [502, 'Cannot reach the log store'], [500, 'HTTP 500']]) {
+    const states = [];
+    const host = {isConnected: true};
+    const context = vm.createContext({host, freshRender: () => () => true, bl: v => v.en, URLSearchParams,
+      apiFetch: async () => ({ok: false, status, body: {error: 'log store unavailable'}}),
+      uiState: (...args) => states.push(args), el: () => ({})});
+    vm.runInContext(source, context);
+    await vm.runInContext('laLoadStream(host, null, null, false)', context);
+    const error = states.find(s => s[1] === 'error');
+    assert.ok(error, `status ${status} did not reach the error state`);
+    assert.ok(String(error[2]).includes(want), `status ${status} showed ${error[2]}`);
+    if (status !== 500) assert.ok(!String(error[2]).includes('HTTP'), `status ${status} still shows a code: ${error[2]}`);
+  }
+});

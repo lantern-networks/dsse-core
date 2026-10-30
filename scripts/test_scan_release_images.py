@@ -87,7 +87,7 @@ class ImageGateTests(unittest.TestCase):
         self.assertFalse(any("egress-broker" in role for role in images))
         self.assertEqual(gate.REQUIRED_BUILT, {"product", "console", "spilo", "etcd", "postgres-tools"})
         self.assertTrue(images["deploy/spilo-4.1-p2.patch:BASE_IMAGE"].endswith(
-            "@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956"))
+            "@sha256:076e7bf82319619f28dd0aa9c02ab34b055ad37100395b4f49a2ffba04fb5e11"))
         self.assertFalse(any("Dockerfile.postgres-tools" in role for role in images))
         self.assertIn("postgres-tools", gate.REQUIRED_BUILT)
 

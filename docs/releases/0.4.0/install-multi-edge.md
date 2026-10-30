@@ -235,6 +235,16 @@ With a private `-portal-ca`, the Edge launcher passes `clientless/trust.pem` as
 trust. Organization application anchors and each IdP connection's CA remain
 separate inputs. Browser trust still has to be provisioned independently.
 
+When running the generated fleet `-verify` command on a CP-only host with a
+private browser CA, add `-portal-ca /secure/browser-ca.pem`. Transfer only the
+approved public CA bundle to that verifier host, never an Edge's browser private
+key. This input is used only for the directed Portal TLS checks and is not saved
+or added to OS, deployment, application or IdP trust. Without that input, the
+verifier uses the local `clientless/trust.pem` when present and system roots.
+Three-Region verification requires each entrance to serve its own Portal and
+refuse the other two Regions' Portal names; it does not require every Edge
+certificate to cover all three names.
+
 `-preflight` uses the carried `install-plan.json` if `-plan` is omitted. It checks
 local generated inputs, publisher, assigned bind IPs, peer/entrance DNS, required
 mounted files, Linux Docker/Compose, preloaded image OS/architecture, first-party

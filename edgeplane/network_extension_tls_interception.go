@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -255,6 +256,7 @@ type NetworkExtensionLabTLSInterception struct {
 	// When the configured revocation directory cannot be read at startup, no
 	// tenant's old root can be proven safe to load or use.
 	revocationStoreUnreadableReason string
+	deploymentCRLIssuer             *InterceptionIssuer // validated shared issuer; guarded by issuerMu
 	// offlinePrimaryTenant is the organization the DEFAULT offline intermediate belongs to. It keeps signing
 	// under that intermediate when per-tenant issuers are added, so turning this on does not break the tenant
 	// whose devices already trust the current anchor. Empty means the default intermediate serves the
@@ -1147,7 +1149,8 @@ func (interception *NetworkExtensionLabTLSInterception) issuerFor(tenantID, cach
 	if !interception.useIntermediate {
 		// The deployment's own root signs leaves directly. This is what dsse-install generates.
 		interception.countSigning("direct_root")
-		return directInterceptionIssuer(provider), "", nil
+		issuer, err := interception.directIssuerLocked(provider)
+		return issuer, "", err
 	}
 	if iss, ok := interception.interceptIssuers[cacheTenant]; ok {
 		interception.countSigning("node_intermediate")
@@ -1173,7 +1176,8 @@ func (interception *NetworkExtensionLabTLSInterception) deploymentOwnIssuerLocke
 		return nil, "", false
 	}
 	if !interception.useIntermediate {
-		return directInterceptionIssuer(provider), "", true
+		issuer, err := interception.directIssuerLocked(provider)
+		return issuer, "", err == nil
 	}
 	if iss, ok := interception.interceptIssuers[cacheTenant]; ok {
 		return iss, "", true
@@ -1818,10 +1822,9 @@ func (interception *NetworkExtensionLabTLSInterception) leafCertificate(tenantID
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 	}
-	// Only a CRL-enabled, per-tenant delegated issuer advertises a leaf CDP. The
-	// issuer's own CDP fixes the tenant and HTTP origin; the leaf points to the
-	// Edge issuer's separately published signed CRL at that same origin. Legacy
-	// authorities keep their existing behavior, without inventing revocation status.
+	// Tenant-delegated and shared deployment issuers have separate publishers.
+	// Both leaf CDPs identify the immediate signer, never its parent's CRL.
+	// Authorities without published CRL locations retain their existing behavior.
 	if issuer.requiresTenantLeafCRL {
 		if createdAt.UnixNano() >= issuer.leafCRLReadyUntil.Load() {
 			return tls.Certificate{}, fmt.Errorf("interception leaf CRL is not published or has expired")
@@ -1835,6 +1838,8 @@ func (interception *NetworkExtensionLabTLSInterception) leafCertificate(tenantID
 			return tls.Certificate{}, fmt.Errorf("construct interception leaf CDP: %w", urlErr)
 		}
 		template.CRLDistributionPoints = points
+	} else {
+		template.CRLDistributionPoints = slices.Clone(issuer.deploymentLeafCRLPoints)
 	}
 	if ip := net.ParseIP(normalizedHost); ip != nil {
 		template.IPAddresses = []net.IP{ip}
@@ -1920,6 +1925,15 @@ func networkExtensionLabTLSLeafFresh(cert tls.Certificate, now func() time.Time,
 	if issuer == nil || issuer.signingCert == nil {
 		// Nothing to compare against: fall back to the leaf's own dates, which is what this did before.
 		return true
+	}
+	if len(issuer.deploymentLeafCRLPoints) > 0 {
+		if len(cert.Certificate) == 0 {
+			return false
+		}
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil || !slices.Equal(leaf.CRLDistributionPoints, issuer.deploymentLeafCRLPoints) {
+			return false
+		}
 	}
 	// ★★★ THE WHOLE PRESENTED CHAIN, NOT ITS FIRST ENTRY (2026-09-08, found by review). Comparing
 	// Certificate[1] catches a replaced signing certificate and misses a replaced TIER ABOVE it — and a

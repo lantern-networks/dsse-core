@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -315,23 +316,23 @@ func decodeSearchCursorOffset(query SearchQuery) (int, error) {
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(rawCursor)
 	if err != nil {
-		return 0, fmt.Errorf("decode search cursor: %w", err)
+		return 0, invalidQuery(fmt.Errorf("decode search cursor: %w", err))
 	}
 	var cursor searchCursor
 	if err := json.Unmarshal(decoded, &cursor); err != nil {
-		return 0, fmt.Errorf("parse search cursor: %w", err)
+		return 0, invalidQuery(fmt.Errorf("parse search cursor: %w", err))
 	}
 	if cursor.Version != 1 {
-		return 0, fmt.Errorf("unsupported search cursor version %d", cursor.Version)
+		return 0, invalidQuery(fmt.Errorf("unsupported search cursor version %d", cursor.Version))
 	}
 	if cursor.Offset < 0 {
-		return 0, fmt.Errorf("search cursor offset must be non-negative")
+		return 0, invalidQuery(errors.New("search cursor offset must be non-negative"))
 	}
 	if cursor.QueryChecksum != searchCursorChecksum(query) {
-		return 0, fmt.Errorf("search cursor does not match query")
+		return 0, invalidQuery(errors.New("search cursor does not match query"))
 	}
 	if !searchCursorSignatureValid(cursor) {
-		return 0, fmt.Errorf("search cursor signature is invalid")
+		return 0, invalidQuery(errors.New("search cursor signature is invalid"))
 	}
 	return cursor.Offset, nil
 }

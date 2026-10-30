@@ -63,6 +63,18 @@ for the plan settings and for building the same images from source instead.
 To install with these images, follow
 [Using the published images](install-multi-edge.md#using-the-published-images).
 
+### Checking the packages
+
+Check each package before installing it, in addition to `SHA256SUMS`:
+
+- macOS: `pkgutil --check-signature LanternDsseAgent-0.4.0-20261026103124.pkg` reports
+  `Developer ID Installer: Lantern Networks, Inc. (M4U8GSBL6C)`, notarized, and
+  `spctl -a -vvv -t install` on the package reports `accepted` with
+  `source=Notarized Developer ID`.
+- Windows: `Get-AuthenticodeSignature .\DsseAgent-0.4.0-windows-x64.msi` reports
+  `Valid`, and the signer certificate's thumbprint is
+  `0E10AB8EC192B4313E472A3CA0723B2D07123923`.
+
 ### Checking the images yourself
 
 You can check the images with this repository and the registry alone:

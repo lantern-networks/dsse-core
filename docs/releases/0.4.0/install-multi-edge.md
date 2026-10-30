@@ -63,8 +63,10 @@ Prepare three Linux hosts, persistent disks, Docker/Compose v2, synchronized tim
 private IPv4 peer routing, stable DNS and verified SSH host keys. IdP/Connector
 fixtures are additional infrastructure. Test real IPv6 egress from every Edge
 host and container before enrolling dual-stack endpoints. Use source, images and
-installer from one reviewed revision. Follow [Building](../../building.md) for the two
-first-party service images and preload required third-party images. Carries do not carry images.
+installer from one reviewed revision. Use the published images (see
+[Using the published images](#using-the-published-images)), or follow
+[Building](../../building.md) for the two first-party service images and preload the
+required third-party images. Carries do not carry images.
 
 ```sh
 export GOTOOLCHAIN=go1.27.3
@@ -142,9 +144,15 @@ docker image inspect --format '{{json .RepoDigests}} {{index .Config.Labels "org
 
 The digest must be the one in the plan, the [release README](README.md#server-container-images)
 and `release-manifest.json`, and the revision label must equal `image_revision`.
+
 `-preflight` repeats the label check and also checks each image's OS and
 architecture and the service binary's own revision. To check the images'
 source, see [Checking the images yourself](README.md#checking-the-images-yourself).
+
+To enroll endpoints with the published signed packages, set `"agent_publisher":
+"M4U8GSBL6C"`, the Apple Team ID that signs the macOS package. A plan carries one
+publisher; the acceptance installation used this value for both the macOS and the
+Windows endpoints. Validating Windows agent updates against it is an open item.
 
 For deployment-certificate Online revocation, declare `deployment_crl_origins`
 **before minting** the authority. Supply one to eight distinct, publicly reachable
